@@ -31,7 +31,14 @@
     "vite-plugin-node-polyfills": "^0.25.0"
   },
   "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
+    "@scure/base": "^2.0.0",
+    "@scure/bip32": "^2.0.1",
+    "@scure/bip39": "^2.0.1",
+    "idb": "^8.0.3",
     "simple-peer": "^9.11.1",
-    "webtorrent": "^1.9.7"
+    "webtorrent": "^1.9.7",
+    "yjs": "^13.6.30"
   }
 }

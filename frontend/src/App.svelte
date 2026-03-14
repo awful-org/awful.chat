@@ -14,6 +14,14 @@
 	import { Badge } from "$lib/components/ui/badge";
 	import { Separator } from "$lib/components/ui/separator";
 	import { File } from "@lucide/svelte";
+	import { identityStore, init, lock } from "$lib/identity.svelte";
+	import IdentitySetup from "$lib/components/IdentitySetup.svelte";
+	import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
+
+	// initialise identity on mount — reads keypair from IndexedDB (no password needed)
+	$effect(() => {
+		init();
+	});
 
 	let roomId = $state("test-room");
 	let input = $state("");
@@ -70,6 +78,22 @@
 	}
 </script>
 
+<!-- identity loading splash -->
+{#if identityStore.loading && !identityStore.keypair}
+	<div class="min-h-screen bg-zinc-950 flex items-center justify-center">
+		<div class="w-2 h-2 rounded-full bg-zinc-600 animate-pulse"></div>
+	</div>
+
+<!-- no identity yet → setup wizard -->
+{:else if !identityStore.keypair}
+	<IdentitySetup />
+
+<!-- identity exists but locked → unlock screen -->
+{:else if !identityStore.isUnlocked}
+	<UnlockIdentity />
+
+<!-- unlocked → main chat UI -->
+{:else}
 <div
 	class="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-4 font-mono"
 >
@@ -86,9 +110,19 @@
 					>mesh chat</span
 				>
 			</div>
-			<span class="text-xs text-zinc-600"
-				>id: <span class="text-zinc-400">{myId}</span></span
-			>
+			<div class="flex items-center gap-3">
+				<span class="text-xs text-zinc-600"
+					>id: <span class="text-zinc-400">{myId}</span></span
+				>
+				<Button
+					onclick={lock}
+					variant="ghost"
+					size="sm"
+					class="text-zinc-600 hover:text-zinc-400 hover:bg-zinc-900 font-mono text-xs h-6 px-2"
+				>
+					lock
+				</Button>
+			</div>
 		</div>
 
 		<Separator class="bg-zinc-800" />
@@ -299,3 +333,4 @@
 		{/if}
 	</div>
 </div>
+{/if}
