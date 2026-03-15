@@ -36,8 +36,8 @@ async function ensureProfile(): Promise<void> {
   const existing = await getOwnProfile();
   if (!existing) {
     await putOwnProfile({
-      id: "own",
       did: identityStore.did ?? "",
+      isMe: true,
       nickname: profileStore.nickname || "Anonymous",
       updatedAt: Date.now(),
     });

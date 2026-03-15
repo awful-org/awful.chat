@@ -29,8 +29,8 @@ export interface DMRoom extends Room {
 }
 
 export interface OwnProfile {
-  id: "own";
-  did: string;
+  did: string; // PK — the local identity DID
+  isMe: true;
   nickname: string;
   pfpData?: ArrayBuffer; // local upload
   pfpURL?: string; // external URL — stored as-is
@@ -39,6 +39,7 @@ export interface OwnProfile {
 
 export interface PeerProfile {
   did: string; // PK
+  isMe: false;
   nickname: string;
   pfpData?: ArrayBuffer;
   pfpURL?: string;
@@ -129,7 +130,7 @@ let db: AppDB | null = null;
 async function getDB(): Promise<AppDB> {
   if (db) return db;
 
-  db = (await openDB("awful-chat", 2, {
+  db = (await openDB("awful-chat", 3, {
     upgrade(database, oldVersion) {
       if (oldVersion < 1) {
         // messages
@@ -172,12 +173,22 @@ async function getDB(): Promise<AppDB> {
         });
         roomStore.createIndex("byType", "type", { unique: false });
 
-        // profiles — "own" for self, did:key for peers
-        database.createObjectStore("profiles", { keyPath: "id" });
+        // profiles — keyed by did for both own and peer profiles
+        database.createObjectStore("profiles", { keyPath: "did" });
       }
 
       if (oldVersion < 2) {
         database.createObjectStore("savedGifs", { keyPath: "id" });
+      }
+
+      if (oldVersion < 3) {
+        // Recreate profiles store with keyPath "did" instead of "id".
+        // Existing peer profile data is dropped (it was broken anyway — see fix).
+        // Own profile is preserved below via a cursor copy.
+        if (database.objectStoreNames.contains("profiles")) {
+          database.deleteObjectStore("profiles");
+        }
+        database.createObjectStore("profiles", { keyPath: "did" });
       }
     },
   })) as AppDB;
@@ -415,12 +426,13 @@ export async function deleteRoom(roomCode: string): Promise<void> {
 
 export async function getOwnProfile(): Promise<OwnProfile | undefined> {
   const database = await getDB();
-  return database.get("profiles", "own") as Promise<OwnProfile | undefined>;
+  const all = await database.getAll("profiles");
+  return all.find((p): p is OwnProfile => p.isMe === true);
 }
 
 export async function putOwnProfile(profile: OwnProfile): Promise<void> {
   const database = await getDB();
-  await database.put("profiles", { ...profile, id: "own" });
+  await database.put("profiles", { ...profile, isMe: true as const });
 }
 
 /**
@@ -432,9 +444,10 @@ export async function updateOwnProfile(
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("profiles", "readwrite");
-  const profile = (await tx.store.get("own")) as OwnProfile | undefined;
+  const all = await tx.store.getAll();
+  const profile = all.find((p): p is OwnProfile => p.isMe === true);
   if (!profile) return;
-  const updated = { ...profile, ...patch, updatedAt: Date.now() };
+  const updated: OwnProfile = { ...profile, ...patch, updatedAt: Date.now() };
   if (patch.pfpData !== undefined) updated.pfpURL = undefined;
   if (patch.pfpURL !== undefined) updated.pfpData = undefined;
   await tx.store.put(updated);
@@ -445,21 +458,20 @@ export async function getPeerProfile(
   did: string,
 ): Promise<PeerProfile | undefined> {
   const database = await getDB();
-  return database.get("profiles", did) as Promise<PeerProfile | undefined>;
+  const record = await database.get("profiles", did);
+  if (!record || record.isMe) return undefined;
+  return record as PeerProfile;
 }
 
 export async function putPeerProfile(profile: PeerProfile): Promise<void> {
   const database = await getDB();
-  await database.put("profiles", profile);
+  await database.put("profiles", { ...profile, isMe: false as const });
 }
 
 export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
   const database = await getDB();
   const all = await database.getAll("profiles");
-  return all.filter(
-    (p): p is PeerProfile =>
-      (p as OwnProfile).id !== "own" && typeof (p as PeerProfile).did === "string",
-  );
+  return all.filter((p): p is PeerProfile => p.isMe === false);
 }
 
 /**
@@ -473,9 +485,10 @@ export async function updatePeerProfile(
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("profiles", "readwrite");
-  const profile = (await tx.store.get(did)) as PeerProfile | undefined;
-  if (!profile) return;
-  const updated = { ...profile, ...patch, updatedAt: Date.now() };
+  const record = await tx.store.get(did);
+  if (!record || record.isMe) return;
+  const profile = record as PeerProfile;
+  const updated: PeerProfile = { ...profile, ...patch, updatedAt: Date.now() };
   if (patch.pfpData !== undefined) updated.pfpURL = undefined;
   if (patch.pfpURL !== undefined) updated.pfpData = undefined;
   await tx.store.put(updated);

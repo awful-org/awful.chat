@@ -23,6 +23,7 @@
   interface TileData {
     id: string;
     label: string;
+    avatarUrl?: string | null;
     isLocal: boolean;
     kind: "camera" | "screen";
     videoTrack: MediaStreamTrack | null;
@@ -43,6 +44,8 @@
     selfId: string;
     callPeerIds?: Set<string>;
     peerNames?: Map<string, string>;
+    peerAvatars?: Map<string, string>;
+    peerIdToDidFn?: (peerId: string) => string;
     onJoinCall: () => void;
     onLeaveCall: () => void;
     onToggleMute: () => void;
@@ -64,6 +67,8 @@
     selfId,
     callPeerIds = new Set<string>(),
     peerNames = new Map<string, string>(),
+    peerAvatars = new Map<string, string>(),
+    peerIdToDidFn = (id: string) => id,
     onJoinCall,
     onLeaveCall,
     onToggleMute,
@@ -187,6 +192,7 @@
     result.push({
       id: "local-camera",
       label: profileStore.nickname || "You",
+      avatarUrl: profileStore.avatarUrl,
       isLocal: true,
       kind: "camera",
       videoTrack: localVideoTrack,
@@ -194,10 +200,13 @@
       muted,
     });
     for (const p of participants.values()) {
-      const label = peerNames.get(p.peerId) ?? p.peerId.slice(0, 8);
+      const did = peerIdToDidFn(p.peerId);
+      const label = peerNames.get(did) ?? p.peerId.slice(0, 8);
+      const avatarUrl = peerAvatars.get(did) ?? null;
       result.push({
         id: `remote-camera-${p.peerId}`,
         label,
+        avatarUrl,
         isLocal: false,
         kind: "camera",
         videoTrack: p.videoTrack,
@@ -209,6 +218,7 @@
       result.push({
         id: "local-screen",
         label: profileStore.nickname || "You",
+        avatarUrl: profileStore.avatarUrl,
         isLocal: true,
         kind: "screen",
         videoTrack: localScreenTrack,
@@ -217,10 +227,13 @@
     }
     for (const p of participants.values()) {
       if (p.screenTrack) {
-        const label = peerNames.get(p.peerId) ?? p.peerId.slice(0, 8);
+        const did = peerIdToDidFn(p.peerId);
+        const label = peerNames.get(did) ?? p.peerId.slice(0, 8);
+        const avatarUrl = peerAvatars.get(did) ?? null;
         result.push({
           id: `remote-screen-${p.peerId}`,
           label,
+          avatarUrl,
           isLocal: false,
           kind: "screen",
           videoTrack: p.screenTrack,
@@ -374,9 +387,9 @@
         class="relative flex items-center justify-center rounded-full bg-primary/20 font-semibold text-primary overflow-hidden font-mono transition-shadow duration-200
         {compact ? 'size-8 text-sm' : 'size-16 text-2xl'}"
       >
-        {#if tile.isLocal && profileStore.avatarUrl}
+        {#if tile.avatarUrl}
           <img
-            src={profileStore.avatarUrl}
+            src={tile.avatarUrl}
             alt={tile.label}
             class="size-full object-cover"
           />
@@ -412,11 +425,16 @@
     <div class="flex-1 flex items-center justify-center">
       <div class="flex items-center gap-1">
         {#each [...callPeerIds] as peerId (peerId)}
+          {@const did = peerIdToDidFn(peerId)}
           <div
-            title={peerNames.get(peerId) ?? peerId}
-            class="flex size-16 sm:size-20 items-center justify-center rounded-full bg-primary/20 text-2xl font-semibold text-primary ring-2 ring-background font-mono"
+            title={peerNames.get(did) ?? peerId}
+            class="flex size-16 sm:size-20 items-center justify-center rounded-full bg-primary/20 text-2xl font-semibold text-primary ring-2 ring-background font-mono overflow-hidden"
           >
-            {(peerNames.get(peerId) ?? peerId).charAt(0).toUpperCase()}
+            {#if peerAvatars.get(did)}
+              <img src={peerAvatars.get(did)} alt={peerNames.get(did) ?? peerId} class="size-full object-cover" />
+            {:else}
+              {(peerNames.get(did) ?? peerId).charAt(0).toUpperCase()}
+            {/if}
           </div>
         {/each}
       </div>

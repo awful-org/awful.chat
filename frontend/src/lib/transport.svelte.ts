@@ -284,6 +284,7 @@ _transport.on("message", (peerId, data) => {
         .then((existing) => {
           putPeerProfile({
             did,
+            isMe: false,
             nickname: envelope.name as string,
             pfpURL: avatarUrl,
             updatedAt: Date.now(),
@@ -544,6 +545,10 @@ export function broadcastProfile(): void {
 
 export function selfId(): string {
   return identityStore.did ?? _transport.selfId();
+}
+
+export function peerIdToDid(peerId: string): string {
+  return _peerIdToDid.get(peerId) ?? peerId;
 }
 
 export async function joinCall(): Promise<void> {

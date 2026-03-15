@@ -17,7 +17,7 @@
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import GifPicker from "./GifPicker.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
-  import { loadMoreMessages, markSeen } from "$lib/transport.svelte";
+  import { loadMoreMessages, markSeen, peerIdToDid } from "$lib/transport.svelte";
 
   $effect(() => {
     loadProfile();
@@ -275,6 +275,8 @@
     {selfId}
     {callPeerIds}
     {peerNames}
+    {peerAvatars}
+    peerIdToDidFn={peerIdToDid}
     {error}
     {onJoinCall}
     {onLeaveCall}
