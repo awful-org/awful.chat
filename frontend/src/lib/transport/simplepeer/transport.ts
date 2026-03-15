@@ -180,8 +180,17 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
     });
 
     peer.on("error", (err: Error) => {
-      console.error(`[SimplePeerTransport] peer ${peerId} error:`, err);
-      this.teardownPeer(peerId);
+      console.warn(`[SimplePeerTransport] peer ${peerId} error:`, err.message);
+      // Only destroy on truly fatal errors — not on media renegotiation
+      // errors like "User-Initiated Abort" which are thrown when streams
+      // are added/removed during an active call.
+      const fatal =
+        err.message.includes("Ice connection failed") ||
+        err.message.includes("connect ECONNREFUSED") ||
+        err.message.includes("ERR_ICE_DISCONNECTED");
+      if (fatal) {
+        this.teardownPeer(peerId);
+      }
     });
 
     this.peerMap.set(peerId, peer);

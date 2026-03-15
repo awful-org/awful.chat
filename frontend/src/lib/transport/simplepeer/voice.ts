@@ -31,6 +31,11 @@ interface RemotePeer {
  *
  * Requires PeerTransport & SimplePeerExtension.
  * Will not compile with LibP2PTransport — use a different VoiceTransport impl.
+ *
+ * Participant lifecycle:
+ *   A peer only appears in `active` (and emits trackAdded) once their audio
+ *   stream actually arrives via onStream. Connecting to the room does NOT
+ *   add anyone to active — only joining the call does.
  */
 export class SimplePeerVoice implements VoiceTransport {
   private audioCtx: AudioContext | null = null;
@@ -45,33 +50,31 @@ export class SimplePeerVoice implements VoiceTransport {
   private currentOutputVolume: number = 1.0;
 
   private remotePeers: Map<string, RemotePeer> = new Map();
-  private active: Set<string> = new Set();
+  private active: Set<string> = new Set(); // peers who have sent us an audio stream
   private muted: boolean = false;
 
   private handlers: Map<keyof VoiceEvents, Set<Function>> = new Map();
 
   constructor(private transport: PeerTransport & SimplePeerExtension) {
-    // peer connects while we are in a call — send our stream immediately
+    // A new peer connects while we are already in a call — send our stream to them.
+    // Their stream will arrive via onStream when they add theirs.
     this.transport.on("connect", (peerId) => {
-      if (this.audioCtx) {
-        if (this.processedStream) {
-          this.transport.addStream(peerId, this.processedStream);
-        }
-        this.active.add(peerId);
-        this.emit("peerJoined", peerId);
+      if (this.audioCtx && this.processedStream) {
+        this.transport.addStream(peerId, this.processedStream);
       }
     });
 
     // peer disconnects — clean up their audio
     this.transport.on("disconnect", (peerId) => {
-      if (this.active.has(peerId)) {
+      if (this.remotePeers.has(peerId)) {
         this.teardownRemotePeer(peerId);
         this.emit("peerLeft", peerId);
       }
     });
 
-    // incoming stream from a remote peer
+    // incoming audio stream from a remote peer — they joined the call
     this.transport.onStream((peerId, stream) => {
+      if (!this.audioCtx) return; // we haven't joined the call yet — ignore
       this.setupRemotePeer(peerId, stream);
     });
   }
@@ -85,27 +88,26 @@ export class SimplePeerVoice implements VoiceTransport {
       // no mic available — join in listen-only mode
     }
 
-    // add our processed stream to all already-connected peers (only if we have one)
+    // send our stream to all already-connected peers and request theirs
     for (const peerId of this.transport.peers()) {
       if (this.processedStream) {
         this.transport.addStream(peerId, this.processedStream);
       }
-      this.active.add(peerId);
-      this.emit("peerJoined", peerId);
     }
   }
 
   leave(): void {
     // remove our stream from all peers
-    for (const peerId of this.active) {
+    for (const peerId of this.transport.peers()) {
       if (this.processedStream) {
         this.transport.removeStream(peerId, this.processedStream);
       }
     }
 
     // tear down all remote peers
-    for (const peerId of this.remotePeers.keys()) {
+    for (const peerId of [...this.remotePeers.keys()]) {
       this.teardownRemotePeer(peerId);
+      this.emit("peerLeft", peerId);
     }
 
     // stop mic tracks
@@ -143,13 +145,15 @@ export class SimplePeerVoice implements VoiceTransport {
       return;
     }
 
+    const oldStream = this.processedStream;
+
     // in a call — hot-swap the mic
     await this.startMic(deviceId);
 
-    // replace stream on all active peers
-    for (const peerId of this.active) {
-      this.transport.removeStream(peerId, this.processedStream!);
-      this.transport.addStream(peerId, this.processedStream!);
+    // replace stream on all connected peers
+    for (const peerId of this.transport.peers()) {
+      if (oldStream) this.transport.removeStream(peerId, oldStream);
+      if (this.processedStream) this.transport.addStream(peerId, this.processedStream);
     }
 
     this.activeInputDevice = deviceId;
@@ -286,7 +290,9 @@ export class SimplePeerVoice implements VoiceTransport {
    */
   private setupRemotePeer(peerId: string, stream: MediaStream): void {
     // tear down previous if re-connecting
-    this.teardownRemotePeer(peerId);
+    if (this.remotePeers.has(peerId)) {
+      this.teardownRemotePeer(peerId);
+    }
 
     const audio = new Audio();
     audio.autoplay = true;
@@ -315,7 +321,6 @@ export class SimplePeerVoice implements VoiceTransport {
 
     const [track] = stream.getAudioTracks();
     if (track) this.emit("trackAdded", peerId, track);
-    this.emit("peerJoined", peerId);
   }
 
   private teardownRemotePeer(peerId: string): void {

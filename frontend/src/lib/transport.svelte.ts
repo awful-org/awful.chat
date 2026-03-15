@@ -237,14 +237,6 @@ function _handleSyncComplete(peerId: string): void {
 
 _transport.on("connect", (peerId) => {
   transportState.peers = _transport.peers();
-  if (!transportState.participants.has(peerId)) {
-    transportState.participants.set(peerId, {
-      peerId,
-      audioTrack: null,
-      videoTrack: null,
-      screenTrack: null,
-    });
-  }
   _broadcastProfile();
 
   const myId = _transport.selfId();
