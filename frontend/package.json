@@ -11,7 +11,7 @@
   },
   "devDependencies": {
     "@internationalized/date": "^3.12.0",
-    "@lucide/svelte": "^0.577.0",
+    "@lucide/svelte": "^0.561.0",
     "@sveltejs/vite-plugin-svelte": "^6.2.1",
     "@tailwindcss/vite": "^4.1.18",
     "@tsconfig/svelte": "^5.0.6",
@@ -20,6 +20,7 @@
     "@types/webtorrent": "^0.110.1",
     "bits-ui": "^2.16.3",
     "clsx": "^2.1.1",
+    "prettier-plugin-svelte": "^3.5.1",
     "svelte": "^5.45.2",
     "svelte-check": "^4.3.4",
     "tailwind-merge": "^3.5.0",
@@ -36,7 +37,9 @@
     "@scure/base": "^2.0.0",
     "@scure/bip32": "^2.0.1",
     "@scure/bip39": "^2.0.1",
+    "@tanstack/svelte-query": "^6.1.0",
     "idb": "^8.0.3",
+    "mediasoup-client": "^3.18.7",
     "simple-peer": "^9.11.1",
     "webtorrent": "^1.9.7",
     "yjs": "^13.6.30"

@@ -23,9 +23,15 @@ importers:
       '@scure/bip39':
         specifier: ^2.0.1
         version: 2.0.1
+      '@tanstack/svelte-query':
+        specifier: ^6.1.0
+        version: 6.1.0(svelte@5.53.10)
       idb:
         specifier: ^8.0.3
         version: 8.0.3
+      mediasoup-client:
+        specifier: ^3.18.7
+        version: 3.18.7
       simple-peer:
         specifier: ^9.11.1
         version: 9.11.1
@@ -40,8 +46,8 @@ importers:
         specifier: ^3.12.0
         version: 3.12.0
       '@lucide/svelte':
-        specifier: ^0.577.0
-        version: 0.577.0(svelte@5.53.10)
+        specifier: ^0.561.0
+        version: 0.561.0(svelte@5.53.10)
       '@sveltejs/vite-plugin-svelte':
         specifier: ^6.2.1
         version: 6.2.4(svelte@5.53.10)(vite@7.3.1(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.31.1))
@@ -66,6 +72,9 @@ importers:
       clsx:
         specifier: ^2.1.1
         version: 2.1.1
+      prettier-plugin-svelte:
+        specifier: ^3.5.1
+        version: 3.5.1(prettier@3.8.1)(svelte@5.53.10)
       svelte:
         specifier: ^5.45.2
         version: 5.53.10
@@ -280,10 +289,18 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@lucide/svelte@0.577.0':
-    resolution: {integrity: sha512-0P6mkySd2MapIEgq08tADPmcN4DHndC/02PWwaLkOerXlx5Sv9aT4BxyXLIY+eccr0g/nEyCYiJesqS61YdBZQ==}
+  '@lucide/svelte@0.561.0':
+    resolution: {integrity: sha512-vofKV2UFVrKE6I4ewKJ3dfCXSV6iP6nWVmiM83MLjsU91EeJcEg7LoWUABLp/aOTxj1HQNbJD1f3g3L0JQgH9A==}
     peerDependencies:
       svelte: ^5
+
+  '@lukeed/csprng@1.1.0':
+    resolution: {integrity: sha512-Z7C/xXCiGWsg0KuKsHTKJxbWhpI3Vs5GwLfOean7MGyVFGqdRgBbAjOCh6u4bbjPc/8MJ2pZmK/0DLdCbivLDA==}
+    engines: {node: '>=8'}
+
+  '@lukeed/uuid@2.0.1':
+    resolution: {integrity: sha512-qC72D4+CDdjGqJvkFMMEAtancHUQ7/d/tAiHf64z8MopFDmcrtbcJuerDtFceuAfQJ2pDSfCKCtbqoGBNnwg0w==}
+    engines: {node: '>=8'}
 
   '@noble/curves@2.0.1':
     resolution: {integrity: sha512-vs1Az2OOTBiP4q0pwjW5aF0xp9n4MxVrmkFBxc6EKZc6ddYx5gaZiAsZoq0uRRXWbi3AT/sBqn05eRPtn1JCPw==}
@@ -558,17 +575,34 @@ packages:
     peerDependencies:
       vite: ^5.2.0 || ^6 || ^7
 
+  '@tanstack/query-core@5.90.20':
+    resolution: {integrity: sha512-OMD2HLpNouXEfZJWcKeVKUgQ5n+n3A2JFmBaScpNDUqSrQSjiveC7dKMe53uJUg1nDG16ttFPz2xfilz6i2uVg==}
+
+  '@tanstack/svelte-query@6.1.0':
+    resolution: {integrity: sha512-iKeMaBalk5NeRvp1Y2LgtG3j9HCeLcTEpfsyM+jL1wASnW/EYdCqyyotMKkOY4SNsnBpPDM5zrmstMn6tOzKFQ==}
+    peerDependencies:
+      svelte: ^5.25.0
+
   '@tsconfig/svelte@5.0.8':
     resolution: {integrity: sha512-UkNnw1/oFEfecR8ypyHIQuWYdkPvHiwcQ78sh+ymIiYoF+uc5H1UBetbjyqT+vgGJ3qQN6nhucJviX6HesWtKQ==}
 
   '@types/bittorrent-protocol@3.1.7':
     resolution: {integrity: sha512-RGOjJndPEuMDP7563SE+s7Yu3ctibhPizVKcFaDYiv6hmckNgdSXMqhABhb48wn2XWIRnj9nF66ryLTb2VuKZQ==}
 
+  '@types/debug@4.1.12':
+    resolution: {integrity: sha512-vIChWdVG3LG1SMxEvI/AK+FWJthlrqlTu7fbrlywTkkaONwk/UAGaULXRlf8vkzFBLVm0zkMdCquhL5aOjhXPQ==}
+
   '@types/estree@1.0.8':
     resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
 
+  '@types/events@3.0.3':
+    resolution: {integrity: sha512-trOc4AAUThEz9hapPtSd7wf5tiQKvTtu5b371UxXdTuqzIh0ArcRspRP0i0Viu+LXstIQ1z96t1nsPxT9ol01g==}
+
   '@types/magnet-uri@5.1.5':
     resolution: {integrity: sha512-SbBjlb1KGe38VfjRR+mwqztJd/4skhdKkRbIzPDhTy7IAeEAPZWIVSEkZw00Qr4ZZOGR3/ATJ20WWPBfrKHGdA==}
+
+  '@types/ms@2.1.0':
+    resolution: {integrity: sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA==}
 
   '@types/node@24.12.0':
     resolution: {integrity: sha512-GYDxsZi3ChgmckRT9HPU0WEhKLP08ev/Yfcq2AstjrDASOYCSXeyjDsHg4v5t4jOj7cyDX3vmprafKlWIG9MXQ==}
@@ -612,6 +646,10 @@ packages:
   available-typed-arrays@1.0.7:
     resolution: {integrity: sha512-wvUjBtSGN7+7SjNpq/9M2Tg350UZD3q62IFZLbRAR1bSMlCo1ZaeW+BJ+D090e4hIIZLBcTDWe4Mh4jvUDajzQ==}
     engines: {node: '>= 0.4'}
+
+  awaitqueue@3.3.0:
+    resolution: {integrity: sha512-zLxDhzQbzHmOyvxi7g3OlfR7jLrcmElStPxfLPpJkrFSDm71RSrY/MvsDA8Btlx8X1nOHUzGhQvc6bdUjL2f2w==}
+    engines: {node: '>=20'}
 
   axobject-query@4.1.0:
     resolution: {integrity: sha512-qIj0G9wZbMGNLjLmg1PT6v2mE9AH2zlnADJD/2tC6E00hgmhUOfEB6greHPAfLRSufHqROIUTkw6E+M3lH0PTQ==}
@@ -924,6 +962,10 @@ packages:
   evp_bytestokey@1.0.3:
     resolution: {integrity: sha512-/f2Go4TognH/KvCISP7OUsHn85hT9nUkxxA9BEWxFn+Oj9o8ZNLm/40hdlgSLyuOimsrTKLUMEorQexp/aPQeA==}
 
+  fake-mediastreamtrack@2.2.1:
+    resolution: {integrity: sha512-SITLc7UTDirSdgLGORrlmqjWLJtbtfIz/xO7DwVbJH3f0ds+NQok4ccl/WEzz49NSgiUlXf2wDW0+y5C+TO6EA==}
+    engines: {node: '>=20'}
+
   fast-blob-stream@1.1.1:
     resolution: {integrity: sha512-wdRazMMeM2pl8hq1lFG8fzix8p1VLAJunTTE2RADiFBwbUfZwybUm6IwPrmMS7qTthiayr166NoXeqWe3hfR5w==}
 
@@ -989,6 +1031,10 @@ packages:
 
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
+
+  h264-profile-level-id@2.3.2:
+    resolution: {integrity: sha512-hnq1UDlw7WGJV6GCr/g7wnkHYUjdAY2bis9rgn2JqSdQS2WfVvnt1ZE9g8nTguracodf5LLKZOwURsDN49YtBQ==}
+    engines: {node: '>=20'}
 
   has-property-descriptors@1.0.2:
     resolution: {integrity: sha512-55JNKuIW+vq4Ke1BjOTjM2YctQIvCT7GFzHwmfZPGo5wnrgkid0YQtnAleFSqumZm4az3n2BS+erby5ipJdgrg==}
@@ -1242,6 +1288,10 @@ packages:
   md5.js@1.3.5:
     resolution: {integrity: sha512-xitP+WxNPcTTOgnTJcrhM0xvdPepipPSf3I8EIpGKeFLjt3PlJLIDG3u8EX53ZIubkb+5U2+3rELYpEhHhzdkg==}
 
+  mediasoup-client@3.18.7:
+    resolution: {integrity: sha512-110f+zYEvSllYoF6didbIznIvSrTwMY9CqDhdWpq1M0goX1HWLoBdguiYB/MqcA858R2dOKDarP1R4vv5RAg1w==}
+    engines: {node: '>=20'}
+
   mediasource@2.4.0:
     resolution: {integrity: sha512-SKUMrbFMHgiCUZFOWZcL0aiF/KgHx9SPIKzxrl6+7nMUMDK/ZnOmJdY/9wKzYeM0g3mybt3ueg+W+/mrYfmeFQ==}
 
@@ -1392,6 +1442,17 @@ packages:
     resolution: {integrity: sha512-OW/rX8O/jXnm82Ey1k44pObPtdblfiuWnrd8X7GJ7emImCOstunGbXUpp7HdBrFQX6rJzn3sPT397Wp5aCwCHg==}
     engines: {node: ^10 || ^12 || >=14}
 
+  prettier-plugin-svelte@3.5.1:
+    resolution: {integrity: sha512-65+fr5+cgIKWKiqM1Doum4uX6bY8iFCdztvvp2RcF+AJoieaw9kJOFMNcJo/bkmKYsxFaM9OsVZK/gWauG/5mg==}
+    peerDependencies:
+      prettier: ^3.0.0
+      svelte: ^3.2.0 || ^4.0.0-next.0 || ^5.0.0-next.0
+
+  prettier@3.8.1:
+    resolution: {integrity: sha512-UOnG6LftzbdaHZcKoPFtOcCKztrQ57WkHDeRD9t/PTQtmT0NHSeWWepj6pS0z/N7+08BHFDQVUrfmfMRcZwbMg==}
+    engines: {node: '>=14'}
+    hasBin: true
+
   process-nextick-args@2.0.1:
     resolution: {integrity: sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag==}
 
@@ -1514,6 +1575,10 @@ packages:
     resolution: {integrity: sha512-x/+Cz4YrimQxQccJf5mKEbIa1NzeCRNI5Ecl/ekmlYaampdNLPalVyIcCZNNH3MvmqBugV5TMYZXv0ljslUlaw==}
     engines: {node: '>= 0.4'}
 
+  sdp-transform@3.0.0:
+    resolution: {integrity: sha512-gfYVRGxjHkGF2NPeUWHw5u6T/KGFtS5/drPms73gaSuMaVHKCY3lpLnGDfswVQO0kddeePoti09AwhYP4zA8dQ==}
+    hasBin: true
+
   set-function-length@1.2.2:
     resolution: {integrity: sha512-pgRc4hJ4/sNjWCSS9AmnS40x3bNMDTknHgL5UaMBTMyJnU90EgWh1Rz+MC9eFu4BuN/UwZjKQuY/1v3rM7HMfg==}
     engines: {node: '>= 0.4'}
@@ -1608,6 +1673,10 @@ packages:
 
   style-to-object@1.0.14:
     resolution: {integrity: sha512-LIN7rULI0jBscWQYaSswptyderlarFkjQ+t79nzty8tcIAceVomEVlLzH5VP4Cmsv6MtKhs7qaAiwlcp+Mgaxw==}
+
+  supports-color@10.2.2:
+    resolution: {integrity: sha512-SS+jx45GF1QjgEXQx4NJZV9ImqmO2NPz5FNsIHrsDjh2YsHnawpan7SNQ1o8NuhrbHZy9AZhIoCUiCeaW/C80g==}
+    engines: {node: '>=18'}
 
   supports-preserve-symlinks-flag@1.0.0:
     resolution: {integrity: sha512-ot0WnXS9fgdkgIcePe6RHNk1WA8+muPa6cSjeR3V8K27q9BB1rTE3R1p7Hv0z1ZyAc8s6Vvv8DIyWf681MAt0w==}
@@ -1960,9 +2029,15 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@lucide/svelte@0.577.0(svelte@5.53.10)':
+  '@lucide/svelte@0.561.0(svelte@5.53.10)':
     dependencies:
       svelte: 5.53.10
+
+  '@lukeed/csprng@1.1.0': {}
+
+  '@lukeed/uuid@2.0.1':
+    dependencies:
+      '@lukeed/csprng': 1.1.0
 
   '@noble/curves@2.0.1':
     dependencies:
@@ -2167,17 +2242,32 @@ snapshots:
       tailwindcss: 4.2.1
       vite: 7.3.1(@types/node@24.12.0)(jiti@2.6.1)(lightningcss@1.31.1)
 
+  '@tanstack/query-core@5.90.20': {}
+
+  '@tanstack/svelte-query@6.1.0(svelte@5.53.10)':
+    dependencies:
+      '@tanstack/query-core': 5.90.20
+      svelte: 5.53.10
+
   '@tsconfig/svelte@5.0.8': {}
 
   '@types/bittorrent-protocol@3.1.7':
     dependencies:
       '@types/node': 24.12.0
 
+  '@types/debug@4.1.12':
+    dependencies:
+      '@types/ms': 2.1.0
+
   '@types/estree@1.0.8': {}
+
+  '@types/events@3.0.3': {}
 
   '@types/magnet-uri@5.1.5':
     dependencies:
       '@types/node': 24.12.0
+
+  '@types/ms@2.1.0': {}
 
   '@types/node@24.12.0':
     dependencies:
@@ -2235,6 +2325,12 @@ snapshots:
     dependencies:
       possible-typed-array-names: 1.1.0
 
+  awaitqueue@3.3.0(supports-color@10.2.2):
+    dependencies:
+      debug: 4.4.3(supports-color@10.2.2)
+    transitivePeerDependencies:
+      - supports-color
+
   axobject-query@4.1.0: {}
 
   b4a@1.8.0: {}
@@ -2267,7 +2363,7 @@ snapshots:
   bittorrent-dht@10.0.7:
     dependencies:
       bencode: 2.0.3
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       k-bucket: 5.1.0
       k-rpc: 5.1.0
       last-one-wins: 1.0.4
@@ -2282,7 +2378,7 @@ snapshots:
   bittorrent-lsd@1.1.1:
     dependencies:
       chrome-dgram: 3.0.6
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
     transitivePeerDependencies:
       - supports-color
 
@@ -2292,7 +2388,7 @@ snapshots:
     dependencies:
       bencode: 2.0.3
       bitfield: 4.2.0
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       randombytes: 2.1.0
       rc4: 0.1.5
       readable-stream: 3.6.2
@@ -2310,7 +2406,7 @@ snapshots:
       chrome-dgram: 3.0.6
       clone: 2.1.2
       compact2string: 1.4.1
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       ip: 1.1.9
       lru: 3.1.0
       minimist: 1.2.8
@@ -2544,9 +2640,11 @@ snapshots:
       randombytes: 2.1.0
       randomfill: 1.0.4
 
-  debug@4.4.3:
+  debug@4.4.3(supports-color@10.2.2):
     dependencies:
       ms: 2.1.3
+    optionalDependencies:
+      supports-color: 10.2.2
 
   decompress-response@6.0.0:
     dependencies:
@@ -2672,6 +2770,10 @@ snapshots:
       md5.js: 1.3.5
       safe-buffer: 5.2.1
 
+  fake-mediastreamtrack@2.2.1:
+    dependencies:
+      '@lukeed/uuid': 2.0.1
+
   fast-blob-stream@1.1.1:
     dependencies:
       fast-readable-async-iterator: 1.1.2
@@ -2739,6 +2841,12 @@ snapshots:
   gopd@1.2.0: {}
 
   graceful-fs@4.2.11: {}
+
+  h264-profile-level-id@2.3.2(supports-color@10.2.2):
+    dependencies:
+      debug: 4.4.3(supports-color@10.2.2)
+    transitivePeerDependencies:
+      - supports-color
 
   has-property-descriptors@1.0.2:
     dependencies:
@@ -2956,7 +3064,7 @@ snapshots:
 
   lt_donthave@1.0.1:
     dependencies:
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       unordered-array-remove: 1.0.2
     transitivePeerDependencies:
       - supports-color
@@ -2979,6 +3087,18 @@ snapshots:
       hash-base: 3.0.5
       inherits: 2.0.4
       safe-buffer: 5.2.1
+
+  mediasoup-client@3.18.7:
+    dependencies:
+      '@types/debug': 4.1.12
+      '@types/events-alias': '@types/events@3.0.3'
+      awaitqueue: 3.3.0(supports-color@10.2.2)
+      debug: 4.4.3(supports-color@10.2.2)
+      events-alias: events@3.3.0
+      fake-mediastreamtrack: 2.2.1
+      h264-profile-level-id: 2.3.2(supports-color@10.2.2)
+      sdp-transform: 3.0.0
+      supports-color: 10.2.2
 
   mediasource@2.4.0:
     dependencies:
@@ -3155,6 +3275,13 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
+  prettier-plugin-svelte@3.5.1(prettier@3.8.1)(svelte@5.53.10):
+    dependencies:
+      prettier: 3.8.1
+      svelte: 5.53.10
+
+  prettier@3.8.1: {}
+
   process-nextick-args@2.0.1: {}
 
   process@0.11.10: {}
@@ -3241,7 +3368,7 @@ snapshots:
 
   render-media@4.1.0:
     dependencies:
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       is-ascii: 1.0.0
       mediasource: 2.4.0
       stream-to-blob-url: 3.0.2
@@ -3324,6 +3451,8 @@ snapshots:
       es-errors: 1.3.0
       is-regex: 1.2.1
 
+  sdp-transform@3.0.0: {}
+
   set-function-length@1.2.2:
     dependencies:
       define-data-property: 1.1.4
@@ -3380,7 +3509,7 @@ snapshots:
   simple-peer@9.11.1:
     dependencies:
       buffer: 6.0.3
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       err-code: 3.0.1
       get-browser-rtc: 1.1.0
       queue-microtask: 1.2.3
@@ -3396,7 +3525,7 @@ snapshots:
 
   simple-websocket@9.1.0(bufferutil@4.1.0)(utf-8-validate@5.0.10):
     dependencies:
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       queue-microtask: 1.2.3
       randombytes: 2.1.0
       readable-stream: 3.6.2
@@ -3476,6 +3605,8 @@ snapshots:
   style-to-object@1.0.14:
     dependencies:
       inline-style-parser: 0.2.7
+
+  supports-color@10.2.2: {}
 
   supports-preserve-symlinks-flag@1.0.0: {}
 
@@ -3572,7 +3703,7 @@ snapshots:
       bittorrent-dht: 10.0.7
       bittorrent-lsd: 1.1.1
       bittorrent-tracker: 9.19.0
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       run-parallel: 1.2.0
     transitivePeerDependencies:
       - react-native-b4a
@@ -3614,7 +3745,7 @@ snapshots:
     dependencies:
       bencode: 2.0.3
       bitfield: 4.2.0
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       simple-sha1: 3.1.0
     transitivePeerDependencies:
       - supports-color
@@ -3698,7 +3829,7 @@ snapshots:
       chunk-store-stream: 4.3.0
       cpus: 1.0.3
       create-torrent: 5.0.9
-      debug: 4.4.3
+      debug: 4.4.3(supports-color@10.2.2)
       end-of-stream: 1.4.5
       escape-html: 1.0.3
       fast-blob-stream: 1.1.1
