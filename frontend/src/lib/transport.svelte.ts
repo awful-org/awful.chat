@@ -8,6 +8,7 @@ import {
   putMessage,
   bulkPutMessages,
   getMessages,
+  getAllMessages,
   getWatermarksForRoom,
   setWatermark,
   markRoomSeen,
@@ -166,7 +167,8 @@ async function _handleSyncRequest(
   watermarks: Record<string, number>
 ): Promise<void> {
   if (!transportState.roomCode) return;
-  const allMsgs = await getMessages(transportState.roomCode);
+  // Use getAllMessages (no page limit) so we send the full history, not just the latest 50
+  const allMsgs = await getAllMessages(transportState.roomCode);
 
   const missing = allMsgs.filter(
     (m) => m.lamport > (watermarks[m.senderId] ?? 0)
@@ -208,14 +210,13 @@ async function _handleSyncRequest(
 
 async function _handleSyncBatch(messages: Message[]): Promise<void> {
   if (!messages.length) return;
-  const existingIds = new Set(transportState.messages.map((m) => m.id));
-  const newMsgs = messages.filter((m) => !existingIds.has(m.id));
-  if (!newMsgs.length) return;
 
-  await bulkPutMessages(newMsgs);
+  // Write all to IDB — put is idempotent so duplicates are safe
+  await bulkPutMessages(messages);
 
-  for (const m of newMsgs) {
+  for (const m of messages) {
     lamportReceive(m.lamport);
+    // setWatermark now has max semantics so batch ordering doesn't matter
     await setWatermark(m.roomCode, m.senderId, m.lamport);
   }
 
@@ -223,12 +224,27 @@ async function _handleSyncBatch(messages: Message[]): Promise<void> {
     refreshUnreadCount(transportState.roomCode).catch(() => {});
   }
 
-  transportState.messages = [...transportState.messages, ...newMsgs].sort(
-    (a, b) =>
-      a.lamport !== b.lamport
-        ? a.lamport - b.lamport
-        : a.senderId.localeCompare(b.senderId)
-  );
+  // Merge into in-memory list (dedup by id, then sort)
+  const existingIds = new Set(transportState.messages.map((m) => m.id));
+  const newMsgs = messages.filter((m) => !existingIds.has(m.id));
+  if (newMsgs.length > 0) {
+    transportState.messages = [...transportState.messages, ...newMsgs].sort(
+      (a, b) =>
+        a.lamport !== b.lamport
+          ? a.lamport - b.lamport
+          : a.senderId.localeCompare(b.senderId)
+    );
+  }
+}
+
+async function _reloadMessagesFromIDB(): Promise<void> {
+  if (!transportState.roomCode) return;
+  // Reload the latest page from IDB to reflect everything written during sync
+  const msgs = await getMessages(transportState.roomCode);
+  transportState.messages = msgs;
+  if (msgs.length > 0) {
+    _lamport = Math.max(_lamport, ...msgs.map((m) => m.lamport));
+  }
 }
 
 function _handleSyncComplete(peerId: string): void {
@@ -236,6 +252,9 @@ function _handleSyncComplete(peerId: string): void {
     if (_syncTimeoutId) clearTimeout(_syncTimeoutId);
     _syncTimeoutId = null;
     _pendingSyncPeer = null;
+    // Reload the display page from IDB — all batches have been written,
+    // so the in-memory view is now authoritative and correctly paginated
+    _reloadMessagesFromIDB().catch(() => {});
   }
 }
 

@@ -232,6 +232,18 @@ export async function getMessages(
   return results.reverse();
 }
 
+/**
+ * Fetch every message for a room with no page limit.
+ * Only used for sync — do not use for display.
+ */
+export async function getAllMessages(roomCode: string): Promise<Message[]> {
+  const database = await getDB();
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const range = IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER]);
+  const results = await index.getAll(range);
+  return results;
+}
+
 export async function getMessage(id: string): Promise<Message | undefined> {
   const database = await getDB();
   return database.get("messages", id);
@@ -529,8 +541,12 @@ export async function setWatermark(
   maxLamport: number,
 ): Promise<void> {
   const database = await getDB();
+  const id = watermarkId(roomCode, senderId);
+  const existing = await database.get("watermarks", id);
+  // Never regress — only advance the watermark
+  if (existing && existing.maxLamport >= maxLamport) return;
   await database.put("watermarks", {
-    id: watermarkId(roomCode, senderId),
+    id,
     roomCode,
     senderId,
     maxLamport,
