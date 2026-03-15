@@ -1,8 +1,10 @@
-FROM node:22-alpine AS base
+FROM node:22-slim AS base
 WORKDIR /app
 
-# mediasoup native build deps
-RUN apk add --no-cache python3 make g++ linux-headers
+# mediasoup native build deps (needed if prebuilt binary is unavailable)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip make g++ \
+ && rm -rf /var/lib/apt/lists/*
 
 FROM base AS deps
 COPY package.json package-lock.json* ./
@@ -13,9 +15,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS runner
+FROM node:22-slim AS runner
 WORKDIR /app
-RUN apk add --no-cache python3 make g++ linux-headers
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
