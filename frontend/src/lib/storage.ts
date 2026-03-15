@@ -57,6 +57,15 @@ export interface YjsDocRecord {
   update: Uint8Array;
 }
 
+export interface SavedGif {
+  id: string;
+  gifId: string;
+  title: string;
+  url: string;
+  previewUrl: string;
+  savedAt: number;
+}
+
 type AppDB = IDBPDatabase<{
   messages: {
     key: string;
@@ -109,6 +118,10 @@ type AppDB = IDBPDatabase<{
     key: string;
     value: OwnProfile | PeerProfile;
   };
+  savedGifs: {
+    key: string;
+    value: SavedGif;
+  };
 }>;
 
 let db: AppDB | null = null;
@@ -116,50 +129,56 @@ let db: AppDB | null = null;
 async function getDB(): Promise<AppDB> {
   if (db) return db;
 
-  db = (await openDB("awful-chat", 1, {
-    upgrade(database) {
-      // messages
-      const msgStore = database.createObjectStore("messages", {
-        keyPath: "id",
-      });
-      msgStore.createIndex("byRoom", "roomCode", { unique: false });
-      msgStore.createIndex("byRoomLamport", ["roomCode", "lamport"], {
-        unique: false,
-      });
-      msgStore.createIndex("bySender", "senderId", { unique: false });
+  db = (await openDB("awful-chat", 2, {
+    upgrade(database, oldVersion) {
+      if (oldVersion < 1) {
+        // messages
+        const msgStore = database.createObjectStore("messages", {
+          keyPath: "id",
+        });
+        msgStore.createIndex("byRoom", "roomCode", { unique: false });
+        msgStore.createIndex("byRoomLamport", ["roomCode", "lamport"], {
+          unique: false,
+        });
+        msgStore.createIndex("bySender", "senderId", { unique: false });
 
-      // attachments
-      const attStore = database.createObjectStore("attachments", {
-        keyPath: "id",
-      });
-      attStore.createIndex("byMessage", "messageId", { unique: false });
-      attStore.createIndex("byInfoHash", "infoHash", { unique: false });
-      attStore.createIndex("byStatus", "status", { unique: false });
+        // attachments
+        const attStore = database.createObjectStore("attachments", {
+          keyPath: "id",
+        });
+        attStore.createIndex("byMessage", "messageId", { unique: false });
+        attStore.createIndex("byInfoHash", "infoHash", { unique: false });
+        attStore.createIndex("byStatus", "status", { unique: false });
 
-      // pending DM messages
-      const penStore = database.createObjectStore("pending", { keyPath: "id" });
-      penStore.createIndex("byRecipient", "to", { unique: false });
+        // pending DM messages
+        const penStore = database.createObjectStore("pending", { keyPath: "id" });
+        penStore.createIndex("byRecipient", "to", { unique: false });
 
-      // identity — keyed by "mnemonic" | "keypair"
-      database.createObjectStore("identity", { keyPath: "id" });
+        // identity — keyed by "mnemonic" | "keypair"
+        database.createObjectStore("identity", { keyPath: "id" });
 
-      // watermarks — keyed by "roomCode:senderId"
-      const wmStore = database.createObjectStore("watermarks", {
-        keyPath: "id",
-      });
-      wmStore.createIndex("byRoom", "roomCode", { unique: false });
+        // watermarks — keyed by "roomCode:senderId"
+        const wmStore = database.createObjectStore("watermarks", {
+          keyPath: "id",
+        });
+        wmStore.createIndex("byRoom", "roomCode", { unique: false });
 
-      // Yjs snapshots — keyed by "channel:{roomCode}"
-      database.createObjectStore("yjsDocs", { keyPath: "id" });
+        // Yjs snapshots — keyed by "channel:{roomCode}"
+        database.createObjectStore("yjsDocs", { keyPath: "id" });
 
-      // rooms — keyed by roomCode
-      const roomStore = database.createObjectStore("rooms", {
-        keyPath: "roomCode",
-      });
-      roomStore.createIndex("byType", "type", { unique: false });
+        // rooms — keyed by roomCode
+        const roomStore = database.createObjectStore("rooms", {
+          keyPath: "roomCode",
+        });
+        roomStore.createIndex("byType", "type", { unique: false });
 
-      // profiles — "own" for self, did:key for peers
-      database.createObjectStore("profiles", { keyPath: "id" });
+        // profiles — "own" for self, did:key for peers
+        database.createObjectStore("profiles", { keyPath: "id" });
+      }
+
+      if (oldVersion < 2) {
+        database.createObjectStore("savedGifs", { keyPath: "id" });
+      }
     },
   })) as AppDB;
 
@@ -216,6 +235,19 @@ export async function bulkPutMessages(messages: Message[]): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("messages", "readwrite");
   await Promise.all([...messages.map((m) => tx.store.put(m)), tx.done]);
+}
+
+export async function getUnreadCount(
+  roomCode: string,
+  lastSeenLamport: number,
+): Promise<number> {
+  const database = await getDB();
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const range = IDBKeyRange.bound(
+    [roomCode, lastSeenLamport + 1],
+    [roomCode, Number.MAX_SAFE_INTEGER],
+  );
+  return index.count(range);
 }
 
 export async function updateMessageStatus(
@@ -421,6 +453,15 @@ export async function putPeerProfile(profile: PeerProfile): Promise<void> {
   await database.put("profiles", profile);
 }
 
+export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
+  const database = await getDB();
+  const all = await database.getAll("profiles");
+  return all.filter(
+    (p): p is PeerProfile =>
+      (p as OwnProfile).id !== "own" && typeof (p as PeerProfile).did === "string",
+  );
+}
+
 /**
  * Patch a cached peer profile.
  * Called when a peer broadcasts a profile update over the data channel.
@@ -513,4 +554,25 @@ export async function saveYjsDoc(id: string, doc: Y.Doc): Promise<void> {
   const database = await getDB();
   const update = Y.encodeStateAsUpdate(doc);
   await database.put("yjsDocs", { id, update });
+}
+
+export async function getAllSavedGifs(): Promise<SavedGif[]> {
+  const database = await getDB();
+  return database.getAll("savedGifs");
+}
+
+export async function putSavedGif(gif: SavedGif): Promise<void> {
+  const database = await getDB();
+  await database.put("savedGifs", gif);
+}
+
+export async function deleteSavedGif(id: string): Promise<void> {
+  const database = await getDB();
+  await database.delete("savedGifs", id);
+}
+
+export async function isGifSaved(gifId: string): Promise<SavedGif | undefined> {
+  const database = await getDB();
+  const all = await database.getAll("savedGifs");
+  return all.find((g) => g.gifId === gifId);
 }
