@@ -127,9 +127,15 @@ async function _loadHistory(roomCode: string): Promise<void> {
   if (msgs.length > 0) {
     _lamport = Math.max(_lamport, ...msgs.map((m) => m.lamport));
   }
-  for (const p of profiles) {
-    transportState.peerNames.set(p.did, p.nickname);
-    if (p.pfpURL) transportState.peerAvatars.set(p.did, p.pfpURL);
+  if (profiles.length > 0) {
+    const names = new Map(transportState.peerNames);
+    const avatars = new Map(transportState.peerAvatars);
+    for (const p of profiles) {
+      names.set(p.did, p.nickname);
+      if (p.pfpURL) avatars.set(p.did, p.pfpURL);
+    }
+    transportState.peerNames = names;
+    transportState.peerAvatars = avatars;
   }
 }
 
@@ -248,11 +254,17 @@ _transport.on("connect", (peerId) => {
 
 _transport.on("disconnect", (peerId) => {
   transportState.peers = _transport.peers();
-  transportState.participants.delete(peerId);
+  const parts = new Map(transportState.participants);
+  parts.delete(peerId);
+  transportState.participants = parts;
   const did = _peerIdToDid.get(peerId);
   if (did) {
-    transportState.peerNames.delete(did);
-    transportState.peerAvatars.delete(did);
+    const names = new Map(transportState.peerNames);
+    const avatars = new Map(transportState.peerAvatars);
+    names.delete(did);
+    avatars.delete(did);
+    transportState.peerNames = names;
+    transportState.peerAvatars = avatars;
     _peerIdToDid.delete(peerId);
   }
 });
@@ -264,14 +276,18 @@ _transport.on("message", (peerId, data) => {
     if (envelope.kind === "profile" && typeof envelope.name === "string") {
       const did = typeof envelope.did === "string" ? envelope.did : peerId;
       _peerIdToDid.set(peerId, did);
-      transportState.peerNames.set(did, envelope.name);
       const avatarUrl =
         typeof envelope.avatarUrl === "string" ? envelope.avatarUrl : undefined;
+      const names = new Map(transportState.peerNames);
+      names.set(did, envelope.name);
+      transportState.peerNames = names;
+      const avatars = new Map(transportState.peerAvatars);
       if (avatarUrl) {
-        transportState.peerAvatars.set(did, avatarUrl);
+        avatars.set(did, avatarUrl);
       } else {
-        transportState.peerAvatars.delete(did);
+        avatars.delete(did);
       }
+      transportState.peerAvatars = avatars;
       getPeerProfile(did)
         .then((existing) => {
           putPeerProfile({
@@ -352,26 +368,34 @@ _transport.on("message", (peerId, data) => {
 // ── Voice handlers ───────────────────────────────────────────────────────────
 
 _voice.on("trackAdded", (peerId, track) => {
-  if (!transportState.participants.has(peerId)) {
-    transportState.participants.set(peerId, {
-      peerId,
-      audioTrack: null,
-      videoTrack: null,
-      screenTrack: null,
-    });
-  }
-  const p = transportState.participants.get(peerId)!;
-  transportState.participants.set(peerId, { ...p, audioTrack: track });
+  const existing = transportState.participants.get(peerId) ?? {
+    peerId,
+    audioTrack: null,
+    videoTrack: null,
+    screenTrack: null,
+  };
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    { ...existing, audioTrack: track }
+  );
 });
 
 _voice.on("trackRemoved", (peerId) => {
   const p = transportState.participants.get(peerId);
-  if (p) transportState.participants.set(peerId, { ...p, audioTrack: null });
+  if (!p) return;
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    { ...p, audioTrack: null }
+  );
 });
 
 _voice.on("peerLeft", (peerId) => {
   const p = transportState.participants.get(peerId);
-  if (p) transportState.participants.set(peerId, { ...p, audioTrack: null });
+  if (!p) return;
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    { ...p, audioTrack: null }
+  );
 });
 
 _voice.on("error", (err) => {
@@ -381,40 +405,38 @@ _voice.on("error", (err) => {
 // ── Video handlers ───────────────────────────────────────────────────────────
 
 _video.on("trackAdded", (peerId, track, source) => {
-  if (!transportState.participants.has(peerId)) {
-    transportState.participants.set(peerId, {
-      peerId,
-      audioTrack: null,
-      videoTrack: null,
-      screenTrack: null,
-    });
-  }
-  const p = transportState.participants.get(peerId)!;
-  if (source === "camera") {
-    transportState.participants.set(peerId, { ...p, videoTrack: track });
-  } else {
-    transportState.participants.set(peerId, { ...p, screenTrack: track });
-  }
+  const existing = transportState.participants.get(peerId) ?? {
+    peerId,
+    audioTrack: null,
+    videoTrack: null,
+    screenTrack: null,
+  };
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    source === "camera"
+      ? { ...existing, videoTrack: track }
+      : { ...existing, screenTrack: track }
+  );
 });
 
 _video.on("trackRemoved", (peerId, source) => {
   const p = transportState.participants.get(peerId);
   if (!p) return;
-  if (source === "camera") {
-    transportState.participants.set(peerId, { ...p, videoTrack: null });
-  } else {
-    transportState.participants.set(peerId, { ...p, screenTrack: null });
-  }
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    source === "camera"
+      ? { ...p, videoTrack: null }
+      : { ...p, screenTrack: null }
+  );
 });
 
 _video.on("peerLeft", (peerId) => {
   const p = transportState.participants.get(peerId);
-  if (p)
-    transportState.participants.set(peerId, {
-      ...p,
-      videoTrack: null,
-      screenTrack: null,
-    });
+  if (!p) return;
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    { ...p, videoTrack: null, screenTrack: null }
+  );
 });
 
 _video.on("error", (err) => {

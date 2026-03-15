@@ -92,7 +92,13 @@
   >();
 
   function startSpeakerDetection(peerId: string, track: MediaStreamTrack) {
-    if (analysers.has(peerId)) return;
+    // If there's a stale entry for a different track, tear it down first
+    const existing = analysers.get(peerId);
+    if (existing) {
+      // Same track — nothing to do
+      if (analysers.get(peerId)?.source.mediaStream.getAudioTracks()[0] === track) return;
+      stopSpeakerDetection(peerId);
+    }
     try {
       const ctx = new AudioContext();
       const analyser = ctx.createAnalyser();
@@ -100,6 +106,8 @@
       const source = ctx.createMediaStreamSource(new MediaStream([track]));
       source.connect(analyser);
       analysers.set(peerId, { ctx, analyser, source });
+      // Resume in case the context started suspended (common for remote tracks)
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
     } catch {
       // ignore
     }
