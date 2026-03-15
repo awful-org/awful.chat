@@ -3,12 +3,13 @@ services:
     build:
       context: ./signal
     restart: unless-stopped
-    # Port is internal only — frontend nginx proxies /signal and /klipy/ to it
     expose:
       - "8080"
     environment:
       NODE_ENV: production
       KLIPY_API_KEY: ${KLIPY_API_KEY}
+    networks:
+      - dokploy-network
 
   frontend:
     build:
@@ -18,9 +19,22 @@ services:
       - "80"
     depends_on:
       - signal
+    networks:
+      - dokploy-network
     labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`)"
-      - "traefik.http.routers.frontend.entrypoints=websecure"
-      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
-      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+      - traefik.enable=true
+      - traefik.http.routers.awful-http.rule=Host(`awful.frav.in`)
+      - traefik.http.routers.awful-http.entrypoints=web
+      - traefik.http.routers.awful-http.middlewares=awful-redirect
+      - traefik.http.middlewares.awful-redirect.redirectscheme.scheme=https
+      - traefik.http.routers.awful-https.rule=Host(`awful.frav.in`)
+      - traefik.http.routers.awful-https.entrypoints=websecure
+      - traefik.http.routers.awful-https.tls=true
+      - traefik.http.routers.awful-https.tls.certresolver=letsencrypt
+      - traefik.http.services.awful-service.loadbalancer.server.port=80
+      - traefik.http.routers.awful-https.service=awful-service
+      - traefik.http.routers.awful-http.service=awful-service
+
+networks:
+  dokploy-network:
+    external: true
