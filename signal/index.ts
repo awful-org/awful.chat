@@ -1,7 +1,7 @@
 import type { ServerWebSocket } from "bun";
 
 type PeerID = string;
-type RoomID = string;
+type RoomCode = string;
 
 interface PeerMeta {
   id: PeerID;
@@ -10,34 +10,35 @@ interface PeerMeta {
 
 interface SocketData {
   peerId: PeerID;
-  roomId: RoomID;
+  roomCode: RoomCode;
 }
 
-// inbound message types from clients
-type ClientMsg = { type: "signal"; to: PeerID; signal: unknown };
-// outbound message types to clients
+type ClientMsg =
+  | { type: "join"; roomCode: RoomCode; peerId: PeerID }
+  | { type: "signal"; to: PeerID; signal: unknown };
+
 type ServerMsg =
   | { type: "peer-joined"; peerId: PeerID; initiator: boolean }
   | { type: "peer-left"; peerId: PeerID }
   | { type: "signal"; from: PeerID; signal: unknown }
   | { type: "error"; message: string };
 
-const rooms = new Map<RoomID, Map<PeerID, PeerMeta>>();
+const rooms = new Map<RoomCode, Map<PeerID, PeerMeta>>();
 
 function send(ws: ServerWebSocket<SocketData>, msg: ServerMsg) {
   ws.send(JSON.stringify(msg));
 }
 
-function getOrCreateRoom(roomId: RoomID): Map<PeerID, PeerMeta> {
-  if (!rooms.has(roomId)) {
-    rooms.set(roomId, new Map());
-    console.log(`[room] created ${roomId}`);
+function getOrCreateRoom(roomCode: RoomCode): Map<PeerID, PeerMeta> {
+  if (!rooms.has(roomCode)) {
+    rooms.set(roomCode, new Map());
+    console.log(`[room] created ${roomCode}`);
   }
-  return rooms.get(roomId)!;
+  return rooms.get(roomCode)!;
 }
 
-function joinRoom(roomId: RoomID, peer: PeerMeta) {
-  const room = getOrCreateRoom(roomId);
+function joinRoom(roomCode: RoomCode, peer: PeerMeta) {
+  const room = getOrCreateRoom(roomCode);
 
   if (room.has(peer.id)) {
     send(peer.ws, { type: "error", message: "peer id already in use" });
@@ -45,16 +46,14 @@ function joinRoom(roomId: RoomID, peer: PeerMeta) {
     return;
   }
 
-  // for each peer, tell the connecting one to be the initiator, and tell the existing one about the newcomer id and that it's not the initiator
+  // newcomer initiates toward each existing peer
+  // existing peers receive the newcomer and do NOT initiate
   for (const existing of room.values()) {
-    // newcomer initiates → existing peer
     send(peer.ws, {
       type: "peer-joined",
       peerId: existing.id,
       initiator: true,
     });
-
-    // existing peer receives → newcomer
     send(existing.ws, {
       type: "peer-joined",
       peerId: peer.id,
@@ -63,44 +62,91 @@ function joinRoom(roomId: RoomID, peer: PeerMeta) {
   }
 
   room.set(peer.id, peer);
-  console.log(`[room] ${peer.id} joined ${roomId} (${room.size} peers)`);
+  console.log(`[room] ${peer.id} joined ${roomCode} (${room.size} peers)`);
 }
 
-function leaveRoom(roomId: RoomID, peerId: PeerID) {
-  const room = rooms.get(roomId);
+function leaveRoom(roomCode: RoomCode, peerId: PeerID) {
+  const room = rooms.get(roomCode);
   if (!room) return;
 
   room.delete(peerId);
-  console.log(`[room] ${peerId} left ${roomId} (${room.size} peers)`);
+  console.log(`[room] ${peerId} left ${roomCode} (${room.size} peers)`);
 
-  // notify remaining peers
   for (const peer of room.values()) {
     send(peer.ws, { type: "peer-left", peerId });
   }
 
-  // clean up empty rooms
   if (room.size === 0) {
-    rooms.delete(roomId);
-    console.log(`[room] deleted ${roomId} (empty)`);
+    rooms.delete(roomCode);
+    console.log(`[room] deleted ${roomCode} (empty)`);
   }
 }
 
 function relaySignal(
-  roomId: RoomID,
+  roomCode: RoomCode,
   from: PeerID,
   to: PeerID,
   signal: unknown,
 ) {
-  const room = rooms.get(roomId);
+  const room = rooms.get(roomCode);
   if (!room) return;
 
   const target = room.get(to);
   if (!target) {
-    console.warn(`[signal] target ${to} not found in room ${roomId}`);
+    console.warn(`[signal] target ${to} not found in room ${roomCode}`);
     return;
   }
 
   send(target.ws, { type: "signal", from, signal });
+}
+
+const KLIPY_API_BASE = "https://api.klipy.com/api/v1";
+const KLIPY_API_KEY = process.env.KLIPY_API_KEY ?? "";
+
+function klipyError(msg: string, status = 500): Response {
+  return new Response(JSON.stringify({ error: msg }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function handleKlipySearch(url: URL): Promise<Response> {
+  if (!KLIPY_API_KEY) return klipyError("KLIPY_API_KEY not configured", 503);
+
+  const q = url.searchParams.get("q") ?? "";
+  const limit = url.searchParams.get("limit") ?? "18";
+  const page = url.searchParams.get("page") ?? "1";
+
+  const upstream = `${KLIPY_API_BASE}/${KLIPY_API_KEY}/gifs/search?q=${encodeURIComponent(q)}&limit=${limit}&page=${page}`;
+
+  try {
+    const res = await fetch(upstream);
+    if (!res.ok)
+      return klipyError(`Klipy API error: ${res.status}`, res.status);
+    const json = await res.json();
+    return Response.json(json);
+  } catch (e) {
+    return klipyError(`Failed to fetch from Klipy: ${e}`);
+  }
+}
+
+async function handleKlipyTrending(url: URL): Promise<Response> {
+  if (!KLIPY_API_KEY) return klipyError("KLIPY_API_KEY not configured", 503);
+
+  const limit = url.searchParams.get("limit") ?? "18";
+  const page = url.searchParams.get("page") ?? "1";
+
+  const upstream = `${KLIPY_API_BASE}/${KLIPY_API_KEY}/gifs/trending?limit=${limit}&page=${page}`;
+
+  try {
+    const res = await fetch(upstream);
+    if (!res.ok)
+      return klipyError(`Klipy API error: ${res.status}`, res.status);
+    const json = await res.json();
+    return Response.json(json);
+  } catch (e) {
+    return klipyError(`Failed to fetch from Klipy: ${e}`);
+  }
 }
 
 const server = Bun.serve<SocketData>({
@@ -109,36 +155,29 @@ const server = Bun.serve<SocketData>({
   fetch(req, server) {
     const url = new URL(req.url);
 
-    if (url.pathname === "/ws") {
-      const roomId = url.searchParams.get("room");
-      const peerId = url.searchParams.get("id");
-
-      if (!roomId || !peerId) {
-        return new Response("missing room or id", { status: 400 });
-      }
-
+    if (url.pathname === "/signal") {
       const upgraded = server.upgrade(req, {
-        data: { roomId, peerId } satisfies SocketData,
+        // roomCode and peerId are not known yet at upgrade time —
+        // client sends a join message after the WS opens
+        data: { peerId: "", roomCode: "" } satisfies SocketData,
       });
-
       return upgraded
         ? undefined
         : new Response("upgrade failed", { status: 500 });
     }
 
+    if (url.pathname === "/klipy/search") return handleKlipySearch(url);
+    if (url.pathname === "/klipy/trending") return handleKlipyTrending(url);
+
     return new Response("not found", { status: 404 });
   },
 
   websocket: {
-    open(ws) {
-      const { roomId, peerId } = ws.data;
-      const peer: PeerMeta = { id: peerId, ws };
-      joinRoom(roomId, peer);
+    open(_ws) {
+      // wait for join message — peerId and roomCode not set yet
     },
 
     message(ws, raw) {
-      const { roomId, peerId } = ws.data;
-
       let msg: ClientMsg;
       try {
         msg = JSON.parse(raw as string);
@@ -148,24 +187,42 @@ const server = Bun.serve<SocketData>({
       }
 
       switch (msg.type) {
-        case "signal":
-          relaySignal(roomId, peerId, msg.to, msg.signal);
+        case "join": {
+          // first message after WS open — sets identity
+          if (ws.data.peerId) {
+            send(ws, { type: "error", message: "already joined" });
+            return;
+          }
+          ws.data.peerId = msg.peerId;
+          ws.data.roomCode = msg.roomCode;
+          joinRoom(msg.roomCode, { id: msg.peerId, ws });
           break;
+        }
 
-        default:
+        case "signal": {
+          const { roomCode, peerId } = ws.data;
+          if (!peerId) {
+            send(ws, { type: "error", message: "send join first" });
+            return;
+          }
+          relaySignal(roomCode, peerId, msg.to, msg.signal);
+          break;
+        }
+
+        default: {
           send(ws, {
             type: "error",
             message: `unknown type: ${(msg as any).type}`,
           });
+        }
       }
     },
 
     close(ws) {
-      const { roomId, peerId } = ws.data;
-      leaveRoom(roomId, peerId);
+      const { roomCode, peerId } = ws.data;
+      if (peerId) leaveRoom(roomCode, peerId);
     },
   },
 });
 
-console.log(`signaling server running on ws://localhost:${server.port}/ws`);
-
+console.log(`signaling server running on ws://localhost:${server.port}/signal`);
