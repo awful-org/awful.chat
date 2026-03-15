@@ -372,8 +372,7 @@
     {:else}
       <div
         class="relative flex items-center justify-center rounded-full bg-primary/20 font-semibold text-primary overflow-hidden font-mono transition-shadow duration-200
-        {compact ? 'size-8 text-sm' : 'size-16 text-2xl'}
-        {isSpeaking ? 'ring-2 ring-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]' : ''}"
+        {compact ? 'size-8 text-sm' : 'size-16 text-2xl'}"
       >
         {#if tile.isLocal && profileStore.avatarUrl}
           <img

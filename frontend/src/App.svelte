@@ -19,7 +19,12 @@
     startScreenShare,
     stopScreenShare,
   } from "$lib/transport.svelte";
-  import { roomsStore, loadRooms, saveRoom, removeRoom } from "$lib/rooms.svelte";
+  import {
+    roomsStore,
+    loadRooms,
+    saveRoom,
+    removeRoom,
+  } from "$lib/rooms.svelte";
   import { loadProfile } from "$lib/profile.svelte";
 
   const queryClient = new QueryClient();
@@ -29,9 +34,13 @@
     return m ? m[1] : null;
   }
 
-  let pendingRoomCode = $state<string | null>(parseRoomCode(window.location.pathname));
+  let pendingRoomCode = $state<string | null>(
+    parseRoomCode(window.location.pathname)
+  );
 
-  $effect(() => { init(); });
+  $effect(() => {
+    init();
+  });
 
   $effect(() => {
     if (identityStore.isUnlocked) {
@@ -56,11 +65,18 @@
       .join("");
   }
 
-  async function handleJoin(roomCode: string, _displayName: string, roomName?: string) {
+  async function handleJoin(
+    roomCode: string,
+    _displayName: string,
+    roomName?: string
+  ) {
     joinError = null;
     try {
       await joinRoom(roomCode);
-      const label = roomName || roomsStore.rooms.find((r) => r.roomCode === roomCode)?.name || roomCode;
+      const label =
+        roomName ||
+        roomsStore.rooms.find((r) => r.roomCode === roomCode)?.name ||
+        roomCode;
       activeRoomCode = roomCode;
       activeRoomName = label;
       await saveRoom(roomCode, label);
@@ -77,7 +93,8 @@
     history.pushState({}, "", "/");
   }
 
-  async function handleRemoveRoom(code: string) {
+  async function handleRemoveRoom(code?: string) {
+    if (!code) code = activeRoomCode!;
     await removeRoom(code);
     if (activeRoomCode === code) {
       handleLeave();
@@ -135,7 +152,7 @@
       {#if hasSidebar}
         <RoomSidebar
           rooms={roomsStore.rooms}
-          activeRoomCode={activeRoomCode}
+          {activeRoomCode}
           unreadCounts={roomsStore.unreadCounts}
           isOpen={sidebarOpen}
           onClose={() => (sidebarOpen = false)}
@@ -159,11 +176,11 @@
             cameraOff={transportState.cameraOff}
             screenSharing={transportState.screenSharing}
             selfId={myId}
-            callPeerIds={callPeerIds}
+            {callPeerIds}
             peerNames={transportState.peerNames}
             peerAvatars={transportState.peerAvatars}
             error={transportState.error}
-            onLeave={handleLeave}
+            onLeave={() => handleRemoveRoom()}
             onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
             onSendMessage={sendMessage}
             onJoinCall={joinCall}

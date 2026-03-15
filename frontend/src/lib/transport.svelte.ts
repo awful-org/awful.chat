@@ -63,8 +63,6 @@ export const transportState = $state<TransportState>({
   error: null,
 });
 
-// ── Lamport clock ────────────────────────────────────────────────────────────
-
 let _lamport = 0;
 
 function lamportSend(): number {
@@ -75,8 +73,6 @@ function lamportSend(): number {
 function lamportReceive(remote: number): void {
   _lamport = Math.max(_lamport, remote) + 1;
 }
-
-// ── Transport instances ──────────────────────────────────────────────────────
 
 const _transport = new SimplePeerTransport();
 const _voice = new SimplePeerVoice(_transport);
@@ -113,7 +109,9 @@ async function _broadcastProfile(): Promise<void> {
     let avatarUrl: string | null = profile?.pfpURL || null;
     if (!avatarUrl && profile?.pfpData) {
       const bytes = new Uint8Array(profile.pfpData);
-      const binary = Array.from(bytes).map((b) => String.fromCharCode(b)).join("");
+      const binary = Array.from(bytes)
+        .map((b) => String.fromCharCode(b))
+        .join("");
       avatarUrl = `data:image/jpeg;base64,${btoa(binary)}`;
     }
     _transport.broadcast(encode({ kind: "profile", name, did, avatarUrl }));
@@ -145,7 +143,7 @@ async function _sendSyncRequest(peerId: string): Promise<void> {
       type: MessageType.SyncRequest,
       roomCode: transportState.roomCode,
       watermarks,
-    }),
+    })
   );
   _pendingSyncPeer = peerId;
   if (_syncTimeoutId) clearTimeout(_syncTimeoutId);
@@ -159,13 +157,13 @@ function _onSyncTimeout(): void {
 
 async function _handleSyncRequest(
   peerId: string,
-  watermarks: Record<string, number>,
+  watermarks: Record<string, number>
 ): Promise<void> {
   if (!transportState.roomCode) return;
   const allMsgs = await getMessages(transportState.roomCode);
 
   const missing = allMsgs.filter(
-    (m) => m.lamport > (watermarks[m.senderId] ?? 0),
+    (m) => m.lamport > (watermarks[m.senderId] ?? 0)
   );
 
   const batches: Message[][] = [];
@@ -180,7 +178,7 @@ async function _handleSyncRequest(
       type: MessageType.SyncOffer,
       totalMessages: missing.length,
       totalBatches: batches.length,
-    }),
+    })
   );
 
   for (let i = 0; i < batches.length; i++) {
@@ -192,13 +190,13 @@ async function _handleSyncRequest(
         messages: batches[i],
         batchIndex: i,
         totalBatches: batches.length,
-      }),
+      })
     );
   }
 
   _transport.send(
     peerId,
-    encode({ kind: "wire", type: MessageType.SyncComplete }),
+    encode({ kind: "wire", type: MessageType.SyncComplete })
   );
 }
 
@@ -219,13 +217,11 @@ async function _handleSyncBatch(messages: Message[]): Promise<void> {
     refreshUnreadCount(transportState.roomCode).catch(() => {});
   }
 
-  transportState.messages = [
-    ...transportState.messages,
-    ...newMsgs,
-  ].sort((a, b) =>
-    a.lamport !== b.lamport
-      ? a.lamport - b.lamport
-      : a.senderId.localeCompare(b.senderId),
+  transportState.messages = [...transportState.messages, ...newMsgs].sort(
+    (a, b) =>
+      a.lamport !== b.lamport
+        ? a.lamport - b.lamport
+        : a.senderId.localeCompare(b.senderId)
   );
 }
 
@@ -277,21 +273,24 @@ _transport.on("message", (peerId, data) => {
       const did = typeof envelope.did === "string" ? envelope.did : peerId;
       _peerIdToDid.set(peerId, did);
       transportState.peerNames.set(did, envelope.name);
-      const avatarUrl = typeof envelope.avatarUrl === "string" ? envelope.avatarUrl : undefined;
+      const avatarUrl =
+        typeof envelope.avatarUrl === "string" ? envelope.avatarUrl : undefined;
       if (avatarUrl) {
         transportState.peerAvatars.set(did, avatarUrl);
       } else {
         transportState.peerAvatars.delete(did);
       }
-      getPeerProfile(did).then((existing) => {
-        putPeerProfile({
-          did,
-          nickname: envelope.name as string,
-          pfpURL: avatarUrl,
-          updatedAt: Date.now(),
-          ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
-        }).catch(() => {});
-      }).catch(() => {});
+      getPeerProfile(did)
+        .then((existing) => {
+          putPeerProfile({
+            did,
+            nickname: envelope.name as string,
+            pfpURL: avatarUrl,
+            updatedAt: Date.now(),
+            ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
+          }).catch(() => {});
+        })
+        .catch(() => {});
       return;
     }
 
@@ -301,7 +300,7 @@ _transport.on("message", (peerId, data) => {
       if (type === MessageType.SyncRequest) {
         _handleSyncRequest(
           peerId,
-          (envelope.watermarks as Record<string, number>) ?? {},
+          (envelope.watermarks as Record<string, number>) ?? {}
         );
         return;
       }
@@ -346,13 +345,11 @@ _transport.on("message", (peerId, data) => {
         setWatermark(msg.roomCode, msg.senderId, msg.lamport).catch(() => {});
         refreshUnreadCount(msg.roomCode).catch(() => {});
 
-        transportState.messages = [
-          ...transportState.messages,
-          msg,
-        ].sort((a, b) =>
-          a.lamport !== b.lamport
-            ? a.lamport - b.lamport
-            : a.senderId.localeCompare(b.senderId),
+        transportState.messages = [...transportState.messages, msg].sort(
+          (a, b) =>
+            a.lamport !== b.lamport
+              ? a.lamport - b.lamport
+              : a.senderId.localeCompare(b.senderId)
         );
       }
     }
@@ -507,19 +504,19 @@ export async function sendMessage(text: string): Promise<void> {
   markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
 }
 
-export async function loadMoreMessages(beforeLamport: number): Promise<boolean> {
+export async function loadMoreMessages(
+  beforeLamport: number
+): Promise<boolean> {
   if (!transportState.roomCode) return false;
   const older = await getMessages(transportState.roomCode, beforeLamport);
   if (!older.length) return false;
   const existingIds = new Set(transportState.messages.map((m) => m.id));
   const newOnes = older.filter((m) => !existingIds.has(m.id));
-  transportState.messages = [
-    ...newOnes,
-    ...transportState.messages,
-  ].sort((a, b) =>
-    a.lamport !== b.lamport
-      ? a.lamport - b.lamport
-      : a.senderId.localeCompare(b.senderId),
+  transportState.messages = [...newOnes, ...transportState.messages].sort(
+    (a, b) =>
+      a.lamport !== b.lamport
+        ? a.lamport - b.lamport
+        : a.senderId.localeCompare(b.senderId)
   );
   return newOnes.length === 50;
 }
@@ -531,7 +528,10 @@ export async function markSeen(): Promise<void> {
   await markRoomSeen(roomCode, maxLamport);
   const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
   if (idx !== -1) {
-    roomsStore.rooms[idx] = { ...roomsStore.rooms[idx], lastSeenLamport: maxLamport };
+    roomsStore.rooms[idx] = {
+      ...roomsStore.rooms[idx],
+      lastSeenLamport: maxLamport,
+    };
   }
   const next = new Map(roomsStore.unreadCounts);
   next.set(roomCode, 0);

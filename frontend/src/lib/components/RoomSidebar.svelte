@@ -120,17 +120,15 @@
       {/each}
     </div>
 
-    <!-- Footer controls -->
     <SidebarControls />
   </aside>
 
-  <!-- Context menu -->
   {#if contextMenu}
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div
       role="menu"
       tabindex="-1"
-      class="fixed z-50 min-w-[140px] rounded-md border border-border bg-popover py-1 shadow-xl"
+      class="fixed z-50 min-w-35 rounded-md border border-border bg-popover py-1 shadow-xl"
       style="top: {contextMenu.y}px; left: {contextMenu.x}px"
       onclick={(e) => e.stopPropagation()}
     >

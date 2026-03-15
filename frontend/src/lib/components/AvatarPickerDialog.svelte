@@ -131,14 +131,16 @@
 
 <DialogPrimitive.Root
   {open}
-  onOpenChange={(v) => { if (!v) handleCancel(); }}
+  onOpenChange={(v) => {
+    if (!v) handleCancel();
+  }}
 >
   <DialogPrimitive.Portal>
     <DialogPrimitive.Overlay
-      class="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
+      class="fixed inset-0 z-60 bg-black/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
     />
     <DialogPrimitive.Content
-      class="fixed top-[50%] left-[50%] z-[60] translate-x-[-50%] translate-y-[-50%] w-full max-w-md mx-4 bg-card border border-border rounded-xl shadow-2xl flex flex-col overflow-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 duration-200"
+      class="fixed top-[50%] left-[50%] z-60 translate-x-[-50%] translate-y-[-50%] w-full max-w-md mx-4 bg-card border border-border rounded-xl shadow-2xl flex flex-col overflow-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 duration-200"
     >
       <div
         class="flex items-center justify-between px-4 py-3 border-b border-border shrink-0"
