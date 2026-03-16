@@ -51,6 +51,7 @@ export class SimplePeerVoice implements VoiceTransport {
 
   private remotePeers: Map<string, RemotePeer> = new Map();
   private active: Set<string> = new Set(); // peers who have sent us an audio stream
+  private pendingRemoteStreams: Map<string, MediaStream> = new Map();
   private muted: boolean = false;
 
   private handlers: Map<keyof VoiceEvents, Set<Function>> = new Map();
@@ -66,6 +67,7 @@ export class SimplePeerVoice implements VoiceTransport {
 
     // peer disconnects — clean up their audio
     this.transport.on("disconnect", (peerId) => {
+      this.pendingRemoteStreams.delete(peerId);
       if (this.remotePeers.has(peerId)) {
         this.teardownRemotePeer(peerId);
         this.emit("peerLeft", peerId);
@@ -74,13 +76,21 @@ export class SimplePeerVoice implements VoiceTransport {
 
     // incoming audio stream from a remote peer — they joined the call
     this.transport.onStream((peerId, stream) => {
-      if (!this.audioCtx) return; // we haven't joined the call yet — ignore
+      if (!this.audioCtx) {
+        // Peer stream can arrive before we join the call. Keep it and attach
+        // once join() creates the AudioContext to avoid one-way audio races.
+        this.pendingRemoteStreams.set(peerId, stream);
+        return;
+      }
       this.setupRemotePeer(peerId, stream);
     });
   }
 
   async join(_roomCode: string): Promise<void> {
     this.audioCtx = new AudioContext();
+    if (this.audioCtx.state === "suspended") {
+      await this.audioCtx.resume().catch(() => {});
+    }
 
     try {
       await this.startMic(this.activeInputDevice ?? undefined);
@@ -101,6 +111,12 @@ export class SimplePeerVoice implements VoiceTransport {
         this.transport.addStream(peerId, this.processedStream);
       }
     }
+
+    // Attach any streams that arrived before we joined the call.
+    for (const [peerId, stream] of this.pendingRemoteStreams) {
+      this.setupRemotePeer(peerId, stream);
+    }
+    this.pendingRemoteStreams.clear();
   }
 
   leave(): void {
@@ -132,6 +148,7 @@ export class SimplePeerVoice implements VoiceTransport {
     this.inputSource = null;
     this.inputGain = null;
     this.active.clear();
+    this.pendingRemoteStreams.clear();
   }
 
   mute(): void {
