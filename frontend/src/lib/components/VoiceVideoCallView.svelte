@@ -227,6 +227,7 @@
       muted,
     });
     for (const p of participants.values()) {
+      if (!p.videoTrack && !p.audioTrack) continue;
       const did = peerIdToDidFn(p.peerId);
       const label = peerNames.get(did) ?? p.peerId.slice(0, 8);
       const avatarUrl = peerAvatars.get(did) ?? null;
@@ -653,7 +654,7 @@
         <Button
           variant="destructive"
           size="icon"
-          class="size-11 sm:size-8 hidden sm:inline-flex cursor-pointer"
+          class="size-11 sm:size-8 cursor-pointer"
           onclick={onStopWatchingTransmission}
           aria-label="Stop watching transmission"
           title="Stop watching transmission"

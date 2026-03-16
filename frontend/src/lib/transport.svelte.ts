@@ -50,6 +50,8 @@ interface TransportState {
   pendingTransmissions: Map<string, string>;
   /** The peerId of the transmission currently being watched, or null. */
   watchingTransmissionPeerId: string | null;
+  /** The producerId of the transmission currently being watched, or null. */
+  watchingTransmissionProducerId: string | null;
 }
 
 export const transportState = $state<TransportState>({
@@ -71,6 +73,7 @@ export const transportState = $state<TransportState>({
   sfuPeerIds: new Set(),
   pendingTransmissions: new Map(),
   watchingTransmissionPeerId: null,
+  watchingTransmissionProducerId: null,
 });
 
 let _lamport = 0;
@@ -304,6 +307,7 @@ _transport.on("disconnect", (peerId) => {
   transportState.pendingTransmissions = txNext;
   if (transportState.watchingTransmissionPeerId === peerId) {
     transportState.watchingTransmissionPeerId = null;
+    transportState.watchingTransmissionProducerId = null;
   }
 });
 
@@ -507,6 +511,7 @@ _video.on("transmissionEnded", (peerId) => {
   // If we were watching this peer, clear that state
   if (transportState.watchingTransmissionPeerId === peerId) {
     transportState.watchingTransmissionPeerId = null;
+    transportState.watchingTransmissionProducerId = null;
   }
 });
 
@@ -551,6 +556,7 @@ export function leaveRoom(): void {
   transportState.sfuPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
   transportState.watchingTransmissionPeerId = null;
+  transportState.watchingTransmissionProducerId = null;
 }
 
 export async function sendMessage(text: string): Promise<void> {
@@ -668,6 +674,7 @@ export function leaveCall(): void {
   transportState.sfuPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
   transportState.watchingTransmissionPeerId = null;
+  transportState.watchingTransmissionProducerId = null;
 }
 
 export function toggleMute(): void {
@@ -755,6 +762,7 @@ export async function watchTransmission(peerId: string, producerId: string): Pro
   try {
     await _video.watchTransmission(peerId, producerId);
     transportState.watchingTransmissionPeerId = peerId;
+    transportState.watchingTransmissionProducerId = producerId;
     // Remove from pending (mediasoup.ts deletes it too, but keep in sync)
     const next = new Map(transportState.pendingTransmissions);
     next.delete(peerId);
@@ -767,9 +775,13 @@ export async function watchTransmission(peerId: string, producerId: string): Pro
 
 export function stopWatchingTransmission(): void {
   const peerId = transportState.watchingTransmissionPeerId;
-  if (!peerId) return;
+  const producerId = transportState.watchingTransmissionProducerId;
+  if (!peerId || !producerId) return;
   _video.stopWatchingTransmission(peerId);
+  // Restore the "Click to watch" tile — the remote peer is still producing
+  transportState.pendingTransmissions = new Map(transportState.pendingTransmissions).set(peerId, producerId);
   transportState.watchingTransmissionPeerId = null;
+  transportState.watchingTransmissionProducerId = null;
 }
 
 // ── Voice device / gain controls ─────────────────────────────────────────────
