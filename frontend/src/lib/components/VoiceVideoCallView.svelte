@@ -246,6 +246,7 @@
         audioTrack: null,
         videoTrack: null,
         screenTrack: null,
+        screenAudioTrack: null,
       };
       const did = peerIdToDidFn(peerId);
       const label = peerNames.get(did) ?? peerId.slice(0, 8);
@@ -315,6 +316,15 @@
   );
 
   const isWatchingTransmission = $derived(watchingTransmissionPeerId !== null);
+
+  const remoteAudio = $derived.by(() => {
+    const tracks: Array<{ id: string; track: MediaStreamTrack }> = [];
+    for (const p of participants.values()) {
+      if (p.audioTrack) tracks.push({ id: `${p.peerId}-voice`, track: p.audioTrack });
+      if (p.screenAudioTrack) tracks.push({ id: `${p.peerId}-screen`, track: p.screenAudioTrack });
+    }
+    return tracks;
+  });
 
   const gridCols = $derived.by(() => {
     const n = tiles.length;
@@ -565,9 +575,9 @@
     {#if error}<p class="text-sm text-destructive px-3 pt-1.5">{error}</p>{/if}
 
     <!-- Always-mounted remote audio elements -->
-    {#each tiles.filter((t) => t.audioTrack && !t.isLocal) as t (t.peerId)}
+    {#each remoteAudio as a (a.id)}
       <!-- svelte-ignore a11y_media_has_caption -->
-      <audio style="display:none" autoplay use:audioAction={t.audioTrack!}
+      <audio style="display:none" autoplay use:audioAction={a.track}
       ></audio>
     {/each}
 

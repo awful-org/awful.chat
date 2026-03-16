@@ -93,7 +93,7 @@ export class MediasoupVideo implements VideoTransport {
   private device: mediasoupClient.types.Device | null = null;
   private sendTransport: mediasoupClient.types.Transport | null = null;
   private recvTransport: mediasoupClient.types.Transport | null = null;
-  private producers: Map<VideoSource, Producer> = new Map();
+  private producers: Map<VideoSource, Producer[]> = new Map();
   private consumers: Map<string, Consumer[]> = new Map(); // peerId → consumers
   private active: Set<string> = new Set();
   private paused: Set<VideoSource> = new Set();
@@ -102,6 +102,8 @@ export class MediasoupVideo implements VideoTransport {
     new Map();
   // Screen-share producers that are available but not yet consumed (opt-in transmissions)
   private pendingTransmissions: Map<string, string> = new Map(); // peerId → producerId
+  // All pending screen producers (video + optional audio) for a peer.
+  private pendingScreenProducerIds: Map<string, Set<string>> = new Map();
 
   // ms:new-producer messages that arrived before recvTransport was ready
   private queuedProducers: MSNewProducer[] = [];
@@ -138,9 +140,11 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   leave(): void {
-    this.producers.forEach((p) => {
-      p.producer.close();
-      p.stream.getTracks().forEach((t) => t.stop());
+    this.producers.forEach((ps) => {
+      ps.forEach((p) => {
+        p.producer.close();
+      });
+      ps[0]?.stream.getTracks().forEach((t) => t.stop());
     });
     this.consumers.forEach((cs) => cs.forEach((c) => c.consumer.close()));
     this.sendTransport?.close();
@@ -158,6 +162,7 @@ export class MediasoupVideo implements VideoTransport {
     this.active.clear();
     this.paused.clear();
     this.pendingTransmissions.clear();
+    this.pendingScreenProducerIds.clear();
     this.queuedProducers = [];
     this.muted = false;
     this.device = null;
@@ -186,7 +191,7 @@ export class MediasoupVideo implements VideoTransport {
   async startScreenShare(stream?: MediaStream): Promise<void> {
     const s = stream ?? await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 15 } }, // lower framerate for screen share
-      audio: false,
+      audio: true,
     });
     await this.publish(s, "screen");
 
@@ -199,16 +204,16 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   pauseVideo(source: VideoSource): void {
-    const p = this.producers.get(source);
-    if (!p) return;
-    p.producer.pause();
+    const ps = this.producers.get(source);
+    if (!ps) return;
+    ps.forEach((p) => p.producer.pause());
     this.paused.add(source);
   }
 
   resumeVideo(source: VideoSource): void {
-    const p = this.producers.get(source);
-    if (!p) return;
-    p.producer.resume();
+    const ps = this.producers.get(source);
+    if (!ps) return;
+    ps.forEach((p) => p.producer.resume());
     this.paused.delete(source);
   }
 
@@ -217,13 +222,20 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   isPublishing(source: VideoSource): boolean {
-    return this.producers.has(source);
+    return (this.producers.get(source)?.length ?? 0) > 0;
   }
 
   /** Start watching a pending screen-share transmission from a remote peer. */
   async watchTransmission(peerId: string, producerId: string): Promise<void> {
     // Remove from pending so the tile changes from "click to watch" to live video
     this.pendingTransmissions.delete(peerId);
+    const all = this.pendingScreenProducerIds.get(peerId);
+    if (all && all.size > 0) {
+      await Promise.all(
+        [...all].map((id) => this.consumeProducer(peerId, id, "screen"))
+      );
+      return;
+    }
     await this.consumeProducer(peerId, producerId, "screen");
   }
 
@@ -269,12 +281,12 @@ export class MediasoupVideo implements VideoTransport {
    */
   mute(): void {
     this.muted = true;
-    this.producers.forEach(({ producer }) => producer.pause());
+    this.producers.forEach((ps) => ps.forEach(({ producer }) => producer.pause()));
   }
 
   unmute(): void {
     this.muted = false;
-    this.producers.forEach(({ producer }) => producer.resume());
+    this.producers.forEach((ps) => ps.forEach(({ producer }) => producer.resume()));
   }
 
   isMuted(): boolean {
@@ -358,26 +370,36 @@ export class MediasoupVideo implements VideoTransport {
     // stop any existing producer for this source
     this.stopSource(source);
 
-    const [track] = stream.getVideoTracks();
-    const producer = await this.sendTransport.produce({
-      track,
-      appData: { source },
-    });
+    const tracks: MediaStreamTrack[] = [];
+    const video = stream.getVideoTracks()[0];
+    if (video) tracks.push(video);
+    if (source === "screen") {
+      const audio = stream.getAudioTracks()[0];
+      if (audio) tracks.push(audio);
+    }
 
-    this.producers.set(source, { producer, source, stream });
+    const produced: Producer[] = [];
+    for (const track of tracks) {
+      const producer = await this.sendTransport.produce({
+        track,
+        appData: { source },
+      });
 
-    // if already muted, pause this new producer immediately
-    if (this.muted) producer.pause();
+      const entry: Producer = { producer, source, stream };
+      produced.push(entry);
 
-    // browser ended track externally (screen share stop button)
-    producer.on("trackended", () => this.stopSource(source));
+      if (this.muted) producer.pause();
+      producer.on("trackended", () => this.stopSource(source));
+    }
+
+    this.producers.set(source, produced);
   }
 
   private stopSource(source: VideoSource): void {
-    const p = this.producers.get(source);
-    if (!p) return;
-    p.producer.close();
-    p.stream.getTracks().forEach((t) => t.stop());
+    const ps = this.producers.get(source);
+    if (!ps || ps.length === 0) return;
+    ps.forEach((p) => p.producer.close());
+    ps[0].stream.getTracks().forEach((t) => t.stop());
     this.producers.delete(source);
     this.paused.delete(source);
   }
@@ -471,6 +493,10 @@ export class MediasoupVideo implements VideoTransport {
         // Camera is auto-consumed as before.
         // Screen share is opt-in — emit transmissionAvailable so the UI can show a tile.
         if (msg.source === "screen") {
+          if (!this.pendingScreenProducerIds.has(msg.peerId)) {
+            this.pendingScreenProducerIds.set(msg.peerId, new Set());
+          }
+          this.pendingScreenProducerIds.get(msg.peerId)!.add(msg.producerId);
           this.pendingTransmissions.set(msg.peerId, msg.producerId);
           this.emit("transmissionAvailable", msg.peerId, msg.producerId);
         } else {
@@ -489,6 +515,7 @@ export class MediasoupVideo implements VideoTransport {
           this.pendingTransmissions.delete(msg.peerId);
           this.emit("transmissionEnded", msg.peerId);
         }
+        this.pendingScreenProducerIds.delete(msg.peerId);
         break;
     }
   }

@@ -26,6 +26,7 @@ export interface ParticipantState {
   audioTrack: MediaStreamTrack | null;
   videoTrack: MediaStreamTrack | null;
   screenTrack: MediaStreamTrack | null;
+  screenAudioTrack: MediaStreamTrack | null;
 }
 
 interface TransportState {
@@ -507,6 +508,7 @@ _voice.on("trackAdded", (peerId, track) => {
     audioTrack: null,
     videoTrack: null,
     screenTrack: null,
+    screenAudioTrack: null,
   };
   transportState.participants = new Map(transportState.participants).set(
     peerId,
@@ -544,12 +546,15 @@ _video.on("trackAdded", (peerId, track, source) => {
     audioTrack: null,
     videoTrack: null,
     screenTrack: null,
+    screenAudioTrack: null,
   };
   transportState.participants = new Map(transportState.participants).set(
     peerId,
     source === "camera"
       ? { ...existing, videoTrack: track }
-      : { ...existing, screenTrack: track }
+      : track.kind === "audio"
+        ? { ...existing, screenAudioTrack: track }
+        : { ...existing, screenTrack: track }
   );
   // When any track is added, the peer is confirmed in the SFU room
   if (!transportState.sfuPeerIds.has(peerId)) {
@@ -564,7 +569,7 @@ _video.on("trackRemoved", (peerId, source) => {
     peerId,
     source === "camera"
       ? { ...p, videoTrack: null }
-      : { ...p, screenTrack: null }
+      : { ...p, screenTrack: null, screenAudioTrack: null }
   );
 });
 
@@ -580,7 +585,7 @@ _video.on("peerLeft", (peerId) => {
   if (p) {
     transportState.participants = new Map(transportState.participants).set(
       peerId,
-      { ...p, videoTrack: null, screenTrack: null }
+      { ...p, videoTrack: null, screenTrack: null, screenAudioTrack: null }
     );
   }
   const next = new Set(transportState.sfuPeerIds);
@@ -852,7 +857,7 @@ export async function startScreenShare(): Promise<void> {
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 15 } },
-      audio: false,
+      audio: true,
     });
     transportState.localScreenStream = stream;
     transportState.screenSharing = true;
