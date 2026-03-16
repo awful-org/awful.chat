@@ -20,6 +20,8 @@
     stopScreenShare,
     watchTransmission,
     stopWatchingTransmission,
+    getTransmissionOutputVolume,
+    setTransmissionOutputVolume,
     setRoomName,
   } from "$lib/transport.svelte";
   import {
@@ -199,6 +201,8 @@
             watchingTransmissionPeerId={transportState.watchingTransmissionPeerId}
             onWatchTransmission={watchTransmission}
             onStopWatchingTransmission={stopWatchingTransmission}
+            transmissionOutputVolume={getTransmissionOutputVolume()}
+            onTransmissionOutputVolumeChange={setTransmissionOutputVolume}
           />
         {:else}
           <RoomCreateJoin

@@ -36,6 +36,7 @@ interface TransportState {
   messages: Message[];
   inCall: boolean;
   muted: boolean;
+  deafened: boolean;
   participants: Map<string, ParticipantState>;
   localCameraStream: MediaStream | null;
   localScreenStream: MediaStream | null;
@@ -65,6 +66,7 @@ export const transportState = $state<TransportState>({
   messages: [],
   inCall: false,
   muted: false,
+  deafened: false,
   participants: new Map(),
   localCameraStream: null,
   localScreenStream: null,
@@ -82,6 +84,8 @@ export const transportState = $state<TransportState>({
 });
 
 let _lamport = 0;
+let _voiceOutputBeforeDeafen = 1;
+let _videoOutputBeforeDeafen = 1;
 
 function lamportSend(): number {
   _lamport += 1;
@@ -210,6 +214,11 @@ async function _sendSyncRequest(peerId: string): Promise<void> {
 function _onSyncTimeout(): void {
   _syncTimeoutId = null;
   _pendingSyncPeer = null;
+  const myId = _transport.selfId();
+  const host = selectSyncHost(_transport.peers(), myId);
+  if (host !== myId) {
+    _sendSyncRequest(host).catch(() => {});
+  }
 }
 
 async function _handleSyncRequest(
@@ -321,7 +330,7 @@ _transport.on("connect", (peerId) => {
   const myId = _transport.selfId();
   const host = selectSyncHost(_transport.peers(), myId);
   if (host !== myId) {
-    _sendSyncRequest(peerId);
+    _sendSyncRequest(host).catch(() => {});
   }
 });
 
@@ -392,8 +401,29 @@ _transport.on("message", (peerId, data) => {
     if (envelope.kind === "call-presence") {
       const inCall = envelope.inCall === true;
       const next = new Set(transportState.callPeerIds);
-      if (inCall) next.add(peerId);
-      else next.delete(peerId);
+      if (inCall) {
+        next.add(peerId);
+      } else {
+        next.delete(peerId);
+
+        // Peer left call: remove stale participant/media/transmission state.
+        const parts = new Map(transportState.participants);
+        parts.delete(peerId);
+        transportState.participants = parts;
+
+        const sfuNext = new Set(transportState.sfuPeerIds);
+        sfuNext.delete(peerId);
+        transportState.sfuPeerIds = sfuNext;
+
+        const txNext = new Map(transportState.pendingTransmissions);
+        txNext.delete(peerId);
+        transportState.pendingTransmissions = txNext;
+
+        if (transportState.watchingTransmissionPeerId === peerId) {
+          transportState.watchingTransmissionPeerId = null;
+          transportState.watchingTransmissionProducerId = null;
+        }
+      }
       transportState.callPeerIds = next;
       return;
     }
@@ -758,6 +788,8 @@ export function leaveCall(): void {
   _video.leave();
   transportState.inCall = false;
   transportState.muted = false;
+  transportState.deafened = false;
+  transportState.participants = new Map();
   transportState.localCameraStream = null;
   transportState.localScreenStream = null;
   transportState.localMicStream = null;
@@ -912,9 +944,47 @@ export function getVoiceActiveOutputDevice(): string | null {
 }
 
 export function setVoiceOutputVolume(volume: number): void {
-  _voice.setOutputVolume(volume);
+  const next = Math.max(0, volume);
+  if (transportState.deafened) {
+    _voiceOutputBeforeDeafen = next;
+    return;
+  }
+  _voiceOutputBeforeDeafen = next;
+  _voice.setOutputVolume(next);
 }
 
 export function getVoiceOutputVolume(): number {
   return _voice.getOutputVolume();
+}
+
+export function setTransmissionOutputVolume(volume: number): void {
+  const next = Math.max(0, volume);
+  if (transportState.deafened) {
+    _videoOutputBeforeDeafen = next;
+    return;
+  }
+  _videoOutputBeforeDeafen = next;
+  _video.setOutputVolume(next);
+}
+
+export function getTransmissionOutputVolume(): number {
+  return _videoOutputBeforeDeafen;
+}
+
+export function setDeafened(deafened: boolean): void {
+  if (deafened) {
+    _voiceOutputBeforeDeafen = _voice.getOutputVolume();
+    _videoOutputBeforeDeafen = getTransmissionOutputVolume();
+    _voice.setOutputVolume(0);
+    _video.setOutputVolume(0);
+    transportState.deafened = true;
+    return;
+  }
+  _voice.setOutputVolume(_voiceOutputBeforeDeafen);
+  _video.setOutputVolume(_videoOutputBeforeDeafen);
+  transportState.deafened = false;
+}
+
+export function toggleDeafen(): void {
+  setDeafened(!transportState.deafened);
 }

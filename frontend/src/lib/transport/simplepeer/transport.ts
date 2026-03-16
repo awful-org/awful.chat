@@ -187,6 +187,9 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
     });
 
     peer.on("error", (err: Error) => {
+      if (err.message.includes("User-Initiated Abort")) {
+        return;
+      }
       console.warn(`[SimplePeerTransport] peer ${peerId} error:`, err.message);
       // Only destroy on truly fatal errors — not on media renegotiation
       // errors like "User-Initiated Abort" which are thrown when streams

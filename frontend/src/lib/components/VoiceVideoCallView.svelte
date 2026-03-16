@@ -63,6 +63,8 @@
     onStopScreenShare: () => void;
     onWatchTransmission?: (peerId: string, producerId: string) => void;
     onStopWatchingTransmission?: () => void;
+    transmissionOutputVolume?: number;
+    onTransmissionOutputVolumeChange?: (volume: number) => void;
     error?: string | null;
   }
 
@@ -90,6 +92,8 @@
     onStopScreenShare,
     onWatchTransmission,
     onStopWatchingTransmission,
+    transmissionOutputVolume = 1,
+    onTransmissionOutputVolumeChange,
     error = null,
   }: Props = $props();
 
@@ -354,13 +358,16 @@
   let controlsVisible = $state(true);
   let panelEl = $state<HTMLDivElement | null>(null);
   let isFullscreen = $state(false);
+  let hoveringControls = $state(false);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
 
   function startHideTimer(delay: number) {
     if (!isFullscreen && !hasActiveVideo) return;
     controlsVisible = true;
     if (hideTimer) clearTimeout(hideTimer);
-    hideTimer = setTimeout(() => (controlsVisible = false), delay);
+    hideTimer = setTimeout(() => {
+      if (!hoveringControls) controlsVisible = false;
+    }, delay);
   }
 
   $effect(() => {
@@ -617,6 +624,8 @@
 
     <!-- Call controls -->
     <div
+      role="group"
+      aria-label="Call controls"
       class="flex items-center justify-center gap-2 transition-all duration-300 absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-4 py-1 backdrop-blur-sm z-10
         {isFullscreen && !controlsVisible
         ? 'translate-y-[calc(100%+2rem)] opacity-0 pointer-events-none'
@@ -624,6 +633,15 @@
         {!isFullscreen && hasActiveVideo && !controlsVisible
         ? 'opacity-0 pointer-events-none'
         : ''}"
+      onmouseenter={() => {
+        hoveringControls = true;
+        controlsVisible = true;
+        if (hideTimer) clearTimeout(hideTimer);
+      }}
+      onmouseleave={() => {
+        hoveringControls = false;
+        startHideTimer(isFullscreen ? 3000 : 120);
+      }}
     >
       <Button
         variant={muted ? "destructive" : "secondary"}
@@ -675,6 +693,23 @@
         >
           <Radio class="size-4 sm:size-3.5" />
         </Button>
+
+        <div class="hidden sm:flex items-center gap-2 px-2">
+          <input
+            type="range"
+            min="0"
+            max="2"
+            step="0.05"
+            value={transmissionOutputVolume}
+            oninput={(e) =>
+              onTransmissionOutputVolumeChange?.(
+                Number((e.currentTarget as HTMLInputElement).value)
+              )}
+            class="w-24 accent-primary"
+            aria-label="Transmission volume"
+            title="Transmission volume"
+          />
+        </div>
       {/if}
 
       <Button

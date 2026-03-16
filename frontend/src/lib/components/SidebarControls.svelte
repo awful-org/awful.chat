@@ -14,6 +14,7 @@
   import {
     transportState,
     toggleMute,
+    toggleDeafen,
     toggleCamera,
     startScreenShare,
     stopScreenShare,
@@ -23,7 +24,6 @@
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import SettingsDialog from "$lib/components/SettingsDialog.svelte";
 
-  let deafened = $state(false);
   let avatarDialogOpen = $state(false);
   let audioSettingsOpen = $state(false);
 
@@ -154,14 +154,14 @@
 
       <button
         type="button"
-        onclick={() => (deafened = !deafened)}
-        aria-label={deafened ? "Undeafen" : "Deafen"}
+        onclick={toggleDeafen}
+        aria-label={transportState.deafened ? "Undeafen" : "Deafen"}
         class="flex items-center justify-center rounded-md size-8 cursor-pointer transition-colors
-          {deafened
+          {transportState.deafened
           ? 'bg-destructive/20 text-destructive hover:bg-destructive/30'
           : 'text-muted-foreground hover:text-foreground hover:bg-muted'}"
       >
-        {#if deafened}
+        {#if transportState.deafened}
           <HeadphoneOff class="size-4" />
         {:else}
           <Headphones class="size-4" />

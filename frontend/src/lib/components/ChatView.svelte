@@ -54,6 +54,8 @@
     onStopScreenShare: () => void;
     onWatchTransmission?: (peerId: string, producerId: string) => void;
     onStopWatchingTransmission?: () => void;
+    transmissionOutputVolume?: number;
+    onTransmissionOutputVolumeChange?: (volume: number) => void;
   }
 
   let {
@@ -87,6 +89,8 @@
     onStopScreenShare,
     onWatchTransmission,
     onStopWatchingTransmission,
+    transmissionOutputVolume = 1,
+    onTransmissionOutputVolumeChange,
   }: Props = $props();
 
   let draft = $state("");
@@ -296,6 +300,8 @@
     {onStopScreenShare}
     {onWatchTransmission}
     {onStopWatchingTransmission}
+    {transmissionOutputVolume}
+    {onTransmissionOutputVolumeChange}
   />
 
   <div
