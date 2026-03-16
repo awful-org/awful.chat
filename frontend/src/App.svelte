@@ -23,6 +23,8 @@
     getTransmissionOutputVolume,
     setTransmissionOutputVolume,
     setRoomName,
+    sendReply,
+    toggleReaction,
   } from "$lib/transport.svelte";
   import {
     roomsStore,
@@ -191,6 +193,8 @@
             onLeave={() => handleRemoveRoom()}
             onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
             onSendMessage={sendMessage}
+            onSendReply={sendReply}
+            onToggleReaction={toggleReaction}
             onJoinCall={joinCall}
             onLeaveCall={leaveCall}
             onToggleMute={toggleMute}

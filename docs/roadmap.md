@@ -25,7 +25,7 @@ idb             → local persistence (messages, attachments, state)
 
 ---
 
-## Phase 2 — Message Reliability + Offline Sync
+## Phase 2 — Message Reliability + Offline Sync (partially implemented)
 
 **Goal:** messages never lost, offline peers catch up on reconnect
 
@@ -38,9 +38,9 @@ message log (append-only)
   → pagination friendly, unbounded history
 
 channel mutations (concurrent writes)
-  → Yjs per-channel doc
-  → reactions, edits, deletes, pins, topic
-  → CRDT handles concurrent writes automatically
+  → planned Yjs per-channel doc
+  → current implementation uses wire messages for replies/reactions
+  → edits/deletes/pins/topic remain pending
 ```
 
 ### 2.2 Room Code
@@ -177,7 +177,7 @@ type AttachmentStatus = "seeding" | "pending" | "downloading" | "complete" | "fa
 
 **File strategy:**
 
-```
+```txt
 < 5MB  → ArrayBuffer in IndexedDB + auto re-seed on startup
 > 5MB  → infoHash only, re-download on demand from peers
 always → infoHash persisted — download possible while someone seeds
@@ -297,7 +297,7 @@ async function loadMessages(roomCode: string, beforeLamport?: number): Promise<M
 
 ---
 
-## Phase 3 — Identity (BIP39 + ed25519)
+## Phase 3 — Identity (BIP39 + ed25519) ✓ (implemented)
 
 **Goal:** persistent cryptographic identity, recoverable, portable
 
@@ -356,13 +356,13 @@ Profile broadcast over data channel on connect so peers can cache it.
 
 ---
 
-## Phase 4 — DMs
+## Phase 4 — DMs (in progress)
 
 **Goal:** private 1-on-1 messages, encrypted, reliable delivery
 
 ### 4.1 DM Rooms
 
-```
+```txt
 roomCode    = sha256(sort([didA, didB]).join(':'))[0..24]
 transport   = SimplePeer direct
 encryption  = X25519 ECDH (ed25519 keys converted to curve25519)
@@ -370,7 +370,7 @@ encryption  = X25519 ECDH (ed25519 keys converted to curve25519)
 
 ### 4.2 Delivery Flow
 
-```
+```txt
 online:   encrypt → send → DeliveryAck → ReadAck
 offline:  encrypt → store as PendingMessage → watch presence
           → peer online → flush → DeliveryAck → ReadAck
@@ -390,12 +390,27 @@ Implemented behavior:
 
 ```txt
 - Voice remains p2p (SimplePeer) with mic/device/gain controls.
+- Voice deafen/undeafen is implemented via output gain control.
+- Duplex voice join race is handled (early remote streams buffered until join).
 - Video (camera + screen) is SFU-backed via mediasoup signaling over /sfu WebSocket.
 - Remote screen share is opt-in: peers receive a pending transmission tile and click to watch.
 - "Stop watching" restores pending transmission tile while producer is still active.
+- Transmission volume control while watching is implemented.
+- Screen-share tab/system audio is published and consumed for watchers.
 - Late joiners consume existing producers via replayed ms:new-producer events.
 - Client queues early producer notifications until recv transport is ready (race-safe).
+- SFU producer-closed signaling clears stale transmission tiles when shares end.
+- Explicit call-presence + room-name sync messages keep call UI state consistent across peers.
 - Local camera/screen preview reuses the same captured stream for publish (single permission prompt).
+
+## Chat Interaction Milestone (current)
+
+```txt
+- Reply UX: hover action, quote preview above composer, sent quote snapshot,
+  click quote to scroll/highlight original message.
+- Reaction UX: hover action, emoji picker, toggle add/remove, and per-message
+  reaction chips with click-to-join behavior.
+```
 ```
 
 ---
@@ -404,7 +419,8 @@ Implemented behavior:
 
 - [ ] Roles + permissions (hash chain model — see SPECSHEET.md)
 - [ ] Server-side file pinning (operator opt-in)
-- [ ] WebTorrent v2 when Vite compatibility fixed
+- [ ] Integrate WebTorrent file flow into active chat UI/path
+- [ ] Yjs mutation layer for edits/deletes/pins/topic reconciliation
 - [ ] mediasoup horizontal scaling
 - [ ] E2E encryption for rooms (MLS protocol)
 - [ ] Federation (Matrix-style)

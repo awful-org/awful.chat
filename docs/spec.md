@@ -18,31 +18,40 @@ Rooms and chat
   - peer profile broadcast and display in chat/call UI
 
 Collaboration data
-  - Yjs per-room channel doc for edits/deletes/reactions/pins/topic
-  - Yjs state sync over SimplePeer data channel (no y-webrtc)
-  - Yjs snapshot persistence in IndexedDB
+  - Not yet implemented in current app flow (planned): Yjs per-room channel doc for edits/deletes/reactions/pins/topic
 
 Files
-  - WebTorrent-based p2p file transfer
-  - infoHash metadata in messages
-  - small file blob persistence and re-seeding
+  - Not yet implemented in current app flow (planned): WebTorrent-based p2p file transfer
 
 Calls
   - p2p voice via SimplePeer + Web Audio input/output controls
+  - working duplex voice (early-stream race buffered until join completes)
+  - deafen/undeafen support (voice + transmission output mute/restore)
   - SFU video via mediasoup (camera + screen share)
   - opt-in screen-share transmissions (remote screen is not auto-consumed)
   - explicit "watch transmission" and "stop watching" flow
+  - transmission volume slider while watching
+  - screen-share tab/system audio publishing + playback for watchers
   - late-join handling for existing SFU producers
+  - producer lifecycle signaling to clear stale transmission tiles
+  - explicit call-presence sync so in-call peer tiles are stable
+  - room-name sync message over p2p data channel
   - local camera/screen preview + remote participant tiles + active speaker ring
+
+Chat interactions
+  - message replies (quote + jump to original)
+  - message reactions with toggle semantics (add/remove)
 ```
 
 ## Data Layer Split
 
-```
+```txt
 message log (append-only)  → lamport + watermark sync + IndexedDB
 channel mutations (CRDT)   → Yjs per-channel doc (reactions, edits, deletes)
 identity                   → BIP39 + ed25519, encrypted at rest in IndexedDB
 ```
+
+Note: the Yjs mutation layer and WebTorrent integration are currently design targets but not wired in the active production message flow yet.
 
 ---
 
@@ -457,9 +466,11 @@ Video:
 Screen share transmissions:
   - remote screen producers emit transmissionAvailable(peerId, producerId)
   - UI shows pending "Click to watch" tile (not auto-consumed)
-  - watchTransmission(peerId, producerId) consumes that producer
+  - watchTransmission(peerId, producerId) consumes all available screen producers for that peer (video + optional audio)
   - stopWatchingTransmission() closes the screen consumer and restores pending tile
   - transmissionEnded(peerId) clears pending/watching state
+  - delayed screen-audio producers are auto-consumed while already watching
+  - SFU emits producer-closed so stopped shares remove stale pending tiles
 
 Late join behavior:
   - SFU replays existing producers to newly joined peers

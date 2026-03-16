@@ -462,7 +462,11 @@ _transport.on("message", (peerId, data) => {
         return;
       }
 
-      if (type === MessageType.Text || type === MessageType.Reply) {
+      if (
+        type === MessageType.Text ||
+        type === MessageType.Reply ||
+        type === MessageType.Reaction
+      ) {
         const wire = envelope as unknown as WireMessage;
         if (!transportState.roomCode) return;
 
@@ -482,6 +486,9 @@ _transport.on("message", (peerId, data) => {
           meta: wire.meta,
           attachments: [],
           replyTo: wire.replyTo,
+          reactionTo: wire.reactionTo,
+          reactionEmoji: wire.reactionEmoji,
+          reactionOp: wire.reactionOp,
         };
 
         putMessage(msg).catch(() => {});
@@ -667,7 +674,18 @@ export function leaveRoom(): void {
   transportState.watchingTransmissionProducerId = null;
 }
 
-export async function sendMessage(text: string): Promise<void> {
+interface SendMessageOptions {
+  replyTo?: Message["replyTo"];
+  type?: MessageType;
+  reactionTo?: string;
+  reactionEmoji?: string;
+  reactionOp?: "add" | "remove";
+}
+
+export async function sendMessage(
+  text: string,
+  options: SendMessageOptions = {}
+): Promise<void> {
   if (!transportState.roomCode) return;
 
   const profile = await getOwnProfile();
@@ -682,9 +700,13 @@ export async function sendMessage(text: string): Promise<void> {
     senderName,
     timestamp: Date.now(),
     lamport,
-    type: MessageType.Text,
+    type: options.type ?? MessageType.Text,
     content: text,
     attachments: [],
+    replyTo: options.replyTo,
+    reactionTo: options.reactionTo,
+    reactionEmoji: options.reactionEmoji,
+    reactionOp: options.reactionOp,
   };
 
   const wire: WireMessage = {
@@ -695,6 +717,10 @@ export async function sendMessage(text: string): Promise<void> {
     lamport: msg.lamport,
     type: msg.type,
     content: msg.content,
+    replyTo: msg.replyTo,
+    reactionTo: msg.reactionTo,
+    reactionEmoji: msg.reactionEmoji,
+    reactionOp: msg.reactionOp,
   };
 
   _transport.broadcast(encode({ kind: "wire", ...wire }));
@@ -702,9 +728,41 @@ export async function sendMessage(text: string): Promise<void> {
   await putMessage(msg);
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
 
-  transportState.messages = [...transportState.messages, msg];
+  transportState.messages = [...transportState.messages, msg].sort((a, b) =>
+    a.lamport !== b.lamport
+      ? a.lamport - b.lamport
+      : a.senderId.localeCompare(b.senderId)
+  );
 
   markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+}
+
+export async function sendReply(text: string, target: Message): Promise<void> {
+  const snapshot = target.content.length > 160
+    ? `${target.content.slice(0, 157)}...`
+    : target.content;
+  await sendMessage(text, {
+    type: MessageType.Reply,
+    replyTo: {
+      id: target.id,
+      senderName: target.senderName,
+      content: snapshot,
+    },
+  });
+}
+
+export async function toggleReaction(messageId: string, emoji: string): Promise<void> {
+  const existing = transportState.messages
+    .filter((m) => m.type === MessageType.Reaction && m.reactionTo === messageId && m.reactionEmoji === emoji)
+    .sort((a, b) => b.lamport - a.lamport)
+    .find((m) => m.senderId === (identityStore.did ?? _transport.selfId()));
+
+  await sendMessage("", {
+    type: MessageType.Reaction,
+    reactionTo: messageId,
+    reactionEmoji: emoji,
+    reactionOp: existing?.reactionOp === "add" ? "remove" : "add",
+  });
 }
 
 export async function loadMoreMessages(

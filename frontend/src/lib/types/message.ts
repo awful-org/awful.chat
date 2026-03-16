@@ -12,6 +12,9 @@ export interface Message {
   meta?: FileMeta;
   attachments: string[]; // Attachment.id refs
   replyTo?: ReplyTo;
+  reactionTo?: string;
+  reactionEmoji?: string;
+  reactionOp?: "add" | "remove";
   status?: MessageStatus; // DMs only
 }
 
@@ -20,6 +23,7 @@ export enum MessageType {
   File = "file",
   System = "system",
   Reply = "reply",
+  Reaction = "reaction",
   SyncRequest = "sync_request",
   SyncOffer = "sync_offer",
   SyncBatch = "sync_batch",
@@ -89,6 +93,9 @@ export interface WireMessage {
   content: string;
   meta?: FileMeta;
   replyTo?: ReplyTo;
+  reactionTo?: string;
+  reactionEmoji?: string;
+  reactionOp?: "add" | "remove";
 }
 
 export interface WireDeliveryAck {

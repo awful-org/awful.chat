@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Message, ParticipantState } from "$lib/transport.svelte";
+  import { MessageType } from "$lib/types/message";
   import {
     LogOut,
     Menu,
@@ -10,6 +11,9 @@
     Check,
     ImagePlay,
     ChevronUp,
+    Smile,
+    Reply,
+    X,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -46,6 +50,8 @@
     onLeave: () => void;
     onOpenSidebar?: () => void;
     onSendMessage: (text: string) => void;
+    onSendReply?: (text: string, target: Message) => void;
+    onToggleReaction?: (messageId: string, emoji: string) => void;
     onJoinCall: () => void;
     onLeaveCall: () => void;
     onToggleMute: () => void;
@@ -81,6 +87,8 @@
     onLeave,
     onOpenSidebar,
     onSendMessage,
+    onSendReply,
+    onToggleReaction,
     onJoinCall,
     onLeaveCall,
     onToggleMute,
@@ -94,9 +102,39 @@
   }: Props = $props();
 
   let draft = $state("");
+  let replyTargetId = $state<string | null>(null);
+  let reactionPickerFor = $state<string | null>(null);
   let gifPickerOpen = $state(false);
   let hasMoreHistory = $state(true);
   let loadingMore = $state(false);
+
+  const reactionPalette = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉"];
+
+  const visibleMessages = $derived(
+    messages.filter((m) => m.type !== MessageType.Reaction)
+  );
+
+  const messageById = $derived(
+    new Map(visibleMessages.map((m) => [m.id, m]))
+  );
+
+  const replyTarget = $derived(
+    replyTargetId ? messageById.get(replyTargetId) ?? null : null
+  );
+
+  const reactionsByMessage = $derived.by(() => {
+    const byMessage = new Map<string, Map<string, Set<string>>>();
+    for (const m of messages) {
+      if (m.type !== MessageType.Reaction || !m.reactionTo || !m.reactionEmoji) continue;
+      if (!byMessage.has(m.reactionTo)) byMessage.set(m.reactionTo, new Map());
+      const byEmoji = byMessage.get(m.reactionTo)!;
+      if (!byEmoji.has(m.reactionEmoji)) byEmoji.set(m.reactionEmoji, new Set());
+      const users = byEmoji.get(m.reactionEmoji)!;
+      if (m.reactionOp === "remove") users.delete(m.senderId);
+      else users.add(m.senderId);
+    }
+    return byMessage;
+  });
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -108,10 +146,28 @@
   function submit() {
     const text = draft.trim();
     if (!text) return;
-    onSendMessage(text);
+    if (replyTarget && onSendReply) onSendReply(text, replyTarget);
+    else onSendMessage(text);
     draft = "";
+    replyTargetId = null;
     autoScroll = true;
     requestAnimationFrame(() => textareaEl?.focus());
+  }
+
+  function startReply(msg: Message) {
+    replyTargetId = msg.id;
+    reactionPickerFor = null;
+    requestAnimationFrame(() => textareaEl?.focus());
+  }
+
+  function jumpToMessage(messageId: string) {
+    const el = document.getElementById(`msg-${messageId}`);
+    if (!el || !messagesEl) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
+    setTimeout(() => {
+      el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
+    }, 900);
   }
 
   function handleGifSelect(url: string) {
@@ -309,7 +365,7 @@
     onscroll={handleScroll}
     class="flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
   >
-    {#if hasMoreHistory && messages.length >= 50}
+    {#if hasMoreHistory && visibleMessages.length >= 50}
       <div class="flex justify-center py-2">
         <Button
           variant="ghost"
@@ -324,7 +380,7 @@
       </div>
     {/if}
 
-    {#if messages.length === 0}
+    {#if visibleMessages.length === 0}
       <div class="flex h-full items-center justify-center py-20">
         <p class="text-sm text-muted-foreground italic">
           No messages yet. Say something!
@@ -332,8 +388,8 @@
       </div>
     {:else}
       <div class="space-y-0.5">
-        {#each messages as msg, i (msg.id)}
-          {@const prev = messages[i - 1]}
+        {#each visibleMessages as msg, i (msg.id)}
+          {@const prev = visibleMessages[i - 1]}
           {@const showDate = shouldShowDateSep(msg.timestamp, prev?.timestamp)}
           {@const showHeader = shouldShowHeader(msg, prev)}
           {@const isOwn = msg.senderId === selfId}
@@ -349,7 +405,8 @@
               </div>
             {/if}
             <div
-              class="group rounded-md px-2 py-0.5 hover:bg-muted/50 {showHeader
+              id={`msg-${msg.id}`}
+              class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 {showHeader
                 ? 'mt-3 pt-1'
                 : ''}"
             >
@@ -393,6 +450,18 @@
                   </div>
                 </div>
               {/if}
+              {#if msg.replyTo}
+                <button
+                  type="button"
+                  class="ml-9 mb-1 max-w-[28rem] text-left rounded border border-border/60 bg-muted/30 px-2 py-1 text-xs text-muted-foreground hover:bg-muted/50 cursor-pointer"
+                  onclick={() => jumpToMessage(msg.replyTo!.id)}
+                >
+                  <span class="font-semibold">{msg.replyTo.senderName}</span>
+                  <span class="mx-1">•</span>
+                  <span class="truncate">{msg.replyTo.content}</span>
+                </button>
+              {/if}
+
               <div class="ml-9 text-sm text-foreground wrap-break-word">
                 {#if isGif}
                   <img
@@ -405,6 +474,63 @@
                   <p class="whitespace-pre-wrap">{msg.content}</p>
                 {/if}
               </div>
+
+              <div class="ml-9 mt-1 flex items-center gap-1 min-h-5">
+                {#if reactionsByMessage.get(msg.id)?.size}
+                  {#each [...(reactionsByMessage.get(msg.id)?.entries() ?? [])] as [emoji, users] (emoji)}
+                    {#if users.size > 0}
+                      {@const reacted = users.has(selfId)}
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
+                          ? 'border-primary/60 bg-primary/15 text-primary'
+                          : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
+                        onclick={() => onToggleReaction?.(msg.id, emoji)}
+                      >
+                        <span>{emoji}</span>
+                        <span>{users.size}</span>
+                      </button>
+                    {/if}
+                  {/each}
+                {/if}
+              </div>
+
+              <div class="absolute right-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+                <button
+                  type="button"
+                  class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                  title="React"
+                  onclick={() =>
+                    (reactionPickerFor = reactionPickerFor === msg.id ? null : msg.id)}
+                >
+                  <Smile class="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                  title="Reply"
+                  onclick={() => startReply(msg)}
+                >
+                  <Reply class="size-3.5" />
+                </button>
+              </div>
+
+              {#if reactionPickerFor === msg.id}
+                <div class="ml-9 mt-1 inline-flex items-center gap-1 rounded-md border border-border bg-card px-1 py-1">
+                  {#each reactionPalette as emoji}
+                    <button
+                      type="button"
+                      class="size-7 inline-flex items-center justify-center rounded hover:bg-muted cursor-pointer text-sm"
+                      onclick={() => {
+                        onToggleReaction?.(msg.id, emoji);
+                        reactionPickerFor = null;
+                      }}
+                    >
+                      {emoji}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
             </div>
           </div>
         {/each}
@@ -412,7 +538,7 @@
     {/if}
   </div>
 
-  {#if !autoScroll && messages.length > 0}
+  {#if !autoScroll && visibleMessages.length > 0}
     <div class="flex justify-center -mt-10 relative z-10">
       <Button
         variant="secondary"
@@ -431,6 +557,26 @@
   <div
     class="border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shrink-0"
   >
+    {#if replyTarget}
+      <div class="mb-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        <div class="flex items-center justify-between gap-2">
+          <div class="truncate">
+            Replying to <span class="font-semibold text-foreground">{replyTarget.senderName}</span>
+            <span class="mx-1">•</span>
+            <span class="truncate">{replyTarget.content}</span>
+          </div>
+          <button
+            type="button"
+            class="size-6 inline-flex items-center justify-center rounded hover:bg-muted cursor-pointer"
+            onclick={() => (replyTargetId = null)}
+            aria-label="Cancel reply"
+          >
+            <X class="size-3.5" />
+          </button>
+        </div>
+      </div>
+    {/if}
+
     <form
       onsubmit={(e) => {
         e.preventDefault();
