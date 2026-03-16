@@ -55,6 +55,12 @@ interface MSPeerLeft {
   type: "ms:peer-left";
   peerId: string;
 }
+interface MSProducerClosed {
+  type: "ms:producer-closed";
+  peerId: string;
+  producerId: string;
+  source: VideoSource;
+}
 
 type MSMessage =
   | MSGetCapabilities
@@ -67,7 +73,8 @@ type MSMessage =
   | MSConsume
   | MSConsumerOptions
   | MSNewProducer
-  | MSPeerLeft;
+  | MSPeerLeft
+  | MSProducerClosed;
 
 interface Producer {
   producer: mediasoupClient.types.Producer;
@@ -543,6 +550,22 @@ export class MediasoupVideo implements VideoTransport {
         }
         this.pendingScreenProducerIds.delete(msg.peerId);
         this.watchingTransmissionPeers.delete(msg.peerId);
+        break;
+
+      case "ms:producer-closed":
+        if (msg.source === "screen") {
+          const ids = this.pendingScreenProducerIds.get(msg.peerId);
+          if (ids) {
+            ids.delete(msg.producerId);
+            if (ids.size === 0) {
+              this.pendingScreenProducerIds.delete(msg.peerId);
+              if (this.pendingTransmissions.has(msg.peerId)) {
+                this.pendingTransmissions.delete(msg.peerId);
+                this.emit("transmissionEnded", msg.peerId);
+              }
+            }
+          }
+        }
         break;
     }
   }

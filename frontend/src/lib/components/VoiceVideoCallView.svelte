@@ -636,7 +636,7 @@
     <div
       role="group"
       aria-label="Call controls"
-      class="flex items-center justify-center gap-2 transition-all duration-300 absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-4 py-1 backdrop-blur-sm z-10
+      class="grid grid-cols-[1fr_auto_1fr] items-center gap-2 transition-all duration-300 absolute bottom-3 left-3 right-3 rounded-2xl border border-white/10 bg-black/70 px-2 py-2 backdrop-blur-md z-10
         {isFullscreen && !controlsVisible
         ? 'translate-y-[calc(100%+2rem)] opacity-0 pointer-events-none'
         : ''}
@@ -653,96 +653,101 @@
         startHideTimer(isFullscreen ? 3000 : 120);
       }}
     >
-      <Button
-        variant={muted ? "destructive" : "secondary"}
-        size="icon"
-        class="size-11 sm:size-8 cursor-pointer"
-        onclick={onToggleMute}
-        aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-      >
-        {#if muted}<MicOff class="size-4 sm:size-3.5" />{:else}<Mic
-            class="size-4 sm:size-3.5"
-          />{/if}
-      </Button>
-
-      <Button
-        variant={cameraOff ? "secondary" : "destructive"}
-        size="icon"
-        class="size-11 sm:size-8 cursor-pointer"
-        onclick={onToggleCamera}
-        aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
-      >
-        {#if cameraOff}<Camera class="size-4 sm:size-3.5" />{:else}<CameraOff
-            class="size-4 sm:size-3.5"
-          />{/if}
-      </Button>
-
-      <Button
-        variant={screenSharing ? "destructive" : "secondary"}
-        size="icon"
-        class="size-11 sm:size-8 hidden sm:inline-flex cursor-pointer"
-        onclick={screenSharing ? onStopScreenShare : onStartScreenShare}
-        aria-label={screenSharing
-          ? "Stop transmission"
-          : "Start transmission (screen share)"}
-        title={screenSharing ? "Stop transmission" : "Start transmission"}
-      >
-        {#if screenSharing}<MonitorOff
-            class="size-4 sm:size-3.5"
-          />{:else}<Monitor class="size-4 sm:size-3.5" />{/if}
-      </Button>
-
-      {#if isWatchingTransmission}
+      <div class="flex items-center gap-2 justify-start min-w-0">
         <Button
-          variant="destructive"
+          variant={muted ? "destructive" : "secondary"}
           size="icon"
-          class="size-11 sm:size-8 cursor-pointer"
-          onclick={onStopWatchingTransmission}
-          aria-label="Stop watching transmission"
-          title="Stop watching transmission"
+          class="size-11 sm:size-9 cursor-pointer"
+          onclick={onToggleMute}
+          aria-label={muted ? "Unmute microphone" : "Mute microphone"}
         >
-          <Radio class="size-4 sm:size-3.5" />
+          {#if muted}<MicOff class="size-4 sm:size-3.5" />{:else}<Mic
+              class="size-4 sm:size-3.5"
+            />{/if}
         </Button>
 
-        <div class="flex items-center gap-2 px-2">
-          <input
-            type="range"
-            min="0"
-            max="2"
-            step="0.05"
-            value={transmissionOutputVolume}
-            oninput={(e) =>
-              onTransmissionOutputVolumeChange?.(
-                Number((e.currentTarget as HTMLInputElement).value)
-              )}
-            class="w-16 sm:w-24 accent-primary"
-            aria-label="Transmission volume"
-            title="Transmission volume"
-          />
-        </div>
-      {/if}
+        <Button
+          variant={cameraOff ? "secondary" : "destructive"}
+          size="icon"
+          class="size-11 sm:size-9 cursor-pointer"
+          onclick={onToggleCamera}
+          aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
+        >
+          {#if cameraOff}<Camera class="size-4 sm:size-3.5" />{:else}<CameraOff
+              class="size-4 sm:size-3.5"
+            />{/if}
+        </Button>
+
+        <Button
+          variant={screenSharing ? "destructive" : "secondary"}
+          size="icon"
+          class="size-11 sm:size-9 hidden sm:inline-flex cursor-pointer"
+          onclick={screenSharing ? onStopScreenShare : onStartScreenShare}
+          aria-label={screenSharing
+            ? "Stop transmission"
+            : "Start transmission (screen share)"}
+          title={screenSharing ? "Stop transmission" : "Start transmission"}
+        >
+          {#if screenSharing}<MonitorOff
+              class="size-4 sm:size-3.5"
+            />{:else}<Monitor class="size-4 sm:size-3.5" />{/if}
+        </Button>
+
+        {#if isWatchingTransmission}
+          <Button
+            variant="destructive"
+            size="icon"
+            class="size-11 sm:size-9 cursor-pointer"
+            onclick={onStopWatchingTransmission}
+            aria-label="Stop watching transmission"
+            title="Stop watching transmission"
+          >
+            <Radio class="size-4 sm:size-3.5" />
+          </Button>
+
+          <div class="flex items-center gap-2 px-1">
+            <input
+              type="range"
+              min="0"
+              max="2"
+              step="0.05"
+              value={transmissionOutputVolume}
+              oninput={(e) =>
+                onTransmissionOutputVolumeChange?.(
+                  Number((e.currentTarget as HTMLInputElement).value)
+                )}
+              class="w-16 sm:w-24 accent-primary"
+              aria-label="Transmission volume"
+              title="Transmission volume"
+            />
+          </div>
+        {/if}
+      </div>
 
       <Button
         variant="destructive"
-        size="icon"
-        class="size-11 sm:size-8 cursor-pointer"
+        class="h-11 sm:h-10 px-5 sm:px-6 cursor-pointer font-mono text-sm font-semibold tracking-wide shadow-md"
         onclick={onLeaveCall}
         aria-label="Leave call"
       >
-        <PhoneOff class="size-4 sm:size-3.5" />
+        <PhoneOff class="size-4 mr-1.5" />
+        End Call
       </Button>
 
-      <Button
-        variant="secondary"
-        size="icon"
-        class="size-11 sm:size-8 hidden sm:inline-flex cursor-pointer"
-        onclick={toggleFullscreen}
-        aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-      >
-        {#if isFullscreen}<Minimize
-            class="size-4 sm:size-3.5"
-          />{:else}<Maximize class="size-4 sm:size-3.5" />{/if}
-      </Button>
+      <div class="flex items-center justify-end">
+        <Button
+          variant="secondary"
+          size="icon"
+          class="size-11 sm:size-9 hidden sm:inline-flex cursor-pointer"
+          onclick={toggleFullscreen}
+          aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+        >
+          {#if isFullscreen}<Minimize
+              class="size-4 sm:size-3.5"
+            />{:else}<Maximize class="size-4 sm:size-3.5" />{/if}
+        </Button>
+      </div>
     </div>
   </div>
 {/if}

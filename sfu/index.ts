@@ -70,6 +70,12 @@ interface MSNewProducer {
   producerId: string;
   source: "camera" | "screen";
 }
+interface MSProducerClosed {
+  type: "ms:producer-closed";
+  peerId: string;
+  producerId: string;
+  source: "camera" | "screen";
+}
 interface MSPeerLeft {
   type: "ms:peer-left";
   peerId: string;
@@ -275,6 +281,34 @@ async function handleProduce(
 
   producer.on("transportclose", () => {
     peer.producers.delete(producer.id);
+    const room = rooms.get(peer.roomCode);
+    if (room) {
+      for (const [otherPeerId, otherPeer] of room) {
+        if (otherPeerId === peer.peerId) continue;
+        send(otherPeer.ws, {
+          type: "ms:producer-closed",
+          peerId: peer.peerId,
+          producerId: producer.id,
+          source: msg.source,
+        } as MSProducerClosed);
+      }
+    }
+  });
+
+  producer.observer.on("close", () => {
+    peer.producers.delete(producer.id);
+    const room = rooms.get(peer.roomCode);
+    if (room) {
+      for (const [otherPeerId, otherPeer] of room) {
+        if (otherPeerId === peer.peerId) continue;
+        send(otherPeer.ws, {
+          type: "ms:producer-closed",
+          peerId: peer.peerId,
+          producerId: producer.id,
+          source: msg.source,
+        } as MSProducerClosed);
+      }
+    }
   });
 
   console.log(`[sfu] peer ${peer.peerId} produced ${producer.id} (${msg.source})`);
