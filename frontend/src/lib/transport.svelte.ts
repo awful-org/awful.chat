@@ -206,19 +206,13 @@ async function _handleDigest(
   if (!transportState.roomCode) return;
   const mine = await getWatermarksForRoom(transportState.roomCode);
 
-  const iNeedSenders = Object.keys(theirWatermarks).filter(
-    (sid) => (mine[sid] ?? -1) < theirWatermarks[sid]
-  );
-  const theyNeedSenders = Object.keys(mine).filter(
+  // Push what they're missing — they'll do the same for us when they receive our digest
+  const theyAreMissingSenders = Object.keys(mine).filter(
     (sid) => (theirWatermarks[sid] ?? -1) < mine[sid]
   );
 
-  if (theyNeedSenders.length > 0) await _pushMissingTo(peerId, theirWatermarks);
-  if (iNeedSenders.length > 0) {
-    _transport.send(
-      peerId,
-      encode({ type: MessageType.SyncRequest, watermarks: mine })
-    );
+  if (theyAreMissingSenders.length > 0) {
+    await _pushMissingTo(peerId, theirWatermarks);
   }
 }
 
@@ -253,13 +247,6 @@ async function _pushMissingTo(
   }
 
   _transport.send(peerId, encode({ type: MessageType.SyncComplete }));
-}
-
-async function _handleSyncRequest(
-  peerId: string,
-  theirWatermarks: Record<string, number>
-): Promise<void> {
-  await _pushMissingTo(peerId, theirWatermarks);
 }
 
 async function _handleSyncBatch(messages: WireChatMessage[]): Promise<void> {
@@ -447,9 +434,6 @@ _transport.on("message", (peerId, data) => {
         break;
       case MessageType.SyncDigest:
         _handleDigest(peerId, msg.watermarks).catch(() => {});
-        break;
-      case MessageType.SyncRequest:
-        _handleSyncRequest(peerId, msg.watermarks).catch(() => {});
         break;
       case MessageType.SyncBatch:
         _handleSyncBatch(msg.messages).catch(() => {});

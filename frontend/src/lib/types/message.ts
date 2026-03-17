@@ -10,7 +10,6 @@ export enum MessageType {
   RoomName = "room_name",
   // sync — wire only, never persisted
   SyncDigest = "sync_digest",
-  SyncRequest = "sync_request",
   SyncBatch = "sync_batch",
   SyncComplete = "sync_complete",
   // future
@@ -146,11 +145,6 @@ export interface WireSyncDigest {
   watermarks: Record<string, number>; // senderId → maxLamport
 }
 
-export interface WireSyncRequest {
-  type: MessageType.SyncRequest;
-  watermarks: Record<string, number>;
-}
-
 export interface WireSyncBatch {
   type: MessageType.SyncBatch;
   messages: WireChatMessage[];
@@ -184,7 +178,6 @@ export type AnyWireMessage =
   | WireCallPresence
   | WireRoomName
   | WireSyncDigest
-  | WireSyncRequest
   | WireSyncBatch
   | WireSyncComplete
   | WireDeliveryAck
