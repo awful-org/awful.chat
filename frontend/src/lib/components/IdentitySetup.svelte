@@ -18,7 +18,15 @@
 
   type Step = "entry" | "create-password" | "mnemonic" | "profile" | "restore";
 
+  interface Props {
+    initialStep?: Step;
+    onCancelToUnlock?: () => void;
+  }
+
+  let { initialStep = "entry", onCancelToUnlock }: Props = $props();
+
   let step = $state<Step>("entry");
+  let _stepInitialized = $state(false);
 
   let password = $state("");
   let passwordConfirm = $state("");
@@ -100,6 +108,12 @@
   const profileInitial = $derived(
     (profileStore.nickname || "?").charAt(0).toUpperCase()
   );
+
+  $effect(() => {
+    if (_stepInitialized) return;
+    step = initialStep;
+    _stepInitialized = true;
+  });
 </script>
 
 <div
@@ -126,14 +140,14 @@
           onclick={() => (step = "create-password")}
           class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
         >
-          create new identity
+          Create new identity
         </Button>
         <Button
           onclick={() => (step = "restore")}
           variant="outline"
           class="w-full font-mono"
         >
-          restore from phrase
+          Restore from phrase
         </Button>
       </CardFooter>
     </Card>
@@ -151,10 +165,10 @@
           <ArrowLeft />
         </button>
         <CardTitle class="text-lg font-mono font-semibold">
-          choose a password
+          Choose a password
         </CardTitle>
         <CardDescription class="text-muted-foreground text-xs font-mono">
-          encrypts your recovery phrase on this device - min 8 characters
+          Encrypts your recovery phrase on this device - min 8 characters
         </CardDescription>
       </CardHeader>
       <CardContent class="flex flex-col gap-3">
@@ -180,7 +194,7 @@
           />
           {#if passwordMismatch}
             <p class="text-xs text-destructive font-mono">
-              passwords do not match
+              Passwords do not match
             </p>
           {/if}
         </div>
@@ -202,10 +216,10 @@
     <Card class="w-full max-w-md bg-card border-border text-card-foreground">
       <CardHeader class="pb-4">
         <CardTitle class="text-lg font-mono font-semibold">
-          write down your recovery phrase
+          Write down your recovery phrase
         </CardTitle>
         <CardDescription class="text-muted-foreground text-xs font-mono">
-          these 12 words are the only way to recover your identity · store them
+          These 12 words are the only way to recover your identity · store them
           somewhere safe · they will not be shown again
         </CardDescription>
       </CardHeader>
@@ -230,7 +244,7 @@
           size="sm"
           class="font-mono text-xs"
         >
-          copy to clipboard
+          Copy to clipboard
         </Button>
 
         <label class="flex items-start gap-2.5 cursor-pointer group">
@@ -242,7 +256,7 @@
           <span
             class="text-xs text-muted-foreground group-hover:text-foreground transition-colors font-mono leading-relaxed"
           >
-            i have written down my recovery phrase and stored it safely
+            I have written down my recovery phrase and stored it safely
           </span>
         </label>
       </CardContent>
@@ -252,7 +266,7 @@
           disabled={!mnemonicConfirmed}
           class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono disabled:opacity-40"
         >
-          i'm ready
+          I'm ready
         </Button>
       </CardFooter>
     </Card>
@@ -260,7 +274,7 @@
     <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
       <CardHeader class="pb-4">
         <CardTitle class="text-lg font-mono font-semibold">
-          set your profile
+          Set your profile
         </CardTitle>
         <CardDescription class="text-muted-foreground text-xs font-mono">
           optional · you can change this any time from the sidebar
@@ -330,10 +344,14 @@
       <CardHeader class="pb-4">
         <button
           onclick={() => {
-            step = "entry";
-            restoreMnemonic = "";
-            restorePassword = "";
-            restorePasswordConfirm = "";
+            if (onCancelToUnlock) {
+              onCancelToUnlock();
+            } else {
+              step = "entry";
+              restoreMnemonic = "";
+              restorePassword = "";
+              restorePasswordConfirm = "";
+            }
           }}
           class="text-muted-foreground hover:text-foreground font-mono mb-2 text-left transition-colors"
         >
@@ -377,7 +395,7 @@
           />
           {#if restorePasswordMismatch}
             <p class="text-xs text-destructive font-mono">
-              passwords do not match
+              Passwords do not match
             </p>
           {/if}
         </div>

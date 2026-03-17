@@ -7,6 +7,7 @@ Identity and profile
   - BIP39 mnemonic identity, password-encrypted at rest (AES-GCM)
   - did:key derivation from ed25519 public key
   - unlock/lock session model (private key in memory only while unlocked)
+  - locked-screen recovery entrypoint (recover from 12-word phrase)
   - local profile (nickname + avatar URL/data) and peer profile caching
 
 Rooms and chat
@@ -16,6 +17,10 @@ Rooms and chat
   - lamport-ordered message log + watermark sync on reconnect
   - pagination / load-more history
   - peer profile broadcast and display in chat/call UI
+  - reply and reaction interactions in chat UI
+
+Local data controls
+  - destructive "erase all local data" action in settings (confirmed wipe of IndexedDB)
 
 Collaboration data
   - Not yet implemented in current app flow (planned): Yjs per-room channel doc for edits/deletes/reactions/pins/topic

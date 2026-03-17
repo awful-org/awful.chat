@@ -1,4 +1,4 @@
-import { openDB, type IDBPDatabase } from "idb";
+import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import * as Y from "yjs";
 
 import type {
@@ -604,4 +604,12 @@ export async function isGifSaved(gifId: string): Promise<SavedGif | undefined> {
   const database = await getDB();
   const all = await database.getAll("savedGifs");
   return all.find((g) => g.gifId === gifId);
+}
+
+export async function wipeLocalDatabase(): Promise<void> {
+  if (db) {
+    db.close();
+    db = null;
+  }
+  await deleteDB("awful-chat");
 }

@@ -16,7 +16,9 @@
   import { Input } from "$lib/components/ui/input";
   import { Separator } from "$lib/components/ui/separator";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import { Button } from "$lib/components/ui/button";
   import { profileStore, saveName } from "$lib/profile.svelte";
+  import { wipeLocalDatabase } from "$lib/storage";
   import {
     setVoiceInputDevice,
     getVoiceInputDevices,
@@ -45,6 +47,7 @@
   let activeOutput = $state<string | null>(null);
   let avatarDialogOpen = $state(false);
   let nameValue = $state("");
+  let confirmErase = $state(false);
 
   const LOG_MIN = Math.log10(0.01); // -2
   const LOG_MAX = Math.log10(2.5); // ~0.398
@@ -114,6 +117,11 @@
     }
   }
 
+  async function handleEraseLocalData() {
+    await wipeLocalDatabase();
+    window.location.reload();
+  }
+
   const profileInitial = $derived(
     (profileStore.nickname || nameValue || "?").charAt(0).toUpperCase()
   );
@@ -131,7 +139,7 @@
   >
     <DialogHeader>
       <DialogTitle class="font-mono text-base font-semibold"
-        >settings</DialogTitle
+        >Settings</DialogTitle
       >
     </DialogHeader>
 
@@ -197,13 +205,17 @@
             <SelectTrigger
               class="bg-background border-input font-mono text-sm focus:ring-ring"
             >
-              {inputDevices.find((d) => d.deviceId === activeInput)?.label ||
-                "Default"}
+              <span class="block max-w-65 truncate">
+                {inputDevices.find((d) => d.deviceId === activeInput)?.label ||
+                  "Default"}
+              </span>
             </SelectTrigger>
             <SelectContent class="bg-popover border-border font-mono">
               {#each inputDevices as dev (dev.deviceId)}
                 <SelectItem value={dev.deviceId} class="font-mono text-sm">
-                  {dev.label || `Microphone ${dev.deviceId.slice(0, 8)}`}
+                  <span class="block max-w-65 truncate">
+                    {dev.label || `Microphone ${dev.deviceId.slice(0, 8)}`}
+                  </span>
                 </SelectItem>
               {/each}
             </SelectContent>
@@ -239,7 +251,7 @@
           class="flex justify-between text-[10px] text-muted-foreground font-mono"
         >
           <span>mute</span>
-          <span>unity</span>
+          <span>100%</span>
           <span>250%</span>
         </div>
       </div>
@@ -261,13 +273,17 @@
             <SelectTrigger
               class="bg-background border-input font-mono text-sm focus:ring-ring"
             >
-              {outputDevices.find((d) => d.deviceId === activeOutput)?.label ||
-                "Default"}
+              <span class="block max-w-[260px] truncate">
+                {outputDevices.find((d) => d.deviceId === activeOutput)
+                  ?.label || "Default"}
+              </span>
             </SelectTrigger>
             <SelectContent class="bg-popover border-border font-mono">
               {#each outputDevices as dev (dev.deviceId)}
                 <SelectItem value={dev.deviceId} class="font-mono text-sm">
-                  {dev.label || `Speaker ${dev.deviceId.slice(0, 8)}`}
+                  <span class="block max-w-[260px] truncate">
+                    {dev.label || `Speaker ${dev.deviceId.slice(0, 8)}`}
+                  </span>
                 </SelectItem>
               {/each}
             </SelectContent>
@@ -303,9 +319,48 @@
           class="flex justify-between text-[10px] text-muted-foreground font-mono"
         >
           <span>mute</span>
-          <span>unity</span>
+          <span>100%</span>
           <span>250%</span>
         </div>
+      </div>
+
+      <Separator class="bg-border" />
+
+      <div class="flex flex-col gap-2">
+        <Label
+          class="text-xs font-mono text-destructive uppercase tracking-widest"
+          >Danger zone</Label
+        >
+        <p class="text-xs text-muted-foreground font-mono">
+          Permanently erase all local chat text, media, rooms, profiles, and
+          identity data stored in IndexedDB.
+        </p>
+        {#if !confirmErase}
+          <Button
+            variant="destructive"
+            class="w-full font-mono"
+            onclick={() => (confirmErase = true)}
+          >
+            Erase all local data
+          </Button>
+        {:else}
+          <div class="grid grid-cols-2 gap-2">
+            <Button
+              variant="outline"
+              class="font-mono"
+              onclick={() => (confirmErase = false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              class="font-mono"
+              onclick={handleEraseLocalData}
+            >
+              Confirm erase
+            </Button>
+          </div>
+        {/if}
       </div>
     </div>
   </DialogContent>

@@ -12,6 +12,11 @@
   } from "$lib/components/ui/card";
 
   let password = $state("");
+  interface Props {
+    onRecover?: () => void;
+  }
+
+  let { onRecover }: Props = $props();
 
   const canUnlock = $derived(password.length > 0 && !identityStore.loading);
 
@@ -67,13 +72,17 @@
         <p class="text-xs text-destructive font-mono">{identityStore.error}</p>
       {/if}
     </CardContent>
-    <CardFooter>
+    <CardFooter class="flex flex-col gap-2">
       <Button
         onclick={handleUnlock}
         disabled={!canUnlock}
         class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono disabled:opacity-40"
       >
-        {identityStore.loading ? "unlocking..." : "unlock"}
+        {identityStore.loading ? "Unlocking..." : "Unlock"}
+      </Button>
+
+      <Button variant="outline" class="w-full font-mono" onclick={onRecover}>
+        Restore from phrase
       </Button>
     </CardFooter>
   </Card>

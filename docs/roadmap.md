@@ -411,6 +411,16 @@ Implemented behavior:
 - Reaction UX: hover action, emoji picker, toggle add/remove, and per-message
   reaction chips with click-to-join behavior.
 ```
+
+## UX + Safety Milestone (current)
+
+```txt
+- Locked-screen account recovery now routes into the existing restore flow
+  (no duplicate recovery implementation).
+- Settings include a confirmed destructive action to wipe all local IndexedDB
+  data (messages/media/rooms/profiles/identity) for device reset/privacy.
+- Device picker labels are truncated to avoid layout breakage on long names.
+```
 ```
 
 ---

@@ -63,6 +63,7 @@
 
   let activeRoomCode = $state<string | null>(null);
   let activeRoomName = $state<string>("");
+  let lockedView = $state<"unlock" | "restore">("unlock");
   let sidebarOpen = $state(false);
   let joinError = $state<string | null>(null);
 
@@ -156,7 +157,20 @@
   {:else if !identityStore.keypair}
     <IdentitySetup />
   {:else if !identityStore.isUnlocked}
-    <UnlockIdentity />
+    {#if lockedView === "restore"}
+      <IdentitySetup
+        initialStep="restore"
+        onCancelToUnlock={() => {
+          lockedView = "unlock";
+        }}
+      />
+    {:else}
+      <UnlockIdentity
+        onRecover={() => {
+          lockedView = "restore";
+        }}
+      />
+    {/if}
   {:else}
     <div class="min-h-screen bg-background text-foreground font-mono flex">
       {#if hasSidebar}

@@ -488,8 +488,8 @@
                 {/if}
               </div>
 
-              <div class="ml-9 mt-1 flex items-center gap-1 min-h-5">
-                {#if reactionsByMessage.get(msg.id)?.size}
+              {#if reactionsByMessage.get(msg.id)?.size}
+                <div class="ml-9 mt-1 flex items-center gap-1">
                   {#each [...(reactionsByMessage
                       .get(msg.id)
                       ?.entries() ?? [])] as [emoji, users] (emoji)}
@@ -498,7 +498,7 @@
                       <button
                         type="button"
                         class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
-                          ? 'border-primary/60 bg-primary/15 text-primary'
+                          ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
                           : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
                         onclick={() => onToggleReaction?.(msg.id, emoji)}
                       >
@@ -507,8 +507,8 @@
                       </button>
                     {/if}
                   {/each}
-                {/if}
-              </div>
+                </div>
+              {/if}
 
               <div
                 class="absolute right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
