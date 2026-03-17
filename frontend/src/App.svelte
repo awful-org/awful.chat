@@ -10,21 +10,8 @@
     transportState,
     joinRoom,
     leaveRoom,
-    sendMessage,
     selfId,
-    joinCall,
-    leaveCall,
-    toggleMute,
-    toggleCamera,
-    startScreenShare,
-    stopScreenShare,
-    watchTransmission,
-    stopWatchingTransmission,
-    getTransmissionOutputVolume,
-    setTransmissionOutputVolume,
     setRoomName,
-    sendReply,
-    toggleReaction,
   } from "$lib/transport.svelte";
   import {
     roomsStore,
@@ -66,13 +53,6 @@
   let lockedView = $state<"unlock" | "restore">("unlock");
   let sidebarOpen = $state(false);
   let joinError = $state<string | null>(null);
-  let transmissionOutputVolume = $state(getTransmissionOutputVolume());
-
-  async function handleCreate(): Promise<string> {
-    return Array.from(crypto.getRandomValues(new Uint8Array(3)))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-  }
 
   async function handleJoin(
     roomCode: string,
@@ -122,7 +102,7 @@
     sidebarOpen = false;
   }
 
-  function handlePopState(e: PopStateEvent) {
+  function handlePopState() {
     const code = parseRoomCode(window.location.pathname);
     if (code && code !== activeRoomCode) {
       leaveRoom();
@@ -137,15 +117,6 @@
 
   const myId = $derived(selfId());
   const hasSidebar = $derived(roomsStore.rooms.length > 0);
-  const callPeerIds = $derived(
-    new Set([
-      ...transportState.callPeerIds,
-      ...[...transportState.participants.entries()]
-        .filter(([, p]) => p.audioTrack || p.videoTrack || p.screenTrack)
-        .map(([id]) => id),
-      ...transportState.sfuPeerIds,
-    ])
-  );
 </script>
 
 <svelte:window onpopstate={handlePopState} />
@@ -190,45 +161,12 @@
           <ChatView
             roomCode={activeRoomCode}
             roomName={transportState.roomName || activeRoomName}
-            peers={transportState.peers}
-            messages={transportState.messages}
-            participants={transportState.participants}
-            localCameraStream={transportState.localCameraStream}
-            localScreenStream={transportState.localScreenStream}
-            localMicStream={transportState.localMicStream}
-            inCall={transportState.inCall}
-            muted={transportState.muted}
-            cameraOff={transportState.cameraOff}
-            screenSharing={transportState.screenSharing}
             selfId={myId}
-            {callPeerIds}
-            peerNames={transportState.peerNames}
-            peerAvatars={transportState.peerAvatars}
-            error={transportState.error}
             onLeave={() => handleRemoveRoom()}
             onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
-            onSendMessage={sendMessage}
-            onSendReply={sendReply}
-            onToggleReaction={toggleReaction}
-            onJoinCall={joinCall}
-            onLeaveCall={leaveCall}
-            onToggleMute={toggleMute}
-            onToggleCamera={toggleCamera}
-            onStartScreenShare={startScreenShare}
-            onStopScreenShare={stopScreenShare}
-            pendingTransmissions={transportState.pendingTransmissions}
-            watchingTransmissionPeerId={transportState.watchingTransmissionPeerId}
-            onWatchTransmission={watchTransmission}
-            onStopWatchingTransmission={stopWatchingTransmission}
-            transmissionOutputVolume={transmissionOutputVolume}
-            {setTransmissionOutputVolume}
           />
         {:else}
-          <RoomCreateJoin
-            onCreate={handleCreate}
-            onJoin={handleJoin}
-            error={joinError}
-          />
+          <RoomCreateJoin onJoin={handleJoin} error={joinError} />
         {/if}
       </div>
     </div>

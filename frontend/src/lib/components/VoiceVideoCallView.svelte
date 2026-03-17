@@ -1,5 +1,18 @@
 <script lang="ts">
-  import type { ParticipantState } from "$lib/transport.svelte";
+  import {
+    transportState,
+    setTransmissionOutputVolume,
+    selfId,
+    peerIdToDid,
+    watchTransmission,
+    joinCall,
+    toggleCamera,
+    toggleMute,
+    stopScreenShare,
+    startScreenShare,
+    leaveCall,
+    stopWatchingTransmission,
+  } from "$lib/transport.svelte";
   import {
     Mic,
     MicOff,
@@ -41,38 +54,11 @@
     producerId?: string;
   }
 
-  interface Props {
-    participants: Map<string, ParticipantState>;
-    localCameraStream: MediaStream | null;
-    localScreenStream: MediaStream | null;
-    localMicStream: MediaStream | null;
-    inCall: boolean;
-    muted: boolean;
-    cameraOff: boolean;
-    screenSharing: boolean;
-    selfId: string;
-    callPeerIds?: Set<string>;
-    peerNames?: Map<string, string>;
-    peerAvatars?: Map<string, string>;
-    peerIdToDidFn?: (peerId: string) => string;
-    /** Pending (not yet watched) screen-share transmissions: peerId → producerId */
-    pendingTransmissions?: Map<string, string>;
-    /** The peerId whose transmission we are currently watching, or null */
-    watchingTransmissionPeerId?: string | null;
-    onJoinCall: () => void;
-    onLeaveCall: () => void;
-    onToggleMute: () => void;
-    onToggleCamera: () => void;
-    onStartScreenShare: () => void;
-    onStopScreenShare: () => void;
-    onWatchTransmission?: (peerId: string, producerId: string) => void;
-    onStopWatchingTransmission?: () => void;
-    setTransmissionOutputVolume?: (volume: number) => void;
-    transmissionOutputVolume?: number;
-    error?: string | null;
-  }
-
   let {
+    peerNames,
+    peerAvatars,
+    transmissionOutputVolume,
+    callPeerIds,
     participants,
     localCameraStream,
     localScreenStream,
@@ -81,25 +67,10 @@
     muted,
     cameraOff,
     screenSharing,
-    selfId,
-    callPeerIds = new Set<string>(),
-    peerNames = new Map<string, string>(),
-    peerAvatars = new Map<string, string>(),
-    peerIdToDidFn = (id: string) => id,
     pendingTransmissions = new Map<string, string>(),
     watchingTransmissionPeerId = null,
-    onJoinCall,
-    onLeaveCall,
-    onToggleMute,
-    onToggleCamera,
-    onStartScreenShare,
-    onStopScreenShare,
-    onWatchTransmission,
-    onStopWatchingTransmission,
-    setTransmissionOutputVolume,
-    transmissionOutputVolume = 1,
     error = null,
-  }: Props = $props();
+  } = $derived(transportState);
 
   let speakingPeers = $state(new Set<string>());
   const analysers = new Map<
@@ -167,15 +138,15 @@
       else stopSpeakerDetection(peerId);
     }
     for (const peerId of analysers.keys()) {
-      if (peerId !== selfId && !seen.has(peerId)) {
+      if (peerId !== selfId() && !seen.has(peerId)) {
         stopSpeakerDetection(peerId);
       }
     }
     if (!muted && localMicStream) {
       const track = localMicStream.getAudioTracks()[0];
-      if (track) startSpeakerDetection(selfId, track);
+      if (track) startSpeakerDetection(selfId(), track);
     } else {
-      stopSpeakerDetection(selfId);
+      stopSpeakerDetection(selfId());
     }
     if (!rafId) rafId = requestAnimationFrame(pollSpeakers);
     return () => {
@@ -238,7 +209,7 @@
       isLocal: true,
       kind: "camera",
       videoTrack: localVideoTrack,
-      peerId: selfId,
+      peerId: selfId(),
       muted,
     });
     for (const peerId of callPeerIds) {
@@ -249,7 +220,7 @@
         screenTrack: null,
         screenAudioTrack: null,
       };
-      const did = peerIdToDidFn(peerId);
+      const did = peerIdToDid(peerId);
       const label = peerNames.get(did) ?? peerId.slice(0, 8);
       const avatarUrl = peerAvatars.get(did) ?? null;
       result.push({
@@ -271,12 +242,12 @@
         isLocal: true,
         kind: "screen",
         videoTrack: localScreenTrack,
-        peerId: selfId,
+        peerId: selfId(),
       });
     }
     for (const p of byPeer.values()) {
       if (p.screenTrack) {
-        const did = peerIdToDidFn(p.peerId);
+        const did = peerIdToDid(p.peerId);
         const label = peerNames.get(did) ?? p.peerId.slice(0, 8);
         const avatarUrl = peerAvatars.get(did) ?? null;
         result.push({
@@ -292,7 +263,7 @@
     }
     // Pending transmission tiles — remote peers sharing their screen (opt-in)
     for (const [peerId, producerId] of pendingTransmissions) {
-      const did = peerIdToDidFn(peerId);
+      const did = peerIdToDid(peerId);
       const label = peerNames.get(did) ?? peerId.slice(0, 8);
       const avatarUrl = peerAvatars.get(did) ?? null;
       result.push({
@@ -469,8 +440,8 @@
     onclick={() => {
       if (isPendingTx) {
         // Join this transmission (opt-in)
-        if (onWatchTransmission && tile.producerId) {
-          onWatchTransmission(tile.peerId, tile.producerId);
+        if (tile.producerId) {
+          watchTransmission(tile.peerId, tile.producerId);
         }
         return;
       }
@@ -556,7 +527,7 @@
     <div class="flex-1 flex items-center justify-center">
       <div class="flex items-center gap-1">
         {#each [...callPeerIds] as peerId (peerId)}
-          {@const did = peerIdToDidFn(peerId)}
+          {@const did = peerIdToDid(peerId)}
           <div
             title={peerNames.get(did) ?? peerId}
             class="flex size-16 sm:size-20 items-center justify-center rounded-full bg-primary/20 text-2xl font-semibold text-primary ring-2 ring-background font-mono overflow-hidden"
@@ -577,7 +548,7 @@
     <div class="absolute bottom-3 left-1/2 -translate-x-1/2">
       <button
         type="button"
-        onclick={onJoinCall}
+        onclick={joinCall}
         class="group relative flex items-center gap-2 rounded-xl bg-linear-to-br from-emerald-600 to-emerald-700 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/30 transition-all duration-200 hover:from-emerald-400 hover:to-emerald-500 hover:scale-105 hover:shadow-emerald-500/50"
       >
         <Phone class="size-4" />
@@ -597,7 +568,8 @@
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
       <!-- svelte-ignore a11y_media_has_caption -->
-      <audio style="display:none" autoplay use:audioAction={a.track}></audio>
+      <audio data-remote style="display:none" autoplay use:audioAction={a.track}
+      ></audio>
     {/each}
 
     <!-- Tile area -->
@@ -676,7 +648,7 @@
       >
         <button
           type="button"
-          onclick={onToggleMute}
+          onclick={toggleMute}
           aria-label={muted ? "Unmute microphone" : "Mute microphone"}
           class="group relative flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-200
           {muted
@@ -691,7 +663,7 @@
         </button>
         <button
           type="button"
-          onclick={onToggleCamera}
+          onclick={toggleCamera}
           aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
           class="group relative flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-200
             {!cameraOff
@@ -707,7 +679,7 @@
 
         <button
           type="button"
-          onclick={screenSharing ? onStopScreenShare : onStartScreenShare}
+          onclick={screenSharing ? stopScreenShare : startScreenShare}
           aria-label={screenSharing
             ? "Stop transmission"
             : "Start transmission"}
@@ -727,7 +699,7 @@
 
       <button
         type="button"
-        onclick={onLeaveCall}
+        onclick={leaveCall}
         aria-label="Leave call"
         class={cn(
           "group relative flex w-16 h-10 items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500 hover:scale-105 hover:shadow-red-500/50",
@@ -741,7 +713,7 @@
         <div class="flex items-center gap-2 p-3 py-2 bg-zinc-900 rounded-xl">
           <button
             type="button"
-            onclick={onStopWatchingTransmission}
+            onclick={stopWatchingTransmission}
             aria-label="Stop watching transmission"
             title="Stop watching transmission"
             class="flex h-10 w-10 items-center justify-center rounded-lg bg-red-500/20 text-red-400 transition-all duration-200 hover:bg-red-500/30 ring-1 ring-red-500/50"
@@ -771,12 +743,10 @@
             <Slider
               type="single"
               min={0}
-              max={2}
+              max={1}
               step={0.05}
               value={transmissionOutputVolume}
-              onValueChange={(v: number) => {
-                setTransmissionOutputVolume?.(v);
-              }}
+              onValueChange={(v: number) => setTransmissionOutputVolume?.(v)}
               class="w-24"
             />
           </div>

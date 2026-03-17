@@ -13,12 +13,11 @@
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
 
   interface Props {
-    onCreate: (roomName?: string) => Promise<string>;
     onJoin: (roomCode: string, displayName: string, roomName?: string) => void;
     error?: string | null;
   }
 
-  let { onCreate, onJoin, error = null }: Props = $props();
+  let { onJoin, error = null }: Props = $props();
 
   let roomName = $state("");
   let joinCode = $state("");
@@ -32,7 +31,9 @@
 
   async function handleCreate() {
     await saveName(profileStore.nickname);
-    const code = await onCreate(roomName.trim() || undefined);
+    const code = Array.from(crypto.getRandomValues(new Uint8Array(3)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
     createdCode = code;
     copied = false;
   }

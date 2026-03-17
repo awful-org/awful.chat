@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Message, ParticipantState } from "$lib/transport.svelte";
+  import type { Message } from "$lib/transport.svelte";
   import { MessageType } from "$lib/types/message";
   import {
     LogOut,
@@ -23,9 +23,14 @@
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
   import {
+    transportState,
+    sendMessage,
+    selfId,
+    joinCall,
+    sendReply,
+    toggleReaction,
     loadMoreMessages,
     markSeen,
-    peerIdToDid,
   } from "$lib/transport.svelte";
 
   $effect(() => {
@@ -35,76 +40,15 @@
   interface Props {
     roomCode: string;
     roomName: string;
-    peers: string[];
-    messages: Message[];
-    participants: Map<string, ParticipantState>;
-    localCameraStream: MediaStream | null;
-    localScreenStream: MediaStream | null;
-    localMicStream: MediaStream | null;
-    inCall: boolean;
-    muted: boolean;
-    cameraOff: boolean;
-    screenSharing: boolean;
     selfId: string;
-    callPeerIds?: Set<string>;
-    peerNames?: Map<string, string>;
-    peerAvatars?: Map<string, string>;
-    pendingTransmissions?: Map<string, string>;
-    watchingTransmissionPeerId?: string | null;
-    error?: string | null;
     onLeave: () => void;
     onOpenSidebar?: () => void;
-    onSendMessage: (text: string) => void;
-    onSendReply?: (text: string, target: Message) => void;
-    onToggleReaction?: (messageId: string, emoji: string) => void;
-    onJoinCall: () => void;
-    onLeaveCall: () => void;
-    onToggleMute: () => void;
-    onToggleCamera: () => void;
-    onStartScreenShare: () => void;
-    onStopScreenShare: () => void;
-    onWatchTransmission?: (peerId: string, producerId: string) => void;
-    onStopWatchingTransmission?: () => void;
-    setTransmissionOutputVolume?: (volume: number) => void;
-    transmissionOutputVolume?: number;
   }
 
-  let {
-    roomCode,
-    roomName,
-    peers,
-    messages,
-    participants,
-    localCameraStream,
-    localScreenStream,
-    localMicStream,
-    inCall,
-    muted,
-    cameraOff,
-    screenSharing,
-    selfId,
-    callPeerIds = new Set(),
-    peerNames = new Map(),
-    peerAvatars = new Map(),
-    pendingTransmissions = new Map(),
-    watchingTransmissionPeerId = null,
-    error = null,
-    onLeave,
-    onOpenSidebar,
-    onSendMessage,
-    onSendReply,
-    onToggleReaction,
-    onJoinCall,
-    onLeaveCall,
-    onToggleMute,
-    onToggleCamera,
-    onStartScreenShare,
-    onStopScreenShare,
-    onWatchTransmission,
-    onStopWatchingTransmission,
-    setTransmissionOutputVolume,
-    transmissionOutputVolume = 1,
-  }: Props = $props();
+  let { roomCode, roomName, onLeave, onOpenSidebar }: Props = $props();
+
+  let { peers, messages, inCall, peerNames, peerAvatars } =
+    $derived(transportState);
 
   let draft = $state("");
   let replyTargetId = $state<string | null>(null);
@@ -150,8 +94,8 @@
   function submit() {
     const text = draft.trim();
     if (!text) return;
-    if (replyTarget && onSendReply) onSendReply(text, replyTarget);
-    else onSendMessage(text);
+    if (replyTarget) sendReply(text, replyTarget);
+    else sendMessage(text);
     draft = "";
     replyTargetId = null;
     autoScroll = true;
@@ -180,7 +124,7 @@
   }
 
   function handleGifSelect(url: string) {
-    onSendMessage(url);
+    sendMessage(url);
     autoScroll = true;
   }
 
@@ -321,7 +265,7 @@
           <Button
             variant="ghost"
             size="icon"
-            onclick={onJoinCall}
+            onclick={joinCall}
             aria-label="Join call"
             class="text-muted-foreground hover:text-foreground cursor-pointer"
           >
@@ -341,34 +285,7 @@
     </div>
   </header>
 
-  <VoiceVideoCallView
-    {participants}
-    {localCameraStream}
-    {localScreenStream}
-    {localMicStream}
-    {inCall}
-    {muted}
-    {cameraOff}
-    {screenSharing}
-    {selfId}
-    {callPeerIds}
-    {peerNames}
-    {peerAvatars}
-    peerIdToDidFn={peerIdToDid}
-    {pendingTransmissions}
-    {watchingTransmissionPeerId}
-    {error}
-    {onJoinCall}
-    {onLeaveCall}
-    {onToggleMute}
-    {onToggleCamera}
-    {onStartScreenShare}
-    {onStopScreenShare}
-    {onWatchTransmission}
-    {onStopWatchingTransmission}
-    {setTransmissionOutputVolume}
-    {transmissionOutputVolume}
-  />
+  <VoiceVideoCallView />
 
   <div
     bind:this={messagesEl}
@@ -402,7 +319,7 @@
           {@const prev = visibleMessages[i - 1]}
           {@const showDate = shouldShowDateSep(msg.timestamp, prev?.timestamp)}
           {@const showHeader = shouldShowHeader(msg, prev)}
-          {@const isOwn = msg.senderId === selfId}
+          {@const isOwn = msg.senderId === selfId()}
           {@const isGif = isGifUrl(msg.content)}
           <div>
             {#if showDate}
@@ -494,13 +411,13 @@
                       .get(msg.id)
                       ?.entries() ?? [])] as [emoji, users] (emoji)}
                     {#if users.size > 0}
-                      {@const reacted = users.has(selfId)}
+                      {@const reacted = users.has(selfId())}
                       <button
                         type="button"
                         class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
                           ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
                           : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
-                        onclick={() => onToggleReaction?.(msg.id, emoji)}
+                        onclick={() => toggleReaction?.(msg.id, emoji)}
                       >
                         <span>{emoji}</span>
                         <span>{users.size}</span>
@@ -642,6 +559,6 @@
   onClose={() => (reactionPickerFor = null)}
   onSelect={(emoji) => {
     if (!reactionPickerFor) return;
-    onToggleReaction?.(reactionPickerFor, emoji);
+    toggleReaction?.(reactionPickerFor, emoji);
   }}
 />

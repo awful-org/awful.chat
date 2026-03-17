@@ -113,6 +113,8 @@ export interface VideoEvents {
   transmissionAvailable: (peerId: string, producerId: string) => void;
   /** Fired when a remote peer's transmission ends (they stopped sharing or left). */
   transmissionEnded: (peerId: string) => void;
+  /** Fired when output volume changes (0.0 to 1.0). */
+  outputVolumeChanged: (volume: number) => void;
   error: (err: Error) => void;
 }
 
@@ -150,13 +152,7 @@ export interface VideoTransport {
   /** Returns all pending (not yet watched) transmissions: peerId → producerId. */
   getPendingTransmissions(): Map<string, string>;
 
-  // self mute — pauses all outgoing producers without stopping tracks
-  mute(): void;
-  unmute(): void;
-  isMuted(): boolean;
-
-  // output volume for incoming remote tracks (0.0–2.0, >1.0 = boost)
-  setOutputVolume(volume: number): void;
+  getAudioTrack(peerId: string): MediaStreamTrack | null;
 
   on<K extends keyof VideoEvents>(event: K, handler: VideoEvents[K]): void;
   off<K extends keyof VideoEvents>(event: K, handler: VideoEvents[K]): void;

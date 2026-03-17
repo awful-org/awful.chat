@@ -63,6 +63,7 @@ interface TransportState {
   pendingTransmissions: Map<string, string>;
   watchingTransmissionPeerId: string | null;
   watchingTransmissionProducerId: string | null;
+  transmissionOutputVolume: number;
 }
 
 export const transportState = $state<TransportState>({
@@ -88,6 +89,7 @@ export const transportState = $state<TransportState>({
   pendingTransmissions: new Map(),
   watchingTransmissionPeerId: null,
   watchingTransmissionProducerId: null,
+  transmissionOutputVolume: 1,
 });
 
 let _lamport = 0;
@@ -957,9 +959,18 @@ export function getVoiceOutputVolume(): number {
 }
 
 export function setTransmissionOutputVolume(volume: number): void {
-  const next = Math.max(0, volume);
+  const next = Math.max(0, Math.min(1, volume));
   _videoOutputBeforeDeafen = next;
-  if (!transportState.deafened) _video.setOutputVolume(next);
+  transportState.transmissionOutputVolume = next;
+  _applyTransmissionVolume(next);
+}
+
+function _applyTransmissionVolume(volume: number): void {
+  document
+    .querySelectorAll<HTMLAudioElement>("audio[data-remote]")
+    .forEach((el) => {
+      el.volume = volume;
+    });
 }
 
 export function getTransmissionOutputVolume(): number {
@@ -969,13 +980,15 @@ export function getTransmissionOutputVolume(): number {
 export function setDeafened(deafened: boolean): void {
   if (deafened) {
     _voiceOutputBeforeDeafen = _voice.getOutputVolume();
-    _videoOutputBeforeDeafen = getTransmissionOutputVolume();
+    _videoOutputBeforeDeafen = transportState.transmissionOutputVolume;
     _voice.setOutputVolume(0);
-    _video.setOutputVolume(0);
+    transportState.transmissionOutputVolume = 0;
+    _applyTransmissionVolume(0);
     transportState.deafened = true;
   } else {
     _voice.setOutputVolume(_voiceOutputBeforeDeafen);
-    _video.setOutputVolume(_videoOutputBeforeDeafen);
+    transportState.transmissionOutputVolume = _videoOutputBeforeDeafen;
+    _applyTransmissionVolume(_videoOutputBeforeDeafen);
     transportState.deafened = false;
   }
 }

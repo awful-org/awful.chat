@@ -117,13 +117,6 @@ export class MediasoupVideo implements VideoTransport {
   // ms:new-producer messages that arrived before recvTransport was ready
   private queuedProducers: MSNewProducer[] = [];
 
-  // mute/volume state
-  private muted: boolean = false;
-  private outputGainValue: number = 1.0;
-  // Web Audio: per remote track gain nodes for output volume control
-  private audioCtx: AudioContext | null = null;
-  private trackGains: Map<string, GainNode> = new Map(); // track.id → GainNode
-
   // SFU WebSocket — opened on join(), closed on leave()
   private sfuWs: WebSocket | null = null;
 
@@ -158,10 +151,6 @@ export class MediasoupVideo implements VideoTransport {
     this.sendTransport?.close();
     this.recvTransport?.close();
 
-    this.trackGains.forEach((g) => g.disconnect());
-    this.trackGains.clear();
-    this.audioCtx?.close();
-
     this.sfuWs?.close();
     this.sfuWs = null;
 
@@ -173,11 +162,9 @@ export class MediasoupVideo implements VideoTransport {
     this.pendingScreenProducerIds.clear();
     this.watchingTransmissionPeers.clear();
     this.queuedProducers = [];
-    this.muted = false;
     this.device = null;
     this.sendTransport = null;
     this.recvTransport = null;
-    this.audioCtx = null;
     this.pending.clear();
   }
 
@@ -299,43 +286,11 @@ export class MediasoupVideo implements VideoTransport {
     return Array.from(this.active);
   }
 
-  /**
-   * Pause all outgoing producers — server stops forwarding our video.
-   * Does NOT stop the camera/screen track — can unpause instantly.
-   */
-  mute(): void {
-    this.muted = true;
-    this.producers.forEach((ps) =>
-      ps.forEach(({ producer }) => producer.pause())
-    );
-  }
-
-  unmute(): void {
-    this.muted = false;
-    this.producers.forEach((ps) =>
-      ps.forEach(({ producer }) => producer.resume())
-    );
-  }
-
-  isMuted(): boolean {
-    return this.muted;
-  }
-
-  /**
-   * Set output volume for all incoming remote tracks.
-   * 0.0 = silent, 1.0 = unity, 2.0 = boost.
-   * Uses Web Audio GainNode — supports values > 1.0.
-   * Primarily useful when screen share includes system audio.
-   */
-  setOutputVolume(volume: number): void {
-    this.outputGainValue = Math.max(0, volume);
-    for (const gainNode of this.trackGains.values()) {
-      gainNode.gain.setTargetAtTime(
-        this.outputGainValue,
-        this.audioCtx!.currentTime,
-        0.01
-      );
-    }
+  getAudioTrack(peerId: string): MediaStreamTrack | null {
+    const peerConsumers = this.consumers.get(peerId);
+    if (!peerConsumers) return null;
+    const audioConsumer = peerConsumers.find((c) => c.source === "screen");
+    return audioConsumer ? audioConsumer.consumer.track : null;
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
@@ -366,7 +321,7 @@ export class MediasoupVideo implements VideoTransport {
         resolve();
       };
 
-      ws.onerror = (e) => {
+      ws.onerror = () => {
         reject(new Error("SFU WebSocket error"));
       };
 
@@ -416,7 +371,6 @@ export class MediasoupVideo implements VideoTransport {
       const entry: Producer = { producer, source, stream };
       produced.push(entry);
 
-      if (this.muted) producer.pause();
       producer.on("trackended", () => this.stopSource(source));
     }
 
@@ -594,7 +548,7 @@ export class MediasoupVideo implements VideoTransport {
       {
         type: "ms:consume",
         producerId,
-        rtpCapabilities: this.device.rtpCapabilities,
+        rtpCapabilities: this.device.recvRtpCapabilities,
       },
       "ms:consumer-options"
     );
@@ -609,31 +563,10 @@ export class MediasoupVideo implements VideoTransport {
       this.emit("peerJoined", peerId);
     }
 
-    // if the incoming track has audio (e.g. screen share with system audio),
-    // route it through a gain node so setOutputVolume applies
-    if (consumer.track.kind === "audio") {
-      if (!this.audioCtx || this.audioCtx.state === "closed") {
-        this.audioCtx = new AudioContext();
-      }
-      if (this.audioCtx.state === "suspended") {
-        this.audioCtx.resume().catch(() => {});
-      }
-      const stream = new MediaStream([consumer.track]);
-      const source = this.audioCtx.createMediaStreamSource(stream);
-      const gainNode = this.audioCtx.createGain();
-      gainNode.gain.value = this.outputGainValue;
-      source.connect(gainNode);
-      gainNode.connect(this.audioCtx.destination);
-      this.trackGains.set(consumer.track.id, gainNode);
-    }
-
     this.emit("trackAdded", peerId, consumer.track, source);
 
     consumer.on("trackended", () => {
-      this.trackGains.get(consumer.track.id)?.disconnect();
-      this.trackGains.delete(consumer.track.id);
       this.emit("trackRemoved", peerId, source);
-      // If the transmitter stopped sharing their screen, notify the UI
       if (source === "screen") {
         this.emit("transmissionEnded", peerId);
       }
