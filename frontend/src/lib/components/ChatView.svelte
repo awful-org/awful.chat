@@ -20,8 +20,13 @@
   import { Separator } from "$lib/components/ui/separator";
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import GifPicker from "./GifPicker.svelte";
+  import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
-  import { loadMoreMessages, markSeen, peerIdToDid } from "$lib/transport.svelte";
+  import {
+    loadMoreMessages,
+    markSeen,
+    peerIdToDid,
+  } from "$lib/transport.svelte";
 
   $effect(() => {
     loadProfile();
@@ -104,31 +109,30 @@
   let draft = $state("");
   let replyTargetId = $state<string | null>(null);
   let reactionPickerFor = $state<string | null>(null);
+  let emojiPickerPos = $state({ x: 0, y: 0 });
   let gifPickerOpen = $state(false);
   let hasMoreHistory = $state(true);
   let loadingMore = $state(false);
-
-  const reactionPalette = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉"];
 
   const visibleMessages = $derived(
     messages.filter((m) => m.type !== MessageType.Reaction)
   );
 
-  const messageById = $derived(
-    new Map(visibleMessages.map((m) => [m.id, m]))
-  );
+  const messageById = $derived(new Map(visibleMessages.map((m) => [m.id, m])));
 
   const replyTarget = $derived(
-    replyTargetId ? messageById.get(replyTargetId) ?? null : null
+    replyTargetId ? (messageById.get(replyTargetId) ?? null) : null
   );
 
   const reactionsByMessage = $derived.by(() => {
     const byMessage = new Map<string, Map<string, Set<string>>>();
     for (const m of messages) {
-      if (m.type !== MessageType.Reaction || !m.reactionTo || !m.reactionEmoji) continue;
+      if (m.type !== MessageType.Reaction || !m.reactionTo || !m.reactionEmoji)
+        continue;
       if (!byMessage.has(m.reactionTo)) byMessage.set(m.reactionTo, new Map());
       const byEmoji = byMessage.get(m.reactionTo)!;
-      if (!byEmoji.has(m.reactionEmoji)) byEmoji.set(m.reactionEmoji, new Set());
+      if (!byEmoji.has(m.reactionEmoji))
+        byEmoji.set(m.reactionEmoji, new Set());
       const users = byEmoji.get(m.reactionEmoji)!;
       if (m.reactionOp === "remove") users.delete(m.senderId);
       else users.add(m.senderId);
@@ -158,6 +162,11 @@
     replyTargetId = msg.id;
     reactionPickerFor = null;
     requestAnimationFrame(() => textareaEl?.focus());
+  }
+
+  function openReactionPicker(msgId: string, e: MouseEvent) {
+    emojiPickerPos = { x: e.clientX - 40, y: e.clientY - 12 };
+    reactionPickerFor = msgId;
   }
 
   function jumpToMessage(messageId: string) {
@@ -232,6 +241,7 @@
     return new Date(ts).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
+      hour12: false,
     });
   }
 
@@ -410,6 +420,21 @@
                 ? 'mt-3 pt-1'
                 : ''}"
             >
+              {#if msg.replyTo}
+                <button
+                  type="button"
+                  class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
+                  onclick={() => jumpToMessage(msg.replyTo!.id)}
+                >
+                  <Reply
+                    size="16"
+                    class="text-muted-foreground -ml-5 transform -scale-x-100"
+                  />
+                  <span class="font-semibold">{msg.replyTo.senderName}</span>
+                  <span class="truncate">{msg.replyTo.content}</span>
+                </button>
+              {/if}
+
               {#if showHeader}
                 <div class="flex items-start gap-2">
                   <div
@@ -450,18 +475,6 @@
                   </div>
                 </div>
               {/if}
-              {#if msg.replyTo}
-                <button
-                  type="button"
-                  class="ml-9 mb-1 max-w-[28rem] text-left rounded border border-border/60 bg-muted/30 px-2 py-1 text-xs text-muted-foreground hover:bg-muted/50 cursor-pointer"
-                  onclick={() => jumpToMessage(msg.replyTo!.id)}
-                >
-                  <span class="font-semibold">{msg.replyTo.senderName}</span>
-                  <span class="mx-1">•</span>
-                  <span class="truncate">{msg.replyTo.content}</span>
-                </button>
-              {/if}
-
               <div class="ml-9 text-sm text-foreground wrap-break-word">
                 {#if isGif}
                   <img
@@ -477,7 +490,9 @@
 
               <div class="ml-9 mt-1 flex items-center gap-1 min-h-5">
                 {#if reactionsByMessage.get(msg.id)?.size}
-                  {#each [...(reactionsByMessage.get(msg.id)?.entries() ?? [])] as [emoji, users] (emoji)}
+                  {#each [...(reactionsByMessage
+                      .get(msg.id)
+                      ?.entries() ?? [])] as [emoji, users] (emoji)}
                     {#if users.size > 0}
                       {@const reacted = users.has(selfId)}
                       <button
@@ -495,13 +510,20 @@
                 {/if}
               </div>
 
-              <div class="absolute right-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+              <div
+                class="absolute right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
+              >
                 <button
                   type="button"
                   class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
                   title="React"
-                  onclick={() =>
-                    (reactionPickerFor = reactionPickerFor === msg.id ? null : msg.id)}
+                  onclick={(e) => {
+                    if (reactionPickerFor === msg.id) {
+                      reactionPickerFor = null;
+                    } else {
+                      openReactionPicker(msg.id, e as MouseEvent);
+                    }
+                  }}
                 >
                   <Smile class="size-3.5" />
                 </button>
@@ -514,23 +536,6 @@
                   <Reply class="size-3.5" />
                 </button>
               </div>
-
-              {#if reactionPickerFor === msg.id}
-                <div class="ml-9 mt-1 inline-flex items-center gap-1 rounded-md border border-border bg-card px-1 py-1">
-                  {#each reactionPalette as emoji}
-                    <button
-                      type="button"
-                      class="size-7 inline-flex items-center justify-center rounded hover:bg-muted cursor-pointer text-sm"
-                      onclick={() => {
-                        onToggleReaction?.(msg.id, emoji);
-                        reactionPickerFor = null;
-                      }}
-                    >
-                      {emoji}
-                    </button>
-                  {/each}
-                </div>
-              {/if}
             </div>
           </div>
         {/each}
@@ -554,29 +559,38 @@
     </div>
   {/if}
 
+  {#if replyTarget}
+    <div
+      class="px-4 p-2 text-muted-foreground bg-muted/50 border-t border-border text-sm"
+    >
+      <div class="flex items-center justify-between gap-2 leading-tight">
+        <Reply
+          size="16"
+          class="text-muted-foreground transform mb-0.5 -scale-x-100"
+        />
+        <div class="truncate mt-0.5 flex flex-row items-center gap-1 w-full">
+          Replying to
+          <span class="font-semibold text-foreground"
+            >{replyTarget.senderName}</span
+          >
+          <span class="mx-1">•</span>
+          <span class="truncate">{replyTarget.content}</span>
+        </div>
+        <button
+          type="button"
+          class="size-5 inline-flex items-center justify-center rounded hover:bg-muted cursor-pointer"
+          onclick={() => (replyTargetId = null)}
+          aria-label="Cancel reply"
+        >
+          <X class="size-3.5" />
+        </button>
+      </div>
+    </div>
+  {/if}
+
   <div
     class="border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))] shrink-0"
   >
-    {#if replyTarget}
-      <div class="mb-2 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-        <div class="flex items-center justify-between gap-2">
-          <div class="truncate">
-            Replying to <span class="font-semibold text-foreground">{replyTarget.senderName}</span>
-            <span class="mx-1">•</span>
-            <span class="truncate">{replyTarget.content}</span>
-          </div>
-          <button
-            type="button"
-            class="size-6 inline-flex items-center justify-center rounded hover:bg-muted cursor-pointer"
-            onclick={() => (replyTargetId = null)}
-            aria-label="Cancel reply"
-          >
-            <X class="size-3.5" />
-          </button>
-        </div>
-      </div>
-    {/if}
-
     <form
       onsubmit={(e) => {
         e.preventDefault();
@@ -619,4 +633,15 @@
   open={gifPickerOpen}
   onOpenChange={(v) => (gifPickerOpen = v)}
   onSelect={handleGifSelect}
+/>
+
+<EmojiPickerPopup
+  open={reactionPickerFor !== null}
+  x={emojiPickerPos.x}
+  y={emojiPickerPos.y}
+  onClose={() => (reactionPickerFor = null)}
+  onSelect={(emoji) => {
+    if (!reactionPickerFor) return;
+    onToggleReaction?.(reactionPickerFor, emoji);
+  }}
 />

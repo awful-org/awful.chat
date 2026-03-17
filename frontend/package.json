@@ -38,6 +38,7 @@
     "@scure/bip32": "^2.0.1",
     "@scure/bip39": "^2.0.1",
     "@tanstack/svelte-query": "^6.1.0",
+    "emoji-picker-element": "^1.29.1",
     "idb": "^8.0.3",
     "mediasoup-client": "^3.18.7",
     "simple-peer": "^9.11.1",
