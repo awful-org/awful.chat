@@ -1,101 +1,39 @@
 <script lang="ts">
-  import { useRegisterSW } from 'virtual:pwa-register/svelte'
+  import { useRegisterSW } from "virtual:pwa-register/svelte";
+  import { X } from "@lucide/svelte";
 
-  import { pwaInfo } from 'virtual:pwa-info'
-
-  // eslint-disable-next-line no-console
-  console.log(pwaInfo)
-
-  // replaced dynamically
-  const buildDate = '__DATE__'
-  // replaced dyanmicaly
-  const reloadSW = '__RELOAD_SW__'
-
-  const {
-      offlineReady,
-      needRefresh,
-      updateServiceWorker,
-  } = useRegisterSW({
-    onRegisteredSW(swUrl, r) {
-        // eslint-disable-next-line no-console
-        console.log(`Service Worker at: ${swUrl}`)
-        if (reloadSW === 'true') {
-            r && setInterval(() => {
-                console.log('Checking for sw update')
-                r.update()
-            }, 20000 /* 20s for testing purposes */)
-        }
-        else {
-            console.log(`SW Registered: ${r}`)
-        }
+  const { needRefresh, updateServiceWorker } = useRegisterSW({
+    onRegisteredSW(swUrl, _) {
+      console.log(`Service Worker at: ${swUrl}`);
     },
     onRegisterError(error) {
-      console.log('SW registration error', error)
+      console.log("SW registration error", error);
     },
-  })
+  });
 
   function close() {
-      offlineReady.set(false)
-      needRefresh.set(false)
+    needRefresh.set(false);
   }
-
-  $: toast = $offlineReady || $needRefresh;
 </script>
 
-{#if toast}
+{#if $needRefresh}
   <div
-    class="pwa-toast"
+    class="fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm text-zinc-200 shadow-lg"
     role="alert"
   >
-    <div class="message">
-      {#if $offlineReady}
-      <span>
-        App ready to work offline
-      </span>
-      {:else}
-      <span>
-        New content available, click on reload button to update.
-      </span>
-      {/if}
-    </div>
-    {#if $needRefresh}
-      <button on:click={() => updateServiceWorker()}>
-        Reload
-      </button>
-    {/if}
-    <button on:click={close}>
-      Close
+    <span>New version available</span>
+    <button
+      class="rounded-md bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-900 transition-colors hover:bg-zinc-200"
+      onclick={() => updateServiceWorker()}
+    >
+      Reload
+    </button>
+    <button
+      class="text-zinc-500 hover:text-zinc-300"
+      onclick={close}
+      aria-label="Close"
+    >
+      <X size={16} />
     </button>
   </div>
 {/if}
-
-<div class='pwa-date'>{buildDate}</div>
-
-<style>
-  .pwa-date {
-    visibility: hidden;
-  }
-  .pwa-toast {
-    position: fixed;
-    right: 0;
-    bottom: 0;
-    margin: 16px;
-    padding: 12px;
-    border: 1px solid #8885;
-    border-radius: 4px;
-    z-index: 2;
-    text-align: left;
-    box-shadow: 3px 4px 5px 0 #8885;
-    background-color: white;
-  }
-  .pwa-toast .message {
-    margin-bottom: 8px;
-  }
-  .pwa-toast button {
-    border: 1px solid #8885;
-    outline: none;
-    margin-right: 5px;
-    border-radius: 2px;
-    padding: 3px 10px;
-  }
-</style>
