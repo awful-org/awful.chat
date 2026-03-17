@@ -131,11 +131,10 @@ export class MediasoupVideo implements VideoTransport {
     try {
       await this.connectSfu(roomCode, peerId);
 
-      const capMsg =
-        await this.request<MSCapabilities>(
-          { type: "ms:get-capabilities" },
-          "ms:capabilities"
-        );
+      const capMsg = await this.request<MSCapabilities>(
+        { type: "ms:get-capabilities" },
+        "ms:capabilities"
+      );
 
       this.device = new mediasoupClient.Device();
       await this.device.load({ routerRtpCapabilities: capMsg.rtpCapabilities });
@@ -183,14 +182,16 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   async startCamera(stream?: MediaStream): Promise<void> {
-    const s = stream ?? await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30 },
-      },
-      audio: false, // audio stays p2p via VoiceTransport
-    });
+    const s =
+      stream ??
+      (await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
+        },
+        audio: false, // audio stays p2p via VoiceTransport
+      }));
     await this.publish(s, "camera");
   }
 
@@ -199,10 +200,12 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   async startScreenShare(stream?: MediaStream): Promise<void> {
-    const s = stream ?? await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 15 } }, // lower framerate for screen share
-      audio: true,
-    });
+    const s =
+      stream ??
+      (await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15 } }, // lower framerate for screen share
+        audio: true,
+      }));
     await this.publish(s, "screen");
 
     // browser fires this when user clicks "stop sharing"
@@ -302,12 +305,16 @@ export class MediasoupVideo implements VideoTransport {
    */
   mute(): void {
     this.muted = true;
-    this.producers.forEach((ps) => ps.forEach(({ producer }) => producer.pause()));
+    this.producers.forEach((ps) =>
+      ps.forEach(({ producer }) => producer.pause())
+    );
   }
 
   unmute(): void {
     this.muted = false;
-    this.producers.forEach((ps) => ps.forEach(({ producer }) => producer.resume()));
+    this.producers.forEach((ps) =>
+      ps.forEach(({ producer }) => producer.resume())
+    );
   }
 
   isMuted(): boolean {
@@ -431,7 +438,9 @@ export class MediasoupVideo implements VideoTransport {
       "ms:transport-options"
     );
 
-    this.sendTransport = this.device!.createSendTransport(msg.options as mediasoupClient.types.TransportOptions);
+    this.sendTransport = this.device!.createSendTransport(
+      msg.options as mediasoupClient.types.TransportOptions
+    );
 
     this.sendTransport.on(
       "connect",
@@ -468,7 +477,9 @@ export class MediasoupVideo implements VideoTransport {
       "ms:transport-options"
     );
 
-    this.recvTransport = this.device!.createRecvTransport(msg.options as mediasoupClient.types.TransportOptions);
+    this.recvTransport = this.device!.createRecvTransport(
+      msg.options as mediasoupClient.types.TransportOptions
+    );
 
     this.recvTransport.on(
       "connect",
@@ -526,7 +537,9 @@ export class MediasoupVideo implements VideoTransport {
             this.watchingTransmissionPeers.has(msg.peerId) ||
             this.consumers.get(msg.peerId)?.some((c) => c.source === "screen")
           ) {
-            this.consumeProducer(msg.peerId, msg.producerId, "screen").catch(() => {});
+            this.consumeProducer(msg.peerId, msg.producerId, "screen").catch(
+              () => {}
+            );
             break;
           }
 

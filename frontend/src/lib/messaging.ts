@@ -23,7 +23,7 @@ import type { Message } from "./types/message";
  * Both signMessage and verifyMessage must use this exact form.
  */
 export function canonicalContent(
-  msg: Pick<Message, "id" | "senderId" | "lamport" | "content">,
+  msg: Pick<Message, "id" | "senderId" | "lamport" | "content">
 ): string {
   return `${msg.id}:${msg.senderId}:${msg.lamport}:${msg.content}`;
 }
@@ -54,7 +54,7 @@ export function signMessage(message: Message): Message {
 export async function verifySignature(
   senderDid: string,
   sig: string,
-  content: string,
+  content: string
 ): Promise<boolean> {
   try {
     const publicKey = didToPublicKey(senderDid);
@@ -74,7 +74,7 @@ export async function verifyMessage(message: Message): Promise<boolean> {
   return verifySignature(
     message.senderDid,
     message.sig,
-    canonicalContent(message),
+    canonicalContent(message)
   );
 }
 
@@ -97,18 +97,18 @@ export function getX25519PublicKey(): Uint8Array<ArrayBuffer> {
  * @param theirEd25519PubKey - Peer's raw ed25519 public key (from didToPublicKey).
  */
 export function computeSharedSecret(
-  theirEd25519PubKey: Uint8Array<ArrayBuffer>,
+  theirEd25519PubKey: Uint8Array<ArrayBuffer>
 ): Uint8Array<ArrayBuffer> {
   const { privateKey } = requireSession();
   const myX25519Priv = ed25519.utils.toMontgomerySecret(
-    privateKey,
+    privateKey
   ) as Uint8Array<ArrayBuffer>;
   const theirX25519Pub = ed25519.utils.toMontgomery(
-    theirEd25519PubKey,
+    theirEd25519PubKey
   ) as Uint8Array<ArrayBuffer>;
   return x25519.getSharedSecret(
     myX25519Priv,
-    theirX25519Pub,
+    theirX25519Pub
   ) as Uint8Array<ArrayBuffer>;
 }
 
@@ -125,7 +125,7 @@ export function computeSharedSecret(
  */
 export async function encryptForRecipient(
   plaintext: string,
-  recipientDid: string,
+  recipientDid: string
 ): Promise<{ iv: string; ct: string }> {
   const sharedSecret = computeSharedSecret(didToPublicKey(recipientDid));
 
@@ -135,12 +135,12 @@ export async function encryptForRecipient(
     sharedSecret,
     "AES-GCM",
     false,
-    ["encrypt"],
+    ["encrypt"]
   );
   const ct = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     aesKey,
-    utf8(plaintext),
+    utf8(plaintext)
   );
 
   return { iv: hex(iv), ct: hex(new Uint8Array(ct)) };
@@ -158,7 +158,7 @@ export async function encryptForRecipient(
 export async function decryptFromSender(
   ct: string,
   iv: string,
-  senderDid: string,
+  senderDid: string
 ): Promise<string> {
   const sharedSecret = computeSharedSecret(didToPublicKey(senderDid));
 
@@ -167,12 +167,12 @@ export async function decryptFromSender(
     sharedSecret,
     "AES-GCM",
     false,
-    ["decrypt"],
+    ["decrypt"]
   );
   const plaintext = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: unhex(iv) },
     aesKey,
-    unhex(ct),
+    unhex(ct)
   );
 
   return new TextDecoder().decode(plaintext);

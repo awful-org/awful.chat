@@ -152,7 +152,9 @@ async function getDB(): Promise<AppDB> {
         attStore.createIndex("byStatus", "status", { unique: false });
 
         // pending DM messages
-        const penStore = database.createObjectStore("pending", { keyPath: "id" });
+        const penStore = database.createObjectStore("pending", {
+          keyPath: "id",
+        });
         penStore.createIndex("byRecipient", "to", { unique: false });
 
         // identity — keyed by "mnemonic" | "keypair"
@@ -204,7 +206,7 @@ const PAGE_SIZE = 50;
  */
 export async function getMessages(
   roomCode: string,
-  beforeLamport?: number,
+  beforeLamport?: number
 ): Promise<Message[]> {
   const database = await getDB();
   const index = database.transaction("messages").store.index("byRoomLamport");
@@ -218,7 +220,7 @@ export async function getMessages(
     lower,
     upper,
     false,
-    beforeLamport !== undefined,
+    beforeLamport !== undefined
   );
 
   const results: Message[] = [];
@@ -239,7 +241,10 @@ export async function getMessages(
 export async function getAllMessages(roomCode: string): Promise<Message[]> {
   const database = await getDB();
   const index = database.transaction("messages").store.index("byRoomLamport");
-  const range = IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER]);
+  const range = IDBKeyRange.bound(
+    [roomCode, 0],
+    [roomCode, Number.MAX_SAFE_INTEGER]
+  );
   const results = await index.getAll(range);
   return results;
 }
@@ -262,20 +267,20 @@ export async function bulkPutMessages(messages: Message[]): Promise<void> {
 
 export async function getUnreadCount(
   roomCode: string,
-  lastSeenLamport: number,
+  lastSeenLamport: number
 ): Promise<number> {
   const database = await getDB();
   const index = database.transaction("messages").store.index("byRoomLamport");
   const range = IDBKeyRange.bound(
     [roomCode, lastSeenLamport + 1],
-    [roomCode, Number.MAX_SAFE_INTEGER],
+    [roomCode, Number.MAX_SAFE_INTEGER]
   );
   return index.count(range);
 }
 
 export async function updateMessageStatus(
   id: string,
-  status: MessageStatus,
+  status: MessageStatus
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("messages", "readwrite");
@@ -286,14 +291,14 @@ export async function updateMessageStatus(
 }
 
 export async function getAttachment(
-  id: string,
+  id: string
 ): Promise<Attachment | undefined> {
   const database = await getDB();
   return database.get("attachments", id);
 }
 
 export async function getAttachmentsByMessage(
-  messageId: string,
+  messageId: string
 ): Promise<Attachment[]> {
   const database = await getDB();
   return database.getAllFromIndex("attachments", "byMessage", messageId);
@@ -304,7 +309,7 @@ export async function getSeedableAttachments(): Promise<Attachment[]> {
   const complete = await database.getAllFromIndex(
     "attachments",
     "byStatus",
-    "complete",
+    "complete"
   );
   return complete.filter((a) => !!a.data);
 }
@@ -317,7 +322,7 @@ export async function putAttachment(attachment: Attachment): Promise<void> {
 
 export async function updateAttachmentStatus(
   id: string,
-  status: AttachmentStatus,
+  status: AttachmentStatus
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("attachments", "readwrite");
@@ -328,7 +333,7 @@ export async function updateAttachmentStatus(
 }
 
 export async function getPendingByRecipient(
-  recipientDid: string,
+  recipientDid: string
 ): Promise<PendingMessage[]> {
   const database = await getDB();
   return database.getAllFromIndex("pending", "byRecipient", recipientDid);
@@ -368,14 +373,14 @@ export async function getMnemonicRecord(): Promise<MnemonicRecord | undefined> {
 }
 
 export async function putIdentityRecord(
-  record: MnemonicRecord | KeypairRecord,
+  record: MnemonicRecord | KeypairRecord
 ): Promise<void> {
   const database = await getDB();
   await database.put("identity", record);
 }
 
 export async function getRoom(
-  roomCode: string,
+  roomCode: string
 ): Promise<Room | DMRoom | undefined> {
   const database = await getDB();
   return database.get("rooms", roomCode);
@@ -402,7 +407,7 @@ export async function putRoom(room: Room | DMRoom): Promise<void> {
  */
 export async function updateRoom(
   roomCode: string,
-  patch: Partial<Pick<Room, "name" | "pfpData" | "pfpURL">>,
+  patch: Partial<Pick<Room, "name" | "pfpData" | "pfpURL">>
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("rooms", "readwrite");
@@ -421,7 +426,7 @@ export async function updateRoom(
  */
 export async function markRoomSeen(
   roomCode: string,
-  lamport: number,
+  lamport: number
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("rooms", "readwrite");
@@ -452,7 +457,7 @@ export async function putOwnProfile(profile: OwnProfile): Promise<void> {
  * pfpData and pfpURL are mutually exclusive — setting one clears the other.
  */
 export async function updateOwnProfile(
-  patch: Partial<Pick<OwnProfile, "nickname" | "pfpData" | "pfpURL">>,
+  patch: Partial<Pick<OwnProfile, "nickname" | "pfpData" | "pfpURL">>
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("profiles", "readwrite");
@@ -467,7 +472,7 @@ export async function updateOwnProfile(
 }
 
 export async function getPeerProfile(
-  did: string,
+  did: string
 ): Promise<PeerProfile | undefined> {
   const database = await getDB();
   const record = await database.get("profiles", did);
@@ -493,7 +498,7 @@ export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
  */
 export async function updatePeerProfile(
   did: string,
-  patch: Partial<Pick<PeerProfile, "nickname" | "pfpData" | "pfpURL">>,
+  patch: Partial<Pick<PeerProfile, "nickname" | "pfpData" | "pfpURL">>
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("profiles", "readwrite");
@@ -514,7 +519,7 @@ export async function updatePeerProfile(
  */
 export function pfpBlobURL(
   pfpData: ArrayBuffer,
-  mimeType = "image/jpeg",
+  mimeType = "image/jpeg"
 ): string {
   return URL.createObjectURL(new Blob([pfpData], { type: mimeType }));
 }
@@ -525,12 +530,12 @@ function watermarkId(roomCode: string, senderId: string): string {
 
 export async function getWatermark(
   roomCode: string,
-  senderId: string,
+  senderId: string
 ): Promise<number> {
   const database = await getDB();
   const record = await database.get(
     "watermarks",
-    watermarkId(roomCode, senderId),
+    watermarkId(roomCode, senderId)
   );
   return record?.maxLamport ?? 0;
 }
@@ -538,7 +543,7 @@ export async function getWatermark(
 export async function setWatermark(
   roomCode: string,
   senderId: string,
-  maxLamport: number,
+  maxLamport: number
 ): Promise<void> {
   const database = await getDB();
   const id = watermarkId(roomCode, senderId);
@@ -554,13 +559,13 @@ export async function setWatermark(
 }
 
 export async function getWatermarksForRoom(
-  roomCode: string,
+  roomCode: string
 ): Promise<Record<string, number>> {
   const database = await getDB();
   const records = await database.getAllFromIndex(
     "watermarks",
     "byRoom",
-    roomCode,
+    roomCode
   );
   return Object.fromEntries(records.map((r) => [r.senderId, r.maxLamport]));
 }

@@ -140,7 +140,7 @@ export function didToPublicKey(did: string): Uint8Array<ArrayBuffer> {
  *          it is never retrievable again without the password.
  */
 export async function createIdentity(
-  password: string,
+  password: string
 ): Promise<{ keypair: KeypairRecord; mnemonic: string }> {
   const mnemonic = generateMnemonic();
   const { privateKey, publicKey } = deriveKeypairFromMnemonic(mnemonic);
@@ -152,7 +152,7 @@ export async function createIdentity(
   const encrypted = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     aesKey,
-    new TextEncoder().encode(mnemonic),
+    new TextEncoder().encode(mnemonic)
   );
 
   const mnemonicRecord: MnemonicRecord = {
@@ -180,7 +180,7 @@ export async function createIdentity(
  */
 export async function restoreIdentity(
   mnemonic: string,
-  password: string,
+  password: string
 ): Promise<KeypairRecord> {
   if (!validateMnemonic(mnemonic)) {
     throw new Error("Invalid mnemonic");
@@ -195,7 +195,7 @@ export async function restoreIdentity(
   const encrypted = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     aesKey,
-    new TextEncoder().encode(mnemonic),
+    new TextEncoder().encode(mnemonic)
   );
 
   const mnemonicRecord: MnemonicRecord = {
@@ -244,7 +244,7 @@ export async function unlockIdentity(password: string): Promise<void> {
     decrypted = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: mnemonicRecord.iv },
       aesKey,
-      mnemonicRecord.encrypted,
+      mnemonicRecord.encrypted
     );
   } catch {
     throw new Error("Wrong password");
@@ -278,14 +278,14 @@ export function lockIdentity(): void {
  */
 export async function AESFromPassword(
   password: string,
-  salt: Uint8Array<ArrayBuffer>,
+  salt: Uint8Array<ArrayBuffer>
 ): Promise<CryptoKey> {
   const baseKey = await crypto.subtle.importKey(
     "raw",
     utf8(password),
     { name: "PBKDF2" },
     false,
-    ["deriveKey"],
+    ["deriveKey"]
   );
 
   return crypto.subtle.deriveKey(
@@ -293,6 +293,6 @@ export async function AESFromPassword(
     baseKey,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt", "decrypt"],
+    ["encrypt", "decrypt"]
   );
 }

@@ -48,7 +48,8 @@ interface KlipyResponse {
   };
 }
 
-const KLIPY_API_BASE = import.meta.env.VITE_API_URL || "https://api.awful.chat/klipy";
+const KLIPY_API_BASE =
+  import.meta.env.VITE_API_URL || "https://api.awful.chat/klipy";
 
 function normalizeGif(item: KlipyResponse["data"]["data"][0]): KlipyGif {
   const file = item.file || {};
@@ -59,10 +60,18 @@ function normalizeGif(item: KlipyResponse["data"]["data"][0]): KlipyGif {
     id: String(item.id),
     title: item.title || "",
     urls: {
-      preview: (sm as KlipyMediaSizes).webp?.url || (sm as KlipyMediaSizes).jpg?.url || (md as KlipyMediaSizes).webp?.url || "",
+      preview:
+        (sm as KlipyMediaSizes).webp?.url ||
+        (sm as KlipyMediaSizes).jpg?.url ||
+        (md as KlipyMediaSizes).webp?.url ||
+        "",
       tinygif: (sm as KlipyMediaSizes).gif?.url || "",
       mediumgif: (md as KlipyMediaSizes).gif?.url || "",
-      gif: (hd as KlipyMediaSizes).gif?.url || (md as KlipyMediaSizes).gif?.url || (sm as KlipyMediaSizes).gif?.url || "",
+      gif:
+        (hd as KlipyMediaSizes).gif?.url ||
+        (md as KlipyMediaSizes).gif?.url ||
+        (sm as KlipyMediaSizes).gif?.url ||
+        "",
     },
   };
 }
@@ -72,15 +81,25 @@ export interface KlipyResult {
   hasMore: boolean;
 }
 
-export async function searchGifs(query: string, limit = 12, page = 1): Promise<KlipyResult> {
+export async function searchGifs(
+  query: string,
+  limit = 12,
+  page = 1
+): Promise<KlipyResult> {
   try {
-    const params = new URLSearchParams({ q: query, limit: String(limit), page: String(page) });
+    const params = new URLSearchParams({
+      q: query,
+      limit: String(limit),
+      page: String(page),
+    });
     const res = await fetch(`${KLIPY_API_BASE}/search?${params}`);
     if (!res.ok) return { gifs: [], hasMore: false };
     const data: KlipyResponse = await res.json();
     if (!data.result) return { gifs: [], hasMore: false };
     return {
-      gifs: data.data.data.map(normalizeGif).filter((g) => g.urls.tinygif || g.urls.mediumgif),
+      gifs: data.data.data
+        .map(normalizeGif)
+        .filter((g) => g.urls.tinygif || g.urls.mediumgif),
       hasMore: data.data.has_next ?? false,
     };
   } catch {
@@ -88,15 +107,23 @@ export async function searchGifs(query: string, limit = 12, page = 1): Promise<K
   }
 }
 
-export async function getTrendingGifs(limit = 12, page = 1): Promise<KlipyResult> {
+export async function getTrendingGifs(
+  limit = 12,
+  page = 1
+): Promise<KlipyResult> {
   try {
-    const params = new URLSearchParams({ limit: String(limit), page: String(page) });
+    const params = new URLSearchParams({
+      limit: String(limit),
+      page: String(page),
+    });
     const res = await fetch(`${KLIPY_API_BASE}/trending?${params}`);
     if (!res.ok) return { gifs: [], hasMore: false };
     const data: KlipyResponse = await res.json();
     if (!data.result) return { gifs: [], hasMore: false };
     return {
-      gifs: data.data.data.map(normalizeGif).filter((g) => g.urls.tinygif || g.urls.mediumgif),
+      gifs: data.data.data
+        .map(normalizeGif)
+        .filter((g) => g.urls.tinygif || g.urls.mediumgif),
       hasMore: data.data.has_next ?? false,
     };
   } catch {

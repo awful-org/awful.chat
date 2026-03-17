@@ -1,5 +1,10 @@
 import { identityStore } from "$lib/identity.svelte";
-import { getOwnProfile, putOwnProfile, updateOwnProfile, pfpBlobURL } from "$lib/storage";
+import {
+  getOwnProfile,
+  putOwnProfile,
+  updateOwnProfile,
+  pfpBlobURL,
+} from "$lib/storage";
 import { broadcastProfile } from "$lib/transport.svelte";
 
 interface ProfileStore {

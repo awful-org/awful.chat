@@ -1,4 +1,10 @@
-import { getAllRooms, putRoom, deleteRoom, getUnreadCount, type Room } from "./storage";
+import {
+  getAllRooms,
+  putRoom,
+  deleteRoom,
+  getUnreadCount,
+  type Room,
+} from "./storage";
 
 interface RoomsStore {
   rooms: Room[];
@@ -37,7 +43,7 @@ async function _refreshAllUnread(): Promise<void> {
     roomsStore.rooms.map(async (r) => {
       const count = await getUnreadCount(r.roomCode, r.lastSeenLamport);
       return [r.roomCode, count] as [string, number];
-    }),
+    })
   );
   roomsStore.unreadCounts = new Map(entries);
 }

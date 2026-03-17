@@ -107,7 +107,7 @@ export async function create(password: string): Promise<string> {
  */
 export async function restore(
   mnemonic: string,
-  password: string,
+  password: string
 ): Promise<void> {
   identityStore.loading = true;
   identityStore.error = null;

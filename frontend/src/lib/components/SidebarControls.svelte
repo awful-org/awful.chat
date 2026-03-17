@@ -189,5 +189,7 @@
 
 <SettingsDialog
   bind:open={audioSettingsOpen}
-  onClose={() => { audioSettingsOpen = false; }}
+  onClose={() => {
+    audioSettingsOpen = false;
+  }}
 />

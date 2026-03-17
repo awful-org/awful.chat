@@ -320,8 +320,10 @@
   const remoteAudio = $derived.by(() => {
     const tracks: Array<{ id: string; track: MediaStreamTrack }> = [];
     for (const p of participants.values()) {
-      if (p.audioTrack) tracks.push({ id: `${p.peerId}-voice`, track: p.audioTrack });
-      if (p.screenAudioTrack) tracks.push({ id: `${p.peerId}-screen`, track: p.screenAudioTrack });
+      if (p.audioTrack)
+        tracks.push({ id: `${p.peerId}-voice`, track: p.audioTrack });
+      if (p.screenAudioTrack)
+        tracks.push({ id: `${p.peerId}-screen`, track: p.screenAudioTrack });
     }
     return tracks;
   });
@@ -505,7 +507,7 @@
     <!-- Name badge -->
     {#if !isPendingTx}
       <div
-      class="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5"
+        class="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5"
       >
         {#if tile.kind === "screen" || tile.kind === "transmission"}
           <MonitorIcon class="size-3 text-white" />
@@ -577,8 +579,7 @@
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
       <!-- svelte-ignore a11y_media_has_caption -->
-      <audio style="display:none" autoplay use:audioAction={a.track}
-      ></audio>
+      <audio style="display:none" autoplay use:audioAction={a.track}></audio>
     {/each}
 
     <!-- Tile area -->

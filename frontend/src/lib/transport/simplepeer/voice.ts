@@ -185,7 +185,8 @@ export class SimplePeerVoice implements VoiceTransport {
     // replace stream on all connected peers
     for (const peerId of this.transport.peers()) {
       if (oldStream) this.transport.removeStream(peerId, oldStream);
-      if (this.processedStream) this.transport.addStream(peerId, this.processedStream);
+      if (this.processedStream)
+        this.transport.addStream(peerId, this.processedStream);
     }
 
     this.activeInputDevice = deviceId;
