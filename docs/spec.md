@@ -1,62 +1,12 @@
 # Technical Specsheet
 
-## Current Functionality (Implemented)
-
-```txt
-Identity and profile
-  - BIP39 mnemonic identity, password-encrypted at rest (AES-GCM)
-  - did:key derivation from ed25519 public key
-  - unlock/lock session model (private key in memory only while unlocked)
-  - locked-screen recovery entrypoint (recover from 12-word phrase)
-  - local profile (nickname + avatar URL/data) and peer profile caching
-
-Rooms and chat
-  - create/join room by code
-  - room sidebar with saved rooms + unread tracking
-  - persistent local history (IndexedDB)
-  - lamport-ordered message log + watermark sync on reconnect
-  - pagination / load-more history
-  - peer profile broadcast and display in chat/call UI
-  - reply and reaction interactions in chat UI
-
-Local data controls
-  - destructive "erase all local data" action in settings (confirmed wipe of IndexedDB)
-
-Collaboration data
-  - Not yet implemented in current app flow (planned): Yjs per-room channel doc for edits/deletes/reactions/pins/topic
-
-Files
-  - Not yet implemented in current app flow (planned): WebTorrent-based p2p file transfer
-
-Calls
-  - p2p voice via SimplePeer + Web Audio input/output controls
-  - working duplex voice (early-stream race buffered until join completes)
-  - deafen/undeafen support (voice + transmission output mute/restore)
-  - SFU video via mediasoup (camera + screen share)
-  - opt-in screen-share transmissions (remote screen is not auto-consumed)
-  - explicit "watch transmission" and "stop watching" flow
-  - transmission volume slider while watching
-  - screen-share tab/system audio publishing + playback for watchers
-  - late-join handling for existing SFU producers
-  - producer lifecycle signaling to clear stale transmission tiles
-  - explicit call-presence sync so in-call peer tiles are stable
-  - room-name sync message over p2p data channel
-  - local camera/screen preview + remote participant tiles + active speaker ring
-
-Chat interactions
-  - message replies (quote + jump to original)
-  - message reactions with toggle semantics (add/remove)
-```
-
 ## Data Layer Split
 
 ```txt
 message log (append-only)  → lamport + watermark sync + IndexedDB
-channel mutations (CRDT)   → Yjs per-channel doc (reactions, edits, deletes)
+channel mutations (CRDT)   → Yjs per-channel doc (pins, topic, room settings)
 identity                   → BIP39 + ed25519, encrypted at rest in IndexedDB
 ```
-
-Note: the Yjs mutation layer and WebTorrent integration are currently design targets but not wired in the active production message flow yet.
 
 ---
 
@@ -120,7 +70,7 @@ interface Message {
   sig?: string           // ed25519 over canonical(id, senderId, lamport, content)
   timestamp: number      // wall clock, display only
   lamport: number        // ordering source of truth
-  type: MessageType
+  type: ChatMessageType  // only chat types stored in IDB
   content: string
   meta?: FileMeta
   attachments: string[]  // Attachment.id refs
@@ -129,18 +79,28 @@ interface Message {
 }
 
 enum MessageType {
+  // chat — persisted to IDB, sent over wire
   Text         = "text",
-  File         = "file",
-  System       = "system",
   Reply        = "reply",
-  SyncRequest  = "sync_request",
-  SyncOffer    = "sync_offer",
+  Reaction     = "reaction",
+  File         = "file",
+  // presence — wire only, never persisted
+  Profile      = "profile",
+  CallPresence = "call_presence",
+  RoomName     = "room_name",
+  // sync — wire only, never persisted
+  SyncDigest   = "sync_digest",
   SyncBatch    = "sync_batch",
   SyncComplete = "sync_complete",
+  // future
   SyncAck      = "sync_ack",
   DeliveryAck  = "delivery_ack",
   ReadAck      = "read_ack",
+  System       = "system",
 }
+
+// only chat types are persisted to IDB
+type ChatMessageType = MessageType.Text | MessageType.Reply | MessageType.Reaction | MessageType.File
 
 type MessageStatus = "sending" | "sent" | "delivered" | "read"
 
@@ -230,7 +190,7 @@ interface PeerProfile {
 //   setting one clears the other
 ```
 
-### Identity Types
+### Identity struct
 
 ```typescript
 interface MnemonicRecord {
@@ -274,7 +234,9 @@ interface PendingMessage {
 ### Wire Types
 
 ```typescript
-interface WireMessage {
+// chat message — sent over wire and persisted on receipt
+interface WireChatMessage {
+  type: ChatMessageType
   id: string
   senderId: string
   senderName: string
@@ -282,28 +244,69 @@ interface WireMessage {
   sig?: string
   timestamp: number
   lamport: number
-  type: MessageType
   content: string
   meta?: FileMeta
   replyTo?: ReplyTo
+  reactionTo?: string
+  reactionEmoji?: string
+  reactionOp?: "add" | "remove"
 }
 
-interface WireDeliveryAck { type: MessageType.DeliveryAck; messageId: string; senderId: string }
-interface WireReadAck     { type: MessageType.ReadAck;     messageId: string; senderId: string }
+// presence — wire only
+interface WireProfile      { type: MessageType.Profile;      name: string; did: string | null; avatarUrl: string | null }
+interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
+interface WireRoomName     { type: MessageType.RoomName;     name: string }
+
+// sync — wire only
+interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
+interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number }
+interface WireSyncComplete { type: MessageType.SyncComplete }
+
+// acks — future
+interface WireDeliveryAck  { type: MessageType.DeliveryAck;  messageId: string; senderId: string }
+interface WireReadAck      { type: MessageType.ReadAck;      messageId: string; senderId: string }
+
+type AnyWireMessage =
+  | WireChatMessage | WireProfile | WireCallPresence | WireRoomName
+  | WireSyncDigest | WireSyncBatch | WireSyncComplete
+  | WireDeliveryAck | WireReadAck
+
+// helpers
+function wireToMessage(wire: WireChatMessage, roomCode: string): Message  // adds roomCode + attachments: []
+function messageToWire(msg: Message): WireChatMessage                      // strips storage-only fields
+function isChatMessage(msg: AnyWireMessage): msg is WireChatMessage        // type guard
 ```
 
 ### Sync Protocol
 
 ```typescript
-interface SyncRequest {
-  type: MessageType.SyncRequest
-  roomCode: string
-  watermarks: Record<string, number>  // senderId → maxLamport seen from them
-}
-interface SyncOffer    { type: MessageType.SyncOffer;    totalMessages: number; totalBatches: number }
-interface SyncBatch    { type: MessageType.SyncBatch;    messages: Message[]; batchIndex: number; totalBatches: number }
-interface SyncComplete { type: MessageType.SyncComplete }
-interface SyncAck      { type: MessageType.SyncAck }
+// all messages share a single type discriminant — no kind/wire wrapper
+// { type: MessageType.SyncDigest, watermarks: { ... } }
+
+// watermarks are a vector clock: senderId → maxLamport seen from that sender
+type Watermarks = Record<string, number>
+```
+
+```txt
+on connect (both peers):
+  → send SyncDigest { watermarks }
+
+on receive SyncDigest:
+  → compare their watermarks against mine
+  → push everything they're missing as SyncBatch[] + SyncComplete
+  → they do the same — one round trip, bidirectional, no host election
+
+on receive SyncBatch:
+  → bulkPut to IDB (idempotent — put by id)
+  → update watermarks (max semantics)
+  → merge into in-memory message list
+
+on receive SyncComplete:
+  → re-sort in-memory list
+  → send SyncDigest to all OTHER connected peers (gossip propagation)
+    so data spreads through partial meshes without requiring direct connections
+
+SyncRequest removed — push-on-digest replaces it, saving one round trip
 ```
 
 ---
@@ -314,9 +317,6 @@ interface SyncAck      { type: MessageType.SyncAck }
 // per channel — reactions, edits, deletes, pins, topic
 // keyed in IndexedDB as "channel:{roomCode}"
 
-channelDoc.getMap<Y.Map<Y.Array<string>>>('reactions') // messageId → emoji → senderIds
-channelDoc.getMap<{ content: string; editedAt: number }>('edits')      // messageId → edit
-channelDoc.getMap<{ deletedAt: number; deletedBy: string }>('deletes') // messageId → tombstone
 channelDoc.getArray<string>('pins')
 channelDoc.getText('topic')
 ```
@@ -364,16 +364,23 @@ function sortMessages(a: Message, b: Message): number {
 ## Sync Flow
 
 ```txt
-peer joins room:
-  → selectSyncHost([...connectedPeers, myId].sort()[0])
-  → if not host: send SyncRequest { watermarks }
-  → if host: respond with SyncOffer + SyncBatch[]
+peer joins room → connects to all peers in full mesh (SimplePeer)
 
-host failure (no SyncComplete within 10s):
-  → recalculate from remaining peers → restart → deduplicate by id
+on each connection (both sides independently):
+  → send SyncDigest { watermarks }          // vector clock of what I have
+
+on receive SyncDigest:
+  → compute what they're missing            // their watermarks < mine
+  → push SyncBatch[] + SyncComplete         // they do the same symmetrically
+
+result:
+  → one round trip per peer pair
+  → no host election, no single point of failure
+  → each SyncComplete triggers gossip to other peers
+    (redundant in full mesh, required for future partial mesh / libp2p)
 
 Yjs:
-  → piggybacks on SimplePeer data channel (kind: "yjs-sync" / "yjs-update")
+  → piggybacks on SimplePeer data channel (type: "yjs-sync" / "yjs-update")
   → load from IndexedDB before connecting peers
   → save to IndexedDB on every update
 ```
@@ -460,19 +467,24 @@ Yjs updates:       { kind: "yjs-update", doc, data: number[] }
 
 ```txt
 Voice:
-  - p2p via SimplePeer (mic only)
+  - p2p via SimplePeer (mic only, audio stays peer-to-peer always)
   - Web Audio input gain + output volume + device selection
+  - input chain:  mic → GainNode → MediaStreamDestination → peers
+  - output chain: remoteStream → GainNode → AudioContext.destination (per peer)
+  - gain supports boost above 1.0 via Web Audio
 
 Video:
   - mediasoup SFU over dedicated /sfu WebSocket signaling
   - camera and screen published as separate sources ("camera" | "screen")
   - recv/send transports created after router capabilities exchange
+  - Node.js worker process required for mediasoup (not compatible with Bun)
+  - Bun handles all client-facing signaling, proxies ms: messages to Node worker
 
 Screen share transmissions:
   - remote screen producers emit transmissionAvailable(peerId, producerId)
   - UI shows pending "Click to watch" tile (not auto-consumed)
-  - watchTransmission(peerId, producerId) consumes all available screen producers for that peer (video + optional audio)
-  - stopWatchingTransmission() closes the screen consumer and restores pending tile
+  - watchTransmission(peerId, producerId) consumes screen producers for that peer
+  - stopWatchingTransmission() closes consumer and restores pending tile
   - transmissionEnded(peerId) clears pending/watching state
   - delayed screen-audio producers are auto-consumed while already watching
   - SFU emits producer-closed so stopped shares remove stale pending tiles
@@ -480,7 +492,6 @@ Screen share transmissions:
 Late join behavior:
   - SFU replays existing producers to newly joined peers
   - client queues early ms:new-producer signals until recv transport is ready
-  - prevents missing tiles/audio-video until peers rejoin
 ```
 
 ---
@@ -504,7 +515,7 @@ all p2p:                 messages, files, Yjs — direct between peers
 
 ---
 
-## Future: Roles + Permissions (Hash Chain Model) (maybe)
+## Future: Roles + Permissions (Hash Chain Model)
 
 *Deferred — implement after core is stable*
 
@@ -532,3 +543,41 @@ known limitation:
   mitigated by syncing from multiple peers + longest valid chain wins
   signaling server can optionally store and serve the chain
 ```
+
+---
+
+## Future: Sequential Sync Queue
+
+*Deferred — only worth implementing if rooms grow large with many simultaneous joins*
+
+**Problem:** When a peer joins and connects to N peers at once, all N digest exchanges happen in parallel. Each peer responds independently with what the joiner is missing — so the same messages can arrive from multiple peers before any response has been processed, wasting bandwidth.
+
+```
+A connects to B and C simultaneously:
+  A → B: digest             A → C: digest
+  B → A: pushes missing     C → A: pushes same missing  ← duplicate on air
+```
+
+**Solution:** Queue digest sends and process them sequentially — wait for SyncComplete from peer N before sending digest to peer N+1. By the time you reach C, your watermarks reflect what B already sent, so C only pushes the delta.
+
+```typescript
+const _syncQueue: string[] = []
+let _syncRunning = false
+
+async function _queueSync(peerId: string): Promise<void> {
+  _syncQueue.push(peerId)
+  if (_syncRunning) return
+  _syncRunning = true
+  while (_syncQueue.length > 0) {
+    const next = _syncQueue.shift()!
+    await _sendDigest(next).catch(() => {})
+    await _
+    waitForSyncComplete(next).catch(() => {})  // resolves on SyncComplete or timeout
+  }
+  _syncRunning = false
+}
+```
+
+**Tradeoff:** Adds latency on join — you wait for the first peer's full push before starting with the second. For small rooms (2–5 peers) with modest history, parallel is faster and the duplicate data is negligible. Sequential only pays off with larger rooms or large histories where duplicate transmission is significant.
+
+**Current behavior:** Parallel. Each peer connection runs an independent digest/push cycle. Duplicate data in flight is bounded to messages missing at join time, sent once per already-connected peer.

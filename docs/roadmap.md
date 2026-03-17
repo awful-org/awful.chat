@@ -3,29 +3,29 @@
 ## Stack Overview
 
 ```txt
-Bun             → signaling server (WebSocket, relay only)
-SimplePeer      → p2p mesh (full mesh rooms, DMs, 1-on-1 calls)
+Bun             → signaling server (WebSocket, relay only) + Klipy GIF proxy
+SimplePeer      → p2p mesh (full mesh rooms, DMs, 1-on-1 voice)
 WebTorrent v1   → file transfer (always p2p)
-mediasoup       → voice/video SFU (group calls)
-Yjs             → channel mutations (reactions, edits, deletes, pins, topic)
+mediasoup       → video SFU (group calls — audio stays p2p always)
+Yjs             → channel mutations (pins, topic, room settings) [planned]
 BIP39 + ed25519 → identity (did:key, message signing)
 idb             → local persistence (messages, attachments, state)
 ```
 
 ---
 
-## Phase 1 — Core Mesh Chat ✓ (current)
+## Phase 1 — Core Mesh Chat ✓
 
 - [x] Bun WebSocket signaling server
 - [x] SimplePeer full mesh
 - [x] Room creation and peer joining
 - [x] Text messaging over data channel
-- [x] File transfer via WebTorrent v1
 - [x] Basic Svelte UI
+- [x] WebTorrent v1 client wired (seeding/leeching infrastructure ready)
 
 ---
 
-## Phase 2 — Message Reliability + Offline Sync (partially implemented)
+## Phase 2 — Message Reliability + Offline Sync ✓
 
 **Goal:** messages never lost, offline peers catch up on reconnect
 
@@ -33,45 +33,51 @@ idb             → local persistence (messages, attachments, state)
 
 ```txt
 message log (append-only)
-  → manual lamport + watermark sync
+  → lamport clock + watermark vector clock
   → IndexedDB as source of truth
-  → pagination friendly, unbounded history
+  → pagination-friendly, unbounded history
 
 channel mutations (concurrent writes)
-  → planned Yjs per-channel doc
-  → current implementation uses wire messages for replies/reactions
+  → Yjs per-channel doc [planned]
+  → current: replies and reactions stored as Message rows
   → edits/deletes/pins/topic remain pending
 ```
 
 ### 2.2 Room Code
 
 ```txt
-format:  "general-4f2a"  (slug + 4 char hex suffix)
-         hex suffix = first 4 chars of sha256(creatorDid + random salt)
-         unique, collision-resistant, human-readable
-DM:      sha256(sort([didA, didB]).join(':'))[0..24] hex — deterministic
+text/voice:  slugify(name) + "-" + sha256(creatorDid + salt)[0..4]
+DM:          sha256(sort([didA, didB]).join(':'))[0..24]
 ```
 
 ### 2.3 Message Types
 
 ```typescript
 enum MessageType {
+  // chat — persisted to IDB
   Text         = "text",
-  File         = "file",
-  System       = "system",       // "X joined", "X left"
   Reply        = "reply",
-  SyncRequest  = "sync_request",
-  SyncOffer    = "sync_offer",
+  Reaction     = "reaction",
+  File         = "file",
+  // presence — wire only, never persisted
+  Profile      = "profile",
+  CallPresence = "call_presence",
+  RoomName     = "room_name",
+  // sync — wire only, never persisted
+  SyncDigest   = "sync_digest",
   SyncBatch    = "sync_batch",
   SyncComplete = "sync_complete",
+  // future
   SyncAck      = "sync_ack",
-  DeliveryAck  = "delivery_ack", // DMs only
-  ReadAck      = "read_ack",     // DMs only
+  DeliveryAck  = "delivery_ack",
+  ReadAck      = "read_ack",
+  System       = "system",
 }
-// edit, delete, reaction → Yjs mutations, not wire types
+
+type ChatMessageType = MessageType.Text | MessageType.Reply | MessageType.Reaction | MessageType.File
 ```
 
-### 2.4 Core Message (IndexedDB — `storage.ts`)
+### 2.4 Core Message (IndexedDB)
 
 ```typescript
 interface Message {
@@ -79,83 +85,97 @@ interface Message {
   roomCode: string
   senderId: string
   senderName: string
-  senderDid?: string     // optional until phase 3
-  sig?: string           // ed25519 — optional until phase 3
+  senderDid?: string
+  sig?: string           // ed25519 over canonical(id, senderId, lamport, content)
   timestamp: number      // wall clock, display only
   lamport: number        // logical clock, ordering source of truth
-  type: MessageType
+  type: ChatMessageType  // only chat types persisted
   content: string
   meta?: FileMeta
   attachments: string[]  // Attachment.id refs
   replyTo?: ReplyTo
+  reactionTo?: string
+  reactionEmoji?: string
+  reactionOp?: "add" | "remove"
   status?: MessageStatus // DMs only
 }
 
 type MessageStatus = "sending" | "sent" | "delivered" | "read"
+```
 
-interface ReplyTo {
+### 2.5 Wire Types
+
+```typescript
+// chat message — sent over wire and persisted on receipt
+interface WireChatMessage {
+  type: ChatMessageType
   id: string
+  senderId: string
   senderName: string
-  content: string        // snapshot at send time
-}
-
-interface FileMeta {
-  files: FileEntry[]
-}
-
-interface FileEntry {
-  filename: string
-  mimeType: string
-  size: number
-  infoHash: string
-}
-```
-
-### 2.5 Yjs Channel Doc — Mutations (`channelStore.ts`)
-
-```typescript
-const channelDoc = new Y.Doc()
-
-// reactions: messageId → emoji → Y.Array<senderId>
-const reactions = channelDoc.getMap<Y.Map<Y.Array<string>>>('reactions')
-
-// edits: messageId → { content, editedAt }
-// only message owner can edit — verified before calling
-const edits = channelDoc.getMap<{ content: string; editedAt: number }>('edits')
-
-// deletes: messageId → tombstone — soft delete
-const deletes = channelDoc.getMap<{ deletedAt: number; deletedBy: string }>('deletes')
-
-// pins and topic
-const pins  = channelDoc.getArray<string>('pins')
-const topic = channelDoc.getText('topic')
-```
-
-**UI merge:**
-
-```typescript
-interface ResolvedMessage extends Message {
+  senderDid?: string
+  sig?: string
+  timestamp: number
+  lamport: number
   content: string
-  edited: boolean
-  deleted: boolean
-  reactions: Record<string, string[]>
+  meta?: FileMeta
+  replyTo?: ReplyTo
+  reactionTo?: string
+  reactionEmoji?: string
+  reactionOp?: "add" | "remove"
 }
 
-function resolveMessage(msg: Message, channelDoc: Y.Doc): ResolvedMessage {
-  const edit = channelDoc.getMap('edits').get(msg.id)   as { content: string } | undefined
-  const del  = channelDoc.getMap('deletes').get(msg.id) as { deletedAt: number } | undefined
-  const rxns = channelDoc.getMap('reactions').get(msg.id)
-  return {
-    ...msg,
-    content:   del ? "" : (edit?.content ?? msg.content),
-    edited:    !!edit && !del,
-    deleted:   !!del,
-    reactions: rxns ? yReactionsToRecord(rxns) : {},
-  }
+// presence
+interface WireProfile      { type: MessageType.Profile;      name: string; did: string | null; avatarUrl: string | null }
+interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
+interface WireRoomName     { type: MessageType.RoomName;     name: string }
+
+// sync
+interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
+interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number }
+interface WireSyncComplete { type: MessageType.SyncComplete }
+
+type AnyWireMessage = WireChatMessage | WireProfile | WireCallPresence | WireRoomName
+                    | WireSyncDigest | WireSyncBatch | WireSyncComplete | ...
+```
+
+All messages share a single `type` discriminant — no `kind`/`wire` wrapper. Message handler is a flat `switch (msg.type)`. Helpers: `wireToMessage(wire, roomCode)`, `messageToWire(msg)`, `isChatMessage(msg)`.
+
+Max DataChannel message: 64 KB. SyncBatch: max 20 messages per batch.
+
+### 2.6 Lamport Clock
+
+```typescript
+// send:    clock++
+// receive: clock = max(local, received) + 1
+
+function sortMessages(a: Message, b: Message): number {
+  if (a.lamport !== b.lamport) return a.lamport - b.lamport
+  return a.senderId.localeCompare(b.senderId)  // deterministic tiebreaker
 }
 ```
 
-### 2.6 Attachment (IndexedDB — `storage.ts`)
+### 2.7 Sync Protocol — Push-on-Digest
+
+```txt
+on connect (both peers independently):
+  → send SyncDigest { watermarks }   // vector clock: senderId → maxLamport
+
+on receive SyncDigest:
+  → compute what they're missing (their watermarks < mine per sender)
+  → push SyncBatch[] + SyncComplete
+  → they do the same symmetrically
+
+result:
+  → one round trip per peer pair, bidirectional, no host election
+  → on SyncComplete: gossip digest to all other connected peers
+    (redundant in full mesh, required for future partial mesh / libp2p)
+
+SyncRequest removed — push-on-digest saves one round trip vs request/response
+```
+
+Watermarks are `Record<senderId, maxLamport>` — a vector clock. IDB `put` is idempotent by id so duplicate batch delivery is safe.
+
+### 2.8 Attachment
 
 ```typescript
 interface Attachment {
@@ -166,7 +186,7 @@ interface Attachment {
   mimeType: string
   size: number
   infoHash: string       // permanent WebTorrent reference
-  data?: ArrayBuffer     // only if size < 5MB, raw binary
+  data?: ArrayBuffer     // only if size < 5MB
   blobURL?: string       // runtime only, never persisted
   status: AttachmentStatus
   createdAt: number
@@ -175,184 +195,60 @@ interface Attachment {
 type AttachmentStatus = "seeding" | "pending" | "downloading" | "complete" | "failed"
 ```
 
-**File strategy:**
-
 ```txt
 < 5MB  → ArrayBuffer in IndexedDB + auto re-seed on startup
-> 5MB  → infoHash only, re-download on demand from peers
-always → infoHash persisted — download possible while someone seeds
+> 5MB  → infoHash only, re-download on demand
 ```
 
-### 2.7 Wire Message (DataChannel — `useDataChannel.ts`)
+### 2.9 Yjs Channel Doc (planned)
 
 ```typescript
-interface WireMessage {
-  id: string
-  senderId: string
-  senderName: string
-  senderDid?: string
-  sig?: string
-  timestamp: number
-  lamport: number
-  type: MessageType
-  content: string
-  meta?: FileMeta
-  replyTo?: ReplyTo
-}
-
-interface WireDeliveryAck { type: MessageType.DeliveryAck; messageId: string; senderId: string }
-interface WireReadAck     { type: MessageType.ReadAck;     messageId: string; senderId: string }
+channelDoc.getMap<Y.Map<Y.Array<string>>>('reactions') // messageId → emoji → senderIds
+channelDoc.getMap<{ content: string; editedAt: number }>('edits')
+channelDoc.getMap<{ deletedAt: number; deletedBy: string }>('deletes')
+channelDoc.getArray<string>('pins')
+channelDoc.getText('topic')
 ```
 
-Max DataChannel message: 64KB. SyncBatch: max 20 messages per batch.
-
-### 2.8 Lamport Clock
-
-```typescript
-// send:    clock++
-// receive: clock = max(local, received) + 1
-
-function sortMessages(a: Message, b: Message): number {
-  if (a.lamport !== b.lamport) return a.lamport - b.lamport
-  return a.senderId.localeCompare(b.senderId)  // tiebreaker
-}
-```
-
-### 2.9 Sync Protocol (`sync.ts`)
-
-```typescript
-interface SyncRequest {
-  type: MessageType.SyncRequest
-  roomCode: string
-  watermarks: Record<string, number>  // senderId → maxLamport seen from them
-}
-interface SyncOffer    { type: MessageType.SyncOffer;    totalMessages: number; totalBatches: number }
-interface SyncBatch    { type: MessageType.SyncBatch;    messages: Message[]; batchIndex: number; totalBatches: number }
-interface SyncComplete { type: MessageType.SyncComplete }
-interface SyncAck      { type: MessageType.SyncAck }
-```
-
-**Host selection:**
-
-```typescript
-// lowest peerId lexicographically — deterministic, no coordination needed
-function selectSyncHost(peers: string[], myId: string): string {
-  return [...peers, myId].sort()[0]
-}
-```
-
-**Host failure:** no SyncComplete within 10s → recalculate host → restart → deduplicate by id.
-
-### 2.10 Yjs Sync Transport
-
-Yjs piggybacks on the existing SimplePeer data channel — no y-webrtc dep.
-
-```typescript
-// on peer connect — send full Yjs state
-peer.on('connect', () => {
-  for (const [id, doc] of yjsDocs) {
-    const state = Y.encodeStateAsUpdate(doc)
-    peer.send(JSON.stringify({ kind: 'yjs-sync', doc: id, data: Array.from(state) }))
-  }
-})
-
-// on data
-peer.on('data', raw => {
-  const msg = JSON.parse(raw)
-  if (msg.kind === 'yjs-update' || msg.kind === 'yjs-sync') {
-    const doc = yjsDocs.get(msg.doc)
-    if (!doc) return
-    Y.applyUpdate(doc, new Uint8Array(msg.data))
-    if (msg.kind === 'yjs-sync') {
-      const state = Y.encodeStateAsUpdate(doc)
-      peer.send(JSON.stringify({ kind: 'yjs-update', doc: msg.doc, data: Array.from(state) }))
-    }
-  }
-})
-
-// on local Yjs change — broadcast
-doc.on('update', (update: Uint8Array) => {
-  const msg = JSON.stringify({ kind: 'yjs-update', doc: docId, data: Array.from(update) })
-  for (const peer of connectedPeers) peer.send(msg)
-})
-```
-
-Yjs persistence — load before connecting peers, save on every update:
-
-```typescript
-await loadYjsDoc(db, `channel:${roomCode}`, doc)
-doc.on('update', () => saveYjsDoc(db, `channel:${roomCode}`, doc))
-```
-
-### 2.11 Message Pagination
-
-```typescript
-const PAGE_SIZE = 50
-
-async function loadMessages(roomCode: string, beforeLamport?: number): Promise<Message[]> {
-  // cursor-based, returns oldest→newest
-  // virtual scroll in UI — load more on scroll up
-}
-```
+Yjs piggybacks on SimplePeer data channel (`type: "yjs-sync"` / `"yjs-update"`). Load from IDB before connecting peers, save on every update.
 
 ---
 
-## Phase 3 — Identity (BIP39 + ed25519) ✓ (implemented)
+## Phase 3 — Identity ✓
 
 **Goal:** persistent cryptographic identity, recoverable, portable
 
-### 3.1 Key Generation
+### 3.1 Key Derivation
 
 ```
-BIP39 mnemonic (12 words)
-  → PBKDF2 seed
-  → SLIP-0010 ed25519 derivation  ← not BIP32, unsafe for ed25519
-  → root keypair
-  → did:key = "did:key:" + base58btc(0xed01 + publicKey)
+password → PBKDF2(salt, 100_000, SHA-256) → AES-256-GCM key → decrypt mnemonic
+mnemonic (BIP39, 12 words) → SLIP-0010 → ed25519 keypair
+did:key = "did:key:" + base58btc(0xed01 + publicKey)
+private key NEVER stored — derived at unlock, held in memory only
 ```
 
-### 3.2 Mnemonic at Rest
-
-```
-encrypted with AES-GCM
-key derived from user password via PBKDF2 (separate from identity derivation)
-stored in IndexedDB — private key NEVER stored, derived at unlock only
-```
-
-### 3.3 Message Signing
+### 3.2 Message Signing
 
 ```typescript
-// canonical excludes timestamp — wall clock is untrusted
 const canonical = `${msg.id}:${msg.senderId}:${msg.lamport}:${msg.content}`
-const sig = hex(ed25519.sign(utf8(canonical), privateKey))
-
-// verify — public key decoded from senderDid
-const valid = ed25519.verify(unhex(sig), utf8(canonical), pubkeyFromDid(senderDid))
+// timestamp excluded — wall clock is untrusted
 ```
 
-### 3.4 Account Recovery
-
-- 12-word mnemonic on first launch — user must confirm backup
-- Same mnemonic on any device → same keypair → same did:key
-- Identity survives device loss
-
-### 3.5 User Profile
+### 3.3 Profile
 
 ```typescript
 interface OwnProfile {
   id: "own"
   did: string
   nickname: string
-  pfpData?: ArrayBuffer  // local file upload, < 2MB
-  pfpURL?: string        // external URL (tenor, giphy, etc) — stored as-is
+  pfpData?: ArrayBuffer  // local upload — blobURL generated at runtime
+  pfpURL?: string        // external URL (tenor, giphy, etc)
   updatedAt: number
-  // pfpData and pfpURL are mutually exclusive
-  // pfpData → blobURL generated at runtime, never stored
-  // pfpURL  → rendered directly as <img src>
+  // pfpData and pfpURL mutually exclusive
 }
 ```
 
-Profile broadcast over data channel on connect so peers can cache it.
+Profile broadcast on connect (`WireProfile`) so peers cache name/avatar.
 
 ---
 
@@ -363,64 +259,77 @@ Profile broadcast over data channel on connect so peers can cache it.
 ### 4.1 DM Rooms
 
 ```txt
-roomCode    = sha256(sort([didA, didB]).join(':'))[0..24]
-transport   = SimplePeer direct
-encryption  = X25519 ECDH (ed25519 keys converted to curve25519)
+roomCode  = sha256(sort([didA, didB]).join(':'))[0..24]
+transport = SimplePeer direct
+encrypt   = X25519 ECDH (ed25519 → curve25519 key conversion)
 ```
 
 ### 4.2 Delivery Flow
 
 ```txt
 online:   encrypt → send → DeliveryAck → ReadAck
-offline:  encrypt → store as PendingMessage → watch presence
-          → peer online → flush → DeliveryAck → ReadAck
+offline:  encrypt → PendingMessage in IDB → watch presence
+          → peer online → flush pending → DeliveryAck → ReadAck
 ```
 
 ---
 
-## Phase 5 — Voice/Video (mediasoup) ✓ (implemented)
+## Phase 5 — Voice/Video ✓
 
 **Goal:** voice and video calls
 
-### 5.1 1-on-1 / voice path → SimplePeer direct, no SFU
-
-### 5.2 Group video (≤15) → mediasoup SFU, text+files remain p2p
-
-Implemented behavior:
+### 5.1 Voice — SimplePeer p2p (audio never goes through SFU)
 
 ```txt
-- Voice remains p2p (SimplePeer) with mic/device/gain controls.
-- Voice deafen/undeafen is implemented via output gain control.
-- Duplex voice join race is handled (early remote streams buffered until join).
-- Video (camera + screen) is SFU-backed via mediasoup signaling over /sfu WebSocket.
-- Remote screen share is opt-in: peers receive a pending transmission tile and click to watch.
-- "Stop watching" restores pending transmission tile while producer is still active.
-- Transmission volume control while watching is implemented.
-- Screen-share tab/system audio is published and consumed for watchers.
-- Late joiners consume existing producers via replayed ms:new-producer events.
-- Client queues early producer notifications until recv transport is ready (race-safe).
-- SFU producer-closed signaling clears stale transmission tiles when shares end.
-- Explicit call-presence + room-name sync messages keep call UI state consistent across peers.
-- Local camera/screen preview reuses the same captured stream for publish (single permission prompt).
+input chain:  mic → GainNode → MediaStreamDestination → peers
+output chain: remoteStream → GainNode → AudioContext.destination (per peer)
 
-## Chat Interaction Milestone (current)
-
-```txt
-- Reply UX: hover action, quote preview above composer, sent quote snapshot,
-  click quote to scroll/highlight original message.
-- Reaction UX: hover action, emoji picker, toggle add/remove, and per-message
-  reaction chips with click-to-join behavior.
+controls: mute, input device, input gain (0–2.0), output device, output volume (0–2.0)
+deafen:   output gain → 0, restores saved volume on undeafen
 ```
 
-## UX + Safety Milestone (current)
+### 5.2 Video — mediasoup SFU
 
 ```txt
-- Locked-screen account recovery now routes into the existing restore flow
-  (no duplicate recovery implementation).
-- Settings include a confirmed destructive action to wipe all local IndexedDB
-  data (messages/media/rooms/profiles/identity) for device reset/privacy.
-- Device picker labels are truncated to avoid layout breakage on long names.
+signaling: dedicated /sfu WebSocket (separate from p2p signaling)
+server:    Node.js worker required (mediasoup not compatible with Bun)
+           Bun handles all client-facing traffic, proxies ms: messages to Node internally
+
+sources:   "camera" | "screen" published as separate producers
+screen:    opt-in — pending "Click to watch" tile, not auto-consumed
+           watchTransmission(peerId, producerId) → consume video + optional audio
+           stopWatchingTransmission() → close consumer, restore pending tile
+           transmissionEnded(peerId) → clear state
+
+late join: SFU replays existing producers; client queues early signals
+           until recv transport is ready (race-safe)
 ```
+
+---
+
+## Phase 6 — File Transfer (next)
+
+**Goal:** p2p file sharing wired into the active chat UI
+
+```txt
+send:
+  1. wtClient.seed(file, { announce: [] }) → infoHash
+  2. store Attachment { infoHash, status: "seeding" }
+  3. if size < 5MB: store data: ArrayBuffer
+  4. broadcast WireChatMessage { type: File, meta: FileMeta }
+
+receive:
+  1. store Attachment { status: "pending" }
+  2. wtClient.add(infoHash) → status: "downloading"
+  3. torrent.on("done") → blobURL → status: "complete"
+  4. if size < 5MB: store ArrayBuffer
+
+startup:
+  re-seed all complete attachments that have data
+
+blobURL:
+  created: torrent done
+  revoked: message scrolls out of virtual list OR beforeunload
 ```
 
 ---
@@ -429,12 +338,11 @@ Implemented behavior:
 
 - [ ] Roles + permissions (hash chain model — see SPECSHEET.md)
 - [ ] Server-side file pinning (operator opt-in)
-- [ ] Integrate WebTorrent file flow into active chat UI/path
-- [ ] Yjs mutation layer for edits/deletes/pins/topic reconciliation
+- [ ] Yjs mutation layer for edits/deletes/pins/topic
+- [ ] Sequential sync queue — reduces duplicate data when N peers connect simultaneously on join (see SPECSHEET.md)
+- [ ] libp2p transport — partial mesh support; gossip propagation already handled by sync design
 - [ ] mediasoup horizontal scaling
 - [ ] E2E encryption for rooms (MLS protocol)
-- [ ] Federation (Matrix-style)
-- [ ] Mobile (Capacitor or React Native)
 - [ ] WebAuthn / biometrics as mnemonic unlock
 
 ---
@@ -444,7 +352,8 @@ Implemented behavior:
 | Phase | New Deps |
 |-------|----------|
 | 1 ✓   | simplepeer, webtorrent@1, bun |
-| 2     | idb, uuidv7, yjs |
-| 3     | @noble/curves, @noble/hashes, @scure/bip39, @scure/bip32, @scure/base |
+| 2 ✓   | idb, uuidv7, yjs |
+| 3 ✓   | @noble/curves, @noble/hashes, @scure/bip39, @scure/bip32, @scure/base |
 | 4     | (no new deps) |
-| 5     | mediasoup-client |
+| 5 ✓   | mediasoup-client |
+| 6     | (no new deps — webtorrent already in phase 1) |
