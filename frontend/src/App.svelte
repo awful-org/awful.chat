@@ -20,6 +20,7 @@
     removeRoom,
   } from "$lib/rooms.svelte";
   import { loadProfile } from "$lib/profile.svelte";
+  import ReloadPrompt from "$lib/components/ReloadPrompt.svelte";
 
   const queryClient = new QueryClient();
 
@@ -172,3 +173,5 @@
     </div>
   {/if}
 </QueryClientProvider>
+
+<ReloadPrompt />
