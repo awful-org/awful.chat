@@ -13,6 +13,9 @@ export default defineConfig({
     nodePolyfills(),
     VitePWA({
       registerType: "autoUpdate",
+      strategies: "injectManifest",
+      srcDir: "src",
+      filename: "sw.ts",
       includeAssets: ["favicon.ico", "apple-touch-icon-180x180.png"],
       manifest: {
         name: "Awful.chat",
@@ -52,6 +55,22 @@ export default defineConfig({
         dir: "ltr",
         orientation: "portrait",
         categories: ["entertainment", "social"],
+        share_target: {
+          action: "/share-target",
+          method: "POST",
+          enctype: "multipart/form-data",
+          params: {
+            title: "title",
+            text: "text",
+            url: "url",
+            files: [
+              {
+                name: "files",
+                accept: ["image/*", "video/*", "audio/*", "application/*", "text/*"],
+              },
+            ],
+          },
+        },
       },
     }),
   ],

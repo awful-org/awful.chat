@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Check, Clipboard, Copy, LogIn, Plus } from "@lucide/svelte";
+  import { Check, Clipboard, Copy, LogIn, Menu, Plus } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import {
@@ -15,9 +15,10 @@
   interface Props {
     onJoin: (roomCode: string, displayName: string, roomName?: string) => void;
     error?: string | null;
+    toggleSidebar?: () => void;
   }
 
-  let { onJoin, error = null }: Props = $props();
+  let { onJoin, error = null, toggleSidebar }: Props = $props();
 
   let roomName = $state("");
   let joinCode = $state("");
@@ -43,7 +44,7 @@
     await saveName(profileStore.nickname);
     onJoin(
       createdCode,
-      profileStore.nickname || "Anonymous",
+      profileStore.nickname || "Anon",
       roomName.trim() || undefined
     );
     createdCode = null;
@@ -79,6 +80,14 @@
   <div
     class="flex min-h-screen h-full items-center justify-center p-4 bg-background"
   >
+    <Button
+      onclick={toggleSidebar}
+      variant="outline"
+      class="absolute top-4 left-4 md:hidden rounded-xl"
+      aria-label="Open sidebar"
+    >
+      <Menu />
+    </Button>
     <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
       <CardHeader>
         <div class="flex items-center justify-between">

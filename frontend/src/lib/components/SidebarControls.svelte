@@ -122,9 +122,9 @@
       </div>
 
       <!-- Name + status -->
-      <div class="flex flex-col gap-1.5 mt-1">
+      <div class="flex flex-col gap-1.5 mt-1 w-full">
         <div
-          class="truncate text-xs font-semibold text-foreground font-mono leading-tight"
+          class="truncate w-26 text-xs font-semibold text-foreground font-mono leading-tight"
         >
           {profileStore.nickname}
         </div>

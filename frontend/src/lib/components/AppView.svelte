@@ -20,6 +20,7 @@
     removeRoom,
   } from "$lib/rooms.svelte";
   import { loadProfile } from "$lib/profile.svelte";
+  import { consumeLatestSharedPayload } from "$lib/share-target";
   import ReloadPrompt from "./ReloadPrompt.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
 
@@ -46,11 +47,30 @@
     }
   });
 
+  $effect(() => {
+    if (!identityStore.isUnlocked) return;
+    consumeSharedIfPresent().catch(() => {});
+  });
+
   let activeRoomCode = $state<string | null>(null);
   let activeRoomName = $state<string>("");
   let lockedView = $state<"unlock" | "restore">("unlock");
   let sidebarOpen = $state(false);
   let joinError = $state<string | null>(null);
+  let incomingSharedFiles = $state<File[]>([]);
+  let incomingSharedText = $state("");
+
+  async function consumeSharedIfPresent() {
+    const payload = await consumeLatestSharedPayload();
+    if (!payload) return;
+    incomingSharedFiles = payload.files;
+    incomingSharedText = payload.text ?? payload.url ?? "";
+    history.replaceState({}, "", "/app");
+  }
+
+  function toggleSidebar() {
+    sidebarOpen = !sidebarOpen;
+  }
 
   async function handleJoin(
     roomCode: string,
@@ -98,6 +118,11 @@
     const room = roomsStore.rooms.find((r) => r.roomCode === code);
     handleJoin(code, "", room?.name);
     sidebarOpen = false;
+  }
+
+  function clearIncomingShared() {
+    incomingSharedFiles = [];
+    incomingSharedText = "";
   }
 
   function handlePopState() {
@@ -162,9 +187,44 @@
             selfId={myId}
             onLeave={() => handleRemoveRoom()}
             onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
+            {incomingSharedFiles}
+            {incomingSharedText}
+            onConsumeIncomingShared={clearIncomingShared}
           />
         {:else}
-          <RoomCreateJoin onJoin={handleJoin} error={joinError} />
+          {#if incomingSharedFiles.length > 0}
+            <div class="border-b border-border bg-muted/30 px-4 py-3">
+              <p class="text-sm text-foreground">
+                Shared {incomingSharedFiles.length} file{incomingSharedFiles.length ===
+                1
+                  ? ""
+                  : "s"} ready to send.
+              </p>
+              {#if roomsStore.rooms.length > 0}
+                <div class="mt-2 flex flex-wrap gap-2">
+                  {#each roomsStore.rooms as room (room.roomCode)}
+                    <button
+                      type="button"
+                      class="rounded border border-border bg-card px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground"
+                      onclick={() => handleSelectRoom(room.roomCode)}
+                    >
+                      Send to {room.name || room.roomCode}
+                    </button>
+                  {/each}
+                </div>
+              {:else}
+                <p class="mt-1 text-xs text-muted-foreground">
+                  Join or create a room, then shared files will be staged
+                  automatically.
+                </p>
+              {/if}
+            </div>
+          {/if}
+          <RoomCreateJoin
+            {toggleSidebar}
+            onJoin={handleJoin}
+            error={joinError}
+          />
         {/if}
       </div>
       <ReloadPrompt />

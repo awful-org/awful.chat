@@ -49,9 +49,20 @@
     selfId: string;
     onLeave: () => void;
     onOpenSidebar?: () => void;
+    incomingSharedFiles?: File[];
+    incomingSharedText?: string;
+    onConsumeIncomingShared?: () => void;
   }
 
-  let { roomCode, roomName, onLeave, onOpenSidebar }: Props = $props();
+  let {
+    roomCode,
+    roomName,
+    onLeave,
+    onOpenSidebar,
+    incomingSharedFiles = [],
+    incomingSharedText = "",
+    onConsumeIncomingShared,
+  }: Props = $props();
 
   let { peers, messages, inCall, peerNames, peerAvatars, fileTransfers } =
     $derived(transportState);
@@ -452,6 +463,15 @@
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
+  });
+
+  $effect(() => {
+    if (!incomingSharedFiles.length) return;
+    void addFilesToStage(incomingSharedFiles);
+    if (incomingSharedText && !draft.trim()) {
+      draft = incomingSharedText;
+    }
+    onConsumeIncomingShared?.();
   });
 
   $effect(() => {
