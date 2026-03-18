@@ -14,3 +14,20 @@ declare module 'virtual:pwa-register' {
     immediate?: boolean
   }): () => void
 }
+
+// PWA install prompt event
+interface BeforeInstallPromptEvent extends Event {
+  readonly platforms: string[];
+  readonly userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+  prompt(): Promise<void>;
+}
+
+// Extend WindowEventMap to include beforeinstallprompt
+declare global {
+  interface WindowEventMap {
+    beforeinstallprompt: BeforeInstallPromptEvent;
+  }
+  interface Navigator {
+    standalone?: boolean;
+  }
+}

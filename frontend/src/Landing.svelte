@@ -477,7 +477,7 @@
       </div>
       <div class="footer-links">
         <a href="https://github.com" target="_blank" rel="noopener">GitHub</a>
-        <a href="#">Documentation</a>
+        <span>Documentation</span>
       </div>
       <div class="footer-license font-mono text-muted">
         100% OPEN SOURCE · MIT LICENSE
