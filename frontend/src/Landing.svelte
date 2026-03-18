@@ -1115,6 +1115,22 @@
     font-size: 0.75rem;
   }
 
+  .underline-not {
+    position: relative;
+    display: inline-block;
+    font-weight: 900;
+  }
+
+  .strike {
+    position: absolute;
+    bottom: -10px;
+    left: -14%;
+    width: 140%;
+    height: 38px;
+    pointer-events: none;
+    filter: drop-shadow(0 0 3px #00ff8840) drop-shadow(0 0 8px #00ff8850);
+  }
+
   /* Responsive */
   @media (min-width: 769px) {
     .app {
@@ -1235,21 +1251,13 @@
     .stat-value {
       font-size: 2rem;
     }
-  }
-
-  .underline-not {
-    position: relative;
-    display: inline-block;
-    font-weight: 900;
-  }
-
-  .strike {
-    position: absolute;
-    bottom: -10px;
-    left: -14%;
-    width: 140%;
-    height: 38px;
-    pointer-events: none;
-    filter: drop-shadow(0 0 3px #00ff8840) drop-shadow(0 0 8px #00ff8850);
+    .strike {
+      position: absolute;
+      bottom: -6px;
+      left: -14%;
+      width: 138%;
+      height: 18px;
+      pointer-events: none;
+    }
   }
 </style>
