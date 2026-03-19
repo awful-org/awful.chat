@@ -102,16 +102,73 @@ function relaySignal(
 
 const KLIPY_API_BASE = "https://api.klipy.com/api/v1";
 const KLIPY_API_KEY = process.env.KLIPY_API_KEY ?? "";
+const NODE_ENV = process.env.NODE_ENV ?? "development";
+const DOMAIN = (process.env.DOMAIN ?? "").trim().toLowerCase();
 
-function klipyError(msg: string, status = 500): Response {
-  return new Response(JSON.stringify({ error: msg }), {
-    status,
-    headers: { "Content-Type": "application/json" },
+function isAllowedOrigin(origin: string | null): boolean {
+  if (!origin) return true;
+  if (NODE_ENV !== "production") return true;
+  if (!DOMAIN) return false;
+
+  try {
+    const parsed = new URL(origin);
+    return (
+      parsed.protocol === "https:" && parsed.hostname.toLowerCase() === DOMAIN
+    );
+  } catch {
+    return false;
+  }
+}
+
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  const allowOrigin =
+    NODE_ENV === "production" ? `https://${DOMAIN}` : (origin ?? "*");
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
+function withCors(req: Request, response: Response): Response {
+  const headers = new Headers(response.headers);
+  const cors = corsHeaders(req);
+  for (const [k, v] of Object.entries(cors)) {
+    headers.set(k, v);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
-async function handleKlipySearch(url: URL): Promise<Response> {
-  if (!KLIPY_API_KEY) return klipyError("KLIPY_API_KEY not configured", 503);
+function preflight(req: Request): Response {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders(req),
+  });
+}
+
+function klipyError(req: Request, msg: string, status = 500): Response {
+  return withCors(
+    req,
+    new Response(JSON.stringify({ error: msg }), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
+
+async function handleKlipySearch(req: Request, url: URL): Promise<Response> {
+  if (!isAllowedOrigin(req.headers.get("origin"))) {
+    return klipyError(req, "Origin not allowed", 403);
+  }
+  if (!KLIPY_API_KEY)
+    return klipyError(req, "KLIPY_API_KEY not configured", 503);
 
   const q = url.searchParams.get("q") ?? "";
   const limit = url.searchParams.get("limit") ?? "18";
@@ -122,16 +179,20 @@ async function handleKlipySearch(url: URL): Promise<Response> {
   try {
     const res = await fetch(upstream);
     if (!res.ok)
-      return klipyError(`Klipy API error: ${res.status}`, res.status);
+      return klipyError(req, `Klipy API error: ${res.status}`, res.status);
     const json = await res.json();
-    return Response.json(json);
+    return withCors(req, Response.json(json));
   } catch (e) {
-    return klipyError(`Failed to fetch from Klipy: ${e}`);
+    return klipyError(req, `Failed to fetch from Klipy: ${e}`);
   }
 }
 
-async function handleKlipyTrending(url: URL): Promise<Response> {
-  if (!KLIPY_API_KEY) return klipyError("KLIPY_API_KEY not configured", 503);
+async function handleKlipyTrending(req: Request, url: URL): Promise<Response> {
+  if (!isAllowedOrigin(req.headers.get("origin"))) {
+    return klipyError(req, "Origin not allowed", 403);
+  }
+  if (!KLIPY_API_KEY)
+    return klipyError(req, "KLIPY_API_KEY not configured", 503);
 
   const limit = url.searchParams.get("limit") ?? "18";
   const page = url.searchParams.get("page") ?? "1";
@@ -141,11 +202,11 @@ async function handleKlipyTrending(url: URL): Promise<Response> {
   try {
     const res = await fetch(upstream);
     if (!res.ok)
-      return klipyError(`Klipy API error: ${res.status}`, res.status);
+      return klipyError(req, `Klipy API error: ${res.status}`, res.status);
     const json = await res.json();
-    return Response.json(json);
+    return withCors(req, Response.json(json));
   } catch (e) {
-    return klipyError(`Failed to fetch from Klipy: ${e}`);
+    return klipyError(req, `Failed to fetch from Klipy: ${e}`);
   }
 }
 
@@ -154,6 +215,13 @@ const server = Bun.serve<SocketData>({
 
   fetch(req, server) {
     const url = new URL(req.url);
+
+    if (req.method === "OPTIONS" && url.pathname.startsWith("/klipy/")) {
+      if (!isAllowedOrigin(req.headers.get("origin"))) {
+        return new Response(null, { status: 403 });
+      }
+      return preflight(req);
+    }
 
     if (url.pathname === "/signal") {
       const upgraded = server.upgrade(req, {
@@ -166,8 +234,9 @@ const server = Bun.serve<SocketData>({
         : new Response("upgrade failed", { status: 500 });
     }
 
-    if (url.pathname === "/klipy/search") return handleKlipySearch(url);
-    if (url.pathname === "/klipy/trending") return handleKlipyTrending(url);
+    if (url.pathname === "/klipy/search") return handleKlipySearch(req, url);
+    if (url.pathname === "/klipy/trending")
+      return handleKlipyTrending(req, url);
 
     return new Response("not found", { status: 404 });
   },
