@@ -83,7 +83,7 @@
     <Button
       onclick={toggleSidebar}
       variant="outline"
-      class="absolute top-4 left-4 hidden xs:inline-flex"
+      class="absolute top-4 left-4 md:hidden"
       aria-label="Open sidebar"
     >
       <Menu />
