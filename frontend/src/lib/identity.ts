@@ -431,7 +431,7 @@ export async function unlockWithWebAuthn(): Promise<void> {
 
 /** Returns true if a WebAuthn credential is enrolled for this identity. */
 export async function hasWebAuthnEnrollment(): Promise<boolean> {
-  return (await getWebAuthnRecord()) !== null;
+  return (await getWebAuthnRecord()) !== undefined;
 }
 
 /**
