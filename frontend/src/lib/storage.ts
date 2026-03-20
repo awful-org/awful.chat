@@ -8,7 +8,7 @@ import type {
   MessageStatus,
   PendingMessage,
 } from "./types/message";
-import type { KeypairRecord, MnemonicRecord } from "./identity";
+import type { KeypairRecord, MnemonicRecord, WebAuthnRecord } from "./identity";
 
 export type RoomType = "text" | "voice" | "dm";
 
@@ -95,7 +95,7 @@ type AppDB = IDBPDatabase<{
   };
   identity: {
     key: string;
-    value: MnemonicRecord | KeypairRecord;
+    value: MnemonicRecord | KeypairRecord | WebAuthnRecord;
   };
   watermarks: {
     key: string;
@@ -321,9 +321,15 @@ export async function getSeedableAttachments(): Promise<Attachment[]> {
   return complete.filter((a) => !!a.data);
 }
 
-export async function getAttachmentsWithData(roomCode: string): Promise<Attachment[]> {
+export async function getAttachmentsWithData(
+  roomCode: string
+): Promise<Attachment[]> {
   const database = await getDB();
-  const all = await database.getAllFromIndex("attachments", "byStatus", "complete");
+  const all = await database.getAllFromIndex(
+    "attachments",
+    "byStatus",
+    "complete"
+  );
   const maybeSeeding = await database.getAllFromIndex(
     "attachments",
     "byStatus",
@@ -393,7 +399,7 @@ export async function getMnemonicRecord(): Promise<MnemonicRecord | undefined> {
 }
 
 export async function putIdentityRecord(
-  record: MnemonicRecord | KeypairRecord
+  record: MnemonicRecord | KeypairRecord | WebAuthnRecord
 ): Promise<void> {
   const database = await getDB();
   await database.put("identity", record);
@@ -629,6 +635,23 @@ export async function isGifSaved(gifId: string): Promise<SavedGif | undefined> {
   const database = await getDB();
   const all = await database.getAll("savedGifs");
   return all.find((g) => g.gifId === gifId);
+}
+
+export async function getWebAuthnRecord(): Promise<WebAuthnRecord | undefined> {
+  const database = await getDB();
+  return database.get("identity", "webauthn") as Promise<
+    WebAuthnRecord | undefined
+  >;
+}
+
+export async function putWebAuthnRecord(record: WebAuthnRecord): Promise<void> {
+  const database = await getDB();
+  await database.put("identity", record);
+}
+
+export async function deleteWebAuthnRecord(): Promise<void> {
+  const database = await getDB();
+  await database.delete("identity", "webauthn");
 }
 
 export async function wipeLocalDatabase(): Promise<void> {

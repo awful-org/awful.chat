@@ -15,14 +15,19 @@
  *   {/if}
  */
 
-import type { KeypairRecord } from "./identity";
+import type { KeypairRecord, WebAuthnCapabilities } from "./identity";
 import {
   createIdentity,
   getIdentity,
   lockIdentity,
   restoreIdentity,
   unlockIdentity,
+  enrollWebAuthn,
+  hasWebAuthnEnrollment,
+  unlockWithWebAuthn,
+  getWebAuthnCapabilities,
 } from "./identity";
+import { deleteWebAuthnRecord } from "./storage";
 
 interface IdentityStore {
   /** True when the private key is held in memory and signing is available. */
@@ -37,6 +42,9 @@ interface IdentityStore {
   loading: boolean;
   /** Last error message from an unlock/create/restore attempt. Cleared on the next call. */
   error: string | null;
+  hasWebAuthn: boolean;
+
+  webAuthnCapabilities: WebAuthnCapabilities | null;
 }
 
 export const identityStore = $state<IdentityStore>({
@@ -46,6 +54,8 @@ export const identityStore = $state<IdentityStore>({
   keypair: null,
   loading: false,
   error: null,
+  hasWebAuthn: false,
+  webAuthnCapabilities: null,
 });
 
 function setUnlocked(keypair: KeypairRecord): void {
@@ -72,6 +82,8 @@ export async function init(): Promise<void> {
   identityStore.error = null;
   try {
     identityStore.keypair = await getIdentity();
+    identityStore.hasWebAuthn = await hasWebAuthnEnrollment();
+    identityStore.webAuthnCapabilities = await getWebAuthnCapabilities();
   } finally {
     identityStore.loading = false;
   }
@@ -152,4 +164,47 @@ export async function unlock(password: string): Promise<void> {
 export function lock(): void {
   lockIdentity();
   setLocked();
+}
+
+/**
+ * Enroll a WebAuthn credential. Call after a successful password unlock.
+ * @throws If PRF not supported, or user cancels the authenticator prompt.
+ */
+export async function enroll(password: string): Promise<void> {
+  identityStore.loading = true;
+  identityStore.error = null;
+  try {
+    await enrollWebAuthn(password);
+    identityStore.hasWebAuthn = true;
+  } catch (err) {
+    identityStore.error = err instanceof Error ? err.message : String(err);
+    throw err;
+  } finally {
+    identityStore.loading = false;
+  }
+}
+
+/**
+ * Unlock via WebAuthn biometrics/PIN. Falls back gracefully if unsupported.
+ * @throws If no enrollment, authenticator cancelled, or PRF unavailable.
+ */
+export async function unlockWithBiometrics(): Promise<void> {
+  identityStore.loading = true;
+  identityStore.error = null;
+  try {
+    await unlockWithWebAuthn();
+    const keypair = await getIdentity();
+    if (!keypair) throw new Error("Identity record missing after unlock.");
+    setUnlocked(keypair);
+  } catch (err) {
+    identityStore.error = err instanceof Error ? err.message : String(err);
+    throw err;
+  } finally {
+    identityStore.loading = false;
+  }
+}
+
+export async function removeWebAuthn(): Promise<void> {
+  await deleteWebAuthnRecord();
+  identityStore.hasWebAuthn = false;
 }

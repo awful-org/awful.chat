@@ -12,11 +12,18 @@
     CardTitle,
   } from "$lib/components/ui/card";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
-  import { profileStore, loadProfile, saveName } from "$lib/profile.svelte";
+  import { profileStore, loadProfile } from "$lib/profile.svelte";
   import type { KeypairRecord } from "$lib/identity";
+  import { enroll } from "$lib/identity.svelte";
   import { ArrowLeft } from "@lucide/svelte";
 
-  type Step = "entry" | "create-password" | "mnemonic" | "profile" | "restore";
+  type Step =
+    | "entry"
+    | "create-password"
+    | "mnemonic"
+    | "profile"
+    | "biometric"
+    | "restore";
 
   interface Props {
     initialStep?: Step;
@@ -40,6 +47,10 @@
   let restoreMnemonic = $state("");
   let restorePassword = $state("");
   let restorePasswordConfirm = $state("");
+
+  let createdPassword = $state(""); // hold password through steps for enrollment
+  let biometricLoading = $state(false);
+  let biometricError = $state<string | null>(null);
 
   const passwordMismatch = $derived(
     passwordConfirm.length > 0 && password !== passwordConfirm
@@ -68,6 +79,9 @@
       const result = await createIdentity(password);
       mnemonic = result.mnemonic;
       pendingKeypair = result.keypair;
+      createdPassword = password; // keep for biometric enrollment
+      password = "";
+      passwordConfirm = "";
       step = "mnemonic";
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -81,15 +95,25 @@
     step = "profile";
   }
 
-  async function handleFinish() {
+  function handleFinish() {
+    if (
+      identityStore.webAuthnCapabilities?.supported &&
+      identityStore.webAuthnCapabilities?.canEnroll
+    ) {
+      step = "biometric";
+    } else {
+      finalizeSession();
+    }
+  }
+
+  async function finalizeSession() {
     if (!pendingKeypair) return;
-    const name = profileStore.nickname.trim();
-    if (name) await saveName(name);
     identityStore.isUnlocked = true;
     identityStore.did = pendingKeypair.did;
     identityStore.publicKey = pendingKeypair.publicKey;
     identityStore.keypair = pendingKeypair;
     identityStore.error = null;
+    createdPassword = "";
     mnemonic = null;
   }
 
@@ -339,6 +363,49 @@
         avatarDialogOpen = false;
       }}
     />
+  {:else if step === "biometric"}
+    <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
+      <CardHeader class="pb-4">
+        <CardTitle class="text-lg font-mono font-semibold">
+          Enable biometric unlock?
+        </CardTitle>
+        <CardDescription class="text-muted-foreground text-xs font-mono">
+          Use your device fingerprint, face, or PIN to unlock without typing
+          your password. You can enable this later in Settings.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {#if biometricError}
+          <p class="text-xs text-destructive font-mono">{biometricError}</p>
+        {/if}
+      </CardContent>
+      <CardFooter class="flex flex-col gap-2">
+        <Button
+          class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
+          disabled={biometricLoading}
+          onclick={async () => {
+            biometricError = null;
+            biometricLoading = true;
+            try {
+              await enroll(createdPassword);
+              await finalizeSession();
+            } catch (e) {
+              biometricError = e instanceof Error ? e.message : String(e);
+              biometricLoading = false;
+            }
+          }}
+        >
+          {biometricLoading ? "waiting for device…" : "Enable biometric unlock"}
+        </Button>
+        <Button
+          variant="outline"
+          class="w-full font-mono"
+          onclick={finalizeSession}
+        >
+          Skip for now
+        </Button>
+      </CardFooter>
+    </Card>
   {:else if step === "restore"}
     <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
       <CardHeader class="pb-4">

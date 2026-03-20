@@ -17,6 +17,7 @@ import {
   getKeypairRecord,
   getMnemonicRecord,
   putIdentityRecord,
+  getWebAuthnRecord,
 } from "./storage";
 import { utf8 } from "./utils";
 
@@ -50,6 +51,25 @@ export interface UnlockedSession {
   publicKey: Uint8Array<ArrayBuffer>;
   /** did:key identifier corresponding to publicKey. */
   did: string;
+}
+
+export interface WebAuthnRecord {
+  id: "webauthn";
+  credentialId: ArrayBuffer;
+  prfSalt: Uint8Array<ArrayBuffer>; // fed to PRF eval
+  iv: Uint8Array<ArrayBuffer>;
+  encrypted: ArrayBuffer; // AES-GCM(prfDerivedKey, password)
+}
+
+export interface WebAuthnCapabilities {
+  /** WebAuthn API exists in this browser */
+  supported: boolean;
+  /** Platform authenticator available (Touch ID, Windows Hello, Android biometrics) */
+  platformAuthenticator: boolean;
+  /** Browser reports PRF extension support (doesn't guarantee authenticator support) */
+  prfBrowserSupport: boolean;
+  /** Full confidence: browser + platform authenticator + PRF all available */
+  canEnroll: boolean;
 }
 
 // ── session ───────────────────────────────────────────────────────────────────
@@ -295,4 +315,168 @@ export async function AESFromPassword(
     false,
     ["encrypt", "decrypt"]
   );
+}
+
+async function AESFromPRF(prfOutput: ArrayBuffer): Promise<CryptoKey> {
+  const raw = await crypto.subtle.importKey("raw", prfOutput, "HKDF", false, [
+    "deriveKey",
+  ]);
+  return crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(32),
+      info: new TextEncoder().encode("webauthn-password-wrap"),
+    },
+    raw,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+/**
+ * Enroll a WebAuthn credential that can unlock this identity.
+ * Must be called while the session is already unlocked (password was used).
+ * Encrypts the password under the PRF output and stores it in IndexedDB.
+ *
+ * @throws If PRF extension is not supported by the authenticator.
+ */
+export async function enrollWebAuthn(password: string): Promise<void> {
+  const prfSalt = crypto.getRandomValues(new Uint8Array(32));
+
+  const cred = (await navigator.credentials.create({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rp: { name: location.hostname, id: location.hostname },
+      user: {
+        id: crypto.getRandomValues(new Uint8Array(16)),
+        name: "local-user",
+        displayName: "Local User",
+      },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -8 }, // ed25519
+        { type: "public-key", alg: -7 }, // ES256 fallback
+      ],
+      authenticatorSelection: { userVerification: "required" },
+      extensions: { prf: { eval: { first: prfSalt } } },
+    },
+  })) as PublicKeyCredential;
+
+  const ext = (cred.getClientExtensionResults() as any).prf;
+  if (!ext?.results?.first) {
+    throw new Error("PRF extension not supported by this authenticator");
+  }
+
+  const aesKey = await AESFromPRF(ext.results.first);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    new TextEncoder().encode(password)
+  );
+
+  const record: WebAuthnRecord = {
+    id: "webauthn",
+    credentialId: cred.rawId,
+    prfSalt,
+    iv,
+    encrypted,
+  };
+  await putIdentityRecord(record);
+}
+
+/**
+ * Unlock identity using a stored WebAuthn credential.
+ * Decrypts the password via PRF, then runs the normal unlock flow.
+ *
+ * @throws If no WebAuthn enrollment exists.
+ * @throws If PRF output doesn't match (wrong authenticator / tampered record).
+ */
+export async function unlockWithWebAuthn(): Promise<void> {
+  const record = await getWebAuthnRecord(); // add to storage.ts
+  if (!record) throw new Error("No WebAuthn enrollment found");
+
+  const assertion = (await navigator.credentials.get({
+    publicKey: {
+      challenge: crypto.getRandomValues(new Uint8Array(32)),
+      rpId: location.hostname,
+      allowCredentials: [{ type: "public-key", id: record.credentialId }],
+      userVerification: "required",
+      extensions: { prf: { eval: { first: record.prfSalt } } },
+    },
+  })) as PublicKeyCredential;
+
+  const ext = (assertion.getClientExtensionResults() as any).prf;
+  if (!ext?.results?.first) {
+    throw new Error("PRF extension not supported by this authenticator");
+  }
+
+  const aesKey = await AESFromPRF(ext.results.first);
+
+  let decrypted: ArrayBuffer;
+  try {
+    decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: record.iv },
+      aesKey,
+      record.encrypted
+    );
+  } catch {
+    throw new Error("WebAuthn decryption failed — wrong authenticator?");
+  }
+
+  const password = new TextDecoder().decode(decrypted);
+  await unlockIdentity(password); // existing flow, unchanged
+}
+
+/** Returns true if a WebAuthn credential is enrolled for this identity. */
+export async function hasWebAuthnEnrollment(): Promise<boolean> {
+  return (await getWebAuthnRecord()) !== null;
+}
+
+/**
+ * Probe WebAuthn capabilities without triggering any browser UI.
+ * Call this before showing any biometric enrollment option in the UI.
+ *
+ * Note: prfBrowserSupport=true does not guarantee the authenticator supports PRF.
+ * That is only confirmed after enrollment (create() returns ext.results.first).
+ */
+export async function getWebAuthnCapabilities(): Promise<WebAuthnCapabilities> {
+  const supported =
+    typeof window !== "undefined" &&
+    !!window.PublicKeyCredential &&
+    !!navigator.credentials;
+
+  if (!supported) {
+    return {
+      supported: false,
+      platformAuthenticator: false,
+      prfBrowserSupport: false,
+      canEnroll: false,
+    };
+  }
+
+  const [platformAuthenticator, prfBrowserSupport] = await Promise.all([
+    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().catch(
+      () => false
+    ),
+    (async () => {
+      if (typeof PublicKeyCredential.getClientCapabilities !== "function")
+        return false;
+      try {
+        const caps = await PublicKeyCredential.getClientCapabilities();
+        // spec: prf key is present and true
+        return !!(caps as Record<string, unknown>)["prf"];
+      } catch {
+        return false;
+      }
+    })(),
+  ]);
+
+  return {
+    supported,
+    platformAuthenticator,
+    prfBrowserSupport,
+    canEnroll: platformAuthenticator && prfBrowserSupport,
+  };
 }

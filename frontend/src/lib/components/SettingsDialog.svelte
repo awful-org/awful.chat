@@ -39,6 +39,7 @@
     transportState,
     toggleMute,
   } from "$lib/transport.svelte";
+  import { enroll, identityStore, removeWebAuthn } from "$lib/identity.svelte";
 
   interface Props {
     open: boolean;
@@ -54,6 +55,17 @@
   let avatarDialogOpen = $state(false);
   let nameValue = $state("");
   let confirmErase = $state(false);
+
+  let biometricPassword = $state("");
+  let biometricLoading = $state(false);
+  let biometricError = $state<string | null>(null);
+  let biometricSuccess = $state(false);
+  let confirmRemoveBiometric = $state(false);
+
+  const canEnrollBiometrics = $derived(
+    !identityStore.hasWebAuthn &&
+      (identityStore.webAuthnCapabilities?.canEnroll ?? false)
+  );
 
   const LOG_MIN = Math.log10(0.01); // -2
   const LOG_MAX = Math.log10(2.5); // ~0.398
@@ -335,6 +347,101 @@
         <span>250%</span>
       </div>
     </div>
+
+    <Separator class="bg-border" />
+
+    {#if canEnrollBiometrics || identityStore.hasWebAuthn}
+      <div class="flex flex-col gap-3">
+        <Label
+          class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
+        >
+          security
+        </Label>
+
+        {#if identityStore.hasWebAuthn}
+          <p class="text-xs text-muted-foreground font-mono">
+            Biometric / device PIN unlock is enabled.
+          </p>
+          {#if !confirmRemoveBiometric}
+            <Button
+              variant="outline"
+              class="w-full font-mono"
+              onclick={() => (confirmRemoveBiometric = true)}
+            >
+              Remove biometric unlock
+            </Button>
+          {:else}
+            <div class="grid grid-cols-2 gap-2">
+              <Button
+                variant="outline"
+                class="font-mono"
+                onclick={() => (confirmRemoveBiometric = false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                class="font-mono"
+                onclick={async () => {
+                  await removeWebAuthn();
+                  confirmRemoveBiometric = false;
+                }}
+              >
+                Confirm remove
+              </Button>
+            </div>
+          {/if}
+        {:else}
+          <p class="text-xs text-muted-foreground font-mono">
+            Use your device biometrics or PIN to unlock instead of typing your
+            password.
+          </p>
+          <div class="flex flex-col gap-2">
+            <Input
+              type="password"
+              bind:value={biometricPassword}
+              placeholder="confirm your password to enroll"
+              class="bg-background border-input font-mono focus-visible:ring-ring
+          {biometricError
+                ? 'border-destructive focus-visible:ring-destructive'
+                : ''}"
+            />
+            {#if biometricError}
+              <p class="text-xs text-destructive font-mono">{biometricError}</p>
+            {/if}
+            {#if biometricSuccess}
+              <p class="text-xs text-green-500 font-mono">
+                Biometric unlock enabled.
+              </p>
+            {/if}
+            <Button
+              variant="outline"
+              class="w-full font-mono"
+              disabled={biometricPassword.length === 0 || biometricLoading}
+              onclick={async () => {
+                biometricError = null;
+                biometricSuccess = false;
+                biometricLoading = true;
+                try {
+                  // verify password is correct first by attempting a decrypt
+                  await enroll(biometricPassword);
+                  biometricPassword = "";
+                  biometricSuccess = true;
+                } catch (e) {
+                  biometricError = e instanceof Error ? e.message : String(e);
+                } finally {
+                  biometricLoading = false;
+                }
+              }}
+            >
+              {biometricLoading
+                ? "waiting for device…"
+                : "Enable biometric unlock"}
+            </Button>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <Separator class="bg-border" />
 
