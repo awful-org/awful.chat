@@ -11,24 +11,43 @@ services:
     networks:
       - dokploy-network
 
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    command: >
+      --log-file=stdout
+      --verbose
+      --realm=awful.frav.in
+      --external-ip=${ANNOUNCED_IP}
+      --listening-ip=0.0.0.0
+      --lt-cred-mech
+      --user=awful:awful
+      --fingerprint
+      --no-multicast-peers
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=172.16.0.0-172.31.255.255
+      --min-port=49152
+      --max-port=49202
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49152-49202:49152-49202/udp"
+    networks:
+      - dokploy-network
+
   sfu:
     build:
       context: ./sfu
     restart: unless-stopped
-    # mediasoup WebSocket signaling port (internal only — reached via nginx proxy)
     expose:
       - "3000"
-    # mediasoup RTC UDP/TCP ports — browsers connect to these directly (bypasses Traefik).
-    # 500 ports supports ~250 concurrent peers (1 send + 1 recv transport each).
-    # These ports must be open in the host firewall.
     ports:
       - ${PORTS_UDP:-40000-40499:40000-40499/udp}
       - ${PORTS_TCP:-40000-40499:40000-40499/tcp}
     environment:
       NODE_ENV: production
       SFU_PORT: "3000"
-      # REQUIRED: set to the host's public IP so browsers can reach the RTC ports above.
-      # In dokploy, add ANNOUNCED_IP as an environment variable in the service settings.
       ANNOUNCED_IP: ${ANNOUNCED_IP:?ANNOUNCED_IP must be set to the server public IP}
       RTC_MIN_PORT: ${RTC_MIN:-40000}
       RTC_MAX_PORT: ${RTC_MAX:-40499}

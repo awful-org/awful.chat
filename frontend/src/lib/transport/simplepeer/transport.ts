@@ -52,7 +52,7 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
             type: "join",
             roomCode: this.roomCode,
             peerId: this.id,
-          }),
+          })
         );
         resolve();
       };
@@ -95,7 +95,7 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
 
   on<K extends keyof TransportEvents>(
     event: K,
-    handler: TransportEvents[K],
+    handler: TransportEvents[K]
   ): void {
     if (!this.handlers.has(event)) this.handlers.set(event, new Set());
     this.handlers.get(event)!.add(handler);
@@ -103,7 +103,7 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
 
   off<K extends keyof TransportEvents>(
     event: K,
-    handler: TransportEvents[K],
+    handler: TransportEvents[K]
   ): void {
     this.handlers.get(event)?.delete(handler);
   }
@@ -155,6 +155,16 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
+          {
+            urls: "turn:awful.frav.in:3478",
+            username: "awful",
+            credential: "awful",
+          },
+          {
+            urls: "turn:awful.frav.in:3478?transport=tcp",
+            username: "awful",
+            credential: "awful",
+          },
         ],
       },
     });
@@ -166,7 +176,7 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
           from: this.id,
           to: peerId,
           signal,
-        }),
+        })
       );
     });
 
