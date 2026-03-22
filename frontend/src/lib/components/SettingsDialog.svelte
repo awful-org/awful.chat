@@ -70,6 +70,9 @@
   let rememberDuration = $state(
     parseInt(localStorage.getItem("awful_remember_duration") ?? "15", 10)
   );
+  let rememberResetTimer = $state(
+    localStorage.getItem("awful_remember_reset_timer") === "true"
+  );
 
   const canEnrollBiometrics = $derived(
     !identityStore.hasWebAuthn &&
@@ -489,6 +492,18 @@
           </SelectContent>
         </Select>
       </div>
+
+      <label class="flex items-center gap-2 text-xs text-muted-foreground font-mono cursor-pointer">
+        <input
+          type="checkbox"
+          bind:checked={rememberResetTimer}
+          onchange={() => {
+            localStorage.setItem("awful_remember_reset_timer", String(rememberResetTimer));
+          }}
+          class="accent-primary"
+        />
+        Reset timer after each login
+      </label>
 
       <Button
         variant="outline"

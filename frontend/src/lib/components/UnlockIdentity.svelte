@@ -66,10 +66,17 @@
         password = stored.value;
         remember = true;
         if (!canUseBiometrics) {
-          unlock(stored.value).catch(() => {
-            password = "";
-            remember = false;
-          });
+          unlock(stored.value)
+            .then(() => {
+              const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
+              if (resetTimer) {
+                saveRememberedPassword(stored.value, getRememberDuration());
+              }
+            })
+            .catch(() => {
+              password = "";
+              remember = false;
+            });
         }
       }
     }
@@ -92,6 +99,13 @@
   async function handleBiometrics() {
     try {
       await unlockWithBiometrics();
+      const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
+      if (resetTimer) {
+        const stored = getRememberedPassword();
+        if (stored) {
+          saveRememberedPassword(stored.value, getRememberDuration());
+        }
+      }
     } catch {
       // error already in identityStore.error
     }
