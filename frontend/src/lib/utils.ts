@@ -37,3 +37,19 @@ export function unhex(h: string): Uint8Array<ArrayBuffer> {
 export function utf8(s: string): Uint8Array<ArrayBuffer> {
   return new TextEncoder().encode(s);
 }
+
+export function setCookie(name: string, value: string, maxAge: number): void {
+  document.cookie = `${name}=${encodeURIComponent(value)}; max-age=${maxAge}; path=/; SameSite=Strict`;
+}
+
+export function getCookie(name: string): string | null {
+  const match = document.cookie.match(
+    new RegExp("(^| )" + name + "=([^;]+)")
+  );
+  if (match) return decodeURIComponent(match[2]);
+  return null;
+}
+
+export function deleteCookie(name: string): void {
+  document.cookie = `${name}=; max-age=0; path=/; SameSite=Strict`;
+}

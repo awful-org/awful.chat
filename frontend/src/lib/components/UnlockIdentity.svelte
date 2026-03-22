@@ -14,13 +14,14 @@
     CardHeader,
     CardTitle,
   } from "$lib/components/ui/card";
+  import { getCookie, setCookie, deleteCookie } from "$lib/utils";
 
   let password = $state("");
   let remember = $state(false);
 
-  const REMEMBER_KEY = "awful_remembered_password";
+  const PASSWORD_COOKIE = "awful_password";
   const DURATION_KEY = "awful_remember_duration";
-  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const ONE_DAY = 86400;
 
   function getRememberDuration(): number {
     const stored = localStorage.getItem(DURATION_KEY);
@@ -29,24 +30,11 @@
   }
 
   function saveRememberedPassword(value: string, duration: number) {
-    const expires = duration === -1 ? -1 : Date.now() + duration * ONE_DAY;
-    localStorage.setItem(
-      REMEMBER_KEY,
-      JSON.stringify({ value, expires })
-    );
+    setCookie(PASSWORD_COOKIE, value, duration * ONE_DAY);
   }
 
-  function getRememberedPassword(): { value: string; expires: number } | null {
-    const stored = localStorage.getItem(REMEMBER_KEY);
-    if (!stored) return null;
-    try {
-      const parsed = JSON.parse(stored);
-      if (parsed.expires === -1 || Date.now() < parsed.expires) return parsed;
-      localStorage.removeItem(REMEMBER_KEY);
-    } catch {
-      localStorage.removeItem(REMEMBER_KEY);
-    }
-    return null;
+  function getRememberedPassword(): string | null {
+    return getCookie(PASSWORD_COOKIE);
   }
 
   interface Props {
@@ -63,14 +51,14 @@
     if (!identityStore.isUnlocked && !identityStore.loading && !identityStore.error) {
       const stored = getRememberedPassword();
       if (stored) {
-        password = stored.value;
+        password = stored;
         remember = true;
         if (!canUseBiometrics) {
-          unlock(stored.value)
+          unlock(stored)
             .then(() => {
               const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
               if (resetTimer) {
-                saveRememberedPassword(stored.value, getRememberDuration());
+                saveRememberedPassword(stored, getRememberDuration());
               }
             })
             .catch(() => {
@@ -89,7 +77,7 @@
       if (duration > 0) {
         saveRememberedPassword(password, duration);
       } else {
-        localStorage.removeItem(REMEMBER_KEY);
+        deleteCookie(PASSWORD_COOKIE);
       }
     } catch {
       password = "";
@@ -103,7 +91,7 @@
       if (resetTimer) {
         const stored = getRememberedPassword();
         if (stored) {
-          saveRememberedPassword(stored.value, getRememberDuration());
+          saveRememberedPassword(stored, getRememberDuration());
         }
       }
     } catch {

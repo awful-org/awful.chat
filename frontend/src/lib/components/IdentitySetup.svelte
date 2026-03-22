@@ -16,6 +16,7 @@
   import type { KeypairRecord } from "$lib/identity";
   import { enroll } from "$lib/identity.svelte";
   import { ArrowLeft } from "@lucide/svelte";
+  import { setCookie } from "$lib/utils";
 
   type Step =
     | "entry"
@@ -53,9 +54,9 @@
   let biometricError = $state<string | null>(null);
   let remember = $state(true);
 
-  const REMEMBER_KEY = "awful_remembered_password";
+  const PASSWORD_COOKIE = "awful_password";
   const DURATION_KEY = "awful_remember_duration";
-  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const ONE_DAY = 86400;
 
   function getRememberDuration(): number {
     const stored = localStorage.getItem(DURATION_KEY);
@@ -64,11 +65,7 @@
   }
 
   function saveRememberedPassword(value: string, duration: number) {
-    const expires = duration === -1 ? -1 : Date.now() + duration * ONE_DAY;
-    localStorage.setItem(
-      REMEMBER_KEY,
-      JSON.stringify({ value, expires })
-    );
+    setCookie(PASSWORD_COOKIE, value, duration * ONE_DAY);
   }
 
   const passwordMismatch = $derived(

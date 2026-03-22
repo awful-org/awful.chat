@@ -45,6 +45,7 @@
     lock,
     removeWebAuthn,
   } from "$lib/identity.svelte";
+  import { deleteCookie } from "$lib/utils";
 
   interface Props {
     open: boolean;
@@ -509,7 +510,7 @@
         variant="outline"
         class="w-full font-mono mt-2"
         onclick={() => {
-          localStorage.removeItem("awful_remembered_password");
+          deleteCookie("awful_password");
           lock();
         }}
       >
