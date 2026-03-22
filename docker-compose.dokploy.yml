@@ -24,6 +24,7 @@ services:
       --user=awful:awful
       --fingerprint
       --no-multicast-peers
+      --alt-listening-port=5349
       --denied-peer-ip=10.0.0.0-10.255.255.255
       --denied-peer-ip=192.168.0.0-192.168.255.255
       --denied-peer-ip=172.16.0.0-172.31.255.255
@@ -63,6 +64,7 @@ services:
     depends_on:
       - signal
       - sfu
+      - coturn
     networks:
       - dokploy-network
     labels:

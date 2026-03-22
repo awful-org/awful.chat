@@ -160,6 +160,7 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
             urls: [
               "turn:awful.frav.in:3478?transport=udp",
               "turn:awful.frav.in:3478?transport=tcp",
+              "turn:awful.frav.in:5349?transport=tcp",
             ],
             username: "awful",
             credential: "awful",
