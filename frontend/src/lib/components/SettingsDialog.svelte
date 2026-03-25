@@ -14,7 +14,20 @@
     DrawerTitle,
   } from "$lib/components/ui/drawer";
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
-  import { QrCode, Camera } from "@lucide/svelte";
+  import {
+    QrCode,
+    Camera,
+    HardDrive,
+    File,
+    MessageSquare,
+    Users,
+    Database,
+    ChartPie,
+    User,
+    Volume2,
+    RefreshCw,
+    LogOut,
+  } from "@lucide/svelte";
   import {
     Select,
     SelectContent,
@@ -26,7 +39,11 @@
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import { Button } from "$lib/components/ui/button";
   import { profileStore, saveName } from "$lib/profile.svelte";
-  import { wipeLocalDatabase } from "$lib/storage";
+  import {
+    wipeLocalDatabase,
+    getStorageMetrics,
+    type StorageMetrics,
+  } from "$lib/storage";
   import {
     setVoiceInputDevice,
     getVoiceInputDevices,
@@ -49,6 +66,8 @@
   } from "$lib/identity.svelte";
   import { deleteCookie } from "$lib/utils";
 
+  type SettingsTab = "profile" | "audio" | "session" | "data";
+
   interface Props {
     open: boolean;
     onClose: () => void;
@@ -65,6 +84,8 @@
   let syncDialogMode: "generate-qr" | "scan-qr" = $state("generate-qr");
   let nameValue = $state("");
   let confirmErase = $state(false);
+  let activeTab = $state<SettingsTab>("profile");
+  let metrics = $state<StorageMetrics | null>(null);
 
   let biometricPassword = $state("");
   let biometricLoading = $state(false);
@@ -79,13 +100,24 @@
     localStorage.getItem("awful_remember_reset_timer") === "true"
   );
 
+  const tabs = $state([
+    { id: "profile" as SettingsTab, label: "Profile", icon: User },
+    { id: "audio" as SettingsTab, label: "Audio", icon: Volume2 },
+    { id: "session" as SettingsTab, label: "Session/Sync", icon: RefreshCw },
+    {
+      id: "data" as SettingsTab,
+      label: "Data",
+      icon: ChartPie,
+    },
+  ]);
+
   const canEnrollBiometrics = $derived(
     !identityStore.hasWebAuthn &&
       (identityStore.webAuthnCapabilities?.canEnroll ?? false)
   );
 
-  const LOG_MIN = Math.log10(0.01); // -2
-  const LOG_MAX = Math.log10(2.5); // ~0.398
+  const LOG_MIN = Math.log10(0.01);
+  const LOG_MAX = Math.log10(2.5);
 
   function gainToSlider(gain: number): number {
     if (gain <= 0) return 0;
@@ -122,6 +154,18 @@
     });
   });
 
+  $effect(() => {
+    if (open && activeTab === "data" && !metrics) {
+      getStorageMetrics()
+        .then((m) => {
+          metrics = m;
+        })
+        .catch(() => {
+          metrics = null;
+        });
+    }
+  });
+
   function handleInputGainChange(vals: number[]) {
     inputSlider = vals;
     const gain = sliderToGain(vals[0]);
@@ -133,6 +177,17 @@
   function handleOutputVolumeChange(vals: number[]) {
     outputSlider = vals;
     setVoiceOutputVolume(sliderToGain(vals[0]));
+  }
+
+  function formatBytes(bytes: number | undefined): string {
+    if (!bytes || bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.min(
+      Math.floor(Math.log(bytes) / Math.log(k)),
+      sizes.length - 1
+    );
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
   }
 
   async function handleInputDeviceChange(deviceId: string) {
@@ -155,6 +210,11 @@
   async function handleEraseLocalData() {
     await wipeLocalDatabase();
     window.location.reload();
+  }
+
+  function handleLockLogout() {
+    deleteCookie("awful_password");
+    lock();
   }
 
   const profileInitial = $derived(
@@ -183,14 +243,29 @@
   });
 </script>
 
-{#snippet SettingsContent()}
-  <div class="flex flex-col gap-5 pt-1">
-    <div class="flex flex-col gap-3">
-      <p
-        class="text-xs text-muted-foreground font-mono uppercase tracking-widest"
+{#snippet TabBar()}
+  <div
+    class="flex flex-row sm:flex-col gap-1 p-1 bg-muted rounded-lg md:h-full"
+  >
+    {#each tabs as tab}
+      <button
+        type="button"
+        onclick={() => (activeTab = tab.id)}
+        class="flex-1 sm:flex-none flex items-center justify-center sm:justify-start gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {activeTab ===
+        tab.id
+          ? 'bg-background text-foreground shadow-sm'
+          : 'text-muted-foreground hover:text-foreground hover:bg-muted-foreground/10'}"
       >
-        Profile
-      </p>
+        <tab.icon class="w-4 h-4" />
+        <span class="hidden sm:inline">{tab.label}</span>
+      </button>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet ProfileSection()}
+  <div class="flex flex-col gap-5">
+    <div class="flex flex-col gap-3">
       <div class="flex flex-col items-center gap-3">
         <button
           type="button"
@@ -198,7 +273,7 @@
             avatarDialogOpen = true;
           }}
           aria-label="Change avatar"
-          class="relative group flex size-24 items-center justify-center rounded-full overflow-hidden bg-primary/20 ring-2 ring-border hover:ring-primary/60 transition-all cursor-pointer shrink-0"
+          class="relative group flex size-20 items-center justify-center rounded-full overflow-hidden bg-primary/20 ring-2 ring-border hover:ring-primary/60 transition-all cursor-pointer shrink-0"
         >
           {#if profileStore.avatarUrl}
             <img
@@ -208,7 +283,7 @@
             />
           {:else}
             <span
-              class="text-3xl font-semibold text-primary font-mono select-none"
+              class="text-2xl font-semibold text-primary font-mono select-none"
               >{profileInitial}</span
             >
           {/if}
@@ -225,17 +300,30 @@
             if (e.key === "Enter") (e.target as HTMLInputElement).blur();
           }}
           placeholder="Display name"
-          class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono focus-visible:ring-ring text-center w-full"
+          class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono focus-visible:ring-ring text-center w-full max-w-50"
         />
       </div>
     </div>
 
-    <Separator class="bg-border" />
+    {#if isMobile}
+      <Button
+        variant="outline"
+        class="w-full font-mono text-muted-foreground"
+        onclick={handleLockLogout}
+      >
+        <LogOut class="w-4 h-4 mr-2" />
+        Lock / Logout
+      </Button>
+    {/if}
+  </div>
+{/snippet}
 
-    <div class="flex flex-col gap-2">
+{#snippet AudioSection()}
+  <div class="flex flex-col gap-6 mb-4">
+    <div class="flex flex-col gap-4">
       <Label
-        class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
-        >microphone</Label
+        class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >Microphone</Label
       >
       {#if inputDevices.length > 0}
         <Select
@@ -246,7 +334,7 @@
           <SelectTrigger
             class="bg-background border-input font-mono text-sm focus:ring-ring"
           >
-            <span class="block max-w-65 truncate">
+            <span class="block truncate">
               {inputDevices.find((d) => d.deviceId === activeInput)?.label ||
                 "Default"}
             </span>
@@ -254,7 +342,7 @@
           <SelectContent class="bg-popover border-border font-mono">
             {#each inputDevices as dev (dev.deviceId)}
               <SelectItem value={dev.deviceId} class="font-mono text-sm">
-                <span class="block max-w-65 truncate">
+                <span class="block truncate">
                   {dev.label || `Microphone ${dev.deviceId.slice(0, 8)}`}
                 </span>
               </SelectItem>
@@ -263,19 +351,18 @@
         </Select>
       {:else}
         <p class="text-xs text-muted-foreground font-mono">
-          join a call to select devices
+          Join a call to select devices
         </p>
       {/if}
     </div>
 
-    <!-- Input gain -->
     <div class="flex flex-col gap-2">
       <div class="flex items-center justify-between">
         <Label
-          class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
-          >input gain</Label
+          class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Input</Label
         >
-        <span class="text-xs font-mono text-foreground tabular-nums"
+        <span class="text-xs font-mono tabular-nums"
           >{gainToPercent(sliderToGain(inputSlider[0]))}</span
         >
       </div>
@@ -288,22 +375,14 @@
         onValueChange={handleInputGainChange}
         class="w-full"
       />
-      <div
-        class="flex justify-between text-[10px] text-muted-foreground font-mono"
-      >
-        <span>mute</span>
-        <span>100%</span>
-        <span>250%</span>
-      </div>
     </div>
 
     <Separator class="bg-border" />
 
-    <!-- Output device -->
-    <div class="flex flex-col gap-2">
+    <div class="flex flex-col gap-4">
       <Label
-        class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
-        >speakers</Label
+        class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >Speakers</Label
       >
       {#if outputDevices.length > 0}
         <Select
@@ -314,7 +393,7 @@
           <SelectTrigger
             class="bg-background border-input font-mono text-sm focus:ring-ring"
           >
-            <span class="block max-w-65 truncate">
+            <span class="block truncate">
               {outputDevices.find((d) => d.deviceId === activeOutput)?.label ||
                 "Default"}
             </span>
@@ -322,7 +401,7 @@
           <SelectContent class="bg-popover border-border font-mono">
             {#each outputDevices as dev (dev.deviceId)}
               <SelectItem value={dev.deviceId} class="font-mono text-sm">
-                <span class="block max-w-65 truncate">
+                <span class="block truncate">
                   {dev.label || `Speaker ${dev.deviceId.slice(0, 8)}`}
                 </span>
               </SelectItem>
@@ -331,19 +410,18 @@
         </Select>
       {:else}
         <p class="text-xs text-muted-foreground font-mono">
-          join a call to select devices
+          Join a call to select devices
         </p>
       {/if}
     </div>
 
-    <!-- Output volume -->
     <div class="flex flex-col gap-2">
       <div class="flex items-center justify-between">
         <Label
-          class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
-          >output volume</Label
+          class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Output</Label
         >
-        <span class="text-xs font-mono text-foreground tabular-nums"
+        <span class="text-xs font-mono tabular-nums"
           >{gainToPercent(sliderToGain(outputSlider[0]))}</span
         >
       </div>
@@ -356,147 +434,41 @@
         onValueChange={handleOutputVolumeChange}
         class="w-full"
       />
-      <div
-        class="flex justify-between text-[10px] text-muted-foreground font-mono"
-      >
-        <span>mute</span>
-        <span>100%</span>
-        <span>250%</span>
-      </div>
     </div>
+  </div>
+{/snippet}
 
-    {#if canEnrollBiometrics || identityStore.hasWebAuthn}
-      <Separator class="bg-border" />
-      <div class="flex flex-col gap-3">
-        <Label
-          class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
-        >
-          security
-        </Label>
-
-        {#if identityStore.hasWebAuthn}
-          <p class="text-xs text-muted-foreground font-mono">
-            Biometric / device PIN unlock is enabled.
-          </p>
-          {#if !confirmRemoveBiometric}
-            <Button
-              variant="outline"
-              class="w-full font-mono"
-              onclick={() => (confirmRemoveBiometric = true)}
-            >
-              Remove biometric unlock
-            </Button>
-          {:else}
-            <div class="grid grid-cols-2 gap-2">
-              <Button
-                variant="outline"
-                class="font-mono"
-                onclick={() => (confirmRemoveBiometric = false)}
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                class="font-mono"
-                onclick={async () => {
-                  await removeWebAuthn();
-                  confirmRemoveBiometric = false;
-                }}
-              >
-                Confirm remove
-              </Button>
-            </div>
-          {/if}
-        {:else}
-          <p class="text-xs text-muted-foreground font-mono">
-            Use your device biometrics or PIN to unlock instead of typing your
-            password.
-          </p>
-          <div class="flex flex-col gap-2">
-            <Input
-              type="password"
-              bind:value={biometricPassword}
-              placeholder="confirm your password to enroll"
-              class="bg-background border-input font-mono focus-visible:ring-ring
-          {biometricError
-                ? 'border-destructive focus-visible:ring-destructive'
-                : ''}"
-            />
-            {#if biometricError}
-              <p class="text-xs text-destructive font-mono">{biometricError}</p>
-            {/if}
-            {#if biometricSuccess}
-              <p class="text-xs text-green-500 font-mono">
-                Biometric unlock enabled.
-              </p>
-            {/if}
-            <Button
-              variant="outline"
-              class="w-full font-mono"
-              disabled={biometricPassword.length === 0 || biometricLoading}
-              onclick={async () => {
-                biometricError = null;
-                biometricSuccess = false;
-                biometricLoading = true;
-                try {
-                  // verify password is correct first by attempting a decrypt
-                  await enroll(biometricPassword);
-                  biometricPassword = "";
-                  biometricSuccess = true;
-                } catch (e) {
-                  biometricError = e instanceof Error ? e.message : String(e);
-                } finally {
-                  biometricLoading = false;
-                }
-              }}
-            >
-              {biometricLoading
-                ? "waiting for device…"
-                : "Enable biometric unlock"}
-            </Button>
-          </div>
-        {/if}
-      </div>
-    {/if}
-
-    <Separator class="bg-border" />
-
-    <div class="flex flex-col gap-2">
+{#snippet SessionSection()}
+  <div class="flex flex-col gap-6">
+    <div class="flex flex-col gap-4">
       <Label
-        class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
+        class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >Session</Label
       >
-        session
-      </Label>
-
-      <div class="flex flex-col gap-1">
-        <Label class="text-xs text-muted-foreground font-mono">
-          Remember password for
-        </Label>
-        <Select
-          type="single"
-          value={rememberDuration.toString()}
-          onValueChange={(v: string) => {
-            const val = parseInt(v, 10);
-            rememberDuration = val;
-            localStorage.setItem("awful_remember_duration", v);
-          }}
-        >
-          <SelectTrigger class="w-full font-mono">
-            <span class="text-xs">
-              {rememberDuration === -1
-                ? "Until I log out"
-                : `${rememberDuration} days`}
-            </span>
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="5">5 days</SelectItem>
-            <SelectItem value="15">15 days</SelectItem>
-            <SelectItem value="30">30 days</SelectItem>
-            <SelectItem value="60">60 days</SelectItem>
-            <SelectItem value="-1">Until I log out</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
+      <Select
+        type="single"
+        value={rememberDuration.toString()}
+        onValueChange={(v: string) => {
+          const val = parseInt(v, 10);
+          rememberDuration = val;
+          localStorage.setItem("awful_remember_duration", v);
+        }}
+      >
+        <SelectTrigger class="w-full font-mono">
+          <span class="text-xs">
+            {rememberDuration === -1
+              ? "Until I log out"
+              : `${rememberDuration} days`}
+          </span>
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="5">5 days</SelectItem>
+          <SelectItem value="15">15 days</SelectItem>
+          <SelectItem value="30">30 days</SelectItem>
+          <SelectItem value="60">60 days</SelectItem>
+          <SelectItem value="-1">Until I log out</SelectItem>
+        </SelectContent>
+      </Select>
 
       <label
         class="flex items-center gap-2 text-xs text-muted-foreground font-mono cursor-pointer"
@@ -512,97 +484,317 @@
           }}
           class="accent-primary"
         />
-        Reset timer after each login
+        Reset timer on login
       </label>
-
-      <Button
-        variant="outline"
-        class="w-full font-mono mt-2"
-        onclick={() => {
-          deleteCookie("awful_password");
-          lock();
-        }}
-      >
-        Lock / Logout
-      </Button>
     </div>
+
+    {#if canEnrollBiometrics || identityStore.hasWebAuthn}
+      <Separator class="bg-border" />
+      <div class="flex flex-col gap-4">
+        <Label
+          class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Security</Label
+        >
+
+        {#if identityStore.hasWebAuthn}
+          <p class="text-xs text-muted-foreground font-mono">
+            Biometric unlock is enabled
+          </p>
+          {#if !confirmRemoveBiometric}
+            <Button
+              variant="outline"
+              class="w-full font-mono text-xs"
+              onclick={() => (confirmRemoveBiometric = true)}
+            >
+              Remove biometric
+            </Button>
+          {:else}
+            <div class="flex gap-2">
+              <Button
+                variant="outline"
+                class="flex-1 font-mono text-xs"
+                onclick={() => (confirmRemoveBiometric = false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                class="flex-1 font-mono text-xs"
+                onclick={async () => {
+                  await removeWebAuthn();
+                  confirmRemoveBiometric = false;
+                }}
+              >
+                Remove
+              </Button>
+            </div>
+          {/if}
+        {:else}
+          <p class="text-xs text-muted-foreground font-mono">
+            Use biometrics to unlock without password
+          </p>
+          <Input
+            type="password"
+            bind:value={biometricPassword}
+            placeholder="Password to enroll"
+            class="bg-background border-input font-mono focus-visible:ring-ring text-sm {biometricError
+              ? 'border-destructive'
+              : ''}"
+          />
+          {#if biometricError}
+            <p class="text-xs text-destructive font-mono">{biometricError}</p>
+          {/if}
+          {#if biometricSuccess}
+            <p class="text-xs text-green-500 font-mono">
+              Biometric unlock enabled
+            </p>
+          {/if}
+          <Button
+            variant="outline"
+            class="w-full font-mono text-xs"
+            disabled={biometricPassword.length === 0 || biometricLoading}
+            onclick={async () => {
+              biometricError = null;
+              biometricSuccess = false;
+              biometricLoading = true;
+              try {
+                await enroll(biometricPassword);
+                biometricPassword = "";
+                biometricSuccess = true;
+              } catch (e) {
+                biometricError = e instanceof Error ? e.message : String(e);
+              } finally {
+                biometricLoading = false;
+              }
+            }}
+          >
+            {biometricLoading ? "Please wait..." : "Enable biometric unlock"}
+          </Button>
+        {/if}
+      </div>
+    {/if}
 
     <Separator class="bg-border" />
 
-    <div class="flex flex-col gap-3">
+    <div class="flex flex-col gap-4">
       <Label
-        class="text-xs font-mono text-muted-foreground uppercase tracking-widest"
+        class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >Sync</Label
       >
-        Sync
-      </Label>
-
-      <div class="flex flex-col gap-2">
-        <p class="text-xs text-muted-foreground font-mono">
-          Sync a new device or merge data with another device.
-        </p>
-        <div class="flex flex-col gap-3">
-          <div class="grid grid-cols-2 gap-2">
-            <Button
-              variant="outline"
-              class="font-mono flex-col h-auto py-3 gap-2"
-              onclick={() => {
-                syncDialogMode = "generate-qr";
-                syncDialogOpen = true;
-              }}
-            >
-              <QrCode class="w-5 h-5" />
-              <span class="text-xs">Generate QR</span>
-            </Button>
-            <Button
-              variant="outline"
-              class="font-mono flex-col h-auto py-3 gap-2"
-              onclick={() => {
-                syncDialogMode = "scan-qr";
-                syncDialogOpen = true;
-              }}
-            >
-              <Camera class="w-5 h-5" />
-              <span class="text-xs">Scan QR</span>
-            </Button>
-          </div>
-        </div>
+      <div class="grid grid-cols-2 gap-2">
+        <Button
+          variant="outline"
+          class="font-mono flex-col h-auto py-3 gap-2"
+          onclick={() => {
+            syncDialogMode = "generate-qr";
+            syncDialogOpen = true;
+          }}
+        >
+          <QrCode class="w-5 h-5" />
+          <span class="text-xs">Generate QR</span>
+        </Button>
+        <Button
+          variant="outline"
+          class="font-mono flex-col h-auto py-3 gap-2"
+          onclick={() => {
+            syncDialogMode = "scan-qr";
+            syncDialogOpen = true;
+          }}
+        >
+          <Camera class="w-5 h-5" />
+          <span class="text-xs">Scan QR</span>
+        </Button>
       </div>
     </div>
+  </div>
+{/snippet}
 
-    <Separator class="bg-border" />
+{#snippet DataSection()}
+  <div class="flex flex-col gap-6">
+    <!-- Metrics Dashboard -->
+    {#if metrics}
+      <div class="flex flex-col gap-4">
+        <Label
+          class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Storage Metrics</Label
+        >
 
+        <!-- Stats Grid -->
+        <div class="grid grid-cols-2 gap-3">
+          <div class="bg-muted/50 rounded-lg p-3">
+            <div class="flex items-center gap-2 mb-1">
+              <MessageSquare class="w-3.5 h-3.5 text-muted-foreground" />
+              <span
+                class="text-[10px] text-muted-foreground font-mono uppercase"
+                >Messages</span
+              >
+            </div>
+            <p class="text-lg font-semibold font-mono">
+              {metrics.totalMessages.toLocaleString()}
+            </p>
+          </div>
+          <div class="bg-muted/50 rounded-lg p-3">
+            <div class="flex items-center gap-2 mb-1">
+              <Users class="w-3.5 h-3.5 text-muted-foreground" />
+              <span
+                class="text-[10px] text-muted-foreground font-mono uppercase"
+                >Rooms</span
+              >
+            </div>
+            <p class="text-lg font-semibold font-mono">
+              {metrics.totalRooms.toLocaleString()}
+            </p>
+          </div>
+          <div class="bg-muted/50 rounded-lg p-3">
+            <div class="flex items-center gap-2 mb-1">
+              <Users class="w-3.5 h-3.5 text-muted-foreground" />
+              <span
+                class="text-[10px] text-muted-foreground font-mono uppercase"
+                >Profiles</span
+              >
+            </div>
+            <p class="text-lg font-semibold font-mono">
+              {metrics.totalProfiles.toLocaleString()}
+            </p>
+          </div>
+          <div class="bg-muted/50 rounded-lg p-3">
+            <div class="flex items-center gap-2 mb-1">
+              <File class="w-3.5 h-3.5 text-muted-foreground" />
+              <span
+                class="text-[10px] text-muted-foreground font-mono uppercase"
+                >Files</span
+              >
+            </div>
+            <p class="text-lg font-semibold font-mono">
+              {metrics.totalAttachments.toLocaleString()}
+            </p>
+          </div>
+        </div>
+
+        <!-- Storage Size Card -->
+        <div class="bg-muted/50 rounded-lg p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <HardDrive class="w-4 h-4 text-muted-foreground" />
+              <span class="text-xs text-muted-foreground font-mono uppercase"
+                >Total Storage</span
+              >
+            </div>
+            <span class="text-lg font-semibold font-mono"
+              >{formatBytes(metrics.storedDataSize)}</span
+            >
+          </div>
+
+          <!-- Seeding progress -->
+          {#if metrics.totalAttachments > 0}
+            <div class="space-y-2">
+              <div class="flex items-center justify-between text-xs">
+                <span class="text-muted-foreground font-mono"
+                  >Seeding {metrics.seedingAttachments} of {metrics.totalAttachments}
+                  files</span
+                >
+                <span class="font-mono text-green-500"
+                  >{Math.round(
+                    (metrics.seedingAttachments / metrics.totalAttachments) *
+                      100
+                  )}%</span
+                >
+              </div>
+              <div class="h-2 bg-muted rounded-full overflow-hidden">
+                <div
+                  class="h-full bg-linear-to-r from-green-500 to-green-400 rounded-full transition-all duration-500"
+                  style="width: {(metrics.seedingAttachments /
+                    metrics.totalAttachments) *
+                    100}%"
+                ></div>
+              </div>
+            </div>
+          {:else}
+            <p class="text-xs text-muted-foreground font-mono">
+              No attachments stored
+            </p>
+          {/if}
+        </div>
+
+        <!-- Top Rooms Bar Chart -->
+        {#if metrics.rooms.length > 0}
+          <div class="bg-muted/50 rounded-lg p-4">
+            <div class="flex items-center gap-2 mb-3">
+              <Database class="w-4 h-4 text-muted-foreground" />
+              <span class="text-xs text-muted-foreground font-mono uppercase"
+                >Top Rooms</span
+              >
+            </div>
+            <div class="flex flex-col gap-2">
+              {#each metrics.rooms as room, i}
+                {@const maxMessages = metrics.rooms[0]?.messageCount || 1}
+                <div class="flex items-center gap-2 text-xs">
+                  <span class="font-mono w-4 text-muted-foreground"
+                    >{i + 1}.</span
+                  >
+                  <span class="font-mono w-24 truncate text-muted-foreground"
+                    >{room.name}</span
+                  >
+                  <div class="flex-1 h-2 bg-muted rounded overflow-hidden">
+                    <div
+                      class="h-full bg-primary/60 rounded transition-all duration-500"
+                      style="width: {(room.messageCount / maxMessages) * 100}%"
+                    ></div>
+                  </div>
+                  <span class="font-mono w-10 text-right"
+                    >{room.messageCount}</span
+                  >
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
+
+      <Separator class="bg-border" />
+    {:else if activeTab === "data"}
+      <div class="flex items-center justify-center py-8">
+        <div class="flex flex-col items-center gap-2">
+          <Database class="w-8 h-8 text-muted-foreground animate-pulse" />
+          <span class="text-xs text-muted-foreground font-mono"
+            >Loading metrics...</span
+          >
+        </div>
+      </div>
+      <Separator class="bg-border" />
+    {/if}
+
+    <!-- Danger Zone -->
     <div class="flex flex-col gap-2">
-      <Label
-        class="text-xs font-mono text-destructive uppercase tracking-widest"
-        >Danger zone</Label
+      <Label class="text-xs font-mono text-destructive uppercase tracking-wider"
+        >Danger Zone</Label
       >
       <p class="text-xs text-muted-foreground font-mono">
-        Permanently erase all local chat text, media, rooms, profiles, and
-        identity data stored in IndexedDB.
+        Erase all local data including identity, messages, and media.
       </p>
       {#if !confirmErase}
         <Button
           variant="destructive"
-          class="w-full font-mono"
+          class="w-full font-mono text-xs"
           onclick={() => (confirmErase = true)}
         >
-          Erase all local data
+          Erase all data
         </Button>
       {:else}
-        <div class="grid grid-cols-2 gap-2">
+        <div class="flex gap-2">
           <Button
             variant="outline"
-            class="font-mono"
+            class="flex-1 font-mono text-xs"
             onclick={() => (confirmErase = false)}
           >
             Cancel
           </Button>
           <Button
             variant="destructive"
-            class="font-mono"
+            class="flex-1 font-mono text-xs"
             onclick={handleEraseLocalData}
           >
-            Confirm erase
+            Confirm
           </Button>
         </div>
       {/if}
@@ -610,35 +802,80 @@
   </div>
 {/snippet}
 
+{#snippet DesktopSidebar()}
+  <div class="flex flex-col h-full">
+    <div class="flex-1">
+      {@render TabBar()}
+    </div>
+    <div class="pt-2 border-t border-border mt-2">
+      <Button
+        variant="ghost"
+        class="w-full font-mono text-xs text-muted-foreground justify-start"
+        onclick={handleLockLogout}
+      >
+        <LogOut class="w-4 h-4 mr-2" />
+        Lock / Logout
+      </Button>
+    </div>
+  </div>
+{/snippet}
+
+{#snippet DesktopContent()}
+  <div class="flex flex-row h-full gap-8">
+    <div class="hidden sm:flex w-36 h-full">
+      {@render DesktopSidebar()}
+    </div>
+    <div class="flex-1 overflow-y-auto pr-2 pt-4">
+      {#if activeTab === "profile"}
+        {@render ProfileSection()}
+      {:else if activeTab === "audio"}
+        {@render AudioSection()}
+      {:else if activeTab === "session"}
+        {@render SessionSection()}
+      {:else if activeTab === "data"}
+        {@render DataSection()}
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
 {#if isMobile}
   <Drawer bind:open onOpenChange={closeHandler} direction="bottom">
-    <DrawerContent
-      class="bg-card text-card-foreground border-border max-h-[90vh]"
-    >
-      <DrawerHeader
-        class="px-4 py-3 w-full flex items-center justify-between gap-2"
-      >
+    <DrawerContent class="bg-card text-card-foreground border-border h-3/4">
+      <DrawerHeader class="px-4 py-3 border-b border-border">
         <DrawerTitle class="font-mono text-base font-semibold"
           >Settings</DrawerTitle
         >
       </DrawerHeader>
-      <div class="overflow-y-auto px-4 pb-4">
-        {@render SettingsContent()}
+      <div class="p-4 space-y-4 border-border">
+        {@render TabBar()}
+        <div class="pt-2">
+          {#if activeTab === "profile"}
+            {@render ProfileSection()}
+          {:else if activeTab === "audio"}
+            {@render AudioSection()}
+          {:else if activeTab === "session"}
+            {@render SessionSection()}
+          {:else if activeTab === "data"}
+            {@render DataSection()}
+          {/if}
+        </div>
       </div>
     </DrawerContent>
   </Drawer>
 {:else}
   <Dialog bind:open onOpenChange={closeHandler}>
     <DialogContent
-      overlayClass="z-30"
-      class="bg-card border-border text-card-foreground font-mono max-w-md max-h-[90vh] overflow-y-auto z-30"
+      class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-200 sm:h-137.5 lg:h-150 flex flex-col p-0"
     >
-      <DialogHeader>
+      <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
         <DialogTitle class="font-mono text-base font-semibold"
           >Settings</DialogTitle
         >
       </DialogHeader>
-      {@render SettingsContent()}
+      <div class="flex-1 overflow-hidden px-4 pb-4">
+        {@render DesktopContent()}
+      </div>
     </DialogContent>
   </Dialog>
 {/if}

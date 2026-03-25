@@ -661,3 +661,47 @@ export async function wipeLocalDatabase(): Promise<void> {
   }
   await deleteDB("awful-chat");
 }
+
+export interface StorageMetrics {
+  totalMessages: number;
+  totalRooms: number;
+  totalProfiles: number;
+  seedingAttachments: number;
+  totalAttachments: number;
+  storedDataSize: number;
+  rooms: { name: string; messageCount: number }[];
+}
+
+export async function getStorageMetrics(): Promise<StorageMetrics> {
+  const database = await getDB();
+  
+  const messages = await database.getAll("messages");
+  const rooms = await database.getAll("rooms");
+  const profiles = await database.getAll("profiles");
+  const attachments = await database.getAll("attachments");
+  
+  const seedingCount = attachments.filter(a => a.status === "seeding").length;
+  
+  let storedSize = 0;
+  attachments.forEach(a => {
+    if (a.data) storedSize += a.data.byteLength;
+  });
+  
+  const roomMetrics = rooms.slice(0, 5).map(room => {
+    const roomMessages = messages.filter(m => m.roomCode === (room as Room | DMRoom).roomCode).length;
+    return {
+      name: (room as Room | DMRoom).name || (room as Room | DMRoom).roomCode,
+      messageCount: roomMessages
+    };
+  }).sort((a, b) => b.messageCount - a.messageCount);
+  
+  return {
+    totalMessages: messages.length,
+    totalRooms: rooms.length,
+    totalProfiles: profiles.length,
+    seedingAttachments: seedingCount,
+    totalAttachments: attachments.length,
+    storedDataSize: storedSize,
+    rooms: roomMetrics
+  };
+}
