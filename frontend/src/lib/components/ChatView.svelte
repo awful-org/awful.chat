@@ -83,32 +83,34 @@
   let stagedPreviewUrls = $state(new Map<string, string>());
   const stagedFileFingerprints = new Map<string, string>();
 
-  // Swipe to reply state
   let swipeStartX = $state(0);
   let swipeStartY = $state(0);
   let swipeCurrentX = $state(0);
   let swipeMessageId = $state<string | null>(null);
   let isSwiping = $state(false);
-  const SWIPE_THRESHOLD = 100; // Minimum swipe distance to trigger reply (less sensitive)
-  const SWIPE_DEADZONE = 15; // Initial movement before considered a swipe (less sensitive)
+  const SWIPE_THRESHOLD = 100;
+  const SWIPE_DEADZONE = 15;
   const SWIPE_MAX_VERTICAL = 24;
   const SWIPE_DIRECTION_RATIO = 1.25;
 
   let isMobile = $state(false);
-
   let rootEl = $state<HTMLDivElement | null>(null);
+  let messagesEl = $state<HTMLDivElement | null>(null);
+  let textareaEl = $state<HTMLTextAreaElement | null>(null);
+  let inputFocused = $state(false);
+  let copied = $state(false);
+  let autoScroll = $state(true);
+  // Tracks whether the initial scroll-to-bottom on mount has happened
+  let initialScrollDone = $state(false);
 
   $effect(() => {
     if (typeof window === "undefined") return;
-
     const media = window.matchMedia("(max-width: 639px)");
     const update = () => {
       isMobile = media.matches;
     };
-
     update();
     media.addEventListener("change", update);
-
     return () => media.removeEventListener("change", update);
   });
 
@@ -138,13 +140,50 @@
     return byMessage;
   });
 
+  function scrollToBottom(behavior: ScrollBehavior = "instant") {
+    if (!messagesEl) return;
+    messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior });
+  }
+
+  function handleScroll() {
+    if (!messagesEl) return;
+    const { scrollHeight, scrollTop, clientHeight } = messagesEl;
+    autoScroll = scrollHeight - scrollTop - clientHeight < 40;
+  }
+
+  $effect(() => {
+    if (initialScrollDone || !messagesEl || visibleMessages.length === 0)
+      return;
+    scrollToBottom();
+    initialScrollDone = true;
+  });
+
+  // Scroll on new messages if autoScroll is enabled
+  $effect(() => {
+    visibleMessages.length;
+    if (!initialScrollDone) return;
+    if (autoScroll && messagesEl) {
+      setTimeout(() => scrollToBottom(), 0);
+    }
+  });
+
+  // Scroll when keyboard opens/closes (visualViewport resize)
+  $effect(() => {
+    if (typeof window === "undefined" || !window.visualViewport) return;
+    const vv = window.visualViewport;
+    const onResize = () => {
+      if (autoScroll) setTimeout(() => scrollToBottom(), 0);
+    };
+    vv.addEventListener("resize", onResize);
+    return () => vv.removeEventListener("resize", onResize);
+  });
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape" && stagedFiles.length > 0) {
       e.preventDefault();
       clearStagedFiles();
       return;
     }
-
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -262,8 +301,7 @@
 
   function removeStagedFile(target: File) {
     const key = fileKey(target);
-    const next = stagedFiles.filter((file) => fileKey(file) !== key);
-    stagedFiles = next;
+    stagedFiles = stagedFiles.filter((file) => fileKey(file) !== key);
 
     const url = stagedPreviewUrls.get(key);
     if (url) {
@@ -291,8 +329,7 @@
 
   function getStagedPreviewURL(file: File): string | null {
     if (!isPreviewable(file)) return null;
-    const key = fileKey(file);
-    return stagedPreviewUrls.get(key) ?? null;
+    return stagedPreviewUrls.get(fileKey(file)) ?? null;
   }
 
   function formatSize(size: number): string {
@@ -305,9 +342,8 @@
 
   function hasFilesInDataTransfer(dt: DataTransfer | null): boolean {
     if (!dt) return false;
-    if (dt.items && dt.items.length > 0) {
+    if (dt.items && dt.items.length > 0)
       return Array.from(dt.items).some((item) => item.kind === "file");
-    }
     if (dt.files && dt.files.length > 0) return true;
     return Array.from(dt.types).includes("Files");
   }
@@ -329,9 +365,7 @@
     if (!hasFilesInDataTransfer(e.dataTransfer)) return;
     e.preventDefault();
     dragDepth = Math.max(0, dragDepth - 1);
-    if (dragDepth === 0) {
-      dragOverlayActive = false;
-    }
+    if (dragDepth === 0) dragOverlayActive = false;
   }
 
   function handleRootDrop(e: DragEvent) {
@@ -343,23 +377,10 @@
     void addFilesToStage(e.dataTransfer.files);
   }
 
-  let textareaEl = $state<HTMLTextAreaElement | null>(null);
-  let inputFocused = $state(false);
-
-  let copied = $state(false);
   async function copyCode() {
     await navigator.clipboard.writeText(window.location.href);
     copied = true;
     setTimeout(() => (copied = false), 2000);
-  }
-
-  let messagesEl = $state<HTMLDivElement | null>(null);
-  let autoScroll = $state(true);
-
-  function handleScroll() {
-    if (!messagesEl) return;
-    const { scrollHeight, scrollTop, clientHeight } = messagesEl;
-    autoScroll = scrollHeight - scrollTop - clientHeight < 40;
   }
 
   function handleMessageClick(msgId: string) {
@@ -378,8 +399,7 @@
     if (rowEl) {
       const rect = rowEl.getBoundingClientRect();
       const touchX = e.touches[0].clientX;
-      const startsInRightHalf = touchX >= rect.left + rect.width * 0.5;
-      if (!startsInRightHalf) {
+      if (touchX < rect.left + rect.width * 0.5) {
         swipeMessageId = null;
         isSwiping = false;
         return;
@@ -401,8 +421,7 @@
   }
 
   function handleTouchMove(msgId: string, e: TouchEvent) {
-    if (swipeMessageId !== msgId) return;
-    if (e.touches.length !== 1) return;
+    if (swipeMessageId !== msgId || e.touches.length !== 1) return;
 
     const touch = e.touches[0];
     const deltaX = touch.clientX - swipeStartX;
@@ -410,7 +429,6 @@
     const absY = Math.abs(touch.clientY - swipeStartY);
 
     if (absX <= SWIPE_DEADZONE) return;
-
     if (deltaX >= 0) {
       isSwiping = false;
       return;
@@ -429,18 +447,14 @@
   function handleTouchEnd(msgId: string, _: TouchEvent) {
     if (swipeMessageId !== msgId) return;
 
-    const deltaX = swipeCurrentX - swipeStartX;
-
-    // If swiped enough to the left (negative deltaX), trigger reply
-    if (isSwiping && deltaX < -SWIPE_THRESHOLD) {
+    if (isSwiping && swipeCurrentX - swipeStartX < -SWIPE_THRESHOLD) {
       const msg = visibleMessages.find((m) => m.id === msgId);
       if (msg) {
         startReply(msg);
-        activeMessageId = null; // Clear active state after reply action
+        activeMessageId = null;
       }
     }
 
-    // Reset swipe state
     swipeMessageId = null;
     isSwiping = false;
     swipeCurrentX = 0;
@@ -448,11 +462,8 @@
 
   $effect(() => {
     const handler = (e: MouseEvent) => {
-      // If clicking outside of messages area or on a different message, clear active
-      const msgEl = (e.target as HTMLElement).closest('[id^="msg-"]');
-      if (!msgEl) {
+      if (!(e.target as HTMLElement).closest('[id^="msg-"]'))
         activeMessageId = null;
-      }
     };
     window.addEventListener("click", handler);
     return () => window.removeEventListener("click", handler);
@@ -472,16 +483,13 @@
   $effect(() => {
     if (!incomingSharedFiles.length) return;
     void addFilesToStage(incomingSharedFiles);
-    if (incomingSharedText && !draft.trim()) {
-      draft = incomingSharedText;
-    }
+    if (incomingSharedText && !draft.trim()) draft = incomingSharedText;
     onConsumeIncomingShared?.();
   });
 
   $effect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      if (stagedFiles.length === 0) return;
+      if (e.key !== "Escape" || stagedFiles.length === 0) return;
       e.preventDefault();
       clearStagedFiles();
     };
@@ -510,9 +518,8 @@
     const onWindowDrop = (e: DragEvent) => {
       if (!hasFilesInDataTransfer(e.dataTransfer)) return;
       e.preventDefault();
-      if (e.dataTransfer?.files?.length) {
+      if (e.dataTransfer?.files?.length)
         void addFilesToStage(e.dataTransfer.files);
-      }
       dragDepth = 0;
       dragOverlayActive = false;
     };
@@ -538,9 +545,7 @@
       if (!isPreviewable(file)) continue;
       const key = fileKey(file);
       activeKeys.add(key);
-      if (!nextMap.has(key)) {
-        nextMap.set(key, URL.createObjectURL(file));
-      }
+      if (!nextMap.has(key)) nextMap.set(key, URL.createObjectURL(file));
     }
 
     for (const [key, url] of nextMap) {
@@ -557,19 +562,8 @@
 
   $effect(() => {
     return () => {
-      for (const url of stagedPreviewUrls.values()) {
-        URL.revokeObjectURL(url);
-      }
+      for (const url of stagedPreviewUrls.values()) URL.revokeObjectURL(url);
     };
-  });
-
-  $effect(() => {
-    messages.length;
-    if (autoScroll && messagesEl) {
-      setTimeout(() => {
-        if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
-      }, 0);
-    }
   });
 
   $effect(() => {
@@ -643,6 +637,7 @@
       </div>
     </div>
   {/if}
+
   <header class="border-b border-border px-4 py-3 shrink-0">
     <div class="flex items-center justify-between gap-2">
       <div class="flex items-center gap-2 min-w-0">
@@ -677,7 +672,7 @@
         >
           <code>{roomCode}</code>
           {#if copied}
-            <Check class="size-3 text-primary " />
+            <Check class="size-3 text-primary" />
           {:else}
             <Copy class="size-3 mb-0.5" />
           {/if}
@@ -835,6 +830,7 @@
                   </div>
                 </div>
               {/if}
+
               <MsgRender
                 {msg}
                 {isOwn}
@@ -868,7 +864,6 @@
                 </div>
               {/if}
 
-              <!-- Swipe indicator for reply -->
               {#if isMobile && swipeMessageId === msg.id && isSwiping}
                 <div
                   class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground opacity-70"
@@ -926,7 +921,7 @@
         size="sm"
         class="rounded-full shadow-md font-mono text-xs"
         onclick={() => {
-          if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+          scrollToBottom("smooth");
           autoScroll = true;
         }}
       >
