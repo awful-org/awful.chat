@@ -45,6 +45,8 @@ interface IdentityStore {
   hasWebAuthn: boolean;
 
   webAuthnCapabilities: WebAuthnCapabilities | null;
+  /** True while app is initializing (loading identity + auto-login attempt). */
+  initializing: boolean;
 }
 
 export const identityStore = $state<IdentityStore>({
@@ -56,6 +58,7 @@ export const identityStore = $state<IdentityStore>({
   error: null,
   hasWebAuthn: false,
   webAuthnCapabilities: null,
+  initializing: true,
 });
 
 function setUnlocked(keypair: KeypairRecord): void {
@@ -80,13 +83,32 @@ function setLocked(): void {
 export async function init(): Promise<void> {
   identityStore.loading = true;
   identityStore.error = null;
+  identityStore.initializing = true;
   try {
     identityStore.keypair = await getIdentity();
     identityStore.hasWebAuthn = await hasWebAuthnEnrollment();
     identityStore.webAuthnCapabilities = await getWebAuthnCapabilities();
   } finally {
     identityStore.loading = false;
+    identityStore.initializing = false;
   }
+}
+
+let _autoLoginPromise: Promise<void> | null = null;
+
+export function startAutoLogin(promise: Promise<void>): void {
+  identityStore.initializing = true;
+  _autoLoginPromise = promise;
+  promise
+    .finally(() => {
+      identityStore.initializing = false;
+      _autoLoginPromise = null;
+    })
+    .catch(() => {});
+}
+
+export function endInitializing(): void {
+  identityStore.initializing = false;
 }
 
 /**

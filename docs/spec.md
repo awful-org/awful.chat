@@ -515,6 +515,19 @@ all p2p:                 messages, files, Yjs — direct between peers
 
 ---
 
+## WebAuthn
+
+```txt
+Purpose: Biometric/hardware key authentication as alternative to password
+Flow:
+  1. Register credential with authenticator during setup
+  2. Authenticate using biometric/hardware key instead of password
+  3. Same key derivation path: PBKDF2 → AES-GCM → mnemonic decryption
+Storage: Credential ID and public key in IndexedDB "webauthn" store
+```
+
+---
+
 ## Future: Roles + Permissions (Hash Chain Model)
 
 *Deferred — implement after core is stable*
@@ -546,13 +559,51 @@ known limitation:
 
 ---
 
+## PWA
+
+```txt
+Manifest: /app/manifest.json with theme color #00FF88, background #09090b
+Service Worker: /app/sw.js handles offline caching, static assets, navigation fallback
+Install: Custom install prompt with deferred browser prompt
+Share Target: Accepts files and text via system share menu
+  - Files: GET/POST /app/ action="share" with enctype="multipart/form-data"
+  - Text: Shared text pre-populates message composer
+Scope: /app/ for all PWA routes
+```
+
+---
+
+## Open Graph (OG) Proxy
+
+```txt
+Purpose: Prevent client IP leaks to third-party sites when fetching link previews
+Endpoint: /og?url=<encoded_url> on signaling server
+Response: JSON { title, description, image, siteName, url }
+Caching: Server-side caching with TTL
+Security: URL allowlist/blocklist, size limits, timeout protection
+```
+
+---
+
+## Password Persistence
+
+```txt
+Storage: HTTP-only cookie "auth" with AES-GCM encrypted password
+Expiry: Sliding window (reset on each successful unlock)
+Security: Cookie SameSite=Strict, Secure flag in production
+Fallback: Manual password entry when cookie expired or absent
+Clearing: Explicit logout clears cookie and memory
+```
+
+---
+
 ## Future: Sequential Sync Queue
 
 *Deferred — only worth implementing if rooms grow large with many simultaneous joins*
 
 **Problem:** When a peer joins and connects to N peers at once, all N digest exchanges happen in parallel. Each peer responds independently with what the joiner is missing — so the same messages can arrive from multiple peers before any response has been processed, wasting bandwidth.
 
-```
+```txt
 A connects to B and C simultaneously:
   A → B: digest             A → C: digest
   B → A: pushes missing     C → A: pushes same missing  ← duplicate on air
@@ -581,3 +632,70 @@ async function _queueSync(peerId: string): Promise<void> {
 **Tradeoff:** Adds latency on join — you wait for the first peer's full push before starting with the second. For small rooms (2–5 peers) with modest history, parallel is faster and the duplicate data is negligible. Sequential only pays off with larger rooms or large histories where duplicate transmission is significant.
 
 **Current behavior:** Parallel. Each peer connection runs an independent digest/push cycle. Duplicate data in flight is bounded to messages missing at join time, sent once per already-connected peer.
+
+---
+
+## Device Sync
+
+### Overview
+
+Implemented bidirectional device sync with two modes:
+
+1. **Replace** - Wipes target device and imports everything from source
+2. **Addition/Merge** - Keeps target's identity and merges data from both devices
+
+### UI Flow
+
+#### IdentitySetup (New Device Flow)
+
+- Always uses **Replace** mode
+- Shows QR code immediately
+- Target enters code → password prompt → sync
+- Complete database replacement
+
+#### Settings - Sync Section
+
+Two buttons added:
+
+##### 1. "Sync new device" (Replace mode)
+
+- Shows QR code
+- Target device replaces all data
+- Includes identity sync with password
+
+##### 2. "Merge devices" (Addition mode)
+
+- Shows QR code on primary device
+- Target scans and selects "Addition (Merge)"
+- Target keeps its identity
+- Messages, rooms, attachments merged from both
+
+### Key Behaviors
+
+**Replace Mode:**
+
+- Source exports identity + all data
+- Target wipes database
+- Target imports everything
+- Password required for identity
+
+**Addition Mode:**
+
+- Source skips identity export
+- Target keeps existing identity
+- Target doesn't wipe database
+- Data merged (deduplication by ID)
+
+### Security
+
+- QR codes expire after 5 minutes
+- 8-char room code + 8-char token
+- P2P connection via ephemeral rooms
+- Password required for identity sync
+- Data transferred over encrypted WebRTC
+
+### Future Enhancements
+
+- Check saved password before prompting
+- Better merge conflict resolution (thinking in having a events table and merge based on timestamps, latest always wins)
+- Progress indicators for large databases

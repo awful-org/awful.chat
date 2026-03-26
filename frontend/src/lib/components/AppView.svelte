@@ -37,6 +37,8 @@
     parseRoomCode(window.location.pathname)
   );
 
+  let joiningRoom = $state(false);
+
   $effect(() => {
     if (identityStore.isUnlocked) {
       loadRooms();
@@ -44,7 +46,10 @@
       if (pendingRoomCode) {
         const code = pendingRoomCode;
         pendingRoomCode = null;
-        handleJoin(code, "");
+        joiningRoom = true;
+        handleJoin(code, "").finally(() => {
+          joiningRoom = false;
+        });
       }
     }
   });
@@ -171,6 +176,10 @@
 
 <QueryClientProvider client={queryClient}>
   {#if identityStore.loading && !identityStore.keypair}
+    <div class="min-h-screen bg-background flex items-center justify-center">
+      <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
+    </div>
+  {:else if joiningRoom}
     <div class="min-h-screen bg-background flex items-center justify-center">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
     </div>

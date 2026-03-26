@@ -65,6 +65,13 @@
     onConsumeIncomingShared,
   }: Props = $props();
 
+  // Reset scroll state when room changes
+  $effect(() => {
+    roomCode;
+    initialScrollDone = false;
+    autoScroll = true;
+  });
+
   let { peers, messages, inCall, peerNames, peerAvatars, fileTransfers } =
     $derived(transportState);
 
@@ -155,8 +162,10 @@
   $effect(() => {
     if (initialScrollDone || !messagesEl || visibleMessages.length === 0)
       return;
-    scrollToBottom();
-    initialScrollDone = true;
+    requestAnimationFrame(() => {
+      scrollToBottom();
+      initialScrollDone = true;
+    });
   });
 
   // Scroll on new messages if autoScroll is enabled
@@ -177,6 +186,18 @@
     };
     vv.addEventListener("resize", onResize);
     return () => vv.removeEventListener("resize", onResize);
+  });
+
+  // Scroll when images/other content load and change scroll height
+  $effect(() => {
+    if (!messagesEl || typeof MutationObserver === "undefined") return;
+    const observer = new MutationObserver(() => {
+      if (autoScroll) {
+        requestAnimationFrame(() => scrollToBottom());
+      }
+    });
+    observer.observe(messagesEl, { childList: true, subtree: true });
+    return () => observer.disconnect();
   });
 
   function handleKeydown(e: KeyboardEvent) {

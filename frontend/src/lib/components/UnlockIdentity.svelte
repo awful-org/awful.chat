@@ -3,6 +3,7 @@
     unlock,
     unlockWithBiometrics,
     identityStore,
+    startAutoLogin,
   } from "$lib/identity.svelte";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -54,17 +55,16 @@
         password = stored;
         remember = true;
         if (!canUseBiometrics) {
-          unlock(stored)
-            .then(() => {
-              const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
-              if (resetTimer) {
-                saveRememberedPassword(stored, getRememberDuration());
-              }
-            })
-            .catch(() => {
-              password = "";
-              remember = false;
-            });
+          startAutoLogin(
+            unlock(stored)
+              .then(() => {
+                const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
+                if (resetTimer) {
+                  saveRememberedPassword(stored, getRememberDuration());
+                }
+              })
+              .catch(() => {})
+          );
         }
       }
     }

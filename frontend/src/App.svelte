@@ -15,6 +15,8 @@
   });
 
   $effect(() => {
+    if (identityStore.initializing) return;
+    
     const pathname = window.location.pathname;
     const roomCode = parseRoomCode(pathname);
 
@@ -27,19 +29,9 @@
     }
   });
 
-  $effect(() => {
-    if (identityStore.isUnlocked && currentRoute === "landing") {
-      const roomCode = parseRoomCode(window.location.pathname);
-      if (roomCode) {
-        history.replaceState({}, "", `/r/${roomCode}`);
-      } else {
-        history.replaceState({}, "", "/app");
-      }
-      currentRoute = "app";
-    }
-  });
-
   function handlePopState() {
+    if (identityStore.initializing) return;
+    
     const pathname = window.location.pathname;
     const roomCode = parseRoomCode(pathname);
 
@@ -53,7 +45,11 @@
 
 <svelte:window onpopstate={handlePopState} />
 
-{#if currentRoute === "landing"}
+{#if identityStore.initializing}
+  <div class="min-h-screen bg-background flex items-center justify-center">
+    <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
+  </div>
+{:else if currentRoute === "landing"}
   <Landing />
 {:else}
   <AppView />
