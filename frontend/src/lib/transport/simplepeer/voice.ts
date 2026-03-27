@@ -1,9 +1,5 @@
-import type {
-  PeerTransport,
-  SimplePeerExtension,
-  VoiceTransport,
-  VoiceEvents,
-} from "../types";
+import type { PeerTransport, VoiceTransport, VoiceEvents } from "../types";
+import type { SimplePeerExtension } from "./types";
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,

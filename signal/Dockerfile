@@ -1,15 +1,14 @@
-FROM oven/bun:1-alpine AS base
+FROM golang:1.21-alpine AS builder
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 
-FROM base AS deps
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
-
-FROM base AS runner
-COPY --from=deps /app/node_modules ./node_modules
 COPY . .
+# Build a statically linked binary
+RUN CGO_ENABLED=0 GOOS=linux go build -o relay-server .
 
-EXPOSE 8080
-ENV NODE_ENV=production
-
-CMD ["bun", "run", "index.ts"]
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/relay-server .
+EXPOSE 9000
+CMD ["./relay-server"]

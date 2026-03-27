@@ -1,9 +1,6 @@
 import SimplePeer from "simple-peer";
-import type {
-  PeerTransport,
-  SimplePeerExtension,
-  TransportEvents,
-} from "../types";
+import type { PeerTransport, TransportEvents } from "../types";
+import type { SimplePeerExtension } from "./types";
 
 interface SignalMessage {
   type: "signal";
@@ -37,6 +34,11 @@ export class SimplePeerTransport implements PeerTransport, SimplePeerExtension {
   // Streams to include when creating new peer connections — set by VoiceTransport
   // before a new peer-joined arrives, so the stream is in the offer from the start.
   private initialStreams: MediaStream[] = [];
+
+  isRelayed(_: string): boolean {
+    // libp2p only
+    return false;
+  }
 
   async connect(roomCode: string): Promise<void> {
     this.roomCode = roomCode;
