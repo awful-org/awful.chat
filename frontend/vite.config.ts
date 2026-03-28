@@ -7,19 +7,22 @@ import { VitePWA } from "vite-plugin-pwa";
 
 // https://vite.dev/config/
 export default defineConfig({
+  define: {
+    global: "globalThis",
+  },
   plugins: [
     tailwindcss(),
     svelte(),
     nodePolyfills(),
-VitePWA({
-			registerType: "autoUpdate",
-			strategies: "injectManifest",
-			srcDir: "src",
-			filename: "sw.ts",
-			injectManifest: {
-				maximumFileSizeToCacheInBytes: 3 * 1024 * 1024, // 3 MB
-			},
-			includeAssets: ["favicon.ico", "apple-touch-icon-180x180.png"],
+    VitePWA({
+      registerType: "autoUpdate",
+      strategies: "injectManifest",
+      srcDir: "src",
+      filename: "sw.ts",
+      injectManifest: {
+        maximumFileSizeToCacheInBytes: 23 * 1024 * 1024,
+      },
+      includeAssets: ["favicon.ico", "apple-touch-icon-180x180.png"],
       manifest: {
         name: "Awful.chat",
         short_name: "Awful.chat",

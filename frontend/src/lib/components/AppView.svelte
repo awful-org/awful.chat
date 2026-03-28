@@ -65,7 +65,6 @@
   let sidebarOpen = $state(false);
   let joinError = $state<string | null>(null);
   let createJoinOpen = $state(false);
-  let isMobile = $state(false);
   let incomingSharedFiles = $state<File[]>([]);
   let incomingSharedText = $state("");
 
@@ -159,17 +158,6 @@
 
   const myId = $derived(selfId());
   const hasSidebar = $derived(roomsStore.rooms.length > 0);
-
-  $effect(() => {
-    if (typeof window === "undefined") return;
-    const media = window.matchMedia("(max-width: 639px)");
-    const update = () => {
-      isMobile = media.matches;
-    };
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  });
 </script>
 
 <svelte:window onpopstate={handlePopState} />
@@ -226,7 +214,9 @@
           />
         {:else}
           {#if incomingSharedFiles.length > 0 || incomingSharedText}
-            <Dialog.Root open={incomingSharedFiles.length > 0 || !!incomingSharedText}>
+            <Dialog.Root
+              open={incomingSharedFiles.length > 0 || !!incomingSharedText}
+            >
               <Dialog.Portal>
                 <Dialog.Overlay
                   class="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm"

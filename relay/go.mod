@@ -1,4 +1,4 @@
-module signal
+module relay
 
 go 1.26.1
 

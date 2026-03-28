@@ -1,5 +1,3 @@
-import { SimplePeerTransport } from "./transport/simplepeer/transport";
-import { SimplePeerVoice } from "./transport/simplepeer/voice";
 import { MediasoupVideo } from "./transport/mediasoup";
 import type { VideoSource } from "./transport/types";
 import { identityStore } from "./identity.svelte";
@@ -57,6 +55,8 @@ import type {
   FileDescriptor,
   FileTransferSnapshot,
 } from "./transport/types";
+import { LibP2PTransport } from "./transport/libp2p/transport";
+import { LibP2PVoice } from "./transport/libp2p/voice";
 
 export type { Message };
 
@@ -135,8 +135,8 @@ const MAX_PERSISTED_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 const _peerIdToDid = new Map<string, string>();
 const _seededByFingerprint = new Map<string, FileDescriptor>();
 
-const _transport = new SimplePeerTransport();
-const _voice = new SimplePeerVoice(_transport);
+const _transport = new LibP2PTransport();
+const _voice = new LibP2PVoice(_transport);
 const _video = new MediasoupVideo();
 const _fileTransport = new WebTorrentFileTransport(() => _transport.selfId());
 
@@ -257,6 +257,31 @@ function _sendRoomName(peerId?: string): void {
   else _transport.broadcast(payload);
 }
 
+async function _sendProfile(peerId?: string): Promise<void> {
+  const profile = await getOwnProfile();
+  const name = profile?.nickname?.trim() || "Anonymous";
+  const did = identityStore.did ?? null;
+  let avatarUrl: string | null = profile?.pfpURL || null;
+  if (!avatarUrl && profile?.pfpData) {
+    const bytes = new Uint8Array(profile.pfpData);
+    const binary = Array.from(bytes)
+      .map((b) => String.fromCharCode(b))
+      .join("");
+    avatarUrl = `data:image/jpeg;base64,${btoa(binary)}`;
+  }
+
+  if (peerId) {
+    _transport.send(
+      peerId,
+      encode({ type: MessageType.Profile, name, did, avatarUrl })
+    );
+    return;
+  }
+  _transport.broadcast(
+    encode({ type: MessageType.Profile, name, did, avatarUrl })
+  );
+}
+
 async function _broadcastProfile(): Promise<void> {
   try {
     const profile = await getOwnProfile();
@@ -279,7 +304,11 @@ async function _broadcastProfile(): Promise<void> {
 async function _sendDigest(peerId: string): Promise<void> {
   if (!transportState.roomCode) return;
   const watermarks = await getWatermarksForRoom(transportState.roomCode);
-  _transport.send(peerId, encode({ type: MessageType.SyncDigest, watermarks }));
+  console.log("[sync] sending digest to", peerId, watermarks);
+  await _transport.send(
+    peerId,
+    encode({ type: MessageType.SyncDigest, watermarks })
+  );
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -330,12 +359,16 @@ async function _handleDigest(
   if (!transportState.roomCode) return;
   const mine = await getWatermarksForRoom(transportState.roomCode);
 
-  // Push what they're missing — they'll do the same for us when they receive our digest
-  const theyAreMissingSenders = Object.keys(mine).filter(
+  console.log("[sync] my watermarks:", mine);
+  console.log("[sync] their watermarks:", theirWatermarks);
+
+  const theyAreMissing = Object.keys(mine).filter(
     (sid) => (theirWatermarks[sid] ?? -1) < mine[sid]
   );
 
-  if (theyAreMissingSenders.length > 0) {
+  console.log("[sync] they are missing senders:", theyAreMissing);
+
+  if (theyAreMissing.length > 0) {
     await _pushMissingTo(peerId, theirWatermarks);
   }
 }
@@ -346,11 +379,11 @@ async function _pushMissingTo(
 ): Promise<void> {
   if (!transportState.roomCode) return;
   const all = await getAllMessages(transportState.roomCode);
+  const missing = all.filter(
+    (m) => m.lamport > (theirWatermarks[m.senderId] ?? -1)
+  );
 
-  const missing = all
-    .filter((m) => m.lamport > (theirWatermarks[m.senderId] ?? -1))
-    .map(messageToWire);
-
+  console.log("[sync] pushing", missing.length, "messages to", peerId);
   if (!missing.length) return;
 
   const batches: WireChatMessage[][] = [];
@@ -703,11 +736,11 @@ _fileTransport.on("downloaded", (infoHash, blob) => {
 _transport.on("connect", (peerId) => {
   transportState.peers = _transport.peers();
   _fileTransport.onPeerConnect(peerId);
-  _broadcastProfile().catch(() => {});
+  _sendProfile(peerId);
   _sendRoomName(peerId);
   if (transportState.inCall) _sendCallPresence(peerId);
   if (transportState.inCall) _sendCallState(peerId);
-  _sendDigest(peerId).catch(() => {});
+  _sendDigest(peerId);
 });
 
 _transport.on("disconnect", (peerId) => {
@@ -782,12 +815,15 @@ _transport.on("message", (peerId, data) => {
         _handleRoomName(msg.name);
         break;
       case MessageType.SyncDigest:
+        console.log("[sync] received digest from", peerId, msg.watermarks);
         _handleDigest(peerId, msg.watermarks).catch(() => {});
         break;
       case MessageType.SyncBatch:
+        console.log("[sync] received batch from", peerId, msg.messages.length);
         _handleSyncBatch(msg.messages).catch(() => {});
         break;
       case MessageType.SyncComplete:
+        console.log("[sync] complete from", peerId);
         _handleSyncComplete(peerId);
         break;
       case MessageType.Text:
@@ -797,7 +833,9 @@ _transport.on("message", (peerId, data) => {
         _handleChatMessage(msg, peerId);
         break;
     }
-  } catch {}
+  } catch (e) {
+    console.warn("[app] message decode failed", e, data);
+  }
 });
 
 // ── Voice events ──────────────────────────────────────────────────────────────

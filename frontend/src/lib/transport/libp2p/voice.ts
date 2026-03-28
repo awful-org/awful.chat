@@ -1,5 +1,8 @@
 import type { Libp2p } from "libp2p";
+import type { Connection, Stream } from "@libp2p/interface";
+import type { StreamMessageEvent, StreamCloseEvent } from "@libp2p/interface";
 import type { VoiceTransport, VoiceEvents } from "../types";
+import type { AppServices, LibP2PTransport } from "./transport";
 
 const VOICE_PROTO = "/voice/1.0.0";
 
@@ -20,21 +23,12 @@ interface RemotePeer {
   audio: HTMLAudioElement;
   sourceNode: MediaStreamAudioSourceNode | null;
   gainNode: GainNode | null;
+  sigStream: Stream | null;
+  readBuf: Uint8Array;
 }
 
-/**
- * Voice over libp2p.
- *
- * Each peer pair gets one RTCPeerConnection managed independently.
- * Signaling (offer/answer/ICE) is exchanged over a persistent libp2p
- * protocol stream on /voice/1.0.0.
- *
- * Web Audio chain (input):  mic → source → gain → destination → pc.addTrack
- * Web Audio chain (output): remoteTrack → source → gain → ctx.destination
- *
- * The libp2p node is injected — this class does not own it.
- */
 export class LibP2PVoice implements VoiceTransport {
+  private node: Libp2p<AppServices> | null = null;
   private audioCtx: AudioContext | null = null;
   private micStream: MediaStream | null = null;
   private processedStream: MediaStream | null = null;
@@ -49,19 +43,24 @@ export class LibP2PVoice implements VoiceTransport {
 
   private remotePeers = new Map<string, RemotePeer>();
   private active = new Set<string>();
-  // Outbound signal queues — buffered while the stream is being dialed.
   private signalQueues = new Map<string, VoiceSignal[]>();
-  // Open write streams to remote peers.
-  private signalStreams = new Map<
-    string,
-    WritableStreamDefaultWriter<Uint8Array>
-  >();
-
   private handlers = new Map<keyof VoiceEvents, Set<Function>>();
 
-  constructor(private node: Libp2p) {}
+  // bound so we can remove them on leave()
+  private onTransportConnect: ((peerId: string) => void) | null = null;
+  private onTransportDisconnect: (peerId: string) => void | null = () => {};
+
+  constructor(private transport: LibP2PTransport) {}
 
   async join(_roomCode: string): Promise<void> {
+    this.node = this.transport.p2pNode;
+
+    if (!this.node) {
+      throw new Error(
+        "Transport not connected — call transport.connect() first"
+      );
+    }
+
     this.audioCtx = new AudioContext();
     if (this.audioCtx.state === "suspended") {
       await this.audioCtx.resume().catch(() => {});
@@ -70,47 +69,59 @@ export class LibP2PVoice implements VoiceTransport {
     try {
       await this.startMic(this.activeInputDevice ?? undefined);
     } catch {
-      // listen-only mode — no mic
+      // listen-only mode
     }
 
-    // Handle incoming /voice/1.0.0 streams (remote peer dialed us).
-    this.node.handle(VOICE_PROTO, async ({ stream, connection }: any) => {
-      const peerId = connection.remotePeer.toString();
-      this.ensureRemotePeer(peerId);
-      this.readSignals(peerId, stream);
-    });
-
-    // For each peer already connected — dial them and offer.
-    for (const peer of this.node.getPeers()) {
-      const peerId = peer.toString();
-      await this.dialAndOffer(peerId);
-    }
-
-    // When a new peer connects while we are in a call — dial and offer.
-    this.node.addEventListener("peer:connect", async (evt) => {
-      const peerId = evt.detail.toString();
-      if (this.remotePeers.has(peerId)) return;
-      if (this.audioCtx) await this.dialAndOffer(peerId);
-    });
-
-    // Peer disconnect cleanup.
-    this.node.addEventListener("peer:disconnect", (evt) => {
-      const peerId = evt.detail.toString();
-      if (this.remotePeers.has(peerId)) {
-        this.teardownRemotePeer(peerId);
-        this.emit("peerLeft", peerId);
+    await this.node.handle(
+      VOICE_PROTO,
+      (stream: Stream, connection: Connection) => {
+        const peerId = connection.remotePeer.toString();
+        const remote = this.ensureRemotePeer(peerId);
+        this.attachStream(peerId, remote, stream);
       }
-    });
+    );
+
+    // Use transport connect/disconnect — fires after peer:identify, safe to dialProtocol
+    this.onTransportConnect = (peerId: string) => {
+      if (this.transport.isRelay(peerId)) return;
+      if (this.remotePeers.has(peerId)) return;
+      // Only the lexicographically smaller peer ID initiates, preventing double-offer
+      if (peerId < this.transport.selfId()) {
+        this.dialAndOffer(peerId).catch(() => {});
+      }
+    };
+
+    this.onTransportDisconnect = (peerId: string) => {
+      if (!this.remotePeers.has(peerId)) return;
+      this.teardownRemotePeer(peerId);
+      this.emit("peerLeft", peerId);
+    };
+
+    this.transport.on("connect", this.onTransportConnect);
+    this.transport.on("disconnect", this.onTransportDisconnect);
+
+    // Dial any peers already connected when we join the call
+    for (const peerId of this.transport.peers()) {
+      if (this.transport.isRelay(peerId)) continue;
+      if (peerId < this.transport.selfId()) {
+        this.dialAndOffer(peerId).catch(() => {});
+      }
+    }
   }
 
   leave(): void {
+    if (this.onTransportConnect) {
+      this.transport.off("connect", this.onTransportConnect);
+      this.onTransportConnect = null;
+    }
+    this.transport.off("disconnect", this.onTransportDisconnect);
+
     for (const peerId of [...this.remotePeers.keys()]) {
       this.teardownRemotePeer(peerId);
       this.emit("peerLeft", peerId);
     }
 
-    this.node.unhandle(VOICE_PROTO);
-
+    this.node?.unhandle(VOICE_PROTO);
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.audioCtx?.close();
 
@@ -121,7 +132,7 @@ export class LibP2PVoice implements VoiceTransport {
     this.inputGain = null;
     this.active.clear();
     this.signalQueues.clear();
-    this.signalStreams.clear();
+    this.node = null;
   }
 
   mute(): void {
@@ -138,6 +149,10 @@ export class LibP2PVoice implements VoiceTransport {
     return this.muted;
   }
 
+  getMicStream(): MediaStream | null {
+    return this.micStream;
+  }
+
   async setInputDevice(deviceId: string): Promise<void> {
     if (!this.audioCtx) {
       this.activeInputDevice = deviceId;
@@ -146,7 +161,6 @@ export class LibP2PVoice implements VoiceTransport {
 
     await this.startMic(deviceId);
 
-    // Replace track on all active RTCPeerConnections.
     const newTrack = this.processedStream?.getAudioTracks()[0] ?? null;
     if (newTrack) {
       for (const remote of this.remotePeers.values()) {
@@ -265,28 +279,106 @@ export class LibP2PVoice implements VoiceTransport {
     this.applyMuteState();
   }
 
-  /**
-   * Dial a remote peer on /voice/1.0.0 and send them an offer.
-   * We are always initiator when we dial.
-   */
   private async dialAndOffer(peerId: string): Promise<void> {
+    if (!this.node || this.transport.isRelay(peerId)) return;
     const remote = this.ensureRemotePeer(peerId);
 
-    try {
-      const stream = await this.node.dialProtocol(
-        this.node.getPeers().find((p) => p.toString() === peerId)!,
-        VOICE_PROTO
-      );
-      this.readSignals(peerId, stream);
-      this.openWriteStream(peerId, stream);
-    } catch (err) {
-      console.warn(`[LibP2PVoice] dial ${peerId} failed:`, err);
-      return;
+    let stream: Stream | null = null;
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      try {
+        const pid = this.node.getPeers().find((p) => p.toString() === peerId);
+        if (!pid) throw new Error("peer not in peerstore");
+        stream = await this.node.dialProtocol(pid, VOICE_PROTO);
+        break;
+      } catch (err) {
+        if (attempt === 3) {
+          console.warn(`[LibP2PVoice] dial ${peerId} failed:`, err);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+      }
     }
+
+    if (!stream) return;
+
+    this.attachStream(peerId, remote, stream);
 
     const offer = await remote.pc.createOffer();
     await remote.pc.setLocalDescription(offer);
     this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! });
+  }
+
+  private attachStream(
+    peerId: string,
+    remote: RemotePeer,
+    stream: Stream
+  ): void {
+    remote.sigStream = stream;
+
+    stream.addEventListener("message", (evt: StreamMessageEvent) => {
+      const chunk: Uint8Array =
+        evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
+
+      const merged = new Uint8Array(
+        remote.readBuf.byteLength + chunk.byteLength
+      );
+      merged.set(remote.readBuf);
+      merged.set(chunk, remote.readBuf.byteLength);
+      remote.readBuf = merged;
+
+      while (remote.readBuf.byteLength >= 4) {
+        const len = new DataView(
+          remote.readBuf.buffer,
+          remote.readBuf.byteOffset
+        ).getUint32(0, false);
+        if (remote.readBuf.byteLength < 4 + len) break;
+        const payload = remote.readBuf.slice(4, 4 + len);
+        remote.readBuf = remote.readBuf.slice(4 + len);
+        try {
+          const signal = JSON.parse(
+            new TextDecoder().decode(payload)
+          ) as VoiceSignal;
+          this.handleSignal(peerId, signal).catch(() => {});
+        } catch {}
+      }
+    });
+
+    stream.addEventListener("close", (_evt: StreamCloseEvent) => {
+      if (remote.sigStream === stream) remote.sigStream = null;
+    });
+
+    const queued = this.signalQueues.get(peerId) ?? [];
+    this.signalQueues.delete(peerId);
+    for (const sig of queued) {
+      this.sendSignal(peerId, sig);
+    }
+  }
+
+  private sendSignal(peerId: string, signal: VoiceSignal): void {
+    const remote = this.remotePeers.get(peerId);
+    if (!remote?.sigStream) {
+      if (!this.signalQueues.has(peerId)) this.signalQueues.set(peerId, []);
+      this.signalQueues.get(peerId)!.push(signal);
+      return;
+    }
+
+    const payload = new TextEncoder().encode(JSON.stringify(signal));
+    const frame = new Uint8Array(4 + payload.byteLength);
+    new DataView(frame.buffer).setUint32(0, payload.byteLength, false);
+    frame.set(payload, 4);
+
+    try {
+      const ok = remote.sigStream.send(frame);
+      if (!ok) {
+        remote.sigStream.onDrain().catch(() => {
+          remote.sigStream?.abort(new Error("drain failed"));
+          remote.sigStream = null;
+        });
+      }
+    } catch (err) {
+      console.warn(`[LibP2PVoice] signal send failed for ${peerId}:`, err);
+      remote.sigStream = null;
+    }
   }
 
   private ensureRemotePeer(peerId: string): RemotePeer {
@@ -299,7 +391,6 @@ export class LibP2PVoice implements VoiceTransport {
       ],
     });
 
-    // Add our processed audio track if we have one.
     if (this.processedStream) {
       for (const track of this.processedStream.getAudioTracks()) {
         pc.addTrack(track, this.processedStream);
@@ -337,6 +428,8 @@ export class LibP2PVoice implements VoiceTransport {
       audio,
       sourceNode: null,
       gainNode: null,
+      sigStream: null,
+      readBuf: new Uint8Array(0),
     };
     this.remotePeers.set(peerId, remote);
     return remote;
@@ -360,7 +453,6 @@ export class LibP2PVoice implements VoiceTransport {
     sourceNode.connect(gainNode);
     gainNode.connect(this.audioCtx.destination);
 
-    // HTMLAudioElement needed only for setSinkId — Web Audio handles actual output.
     remote.audio.srcObject = stream;
     remote.audio.volume = 0;
     remote.audio.muted = true;
@@ -381,68 +473,14 @@ export class LibP2PVoice implements VoiceTransport {
     remote.gainNode?.disconnect();
     remote.audio.srcObject = null;
     remote.stream?.getTracks().forEach((t) => t.stop());
+    remote.sigStream?.abort(new Error("teardown"));
     remote.pc.close();
 
     this.remotePeers.delete(peerId);
     this.active.delete(peerId);
-    this.signalStreams
-      .get(peerId)
-      ?.close()
-      .catch(() => {});
-    this.signalStreams.delete(peerId);
     this.signalQueues.delete(peerId);
 
     this.emit("trackRemoved", peerId);
-  }
-
-  /**
-   * Read incoming signals from a /voice/1.0.0 stream.
-   * The stream is shared for both reading and writing when the remote dialed us
-   * (answerer path); when we dialed (initiator path) we read from our own outbound stream.
-   */
-  private async readSignals(peerId: string, stream: any): Promise<void> {
-    try {
-      for await (const chunk of stream.source) {
-        const raw =
-          typeof chunk === "string"
-            ? chunk
-            : new TextDecoder().decode(
-                chunk.subarray ? chunk.subarray() : chunk
-              );
-        const signal = JSON.parse(raw) as VoiceSignal;
-        await this.handleSignal(peerId, signal);
-      }
-    } catch {
-      // stream closed
-    }
-  }
-
-  private openWriteStream(peerId: string, stream: any): void {
-    // Wrap the libp2p stream sink in a writable we can push to later.
-    const writer = {
-      write: (data: Uint8Array) => stream.sink([data]),
-      close: () => stream.close(),
-    };
-    // Store a simple object that matches what sendSignal needs.
-    (this.signalStreams as any).set(peerId, writer);
-
-    // Flush queued signals.
-    const queue = this.signalQueues.get(peerId) ?? [];
-    this.signalQueues.delete(peerId);
-    for (const sig of queue) {
-      this.sendSignal(peerId, sig);
-    }
-  }
-
-  private sendSignal(peerId: string, signal: VoiceSignal): void {
-    const writer = (this.signalStreams as any).get(peerId);
-    if (!writer) {
-      if (!this.signalQueues.has(peerId)) this.signalQueues.set(peerId, []);
-      this.signalQueues.get(peerId)!.push(signal);
-      return;
-    }
-    const data = new TextEncoder().encode(JSON.stringify(signal));
-    writer.write(data).catch(() => {});
   }
 
   private async handleSignal(
