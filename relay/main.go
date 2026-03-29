@@ -226,7 +226,6 @@ func (r *registry) handleStream(s network.Stream) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	wsPort := flag.Int("ws-port", 9000, "libp2p WebSocket port")
 	flag.Parse()
 
 	os.MkdirAll("/app/data", os.ModePerm)
@@ -234,9 +233,16 @@ func main() {
 
 	connMgr, _ := connmgr.NewConnManager(256, 512)
 
+	// Get port from env or default to 8080
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		httpPort = "8080"
+	}
+
+	// libp2p WebSocket
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d/ws", *wsPort)),
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", httpPort)),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		libp2p.Muxer("/yamux/1.0.0", yamux.DefaultTransport),
@@ -255,8 +261,18 @@ func main() {
 	reg := newRegistry()
 	h.SetStreamHandler(RendezvousProtocol, reg.handleStream)
 
-	// HTTP server for OG and Klipy endpoints
-	go startHTTPServer()
+	// HTTP server for OG and Klipy endpoints (run on separate internal port)
+	apiPort := "8081"
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/og", handleOgPreview)
+		mux.HandleFunc("/klipy/search", handleKlipySearch)
+		mux.HandleFunc("/klipy/trending", handleKlipyTrending)
+		log.Printf("[http] Starting API server on port %s", apiPort)
+		if err := http.ListenAndServe(":"+apiPort, mux); err != nil {
+			log.Printf("[http] API server error: %v", err)
+		}
+	}()
 
 	// Clean up on libp2p disconnect (belt + suspenders with stream close)
 	h.Network().Notify(&network.NotifyBundle{
@@ -315,19 +331,31 @@ func printAddrs(h host.Host) {
 	}
 }
 
-func startHTTPServer() {
+func startHTTPServerWithHost(h host.Host, port string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/og", handleOgPreview)
 	mux.HandleFunc("/klipy/search", handleKlipySearch)
 	mux.HandleFunc("/klipy/trending", handleKlipyTrending)
 
-	port := os.Getenv("HTTP_PORT")
-	if port == "" {
-		port = "3000"
-	}
+	// Wrap with WebSocket upgrade handler for libp2p
+	handler := &wsUpgradeHandler{next: mux, host: h}
 
-	log.Printf("[http] Starting on port %s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("[http] Starting on port %s (HTTP + WebSocket)", port)
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		log.Printf("[http] Server error: %v", err)
 	}
+}
+
+type wsUpgradeHandler struct {
+	next http.Handler
+	host host.Host
+}
+
+func (h *wsUpgradeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a WebSocket upgrade request
+	if r.Header.Get("Upgrade") == "websocket" {
+		// Let libp2p handle it - the websocket transport should handle this
+		// For now, fall through to next handler
+	}
+	h.next.ServeHTTP(w, r)
 }

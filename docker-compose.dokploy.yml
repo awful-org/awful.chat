@@ -4,7 +4,8 @@ services:
       context: ./relay
     restart: unless-stopped
     expose:
-      - "9000"
+      - "8080"
+      - "8081"
     environment:
       - HTTP_PORT=8080
       - KLIPY_API_KEY=${KLIPY_API_KEY}
@@ -27,6 +28,17 @@ services:
       - traefik.http.routers.relay-https.service=relay-service
       - traefik.http.routers.relay-http.service=relay-service
       - traefik.http.middlewares.relay-redirect.redirectscheme.scheme=https
+      - traefik.http.routers.og.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/og`)
+      - traefik.http.routers.og.entrypoints=websecure
+      - traefik.http.routers.og.tls=true
+      - traefik.http.routers.og.tls.certresolver=letsencrypt
+      - traefik.http.routers.og.service=relay-api-service
+      - traefik.http.services.relay-api-service.loadbalancer.server.port=8081
+      - traefik.http.routers.klipy.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/klipy`)
+      - traefik.http.routers.klipy.entrypoints=websecure
+      - traefik.http.routers.klipy.tls=true
+      - traefik.http.routers.klipy.tls.certresolver=letsencrypt
+      - traefik.http.routers.klipy.service=relay-api-service
 
   sfu:
     build:
