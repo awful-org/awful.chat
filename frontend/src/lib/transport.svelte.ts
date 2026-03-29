@@ -36,6 +36,8 @@ import {
   getRoomParticipants,
   addRoomParticipant,
   removeRoomParticipant,
+  updateParticipantLastSeen,
+  cleanupInactiveParticipants,
 } from "./storage";
 import {
   MessageType,
@@ -75,6 +77,7 @@ export interface ParticipantState {
 
 interface TransportState {
   connected: boolean;
+  connecting: boolean;
   roomCode: string | null;
   roomName: string;
   peers: string[];
@@ -104,6 +107,7 @@ interface TransportState {
 
 export const transportState = $state<TransportState>({
   connected: false,
+  connecting: false,
   roomCode: null,
   roomName: "",
   peers: [],
@@ -539,16 +543,16 @@ function _handleJoinRoom(peerId: string): void {
 }
 
 function _handleLeaveRoom(peerId: string): void {
-	// Explicit leave - remove user from room list AND from peerId->DID mapping
-	if (!transportState.roomCode) return;
-	const currentUsers = new Set(transportState.roomUsers);
-	if (currentUsers.has(peerId)) {
-		currentUsers.delete(peerId);
-		transportState.roomUsers = [...currentUsers];
-		removeRoomParticipant(transportState.roomCode, peerId).catch(() => {});
-	}
-	// Clean up the peerId->DID mapping when user explicitly leaves
-	_peerIdToDid.delete(peerId);
+  // Explicit leave - remove user from room list AND from peerId->DID mapping
+  if (!transportState.roomCode) return;
+  const currentUsers = new Set(transportState.roomUsers);
+  if (currentUsers.has(peerId)) {
+    currentUsers.delete(peerId);
+    transportState.roomUsers = [...currentUsers];
+    removeRoomParticipant(transportState.roomCode, peerId).catch(() => {});
+  }
+  // Clean up the peerId->DID mapping when user explicitly leaves
+  _peerIdToDid.delete(peerId);
 }
 
 function _handleRoomUsersSync(participants: string[]): void {
@@ -562,9 +566,7 @@ function _handleRoomUsersSync(participants: string[]): void {
 function _broadcastJoinRoom(): void {
   const selfDid = identityStore.did ?? _transport.selfId();
   if (!selfDid || !transportState.roomCode) return;
-  _transport.broadcast(
-    encode({ type: MessageType.JoinRoom, peerId: selfDid })
-  );
+  _transport.broadcast(encode({ type: MessageType.JoinRoom, peerId: selfDid }));
 }
 
 function _broadcastLeaveRoom(): void {
@@ -572,15 +574,6 @@ function _broadcastLeaveRoom(): void {
   if (!selfDid || !transportState.roomCode) return;
   _transport.broadcast(
     encode({ type: MessageType.LeaveRoom, peerId: selfDid })
-  );
-}
-
-function _sendRoomUsersSync(peerId: string): void {
-  const selfDid = identityStore.did ?? _transport.selfId();
-  const participants = [...new Set([...transportState.roomUsers, selfDid])];
-  _transport.send(
-    peerId,
-    encode({ type: MessageType.RoomUsersSync, participants })
   );
 }
 
@@ -812,13 +805,13 @@ _transport.on("connect", (peerId) => {
 });
 
 _transport.on("disconnect", (peerId) => {
-		transportState.peers = _transport.peers();
-		_fileTransport.onPeerDisconnect(peerId);
+  transportState.peers = _transport.peers();
+  _fileTransport.onPeerDisconnect(peerId);
 
-		// Note: We intentionally do NOT delete the peerId->DID mapping here.
-		// The mapping is kept so we can still identify which DID a peerId
-		// belonged to for offline user tracking. The mapping is only removed
-		// when we receive an explicit LeaveRoom message.
+  // Note: We intentionally do NOT delete the peerId->DID mapping here.
+  // The mapping is kept so we can still identify which DID a peerId
+  // belonged to for offline user tracking. The mapping is only removed
+  // when we receive an explicit LeaveRoom message.
 
   const parts = new Map(transportState.participants);
   parts.delete(peerId);
@@ -859,6 +852,12 @@ _transport.on("message", (peerId, data) => {
         _fileTransport.handleSignal(peerId, decoded.payload);
       }
       return;
+    }
+
+    // Update last seen for this peer
+    const did = _peerIdToDid.get(peerId);
+    if (did && transportState.roomCode) {
+      updateParticipantLastSeen(transportState.roomCode, did).catch(() => {});
     }
 
     const msg = decoded as AnyWireMessage;
@@ -1058,18 +1057,27 @@ _video.on("error", (err) => {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function joinRoom(roomCode: string): Promise<void> {
-	transportState.error = null;
-	try {
-		await _loadHistory(roomCode);
-		await _hydrateFileTransfersFromStorage(roomCode);
-		await _transport.connect(roomCode);
+  transportState.error = null;
+  transportState.connecting = true;
+  try {
+    await _loadHistory(roomCode);
+    await _hydrateFileTransfersFromStorage(roomCode);
+    await _transport.connect(roomCode);
     transportState.connected = true;
+    transportState.connecting = false;
     transportState.roomCode = roomCode;
     transportState.roomName = "";
     transportState.peers = _transport.peers();
     const selfDid = identityStore.did ?? _transport.selfId();
     const savedParticipants = await getRoomParticipants(roomCode);
-    const participants = new Set(savedParticipants);
+    // Clean up inactive participants (not seen in 7 days)
+    const removedInactive = await cleanupInactiveParticipants(roomCode);
+    if (removedInactive.length > 0) {
+      console.log("[room] removed inactive participants:", removedInactive);
+    }
+    const participants = new Set(
+      savedParticipants.filter((p) => !removedInactive.includes(p))
+    );
     participants.add(selfDid);
     transportState.roomUsers = [...participants];
     await addRoomParticipant(roomCode, selfDid);
@@ -1078,50 +1086,51 @@ export async function joinRoom(roomCode: string): Promise<void> {
     _broadcastJoinRoom();
   } catch (err) {
     transportState.error = err instanceof Error ? err.message : String(err);
+    transportState.connecting = false;
     throw err;
   }
 }
 
 export function leaveRoom(): void {
-	_broadcastLeaveRoomAndDisconnect();
+  _broadcastLeaveRoomAndDisconnect();
 }
 
 export function switchRoom(): void {
-	_disconnectWithoutBroadcasting();
+  _disconnectWithoutBroadcasting();
 }
 
 function _broadcastLeaveRoomAndDisconnect(): void {
-	const roomCode = transportState.roomCode;
-	const selfDid = identityStore.did ?? _transport.selfId();
-	if (roomCode && selfDid) {
-		_broadcastLeaveRoom();
-	}
-	_disconnectWithoutBroadcasting();
+  const roomCode = transportState.roomCode;
+  const selfDid = identityStore.did ?? _transport.selfId();
+  if (roomCode && selfDid) {
+    _broadcastLeaveRoom();
+  }
+  _disconnectWithoutBroadcasting();
 }
 
 function _disconnectWithoutBroadcasting(): void {
-	for (const transfer of transportState.fileTransfers.values()) {
-		if (transfer.blobURL) URL.revokeObjectURL(transfer.blobURL);
-	}
-	leaveCall();
-	_transport.disconnect();
-	_peerIdToDid.clear();
-	transportState.connected = false;
-	transportState.roomCode = null;
-	transportState.roomName = "";
-	transportState.peers = [];
-	transportState.messages = [];
-	transportState.participants = new Map();
-	transportState.peerNames = new Map();
-	transportState.peerAvatars = new Map();
-	transportState.error = null;
-	transportState.callPeerIds = new Set();
-	transportState.sfuPeerIds = new Set();
-	transportState.pendingTransmissions = new Map();
-	transportState.watchingTransmissionPeerId = null;
-	transportState.watchingTransmissionProducerId = null;
-	transportState.fileTransfers = new Map();
-	transportState.callPeerStates = new Map();
+  for (const transfer of transportState.fileTransfers.values()) {
+    if (transfer.blobURL) URL.revokeObjectURL(transfer.blobURL);
+  }
+  leaveCall();
+  _transport.disconnect();
+  _peerIdToDid.clear();
+  transportState.connected = false;
+  transportState.roomCode = null;
+  transportState.roomName = "";
+  transportState.peers = [];
+  transportState.messages = [];
+  transportState.participants = new Map();
+  transportState.peerNames = new Map();
+  transportState.peerAvatars = new Map();
+  transportState.error = null;
+  transportState.callPeerIds = new Set();
+  transportState.sfuPeerIds = new Set();
+  transportState.pendingTransmissions = new Map();
+  transportState.watchingTransmissionPeerId = null;
+  transportState.watchingTransmissionProducerId = null;
+  transportState.fileTransfers = new Map();
+  transportState.callPeerStates = new Map();
 }
 
 interface SendMessageOptions {

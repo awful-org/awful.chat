@@ -591,6 +591,9 @@
               ? `${tile.label} (You)`
               : tile.label}
         </span>
+        {#if !tile.isLocal && tile.kind === "camera" && isRelayed(tile.peerId)}
+          <Workflow class="size-3 text-blue-400 ml-1" />
+        {/if}
       </div>
     {/if}
   </button>
@@ -620,7 +623,9 @@
               {label.charAt(0).toUpperCase()}
             {/if}
             {#if relayed}
-              <div class="absolute -top-1 -right-1 bg-blue-500 rounded-full p-0.5">
+              <div
+                class="absolute -top-1 -right-1 bg-blue-500 rounded-full p-0.5"
+              >
                 <Workflow class="size-3 text-white" />
               </div>
             {/if}

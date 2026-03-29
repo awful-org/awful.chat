@@ -73,8 +73,16 @@
     autoScroll = true;
   });
 
-  let { peers, messages, inCall, peerNames, peerAvatars, fileTransfers } =
-    $derived(transportState);
+  let {
+    peers,
+    messages,
+    inCall,
+    peerNames,
+    peerAvatars,
+    fileTransfers,
+    connecting,
+  } = $derived(transportState);
+  let showUserList = $state(false);
 
   let draft = $state("");
   let replyTargetId = $state<string | null>(null);
@@ -736,6 +744,17 @@
         <Button
           variant="ghost"
           size="icon"
+          onclick={() => (showUserList = !showUserList)}
+          aria-label="Toggle user list"
+          class="hidden sm:flex text-muted-foreground hover:text-foreground cursor-pointer {showUserList
+            ? 'text-primary'
+            : ''}"
+        >
+          <Users class="size-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
           onclick={onLeave}
           aria-label="Leave room"
           class="text-destructive hover:text-destructive/80 cursor-pointer"
@@ -748,224 +767,242 @@
 
   <VoiceVideoCallView />
 
+  {#if connecting}
+    <div
+      class="absolute inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center"
+    >
+      <div class="flex flex-col items-center gap-3">
+        <div
+          class="w-8 h-8 border-2 border-primary/30 border-t-primary rounded-full animate-spin"
+        ></div>
+        <p class="text-sm text-muted-foreground">Connecting...</p>
+      </div>
+    </div>
+  {/if}
+
   <div class="flex flex-1 min-h-0 overflow-hidden">
     <div
       bind:this={messagesEl}
       onscroll={handleScroll}
       class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
     >
-    {#if hasMoreHistory && visibleMessages.length >= 50}
-      <div class="flex justify-center py-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={handleLoadMore}
-          disabled={loadingMore}
-          class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
-        >
-          <ChevronUp class="size-3.5" />
-          {loadingMore ? "Loading..." : "Load older messages"}
-        </Button>
-      </div>
-    {/if}
+      {#if hasMoreHistory && visibleMessages.length >= 50}
+        <div class="flex justify-center py-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={handleLoadMore}
+            disabled={loadingMore}
+            class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
+          >
+            <ChevronUp class="size-3.5" />
+            {loadingMore ? "Loading..." : "Load older messages"}
+          </Button>
+        </div>
+      {/if}
 
-    {#if visibleMessages.length === 0}
-      <div class="flex h-full items-center justify-center py-20">
-        <p class="text-sm text-muted-foreground italic">
-          No messages yet. Say something!
-        </p>
-      </div>
-    {:else}
-      <div class="space-y-0.5">
-        {#each visibleMessages as msg, i (msg.id)}
-          {@const prev = visibleMessages[i - 1]}
-          {@const showDate = shouldShowDateSep(msg.timestamp, prev?.timestamp)}
-          {@const showHeader = shouldShowHeader(msg, prev)}
-          {@const isOwn = msg.senderId === selfId()}
-          <div>
-            {#if showDate}
-              <div class="flex items-center gap-3 py-3">
-                <Separator class="flex-1 bg-border" />
-                <span class="text-xs text-muted-foreground"
-                  >{formatDate(msg.timestamp)}</span
-                >
-                <Separator class="flex-1 bg-border" />
-              </div>
-            {/if}
-            <div
-              id={`msg-${msg.id}`}
-              class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
-                ? 'mt-3 pt-1'
-                : ''}"
-              role="button"
-              tabindex={isMobile ? 0 : -1}
-              onclick={() => isMobile && handleMessageClick(msg.id)}
-              onkeydown={isMobile
-                ? (e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      handleMessageClick(msg.id);
-                    }
-                  }
-                : undefined}
-              ontouchstart={isMobile
-                ? (e) => handleTouchStart(msg.id, e)
-                : undefined}
-              ontouchmove={isMobile
-                ? (e) => handleTouchMove(msg.id, e)
-                : undefined}
-              ontouchend={isMobile
-                ? (e) => handleTouchEnd(msg.id, e)
-                : undefined}
-              style={isMobile && swipeMessageId === msg.id
-                ? `transform: translateX(${Math.min(0, swipeCurrentX - swipeStartX)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}`
-                : ""}
-            >
-              {#if msg.replyTo}
-                <button
-                  type="button"
-                  class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
-                  onclick={() => jumpToMessage(msg.replyTo!.id)}
-                >
-                  <Reply
-                    size="16"
-                    class="text-muted-foreground -ml-5 transform -scale-x-100"
-                  />
-                  <span class="font-semibold">{msg.replyTo.senderName}</span>
-                  <span class="truncate">{msg.replyTo.content}</span>
-                </button>
-              {/if}
-
-              {#if showHeader}
-                <div class="flex items-start gap-2">
-                  <div
-                    class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold
-                      {isOwn
-                      ? 'bg-primary/20 text-primary'
-                      : 'bg-secondary text-secondary-foreground'}"
+      {#if visibleMessages.length === 0}
+        <div class="flex h-full items-center justify-center py-20">
+          <p class="text-sm text-muted-foreground italic">
+            No messages yet. Say something!
+          </p>
+        </div>
+      {:else}
+        <div class="space-y-0.5">
+          {#each visibleMessages as msg, i (msg.id)}
+            {@const prev = visibleMessages[i - 1]}
+            {@const showDate = shouldShowDateSep(
+              msg.timestamp,
+              prev?.timestamp
+            )}
+            {@const showHeader = shouldShowHeader(msg, prev)}
+            {@const isOwn = msg.senderId === selfId()}
+            <div>
+              {#if showDate}
+                <div class="flex items-center gap-3 py-3">
+                  <Separator class="flex-1 bg-border" />
+                  <span class="text-xs text-muted-foreground"
+                    >{formatDate(msg.timestamp)}</span
                   >
-                    {#if isOwn && profileStore.avatarUrl}
-                      <img
-                        src={profileStore.avatarUrl}
-                        alt="You"
-                        class="size-full object-cover"
-                      />
-                    {:else if !isOwn && peerAvatars.get(msg.senderId)}
-                      <img
-                        src={peerAvatars.get(msg.senderId)}
-                        alt={displayName(msg)}
-                        class="size-full object-cover"
-                      />
-                    {:else}
-                      {initials(msg)}
-                    {/if}
-                  </div>
-                  <div class="flex items-baseline gap-2">
-                    <span
-                      class="text-sm font-medium {isOwn
-                        ? 'text-primary'
-                        : 'text-foreground'}"
-                    >
-                      {isOwn
-                        ? profileStore.nickname || "You"
-                        : displayName(msg)}
-                    </span>
-                    <span class="text-xs text-muted-foreground"
-                      >{formatTime(msg.timestamp)}</span
-                    >
-                  </div>
+                  <Separator class="flex-1 bg-border" />
                 </div>
               {/if}
-
-              <MsgRender
-                {msg}
-                {isOwn}
-                {fileTransfers}
-                onRequestFileDownload={requestFileDownload}
-              />
-
-              {#if reactionsByMessage.get(msg.id)?.size}
-                <div class="ml-9 mt-1 flex items-center gap-1">
-                  {#each [...(reactionsByMessage
-                      .get(msg.id)
-                      ?.entries() ?? [])] as [emoji, users] (emoji)}
-                    {#if users.size > 0}
-                      {@const reacted = users.has(selfId())}
-                      <button
-                        type="button"
-                        class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
-                          ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
-                          : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
-                        onclick={(e) => {
-                          e.stopPropagation();
-                          toggleReaction?.(msg.id, emoji);
-                          activeMessageId = null;
-                        }}
-                      >
-                        <span>{emoji}</span>
-                        <span>{users.size}</span>
-                      </button>
-                    {/if}
-                  {/each}
-                </div>
-              {/if}
-
-              {#if isMobile && swipeMessageId === msg.id}
-                {@const progress = Math.min(
-                  1,
-                  Math.abs((swipeCurrentX - swipeStartX) / SWIPE_THRESHOLD)
-                )}
-                <div
-                  class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
-                  style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
-                >
-                  <Reply class="size-5" />
-                </div>
-              {/if}
-
               <div
-                class="absolute right-0 sm:right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 {activeMessageId ===
-                msg.id
-                  ? 'opacity-100'
-                  : ''} transition-opacity flex items-center gap-1 pr-1"
-              >
-                <button
-                  type="button"
-                  class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
-                  title="React"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    if (reactionPickerFor === msg.id) {
-                      reactionPickerFor = null;
-                    } else {
-                      openReactionPicker(msg.id, e as MouseEvent);
+                id={`msg-${msg.id}`}
+                class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
+                  ? 'mt-3 pt-1'
+                  : ''}"
+                role="button"
+                tabindex={isMobile ? 0 : -1}
+                onclick={() => isMobile && handleMessageClick(msg.id)}
+                onkeydown={isMobile
+                  ? (e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        handleMessageClick(msg.id);
+                      }
                     }
-                    activeMessageId = null;
-                  }}
+                  : undefined}
+                ontouchstart={isMobile
+                  ? (e) => handleTouchStart(msg.id, e)
+                  : undefined}
+                ontouchmove={isMobile
+                  ? (e) => handleTouchMove(msg.id, e)
+                  : undefined}
+                ontouchend={isMobile
+                  ? (e) => handleTouchEnd(msg.id, e)
+                  : undefined}
+                style={isMobile && swipeMessageId === msg.id
+                  ? `transform: translateX(${Math.min(0, swipeCurrentX - swipeStartX)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}`
+                  : ""}
+              >
+                {#if msg.replyTo}
+                  <button
+                    type="button"
+                    class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
+                    onclick={() => jumpToMessage(msg.replyTo!.id)}
+                  >
+                    <Reply
+                      size="16"
+                      class="text-muted-foreground -ml-5 transform -scale-x-100"
+                    />
+                    <span class="font-semibold">{msg.replyTo.senderName}</span>
+                    <span class="truncate">{msg.replyTo.content}</span>
+                  </button>
+                {/if}
+
+                {#if showHeader}
+                  <div class="flex items-start gap-2">
+                    <div
+                      class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold
+                      {isOwn
+                        ? 'bg-primary/20 text-primary'
+                        : 'bg-secondary text-secondary-foreground'}"
+                    >
+                      {#if isOwn && profileStore.avatarUrl}
+                        <img
+                          src={profileStore.avatarUrl}
+                          alt="You"
+                          class="size-full object-cover"
+                        />
+                      {:else if !isOwn && peerAvatars.get(msg.senderId)}
+                        <img
+                          src={peerAvatars.get(msg.senderId)}
+                          alt={displayName(msg)}
+                          class="size-full object-cover"
+                        />
+                      {:else}
+                        {initials(msg)}
+                      {/if}
+                    </div>
+                    <div class="flex items-baseline gap-2">
+                      <span
+                        class="text-sm font-medium {isOwn
+                          ? 'text-primary'
+                          : 'text-foreground'}"
+                      >
+                        {isOwn
+                          ? profileStore.nickname || "You"
+                          : displayName(msg)}
+                      </span>
+                      <span class="text-xs text-muted-foreground"
+                        >{formatTime(msg.timestamp)}</span
+                      >
+                    </div>
+                  </div>
+                {/if}
+
+                <MsgRender
+                  {msg}
+                  {isOwn}
+                  {fileTransfers}
+                  onRequestFileDownload={requestFileDownload}
+                />
+
+                {#if reactionsByMessage.get(msg.id)?.size}
+                  <div class="ml-9 mt-1 flex items-center gap-1">
+                    {#each [...(reactionsByMessage
+                        .get(msg.id)
+                        ?.entries() ?? [])] as [emoji, users] (emoji)}
+                      {#if users.size > 0}
+                        {@const reacted = users.has(selfId())}
+                        <button
+                          type="button"
+                          class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
+                            ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
+                            : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
+                          onclick={(e) => {
+                            e.stopPropagation();
+                            toggleReaction?.(msg.id, emoji);
+                            activeMessageId = null;
+                          }}
+                        >
+                          <span>{emoji}</span>
+                          <span>{users.size}</span>
+                        </button>
+                      {/if}
+                    {/each}
+                  </div>
+                {/if}
+
+                {#if isMobile && swipeMessageId === msg.id}
+                  {@const progress = Math.min(
+                    1,
+                    Math.abs((swipeCurrentX - swipeStartX) / SWIPE_THRESHOLD)
+                  )}
+                  <div
+                    class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
+                    style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
+                  >
+                    <Reply class="size-5" />
+                  </div>
+                {/if}
+
+                <div
+                  class="absolute right-0 sm:right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 {activeMessageId ===
+                  msg.id
+                    ? 'opacity-100'
+                    : ''} transition-opacity flex items-center gap-1 pr-1"
                 >
-                  <Smile class="size-3.5" />
-                </button>
-                <button
-                  type="button"
-                  class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
-                  title="Reply"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    startReply(msg);
-                    activeMessageId = null;
-                  }}
-                >
-                  <Reply class="size-3.5" />
-                </button>
+                  <button
+                    type="button"
+                    class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                    title="React"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      if (reactionPickerFor === msg.id) {
+                        reactionPickerFor = null;
+                      } else {
+                        openReactionPicker(msg.id, e as MouseEvent);
+                      }
+                      activeMessageId = null;
+                    }}
+                  >
+                    <Smile class="size-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                    title="Reply"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      startReply(msg);
+                      activeMessageId = null;
+                    }}
+                  >
+                    <Reply class="size-3.5" />
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
-        {/each}
-      </div>
-    {/if}
+          {/each}
+        </div>
+      {/if}
     </div>
 
-    <UserListSidebar />
+    {#if showUserList}
+      <UserListSidebar />
+    {/if}
   </div>
 
   {#if !autoScroll && visibleMessages.length > 0}
