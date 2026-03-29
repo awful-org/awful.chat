@@ -1,0 +1,19 @@
+FROM golang:1.26.1-alpine
+
+WORKDIR /app
+
+# Install air for hot reload
+RUN go install github.com/air-verse/air@latest
+
+# Copy go mod files first for better caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the rest
+COPY . .
+
+# Expose both ports (HTTP and WebSocket)
+EXPOSE 3000 9000
+
+# Run with air (hot reload)
+CMD ["air"]

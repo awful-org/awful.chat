@@ -4,7 +4,12 @@ services:
       context: ./relay
     restart: unless-stopped
     expose:
-      - "9000"
+      - "3000"
+    environment:
+      - HTTP_PORT=3000
+      - KLIPY_API_KEY=${KLIPY_API_KEY}
+      - NODE_ENV=production
+      - DOMAIN=${DOMAIN}
     volumes:
       - relay_data:/app/data
     networks:
@@ -18,10 +23,28 @@ services:
       - traefik.http.routers.relay-https.entrypoints=websecure
       - traefik.http.routers.relay-https.tls=true
       - traefik.http.routers.relay-https.tls.certresolver=letsencrypt
-      - traefik.http.services.relay-service.loadbalancer.server.port=9000
+      - traefik.http.services.relay-service.loadbalancer.server.port=3000
       - traefik.http.routers.relay-https.service=relay-service
       - traefik.http.routers.relay-http.service=relay-service
-      - traefik.http.routers.relay-http.service=relay-service
+      - traefik.http.middlewares.relay-redirect.redirectscheme.scheme=https
+
+  sfu:
+    build:
+      context: ./sfu
+    restart: unless-stopped
+    expose:
+      - "3000"
+    ports:
+      - ${PORTS_UDP:-40000-40499:40000-40499/udp}
+      - ${PORTS_TCP:-40000-40499:40000-40499/tcp}
+    environment:
+      NODE_ENV: production
+      SFU_PORT: "3000"
+      ANNOUNCED_IP: ${ANNOUNCED_IP:?ANNOUNCED_IP must be set to the server public IP}
+      RTC_MIN_PORT: ${RTC_MIN:-40000}
+      RTC_MAX_PORT: ${RTC_MAX:-40499}
+    networks:
+      - dokploy-network
 
   frontend:
     build:

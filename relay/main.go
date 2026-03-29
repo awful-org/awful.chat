@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -254,6 +255,9 @@ func main() {
 	reg := newRegistry()
 	h.SetStreamHandler(RendezvousProtocol, reg.handleStream)
 
+	// HTTP server for OG and Klipy endpoints
+	go startHTTPServer()
+
 	// Clean up on libp2p disconnect (belt + suspenders with stream close)
 	h.Network().Notify(&network.NotifyBundle{
 		ConnectedF: func(_ network.Network, c network.Conn) {
@@ -307,7 +311,23 @@ func loadOrGenKey(path string) crypto.PrivKey {
 func printAddrs(h host.Host) {
 	log.Printf("PeerID: %s", h.ID())
 	for _, ma := range h.Addrs() {
-		log.Printf("  %s/p2p/%s", ma, h.ID())
+		log.Printf(" %s/p2p/%s", ma, h.ID())
 	}
 }
 
+func startHTTPServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/og", handleOgPreview)
+	mux.HandleFunc("/klipy/search", handleKlipySearch)
+	mux.HandleFunc("/klipy/trending", handleKlipyTrending)
+
+	port := os.Getenv("HTTP_PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	log.Printf("[http] Starting on port %s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Printf("[http] Server error: %v", err)
+	}
+}
