@@ -10,6 +10,7 @@ export class DtlnProcessor {
   private readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private initializing = false;
+  private transportDest: AudioNode | null = null;
 
   constructor() {
     this.readyPromise = new Promise((r) => (this.resolveReady = r));
@@ -58,8 +59,8 @@ export class DtlnProcessor {
     this.resolveReady();
   }
 
-  private handleWorkletMessage(event: MessageEvent): void {
-    console.log("Message from DTLN worklet:", event.data);
+  private handleWorkletMessage(_: MessageEvent): void {
+    //console.log("Message from DTLN worklet:", event.data);
   }
 
   waitUntilReady(): Promise<void> {
@@ -96,7 +97,7 @@ export class DtlnProcessor {
     if (ctx.state === "suspended") {
       await ctx.resume();
     }
-    this.setGain(1.0);
+
     const source = ctx.createMediaStreamSource(micStream);
     const gain = ctx.createGain();
     const dest = ctx.createMediaStreamDestination();
@@ -104,29 +105,46 @@ export class DtlnProcessor {
     source.connect(gain);
     gain.connect(this.node);
     this.node.connect(dest);
-
+    this.transportDest = dest;
     return dest.stream;
   }
 
+  disconnectFromTransport() {
+    if (this.transportDest) {
+      try {
+        this.node.disconnect(this.transportDest);
+      } catch {}
+    }
+  }
+
+  reconnectToTransport() {
+    if (this.transportDest) {
+      try {
+        this.node.connect(this.transportDest);
+      } catch {}
+    }
+  }
+
   // for mic test - connect to speakers directly so user can hear themselves
-  async monitorStream(micStream: MediaStream): Promise<() => void> {
+  async monitorStream(
+    micStream: MediaStream
+  ): Promise<{ processedStream: MediaStream; cleanup: () => void }> {
     await this.waitUntilReady();
     const ctx = this.ctx;
-    if (ctx.state === "suspended") {
-      await ctx.resume();
-    }
-    this.setGain(1.0);
+    if (ctx.state === "suspended") await ctx.resume();
     const source = ctx.createMediaStreamSource(micStream);
     const gain = ctx.createGain();
-
+    const dest = ctx.createMediaStreamDestination();
     source.connect(gain);
     gain.connect(this.node);
-    this.node.connect(ctx.destination);
-
-    return () => {
-      source.disconnect();
-      gain.disconnect();
-      this.node.disconnect(ctx.destination);
+    this.node.connect(dest);
+    return {
+      processedStream: dest.stream,
+      cleanup: () => {
+        source.disconnect();
+        gain.disconnect();
+        this.node.disconnect(dest);
+      },
     };
   }
 }

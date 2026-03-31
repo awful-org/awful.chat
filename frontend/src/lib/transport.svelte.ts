@@ -139,6 +139,7 @@ export const transportState = $state<TransportState>({
 let _lamport = 0;
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
+let _mutedBeforeDeafen = false;
 
 const BATCH_SIZE = 20;
 const MAX_PERSISTED_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -1619,17 +1620,31 @@ export function getTransmissionOutputVolume(): number {
 
 export function setDeafened(deafened: boolean): void {
   if (deafened) {
+    // Save current states before deafening
     _voiceOutputBeforeDeafen = _voice.getOutputVolume();
     _videoOutputBeforeDeafen = transportState.transmissionOutputVolume;
+    _mutedBeforeDeafen = transportState.muted;
+    // Deafen (mute output)
     _voice.setOutputVolume(0);
     transportState.transmissionOutputVolume = 0;
     _applyTransmissionVolume(0);
+    // Also mute input if not already muted
+    if (!_voice.isMuted()) {
+      _voice.mute();
+      transportState.muted = true;
+    }
     transportState.deafened = true;
     playDeafenSound();
   } else {
+    // Undeafen (restore output)
     _voice.setOutputVolume(_voiceOutputBeforeDeafen);
     transportState.transmissionOutputVolume = _videoOutputBeforeDeafen;
     _applyTransmissionVolume(_videoOutputBeforeDeafen);
+    // Restore mute state: unmute only if we weren't muted before deafening
+    if (!_mutedBeforeDeafen && _voice.isMuted()) {
+      _voice.unmute();
+      transportState.muted = false;
+    }
     transportState.deafened = false;
     playUndeafenSound();
   }

@@ -582,7 +582,7 @@
           <MicOff class="size-3 text-red-400" />
         {/if}
         {#if tile.kind === "camera" && tile.deafened}
-          <HeadphoneOff class="size-3 text-amber-300" />
+          <HeadphoneOff class="size-3 text-red-400" />
         {/if}
         <span class="text-xs mt-0.75 leading-none text-white font-mono">
           {tile.kind === "transmission"

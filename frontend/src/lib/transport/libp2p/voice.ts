@@ -201,6 +201,9 @@ export class LibP2PVoice implements VoiceTransport {
         this.audioCtx!.currentTime + 0.05
       );
     }
+    if (this.dtlnEnabled && this.dtln) {
+      this.dtln.setGain(clamped);
+    }
   }
 
   getInputGain(): number {
@@ -561,8 +564,9 @@ export class LibP2PVoice implements VoiceTransport {
   }
 
   private applyMuteState(): void {
-    if (this.inputGain && this.audioCtx) {
-      this.inputGain.gain.value = this.muted ? 0 : this.currentInputGain;
+    if (!this.micStream) return;
+    for (const track of this.micStream.getAudioTracks()) {
+      track.enabled = !this.muted;
     }
   }
 

@@ -22,10 +22,12 @@
 
   type Tab = "upload" | "klipy" | "url";
   let activeTab = $state<Tab>("klipy");
-  let preview = $state<string | undefined>(profileStore.avatarUrl);
+  let preview = $state<string | undefined>(undefined);
 
   $effect(() => {
-    preview = profileStore.avatarUrl;
+    if (open) {
+      preview = profileStore.avatarUrl;
+    }
   });
 
   let urlInput = $state("");
