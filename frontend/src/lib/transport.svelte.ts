@@ -62,6 +62,7 @@ import type {
 } from "./transport/types";
 import { LibP2PTransport } from "./transport/libp2p/transport";
 import { LibP2PVoice } from "./transport/libp2p/voice";
+import { DtlnProcessor } from "./audio/dtln-processor";
 
 export type { Message };
 
@@ -144,10 +145,14 @@ const MAX_PERSISTED_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 const _peerIdToDid = new Map<string, string>();
 const _seededByFingerprint = new Map<string, FileDescriptor>();
 
-const _transport = new LibP2PTransport();
-const _voice = new LibP2PVoice(_transport);
-const _video = new MediasoupVideo();
-const _fileTransport = new WebTorrentFileTransport(() => _transport.selfId());
+export const _dtln = new DtlnProcessor();
+_dtln.init().catch(console.error);
+export const _transport = new LibP2PTransport();
+export const _voice = new LibP2PVoice(_transport, _dtln);
+export const _video = new MediasoupVideo();
+export const _fileTransport = new WebTorrentFileTransport(() =>
+  _transport.selfId()
+);
 
 function lamportSend(): number {
   _lamport += 1;
@@ -313,7 +318,6 @@ async function _broadcastProfile(): Promise<void> {
 async function _sendDigest(peerId: string): Promise<void> {
   if (!transportState.roomCode) return;
   const watermarks = await getWatermarksForRoom(transportState.roomCode);
-  console.log("[sync] sending digest to", peerId, watermarks);
   await _transport.send(
     peerId,
     encode({ type: MessageType.SyncDigest, watermarks })
@@ -368,14 +372,9 @@ async function _handleDigest(
   if (!transportState.roomCode) return;
   const mine = await getWatermarksForRoom(transportState.roomCode);
 
-  console.log("[sync] my watermarks:", mine);
-  console.log("[sync] their watermarks:", theirWatermarks);
-
   const theyAreMissing = Object.keys(mine).filter(
     (sid) => (theirWatermarks[sid] ?? -1) < mine[sid]
   );
-
-  console.log("[sync] they are missing senders:", theyAreMissing);
 
   if (theyAreMissing.length > 0) {
     await _pushMissingTo(peerId, theirWatermarks);
@@ -392,7 +391,6 @@ async function _pushMissingTo(
     (m) => m.lamport > (theirWatermarks[m.senderId] ?? -1)
   );
 
-  console.log("[sync] pushing", missing.length, "messages to", peerId);
   if (!missing.length) return;
 
   const batches: WireChatMessage[][] = [];
@@ -885,15 +883,12 @@ _transport.on("message", (peerId, data) => {
         _handleRoomUsersSync(msg.participants);
         break;
       case MessageType.SyncDigest:
-        console.log("[sync] received digest from", peerId, msg.watermarks);
         _handleDigest(peerId, msg.watermarks).catch(() => {});
         break;
       case MessageType.SyncBatch:
-        console.log("[sync] received batch from", peerId, msg.messages.length);
         _handleSyncBatch(msg.messages).catch(() => {});
         break;
       case MessageType.SyncComplete:
-        console.log("[sync] complete from", peerId);
         _handleSyncComplete(peerId);
         break;
       case MessageType.Text:
@@ -1589,6 +1584,18 @@ export function setVoiceOutputVolume(volume: number): void {
 
 export function getVoiceOutputVolume(): number {
   return _voice.getOutputVolume();
+}
+
+export function setVoiceDtlnNoiseGate(threshold: number): void {
+  _dtln.setNoiseGate(threshold);
+}
+
+export function setVoiceDtlnEnabled(enabled: boolean): void {
+  _voice.setDtlnEnabled(enabled);
+}
+
+export function getVoiceDtlnEnabled(): boolean {
+  return _voice.isDtlnEnabled();
 }
 
 export function setTransmissionOutputVolume(volume: number): void {

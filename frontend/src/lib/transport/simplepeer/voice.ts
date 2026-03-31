@@ -1,5 +1,4 @@
 import type { PeerTransport, VoiceTransport, VoiceEvents } from "../types";
-import type { SimplePeerExtension } from "./types";
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
@@ -12,6 +11,18 @@ interface RemotePeer {
   audio: HTMLAudioElement;
   sourceNode: MediaStreamAudioSourceNode;
   gainNode: GainNode;
+}
+
+export interface SimplePeerExtension {
+  addStream(peerId: string, stream: MediaStream): void;
+  removeStream(peerId: string, stream: MediaStream): void;
+  onStream(handler: (peerId: string, stream: MediaStream) => void): void;
+  /**
+   * Called by VoiceTransport to register a stream that should be included
+   * when a NEW peer connection is created (i.e. when peer-joined fires while
+   * already in a call). Avoids mid-connection renegotiation via addStream.
+   */
+  setInitialStreams(streams: MediaStream[]): void;
 }
 
 /**
@@ -252,6 +263,14 @@ export class SimplePeerVoice implements VoiceTransport {
 
   getOutputVolume(): number {
     return this.currentOutputVolume;
+  }
+
+  setDtlnEnabled(_enabled: boolean): void {
+    // Not implemented - SimplePeer uses browser's built-in noise suppression
+  }
+
+  isDtlnEnabled(): boolean {
+    return false; // SimplePeer doesn't have DTLN support
   }
 
   on<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void {

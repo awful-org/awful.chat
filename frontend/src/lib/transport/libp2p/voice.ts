@@ -3,13 +3,20 @@ import type { Connection, Stream } from "@libp2p/interface";
 import type { StreamMessageEvent, StreamCloseEvent } from "@libp2p/interface";
 import type { VoiceTransport, VoiceEvents } from "../types";
 import type { AppServices, LibP2PTransport } from "./transport";
+import type { DtlnProcessor } from "$lib/audio/dtln-processor";
 
 const VOICE_PROTO = "/voice/1.0.0";
 
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+};
+
+const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
-  autoGainControl: true,
+  autoGainControl: false,
 };
 
 type VoiceSignal =
@@ -46,11 +53,15 @@ export class LibP2PVoice implements VoiceTransport {
   private signalQueues = new Map<string, VoiceSignal[]>();
   private handlers = new Map<keyof VoiceEvents, Set<Function>>();
 
-  // bound so we can remove them on leave()
+  private dtlnEnabled = true;
+
   private onTransportConnect: ((peerId: string) => void) | null = null;
   private onTransportDisconnect: (peerId: string) => void | null = () => {};
 
-  constructor(private transport: LibP2PTransport) {}
+  constructor(
+    private transport: LibP2PTransport,
+    private dtln: DtlnProcessor | null = null
+  ) {}
 
   async join(_roomCode: string): Promise<void> {
     this.node = this.transport.p2pNode;
@@ -81,11 +92,9 @@ export class LibP2PVoice implements VoiceTransport {
       }
     );
 
-    // Use transport connect/disconnect — fires after peer:identify, safe to dialProtocol
     this.onTransportConnect = (peerId: string) => {
       if (this.transport.isRelay(peerId)) return;
       if (this.remotePeers.has(peerId)) return;
-      // Only the lexicographically smaller peer ID initiates, preventing double-offer
       if (peerId < this.transport.selfId()) {
         this.dialAndOffer(peerId).catch(() => {});
       }
@@ -100,7 +109,6 @@ export class LibP2PVoice implements VoiceTransport {
     this.transport.on("connect", this.onTransportConnect);
     this.transport.on("disconnect", this.onTransportDisconnect);
 
-    // Dial any peers already connected when we join the call
     for (const peerId of this.transport.peers()) {
       if (this.transport.isRelay(peerId)) continue;
       if (peerId < this.transport.selfId()) {
@@ -235,6 +243,18 @@ export class LibP2PVoice implements VoiceTransport {
     return this.currentOutputVolume;
   }
 
+  async setDtlnEnabled(enabled: boolean): Promise<void> {
+    if (this.dtlnEnabled === enabled) return;
+    this.dtlnEnabled = enabled;
+    if (this.audioCtx) {
+      await this.startMic(this.activeInputDevice ?? undefined);
+    }
+  }
+
+  isDtlnEnabled(): boolean {
+    return this.dtlnEnabled;
+  }
+
   on<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void {
     if (!this.handlers.has(event)) this.handlers.set(event, new Set());
     this.handlers.get(event)!.add(handler);
@@ -255,27 +275,54 @@ export class LibP2PVoice implements VoiceTransport {
     this.inputSource?.disconnect();
     this.inputGain?.disconnect();
 
+    const useDtln = this.dtlnEnabled && this.dtln != null;
+
     const constraints: MediaStreamConstraints = {
       audio: deviceId
-        ? { ...AUDIO_CONSTRAINTS, deviceId: { exact: deviceId } }
-        : AUDIO_CONSTRAINTS,
+        ? {
+            ...(useDtln ? AUDIO_CONSTRAINTS : AUDIO_CONSTRAINTS_NO_DTLN),
+            deviceId: { exact: deviceId },
+          }
+        : useDtln
+          ? AUDIO_CONSTRAINTS
+          : AUDIO_CONSTRAINTS_NO_DTLN,
       video: false,
     };
 
     this.micStream = await navigator.mediaDevices.getUserMedia(constraints);
-
     const track = this.micStream.getAudioTracks()[0];
     this.activeInputDevice = track.getSettings().deviceId ?? null;
 
-    this.inputSource = this.audioCtx!.createMediaStreamSource(this.micStream);
-    this.inputGain = this.audioCtx!.createGain();
-    const dest = this.audioCtx!.createMediaStreamDestination();
+    if (useDtln) {
+      await this.dtln?.waitUntilReady().catch(() => {
+        console.error;
+      });
+      this.processedStream = await this.dtln!.processStream(this.micStream);
+    } else {
+      const ctx = this.audioCtx!;
+      this.inputSource = ctx.createMediaStreamSource(this.micStream);
+      this.inputGain = ctx.createGain();
+      this.inputGain.gain.value = this.currentInputGain;
+      const dest = ctx.createMediaStreamDestination();
+      this.inputSource.connect(this.inputGain);
+      this.inputGain.connect(dest);
+      this.processedStream = dest.stream;
+    }
 
-    this.inputGain.gain.value = this.currentInputGain;
-    this.inputSource.connect(this.inputGain);
-    this.inputGain.connect(dest);
+    const newTrack = this.processedStream.getAudioTracks()[0] ?? null;
+    if (newTrack) {
+      for (const remote of this.remotePeers.values()) {
+        const sender = remote.pc
+          .getSenders()
+          .find((s) => s.track?.kind === "audio");
+        if (sender) {
+          await sender.replaceTrack(newTrack);
+        } else {
+          remote.pc.addTrack(newTrack, this.processedStream);
+        }
+      }
+    }
 
-    this.processedStream = dest.stream;
     this.applyMuteState();
   }
 
@@ -349,9 +396,7 @@ export class LibP2PVoice implements VoiceTransport {
 
     const queued = this.signalQueues.get(peerId) ?? [];
     this.signalQueues.delete(peerId);
-    for (const sig of queued) {
-      this.sendSignal(peerId, sig);
-    }
+    for (const sig of queued) this.sendSignal(peerId, sig);
   }
 
   private sendSignal(peerId: string, signal: VoiceSignal): void {
@@ -516,9 +561,8 @@ export class LibP2PVoice implements VoiceTransport {
   }
 
   private applyMuteState(): void {
-    if (!this.micStream) return;
-    for (const track of this.micStream.getAudioTracks()) {
-      track.enabled = !this.muted;
+    if (this.inputGain && this.audioCtx) {
+      this.inputGain.gain.value = this.muted ? 0 : this.currentInputGain;
     }
   }
 
