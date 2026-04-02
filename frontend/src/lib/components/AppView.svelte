@@ -15,12 +15,10 @@
     connect,
     openDmConversation,
     dmConversationCodeFor,
-    dmConversationCodeForSync,
     removeDmConversation,
     addToPhonebook,
     removeFromPhonebook,
     peerIdToDid,
-    peerId,
   } from "$lib/transport.svelte";
   import {
     roomsStore,
@@ -231,20 +229,13 @@
   }
 
   function dmTitleFor(peerId: string): string {
-    const normalizedPeerId =
-      dmEntries.find(
-        (u) =>
-          dmConversationCodeForSync(u.peerId) ===
-          dmConversationCodeForSync(peerId)
-      )?.peerId ?? peerId;
-    const did = peerIdToDid(normalizedPeerId);
+    const did = peerIdToDid(peerId);
     return (
-      roomsStore.phonebook.find((p) => p.peerId === normalizedPeerId)
-        ?.nickname ||
+      roomsStore.phonebook.find((p) => p.peerId === peerId)?.nickname ||
       transportState.peerNames.get(did) ||
-      transportState.peerNames.get(normalizedPeerId) ||
-      dmLatestByPeer.get(normalizedPeerId)?.nickname ||
-      normalizedPeerId.slice(0, 12)
+      transportState.peerNames.get(peerId) ||
+      dmLatestByPeer.get(peerId)?.nickname ||
+      peerId.slice(0, 12)
     );
   }
 
@@ -271,14 +262,13 @@
     const msgs = await getMessages(dmCode);
     const latest = msgs[msgs.length - 1];
     if (latest) {
-      await markSeenForDm(dmCode, latest.lamport, resolvedPeerId);
+      await markSeenForDm(dmCode, latest.lamport);
     }
   }
 
   async function markSeenForDm(
     roomCode: string,
-    lamport: number,
-    peerId?: string
+    lamport: number
   ): Promise<void> {
     const { markRoomSeen } = await import("$lib/storage");
     await markRoomSeen(roomCode, lamport);
@@ -387,7 +377,7 @@
     const phonebookByPeer = new Map<string, PhonebookEntry>(
       roomsStore.phonebook.map((p) => [p.peerId, p])
     );
-    for (const [roomCode, data] of dmInbox) {
+    for (const [_, data] of dmInbox) {
       const peerId = data.peerId;
       const pb = phonebookByPeer.get(peerId);
       const did = peerIdToDid(peerId);
@@ -409,9 +399,6 @@
       }
       if (!dmPreviews.has(peerId) && data.text) {
         dmPreviews.set(peerId, { text: data.text, ts: data.ts });
-      }
-      if (!dmUnread.has(roomCode)) {
-        dmUnread.set(roomCode, 0);
       }
     }
     return [...map.values()].sort((a, b) => {
@@ -468,7 +455,6 @@
   });
 
   $effect(() => {
-    // Dependencies for reactivity
     roomsStore.dmRooms.length;
     transportState.messages.length;
     transportState.dmVersion;
@@ -490,10 +476,7 @@
       >();
       const unreadNext = new Map<string, number>();
 
-      // DM list comes from dmRooms (actual conversations), NOT phonebook
-      const dmRooms = roomsStore.dmRooms;
-
-      for (const room of dmRooms) {
+      for (const room of roomsStore.dmRooms) {
         const peerId = room.participantDid;
         if (!peerId) continue;
 

@@ -207,19 +207,6 @@ async function hashDmRoomCode(did1: string, did2: string): Promise<string> {
   return roomCode;
 }
 
-// Synchronous version for cases where we can't await
-// Uses cached value or falls back to simple join (which will be fixed on next async call)
-function dmRoomCodeSync(did1: string, did2: string): string {
-  const sorted = [did1, did2].sort();
-  const input = sorted.join("|");
-  const cached = _dmRoomCodeCache.get(input);
-  if (cached) return cached;
-  // Fallback: trigger async hash and return temporary code
-  // This should rarely happen after initial setup
-  hashDmRoomCode(did1, did2).catch(() => {});
-  return `dm-${sorted.join("-").slice(0, 44)}`;
-}
-
 /**
  * Get the stable DM room code for a conversation with a peer.
  * Uses DIDs (stable identity) not peer IDs (ephemeral).
@@ -229,16 +216,6 @@ async function dmConversationCodeAsync(peerIdOrDid: string): Promise<string> {
   // Resolve to DID if we have a mapping, otherwise use as-is
   const peerDid = _peerIdToDid.get(peerIdOrDid) ?? peerIdOrDid;
   return hashDmRoomCode(selfDid, peerDid);
-}
-
-/**
- * Synchronous version - uses cache or fallback.
- * Prefer dmConversationCodeAsync when possible.
- */
-function dmConversationCodeSync(peerIdOrDid: string): string {
-  const selfDid = identityStore.did ?? _transport.selfId();
-  const peerDid = _peerIdToDid.get(peerIdOrDid) ?? peerIdOrDid;
-  return dmRoomCodeSync(selfDid, peerDid);
 }
 
 function looksLikePeerId(value: string): boolean {
@@ -1486,6 +1463,10 @@ export async function joinRoom(roomCode: string): Promise<void> {
   }
 }
 
+export function getRoomUsers(): string[] {
+  return transportState.roomUsers;
+}
+
 export function leaveRoom(): void {
   _broadcastLeaveRoomAndDisconnect();
 }
@@ -1808,11 +1789,6 @@ export async function dmConversationCodeFor(
   return dmConversationCodeAsync(resolvedPeerId);
 }
 
-export function dmConversationCodeForSync(peerIdOrDid: string): string {
-  const resolvedPeerId = resolveDmPeerId(peerIdOrDid) ?? peerIdOrDid;
-  return dmConversationCodeSync(resolvedPeerId);
-}
-
 export async function openDmConversation(peerIdOrDid: string): Promise<void> {
   if (!_transport.selfId()) return;
   // Use the input as-is if we can't resolve to a peer ID
@@ -1843,13 +1819,26 @@ export async function sendDirectMessage(text: string): Promise<void> {
   const envelope = encodeDmChatEnvelope({ id, text: body, ts });
 
   const peerDid = _peerIdToDid.get(peerId) ?? peerId;
-  const resolvedPeerId = resolveDmPeerId(peerId);
 
-  if (!resolvedPeerId || !_transport.peers().includes(resolvedPeerId)) {
+  // Resolve to an actual peer ID (not a DID) before checking online status.
+  // resolveDmPeerId already handles peerId→peerId and DID→peerId via _peerIdToDid,
+  // but falls back to the DID itself when no mapping exists. We need a real peer ID
+  // to check _transport.peers(), so we try didToPeerId as a second pass.
+  let resolvedPeerId = resolveDmPeerId(peerId);
+  if (resolvedPeerId && looksLikeDid(resolvedPeerId)) {
+    resolvedPeerId = didToPeerId(resolvedPeerId) ?? resolvedPeerId;
+  }
+
+  const isOnline =
+    !!resolvedPeerId &&
+    !looksLikeDid(resolvedPeerId) &&
+    _transport.peers().includes(resolvedPeerId);
+
+  if (!isOnline) {
     queueDmMessage(peerDid, envelope);
   } else {
     try {
-      await _transport.send(resolvedPeerId, envelope);
+      await _transport.send(resolvedPeerId!, envelope);
     } catch {
       queueDmMessage(peerDid, envelope);
     }
@@ -1870,7 +1859,6 @@ export async function sendDirectMessage(text: string): Promise<void> {
   };
 
   await putMessage(msg);
-  // Refresh DM rooms list so the UI updates
   await refreshDmRooms();
   transportState.dmVersion += 1;
   if (

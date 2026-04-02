@@ -8,6 +8,7 @@
     openDmConversation,
     addToPhonebook,
     removeFromPhonebook,
+    getRoomUsers,
   } from "$lib/transport.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity.svelte";
@@ -50,6 +51,7 @@
 
   $effect(() => {
     loadProfile();
+    getRoomUsers();
   });
 
   const users = $derived.by(() => {
@@ -194,7 +196,7 @@
 
   async function handleOpenDm(peerId: string): Promise<void> {
     if (onOpenDm) {
-      await onOpenDm(peerId);
+      onOpenDm(peerId);
     } else {
       await openDmConversation(peerId);
     }
