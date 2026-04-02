@@ -49,24 +49,32 @@
   );
 
   $effect(() => {
-    if (!identityStore.isUnlocked && !identityStore.loading && !identityStore.error) {
+    if (
+      !identityStore.isUnlocked &&
+      !identityStore.loading &&
+      !identityStore.error
+    ) {
       const stored = getRememberedPassword();
-      if (stored) {
-        password = stored;
-        remember = true;
-        if (!canUseBiometrics) {
-          startAutoLogin(
-            unlock(stored)
-              .then(() => {
-                const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
-                if (resetTimer) {
-                  saveRememberedPassword(stored, getRememberDuration());
-                }
-              })
-              .catch(() => {})
-          );
-        }
+      if (!stored) {
+        deleteCookie(PASSWORD_COOKIE);
+        return;
       }
+      password = stored;
+      remember = true;
+      if (canUseBiometrics) {
+        return;
+      }
+      startAutoLogin(
+        unlock(stored)
+          .then(() => {
+            const resetTimer =
+              localStorage.getItem("awful_remember_reset_timer") === "true";
+            if (resetTimer) {
+              saveRememberedPassword(stored, getRememberDuration());
+            }
+          })
+          .catch(() => {})
+      );
     }
   });
 
@@ -87,7 +95,8 @@
   async function handleBiometrics() {
     try {
       await unlockWithBiometrics();
-      const resetTimer = localStorage.getItem("awful_remember_reset_timer") === "true";
+      const resetTimer =
+        localStorage.getItem("awful_remember_reset_timer") === "true";
       if (resetTimer) {
         const stored = getRememberedPassword();
         if (stored) {
@@ -160,12 +169,10 @@
         <p class="text-xs text-destructive font-mono">{identityStore.error}</p>
       {/if}
 
-      <label class="flex items-center gap-2 text-xs text-muted-foreground font-mono cursor-pointer">
-        <input
-          type="checkbox"
-          bind:checked={remember}
-          class="accent-primary"
-        />
+      <label
+        class="flex items-center gap-2 text-xs text-muted-foreground font-mono cursor-pointer"
+      >
+        <input type="checkbox" bind:checked={remember} class="accent-primary" />
         Remember my password
       </label>
     </CardContent>

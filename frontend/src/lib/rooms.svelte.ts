@@ -1,19 +1,27 @@
 import {
   getAllRooms,
+  getDMRooms,
   putRoom,
   deleteRoom,
   getUnreadCount,
+  getPhonebookEntries,
+  type DMRoom,
+  type PhonebookEntry,
   type Room,
 } from "./storage";
 
 interface RoomsStore {
   rooms: Room[];
+  dmRooms: DMRoom[];
+  phonebook: PhonebookEntry[];
   loading: boolean;
   unreadCounts: Map<string, number>;
 }
 
 export const roomsStore = $state<RoomsStore>({
   rooms: [],
+  dmRooms: [],
+  phonebook: [],
   loading: false,
   unreadCounts: new Map(),
 });
@@ -23,10 +31,20 @@ export async function loadRooms(): Promise<void> {
   try {
     const all = await getAllRooms();
     roomsStore.rooms = all.filter((r) => r.type !== "dm") as Room[];
+    roomsStore.dmRooms = await getDMRooms();
+    roomsStore.phonebook = await getPhonebookEntries();
     await _refreshAllUnread();
   } finally {
     roomsStore.loading = false;
   }
+}
+
+export async function refreshPhonebook(): Promise<void> {
+  roomsStore.phonebook = await getPhonebookEntries();
+}
+
+export async function refreshDmRooms(): Promise<void> {
+  roomsStore.dmRooms = await getDMRooms();
 }
 
 export async function refreshUnreadCount(roomCode: string): Promise<void> {

@@ -117,7 +117,7 @@
         </button>
         <div
           class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full ring-2 ring-card
-          {transportState.connected ? 'bg-primary' : 'bg-yellow-500'}"
+          {transportState.relayConnected ? 'bg-primary' : 'bg-yellow-500'}"
         ></div>
       </div>
 
@@ -129,7 +129,7 @@
           {profileStore.nickname}
         </div>
         <div class="text-xs text-muted-foreground font-mono leading-tight">
-          {transportState.connected ? "Connected" : "Connecting..."}
+          {transportState.relayConnected ? "Connected" : "Connecting..."}
         </div>
       </div>
     </div>

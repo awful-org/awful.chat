@@ -23,7 +23,6 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
-	"github.com/multiformats/go-multiaddr"
 )
 
 const RendezvousProtocol = "/awful/rendezvous/1.0.0"
@@ -244,17 +243,6 @@ func main() {
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", httpPort)),
-		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			domain := os.Getenv("DOMAIN")
-			if domain == "" {
-				return addrs
-			}
-			ext, err := multiaddr.NewMultiaddr(fmt.Sprintf("/dns4/%s/tcp/443/wss", domain))
-			if err != nil {
-				return addrs
-			}
-			return []multiaddr.Multiaddr{ext}
-		}),
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		libp2p.Muxer("/yamux/1.0.0", yamux.DefaultTransport),

@@ -11,6 +11,7 @@
   } from "$lib/components/ui/card";
   import { profileStore, loadProfile, saveName } from "$lib/profile.svelte";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import { transportState } from "$lib/transport.svelte";
 
   interface Props {
     onJoin: (roomCode: string, displayName: string, roomName?: string) => void;
@@ -25,6 +26,8 @@
   let createdCode = $state<string | null>(null);
   let copied = $state(false);
   let avatarDialogOpen = $state(false);
+
+  let { relayConnected } = $derived(transportState);
 
   $effect(() => {
     loadProfile();
@@ -105,12 +108,22 @@
               Private rooms, peer-to-peer
             </CardDescription>
           </div>
-          <div
-            class="flex items-center gap-1.5 px-2 py-1 rounded-full bg-muted text-xs"
-          >
-            <span class="size-2 rounded-full bg-primary"></span>
-            <span class="text-muted-foreground">Connected</span>
-          </div>
+
+          {#if relayConnected}
+            <div
+              class="flex items-center gap-1.5 px-2 py-1 rounded-full bg-muted text-xs"
+            >
+              <span class="size-2 rounded-full bg-primary"></span>
+              <span class="text-muted-foreground">Connected</span>
+            </div>
+          {:else}
+            <div
+              class="flex items-center gap-1.5 px-2 py-1 rounded-full bg-amber-300/10 text-xs"
+            >
+              <span class="size-2 rounded-full bg-amber-300"></span>
+              <span class="text-destructive">Connecting...</span>
+            </div>
+          {/if}
         </div>
       </CardHeader>
 

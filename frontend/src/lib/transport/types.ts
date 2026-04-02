@@ -1,19 +1,17 @@
 export interface TransportEvents {
   connect: (peerId: string) => void;
   disconnect: (peerId: string) => void;
-  message: (peerId: string, data: Uint8Array) => void;
+  message: (peerId: string, data: Uint8Array, room: string | null) => void;
 }
 
-/**
- * Core p2p data transport interface.
- * Implemented by SimplePeerTransport and LibP2PTransport.
- * All app logic (sync, Yjs, messages) uses only this interface.
- */
 export interface PeerTransport {
-  connect(roomCode: string): Promise<void>;
+  connect(privateKeyBytes?: Uint8Array | null): Promise<void>;
   disconnect(): void;
-  send(peerId: string, data: Uint8Array): void;
-  broadcast(data: Uint8Array): void;
+  joinRoom(roomCode: string): void;
+  leaveRoom(roomCode: string): void;
+  rooms(): string[];
+  send(peerId: string, data: Uint8Array): Promise<void>;
+  broadcast(data: Uint8Array, roomCode: string): void;
   on<K extends keyof TransportEvents>(
     event: K,
     handler: TransportEvents[K]

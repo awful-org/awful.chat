@@ -2,12 +2,17 @@
   import {
     transportState,
     peerIdToDid,
+    didToPeerId,
     selfId,
     isRelayed,
+    openDmConversation,
+    addToPhonebook,
+    removeFromPhonebook,
   } from "$lib/transport.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity.svelte";
-  import { Users, Workflow } from "@lucide/svelte";
+  import { UserPlus, UserRoundMinus, Users, Workflow } from "@lucide/svelte";
+  import { roomsStore, refreshPhonebook } from "$lib/rooms.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { ScrollArea } from "$lib/components/ui/scroll-area";
   import {
@@ -20,12 +25,14 @@
   interface Props {
     open: boolean;
     onToggle: () => void;
+    onOpenDm?: (peerId: string) => void;
   }
 
-  let { open, onToggle }: Props = $props();
+  let { open, onToggle, onOpenDm }: Props = $props();
 
   interface User {
     did: string;
+    peerId: string | null;
     name: string;
     avatarUrl: string | null;
     isOnline: boolean;
@@ -33,7 +40,10 @@
     isRelayed: boolean;
   }
 
-  const { roomUsers, peers, peerNames, peerAvatars } = $derived(transportState);
+  const roomUsers = $derived(transportState.roomUsers);
+  const peers = $derived(transportState.peers);
+  const peerNames = $derived(transportState.peerNames);
+  const peerAvatars = $derived(transportState.peerAvatars);
 
   const selfDid = $derived(selfId());
   const ownDid = $derived(identityStore.did);
@@ -50,8 +60,19 @@
       const connectedPeerId = peers.find(
         (peerId) => peerIdToDid(peerId) === did
       );
-      const isOnline = isSelf || !!connectedPeerId;
-      const userIsRelayed = !!connectedPeerId && isRelayed(connectedPeerId);
+      const mappedPeerId =
+        connectedPeerId ??
+        didToPeerId(did) ??
+        (looksLikePeerId(did) ? did : null);
+      const directlyConnected = peers.includes(did);
+      const isOnline =
+        isSelf ||
+        !!connectedPeerId ||
+        directlyConnected ||
+        (!!mappedPeerId && peers.includes(mappedPeerId));
+      const relayedPeerId = connectedPeerId ?? mappedPeerId;
+      const userIsRelayed =
+        !!relayedPeerId && isOnline && isRelayed(relayedPeerId);
 
       let name: string;
       let avatarUrl: string | null = null;
@@ -66,6 +87,7 @@
 
       allUsers.push({
         did,
+        peerId: mappedPeerId,
         name,
         avatarUrl,
         isOnline,
@@ -102,10 +124,109 @@
   function getInitials(name: string): string {
     return name.charAt(0).toUpperCase();
   }
+
+  function looksLikePeerId(value: string): boolean {
+    return value.startsWith("12D3") || value.startsWith("Qm");
+  }
+
+  let userMenu = $state<{ user: User; x: number; y: number } | null>(null);
+
+  function openUserMenu(e: MouseEvent, user: User): void {
+    if (user.isSelf) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const pos = clampMenuPosition(e.clientX, e.clientY);
+    userMenu = { user, x: pos.x, y: pos.y };
+  }
+
+  function openUserMenuAtElement(
+    e: MouseEvent,
+    user: User,
+    el: HTMLElement | null
+  ): void {
+    e.preventDefault();
+    e.stopPropagation();
+    if (user.isSelf || !el) return;
+    const rect = el.getBoundingClientRect();
+    const pos = clampMenuPosition(
+      e.clientX || rect.left + Math.min(220, rect.width * 0.6),
+      e.clientY || rect.top + rect.height * 0.6
+    );
+    userMenu = {
+      user,
+      x: pos.x,
+      y: pos.y,
+    };
+  }
+
+  function clampMenuPosition(x: number, y: number): { x: number; y: number } {
+    if (typeof window === "undefined") return { x, y };
+    const menuWidth = 250;
+    const menuHeight = 170;
+    let adjustedX = x;
+    if (x + menuWidth > window.innerWidth) {
+      adjustedX = x - menuWidth;
+    }
+    if (adjustedX < 0) adjustedX = 0;
+    const adjustedY = Math.max(0, Math.min(y, window.innerHeight - menuHeight));
+    return { x: adjustedX, y: adjustedY };
+  }
+
+  function closeUserMenu(): void {
+    userMenu = null;
+  }
+
+  function isInPhonebook(peerId: string): boolean {
+    return roomsStore.phonebook.some((entry) => entry.peerId === peerId);
+  }
+
+  async function handleAddToPhonebook(peerId: string): Promise<void> {
+    await addToPhonebook(peerId);
+    await refreshPhonebook();
+    closeUserMenu();
+  }
+
+  async function handleRemoveFromPhonebook(peerId: string): Promise<void> {
+    await removeFromPhonebook(peerId);
+    await refreshPhonebook();
+    closeUserMenu();
+  }
+
+  async function handleOpenDm(peerId: string): Promise<void> {
+    if (onOpenDm) {
+      await onOpenDm(peerId);
+    } else {
+      await openDmConversation(peerId);
+    }
+    closeUserMenu();
+  }
 </script>
 
+<svelte:window
+  onclick={closeUserMenu}
+  onkeydown={(e) => {
+    if (e.key === "Escape") closeUserMenu();
+  }}
+/>
+
 {#snippet UserItem(user: User)}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
+    role="button"
+    tabindex="0"
+    oncontextmenu={(e) => openUserMenu(e, user)}
+    onclick={(e) =>
+      openUserMenuAtElement(e, user, e.currentTarget as HTMLElement)}
+    onkeydown={(e) => {
+      if (!user.isSelf && (e.key === "Enter" || e.key === " ")) {
+        e.preventDefault();
+        openUserMenuAtElement(
+          e as unknown as MouseEvent,
+          user,
+          e.currentTarget as HTMLElement
+        );
+      }
+    }}
     class="flex items-center ml-2 gap-3 px-2 py-1.5 rounded-md transition-colors {user.isOnline
       ? 'hover:bg-muted/50'
       : 'opacity-60 hover:bg-muted/30'}"
@@ -218,4 +339,48 @@
       {@render UserListContent()}
     </ScrollArea>
   </aside>
+{/if}
+
+{#if userMenu}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    role="menu"
+    tabindex="-1"
+    class="fixed z-50 min-w-40 rounded-md border border-border bg-popover py-1 shadow-xl"
+    style="top: {userMenu.y}px; left: {userMenu.x}px"
+    onclick={(e) => e.stopPropagation()}
+  >
+    <button
+      type="button"
+      disabled={!userMenu.user.peerId}
+      class="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted cursor-pointer"
+      onclick={() =>
+        userMenu?.user.peerId && handleOpenDm(userMenu.user.peerId)}
+    >
+      <Users class="size-4" />
+      {userMenu.user.peerId ? "DM user" : "DM unavailable"}
+    </button>
+    {#if userMenu.user.peerId && !isInPhonebook(userMenu.user.peerId)}
+      <button
+        type="button"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted cursor-pointer"
+        onclick={() =>
+          userMenu?.user.peerId && handleAddToPhonebook(userMenu.user.peerId)}
+      >
+        <UserPlus class="size-4" />
+        Add to phonebook
+      </button>
+    {:else if userMenu.user.peerId}
+      <button
+        type="button"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm text-destructive hover:bg-muted cursor-pointer"
+        onclick={() =>
+          userMenu?.user.peerId &&
+          handleRemoveFromPhonebook(userMenu.user.peerId)}
+      >
+        <UserRoundMinus class="size-4" />
+        Remove from phonebook
+      </button>
+    {/if}
+  </div>
 {/if}

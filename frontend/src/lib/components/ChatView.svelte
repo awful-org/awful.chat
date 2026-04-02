@@ -17,6 +17,8 @@
     Paperclip,
     FileText,
     ArrowDown,
+    UserPlus,
+    UserRoundMinus,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -32,6 +34,10 @@
     transportState,
     sendMessage,
     selfId,
+    didToPeerId,
+    openDmConversation,
+    addToPhonebook,
+    removeFromPhonebook,
     joinCall,
     sendReply,
     sendFiles,
@@ -40,6 +46,7 @@
     markSeen,
     requestFileDownload,
   } from "$lib/transport.svelte";
+  import { roomsStore, refreshPhonebook } from "$lib/rooms.svelte";
 
   $effect(() => {
     loadProfile();
@@ -51,6 +58,7 @@
     selfId: string;
     onLeave: () => void;
     onOpenSidebar?: () => void;
+    onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
     incomingSharedText?: string;
     onConsumeIncomingShared?: () => void;
@@ -61,6 +69,7 @@
     roomName,
     onLeave,
     onOpenSidebar,
+    onOpenDm,
     incomingSharedFiles = [],
     incomingSharedText = "",
     onConsumeIncomingShared,
@@ -119,6 +128,12 @@
   let autoScroll = $state(true);
   // Tracks whether the initial scroll-to-bottom on mount has happened
   let initialScrollDone = $state(false);
+  let userMenu = $state<{
+    peerId: string | null;
+    senderId: string;
+    x: number;
+    y: number;
+  } | null>(null);
 
   $effect(() => {
     if (typeof window === "undefined") return;
@@ -667,7 +682,89 @@
       peerNames.get(msg.senderId) || msg.senderName || msg.senderId.slice(0, 8)
     );
   }
+
+  function peerIdForSender(senderId: string): string | null {
+    if (peers.includes(senderId)) return senderId;
+    const mapped = didToPeerId(senderId);
+    if (mapped) return mapped;
+    if (senderId.startsWith("12D3") || senderId.startsWith("Qm"))
+      return senderId;
+    return null;
+  }
+
+  function openUserMenuFromMessage(msg: Message, e: MouseEvent): void {
+    if (msg.senderId === selfId()) return;
+    e.stopPropagation();
+    const peerId = peerIdForSender(msg.senderId);
+    const pos = clampMenu(e.clientX, e.clientY);
+    userMenu = { peerId, senderId: msg.senderId, x: pos.x, y: pos.y };
+  }
+
+  function clampMenu(x: number, y: number): { x: number; y: number } {
+    if (typeof window === "undefined") return { x, y };
+    const menuWidth = 240;
+    const menuHeight = 170;
+    const pad = 8;
+    return {
+      x: Math.max(pad, Math.min(x, window.innerWidth - menuWidth - pad)),
+      y: Math.max(pad, Math.min(y, window.innerHeight - menuHeight - pad)),
+    };
+  }
+
+  function closeUserMenu(): void {
+    userMenu = null;
+  }
+
+  function isInPhonebook(peerId: string): boolean {
+    return roomsStore.phonebook.some((entry) => entry.peerId === peerId);
+  }
+
+  async function startDmFromMenu(peerId: string): Promise<void> {
+    if (onOpenDm) {
+      await onOpenDm(peerId);
+    } else {
+      await openDmConversation(peerId);
+    }
+    closeUserMenu();
+  }
+
+  async function addFromMenu(peerId: string): Promise<void> {
+    await addToPhonebook(peerId);
+    await refreshPhonebook();
+    closeUserMenu();
+  }
+
+  async function removeFromMenu(peerId: string): Promise<void> {
+    await removeFromPhonebook(peerId);
+    await refreshPhonebook();
+    closeUserMenu();
+  }
+
+  const isDmChat = $derived(
+    transportState.chatMode === "dm" && !!transportState.activeDmPeerId
+  );
+
+  const dmPeerInPhonebook = $derived.by(() => {
+    const peerId = transportState.activeDmPeerId;
+    if (!peerId) return false;
+    return roomsStore.phonebook.some((entry) => entry.peerId === peerId);
+  });
+
+  async function toggleActiveDmPhonebook(): Promise<void> {
+    const peerId = transportState.activeDmPeerId;
+    if (!peerId) return;
+    if (dmPeerInPhonebook) await removeFromPhonebook(peerId);
+    else await addToPhonebook(peerId);
+    await refreshPhonebook();
+  }
 </script>
+
+<svelte:window
+  onclick={closeUserMenu}
+  onkeydown={(e) => {
+    if (e.key === "Escape") closeUserMenu();
+  }}
+/>
 
 <div
   bind:this={rootEl}
@@ -708,28 +805,32 @@
         <h1 class="text-sm font-semibold truncate text-foreground">
           {roomName || roomCode}
         </h1>
-        <Badge
-          variant="outline"
-          class="gap-1 text-xs shrink-0 border-border text-muted-foreground"
-        >
-          <Users class="size-3" />
-          {peers.length + 1}
-        </Badge>
+        {#if !isDmChat}
+          <Badge
+            variant="outline"
+            class="gap-1 text-xs shrink-0 border-border text-muted-foreground"
+          >
+            <Users class="size-3" />
+            {peers.length + 1}
+          </Badge>
+        {/if}
       </div>
       <div class="flex items-center gap-2 shrink-0">
-        <button
-          type="button"
-          onclick={copyCode}
-          aria-label="Copy room code"
-          class="hidden sm:flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
-        >
-          <code>{roomCode}</code>
-          {#if copied}
-            <Check class="size-3 text-primary" />
-          {:else}
-            <Copy class="size-3 mb-0.5" />
-          {/if}
-        </button>
+        {#if !isDmChat}
+          <button
+            type="button"
+            onclick={copyCode}
+            aria-label="Copy room code"
+            class="hidden sm:flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <code>{roomCode}</code>
+            {#if copied}
+              <Check class="size-3 text-primary" />
+            {:else}
+              <Copy class="size-3 mb-0.5" />
+            {/if}
+          </button>
+        {/if}
         {#if !inCall}
           <Button
             variant="ghost"
@@ -741,17 +842,41 @@
             <Phone class="size-4" />
           </Button>
         {/if}
-        <Button
-          variant="ghost"
-          size="icon"
-          onclick={() => (showUserList = !showUserList)}
-          aria-label="Toggle user list"
-          class="flex text-muted-foreground hover:text-foreground cursor-pointer {showUserList
-            ? 'text-primary'
-            : ''}"
-        >
-          <Users class="size-4" />
-        </Button>
+        {#if !isDmChat}
+          <Button
+            variant="ghost"
+            size="icon"
+            onclick={() => (showUserList = !showUserList)}
+            aria-label="Toggle user list"
+            class="flex text-muted-foreground hover:text-foreground cursor-pointer {showUserList
+              ? 'text-primary'
+              : ''}"
+          >
+            <Users class="size-4" />
+          </Button>
+        {/if}
+        {#if isDmChat}
+          <Button
+            variant="ghost"
+            size="icon"
+            onclick={toggleActiveDmPhonebook}
+            aria-label={dmPeerInPhonebook
+              ? "Remove from phonebook"
+              : "Add to phonebook"}
+            title={dmPeerInPhonebook
+              ? "Remove from phonebook"
+              : "Add to phonebook"}
+            class={dmPeerInPhonebook
+              ? "text-red-500 hover:text-red-600 cursor-pointer"
+              : "text-green-500 hover:text-green-600 cursor-pointer"}
+          >
+            {#if dmPeerInPhonebook}
+              <UserRoundMinus class="size-4" />
+            {:else}
+              <UserPlus class="size-4" />
+            {/if}
+          </Button>
+        {/if}
         <Button
           variant="ghost"
           size="icon"
@@ -874,6 +999,18 @@
                 {#if showHeader}
                   <div class="flex items-start gap-2">
                     <div
+                      role="button"
+                      tabindex="0"
+                      onclick={(e) => openUserMenuFromMessage(msg, e)}
+                      onkeydown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          openUserMenuFromMessage(
+                            msg,
+                            e as unknown as MouseEvent
+                          );
+                        }
+                      }}
                       class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold
                       {isOwn
                         ? 'bg-primary/20 text-primary'
@@ -1000,10 +1137,13 @@
       {/if}
     </div>
 
-    <UserListSidebar
-      open={showUserList}
-      onToggle={() => (showUserList = !showUserList)}
-    />
+    {#if !isDmChat}
+      <UserListSidebar
+        open={showUserList}
+        onToggle={() => (showUserList = !showUserList)}
+        {onOpenDm}
+      />
+    {/if}
   </div>
 
   {#if !autoScroll && visibleMessages.length > 0}
@@ -1195,3 +1335,48 @@
     activeMessageId = null;
   }}
 />
+
+{#if userMenu}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    role="menu"
+    tabindex="-1"
+    class="fixed z-50 min-w-40 rounded-md border border-border bg-popover py-1 shadow-xl"
+    style="top: {userMenu.y}px; left: {userMenu.x}px"
+    onkeydown={() => {}}
+    onclick={(e) => e.stopPropagation()}
+  >
+    <button
+      type="button"
+      disabled={!userMenu.peerId}
+      class="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted cursor-pointer"
+      onclick={() => userMenu?.peerId && startDmFromMenu(userMenu.peerId)}
+    >
+      <Users class="size-4" />
+      {userMenu.peerId ? "DM user" : "DM unavailable"}
+    </button>
+    {#if userMenu.peerId && !isInPhonebook(userMenu.peerId)}
+      <button
+        type="button"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted cursor-pointer"
+        onclick={() => userMenu?.peerId && addFromMenu(userMenu.peerId)}
+      >
+        <UserPlus class="size-4" />
+        Add to phonebook
+      </button>
+    {:else if userMenu.peerId}
+      <button
+        type="button"
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm text-destructive hover:bg-muted cursor-pointer"
+        onclick={() => userMenu?.peerId && removeFromMenu(userMenu.peerId)}
+      >
+        <UserRoundMinus class="size-4" />
+        Remove from phonebook
+      </button>
+    {:else}
+      <div class="px-3 py-1.5 text-xs text-muted-foreground">
+        Peer unavailable
+      </div>
+    {/if}
+  </div>
+{/if}

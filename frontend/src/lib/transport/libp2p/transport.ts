@@ -45,7 +45,6 @@ export interface AppServices {
 
 export class LibP2PTransport implements PeerTransport {
   private node: Libp2p<AppServices> | null = null;
-  private roomCode: string | null = null;
   private handlers = new Map<keyof TransportEvents, Set<Function>>();
   private relayedPeers = new Set<string>();
   private connectedPeers = new Set<string>();
@@ -56,17 +55,15 @@ export class LibP2PTransport implements PeerTransport {
   private peerStreams = new Map<string, Stream>();
   private pendingQueues = new Map<string, Uint8Array[]>();
   private openingStreams = new Set<string>();
+  private dialingPeers = new Set<string>();
+  private joinedRooms = new Set<string>();
 
   get p2pNode(): Libp2p<AppServices> | null {
     return this.node;
   }
 
-  async connect(
-    roomCode: string,
-    privateKeyBytes?: Uint8Array | null
-  ): Promise<void> {
-    this.roomCode = roomCode;
-
+  // Connects to the relay and sets up the node. Does NOT join any room.
+  async connect(privateKeyBytes?: Uint8Array | null): Promise<void> {
     const peerId = privateKeyBytes
       ? await this.peerIdFromRawKey(privateKeyBytes)
       : undefined;
@@ -109,7 +106,6 @@ export class LibP2PTransport implements PeerTransport {
     const myId = this.node.peerId.toString();
     console.log("[LibP2PTransport] node started, selfId:", myId);
 
-    console.log("[Transport] dialing relay:", relayMa);
     try {
       await this.node.dial(multiaddr(relayMa));
       console.log("[Transport] relay connected");
@@ -118,34 +114,25 @@ export class LibP2PTransport implements PeerTransport {
       throw err;
     }
 
-    // Explicitly request a circuit relay reservation on the relay we just connected to.
-    // The circuit relay transport does this automatically on identify, but we force it
-    // by telling the transport manager to listen on the p2p-circuit multiaddr.
     const circuitListenAddr = multiaddr(`${relayMa}/p2p-circuit`);
-    console.log(
-      "[Transport] requesting relay reservation:",
-      circuitListenAddr.toString()
-    );
     try {
       await (this.node as any).components.transportManager.listen([
         circuitListenAddr,
       ]);
-      console.log("[Transport] reservation requested");
     } catch (err) {
       console.warn("[Transport] reservation request failed:", err);
     }
 
     await this.waitForRelayReservation();
 
-    this.startRendezvous();
-
-    this.node.services.pubsub.subscribe(roomTopic(roomCode));
-
     this.node.services.pubsub.addEventListener("message", (evt: any) => {
       const from = evt.detail.from.toString();
       if (from === myId || this.isRelayPeer(from)) return;
-      if (evt.detail.topic === roomTopic(roomCode)) {
-        this.emit("message", from, evt.detail.data);
+      const topic: string = evt.detail.topic;
+      // strip "app:room:" prefix to get the room code
+      const room = topic.startsWith("app:room:") ? topic.slice(9) : null;
+      if (room && this.joinedRooms.has(room)) {
+        this.emit("message", from, evt.detail.data, room);
       }
     });
 
@@ -174,19 +161,44 @@ export class LibP2PTransport implements PeerTransport {
       this.cleanupPeerStream(id);
       this.emit("disconnect", id);
     });
+
+    // open the rendezvous stream — rooms registered later via joinRoom()
+    this.startRendezvous();
+  }
+
+  // Joins a room: registers with rendezvous and subscribes to pubsub topic.
+  joinRoom(roomCode: string): void {
+    if (this.joinedRooms.has(roomCode)) return;
+    this.joinedRooms.add(roomCode);
+    this.node?.services.pubsub.subscribe(roomTopic(roomCode));
+    this.rendezvousSend({ type: "REGISTER", room: roomCode });
+  }
+
+  // Leaves a room: unregisters from rendezvous and unsubscribes pubsub.
+  leaveRoom(roomCode: string): void {
+    if (!this.joinedRooms.has(roomCode)) return;
+    this.joinedRooms.delete(roomCode);
+    this.rendezvousSend({ type: "UNREGISTER", room: roomCode });
+    try {
+      this.node?.services.pubsub.unsubscribe(roomTopic(roomCode));
+    } catch {}
   }
 
   disconnect(): void {
     if (!this.node) return;
+    for (const room of this.joinedRooms) {
+      this.rendezvousSend({ type: "UNREGISTER", room });
+    }
     this.node.stop();
     this.node = null;
-    this.roomCode = null;
     this.relayPeerId = null;
+    this.joinedRooms.clear();
     this.connectedPeers.clear();
     this.relayedPeers.clear();
     this.peerStreams.clear();
     this.pendingQueues.clear();
     this.openingStreams.clear();
+    this.dialingPeers.clear();
   }
 
   async send(peerId: string, data: Uint8Array): Promise<void> {
@@ -214,10 +226,10 @@ export class LibP2PTransport implements PeerTransport {
     }
   }
 
-  broadcast(data: Uint8Array): void {
-    if (!this.node || !this.roomCode) return;
+  broadcast(data: Uint8Array, roomCode: string): void {
+    if (!this.node || !this.joinedRooms.has(roomCode)) return;
     try {
-      this.node.services.pubsub.publish(roomTopic(this.roomCode), data);
+      this.node.services.pubsub.publish(roomTopic(roomCode), data);
     } catch (err) {
       console.warn("[LibP2PTransport] broadcast failed:", err);
     }
@@ -254,6 +266,10 @@ export class LibP2PTransport implements PeerTransport {
     return this.isRelayPeer(peerId);
   }
 
+  rooms(): string[] {
+    return Array.from(this.joinedRooms);
+  }
+
   private isRelayPeer(peerId: string): boolean {
     return this.relayPeerId !== null && peerId === this.relayPeerId;
   }
@@ -275,7 +291,6 @@ export class LibP2PTransport implements PeerTransport {
       this.writeFrame(peerId, stream, msg);
     }
 
-    // StreamCloseEvent is the type for the 'close' event — no 'abort' event exists
     stream.addEventListener("close", (_evt: StreamCloseEvent) => {
       this.cleanupPeerStream(peerId);
     });
@@ -296,7 +311,6 @@ export class LibP2PTransport implements PeerTransport {
   private handleInboundStream(fromId: string, stream: Stream): void {
     let buf = new Uint8Array(0);
 
-    // StreamMessageEvent.data — not .detail
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
         evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
@@ -314,7 +328,8 @@ export class LibP2PTransport implements PeerTransport {
         if (buf.byteLength < 4 + len) break;
         const payload = buf.slice(4, 4 + len);
         buf = buf.slice(4 + len);
-        this.emit("message", fromId, payload);
+        // direct stream messages have no room — null signals DM/direct
+        this.emit("message", fromId, payload, null);
       }
     });
 
@@ -334,7 +349,7 @@ export class LibP2PTransport implements PeerTransport {
   }
 
   private async startRendezvous(): Promise<void> {
-    if (!this.node || !this.roomCode || !this.relayPeerId) return;
+    if (!this.node || !this.relayPeerId) return;
 
     const selfId = this.node.peerId.toString();
 
@@ -344,9 +359,7 @@ export class LibP2PTransport implements PeerTransport {
       stream = await this.node.dialProtocol(
         relayPid,
         "/awful/rendezvous/1.0.0",
-        {
-          runOnLimitedConnection: true,
-        }
+        { runOnLimitedConnection: true }
       );
     } catch (err) {
       console.warn("[Rendezvous] failed to open stream, retrying in 2s:", err);
@@ -357,8 +370,10 @@ export class LibP2PTransport implements PeerTransport {
     this.rendezvousStream = stream;
     this.rendezvousReadBuf = new Uint8Array(0);
 
-    // Tell the relay we are in this room
-    this.rendezvousSend({ type: "REGISTER", room: this.roomCode });
+    // re-register all rooms we were in before the reconnect
+    for (const room of this.joinedRooms) {
+      this.rendezvousSend({ type: "REGISTER", room });
+    }
 
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
@@ -392,8 +407,7 @@ export class LibP2PTransport implements PeerTransport {
 
     stream.addEventListener("close", (_evt: StreamCloseEvent) => {
       this.rendezvousStream = null;
-      // Relay stream closed — reconnect unless we intentionally disconnected
-      if (this.node && this.roomCode) {
+      if (this.node) {
         console.warn("[Rendezvous] stream closed, reconnecting in 2s");
         setTimeout(() => this.startRendezvous(), 2_000);
       }
@@ -414,35 +428,38 @@ export class LibP2PTransport implements PeerTransport {
   }
 
   private async dialPeer(peerId: string): Promise<void> {
-    if (!this.node) return;
-
-    // Construct both possible circuit addresses — with and without /webrtc.
-    // The reservation addr includes /webrtc when the peer also listens on webrtc,
-    // so we try that first, then fall back to plain p2p-circuit.
-    const relayAddr = import.meta.env.VITE_RELAY_MULTIADDR as string;
-    const withWebRTC = multiaddr(
-      `${relayAddr}/p2p-circuit/webrtc/p2p/${peerId}`
-    );
-    const withoutWebRTC = multiaddr(`${relayAddr}/p2p-circuit/p2p/${peerId}`);
-
-    console.log("[Rendezvous] dialing peer", peerId.slice(-8));
+    if (!this.node || this.connectedPeers.has(peerId)) return;
+    if (this.dialingPeers.has(peerId)) return;
+    this.dialingPeers.add(peerId);
 
     try {
-      await this.node.dial(withWebRTC);
-      console.log("[Rendezvous] dial via webrtc ok", peerId.slice(-8));
-      return;
-    } catch (err) {
-      console.warn(
-        "[Rendezvous] webrtc dial failed, trying plain circuit:",
-        err
+      const relayAddr = import.meta.env.VITE_RELAY_MULTIADDR as string;
+      const withWebRTC = multiaddr(
+        `${relayAddr}/p2p-circuit/webrtc/p2p/${peerId}`
       );
-    }
+      const withoutWebRTC = multiaddr(`${relayAddr}/p2p-circuit/p2p/${peerId}`);
 
-    try {
-      await this.node.dial(withoutWebRTC);
-      console.log("[Rendezvous] dial via circuit ok", peerId.slice(-8));
-    } catch (err) {
-      console.warn("[Rendezvous] both dials failed for", peerId.slice(-8), err);
+      try {
+        await this.node.dial(withWebRTC);
+        return;
+      } catch {
+        // many peers are not currently relay-reserved; fallback below
+      }
+
+      try {
+        await this.node.dial(withoutWebRTC);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!message.includes("NO_RESERVATION")) {
+          console.warn(
+            "[Rendezvous] both dials failed for",
+            peerId.slice(-8),
+            err
+          );
+        }
+      }
+    } finally {
+      this.dialingPeers.delete(peerId);
     }
   }
 
@@ -450,7 +467,6 @@ export class LibP2PTransport implements PeerTransport {
     selfId: string,
     msg: RendezvousServerMsg
   ): Promise<void> {
-    console.log("[Rendezvous] msg", msg.type, msg);
     switch (msg.type) {
       case "PEERS": {
         for (const peerId of msg.peers ?? []) {
@@ -510,8 +526,7 @@ export class LibP2PTransport implements PeerTransport {
     if (!connections?.length) return;
 
     const hasDirect = connections.some((c) => {
-      const addr = c.remoteAddr.toString();
-      return !addr.includes("/p2p-circuit");
+      return !c.remoteAddr.toString().includes("/p2p-circuit");
     });
 
     if (hasDirect) this.relayedPeers.delete(peerId);

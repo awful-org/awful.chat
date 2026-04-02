@@ -71,6 +71,13 @@ export interface SavedGif {
   savedAt: number;
 }
 
+export interface PhonebookEntry {
+  peerId: string;
+  nickname: string;
+  addedAt: number;
+  favorite?: boolean;
+}
+
 type AppDB = IDBPDatabase<{
   messages: {
     key: string;
@@ -127,6 +134,10 @@ type AppDB = IDBPDatabase<{
     key: string;
     value: SavedGif;
   };
+  phonebook: {
+    key: string;
+    value: PhonebookEntry;
+  };
 }>;
 
 let db: AppDB | null = null;
@@ -134,7 +145,7 @@ let db: AppDB | null = null;
 export async function getDB(): Promise<AppDB> {
   if (db) return db;
 
-  db = (await openDB("awful-chat", 3, {
+  db = (await openDB("awful-chat", 4, {
     upgrade(database, oldVersion) {
       if (oldVersion < 1) {
         // messages
@@ -195,6 +206,10 @@ export async function getDB(): Promise<AppDB> {
           database.deleteObjectStore("profiles");
         }
         database.createObjectStore("profiles", { keyPath: "did" });
+      }
+
+      if (oldVersion < 4) {
+        database.createObjectStore("phonebook", { keyPath: "peerId" });
       }
     },
   })) as AppDB;
@@ -269,17 +284,43 @@ export async function bulkPutMessages(messages: Message[]): Promise<void> {
   await Promise.all([...messages.map((m) => tx.store.put(m)), tx.done]);
 }
 
+export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
+  const database = await getDB();
+  const tx = database.transaction(["messages", "attachments"], "readwrite");
+  const messagesIndex = tx.objectStore("messages").index("byRoom");
+  const messages = await messagesIndex.getAll(roomCode);
+
+  for (const message of messages) {
+    const attachmentsIndex = tx.objectStore("attachments").index("byMessage");
+    const attachments = await attachmentsIndex.getAll(message.id);
+    for (const attachment of attachments) {
+      await tx.objectStore("attachments").delete(attachment.id);
+    }
+    await tx.objectStore("messages").delete(message.id);
+  }
+
+  await tx.done;
+}
+
 export async function getUnreadCount(
   roomCode: string,
-  lastSeenLamport: number
+  lastSeenLamport: number,
+  excludeSenderId?: string
 ): Promise<number> {
   const database = await getDB();
-  const index = database.transaction("messages").store.index("byRoomLamport");
+  const tx = database.transaction("messages");
+  const index = tx.store.index("byRoomLamport");
   const range = IDBKeyRange.bound(
     [roomCode, lastSeenLamport + 1],
     [roomCode, Number.MAX_SAFE_INTEGER]
   );
-  return index.count(range);
+
+  if (!excludeSenderId) {
+    return index.count(range);
+  }
+
+  const messages = await index.getAll(range);
+  return messages.filter((m) => m.senderId !== excludeSenderId).length;
 }
 
 export async function updateMessageStatus(
@@ -738,6 +779,33 @@ export async function getWebAuthnRecord(): Promise<WebAuthnRecord | undefined> {
   return database.get("identity", "webauthn") as Promise<
     WebAuthnRecord | undefined
   >;
+}
+
+export async function getPhonebookEntries(): Promise<PhonebookEntry[]> {
+  const database = await getDB();
+  const entries = await database.getAll("phonebook");
+  return entries.sort((a, b) => {
+    const favDiff = Number(!!b.favorite) - Number(!!a.favorite);
+    if (favDiff !== 0) return favDiff;
+    return a.addedAt - b.addedAt;
+  });
+}
+
+export async function getPhonebookEntry(
+  peerId: string
+): Promise<PhonebookEntry | undefined> {
+  const database = await getDB();
+  return database.get("phonebook", peerId);
+}
+
+export async function putPhonebookEntry(entry: PhonebookEntry): Promise<void> {
+  const database = await getDB();
+  await database.put("phonebook", entry);
+}
+
+export async function deletePhonebookEntry(peerId: string): Promise<void> {
+  const database = await getDB();
+  await database.delete("phonebook", peerId);
 }
 
 export async function putWebAuthnRecord(record: WebAuthnRecord): Promise<void> {
