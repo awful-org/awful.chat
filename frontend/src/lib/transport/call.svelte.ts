@@ -12,7 +12,13 @@ import {
 } from "$lib/sounds";
 import { MessageType } from "$lib/types/message";
 import { encode } from "$lib/utils";
-import { _transport, _video, _voice, transportState } from "./transport.svelte";
+import {
+  _transport,
+  _video,
+  _voice,
+  connect,
+  transportState,
+} from "./transport.svelte";
 import type { VideoSource } from "./types";
 import { setTransmissionOutputVolume } from "./transmission.svelte";
 
@@ -43,6 +49,10 @@ export function _sendCallPresence(peerId?: string): void {
 export async function joinCall(): Promise<void> {
   transportState.error = null;
   try {
+    // Ensure transport is connected before joining voice
+    if (!transportState.relayConnected) {
+      await connect();
+    }
     await _voice.join(transportState.roomCode ?? "");
     await _video.join(transportState.roomCode ?? "", _transport.selfId());
     transportState.inCall = true;
@@ -143,6 +153,9 @@ export async function toggleCamera(): Promise<void> {
 
 export async function startScreenShare(): Promise<void> {
   transportState.error = null;
+  if (!navigator.mediaDevices.getDisplayMedia) {
+    throw new Error("Screen sharing is not supported on this device");
+  }
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 15 } },

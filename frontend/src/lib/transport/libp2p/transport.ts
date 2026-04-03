@@ -217,6 +217,7 @@ export class LibP2PTransport implements PeerTransport {
 
   async send(peerId: string, data: Uint8Array): Promise<void> {
     if (!this.node || this.isRelayPeer(peerId)) return;
+if (peerId === this.node.peerId.toString()) return;
 
     const stream = this.peerStreams.get(peerId);
     if (stream) {
@@ -234,10 +235,10 @@ export class LibP2PTransport implements PeerTransport {
           `[LibP2PTransport] stream open failed for ${peerId}:`,
           err
         );
-        this.emit("status", { 
-          type: "stream-open-failed", 
+        this.emit("status", {
+          type: "stream-open-failed",
           peerId: peerId.slice(-8),
-          message: `Failed to open stream to peer ${peerId.slice(-8)}` 
+          message: `Failed to open stream to peer ${peerId.slice(-8)}`
         });
         this.openingStreams.delete(peerId);
         this.pendingQueues.delete(peerId);
@@ -441,9 +442,9 @@ export class LibP2PTransport implements PeerTransport {
       );
     } catch (err) {
       console.warn("[Rendezvous] failed to open stream, retrying:", err);
-      this.emit("status", { 
-        type: "rendezvous-failed", 
-        message: "Failed to connect to room server - retrying..." 
+      this.emit("status", {
+        type: "rendezvous-failed",
+        message: "Failed to connect to room server - retrying..."
       });
       setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
       return;
@@ -491,9 +492,9 @@ export class LibP2PTransport implements PeerTransport {
       this.rendezvousStream = null;
       if (!this.intentionalDisconnect && this.node) {
         console.warn("[Rendezvous] stream closed, reconnecting");
-        this.emit("status", { 
-          type: "rendezvous-reconnecting", 
-          message: "Room server disconnected - reconnecting..." 
+        this.emit("status", {
+          type: "rendezvous-reconnecting",
+          message: "Room server disconnected - reconnecting..."
         });
         setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
       }

@@ -426,6 +426,8 @@ export class MediasoupVideo implements VideoTransport {
     ps[0].stream.getTracks().forEach((t) => t.stop());
     this.producers.delete(source);
     this.paused.delete(source);
+    // Emit locally so UI updates immediately for the sender
+    this.emit("trackRemoved", "local", source);
   }
 
   private async createSendTransport(): Promise<void> {
@@ -567,9 +569,7 @@ export class MediasoupVideo implements VideoTransport {
           const filtered = consumerList.filter((c) => {
             if (c.consumer.producerId === msg.producerId) {
               c.consumer.close();
-              if (msg.source === "screen") {
-                this.emit("trackRemoved", peerId, "screen");
-              }
+              this.emit("trackRemoved", peerId, msg.source);
               return false;
             }
             return true;

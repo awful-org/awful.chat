@@ -90,7 +90,10 @@ export class DtlnProcessor {
   }
 
   // connect a mic stream through DTLN, returns the processed MediaStream
-  async processStream(micStream: MediaStream): Promise<MediaStream> {
+  async processStream(
+    micStream: MediaStream,
+    inputGain = 1.0
+  ): Promise<MediaStream> {
     await this.waitUntilReady();
     const ctx = this.ctx;
     // without user gesture it will start suspended
@@ -99,14 +102,32 @@ export class DtlnProcessor {
     }
 
     const source = ctx.createMediaStreamSource(micStream);
-    const gain = ctx.createGain();
+    const inputGainNode = ctx.createGain();
+    const outputGainNode = ctx.createGain();
     const dest = ctx.createMediaStreamDestination();
 
-    source.connect(gain);
-    gain.connect(this.node);
-    this.node.connect(dest);
+    // Set initial gain values
+    inputGainNode.gain.value = inputGain;
+    // Boost output to compensate for DTLN attenuation
+    outputGainNode.gain.value = 3.0;
+
+    source.connect(inputGainNode);
+    inputGainNode.connect(this.node);
+    this.node.connect(outputGainNode);
+    outputGainNode.connect(dest);
+
+    // Store refs for later adjustment
+    (this as any).inputGainNode = inputGainNode;
+    (this as any).outputGainNode = outputGainNode;
     this.transportDest = dest;
     return dest.stream;
+  }
+
+  setInputGain(gain: number): void {
+    const node = (this as any).inputGainNode as GainNode | undefined;
+    if (node) {
+      node.gain.value = gain;
+    }
   }
 
   disconnectFromTransport() {

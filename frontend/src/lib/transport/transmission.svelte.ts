@@ -39,16 +39,25 @@ export function initTransmission(video: MediasoupVideo): void {
     }
   });
 
-  _video.on("trackRemoved", (peerId, source) => {
-    const p = transportState.participants.get(peerId);
-    if (!p) return;
-    transportState.participants = new Map(transportState.participants).set(
-      peerId,
-      source === "camera"
-        ? { ...p, videoTrack: null }
-        : { ...p, screenTrack: null, screenAudioTrack: null }
-    );
-  });
+_video.on("trackRemoved", (peerId, source) => {
+  // Handle local tracks (screen share stopped via browser button)
+  if (peerId === "local") {
+    if (source === "screen") {
+      transportState.screenSharing = false;
+      transportState.localScreenStream = null;
+    }
+    return;
+  }
+  // Handle remote tracks
+  const p = transportState.participants.get(peerId);
+  if (!p) return;
+  transportState.participants = new Map(transportState.participants).set(
+    peerId,
+    source === "camera"
+      ? { ...p, videoTrack: null }
+      : { ...p, screenTrack: null, screenAudioTrack: null }
+  );
+});
 
   _video.on("peerJoined", (peerId) => {
     if (!transportState.sfuPeerIds.has(peerId)) {

@@ -42,6 +42,7 @@ export class LibP2PVoice implements VoiceTransport {
   private processedStream: MediaStream | null = null;
   private inputSource: MediaStreamAudioSourceNode | null = null;
   private inputGain: GainNode | null = null;
+  private voiceHandlerRegistered = false;
 
   private activeInputDevice: string | null = null;
   private activeOutputDevice: string | null = null;
@@ -66,6 +67,7 @@ export class LibP2PVoice implements VoiceTransport {
 
   async join(_roomCode: string): Promise<void> {
     this.node = this.transport.p2pNode;
+    if (!this.node) throw new Error("Transport not connected");
 
     if (!this.node) {
       throw new Error(
@@ -84,14 +86,17 @@ export class LibP2PVoice implements VoiceTransport {
       // listen-only mode
     }
 
-    await this.node.handle(
-      VOICE_PROTO,
-      (stream: Stream, connection: Connection) => {
-        const peerId = connection.remotePeer.toString();
-        const remote = this.ensureRemotePeer(peerId);
-        this.attachStream(peerId, remote, stream);
-      }
-    );
+    if (!this.voiceHandlerRegistered) {
+      await this.node.handle(
+        VOICE_PROTO,
+        (stream: Stream, connection: Connection) => {
+          const peerId = connection.remotePeer.toString();
+          const remote = this.ensureRemotePeer(peerId);
+          this.attachStream(peerId, remote, stream);
+        }
+      );
+      this.voiceHandlerRegistered = true;
+    }
 
     this.onTransportConnect = (peerId: string) => {
       if (this.transport.isRelay(peerId)) return;
@@ -129,8 +134,11 @@ export class LibP2PVoice implements VoiceTransport {
       this.teardownRemotePeer(peerId);
       this.emit("peerLeft", peerId);
     }
+    if (this.voiceHandlerRegistered) {
+      this.node?.unhandle(VOICE_PROTO);
+      this.voiceHandlerRegistered = false;
+    }
 
-    this.node?.unhandle(VOICE_PROTO);
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.audioCtx?.close();
 
@@ -301,7 +309,10 @@ export class LibP2PVoice implements VoiceTransport {
       await this.dtln?.waitUntilReady().catch(() => {
         console.error;
       });
-      this.processedStream = await this.dtln!.processStream(this.micStream);
+      this.processedStream = await this.dtln!.processStream(
+        this.micStream,
+        this.currentInputGain
+      );
     } else {
       const ctx = this.audioCtx!;
       this.inputSource = ctx.createMediaStreamSource(this.micStream);

@@ -43,6 +43,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private connectedPeers = new Set<string>();
   private seedersByHash = new Map<string, Set<string>>();
   private wtPeers = new Map<string, SimplePeerInstance>();
+  private attachedTorrents = new Set<string>();
+  private seedingByHash = new Map<string, boolean>();
 
   constructor(private readonly selfId: () => string) {}
 
@@ -225,7 +227,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.seedersByHash.clear();
     this.localSeedHashes.clear();
     this.connectedPeers.clear();
-
+    this.attachedTorrents.clear();
+    this.seedingByHash.clear();
     this.client.destroy(() => {});
   }
 
@@ -351,9 +354,17 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const infoHash = torrent.infoHash;
     if (!infoHash) return;
 
+    // Always update seeding state - seed wins over download
+    if (seeding) {
+      this.seedingByHash.set(infoHash, true);
+    } else if (!this.seedingByHash.has(infoHash)) {
+      this.seedingByHash.set(infoHash, false);
+    }
+
     const descriptor = this.knownFiles.get(infoHash) ?? fallback;
 
     const pushUpdate = () => {
+      const isSeeding = this.seedingByHash.get(infoHash) ?? seeding;
       const existing = this.transfers.get(infoHash);
       this.upsertTransfer({
         infoHash,
@@ -361,13 +372,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         mimeType: descriptor.mimeType,
         size: descriptor.size,
         status: torrent.done
-          ? seeding
+          ? isSeeding
             ? "seeding"
             : "complete"
           : "downloading",
         progress: torrent.progress ?? existing?.progress ?? 0,
         done: torrent.done,
-        seeding,
+        seeding: isSeeding,
         peers: torrent.numPeers ?? existing?.peers ?? 0,
         seeders:
           this.seedersByHash.get(infoHash)?.size ?? existing?.seeders ?? 0,
@@ -376,13 +387,19 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       });
     };
 
+    if (this.attachedTorrents.has(infoHash)) {
+      pushUpdate();
+      return;
+    }
+
+    this.attachedTorrents.add(infoHash);
     torrent.on("download", pushUpdate);
     torrent.on("upload", pushUpdate);
     torrent.on("wire", pushUpdate);
 
     torrent.on("done", () => {
       pushUpdate();
-      if (seeding) return;
+      if (this.seedingByHash.get(infoHash)) return;
       const file = torrent.files?.[0];
       if (!file) return;
       file.getBlob((_err, blob) => {
@@ -420,7 +437,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         status: "failed",
         progress: prev?.progress ?? 0,
         done: false,
-        seeding,
+        seeding: this.seedingByHash.get(infoHash) ?? false,
         peers: prev?.peers ?? 0,
         seeders: this.seedersByHash.get(infoHash)?.size ?? prev?.seeders ?? 0,
         blobURL: prev?.blobURL,

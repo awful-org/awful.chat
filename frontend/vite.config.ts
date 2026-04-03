@@ -5,8 +5,7 @@ import path from "path";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
 import { VitePWA } from "vite-plugin-pwa";
 
-// https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   define: {
     global: "globalThis",
   },
@@ -87,7 +86,7 @@ export default defineConfig({
         protocol_handlers: [
           {
             protocol: "web+awfl",
-            url: "/r/%s", // web+awfl:a89f81 -> /r/a89f81 in PWA
+            url: "/r/%s",
           },
         ],
       },
@@ -108,4 +107,13 @@ export default defineConfig({
       webtorrent: "webtorrent/webtorrent.min.js",
     },
   },
-});
+  server:
+    mode === "development"
+      ? {
+          proxy: {
+            "/klipy": "http://localhost:8081",
+            "/og": "http://localhost:8081",
+          },
+        }
+      : {},
+}));

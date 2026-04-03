@@ -487,11 +487,11 @@
         const did = peerIdToDid(peerId);
         let source = await getMessages(room.roomCode);
 
-        const activeDid = peerIdToDid(transportState.activeDmPeerId ?? "");
-        const roomDid = peerIdToDid(peerId);
-        if (transportState.chatMode === "dm" && activeDid === roomDid) {
-          source = transportState.messages;
-        }
+    const activeDid = peerIdToDid(transportState.activeDmPeerId ?? "");
+    const roomDid = peerIdToDid(peerId);
+    if (transportState.chatMode === "dm" && activeDid === roomDid) {
+      source = transportState.messages.filter((m) => m.roomCode === room.roomCode);
+    }
 
         const last = source[source.length - 1];
         const profile = await getPeerProfile(did).catch(() => undefined);

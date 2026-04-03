@@ -54,10 +54,6 @@
         case "peer-disconnected":
           peerCount = _transport?.peers().length ?? 0;
           break;
-        case "stream-open-failed":
-          currentStatus = "error";
-          errorMessage = "Stream failed";
-          break;
         case "rendezvous-failed":
         case "rendezvous-reconnecting":
           currentStatus = "reconnecting";
