@@ -111,8 +111,8 @@ export default defineConfig(({ mode }) => ({
     mode === "development"
       ? {
           proxy: {
-            "/klipy": "http://localhost:8081",
-            "/og": "http://localhost:8081",
+            "/klipy": "http://relay:8081",
+            "/og": "http://relay:8081",
           },
         }
       : {},

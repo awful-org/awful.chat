@@ -152,7 +152,10 @@ export class LibP2PTransport implements PeerTransport {
       if (this.isRelayPeer(id)) {
         if (!this.intentionalDisconnect) {
           console.warn("[Transport] relay disconnected, scheduling reconnect");
-          this.emit("status", { type: "relay-disconnected", message: "Relay disconnected - reconnecting..." });
+          this.emit("status", {
+            type: "relay-disconnected",
+            message: "Relay disconnected - reconnecting...",
+          });
           this.scheduleRelayReconnect();
         }
         return;
@@ -217,7 +220,7 @@ export class LibP2PTransport implements PeerTransport {
 
   async send(peerId: string, data: Uint8Array): Promise<void> {
     if (!this.node || this.isRelayPeer(peerId)) return;
-if (peerId === this.node.peerId.toString()) return;
+    if (peerId === this.node.peerId.toString()) return;
 
     const stream = this.peerStreams.get(peerId);
     if (stream) {
@@ -238,7 +241,7 @@ if (peerId === this.node.peerId.toString()) return;
         this.emit("status", {
           type: "stream-open-failed",
           peerId: peerId.slice(-8),
-          message: `Failed to open stream to peer ${peerId.slice(-8)}`
+          message: `Failed to open stream to peer ${peerId.slice(-8)}`,
         });
         this.openingStreams.delete(peerId);
         this.pendingQueues.delete(peerId);
@@ -300,10 +303,16 @@ if (peerId === this.node.peerId.toString()) return;
     try {
       await this.node.dial(multiaddr(relayMa));
       console.log("[Transport] relay connected");
-      this.emit("status", { type: "relay-connected", message: "Connected to relay" });
+      this.emit("status", {
+        type: "relay-connected",
+        message: "Connected to relay",
+      });
     } catch (err) {
       console.error("[Transport] relay dial failed:", err);
-      this.emit("status", { type: "relay-dial-failed", message: "Failed to connect to relay" });
+      this.emit("status", {
+        type: "relay-dial-failed",
+        message: "Failed to connect to relay",
+      });
       throw err;
     }
   }
@@ -333,7 +342,10 @@ if (peerId === this.node.peerId.toString()) return;
     if (this.intentionalDisconnect || this.relayReconnectTimer || !this.node)
       return;
 
-    this.emit("status", { type: "relay-reconnecting", message: "Reconnecting to relay..." });
+    this.emit("status", {
+      type: "relay-reconnecting",
+      message: "Reconnecting to relay...",
+    });
 
     this.relayReconnectTimer = setTimeout(async () => {
       this.relayReconnectTimer = null;
@@ -348,7 +360,10 @@ if (peerId === this.node.peerId.toString()) return;
         this.startRendezvous();
       } catch (err) {
         console.warn("[Transport] relay reconnect failed, retrying:", err);
-        this.emit("status", { type: "relay-reconnect-failed", message: "Relay reconnect failed - retrying..." });
+        this.emit("status", {
+          type: "relay-reconnect-failed",
+          message: "Relay reconnect failed - retrying...",
+        });
         this.scheduleRelayReconnect();
       }
     }, RELAY_RECONNECT_DELAY_MS);
@@ -444,7 +459,7 @@ if (peerId === this.node.peerId.toString()) return;
       console.warn("[Rendezvous] failed to open stream, retrying:", err);
       this.emit("status", {
         type: "rendezvous-failed",
-        message: "Failed to connect to room server - retrying..."
+        message: "Failed to connect to room server - retrying...",
       });
       setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
       return;
@@ -494,7 +509,7 @@ if (peerId === this.node.peerId.toString()) return;
         console.warn("[Rendezvous] stream closed, reconnecting");
         this.emit("status", {
           type: "rendezvous-reconnecting",
-          message: "Room server disconnected - reconnecting..."
+          message: "Room server disconnected - reconnecting...",
         });
         setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
       }
@@ -541,6 +556,11 @@ if (peerId === this.node.peerId.toString()) return;
             peerId.slice(-8),
             err
           );
+          this.emit("status", {
+            type: "peer-dial-failed",
+            peerId: peerId.slice(-8),
+            message: `Could not reach peer ${peerId.slice(-8)}`,
+          });
         }
       }
     } finally {
@@ -579,6 +599,11 @@ if (peerId === this.node.peerId.toString()) return;
           this.node?.getMultiaddrs().map((a) => a.toString())
         );
         this.node?.removeEventListener("self:peer:update", check);
+
+        this.emit("status", {
+          type: "reservation-timeout",
+          message: "Relay reservation timed out — you may not be reachable",
+        });
         resolve();
       }, RELAY_RESERVATION_TIMEOUT_MS);
 

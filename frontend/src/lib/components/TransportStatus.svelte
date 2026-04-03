@@ -12,6 +12,9 @@
     Unplug,
     MessageSquareOff,
     Radio,
+    PhoneOff,
+    Phone,
+    PhoneMissed,
   } from "@lucide/svelte";
   import { onMount, onDestroy } from "svelte";
   import { cn } from "$lib/utils";
@@ -111,16 +114,30 @@
         case "rendezvous-reconnecting":
           addStatus("warning", status.message, RefreshCw);
           break;
-        case "peer-connected":
-          updatePeerCount();
-          addStatus("connected", status.message, Wifi);
-          break;
-        case "peer-disconnected":
-          updatePeerCount();
-          addStatus("disconnected", status.message, WifiOff);
-          break;
         case "reservation-timeout":
           addStatus("error", status.message, CircleAlert);
+          break;
+        case "peer-dial-failed":
+          addStatus("error", status.message, CircleAlert);
+          break;
+        case "voice-ice-connected":
+          addStatus(
+            "connected",
+            status.message,
+            status.relayed ? Radio : Phone
+          );
+          break;
+        case "voice-connection-failed":
+          addStatus("error", status.message, PhoneMissed);
+          break;
+        case "voice-dial-failed":
+          addStatus("error", status.message, PhoneOff);
+          break;
+        case "voice-dial-retrying":
+          addStatus("warning", status.message, RefreshCw);
+          break;
+        case "voice-peer-left":
+          addStatus("disconnected", status.message, PhoneOff);
           break;
       }
     };
@@ -242,14 +259,8 @@
         )}
         role="status"
       >
-        {#if item.type === "connected"}
-          <Wifi class={cn("size-3.5", getStatusColor(item.type))} />
-        {:else if item.type === "connecting"}
-          <Activity class={cn("size-3.5", getStatusColor(item.type))} />
-        {:else if item.type === "disconnected"}
-          <WifiOff class={cn("size-3.5", getStatusColor(item.type))} />
-        {:else if item.type === "warning"}
-          <RefreshCw class={cn("size-3.5", getStatusColor(item.type))} />
+        {#if item.icon}
+          <item.icon class={cn("size-3.5", getStatusColor(item.type))} />
         {:else}
           <CircleAlert class={cn("size-3.5", getStatusColor(item.type))} />
         {/if}

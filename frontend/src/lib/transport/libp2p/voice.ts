@@ -69,12 +69,6 @@ export class LibP2PVoice implements VoiceTransport {
     this.node = this.transport.p2pNode;
     if (!this.node) throw new Error("Transport not connected");
 
-    if (!this.node) {
-      throw new Error(
-        "Transport not connected — call transport.connect() first"
-      );
-    }
-
     this.audioCtx = new AudioContext();
     if (this.audioCtx.state === "suspended") {
       await this.audioCtx.resume().catch(() => {});
@@ -101,9 +95,17 @@ export class LibP2PVoice implements VoiceTransport {
     this.onTransportConnect = (peerId: string) => {
       if (this.transport.isRelay(peerId)) return;
       if (this.remotePeers.has(peerId)) return;
-      if (peerId < this.transport.selfId()) {
-        this.dialAndOffer(peerId).catch(() => {});
-      }
+      // always dial from both sides — ensureRemotePeer + pc state guards duplication
+      this.dialAndOffer(peerId).catch((err) => {
+        this.emit("status", {
+          type: "voice-dial-failed",
+          peerId: peerId.slice(-8),
+          message:
+            err instanceof Error
+              ? err.message
+              : "Voice dial failed on peer connect",
+        });
+      });
     };
 
     this.onTransportDisconnect = (peerId: string) => {
@@ -118,7 +120,14 @@ export class LibP2PVoice implements VoiceTransport {
     for (const peerId of this.transport.peers()) {
       if (this.transport.isRelay(peerId)) continue;
       if (peerId < this.transport.selfId()) {
-        this.dialAndOffer(peerId).catch(() => {});
+        this.dialAndOffer(peerId).catch((err) => {
+          this.emit("status", {
+            type: "voice-dial-failed",
+            peerId: peerId.slice(-8),
+            message:
+              err instanceof Error ? err.message : "Voice dial failed on join",
+          });
+        });
       }
     }
   }
@@ -343,27 +352,52 @@ export class LibP2PVoice implements VoiceTransport {
 
   private async dialAndOffer(peerId: string): Promise<void> {
     if (!this.node || this.transport.isRelay(peerId)) return;
+
+    // if the other side already dialed us, we're done
+    if (this.remotePeers.get(peerId)?.sigStream) return;
+
     const remote = this.ensureRemotePeer(peerId);
 
     let stream: Stream | null = null;
-    for (let attempt = 0; attempt <= 3; attempt++) {
+    for (let attempt = 0; attempt <= 5; attempt++) {
       try {
         const pid = this.node.getPeers().find((p) => p.toString() === peerId);
         if (!pid) throw new Error("peer not in peerstore");
         stream = await this.node.dialProtocol(pid, VOICE_PROTO);
         break;
       } catch (err) {
-        if (attempt === 3) {
+        if (attempt === 5) {
           console.warn(`[LibP2PVoice] dial ${peerId} failed:`, err);
+          this.emit("status", {
+            type: "voice-dial-failed",
+            peerId: peerId.slice(-8),
+            message:
+              err instanceof Error
+                ? err.message
+                : "Failed to open voice stream",
+          });
           return;
         }
-        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        this.emit("status", {
+          type: "voice-dial-retrying",
+          peerId: peerId.slice(-8),
+          attempt: attempt + 1,
+          message: `Retrying voice connection (${attempt + 1}/5)...`,
+        });
+        await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
       }
     }
 
     if (!stream) return;
 
+    // check again — remote may have connected to us during our retries
+    if (remote.sigStream) return;
+
     this.attachStream(peerId, remote, stream);
+
+    // only create offer if we don't already have a remote description
+    if (remote.pc.signalingState !== "stable" || remote.pc.remoteDescription)
+      return;
 
     const offer = await remote.pc.createOffer();
     await remote.pc.setLocalDescription(offer);
@@ -468,9 +502,45 @@ export class LibP2PVoice implements VoiceTransport {
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      const state = pc.connectionState;
+      if (state === "connected") {
+        // check if relayed via TURN
+        pc.getStats()
+          .then((stats) => {
+            for (const report of stats.values()) {
+              if (
+                report.type === "candidate-pair" &&
+                report.state === "succeeded"
+              ) {
+                const isRelay =
+                  report.localCandidateType === "relay" ||
+                  report.remoteCandidateType === "relay";
+                this.emit("status", {
+                  type: "voice-ice-connected",
+                  peerId: peerId.slice(-8),
+                  relayed: isRelay,
+                  message: isRelay
+                    ? "Voice connected via relay (TURN)"
+                    : "Voice connected directly (P2P)",
+                });
+              }
+            }
+          })
+          .catch(() => {});
+      } else if (state === "failed") {
+        this.emit("status", {
+          type: "voice-connection-failed",
+          peerId: peerId.slice(-8),
+          message: `Voice connection failed for ${peerId.slice(-8)}`,
+        });
         this.teardownRemotePeer(peerId);
         this.emit("peerLeft", peerId);
+      } else if (state === "disconnected") {
+        this.emit("status", {
+          type: "voice-degraded",
+          peerId: peerId.slice(-8),
+          message: `Voice signal lost from ${peerId.slice(-8)} — reconnecting...`,
+        });
       }
     };
 
@@ -550,6 +620,14 @@ export class LibP2PVoice implements VoiceTransport {
 
     switch (signal.type) {
       case "offer": {
+        // if we already sent an offer, the higher peerId yields
+        if (remote.pc.signalingState !== "stable") {
+          if (this.transport.selfId() > peerId) {
+            await remote.pc.setLocalDescription({ type: "rollback" });
+          } else {
+            return; // let our offer win
+          }
+        }
         await remote.pc.setRemoteDescription({
           type: "offer",
           sdp: signal.sdp,

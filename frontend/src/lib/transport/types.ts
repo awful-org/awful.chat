@@ -14,10 +14,30 @@ export type TransportStatus =
   | { type: "stream-open-failed"; peerId: string; message: string }
   | { type: "rendezvous-failed"; message: string }
   | { type: "rendezvous-reconnecting"; message: string }
-  | { type: "peer-dialing"; peerId: string; message: string }
-  | { type: "peer-connected"; peerId: string; message: string }
-  | { type: "peer-disconnected"; peerId: string; message: string }
-  | { type: "reservation-timeout"; message: string };
+  | { type: "reservation-timeout"; message: string }
+  | { type: "voice-dial-failed"; peerId: string; message: string }
+  | {
+      type: "voice-dial-retrying";
+      peerId: string;
+      attempt: number;
+      message: string;
+    }
+  | { type: "voice-peer-left"; peerId: string; message: string }
+  | {
+      type: "voice-glare-resolved";
+      peerId: string;
+      winner: string;
+      message: string;
+    }
+  | { type: "peer-dial-failed"; peerId: string; message: string }
+  | { type: "voice-connection-failed"; peerId: string; message: string }
+  | {
+      type: "voice-ice-connected";
+      peerId: string;
+      relayed: boolean;
+      message: string;
+    }
+  | { type: "voice-degraded"; peerId: string; message: string };
 
 export interface PeerTransport {
   connect(privateKeyBytes?: Uint8Array | null): Promise<void>;
@@ -47,6 +67,7 @@ export interface VoiceEvents {
   peerLeft: (peerId: string) => void;
   deviceChanged: (kind: "input" | "output", deviceId: string) => void;
   error: (err: Error) => void;
+  status: (status: TransportStatus) => void;
 }
 
 /**
