@@ -33,6 +33,7 @@ interface RemotePeer {
   gainNode: GainNode | null;
   sigStream: Stream | null;
   readBuf: Uint8Array;
+  pendingCandidates: RTCIceCandidateInit[];
 }
 
 export class LibP2PVoice implements VoiceTransport {
@@ -95,6 +96,7 @@ export class LibP2PVoice implements VoiceTransport {
     this.onTransportConnect = (peerId: string) => {
       if (this.transport.isRelay(peerId)) return;
       if (this.remotePeers.has(peerId)) return;
+      if (peerId > this.transport.selfId()) return;
       // always dial from both sides — ensureRemotePeer + pc state guards duplication
       this.dialAndOffer(peerId).catch((err) => {
         this.emit("status", {
@@ -137,7 +139,6 @@ export class LibP2PVoice implements VoiceTransport {
       this.transport.off("connect", this.onTransportConnect);
       this.onTransportConnect = null;
     }
-    this.transport.off("disconnect", this.onTransportDisconnect);
 
     for (const peerId of [...this.remotePeers.keys()]) {
       this.teardownRemotePeer(peerId);
@@ -188,13 +189,12 @@ export class LibP2PVoice implements VoiceTransport {
     await this.startMic(deviceId);
 
     const newTrack = this.processedStream?.getAudioTracks()[0] ?? null;
-    if (newTrack) {
-      for (const remote of this.remotePeers.values()) {
-        const sender = remote.pc
-          .getSenders()
-          .find((s) => s.track?.kind === "audio");
-        if (sender) await sender.replaceTrack(newTrack);
-      }
+    if (!newTrack) return;
+    for (const remote of this.remotePeers.values()) {
+      const sender = remote.pc
+        .getSenders()
+        .find((s) => s.track?.kind === "audio");
+      if (sender) await sender.replaceTrack(newTrack);
     }
 
     this.activeInputDevice = deviceId;
@@ -390,14 +390,11 @@ export class LibP2PVoice implements VoiceTransport {
 
     if (!stream) return;
 
-    // check again — remote may have connected to us during our retries
-    if (remote.sigStream) return;
+    if (remote.pc.remoteDescription) return;
 
     this.attachStream(peerId, remote, stream);
 
-    // only create offer if we don't already have a remote description
-    if (remote.pc.signalingState !== "stable" || remote.pc.remoteDescription)
-      return;
+    if (remote.pc.signalingState === "have-local-offer") return;
 
     const offer = await remote.pc.createOffer();
     await remote.pc.setLocalDescription(offer);
@@ -440,7 +437,13 @@ export class LibP2PVoice implements VoiceTransport {
     });
 
     stream.addEventListener("close", (_evt: StreamCloseEvent) => {
-      if (remote.sigStream === stream) remote.sigStream = null;
+      if (remote.sigStream !== stream) return;
+      remote.sigStream = null;
+
+      const state = remote.pc.connectionState;
+      if (state !== "closed" && state !== "failed" && this.node) {
+        this.dialAndOffer(peerId).catch(() => {});
+      }
     });
 
     const queued = this.signalQueues.get(peerId) ?? [];
@@ -541,6 +544,15 @@ export class LibP2PVoice implements VoiceTransport {
           peerId: peerId.slice(-8),
           message: `Voice signal lost from ${peerId.slice(-8)} — reconnecting...`,
         });
+        // attempt ICE restart if signaling stream is still alive
+        if (remote.sigStream && remote.pc.signalingState === "stable") {
+          remote.pc.restartIce();
+          remote.pc.createOffer({ iceRestart: true }).then((offer) => {
+            remote.pc.setLocalDescription(offer).then(() => {
+              this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! });
+            });
+          });
+        }
       }
     };
 
@@ -558,6 +570,7 @@ export class LibP2PVoice implements VoiceTransport {
       gainNode: null,
       sigStream: null,
       readBuf: new Uint8Array(0),
+      pendingCandidates: [],
     };
     this.remotePeers.set(peerId, remote);
     return remote;
@@ -620,34 +633,56 @@ export class LibP2PVoice implements VoiceTransport {
 
     switch (signal.type) {
       case "offer": {
-        // if we already sent an offer, the higher peerId yields
-        if (remote.pc.signalingState !== "stable") {
+        const state = remote.pc.signalingState;
+
+        if (state === "have-local-offer") {
+          // glare: higher peerId yields
           if (this.transport.selfId() > peerId) {
             await remote.pc.setLocalDescription({ type: "rollback" });
           } else {
-            return; // let our offer win
+            return;
           }
+        } else if (state !== "stable") {
+          // unexpected state — log and bail
+          console.warn(
+            `[Voice] unexpected signaling state ${state} on offer from ${peerId}`
+          );
+          return;
         }
+
         await remote.pc.setRemoteDescription({
           type: "offer",
           sdp: signal.sdp,
         });
+        await this.drainCandidates(remote); // drain buffered ICE
         const answer = await remote.pc.createAnswer();
         await remote.pc.setLocalDescription(answer);
         this.sendSignal(peerId, { type: "answer", sdp: answer.sdp! });
         break;
       }
+
       case "answer": {
         await remote.pc.setRemoteDescription({
           type: "answer",
           sdp: signal.sdp,
         });
+        await this.drainCandidates(remote); // drain buffered ICE
         break;
       }
       case "ice": {
+        if (!remote.pc.remoteDescription) {
+          remote.pendingCandidates.push(signal.candidate);
+          return;
+        }
         await remote.pc.addIceCandidate(signal.candidate).catch(() => {});
         break;
       }
+    }
+  }
+
+  private async drainCandidates(remote: RemotePeer): Promise<void> {
+    for (const c of remote.pendingCandidates.splice(0)) {
+      await remote.pc.addIceCandidate(c).catch(() => {});
     }
   }
 
