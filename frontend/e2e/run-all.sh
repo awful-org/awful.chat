@@ -5,7 +5,7 @@
 set -u
 cd "$(dirname "$0")"
 FIRST="dm-extras sync-recovers dm-removal title-and-sound dtln-gain clock-skew"
-SECOND="room-removal reconnect-churn audio-prefs peer-volume background-sync rapid-switch drag-drop call-status"
+SECOND="room-removal reconnect-churn audio-prefs peer-volume background-sync rapid-switch drag-drop call-status call-roster-ttl history-pull"
 fail=0
 run() {
   for sc in $1; do

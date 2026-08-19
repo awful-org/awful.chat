@@ -104,6 +104,8 @@ export function joinCall(): Promise<void> {
   return _joinPromise;
 }
 
+let _presenceHeartbeat: ReturnType<typeof setInterval> | null = null;
+
 async function _joinCall(): Promise<void> {
   transportState.error = null;
   try {
@@ -118,11 +120,18 @@ async function _joinCall(): Promise<void> {
     acquireWakeLock();
     playJoinSound();
     _sendCallPresence();
+    // Heartbeat: peers expire silent roster entries after 60s, so a healthy
+    // call re-announces itself well inside that window.
+    _presenceHeartbeat = setInterval(() => _sendCallPresence(), 20_000);
     transportState.muted = _voice.isMuted();
     _sendCallState();
     transportState.localMicStream = _voice.getMicStream();
   } catch (err) {
     releaseWakeLock();
+    if (_presenceHeartbeat) {
+      clearInterval(_presenceHeartbeat);
+      _presenceHeartbeat = null;
+    }
     _voice.leave();
     _video.leave();
     transportState.inCall = false;
@@ -140,6 +149,10 @@ async function _joinCall(): Promise<void> {
 
 export function leaveCall(): void {
   releaseWakeLock();
+  if (_presenceHeartbeat) {
+    clearInterval(_presenceHeartbeat);
+    _presenceHeartbeat = null;
+  }
   if (transportState.inCall) {
     playLeaveSound();
     transportState.inCall = false;

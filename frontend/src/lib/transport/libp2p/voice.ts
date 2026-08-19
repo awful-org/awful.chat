@@ -584,7 +584,9 @@ export class LibP2PVoice implements VoiceTransport {
                   report.remoteCandidateType === "relay";
                 this.emit("status", {
                   type: "voice-ice-connected",
-                  peerId: peerId.slice(-8),
+                  // Full id: consumers match tiles against it; the human-
+                  // readable part is the message.
+                  peerId,
                   relayed: isRelay,
                   message: isRelay
                     ? "Voice connected via relay (TURN)"

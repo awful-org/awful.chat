@@ -22,6 +22,7 @@ import {
   getOwnProfile,
   putOwnProfile,
   updateOwnProfile,
+  getAllMessages,
 } from "./storage";
 import { MessageType, type Message } from "./types/message";
 
@@ -239,5 +240,40 @@ describe("markOwnMessagesReadUpTo", () => {
     expect((await getMessage("own-3"))?.status).toBe("sent");
     expect((await getMessage("theirs"))?.status).toBe("delivered");
     expect((await getMessage("own-1"))?.status).toBe("read");
+  });
+});
+
+describe("history pagination", () => {
+  it("pages backwards without overlap or gaps and reports the end", async () => {
+    const rows = [];
+    for (let i = 1; i <= 120; i++) {
+      rows.push(msg({ id: `h-${i}`, roomCode: "room-pg", lamport: i }));
+    }
+    await bulkPutMessages(rows);
+
+    const page1 = await getMessages("room-pg");
+    expect(page1).toHaveLength(50);
+    expect(page1[0].lamport).toBe(71);
+    expect(page1[49].lamport).toBe(120);
+
+    const page2 = await getMessages("room-pg", page1[0].lamport);
+    expect(page2).toHaveLength(50);
+    expect(page2[0].lamport).toBe(21);
+    expect(page2[49].lamport).toBe(70);
+
+    const page3 = await getMessages("room-pg", page2[0].lamport);
+    expect(page3).toHaveLength(20);
+    expect(page3[0].lamport).toBe(1);
+
+    expect(await getMessages("room-pg", page3[0].lamport)).toHaveLength(0);
+
+    const ids = new Set([...page1, ...page2, ...page3].map((m) => m.id));
+    expect(ids.size).toBe(120);
+
+    // The sync path reads the same history unpaged, in lamport order.
+    const all = await getAllMessages("room-pg");
+    expect(all).toHaveLength(120);
+    expect(all[0].lamport).toBe(1);
+    expect(all[119].lamport).toBe(120);
   });
 });

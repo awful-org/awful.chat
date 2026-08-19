@@ -68,9 +68,16 @@ services:
     networks:
       - dokploy-network
 
+  # For TLS TURN (turns: - strongly recommended for mobile-carrier users):
+  # put fullchain.pem + privkey.pem for the domain in a directory, set
+  #   TURN_TLS_DIR=/path/to/certs
+  #   TURN_TLS_ARGS=--cert=/certs/fullchain.pem --pkey=/certs/privkey.pem
+  # and uncomment the volumes line below.
   coturn:
     image: coturn/coturn:latest
     restart: unless-stopped
+    # volumes:
+    #   - ${TURN_TLS_DIR}:/certs:ro
     command: >
       --log-file=stdout
       --verbose
@@ -82,14 +89,21 @@ services:
       --fingerprint
       --no-multicast-peers
       --alt-listening-port=5349
+      --denied-peer-ip=100.64.0.0-100.127.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
       --denied-peer-ip=192.168.0.0-192.168.255.255
       --denied-peer-ip=172.16.0.0-172.31.255.255
       --min-port=49152
       --max-port=49202
+      ${TURN_TLS_ARGS:-}
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
+      # 5349 was advertised to clients but never published - the tcp fallback
+      # URL was dead. With TURN_TLS_DIR mounted it also serves turns: (TLS),
+      # which is what mobile carriers that block plain UDP/TCP still allow.
+      - "5349:5349/tcp"
+      - "5349:5349/udp"
       - "49152-49202:49152-49202/udp"
     networks:
       - dokploy-network

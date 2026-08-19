@@ -19,6 +19,9 @@ const STATIC_TURN: RTCIceServer = {
     "turn:awful.frav.in:3478?transport=udp",
     "turn:awful.frav.in:3478?transport=tcp",
     "turn:awful.frav.in:5349?transport=tcp",
+    // TLS is what restrictive mobile carriers still allow; skipped harmlessly
+    // until coturn is given a certificate.
+    "turns:awful.frav.in:5349?transport=tcp",
   ],
   username: "awful",
   credential: "awful",

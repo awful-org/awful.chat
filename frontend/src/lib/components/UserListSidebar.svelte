@@ -337,11 +337,22 @@
   </div>
 {/snippet}
 
-{#snippet SectionDivider(label: string, count: number)}
-  <div class="flex items-center gap-2 px-2 py-1.5">
+{#snippet SectionDivider(label: string, count: number, Icon?: typeof Users)}
+  <!-- The icon slot is always reserved so every section's label and count
+       start at the same x, icon or not - ragged headers read as misaligned. -->
+  <div class="flex items-center gap-2 px-3 py-1.5">
+    {#if Icon}
+      <Icon class="size-4 shrink-0 {label === 'In call'
+          ? 'text-primary'
+          : 'text-muted-foreground'}" />
+    {:else}
+      <span class="size-4 shrink-0"></span>
+    {/if}
     <span
-      class="text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
-      >{label}</span
+      class="text-xs font-semibold uppercase tracking-wider font-mono {label ===
+      'In call'
+        ? 'text-primary'
+        : 'text-muted-foreground'}">{label}</span
     >
     <Badge variant="secondary" class="text-muted-foreground">{count}</Badge>
   </div>
@@ -356,16 +367,7 @@
     {:else}
       {#if inCallUsers.length > 0}
         <div class="rounded-lg border border-primary/20 bg-primary/5 pb-1 mb-2">
-          <div class="flex items-center gap-2 px-2 py-1.5">
-            <Headphones class="size-3.5 text-primary" />
-            <span
-              class="text-xs font-semibold text-primary uppercase tracking-wider font-mono"
-              >In call</span
-            >
-            <Badge variant="secondary" class="text-muted-foreground"
-              >{inCallUsers.length}</Badge
-            >
-          </div>
+          {@render SectionDivider("In call", inCallUsers.length, Headphones)}
           {#each inCallUsers as user (user.did)}
             {@render UserItem(user)}
           {/each}

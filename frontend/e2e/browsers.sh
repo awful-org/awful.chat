@@ -23,6 +23,8 @@ user_pref("media.navigator.permission.disabled", true);
 user_pref("media.autoplay.default", 0);
 user_pref("media.autoplay.blocking_policy", 0);
 user_pref("media.autoplay.block-webaudio", false);
+user_pref("media.peerconnection.ice.loopback", true);
+user_pref("media.peerconnection.ice.obfuscate_host_addresses", false);
 PREFS
   setsid /usr/lib/firefox/firefox --headless --profile "$DIR/$prof" \
     --remote-debugging-port="$port" >"$DIR/$prof.log" 2>&1 </dev/null &

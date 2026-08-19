@@ -17,6 +17,7 @@
   } from "$lib/audio/volume-curve";
   import {
     transportState,
+    _transport,
     selfId,
     peerIdToDid,
     isRelayed,
@@ -55,7 +56,7 @@
     VolumeX,
     Workflow,
   } from "@lucide/svelte";
-  import { MessageSquare, MonitorIcon } from "@lucide/svelte";
+  import { MessageSquare, MonitorIcon, Users as UsersIcon } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
 import { displayPrefs } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
@@ -76,6 +77,8 @@ import { cn } from "$lib/utils";
     peerId: string;
     muted?: boolean;
     deafened?: boolean;
+    /** Announced in the call but their voice link is not up yet. */
+    connecting?: boolean;
     /** True when this is a screen-share transmission tile that hasn't been joined yet. */
     isPending?: boolean;
     /** The SFU producerId - only set on pending transmission tiles. */
@@ -106,6 +109,14 @@ import { cn } from "$lib/utils";
     const did = peerIdToDid(peerId);
     return peerNames.get(did) ?? peerNames.get(peerId) ?? peerId.slice(0, 8);
   }
+
+  const callMembers = $derived.by(() => {
+    const names = [...callPeerIds].map(getPeerLabel);
+    return {
+      count: names.length + (transportState.inCall ? 1 : 0),
+      label: formatReactorNames(names, transportState.inCall),
+    };
+  });
 
   function transmissionAudience(sharerPeerId: string): {
     count: number;
@@ -248,6 +259,28 @@ import { cn } from "$lib/utils";
   const SPEAKING_ON = 5;
   const SPEAKING_OFF = 2;
   const lastLoudAt = new Map<string, number>();
+
+  // Peers whose voice ICE actually completed - a roster tile without a track
+  // AND without this is still connecting, and must not render as present.
+  let iceConnectedPeers = $state(new Set<string>());
+  $effect(() => {
+    const onStatus = (st: { type: string; peerId?: string }) => {
+      if (st.type === "voice-ice-connected" && st.peerId) {
+        iceConnectedPeers = new Set([...iceConnectedPeers, st.peerId]);
+      }
+      if (
+        (st.type === "voice-peer-left" ||
+          st.type === "voice-connection-failed") &&
+        st.peerId
+      ) {
+        const next = new Set(iceConnectedPeers);
+        next.delete(st.peerId);
+        iceConnectedPeers = next;
+      }
+    };
+    _transport?.on("status", onStatus);
+    return () => _transport?.off("status", onStatus);
+  });
 
   // Hoisted: allocating a fresh buffer per animation frame churned the GC.
   const speakerBuf = new Uint8Array(512);
@@ -426,6 +459,8 @@ import { cn } from "$lib/utils";
         peerId,
         muted: remoteCallState?.muted,
         deafened: remoteCallState?.deafened,
+        connecting:
+          !p.audioTrack && !p.videoTrack && !iceConnectedPeers.has(peerId),
       });
     }
     if (localScreenTrack) {
@@ -714,6 +749,7 @@ import { cn } from "$lib/utils";
     type="button"
     oncontextmenu={(e) => openPeerMenu(e, tile)}
     class="group relative flex items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
+      {tile.connecting ? 'connecting-wave' : ''}
       {isFocused ? 'w-full h-full' : ''}
       {compact ? 'aspect-video' : ''}
       {isSpeaking
@@ -1250,6 +1286,21 @@ import { cn } from "$lib/utils";
       {/if}
     </div>
 
+    {#if callMembers.count > 0}
+      <Tip text={callMembers.label}>
+        {#snippet children(props)}
+          <div
+            {...props}
+            aria-label="Call members"
+            class="absolute top-3 right-12 sm:top-4 sm:right-16 z-20 flex h-8 sm:h-10 items-center gap-1.5 rounded-lg bg-zinc-900 px-2.5 font-mono text-xs text-zinc-300"
+          >
+            <UsersIcon class="size-4" />
+            {callMembers.count}
+          </div>
+        {/snippet}
+      </Tip>
+    {/if}
+
     <button
       type="button"
       onclick={toggleFullscreen}
@@ -1323,3 +1374,20 @@ import { cn } from "$lib/utils";
     </div>
   </div>
 {/if}
+
+<style>
+  /* Connecting tiles: a pronounced opacity wave - Tailwind's pulse was too
+     subtle to read as "not here yet". */
+  .connecting-wave {
+    animation: connecting-wave 1.4s ease-in-out infinite;
+  }
+  @keyframes connecting-wave {
+    0%,
+    100% {
+      opacity: 0.9;
+    }
+    50% {
+      opacity: 0.2;
+    }
+  }
+</style>

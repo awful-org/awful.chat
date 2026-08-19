@@ -285,7 +285,12 @@
     draft = "";
     replyTargetId = null;
     autoScroll = true;
-    requestAnimationFrame(() => textareaEl?.focus());
+    // The composer grew with the multiline draft; clearing the value does
+    // not fire input, so shrink it back explicitly.
+    requestAnimationFrame(() => {
+      autoResize();
+      textareaEl?.focus();
+    });
   }
 
   function startReply(msg: Message) {

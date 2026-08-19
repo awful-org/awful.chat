@@ -193,6 +193,7 @@ export class LibP2PTransport implements PeerTransport {
     framesIn: 0,
     pingsIn: 0,
     pongsIn: 0,
+    suppressedStreamErrors: 0,
   };
 
   // set to true only by disconnect() - prevents any reconnect logic from firing
@@ -210,7 +211,31 @@ export class LibP2PTransport implements PeerTransport {
     return this.node;
   }
 
+  /**
+   * Gossipsub's heartbeat races departing peers: it writes GRAFT/PRUNE to a
+   * stream the peer just closed, and the rejection escapes the library as
+   * uncaught console noise. The mesh self-heals on the next heartbeat, so
+   * this exact error is not actionable - swallow it (counted in debugStats),
+   * and only it: every other rejection stays loud.
+   */
+  private installStreamNoiseFilter(): void {
+    if (typeof window === "undefined" || this.noiseFilterInstalled) return;
+    this.noiseFilterInstalled = true;
+    window.addEventListener("unhandledrejection", (e) => {
+      const r = e.reason as { name?: string; message?: string } | undefined;
+      if (
+        r?.name === "StreamStateError" &&
+        /stream that is closed/i.test(r?.message ?? "")
+      ) {
+        this.debugStats.suppressedStreamErrors++;
+        e.preventDefault();
+      }
+    });
+  }
+  private noiseFilterInstalled = false;
+
   async connect(privateKeyBytes?: Uint8Array | null): Promise<void> {
+    this.installStreamNoiseFilter();
     this.intentionalDisconnect = false;
 
     // A previous failed connect may have left a half-started node behind -

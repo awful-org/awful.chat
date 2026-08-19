@@ -17,6 +17,9 @@ var defaultTurnURLs = []string{
 	"turn:awful.frav.in:3478?transport=udp",
 	"turn:awful.frav.in:3478?transport=tcp",
 	"turn:awful.frav.in:5349?transport=tcp",
+	// TLS: the only thing some mobile carriers and corporate networks let
+	// through. Harmless when coturn has no cert - gathering just skips it.
+	"turns:awful.frav.in:5349?transport=tcp",
 }
 
 // handleTurnCredentials issues short-lived TURN credentials using coturn's
