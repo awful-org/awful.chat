@@ -13,6 +13,7 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import CallStatus from "./CallStatus.svelte";
   import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
+  import { displayPrefs } from "$lib/display-prefs.svelte";
 
   interface DmPreview {
     text: string;
@@ -116,6 +117,7 @@
 
   function colorForPeer(peerId: string): string | undefined {
     const did = peerIdToDid(peerId);
+    if (!displayPrefs.showPeerNicknameColors) return undefined;
     return peerColors.get(peerId) ?? (did ? peerColors.get(did) : undefined);
   }
 

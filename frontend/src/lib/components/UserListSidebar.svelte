@@ -15,6 +15,7 @@
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { displayPrefs } from "$lib/display-prefs.svelte";
   import GifImage from "./GifImage.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import {
@@ -106,7 +107,10 @@
         const nameKey = peerIdToDid(did) || did;
         name = peerNames.get(nameKey) || peerNames.get(did) || did.slice(0, 12);
         avatarUrl = peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
-        color = peerColors.get(nameKey) || peerColors.get(did) || null;
+        color =
+          displayPrefs.showPeerNicknameColors
+            ? peerColors.get(nameKey) || peerColors.get(did) || null
+            : null;
       }
 
       // In a call in THIS room: presence is announced per peer, self via

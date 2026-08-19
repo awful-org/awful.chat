@@ -36,6 +36,7 @@
     type PhonebookEntry,
   } from "$lib/storage";
   import { loadProfile } from "$lib/profile.svelte";
+import { displayPrefs } from "$lib/display-prefs.svelte";
   import { consumeLatestSharedPayload } from "$lib/share-target";
   import ReloadPrompt from "./ReloadPrompt.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
@@ -478,6 +479,7 @@
 
   /** User-picked nickname color for a contact row, if the peer has one. */
   function colorForPeer(peerId: string): string | undefined {
+    if (!displayPrefs.showPeerNicknameColors) return undefined;
     const did = peerIdToDid(peerId);
     return (
       transportState.peerColors.get(peerId) ??

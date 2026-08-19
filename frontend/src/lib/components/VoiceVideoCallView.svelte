@@ -57,6 +57,7 @@
   } from "@lucide/svelte";
   import { MessageSquare, MonitorIcon } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
+import { displayPrefs } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
   import { Slider } from "./ui/slider";
 
@@ -130,6 +131,7 @@ import { cn } from "$lib/utils";
     if (peerId === selfId() || peerId === selfPeerId()) {
       return profileStore.color ?? null;
     }
+    if (!displayPrefs.showPeerNicknameColors) return null;
     const did = peerIdToDid(peerId);
     return (
       transportState.peerColors.get(peerId) ??

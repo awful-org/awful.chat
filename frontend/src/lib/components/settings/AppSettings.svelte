@@ -7,6 +7,11 @@ import {
   setNotificationsEnabled,
 } from "$lib/notify.svelte";
 import { mediaPrefs, setGifAutoplay } from "$lib/media-prefs.svelte";
+import {
+  displayPrefs,
+  setItalicOwnName,
+  setShowPeerNicknameColors,
+} from "$lib/display-prefs.svelte";
 </script>
 
 <div class="flex flex-col gap-6">
@@ -82,6 +87,32 @@ import { mediaPrefs, setGifAutoplay } from "$lib/media-prefs.svelte";
     <Switch
       checked={mediaPrefs.gifAutoplay}
       onCheckedChange={(checked) => setGifAutoplay(checked)}
+    />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Italicize my name</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Renders your name above your own messages in italics. Only affects
+        your view of the chat.
+      </span>
+    </div>
+    <Switch
+      checked={displayPrefs.italicOwnName}
+      onCheckedChange={(checked) => setItalicOwnName(checked)}
+    />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Show others' nickname colors</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Off keeps every remote name in the default color and hides the
+        initials tint. Your own color still shows to you.
+      </span>
+    </div>
+    <Switch
+      checked={displayPrefs.showPeerNicknameColors}
+      onCheckedChange={(checked) => setShowPeerNicknameColors(checked)}
     />
   </div>
 </div>
