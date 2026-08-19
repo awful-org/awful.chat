@@ -42,6 +42,8 @@ export interface OwnProfile {
   nickname: string;
   pfpData?: ArrayBuffer; // local upload
   pfpURL?: string; // external URL - stored as-is
+  /** User-picked nickname color, hex like "#aabbcc". Absent = default. */
+  color?: string;
   updatedAt: number;
 }
 
@@ -51,6 +53,8 @@ export interface PeerProfile {
   nickname: string;
   pfpData?: ArrayBuffer;
   pfpURL?: string;
+  /** User-picked nickname color, hex like "#aabbcc". Absent = default. */
+  color?: string;
   updatedAt: number;
 }
 
@@ -776,7 +780,7 @@ export async function rekeyOwnProfile(
  * pfpData and pfpURL are mutually exclusive - setting one clears the other.
  */
 export async function updateOwnProfile(
-  patch: Partial<Pick<OwnProfile, "nickname" | "pfpData" | "pfpURL">>
+  patch: Partial<Pick<OwnProfile, "nickname" | "pfpData" | "pfpURL" | "color">>
 ): Promise<void> {
   const database = await getDB();
   const tx = database.transaction("profiles", "readwrite");

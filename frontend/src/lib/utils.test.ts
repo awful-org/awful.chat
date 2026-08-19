@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { decode, encode, hex, normalizeAvatarUrl, unhex } from "./utils";
+import {
+  decode,
+  encode,
+  hex,
+  normalizeAvatarUrl,
+  normalizeNicknameColor,
+  unhex,
+} from "./utils";
 
 describe("hex codec", () => {
   it("round-trips bytes", () => {
@@ -53,5 +60,24 @@ describe("normalizeAvatarUrl", () => {
   it("rejects non-strings and garbage", () => {
     expect(normalizeAvatarUrl(42)).toBeUndefined();
     expect(normalizeAvatarUrl("not a url")).toBeUndefined();
+  });
+});
+
+describe("normalizeNicknameColor", () => {
+  it("accepts 6-digit hex and lowercases it", () => {
+    expect(normalizeNicknameColor("#AB12CD")).toBe("#ab12cd");
+    expect(normalizeNicknameColor("#aabbcc")).toBe("#aabbcc");
+  });
+
+  it("rejects anything a style attribute could abuse", () => {
+    expect(normalizeNicknameColor("red")).toBeUndefined();
+    expect(normalizeNicknameColor("url(javascript:alert(1))")).toBeUndefined();
+    expect(normalizeNicknameColor("#12345")).toBeUndefined();
+    expect(normalizeNicknameColor("#1234567")).toBeUndefined();
+    expect(normalizeNicknameColor("rgb(1,2,3)")).toBeUndefined();
+    expect(normalizeNicknameColor("")).toBeUndefined();
+    expect(normalizeNicknameColor(42)).toBeUndefined();
+    expect(normalizeNicknameColor(null)).toBeUndefined();
+    expect(normalizeNicknameColor(undefined)).toBeUndefined();
   });
 });

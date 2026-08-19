@@ -19,6 +19,9 @@ import {
   putPhonebookEntry,
   getPhonebookEntries,
   markOwnMessagesReadUpTo,
+  getOwnProfile,
+  putOwnProfile,
+  updateOwnProfile,
 } from "./storage";
 import { MessageType, type Message } from "./types/message";
 
@@ -194,6 +197,32 @@ describe("dedupePhonebook", () => {
     expect(dupes[0].favorite).toBe(true);
     expect(dupes[0].addedAt).toBe(1_000);
     expect(entries.some((e) => e.peerId === "12D3KooWLoner")).toBe(true);
+  });
+});
+
+describe("own profile color", () => {
+  it("persists a selected nickname color", async () => {
+    await putOwnProfile({
+      did: "did:key:zMe",
+      isMe: true,
+      nickname: "Me",
+      updatedAt: 1_000,
+    });
+    await updateOwnProfile({ color: "#ab12cd" });
+    expect((await getOwnProfile())?.color).toBe("#ab12cd");
+    expect((await getOwnProfile())?.nickname).toBe("Me");
+  });
+
+  it("clears an existing color", async () => {
+    await putOwnProfile({
+      did: "did:key:zMe",
+      isMe: true,
+      nickname: "Me",
+      color: "#ab12cd",
+      updatedAt: 1_000,
+    });
+    await updateOwnProfile({ color: undefined });
+    expect((await getOwnProfile())?.color).toBeUndefined();
   });
 });
 

@@ -49,6 +49,7 @@
     peerId: string | null;
     name: string;
     avatarUrl: string | null;
+    color: string | null;
     isOnline: boolean;
     isSelf: boolean;
     isRelayed: boolean;
@@ -59,6 +60,7 @@
   const peers = $derived(transportState.peers);
   const peerNames = $derived(transportState.peerNames);
   const peerAvatars = $derived(transportState.peerAvatars);
+  const peerColors = $derived(transportState.peerColors);
 
   const selfDid = $derived(selfId());
   const ownDid = $derived(identityStore.did);
@@ -93,15 +95,18 @@
 
       let name: string;
       let avatarUrl: string | null = null;
+      let color: string | null = null;
 
       if (isSelf) {
         name = profileStore.nickname || "You";
         avatarUrl = profileStore.avatarUrl || null;
+        color = profileStore.color || null;
       } else {
         // roomUsers can carry a raw peerId while these maps are DID-keyed.
         const nameKey = peerIdToDid(did) || did;
         name = peerNames.get(nameKey) || peerNames.get(did) || did.slice(0, 12);
         avatarUrl = peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
+        color = peerColors.get(nameKey) || peerColors.get(did) || null;
       }
 
       // In a call in THIS room: presence is announced per peer, self via
@@ -119,6 +124,7 @@
         peerId: mappedPeerId,
         name,
         avatarUrl,
+        color,
         isOnline,
         isSelf,
         isRelayed: userIsRelayed,
@@ -276,6 +282,7 @@
           {user.isSelf
           ? 'bg-primary/20 text-primary'
           : 'bg-secondary text-secondary-foreground'}"
+        style={user.color ? `color: ${user.color}` : ""}
       >
         {#if user.avatarUrl}
           <GifImage
@@ -299,6 +306,7 @@
         class="text-sm font-medium truncate {user.isSelf
           ? 'text-primary'
           : ''} flex items-center gap-1"
+        style={user.color ? `color: ${user.color}` : ""}
       >
         {user.isSelf ? `${user.name} (You)` : user.name}
         {#if user.isRelayed}

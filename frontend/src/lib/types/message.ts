@@ -133,6 +133,8 @@ export interface WireProfile {
   name: string;
   did: string | null;
   avatarUrl: string | null;
+  /** User-picked nickname color, hex like "#aabbcc". Absent = default. */
+  color?: string;
   /**
    * Proof that `did` owns the libp2p peerId this arrived from: the sender's
    * peerId, signed by the identity key behind `did`. The peerId can no longer

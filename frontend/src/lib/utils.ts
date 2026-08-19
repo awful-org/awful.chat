@@ -53,6 +53,18 @@ const DATA_AVATAR_RE =
 /** ~1.4 MB of base64, i.e. about a 1 MB image. */
 const MAX_DATA_AVATAR_LEN = 1_400_000;
 
+/**
+ * Only 6-digit hex colors survive. Nickname colors end up in inline style
+ * attributes, so anything wider (CSS expressions, url(), named colors) is
+ * rejected instead of trusted from the wire.
+ */
+const NICKNAME_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+export function normalizeNicknameColor(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return NICKNAME_COLOR_RE.test(value) ? value.toLowerCase() : undefined;
+}
+
 export function normalizeAvatarUrl(url: unknown): string | undefined {
   if (typeof url !== "string") return undefined;
   // An avatar picked from the device is sent inline as a data: URL - rejecting

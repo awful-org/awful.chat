@@ -65,7 +65,7 @@ import {
   verifyPeerBinding,
   verifySignature,
 } from "../messaging";
-import { encode, decode, normalizeAvatarUrl } from "../utils";
+import { encode, decode, normalizeAvatarUrl, normalizeNicknameColor } from "../utils";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
 import { _sendWatchPresence } from "./transmission.svelte";
 import {
@@ -168,6 +168,8 @@ interface TransportState {
   /** Bumped on every peer->DID mapping change; see peerIdToDid(). */
   peerDidVersion: number;
   peerAvatars: Map<string, string>;
+  /** User-picked nickname colors, keyed like peerNames (by DID). */
+  peerColors: Map<string, string>;
   error: string | null;
   callPeerIds: Set<string>;
   callPeerRooms: Map<string, string>; // peerId -> roomCode they're calling in
@@ -207,6 +209,7 @@ export const transportState = $state<TransportState>({
   peerNames: new Map(),
   peerDidVersion: 0,
   peerAvatars: new Map(),
+  peerColors: new Map(),
   error: null,
   callPeerIds: new Set(),
   callPeerRooms: new Map(),
@@ -403,6 +406,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     name,
     did,
     avatarUrl,
+    color: profile?.color ?? null,
     peerId: _transport.selfId(),
     bindingSig: binding?.bindingSig,
     reply: isReply || undefined,
@@ -605,12 +609,15 @@ export async function _loadHistory(
   if (profiles.length > 0) {
     const names = new Map(transportState.peerNames);
     const avatars = new Map(transportState.peerAvatars);
+    const colors = new Map(transportState.peerColors);
     for (const p of profiles) {
       names.set(p.did, p.nickname);
       if (p.pfpURL) avatars.set(p.did, p.pfpURL);
+      if (p.color) colors.set(p.did, p.color);
     }
     transportState.peerNames = names;
     transportState.peerAvatars = avatars;
+    transportState.peerColors = colors;
   }
 
   for (const msg of msgs) {
@@ -812,6 +819,10 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   _syncPeer(peerId);
 
   const avatarUrl = normalizeAvatarUrl(msg.avatarUrl);
+  // `color` absent = older build, which has no such field - keep any cached
+  // color. Explicit null (or junk that fails sanitizing) = "no color".
+  const hasColorField = msg.color !== undefined;
+  const color = hasColorField ? normalizeNicknameColor(msg.color) : undefined;
 
   const names = new Map(transportState.peerNames);
   names.set(did, msg.name);
@@ -822,6 +833,13 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   else avatars.delete(did);
   transportState.peerAvatars = avatars;
 
+  if (hasColorField) {
+    const colors = new Map(transportState.peerColors);
+    if (color) colors.set(did, color);
+    else colors.delete(did);
+    transportState.peerColors = colors;
+  }
+
   getPeerProfile(did)
     .then((existing) =>
       putPeerProfile({
@@ -830,6 +848,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
         nickname: msg.name,
         pfpURL: avatarUrl,
         updatedAt: Date.now(),
+        color: hasColorField ? (color ?? undefined) : existing?.color,
         ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
       }).catch(() => {})
     )
@@ -1765,6 +1784,7 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.participants = new Map();
   transportState.peerNames = new Map();
   transportState.peerAvatars = new Map();
+  transportState.peerColors = new Map();
   transportState.error = null;
   transportState.callPeerIds = new Set();
   transportState.sfuPeerIds = new Set();

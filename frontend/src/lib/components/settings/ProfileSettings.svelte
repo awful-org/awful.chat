@@ -2,7 +2,7 @@
   import { Input } from "$lib/components/ui/input";
 import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
-  import { profileStore, saveName } from "$lib/profile.svelte";
+  import { profileStore, saveName, saveColor } from "$lib/profile.svelte";
   import { lock } from "$lib/identity/identity.svelte";
   import { Pencil, LogOut } from "@lucide/svelte";
 
@@ -15,9 +15,11 @@ import { Label } from "$lib/components/ui/label";
   let { isMobile = false, onAvatarClick }: Props = $props();
 
   let nameValue = $state("");
+  let colorValue = $state("#3b82f6");
 
   $effect(() => {
     nameValue = profileStore.nickname;
+    colorValue = profileStore.color ?? "#3b82f6";
   });
 
   const profileInitial = $derived(
@@ -82,6 +84,41 @@ import { Label } from "$lib/components/ui/label";
         placeholder="Your display name"
         class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono focus-visible:ring-ring text-center w-full max-w-64 md:max-w-80"
       />
+
+      <div class="flex flex-col gap-2 w-full max-w-64 md:max-w-80">
+        <Label
+          class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Nickname color</Label
+        >
+        <div class="flex items-center gap-2">
+          <input
+            type="color"
+            bind:value={colorValue}
+            onchange={() => saveColor(colorValue).catch(() => {})}
+            aria-label="Nickname color"
+            class="size-8 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0.5"
+          />
+          <span
+            class="flex-1 truncate text-sm font-medium font-mono"
+            style={profileStore.color
+              ? `color: ${profileStore.color}`
+              : ""}
+            >{profileStore.nickname || "Anonymous"}
+            {#if !profileStore.color}(default){/if}</span
+          >
+          <button
+            type="button"
+            onclick={() => {
+              colorValue = "#3b82f6";
+              saveColor(null).catch(() => {});
+            }}
+            aria-label="Reset nickname color to default"
+            class="text-xs font-mono text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+          >
+            Reset
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 

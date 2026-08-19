@@ -11,11 +11,14 @@ import { broadcastProfile } from "$lib/transport/transport.svelte";
 interface ProfileStore {
   nickname: string;
   avatarUrl: string | undefined;
+  /** User-picked nickname color, hex like "#aabbcc". Absent = default. */
+  color: string | undefined;
 }
 
 export const profileStore = $state<ProfileStore>({
   nickname: "Anonymous",
   avatarUrl: undefined,
+  color: undefined,
 });
 
 let _blobUrl: string | undefined;
@@ -29,6 +32,7 @@ export async function loadProfile(): Promise<void> {
     await rekeyOwnProfile(p.did ?? "", identityStore.did);
   }
   profileStore.nickname = p.nickname || "Anonymous";
+  profileStore.color = p.color;
   if (_blobUrl) {
     URL.revokeObjectURL(_blobUrl);
     _blobUrl = undefined;
@@ -84,6 +88,19 @@ export async function saveName(name: string, did?: string): Promise<void> {
   await chained(async () => {
     await ensureProfile(did);
     await updateOwnProfile({ nickname: name });
+  });
+  broadcastProfile();
+}
+
+/**
+ * @param color - the picked hex color, or undefined/null to reset to default.
+ * Values are sanitized on receipt from the wire; here we trust the picker.
+ */
+export async function saveColor(color: string | undefined | null): Promise<void> {
+  profileStore.color = color ?? undefined;
+  await chained(async () => {
+    await ensureProfile();
+    await updateOwnProfile({ color: color ?? undefined });
   });
   broadcastProfile();
 }
