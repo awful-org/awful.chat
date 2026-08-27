@@ -16,6 +16,12 @@
   import { cn } from "$lib/utils";
   import type { TransportStatus } from "$lib/transport/types";
 
+  interface Props {
+    /** Icon-rail layout: one icon, the whole status in a tooltip. */
+    collapsed?: boolean;
+  }
+  let { collapsed = false }: Props = $props();
+
   type CallQuality = "connecting" | "p2p" | "relayed" | "degraded" | "failed";
 
   let quality = $state<CallQuality>("connecting");
@@ -168,51 +174,76 @@
 </script>
 
 {#if transportState.inCall}
-  <div
-    class={cn(
-      "flex items-center justify-between px-3 py-2 rounded-lg border text-sm mb-2",
-      config.bg,
-      config.border
-    )}
-  >
-    <div class="flex items-center gap-2">
-      <div class={cn("relative", config.color)}>
-        <StatusIcon class="size-5" />
-        {#if quality === "failed"}
-          <div class="absolute inset-0 flex items-center justify-center">
-            <div class="w-0.5 h-3 bg-current rotate-45"></div>
-          </div>
+  {#if collapsed}
+    <Tip
+      text={`${config.label} · ${transportState.roomName || "Voice"}${
+        quality === "relayed" ? " · relayed" : ""
+      }${deafened ? " · deafened" : ""}`}
+      side="right"
+    >
+      {#snippet children(props)}
+        <div
+          {...props}
+          class={cn(
+            "mx-2 mb-2 flex items-center justify-center rounded-lg border py-2",
+            config.bg,
+            config.border
+          )}
+        >
+          <StatusIcon class={cn("size-5", config.color)} />
+        </div>
+      {/snippet}
+    </Tip>
+  {:else}
+    <div
+      class={cn(
+        "flex items-center justify-between px-3 py-2 rounded-lg border text-sm mb-2",
+        config.bg,
+        config.border
+      )}
+    >
+      <div class="flex items-center gap-2">
+        <div class={cn("relative", config.color)}>
+          <StatusIcon class="size-5" />
+          {#if quality === "failed"}
+            <div class="absolute inset-0 flex items-center justify-center">
+              <div class="w-0.5 h-3 bg-current rotate-45"></div>
+            </div>
+          {/if}
+        </div>
+        <div class="flex flex-col">
+          <span class={cn("font-medium text-xs", config.color)}
+            >{config.label}</span
+          >
+          <span class="text-[10px] text-gray-400"
+            >{transportState.roomName || "Voice"}</span
+          >
+        </div>
+      </div>
+
+      <div class="flex items-center gap-1">
+        {#if quality === "relayed"}
+          <Tip text="Connected via TURN relay">
+            {#snippet children(props)}
+              <div
+                {...props}
+                class="p-1.5 rounded bg-yellow-500/10 text-yellow-400"
+              >
+                <Radio class="size-4" />
+              </div>
+            {/snippet}
+          </Tip>
+        {/if}
+        {#if deafened}
+          <Tip text="Deafened">
+            {#snippet children(props)}
+              <div {...props} class="p-1.5 rounded bg-red-500/20 text-red-400">
+                <Headphones class="size-4" />
+              </div>
+            {/snippet}
+          </Tip>
         {/if}
       </div>
-      <div class="flex flex-col">
-        <span class={cn("font-medium text-xs", config.color)}
-          >{config.label}</span
-        >
-        <span class="text-[10px] text-gray-400"
-          >{transportState.roomName || "Voice"}</span
-        >
-      </div>
     </div>
-
-    <div class="flex items-center gap-1">
-      {#if quality === "relayed"}
-        <Tip text="Connected via TURN relay">
-          {#snippet children(props)}
-            <div {...props} class="p-1.5 rounded bg-yellow-500/10 text-yellow-400">
-              <Radio class="size-4" />
-            </div>
-          {/snippet}
-        </Tip>
-      {/if}
-      {#if deafened}
-        <Tip text="Deafened">
-          {#snippet children(props)}
-            <div {...props} class="p-1.5 rounded bg-red-500/20 text-red-400">
-              <Headphones class="size-4" />
-            </div>
-          {/snippet}
-        </Tip>
-      {/if}
-    </div>
-  </div>
+  {/if}
 {/if}

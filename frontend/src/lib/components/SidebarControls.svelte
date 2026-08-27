@@ -27,6 +27,15 @@
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import { toggleDeafen } from "$lib/transport/call.svelte";
 
+  interface Props {
+    /** Icon-rail layout: no name, no status text, controls stacked. */
+    collapsed?: boolean;
+  }
+  let { collapsed = false }: Props = $props();
+
+  // In a column the buttons must grow across, not along, the axis.
+  const mediaBtnWidth = $derived(collapsed ? "w-full" : "flex-1");
+
   let avatarDialogOpen = $state(false);
   let audioSettingsOpen = $state(false);
 
@@ -70,7 +79,9 @@
   <!-- In-call media row -->
   {#if transportState.inCall}
     <div
-      class="flex items-center justify-stretch gap-1 px-2 py-2 border-b border-sidebar-border"
+      class="flex px-2 py-2 border-b border-sidebar-border {collapsed
+        ? 'flex-col gap-1'
+        : 'items-center justify-stretch gap-1'}"
     >
       <Tip
         text={transportState.cameraOff ? "Turn on camera" : "Turn off camera"}
@@ -83,7 +94,7 @@
         aria-label={transportState.cameraOff
           ? "Turn on camera"
           : "Turn off camera"}
-        class="flex flex-1 items-center justify-center rounded-md h-9 cursor-pointer transition-colors
+        class="flex {mediaBtnWidth} items-center justify-center rounded-md h-9 cursor-pointer transition-colors
           {transportState.cameraOff
           ? 'bg-secondary text-secondary-foreground hover:bg-secondary/80'
           : 'bg-destructive/20 text-destructive hover:bg-destructive/30'}"
@@ -112,7 +123,7 @@
         aria-label={transportState.screenSharing
           ? "Stop screen share"
           : "Share screen"}
-        class="flex flex-1 items-center justify-center rounded-md h-9 cursor-pointer transition-colors
+        class="flex {mediaBtnWidth} items-center justify-center rounded-md h-9 cursor-pointer transition-colors
           {transportState.screenSharing
           ? 'bg-destructive/20 text-destructive hover:bg-destructive/30'
           : 'bg-secondary text-secondary-foreground hover:bg-secondary/80'}"
@@ -133,7 +144,7 @@
         type="button"
         onclick={leaveCall}
         aria-label="Leave call"
-        class="flex flex-1 items-center justify-center rounded-md h-9 cursor-pointer transition-colors bg-destructive/20 text-destructive hover:bg-destructive/30"
+        class="flex {mediaBtnWidth} items-center justify-center rounded-md h-9 cursor-pointer transition-colors bg-destructive/20 text-destructive hover:bg-destructive/30"
       >
         <PhoneOff class="size-4" />
       </button>
@@ -142,8 +153,12 @@
     </div>
   {/if}
 
-  <div class="flex gap-2 px-2 py-4.25 w-full justify-between">
-    <div class="flex items-center gap-2">
+  <div
+    class="flex w-full {collapsed
+      ? 'flex-col items-center gap-2 px-1 py-3'
+      : 'gap-2 px-2 py-4.25 justify-between'}"
+  >
+    <div class="flex items-center gap-2 {collapsed ? 'flex-col' : ''}">
       <div class="relative">
         <button
           type="button"
@@ -173,21 +188,28 @@
       </div>
 
       <!-- Name + status -->
-      <div class="flex flex-col gap-1.5 mt-1 w-full">
-        <div
-          class="truncate w-26 text-xs font-semibold text-foreground font-mono leading-tight"
-        >
-          {profileStore.nickname}
+      {#if !collapsed}
+        <div class="flex flex-col gap-1.5 mt-1 w-full">
+          <div
+            class="truncate w-26 text-xs font-semibold text-foreground font-mono leading-tight"
+          >
+            {profileStore.nickname}
+          </div>
+          <div class="text-xs text-muted-foreground font-mono leading-tight">
+            {transportState.relayConnected ? "Connected" : "Connecting..."}
+          </div>
         </div>
-        <div class="text-xs text-muted-foreground font-mono leading-tight">
-          {transportState.relayConnected ? "Connected" : "Connecting..."}
-        </div>
-      </div>
+      {/if}
     </div>
 
     <!-- Mic, Deafen, Settings -->
-    <div class="flex items-center gap-0.5 justify-end">
-      <Tip text={transportState.muted ? "Unmute" : "Mute"}>
+    <div
+      class="flex items-center gap-0.5 {collapsed ? 'flex-col' : 'justify-end'}"
+    >
+      <Tip
+        text={transportState.muted ? "Unmute" : "Mute"}
+        side={collapsed ? "right" : "top"}
+      >
         {#snippet children(props)}
       <button
         {...props}
@@ -208,7 +230,10 @@
         {/snippet}
       </Tip>
 
-      <Tip text={transportState.deafened ? "Undeafen" : "Deafen"}>
+      <Tip
+        text={transportState.deafened ? "Undeafen" : "Deafen"}
+        side={collapsed ? "right" : "top"}
+      >
         {#snippet children(props)}
       <button
         {...props}
@@ -229,7 +254,7 @@
         {/snippet}
       </Tip>
 
-      <Tip text="Settings">
+      <Tip text="Settings" side={collapsed ? "right" : "top"}>
         {#snippet children(props)}
       <button
         {...props}

@@ -38,7 +38,7 @@
   } from "$lib/storage";
   import { MessageType } from "$lib/types/message";
   import { loadProfile } from "$lib/profile.svelte";
-import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
   import { consumeLatestSharedPayload } from "$lib/share-target";
   import { humanizeMentions } from "$lib/mentions";
   import ReloadPrompt from "./ReloadPrompt.svelte";
@@ -756,7 +756,18 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   });
 </script>
 
-<svelte:window onpopstate={handlePopState} />
+<svelte:window
+  onpopstate={handlePopState}
+  onkeydown={(e) => {
+    // Cmd/Ctrl+B collapses the room sidebar. The composer is a plain
+    // textarea, so there is no native bold to steal.
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    if (e.key.toLowerCase() !== "b") return;
+    if (isMobile) return;
+    e.preventDefault();
+    setSidebarCollapsed(!displayPrefs.sidebarCollapsed);
+  }}
+/>
 
 <QueryClientProvider client={queryClient}>
   {#if identityStore.loading && !identityStore.keypair}
@@ -808,6 +819,9 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
         onRemoveRoom={handleRemoveRoom}
         onOpenCreateJoin={openCreateJoin}
         onOpenPhonebook={() => (phonebookOpen = true)}
+        collapsed={!isMobile && displayPrefs.sidebarCollapsed}
+        onToggleCollapsed={() =>
+          setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
       />
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}

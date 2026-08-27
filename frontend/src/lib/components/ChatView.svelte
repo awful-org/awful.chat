@@ -1192,6 +1192,19 @@
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
 
+  // Desktop only: below sm there is no room for two columns, and the call
+  // stage would squeeze the messages to nothing.
+  const callBeside = $derived(displayPrefs.callChatBeside && !isMobile);
+  // Opening the user list widens the chat column instead of crushing the
+  // message text into what the w-60 aside leaves behind.
+  const chatColClass = $derived(
+    callBeside && showCallView
+      ? `shrink-0 border-l border-border ${
+          showUserList && !isDmChat ? "w-156" : "w-96"
+        }`
+      : "flex-1"
+  );
+
   const dmPeerInPhonebook = $derived.by(() => {
     const peerId = transportState.activeDmPeerId;
     if (!peerId) return false;
@@ -1387,10 +1400,6 @@
     </div>
   </header>
 
-  {#if showCallView}
-    <VoiceVideoCallView />
-  {/if}
-
   {#if connecting}
     <div
       class="absolute inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center"
@@ -1403,6 +1412,29 @@
       </div>
     </div>
   {/if}
+
+  <!-- Call and chat. Stacked by default, side by side when callBeside. The
+       wrapper is always mounted: a remount would rebind messagesEl and drop
+       the scroll position on every switch. -->
+  <div
+    class="flex flex-1 min-h-0 overflow-hidden {callBeside
+      ? 'flex-row'
+      : 'flex-col'}"
+  >
+    {#if showCallView}
+      <!-- Own column: the call view also renders an error banner, which must
+           not become a second column of the row. -->
+      <div
+        class="flex min-h-0 flex-col {callBeside
+          ? 'min-w-0 flex-1'
+          : 'shrink-0'}"
+      >
+        <VoiceVideoCallView beside={callBeside} />
+      </div>
+    {/if}
+    <div
+      class="flex min-h-0 min-w-0 flex-col overflow-hidden {chatColClass}"
+    >
 
   <div class="flex flex-1 min-h-0 overflow-hidden">
     <div
@@ -1973,6 +2005,8 @@
         <Send class="size-4" />
       </Button>
     </form>
+  </div>
+    </div>
   </div>
 </div>
 

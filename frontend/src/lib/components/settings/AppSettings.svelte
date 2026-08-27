@@ -9,8 +9,10 @@ import {
 import { mediaPrefs, setGifAutoplay } from "$lib/media-prefs.svelte";
 import {
   displayPrefs,
+  setCallChatBeside,
   setItalicOwnName,
   setShowPeerNicknameColors,
+  setSidebarCollapsed,
 } from "$lib/display-prefs.svelte";
 </script>
 
@@ -113,6 +115,32 @@ import {
     <Switch
       checked={displayPrefs.showPeerNicknameColors}
       onCheckedChange={(checked) => setShowPeerNicknameColors(checked)}
+    />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Collapse the sidebar</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Shrinks the room list to an icon rail. Cmd or Ctrl + B toggles it too.
+        Pinned plugin widgets hide while it is collapsed. No effect on a phone.
+      </span>
+    </div>
+    <Switch
+      checked={displayPrefs.sidebarCollapsed}
+      onCheckedChange={(checked) => setSidebarCollapsed(checked)}
+    />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Chat beside the call</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        In a call the video sits on the left and the chat is a column on the
+        right, instead of a band above the messages. No effect on a phone.
+      </span>
+    </div>
+    <Switch
+      checked={displayPrefs.callChatBeside}
+      onCheckedChange={(checked) => setCallChatBeside(checked)}
     />
   </div>
 </div>

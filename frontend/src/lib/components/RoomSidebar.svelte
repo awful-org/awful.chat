@@ -3,6 +3,8 @@
   import {
     Hash,
     MessageSquare,
+    PanelLeftClose,
+    PanelLeftOpen,
     Plus,
     Trash2,
     User,
@@ -48,6 +50,9 @@
     roomActivity: Map<string, number>;
     isOpen?: boolean;
     onClose?: () => void;
+    /** Desktop icon rail. Ignored below sm, where the sidebar is a slide-over. */
+    collapsed?: boolean;
+    onToggleCollapsed?: () => void;
     onSelectRoom: (code: string) => void;
     onSelectDm: (peerId: string) => void;
     onAddToPhonebook: (peerId: string) => void;
@@ -73,6 +78,8 @@
     roomActivity,
     isOpen = false,
     onClose,
+    collapsed = false,
+    onToggleCollapsed,
     onSelectRoom,
     onSelectDm,
     onAddToPhonebook,
@@ -196,15 +203,47 @@
 <aside
   class="flex h-dvh w-68 shrink-0 flex-col border-r border-sidebar-border bg-sidebar
       fixed inset-y-0 left-0 z-40 transition-transform duration-200
-      sm:static sm:translate-x-0 sm:z-auto sm:transition-none
+      sm:static sm:translate-x-0 sm:z-auto sm:transition-[width] sm:duration-200
+      {collapsed ? 'sm:w-14' : 'sm:w-68'}
       {isOpen ? 'translate-x-0' : '-translate-x-full'}"
 >
   <!-- Header - h-13 is shared with the chat header (ChatView) so they align. -->
+  {#if collapsed}
+    <div
+      class="flex h-13 shrink-0 items-center justify-center border-b border-sidebar-border"
+    >
+      <Tip text="Expand sidebar" side="right">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={onToggleCollapsed}
+            aria-label="Expand sidebar"
+            class="inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent hover:text-foreground cursor-pointer"
+          >
+            <PanelLeftOpen class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
+    </div>
+  {:else}
   <div
     class="flex h-13 items-center justify-between border-b border-sidebar-border px-3 shrink-0"
   >
     <div class="flex items-center gap-2">
-      <MessageSquare class="size-4 text-muted-foreground" />
+      <Tip text="Collapse sidebar" side="bottom">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={onToggleCollapsed}
+            aria-label="Collapse sidebar"
+            class="inline-flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent hover:text-foreground cursor-pointer"
+          >
+            <PanelLeftClose class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
       <span
         class="text-xs font-semibold text-muted-foreground mt-0.75 uppercase tracking-wider font-mono"
       >
@@ -241,7 +280,80 @@
       </Tip>
     {/if}
   </div>
+  {/if}
 
+  {#if collapsed}
+    <div class="flex flex-col items-center gap-1 px-2 pt-1.5">
+      <Tip text="Rooms" side="right">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={() => onChangeTab("rooms")}
+            aria-label="Rooms"
+            class="inline-flex size-9 items-center justify-center rounded-md transition-colors cursor-pointer {activeTab ===
+            'rooms'
+              ? 'bg-accent text-accent-foreground'
+              : 'text-muted-foreground hover:bg-accent/50'}"
+          >
+            <Hash class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
+      <Tip text="DMs" side="right">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={() => onChangeTab("users")}
+            aria-label="DMs"
+            class="relative inline-flex size-9 items-center justify-center rounded-md transition-colors cursor-pointer {activeTab ===
+            'users'
+              ? 'bg-accent text-accent-foreground'
+              : 'text-muted-foreground hover:bg-accent/50'}"
+          >
+            <MessageSquare class="size-4" />
+            {#if dmUnreadTotal > 0}
+              <span
+                class="absolute -top-1 -right-1 inline-flex min-w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold items-center justify-center px-1 tabular-nums"
+              >
+                {Math.min(dmUnreadTotal, 99)}
+              </span>
+            {/if}
+          </button>
+        {/snippet}
+      </Tip>
+      {#if activeTab === "rooms" && onOpenCreateJoin && shouldShowAddBtn}
+        <Tip text="Create or join a room" side="right">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={onOpenCreateJoin}
+              aria-label="Create or join room"
+              class="inline-flex size-9 items-center justify-center rounded-md border border-sidebar-border bg-sidebar-accent/40 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent cursor-pointer"
+            >
+              <Plus class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
+      {:else if activeTab === "users" && onOpenPhonebook}
+        <Tip text="Phonebook" side="right">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={onOpenPhonebook}
+              aria-label="Open phonebook"
+              class="inline-flex size-9 items-center justify-center rounded-md border border-sidebar-border bg-sidebar-accent/40 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent cursor-pointer"
+            >
+              <Users class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
+    </div>
+  {:else}
   <div class="grid grid-cols-2 gap-1 px-2 pt-1.5">
     <button
       type="button"
@@ -271,9 +383,92 @@
       {/if}
     </button>
   </div>
+  {/if}
 
   <!-- Room list -->
   <div class="flex-1 overflow-y-auto p-1.5">
+    {#if collapsed}
+      {#if activeTab === "rooms"}
+        {#each rooms as room (room.roomCode)}
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <div
+            role="none"
+            oncontextmenu={(e) => openContextMenu(e, room.roomCode)}
+          >
+            <Tip text={room.name || room.roomCode} side="right">
+              {#snippet children(props)}
+                <button
+                  {...props}
+                  type="button"
+                  onclick={() => onSelectRoom(room.roomCode)}
+                  class="relative mb-1 flex w-full items-center justify-center rounded-md p-2 transition-colors cursor-pointer hover:bg-accent/50 {activeRoomCode ===
+                  room.roomCode
+                    ? 'bg-accent text-accent-foreground'
+                    : 'text-muted-foreground'}"
+                >
+                  <Hash class="size-4 shrink-0 opacity-70" />
+                  {#if (unreadCounts.get(room.roomCode) ?? 0) > 0 && activeRoomCode !== room.roomCode}
+                    <span
+                      class="absolute -top-0.5 -right-0.5 min-w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold flex items-center justify-center px-1 tabular-nums"
+                    >
+                      {Math.min(unreadCounts.get(room.roomCode) ?? 0, 99)}
+                    </span>
+                  {/if}
+                </button>
+              {/snippet}
+            </Tip>
+          </div>
+        {/each}
+      {:else}
+        {#each phonebook as entry (entry.peerId)}
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <div
+            role="none"
+            oncontextmenu={(e) =>
+              openDmContextMenu(e, entry.peerId, !!entry.inPhonebook)}
+          >
+            <Tip text={entry.nickname} side="right">
+              {#snippet children(props)}
+                <button
+                  {...props}
+                  type="button"
+                  onclick={() => onSelectDm(entry.peerId)}
+                  class="relative mb-1 flex w-full items-center justify-center rounded-md p-2 transition-colors cursor-pointer hover:bg-accent/50 {activeDmPeerId ===
+                  entry.peerId
+                    ? 'bg-accent text-accent-foreground'
+                    : 'text-muted-foreground'}"
+                >
+                  <div
+                    class="flex size-6 shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground text-xs font-semibold font-mono"
+                    style={colorForPeer(entry.peerId)
+                      ? `color: ${colorForPeer(entry.peerId)}`
+                      : ""}
+                  >
+                    {#if entry.avatarUrl}
+                      <GifImage
+                        src={entry.avatarUrl}
+                        alt={entry.nickname}
+                        class="size-full rounded-full object-cover"
+                        animate="hover"
+                      />
+                    {:else}
+                      {(entry.nickname || "?").charAt(0).toUpperCase()}
+                    {/if}
+                  </div>
+                  {#if (dmUnreadCounts.get(entry.peerId) ?? 0) > 0}
+                    <span
+                      class="absolute -top-0.5 -right-0.5 min-w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold flex items-center justify-center px-1 tabular-nums"
+                    >
+                      {Math.min(dmUnreadCounts.get(entry.peerId) ?? 0, 99)}
+                    </span>
+                  {/if}
+                </button>
+              {/snippet}
+            </Tip>
+          </div>
+        {/each}
+      {/if}
+    {:else}
     {#if activeTab === "rooms" && rooms.length === 0}
       <div
         class="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground"
@@ -391,11 +586,14 @@
         </div>
       {/each}
     {/if}
+    {/if}
   </div>
 
-  <PluginWidgetSlots />
-  <CallStatus />
-  <SidebarControls />
+  {#if !collapsed}
+    <PluginWidgetSlots />
+  {/if}
+  <CallStatus {collapsed} />
+  <SidebarControls {collapsed} />
 </aside>
 
 {#if contextMenu && activeTab === "rooms"}
