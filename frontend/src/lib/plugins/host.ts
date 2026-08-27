@@ -16,6 +16,7 @@ import {
 } from "$lib/transport/transport.svelte";
 import { getPluginCardMessages } from "$lib/storage";
 import { setNowPlayingFor } from "./media-session";
+import { getCardState, onCardStateChange as onPluginCardStateChange } from "./state.svelte";
 import { MessageType } from "$lib/types/message";
 
 export function makeHostApi(pluginId: string, roomCode: string): HostApi {
@@ -53,6 +54,9 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       );
     },
     onBeforeDisconnect,
+    onCardStateChange(listener) {
+      return onPluginCardStateChange(listener);
+    },
     sendUpdateImmediately(cardId, payload) {
       // Same binding as sendUpdate: the card's room, never the open one.
       sendUpdateImmediately(pluginId, cardId, payload, roomCode);
@@ -61,7 +65,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       // Card rows only - getAllMessages decrypted the ENTIRE room history
       // for this, which froze the UI on every plugin join.
       const messages = await getPluginCardMessages(roomCode);
-      return messages.flatMap((message) => {
+      const cards = messages.flatMap((message) => {
         if (message.type !== MessageType.PluginCard) return [];
         try {
           const payload = JSON.parse(message.content);
@@ -77,6 +81,15 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
           return [];
         }
       });
+      const { getPlugin } = await import("./registry");
+      const definition = await getPlugin(pluginId);
+      if (!definition) return cards;
+      return Promise.all(
+        cards.map(async (card) => ({
+          ...card,
+          state: await getCardState(card.id, roomCode, definition),
+        }))
+      );
     },
     seededRandom,
     // ponytail: localStorage-backed plugin storage, namespaced per plugin.

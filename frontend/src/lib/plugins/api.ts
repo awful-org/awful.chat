@@ -52,7 +52,9 @@ export interface HostApi {
   ): () => void;
   onBeforeDisconnect(listener: () => void): () => void;
   sendUpdateImmediately(cardId: string, payload: unknown): void;
-  cards(): Promise<Array<{ id: string; senderDid: string }>>;
+  cards(): Promise<Array<{ id: string; senderDid: string; state?: unknown }>>;
+  /** Notify card surfaces after a persisted plugin state fold. */
+  onCardStateChange(listener: () => void): () => void;
   /**
    * Put the plugin's playback on the OS media surface (lock screen, media
    * keys, headsets). The host owns navigator.mediaSession and arbitrates:

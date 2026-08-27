@@ -1052,6 +1052,24 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     >
       <!-- Content lives in the persistent layer; this is only the anchor
            the layer follows, plus the chrome painted above it. -->
+      <Tip text="Stop watching plugin">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={(event) => {
+              event.stopPropagation();
+              joinedPluginTiles = new Set(
+                [...joinedPluginTiles].filter((id) => id !== tile.id)
+              );
+            }}
+            aria-label="Stop watching plugin"
+            class="absolute left-1.5 top-1.5 z-30 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 hover:bg-red-500/45"
+          >
+            <Radio class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
       <div
         class="absolute bottom-1.5 left-1.5 z-30 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none transition-opacity {pluginBadgeHidden(
           tile.id
