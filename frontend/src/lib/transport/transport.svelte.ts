@@ -2787,6 +2787,8 @@ export async function sendCard(
   return cardId;
 }
 
+let cachedPluginSenderName = "";
+
 export async function sendUpdate(
   pluginId: string,
   cardId: string,
@@ -2814,6 +2816,7 @@ export async function sendUpdate(
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   const senderName = profile?.nickname?.trim() || "Anonymous";
+  if (senderName && senderName !== "Anonymous") cachedPluginSenderName = senderName;
   const myId = identityStore.did ?? _transport.selfId();
 
   // Ephemeral messages: check flood cap, wire-only (lamport:0), PluginEphemeral type
@@ -2926,7 +2929,11 @@ export function sendUpdateImmediately(
     id: crypto.randomUUID(),
     roomCode,
     senderId: identityStore.did ?? _transport.selfId(),
-    senderName: "Anonymous",
+    senderName:
+      cachedPluginSenderName ||
+      identityStore.did?.slice(0, 12) ||
+      _transport.selfId().slice(0, 12) ||
+      "Unknown",
     timestamp: Date.now(),
     lamport: lamportSend(roomCode),
     type: MessageType.PluginUpdate,

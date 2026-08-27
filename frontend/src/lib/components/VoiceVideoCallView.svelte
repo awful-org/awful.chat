@@ -1020,6 +1020,8 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 )}
   {@const hasVideo = tile.videoTrack !== null}
   {@const isPendingTx = tile.kind === "transmission" && tile.isPending}
+  {@const isWatchedTx =
+    tile.kind === "transmission" && watchingTransmissionPeerId === tile.peerId}
   {@const tileColor = getPeerColor(tile.peerId)}
   {#if tile.kind === "plugin" && joinedPluginTiles.has(tile.id)}
     <!-- A DIV, not the button every other tile is: the plugin renders its
@@ -1078,8 +1080,9 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       {/if}
     </div>
   {:else}
-  <button
-    type="button"
+  <div
+    role="button"
+    tabindex="0"
     oncontextmenu={(e) => openPeerMenu(e, tile)}
     class="group relative flex items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
       {tile.connecting ? 'connecting-wave' : ''}
@@ -1106,6 +1109,18 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       if (isFocused) onUnfocus();
       else onFocus();
     }}
+    onkeydown={(event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      if (tile.kind === "plugin") {
+        joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+      } else if (isPendingTx && tile.producerId) {
+        void watchTransmission(tile.peerId, tile.producerId);
+      } else if (!isOnlyOne) {
+        if (isFocused) onUnfocus();
+        else onFocus();
+      }
+    }}
     aria-label={tile.kind === "plugin"
       ? `Join ${tile.label}`
       : isPendingTx
@@ -1114,6 +1129,19 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           ? "Minimize tile"
           : `Focus ${tile.label}`}
   >
+    {#if isWatchedTx}
+      <button
+        type="button"
+        onclick={(event) => {
+          event.stopPropagation();
+          stopWatchingTransmission();
+        }}
+        aria-label="Stop watching"
+        class="absolute top-1.5 left-1.5 z-20 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 hover:bg-red-500/45"
+      >
+        <Radio class="size-4" />
+      </button>
+    {/if}
     {#if hasVideo}
       <video
         autoplay
@@ -1251,7 +1279,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
         {/if}
       </div>
     {/if}
-  </button>
+  </div>
   {/if}
 {/snippet}
 
