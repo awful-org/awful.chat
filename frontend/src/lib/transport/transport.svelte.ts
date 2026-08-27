@@ -1,4 +1,8 @@
 import { MediasoupVideo } from "./mediasoup";
+import {
+  cachePluginSenderName,
+  immediatePluginSenderName,
+} from "./plugin-sender-name";
 import { identityStore } from "../identity/identity.svelte";
 import {
   getOwnProfile,
@@ -2816,7 +2820,10 @@ export async function sendUpdate(
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   const senderName = profile?.nickname?.trim() || "Anonymous";
-  if (senderName && senderName !== "Anonymous") cachedPluginSenderName = senderName;
+  cachedPluginSenderName = cachePluginSenderName(
+    cachedPluginSenderName,
+    profile?.nickname
+  );
   const myId = identityStore.did ?? _transport.selfId();
 
   // Ephemeral messages: check flood cap, wire-only (lamport:0), PluginEphemeral type
@@ -2929,11 +2936,11 @@ export function sendUpdateImmediately(
     id: crypto.randomUUID(),
     roomCode,
     senderId: identityStore.did ?? _transport.selfId(),
-    senderName:
-      cachedPluginSenderName ||
-      identityStore.did?.slice(0, 12) ||
-      _transport.selfId().slice(0, 12) ||
-      "Unknown",
+    senderName: immediatePluginSenderName(
+      cachedPluginSenderName,
+      identityStore.did,
+      _transport.selfId()
+    ),
     timestamp: Date.now(),
     lamport: lamportSend(roomCode),
     type: MessageType.PluginUpdate,
