@@ -99,6 +99,19 @@
     y: number;
   } | null>(null);
 
+  // The Rooms switch had no counter while the DMs switch did, so unread room
+  // traffic was invisible from the DMs tab. Same rule as the per-room badges:
+  // the room on screen is being read, so it does not count.
+  const roomUnreadTotal = $derived(
+    rooms.reduce(
+      (sum, room) =>
+        room.roomCode === activeRoomCode
+          ? sum
+          : sum + (unreadCounts.get(room.roomCode) ?? 0),
+      0
+    )
+  );
+
   // Same clamp the other context menus use, so a right-click near the edge
   // does not render the menu offscreen.
   function clampMenu(x: number, y: number) {
@@ -291,12 +304,19 @@
             type="button"
             onclick={() => onChangeTab("rooms")}
             aria-label="Rooms"
-            class="inline-flex size-9 items-center justify-center rounded-md transition-colors cursor-pointer {activeTab ===
+            class="relative inline-flex size-9 items-center justify-center rounded-md transition-colors cursor-pointer {activeTab ===
             'rooms'
               ? 'bg-accent text-accent-foreground'
               : 'text-muted-foreground hover:bg-accent/50'}"
           >
             <Hash class="size-4" />
+            {#if roomUnreadTotal > 0}
+              <span
+                class="absolute -top-1 -right-1 inline-flex min-w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold items-center justify-center px-1 tabular-nums"
+              >
+                {Math.min(roomUnreadTotal, 99)}
+              </span>
+            {/if}
           </button>
         {/snippet}
       </Tip>
@@ -364,6 +384,13 @@
       onclick={() => onChangeTab("rooms")}
     >
       Rooms
+      {#if roomUnreadTotal > 0}
+        <span
+          class="ml-1 inline-flex min-w-4.5 h-4.5 rounded-full bg-primary text-primary-foreground text-[10px] font-bold items-center justify-center px-1 tabular-nums"
+        >
+          {Math.min(roomUnreadTotal, 99)}
+        </span>
+      {/if}
     </button>
     <button
       type="button"

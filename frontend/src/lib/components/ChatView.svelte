@@ -1023,6 +1023,13 @@
     if (messages.length > 0) markSeen().catch(() => {});
   });
 
+  // markSeen refuses to run while the page is hidden, so the room the user was
+  // parked on keeps its unread count in a background tab. Catch it up the
+  // moment they look again.
+  function markSeenOnReturn(): void {
+    if (document.visibilityState === "visible") markSeen().catch(() => {});
+  }
+
   function shouldShowHeader(current: Message, previous?: Message): boolean {
     if (!previous) return true;
     const a = senderDid(current.senderId) || current.senderId;
@@ -1280,6 +1287,8 @@
     }
   }}
 />
+
+<svelte:document onvisibilitychange={markSeenOnReturn} />
 
 <div
   use:viewportHeight

@@ -97,7 +97,13 @@ export async function refreshDmRooms(): Promise<void> {
 }
 
 export async function refreshUnreadCount(roomCode: string): Promise<void> {
-  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  // Fall back to the database when the mirror has not caught up: a message can
+  // arrive for a room whose record exists but whose sidebar entry is still in
+  // flight (a deep-link join), and dropping the count there left the badge
+  // dark until the next full sweep.
+  const room =
+    roomsStore.rooms.find((r) => r.roomCode === roomCode) ??
+    (await getRoom(roomCode));
   if (!room) return;
   const count = await getUnreadCount(
     roomCode,
@@ -106,9 +112,10 @@ export async function refreshUnreadCount(roomCode: string): Promise<void> {
   );
   // If markSeen advanced the watermark while the count was in flight, this
   // result is stale - writing it would relight the badge on a room the user
-  // is reading. Drop it; the next event recomputes.
+  // is reading. Drop it; the next event recomputes. A room still absent from
+  // the mirror cannot have been read through it, so it keeps its count.
   const now = roomsStore.rooms.find((r) => r.roomCode === roomCode);
-  if (!now || now.lastSeenLamport !== room.lastSeenLamport) return;
+  if (now && now.lastSeenLamport !== room.lastSeenLamport) return;
   const next = new Map(roomsStore.unreadCounts);
   next.set(roomCode, count);
   roomsStore.unreadCounts = next;
@@ -130,23 +137,27 @@ async function _refreshAllActivity(): Promise<void> {
   roomsStore.lastActivity = merged;
 }
 
+/**
+ * Recount every room. Authoritative, not seed-only: it counts from each room's
+ * persisted watermark, which is the same source markSeen writes, so a room the
+ * user has just read counts zero anyway. Skipping rooms already in the map
+ * meant a second sweep silently kept stale counts.
+ */
 async function _refreshAllUnread(): Promise<void> {
-  const entries = await Promise.all(
-    roomsStore.rooms.map(async (r) => {
-      const count = await getUnreadCount(
-        r.roomCode,
-        r.lastSeenLamport,
-        selfSenderId()
-      );
-      return [r.roomCode, count] as [string, number];
-    })
+  const before = roomsStore.rooms.map((r) => r.lastSeenLamport);
+  const counts = await Promise.all(
+    roomsStore.rooms.map((r) =>
+      getUnreadCount(r.roomCode, r.lastSeenLamport, selfSenderId())
+    )
   );
   const merged = new Map(roomsStore.unreadCounts);
-  for (const [roomCode, count] of entries) {
-    if (!merged.has(roomCode)) {
-      merged.set(roomCode, count);
-    }
-  }
+  roomsStore.rooms.forEach((room, i) => {
+    // Same staleness rule as refreshUnreadCount: if markSeen moved the
+    // watermark while the sweep was in flight, this count would relight the
+    // badge on a room being read.
+    if (room.lastSeenLamport !== before[i]) return;
+    merged.set(room.roomCode, counts[i]);
+  });
   roomsStore.unreadCounts = merged;
 }
 

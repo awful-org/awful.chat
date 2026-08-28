@@ -3031,7 +3031,18 @@ export async function loadMoreMessages(
   return older.length === PAGE_SIZE;
 }
 
+/**
+ * Mark everything loaded in the open conversation as read.
+ *
+ * Only while the page is actually visible. A backgrounded tab parked on a room
+ * kept marking arriving messages read, so that room accrued no unread count and
+ * the tab title and app icon under-counted by exactly its traffic - the whole
+ * point of a counter is to survive not looking. Callers re-run this when the
+ * page comes back.
+ */
 export async function markSeen(): Promise<void> {
+  if (typeof document !== "undefined" && document.visibilityState !== "visible")
+    return;
   const roomCode = transportState.roomCode;
   if (!roomCode) return;
   // Only this room's messages: a sync batch for another room can share the
