@@ -140,38 +140,90 @@ Traefik. One VPS is enough; give it swap before the first deploy, the
 frontend build is memory-hungry. Copy [.env.example](.env.example) to `.env`
 as a starting point.
 
+Before the first `docker compose up`, disable docker's userland proxy by setting
+`{"userland-proxy": false}` in `/etc/docker/daemon.json` and restarting docker.
+Without this, docker spawns one proxy process per published port per protocol.
+The SFU media range (500 ports, published for both UDP and TCP) measured at 2000
+processes and 8.4 GB of RAM, which will OOM a small VPS. With the flag off, the range uses
+iptables DNAT instead, which costs nothing.
+
 | Variable | Required | What it is |
 | --- | --- | --- |
 | `DOMAIN` | yes | public domain of the instance |
 | `ANNOUNCED_IP` | yes | the server's public IP (SFU and coturn announce it) |
 | `VITE_API_URL` | yes | relay API origin, e.g. `https://relay.<domain>` |
 | `VITE_RELAY_MULTIADDR` | yes | the relay's libp2p multiaddr shown on boot |
+| `TURN_SECRET` | yes | shared secret between the relay and coturn (`openssl rand -hex 32`); coturn refuses to start without it |
 | `VITE_SFU_URL` | no | SFU websocket URL, defaults to `/sfu` on the app origin |
+| `VITE_SFU_URLS` | no | several SFUs, comma-separated (below) |
 | `KLIPY_API_KEY` | no | enables the GIF picker (klipy.co) |
 | `PLUGIN_SOURCES` | no | plugins fetched at build time, see the [plugin guide](frontend/plugins/README.md) |
-| `TURN_SECRET` | no | switches TURN to short-lived credentials (below) |
-| `TURN_URLS` | no | override the TURN URL list served to clients |
+| `TURN_URLS` | no | the TURN URL list served to clients, comma-separated (below) |
+| `SFU_RTC_MIN_PORT` / `SFU_RTC_MAX_PORT` | no | SFU media range, published and allocated from (default 61000-61499) |
+| `TURN_MIN_PORT` / `TURN_MAX_PORT` | no | coturn relay range, one port per allocation (default 49152-50151) |
+| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide and per credential |
 | `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` |
 | `PLUGIN_PROXY_SECRETS` | no | `NAME@host=value` list; plugins reference `{{secret:NAME}}`, substituted server-side only for that host |
 
 Firewall: open 80/443 (web), 3478 tcp+udp (TURN), 5349 tcp+udp (TURN TLS,
-when configured), the SFU port range (40000-40499 by default) and coturn's
-relay range (49152-49251).
+when configured), the SFU media range (`SFU_RTC_MIN_PORT`-`SFU_RTC_MAX_PORT`,
+61000-61499 by default) and coturn's relay range (`TURN_MIN_PORT`-
+`TURN_MAX_PORT`, 49152-50151 by default).
 
-### TURN credentials (optional hardening)
+The SFU media range must stay above 60999. Linux ephemeral ports span 32768-60999
+by default, and docker binds every port in the range when the container starts.
+If a single port is already in use by an outbound connection (common after a
+reboot), the whole SFU fails to start. A range inside the ephemeral window makes
+the SFU start fail at random; ranges above 60999 avoid this entirely.
 
-By default coturn uses a static username/password baked into the client
-bundle, which means anyone can relay traffic through your server. To issue
-short-lived per-session credentials instead:
+Both ranges are capacity ceilings, not formalities: one coturn port per
+relayed peer, and past the end calls fail outright rather than degrading.
 
-1. Set a strong `TURN_SECRET` on the relay service.
-2. Switch coturn from `--lt-cred-mech --user=awful:awful` to
-   `--use-auth-secret --static-auth-secret=<same TURN_SECRET>`.
+If updating an existing instance to a new deployment, open the SFU media range
+(default 61000-61499) in your firewall before redeploying, since the default
+range changed from 40000-40499.
 
-The relay's `/turn-credentials` endpoint then hands the frontend HMAC
-credentials (coturn REST convention) expiring after 12 hours. With
-`TURN_SECRET` unset the endpoint returns 204 and clients keep the static
-fallback, so this is safe to leave off until both sides are configured.
+### TURN
+
+`TURN_SECRET` is shared between the relay and coturn. The relay's
+`/turn-credentials` endpoint mints a short-lived HMAC credential per client
+(coturn's REST convention, 12 hour expiry) and coturn verifies it with
+`--use-auth-secret`, so no TURN password ships in the JavaScript bundle.
+
+This is not optional hardening. The bundle used to carry a permanent
+`awful:awful`, readable by anyone who opened the JS, which made the server an
+open relay for the whole internet - and the people that hurts first are the
+ones who need TURN at all. Mobile and CGNAT users cannot connect directly, so
+they are the ones who end up relayed, and the relay port range is finite: a
+stranger exhausting it does not slow them down, it locks them out.
+
+**More than one TURN server.** Put a comma-separated list in `TURN_URLS`. ICE
+gathers a candidate from every entry at once and uses whichever connects
+first, so a server near a group of users improves both their connect time and
+their relayed latency. Each server runs coturn with the same `TURN_SECRET` and
+nothing else in common, so one can live on somebody else's VPS entirely.
+
+**TLS.** `turns:` on 5349 is what gets through restrictive mobile carriers.
+Point `TURN_TLS_DIR` at a directory holding `fullchain.pem` and `privkey.pem`,
+set `TURN_TLS_ARGS`, and uncomment the volume in the compose file. Traefik
+holds 443 on the host, so `turns:` cannot also live there without a second
+address.
+
+### More than one SFU
+
+`VITE_SFU_URLS` takes a comma-separated list. Each room is placed on ONE of
+them by hashing its room code, so every participant resolves the same server
+with no coordination and no extra round trip.
+
+It spreads rooms, not participants: a single room cannot straddle two SFUs
+(there is no router cascading between instances), so a room is only as fast as
+the server it lands on. The useful arrangement is one SFU near each cluster of
+users. Adding a server moves only its own share of rooms - placement is
+rendezvous hashing, not modulo - and never disturbs a call in progress, since
+the URL is resolved once at join.
+
+Each SFU needs its own host, its own `ANNOUNCED_IP` and its own open media
+range.
 
 ## License
 

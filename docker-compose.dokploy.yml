@@ -3,6 +3,14 @@ services:
     build:
       context: ./relay
     restart: unless-stopped
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     expose:
       - "8080"
       - "8081"
@@ -11,10 +19,16 @@ services:
       - KLIPY_API_KEY=${KLIPY_API_KEY}
       - NODE_ENV=production
       - DOMAIN=${DOMAIN}
-      # Set TURN_SECRET (matching coturn's --static-auth-secret) to serve
-      # short-lived TURN credentials. Unset = /turn-credentials returns 204 and
-      # clients fall back to the bundled static creds. See README.
+      # Shared with coturn below, which now REQUIRES it (--use-auth-secret).
+      # The relay mints a short-lived HMAC credential per client; there are no
+      # bundled fallback credentials any more, so unset means no TURN at all
+      # and relayed peers (mobile, CGNAT) cannot connect. See README.
       - TURN_SECRET=${TURN_SECRET:-}
+      # The hostname the relay puts in the TURN urls it mints. Falls back to
+      # DOMAIN, which is wrong whenever DOMAIN is behind a CDN: a proxied name
+      # forwards neither UDP nor raw TCP, so TURN silently points at something
+      # that cannot serve it and mobile/CGNAT peers just time out.
+      - TURN_HOST=${TURN_HOST:-}
       - TURN_URLS=${TURN_URLS:-}
       # Generic plugin proxy: allowlisted upstream hosts and named secrets
       # substituted server-side ({{secret:NAME}}). Bind secrets to their
@@ -33,35 +47,53 @@ services:
       - traefik.http.routers.relay-http.middlewares=relay-redirect
       - traefik.http.routers.relay-https.rule=Host(`relay.${DOMAIN}`)
       - traefik.http.routers.relay-https.entrypoints=websecure
+      - traefik.http.routers.relay-https.middlewares=relay-sec
       - traefik.http.routers.relay-https.tls=true
       - traefik.http.routers.relay-https.tls.certresolver=letsencrypt
       - traefik.http.services.relay-service.loadbalancer.server.port=8080
       - traefik.http.routers.relay-https.service=relay-service
       - traefik.http.routers.relay-http.service=relay-service
       - traefik.http.middlewares.relay-redirect.redirectscheme.scheme=https
+      # The redirectscheme above upgrades one request; HSTS is what makes the
+      # browser remember to. It has to hang off the https routers - a browser
+      # ignores Strict-Transport-Security on a plain-http response - and off
+      # every one of them, because a client that only ever calls /klipy would
+      # otherwise never be told. stsPreload just sets the header flag;
+      # submitting the domain to the preload list is a separate manual step.
+      - traefik.http.middlewares.relay-sec.headers.stsSeconds=63072000
+      - traefik.http.middlewares.relay-sec.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.relay-sec.headers.stsPreload=true
+      - traefik.http.middlewares.relay-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.relay-sec.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.relay-sec.headers.frameDeny=true
       - traefik.http.routers.og.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/og`)
       - traefik.http.routers.og.entrypoints=websecure
+      - traefik.http.routers.og.middlewares=relay-sec
       - traefik.http.routers.og.tls=true
       - traefik.http.routers.og.tls.certresolver=letsencrypt
       - traefik.http.routers.og.service=relay-api-service
       - traefik.http.services.relay-api-service.loadbalancer.server.port=8081
       - traefik.http.routers.klipy.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/klipy`)
       - traefik.http.routers.klipy.entrypoints=websecure
+      - traefik.http.routers.klipy.middlewares=relay-sec
       - traefik.http.routers.klipy.tls=true
       - traefik.http.routers.klipy.tls.certresolver=letsencrypt
       - traefik.http.routers.klipy.service=relay-api-service
       - traefik.http.routers.turn.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/turn-credentials`)
       - traefik.http.routers.turn.entrypoints=websecure
+      - traefik.http.routers.turn.middlewares=relay-sec
       - traefik.http.routers.turn.tls=true
       - traefik.http.routers.turn.tls.certresolver=letsencrypt
       - traefik.http.routers.turn.service=relay-api-service
       - traefik.http.routers.steam.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/plugin-proxy`)
       - traefik.http.routers.steam.entrypoints=websecure
+      - traefik.http.routers.steam.middlewares=relay-sec
       - traefik.http.routers.steam.tls=true
       - traefik.http.routers.steam.tls.certresolver=letsencrypt
       - traefik.http.routers.steam.service=relay-api-service
       - traefik.http.routers.mailbox.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/mailbox`)
       - traefik.http.routers.mailbox.entrypoints=websecure
+      - traefik.http.routers.mailbox.middlewares=relay-sec
       - traefik.http.routers.mailbox.tls=true
       - traefik.http.routers.mailbox.tls.certresolver=letsencrypt
       - traefik.http.routers.mailbox.service=relay-api-service
@@ -70,17 +102,47 @@ services:
     build:
       context: ./sfu
     restart: unless-stopped
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     expose:
       - "3000"
+    # ONE pair of variables drives both the published range and the range
+    # mediasoup actually allocates from. They used to be four (RTC_MIN/RTC_MAX
+    # plus a whole PORTS_UDP/PORTS_TCP mapping string) that had to be kept in
+    # sync by hand, and a mismatch fails in the worst way: media allocates on
+    # a port the host never published, so the call connects and then nobody
+    # hears anything.
+    #
+    # Two constraints on the range itself, both of which bite at `up` time:
+    #
+    #   Keep it above 60999. Docker binds every port in the range when the
+    #   container starts and one port already in use aborts the whole
+    #   container, so a range inside Linux's ephemeral window (32768-60999)
+    #   makes the SFU fail to start at random - typically after a reboot.
+    #
+    #   Set {"userland-proxy": false} in /etc/docker/daemon.json and restart
+    #   docker BEFORE the first `up`. Otherwise docker starts one proxy
+    #   PROCESS per published port per protocol: 500 ports twice measured at
+    #   2000 processes and 8.4 GB, which OOMs a small VPS. With the flag off
+    #   the range is pure iptables DNAT and costs nothing.
     ports:
-      - ${PORTS_UDP:-40000-40499:40000-40499/udp}
-      - ${PORTS_TCP:-40000-40499:40000-40499/tcp}
+      - ${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}:${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}/udp
+      - ${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}:${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}/tcp
     environment:
       NODE_ENV: production
       SFU_PORT: "3000"
       ANNOUNCED_IP: ${ANNOUNCED_IP:?ANNOUNCED_IP must be set to the server public IP}
-      RTC_MIN_PORT: ${RTC_MIN:-40000}
-      RTC_MAX_PORT: ${RTC_MAX:-40499}
+      RTC_MIN_PORT: ${SFU_RTC_MIN_PORT:-61000}
+      RTC_MAX_PORT: ${SFU_RTC_MAX_PORT:-61499}
+      # Documented as an instance variable but never passed through, so
+      # setting it in .env did nothing and the SFU kept its built-in default.
+      SFU_MAX_ROOMS: ${SFU_MAX_ROOMS:-250}
     networks:
       - dokploy-network
 
@@ -115,32 +177,55 @@ services:
   # while an unused port like tcp/12345 refuses immediately, so packets are
   # being dropped upstream of the host - not a missing listener.
   #
+  # No --verbose. coturn guards every line that carries a client's source
+  # address behind that flag - the per-session "closed, user <..>, remote
+  # <ip:port>" record and the per-permission and per-channel lines - so
+  # running verbose wrote the one end-to-end view of who talked to whom into
+  # the container log, for as long as the host keeps logs. Errors and startup
+  # still print.
+  #
   # Keep every argument below a real flag: this is a folded block, so a "#"
   # line here becomes a literal argument rather than a comment.
   coturn:
     image: coturn/coturn:latest
     restart: unless-stopped
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # volumes:
     #   - ${TURN_TLS_DIR}:/certs:ro
     command: >
       --log-file=stdout
-      --verbose
-      --realm=awful.frav.in
+      --realm=${TURN_REALM:-${DOMAIN}}
       --external-ip=${ANNOUNCED_IP}
       --listening-ip=0.0.0.0
-      --lt-cred-mech
-      --user=awful:awful
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set - see .env.example}
       --fingerprint
       --no-multicast-peers
+      --no-tcp-relay
       --alt-listening-port=5349
+      --denied-peer-ip=${ANNOUNCED_IP}
       --denied-peer-ip=100.64.0.0-100.127.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
       --denied-peer-ip=192.168.0.0-192.168.255.255
       --denied-peer-ip=172.16.0.0-172.31.255.255
       --denied-peer-ip=127.0.0.0-127.255.255.255
       --denied-peer-ip=169.254.0.0-169.254.255.255
-      --min-port=49152
-      --max-port=49251
+      --denied-peer-ip=0.0.0.0-0.255.255.255
+      --denied-peer-ip=224.0.0.0-255.255.255.255
+      --denied-peer-ip=::1
+      --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --min-port=${TURN_MIN_PORT:-49152}
+      --max-port=${TURN_MAX_PORT:-50151}
+      --total-quota=${TURN_TOTAL_QUOTA:-300}
+      --user-quota=${TURN_USER_QUOTA:-12}
       ${TURN_TLS_ARGS:-}
     network_mode: host
 
@@ -150,9 +235,22 @@ services:
       args:
         - VITE_API_URL=${VITE_API_URL}
         - VITE_RELAY_MULTIADDR=${VITE_RELAY_MULTIADDR}
+        # One SFU, or a comma-separated list. Rooms are placed across a list
+        # by hashing the room code, so participants agree without a
+        # coordinator. Empty = this origin's own /sfu.
+        - VITE_SFU_URL=${VITE_SFU_URL:-}
+        - VITE_SFU_URLS=${VITE_SFU_URLS:-}
         # External plugins fetched at build time; see frontend/plugins/README.md
         - PLUGIN_SOURCES=${PLUGIN_SOURCES:-}
     restart: unless-stopped
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - relay
     networks:
@@ -163,8 +261,19 @@ services:
       - traefik.http.routers.awful2-http.entrypoints=web
       - traefik.http.routers.awful2-http.middlewares=awful2-redirect
       - traefik.http.middlewares.awful2-redirect.redirectscheme.scheme=https
+      # Same reasoning as relay-sec above: the 301 upgrades one request, this
+      # is what stops the next one starting in plain text. Content-Security-
+      # Policy is not here - it lives in frontend/nginx.conf, next to the app
+      # whose sources it describes.
+      - traefik.http.middlewares.awful2-sec.headers.stsSeconds=63072000
+      - traefik.http.middlewares.awful2-sec.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.awful2-sec.headers.stsPreload=true
+      - traefik.http.middlewares.awful2-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.awful2-sec.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.awful2-sec.headers.frameDeny=true
       - traefik.http.routers.awful2-https.rule=Host(`${DOMAIN}`)
       - traefik.http.routers.awful2-https.entrypoints=websecure
+      - traefik.http.routers.awful2-https.middlewares=awful2-sec
       - traefik.http.routers.awful2-https.tls=true
       - traefik.http.routers.awful2-https.tls.certresolver=letsencrypt
       - traefik.http.services.awful2-service.loadbalancer.server.port=80

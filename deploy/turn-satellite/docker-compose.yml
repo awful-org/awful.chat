@@ -1,0 +1,73 @@
+# A TURN server for an awful.chat instance, running anywhere.
+#
+# This is the whole thing: stock coturn, one secret, no repository checkout and
+# nothing shared with the main instance but TURN_SECRET. Someone can run this
+# on their own VPS for you.
+#
+#   cp .env.example .env   # fill in PUBLIC_IP, PUBLIC_HOSTNAME and TURN_SECRET
+#   docker compose up -d
+#
+# Then add its URLs to TURN_URLS on the main instance and redeploy the relay.
+# See ../README.md.
+
+services:
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Host networking, because TURN hands out the ports it listens on and a
+    # docker NAT in between would advertise addresses nobody can reach.
+    network_mode: host
+    volumes:
+      # Mounted unconditionally so turning TLS on is an .env change and
+      # nothing else. Left unset it mounts an empty directory, which coturn
+      # ignores because TURN_TLS_ARGS is then empty too.
+      #
+      # Point TURN_TLS_DIR at the WHOLE /etc/letsencrypt tree, not at
+      # live/<host>: everything in live/ is a relative symlink into
+      # ../../archive/, and mounting only live/ leaves those targets outside
+      # the mount, so coturn reports the certificate as missing.
+      - ${TURN_TLS_DIR:-/var/empty}:/certs:ro
+    # --no-tcp-relay: browsers never use RFC6062 TCP relaying, so refusing it
+    # removes a whole class of abuse the operator would be blamed for.
+    #
+    # PUBLIC_IP is denied as a PEER. network_mode: host puts coturn on the
+    # host's stack, and Linux delivers a packet addressed to a local public IP
+    # over loopback - so without that line a TURN client asking for a
+    # permission to PUBLIC_IP reaches anything bound to 0.0.0.0 on this box
+    # (an admin UI, an exporter, a stray database), straight through the
+    # provider's ingress firewall.
+    #
+    # Keep every argument below a real flag: this is a folded block, so a "#"
+    # line inside it becomes a literal argument rather than a comment.
+    command: >
+      --log-file=stdout
+      --realm=${TURN_REALM:-${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME (or TURN_REALM) - an empty realm makes coturn reject every credential}}
+      --external-ip=${PUBLIC_IP:?PUBLIC_IP must be the public address of THIS server}
+      --listening-ip=0.0.0.0
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET:?TURN_SECRET must match the main instance exactly}
+      --fingerprint
+      --no-multicast-peers
+      --no-tcp-relay
+      --denied-peer-ip=${PUBLIC_IP}
+      --denied-peer-ip=100.64.0.0-100.127.255.255
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=172.16.0.0-172.31.255.255
+      --denied-peer-ip=127.0.0.0-127.255.255.255
+      --denied-peer-ip=169.254.0.0-169.254.255.255
+      --denied-peer-ip=0.0.0.0-0.255.255.255
+      --denied-peer-ip=224.0.0.0-255.255.255.255
+      --denied-peer-ip=::1
+      --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --min-port=${TURN_MIN_PORT:-49152}
+      --max-port=${TURN_MAX_PORT:-50151}
+      --total-quota=${TURN_TOTAL_QUOTA:-300}
+      --user-quota=${TURN_USER_QUOTA:-12}
+      ${TURN_TLS_ARGS:-}

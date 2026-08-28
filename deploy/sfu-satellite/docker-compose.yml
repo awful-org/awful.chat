@@ -1,0 +1,83 @@
+# An extra SFU for an awful.chat instance, running anywhere.
+#
+# Needs a checkout of this repository (the SFU is built from ./sfu), and it
+# shares NOTHING with the main instance: no secret, no database, no network
+# path. Rooms are placed across SFUs by hashing the room code, so this server
+# only has to be reachable over wss://.
+#
+#   git clone https://github.com/awful-org/awful.chat
+#   cd awful.chat/deploy/sfu-satellite
+#   cp .env.example .env      # fill in PUBLIC_IP and SFU_HOSTNAME
+#   docker compose up -d
+#
+# BEFORE the first `up`, put this in /etc/docker/daemon.json and restart
+# docker:
+#
+#   { "userland-proxy": false }
+#
+# Docker otherwise starts one docker-proxy PROCESS per published port per
+# protocol. This compose publishes a 500-port range twice (udp and tcp), which
+# measured at 2000 processes and 8.4 GB of RAM - enough to OOM the small VPS
+# this is meant to run on, and roughly a minute per up/down. With the flag off
+# the range is pure iptables DNAT and costs nothing.
+#
+# Caddy terminates TLS and gets its own certificate, so all you need is a
+# DNS A record for SFU_HOSTNAME pointing here and ports 80/443 open.
+#
+# Then add wss://<SFU_HOSTNAME>/sfu to VITE_SFU_URLS on the main instance and
+# REBUILD THE FRONTEND - that variable is baked in at build time. See
+# ../README.md.
+
+services:
+  sfu:
+    build:
+      context: ../../sfu
+    restart: unless-stopped
+    # Media ports are published directly: mediasoup announces PUBLIC_IP and
+    # the port it allocated, and the browser sends UDP straight here. Nothing
+    # proxies this traffic - only the signalling WebSocket goes through Caddy.
+    #
+    # The default range starts at 61000, ABOVE Linux's default ephemeral range
+    # (32768-60999). Docker binds every port in the range at container start
+    # and one already-taken port aborts the whole container, so a range inside
+    # the ephemeral window makes the SFU fail to start at random - typically
+    # after a reboot, when some outbound connection happens to hold a port.
+    ports:
+      - ${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}:${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}/udp
+      - ${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}:${SFU_RTC_MIN_PORT:-61000}-${SFU_RTC_MAX_PORT:-61499}/tcp
+    environment:
+      NODE_ENV: production
+      SFU_PORT: "3000"
+      ANNOUNCED_IP: ${PUBLIC_IP:?PUBLIC_IP must be the public address of THIS server}
+      RTC_MIN_PORT: ${SFU_RTC_MIN_PORT:-61000}
+      RTC_MAX_PORT: ${SFU_RTC_MAX_PORT:-61499}
+      # Rooms holding a live router. The port range above is the real ceiling
+      # (roughly one port per transport, two per participant in a call), so
+      # keep the two in step.
+      SFU_MAX_ROOMS: ${SFU_MAX_ROOMS:-250}
+    networks:
+      - sfu-net
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - sfu
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SFU_HOSTNAME: ${SFU_HOSTNAME:?SFU_HOSTNAME must be a DNS name pointing at this server}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - sfu-net
+
+networks:
+  sfu-net:
+
+volumes:
+  caddy_data:
+  caddy_config:

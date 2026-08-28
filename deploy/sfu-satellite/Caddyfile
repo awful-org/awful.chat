@@ -1,0 +1,32 @@
+# TLS for the SFU's signalling WebSocket. Caddy obtains and renews the
+# certificate itself, so the only prerequisite is a DNS A record for
+# SFU_HOSTNAME pointing at this server with 80 and 443 reachable.
+#
+# Only signalling passes through here. Media (the ports published in
+# docker-compose.yml) goes browser-to-server directly over UDP and never
+# touches this proxy, which is why a CDN in front of it would be pointless
+# and why Caddy is enough.
+
+{
+	# HTTP/1.1 and HTTP/2 only. Caddy enables HTTP/3 by default and advertises
+	# it with an Alt-Svc header browsers cache for 30 days - but 443/udp is not
+	# published by the compose file, so every client would then race a QUIC
+	# attempt into a black hole before falling back to TCP. Nothing to gain
+	# here: this endpoint carries one long-lived WebSocket.
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$SFU_HOSTNAME} {
+	# The client connects to wss://<host>/sfu, matching the path the app's own
+	# nginx uses, so one URL shape works whether the SFU is local or remote.
+	handle /sfu* {
+		reverse_proxy sfu:3000
+	}
+
+	# Anything else here is a scan or a stray probe. Nothing else is served.
+	handle {
+		respond "awful.chat sfu" 200
+	}
+}

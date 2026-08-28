@@ -102,7 +102,7 @@ interface Message {
   senderName: string
   senderDid?: string
   sig?: string           // ed25519 over the canonical form (see below)
-  sigV?: number          // 3 = current (adds type + roomCode); 2 still verifies
+  sigV?: number          // 3 = the only version accepted on the wire
   timestamp: number      // wall clock, display only
   lamport: number        // ordering source of truth
   type: ChatMessageType  // only chat types stored in IDB
@@ -433,9 +433,13 @@ result:
     (spreads data through partial meshes without direct connections)
 
 signature policy on receive (MANDATORY since 2026-08):
-  → sigV 3 verifies against the canonical rebuilt with the AUTHENTICATED
-    topic room (the wire carries no roomCode); sigV 2 still verifies
-  → sigV 1 and unsigned messages are REJECTED, with one exception:
+  → sigV 3 ONLY, verified against the canonical rebuilt with the
+    AUTHENTICATED topic room (the wire carries no roomCode). sigV 2 was
+    retired on 2026-08-28: it signed neither the type nor the room, so a
+    valid v2 signature was still a working cross-room replay - and since
+    storage puts by the globally unique id, the replay MOVED the receiver's
+    original rather than copying it
+  → sigV 1 and 2, and unsigned messages, are REJECTED, with one exception:
     unsigned rows inside a DM sync batch from the authenticated DM
     counterparty (or the own identity's paired device) are accepted -
     receiver-stored DM history predates signing
@@ -471,8 +475,9 @@ lock     → zero out private key bytes → null session
 ```typescript
 // v1 (legacy): `${id}:${senderId}:${lamport}:${content}` - kept only so old
 // local rows can be re-verified; REJECTED on the wire.
-// v2 (still verified) - covers reaction fields, replyTo.id, and file meta
-// (infoHash/size/mime/name) so they can't be swapped in transit:
+// v2 (RETIRED 2026-08-28, rejected on the wire) - covered reaction fields,
+// replyTo.id and file meta, but neither the type nor the room, so a valid v2
+// signature was still a working cross-room replay:
 const canonicalV2 = JSON.stringify([id, senderId, lamport, content,
   reactionTo, reactionEmoji, reactionOp, replyTo?.id, metaFileStrings])
 // v3 (current, msg.sigV === 3) - additionally binds type and roomCode, so a
@@ -480,9 +485,12 @@ const canonicalV2 = JSON.stringify([id, senderId, lamport, content,
 const canonicalV3 = JSON.stringify([3, type, roomCode, id, senderId, lamport,
   content, reactionTo, reactionEmoji, reactionOp, replyTo?.id, metaFileStrings])
 // sign with private key in memory
-// verify with pubkey decoded from senderDid (did:key); senderDid must
-// equal senderId when senderId is a did:key; the verifier reconstructs
-// roomCode from the authenticated gossipsub topic, never from the wire
+// verify with pubkey decoded from senderDid (did:key); senderDid must ALWAYS
+// equal senderId (a peerId-form senderId once skipped this check, so any key
+// could sign as anyone); ed25519 verification runs with zip215:false, which
+// rejects small-order keys that would otherwise verify any signature; and the
+// verifier reconstructs roomCode from the authenticated gossipsub topic,
+// never from the wire
 ```
 
 ### Peer Identity Binding
@@ -648,7 +656,12 @@ Late join behavior:
 ## Room Codes
 
 ```txt
-text:  slugify(name) + "-" + sha256(creatorDid + salt)[0..4]
+text:  8 random bytes as hex (64 bits) - see frontend/src/lib/room-code.ts.
+       Rooms created before 2026-08-28 carry 3 bytes (24 bits) and keep it:
+       a room cannot be re-keyed without becoming a different room. The code
+       is the room's ONLY membership secret - it names the gossipsub topic,
+       keys the relay rendezvous, and is the SFU join key - so it is never
+       disclosed to a peer outside the room (see _sendDigestForRoom).
 DM:    "dm-" + hex(sha256(sort([didA, didB]).join("|")))[0..40]
        (deterministic - both peers derive the same room without coordination)
 ```
