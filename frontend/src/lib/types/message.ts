@@ -251,6 +251,13 @@ export interface WireSyncBatch {
   messages: WireChatMessage[];
   batchIndex: number;
   totalBatches: number;
+  /**
+   * This batch is the direct copy of a live send, not history repair. The
+   * receiver announces a live batch (sound, notification) and stays quiet for
+   * repair, which would otherwise beep once per recovered message. Absent from
+   * older senders, which is why quiet is the default.
+   */
+  live?: boolean;
 }
 
 export interface WireSyncComplete {

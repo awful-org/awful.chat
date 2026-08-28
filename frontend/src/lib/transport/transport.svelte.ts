@@ -93,7 +93,7 @@ import {
   foldUpdate,
   touchCardStates,
 } from "../plugins/state.svelte";
-import { humanizeMentions, mentionsMe } from "../mentions";
+import { announceMessage } from "../announce";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
@@ -127,7 +127,6 @@ import {
 } from "./files.svelte";
 import { initVoice } from "./voice.svelte";
 import { initTransmission } from "./transmission.svelte";
-import { notifyMessage } from "../notify.svelte";
 
 const MSG_ORDER = (a: Message, b: Message) =>
   a.lamport !== b.lamport
@@ -1011,7 +1010,13 @@ async function _pushMissingTo(
 async function _handleSyncBatch(
   roomCode: string,
   messages: WireChatMessage[],
-  fromPeerId?: string
+  fromPeerId?: string,
+  /**
+   * The sender marked this as the direct copy of a live send, not history
+   * repair. Only a live batch may announce: a repair would beep once per
+   * recovered message.
+   */
+  live = false
 ): Promise<void> {
   // Bind incoming history to the room named in the (signed-message-bearing)
   // batch, and only if we actually joined it - a peer cannot inject history
@@ -1085,6 +1090,19 @@ async function _handleSyncBatch(
   // path otherwise never creates.
   for (const m of fullMessages) stripAndAdoptInlineFiles(m);
 
+  // Newness has to be read BEFORE the write below, which would otherwise
+  // satisfy the lookup. Only worth the round trip for a live batch: repair
+  // never announces, so it never needs the answer.
+  const unannounced = live
+    ? await Promise.all(
+        fullMessages.map(
+          async (m) =>
+            !transportState.messages.some((x) => x.id === m.id) &&
+            !(await getMessage(m.id))
+        )
+      )
+    : [];
+
   await bulkPutMessages(fullMessages);
 
   // Backfilled plugin updates cannot be folded onto a cached state (the fold
@@ -1119,6 +1137,12 @@ async function _handleSyncBatch(
 
   refreshUnreadCount(roomCode).catch(() => {});
   for (const m of fullMessages) noteRoomActivity(m.roomCode, m.timestamp);
+
+  if (live) {
+    fullMessages.forEach((m, i) => {
+      if (unannounced[i]) _announceMessage(m);
+    });
+  }
 
   // Storage got everything; the view only takes messages for the room that is
   // actually open (the user may have switched while the batch was in flight),
@@ -1620,6 +1644,19 @@ async function _verifyIncoming(
   return verifySignature(wire.senderDid, wire.sig, canonicalFor(wire));
 }
 
+/**
+ * Bind an incoming message to this client's identity and view, then let
+ * announce.ts decide whether to make a sound about it. The caller has already
+ * established that the message is genuinely new.
+ */
+function _announceMessage(msg: Message): void {
+  announceMessage(msg, {
+    selfIds: [identityStore.did ?? "", _transport.selfId()],
+    uiRoomCode: transportState.uiRoomCode,
+    resolveName: resolveMentionDisplayName,
+  });
+}
+
 async function _handleChatMessage(
   wire: WireChatMessage,
   roomCodeOverride?: string,
@@ -1723,50 +1760,7 @@ async function _handleChatMessage(
     transportState.dmVersion += 1;
   }
 
-  // Reactions and plugin updates are noise as notifications, and a message
-  // replayed by sync is not news - only announce genuinely new chat arriving
-  // from someone else.
-  if (
-    isNewMessage &&
-    msg.type !== MessageType.Reaction &&
-    msg.type !== MessageType.PluginUpdate &&
-    !isSelfSender(msg.senderId)
-  ) {
-    // This whole block sits between putMessage and appendSorted: an
-    // uncaught throw here (a bad mention resolve, a notification quirk)
-    // turns "stored" into "invisible until refresh" for every message
-    // after it. Notifying is best-effort; painting the message is not.
-    try {
-      let body = msg.content || "[file]";
-      if (msg.type === MessageType.PluginCard) {
-        try {
-          const payload = JSON.parse(msg.content);
-          const { getManifest } = await import("../plugins/registry");
-          const manifest = getManifest(payload.pluginId);
-          body = `posted a ${manifest?.name || payload.pluginId}`;
-        } catch {
-          body = "posted a plugin card";
-        }
-      } else {
-        body = humanizeMentions(body, resolveMentionDisplayName);
-      }
-      const mentioned = mentionsMe(msg.content ?? "", [
-        identityStore.did ?? "",
-        _transport.selfId(),
-      ]);
-      notifyMessage({
-        title: mentioned
-          ? `${msg.senderName} mentioned you`
-          : transportState.roomName || msg.roomCode,
-        body: `${msg.senderName}: ${body}`,
-        tag: `room:${msg.roomCode}`,
-        viewingConversation: transportState.uiRoomCode === msg.roomCode,
-        data: { roomCode: msg.roomCode },
-      });
-    } catch (err) {
-      console.warn("[chat] notification failed:", err);
-    }
-  }
+  if (isNewMessage) _announceMessage(msg);
 
   // Match on the open room, not the mode: DM file messages arrive through
   // this path too, and the mode check kept them invisible until reopen.
@@ -2013,16 +2007,8 @@ function _handleDmChatAsync(
       const isViewingThisDm =
         transportState.chatMode === "dm" &&
         (activeDid === senderDid || activeDid === peerId);
-      // Reactions are noise as notifications, same rule as rooms.
-      if (!reaction) {
-        notifyMessage({
-          title: msg.senderName,
-          body: humanizeMentions(msg.content, resolveMentionDisplayName),
-          tag: `dm:${roomCode}`,
-          viewingConversation: transportState.uiRoomCode === roomCode,
-          data: { roomCode, dmPeerDid: senderDid },
-        });
-      }
+      // Reactions are filtered inside the funnel, same rule as rooms.
+      _announceMessage(msg);
       if (isViewingThisDm) {
         transportState.messages = appendSorted(transportState.messages, msg);
         await markRoomSeen(roomCode, msg.lamport);
@@ -2195,7 +2181,12 @@ _transport.on("message", (peerId, data, room) => {
         _handleDigest(peerId, msg.roomCode, msg.watermarks).catch(() => {});
         break;
       case MessageType.SyncBatch:
-        _handleSyncBatch(msg.roomCode, msg.messages, peerId).catch(() => {});
+        _handleSyncBatch(
+          msg.roomCode,
+          msg.messages,
+          peerId,
+          msg.live === true
+        ).catch(() => {});
         break;
       case MessageType.SyncComplete:
         _handleSyncComplete(peerId, msg.roomCode);
@@ -2556,6 +2547,10 @@ function _broadcastChatWire(wire: WireChatMessage, roomCode: string): void {
     messages: [wire],
     batchIndex: 0,
     totalBatches: 1,
+    // Not history repair: whichever copy of this message lands first is the
+    // one that has to announce it, because the publish above is dropped
+    // outright when the mesh has no topic peers for the room.
+    live: true,
   });
   // DM rooms have no roomUsers roster - the direct copy goes to the one peer
   // the conversation is with (plugin cards and files ride this path too).

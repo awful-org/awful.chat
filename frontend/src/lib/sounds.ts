@@ -12,7 +12,9 @@ function getCtx(): AudioContext {
 // Autoplay policy: resume() is IGNORED outside a user gesture, so a session
 // that never played a gesture-driven sound (joining a call, toggling mute)
 // carried a permanently suspended context - incoming-message beeps were
-// scheduled into silence. The session's first gesture unlocks it for good.
+// scheduled into silence. Every gesture re-arms it, not just the first: the
+// context can be suspended again later (mobile backgrounding, an audio-session
+// interruption), and a one-shot listener left the session mute for good.
 if (typeof window !== "undefined") {
   const unlock = () => {
     try {
@@ -20,11 +22,9 @@ if (typeof window !== "undefined") {
     } catch {
       /* no audio here */
     }
-    window.removeEventListener("pointerdown", unlock);
-    window.removeEventListener("keydown", unlock);
   };
-  window.addEventListener("pointerdown", unlock);
-  window.addEventListener("keydown", unlock);
+  window.addEventListener("pointerdown", unlock, { passive: true });
+  window.addEventListener("keydown", unlock, { passive: true });
 }
 
 function playOsc(
@@ -32,7 +32,15 @@ function playOsc(
   duration: number,
   type: OscillatorType = "sine",
   gain = 0.15,
-  attack = 0.005
+  attack = 0.005,
+  /**
+   * Seconds to wait before the note starts, measured on the AUDIO clock.
+   * setTimeout is clamped to >=1s in a background tab - exactly where an
+   * incoming-message beep matters most - which degraded a two-note chime to a
+   * single blip. Anything that has to land inside a few tens of milliseconds
+   * belongs here, not in a timer.
+   */
+  delay = 0
 ) {
   const ctx = getCtx();
   const osc = ctx.createOscillator();
@@ -41,15 +49,18 @@ function playOsc(
   osc.type = type;
   osc.frequency.value = freq;
 
-  gainNode.gain.value = 0;
-  gainNode.gain.linearRampToValueAtTime(gain, ctx.currentTime + attack);
-  gainNode.gain.linearRampToValueAtTime(0, ctx.currentTime + duration);
+  const start = ctx.currentTime + delay;
+  // A ramp with no preceding event starts from an implementation-defined
+  // time. Anchor it so the attack is the same in every browser.
+  gainNode.gain.setValueAtTime(0, start);
+  gainNode.gain.linearRampToValueAtTime(gain, start + attack);
+  gainNode.gain.linearRampToValueAtTime(0, start + duration);
 
   osc.connect(gainNode);
   gainNode.connect(ctx.destination);
 
-  osc.start();
-  osc.stop(ctx.currentTime + duration);
+  osc.start(start);
+  osc.stop(start + duration);
 }
 
 export async function playJoinSound() {
@@ -119,10 +130,14 @@ export async function playUndeafenSound() {
 /**
  * An incoming chat message. Softer and shorter than the notification triple:
  * this can fire often, so it has to be ignorable.
+ *
+ * Both notes are scheduled up front on the audio clock. This is the one cue
+ * that plays while the tab is in the background, where a 45 ms setTimeout is
+ * clamped to a second and the chime arrives as one lonely blip.
  */
 export async function playMessageSound() {
   playOsc(880, 0.05, "sine", 0.06);
-  setTimeout(() => playOsc(1175, 0.07, "sine", 0.05), 45);
+  playOsc(1175, 0.07, "sine", 0.05, 0.005, 0.045);
 }
 
 export async function playNotifySound() {
