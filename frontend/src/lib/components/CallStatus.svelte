@@ -6,12 +6,15 @@
     _voice,
   } from "$lib/transport/transport.svelte";
   import {
+    CornerUpLeft,
     Headphones,
     Signal,
     SignalHigh,
     WifiOff,
     Radio,
   } from "@lucide/svelte";
+  import { roomsStore } from "$lib/rooms.svelte";
+  import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { onMount, onDestroy } from "svelte";
   import { cn } from "$lib/utils";
   import type { TransportStatus } from "$lib/transport/types";
@@ -171,57 +174,99 @@
     return quality === "connecting" ? getStatusConfig("p2p") : base;
   });
   const StatusIcon = $derived(config.icon);
+
+  // The room the CALL is in, not the one on screen. Reading transportState
+  // .roomName meant that as soon as you looked elsewhere the chip announced
+  // "Connected" under the name of a room you were not calling in.
+  const callRoomName = $derived.by(() => {
+    const code = transportState.callRoomCode;
+    if (!code) return "Voice";
+    if (code.startsWith("dm-")) {
+      const did = roomsStore.dmRooms.find(
+        (r) => r.roomCode === code
+      )?.participantDid;
+      return (did && transportState.peerNames.get(did)) || "Direct call";
+    }
+    return roomsStore.rooms.find((r) => r.roomCode === code)?.name || code;
+  });
+
+  // Away from the call the chip stops being a status line and becomes the way
+  // back: nothing else on screen leads there, and the call keeps running
+  // regardless of what the user is looking at.
+  const away = $derived(
+    transportState.inCall &&
+      !!transportState.callRoomCode &&
+      transportState.uiRoomCode !== transportState.callRoomCode
+  );
 </script>
 
 {#if transportState.inCall}
   {#if collapsed}
     <Tip
-      text={`${config.label} · ${transportState.roomName || "Voice"}${
+      text={`${away ? "Back to call · " : ""}${config.label} · ${callRoomName}${
         quality === "relayed" ? " · relayed" : ""
       }${deafened ? " · deafened" : ""}`}
       side="right"
     >
       {#snippet children(props)}
-        <div
+        <svelte:element
+          this={away ? "button" : "div"}
           {...props}
+          type={away ? "button" : undefined}
+          role={away ? "button" : undefined}
+          aria-label={away ? `Back to call in ${callRoomName}` : undefined}
+          onclick={away ? requestReturnToCall : undefined}
           class={cn(
             "mx-2 mb-2 flex items-center justify-center rounded-lg border py-2",
             config.bg,
-            config.border
+            config.border,
+            away && "cursor-pointer hover:brightness-125"
           )}
         >
-          <StatusIcon class={cn("size-5", config.color)} />
-        </div>
+          {#if away}
+            <CornerUpLeft class={cn("size-5", config.color)} />
+          {:else}
+            <StatusIcon class={cn("size-5", config.color)} />
+          {/if}
+        </svelte:element>
       {/snippet}
     </Tip>
   {:else}
-    <div
+    <svelte:element
+      this={away ? "button" : "div"}
+      type={away ? "button" : undefined}
+      role={away ? "button" : undefined}
+      aria-label={away ? `Back to call in ${callRoomName}` : undefined}
+      onclick={away ? requestReturnToCall : undefined}
       class={cn(
         "flex items-center justify-between px-3 py-2 rounded-lg border text-sm mb-2",
         config.bg,
-        config.border
+        config.border,
+        away && "w-full text-left cursor-pointer hover:brightness-125"
       )}
     >
-      <div class="flex items-center gap-2">
-        <div class={cn("relative", config.color)}>
-          <StatusIcon class="size-5" />
-          {#if quality === "failed"}
-            <div class="absolute inset-0 flex items-center justify-center">
-              <div class="w-0.5 h-3 bg-current rotate-45"></div>
-            </div>
+      <div class="flex items-center gap-2 min-w-0">
+        <div class={cn("relative shrink-0", config.color)}>
+          {#if away}
+            <CornerUpLeft class="size-5" />
+          {:else}
+            <StatusIcon class="size-5" />
+            {#if quality === "failed"}
+              <div class="absolute inset-0 flex items-center justify-center">
+                <div class="w-0.5 h-3 bg-current rotate-45"></div>
+              </div>
+            {/if}
           {/if}
         </div>
-        <div class="flex flex-col">
+        <div class="flex flex-col min-w-0">
           <span class={cn("font-medium text-xs", config.color)}
-            >{config.label}</span
+            >{away ? "Back to call" : config.label}</span
           >
-          <span class="text-[10px] text-gray-400"
-            >{transportState.roomName || "Voice"}</span
-          >
+          <span class="text-[10px] text-gray-400 truncate">{callRoomName}</span>
         </div>
       </div>
 
-      <div class="flex items-center gap-1">
+      <div class="flex items-center gap-1 shrink-0">
         {#if quality === "relayed"}
           <Tip text="Connected via TURN relay">
             {#snippet children(props)}
@@ -244,6 +289,6 @@
           </Tip>
         {/if}
       </div>
-    </div>
+    </svelte:element>
   {/if}
 {/if}

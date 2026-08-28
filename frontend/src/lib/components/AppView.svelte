@@ -26,6 +26,7 @@
     refreshPhonebook,
     refreshDmRooms,
   } from "$lib/rooms.svelte";
+  import { uiState } from "$lib/ui-state.svelte";
   import {
     getMessages,
     getLastMessage,
@@ -380,6 +381,31 @@
     sidebarTab = "rooms";
     sidebarOpen = false;
   }
+
+  /**
+   * Take the user back to the call they are in. The call survives navigating
+   * away - only the stage unmounts, because it is gated on the conversation on
+   * screen being the call's - so getting back is pure navigation. Nothing is
+   * rejoined.
+   */
+  async function returnToCall(): Promise<void> {
+    const code = transportState.callRoomCode;
+    if (!code) return;
+    if (code.startsWith("dm-")) {
+      const peer = roomsStore.dmRooms.find(
+        (r) => r.roomCode === code
+      )?.participantDid;
+      if (peer) await handleSelectDm(peer);
+      return;
+    }
+    await handleSelectRoom(code);
+  }
+
+  $effect(() => {
+    if (!uiState.returnToCallRequested) return;
+    uiState.returnToCallRequested = false;
+    void returnToCall();
+  });
 
   function dmTitleFor(peerId: string): string {
     const did = peerIdToDid(peerId);

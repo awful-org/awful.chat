@@ -38,6 +38,7 @@
     Star,
     ChessQueen,
     ThumbsUp,
+    CornerUpLeft,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -83,7 +84,7 @@
   import { makeHostApi } from "$lib/plugins/host";
   import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import UserProfileCard from "./UserProfileCard.svelte";
-  import { openSettings } from "$lib/ui-state.svelte";
+  import { openSettings, requestReturnToCall } from "$lib/ui-state.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { getRegistry, getPlugin } from "$lib/plugins/registry";
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
@@ -1374,6 +1375,30 @@
               >
                 <Phone class="size-4" />
               </Button>
+            {/snippet}
+          </Tip>
+        {:else if callRoomCode && callRoomCode !== roomCode}
+          <!--
+            The call is live in another conversation and its stage is not on
+            screen. The sidebar chip also leads back, but below sm the sidebar
+            is off-canvas - so the way back has to exist here too, and this slot
+            is empty in exactly this state.
+          -->
+          <Tip text="Back to the call you are in">
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={requestReturnToCall}
+                aria-label="Back to call"
+                class="flex items-center gap-1.5 rounded-full border border-green-500/20 bg-green-500/10 px-2 py-1 text-xs font-mono text-green-400 hover:brightness-125 cursor-pointer"
+              >
+                <span
+                  class="size-1.5 rounded-full bg-green-400 animate-pulse"
+                ></span>
+                <CornerUpLeft class="size-3.5" />
+                <span class="hidden sm:inline">Back to call</span>
+              </button>
             {/snippet}
           </Tip>
         {/if}
