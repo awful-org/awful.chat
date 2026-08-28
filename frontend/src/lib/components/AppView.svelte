@@ -44,6 +44,8 @@
   import { humanizeMentions } from "$lib/mentions";
   import ReloadPrompt from "./ReloadPrompt.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
+  import CommandPalette from "./palette/CommandPalette.svelte";
+  import type { PaletteHost } from "$lib/palette/host";
   import { Dialog } from "bits-ui";
   import { Notebook, Star, Trash2, Users, X } from "@lucide/svelte";
   import {
@@ -525,6 +527,34 @@
     createJoinOpen = true;
   }
 
+  let paletteOpen = $state(false);
+
+  // Anything outside this tree asks for the palette through uiState, the same
+  // way it asks for the settings dialog.
+  $effect(() => {
+    if (!uiState.paletteOpenRequested) return;
+    uiState.paletteOpenRequested = false;
+    if (identityStore.isUnlocked) paletteOpen = true;
+  });
+
+  // The palette cannot navigate on its own: this component owns activeRoomCode,
+  // the history push, and the room-name broadcast. Reproducing that inside the
+  // palette would fork the join path, so it delegates back here.
+  //
+  // activeRoomCode is a getter, not a snapshot, or the palette would read a
+  // stale room for the whole time it is mounted.
+  const paletteHost: PaletteHost = {
+    get activeRoomCode() {
+      return activeRoomCode;
+    },
+    openRoom: (code) => void handleSelectRoom(code),
+    joinRoomByCode: (code) => void handleJoin(code, ""),
+    openDm: (peerId) => void handleSelectDm(peerId),
+    leaveRoom: handleLeave,
+    removeRoom: (code) => void handleRemoveRoom(code),
+    openCreateJoin,
+  };
+
   // Manifest shortcut: long-press the installed icon > "New room".
   // The param is stripped so a later reload does not reopen the dialog.
   $effect(() => {
@@ -796,10 +826,23 @@
 <svelte:window
   onpopstate={handlePopState}
   onkeydown={(e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    const key = e.key.toLowerCase();
+
+    // Cmd/Ctrl+K opens the command palette. preventDefault is required even
+    // though nothing here claims the key: Firefox maps it to the search bar.
+    // Stays enabled on mobile, unlike the sidebar shortcut, because an external
+    // keyboard is the whole point of it.
+    if (key === "k") {
+      e.preventDefault();
+      if (!identityStore.isUnlocked) return;
+      paletteOpen = !paletteOpen;
+      return;
+    }
+
     // Cmd/Ctrl+B collapses the room sidebar. The composer is a plain
     // textarea, so there is no native bold to steal.
-    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-    if (e.key.toLowerCase() !== "b") return;
+    if (key !== "b") return;
     if (isMobile) return;
     e.preventDefault();
     setSidebarCollapsed(!displayPrefs.sidebarCollapsed);
@@ -1334,4 +1377,13 @@
     with the surface it was opened from is not floating.
   -->
   <FloatingDmPanel onExpand={expandDmPanel} />
+
+  <!-- Also outside the unlocked branch, for the same reason: mounting it once
+       here means the palette survives lock/unlock and room switches, and it is
+       reachable whether or not a room is open. It is gated on isUnlocked because
+       every command needs an identity, and because openSettings' consumer only
+       exists in the unlocked tree. -->
+  {#if identityStore.isUnlocked}
+    <CommandPalette bind:open={paletteOpen} host={paletteHost} />
+  {/if}
 </QueryClientProvider>

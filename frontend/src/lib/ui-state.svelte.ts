@@ -12,6 +12,11 @@ export const uiState = $state({
    * in the sidebar, so the request travels through here.
    */
   returnToCallRequested: false,
+  /**
+   * Somebody asked for the command palette. AppView owns it and binds
+   * Cmd/Ctrl+K, so anything outside that tree travels through here too.
+   */
+  paletteOpenRequested: false,
 });
 
 export function openSettings(tab: string | null = null): void {
@@ -21,4 +26,12 @@ export function openSettings(tab: string | null = null): void {
 
 export function requestReturnToCall(): void {
   uiState.returnToCallRequested = true;
+}
+
+/**
+ * Ask for the command palette. The palette is owned by AppView, which also binds
+ * Cmd/Ctrl+K, so anything outside that tree requests it here.
+ */
+export function openPalette(): void {
+  uiState.paletteOpenRequested = true;
 }
