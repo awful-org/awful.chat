@@ -30,10 +30,17 @@ describe("storage at-rest crypto", () => {
     };
     const sealed = await sealRow(msg, STORE_SPECS.messages);
 
-    // Clear fields survive for the indexes...
+    // ID and lamport are clear fields; they survive for indexes.
     expect(sealed.id).toBe("m1");
-    expect(sealed.roomCode).toBe("room-a");
     expect(sealed.lamport).toBe(4);
+    // roomCode and senderId are blinded - the hash is indexable, the real
+    // value is encrypted inside the blob.
+    expect(typeof sealed.roomCode).toBe("string");
+    expect(sealed.roomCode).toMatch(/^b1:/); // Blinded prefix
+    expect(sealed.roomCode).not.toBe("room-a"); // Not plaintext
+    expect(typeof sealed.senderId).toBe("string");
+    expect(sealed.senderId).toMatch(/^b1:/); // Blinded prefix
+    expect(sealed.senderId).not.toBe("alice"); // Not plaintext
     // ...and NOTHING readable remains of the body.
     expect(JSON.stringify(sealed)).not.toContain("secret plan");
     expect(JSON.stringify(sealed)).not.toContain("Alice");

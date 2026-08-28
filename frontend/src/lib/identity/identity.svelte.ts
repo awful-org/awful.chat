@@ -173,13 +173,25 @@ export async function unlock(password: string): Promise<void> {
   identityStore.loading = true;
   identityStore.error = null;
   try {
-    // The duress check runs FIRST and costs one PBKDF2 - the same order of
-    // work a real unlock does, so nothing observable distinguishes the two
-    // until the wipe lands. executeDuressWipe never returns.
-    if (await isDuressPassword(password)) {
-      await executeDuressWipe();
+    try {
+      await unlockIdentity(password);
+    } catch (unlockErr) {
+      // The duress password is required to differ from the real one (settings
+      // rejects a match), so it can only ever turn up here, on a failed unlock.
+      // Checking it first instead made EVERY successful unlock pay a second
+      // 600,000-iteration PBKDF2 for a record almost no device has - worst on
+      // the boot path, where a remembered password auto-unlocks and a duress
+      // record provably cannot exist, because setDuressPassword clears the
+      // remembered password. Here the success path is back to one derivation
+      // and a failed attempt still takes the same time whether or not duress is
+      // armed: isDuressPassword derives against a throwaway salt when there is
+      // no record, so a wrong password costs exactly two derivations either way.
+      // executeDuressWipe never returns.
+      if (await isDuressPassword(password)) {
+        await executeDuressWipe();
+      }
+      throw unlockErr;
     }
-    await unlockIdentity(password);
     // Re-read the keypair record for public key and did
     const keypair = await getIdentity();
     if (!keypair) throw new Error("Identity record missing after unlock.");

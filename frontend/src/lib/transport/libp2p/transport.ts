@@ -47,6 +47,15 @@ const MAX_RENDEZVOUS_FRAME_BYTES = 16 * 1024;
 const PEER_REDIAL_DELAY_MS = 3_000;
 const PEER_REDIAL_MAX_MS = 60_000;
 const RELAY_RECONNECT_DELAY_MS = 3_000;
+// The FIRST relay dial gets retries of its own. libp2p's dial has no
+// failure cooldown, so a re-dial genuinely re-attempts, and a browser that
+// just woke a radio, switched networks or lost a TLS handshake fails the
+// first one routinely. Without this, one transient WebSocket error made
+// connect() throw - the app papered over it with its own connect retry, but
+// device sync had no such net and simply died ("relay dial failed").
+const RELAY_DIAL_ATTEMPTS = 4;
+const RELAY_DIAL_BASE_MS = 700;
+const RELAY_DIAL_MAX_MS = 6_000;
 const CONNECTION_RECONCILE_MS = 5_000;
 /**
  * The gap between upgrade attempts, and the ceiling once they keep failing.
@@ -262,6 +271,18 @@ export class LibP2PTransport implements PeerTransport {
     this.installStreamNoiseFilter();
     this.intentionalDisconnect = false;
 
+    // A reconnect used to leak the previous node's timers: reconcileTimer was
+    // overwritten (leaving an interval running against a dead node forever)
+    // and a pending relayReconnectTimer could fire into the new one.
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
+    }
+    if (this.relayReconnectTimer) {
+      clearTimeout(this.relayReconnectTimer);
+      this.relayReconnectTimer = null;
+    }
+
     // A previous failed connect may have left a half-started node behind -
     // stop it so retries don't leak libp2p nodes.
     if (this.node) {
@@ -400,7 +421,18 @@ export class LibP2PTransport implements PeerTransport {
       throw err;
     }
     await this.requestRelayReservation();
-    await this.waitForRelayReservation();
+    if (!(await this.waitForRelayReservation())) {
+      // No reservation means nobody can reach US: a browser cannot listen, so
+      // every inbound path runs through the relay circuit. One more attempt
+      // covers the common case of the first request racing the relay dial.
+      // (A reservation that failed with a DialError poisons libp2p's own
+      // relay filter for the lifetime of this node - the retry then fails
+      // fast with "previously invalid", and the app's connect retry, which
+      // builds a FRESH node, is the real recovery.)
+      console.warn("[Transport] no relay reservation, retrying once");
+      await this.requestRelayReservation();
+      await this.waitForRelayReservation();
+    }
 
     // Anything that connected before the listeners existed (or whose event we
     // missed for any other reason) is picked up here.
@@ -625,6 +657,21 @@ export class LibP2PTransport implements PeerTransport {
     handler: TransportEvents[K]
   ): void {
     this.handlers.get(event)?.delete(handler);
+  }
+
+  /**
+   * Connected peers the RELAY has told us are registered in this room.
+   *
+   * Filled from the rendezvous PEERS reply and PEER_JOINED, so it is the
+   * relay's view of membership rather than anything a peer asserted. Used to
+   * decide who may be told that a room exists: a room code is the room's only
+   * membership secret, so naming a room to somebody outside it hands them the
+   * key to it.
+   */
+  peersInRoom(room: string): string[] {
+    const known = this.roomPeers.get(room);
+    if (!known) return [];
+    return [...known].filter((p) => this.connectedPeers.has(p));
   }
 
   peers(): string[] {
@@ -968,21 +1015,62 @@ export class LibP2PTransport implements PeerTransport {
   private async dialRelay(): Promise<void> {
     if (!this.node) return;
     const relayMa = import.meta.env.VITE_RELAY_MULTIADDR as string;
-    try {
-      await this.node.dial(multiaddr(relayMa));
-      console.log("[Transport] relay connected");
-      this.emit("status", {
-        type: "relay-connected",
-        message: "Connected to relay",
-      });
-    } catch (err) {
-      console.error("[Transport] relay dial failed:", err);
-      this.emit("status", {
-        type: "relay-dial-failed",
-        message: "Failed to connect to relay",
-      });
-      throw err;
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt < RELAY_DIAL_ATTEMPTS; attempt++) {
+      // A disconnect() landing mid-backoff must ABORT the connect, not fall
+      // through: returning normally would send connect() on to attach
+      // listeners to a node that is already stopped (or null).
+      if (this.intentionalDisconnect || !this.node) {
+        throw new Error("relay dial aborted");
+      }
+      try {
+        await this.node.dial(multiaddr(relayMa));
+        console.log("[Transport] relay connected");
+        this.emit("status", {
+          type: "relay-connected",
+          message: "Connected to relay",
+        });
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt === RELAY_DIAL_ATTEMPTS - 1) break;
+        // Jittered backoff: two devices starting a sync together would
+        // otherwise retry in lockstep and collide on the same failure.
+        const wait = Math.min(
+          RELAY_DIAL_BASE_MS * 2 ** attempt,
+          RELAY_DIAL_MAX_MS
+        );
+        const delay = wait + Math.random() * wait * 0.3;
+        console.warn(
+          `[Transport] relay dial attempt ${attempt + 1}/${RELAY_DIAL_ATTEMPTS} failed, retrying in ${Math.round(delay)}ms`
+        );
+        this.emit("status", {
+          type: "relay-dial-retry",
+          message: `Relay unreachable - retrying (${attempt + 1}/${RELAY_DIAL_ATTEMPTS})`,
+        });
+        await new Promise((r) => setTimeout(r, delay));
+      }
     }
+
+    console.error("[Transport] relay dial failed:", lastErr);
+    this.emit("status", {
+      type: "relay-dial-failed",
+      message: "Failed to connect to relay",
+    });
+    // A browser WebSocket failure arrives as a DOM Event, and every caller
+    // that showed it to a user rendered "[object Event]". Carry a sentence
+    // a person can act on instead, keeping the original as the cause.
+    const detail =
+      lastErr instanceof Error
+        ? lastErr.message
+        : lastErr && typeof lastErr === "object" && "type" in lastErr
+          ? `websocket ${(lastErr as { type: string }).type}`
+          : String(lastErr);
+    throw new Error(
+      `Could not reach the relay after ${RELAY_DIAL_ATTEMPTS} attempts (${detail}). Check your connection and try again.`,
+      { cause: lastErr }
+    );
   }
 
   private async requestRelayReservation(): Promise<void> {
@@ -1499,12 +1587,20 @@ export class LibP2PTransport implements PeerTransport {
           if (this.connectedPeers.has(peerId)) continue;
           this.dialPeer(peerId).catch(() => {});
         }
+        // Peers we were ALREADY connected to fire no connect event, so
+        // without this nothing would reconcile history with them until the
+        // repair tick came round - digests are gated on membership, and this
+        // reply is where membership becomes known.
+        this.emit("roomPeers", msg.room, this.peersInRoom(msg.room));
         break;
       }
       case "PEER_JOINED": {
         const peerId = msg.peer;
         if (peerId === selfId) break;
         this.rememberRoomPeer(msg.room, peerId);
+        if (this.connectedPeers.has(peerId)) {
+          this.emit("roomPeers", msg.room, [peerId]);
+        }
         if (this.connectedPeers.has(peerId)) break;
         this.dialPeer(peerId).catch(() => {});
         break;
@@ -1518,9 +1614,10 @@ export class LibP2PTransport implements PeerTransport {
     }
   }
 
-  private waitForRelayReservation(): Promise<void> {
+  /** Resolves true once the circuit reservation is live, false on timeout. */
+  private waitForRelayReservation(): Promise<boolean> {
     return new Promise((resolve) => {
-      if (!this.node) return resolve();
+      if (!this.node) return resolve(false);
       const ownId = this.node.peerId.toString();
 
       const deadline = setTimeout(() => {
@@ -1534,7 +1631,7 @@ export class LibP2PTransport implements PeerTransport {
           type: "reservation-timeout",
           message: "Relay reservation timed out - you may not be reachable",
         });
-        resolve();
+        resolve(false);
       }, RELAY_RESERVATION_TIMEOUT_MS);
 
       const check = () => {
@@ -1547,7 +1644,7 @@ export class LibP2PTransport implements PeerTransport {
           console.log("[Transport] relay reservation ok:", circuit.toString());
           clearTimeout(deadline);
           this.node?.removeEventListener("self:peer:update", check);
-          resolve();
+          resolve(true);
         }
       };
 

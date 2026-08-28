@@ -20,6 +20,7 @@ import {
   getWebAuthnRecord,
   deleteWebAuthnRecord,
   migrateAtRest,
+  setAtRestOwner,
 } from "../storage";
 import { initStorageCrypto, clearStorageCrypto } from "../storage-crypto";
 import { clearRememberedPassword } from "./remembered-password";
@@ -192,9 +193,64 @@ async function _activateSession(
 ): Promise<void> {
   await initStorageCrypto(privateKey);
   session = { privateKey, publicKey, did };
+  // The sweep seals with THIS identity's key, so whether it has run is a
+  // property of the identity, not of the device.
+  setAtRestOwner(did);
   migrateAtRest().catch((err) =>
     console.warn("[storage] at-rest migration failed, will retry:", err)
   );
+}
+
+/** localStorage written on behalf of the signed-in identity. */
+const IDENTITY_SCOPED_KEYS = [
+  "awful:dm-queue:v1", // queued DM envelopes, sealed to the old identity
+  "awful:mailbox-optin:v1",
+  "awful:duress:v1", // the old account's duress registration
+  "awful_remember_duration",
+  "awful_remember_reset_timer",
+];
+
+/**
+ * Erase everything the PREVIOUS identity owned on this device.
+ *
+ * Called when a different identity takes over: a new account, or a restore of
+ * a phrase that is not the one already here. Its rows are sealed under a key
+ * derived from ITS private key, so under the new identity most of them can
+ * never be read again - but "unreadable" is not "gone". Clear fields survive
+ * (a room's code, a message's sender and lamport), rows written before at-rest
+ * encryption or during a locked import are not sealed at all and so open under
+ * any key, and the at-rest sweep would re-seal exactly those under the NEW
+ * identity's key, quietly adopting the old account's data into the new one.
+ *
+ * That is how a fresh account inherited the previous account's room list.
+ */
+async function wipePreviousIdentityData(): Promise<void> {
+  const { wipeLocalDatabase } = await import("../storage");
+  await wipeLocalDatabase();
+
+  // The chat database is not the only place the old account left content.
+  const { KNOWN_DBS } = await import("../duress");
+  await Promise.all(
+    KNOWN_DBS.filter((name) => name !== "awful-chat").map(
+      (name) =>
+        new Promise<void>((resolve) => {
+          // Never reject and never hang: another tab holding a handle blocks
+          // the delete, and a new account must still be able to start.
+          const req = indexedDB.deleteDatabase(name);
+          req.onsuccess = req.onerror = req.onblocked = () => resolve();
+        })
+    )
+  );
+
+  // Device-scoped preferences (theme, audio devices, the libp2p device key)
+  // belong to the DEVICE, not the account, and are deliberately left alone.
+  for (const key of IDENTITY_SCOPED_KEYS) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      /* blocked storage held nothing to remove */
+    }
+  }
 }
 
 export async function createIdentity(
@@ -212,6 +268,15 @@ export async function createIdentity(
     aesKey,
     new TextEncoder().encode(mnemonic)
   );
+
+  // A new account on a device that already had one: the old account's data is
+  // not this account's to keep. restoreIdentity has always done this; creating
+  // did not, so a fresh identity inherited the previous one's rooms. Must run
+  // BEFORE the writes below, because the wipe drops the whole database.
+  const existing = await getKeypairRecord();
+  if (existing && existing.did !== did) {
+    await wipePreviousIdentityData();
+  }
 
   const mnemonicRecord: MnemonicRecord = {
     id: "mnemonic",
@@ -255,8 +320,7 @@ export async function restoreIdentity(
   // phrase) keeps local history, the derived key matches.
   const existing = await getKeypairRecord();
   if (existing && existing.did !== did) {
-    const { wipeLocalDatabase } = await import("../storage");
-    await wipeLocalDatabase();
+    await wipePreviousIdentityData();
   }
 
   const salt = crypto.getRandomValues(new Uint8Array(16));

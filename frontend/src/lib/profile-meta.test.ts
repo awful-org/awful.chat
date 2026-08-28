@@ -120,6 +120,38 @@ describe("validateProfileMeta", () => {
       expect(validateProfileMeta({ bannerUrl: "data:text/plain;base64,..." }).bannerUrl).toBeUndefined();
     });
 
+    it("drops svg+xml, matching the avatar policy", () => {
+      // SVG can carry script and external references; normalizeAvatarUrl has
+      // always excluded it and the banner allowlist must not disagree.
+      expect(
+        validateProfileMeta({
+          bannerUrl: "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+        }).bannerUrl
+      ).toBeUndefined();
+      expect(
+        validateProfileMeta({
+          bannerUrl: "data:image/svg+xml,%3Csvg%3E%3C/svg%3E",
+        }).bannerUrl
+      ).toBeUndefined();
+    });
+
+    it("drops non-base64 and malformed data: images", () => {
+      expect(
+        validateProfileMeta({ bannerUrl: "data:image/png,notbase64" }).bannerUrl
+      ).toBeUndefined();
+      expect(
+        validateProfileMeta({ bannerUrl: "data:image/png;base64,ab cd" })
+          .bannerUrl
+      ).toBeUndefined();
+    });
+
+    it("accepts every raster type the avatar allowlist accepts", () => {
+      for (const type of ["png", "jpeg", "jpg", "gif", "webp", "avif"]) {
+        const url = `data:image/${type};base64,iVBORw0KGgo=`;
+        expect(validateProfileMeta({ bannerUrl: url }).bannerUrl).toBe(url);
+      }
+    });
+
     it("drops URLs over 1.5 MB", () => {
       const longUrl = "data:image/png;base64," + "a".repeat(1_500_001);
       expect(validateProfileMeta({ bannerUrl: longUrl }).bannerUrl).toBeUndefined();

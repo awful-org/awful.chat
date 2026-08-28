@@ -5,8 +5,19 @@
  */
 
 let _pendingBackup: File | null = null;
+// setConsumer takes exactly one consumer per page, and TWO screens need to
+// register: the setup screen (a device with no account, where a backup is the
+// only way in) and the app itself. First registration wins; the later caller
+// finds the file already parked and takes it with takePendingBackupFile().
+let _registered = false;
 
 export function initLaunchQueue(onBackupFile: () => void): void {
+  if (_registered) {
+    // Already parked by an earlier screen: tell this caller so it can consume
+    // it, rather than silently doing nothing.
+    if (_pendingBackup) onBackupFile();
+    return;
+  }
   const lq = (
     window as Window & {
       launchQueue?: {
@@ -15,6 +26,7 @@ export function initLaunchQueue(onBackupFile: () => void): void {
     }
   ).launchQueue;
   if (!lq) return;
+  _registered = true;
   lq.setConsumer((params) => {
     void (async () => {
       const handle = params.files?.[0];

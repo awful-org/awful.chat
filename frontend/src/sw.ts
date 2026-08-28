@@ -108,6 +108,36 @@ async function cacheFirst(
   return response;
 }
 
+/**
+ * A share POST cannot be attributed to its sender from inside a service
+ * worker. Origin and Sec-Fetch-Site are appended after the fetch event is
+ * dispatched, so they are simply absent from request.headers here
+ * (whatwg/fetch#1322 exists to fix exactly that), and the referrer is one
+ * referrerpolicy="no-referrer" away from being empty - which is what a
+ * hostile page sets and a genuine OS share may carry anyway. A referrer test
+ * therefore rejects nobody who tries while risking every real share, so we
+ * do not run one.
+ *
+ * What a page cannot fake is the shape of the navigation it caused. A share
+ * is always a top-level navigation: the share sheet opens the app. A form
+ * auto-submitted into a hidden iframe or an <object> is the only shape that
+ * can plant payloads and hammer the storage quota in a loop without the user
+ * ever seeing it, and that is what this rejects. A top-level POST from a
+ * hostile page still reaches the handler - it also drags the user onto our
+ * own origin in a visible tab, one payload per navigation, and the bounds in
+ * storeSharedPayload are what keep that from costing anything.
+ *
+ * This is a deny list on purpose: an unfamiliar destination passes, because
+ * silently dropping a real share is worse than storing a bounded record.
+ */
+const NESTED_NAVIGATION_DESTINATIONS = new Set([
+  "iframe",
+  "frame",
+  "fencedframe",
+  "embed",
+  "object",
+]);
+
 /** The app is a SPA: every in-scope navigation is served by index.html. */
 async function handleNavigation(request: Request): Promise<Response> {
   const cached = await matchPrecache("index.html");
@@ -121,6 +151,9 @@ self.addEventListener("fetch", (event) => {
   if (request.method === "POST") {
     const url = new URL(request.url);
     if (url.pathname !== "/share-target") return;
+    // Not answering leaves the POST to the network, where nginx serves a
+    // static path and returns 405 - nothing is stored either way.
+    if (NESTED_NAVIGATION_DESTINATIONS.has(request.destination)) return;
 
     event.respondWith(
       (async () => {

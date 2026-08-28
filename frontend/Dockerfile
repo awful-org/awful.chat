@@ -16,6 +16,12 @@ COPY . .
 ARG VITE_SIGNAL_URL
 ARG VITE_API_URL
 ARG VITE_RELAY_MULTIADDR
+# One SFU, or a comma-separated list of them. With a list, each room is placed
+# on one server by hashing its room code, so every participant agrees without
+# coordinating - see src/lib/transport/sfu-pool.ts. Neither reached the build
+# before, so setting VITE_SFU_URL in .env quietly did nothing.
+ARG VITE_SFU_URL
+ARG VITE_SFU_URLS
 # Comma/space separated plugin sources (github urls, user/repo[#ref]) fetched
 # into plugins/ before the build - see plugins/README.md. Empty = built-ins only.
 ARG PLUGIN_SOURCES
@@ -23,6 +29,8 @@ ARG PLUGIN_SOURCES
 ENV VITE_SIGNAL_URL=$VITE_SIGNAL_URL
 ENV VITE_API_URL=$VITE_API_URL
 ENV VITE_RELAY_MULTIADDR=$VITE_RELAY_MULTIADDR
+ENV VITE_SFU_URL=$VITE_SFU_URL
+ENV VITE_SFU_URLS=$VITE_SFU_URLS
 ENV PLUGIN_SOURCES=$PLUGIN_SOURCES
 
 RUN node scripts/fetch-plugins.mjs

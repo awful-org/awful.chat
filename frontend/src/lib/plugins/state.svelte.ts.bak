@@ -60,6 +60,13 @@ export function evictCardState(cardId: string): void {
  *  storage - getCardState re-reads for these before caching. */
 const _missedFold = new Set<string>();
 
+/** How many times getCardState re-reads storage for a card that was flagged
+ *  mid-build. The flag can be re-raised by every update that lands while the
+ *  read is in flight, and a peer can send those as fast as it likes, so the
+ *  retry has to stop somewhere or the read loops forever over the room's
+ *  whole plugin history and the build never resolves. */
+const _MAX_REBUILD_RETRIES = 2;
+
 /**
  * Comparator for deterministic update ordering: lamport, then senderId, then id.
  * This is MSG_ORDER extended with id as tiebreaker for DM rooms.
@@ -296,27 +303,25 @@ export async function getCardState(
     let built = await buildCardState(cardId, roomCode, definition);
     // An update folded while we were reading storage found no entry and was
     // dropped - but its putMessage preceded the fold, so a fresh read sees it.
-    // Re-read up to MAX_REBUILD_RETRIES times. Bail out if updates keep landing
-    // faster than the read completes - that state is stale and must not be installed.
-    const MAX_REBUILD_RETRIES = 2;
-    for (let retry = 0; retry < MAX_REBUILD_RETRIES && _missedFold.has(cardId); retry++) {
-      _missedFold.delete(cardId);
+    for (let retry = 0; retry < _MAX_REBUILD_RETRIES; retry++) {
+      if (!_missedFold.delete(cardId)) break;
       built = await buildCardState(cardId, roomCode, definition);
     }
-    // If still flagged after retries, updates are arriving faster than the read.
-    // The built state is known to be stale - installing it would diverge permanently
-    // from storage until an eviction replayed it. Instead, skip installation and let
-    // the next fold attempt trigger another build once updates stabilize.
+    // If still flagged after retries, updates are arriving faster than the
+    // read completes. The built state is known to be stale - installing it
+    // would diverge permanently from storage until an eviction replayed it.
+    // Instead, discard the stale build and return no state; the next fold will
+    // trigger another build attempt once updates stabilize.
     if (_missedFold.has(cardId)) {
       _missedFold.delete(cardId);
-      // A concurrent build may have already installed an entry while we were reading;
-      // return that if it exists.
+      // A concurrent build may have already installed an entry while we were
+      // reading storage; return that if it exists.
       const existing = cardStates.get(cardId);
       return existing?.state;
     }
-    // No longer flagged after retries: built state matches storage. A concurrent
-    // getCardState may have set the entry first; live folds have been applying to
-    // THAT object, so ours must not clobber it.
+    // No longer flagged: the retry budget was sufficient, and built state
+    // matches storage. A concurrent getCardState may have set the entry first;
+    // live folds have been applying to THAT object, so ours must not clobber it.
     const existing = cardStates.get(cardId);
     if (existing) return existing.state;
     cardStates.set(cardId, built);

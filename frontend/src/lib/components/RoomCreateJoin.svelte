@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { newRoomCode } from "$lib/room-code";
   import { Check, Clipboard, Copy, LogIn, Menu, Plus } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -41,9 +42,7 @@
     creating = true;
     try {
       await saveName(profileStore.nickname);
-      const code = Array.from(crypto.getRandomValues(new Uint8Array(3)))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
+      const code = newRoomCode();
       createdCode = code;
       copied = false;
     } finally {

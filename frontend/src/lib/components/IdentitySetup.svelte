@@ -15,7 +15,14 @@
   import { profileStore, loadProfile, saveName } from "$lib/profile.svelte";
   import type { KeypairRecord } from "$lib/identity/identity";
   import { enroll } from "$lib/identity/identity.svelte";
-  import { ArrowLeft, Smartphone, Info } from "@lucide/svelte";
+  import { ArrowLeft, Smartphone, Info, Upload } from "@lucide/svelte";
+  import {
+    readBackupFile,
+    applyBackup,
+    summarizeBackup,
+    type BackupFile,
+    type BackupSummary,
+  } from "$lib/transport/sync.svelte";
   import { saveRememberedPassword } from "$lib/identity/remembered-password";
   import { requestPersistentStorage } from "$lib/storage";
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
@@ -35,7 +42,8 @@
     | "mnemonic"
     | "profile"
     | "biometric"
-    | "restore";
+    | "restore"
+    | "restore-backup";
 
   interface Props {
     initialStep?: Step;
@@ -61,6 +69,87 @@
   let restorePasswordConfirm = $state("");
 
   let syncDialogOpen = $state(false);
+
+  // Restore from a backup FILE, which the setup screen never offered before:
+  // import lived only in Settings, and Settings needs an unlocked identity -
+  // so the one situation a backup exists for (this device is empty, or the
+  // phrase is gone) was the one situation it could not be used in.
+  let backupFile = $state<BackupFile | null>(null);
+  let backupSummary = $state<BackupSummary | null>(null);
+  let backupError = $state<string | null>(null);
+  let backupBusy = $state(false);
+
+  // globalThis.File: the lucide File icon shadows the DOM type elsewhere in
+  // the app, so this file follows the same convention.
+  async function readBackup(file: globalThis.File) {
+    backupError = null;
+    backupBusy = true;
+    try {
+      const data = await readBackupFile(file);
+      if (!data.identity) {
+        // "add" mode merges into an existing identity; there is none here, so
+        // a backup without one cannot start this device.
+        throw new Error(
+          "This backup has no identity in it, so it cannot restore an account. Use a backup taken with 'include identity', or restore from your recovery phrase."
+        );
+      }
+      backupFile = data;
+      backupSummary = summarizeBackup(data);
+    } catch (e) {
+      backupError = e instanceof Error ? e.message : String(e);
+      backupFile = null;
+      backupSummary = null;
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  // A backup the OS handed us (manifest file_handlers, .awfulbackup) parks in
+  // launch-file.ts. Only Settings consumed it, and Settings needs an unlocked
+  // identity - so double-clicking a backup on a device with no account opened
+  // the app and then did nothing with the file. Jump straight to this step.
+  $effect(() => {
+    if (step !== "entry" && step !== "restore-backup") return;
+    void import("$lib/launch-file").then(
+      ({ initLaunchQueue, takePendingBackupFile }) => {
+        const take = () => {
+          const file = takePendingBackupFile();
+          if (!file) return;
+          step = "restore-backup";
+          void readBackup(file);
+        };
+        // AppView registers the consumer too, but it only mounts AFTER an
+        // unlock - on a device with no account nothing was listening, so the
+        // OS handed over a file that went nowhere.
+        initLaunchQueue(take);
+        take();
+      }
+    );
+  });
+
+  async function handleBackupPicked(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = ""; // let the same file be picked again after a cancel
+    if (!file) return;
+    await readBackup(file);
+  }
+
+  async function handleApplyBackup() {
+    if (!backupFile) return;
+    backupError = null;
+    backupBusy = true;
+    try {
+      // "replace" adopts the identity stored in the file. The reload then
+      // boots into the unlock screen, where the password is the one that was
+      // in use when the backup was taken.
+      await applyBackup(backupFile, "replace");
+      window.location.reload();
+    } catch (e) {
+      backupError = e instanceof Error ? e.message : String(e);
+      backupBusy = false;
+    }
+  }
 
   // First-run "how this app behaves" notice. Shown before any credential step,
   // once per browser; always reachable again from Settings > Quirks.
@@ -221,8 +310,8 @@
           No identity found
         </CardTitle>
         <CardDescription class="text-muted-foreground text-xs font-mono">
-          Create a new identity, restore from a recovery phrase, or sync from
-          another device
+          Create a new identity, restore from a recovery phrase or a backup
+          file, or sync from another device
         </CardDescription>
       </CardHeader>
       <CardFooter class="flex flex-col gap-2 pt-0">
@@ -238,6 +327,19 @@
           class="w-full font-mono"
         >
           Restore from phrase
+        </Button>
+        <Button
+          onclick={() => {
+            backupError = null;
+            backupFile = null;
+            backupSummary = null;
+            step = "restore-backup";
+          }}
+          variant="outline"
+          class="w-full font-mono"
+        >
+          <Upload class="w-4 h-4 mr-2" />
+          Restore from backup file
         </Button>
         <Button
           onclick={() => {
@@ -498,6 +600,89 @@
           onclick={finalizeSession}
         >
           Skip for now
+        </Button>
+      </CardFooter>
+    </Card>
+  {:else if step === "restore-backup"}
+    <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
+      <CardHeader class="pb-4">
+        <button
+          onclick={() => {
+            step = "entry";
+            backupFile = null;
+            backupSummary = null;
+            backupError = null;
+          }}
+          class="text-muted-foreground hover:text-foreground font-mono mb-2 text-left transition-colors"
+        >
+          <ArrowLeft class="size-4" />
+        </button>
+        <CardTitle class="text-lg font-mono font-semibold">
+          Restore from backup
+        </CardTitle>
+        <CardDescription class="text-muted-foreground text-xs font-mono">
+          Bring back an account and its history from a backup file
+        </CardDescription>
+        <p class="text-muted-foreground text-xs font-mono leading-relaxed mt-2">
+          Unlike a recovery phrase, this restores your rooms and messages too.
+          You unlock afterwards with the password that was in use when the
+          backup was taken.
+        </p>
+      </CardHeader>
+      <CardContent class="flex flex-col gap-3">
+        {#if !backupSummary}
+          <label
+            class="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed border-input px-4 py-6 cursor-pointer hover:border-primary/60 hover:bg-muted/30 transition-colors"
+          >
+            <Upload class="size-5 text-muted-foreground" />
+            <span class="text-xs font-mono text-muted-foreground">
+              {backupBusy ? "Reading..." : "Choose a backup file"}
+            </span>
+            <input
+              type="file"
+              accept="application/json,.json,.awfulbackup"
+              class="hidden"
+              disabled={backupBusy}
+              onchange={handleBackupPicked}
+            />
+          </label>
+        {:else}
+          <div
+            class="flex flex-col gap-1 rounded-md border border-border/50 bg-muted/30 px-3 py-2 font-mono text-xs"
+          >
+            <span class="text-foreground">This backup contains</span>
+            <span class="text-muted-foreground">
+              {backupSummary.messages} messages, {backupSummary.rooms} rooms,
+              {backupSummary.attachments} files
+            </span>
+            {#if backupSummary.exportedAt}
+              <span class="text-muted-foreground">
+                taken {new Date(backupSummary.exportedAt).toLocaleString()}
+              </span>
+            {/if}
+            {#if backupSummary.did}
+              <span class="text-muted-foreground break-all">
+                {backupSummary.did.slice(0, 24)}...
+              </span>
+            {/if}
+          </div>
+          <p class="text-muted-foreground text-xs font-mono leading-relaxed">
+            This device is empty, so nothing here is overwritten.
+          </p>
+        {/if}
+        {#if backupError}
+          <p class="text-destructive text-xs font-mono leading-relaxed">
+            {backupError}
+          </p>
+        {/if}
+      </CardContent>
+      <CardFooter class="flex flex-col gap-2 pt-0">
+        <Button
+          onclick={handleApplyBackup}
+          disabled={!backupFile || backupBusy}
+          class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
+        >
+          {backupBusy ? "Restoring..." : "Restore this backup"}
         </Button>
       </CardFooter>
     </Card>

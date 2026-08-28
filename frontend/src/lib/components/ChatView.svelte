@@ -2,6 +2,7 @@
   import { tick } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
+  import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
     LogOut,
@@ -1134,6 +1135,24 @@
     return displayNameFor(msg.senderId, msg.senderName);
   }
 
+  /** What a reply should QUOTE.
+   *
+   *  The reply snapshot travels unsigned: no canonical version covers
+   *  replyTo.senderName or replyTo.content, so any room member can take a
+   *  genuine signed message, rewrite the words it appears to be quoting, and
+   *  have it verify honestly - and because sync puts by id, their copy
+   *  overwrites the original on peers that already hold it. Whenever we hold
+   *  the quoted message ourselves, its own signed content is the truth and the
+   *  snapshot is ignored. The snapshot is still the fallback for a quote whose
+   *  target we never received. */
+  function quoted(r: ReplyTo): { name: string; content: string } {
+    const held = messageById.get(r.id);
+    if (held) {
+      return { name: displayName(held), content: held.content };
+    }
+    return { name: r.senderName, content: r.content };
+  }
+
   function reactorNames(users: Set<string>): string {
     const names: string[] = [];
     let self = false;
@@ -1563,6 +1582,7 @@
                   : ""}
               >
                 {#if msg.replyTo}
+                  {@const q = quoted(msg.replyTo)}
                   <button
                     type="button"
                     class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
@@ -1572,10 +1592,10 @@
                       size="16"
                       class="text-muted-foreground -ml-5 transform -scale-x-100"
                     />
-                    <span class="font-semibold">{msg.replyTo.senderName}</span>
+                    <span class="font-semibold">{q.name}</span>
                     <span class="truncate"
                       >{humanizeMentions(
-                        msg.replyTo.content,
+                        q.content,
                         resolveMentionDisplayName
                       )}</span
                     >

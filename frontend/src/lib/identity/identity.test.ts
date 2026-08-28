@@ -6,7 +6,13 @@ import {
   unlockIdentity,
   isUnlocked,
 } from "./identity";
-import { getMnemonicRecord, wipeLocalDatabase } from "../storage";
+import {
+  getAllRooms,
+  getDB,
+  getMnemonicRecord,
+  putRoom,
+  wipeLocalDatabase,
+} from "../storage";
 
 const PASSWORD = "correct horse battery staple";
 
@@ -85,5 +91,71 @@ describe("password-derived key", () => {
       ciphertext
     );
     expect(new TextDecoder().decode(out)).toBe("legacy mnemonic");
+  });
+});
+
+// A device that already holds an account, then makes a NEW one. The old
+// account's rows are sealed under a key derived from ITS private key, so most
+// of them cannot be read again - but unreadable is not gone: clear fields
+// survive, rows written before at-rest encryption (or during a locked import)
+// are not sealed at all and open under any key, and the at-rest sweep would
+// re-seal those under the new identity's key. A friend reported exactly this:
+// a fresh account that still listed the previous account's room.
+describe("a new identity does not inherit the previous one's data", () => {
+  beforeEach(async () => {
+    await wipeLocalDatabase();
+    lockIdentity();
+  });
+
+  it("removes the old account's rows rather than leaving them unreadable", async () => {
+    await createIdentity(PASSWORD);
+    await putRoom({
+      roomCode: "a1b2c3d4e5f60718",
+      type: "text",
+      name: "Old account's room",
+      lastSeenLamport: 0,
+      createdAt: 1,
+      participants: [],
+    });
+
+    await createIdentity("a completely different password");
+
+    // NOT getAllRooms(): a sealed row the new key cannot open is dropped on
+    // read, so that would pass whether the data was erased or merely hidden.
+    // Go to the raw store - the row has to be GONE.
+    const db = await getDB();
+    expect(await db.getAll("rooms")).toEqual([]);
+  });
+
+  // The shape that actually reached a user. A row written before at-rest
+  // encryption existed (or during a locked import) is NOT sealed, and openRow
+  // passes an unsealed row straight through - so it opens under whatever
+  // identity is signed in, and the new account sees the old account's room.
+  it("removes UNSEALED legacy rows, which open under any identity", async () => {
+    await createIdentity(PASSWORD);
+    const db = await getDB();
+    await db.put("rooms", {
+      roomCode: "legacyroom000000",
+      type: "text",
+      name: "Written before at-rest encryption",
+      lastSeenLamport: 0,
+      createdAt: 1,
+      participants: [],
+    } as never);
+    expect(await getAllRooms()).toHaveLength(1);
+
+    await createIdentity("a completely different password");
+
+    // Raw store again, for the same reason as above: the at-rest sweep may
+    // have sealed this row under the OLD key first, and a sealed row is
+    // merely dropped on read. Erased is the only acceptable outcome.
+    const after = await getDB();
+    expect(await after.getAll("rooms")).toEqual([]);
+  });
+
+  it("still works on a device with no previous account", async () => {
+    const { keypair } = await createIdentity(PASSWORD);
+    expect(keypair.did).toMatch(/^did:key:/);
+    expect(await getAllRooms()).toEqual([]);
   });
 });

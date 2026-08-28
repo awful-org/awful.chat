@@ -3,6 +3,7 @@
 // turn a camera on.
 import type * as mediasoupClient from "mediasoup-client";
 import type { VideoTransport, VideoEvents, VideoSource } from "./types";
+import { sfuForRoom } from "./sfu-pool";
 import { shouldBlockSfu } from "./faults";
 
 /**
@@ -90,6 +91,17 @@ interface MSCloseProducer {
   type: "ms:close-producer";
   producerId: string;
 }
+/**
+ * How the SFU refuses a session: it sends this and closes the socket. Without
+ * a variant here the frame fell through handleSignal's switch and the refusal
+ * was silent - a call that never started, with nothing on screen saying why.
+ * `reason` is typed loosely on purpose so an SFU that grows a new one still
+ * lands on the generic message rather than on nothing at all.
+ */
+interface MSError {
+  type: "ms:error";
+  reason: string;
+}
 
 type MSMessage =
   | MSGetCapabilities
@@ -107,7 +119,29 @@ type MSMessage =
   | MSProducerConsumed
   | MSProducerConsumerClosed
   | MSCloseConsumer
-  | MSCloseProducer;
+  | MSCloseProducer
+  | MSError;
+
+/**
+ * Turns an SFU refusal into a sentence for the person in the call. It reaches
+ * them verbatim, the same way SFU_UNREACHABLE does, so it names what happened
+ * and what still works rather than the wire reason. Every one of these is
+ * retried by the rejoin ladder, which is why the banners promise that.
+ */
+function sfuRefusalMessage(reason: unknown): string {
+  switch (reason) {
+    case "server-full":
+      return "Video server is full - voice still works, retrying in the background";
+    case "room-full":
+      return "Too many people in this call for video - voice still works";
+    case "peer-id-in-use":
+      return "Another session is already in this call as you - video stays off here until that one ends";
+    case "invalid-join":
+      return "Video server rejected this room - voice still works";
+    default:
+      return "Video server refused the connection - voice still works, retrying in the background";
+  }
+}
 
 interface Producer {
   producer: mediasoupClient.types.Producer;
@@ -126,8 +160,10 @@ interface Consumer {
  * Audio is NOT handled here - stays p2p via SimplePeerVoice.
  *
  * Signaling flows over a dedicated WebSocket connection to the SFU server.
- * The SFU URL is resolved from VITE_SFU_URL env var, defaulting to /sfu on
- * the same host as the page (routed by the reverse proxy in production).
+ * The SFU URL is resolved from the room code using sfuForRoom(), which hashes
+ * the code against VITE_SFU_URLS (or VITE_SFU_URL) so all participants pick
+ * the same server deterministically. Defaults to /sfu on the same host if
+ * neither is configured.
  */
 export class MediasoupVideo implements VideoTransport {
   private device: mediasoupClient.types.Device | null = null;
@@ -141,6 +177,11 @@ export class MediasoupVideo implements VideoTransport {
   private pending: Map<string, { resolve: Function; reject: Function }[]> =
     new Map();
   private pendingChains: Map<string, Promise<any>> = new Map();
+  // Set when the SFU refuses this session with an ms:error frame, cleared when
+  // a new socket is opened. The refusal is immediately followed by the socket
+  // closing, so a request issued after it would be dropped by signal() and sit
+  // out its own 10s timeout with nothing left alive to answer it.
+  private refusal: Error | null = null;
   // Screen-share producers that are available but not yet consumed (opt-in transmissions)
   private pendingTransmissions: Map<string, string> = new Map(); // peerId → producerId
   // All pending screen producers (video + optional audio) for a peer.
@@ -368,9 +409,16 @@ export class MediasoupVideo implements VideoTransport {
         reject(new Error(SFU_UNREACHABLE));
         return;
       }
+      // Which SFU serves this room is a pure function of the room code, so
+      // every participant picks the same one without any coordination. With
+      // a single VITE_SFU_URL (or none) this is the old behaviour exactly.
       const sfuUrl =
-        (import.meta as any).env?.VITE_SFU_URL ??
+        sfuForRoom(roomCode) ??
         `${location.origin.replace(/^http/, "ws")}/sfu`;
+
+      // A fresh socket starts clean: the previous session's refusal must not
+      // fail the requests this one is about to make.
+      this.refusal = null;
 
       const ws = new WebSocket(sfuUrl);
       this.sfuWs = ws;
@@ -700,6 +748,14 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   private handleSignal(msg: MSMessage): void {
+    // A refusal answers no particular request, so it is handled before the
+    // pending lookup: every reason the SFU sends lands during the join
+    // handshake, where a request is waiting for a frame that is never coming.
+    if (msg.type === "ms:error") {
+      this.failSession(sfuRefusalMessage(msg.reason));
+      return;
+    }
+
     // resolve pending request
     const queue = this.pending.get(msg.type);
     if (queue && queue.length > 0) {
@@ -845,6 +901,23 @@ export class MediasoupVideo implements VideoTransport {
     });
   }
 
+  /**
+   * The SFU refused this session. Fail everything waiting on it now instead of
+   * letting each request sit out its 10s timeout, and emit the reason so the
+   * call view can show it - join() surfaces the rejection too, but a refusal
+   * that arrives with nothing in flight would otherwise reach nobody.
+   */
+  private failSession(message: string): void {
+    const err = new Error(message);
+    this.refusal = err;
+    for (const queue of this.pending.values()) {
+      for (const req of queue) req.reject(err);
+    }
+    this.pending.clear();
+    this.pendingChains.clear();
+    this.emit("error", err);
+  }
+
   private request<T>(msg: MSMessage, responseType: string): Promise<T> {
     // Chain this request to serialize by responseType. The .catch() is
     // load-bearing: without it one timed-out request would poison the chain
@@ -853,6 +926,14 @@ export class MediasoupVideo implements VideoTransport {
     const chain = prevChain.catch(() => {}).then(
       () =>
         new Promise<T>((resolve, reject) => {
+          // A refused session never answers anything: the SFU closed the
+          // socket right after its ms:error, so signal() below would drop this
+          // frame and the caller would wait out the full timeout for nothing.
+          if (this.refusal) {
+            reject(this.refusal);
+            return;
+          }
+
           // Queue this request
           if (!this.pending.has(responseType)) {
             this.pending.set(responseType, []);

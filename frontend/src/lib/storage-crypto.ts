@@ -38,11 +38,31 @@ export interface SealedRow {
 export interface StoreCryptoSpec {
   /** Fields kept in plaintext: the keyPath and every indexed/query field. */
   clear: string[];
+  /**
+   * Fields stored as a keyed hash for indexing, with the REAL value encrypted
+   * inside _enc. IndexedDB can only look up what it can see, so a field the
+   * app queries by has to be readable without the key - which is why
+   * roomCode, senderId and the rest used to sit in plaintext, handing anyone
+   * with raw database access the room codes (the membership secret), the file
+   * infohashes, and the entire named social graph.
+   *
+   * A keyed hash keeps the lookup working - equality still matches, and a
+   * compound [blinded, lamport] range behaves exactly as [roomCode, lamport]
+   * did - while revealing nothing about the input without the key. The blind
+   * key is derived per identity, so two accounts on one device produce
+   * different hashes for the same room and cannot be correlated.
+   *
+   * Only worth it for HIGH-ENTROPY values. Hashing `type: "group"` or
+   * `status: "sent"` would hide nothing, because an attacker just hashes the
+   * three possible inputs and compares - those stay in `clear`.
+   */
+  blind?: string[];
   /** ArrayBuffer fields encrypted as raw buffers instead of via JSON. */
   bytes?: string[];
 }
 
 let _key: CryptoKey | null = null;
+let _indexKey: CryptoKey | null = null;
 let _plaintextImportDepth = 0;
 
 /**
@@ -86,11 +106,92 @@ export async function initStorageCrypto(
     false,
     ["encrypt", "decrypt"]
   );
+  // A SEPARATE key for the blind index, from the same HKDF input with a
+  // different info string, so the index key never doubles as the content key.
+  // Both are identity-scoped: two accounts on one device blind the same room
+  // code to different values, so nothing on disk correlates them.
+  _indexKey = await crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: utf8("awful.chat storage at-rest v1"),
+      info: utf8("index-key"),
+    },
+    ikm,
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    false,
+    ["sign"]
+  );
+  _blindCache.clear();
 }
 
 /** Drop the key. Call on lock/logout; sealed rows become unreadable. */
 export function clearStorageCrypto(): void {
   _key = null;
+  _indexKey = null;
+  _blindCache.clear();
+}
+
+/**
+ * Marks a value as a blind index rather than a plaintext one. Self-describing
+ * on purpose: the migration has to tell an already-blinded row from a legacy
+ * plaintext one, and every real value this replaces (a hex room code, a
+ * did:key, a base58 peer id, a hex infohash) is a different shape, so a
+ * length or charset heuristic would be guesswork. A prefix is unambiguous.
+ */
+const BLIND_PREFIX = "b1:";
+
+/**
+ * A value that has been through blindValue(). Distinct from a plain string on
+ * purpose: passing a real room code where a blinded one belongs compiles
+ * perfectly and then silently matches nothing in IndexedDB, which is how a
+ * dozen call sites shipped broken - a delete that deleted nothing, a lookup
+ * that always returned empty, a comparison that was never true. Branding the
+ * type turns every one of those into a compile error.
+ */
+export type Blinded = string & { readonly __blinded: unique symbol };
+
+export function isBlinded(v: unknown): v is Blinded {
+  return typeof v === "string" && v.startsWith(BLIND_PREFIX);
+}
+
+/**
+ * Blinding runs on the hot read path - every room query blinds its room code
+ * first - and the same handful of values recur constantly, so the HMAC is
+ * memoized. Bounded because the inputs are room codes, DIDs and infohashes,
+ * all of which are finite per session; cleared with the key on lock.
+ */
+const _blindCache = new Map<string, string>();
+const BLIND_CACHE_MAX = 4096;
+
+/** The keyed hash of a value, for storing in an indexable field. */
+export async function blindValue(value: string): Promise<Blinded> {
+  if (isBlinded(value)) return value; // already blinded; never double-hash
+  const hit = _blindCache.get(value);
+  if (hit !== undefined) return hit as Blinded;
+  if (!_indexKey) {
+    // During plaintext import (no key yet), return the value as-is with a marker.
+    // The migration will re-seal these rows with proper blinding later.
+    if (_plaintextImportDepth > 0) {
+      return value as Blinded;
+    }
+    throw new Error("storage is locked: no at-rest key (unlock first)");
+  }
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    _indexKey,
+    new TextEncoder().encode(value)
+  );
+  // base64url, so a blinded value is safe in any key path or log line.
+  const out =
+    BLIND_PREFIX +
+    btoa(String.fromCharCode(...new Uint8Array(mac)))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  if (_blindCache.size >= BLIND_CACHE_MAX) _blindCache.clear();
+  _blindCache.set(value, out);
+  return out as Blinded;
 }
 
 export function storageCryptoReady(): boolean {
@@ -148,10 +249,17 @@ export async function sealRow<T extends Record<string, unknown>>(
   const clearSet = new Set(spec.clear);
   let encBytes: Record<string, EncBlob> | undefined;
 
+  const blindSet = new Set(spec.blind ?? []);
+
   for (const [k, v] of Object.entries(record)) {
     if (v === undefined) continue;
     if (clearSet.has(k)) {
       out[k] = v;
+    } else if (blindSet.has(k)) {
+      // The hash is what the index sees; the real value goes into `rest` and
+      // is encrypted with everything else, so openRow hands it back intact.
+      out[k] = await blindValue(String(v));
+      rest[k] = v;
     } else if (byteSet.has(k)) {
       const buf = new Uint8Array(
         v instanceof ArrayBuffer ? v : (v as Uint8Array<ArrayBuffer>).slice()
@@ -235,43 +343,79 @@ export async function openRows<T>(
 
 export const STORE_SPECS = {
   messages: {
-    // status is clear ON PURPOSE: delivery-state writes re-check it at
-    // write time inside the transaction (updateMessageStatus), which only
-    // works on a field readable without a decrypt. It leaks nothing beyond
-    // the sync metadata already clear. Older sealed rows without a clear
-    // status still open fine - openRow only copies clear keys present on
-    // the row, the blob's value wins otherwise.
-    clear: ["id", "roomCode", "lamport", "senderId", "type", "status"],
+    // id stays clear: it is the primary key, and peers already know it - the
+    // same id travels on the wire with every message. lamport stays clear
+    // because it is the RANGE half of the [roomCode, lamport] compound index,
+    // and a keyed hash destroys ordering. type and status stay clear because
+    // they are three- and four-valued: hashing them hides nothing, since the
+    // inputs can simply be enumerated and compared.
+    clear: ["id", "lamport", "type", "status"],
+    // roomCode is the membership secret and senderId is the social graph.
+    // Both were readable with no key at all, which is how a second account on
+    // one device could list the previous account's rooms and everyone in them.
+    blind: ["roomCode", "senderId"],
   },
   attachments: {
-    clear: ["id", "roomCode", "messageId", "infoHash", "status"],
+    clear: ["id", "status"],
+    // infoHash identifies the file in the torrent swarm, and files are seeded
+    // unencrypted - so a clear infohash plus a clear room code was a working
+    // recipe for fetching someone's shared files.
+    blind: ["roomCode", "messageId", "infoHash"],
+    // The file bytes. MUST stay listed here: a field that is neither clear,
+    // blind nor bytes goes through JSON.stringify, and an ArrayBuffer
+    // stringifies to {} - so omitting this silently destroyed every stored
+    // attachment's contents.
     bytes: ["data"],
   },
   rooms: {
-    clear: ["roomCode", "type"],
+    clear: ["type"],
+    // Also the primary key of this store, so the key path holds the hash.
+    blind: ["roomCode"],
     bytes: ["pfpData"],
   },
   profiles: {
-    clear: ["did", "isMe"],
+    clear: ["isMe"],
+    blind: ["did"],
     bytes: ["pfpData", "bannerData"],
   },
   phonebook: {
-    clear: ["peerId"],
+    blind: ["peerId"],
+    clear: [],
   },
   savedGifs: {
-    clear: ["id", "gifId"],
+    clear: ["id"],
+    blind: ["gifId"],
     bytes: ["data"],
   },
   pending: {
-    clear: ["id", "to"],
-  },
-  // Yjs updates ARE channel content; only watermarks (pure sync counters,
-  // needed clear for digest sweeps) and the identity store (already under
-  // the password's PBKDF2 key) stay outside this list. A NEW STORE added to
-  // the schema must be added here too, or it ships plaintext by omission.
-  yjsDocs: {
     clear: ["id"],
+    blind: ["to"],
+  },
+  // Yjs updates ARE channel content. The id is "channel:{roomCode}", so the
+  // key path carried the room code in plaintext even though the update beside
+  // it was encrypted; it is blinded as "channel:{hash}".
+  yjsDocs: {
+    // The id is "channel:{roomCode}", so leaving it clear published the room
+    // code in the primary key of the one store whose own comment calls its
+    // contents channel content. It is blinded as "channel:{hash}".
+    blind: ["id"],
+    clear: [],
     bytes: ["update"],
+  },
+  // Watermarks used to skip encryption entirely, on the grounds that they are
+  // pure sync counters digest sweeps read without a decrypt. But the key was
+  // "roomCode:senderId" with a roomCode index beside it, so the store that
+  // opted out was publishing the very room codes and DIDs every other store
+  // protects. It is sealed now; maxLamport stays clear so the never-regress
+  // comparison in setWatermark still works inside its write transaction,
+  // where nothing can be decrypted.
+  watermarks: {
+    // maxLamport, NOT "lamport" - the field name matters. setWatermark's
+    // never-regress check compares it against the stored row INSIDE the
+    // write transaction, where nothing can be decrypted, so sealing it made
+    // the comparison read undefined and silently skip every write.
+    clear: ["maxLamport"],
+    blind: ["id", "roomCode", "senderId"],
   },
 } as const satisfies Record<string, StoreCryptoSpec>;
 

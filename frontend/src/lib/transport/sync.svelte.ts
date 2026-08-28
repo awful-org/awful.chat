@@ -57,6 +57,14 @@ import {
 } from "./backup";
 
 export { summarizeBackup } from "./backup";
+// The apply/import half lives in a transport-free module so it can be tested;
+// re-exported here because the UI has always imported it from this path.
+export {
+  applyBackup,
+  readBackupFile,
+  importDatabase,
+} from "./backup-restore";
+import { importDatabase } from "./backup-restore";
 export type { BackupFile, BackupSummary } from "./backup";
 
 export interface SyncPayload {
@@ -130,6 +138,14 @@ const MAX_BATCH_BYTES = 2_500_000;
 /** How long the source waits for the target's import ack before erroring. */
 const ACK_TIMEOUT_MS = 120_000;
 let _ackTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+/** Target-side: guards against a second ExportRequest on a re-connect. */
+let _exportRequested = false;
+/** Target-side: the source has to actually show up in the sync room. */
+let _peerWaitTimer: ReturnType<typeof setTimeout> | null = null;
+// Rendezvous registration, the relay's PEERS reply, the dial and the WebRTC
+// upgrade all happen inside this window. Generous, because the alternative
+// (what shipped) was an spinner that never resolved.
+const PEER_WAIT_TIMEOUT = 45_000;
 
 function encode(data: unknown): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(data));
@@ -239,7 +255,17 @@ export async function generateSyncCode(): Promise<void> {
     _isSourceDevice = true;
 
     // Start listening for connections
-    await startSyncServer();
+    try {
+      await startSyncServer();
+    } catch (err) {
+      // The code is USELESS if the server never came up: the other device
+      // would scan it, join an empty room and sit there until it timed out.
+      // Withdraw it rather than displaying a QR that cannot work.
+      syncState.qrDataUrl = null;
+      syncState.plaintextToken = null;
+      await cleanup();
+      throw err;
+    }
   } catch (err) {
     syncState.syncError = err instanceof Error ? err.message : String(err);
   } finally {
@@ -506,6 +532,7 @@ async function sendExportData(
     // Don't set to 100% here - wait for target's acknowledgment, but not
     // forever: a target that died mid-import used to leave this side parked
     // at 90% with no error.
+    if (_ackTimeoutTimer) clearTimeout(_ackTimeoutTimer);
     _ackTimeoutTimer = setTimeout(() => {
       syncState.syncError =
         "The other device never confirmed the import - try again";
@@ -561,8 +588,22 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
         );
         return;
       }
+      // ONE request per sync. peer:identify fires again whenever the link is
+      // re-established - notably when the relayed circuit upgrades to direct
+      // WebRTC, which happens mid-transfer - and the transport re-emits
+      // "connect" for it. Re-sending here made the source restart the whole
+      // export on top of the one in flight.
+      if (_exportRequested) {
+        console.log("[Sync][Target] Re-connect to source, export already requested");
+        return;
+      }
+      _exportRequested = true;
       _targetSourcePeerId = peerId;
       console.log("[Sync][Target] Connected to source:", peerId.slice(0, 8));
+      if (_peerWaitTimer) {
+        clearTimeout(_peerWaitTimer);
+        _peerWaitTimer = null;
+      }
       syncState.isConnecting = false;
       syncState.isSyncing = true;
 
@@ -693,11 +734,14 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
               console.log(
                 "[Sync][Target] Import complete, sending acknowledgment"
               );
-              // Send acknowledgment back to source
-              _transport?.send(
-                peerId,
-                encode({ type: SyncMessageType.ExportComplete })
-              );
+              // AWAIT it, then tear down. send() is async, and dropping the
+              // promise before cleanup() disconnected the transport meant the
+              // source often never saw the completion: it sat there until its
+              // ack timeout and reported a failure for a sync that had in
+              // fact finished.
+              await _transport
+                ?.send(peerId, encode({ type: SyncMessageType.ExportComplete }))
+                .catch(() => false);
 
               syncState.isSyncing = false;
               syncState.isComplete = true;
@@ -707,13 +751,15 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
               console.error("[Sync][Target] Import failed:", err);
               syncState.syncError =
                 err instanceof Error ? err.message : "Import failed";
-              _transport?.send(
-                peerId,
-                encode({
-                  type: SyncMessageType.SyncError,
-                  payload: { error: String(err) },
-                })
-              );
+              await _transport
+                ?.send(
+                  peerId,
+                  encode({
+                    type: SyncMessageType.SyncError,
+                    payload: { error: String(err) },
+                  })
+                )
+                .catch(() => false);
             }
           } else {
             syncState.syncError = "No identity data received";
@@ -730,6 +776,21 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
 
     await _transport.connect();
     _transport.joinRoom(payload.roomCode);
+
+    // Joining the room is not the same as finding the other device: the
+    // source may have expired its code, closed the dialog, or never gotten
+    // its own server up. Without this the target spun forever on
+    // "Connecting..." with nothing to act on.
+    if (_peerWaitTimer) clearTimeout(_peerWaitTimer);
+    _peerWaitTimer = setTimeout(() => {
+      _peerWaitTimer = null;
+      if (_targetSourcePeerId || syncState.isSyncing || syncState.isComplete)
+        return;
+      syncState.isConnecting = false;
+      syncState.syncError =
+        "Could not reach the other device. Make sure its sync screen is still open, then generate a new code and try again.";
+      cleanup().catch(() => {});
+    }, PEER_WAIT_TIMEOUT);
   } catch (err) {
     syncState.isConnecting = false;
     syncState.syncError = err instanceof Error ? err.message : String(err);
@@ -845,172 +906,6 @@ async function exportDatabase(skipIdentity = false): Promise<DatabaseExport> {
  * Import database content from export.
  * @param mode - "replace" wipes database first, "add" merges data
  */
-async function importDatabase(
-  data: DatabaseExport,
-  mode: "add" | "replace" = "replace"
-): Promise<void> {
-  console.log(`[Sync] Importing database in ${mode} mode`);
-
-  if (mode === "replace") {
-    // Clear existing data first
-    console.log("[Sync] Wiping local database (replace mode)");
-    await wipeLocalDatabase();
-    // Replace mode installs a possibly DIFFERENT identity. Sealing the
-    // imported rows with the currently armed key would brick them for the
-    // identity that owns them, so drop the key: the rows land plaintext and
-    // the first unlock as the RIGHT identity derives the right key and
-    // sweeps them sealed. (DataSettings reloads after a replace restore, so
-    // the stale session never touches storage again.)
-    clearStorageCrypto();
-  }
-  // A fresh sync target has never unlocked, so no at-rest key exists yet -
-  // there is nothing to derive it from until the user types their password.
-  // Inside this window sealRow passes rows through as plaintext instead of
-  // throwing, and the sweep flag makes the first unlock seal all of it.
-  const endPlaintextImport = beginPlaintextImport();
-  if (!storageCryptoReady()) markAtRestSweepNeeded();
-  try {
-    await importDatabaseInner(data, mode);
-  } finally {
-    endPlaintextImport();
-  }
-}
-
-async function importDatabaseInner(
-  data: DatabaseExport,
-  mode: "add" | "replace"
-): Promise<void> {
-
-  // Import identity only if provided (not provided in "add" mode)
-  if (data.identity) {
-    console.log("[Sync] Importing identity");
-    const mnemonicRecord = {
-      id: "mnemonic" as const,
-      salt: new Uint8Array(data.identity.mnemonic.salt),
-      iv: new Uint8Array(data.identity.mnemonic.iv),
-      encrypted: new Uint8Array(data.identity.mnemonic.encrypted).buffer,
-      // Absent = written before per-record counts existed = legacy 100k,
-      // which is exactly what unlockIdentity assumes when it is undefined.
-      ...(typeof data.identity.mnemonic.iterations === "number"
-        ? { iterations: data.identity.mnemonic.iterations }
-        : {}),
-    };
-
-    const keypairRecord = {
-      id: "keypair" as const,
-      did: data.identity.keypair.did,
-      publicKey: new Uint8Array(data.identity.keypair.publicKey),
-    };
-
-    await putIdentityRecord(mnemonicRecord);
-    await putIdentityRecord(keypairRecord);
-  }
-
-  // Import other data
-  console.log(
-    `[Sync] Importing ${data.messages.length} messages, ${data.rooms.length} rooms, etc.`
-  );
-  // One transaction for the messages rather than one per message: a device
-  // sync carries the whole history, and hundreds of independent transactions
-  // are both slower and able to leave the database half-imported if one fails.
-  await bulkPutMessages(data.messages);
-  await Promise.all([
-    ...data.attachments.map((a) =>
-      putAttachment({
-        ...a,
-        data: bytesFromExport(a.data),
-      } as Attachment)
-    ),
-    ...data.rooms.map((r) => {
-      const importedRoom = pfpFromJson(r);
-      if (mode === "add") {
-        return (async () => {
-          const localRoom = await getRoom(importedRoom.roomCode);
-          if (localRoom) {
-            await putRoom(mergeImportedRoom(localRoom, importedRoom));
-          } else {
-            await putRoom(importedRoom);
-          }
-        })();
-      } else {
-        return putRoom(importedRoom);
-      }
-    }),
-    ...data.profiles.map((raw) => {
-      const importedProfile = pfpFromJson(raw);
-      if (mode === "add") {
-        return (async () => {
-          if (importedProfile.isMe) {
-            const localProfile = await getOwnProfile();
-            const importedUpdatedAt = (importedProfile as OwnProfile).updatedAt ?? 0;
-            const localUpdatedAt = (localProfile as OwnProfile | undefined)?.updatedAt ?? 0;
-            if (importedUpdatedAt >= localUpdatedAt) {
-              await putOwnProfile(importedProfile as OwnProfile);
-            }
-          } else {
-            const localProfile = await getPeerProfile(importedProfile.did);
-            const importedUpdatedAt = (importedProfile as PeerProfile).updatedAt ?? 0;
-            const localUpdatedAt = (localProfile as PeerProfile | undefined)?.updatedAt ?? 0;
-            if (importedUpdatedAt >= localUpdatedAt) {
-              await putPeerProfile(importedProfile as PeerProfile);
-            }
-          }
-        })();
-      } else {
-        if (importedProfile.isMe) {
-          return putOwnProfile(importedProfile as OwnProfile);
-        } else {
-          return putPeerProfile(importedProfile as PeerProfile);
-        }
-      }
-    }),
-    ...data.savedGifs.map((g) =>
-      putSavedGif({
-        ...g,
-        data: bytesFromExport(
-          g.data as unknown as string | number[] | undefined
-        ),
-      })
-    ),
-    ...data.pending.map((p) => {
-      return (async () => {
-        const db = await getDB();
-        await db.put(
-          "pending",
-          (await sealRow(
-            p as unknown as Record<string, unknown>,
-            STORE_SPECS.pending
-          )) as unknown as PendingMessage
-        );
-      })();
-    }),
-    ...data.watermarks.map((w) => {
-      if (mode === "add") {
-        return setWatermark(w.roomCode, w.senderId, w.maxLamport);
-      } else {
-        return (async () => {
-          const db = await getDB();
-          await db.put("watermarks", w);
-        })();
-      }
-    }),
-    ...data.yjsDocs.map((doc) => {
-      return (async () => {
-        const db = await getDB();
-        await db.put(
-          "yjsDocs",
-          (await sealRow(
-            { id: doc.id, update: new Uint8Array(doc.update) },
-            STORE_SPECS.yjsDocs
-          )) as unknown as { id: string; update: Uint8Array }
-        );
-      })();
-    }),
-  ]);
-}
-
-// ── File backup (QR-less alternative to device sync) ─────────────────────────
-
 /**
  * Build a full backup and hand it to the browser as a download.
  * Includes the identity record, which is the AES-GCM encrypted mnemonic - the
@@ -1042,36 +937,6 @@ export async function downloadBackup(): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-/**
- * Parse and validate a backup file chosen by the user.
- * @throws if the file is not a backup this build understands.
- */
-export async function readBackupFile(file: File): Promise<BackupFile> {
-  return parseBackup(await file.text());
-}
-
-/**
- * Apply a parsed backup.
- * "add" merges into the current identity; "replace" wipes local data first and
- * adopts the identity stored in the file (you then unlock with the password
- * that was in use when the backup was taken).
- */
-export async function applyBackup(
-  data: BackupFile,
-  mode: "add" | "replace"
-): Promise<void> {
-  if (mode === "replace" && !data.identity) {
-    throw new Error("This backup has no identity, so it cannot replace yours");
-  }
-  await importDatabase(
-    mode === "add" ? { ...data, identity: undefined } : data,
-    mode
-  );
-}
-
-/**
- * Start camera scanning for QR codes.
- */
 export async function startScanning(
   elementId: string,
   onScan: (payload: SyncPayload) => void,
@@ -1149,9 +1014,22 @@ export function resetSyncState(): void {
 async function cleanup(): Promise<void> {
   if (_ackTimeoutTimer) clearTimeout(_ackTimeoutTimer);
   _ackTimeoutTimer = null;
+  if (_peerWaitTimer) clearTimeout(_peerWaitTimer);
+  _peerWaitTimer = null;
   if (_transport) {
-    _transport.disconnect();
+    // AWAIT it. disconnect() stops the libp2p node asynchronously, and
+    // dropping the promise let the next attempt start a second node while
+    // the first was still tearing its relay socket down - two nodes racing
+    // the same dial is exactly what made a retry fail more often than the
+    // first try.
+    const dying = _transport;
     _transport = null;
+    try {
+      await dying.disconnect();
+    } catch {
+      // A node that fails to stop cleanly is already unusable; the reference
+      // is dropped either way.
+    }
   }
   await stopScanning();
   if (_syncExpiryTimer) {
@@ -1162,6 +1040,7 @@ async function cleanup(): Promise<void> {
   _syncToken = null;
   _isSourceDevice = false;
   _targetSourcePeerId = null;
+  _exportRequested = false;
 }
 
 /**

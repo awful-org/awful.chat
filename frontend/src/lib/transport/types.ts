@@ -2,6 +2,12 @@ export interface TransportEvents {
   connect: (peerId: string) => void;
   disconnect: (peerId: string) => void;
   message: (peerId: string, data: Uint8Array, room: string | null) => void;
+  /**
+   * The relay told us who is registered in a room (its PEERS reply, or a
+   * PEER_JOINED). Membership is what gates telling a peer that a room exists,
+   * so this is the moment history can be reconciled with them.
+   */
+  roomPeers: (room: string, peerIds: string[]) => void;
   status: (status: TransportStatus) => void;
 }
 
@@ -9,6 +15,7 @@ export type TransportStatus =
   | { type: "app-warning"; message: string }
   | { type: "relay-connected"; message: string }
   | { type: "relay-disconnected"; message: string }
+  | { type: "relay-dial-retry"; message: string }
   | { type: "relay-dial-failed"; message: string }
   | { type: "relay-reconnect-failed"; message: string }
   | { type: "relay-reconnecting"; message: string }

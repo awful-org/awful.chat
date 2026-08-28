@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   bulkPutMessages,
   getMessage,
@@ -31,7 +31,10 @@ import {
   getDB,
   migrateAtRest,
 } from "./storage";
+import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { MessageType, type Message } from "./types/message";
+
+const TEST_KEY = new Uint8Array(32).fill(42);
 
 let seq = 0;
 function msg(overrides: Partial<Message> = {}): Message {
@@ -51,8 +54,14 @@ function msg(overrides: Partial<Message> = {}): Message {
 }
 
 beforeEach(async () => {
+  await initStorageCrypto(TEST_KEY);
   await wipeLocalDatabase();
   seq = 0;
+});
+
+// Clean up after all tests to avoid affecting other test suites
+afterEach(() => {
+  clearStorageCrypto();
 });
 
 describe("watermarks", () => {
