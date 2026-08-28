@@ -34,8 +34,23 @@ const pluginProxyMaxBody = 2 << 20 // 2 MB
 const pluginProxyCacheTTL = 5 * time.Minute
 
 // Small response cache: upstream APIs rate limit, and a room of people
-// loading the same card should cost one upstream call.
-var pluginProxyCache sync.Map // key string -> pluginProxyCacheEntry
+// loading the same card should cost one upstream call. Bounded on BOTH axes
+// and evicted oldest-first, because neither the key space nor the TTL bounds
+// anything on its own: keys are caller-chosen (any query string on an
+// allowlisted host), and expiry is only ever evaluated on a lookup of that
+// exact key, so an entry nobody asks for a second time used to stay resident
+// for the life of the process. A plain map under a mutex, not sync.Map, for
+// the same reason the rate limiter below uses one: the size bookkeeping has
+// to be atomic with the insert.
+const pluginProxyCacheMaxEntries = 512
+const pluginProxyCacheMaxBytes = 64 << 20
+
+var (
+	pluginProxyCacheMu    sync.Mutex
+	pluginProxyCache      = map[string]pluginProxyCacheEntry{}
+	pluginProxyCacheOrder []string // keys in insertion order, oldest first
+	pluginProxyCacheBytes int
+)
 
 type pluginProxyCacheEntry struct {
 	body        []byte
@@ -43,19 +58,48 @@ type pluginProxyCacheEntry struct {
 	expires     time.Time
 }
 
-func pluginProxyCached(key string) (pluginProxyCacheEntry, bool) {
-	if v, ok := pluginProxyCache.Load(key); ok {
-		e := v.(pluginProxyCacheEntry)
-		if time.Now().Before(e.expires) {
-			return e, true
-		}
-		pluginProxyCache.Delete(key)
+// pluginProxyCacheDropLocked removes one key and its accounting. Callers hold
+// pluginProxyCacheMu.
+func pluginProxyCacheDropLocked(key string) {
+	e, ok := pluginProxyCache[key]
+	if !ok {
+		return
 	}
+	pluginProxyCacheBytes -= len(e.body)
+	delete(pluginProxyCache, key)
+	for i, k := range pluginProxyCacheOrder {
+		if k == key {
+			pluginProxyCacheOrder = append(pluginProxyCacheOrder[:i], pluginProxyCacheOrder[i+1:]...)
+			break
+		}
+	}
+}
+
+func pluginProxyCached(key string) (pluginProxyCacheEntry, bool) {
+	pluginProxyCacheMu.Lock()
+	defer pluginProxyCacheMu.Unlock()
+	e, ok := pluginProxyCache[key]
+	if !ok {
+		return pluginProxyCacheEntry{}, false
+	}
+	if time.Now().Before(e.expires) {
+		return e, true
+	}
+	pluginProxyCacheDropLocked(key)
 	return pluginProxyCacheEntry{}, false
 }
 
 func pluginProxyStore(key string, body []byte, contentType string) {
-	pluginProxyCache.Store(key, pluginProxyCacheEntry{body: body, contentType: contentType, expires: time.Now().Add(pluginProxyCacheTTL)})
+	pluginProxyCacheMu.Lock()
+	defer pluginProxyCacheMu.Unlock()
+	pluginProxyCacheDropLocked(key) // a refresh must not be counted twice
+	pluginProxyCache[key] = pluginProxyCacheEntry{body: body, contentType: contentType, expires: time.Now().Add(pluginProxyCacheTTL)}
+	pluginProxyCacheOrder = append(pluginProxyCacheOrder, key)
+	pluginProxyCacheBytes += len(body)
+	for len(pluginProxyCacheOrder) > 0 &&
+		(len(pluginProxyCacheOrder) > pluginProxyCacheMaxEntries || pluginProxyCacheBytes > pluginProxyCacheMaxBytes) {
+		pluginProxyCacheDropLocked(pluginProxyCacheOrder[0])
+	}
 }
 
 // Per-client fixed-window rate limit. The Origin check only holds honest
@@ -110,20 +154,80 @@ func pluginProxyAllow(ip string) bool {
 	return rateAllow("pp:"+ip, pluginProxyRateLimit)
 }
 
+// Peers whose X-Forwarded-For we believe. Behind traefik the socket peer is
+// traefik on the docker network, so private plus loopback is the whole trusted
+// set; TRUSTED_PROXY_CIDRS (comma-separated) replaces it for any other
+// topology, e.g. adding a CDN's ranges so its hop is skipped too.
+var trustedProxyNets = func() []*net.IPNet {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if raw == "" {
+		raw = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
+	}
+	var out []*net.IPNet
+	for _, c := range strings.Split(raw, ",") {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		} else {
+			log.Printf("[relay] ignoring unparseable TRUSTED_PROXY_CIDRS entry %q", c)
+		}
+	}
+	return out
+}()
+
+func isTrustedProxy(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, n := range trustedProxyNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func clientIP(r *http.Request) string {
-	// Behind traefik the socket peer is traefik. Trust the LAST hop of
-	// X-Forwarded-For: traefik overwrites the header today, but if any
-	// front hop ever appends instead, the first entry is client-supplied
-	// and taking it would make every per-IP limit spoofable.
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[len(parts)-1])
+	remote := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	// X-Forwarded-For is an ordinary request header, so it is only worth
+	// anything when the socket peer is a proxy we deployed. Reached directly -
+	// the dev compose publishes 8081, and nothing stops a container on the
+	// same network from doing it in production - the peer IS the client and
+	// its own header would let it pick its rate-limit bucket.
+	if !isTrustedProxy(net.ParseIP(remote)) {
+		return remote
 	}
-	return host
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				hops = append(hops, p)
+			}
+		}
+	}
+	if len(hops) == 0 {
+		return remote
+	}
+	// Right to left, skipping hops that are themselves trusted proxies: every
+	// entry to the left of one our own proxy appended is client-supplied, so
+	// the rightmost entry that is not a known proxy is the closest thing to
+	// the real client that no client could have forged. If every hop looks
+	// like a proxy (a deployment whose users are on the same private network),
+	// the last one is still the one our proxy wrote.
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(hops[i])
+		if ip == nil || isTrustedProxy(ip) {
+			continue
+		}
+		return ip.String()
+	}
+	return hops[len(hops)-1]
 }
 
 var secretPlaceholderRe = regexp.MustCompile(`\{\{secret:([A-Za-z0-9_-]+)\}\}`)
@@ -203,41 +307,72 @@ func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost s
 	return replaced, nil
 }
 
-func pluginProxyClient(allowed map[string]bool) *http.Client {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address: %w", err)
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil || len(ips) == 0 {
-				return nil, fmt.Errorf("lookup failed for %s", host)
-			}
-			for _, ipAddr := range ips {
-				if isDisallowedIP(ipAddr.IP) {
-					return nil, fmt.Errorf("disallowed IP: %s", ipAddr.IP)
-				}
-			}
-			d := &net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-		},
+// pluginProxyClient builds the outbound client. pinHost, when non-empty, is
+// the host a substituted secret is bound to: redirects must then stay on it,
+// so a key configured for host A cannot be walked to allowlisted host B.
+// pluginProxySafeDial resolves the host itself and refuses any address that
+// would reach the relay's own network, so an allowlisted upstream cannot be
+// pointed at internal services through DNS.
+func pluginProxySafeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address: %w", err)
 	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("lookup failed for %s", host)
+	}
+	for _, ipAddr := range ips {
+		if isDisallowedIP(ipAddr.IP) {
+			return nil, fmt.Errorf("disallowed IP: %s", ipAddr.IP)
+		}
+	}
+	d := &net.Dialer{Timeout: 5 * time.Second}
+	return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+}
+
+// ONE Transport for the whole process, exactly as og.go does and for the same
+// reason. A Transport built per request does not inherit http.DefaultTransport's
+// 90s IdleConnTimeout, and net/http only arms the idle timer when that value is
+// above zero - so every request's keep-alive connection, and the readLoop and
+// writeLoop goroutines serving it, stayed alive for the life of the process.
+// The Transport could not be collected either, because those goroutine stacks
+// reference it. Each /plugin-proxy call to a new upstream leaked a Transport,
+// two goroutines and a socket, permanently.
+//
+// Only the Client is per-request now, because CheckRedirect has to close over
+// this request's allowlist and pinned host.
+var pluginProxyTransport = &http.Transport{
+	DialContext:         pluginProxySafeDial,
+	IdleConnTimeout:     90 * time.Second,
+	MaxIdleConns:        64,
+	MaxIdleConnsPerHost: 4,
+}
+
+func pluginProxyClient(allowed map[string]bool, pinHost string) *http.Client {
 	return &http.Client{
 		Timeout:   10 * time.Second,
-		Transport: transport,
+		Transport: pluginProxyTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Go has already copied the previous url into Referer by the time
+			// this runs, and that url carries the substituted {{secret:NAME}}
+			// value in its query string. Handing it to the redirect target
+			// leaks the key through a header the host binding never sees.
+			req.Header.Del("Referer")
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
 			}
-			if req.URL.Scheme != "https" || !allowed[strings.ToLower(req.URL.Hostname())] {
+			host := strings.ToLower(req.URL.Hostname())
+			if req.URL.Scheme != "https" || !allowed[host] {
 				return fmt.Errorf("redirect outside the allowlist: %s", req.URL.Host)
+			}
+			if pinHost != "" && host != pinHost {
+				return fmt.Errorf("secret-bearing request redirected off %s", pinHost)
 			}
 			return nil
 		},
 	}
 }
-
 func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 	if !isAllowedOrigin(r.Header.Get("Origin")) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
@@ -295,7 +430,14 @@ func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := pluginProxyClient(allowed).Get(substituted)
+	// A url that actually had a placeholder filled is pinned to its host for
+	// the whole redirect chain; one that carries no secret keeps the plain
+	// allowlist-wide behaviour.
+	pinHost := ""
+	if substituted != raw {
+		pinHost = host
+	}
+	resp, err := pluginProxyClient(allowed, pinHost).Get(substituted)
 	if err != nil {
 		apiError(w, r, "Upstream unreachable", http.StatusBadGateway)
 		return

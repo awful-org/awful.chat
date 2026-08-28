@@ -9,23 +9,32 @@ import (
 )
 
 var (
-	nodeEnv = os.Getenv("NODE_ENV")
-	domain  = os.Getenv("DOMAIN")
+	nodeEnv = strings.TrimSpace(os.Getenv("NODE_ENV"))
+	domain  = strings.ToLower(strings.TrimSpace(os.Getenv("DOMAIN")))
+	// Strictness follows DOMAIN, not NODE_ENV. NODE_ENV defaulted to
+	// "development" when it was unset, so an instance that set DOMAIN but
+	// forgot the second variable ran with the Origin gate wide open - a
+	// security switch that failed open on a missing value. DOMAIN is already
+	// mandatory in every real deploy (traefik routes on Host(relay.${DOMAIN}))
+	// and is unset only in local dev, where the dev compose publishes the
+	// ports directly and no origin is known. NODE_ENV=production still forces
+	// strict for a deployment that routes some other way.
+	strictOrigin = domain != "" || strings.EqualFold(nodeEnv, "production")
 )
-
-func init() {
-	if nodeEnv == "" {
-		nodeEnv = "development"
-	}
-	domain = strings.TrimSpace(strings.ToLower(domain))
-}
 
 // isAllowedOrigin checks if the origin is allowed to make requests
 func isAllowedOrigin(origin string) bool {
+	// A missing Origin is allowed on purpose and this is load-bearing: the
+	// frontend defaults its API base to "" (same-origin) and browsers send no
+	// Origin header on a same-origin GET, so rejecting the empty case would
+	// 403 every same-origin deployment. It is not the hole it looks like
+	// either - Origin is an ordinary request header, so any non-browser client
+	// can send whatever value it likes. What bounds non-browser abuse is the
+	// per-IP rateAllow budget on each handler, not this check.
 	if origin == "" {
 		return true
 	}
-	if nodeEnv != "production" {
+	if !strictOrigin {
 		return true
 	}
 	if domain == "" {
@@ -42,7 +51,7 @@ func isAllowedOrigin(origin string) bool {
 func corsHeaders(r *http.Request) http.Header {
 	origin := r.Header.Get("Origin")
 	var allowOrigin string
-	if nodeEnv == "production" {
+	if strictOrigin {
 		allowOrigin = "https://" + domain
 	} else if origin != "" {
 		allowOrigin = origin

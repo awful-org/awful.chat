@@ -1,10 +1,29 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// resetRateLimiter clears the process-global rate buckets. Without it these
+// tests only pass on the first run in a process: `go test -count=2` (and any
+// future test that spends the same bucket) starts with a drained window and
+// the very first request is refused.
+func resetRateLimiter(t *testing.T) {
+	t.Helper()
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	for k := range rateBy {
+		delete(rateBy, k)
+	}
+	lastSweep = time.Time{}
+}
 
 func TestSubstituteSecrets(t *testing.T) {
 	secrets := map[string]pluginSecret{
@@ -37,6 +56,7 @@ func TestSubstituteSecrets(t *testing.T) {
 }
 
 func TestPluginProxyRateLimit(t *testing.T) {
+	resetRateLimiter(t)
 	ip := "203.0.113.9"
 	for i := 0; i < pluginProxyRateLimit; i++ {
 		if !pluginProxyAllow(ip) {
@@ -68,6 +88,7 @@ func TestPluginProxyEnvParsing(t *testing.T) {
 }
 
 func TestRateAllowConcurrent(t *testing.T) {
+	resetRateLimiter(t)
 	// The sync.Map predecessor let N concurrent requests all read the same
 	// stale count and all pass; the mutexed window must admit exactly the
 	// limit no matter the concurrency.
@@ -86,5 +107,105 @@ func TestRateAllowConcurrent(t *testing.T) {
 	wg.Wait()
 	if allowed != 10 {
 		t.Fatalf("admitted %d, want exactly 10", allowed)
+	}
+}
+
+// X-Forwarded-For is a request header, so honouring it from a peer that is
+// not our own proxy let any direct caller pick its own rate-limit bucket -
+// every per-IP budget in the binary became a formality.
+func TestClientIPTrustsOnlyProxies(t *testing.T) {
+	cases := []struct {
+		name   string
+		remote string
+		xff    string
+		want   string
+	}{
+		{"direct caller cannot forge a bucket", "198.51.100.4:9000", "203.0.113.1", "198.51.100.4"},
+		{"behind the proxy the header is the client", "10.0.0.1:9000", "203.0.113.1", "203.0.113.1"},
+		{"a client-prepended hop is ignored", "10.0.0.1:9000", "203.0.113.1, 198.51.100.9", "198.51.100.9"},
+		{"a trusted extra hop is skipped", "10.0.0.1:9000", "203.0.113.1, 10.0.0.7", "203.0.113.1"},
+		{"no header falls back to the socket peer", "10.0.0.1:9000", "", "10.0.0.1"},
+		{"all-private hops keep the last one", "10.0.0.1:9000", "10.4.4.4", "10.4.4.4"},
+		{"garbage in the header is skipped", "10.0.0.1:9000", "203.0.113.1, not-an-ip", "203.0.113.1"},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest("GET", "/plugin-proxy", nil)
+		req.RemoteAddr = c.remote
+		if c.xff != "" {
+			req.Header.Set("X-Forwarded-For", c.xff)
+		}
+		if got := clientIP(req); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// The cache key is caller-chosen and expiry is only ever evaluated on a
+// lookup of that exact key, so an unbounded map meant any caller could pin
+// memory permanently by never asking for the same url twice.
+func TestPluginProxyCacheBounded(t *testing.T) {
+	body := bytes.Repeat([]byte("b"), 1024)
+	for i := 0; i < pluginProxyCacheMaxEntries*2; i++ {
+		pluginProxyStore(fmt.Sprintf("pp:https://h/?i=%d", i), body, "application/json")
+	}
+	pluginProxyCacheMu.Lock()
+	entries, order, size := len(pluginProxyCache), len(pluginProxyCacheOrder), pluginProxyCacheBytes
+	pluginProxyCacheMu.Unlock()
+	if entries > pluginProxyCacheMaxEntries || order != entries {
+		t.Fatalf("cache held %d entries (order %d), cap is %d", entries, order, pluginProxyCacheMaxEntries)
+	}
+	if size != entries*len(body) {
+		t.Fatalf("byte accounting drifted: %d bytes for %d entries", size, entries)
+	}
+	// Oldest-first: the first key is gone, the last one is still served.
+	if _, ok := pluginProxyCached("pp:https://h/?i=0"); ok {
+		t.Error("the oldest entry survived eviction")
+	}
+	last := fmt.Sprintf("pp:https://h/?i=%d", pluginProxyCacheMaxEntries*2-1)
+	if _, ok := pluginProxyCached(last); !ok {
+		t.Error("the newest entry was evicted")
+	}
+	// Re-storing a key must not double-count it.
+	before := size
+	pluginProxyStore(last, body, "application/json")
+	pluginProxyCacheMu.Lock()
+	after := pluginProxyCacheBytes
+	pluginProxyCacheMu.Unlock()
+	if after != before {
+		t.Fatalf("refresh double-counted: %d -> %d", before, after)
+	}
+}
+
+// Every /plugin-proxy request used to build its own http.Transport. A
+// hand-built Transport does not inherit http.DefaultTransport's 90s
+// IdleConnTimeout, and net/http only arms the idle timer when that value is
+// above zero - so each request's keep-alive connection, plus the readLoop and
+// writeLoop goroutines serving it, stayed alive for the life of the process,
+// and the Transport itself could not be collected because those goroutine
+// stacks referenced it. Only the Client may vary per request; it has to,
+// because CheckRedirect closes over the caller's allowlist and pinned host.
+func TestPluginProxyClientsShareOneTransport(t *testing.T) {
+	a := pluginProxyClient(map[string]bool{"a.example": true}, "a.example")
+	b := pluginProxyClient(map[string]bool{"b.example": true}, "")
+
+	if a == b {
+		t.Fatal("the Client must stay per-request: CheckRedirect closes over the allowlist")
+	}
+	if a.Transport != b.Transport {
+		t.Fatal("each call built its own Transport; that is the goroutine and socket leak")
+	}
+	tr, ok := a.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type %T", a.Transport)
+	}
+	if tr.IdleConnTimeout <= 0 {
+		t.Fatal("IdleConnTimeout is unset, so idle keep-alive connections are never reaped")
+	}
+
+	// The redirect policy must still be per-request, or one caller's allowlist
+	// would govern another's.
+	req := httptest.NewRequest(http.MethodGet, "https://b.example/x", nil)
+	if err := a.CheckRedirect(req, nil); err == nil {
+		t.Fatal("client a accepted a redirect to b.example; the closures got shared")
 	}
 }

@@ -117,8 +117,35 @@ func absolutizeUrl(raw, base string) *string {
 	return &s
 }
 
+// Ranges the stdlib predicates in isDisallowedIP do not cover but that are
+// still not the public internet. CGNAT is the one that matters in practice:
+// Tailscale tailnets and several hosting providers' internal service networks
+// live in 100.64.0.0/10, and the coturn config already denies exactly that
+// range (docker-compose.dokploy.yml), so the preview fetcher should not be the
+// one door left open onto it.
+var disallowedNets = func() []*net.IPNet {
+	cidrs := []string{
+		"0.0.0.0/8",     // "this network"; IsUnspecified matches only 0.0.0.0 itself
+		"100.64.0.0/10", // CGNAT and Tailscale; the range coturn already denies
+		"198.18.0.0/15", // benchmarking, wired to internal test gear on some networks
+		"240.0.0.0/4",   // reserved, and covers the 255.255.255.255 broadcast address
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			// These are literals, so a parse failure is a typo in this file
+			// and must not degrade silently into a wider SSRF surface.
+			panic("bad disallowed CIDR " + c + ": " + err.Error())
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
 // isDisallowedIP checks if an IP is in a disallowed range (loopback, private,
-// link-local, multicast, unspecified). Returns true if the IP should be blocked.
+// link-local, multicast, unspecified, plus the extra ranges in
+// disallowedNets). Returns true if the IP should be blocked.
 func isDisallowedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -144,7 +171,80 @@ func isDisallowedIP(ip net.IP) bool {
 	if ip.IsMulticast() {
 		return true
 	}
+	// Everything the predicates above miss. Contains normalizes IPv4-mapped
+	// IPv6 first, so ::ffff:100.64.0.1 is caught too.
+	for _, n := range disallowedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
 	return false
+}
+
+// ogSafeDial resolves the target host itself and refuses every address that is
+// not on the public internet, so neither an attacker-chosen hostname nor a
+// redirect can turn the preview fetcher into a probe of the relay's own
+// network.
+func ogSafeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+	// Resolve and validate all IPs returned by the resolver
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("lookup failed: %w", err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPs resolved for %s", host)
+	}
+	for _, ipAddr := range ips {
+		if isDisallowedIP(ipAddr.IP) {
+			return nil, fmt.Errorf("disallowed IP: %s", ipAddr.IP)
+		}
+	}
+	// Use standard dialer with the validated IP
+	dialer := &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 5 * time.Second,
+	}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+}
+
+// One client for every preview fetch instead of one per request. Building a
+// Transport per request leaked: a hand-built Transport does not inherit
+// http.DefaultTransport's 90s IdleConnTimeout, and net/http only arms the idle
+// timer when that value is above zero, so every request's keep-alive
+// connection - and the read and write goroutines serving it - stayed alive for
+// the life of the process. Sharing one Transport also lets a second preview of
+// the same host reuse the connection instead of redialing.
+var ogHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		DialContext:         ogSafeDial,
+		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 4,
+	},
+	// via holds the requests already made, so this errors on the sixth
+	// redirect exactly as the per-request counter it replaced did.
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) > 5 {
+			return fmt.Errorf("too many redirects")
+		}
+		// Re-validate the redirect target host
+		targetHost := req.URL.Hostname()
+		ips, err := net.DefaultResolver.LookupIPAddr(req.Context(), targetHost)
+		if err != nil {
+			return fmt.Errorf("redirect target resolution failed: %w", err)
+		}
+		for _, ipAddr := range ips {
+			if isDisallowedIP(ipAddr.IP) {
+				return fmt.Errorf("redirect target has disallowed IP: %s", ipAddr.IP)
+			}
+		}
+		return nil
+	},
 }
 
 func handleOgPreview(w http.ResponseWriter, r *http.Request) {
@@ -182,59 +282,6 @@ func handleOgPreview(w http.ResponseWriter, r *http.Request) {
 	var html string
 	finalUrl := targetURL.String()
 
-	// Custom dialer that validates IP addresses to prevent SSRF
-	redirectCount := 0
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, fmt.Errorf("invalid address: %w", err)
-			}
-			// Resolve and validate all IPs returned by the resolver
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				return nil, fmt.Errorf("lookup failed: %w", err)
-			}
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("no IPs resolved for %s", host)
-			}
-			for _, ipAddr := range ips {
-				if isDisallowedIP(ipAddr.IP) {
-					return nil, fmt.Errorf("disallowed IP: %s", ipAddr.IP)
-				}
-			}
-			// Use standard dialer with the validated IP
-			dialer := &net.Dialer{
-				Timeout:   5 * time.Second,
-				KeepAlive: 5 * time.Second,
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
-		},
-	}
-
-	client := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			redirectCount++
-			if redirectCount > 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			// Re-validate the redirect target host
-			targetHost := req.URL.Hostname()
-			ips, err := net.DefaultResolver.LookupIPAddr(context.Background(), targetHost)
-			if err != nil {
-				return fmt.Errorf("redirect target resolution failed: %w", err)
-			}
-			for _, ipAddr := range ips {
-				if isDisallowedIP(ipAddr.IP) {
-					return fmt.Errorf("redirect target has disallowed IP: %s", ipAddr.IP)
-				}
-			}
-			return nil
-		},
-	}
-
 	const maxBodyBytes = 5 * 1024 * 1024 // 5 MB limit
 
 	for _, candidate := range candidates {
@@ -245,7 +292,7 @@ func handleOgPreview(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("User-Agent", "TelegramBot (like TwitterBot)")
 		req.Header.Set("Accept", "text/html,application/xhtml+xml")
 
-		resp, err := client.Do(req)
+		resp, err := ogHTTPClient.Do(req)
 		if err != nil {
 			continue
 		}
