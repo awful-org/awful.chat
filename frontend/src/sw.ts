@@ -67,7 +67,8 @@ precacheAndRoute(
 
 // Big, rarely-needed assets are kept OUT of the precache (see globIgnores in
 // vite.config.ts) and cached the first time they are actually used instead:
-//   - the DTLN wasm worklet (~8 MB), fetched once on first app start
+//   - the DTLN wasm worklet (~8 MB), warmed once in the idle time after
+//     app start and loaded on first voice use
 //   - shiki language chunks (~300 files), fetched only when a code block of
 //     that language is rendered
 // Precaching them cost every visitor ~16 MB on install and on every update.
@@ -81,13 +82,29 @@ function runtimeCacheName(url: URL): string | null {
   return null;
 }
 
-async function cacheFirst(request: Request, cacheName: string): Promise<Response> {
+async function cacheFirst(
+  request: Request,
+  cacheName: string,
+  exclusive = false
+): Promise<Response> {
   const cache = await caches.open(cacheName);
   const hit = await cache.match(request);
   if (hit) return hit;
   const response = await fetch(request);
-  // Hashed filenames, so a successful response is safe to keep forever.
-  if (response.ok) cache.put(request, response.clone()).catch(() => {});
+  // Entries are content-versioned (hashed filename or ?v= query), so a
+  // successful response is safe to keep until its URL changes.
+  if (response.ok) {
+    if (exclusive) {
+      // One live version: a changed ?v= misses the cache above, lands here,
+      // and replaces the superseded entry instead of accumulating 8 MB blobs.
+      try {
+        for (const key of await cache.keys()) await cache.delete(key);
+      } catch {
+        // noop: worst case the old entry lingers
+      }
+    }
+    cache.put(request, response.clone()).catch(() => {});
+  }
   return response;
 }
 
@@ -146,6 +163,8 @@ self.addEventListener("fetch", (event) => {
 
   const cacheName = runtimeCacheName(new URL(request.url));
   if (cacheName) {
-    event.respondWith(cacheFirst(request, cacheName));
+    event.respondWith(
+      cacheFirst(request, cacheName, cacheName === WORKLET_CACHE)
+    );
   }
 });

@@ -9,6 +9,7 @@ fair, the spinner influences the seed).
 
 ```
 /wheel Valorant, CS2, Deep Rock
+/wheel What are we playing? Valorant, CS2, Deep Rock
 ```
 
 Anyone in the room can hit Spin once. The wheel animates onto the winner;

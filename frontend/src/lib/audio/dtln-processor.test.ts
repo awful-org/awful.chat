@@ -36,8 +36,15 @@ class FakeCtx {
   dests: FakeDest[] = [];
   sources: FakeNode[] = [];
   audioWorklet = { addModule: async () => {} };
+  // Real contexts flip `state` in a queued task, never synchronously - the
+  // suspend-vs-resume ordering bugs only exist under that timing model.
   async resume() {
+    await Promise.resolve();
     this.state = "running";
+  }
+  async suspend() {
+    await Promise.resolve();
+    this.state = "suspended";
   }
   createMediaStreamSource(_s: MediaStream) {
     const n = new FakeNode();
@@ -191,5 +198,98 @@ describe("DtlnProcessor graph wiring", () => {
     expect(firstSource.outputs.size).toBe(0);
     expect(firstInputGain.outputs.size).toBe(0);
     expect(firstOutputGain.isConnectedTo(firstDest)).toBe(false);
+  });
+});
+
+describe("DtlnProcessor lifecycle", () => {
+  it("suspends the context once both graphs are released, resumes on reuse", async () => {
+    const d = await makeProcessor();
+    await d.processStream(micStream);
+    expect(ctx.state).toBe("running");
+
+    d.releaseTransport();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.state).toBe("suspended");
+
+    await d.processStream(micStream);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.state).toBe("running");
+  });
+
+  it("rebuilding the mic mid-call leaves the context running", async () => {
+    const d = await makeProcessor();
+    await d.processStream(micStream);
+    // e.g. the user switches input device during a call: processStream
+    // releases the old graph (queuing a suspend) and rebuilds - the fresh
+    // graph must not end up on a suspended context.
+    await d.processStream(micStream);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.state).toBe("running");
+  });
+
+  it("does not suspend while a mic test still monitors", async () => {
+    const d = await makeProcessor();
+    await d.processStream(micStream);
+    await d.monitorStream(micStream);
+
+    d.releaseTransport();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.state).toBe("running");
+  });
+
+  it("a synchronous init failure still rejects waitUntilReady", async () => {
+    (globalThis as any).AudioContext = function () {
+      throw new Error("no 16 kHz context");
+    };
+    (globalThis as any).AudioWorkletNode = FakeWorkletNode;
+    const d = new DtlnProcessor();
+
+    await expect(d.waitUntilReady()).rejects.toThrow("no 16 kHz context");
+  });
+
+  it("a failed init rejects waitUntilReady, and a later retry can succeed", async () => {
+    ctx = new FakeCtx();
+    let fail = true;
+    ctx.audioWorklet = {
+      addModule: async () => {
+        if (fail) throw new Error("offline");
+      },
+    };
+    (globalThis as any).AudioContext = function () {
+      return ctx;
+    };
+    (globalThis as any).AudioWorkletNode = FakeWorkletNode;
+    const d = new DtlnProcessor();
+
+    // The old code left this promise pending forever, wedging join().
+    await expect(d.waitUntilReady()).rejects.toThrow("offline");
+    expect(d.isReady()).toBe(false);
+
+    fail = false;
+    await d.waitUntilReady();
+    expect(d.isReady()).toBe(true);
+  });
+
+  it("a processor crash during init rejects instead of eating the timeout", async () => {
+    ctx = new FakeCtx();
+    (globalThis as any).AudioContext = function () {
+      return ctx;
+    };
+    class CrashingWorkletNode extends FakeNode {
+      onprocessorerror: (() => void) | null = null;
+      port = {
+        onmessage: null as ((e: { data: unknown }) => void) | null,
+        postMessage: () => {},
+      };
+      constructor() {
+        super();
+        // Never posts "ready" - dies instead.
+        setTimeout(() => this.onprocessorerror?.(), 0);
+      }
+    }
+    (globalThis as any).AudioWorkletNode = CrashingWorkletNode;
+    const d = new DtlnProcessor();
+
+    await expect(d.waitUntilReady()).rejects.toThrow("crashed during init");
   });
 });

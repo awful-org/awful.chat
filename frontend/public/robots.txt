@@ -4,4 +4,4 @@ Allow: /
 Disallow: /app
 Disallow: /r/
 
-Sitemap: https://awful.frav.in/sitemap.xml
+Sitemap: https://awful.chat/sitemap.xml

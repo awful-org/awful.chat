@@ -814,8 +814,22 @@ export class LibP2PTransport implements PeerTransport {
 
   private reconcileConnections(): void {
     if (!this.node) return;
-    for (const connection of this.node.getConnections()) {
+    const connections = this.node.getConnections();
+    // Surface runaway connection growth: the relay's conn manager prunes
+    // hard above its high-water mark, and a leak here reads as "peers
+    // randomly disconnecting" everywhere else.
+    if (connections.length > 50) {
+      console.warn(
+        `[Transport] high connection count: ${connections.length} ` +
+          `(${this.connectedPeers.size} peers)`
+      );
+    }
+    const byPeer = new Map<string, Connection[]>();
+    for (const connection of connections) {
       const id = connection.remotePeer.toString();
+      const list = byPeer.get(id);
+      if (list) list.push(connection);
+      else byPeer.set(id, [connection]);
       if (this.isRelayPeer(id) || this.connectedPeers.has(id)) continue;
       console.log("[Transport] reconciled missed peer:", id.slice(-8));
       this.registerPeer(id);
@@ -823,7 +837,7 @@ export class LibP2PTransport implements PeerTransport {
     }
     this.probeSilentPeers();
     this.retryMissingRoomPeers();
-    this.upgradeRelayedPeers();
+    this.upgradeRelayedPeers(byPeer);
   }
 
   /**
@@ -840,7 +854,7 @@ export class LibP2PTransport implements PeerTransport {
    * the dial really happens. (Not because circuit connections are "limited":
    * our relay grants infinite limits, so they are not.)
    */
-  private upgradeRelayedPeers(): void {
+  private upgradeRelayedPeers(byPeer?: Map<string, Connection[]>): void {
     if (this.intentionalDisconnect || !this.node) return;
     if (typeof document !== "undefined" && document.hidden) return;
     const now = Date.now();
@@ -848,8 +862,10 @@ export class LibP2PTransport implements PeerTransport {
       // Refresh first. updateRelayedStatus only ever ran on connect events, so
       // when a direct connection died the peer stayed marked direct forever -
       // the status shown in the UI went stale, and nothing here would have
-      // tried to win the direct connection back.
-      this.updateRelayedStatus(peerId);
+      // tried to win the direct connection back. The prefetched connection
+      // map keeps this O(peers): getPeers().find() per peer serialized every
+      // PeerId per iteration - profiled at over a second of CPU per tick.
+      this.updateRelayedStatus(peerId, byPeer?.get(peerId));
       if (!this.relayedPeers.has(peerId)) {
         this.nextUpgradeAt.delete(peerId);
         this.upgradeBackoff.delete(peerId);
@@ -1540,14 +1556,20 @@ export class LibP2PTransport implements PeerTransport {
     });
   }
 
-  private updateRelayedStatus(peerId: string): void {
+  private updateRelayedStatus(
+    peerId: string,
+    prefetched?: Connection[]
+  ): void {
     if (!this.node) return;
-    const pid = this.node.getPeers().find((p) => p.toString() === peerId);
-    // getConnections(undefined) returns EVERY connection in the node, relay
-    // included, which reads as "direct" and silently answers a question we
-    // cannot answer. A peer with no connections has no status.
-    if (pid == null) return;
-    const connections = this.node.getConnections(pid);
+    let connections = prefetched;
+    if (!connections) {
+      const pid = this.node.getPeers().find((p) => p.toString() === peerId);
+      // getConnections(undefined) returns EVERY connection in the node, relay
+      // included, which reads as "direct" and silently answers a question we
+      // cannot answer. A peer with no connections has no status.
+      if (pid == null) return;
+      connections = this.node.getConnections(pid);
+    }
     if (!connections?.length) return;
 
     // Not a substring test on the address. A direct WebRTC connection is

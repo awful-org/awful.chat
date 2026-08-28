@@ -10,5 +10,5 @@ export const manifest: PluginManifest = {
   version: "1.1.0",
   repository: "https://github.com/awful-org/awful.chat/tree/main/frontend/plugins/wheel",
   apiVersion: 1,
-  commands: [{ name: "wheel", usage: "/wheel option1, option2, ..." }],
+  commands: [{ name: "wheel", usage: "/wheel Question? option1, option2, ..." }],
 };

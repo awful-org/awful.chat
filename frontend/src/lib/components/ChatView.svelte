@@ -22,6 +22,23 @@
     UserPlus,
     UserRoundMinus,
     Trash2,
+    Angry,
+    Annoyed,
+    Laugh,
+    Meh,
+    Frown,
+    Baby,
+    Dog,
+    Skull,
+    Ghost,
+    Cat,
+    Bot,
+    PartyPopper,
+    Heart,
+    Star,
+    ChessQueen,
+    ThumbsUp,
+    CornerUpLeft,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -36,6 +53,7 @@
   import UserListSidebar from "./UserListSidebar.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { resolveChatFontStack } from "$lib/chat-font";
   import { nameEffectStyle } from "$lib/name-effect";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import {
@@ -59,15 +77,20 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
-    openDmConversation,
+    openDmPanel,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
-  import { serialize, mentionsMe, segmentDraft } from "$lib/mentions";
+  import {
+    buildMentionCandidates,
+    mentionsMe,
+    segmentDraft,
+    serialize,
+  } from "$lib/mentions";
   import { makeHostApi } from "$lib/plugins/host";
   import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import UserProfileCard from "./UserProfileCard.svelte";
-  import { openSettings } from "$lib/ui-state.svelte";
+  import { openSettings, requestReturnToCall } from "$lib/ui-state.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { getRegistry, getPlugin } from "$lib/plugins/registry";
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
@@ -115,6 +138,7 @@
 
   let {
     peers,
+    roomUsers,
     messages,
     inCall,
     callRoomCode,
@@ -155,12 +179,38 @@
   let reactionPickerFor = $state<string | null>(null);
   let reactionAnchor = $state<DOMRect | null>(null);
   let composerEmojiOpen = $state(false);
+  // Idle toy: each hover of the emoji button steps to the next icon, and it
+  // STAYS there until the next hover. Deliberately not persisted - a refresh
+  // starts back at Smile.
+  const emojiCycle = [
+    Smile,
+    Angry,
+    Annoyed,
+    Laugh,
+    Meh,
+    Frown,
+    Baby,
+    Dog,
+    Skull,
+    Ghost,
+    Cat,
+    Bot,
+    PartyPopper,
+    Heart,
+    Star,
+    ChessQueen,
+    ThumbsUp,
+  ];
+  let emojiCycleIdx = $state(0);
   let composerEmojiAnchor = $state<DOMRect | null>(null);
   let gifPickerOpen = $state(false);
   let hasMoreHistory = $state(true);
   let loadingMore = $state(false);
   let activeMessageId = $state<string | null>(null);
   let stagedFiles = $state<File[]>([]);
+  // Names of files between "Enter pressed" and "message echoed" - hashing
+  // for seeding happens in that window and it is silent otherwise.
+  let sendingFiles = $state<string[]>([]);
   let fileInputEl = $state<HTMLInputElement | null>(null);
   let dragOverlayActive = $state(false);
   let dragDepth = $state(0);
@@ -394,15 +444,29 @@
    */
   const draftSegments = $derived(segmentDraft(draft, draftMentionMap));
 
+  /**
+   * `roomUsers` is DID-keyed and seeded on join from the persisted participant
+   * list, and `peerNames` is seeded from stored peer profiles, so an offline
+   * member is still mentionable by name. The selection rules live in
+   * `mentions.ts` because they are testable there and this file is not.
+   */
+  const mentionCandidates = $derived(
+    buildMentionCandidates({
+      roomUsers,
+      peers,
+      toDid: senderDid,
+      nameOf: (id) => peerNames.get(id),
+      selfIds: [identityStore.did ?? "", selfId(), myPeerId()],
+    }),
+  );
+
   const filteredMembersForMention = $derived.by(() => {
     if (!mentionPopupOpen) return [];
-    const self = selfId();
-    const mine = myPeerId();
     const lower = mentionPrefix.toLowerCase();
-    return peers
-      .filter((pid) => pid !== self && pid !== mine)
-      .map((pid) => ({ did: senderDid(pid), name: displayNameFor(pid) }))
-      .filter((m) => !lower || m.name.toLowerCase().includes(lower));
+    if (!lower) return mentionCandidates;
+    return mentionCandidates.filter((m) =>
+      m.name.toLowerCase().includes(lower),
+    );
   });
 
   function updateMentionState() {
@@ -537,6 +601,7 @@
     const wireText = serialize(text, draftMentionMap);
 
     if (stagedFiles.length > 0) {
+      sendingFiles = stagedFiles.map((f) => f.name);
       sendFiles(stagedFiles, wireText, {
         replyTo: replyTarget
           ? {
@@ -548,6 +613,8 @@
                   : replyTarget.content,
             }
           : undefined,
+      }).finally(() => {
+        sendingFiles = [];
       });
       clearStagedFiles();
     } else if (replyTarget) {
@@ -618,7 +685,10 @@
   function handleGifFileSelect(file: File) {
     // A saved uploaded gif re-enters as a fresh file send: re-seeded, and
     // inlined into the message when small enough.
-    sendFiles([file]).catch(() => {});
+    sendingFiles = [file.name];
+    sendFiles([file])
+      .catch(() => {})
+      .finally(() => (sendingFiles = []));
     autoScroll = true;
   }
 
@@ -975,6 +1045,13 @@
     if (messages.length > 0) markSeen().catch(() => {});
   });
 
+  // markSeen refuses to run while the page is hidden, so the room the user was
+  // parked on keeps its unread count in a background tab. Catch it up the
+  // moment they look again.
+  function markSeenOnReturn(): void {
+    if (document.visibilityState === "visible") markSeen().catch(() => {});
+  }
+
   function shouldShowHeader(current: Message, previous?: Message): boolean {
     if (!previous) return true;
     const a = senderDid(current.senderId) || current.senderId;
@@ -1168,7 +1245,10 @@
     if (onOpenDm) {
       await onOpenDm(peerId);
     } else {
-      await openDmConversation(peerId);
+      // No host to switch the view for us, so the panel: openDmConversation
+      // only moves the transport, leaving this pane rendering the room it is
+      // still keyed to and the DM invisible.
+      await openDmPanel(peerId);
     }
     closeUserMenu();
   }
@@ -1190,6 +1270,26 @@
 
   const isDmChat = $derived(
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
+  );
+
+  // Desktop only: below sm there is no room for two columns, and the call
+  // stage would squeeze the messages to nothing.
+  const callBeside = $derived(displayPrefs.callChatBeside && !isMobile);
+
+  // The stored pref is a stack id or a custom family name; the resolver turns
+  // either into a complete CSS stack, and sanitises the custom case because the
+  // value lands in an inline style attribute.
+  const chatFontStack = $derived(
+    resolveChatFontStack(displayPrefs.chatFontFamily),
+  );
+  // Opening the user list widens the chat column instead of crushing the
+  // message text into what the w-60 aside leaves behind.
+  const chatColClass = $derived(
+    callBeside && showCallView
+      ? `shrink-0 border-l border-border ${
+          showUserList && !isDmChat ? "w-156" : "w-96"
+        }`
+      : "flex-1"
   );
 
   const dmPeerInPhonebook = $derived.by(() => {
@@ -1220,9 +1320,18 @@
   }}
 />
 
+<svelte:document onvisibilitychange={markSeenOnReturn} />
+
+<!--
+  The two chat font properties are declared here and consumed by the message
+  body. They are purpose-named on purpose: overriding Tailwind's `--font-mono`
+  instead would also retarget every shiki code block, because Preflight resolves
+  `code`/`pre`/`kbd`/`samp` from that token.
+-->
 <div
   use:viewportHeight
-  class="relative flex flex-col bg-background text-foreground font-mono overflow-hidden"
+  style="--chat-font-size: {displayPrefs.chatFontSize}px; --chat-font-family: {chatFontStack}"
+  class="relative flex flex-col bg-background text-foreground font-(family-name:--chat-font-family) overflow-hidden"
   role="main"
   ondragenter={handleRootDragEnter}
   ondragover={handleRootDragOver}
@@ -1306,6 +1415,30 @@
               </Button>
             {/snippet}
           </Tip>
+        {:else if callRoomCode && callRoomCode !== roomCode}
+          <!--
+            The call is live in another conversation and its stage is not on
+            screen. The sidebar chip also leads back, but below sm the sidebar
+            is off-canvas - so the way back has to exist here too, and this slot
+            is empty in exactly this state.
+          -->
+          <Tip text="Back to the call you are in">
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={requestReturnToCall}
+                aria-label="Back to call"
+                class="flex items-center gap-1.5 rounded-full border border-green-500/20 bg-green-500/10 px-2 py-1 text-xs font-mono text-green-400 hover:brightness-125 cursor-pointer"
+              >
+                <span
+                  class="size-1.5 rounded-full bg-green-400 animate-pulse"
+                ></span>
+                <CornerUpLeft class="size-3.5" />
+                <span class="hidden sm:inline">Back to call</span>
+              </button>
+            {/snippet}
+          </Tip>
         {/if}
         {#if !isDmChat}
           <Tip text={showUserList ? "Hide users" : "Show users"}>
@@ -1387,10 +1520,6 @@
     </div>
   </header>
 
-  {#if showCallView}
-    <VoiceVideoCallView />
-  {/if}
-
   {#if connecting}
     <div
       class="absolute inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center"
@@ -1403,6 +1532,29 @@
       </div>
     </div>
   {/if}
+
+  <!-- Call and chat. Stacked by default, side by side when callBeside. The
+       wrapper is always mounted: a remount would rebind messagesEl and drop
+       the scroll position on every switch. -->
+  <div
+    class="flex flex-1 min-h-0 overflow-hidden {callBeside
+      ? 'flex-row'
+      : 'flex-col'}"
+  >
+    {#if showCallView}
+      <!-- Own column: the call view also renders an error banner, which must
+           not become a second column of the row. -->
+      <div
+        class="flex min-h-0 flex-col {callBeside
+          ? 'min-w-0 flex-1'
+          : 'shrink-0'}"
+      >
+        <VoiceVideoCallView beside={callBeside} />
+      </div>
+    {/if}
+    <div
+      class="flex min-h-0 min-w-0 flex-col overflow-hidden {chatColClass}"
+    >
 
   <div class="flex flex-1 min-h-0 overflow-hidden">
     <div
@@ -1777,9 +1929,32 @@
     </div>
   {/if}
 
+  {#if sendingFiles.length > 0}
+    <!-- The gap this fills: staged previews clear on Enter, but the message
+         only appears once the file is fingerprinted and hashed for seeding -
+         seconds of dead air on a big file with nothing saying it is going. -->
+    <div
+      class="flex items-center gap-2 border-t border-border bg-muted/30 px-4 py-2 font-mono text-xs text-muted-foreground"
+    >
+      <span
+        class="size-2 shrink-0 animate-pulse rounded-full bg-primary"
+      ></span>
+      <span class="truncate">
+        Sending {sendingFiles.length === 1
+          ? sendingFiles[0]
+          : `${sendingFiles.length} files`}...
+      </span>
+    </div>
+  {/if}
+
   {#if stagedFiles.length > 0}
-    <div class="border-t border-border bg-muted/30 px-4 py-2">
-      <div class="flex gap-2 overflow-x-auto pb-1">
+    <div
+      class="flex items-start gap-2 border-t border-border bg-muted/30 px-4 py-2"
+    >
+      <!-- pt-2/pr-2 inside the scroll area: the per-file delete badge hangs
+           past the tile's top-right corner, and the overflow container was
+           cropping it. -->
+      <div class="flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1 pr-2 pt-2">
         {#each stagedFiles as file (fileKey(file))}
           {@const previewUrl = getStagedPreviewURL(file)}
           <div
@@ -1827,6 +2002,20 @@
           </div>
         {/each}
       </div>
+      <!-- Same way out the reply banner has: one X clears everything staged. -->
+      <Tip text="Remove attachments (Esc)">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            class="self-center size-6 shrink-0 inline-flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+            onclick={clearStagedFiles}
+            aria-label="Remove all attachments"
+          >
+            <X class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
     </div>
   {/if}
 
@@ -1904,6 +2093,13 @@
               >
                 <span class="text-muted-foreground">@</span>
                 <span class="truncate">{member.name}</span>
+                {#if !member.online}
+                  <!-- Say so rather than hiding them: mentioning an away member
+                       is the point, and a silent list looks like a bug. -->
+                  <span class="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                    away
+                  </span>
+                {/if}
               </button>
             {/each}
           </div>
@@ -1941,8 +2137,11 @@
                 }}
                 aria-label="Insert emoji"
                 class="size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+                onpointerenter={() =>
+                  (emojiCycleIdx = (emojiCycleIdx + 1) % emojiCycle.length)}
               >
-                <Smile class="size-4" />
+                {@const CycleIcon = emojiCycle[emojiCycleIdx]}
+                <CycleIcon class="size-4" />
               </Button>
             {/snippet}
           </Tip>
@@ -1973,6 +2172,8 @@
         <Send class="size-4" />
       </Button>
     </form>
+  </div>
+    </div>
   </div>
 </div>
 

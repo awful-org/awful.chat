@@ -13,6 +13,7 @@
 
   const wheelState = $derived(
     cardState as {
+      question: string;
       options: string[];
       spun: boolean;
       winner: number | null;
@@ -97,6 +98,11 @@
 
 <!-- w-full + centered: the host frame sets the default card size. -->
 <div class="flex w-full flex-col items-center gap-3">
+  {#if wheelState.question}
+    <p class="w-full text-center font-mono text-sm font-semibold text-foreground">
+      {wheelState.question}
+    </p>
+  {/if}
   {#if wheelState.options.length === 0}
     <div class="text-xs text-muted-foreground">No options configured</div>
   {:else}

@@ -65,6 +65,7 @@ import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
 import { DtlnProcessor } from "../audio/dtln-processor";
+import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession } from "../identity/identity";
 import { deviceKeySeed } from "./device-key";
 import { looksLikeDid, looksLikePeerId } from "../identity/identity-utils";
@@ -96,7 +97,9 @@ import {
   foldUpdate,
   touchCardStates,
 } from "../plugins/state.svelte";
-import { humanizeMentions, mentionsMe } from "../mentions";
+import { announceMessage } from "../announce";
+import { mentionsMe } from "../mentions";
+import { appendToDmPanel, dmPanelIsShowing } from "../dm-panel.svelte";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
@@ -130,7 +133,6 @@ import {
 } from "./files.svelte";
 import { initVoice } from "./voice.svelte";
 import { initTransmission } from "./transmission.svelte";
-import { notifyMessage } from "../notify.svelte";
 
 const MSG_ORDER = (a: Message, b: Message) =>
   a.lamport !== b.lamport
@@ -428,7 +430,12 @@ function _setPeerDid(peerId: string, did: string): void {
 const _seededByFingerprint = new Map<string, FileDescriptor>();
 
 export const _dtln = new DtlnProcessor();
-_dtln.init().catch(console.error);
+// The 8 MB worklet is loaded lazily on first voice use (waitUntilReady kicks
+// init); at startup we only warm the service-worker cache for it, off the
+// critical path, so the first call doesn't also pay the download.
+const warmWorkletCache = () => void fetch(WORKLET_URL).catch(() => {});
+if (typeof requestIdleCallback === "function") requestIdleCallback(warmWorkletCache);
+else setTimeout(warmWorkletCache, 3000);
 export const _transport = new LibP2PTransport();
 export const _voice = new LibP2PVoice(_transport, _dtln);
 export const _video = new MediasoupVideo();
@@ -1009,7 +1016,13 @@ async function _pushMissingTo(
 async function _handleSyncBatch(
   roomCode: string,
   messages: WireChatMessage[],
-  fromPeerId?: string
+  fromPeerId?: string,
+  /**
+   * The sender marked this as the direct copy of a live send, not history
+   * repair. Only a live batch may announce: a repair would beep once per
+   * recovered message.
+   */
+  live = false
 ): Promise<void> {
   // Bind incoming history to the room named in the (signed-message-bearing)
   // batch, and only if we actually joined it - a peer cannot inject history
@@ -1043,18 +1056,38 @@ async function _handleSyncBatch(
       `[sync] dropped ${messages.length - verified.length} message(s) with invalid signatures`
     );
   }
-  // The lowest lamport we REJECTED, per sender. A watermark may not pass it:
-  // claiming a message we threw away means no peer will ever offer it again,
-  // and there is no repair for that. It bites for real on legacy v1-signed
-  // history, which _verifyIncoming rejects wholesale.
+  // Two kinds of rejection. A SIGNED (v2/v3) message that failed verify is
+  // suspicious - maybe corruption, maybe a better copy exists - so its
+  // lamport is a floor watermarks may not pass (claiming it would mean no
+  // peer ever offers it again). But an unsigned row in a signed room, or
+  // the retired v1 canonical, is rejected DETERMINISTICALLY, FOREVER: not
+  // claiming those made every peer re-advertise the same gap and every
+  // pusher re-decrypt and re-send the entire legacy backlog on each repair
+  // tick - a permanent sync storm that pinned CPU on both ends (profiled:
+  // getMessagesAboveWatermarks + _openAll at 40%+ of an idle tab). There
+  // is no repair to protect; claim them.
   const rejectedFloor = new Map<string, number>();
+  const permanentMax = new Map<string, number>();
   messages.forEach((m, i) => {
     if (verdicts[i]) return;
+    if (!m.sig || (m.sigV !== 2 && m.sigV !== 3)) {
+      const at = permanentMax.get(m.senderId);
+      if (at === undefined || m.lamport > at) {
+        permanentMax.set(m.senderId, m.lamport);
+      }
+      return;
+    }
     const at = rejectedFloor.get(m.senderId);
     if (at === undefined || m.lamport < at) {
       rejectedFloor.set(m.senderId, m.lamport);
     }
   });
+  for (const [sid, lamport] of permanentMax) {
+    const floor = rejectedFloor.get(sid);
+    if (floor === undefined || lamport < floor) {
+      await setWatermark(roomCode, sid, lamport);
+    }
+  }
   if (!verified.length) return;
   const fullMessages = verified.map((w) => wireToMessage(w, roomCode));
 
@@ -1062,6 +1095,26 @@ async function _handleSyncBatch(
   // also gives synced file messages their attachment records, which the sync
   // path otherwise never creates.
   for (const m of fullMessages) stripAndAdoptInlineFiles(m);
+
+  // Newness has to be read BEFORE the write below, which would otherwise
+  // satisfy the lookup.
+  //
+  // A live batch checks every message. A repair batch checks only the ones that
+  // mention me. "Repair never announces" is the right rule for bulk history --
+  // syncing a busy room must not fire a hundred notifications -- but a mention
+  // you were away for is the one thing you MUST still be told about, and that
+  // is exactly the case that used to be silent. Scoping the check to mentions
+  // keeps the round trips proportional to mentions, not to the backfill size:
+  // the `&&` short-circuits before `getMessage` for everything else.
+  const selfIds = _selfIds();
+  const unannounced = await Promise.all(
+    fullMessages.map(
+      async (m) =>
+        (live || mentionsMe(m.content ?? "", selfIds)) &&
+        !transportState.messages.some((x) => x.id === m.id) &&
+        !(await getMessage(m.id))
+    )
+  );
 
   await bulkPutMessages(fullMessages);
 
@@ -1097,6 +1150,12 @@ async function _handleSyncBatch(
 
   refreshUnreadCount(roomCode).catch(() => {});
   for (const m of fullMessages) noteRoomActivity(m.roomCode, m.timestamp);
+
+  // No `live` gate here: `unannounced` already encodes the policy, and it is
+  // false for every non-mention in a repair batch.
+  fullMessages.forEach((m, i) => {
+    if (unannounced[i]) _announceMessage(m);
+  });
 
   // Storage got everything; the view only takes messages for the room that is
   // actually open (the user may have switched while the batch was in flight),
@@ -1598,6 +1657,24 @@ async function _verifyIncoming(
   return verifySignature(wire.senderDid, wire.sig, canonicalFor(wire));
 }
 
+/** Every id that means "me". Shared so the announce and mention checks agree. */
+function _selfIds(): string[] {
+  return [identityStore.did ?? "", _transport.selfId()];
+}
+
+/**
+ * Bind an incoming message to this client's identity and view, then let
+ * announce.ts decide whether to make a sound about it. The caller has already
+ * established that the message is genuinely new.
+ */
+function _announceMessage(msg: Message): void {
+  announceMessage(msg, {
+    selfIds: _selfIds(),
+    uiRoomCode: transportState.uiRoomCode,
+    resolveName: resolveMentionDisplayName,
+  });
+}
+
 async function _handleChatMessage(
   wire: WireChatMessage,
   roomCodeOverride?: string,
@@ -1701,50 +1778,7 @@ async function _handleChatMessage(
     transportState.dmVersion += 1;
   }
 
-  // Reactions and plugin updates are noise as notifications, and a message
-  // replayed by sync is not news - only announce genuinely new chat arriving
-  // from someone else.
-  if (
-    isNewMessage &&
-    msg.type !== MessageType.Reaction &&
-    msg.type !== MessageType.PluginUpdate &&
-    !isSelfSender(msg.senderId)
-  ) {
-    // This whole block sits between putMessage and appendSorted: an
-    // uncaught throw here (a bad mention resolve, a notification quirk)
-    // turns "stored" into "invisible until refresh" for every message
-    // after it. Notifying is best-effort; painting the message is not.
-    try {
-      let body = msg.content || "[file]";
-      if (msg.type === MessageType.PluginCard) {
-        try {
-          const payload = JSON.parse(msg.content);
-          const { getManifest } = await import("../plugins/registry");
-          const manifest = getManifest(payload.pluginId);
-          body = `posted a ${manifest?.name || payload.pluginId}`;
-        } catch {
-          body = "posted a plugin card";
-        }
-      } else {
-        body = humanizeMentions(body, resolveMentionDisplayName);
-      }
-      const mentioned = mentionsMe(msg.content ?? "", [
-        identityStore.did ?? "",
-        _transport.selfId(),
-      ]);
-      notifyMessage({
-        title: mentioned
-          ? `${msg.senderName} mentioned you`
-          : transportState.roomName || msg.roomCode,
-        body: `${msg.senderName}: ${body}`,
-        tag: `room:${msg.roomCode}`,
-        viewingConversation: transportState.uiRoomCode === msg.roomCode,
-        data: { roomCode: msg.roomCode },
-      });
-    } catch (err) {
-      console.warn("[chat] notification failed:", err);
-    }
-  }
+  if (isNewMessage) _announceMessage(msg);
 
   // Match on the open room, not the mode: DM file messages arrive through
   // this path too, and the mode check kept them invisible until reopen.
@@ -1930,7 +1964,7 @@ export function deliverMailboxDm(
   // AWAITABLE on purpose: the mailbox collector must not ack (= delete the
   // relay's only copy) until the local write actually settled - a locked
   // identity mid-drain throws here instead of vanishing the message.
-  return _handleDmChatAsync(senderDid, senderDid, { payload });
+  return _handleDmChatAsync(senderDid, senderDid, { payload }, true);
 }
 
 function _handleDmChat(
@@ -1944,7 +1978,14 @@ function _handleDmChat(
 function _handleDmChatAsync(
   peerId: string,
   senderDid: string,
-  envelope: { payload: DmPayload }
+  envelope: { payload: DmPayload },
+  /**
+   * This arrived from the relay mailbox, so `peerId` is the sender's DID
+   * standing in for a stream that does not exist. Passed explicitly rather than
+   * inferred from `peerId === senderDid`: that coincidence is not a contract,
+   * and getting it wrong emits a user-visible error.
+   */
+  viaMailbox = false
 ): Promise<void> {
   return (async () => {
     const roomCode = await ensureDmRoomForPeer(peerId);
@@ -1991,18 +2032,20 @@ function _handleDmChatAsync(
       const isViewingThisDm =
         transportState.chatMode === "dm" &&
         (activeDid === senderDid || activeDid === peerId);
-      // Reactions are noise as notifications, same rule as rooms.
-      if (!reaction) {
-        notifyMessage({
-          title: msg.senderName,
-          body: humanizeMentions(msg.content, resolveMentionDisplayName),
-          tag: `dm:${roomCode}`,
-          viewingConversation: transportState.uiRoomCode === roomCode,
-          data: { roomCode, dmPeerDid: senderDid },
-        });
-      }
+      // Reactions are filtered inside the funnel, same rule as rooms.
+      _announceMessage(msg);
+      // The floating panel is a second place this conversation can be on
+      // screen, and it can be showing it while the pane behind shows another
+      // room entirely. Keyed on the room code, so this is a no-op otherwise.
+      appendToDmPanel(msg);
+      // The pane's array belongs to the conversation the pane is on. Appending
+      // to it because the PANEL is showing this DM is how a message ends up
+      // filed under the wrong conversation.
       if (isViewingThisDm) {
         transportState.messages = appendSorted(transportState.messages, msg);
+      }
+      // Visible in either surface means read, not merely delivered.
+      if (isViewingThisDm || dmPanelIsShowing(roomCode)) {
         await markRoomSeen(roomCode, msg.lamport);
         const roomIndex = roomsStore.dmRooms.findIndex(
           (r) => r.roomCode === roomCode
@@ -2018,16 +2061,24 @@ function _handleDmChatAsync(
         }
         await refreshDmRooms();
         transportState.dmVersion += 1;
-        // Conversation is on screen - this message is read, not just delivered
-        _transport
-          .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
-          .catch(() => {});
+        // No stream to reply on when the DM came out of the mailbox. Calling
+        // send() with a DID makes peerIdFromString throw inside libp2p, and
+        // that surfaces as a `stream-open-failed` toast the user reads as a
+        // real error - up to two per collected DM. The sender learns the
+        // message landed when the offline queue next reaches them live.
+        if (!viaMailbox) {
+          _transport
+            .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
+            .catch(() => {});
+        }
       }
     }
 
-    _transport
-      .send(peerId, encodeDmAckEnvelope(envelope.payload.id))
-      .catch(() => {});
+    if (!viaMailbox) {
+      _transport
+        .send(peerId, encodeDmAckEnvelope(envelope.payload.id))
+        .catch(() => {});
+    }
   })();
 }
 
@@ -2173,7 +2224,12 @@ _transport.on("message", (peerId, data, room) => {
         _handleDigest(peerId, msg.roomCode, msg.watermarks).catch(() => {});
         break;
       case MessageType.SyncBatch:
-        _handleSyncBatch(msg.roomCode, msg.messages, peerId).catch(() => {});
+        _handleSyncBatch(
+          msg.roomCode,
+          msg.messages,
+          peerId,
+          msg.live === true
+        ).catch(() => {});
         break;
       case MessageType.SyncComplete:
         _handleSyncComplete(peerId, msg.roomCode);
@@ -2534,6 +2590,10 @@ function _broadcastChatWire(wire: WireChatMessage, roomCode: string): void {
     messages: [wire],
     batchIndex: 0,
     totalBatches: 1,
+    // Not history repair: whichever copy of this message lands first is the
+    // one that has to announce it, because the publish above is dropped
+    // outright when the mesh has no topic peers for the room.
+    live: true,
   });
   // DM rooms have no roomUsers roster - the direct copy goes to the one peer
   // the conversation is with (plugin cards and files ride this path too).
@@ -3024,7 +3084,18 @@ export async function loadMoreMessages(
   return older.length === PAGE_SIZE;
 }
 
+/**
+ * Mark everything loaded in the open conversation as read.
+ *
+ * Only while the page is actually visible. A backgrounded tab parked on a room
+ * kept marking arriving messages read, so that room accrued no unread count and
+ * the tab title and app icon under-counted by exactly its traffic - the whole
+ * point of a counter is to survive not looking. Callers re-run this when the
+ * page comes back.
+ */
 export async function markSeen(): Promise<void> {
+  if (typeof document !== "undefined" && document.visibilityState !== "visible")
+    return;
   const roomCode = transportState.roomCode;
   if (!roomCode) return;
   // Only this room's messages: a sync batch for another room can share the

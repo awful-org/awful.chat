@@ -6,10 +6,29 @@
 import type { UpdateCtx } from "$lib/plugins/api";
 
 export interface WheelState {
+  question: string;
   options: string[];
   spun: boolean;
   winner: number | null;
   spinnerName: string;
+}
+
+/**
+ * Split "/wheel Question? a, b" on the FIRST "?" only; without one the whole
+ * input is the option list. Returns null with fewer than two options.
+ */
+export function parseWheelArgs(
+  args: string
+): { question: string; options: string[] } | null {
+  const qIndex = args.indexOf("?");
+  const question = qIndex >= 0 ? args.slice(0, qIndex + 1).trim() : "";
+  const optionText = qIndex >= 0 ? args.slice(qIndex + 1) : args;
+  const options = optionText
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (options.length < 2) return null;
+  return { question, options };
 }
 
 // Deterministic hash function for seed string
@@ -24,8 +43,10 @@ export function hashSeed(seed: string): number {
 }
 
 export const initialState = (cardData: unknown) => {
-    const data = (cardData ?? {}) as { options?: unknown };
+    const data = (cardData ?? {}) as { options?: unknown; question?: unknown };
     return {
+      question:
+        typeof data.question === "string" ? data.question.slice(0, 200) : "",
       options: Array.isArray(data.options)
         ? data.options.filter((o): o is string => typeof o === "string")
         : [],
@@ -37,10 +58,12 @@ export const initialState = (cardData: unknown) => {
 
 export const reduce = function (state: unknown, update: { data: unknown }, ctx: UpdateCtx) {
     const wheelState = state as WheelState;
-    const data = update.data as Record<string, unknown>;
+    // Peer-supplied: data can be anything, null included.
+    const data = update.data;
+    if (typeof data !== "object" || data === null) return state;
 
     // Only handle spin actions
-    if (data.action !== "spin") return state;
+    if ((data as Record<string, unknown>).action !== "spin") return state;
 
     // First spin wins, later spins are no-ops
     if (wheelState.spun) return state;

@@ -1,11 +1,13 @@
 <script lang="ts">
   import { createInfiniteQuery } from "@tanstack/svelte-query";
-  import { X, Upload, Search, Link } from "@lucide/svelte";
+  import { X, Upload, Search, Link, Crop } from "@lucide/svelte";
   import { Dialog as DialogPrimitive } from "bits-ui";
   import Button from "$lib/components/ui/button/button.svelte";
   import Input from "$lib/components/ui/input/input.svelte";
   import { Drawer, DrawerContent } from "$lib/components/ui/drawer";
   import { saveAvatar, saveBanner, profileStore } from "$lib/profile.svelte";
+  import ImageCropper from "$lib/components/ImageCropper.svelte";
+  import { cropImageToDataUrl, type CropView, type CropTarget } from "$lib/crop";
   import {
     searchGifs,
     getTrendingGifs,
@@ -29,6 +31,33 @@
   let error = $state<string | undefined>(undefined);
 
   const MAX_AVATAR_BYTES = $derived(isBanner ? 1_000_000 : 512 * 1024);
+
+  // Crop editor state. The output aspect and the byte budget differ per target:
+  // a square avatar shown as a circle, a wide 3:1 banner. The budget keeps the
+  // re-encoded data URL under the profile-meta limit after base64 inflation.
+  const cropTarget = $derived<CropTarget & { aspect: number; circle: boolean }>(
+    isBanner
+      ? { outWidth: 720, outHeight: 240, maxBytes: 700_000, aspect: 3, circle: false }
+      : { outWidth: 256, outHeight: 256, maxBytes: 400_000, aspect: 1, circle: true }
+  );
+  let cropping = $state(false);
+  let cropBusy = $state(false);
+
+  async function applyCrop(view: CropView) {
+    if (!preview || cropBusy) return;
+    cropBusy = true;
+    error = undefined;
+    try {
+      preview = await cropImageToDataUrl(preview, view, cropTarget);
+      cropping = false;
+    } catch {
+      error =
+        "This image can't be cropped here. Try the Upload tab with a saved copy.";
+      cropping = false;
+    } finally {
+      cropBusy = false;
+    }
+  }
 
   $effect(() => {
     if (open) {
@@ -205,6 +234,8 @@
     searchQuery = "";
     debouncedQuery = "";
     activeTab = "upload";
+    cropping = false;
+    cropBusy = false;
     error = undefined;
     onClose();
   }
@@ -250,6 +281,19 @@
     </button>
   </div>
 
+  {#if cropping && preview}
+    <div class="h-[24rem]">
+      <ImageCropper
+        src={preview}
+        aspect={cropTarget.aspect}
+        circle={cropTarget.circle}
+        busy={cropBusy}
+        onCancel={() => (cropping = false)}
+        onApply={applyCrop}
+      />
+    </div>
+  {:else}
+
   <div class="flex justify-center pt-4 pb-2 shrink-0">
     <div class="relative group">
       <div
@@ -284,6 +328,19 @@
       {/if}
     </div>
   </div>
+
+  {#if preview}
+    <div class="flex justify-center pb-2 shrink-0">
+      <button
+        type="button"
+        onclick={() => (cropping = true)}
+        class="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-mono text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+      >
+        <Crop class="size-3.5" />
+        Crop
+      </button>
+    </div>
+  {/if}
 
   <!-- Tabs -->
   <div class="flex px-4 gap-1 shrink-0 border-b border-border">
@@ -448,6 +505,7 @@
     <Button size="sm" onclick={handleSave}
             disabled={saving}>Save</Button>
   </div>
+  {/if}
 {/snippet}
 
 {#if isMobile}

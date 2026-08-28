@@ -26,6 +26,7 @@
     refreshPhonebook,
     refreshDmRooms,
   } from "$lib/rooms.svelte";
+  import { uiState } from "$lib/ui-state.svelte";
   import {
     getMessages,
     getLastMessage,
@@ -38,11 +39,13 @@
   } from "$lib/storage";
   import { MessageType } from "$lib/types/message";
   import { loadProfile } from "$lib/profile.svelte";
-import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
   import { consumeLatestSharedPayload } from "$lib/share-target";
   import { humanizeMentions } from "$lib/mentions";
   import ReloadPrompt from "./ReloadPrompt.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
+  import CommandPalette from "./palette/CommandPalette.svelte";
+  import type { PaletteHost } from "$lib/palette/host";
   import { Dialog } from "bits-ui";
   import { Notebook, Star, Trash2, Users, X } from "@lucide/svelte";
   import {
@@ -53,11 +56,13 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   } from "$lib/components/ui/drawer";
   import {
     addToPhonebook,
+    closeDmPanel,
     dmConversationCodeFor,
     openDmConversation,
     removeDmConversation,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
+  import FloatingDmPanel from "$lib/components/FloatingDmPanel.svelte";
 
   const queryClient = new QueryClient();
 
@@ -194,9 +199,14 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
 
   // Mirror everything unread onto the installed app icon and the tab title,
   // so a background tab shows "(3) Awful.chat" at a glance.
+  //
+  // Summed over the rooms that exist, not over every key in the map: summing
+  // the map wholesale meant any entry that was not a room inflated the title
+  // while the sidebar, which walks the room list, stayed right - and the two
+  // numbers disagreeing is the bug the reader actually notices.
   $effect(() => {
-    const rooms = [...roomsStore.unreadCounts.values()].reduce(
-      (sum, n) => sum + n,
+    const rooms = roomsStore.rooms.reduce(
+      (sum, room) => sum + (roomsStore.unreadCounts.get(room.roomCode) ?? 0),
       0
     );
     const total = rooms + dmUnreadTotal;
@@ -381,6 +391,40 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
     sidebarOpen = false;
   }
 
+  /**
+   * Take the user back to the call they are in. The call survives navigating
+   * away - only the stage unmounts, because it is gated on the conversation on
+   * screen being the call's - so getting back is pure navigation. Nothing is
+   * rejoined.
+   */
+  async function returnToCall(): Promise<void> {
+    const code = transportState.callRoomCode;
+    if (!code) return;
+    if (code.startsWith("dm-")) {
+      const peer = roomsStore.dmRooms.find(
+        (r) => r.roomCode === code
+      )?.participantDid;
+      if (peer) await handleSelectDm(peer);
+      return;
+    }
+    await handleSelectRoom(code);
+  }
+
+  $effect(() => {
+    if (!uiState.returnToCallRequested) return;
+    uiState.returnToCallRequested = false;
+    void returnToCall();
+  });
+
+  /**
+   * Promote the floating panel's conversation to the full DMs view. The panel
+   * closes: leaving it open over the same conversation would show it twice.
+   */
+  async function expandDmPanel(peerId: string): Promise<void> {
+    closeDmPanel();
+    await handleSelectDm(peerId);
+  }
+
   function dmTitleFor(peerId: string): string {
     const did = peerIdToDid(peerId);
     return (
@@ -487,6 +531,34 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   function openCreateJoin() {
     createJoinOpen = true;
   }
+
+  let paletteOpen = $state(false);
+
+  // Anything outside this tree asks for the palette through uiState, the same
+  // way it asks for the settings dialog.
+  $effect(() => {
+    if (!uiState.paletteOpenRequested) return;
+    uiState.paletteOpenRequested = false;
+    if (identityStore.isUnlocked) paletteOpen = true;
+  });
+
+  // The palette cannot navigate on its own: this component owns activeRoomCode,
+  // the history push, and the room-name broadcast. Reproducing that inside the
+  // palette would fork the join path, so it delegates back here.
+  //
+  // activeRoomCode is a getter, not a snapshot, or the palette would read a
+  // stale room for the whole time it is mounted.
+  const paletteHost: PaletteHost = {
+    get activeRoomCode() {
+      return activeRoomCode;
+    },
+    openRoom: (code) => void handleSelectRoom(code),
+    joinRoomByCode: (code) => void handleJoin(code, ""),
+    openDm: (peerId) => void handleSelectDm(peerId),
+    leaveRoom: handleLeave,
+    removeRoom: (code) => void handleRemoveRoom(code),
+    openCreateJoin,
+  };
 
   // Manifest shortcut: long-press the installed icon > "New room".
   // The param is stripped so a later reload does not reopen the dialog.
@@ -756,7 +828,31 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   });
 </script>
 
-<svelte:window onpopstate={handlePopState} />
+<svelte:window
+  onpopstate={handlePopState}
+  onkeydown={(e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    const key = e.key.toLowerCase();
+
+    // Cmd/Ctrl+K opens the command palette. preventDefault is required even
+    // though nothing here claims the key: Firefox maps it to the search bar.
+    // Stays enabled on mobile, unlike the sidebar shortcut, because an external
+    // keyboard is the whole point of it.
+    if (key === "k") {
+      e.preventDefault();
+      if (!identityStore.isUnlocked) return;
+      paletteOpen = !paletteOpen;
+      return;
+    }
+
+    // Cmd/Ctrl+B collapses the room sidebar. The composer is a plain
+    // textarea, so there is no native bold to steal.
+    if (key !== "b") return;
+    if (isMobile) return;
+    e.preventDefault();
+    setSidebarCollapsed(!displayPrefs.sidebarCollapsed);
+  }}
+/>
 
 <QueryClientProvider client={queryClient}>
   {#if identityStore.loading && !identityStore.keypair}
@@ -808,6 +904,9 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
         onRemoveRoom={handleRemoveRoom}
         onOpenCreateJoin={openCreateJoin}
         onOpenPhonebook={() => (phonebookOpen = true)}
+        collapsed={!isMobile && displayPrefs.sidebarCollapsed}
+        onToggleCollapsed={() =>
+          setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
       />
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}
@@ -1276,4 +1375,20 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   <ReloadPrompt />
 
   <TransportStatus />
+
+  <!--
+    Here, not inside ChatView or the call view: both unmount when the user
+    leaves the conversation or the call ends, and a floating panel that dies
+    with the surface it was opened from is not floating.
+  -->
+  <FloatingDmPanel onExpand={expandDmPanel} />
+
+  <!-- Also outside the unlocked branch, for the same reason: mounting it once
+       here means the palette survives lock/unlock and room switches, and it is
+       reachable whether or not a room is open. It is gated on isUnlocked because
+       every command needs an identity, and because openSettings' consumer only
+       exists in the unlocked tree. -->
+  {#if identityStore.isUnlocked}
+    <CommandPalette bind:open={paletteOpen} host={paletteHost} />
+  {/if}
 </QueryClientProvider>

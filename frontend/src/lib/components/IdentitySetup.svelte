@@ -252,10 +252,10 @@
         <button
           type="button"
           onclick={openQuirks}
-          class="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground font-mono transition-colors"
+          class="mt-1 inline-flex items-center gap-1.5 text-xs leading-none text-muted-foreground hover:text-foreground font-mono transition-colors"
         >
-          <Info class="w-3.5 h-3.5" />
-          How this app works
+          <Info class="size-3.5 shrink-0" />
+          <span class="leading-none">How this app works</span>
         </button>
       </CardFooter>
     </Card>

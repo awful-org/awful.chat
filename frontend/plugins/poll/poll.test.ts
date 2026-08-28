@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { initialState, reduce, type PollState } from "./logic";
+import { initialState, parsePollArgs, reduce, type PollState } from "./logic";
 
 const ctx = (did: string, name = "N", id = "u1", lamport = 1) => ({
   senderDid: did,
@@ -51,5 +51,36 @@ describe("poll logic (the real module, not a copy)", () => {
     const state = initialState({ question: "q", options: ["a", "b"] }) as PollState;
     const next = reduce(state, { data: { action: "reset" } }, ctx("d"));
     expect(next).toBe(state);
+  });
+
+  it("ignores non-object update data instead of throwing", () => {
+    const state = initialState({ question: "q", options: ["a", "b"] }) as PollState;
+    for (const bad of [null, undefined, "vote", 7, true]) {
+      expect(reduce(state, { data: bad }, ctx("d"))).toBe(state);
+    }
+  });
+
+  it("caps the question at 200 chars like wheel does", () => {
+    const state = initialState({
+      question: "x".repeat(500),
+      options: ["a", "b"],
+    }) as PollState;
+    expect(state.question).toHaveLength(200);
+  });
+});
+
+describe("poll command parsing", () => {
+  it("splits on the FIRST question mark only", () => {
+    // split("?") regression: "A?" in an option used to swallow B and C.
+    expect(parsePollArgs("What now? A?, B, C")).toEqual({
+      question: "What now",
+      options: ["A?", "B", "C"],
+    });
+  });
+
+  it("rejects input without a question or with fewer than 2 options", () => {
+    expect(parsePollArgs("no question here")).toBeNull();
+    expect(parsePollArgs("Question? only-one")).toBeNull();
+    expect(parsePollArgs("Question? , ,")).toBeNull();
   });
 });

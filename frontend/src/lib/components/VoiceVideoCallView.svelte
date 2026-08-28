@@ -4,7 +4,7 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
-  import { openDmConversation } from "$lib/transport/dm.svelte";
+  import { openDmPanel } from "$lib/transport/dm.svelte";
   import {
     getVoicePeerVolume,
     setVoicePeerVolume,
@@ -58,9 +58,9 @@
     Puzzle,
     X as XIcon,
   } from "@lucide/svelte";
-  import { Check, MessageSquare, MonitorIcon, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
+  import { Check, Columns2, MessageSquare, MonitorIcon, Rows2, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
-import { displayPrefs } from "$lib/display-prefs.svelte";
+import { displayPrefs, setCallChatBeside } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
 import { callTilesState, refreshCallTiles } from "$lib/plugins/call-tiles.svelte";
 import { getManifest } from "$lib/plugins/registry";
@@ -68,6 +68,12 @@ import { onCardStateChange } from "$lib/plugins/state.svelte";
 import PluginCallTileView from "./PluginCallTileView.svelte";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import { Slider } from "./ui/slider";
+
+  interface Props {
+    /** The call stage is a column beside the chat, not a band above it. */
+    beside?: boolean;
+  }
+  let { beside = false }: Props = $props();
 
   $effect(() => {
     loadProfile();
@@ -208,7 +214,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   function openViewMenu(e: MouseEvent): void {
     e.preventDefault();
     peerMenu = null;
-    viewMenu = clampMenu(e, 224, 248);
+    viewMenu = clampMenu(e, 224, 320);
   }
 
   function closeMenus(): void {
@@ -221,10 +227,16 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     if (peerMenu) setVoicePeerVolume(peerMenu.peerId, sliderToGain(value));
   }
 
+  /**
+   * The floating panel, not the chat pane. Pointing the pane at the DM unmounts
+   * this call stage - the stage is gated on the pane showing the call's room -
+   * and the pane filters messages by the room the VIEW is on, so the DM
+   * rendered as an empty conversation you could send into but never see.
+   */
   async function dmFromPeerMenu(): Promise<void> {
     const peerId = peerMenu?.peerId;
     closeMenus();
-    if (peerId) await openDmConversation(peerId);
+    if (peerId) await openDmPanel(peerId);
   }
 
   let speakingPeers = $state(new Set<string>());
@@ -731,12 +743,6 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   let cardStateTickForPlugins = $state(0);
   $effect(() => onCardStateChange(() => (cardStateTickForPlugins += 1)));
 
-  const hasActiveVideo = $derived(
-    localVideoTrack !== null ||
-      localScreenTrack !== null ||
-      [...participants.values()].some((p) => p.videoTrack || p.screenTrack)
-  );
-
   const isWatchingTransmission = $derived(watchingTransmissionPeerId !== null);
 
   const remoteAudio = $derived.by(() => {
@@ -792,12 +798,14 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     return kept.length ? kept : tiles;
   });
 
+  // Container queries, not viewport ones: beside the chat the stage is a
+  // narrow column inside a wide window.
   const gridCols = $derived.by(() => {
     const n = visibleTiles.length;
     if (n <= 1) return "grid-cols-1";
-    if (n <= 3) return "grid-cols-1 sm:grid-cols-2";
-    if (n <= 7) return "grid-cols-2 sm:grid-cols-3";
-    return "grid-cols-2 sm:grid-cols-4";
+    if (n <= 3) return "grid-cols-1 @md:grid-cols-2";
+    if (n <= 7) return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-3";
+    return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-4";
   });
 
   const rowClass = $derived.by(() => {
@@ -811,6 +819,14 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     return rows <= 1 ? "h-[35vh]" : "h-[45vh]";
   });
 
+  // rowClass is viewport-height based and only means anything stacked. Beside
+  // the chat the panel just fills its row.
+  const panelSizeClass = $derived.by(() => {
+    if (isFullscreen) return "h-screen";
+    if (beside) return "min-h-0 flex-1";
+    return `shrink-0 border-b border-border ${rowClass}`;
+  });
+
   // ── Focus ─────────────────────────────────────────────────────────────────
 
   let focusedTileId = $state<string | null>(null);
@@ -819,12 +835,14 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       ? (visibleTiles.find((t) => t.id === focusedTileId) ?? null)
       : null
   );
-  // A focused screen/transmission is being WATCHED, not glanced at: the
-  // panel grows (rowClass) and the controls go immersive like fullscreen
-  // (dockedControls).
+  // A focused screen/transmission/plugin tile is being WATCHED, not glanced
+  // at: the panel grows (rowClass) and the controls go immersive like
+  // fullscreen (dockedControls).
   const watchingFocused = $derived(
     !!focusedTile &&
-      (focusedTile.kind === "screen" || focusedTile.kind === "transmission")
+      (focusedTile.kind === "screen" ||
+        focusedTile.kind === "transmission" ||
+        focusedTile.kind === "plugin")
   );
   const showThumbnails = $derived(
     focusedTile ? focusedTile.kind !== "screen" : false
@@ -1278,7 +1296,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
               ? `${tile.label} (You)`
               : tile.label}
         </span>
-        {#if !tile.isLocal && isRelayed(tile.peerId)}
+        {#if !tile.isLocal && isRelayed(tile.peerId) && displayPrefs.showConnectionInfo}
           <!-- pointer-events-auto: the badge itself ignores the pointer so it
                does not swallow clicks on the tile, but the tooltip needs the
                hover. -->
@@ -1305,10 +1323,13 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   <!-- render nothing -->
 {:else if othersInCallNotUs}
   <div
-    class="flex flex-col border-b border-border shrink-0 h-[12vh] sm:h-[16vh] pb-14 relative bg-background"
+    class="flex flex-col relative pb-14 bg-background
+      {beside
+      ? 'min-h-0 flex-1'
+      : 'h-[12vh] sm:h-[16vh] shrink-0 border-b border-border'}"
   >
     <div class="flex-1 flex items-center justify-center">
-      <div class="flex items-center gap-1">
+      <div class="flex flex-wrap items-center justify-center gap-1">
         {#each [...callPeerIds] as peerId (peerId)}
           {@const label = getPeerLabel(peerId)}
           {@const avatar = getPeerAvatar(peerId)}
@@ -1333,7 +1354,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             {:else}
               {label.charAt(0).toUpperCase()}
             {/if}
-            {#if relayed}
+            {#if relayed && displayPrefs.showConnectionInfo}
               <Tip text={RELAY_TIP} side="top">
                 {#snippet children(props)}
                   <button
@@ -1384,9 +1405,8 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     role="group"
     aria-label="Call"
     oncontextmenu={openViewMenu}
-    class="flex flex-col border-b border-border relative shrink-0 bg-background
-      {isFullscreen ? 'h-screen' : rowClass}
-      {!isFullscreen && !hasActiveVideo ? 'pb-14' : ''}"
+    class="flex flex-col relative bg-background {panelSizeClass}
+      {dockedControls ? 'pb-14' : ''}"
   >
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
@@ -1396,7 +1416,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     {/each}
 
     <!-- Tile area -->
-    <div class="relative flex-1 min-h-0 overflow-hidden p-1.5">
+    <div class="@container relative flex-1 min-h-0 overflow-hidden p-1.5">
       {#if focusedTile}
         <div class="flex h-full gap-1.5">
           <div class="flex-1 min-w-0">
@@ -1413,7 +1433,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           </div>
           {#if thumbnailTiles.length > 0}
             <div
-              class="flex flex-col gap-1 overflow-y-auto w-20 sm:w-28 shrink-0"
+              class="flex flex-col gap-1 overflow-y-auto w-20 @xl:w-28 shrink-0"
             >
               {#each thumbnailTiles as tile (tile.id)}
                 {@render callTile(
@@ -1634,7 +1654,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           </div>
         </div>
       {:else}
-        <div class="flex items-center gap-4">
+        <div class="flex max-w-full flex-wrap items-center justify-center gap-4">
           <div
             class={cn(
               "flex gap-2",
@@ -1902,6 +1922,27 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             <Check class="size-3.5 shrink-0 text-primary" />
           {/if}
         </button>
+        {#if !isSmallScreen}
+          <div class="my-1 border-t border-border"></div>
+          <p class="truncate px-3 pb-1 pt-0.5 text-xs text-muted-foreground">
+            Layout
+          </p>
+          {#each [{ beside: false, label: "Chat below", icon: Rows2 }, { beside: true, label: "Chat beside", icon: Columns2 }] as opt (opt.label)}
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={displayPrefs.callChatBeside === opt.beside}
+              class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
+              onclick={() => setCallChatBeside(opt.beside)}
+            >
+              <opt.icon class="size-4 shrink-0" />
+              <span class="flex-1 truncate text-left">{opt.label}</span>
+              {#if displayPrefs.callChatBeside === opt.beside}
+                <Check class="size-3.5 shrink-0 text-primary" />
+              {/if}
+            </button>
+          {/each}
+        {/if}
       </div>
     {/if}
 

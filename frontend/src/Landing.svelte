@@ -6,10 +6,48 @@
     { href: "#features", label: "Features" },
     { href: "#stack", label: "Stack" },
     { href: "#deploy", label: "Deploy" },
+    { href: "#faq", label: "FAQ" },
     {
       href: "https://github.com/awful-org/awful.chat",
       label: "GitHub",
       external: true,
+    },
+  ];
+
+  // Mirrored in index.html's FAQPage JSON-LD - keep the two in sync, search
+  // engines cross-check the structured data against the visible text.
+  const faqs = [
+    {
+      q: "Do I need a phone number or an email?",
+      a: "No. Your identity is a 12-word seed phrase generated on your device - it derives your keypair, and there is no account to create and nothing to hand over.",
+    },
+    {
+      q: "Can the server read my messages?",
+      a: "No. Chat messages, files and voice calls are end-to-end encrypted and travel peer-to-peer - the relay introduces peers, forwards encrypted traffic, and holds a 48-hour encrypted mailbox for offline DMs it cannot open (on by default, can be turned off in settings). The one exception is group video and screen share, which route through the SFU server, as the table above shows.",
+    },
+    {
+      q: "Can I host it myself?",
+      a: "Yes. The whole stack is open source and ships as one Docker Compose file: the web app, a Go relay, a mediasoup SFU and a TURN server. Clone the repo, set a few env vars, run one docker compose command, and you have your own private chat instance that never talks to ours.",
+    },
+    {
+      q: "How do voice and video calls work?",
+      a: "Voice is always peer-to-peer over WebRTC. Group video and screen share go through a mediasoup SFU so many people can watch without melting anyone's upload bandwidth.",
+    },
+    {
+      q: "Does it have plugins?",
+      a: "Yes. Instances can ship plugins - watch-together listening parties, polls, a shared-Steam-library roulette - and a curated collection is maintained at awful-org/awfully-awesome. Operators pull them in with one deploy variable, and anyone can write their own.",
+      link: {
+        href: "https://github.com/awful-org/awfully-awesome",
+        label: "Browse the curated plugins",
+      },
+    },
+    {
+      q: "What if I lose my seed phrase?",
+      a: "It is gone, and so is the identity - there is no reset email because there is no account. Back up the 12 words; syncing a second device via QR code also works as a backup.",
+    },
+    {
+      q: "Is it really free and open source?",
+      a: "Yes. Apache-2.0, source on GitHub, no premium tier, no data harvesting to pay for it.",
     },
   ];
 
@@ -21,13 +59,13 @@
     { text: "OPEN SOURCE", highlight: false },
     { text: "WEBRTC", highlight: true },
     { text: "MEDIASOUP", highlight: false },
-    { text: "ZERO KNOWLEDGE", highlight: true },
+    { text: "PRIVATE BY DESIGN", highlight: true },
   ];
 
   const stats = [
     { value: "0", label: "EMAILS REQUIRED" },
     { value: "0", label: "PHONE NUMBERS" },
-    { value: "0", label: "DATA COLLECTED" },
+    { value: "0", label: "PERSONAL DATA" },
   ];
 
   const serverVisibility = [
@@ -90,7 +128,7 @@
     {
       tag: "100%",
       title: "Open Source",
-      description: "MIT licensed. Fork it. Audit it. Modify it.",
+      description: "Apache-2.0 licensed. Fork it. Audit it. Modify it.",
     },
     {
       tag: "DOCKER",
@@ -190,9 +228,13 @@
       </h1>
       <div class="grid-2col hero-grid">
         <p class="hero-desc">
-          End-to-end encrypted. Peer-to-peer. Self-hosted.
-          <span class="text-fg">The server is just a dumb signaling pipe.</span>
-          It cannot read your messages.
+          Encrypted peer-to-peer chat with voice, video calls and file sharing
+          - no account, no phone number.
+          <span class="text-fg"
+            >The server is a dumb pipe: it introduces peers, forwards
+            ciphertext, and can't read any of it.</span
+          >
+          And you can host it yourself.
         </p>
         <div class="hero-buttons">
           <a href="/app" class="btn btn-primary">
@@ -290,7 +332,7 @@
           <div class="terminal-line" style="margin-top: 1rem;">
             <span class="terminal-output">Public key:</span>
           </div>
-          <div class="pubkey">did:key:6MkjSomRYwejbarg...f3kq</div>
+          <div class="pubkey">did:key:z6MkjSomRYwejbarg...f3kq</div>
           <div class="terminal-line" style="margin-top: 1rem;">
             <span class="text-accent">Ready.</span>
             <span class="terminal-output">Your identity exists only here.</span>
@@ -311,9 +353,9 @@
             <span class="text-accent">peer.</span>
           </h2>
           <p class="section-desc">
-            Messages travel directly between devices via WebRTC. The server only
-            helps you find each other - it never sees your conversations. Built
-            on mediasoup for video at scale
+            Messages, files and voice calls travel directly between devices via
+            WebRTC. The server only helps you find each other - it never sees
+            your conversations. Built on mediasoup for video at scale
           </p>
           <p class="section-desc">
             *The server has access to the videos and streams, this is needed to
@@ -411,8 +453,9 @@
             <span class="text-accent">everything.</span>
           </h2>
           <p class="section-desc">
-            One command. Full control. Run your own instance on any server. We
-            don't even need to know you exist. That's the point.
+            One compose file. Full control. Run your own private chat instance
+            on any server. We don't even need to know you exist. That's the
+            point.
           </p>
           <div class="terminal deploy-terminal">
             <div class="terminal-header">
@@ -429,11 +472,17 @@
               </div>
               <div class="terminal-line">
                 <span class="terminal-prompt">$</span>
-                <span class="terminal-cmd">docker compose up -d</span>
+                <span class="terminal-cmd">cp .env.example .env</span>
+              </div>
+              <div class="terminal-line">
+                <span class="terminal-prompt">$</span>
+                <span class="terminal-cmd"
+                  >docker compose -f docker-compose.dokploy.yml up -d</span
+                >
               </div>
               <div class="terminal-line" style="margin-top: 1rem;">
                 <span class="text-accent">Done.</span>
-                <span class="terminal-output">Running at localhost:5173</span>
+                <span class="terminal-output">Running at your domain.</span>
               </div>
             </div>
           </div>
@@ -447,6 +496,34 @@
             </div>
           {/each}
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ Section -->
+  <section id="faq" class="section-center">
+    <div class="container">
+      <div class="section-num">06 - FAQ</div>
+      <h2 class="display-large section-title">
+        Common<br /><span class="text-accent">questions.</span>
+      </h2>
+      <div class="faq-list">
+        {#each faqs as faq}
+          <div class="faq-item">
+            <h3 class="faq-q">{faq.q}</h3>
+            <p class="faq-a text-muted">
+              {faq.a}
+              {#if "link" in faq && faq.link}
+                <a
+                  href={faq.link.href}
+                  target="_blank"
+                  rel="noopener"
+                  class="faq-link">{faq.link.label} &nearr;</a
+                >
+              {/if}
+            </p>
+          </div>
+        {/each}
       </div>
     </div>
   </section>
@@ -493,11 +570,24 @@
         </div>
       </div>
       <div class="footer-links">
-        <a href="https://github.com" target="_blank" rel="noopener">GitHub</a>
-        <span>Documentation</span>
+        <a
+          href="https://github.com/awful-org/awful.chat"
+          target="_blank"
+          rel="noopener">GitHub</a
+        >
+        <a
+          href="https://github.com/awful-org/awful.chat/tree/main/frontend/plugins#readme"
+          target="_blank"
+          rel="noopener">Write a plugin</a
+        >
+        <a
+          href="https://github.com/awful-org/awfully-awesome"
+          target="_blank"
+          rel="noopener">Curated plugins</a
+        >
       </div>
       <div class="footer-license font-mono text-muted">
-        100% OPEN SOURCE · MIT LICENSE
+        100% OPEN SOURCE · APACHE-2.0 LICENSE
       </div>
     </div>
   </footer>
@@ -1065,6 +1155,35 @@
   .btn-large {
     font-size: 2rem;
     padding: 1.25rem 3rem;
+  }
+
+  /* FAQ */
+  .faq-list {
+    max-width: 46rem;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2.5rem;
+    text-align: left;
+  }
+
+  .faq-q {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+
+  .faq-a {
+    line-height: 1.65;
+  }
+
+  .faq-link {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  .faq-link:hover {
+    text-decoration: underline;
   }
 
   /* CTA */

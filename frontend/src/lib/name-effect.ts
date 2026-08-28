@@ -46,7 +46,11 @@ export function nameEffectStyle(
       // Animated gradient sweep
       return {
         class: `${baseClass} name-effect-shimmer`,
-        style: `background: linear-gradient(90deg, ${color}, rgba(255,255,255,0.3), ${color}); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; animation: shimmer 3.5s infinite;`,
+        // steps(): background-position and text-shadow animations PAINT on
+        // every frame and cannot be GPU-composited - a handful of animated
+        // names idled the whole tab at several % CPU. Stepped timing keeps
+        // the look at ~15fps for a fraction of the paint work.
+        style: `background: linear-gradient(90deg, ${color}, rgba(255,255,255,0.3), ${color}); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; animation: shimmer 3.5s steps(50) infinite;`,
       };
     }
 
@@ -54,7 +58,7 @@ export function nameEffectStyle(
       // Text-shadow pulse in the nickname color
       return {
         class: `${baseClass} name-effect-glow`,
-        style: `color: ${color}; text-shadow: 0 0 8px ${color}; animation: glow 2s ease-in-out infinite;`,
+        style: `color: ${color}; text-shadow: 0 0 8px ${color}; animation: glow 2s steps(24) infinite;`,
       };
     }
 

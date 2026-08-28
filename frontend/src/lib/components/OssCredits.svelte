@@ -174,6 +174,11 @@
           url: "https://github.com/DataDog/dtln-rs-demo",
         },
         {
+          name: "dtln-rs-web",
+          what: "our fork, reworked from a record-then-process demo into the real-time streaming worklet this app ships",
+          url: "https://github.com/FlavioZanoni/dtln-rs-web",
+        },
+        {
           name: "DTLN",
           what: "the dual-signal LSTM approach the above implements",
           url: "https://github.com/breizhn/DTLN",

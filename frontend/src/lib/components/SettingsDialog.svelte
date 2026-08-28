@@ -136,32 +136,53 @@
 
 {#snippet OssTab()}
   <div class="flex flex-col gap-3">
-    <div class="flex items-center gap-2">
-      <a
-        href="https://github.com/awful-org/awful.chat"
-        target="_blank"
-        rel="noopener noreferrer"
-        class="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 font-mono text-xs text-muted-foreground transition-colors hover:border-primary/60 hover:text-foreground"
-      >
-        <Github class="size-4" />
-        awful-org/awful.chat
-      </a>
+    <!-- One card, wrap-friendly: the old side-by-side button + version row
+         overflowed narrow settings panels. -->
+    <div
+      class="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-lg border border-border/50 bg-muted/30 p-3"
+    >
+      <div class="flex min-w-0 items-center gap-2.5">
+        <Github class="size-5 shrink-0 text-muted-foreground" />
+        <div class="min-w-0">
+          <p class="truncate font-mono text-xs font-semibold text-foreground">
+            Awful.chat
+            <span class="font-normal text-muted-foreground">
+              - <a
+                href="https://github.com/awful-org/awful.chat/blob/main/LICENSE"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="hover:text-primary hover:underline">Apache-2.0</a
+              ></span
+            >
+          </p>
+          <a
+            href="https://github.com/awful-org/awful.chat"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="block truncate font-mono text-[11px] text-muted-foreground hover:text-primary hover:underline"
+          >
+            github.com/awful-org/awful.chat
+          </a>
+        </div>
+      </div>
       <!-- Pre-1.0 there are no tags to link, so 0.x points at the releases
-           list; once versions ship the link lands on the exact release. -->
+           list; once versions ship the link lands on the exact release. The
+           commit hash is what identifies a build until then. -->
       <a
         href={__APP_VERSION__ === "0.0.0"
           ? "https://github.com/awful-org/awful.chat/releases"
           : `https://github.com/awful-org/awful.chat/releases/tag/v${__APP_VERSION__}`}
         target="_blank"
         rel="noopener noreferrer"
-        class="font-mono text-xs text-muted-foreground hover:text-primary hover:underline"
+        class="shrink-0 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-primary/60 hover:text-foreground"
       >
-        v{__APP_VERSION__}
+        v{__APP_VERSION__}{__APP_COMMIT__ ? `-${__APP_COMMIT__}` : ""}
       </a>
     </div>
     <p class="text-xs font-mono text-muted-foreground leading-relaxed">
-      Awful.chat is built entirely on open source. These are the projects doing
-      the heavy lifting, and they deserve the credit.
+      Awful.chat is entirely open source, and it is built on open source.
+      These are the projects doing the heavy lifting, and they deserve the
+      credit.
     </p>
     <OssCredits />
   </div>

@@ -7,7 +7,7 @@
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true",
     "dev": "vite",
-    "build": "vite build",
+    "build": "node scripts/generate-notices.mjs && vite build",
     "generate-pwa-assets": "pwa-assets-generator --preset minimal-2023 public/logo.svg",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
@@ -61,6 +61,8 @@
     "@scure/bip39": "^2.0.1",
     "@tanstack/svelte-query": "^6.1.12",
     "emoji-picker-element": "^1.29.1",
+    "gifenc": "^1.0.3",
+    "gifuct-js": "^2.1.2",
     "html5-qrcode": "^2.3.8",
     "idb": "^8.0.3",
     "libp2p": "~3.1.7",

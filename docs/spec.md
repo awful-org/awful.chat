@@ -20,6 +20,9 @@ with reactionTo/reactionEmoji/reactionOp), resolved at render time.
 // v4 added phonebook. See storage.ts for the authoritative upgrade path.
 export async function getDB(): Promise<AppDB> {
   // singleton - one connection for app lifetime
+  // NOTE: rows in messages/attachments/profiles/rooms are SEALED at rest -
+  // see "At-Rest Encryption" below. The keyPath and indexed fields shown
+  // here stay in clear; everything else lives inside an AES-GCM blob.
   return openDB("awful-chat", 4, {
     upgrade(db) {
       // messages
@@ -61,6 +64,32 @@ export async function getDB(): Promise<AppDB> {
 
 ---
 
+## At-Rest Encryption
+
+```txt
+Why: IndexedDB deletion is not erasure (LevelDB keeps old values until a
+compaction the page cannot trigger), so the disk only ever holds AES-GCM
+ciphertext - crypto-shredding by never yielding the key.
+
+Key:    HKDF from the identity's ed25519 private key with a purpose label.
+        Exists only while unlocked, never stored; every device of the same
+        identity derives the same key (device sync round-trips).
+Layout: per row, keyPath + indexed/query fields stay in clear ("clear
+        fields"); everything else is one AES-GCM blob (_enc, fresh IV per
+        write); ArrayBuffer fields (file bytes, avatars) sealed as raw
+        buffers beside it (_encBytes).
+Clear fields: messages(id, roomCode, lamport, senderId, type, status),
+        attachments add messageId/infoHash, profiles/rooms keep byte
+        fields sealed (pfpData/bannerData).
+Query doctrine: bulk index getAll of raw sealed rows, filter on clear
+        fields in memory, decrypt only survivors. Cursors only for stores
+        with multi-MB byte rows (attachments); openRow supports skipBytes
+        to leave large buffers sealed when the caller only needs metadata.
+        (see frontend/src/lib/storage-crypto.ts)
+```
+
+---
+
 ## Types
 
 ### Message
@@ -72,8 +101,8 @@ interface Message {
   senderId: string
   senderName: string
   senderDid?: string
-  sig?: string           // ed25519 over the canonical form (v1 or v2, see below)
-  sigV?: number          // 2 = canonical covers reactions/replyTo/meta
+  sig?: string           // ed25519 over the canonical form (see below)
+  sigV?: number          // 3 = current (adds type + roomCode); 2 still verifies
   timestamp: number      // wall clock, display only
   lamport: number        // ordering source of truth
   type: ChatMessageType  // only chat types stored in IDB
@@ -86,18 +115,27 @@ interface Message {
 
 enum MessageType {
   // chat - persisted to IDB, sent over wire
-  Text         = "text",
-  Reply        = "reply",
-  Reaction     = "reaction",
-  File         = "file",
+  Text            = "text",
+  Reply           = "reply",
+  Reaction        = "reaction",
+  File            = "file",
+  PluginCard      = "plugin_card",      // plugin surface, see docs/plugin-surface.md
+  PluginUpdate    = "plugin_update",
   // presence - wire only, never persisted
-  Profile      = "profile",
-  CallPresence = "call_presence",
-  RoomName     = "room_name",
+  Profile         = "profile",
+  CallPresence    = "call_presence",
+  CallState       = "call_state",
+  WatchPresence   = "watch_presence",
+  VoiceRedial     = "voice_redial",
+  RoomName        = "room_name",
+  PluginEphemeral = "plugin_ephemeral",
+  JoinRoom        = "join_room",
+  LeaveRoom       = "leave_room",
+  RoomUsersSync   = "room_users_sync",
   // sync - wire only, never persisted
-  SyncDigest   = "sync_digest",
-  SyncBatch    = "sync_batch",
-  SyncComplete = "sync_complete",
+  SyncDigest      = "sync_digest",
+  SyncBatch       = "sync_batch",
+  SyncComplete    = "sync_complete",
 }
 
 // NOTE: DM delivery/read receipts are implemented, but NOT via these wire
@@ -110,7 +148,8 @@ enum MessageType {
 // Statuses never regress; queued DMs retry when the peer's profile arrives.
 
 // only chat types are persisted to IDB
-type ChatMessageType = MessageType.Text | MessageType.Reply | MessageType.Reaction | MessageType.File
+type ChatMessageType = MessageType.Text | MessageType.Reply | MessageType.Reaction
+  | MessageType.File | MessageType.PluginCard | MessageType.PluginUpdate
 
 type MessageStatus = "sending" | "sent" | "delivered" | "read"
 
@@ -393,9 +432,16 @@ result:
   → each SyncComplete triggers gossip to other peers
     (spreads data through partial meshes without direct connections)
 
-signature policy on receive:
-  → signed messages must verify (sigV 2 covers reactions/replyTo/meta)
-  → unsigned messages accepted (pre-signing history, receiver-stored DMs)
+signature policy on receive (MANDATORY since 2026-08):
+  → sigV 3 verifies against the canonical rebuilt with the AUTHENTICATED
+    topic room (the wire carries no roomCode); sigV 2 still verifies
+  → sigV 1 and unsigned messages are REJECTED, with one exception:
+    unsigned rows inside a DM sync batch from the authenticated DM
+    counterparty (or the own identity's paired device) are accepted -
+    receiver-stored DM history predates signing
+  → deterministic rejects (no sig, sigV outside {2,3}) CLAIM watermarks
+    so the sender stops re-pushing the same dead backlog every digest;
+    only signed-but-failing rows keep the floor open for retry
 ```
 
 ---
@@ -423,15 +469,20 @@ lock     → zero out private key bytes → null session
 ### Message Signature
 
 ```typescript
-// v1 (legacy, still verified):
-const canonicalV1 = `${id}:${senderId}:${lamport}:${content}`
-// v2 (current, msg.sigV === 2) - also covers reaction fields, replyTo.id,
-// and file meta (infoHash/size/mime/name) so they can't be swapped in transit:
+// v1 (legacy): `${id}:${senderId}:${lamport}:${content}` - kept only so old
+// local rows can be re-verified; REJECTED on the wire.
+// v2 (still verified) - covers reaction fields, replyTo.id, and file meta
+// (infoHash/size/mime/name) so they can't be swapped in transit:
 const canonicalV2 = JSON.stringify([id, senderId, lamport, content,
   reactionTo, reactionEmoji, reactionOp, replyTo?.id, metaFileStrings])
+// v3 (current, msg.sigV === 3) - additionally binds type and roomCode, so a
+// message can't be replayed into another room or retyped:
+const canonicalV3 = JSON.stringify([3, type, roomCode, id, senderId, lamport,
+  content, reactionTo, reactionEmoji, reactionOp, replyTo?.id, metaFileStrings])
 // sign with private key in memory
 // verify with pubkey decoded from senderDid (did:key); senderDid must
-// equal senderId when senderId is a did:key
+// equal senderId when senderId is a did:key; the verifier reconstructs
+// roomCode from the authenticated gossipsub topic, never from the wire
 ```
 
 ### Peer Identity Binding
@@ -483,7 +534,42 @@ the two peers (the relay only forwards ciphertext, even on circuit relay).
 
 App-layer primitives exist for future double encryption (messaging.ts):
   ed25519 → curve25519 ECDH, shared secret = SHA-256("awful-dm-v1" || raw)
-  → AES-256-GCM. Implemented and tested, not yet wired into the DM path.
+  → AES-256-GCM. Implemented and tested, not yet wired into the DM
+  STREAM path. The offline mailbox (below) has its own sealed-box crypto.
+```
+
+---
+
+## Offline DM Mailbox
+
+```txt
+Problem: DMs need both peers online at once; the mailbox lets the relay
+hold an encrypted envelope for an offline recipient. Default ON, with a
+quirks disclosure.
+
+Crypto (frontend/src/lib/mailbox-crypto.ts, "awful-mailbox-v1"):
+  sealed box - ephemeral-static X25519 ECDH against the recipient's
+  identity key (ed25519 converted to Montgomery form), no prior handshake.
+  The sealed PLAINTEXT carries the sender's did + an ed25519 signature
+  binding the envelope to the recipient (a blob has no transport to
+  authenticate it). Plaintext pads to fixed buckets (1 KiB / 4 KiB /
+  15 KiB) so blob sizes leak almost nothing; larger content stays p2p-only.
+
+Relay side (relay/mailbox.go):
+  blobs keyed by a hash of the recipient DID; 16 KiB blob cap; unclaimed
+  blobs expire after 48 h; deposits rate-limited and a global byte quota
+  caps total mailbox disk. Collection authenticates with an ed25519
+  signature over "awful-mailbox:<unix-ts>" by the recipient DID (accepted
+  with or without the multibase z prefix).
+
+Client collect: on unlock/startup, fetch + unseal + ack. Undecryptable
+  blobs are poison-acked (deleted) so they cannot wedge the box; transient
+  failures keep the blob for the next poll. Message-id dedup against
+  storage stops replays.
+
+What the relay learns: THAT a DID has mail and roughly when - never
+  content, never the sender (ephemeral key, no sender field outside the
+  sealed plaintext).
 ```
 
 ---
@@ -572,9 +658,12 @@ DM:    "dm-" + hex(sha256(sort([didA, didB]).join("|")))[0..40]
 ## Server Privacy
 
 ```txt
-relay knows:   libp2p peerId + which roomCodes it registered (rendezvous)
-never knows:   did:key, message content, file content - all traffic it
-               forwards is noise-encrypted end-to-end between peers
+relay knows:   libp2p peerId + which roomCodes it registered (rendezvous);
+               with the offline mailbox, THAT a DID has pending mail
+               (sealed blobs, padded sizes, no sender attribution)
+never knows:   message content, file content, who sent a mailbox blob -
+               all traffic it forwards is noise-encrypted end-to-end
+               between peers, mailbox blobs are sealed to the recipient
 SFU knows:     video/screen streams it routes (see landing page disclosure);
                voice never touches it
 all p2p:       messages, files, voice - direct between peers

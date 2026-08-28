@@ -117,6 +117,22 @@ cd frontend && pnpm check   # svelte-check + tsc
 cd relay && go test ./...   # rendezvous registry + TURN credentials
 ```
 
+The DTLN noise-suppression worklet is built in a separate repo,
+[dtln-rs-web](https://github.com/FlavioZanoni/dtln-rs-web). Both
+`frontend/public/audio-worklet.js` and `frontend/src/lib/audio/worklet-url.ts`
+are generated from it - never edit either by hand:
+
+```sh
+cd ../dtln && npm run sync   # rebuild, copy the bundle here, and stamp a
+                             # fresh ?v= hash into worklet-url.ts
+```
+
+That hash is load-bearing: the service worker caches the worklet forever, so a
+new build without a new URL never reaches anyone who has opened the app before.
+The dtln repo's own page (`npm run serve`) self-checks the worklet - worth
+running before syncing, since a broken worklet fails silently rather than
+loudly.
+
 ## Self-hosting
 
 `docker-compose.dokploy.yml` runs relay + sfu + coturn + frontend behind

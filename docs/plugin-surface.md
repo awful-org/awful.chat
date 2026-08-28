@@ -6,6 +6,33 @@ third-party code at runtime, no server-side plugin logic, no sandboxing:
 plugins share the exact trust level of the app bundle itself, because the
 operator already ships all the code every visitor runs.
 
+## Status: shipped, and grown past this plan
+
+This document is the original v1 design and review record; everything in it
+was built. The living author contract is `frontend/plugins/README.md` - when
+this file and the README disagree, the README wins. What has grown since:
+
+- Manifest gained `name`-adjacent metadata: `version`, `author`, `license`,
+  `repository` (the settings page groups plugins by repository origin and
+  links it), and `icon` accepts `lucide:*` names, not just emoji.
+- External plugin sources: the frontend Dockerfile fetches extra plugin repos
+  at build time via `PLUGIN_SOURCES` (e.g. `awful-org/awfully-awesome`),
+  deleting any fetched `.gitignore` so Tailwind scans their markup. A
+  pre-commit hook keeps fetched plugins out of the app repo.
+- Host API grew: `cards()` and `sendUpdateImmediately` (host-bound, room
+  targeted), a now-playing media surface (`setNowPlaying`), and call-view
+  plugin TILES with join presence - the "no surfaces outside chat" non-goal
+  fell (waffle-party exercises all of it).
+- A server-side component exists after all: the relay's plugin proxy
+  (`PLUGIN_PROXY_HOSTS` / `PLUGIN_PROXY_SECRETS`) so plugins can call
+  allowlisted third-party APIs without leaking client IPs or shipping keys.
+- Signatures moved to sigV 3 (canonical binds type + roomCode); the "zero
+  signature-format changes" note below describes the v2 era.
+- Settings panel leads with a trust notice (plugins are unvetted, run with
+  app-level access, can degrade performance).
+- Reference plugins: wheel took an optional question (`/wheel Question? a, b`),
+  and poll shipped as planned.
+
 ## Goals
 
 - Adding a plugin = dropping a folder in `frontend/plugins/` and redeploying.

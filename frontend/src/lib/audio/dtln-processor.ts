@@ -1,5 +1,7 @@
+import { AUDIO_PREF_DEFAULTS } from "$lib/transport/audio-prefs";
+import { WORKLET_URL } from "./worklet-url";
+
 export interface DtlnMessage {
-  output_gain?: number;
   noise_gate?: number;
 }
 
@@ -7,19 +9,16 @@ export class DtlnProcessor {
   private audioCtx: AudioContext | null = null;
   private workletNode: AudioWorkletNode | null = null;
   private ready = false;
-  private readyPromise: Promise<void>;
+  private readyPromise!: Promise<void>;
   private resolveReady!: () => void;
+  private rejectReady!: (err: Error) => void;
   private initializing = false;
-  private noiseGate = 0.002;
+  private noiseGate = AUDIO_PREF_DEFAULTS.noiseGate;
   private inputGain = 1.0;
 
   /**
-   * The one, visible compensation for the model's attenuation. The worklet
-   * ALSO ships an internal output_gain that defaults to 3 - left alone, the
-   * two multiply and everyone with noise suppression on transmits at NINE
-   * times the slider value, clipping hard. That is what "audio is spotty,
-   * turning DTLN off fixes it" was: 9x distortion, not the model. init()
-   * pins the worklet's copy to 1 so this constant is the only boost.
+   * The one compensation for the model's attenuation. The worklet itself is
+   * unity gain, so this constant is the only boost in the chain.
    */
   static readonly OUTPUT_COMPENSATION = 3.0;
 
@@ -41,8 +40,17 @@ export class DtlnProcessor {
   private monDest: MediaStreamAudioDestinationNode | null = null;
 
   constructor() {
-    this.readyPromise = new Promise((r) => (this.resolveReady = r));
-    console.log("DtlnProcessor created");
+    this.armReadyPromise();
+  }
+
+  private armReadyPromise(): void {
+    this.readyPromise = new Promise((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    // Nobody may be awaiting at the moment init fails; that must not surface
+    // as an unhandled rejection.
+    this.readyPromise.catch(() => {});
   }
 
   async init(): Promise<void> {
@@ -50,55 +58,90 @@ export class DtlnProcessor {
     if (this.initializing) return this.readyPromise;
     this.initializing = true;
 
-    // Create context (it will start 'suspended' if no user gesture)
-    this.audioCtx = new AudioContext({ sampleRate: 16000 });
+    try {
+      // Create context (it will start 'suspended' if no user gesture)
+      this.audioCtx ??= new AudioContext({ sampleRate: 16000 });
 
-    await this.audioCtx.audioWorklet.addModule("/audio-worklet.js");
+      await this.audioCtx.audioWorklet.addModule(WORKLET_URL);
 
-    this.workletNode = new AudioWorkletNode(
-      this.audioCtx,
-      "NoiseSuppressionWorker",
-      {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-        channelCount: 1,
-        channelCountMode: "explicit",
-      }
-    );
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error("DTLN ready timeout")),
-        15000
+      const node = new AudioWorkletNode(
+        this.audioCtx,
+        "NoiseSuppressionWorker",
+        {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+          channelCount: 1,
+          channelCountMode: "explicit",
+        }
       );
 
-      this.workletNode!.port.onmessage = (event) => {
-        if (event.data === "ready") {
+      await new Promise<void>((resolve, reject) => {
+        // The worklet posts "ready" once its WASM runtime is up and the
+        // denoiser exists; a processor that crashes instead rejects in
+        // milliseconds rather than eating the whole timeout.
+        const timeout = setTimeout(
+          () => reject(new Error("DTLN ready timeout")),
+          15000
+        );
+        node.onprocessorerror = () => {
           clearTimeout(timeout);
-          this.workletNode!.port.onmessage = (e) =>
-            this.handleWorkletMessage(e);
-          resolve();
-        }
-      };
-    });
+          reject(new Error("DTLN processor crashed during init"));
+        };
+        node.port.onmessage = (event) => {
+          if (event.data === "ready") {
+            clearTimeout(timeout);
+            resolve();
+          }
+        };
+      });
 
-    this.ready = true;
-    this.workletNode.port.postMessage({
-      noise_gate: this.noiseGate,
-      // Pin the worklet's internal gain to 1: its default of 3 doubles up
-      // with OUTPUT_COMPENSATION into a 9x blast. See that constant.
-      output_gain: 1.0,
-    });
-    this.resolveReady();
+      node.onprocessorerror = () =>
+        this.handleFatal(new Error("DTLN processor crashed"));
+      this.workletNode = node;
+      this.ready = true;
+      node.port.postMessage({
+        noise_gate: this.noiseGate,
+      } satisfies DtlnMessage);
+      this.resolveReady();
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      this.initializing = false;
+      this.rejectReady(e);
+      // Re-arm so a later voice start can retry instead of seeing the same
+      // stale rejection forever (e.g. first visit offline, then back online).
+      this.armReadyPromise();
+      throw e;
+    }
+    this.initializing = false;
   }
 
-  private handleWorkletMessage(_: MessageEvent): void {
-    //console.log("Message from DTLN worklet:", event.data);
+  /**
+   * A processor that dies after init would otherwise be a silent zombie for
+   * the rest of the session. Drop it so the next voice start rebuilds.
+   */
+  private handleFatal(err: Error): void {
+    console.error("[DTLN]", err);
+    this.releaseTransport();
+    this.releaseMonitor();
+    this.workletNode = null;
+    this.ready = false;
+    this.initializing = false;
+    this.armReadyPromise();
   }
 
+  /**
+   * Resolves once the worklet is usable, rejecting if it cannot be loaded.
+   * Also the lazy entry point: nothing pays for the 8 MB worklet until the
+   * first voice use calls this.
+   */
   waitUntilReady(): Promise<void> {
-    return this.readyPromise;
+    // Snapshot first: a synchronously-failing init() rejects and re-arms
+    // readyPromise before this function returns, and the caller must get
+    // the rejected one, not the fresh forever-pending one.
+    const p = this.readyPromise;
+    if (!this.ready && !this.initializing) void this.init().catch(() => {});
+    return p;
   }
 
   isReady(): boolean {
@@ -151,10 +194,6 @@ export class DtlnProcessor {
   ): Promise<MediaStream> {
     await this.waitUntilReady();
     const ctx = this.ctx;
-    // without user gesture it will start suspended
-    if (ctx.state === "suspended") {
-      await ctx.resume();
-    }
 
     // Replace only the previous transport graph - a running mic test keeps its own.
     this.releaseTransport();
@@ -181,6 +220,12 @@ export class DtlnProcessor {
     this.txInputGain = inputGainNode;
     this.txOutputGain = outputGainNode;
     this.transportDest = dest;
+
+    // Resume last, unconditionally: releaseTransport() above queues a
+    // suspend whose state change lands asynchronously, so ctx.state still
+    // reads "running" here. Control messages process in order - a resume
+    // queued now overrides it, and is a no-op on a running context.
+    await ctx.resume();
     return dest.stream;
   }
 
@@ -202,6 +247,7 @@ export class DtlnProcessor {
     this.txInputGain = null;
     this.txOutputGain = null;
     this.transportDest = null;
+    this.suspendIfIdle();
   }
 
   /**
@@ -229,7 +275,6 @@ export class DtlnProcessor {
   ): Promise<{ processedStream: MediaStream; cleanup: () => void }> {
     await this.waitUntilReady();
     const ctx = this.ctx;
-    if (ctx.state === "suspended") await ctx.resume();
 
     // Replace only a previous monitor graph - never touch the call's path.
     this.releaseMonitor();
@@ -253,6 +298,10 @@ export class DtlnProcessor {
     this.monOutGain = outGain;
     this.monDest = dest;
 
+    // Resume last, unconditionally - releaseMonitor() above may have queued
+    // a suspend whose state change has not landed yet (see processStream).
+    await ctx.resume();
+
     return {
       processedStream: dest.stream,
       cleanup: () => this.releaseMonitor(),
@@ -274,5 +323,17 @@ export class DtlnProcessor {
     this.monGain = null;
     this.monOutGain = null;
     this.monDest = null;
+    this.suspendIfIdle();
+  }
+
+  /**
+   * With no call and no mic test the context has nothing to render - suspend
+   * it so the audio thread and the OS audio stream stand down instead of
+   * ticking for the rest of the session. Resumed on the next use.
+   */
+  private suspendIfIdle(): void {
+    if (!this.txSource && !this.monSource) {
+      void this.audioCtx?.suspend().catch(() => {});
+    }
   }
 }

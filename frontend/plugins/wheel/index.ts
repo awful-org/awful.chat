@@ -1,7 +1,7 @@
 import { definePlugin } from "$lib/plugins/api";
 import { manifest } from "./manifest";
 import WheelCard from "./WheelCard.svelte";
-import { initialState, reduce } from "./logic";
+import { initialState, parseWheelArgs, reduce } from "./logic";
 
 export default definePlugin({
   manifest,
@@ -10,15 +10,14 @@ export default definePlugin({
   reduce,
   commands: {
     wheel: async (args: string, host: HostApi) => {
-      const options = args
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (options.length < 2) {
-        console.warn("[wheel] need at least 2 options");
+      const parsed = parseWheelArgs(args);
+      if (!parsed) {
+        console.warn(
+          "[wheel] format: /wheel Question? option1, option2 (question optional)"
+        );
         return;
       }
-      await host.sendCard({ options });
+      await host.sendCard(parsed);
     },
   },
 });

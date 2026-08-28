@@ -6,6 +6,7 @@
     RefreshCw,
     Hash,
     FileDown,
+    Server,
     Smartphone,
     BellOff,
     Video,
@@ -14,10 +15,23 @@
   // Single source of truth for the "how this app behaves" copy. Rendered both
   // in the first-run dialog (IdentitySetup) and the Quirks settings tab.
   const quirks = [
+    // The WARNINGS lead: these are the trust decisions in the list.
+    {
+      icon: Server,
+      warn: true,
+      title: "Only use an instance you trust",
+      body: "The instance hands your browser the app itself, on every visit. A malicious operator can serve modified code - to everyone or just to you - and nothing in a browser can detect that: the source being open lets you verify what is published, never what you were served. End-to-end encryption is only as honest as the code doing the encrypting, so use an instance run by you or by someone you actually trust. Self-hosting is the strong answer.",
+    },
+    {
+      icon: Video,
+      warn: true,
+      title: "Voice is peer-to-peer, video passes through a server",
+      body: "Your messages, files and voice audio all travel straight between peers, never through a server. Camera and screen share are the one exception: they are routed by a media server so bigger calls work, which means that server sees those streams. On a self-hosted instance that server belongs to whoever runs it, and they can access what passes through it, so only turn on your camera or share your screen on an instance you trust.",
+    },
     {
       icon: HardDrive,
       title: "Every device is a server, yours included",
-      body: "Messages, files and your identity live in this browser's storage, never on a server. Clearing site data, private browsing or uninstalling the app erases your copy. That is not always fatal: everyone in a room keeps their own copy, so with your 12 words you can restore your identity, rejoin with the room code and pull history back from peers who are online and still have it. Expect gaps in what comes back, and if everyone in a room wipes their data the conversation is gone for good.",
+      body: "Messages, files and your identity live in this browser's storage, not on a server (the one exception: offline DMs wait encrypted at the relay for up to 48 hours). Clearing site data, private browsing or uninstalling the app erases your copy. That is not always fatal: everyone in a room keeps their own copy, so with your 12 words you can restore your identity, rejoin with the room code and pull history back from peers who are online and still have it. Expect gaps in what comes back, and if everyone in a room wipes their data the conversation is gone for good. Settings > Data can ask the browser to protect this storage from being cleared automatically when space runs low.",
     },
     {
       icon: KeyRound,
@@ -53,12 +67,6 @@
       icon: BellOff,
       title: "Nothing reaches you while the app is closed",
       body: "There are no push notifications: nothing wakes this device while the app is closed. Offline DMs wait for you (encrypted, at the relay) and room messages wait with your peers, but you only find out about any of it once you open the app and it connects.",
-    },
-    {
-      icon: Video,
-      warn: true,
-      title: "Voice is peer-to-peer, video passes through a server",
-      body: "Your messages, files and voice audio all travel straight between peers, never through a server. Camera and screen share are the one exception: they are routed by a media server so bigger calls work, which means that server sees those streams. On a self-hosted instance that server belongs to whoever runs it, and they can access what passes through it, so only turn on your camera or share your screen on an instance you trust.",
     },
   ];
 </script>

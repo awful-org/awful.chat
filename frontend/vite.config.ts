@@ -1,4 +1,5 @@
 import tailwindcss from "@tailwindcss/vite";
+import { execSync } from "node:child_process";
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import path from "path";
@@ -15,6 +16,22 @@ export default defineConfig(({ mode }) => ({
     global: "globalThis",
     // The app's version, straight from package.json at build time.
     __APP_VERSION__: JSON.stringify(pkg.version),
+    // Best-effort commit hash: pre-1.0 every deploy shares the version, so
+    // the hash is what actually identifies a build. Empty when the build
+    // context has no git (some docker contexts) - the UI just omits it.
+    __APP_COMMIT__: JSON.stringify(
+      (() => {
+        try {
+          return execSync("git rev-parse --short HEAD", {
+            stdio: ["ignore", "pipe", "ignore"],
+          })
+            .toString()
+            .trim();
+        } catch {
+          return "";
+        }
+      })()
+    ),
   },
   plugins: [
     tailwindcss(),
@@ -35,6 +52,7 @@ export default defineConfig(({ mode }) => ({
           "assets/langs/**", // ~300 shiki language chunks, ~8 MB
           "assets/lazy/**", // shiki themes+wasm engine, webtorrent: ~2.6 MB
           "audio-worklet.js", // DTLN wasm, ~8 MB
+          "third-party-notices.txt", // ~500 KB of license texts, on demand
         ],
       },
       includeAssets: ["favicon.ico", "apple-touch-icon-180x180.png"],

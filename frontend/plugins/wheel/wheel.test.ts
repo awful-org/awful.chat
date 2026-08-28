@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { initialState, reduce, hashSeed, type WheelState } from "./logic";
+import {
+  initialState,
+  parseWheelArgs,
+  reduce,
+  hashSeed,
+  type WheelState,
+} from "./logic";
 
 const ctx = (did: string, id = "u1", lamport = 1) => ({
   senderDid: did,
@@ -42,5 +48,49 @@ describe("wheel logic (the real module, not a copy)", () => {
   it("hashSeed fixed vectors stay stable across builds", () => {
     expect(hashSeed("abc")).toBe(hashSeed("abc"));
     expect(hashSeed("abc")).not.toBe(hashSeed("abd"));
+  });
+});
+
+describe("wheel question", () => {
+  it("seeds an optional question from card data, capped and typed", () => {
+    expect(initialState({ options: ["a", "b"] }).question).toBe("");
+    expect(
+      initialState({ question: "What game?", options: ["a", "b"] }).question
+    ).toBe("What game?");
+    expect(
+      initialState({ question: 42, options: ["a", "b"] }).question
+    ).toBe("");
+    expect(
+      initialState({ question: "x".repeat(500), options: ["a", "b"] }).question
+    ).toHaveLength(200);
+  });
+});
+
+describe("wheel hardening", () => {
+  const ctx2 = {
+    senderDid: "d",
+    senderName: "N",
+    updateId: "u1",
+    lamport: 1,
+    ephemeral: false,
+  };
+
+  it("ignores non-object update data instead of throwing", () => {
+    const state = initialState({ options: ["a", "b"] }) as WheelState;
+    for (const bad of [null, undefined, "spin", 7, true]) {
+      expect(reduce(state, { data: bad }, ctx2)).toBe(state);
+    }
+  });
+
+  it("parses the command with the question split on the FIRST ?", () => {
+    expect(parseWheelArgs("What game? CS?, Dota")).toEqual({
+      question: "What game?",
+      options: ["CS?", "Dota"],
+    });
+    expect(parseWheelArgs("a, b, c")).toEqual({
+      question: "",
+      options: ["a", "b", "c"],
+    });
+    expect(parseWheelArgs("only-one")).toBeNull();
   });
 });

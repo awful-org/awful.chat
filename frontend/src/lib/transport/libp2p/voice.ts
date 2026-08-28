@@ -640,14 +640,46 @@ export class LibP2PVoice implements VoiceTransport {
     const track = this.micStream.getAudioTracks()[0];
     this.activeInputDevice = track.getSettings().deviceId ?? null;
 
+    let processed: MediaStream | null = null;
     if (useDtln) {
-      await this.dtln?.waitUntilReady().catch(() => {
-        console.error;
-      });
-      this.processedStream = await this.dtln!.processStream(
-        this.micStream,
-        this.currentInputGain
-      );
+      try {
+        await this.dtln!.waitUntilReady();
+        processed = await this.dtln!.processStream(
+          this.micStream,
+          this.currentInputGain
+        );
+      } catch (err) {
+        // DTLN unavailable (load failure, unsupported browser, crashed
+        // worklet): fall back to the plain path with the browser's own noise
+        // suppression instead of joining the call with no mic at all.
+        // Re-request the mic so the native processing constraints apply.
+        console.error(
+          "[voice] DTLN failed, falling back to browser noise suppression:",
+          err
+        );
+        this.dtln?.releaseTransport();
+        this.micStream.getTracks().forEach((t) => t.stop());
+        try {
+          this.micStream = await navigator.mediaDevices.getUserMedia({
+            audio: this.activeInputDevice
+              ? {
+                  ...AUDIO_CONSTRAINTS_NO_DTLN,
+                  deviceId: { exact: this.activeInputDevice },
+                }
+              : AUDIO_CONSTRAINTS_NO_DTLN,
+            video: false,
+          });
+        } catch {
+          // The remembered mic may be gone - same fallback as above.
+          this.micStream = await navigator.mediaDevices.getUserMedia({
+            audio: AUDIO_CONSTRAINTS_NO_DTLN,
+            video: false,
+          });
+        }
+      }
+    }
+    if (processed) {
+      this.processedStream = processed;
     } else {
       // DTLN off: drop its graph so the worklet stops processing the (now
       // stopped) previous mic and peers are fed by the plain path only.

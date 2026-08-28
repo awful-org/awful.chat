@@ -19,6 +19,9 @@
   import AudioPlayer from "./AudioPlayer.svelte";
   import GifImage from "./GifImage.svelte";
   import { mediaPrefs } from "$lib/media-prefs.svelte";
+  // The queued tooltip must not promise the relay is holding a copy when the
+  // sender opted out of the mailbox, in which case no deposit happened.
+  import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
   import { humanize } from "$lib/mentions";
   import { makeHostApi } from "$lib/plugins/host";
@@ -389,7 +392,15 @@
   }
 </script>
 
-<div class="ml-9 text-sm text-foreground wrap-break-word">
+<!--
+  `leading-normal` is not decoration. `text-sm` shipped a ratio line-height with
+  it for free; `text-(length:…)` emits font-size only, so without an explicit
+  line-height the body would render on the container's line box and clip at
+  larger sizes.
+-->
+<div
+  class="ml-9 text-(length:--chat-font-size) leading-normal text-foreground wrap-break-word"
+>
   {#if isFileMessage}
     {#if msg.content}
       <!-- Through linkifyText like every other body: rendered raw, a caption
@@ -743,7 +754,9 @@
   {#if isOwn && msg.status}
     <Tip
       text={msg.status === "sending"
-        ? "Queued - will send when the recipient is reachable"
+        ? mailboxPrefs.enabled
+          ? "Queued - waiting in their offline inbox"
+          : "Queued - will send when the recipient is reachable"
         : msg.status.charAt(0).toUpperCase() + msg.status.slice(1)}
     >
       {#snippet children(props)}

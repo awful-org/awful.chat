@@ -47,7 +47,6 @@
   });
 
   const totalVotes = $derived(pollState.votes.size);
-  const maxVotes = $derived(Math.max(...voteCounts, 1));
   /** The option I voted for, or null. */
   const myVote = $derived(pollState.votes.get(host.selfDid())?.vote ?? null);
 </script>
