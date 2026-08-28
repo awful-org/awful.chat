@@ -16,7 +16,13 @@ import {
   putPhonebookEntry,
   putRoom,
   type DMRoom,
+  getMessages,
 } from "$lib/storage";
+import {
+  appendToDmPanel,
+  defaultPanelPosition,
+  dmPanel,
+} from "$lib/dm-panel.svelte";
 import { MessageType, type Message } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
 import { leaveCall } from "./call.svelte";
@@ -215,16 +221,84 @@ export async function openDmConversation(
   return true;
 }
 
+/**
+ * Open a conversation in the floating panel, leaving the view alone.
+ *
+ * The counterpart to openDmConversation, which claims the whole chat pane. Use
+ * this when the user asked to message somebody WITHOUT leaving what they are
+ * doing - from a call tile, most obviously, where taking over the pane also
+ * unmounts the call stage.
+ */
+export async function openDmPanel(peerIdOrDid: string): Promise<boolean> {
+  if (!_transport.selfId()) return false;
+  const resolvedPeerId = resolveDmPeerId(peerIdOrDid) ?? peerIdOrDid;
+  if (!resolvedPeerId) return false;
+  const roomCode = await ensureDmRoomForPeer(resolvedPeerId);
+  if (!roomCode) {
+    transportState.error =
+      "Cannot open this conversation yet: waiting to verify who this peer is.";
+    return false;
+  }
+  // Files and plugin cards in a DM ride the room topic, so the panel has to be
+  // subscribed for the same reasons the pane is. Text arrives over a direct
+  // stream either way.
+  _transport.joinRoom(roomCode);
+
+  if (dmPanel.peerId !== resolvedPeerId) {
+    Object.assign(dmPanel, defaultPanelPosition());
+  }
+  dmPanel.peerId = resolvedPeerId;
+  dmPanel.roomCode = roomCode;
+  dmPanel.peerName = resolveDmDisplayName(resolvedPeerId);
+  dmPanel.messages = [];
+  dmPanel.minimized = false;
+  dmPanel.loading = true;
+
+  const page = await getMessages(roomCode);
+  // The user can close the panel, or open another conversation in it, while
+  // the page is in flight.
+  if (dmPanel.roomCode !== roomCode) return false;
+  dmPanel.messages = page;
+  dmPanel.loading = false;
+
+  const selfDid = identityStore.did ?? _transport.selfId();
+  const theirs = page
+    .filter((m) => m.senderId !== selfDid)
+    .map((m) => m.id);
+  if (theirs.length) sendDmReadAcks(resolvedPeerId, theirs);
+  await markRoomSeen(roomCode, page[page.length - 1]?.lamport ?? 0).catch(
+    () => {}
+  );
+  await refreshDmRooms();
+  transportState.dmVersion += 1;
+  return true;
+}
+
+export function closeDmPanel(): void {
+  dmPanel.peerId = null;
+  dmPanel.roomCode = null;
+  dmPanel.peerName = "";
+  dmPanel.messages = [];
+  dmPanel.minimized = false;
+  dmPanel.loading = false;
+}
+
 export interface DirectMessageOptions {
   replyTo?: { id: string; senderName: string; content: string };
   reaction?: { to: string; emoji: string; op: "add" | "remove" };
+  /**
+   * Send to this peer instead of the conversation on screen. The floating DM
+   * panel is a second conversation surface, so "the active DM" stopped being
+   * the only possible answer to "who is this for".
+   */
+  peerId?: string;
 }
 
 export async function sendDirectMessage(
   text: string,
   options: DirectMessageOptions = {}
 ): Promise<void> {
-  const peerId = transportState.activeDmPeerId;
+  const peerId = options.peerId ?? transportState.activeDmPeerId;
   if (!peerId) return;
   const body = text.trim();
   // Reactions travel as empty-bodied envelopes; everything else needs text.
@@ -327,6 +401,10 @@ export async function sendDirectMessage(
   ) {
     transportState.messages = appendSorted(transportState.messages, msg);
   }
+  // The panel keys on the room code, so this is a no-op unless the panel is
+  // showing this very conversation - including when the pane behind it shows
+  // something else entirely, which is the whole reason the panel exists.
+  appendToDmPanel(msg);
 
   await putMessage(msg);
   await setWatermark(roomCode, mySenderId, msg.lamport);

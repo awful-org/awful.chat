@@ -94,6 +94,7 @@ import {
   touchCardStates,
 } from "../plugins/state.svelte";
 import { announceMessage } from "../announce";
+import { appendToDmPanel, dmPanelIsShowing } from "../dm-panel.svelte";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
@@ -2009,8 +2010,18 @@ function _handleDmChatAsync(
         (activeDid === senderDid || activeDid === peerId);
       // Reactions are filtered inside the funnel, same rule as rooms.
       _announceMessage(msg);
+      // The floating panel is a second place this conversation can be on
+      // screen, and it can be showing it while the pane behind shows another
+      // room entirely. Keyed on the room code, so this is a no-op otherwise.
+      appendToDmPanel(msg);
+      // The pane's array belongs to the conversation the pane is on. Appending
+      // to it because the PANEL is showing this DM is how a message ends up
+      // filed under the wrong conversation.
       if (isViewingThisDm) {
         transportState.messages = appendSorted(transportState.messages, msg);
+      }
+      // Visible in either surface means read, not merely delivered.
+      if (isViewingThisDm || dmPanelIsShowing(roomCode)) {
         await markRoomSeen(roomCode, msg.lamport);
         const roomIndex = roomsStore.dmRooms.findIndex(
           (r) => r.roomCode === roomCode
@@ -2026,7 +2037,6 @@ function _handleDmChatAsync(
         }
         await refreshDmRooms();
         transportState.dmVersion += 1;
-        // Conversation is on screen - this message is read, not just delivered
         _transport
           .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
           .catch(() => {});

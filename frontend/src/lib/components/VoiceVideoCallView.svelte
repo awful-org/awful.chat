@@ -4,7 +4,7 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
-  import { openDmConversation } from "$lib/transport/dm.svelte";
+  import { openDmPanel } from "$lib/transport/dm.svelte";
   import {
     getVoicePeerVolume,
     setVoicePeerVolume,
@@ -227,10 +227,16 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     if (peerMenu) setVoicePeerVolume(peerMenu.peerId, sliderToGain(value));
   }
 
+  /**
+   * The floating panel, not the chat pane. Pointing the pane at the DM unmounts
+   * this call stage - the stage is gated on the pane showing the call's room -
+   * and the pane filters messages by the room the VIEW is on, so the DM
+   * rendered as an empty conversation you could send into but never see.
+   */
   async function dmFromPeerMenu(): Promise<void> {
     const peerId = peerMenu?.peerId;
     closeMenus();
-    if (peerId) await openDmConversation(peerId);
+    if (peerId) await openDmPanel(peerId);
   }
 
   let speakingPeers = $state(new Set<string>());

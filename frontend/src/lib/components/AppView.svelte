@@ -54,11 +54,13 @@
   } from "$lib/components/ui/drawer";
   import {
     addToPhonebook,
+    closeDmPanel,
     dmConversationCodeFor,
     openDmConversation,
     removeDmConversation,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
+  import FloatingDmPanel from "$lib/components/FloatingDmPanel.svelte";
 
   const queryClient = new QueryClient();
 
@@ -406,6 +408,15 @@
     uiState.returnToCallRequested = false;
     void returnToCall();
   });
+
+  /**
+   * Promote the floating panel's conversation to the full DMs view. The panel
+   * closes: leaving it open over the same conversation would show it twice.
+   */
+  async function expandDmPanel(peerId: string): Promise<void> {
+    closeDmPanel();
+    await handleSelectDm(peerId);
+  }
 
   function dmTitleFor(peerId: string): string {
     const did = peerIdToDid(peerId);
@@ -1316,4 +1327,11 @@
   <ReloadPrompt />
 
   <TransportStatus />
+
+  <!--
+    Here, not inside ChatView or the call view: both unmount when the user
+    leaves the conversation or the call ends, and a floating panel that dies
+    with the surface it was opened from is not floating.
+  -->
+  <FloatingDmPanel onExpand={expandDmPanel} />
 </QueryClientProvider>

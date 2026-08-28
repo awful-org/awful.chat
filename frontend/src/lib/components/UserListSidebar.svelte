@@ -10,7 +10,7 @@
   } from "$lib/transport/transport.svelte";
   import { looksLikePeerId } from "$lib/identity/identity-utils";
   import {
-    openDmConversation,
+    openDmPanel,
     addToPhonebook,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
@@ -278,7 +278,10 @@
     if (onOpenDm) {
       onOpenDm(peerId);
     } else {
-      await openDmConversation(peerId);
+      // No host to switch the view for us, so the panel: openDmConversation
+      // only moves the transport, leaving the pane rendering the room it is
+      // still keyed to and the DM invisible.
+      await openDmPanel(peerId);
     }
     closeUserMenu();
   }

@@ -76,7 +76,7 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
-    openDmConversation,
+    openDmPanel,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
@@ -1224,7 +1224,10 @@
     if (onOpenDm) {
       await onOpenDm(peerId);
     } else {
-      await openDmConversation(peerId);
+      // No host to switch the view for us, so the panel: openDmConversation
+      // only moves the transport, leaving this pane rendering the room it is
+      // still keyed to and the DM invisible.
+      await openDmPanel(peerId);
     }
     closeUserMenu();
   }
