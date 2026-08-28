@@ -21,6 +21,7 @@
     leaveCall,
   } from "$lib/transport/call.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { displayPrefs } from "$lib/display-prefs.svelte";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import SettingsDialog from "$lib/components/SettingsDialog.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
@@ -181,10 +182,12 @@
             >
           {/if}
         </button>
-        <div
-          class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full ring-2 ring-card
-          {transportState.relayConnected ? 'bg-primary' : 'bg-yellow-500'}"
-        ></div>
+        {#if displayPrefs.showConnectionInfo}
+          <div
+            class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full ring-2 ring-card
+            {transportState.relayConnected ? 'bg-primary' : 'bg-yellow-500'}"
+          ></div>
+        {/if}
       </div>
 
       <!-- Name + status -->
@@ -195,9 +198,11 @@
           >
             {profileStore.nickname}
           </div>
-          <div class="text-xs text-muted-foreground font-mono leading-tight">
-            {transportState.relayConnected ? "Connected" : "Connecting..."}
-          </div>
+          {#if displayPrefs.showConnectionInfo}
+            <div class="text-xs text-muted-foreground font-mono leading-tight">
+              {transportState.relayConnected ? "Connected" : "Connecting..."}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>

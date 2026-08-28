@@ -359,7 +359,7 @@
               style={`background-color: ${user.tagChipColor ?? "#e5e7eb"}; color: ${user.tagTextColor ?? "#000000"}`}
             >{user.tagText}</span>
           {/if}
-          {#if user.isRelayed}
+          {#if user.isRelayed && displayPrefs.showConnectionInfo}
             <Tip text={RELAY_TIP}>
               {#snippet children(props)}
                 <button

@@ -7,6 +7,7 @@ const ITALIC_KEY = "awful:italic-own-name:v1";
 const PEER_COLORS_KEY = "awful:show-peer-colors:v1";
 const SIDEBAR_COLLAPSED_KEY = "awful:sidebar-collapsed:v1";
 const CALL_CHAT_BESIDE_KEY = "awful:call-chat-beside:v1";
+const CONNECTION_INFO_KEY = "awful:debug-connection-info:v1";
 
 function readStored(key: string, defaultValue: boolean): boolean {
   if (typeof localStorage === "undefined") return defaultValue;
@@ -23,6 +24,12 @@ export const displayPrefs = $state({
   sidebarCollapsed: readStored(SIDEBAR_COLLAPSED_KEY, false),
   /** Desktop only: in a call the chat sits beside the stage, not below it. */
   callChatBeside: readStored(CALL_CHAT_BESIDE_KEY, false),
+  /**
+   * Debug: render the relay/connection indicators - the transport status
+   * overlay, the "Relayed" peer badges, the sidebar connection dot and text,
+   * and the room "Connected" pill. Off by default keeps them hidden.
+   */
+  showConnectionInfo: readStored(CONNECTION_INFO_KEY, false),
 });
 
 export function setItalicOwnName(on: boolean): void {
@@ -61,6 +68,15 @@ export function setCallChatBeside(on: boolean): void {
   }
 }
 
+export function setShowConnectionInfo(on: boolean): void {
+  displayPrefs.showConnectionInfo = on;
+  try {
+    localStorage.setItem(CONNECTION_INFO_KEY, on ? "1" : "0");
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
 // A second tab flipping a switch should be reflected here, not fought.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (e) => {
@@ -72,5 +88,7 @@ if (typeof window !== "undefined") {
       displayPrefs.sidebarCollapsed = e.newValue === "1";
     if (e.key === CALL_CHAT_BESIDE_KEY)
       displayPrefs.callChatBeside = e.newValue === "1";
+    if (e.key === CONNECTION_INFO_KEY)
+      displayPrefs.showConnectionInfo = e.newValue === "1";
   });
 }

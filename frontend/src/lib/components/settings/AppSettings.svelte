@@ -11,6 +11,7 @@ import {
   displayPrefs,
   setCallChatBeside,
   setItalicOwnName,
+  setShowConnectionInfo,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
 } from "$lib/display-prefs.svelte";
@@ -141,6 +142,33 @@ import {
     <Switch
       checked={displayPrefs.callChatBeside}
       onCheckedChange={(checked) => setCallChatBeside(checked)}
+    />
+  </div>
+</div>
+
+<!-- Debug Section -->
+<div
+  class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+>
+  <div class="flex items-center gap-2">
+    <div class="w-1 h-4 bg-sky-500 rounded-full"></div>
+    <Label
+      class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+      >Debug</Label
+    >
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Connection &amp; relay indicators</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Off hides the transport status overlay, the "Relayed" peer badges, the
+        sidebar connection dot and the room "Connected" pill. Turn it on to see
+        relay and connection state.
+      </span>
+    </div>
+    <Switch
+      checked={displayPrefs.showConnectionInfo}
+      onCheckedChange={(checked) => setShowConnectionInfo(checked)}
     />
   </div>
 </div>

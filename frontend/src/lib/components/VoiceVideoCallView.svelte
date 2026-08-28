@@ -1244,7 +1244,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
               ? `${tile.label} (You)`
               : tile.label}
         </span>
-        {#if !tile.isLocal && isRelayed(tile.peerId)}
+        {#if !tile.isLocal && isRelayed(tile.peerId) && displayPrefs.showConnectionInfo}
           <!-- pointer-events-auto: the badge itself ignores the pointer so it
                does not swallow clicks on the tile, but the tooltip needs the
                hover. -->
@@ -1302,7 +1302,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             {:else}
               {label.charAt(0).toUpperCase()}
             {/if}
-            {#if relayed}
+            {#if relayed && displayPrefs.showConnectionInfo}
               <Tip text={RELAY_TIP} side="top">
                 {#snippet children(props)}
                   <button

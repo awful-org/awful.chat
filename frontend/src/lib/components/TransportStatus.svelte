@@ -18,6 +18,7 @@
   } from "@lucide/svelte";
   import { onMount, onDestroy } from "svelte";
   import { cn } from "$lib/utils";
+  import { displayPrefs } from "$lib/display-prefs.svelte";
 
   type StatusType =
     | "connecting"
@@ -215,7 +216,7 @@
   }
 </script>
 
-{#if statusItems.length > 0 || (!relayConnected && sawRelayEvent) || peerCount > 0}
+{#if displayPrefs.showConnectionInfo && (statusItems.length > 0 || (!relayConnected && sawRelayEvent) || peerCount > 0)}
   <div
     class={cn(
       "fixed z-50 flex flex-col gap-2 max-w-sm",
@@ -278,7 +279,7 @@
 {/if}
 
 <!-- Toggle button when hidden -->
-{#if !isVisible && (peerCount > 0 || (!relayConnected && sawRelayEvent))}
+{#if displayPrefs.showConnectionInfo && !isVisible && (peerCount > 0 || (!relayConnected && sawRelayEvent))}
   <button
     class="fixed bottom-36 right-3.75 z-50 p-2 rounded-full bg-background border shadow-lg hover:bg-accent transition-colors"
     onclick={() => (isVisible = true)}
