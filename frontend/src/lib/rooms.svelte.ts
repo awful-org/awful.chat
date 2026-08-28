@@ -97,6 +97,16 @@ export async function refreshDmRooms(): Promise<void> {
 }
 
 export async function refreshUnreadCount(roomCode: string): Promise<void> {
+  // unreadCounts is the ROOM counter. DM conversations are counted separately,
+  // against roomsStore.dmRooms, and anything filed here is also added to that
+  // total - so a dm- code landing in this map is counted twice by every
+  // consumer that sums the whole thing.
+  //
+  // Worth stating because it is easy to reintroduce: DM records live in the
+  // same storage as rooms, so the getRoom fallback below happily resolves one.
+  // The callers cannot help: a DM file, a DM plugin card and a DM history
+  // repair all arrive through the room paths carrying a dm- roomCode.
+  if (roomCode.startsWith("dm-")) return;
   // Fall back to the database when the mirror has not caught up: a message can
   // arrive for a room whose record exists but whose sidebar entry is still in
   // flight (a deep-link join), and dropping the count there left the badge

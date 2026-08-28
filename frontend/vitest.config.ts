@@ -3,6 +3,7 @@ import path from "path";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 export default defineConfig({
+  // Compiled, so rune-backed stores (.svelte.ts) can be tested at all.
   plugins: [svelte()],
   resolve: {
     alias: {

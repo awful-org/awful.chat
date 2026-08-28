@@ -199,9 +199,14 @@
 
   // Mirror everything unread onto the installed app icon and the tab title,
   // so a background tab shows "(3) Awful.chat" at a glance.
+  //
+  // Summed over the rooms that exist, not over every key in the map: summing
+  // the map wholesale meant any entry that was not a room inflated the title
+  // while the sidebar, which walks the room list, stayed right - and the two
+  // numbers disagreeing is the bug the reader actually notices.
   $effect(() => {
-    const rooms = [...roomsStore.unreadCounts.values()].reduce(
-      (sum, n) => sum + n,
+    const rooms = roomsStore.rooms.reduce(
+      (sum, room) => sum + (roomsStore.unreadCounts.get(room.roomCode) ?? 0),
       0
     );
     const total = rooms + dmUnreadTotal;
