@@ -149,10 +149,22 @@ export async function collectMailbox(): Promise<void> {
 }
 
 let _timer: ReturnType<typeof setInterval> | undefined;
+let _wakeBound = false;
 
 /** Start the collect loop. Idempotent; call after unlock. */
 export function startMailboxCollector(): void {
   if (_timer) return;
   void collectMailbox();
   _timer = setInterval(() => void collectMailbox(), COLLECT_EVERY);
+
+  // The interval alone means a worst case of COLLECT_EVERY, and worse than that
+  // in a background tab, where timers are throttled hard. Coming back to the
+  // app is the moment a waiting DM matters most, so drain then as well.
+  // `collectMailbox` already guards re-entry, so an extra call is free.
+  if (_wakeBound || typeof document === "undefined") return;
+  _wakeBound = true;
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void collectMailbox();
+  });
+  window.addEventListener("online", () => void collectMailbox());
 }

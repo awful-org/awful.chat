@@ -10,6 +10,8 @@
     defaultPanelPosition,
   } from "$lib/dm-panel.svelte";
   import { closeDmPanel, sendDirectMessage } from "$lib/transport/dm.svelte";
+  import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { resolveChatFontStack } from "$lib/chat-font";
   import {
     requestFileDownload,
     selfId,
@@ -54,6 +56,9 @@
   }
 
   const height = $derived(dmPanel.minimized ? BAR_HEIGHT : HEIGHT);
+  const chatFontStack = $derived(
+    resolveChatFontStack(displayPrefs.chatFontFamily),
+  );
 
   // A viewport that shrank under a parked panel (rotation, a resized window)
   // would otherwise leave it half off screen with its drag handle out of reach.
@@ -108,9 +113,13 @@
     the panel belongs with them: it floats over a live call without stealing
     focus the way a modal dialog would.
   -->
+  <!--
+    The same two properties ChatView declares. Miss this and a DM read in the
+    floating panel disagrees with the same DM read in the room.
+  -->
   <div
-    class="fixed z-50 flex flex-col overflow-hidden rounded-lg border border-border bg-card font-mono shadow-2xl"
-    style="left: {dmPanel.x}px; top: {dmPanel.y}px; width: {WIDTH}px; height: {height}px;"
+    class="fixed z-50 flex flex-col overflow-hidden rounded-lg border border-border bg-card font-(family-name:--chat-font-family) shadow-2xl"
+    style="left: {dmPanel.x}px; top: {dmPanel.y}px; width: {WIDTH}px; height: {height}px; --chat-font-size: {displayPrefs.chatFontSize}px; --chat-font-family: {chatFontStack}"
   >
     <div
       use:draggable={{
@@ -169,7 +178,10 @@
     </div>
 
     {#if !dmPanel.minimized}
-      <div bind:this={list} class="flex-1 overflow-y-auto px-2 py-1.5 text-sm">
+      <div
+        bind:this={list}
+        class="flex-1 overflow-y-auto px-2 py-1.5 text-(length:--chat-font-size) leading-normal"
+      >
         {#if dmPanel.loading}
           <div class="flex h-full items-center justify-center">
             <div class="size-2 animate-pulse rounded-full bg-muted-foreground"></div>

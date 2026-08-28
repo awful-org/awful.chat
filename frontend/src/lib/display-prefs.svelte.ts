@@ -3,16 +3,43 @@
  * preference about this screen, not part of the identity or profile.
  */
 
+import {
+  DEFAULT_CHAT_FONT_SIZE,
+  DEFAULT_FONT_STACK,
+  FONT_STACK_IDS,
+  clampChatFontSize,
+  sanitizeFontFamily,
+} from "./chat-font";
+
 const ITALIC_KEY = "awful:italic-own-name:v1";
 const PEER_COLORS_KEY = "awful:show-peer-colors:v1";
 const SIDEBAR_COLLAPSED_KEY = "awful:sidebar-collapsed:v1";
 const CALL_CHAT_BESIDE_KEY = "awful:call-chat-beside:v1";
 const CONNECTION_INFO_KEY = "awful:debug-connection-info:v1";
+const CHAT_FONT_SIZE_KEY = "awful:chat-font-size:v1";
+const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
 
 function readStored(key: string, defaultValue: boolean): boolean {
   if (typeof localStorage === "undefined") return defaultValue;
   const v = localStorage.getItem(key);
   return v === null ? defaultValue : v === "1";
+}
+
+function readChatFontSize(): number {
+  if (typeof localStorage === "undefined") return DEFAULT_CHAT_FONT_SIZE;
+  const raw = localStorage.getItem(CHAT_FONT_SIZE_KEY);
+  // Number(null) is 0, which would clamp to the minimum instead of the
+  // default, so the missing-key case must be checked before conversion.
+  return raw === null ? DEFAULT_CHAT_FONT_SIZE : clampChatFontSize(raw);
+}
+
+// Shared by the reader, the setter, and the cross-tab listener: a stored id
+// is kept as-is, a custom family is sanitized, and anything that survives
+// neither check falls back to the default stack.
+function normalizeChatFontFamily(value: unknown): string {
+  if (typeof value !== "string") return DEFAULT_FONT_STACK;
+  if ((FONT_STACK_IDS as readonly string[]).includes(value)) return value;
+  return sanitizeFontFamily(value) ?? DEFAULT_FONT_STACK;
 }
 
 export const displayPrefs = $state({
@@ -30,6 +57,14 @@ export const displayPrefs = $state({
    * and the room "Connected" pill. Off by default keeps them hidden.
    */
   showConnectionInfo: readStored(CONNECTION_INFO_KEY, false),
+  /** Chat message text size, in pixels. */
+  chatFontSize: readChatFontSize(),
+  /** Chat message font: a FontStackId, or a sanitized custom family name. */
+  chatFontFamily: normalizeChatFontFamily(
+    typeof localStorage === "undefined"
+      ? null
+      : localStorage.getItem(CHAT_FONT_FAMILY_KEY),
+  ),
 });
 
 export function setItalicOwnName(on: boolean): void {
@@ -77,6 +112,24 @@ export function setShowConnectionInfo(on: boolean): void {
   }
 }
 
+export function setChatFontSize(px: number): void {
+  displayPrefs.chatFontSize = clampChatFontSize(px);
+  try {
+    localStorage.setItem(CHAT_FONT_SIZE_KEY, String(displayPrefs.chatFontSize));
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
+export function setChatFontFamily(value: string): void {
+  displayPrefs.chatFontFamily = normalizeChatFontFamily(value);
+  try {
+    localStorage.setItem(CHAT_FONT_FAMILY_KEY, displayPrefs.chatFontFamily);
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
 // A second tab flipping a switch should be reflected here, not fought.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (e) => {
@@ -90,5 +143,12 @@ if (typeof window !== "undefined") {
       displayPrefs.callChatBeside = e.newValue === "1";
     if (e.key === CONNECTION_INFO_KEY)
       displayPrefs.showConnectionInfo = e.newValue === "1";
+    if (e.key === CHAT_FONT_SIZE_KEY)
+      displayPrefs.chatFontSize =
+        e.newValue === null
+          ? DEFAULT_CHAT_FONT_SIZE
+          : clampChatFontSize(e.newValue);
+    if (e.key === CHAT_FONT_FAMILY_KEY)
+      displayPrefs.chatFontFamily = normalizeChatFontFamily(e.newValue);
   });
 }

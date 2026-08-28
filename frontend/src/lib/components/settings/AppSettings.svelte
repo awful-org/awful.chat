@@ -10,11 +10,83 @@ import { mediaPrefs, setGifAutoplay } from "$lib/media-prefs.svelte";
 import {
   displayPrefs,
   setCallChatBeside,
+  setChatFontFamily,
+  setChatFontSize,
   setItalicOwnName,
   setShowConnectionInfo,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
 } from "$lib/display-prefs.svelte";
+import { Slider } from "$lib/components/ui/slider";
+import { Input } from "$lib/components/ui/input";
+import { Button } from "$lib/components/ui/button";
+import {
+  FONT_STACKS,
+  MAX_CHAT_FONT_SIZE,
+  MIN_CHAT_FONT_SIZE,
+  resolveChatFontStack,
+  sanitizeFontFamily,
+} from "$lib/chat-font";
+
+/** Three short lines: the desktop dialog is a fixed height, mobile is a drawer. */
+const PREVIEW_LINES = [
+  { name: "ana", text: "did the relay come back up?" },
+  { name: "you", text: "yes — mailbox drained, nothing lost" },
+  { name: "kai", text: "0x1f4a9 renders fine at this size 💩" },
+] as const;
+
+const previewStack = $derived(resolveChatFontStack(displayPrefs.chatFontFamily));
+
+let customFamily = $state("");
+let localFonts = $state<string[]>([]);
+let loadingFonts = $state(false);
+let fontsError = $state<string | null>(null);
+
+// Feature-detected, not assumed. `queryLocalFonts` is Chromium-on-desktop only:
+// Firefox and Safari have never implemented it, and Chrome on Android does not
+// either. So the typed field above is the mechanism and this is the shortcut.
+//
+// Typed here rather than in vite-env.d.ts because that file is a global script,
+// where `declare global` cannot augment `Window`, and one call site does not
+// justify reshaping the ambient types.
+type LocalFont = { family: string };
+const queryLocalFonts = (
+  globalThis as unknown as {
+    queryLocalFonts?: () => Promise<LocalFont[]>;
+  }
+).queryLocalFonts;
+const canQueryLocalFonts = typeof queryLocalFonts === "function";
+
+function applyCustomFamily(): void {
+  const safe = sanitizeFontFamily(customFamily);
+  if (safe === null) return;
+  setChatFontFamily(safe);
+  customFamily = "";
+}
+
+async function loadLocalFonts(): Promise<void> {
+  loadingFonts = true;
+  fontsError = null;
+  try {
+    // MUST run from a click: the API throws SecurityError without a real user
+    // gesture, and the first call prompts for permission.
+    const faces = await queryLocalFonts!();
+    // One entry per FACE, so Menlo Regular/Bold/Italic all report family
+    // "Menlo". Dedupe to families, which is what font-family takes.
+    const families = [...new Set(faces.map((f) => f.family))]
+      .filter((f) => sanitizeFontFamily(f) !== null)
+      .sort((a, b) => a.localeCompare(b));
+    localFonts = families;
+    if (families.length === 0) {
+      fontsError = "The browser returned no fonts. Type a name instead.";
+    }
+  } catch {
+    // Denial is a normal answer, not a failure worth a stack trace.
+    fontsError = "No permission to list fonts. Type a name instead.";
+  } finally {
+    loadingFonts = false;
+  }
+}
 </script>
 
 <div class="flex flex-col gap-6">
@@ -143,6 +215,151 @@ import {
       checked={displayPrefs.callChatBeside}
       onCheckedChange={(checked) => setCallChatBeside(checked)}
     />
+  </div>
+</div>
+
+<!-- Chat text Section -->
+<div
+  class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+>
+  <div class="flex items-center gap-2">
+    <div class="w-1 h-4 bg-teal-500 rounded-full"></div>
+    <Label
+      class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+      >Chat text</Label
+    >
+  </div>
+
+  <div class="flex flex-col gap-2">
+    <div class="flex items-center justify-between">
+      <span class="text-xs font-mono text-muted-foreground">Size</span>
+      <span class="text-xs font-mono tabular-nums text-green-400"
+        >{displayPrefs.chatFontSize}px</span
+      >
+    </div>
+    <Slider
+      type="single"
+      value={displayPrefs.chatFontSize}
+      min={MIN_CHAT_FONT_SIZE}
+      max={MAX_CHAT_FONT_SIZE}
+      step={1}
+      onValueChange={(v) => setChatFontSize(v)}
+      class="w-full **:data-[orientation=vertical]:h-full"
+    />
+  </div>
+
+  <div class="flex flex-col gap-2">
+    <span class="text-xs font-mono text-muted-foreground">Font</span>
+    <!--
+      Each option renders in its own family, so you can see whether a stack
+      actually resolved on this machine. That is a better answer than a dropdown
+      of names, and it needs no permission prompt.
+    -->
+    <div class="flex flex-wrap items-center gap-1.5">
+      {#each FONT_STACKS as entry (entry.id)}
+        <button
+          type="button"
+          onclick={() => setChatFontFamily(entry.id)}
+          style="font-family: {entry.stack}"
+          class="cursor-pointer rounded-full border px-2.5 py-1 text-xs transition-colors {displayPrefs.chatFontFamily ===
+          entry.id
+            ? 'border-primary bg-primary/10'
+            : 'border-border hover:border-primary/40'}"
+        >
+          {entry.label}
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <div class="flex flex-col gap-2">
+    <span class="text-xs font-mono text-muted-foreground"
+      >Or name a font installed on this device</span
+    >
+    <div class="flex items-center gap-2">
+      <Input
+        value={customFamily}
+        placeholder="Consolas, Inter, Comic Sans MS…"
+        oninput={(e) => (customFamily = e.currentTarget.value)}
+        onkeydown={(e) => {
+          if (e.key === "Enter") applyCustomFamily();
+        }}
+        class="h-8 text-xs"
+      />
+      <Button
+        variant="outline"
+        size="sm"
+        class="h-8 shrink-0 text-xs"
+        disabled={sanitizeFontFamily(customFamily) === null}
+        onclick={applyCustomFamily}
+      >
+        Use
+      </Button>
+    </div>
+    {#if localFonts.length > 0}
+      <!--
+        Populated only after a click, because queryLocalFonts needs a real user
+        gesture and asks the user's permission.
+      -->
+      <div class="flex flex-wrap items-center gap-1.5">
+        {#each localFonts as family (family)}
+          <button
+            type="button"
+            onclick={() => setChatFontFamily(family)}
+            style="font-family: '{family}'"
+            class="cursor-pointer rounded-full border px-2.5 py-1 text-xs transition-colors {displayPrefs.chatFontFamily ===
+            family
+              ? 'border-primary bg-primary/10'
+              : 'border-border hover:border-primary/40'}"
+          >
+            {family}
+          </button>
+        {/each}
+      </div>
+    {:else if canQueryLocalFonts}
+      <Button
+        variant="outline"
+        size="sm"
+        class="h-8 self-start text-xs"
+        disabled={loadingFonts}
+        onclick={loadLocalFonts}
+      >
+        {loadingFonts ? "Asking…" : "List my installed fonts"}
+      </Button>
+    {:else}
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        This browser cannot list your fonts, so type the name instead. Any font
+        installed on this device works.
+      </span>
+    {/if}
+    {#if fontsError}
+      <span class="text-xs font-mono text-destructive">{fontsError}</span>
+    {/if}
+  </div>
+
+  <!--
+    The preview declares the SAME two custom properties the real chat container
+    does, so it is structurally identical to production rather than an
+    approximation of it. Kept to three short lines: the desktop dialog has a
+    fixed height and the mobile path is a bottom drawer.
+  -->
+  <div
+    style="--chat-font-size: {displayPrefs.chatFontSize}px; --chat-font-family: {previewStack}"
+    class="rounded-md border border-border bg-background p-3 font-(family-name:--chat-font-family)"
+  >
+    <div class="flex flex-col gap-1.5">
+      {#each PREVIEW_LINES as line (line.name)}
+        <div class="flex gap-2">
+          <span class="shrink-0 text-xs font-semibold text-primary"
+            >{line.name}</span
+          >
+          <span
+            class="text-(length:--chat-font-size) leading-normal text-foreground"
+            >{line.text}</span
+          >
+        </div>
+      {/each}
+    </div>
   </div>
 </div>
 

@@ -53,6 +53,7 @@
   import UserListSidebar from "./UserListSidebar.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { resolveChatFontStack } from "$lib/chat-font";
   import { nameEffectStyle } from "$lib/name-effect";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import {
@@ -80,7 +81,12 @@
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
-  import { serialize, mentionsMe, segmentDraft } from "$lib/mentions";
+  import {
+    buildMentionCandidates,
+    mentionsMe,
+    segmentDraft,
+    serialize,
+  } from "$lib/mentions";
   import { makeHostApi } from "$lib/plugins/host";
   import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import UserProfileCard from "./UserProfileCard.svelte";
@@ -132,6 +138,7 @@
 
   let {
     peers,
+    roomUsers,
     messages,
     inCall,
     callRoomCode,
@@ -437,15 +444,29 @@
    */
   const draftSegments = $derived(segmentDraft(draft, draftMentionMap));
 
+  /**
+   * `roomUsers` is DID-keyed and seeded on join from the persisted participant
+   * list, and `peerNames` is seeded from stored peer profiles, so an offline
+   * member is still mentionable by name. The selection rules live in
+   * `mentions.ts` because they are testable there and this file is not.
+   */
+  const mentionCandidates = $derived(
+    buildMentionCandidates({
+      roomUsers,
+      peers,
+      toDid: senderDid,
+      nameOf: (id) => peerNames.get(id),
+      selfIds: [identityStore.did ?? "", selfId(), myPeerId()],
+    }),
+  );
+
   const filteredMembersForMention = $derived.by(() => {
     if (!mentionPopupOpen) return [];
-    const self = selfId();
-    const mine = myPeerId();
     const lower = mentionPrefix.toLowerCase();
-    return peers
-      .filter((pid) => pid !== self && pid !== mine)
-      .map((pid) => ({ did: senderDid(pid), name: displayNameFor(pid) }))
-      .filter((m) => !lower || m.name.toLowerCase().includes(lower));
+    if (!lower) return mentionCandidates;
+    return mentionCandidates.filter((m) =>
+      m.name.toLowerCase().includes(lower),
+    );
   });
 
   function updateMentionState() {
@@ -1254,6 +1275,13 @@
   // Desktop only: below sm there is no room for two columns, and the call
   // stage would squeeze the messages to nothing.
   const callBeside = $derived(displayPrefs.callChatBeside && !isMobile);
+
+  // The stored pref is a stack id or a custom family name; the resolver turns
+  // either into a complete CSS stack, and sanitises the custom case because the
+  // value lands in an inline style attribute.
+  const chatFontStack = $derived(
+    resolveChatFontStack(displayPrefs.chatFontFamily),
+  );
   // Opening the user list widens the chat column instead of crushing the
   // message text into what the w-60 aside leaves behind.
   const chatColClass = $derived(
@@ -1294,9 +1322,16 @@
 
 <svelte:document onvisibilitychange={markSeenOnReturn} />
 
+<!--
+  The two chat font properties are declared here and consumed by the message
+  body. They are purpose-named on purpose: overriding Tailwind's `--font-mono`
+  instead would also retarget every shiki code block, because Preflight resolves
+  `code`/`pre`/`kbd`/`samp` from that token.
+-->
 <div
   use:viewportHeight
-  class="relative flex flex-col bg-background text-foreground font-mono overflow-hidden"
+  style="--chat-font-size: {displayPrefs.chatFontSize}px; --chat-font-family: {chatFontStack}"
+  class="relative flex flex-col bg-background text-foreground font-(family-name:--chat-font-family) overflow-hidden"
   role="main"
   ondragenter={handleRootDragEnter}
   ondragover={handleRootDragOver}
@@ -2058,6 +2093,13 @@
               >
                 <span class="text-muted-foreground">@</span>
                 <span class="truncate">{member.name}</span>
+                {#if !member.online}
+                  <!-- Say so rather than hiding them: mentioning an away member
+                       is the point, and a silent list looks like a bug. -->
+                  <span class="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                    away
+                  </span>
+                {/if}
               </button>
             {/each}
           </div>

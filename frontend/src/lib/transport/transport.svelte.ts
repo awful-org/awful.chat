@@ -94,6 +94,7 @@ import {
   touchCardStates,
 } from "../plugins/state.svelte";
 import { announceMessage } from "../announce";
+import { mentionsMe } from "../mentions";
 import { appendToDmPanel, dmPanelIsShowing } from "../dm-panel.svelte";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
@@ -1092,17 +1093,24 @@ async function _handleSyncBatch(
   for (const m of fullMessages) stripAndAdoptInlineFiles(m);
 
   // Newness has to be read BEFORE the write below, which would otherwise
-  // satisfy the lookup. Only worth the round trip for a live batch: repair
-  // never announces, so it never needs the answer.
-  const unannounced = live
-    ? await Promise.all(
-        fullMessages.map(
-          async (m) =>
-            !transportState.messages.some((x) => x.id === m.id) &&
-            !(await getMessage(m.id))
-        )
-      )
-    : [];
+  // satisfy the lookup.
+  //
+  // A live batch checks every message. A repair batch checks only the ones that
+  // mention me. "Repair never announces" is the right rule for bulk history --
+  // syncing a busy room must not fire a hundred notifications -- but a mention
+  // you were away for is the one thing you MUST still be told about, and that
+  // is exactly the case that used to be silent. Scoping the check to mentions
+  // keeps the round trips proportional to mentions, not to the backfill size:
+  // the `&&` short-circuits before `getMessage` for everything else.
+  const selfIds = _selfIds();
+  const unannounced = await Promise.all(
+    fullMessages.map(
+      async (m) =>
+        (live || mentionsMe(m.content ?? "", selfIds)) &&
+        !transportState.messages.some((x) => x.id === m.id) &&
+        !(await getMessage(m.id))
+    )
+  );
 
   await bulkPutMessages(fullMessages);
 
@@ -1139,11 +1147,11 @@ async function _handleSyncBatch(
   refreshUnreadCount(roomCode).catch(() => {});
   for (const m of fullMessages) noteRoomActivity(m.roomCode, m.timestamp);
 
-  if (live) {
-    fullMessages.forEach((m, i) => {
-      if (unannounced[i]) _announceMessage(m);
-    });
-  }
+  // No `live` gate here: `unannounced` already encodes the policy, and it is
+  // false for every non-mention in a repair batch.
+  fullMessages.forEach((m, i) => {
+    if (unannounced[i]) _announceMessage(m);
+  });
 
   // Storage got everything; the view only takes messages for the room that is
   // actually open (the user may have switched while the batch was in flight),
@@ -1645,6 +1653,11 @@ async function _verifyIncoming(
   return verifySignature(wire.senderDid, wire.sig, canonicalFor(wire));
 }
 
+/** Every id that means "me". Shared so the announce and mention checks agree. */
+function _selfIds(): string[] {
+  return [identityStore.did ?? "", _transport.selfId()];
+}
+
 /**
  * Bind an incoming message to this client's identity and view, then let
  * announce.ts decide whether to make a sound about it. The caller has already
@@ -1652,7 +1665,7 @@ async function _verifyIncoming(
  */
 function _announceMessage(msg: Message): void {
   announceMessage(msg, {
-    selfIds: [identityStore.did ?? "", _transport.selfId()],
+    selfIds: _selfIds(),
     uiRoomCode: transportState.uiRoomCode,
     resolveName: resolveMentionDisplayName,
   });
@@ -1947,7 +1960,7 @@ export function deliverMailboxDm(
   // AWAITABLE on purpose: the mailbox collector must not ack (= delete the
   // relay's only copy) until the local write actually settled - a locked
   // identity mid-drain throws here instead of vanishing the message.
-  return _handleDmChatAsync(senderDid, senderDid, { payload });
+  return _handleDmChatAsync(senderDid, senderDid, { payload }, true);
 }
 
 function _handleDmChat(
@@ -1961,7 +1974,14 @@ function _handleDmChat(
 function _handleDmChatAsync(
   peerId: string,
   senderDid: string,
-  envelope: { payload: DmPayload }
+  envelope: { payload: DmPayload },
+  /**
+   * This arrived from the relay mailbox, so `peerId` is the sender's DID
+   * standing in for a stream that does not exist. Passed explicitly rather than
+   * inferred from `peerId === senderDid`: that coincidence is not a contract,
+   * and getting it wrong emits a user-visible error.
+   */
+  viaMailbox = false
 ): Promise<void> {
   return (async () => {
     const roomCode = await ensureDmRoomForPeer(peerId);
@@ -2037,15 +2057,24 @@ function _handleDmChatAsync(
         }
         await refreshDmRooms();
         transportState.dmVersion += 1;
-        _transport
-          .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
-          .catch(() => {});
+        // No stream to reply on when the DM came out of the mailbox. Calling
+        // send() with a DID makes peerIdFromString throw inside libp2p, and
+        // that surfaces as a `stream-open-failed` toast the user reads as a
+        // real error - up to two per collected DM. The sender learns the
+        // message landed when the offline queue next reaches them live.
+        if (!viaMailbox) {
+          _transport
+            .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
+            .catch(() => {});
+        }
       }
     }
 
-    _transport
-      .send(peerId, encodeDmAckEnvelope(envelope.payload.id))
-      .catch(() => {});
+    if (!viaMailbox) {
+      _transport
+        .send(peerId, encodeDmAckEnvelope(envelope.payload.id))
+        .catch(() => {});
+    }
   })();
 }
 

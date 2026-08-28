@@ -18,6 +18,7 @@ import {
   type DMRoom,
   getMessages,
 } from "$lib/storage";
+import { roomsStore } from "$lib/rooms.svelte";
 import {
   appendToDmPanel,
   defaultPanelPosition,
@@ -468,15 +469,26 @@ async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
   );
 }
 
+/**
+ * A readable name for the other side of a DM.
+ *
+ * `peerId` is a real peer id on the live path but the sender's DID on the
+ * mailbox path, so both keys are tried either way: the peerId-to-DID map misses
+ * for a DID input, which used to drop straight through to a `did:key:z6Mk`
+ * fragment as the sender's name.
+ */
 export function resolveDmDisplayName(peerId: string): string {
   const did = _peerIdToDid.get(peerId);
-  if (did)
-    return (
-      transportState.peerNames.get(did) ??
-      transportState.peerNames.get(peerId) ??
-      peerId.slice(0, 12)
-    );
-  return transportState.peerNames.get(peerId) ?? peerId.slice(0, 12);
+  const names = transportState.peerNames;
+  const named = (did ? names.get(did) : undefined) ?? names.get(peerId);
+  if (named) return named;
+  // The phonebook nickname survives a reload even when no profile was ever
+  // cached, which is exactly the case a mailbox DM from a stranger hits.
+  const entry = roomsStore.phonebook.find(
+    (e) => e.peerId === peerId || e.did === peerId || (!!did && e.did === did)
+  );
+  if (entry?.nickname) return entry.nickname;
+  return peerId.slice(0, 12);
 }
 
 export async function joinPhonebookDmRooms(): Promise<void> {

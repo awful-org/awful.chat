@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { serialize, humanize, mentionsMe, segmentDraft } from "./mentions";
+import {
+  buildMentionCandidates,
+  humanize,
+  mentionsMe,
+  segmentDraft,
+  serialize,
+} from "./mentions";
 
 describe("mentions", () => {
   describe("serialize", () => {
@@ -249,5 +255,92 @@ describe("segmentDraft", () => {
     expect(serialize(draft, map)).toBe(
       "@[did:key:z6MkAlice] @Alice-bot @[did:key:z6MkBob] @Charlie"
     );
+  });
+});
+
+describe("buildMentionCandidates", () => {
+  /** A roster where names are known for everyone unless stated otherwise. */
+  const names: Record<string, string> = {
+    "did:alice": "Alice",
+    "did:bob": "Bob",
+    "did:carol": "Carol",
+    "did:me": "Me",
+  };
+  const peerToDid: Record<string, string> = {
+    "peer-alice": "did:alice",
+    "peer-me": "did:me",
+  };
+
+  function build(over: Partial<Parameters<typeof buildMentionCandidates>[0]> = {}) {
+    return buildMentionCandidates({
+      roomUsers: ["did:alice", "did:bob", "did:carol"],
+      peers: [],
+      toDid: (id) => peerToDid[id] ?? id,
+      nameOf: (id) => names[id],
+      selfIds: ["did:me", "peer-me"],
+      ...over,
+    });
+  }
+
+  it("offers a roster member who is not connected", () => {
+    // The whole point: nobody is online here, and all three are still offerable.
+    expect(build().map((c) => c.name)).toEqual(["Alice", "Bob", "Carol"]);
+  });
+
+  it("marks a connected member online and an absent one offline", () => {
+    const out = build({ peers: ["peer-alice"] });
+    expect(out.find((c) => c.name === "Alice")?.online).toBe(true);
+    expect(out.find((c) => c.name === "Bob")?.online).toBe(false);
+  });
+
+  it("puts online members before offline ones", () => {
+    // Carol sorts last alphabetically but first when she is the one connected.
+    const out = build({
+      peers: ["peer-carol"],
+      toDid: (id) => (id === "peer-carol" ? "did:carol" : (peerToDid[id] ?? id)),
+    });
+    expect(out[0].name).toBe("Carol");
+  });
+
+  it("sorts alphabetically within the same online state", () => {
+    expect(build({ roomUsers: ["did:carol", "did:bob", "did:alice"] }).map((c) => c.name)).toEqual(
+      ["Alice", "Bob", "Carol"]
+    );
+  });
+
+  it("never offers you yourself, by DID or by peer id", () => {
+    const out = build({ roomUsers: ["did:alice", "did:me"], peers: ["peer-me"] });
+    expect(out.map((c) => c.name)).toEqual(["Alice"]);
+  });
+
+  it("drops a member whose name is not known", () => {
+    // The caller's fallback would be a DID fragment, and `@did:key:z6Mk` is not
+    // a mention anybody means to type.
+    const out = build({ roomUsers: ["did:alice", "did:stranger"] });
+    expect(out.map((c) => c.did)).toEqual(["did:alice"]);
+  });
+
+  it("reports one entry per person when the roster and the peers overlap", () => {
+    const out = build({ roomUsers: ["did:alice"], peers: ["peer-alice"] });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({ did: "did:alice", name: "Alice", online: true });
+  });
+
+  it("resolves a name keyed by peer id when the DID has none", () => {
+    const out = build({
+      roomUsers: [],
+      peers: ["peer-zed"],
+      toDid: (id) => (id === "peer-zed" ? "did:zed" : id),
+      nameOf: (id) => (id === "peer-zed" ? "Zed" : names[id]),
+    });
+    expect(out).toEqual([{ did: "did:zed", name: "Zed", online: true }]);
+  });
+
+  it("ignores empty ids", () => {
+    expect(build({ roomUsers: ["", "did:alice"] }).map((c) => c.name)).toEqual(["Alice"]);
+  });
+
+  it("returns nothing for an empty roster", () => {
+    expect(build({ roomUsers: [], peers: [] })).toEqual([]);
   });
 });
