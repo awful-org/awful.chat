@@ -163,7 +163,7 @@
 
       <div class="flex min-w-0 items-center gap-2 px-1">
         <span
-          class="min-w-0 flex-1 truncate text-lg font-mono font-semibold {effectStyle.class}"
+          class="w-0 min-w-0 flex-1 truncate text-lg font-mono font-semibold {effectStyle.class}"
           style={effectStyle.style || (color ? `color: ${color}` : "")}
         >
           {name}

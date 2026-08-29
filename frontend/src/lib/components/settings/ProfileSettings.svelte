@@ -357,6 +357,9 @@
           <input
             type="color"
             bind:value={colorValue}
+            oninput={() => {
+              colorTouched = true;
+            }}
             onchange={() => {
               colorTouched = true;
               saveColor(colorValue).catch(() => {});
