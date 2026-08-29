@@ -217,15 +217,6 @@ body {
   }
 }
 
-@keyframes glow {
-  0%, 100% {
-    text-shadow: 0 0 8px var(--name-glow-color, currentColor);
-  }
-  50% {
-    text-shadow: 0 0 16px var(--name-glow-color, currentColor);
-  }
-}
-
 @keyframes rainbow {
   0% {
     filter: hue-rotate(0deg);
@@ -237,7 +228,6 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .name-effect-shimmer,
-  .name-effect-glow,
   .name-effect-rainbow {
     animation: none !important;
   }

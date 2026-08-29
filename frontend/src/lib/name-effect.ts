@@ -170,8 +170,7 @@ export function nameEffectStyle(
   if (model.glow) {
     classes.push("name-effect-glow");
     cssProperties["--name-glow-color"] = color!;
-    cssProperties["text-shadow"] = `0 0 8px ${color}`;
-    animations.push("glow 2s ease-in-out infinite");
+    cssProperties["text-shadow"] = `0 0 3px ${color}`;
   }
 
   if (color && model.fill === "none" && !model.shimmer) {
