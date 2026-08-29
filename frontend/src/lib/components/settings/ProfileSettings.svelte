@@ -511,7 +511,7 @@
             class="group flex min-w-0 flex-1 cursor-pointer items-center gap-1.5"
           >
             <span
-              class="min-w-0 flex-1 truncate font-mono text-base font-semibold {effectStyle.class}"
+              class="min-w-0 flex-1 truncate text-left font-mono text-base font-semibold {effectStyle.class}"
               style={effectStyle.style ||
                 (profileStore.color ? `color: ${profileStore.color}` : "")}
             >
