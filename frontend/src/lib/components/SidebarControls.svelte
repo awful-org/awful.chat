@@ -20,6 +20,7 @@
     leaveCall,
   } from "$lib/transport/call.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { nameEffectStyle } from "$lib/name-effect";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import SettingsDialog from "$lib/components/SettingsDialog.svelte";
@@ -195,11 +196,29 @@
 
       <!-- Name + status -->
       {#if !collapsed}
-        <div class="flex flex-col gap-1.5 mt-1 w-full">
-          <div
-            class="truncate w-26 text-xs font-semibold text-foreground font-mono leading-tight"
-          >
-            {profileStore.nickname}
+        {@const effectStyle = nameEffectStyle(
+          profileStore.nameEffect,
+          profileStore.color ?? undefined,
+          profileStore.gradient2 ?? undefined,
+          profileStore.gradient3 ?? undefined,
+          profileStore.nameShimmer ?? undefined,
+          profileStore.nameGlow ?? undefined
+        )}
+        <div class="flex flex-col gap-1.5 mt-1 w-full min-w-0">
+          <div class="flex items-baseline gap-1 w-full min-w-0">
+            <span
+              class="truncate flex-1 min-w-0 text-xs font-semibold text-foreground font-mono leading-tight {effectStyle.class}"
+              style={effectStyle.style ||
+                (profileStore.color ? `color: ${profileStore.color}` : "")}
+              >{profileStore.nickname}</span
+            >
+            {#if profileStore.tagText}
+              <span
+                class="shrink-0 rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
+                style={`background-color: ${profileStore.tagChipColor ?? "#e5e7eb"}; color: ${profileStore.tagTextColor ?? "#000000"}`}
+                >{profileStore.tagText}</span
+              >
+            {/if}
           </div>
           <!-- Connection status text: always shown, not gated on showConnectionInfo.
                That setting controls only the floating panel on the right. -->
