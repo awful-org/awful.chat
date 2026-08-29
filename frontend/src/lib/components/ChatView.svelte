@@ -1832,7 +1832,7 @@
                         {initials(msg)}
                       {/if}
                     </div>
-                    <div class="flex items-baseline gap-2">
+                    <div class="flex min-w-0 items-baseline gap-2">
                       {#if isOwn}
                         {@const effectStyle = nameEffectStyle(profileStore.nameEffect, profileStore.color, profileStore.gradient2 ?? undefined, profileStore.gradient3 ?? undefined, profileStore.nameShimmer, profileStore.nameGlow)}
                         <span
@@ -1842,7 +1842,7 @@
                           onkeydown={(e) => {
                             if (e.key === "Enter") openProfileFromMessage(msg);
                           }}
-                          class="cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
+                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
                             ? 'italic'
                             : ''} {effectStyle.class}"
                           style={effectStyle.style || (profileStore.color ? `color: ${profileStore.color}` : "")}
@@ -1874,7 +1874,7 @@
                           onkeydown={(e) => {
                             if (e.key === "Enter") openProfileFromMessage(msg);
                           }}
-                          class="cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
+                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
                           style={effectStyle.style || (color ? `color: ${color}` : "")}
                         >
                           {displayName(msg)}
