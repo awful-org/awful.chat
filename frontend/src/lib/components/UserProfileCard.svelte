@@ -161,9 +161,9 @@
         {/if}
       </div>
 
-      <div class="flex min-w-0 items-center gap-2 px-1">
+      <div class="flex min-w-0 items-center justify-start gap-2 px-1 text-left">
         <span
-          class="w-0 min-w-0 flex-1 truncate text-lg font-mono font-semibold {effectStyle.class}"
+          class="w-0 min-w-0 flex-1 truncate text-left text-lg font-mono font-semibold {effectStyle.class}"
           style={effectStyle.style || (color ? `color: ${color}` : "")}
         >
           {name}
