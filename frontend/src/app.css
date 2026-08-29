@@ -219,10 +219,10 @@ body {
 
 @keyframes glow {
   0%, 100% {
-    text-shadow: 0 0 8px currentColor;
+    text-shadow: 0 0 8px var(--name-glow-color, currentColor);
   }
   50% {
-    text-shadow: 0 0 16px currentColor;
+    text-shadow: 0 0 16px var(--name-glow-color, currentColor);
   }
 }
 

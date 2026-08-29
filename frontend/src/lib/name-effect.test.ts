@@ -145,6 +145,37 @@ describe("nameEffectStyle", () => {
     });
   });
 
+  describe("glow preserves the selected fill", () => {
+    it.each([
+      [undefined, false, "#d946ef", "solid"],
+      ["gradient", false, "#d946ef", "gradient"],
+      ["gradient", true, "#d946ef", "shimmer"],
+      ["rainbow", false, "#d946ef", "rainbow"],
+    ] as const)(
+      "keeps the %s fill and uses the saved colour for its glow",
+      (effect, shimmer, color, _label) => {
+        const result = nameEffectStyle(
+          effect,
+          color,
+          "#22d3ee",
+          undefined,
+          shimmer,
+          true
+        );
+
+        expect(result.class).toContain("name-effect-glow");
+        expect(result.style).toContain(`--name-glow-color: ${color}`);
+
+        if (effect === undefined) {
+          expect(result.style).toContain(`color: ${color}`);
+          expect(result.style).not.toContain("background-clip: text");
+        } else {
+          expect(result.style).toContain("background-clip: text");
+        }
+      }
+    );
+  });
+
   describe("no effects", () => {
     it("no effects returns empty style", () => {
       const result = nameEffectStyle(undefined, "#3b82f6");

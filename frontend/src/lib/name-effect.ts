@@ -169,8 +169,13 @@ export function nameEffectStyle(
   // -webkit-text-fill-color, so it layers on top of any fill.
   if (model.glow) {
     classes.push("name-effect-glow");
+    cssProperties["--name-glow-color"] = color!;
     cssProperties["text-shadow"] = `0 0 8px ${color}`;
-    animations.push("glow 2s steps(24) infinite");
+    animations.push("glow 2s ease-in-out infinite");
+  }
+
+  if (color && model.fill === "none" && !model.shimmer) {
+    cssProperties["color"] = color;
   }
 
   // Combine animations into a single property to avoid cascade issues
