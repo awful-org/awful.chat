@@ -161,16 +161,16 @@
         {/if}
       </div>
 
-      <div class="flex flex-wrap items-center gap-2 px-1">
+      <div class="flex min-w-0 items-center gap-2 px-1">
         <span
-          class="text-lg font-mono font-semibold {effectStyle.class}"
+          class="min-w-0 flex-1 truncate text-lg font-mono font-semibold {effectStyle.class}"
           style={effectStyle.style || (color ? `color: ${color}` : "")}
         >
           {name}
         </span>
         {#if tagText}
           <div
-            class="px-2 py-1 rounded text-xs font-mono font-semibold uppercase"
+            class="shrink-0 rounded px-2 py-1 text-xs font-mono font-semibold uppercase"
             style={`background-color: ${tagChipColor}; color: ${tagTextColor}`}
           >
             {tagText}
