@@ -118,6 +118,7 @@
   let gradient3El = $state<HTMLInputElement | null>(null);
   let addColorEl = $state<HTMLButtonElement | null>(null);
   let nameEditorEl = $state<HTMLElement | null>(null);
+  let tagEditorEl = $state<HTMLElement | null>(null);
   let colorTouched = $state(false);
   let gradientTouched = $state(false);
 
@@ -125,12 +126,14 @@
   // focusout with no destination, but no in-page pointer event. Only a real
   // pointerdown outside this editor is a click-away.
   $effect(() => {
-    if (editing !== "name") return;
+    if (editing !== "name" && editing !== "tag") return;
     const onPointerDown = (e: PointerEvent) => {
-      if (!nameEditorEl) return;
+      const editor = editing === "name" ? nameEditorEl : tagEditorEl;
+      if (!editor) return;
       const target = e.target;
-      if (!(target instanceof Node) || nameEditorEl.contains(target)) return;
-      void commitName();
+      if (!(target instanceof Node) || editor.contains(target)) return;
+      if (editing === "name") void commitName();
+      else void commitTag();
     };
     document.addEventListener("pointerdown", onPointerDown, true);
     return () => document.removeEventListener("pointerdown", onPointerDown, true);
@@ -496,7 +499,7 @@
         </div>
         </div>
       {:else}
-        <div class="flex flex-wrap items-center gap-2">
+        <div class="flex min-w-0 items-center gap-2">
           <button
             type="button"
             onclick={() => {
@@ -505,17 +508,17 @@
               editing = "name";
             }}
             aria-label="Edit name, color and effect"
-            class="group flex cursor-pointer items-center gap-1.5"
+            class="group flex min-w-0 flex-1 cursor-pointer items-center gap-1.5"
           >
             <span
-              class="font-mono text-base font-semibold {effectStyle.class}"
+              class="min-w-0 flex-1 truncate font-mono text-base font-semibold {effectStyle.class}"
               style={effectStyle.style ||
                 (profileStore.color ? `color: ${profileStore.color}` : "")}
             >
               {profileStore.nickname || "Anonymous"}
             </span>
             <Pencil
-              class="size-3 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
+              class="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
             />
           </button>
 
@@ -525,7 +528,7 @@
                 type="button"
                 onclick={() => (editing = "tag")}
                 aria-label="Edit tag"
-                class="cursor-pointer rounded px-2 py-0.5 font-mono text-xs font-semibold uppercase hover:opacity-80"
+                class="shrink-0 cursor-pointer rounded px-2 py-0.5 font-mono text-xs font-semibold uppercase hover:opacity-80"
                 style={`background-color: ${profileStore.tagChipColor ?? "#e5e7eb"}; color: ${profileStore.tagTextColor ?? "#000000"}`}
               >
                 {profileStore.tagText}
@@ -549,9 +552,12 @@
              check-button-only silently discarded a typed tag on blur. -->
         <div
           class="flex flex-wrap items-center gap-2"
+          bind:this={tagEditorEl}
           onfocusout={(e) => {
+            if (!(e.target as HTMLElement).isConnected) return;
             const row = e.currentTarget as HTMLElement;
-            if (!row.contains(e.relatedTarget as Node)) commitTag();
+            const next = e.relatedTarget as Node | null;
+            if (next && !row.contains(next)) void commitTag();
           }}
         >
           <input
@@ -571,6 +577,8 @@
           <input
             type="color"
             bind:value={tagTextColor}
+            onchange={() =>
+              saveTagColors(tagTextColor || undefined, tagChipColor || undefined).catch(() => {})}
             aria-label="Tag text color"
             title="Text"
             class="size-7 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0.5"
@@ -578,6 +586,8 @@
           <input
             type="color"
             bind:value={tagChipColor}
+            onchange={() =>
+              saveTagColors(tagTextColor || undefined, tagChipColor || undefined).catch(() => {})}
             aria-label="Tag chip color"
             title="Chip"
             class="size-7 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0.5"
