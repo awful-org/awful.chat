@@ -26,6 +26,7 @@ import {
 } from "$lib/dm-panel.svelte";
 import { MessageType, type Message } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
+import { base64ToBytes, bytesToBase64 } from "$lib/utils";
 import { leaveCall } from "./call.svelte";
 import {
   _hydrateAndSeedAttachments,
@@ -51,6 +52,12 @@ import {
   encodeDmReadEnvelope,
   hashDmRoomCode,
 } from "./dm-codec";
+import {
+  openRow,
+  sealRow,
+  storageCryptoReady,
+  type StoreCryptoSpec,
+} from "$lib/storage-crypto";
 
 interface QueuedMessage {
   to: string;
@@ -61,29 +68,88 @@ interface QueuedMessage {
 
 const DM_QUEUE_KEY = "awful:dm-queue:v1";
 
-function loadQueuedDmMessages(): QueuedMessage[] {
+// The queue holds message plaintext - body text, quoted replies, reaction
+// emoji, the recipient's DID - which everywhere else in the app reaches disk
+// only as AES-GCM ciphertext (storage-crypto.ts). Written as readable JSON it
+// also survived lockIdentity(), which drops the at-rest key but not
+// localStorage, so a locked or seized device still gave up every undelivered
+// DM. The value is now a single sealed blob under that same at-rest key.
+// localStorage stays the medium because the send path needs the queue to
+// survive a reload; base64 because localStorage only holds strings.
+const DM_QUEUE_SPEC: StoreCryptoSpec = { clear: [] };
+
+function validQueueEntries(items: unknown[]): QueuedMessage[] {
+  return items.filter(
+    (item): item is QueuedMessage =>
+      !!item &&
+      typeof (item as QueuedMessage).to === "string" &&
+      Array.isArray((item as QueuedMessage).data) &&
+      typeof (item as QueuedMessage).queuedAt === "number"
+  );
+}
+
+async function loadQueuedDmMessages(): Promise<QueuedMessage[]> {
   if (typeof localStorage === "undefined") return [];
+  let raw: string | null = null;
   try {
-    const raw = localStorage.getItem(DM_QUEUE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (item) =>
-        item &&
-        typeof item.to === "string" &&
-        Array.isArray(item.data) &&
-        typeof item.queuedAt === "number"
-    ) as QueuedMessage[];
+    raw = localStorage.getItem(DM_QUEUE_KEY);
   } catch {
+    return [];
+  }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      // A queue left by a build from before the sealing. Read it so pending
+      // messages still go out, then write it straight back sealed: that
+      // clears the readable copy, though the bytes already handed to the
+      // profile's LevelDB stay recoverable until a compaction the page
+      // cannot trigger.
+      const legacy = validQueueEntries(parsed);
+      await saveQueuedDmMessages(legacy);
+      return legacy;
+    }
+    const blob = parsed as { iv?: unknown; ct?: unknown };
+    if (typeof blob.iv !== "string" || typeof blob.ct !== "string") return [];
+    // Locked: there is nothing to flush before unlock anyway, and returning
+    // empty here is safe only because saveQueuedDmMessages refuses to write
+    // while locked - otherwise an empty read would overwrite the queue.
+    if (!storageCryptoReady()) return [];
+    const opened = await openRow<{ q?: unknown }>(
+      {
+        _enc: { iv: base64ToBytes(blob.iv), ct: base64ToBytes(blob.ct).buffer },
+      },
+      DM_QUEUE_SPEC
+    );
+    return Array.isArray(opened.q) ? validQueueEntries(opened.q) : [];
+  } catch {
+    // Undecryptable (another identity's key, a truncated write): the queue is
+    // unrecoverable, and treating it as empty beats throwing out of the send
+    // path. Nothing overwrites it until the next successful save.
     return [];
   }
 }
 
-function saveQueuedDmMessages(queue: QueuedMessage[]): void {
+async function saveQueuedDmMessages(queue: QueuedMessage[]): Promise<void> {
   if (typeof localStorage === "undefined") return;
+  if (!storageCryptoReady()) {
+    // No at-rest key means no way to persist this without putting plaintext
+    // back on disk, and refusing beats that. Unreachable from the send path:
+    // composing a DM already needs the unlocked identity to sign the envelope
+    // and to allocate a lamport out of IndexedDB, so the key is armed by the
+    // time anything can be queued.
+    console.warn("[dm] storage locked: offline queue not persisted");
+    return;
+  }
   try {
-    localStorage.setItem(DM_QUEUE_KEY, JSON.stringify(queue));
+    const sealed = await sealRow({ q: queue }, DM_QUEUE_SPEC);
+    localStorage.setItem(
+      DM_QUEUE_KEY,
+      JSON.stringify({
+        iv: bytesToBase64(sealed._enc.iv),
+        ct: bytesToBase64(new Uint8Array(sealed._enc.ct)),
+      })
+    );
   } catch {
     // Storage full or blocked: the message still sent or sits in memory;
     // a quota error must not blow up out of sendDirectMessage.
@@ -116,20 +182,41 @@ function resolveDmPeerId(candidate: string): string | null {
 /** Bound the offline queue; beyond this the oldest entries give way. */
 const DM_QUEUE_MAX = 200;
 
+// Every read-modify-write of the queue runs through this chain, one at a time.
+// Sealing the queue made load and save asynchronous, and ChatView calls
+// sendMessage() without awaiting it, so two quick sends to an offline peer both
+// loaded the same snapshot and both wrote snapshot+1: the first message was
+// dropped without a trace, never retried, its status stuck on "sending"
+// forever. Holding the chain across the load AND the save is what makes each
+// mutation see the previous one's write.
+let _queueChain: Promise<void> = Promise.resolve();
+
+function mutateDmQueue(
+  mutate: (queue: QueuedMessage[]) => QueuedMessage[]
+): Promise<void> {
+  const run = _queueChain.then(async () => {
+    await saveQueuedDmMessages(mutate(await loadQueuedDmMessages()));
+  });
+  // One failed mutation must not wedge the chain for every later one.
+  _queueChain = run.catch(() => {});
+  return run;
+}
+
 function queueDmMessage(
   toDid: string,
   data: Uint8Array,
   messageId?: string
-): void {
-  const queue = loadQueuedDmMessages();
-  while (queue.length >= DM_QUEUE_MAX) queue.shift();
-  queue.push({
-    to: toDid,
-    data: Array.from(data),
-    queuedAt: Date.now(),
-    messageId,
+): Promise<void> {
+  return mutateDmQueue((queue) => {
+    while (queue.length >= DM_QUEUE_MAX) queue.shift();
+    queue.push({
+      to: toDid,
+      data: Array.from(data),
+      queuedAt: Date.now(),
+      messageId,
+    });
+    return queue;
   });
-  saveQueuedDmMessages(queue);
 }
 
 export async function dmConversationCodeFor(
@@ -354,11 +441,16 @@ export async function sendDirectMessage(
   if (isOnline) {
     delivered = await _transport.send(resolvedPeerId!, envelope);
   }
+  // STARTED here, awaited after the local echo. The queue write is now a
+  // sealed read-modify-write of the whole queue (AES-GCM both ways), and
+  // awaiting it here put all of that in front of the user's own bubble - the
+  // exact send lag the echo below was reordered to remove.
+  let queued: Promise<void> | null = null;
   if (!delivered) {
-    queueDmMessage(peerDid, envelope, id);
+    queued = queueDmMessage(peerDid, envelope, id);
     // Opt-in relay mailbox: a sealed copy waits for the offline peer so
     // delivery does not require both of you online at once. Best-effort -
-    // the queue above keeps retrying P2P either way.
+    // the queue keeps retrying P2P either way.
     if (peerDid.startsWith("did:")) {
       const { depositDmToMailbox } = await import("./mailbox.svelte");
       void depositDmToMailbox(peerDid, envelope);
@@ -407,6 +499,10 @@ export async function sendDirectMessage(
   // something else entirely, which is the whole reason the panel exists.
   appendToDmPanel(msg);
 
+  // Now that the bubble is on screen, make sure the offline queue write
+  // actually landed - it is what retries this message after a reload.
+  if (queued) await queued;
+
   await putMessage(msg);
   await setWatermark(roomCode, mySenderId, msg.lamport);
   // Sending is reading: your own message must not count as unread, and the
@@ -453,7 +549,7 @@ async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
   if (!peerDid) return; // Can't flush if we don't know their DID yet
 
   const sent = new Set<string>();
-  for (const entry of loadQueuedDmMessages()) {
+  for (const entry of await loadQueuedDmMessages()) {
     // Match entries keyed by the DID *or* by the raw peerId - older entries
     // queued before the DID was known were stored under the peerId.
     if (entry.to !== peerDid && entry.to !== peerId) continue;
@@ -464,8 +560,11 @@ async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
     }
   }
   if (sent.size === 0) return;
-  saveQueuedDmMessages(
-    loadQueuedDmMessages().filter((e) => !sent.has(queueEntryKey(e)))
+  // The fresh read and the write-back have to be one uninterrupted step, or a
+  // message queued (for any peer) while the sends above were in flight is
+  // clobbered by this write - which is exactly what the comment above promises.
+  await mutateDmQueue((queue) =>
+    queue.filter((e) => !sent.has(queueEntryKey(e)))
   );
 }
 
@@ -610,8 +709,7 @@ export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
   // The queue is keyed by DID; filtering by peerId left the messages behind to
   // be delivered later into a conversation that had been deleted.
   const queuedDid = dmPeerDid(resolvedPeerId);
-  const queue = loadQueuedDmMessages();
-  saveQueuedDmMessages(
+  await mutateDmQueue((queue) =>
     queue.filter((q) => q.to !== resolvedPeerId && q.to !== queuedDid)
   );
 

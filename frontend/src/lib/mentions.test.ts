@@ -126,6 +126,29 @@ describe("mentions", () => {
       // humanize will still replace it - code handling is in MsgRender
       expect(result).toContain("@Alice");
     });
+
+    it("escapes HTML in the resolved name", () => {
+      const resolveName = () => '<img src=x onerror="alert(1)">';
+      const result = humanize("@[did:key:z6MkEvil]", resolveName);
+      expect(result).not.toContain("<img");
+      expect(result).toContain("&lt;img");
+      expect(result).toContain("&quot;");
+    });
+
+    it("survives a non-string name instead of throwing", () => {
+      // Peer display names are stored straight off the wire with no runtime
+      // type check, so resolveName can return a number or an object. Before
+      // the String() coercion this threw and killed the whole message list.
+      const cases: unknown[] = [42, null, undefined, { toString: () => "<x>" }];
+      for (const value of cases) {
+        const result = humanize(
+          "@[did:key:z6MkOdd]",
+          () => value as unknown as string
+        );
+        expect(result).not.toContain("<x>");
+        expect(result).toContain("<span");
+      }
+    });
   });
 
   describe("mentionsMe", () => {

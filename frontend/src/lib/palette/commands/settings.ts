@@ -12,6 +12,7 @@ import {
 import {
   displayPrefs,
   setCallChatBeside,
+  setCallPip,
   setItalicOwnName,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
@@ -122,6 +123,19 @@ export const settingsCommands: CmdSource = () => {
       kind: "act",
       keepOpen: true,
       perform: () => setCallChatBeside(!displayPrefs.callChatBeside),
+    },
+  });
+
+  cmds.push({
+    id: "settings.toggle:callPip",
+    title: "Call picture-in-picture",
+    keywords: ["toggle", "enable", "disable", "pip", "floating", "call"],
+    group: "Settings",
+    badge: displayPrefs.callPip ? "On" : "Off",
+    action: {
+      kind: "act",
+      keepOpen: true,
+      perform: () => setCallPip(!displayPrefs.callPip),
     },
   });
 

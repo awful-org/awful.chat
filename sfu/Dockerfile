@@ -18,6 +18,11 @@ RUN npm run build
 FROM node:22-slim AS runner
 WORKDIR /app
 
+# Create non-root user to avoid running node and mediasoup native worker as
+# root. The RTC port range (61000-61499 by default) is above 1024 so a non-root
+# user can bind it.
+RUN useradd --create-home --no-log-init sfu && chown -R sfu:sfu /app
+
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json ./
@@ -25,5 +30,7 @@ COPY package.json ./
 EXPOSE 3000
 
 ENV NODE_ENV=production
+
+USER sfu
 
 CMD ["node", "dist/index.js"]

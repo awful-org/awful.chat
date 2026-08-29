@@ -16,6 +16,7 @@ const PEER_COLORS_KEY = "awful:show-peer-colors:v1";
 const SIDEBAR_COLLAPSED_KEY = "awful:sidebar-collapsed:v1";
 const CALL_CHAT_BESIDE_KEY = "awful:call-chat-beside:v1";
 const CONNECTION_INFO_KEY = "awful:debug-connection-info:v1";
+const CALL_PIP_KEY = "awful:call-pip:v1";
 const CHAT_FONT_SIZE_KEY = "awful:chat-font-size:v1";
 const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
 
@@ -57,6 +58,12 @@ export const displayPrefs = $state({
    * and the room "Connected" pill. Off by default keeps them hidden.
    */
   showConnectionInfo: readStored(CONNECTION_INFO_KEY, false),
+  /**
+   * Keep the call in view when it is not on screen: the floating panel when
+   * you move to another room or DM, and the browser's own PiP window on a
+   * tab switch (Chromium). Off means the call is only the stage.
+   */
+  callPip: readStored(CALL_PIP_KEY, true),
   /** Chat message text size, in pixels. */
   chatFontSize: readChatFontSize(),
   /** Chat message font: a FontStackId, or a sanitized custom family name. */
@@ -66,6 +73,15 @@ export const displayPrefs = $state({
       : localStorage.getItem(CHAT_FONT_FAMILY_KEY),
   ),
 });
+
+export function setCallPip(on: boolean): void {
+  displayPrefs.callPip = on;
+  try {
+    localStorage.setItem(CALL_PIP_KEY, on ? "1" : "0");
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
 
 export function setItalicOwnName(on: boolean): void {
   displayPrefs.italicOwnName = on;

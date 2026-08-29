@@ -28,7 +28,7 @@
   import { peerIdToDid, transportState, resolveMentionDisplayName } from "$lib/transport/transport.svelte";
   import { getPlugin, getManifest } from "$lib/plugins/registry";
   import { getCardState, onCardStateChange } from "$lib/plugins/state.svelte";
-  import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
+  import { isPluginEnabled, pluginPrefs } from "$lib/plugins/prefs.svelte";
   import type { ComponentType } from "svelte";
 
   interface Props {
@@ -55,6 +55,13 @@
 
   let { msg, isOwn, fileTransfers, onRequestFileDownload }: Props = $props();
 
+  // `Message.content` is a TypeScript claim, not a runtime guarantee: a wire
+  // message is JSON.parse output that is only cast, so a peer can put a number
+  // or an object there and it still signs and verifies. Every use below calls
+  // string methods (.match, .indexOf, .slice), and one throw inside a $derived
+  // takes down the whole message list until reload - so coerce once, here.
+  const content = $derived(typeof msg.content === "string" ? msg.content : "");
+
   let isMobile = $state(false);
   let highlightedCode = $state<string | null>(null);
   let ogPreview = $state<OgPreview | null>(null);
@@ -68,6 +75,7 @@
   let pluginCardComponent = $state<ComponentType | null>(null);
   let pluginCardState = $state<unknown>(undefined);
   let pluginCardError = $state<string | null>(null);
+  let pluginCardDisabled = $state(false);
   let pluginCardPluginId = $state("");
 
   $effect(() => {
@@ -100,16 +108,39 @@
 
   $effect(() => {
     void cardStateTickLocal;
+    // The type guard comes FIRST. Every message in the scrollback mounts one
+    // of these effects, and subscribing to disabledPluginIds before the guard
+    // made every text, file and reaction message re-run this effect whenever
+    // any plugin toggle flipped - hundreds of effects for a list that only
+    // matters to plugin cards.
     if (msg.type !== MessageType.PluginCard) {
       pluginCardComponent = null;
       pluginCardError = null;
+      pluginCardDisabled = false;
       return;
     }
+    // Synchronous read so this effect re-runs when the user flips a plugin
+    // off or on: the isPluginEnabled() call below sits after an `await` in
+    // the IIFE, which is outside the tracking window and registers nothing.
+    void pluginPrefs.disabledPluginIds;
     void (async () => {
       try {
-        const payload = JSON.parse(msg.content);
+        const payload = JSON.parse(content);
         const { pluginId } = payload;
         pluginCardPluginId = pluginId;
+        // Checked BEFORE getPlugin: disabling a plugin has to stop its code
+        // from running, and getPlugin imports and executes the module. The
+        // card mounted and ran regardless of the toggle until this check
+        // existed - a music-party card, for example, would start playback in
+        // a room the user had explicitly opted out of.
+        if (!isPluginEnabled(pluginId)) {
+          pluginCardComponent = null;
+          pluginCardState = undefined;
+          pluginCardError = null;
+          pluginCardDisabled = true;
+          return;
+        }
+        pluginCardDisabled = false;
         const plugin = await getPlugin(pluginId);
         if (!plugin) {
           pluginCardError = `Plugin ${pluginId} not found`;
@@ -136,25 +167,30 @@
   }
 
   function isGifUrl(text: string): boolean {
-    // Check for direct GIF/WebP file URLs
-    if (/^https?:\/\/.+\.(gif|webp)(\?.*)?$/i.test(text)) {
-      return true;
-    }
-
-    // Check if the entire message is a URL to a known GIF host
+    // The whole message must be the URL - a gif link inside a sentence stays
+    // a link - but the host is deliberately NOT restricted. A host allowlist
+    // here rejected every ordinary place a gif lives (imgur, the Discord CDN,
+    // someone's own server); those messages then fell through to the OG card,
+    // and for a raw image URL the relay reads the binary body as HTML, finds
+    // no meta tags and answers mediaType "none", so the user got the bare link
+    // plus an empty bordered card - and every viewer of the message made the
+    // relay download the image, uncached.
+    //
+    // It also bought nothing: the same peer-supplied link still renders the
+    // OG card's og:image as an <img src>, so the browser fetch the allowlist
+    // was meant to prevent happened anyway, one hop later. Loading a remote
+    // image on render does expose the viewer's IP to whoever hosts it; that
+    // has to be answered where every remote image goes through (a relay-side
+    // image proxy), not by breaking gif links.
     const trimmed = text.trim();
     if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
       return false;
     }
 
     try {
-      const url = new URL(trimmed);
-      const hostname = url.hostname.toLowerCase();
-      // Allowlist of known GIF hosting domains and their subdomains
-      const allowlist = ['klipy.co', 'tenor.com', 'giphy.com', 'media.giphy.com'];
-      return allowlist.some(host =>
-        hostname === host || hostname.endsWith('.' + host)
-      );
+      // The extension is read off the pathname so a CDN's cache-busting query
+      // ("...cat.gif?width=200") still counts as an image.
+      return /\.(gif|webp)$/i.test(new URL(trimmed).pathname);
     } catch {
       return false;
     }
@@ -171,20 +207,20 @@
 
   const isFileMessage = $derived(msg.type === MessageType.File);
   const asCodeBlock = $derived.by(() => {
-    const match = msg.content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
+    const match = content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
     if (!match) return null;
     return { lang: match[1] || "text", code: match[2] };
   });
   const codeSegments = $derived.by(() => {
-    const match = msg.content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
+    const match = content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
     if (!match) return null;
     const fullMatch = match[0];
-    const startIdx = msg.content.indexOf(fullMatch);
+    const startIdx = content.indexOf(fullMatch);
     const endIdx = startIdx + fullMatch.length;
 
-    const before = msg.content.slice(0, startIdx).trim();
+    const before = content.slice(0, startIdx).trim();
     const code = match[2];
-    const after = msg.content.slice(endIdx).trim();
+    const after = content.slice(endIdx).trim();
 
     return {
       before,
@@ -193,8 +229,8 @@
       after,
     };
   });
-  const linkedUrl = $derived(firstUrl(msg.content));
-  const isGifMessage = $derived(isGifUrl(msg.content));
+  const linkedUrl = $derived(firstUrl(content));
+  const isGifMessage = $derived(isGifUrl(content));
   const shouldShowOg = $derived(!isFileMessage && !!linkedUrl && !isGifMessage);
 
   const ogDomain = $derived.by(() => {
@@ -266,8 +302,8 @@
 
   $effect(() => {
     gifSaved = false;
-    if (!isGifMessage || !msg.content) return;
-    isGifSaved(msg.content).then((saved) => {
+    if (!isGifMessage || !content) return;
+    isGifSaved(content).then((saved) => {
       gifSaved = !!saved;
     });
   });
@@ -325,8 +361,8 @@
   async function toggleSaveGif(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    if (!isGifMessage || !msg.content) return;
-    const existing = await isGifSaved(msg.content);
+    if (!isGifMessage || !content) return;
+    const existing = await isGifSaved(content);
     if (existing) {
       await deleteSavedGif(existing.id);
       gifSaved = false;
@@ -334,11 +370,11 @@
     }
     await putSavedGif({
       // Keyed by the gif URL: double-taps upsert instead of duplicating.
-      id: msg.content,
-      gifId: msg.content,
+      id: content,
+      gifId: content,
       title: `GIF from ${msg.senderName}`,
-      url: msg.content,
-      previewUrl: msg.content,
+      url: content,
+      previewUrl: content,
       savedAt: Date.now(),
     });
     gifSaved = true;
@@ -402,10 +438,10 @@
   class="ml-9 text-(length:--chat-font-size) leading-normal text-foreground wrap-break-word"
 >
   {#if isFileMessage}
-    {#if msg.content}
+    {#if content}
       <!-- Through linkifyText like every other body: rendered raw, a caption
            showed mention tokens as @[did:key:...] instead of the name. -->
-      <p class="whitespace-pre-wrap mb-2">{@html linkifyText(msg.content)}</p>
+      <p class="whitespace-pre-wrap mb-2">{@html linkifyText(content)}</p>
     {/if}
 
     <div class="space-y-2">
@@ -539,9 +575,9 @@
     {/if}
   {:else if isGifMessage}
     <div class="group relative inline-block">
-      <button type="button" onclick={() => (lightboxUrl = msg.content)}>
+      <button type="button" onclick={() => (lightboxUrl = content)}>
         <GifImage
-          src={msg.content}
+          src={content}
           alt="GIF"
           class="max-w-xs max-h-56 rounded-md object-contain"
           loading="lazy"
@@ -563,7 +599,13 @@
       </button>
     </div>
   {:else if msg.type === MessageType.PluginCard}
-    {#if pluginCardError}
+    {#if pluginCardDisabled}
+      <!-- Not the error box: the user asked for this, so it is muted like the
+           loading state rather than shouting in destructive red. -->
+      <div class="inline-block px-3 py-2 rounded-md bg-muted/50 text-muted-foreground text-sm">
+        🔌 {getManifest(pluginCardPluginId)?.name ?? pluginCardPluginId} is disabled
+      </div>
+    {:else if pluginCardError}
       <div class="inline-block px-3 py-2 rounded-md bg-destructive/10 text-destructive text-sm">
         🔌 Plugin error: {pluginCardError}
       </div>
@@ -616,7 +658,7 @@
       </div>
     {/if}
   {:else}
-    <p class="whitespace-pre-wrap">{@html linkifyText(msg.content)}</p>
+    <p class="whitespace-pre-wrap">{@html linkifyText(content)}</p>
 
     {#if linkedUrl && ogPreview}
       <div
@@ -626,6 +668,10 @@
           {#if videoPlaying}
             <div class="w-full bg-black" style={videoAspectStyle}>
               <!-- svelte-ignore a11y_media_has_caption -->
+              <!-- No referrerpolicy here: <video> does not support the
+                   attribute, so this fetch still carries the document
+                   referrer. It is at least behind an explicit play click,
+                   unlike the poster image below. -->
               <video
                 bind:this={videoEl}
                 src={ogPreview.video}
@@ -647,6 +693,7 @@
                 <img
                   src={ogPreview.image}
                   alt=""
+                  referrerpolicy="no-referrer"
                   class="absolute inset-0 w-full h-full object-cover"
                 />
               {/if}
@@ -674,6 +721,7 @@
             <img
               src={ogPreview.image}
               alt={ogPreview.title ?? ""}
+              referrerpolicy="no-referrer"
               class="w-full max-h-80 object-contain object-center"
             />
           </a>

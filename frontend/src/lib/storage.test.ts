@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   bulkPutMessages,
   getMessage,
@@ -30,8 +30,16 @@ import {
   putAttachment,
   getDB,
   migrateAtRest,
+  addRoomParticipant,
+  updateParticipantLastSeen,
+  removeRoomParticipant,
+  cleanupInactiveParticipants,
+  getRoomParticipants,
 } from "./storage";
+import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { MessageType, type Message } from "./types/message";
+
+const TEST_KEY = new Uint8Array(32).fill(42);
 
 let seq = 0;
 function msg(overrides: Partial<Message> = {}): Message {
@@ -51,8 +59,14 @@ function msg(overrides: Partial<Message> = {}): Message {
 }
 
 beforeEach(async () => {
+  await initStorageCrypto(TEST_KEY);
   await wipeLocalDatabase();
   seq = 0;
+});
+
+// Clean up after all tests to avoid affecting other test suites
+afterEach(() => {
+  clearStorageCrypto();
 });
 
 describe("watermarks", () => {
@@ -427,5 +441,200 @@ describe("getSeedableFiles", () => {
     expect(seedable.map((s) => s.file.infoHash).sort()).toEqual(["h1"]);
     expect(seedable[0].roomCode).toBe("room-a");
     expect(attachmentEpoch()).toBeGreaterThan(before);
+  });
+});
+
+describe("room participants and persistence", () => {
+  const baseRoom: Room = {
+    roomCode: "room-persist",
+    type: "text",
+    name: "Persistent Room",
+    lastSeenLamport: 0,
+    createdAt: 0,
+    participants: [],
+  };
+
+  it("adds a new participant with current timestamp", async () => {
+    await putRoom(baseRoom);
+    const now = Date.now();
+    await addRoomParticipant("room-persist", "did:key:zAlice");
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toContain("did:key:zAlice");
+    expect(room?.participantLastSeen?.["did:key:zAlice"]).toBeGreaterThanOrEqual(now);
+  });
+
+  it("updates timestamp for existing participant", async () => {
+    await putRoom(baseRoom);
+    const before = Date.now();
+    await addRoomParticipant("room-persist", "did:key:zBob");
+    // Wait a tiny bit to ensure different timestamp
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const after = Date.now();
+    const firstTimestamp = (await getRoom("room-persist"))?.participantLastSeen?.[
+      "did:key:zBob"
+    ];
+    expect(firstTimestamp).toBeGreaterThanOrEqual(before);
+    expect(firstTimestamp).toBeLessThanOrEqual(after);
+    await updateParticipantLastSeen("room-persist", "did:key:zBob");
+    const secondTimestamp = (await getRoom("room-persist"))?.participantLastSeen?.[
+      "did:key:zBob"
+    ];
+    expect(secondTimestamp).toBeGreaterThanOrEqual(after);
+  });
+
+  it("removes a participant and its timestamp", async () => {
+    await putRoom(baseRoom);
+    await addRoomParticipant("room-persist", "did:key:zCarol");
+    let room = await getRoom("room-persist");
+    expect(room?.participants).toContain("did:key:zCarol");
+    await removeRoomParticipant("room-persist", "did:key:zCarol");
+    room = await getRoom("room-persist");
+    expect(room?.participants).not.toContain("did:key:zCarol");
+    expect(room?.participantLastSeen?.["did:key:zCarol"]).toBeUndefined();
+  });
+
+  it("survives cleanup if seen within 30 days", async () => {
+    await putRoom(baseRoom);
+    const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000 + 1000; // 1 second ago in the 30-day window
+    await putRoom({
+      ...baseRoom,
+      participants: ["did:key:zAlice"],
+      participantLastSeen: {
+        "did:key:zAlice": thirtyDaysAgo,
+      },
+    });
+    const removed = await cleanupInactiveParticipants("room-persist");
+    expect(removed).not.toContain("did:key:zAlice");
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toContain("did:key:zAlice");
+  });
+
+  it("removes members not seen for 30+ days", async () => {
+    await putRoom(baseRoom);
+    const thirtyOneDaysAgo = Date.now() - 31 * 24 * 60 * 60 * 1000;
+    await putRoom({
+      ...baseRoom,
+      participants: ["did:key:zBob"],
+      participantLastSeen: {
+        "did:key:zBob": thirtyOneDaysAgo,
+      },
+    });
+    const removed = await cleanupInactiveParticipants("room-persist");
+    expect(removed).toContain("did:key:zBob");
+    const room = await getRoom("room-persist");
+    expect(room?.participants).not.toContain("did:key:zBob");
+  });
+
+  it("survives the first cleanup when no timestamp exists (migration safety)", async () => {
+    // This test covers the trap where a missing timestamp must NOT mean
+    // infinitely stale. During the migration from never-recording-timestamps
+    // to the new system, existing members with no timestamp should survive
+    // the first cleanup run.
+    await putRoom({
+      ...baseRoom,
+      participants: ["did:key:zCarol", "did:key:zDave"],
+      // participantLastSeen is missing entirely, simulating pre-migration state
+    });
+    const removed = await cleanupInactiveParticipants("room-persist");
+    expect(removed).toHaveLength(0);
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toContain("did:key:zCarol");
+    expect(room?.participants).toContain("did:key:zDave");
+  });
+
+  it("never writes a peerId to participants (trap 2)", async () => {
+    // A raw peerId written into participants is never matched by a leave
+    // (keyed by DID) and ghosts the member list for 30 days. The validation
+    // check in addRoomParticipant should prevent this.
+    await putRoom(baseRoom);
+    // Try to add a peerId (starts with Qm, not did:)
+    await addRoomParticipant("room-persist", "QmPeerId123");
+    const room = await getRoom("room-persist");
+    // The peerId should NOT be in participants because addRoomParticipant
+    // validates it starts with "did:"
+    expect(room?.participants).not.toContain("QmPeerId123");
+    expect(room?.participants).toHaveLength(0);
+  });
+
+  it("preserves multiple participants correctly", async () => {
+    await putRoom(baseRoom);
+    const dids = ["did:key:zA", "did:key:zB", "did:key:zC"];
+    for (const did of dids) {
+      await addRoomParticipant("room-persist", did);
+    }
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toHaveLength(3);
+    expect(new Set(room?.participants)).toEqual(new Set(dids));
+    // All should have timestamps
+    for (const did of dids) {
+      expect(room?.participantLastSeen?.[did]).toBeGreaterThan(0);
+    }
+  });
+
+  it("handles mixed recent and stale participants in cleanup", async () => {
+    const now = Date.now();
+    const thirtyOneDaysAgo = now - 31 * 24 * 60 * 60 * 1000;
+    const tenDaysAgo = now - 10 * 24 * 60 * 60 * 1000;
+    await putRoom({
+      ...baseRoom,
+      participants: ["did:key:zStale", "did:key:zRecent", "did:key:zNoTimestamp"],
+      participantLastSeen: {
+        "did:key:zStale": thirtyOneDaysAgo,
+        "did:key:zRecent": tenDaysAgo,
+        // zNoTimestamp has no entry, testing migration path
+      },
+    });
+    const removed = await cleanupInactiveParticipants("room-persist");
+    expect(removed).toEqual(["did:key:zStale"]);
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toEqual(
+      expect.arrayContaining(["did:key:zRecent", "did:key:zNoTimestamp"])
+    );
+    expect(room?.participants).not.toContain("did:key:zStale");
+  });
+});
+
+// The 30-day rule has to apply to members who left before timestamps existed,
+// not just to ones seen since. Defaulting a missing timestamp to "now" on every
+// read - rather than writing it once - would make such a member immortal: each
+// pass re-reads undefined, re-defaults, and the cutoff can never be crossed.
+describe("participant expiry reaches members who predate timestamps", () => {
+  it("backfills a missing timestamp instead of only defaulting it", async () => {
+    const db = await getDB();
+    await db.clear("rooms");
+    await putRoom({
+      roomCode: "backfill-room",
+      type: "text",
+      name: "R",
+      lastSeenLamport: 0,
+      createdAt: 1,
+      participants: ["did:key:zGhost"],
+    } as never);
+
+    // First pass: nobody is removed, but the clock must now be started.
+    expect(await cleanupInactiveParticipants("backfill-room")).toEqual([]);
+    const after = await getRoom("backfill-room");
+    expect(after?.participants).toEqual(["did:key:zGhost"]);
+    expect(after?.participantLastSeen?.["did:key:zGhost"]).toBeTypeOf("number");
+  });
+
+  it("removes that member once the backfilled clock ages past the window", async () => {
+    const db = await getDB();
+    await db.clear("rooms");
+    const longAgo = Date.now() - 31 * 24 * 60 * 60 * 1000;
+    await putRoom({
+      roomCode: "aged-room",
+      type: "text",
+      name: "R",
+      lastSeenLamport: 0,
+      createdAt: 1,
+      participants: ["did:key:zGhost"],
+      participantLastSeen: { "did:key:zGhost": longAgo },
+    } as never);
+
+    expect(await cleanupInactiveParticipants("aged-room")).toEqual([
+      "did:key:zGhost",
+    ]);
+    expect((await getRoom("aged-room"))?.participants).toEqual([]);
   });
 });

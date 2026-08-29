@@ -224,6 +224,12 @@ PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
 - Removing an entry removes the plugin on the next deploy. Fetched plugins
   never overwrite the built-in ones, and a broken source fails the build
   loudly rather than silently shipping without it.
+- A source with no `#ref` fails the build: it fetches HEAD of a third-party
+  repo with no integrity check, so the same env value can ship different
+  code on the next build. Pin it (`user/repo#<commit-sha or tag>`), or set
+  `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to opt in anyway. Every fetched source
+  logs its tarball's sha256 so you can confirm two fetches pulled the same
+  bytes.
 - Trust: a fetched plugin runs with the same trust as the app itself, in
   every user's browser, unsandboxed. Only list sources you trust like your
   own code.

@@ -3,9 +3,12 @@ import {
   mergeImportedRoom,
   BACKUP_FORMAT,
   BACKUP_VERSION,
+  isValidMessageRecord,
+  MAX_MESSAGE_CONTENT_LENGTH,
   parseBackup,
   pfpFromJson,
   pfpToJson,
+  sanitizeCollections,
   summarizeBackup,
   type BackupFile,
   bytesFromExport,
@@ -165,6 +168,101 @@ describe("mergeImportedRoom", () => {
     );
     expect(merged.lastSeenLamport).toBe(900);
     expect(merged.name).toBe("Real Name");
+  });
+});
+
+function validMessage(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "m1",
+    roomCode: "r1",
+    senderId: "did:key:zAlice",
+    senderName: "Alice",
+    timestamp: 1,
+    lamport: 1,
+    type: "text",
+    content: "hello",
+    attachments: [],
+    ...overrides,
+  };
+}
+
+describe("isValidMessageRecord", () => {
+  it("accepts a well-formed message", () => {
+    expect(isValidMessageRecord(validMessage())).toBe(true);
+  });
+
+  it("rejects records missing or mistyping required fields", () => {
+    expect(isValidMessageRecord(null)).toBe(false);
+    expect(isValidMessageRecord("not an object")).toBe(false);
+    expect(isValidMessageRecord(validMessage({ id: 123 }))).toBe(false);
+    expect(isValidMessageRecord(validMessage({ roomCode: undefined }))).toBe(
+      false
+    );
+    expect(isValidMessageRecord(validMessage({ senderId: "" }))).toBe(false);
+    expect(isValidMessageRecord(validMessage({ content: 42 }))).toBe(false);
+  });
+
+  it("rejects a message type outside the known enum", () => {
+    expect(isValidMessageRecord(validMessage({ type: "not_a_type" }))).toBe(
+      false
+    );
+  });
+
+  it("rejects a non-finite or negative lamport", () => {
+    expect(isValidMessageRecord(validMessage({ lamport: -1 }))).toBe(false);
+    expect(isValidMessageRecord(validMessage({ lamport: NaN }))).toBe(false);
+    expect(isValidMessageRecord(validMessage({ lamport: Infinity }))).toBe(
+      false
+    );
+    expect(isValidMessageRecord(validMessage({ lamport: "1" }))).toBe(false);
+  });
+
+  it("accepts content right at the size cap and rejects content over it", () => {
+    const atCap = "a".repeat(MAX_MESSAGE_CONTENT_LENGTH);
+    expect(isValidMessageRecord(validMessage({ content: atCap }))).toBe(true);
+    const overCap = "a".repeat(MAX_MESSAGE_CONTENT_LENGTH + 1);
+    expect(isValidMessageRecord(validMessage({ content: overCap }))).toBe(
+      false
+    );
+  });
+});
+
+describe("sanitizeCollections", () => {
+  it("drops malformed records per collection and reports a total count", () => {
+    const result = sanitizeCollections({
+      messages: [validMessage(), { id: "bad" }, validMessage({ id: "m2" })],
+      attachments: [{ not: "an attachment" }],
+      pending: [],
+      watermarks: [
+        { roomCode: "r1", senderId: "did:key:zAlice", maxLamport: 5 },
+        { roomCode: "r1" }, // missing senderId/maxLamport
+      ],
+      yjsDocs: [],
+      rooms: [],
+      profiles: [],
+      savedGifs: [],
+    });
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.attachments).toHaveLength(0);
+    expect(result.watermarks).toHaveLength(1);
+    // 1 bad message + 1 bad attachment + 1 bad watermark
+    expect(result.dropped).toBe(3);
+  });
+
+  it("keeps every record when the input is already well-formed", () => {
+    const result = sanitizeCollections({
+      messages: [validMessage()],
+      attachments: [],
+      pending: [],
+      watermarks: [],
+      yjsDocs: [],
+      rooms: [],
+      profiles: [],
+      savedGifs: [],
+    });
+    expect(result.dropped).toBe(0);
+    expect(result.messages).toHaveLength(1);
   });
 });
 

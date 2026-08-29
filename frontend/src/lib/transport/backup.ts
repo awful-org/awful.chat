@@ -7,6 +7,7 @@
  */
 
 import { base64ToBytes, bytesToBase64 } from "../utils";
+import { MessageType } from "../types/message";
 import type { Message, Attachment, PendingMessage } from "../types/message";
 import type {
   Room,
@@ -251,5 +252,214 @@ export function summarizeBackup(data: BackupFile): BackupSummary {
     rooms: data.rooms.length,
     attachments: data.attachments.length,
     profiles: data.profiles.length,
+  };
+}
+
+// ── Record validation ─────────────────────────────────────────────────────────
+//
+// parseBackup only checks the envelope (format/version) and coerces each
+// collection to an array - a hand-edited or truncated file, or a bug on the
+// sending device, can still put per-record garbage into that array. This is
+// NOT signature verification (a restored backup or a device-sync export is
+// trusted at the file/transport level already; see verify-incoming.ts for
+// why pre-v3 message history has none at all) - it only stops a malformed
+// record from crashing the import partway through or writing something
+// storage/UI code doesn't expect. Checks stay cheap: primitive type and
+// presence only, no deep structural validation.
+
+/** Records above this size are dropped rather than truncated - a truncated
+ * message reads as a smaller, wrong message rather than as invalid. */
+export const MAX_MESSAGE_CONTENT_LENGTH = 64 * 1024;
+
+const VALID_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>([
+  MessageType.Text,
+  MessageType.Reply,
+  MessageType.Reaction,
+  MessageType.File,
+  MessageType.PluginCard,
+  MessageType.PluginUpdate,
+]);
+
+function isFiniteNonNegative(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n) && n >= 0;
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+/**
+ * Shape/size check for one imported message: id/roomCode/senderId as
+ * strings, a known message type, a finite non-negative lamport, and content
+ * within a sane size cap.
+ */
+export function isValidMessageRecord(m: unknown): m is Message {
+  if (!m || typeof m !== "object") return false;
+  const r = m as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.id) &&
+    isNonEmptyString(r.roomCode) &&
+    isNonEmptyString(r.senderId) &&
+    typeof r.type === "string" &&
+    VALID_MESSAGE_TYPES.has(r.type) &&
+    isFiniteNonNegative(r.lamport) &&
+    (r.content === undefined ||
+      r.content === null ||
+      (typeof r.content === "string" &&
+        r.content.length <= MAX_MESSAGE_CONTENT_LENGTH))
+  );
+}
+
+export function isValidAttachmentRecord(a: unknown): a is AttachmentExport {
+  if (!a || typeof a !== "object") return false;
+  const r = a as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.id) &&
+    isNonEmptyString(r.roomCode) &&
+    isNonEmptyString(r.messageId) &&
+    typeof r.filename === "string" &&
+    typeof r.mimeType === "string" &&
+    isFiniteNonNegative(r.size) &&
+    typeof r.infoHash === "string"
+  );
+}
+
+export function isValidWatermarkRecord(w: unknown): w is WatermarkRecord {
+  if (!w || typeof w !== "object") return false;
+  const r = w as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.roomCode) &&
+    isNonEmptyString(r.senderId) &&
+    isFiniteNonNegative(r.maxLamport)
+  );
+}
+
+export function isValidRoomRecord(room: unknown): room is Room | DMRoom {
+  if (!room || typeof room !== "object") return false;
+  const r = room as Record<string, unknown>;
+  return (
+    // Only the key and the discriminator: rooms written by older builds
+    // lack lastSeenLamport/createdAt, and a dropped room is data loss.
+    isNonEmptyString(r.roomCode) &&
+    typeof r.type === "string" &&
+    (r.participants === undefined || Array.isArray(r.participants))
+  );
+}
+
+export function isValidProfileRecord(
+  p: unknown
+): p is PeerProfile | OwnProfile {
+  if (!p || typeof p !== "object") return false;
+  const r = p as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.did) && typeof r.nickname === "string"
+  );
+}
+
+export function isValidSavedGifRecord(g: unknown): g is SavedGif {
+  if (!g || typeof g !== "object") return false;
+  const r = g as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.id) &&
+    isNonEmptyString(r.gifId) &&
+    typeof r.title === "string"
+  );
+}
+
+export function isValidPendingRecord(p: unknown): p is PendingMessage {
+  if (!p || typeof p !== "object") return false;
+  const r = p as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.id) &&
+    isNonEmptyString(r.to) &&
+    !!r.message &&
+    typeof r.message === "object"
+  );
+}
+
+export function isValidYjsDocRecord(
+  d: unknown
+): d is { id: string; update: number[] } {
+  if (!d || typeof d !== "object") return false;
+  const r = d as Record<string, unknown>;
+  return isNonEmptyString(r.id) && Array.isArray(r.update);
+}
+
+export interface SanitizeResult<T> {
+  records: T[];
+  dropped: number;
+}
+
+function sanitize<T>(
+  records: unknown[],
+  isValid: (r: unknown) => r is T
+): SanitizeResult<T> {
+  const valid: T[] = [];
+  let dropped = 0;
+  for (const r of records) {
+    if (isValid(r)) valid.push(r);
+    else dropped++;
+  }
+  return { records: valid, dropped };
+}
+
+export interface SanitizedCollections {
+  messages: Message[];
+  attachments: AttachmentExport[];
+  pending: PendingMessage[];
+  watermarks: WatermarkRecord[];
+  yjsDocs: { id: string; update: number[] }[];
+  rooms: (Room | DMRoom)[];
+  profiles: (PeerProfile | OwnProfile)[];
+  savedGifs: SavedGif[];
+  /** Total records dropped across every collection above. */
+  dropped: number;
+}
+
+/**
+ * Filter every collection of an untrusted DatabaseExport down to shape-valid
+ * records, and report how many were dropped. Shared by the file-restore path
+ * (applyBackup) and the device-sync import (both funnel through
+ * importDatabase in backup-restore.ts), since both hand this module data
+ * that only ever passed through JSON.parse/JSON.stringify - never re-checked
+ * against the TypeScript types the app otherwise trusts at compile time.
+ */
+export function sanitizeCollections(data: {
+  messages: unknown[];
+  attachments: unknown[];
+  pending: unknown[];
+  watermarks: unknown[];
+  yjsDocs: unknown[];
+  rooms: unknown[];
+  profiles: unknown[];
+  savedGifs: unknown[];
+}): SanitizedCollections {
+  const messages = sanitize(data.messages, isValidMessageRecord);
+  const attachments = sanitize(data.attachments, isValidAttachmentRecord);
+  const pending = sanitize(data.pending, isValidPendingRecord);
+  const watermarks = sanitize(data.watermarks, isValidWatermarkRecord);
+  const yjsDocs = sanitize(data.yjsDocs, isValidYjsDocRecord);
+  const rooms = sanitize(data.rooms, isValidRoomRecord);
+  const profiles = sanitize(data.profiles, isValidProfileRecord);
+  const savedGifs = sanitize(data.savedGifs, isValidSavedGifRecord);
+
+  return {
+    messages: messages.records,
+    attachments: attachments.records,
+    pending: pending.records,
+    watermarks: watermarks.records,
+    yjsDocs: yjsDocs.records,
+    rooms: rooms.records,
+    profiles: profiles.records,
+    savedGifs: savedGifs.records,
+    dropped:
+      messages.dropped +
+      attachments.dropped +
+      pending.dropped +
+      watermarks.dropped +
+      yjsDocs.dropped +
+      rooms.dropped +
+      profiles.dropped +
+      savedGifs.dropped,
   };
 }

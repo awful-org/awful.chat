@@ -362,7 +362,9 @@
               style={`background-color: ${user.tagChipColor ?? "#e5e7eb"}; color: ${user.tagTextColor ?? "#000000"}`}
             >{user.tagText}</span>
           {/if}
-          {#if user.isRelayed && displayPrefs.showConnectionInfo}
+          <!-- Relayed badge: always shown, not gated on showConnectionInfo.
+               That setting controls only the floating panel on the right. -->
+          {#if user.isRelayed}
             <Tip text={RELAY_TIP}>
               {#snippet children(props)}
                 <button

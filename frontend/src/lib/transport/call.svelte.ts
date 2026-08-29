@@ -22,11 +22,15 @@ import {
 } from "./transport.svelte";
 import type { VideoSource } from "./types";
 import { setTransmissionOutputVolume } from "./transmission.svelte";
+import {
+  cancelErrorClear,
+  describeMediaError,
+  setErrorWithAutoClear,
+} from "./call-error";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
 let _mutedBeforeDeafen = false;
-
 export function _sendCallState(peerId?: string): void {
   const payload = encode({
     type: MessageType.CallState,
@@ -116,6 +120,9 @@ export function joinCall(): Promise<void> {
 let _presenceHeartbeat: ReturnType<typeof setInterval> | null = null;
 
 async function _joinCall(): Promise<void> {
+  // Clear any pending error timeout and reset the error state. Attempting
+  // the operation again makes any stale error irrelevant.
+  cancelErrorClear();
   transportState.error = null;
   try {
     // Ensure transport is connected before joining voice
@@ -130,6 +137,17 @@ async function _joinCall(): Promise<void> {
     // person immediately and the rest a couple of minutes later.
     _transport.reconcileNow();
     await _voice.join(transportState.roomCode ?? "");
+    // Close the default-deny window right away: _voice.join() registers the
+    // inbound stream handler before we have handed it any roster, and that
+    // handler rejects everyone until setCallPeers() is called at least once.
+    // _video.join() below is a network round trip, and without this call the
+    // handler would sit open to any peer that can dial /voice/1.0.0 for its
+    // whole duration. transportState.inCall/.callRoomCode are not set yet at
+    // this point, so this first pass syncs an empty roster (default-deny with
+    // nobody admitted) - the real roster lands with the call below, and the
+    // reconcile tick (VOICE_RECONCILE_MS) plus the presence heartbeat pick up
+    // anyone still missing from there.
+    _syncVoiceRoster();
     // Voice is peer-to-peer; only camera and screen share go through the SFU.
     // Awaiting this unguarded meant a media server that was down (or a VPS
     // whose DNS had moved) failed the whole join, taking out calls that never
@@ -172,12 +190,26 @@ async function _joinCall(): Promise<void> {
     transportState.localMicStream = null;
     transportState.cameraOff = true;
     transportState.screenSharing = false;
-    transportState.error = err instanceof Error ? err.message : String(err);
+    // Set error with auto-clear: transient permission errors should not persist
+    // indefinitely on screen. If the join fails for another reason, the error
+    // still clears after 10 seconds or when the user attempts to join again.
+    setErrorWithAutoClear(transportState, describeMediaError(err));
     throw err;
   }
 }
 
 export function leaveCall(): void {
+  // Clear any pending error auto-clear timer and the error itself. Once the
+  // user leaves the call, any call-related error (like a permission denial
+  // during camera startup) becomes stale.
+  cancelErrorClear();
+  transportState.error = null;
+
+  // Close any open browser PiP window when the call ends.
+  if (typeof document !== "undefined" && document.pictureInPictureElement) {
+    document.exitPictureInPicture().catch(() => {});
+  }
+
   releaseWakeLock();
   if (_presenceHeartbeat) {
     clearInterval(_presenceHeartbeat);
@@ -230,6 +262,9 @@ export function toggleMute(): void {
 }
 
 export async function startCamera(): Promise<void> {
+  // Clear any pending error timeout and reset the error state. Attempting
+  // the operation again makes any stale error irrelevant.
+  cancelErrorClear();
   transportState.error = null;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -255,7 +290,11 @@ export async function startCamera(): Promise<void> {
       throw err;
     }
   } catch (err) {
-    transportState.error = err instanceof Error ? err.message : String(err);
+    // Set error with auto-clear: permission errors should not persist
+    // indefinitely on screen. The user is still in the call after camera
+    // startup fails, so the error clears when they retry or when the timer
+    // expires.
+    setErrorWithAutoClear(transportState, describeMediaError(err));
     throw err;
   }
 }
@@ -274,6 +313,9 @@ export async function toggleCamera(): Promise<void> {
 }
 
 export async function startScreenShare(): Promise<void> {
+  // Clear any pending error timeout and reset the error state. Attempting
+  // the operation again makes any stale error irrelevant.
+  cancelErrorClear();
   transportState.error = null;
   if (!navigator.mediaDevices.getDisplayMedia) {
     throw new Error("Screen sharing is not supported on this device");
@@ -331,7 +373,11 @@ export async function startScreenShare(): Promise<void> {
       throw err;
     }
   } catch (err) {
-    transportState.error = err instanceof Error ? err.message : String(err);
+    // Set error with auto-clear: permission errors should not persist
+    // indefinitely on screen. The user is still in the call after screen share
+    // startup fails, so the error clears when they retry or when the timer
+    // expires.
+    setErrorWithAutoClear(transportState, describeMediaError(err));
     throw err;
   }
 }

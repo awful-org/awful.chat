@@ -76,3 +76,47 @@ export function setNowPlayingFor(
   _owner = token;
   apply(info);
 }
+
+// Picture-in-Picture action handler. The module owns media-related global
+// resources, so PiP action registration goes through here for consistency.
+// When the browser's Media Session initiates PiP (e.g., on tab switch for
+// Chromium), this handler is called to enter browser PiP.
+let _pipEnterHandler: (() => void) | null = null;
+
+/**
+ * Register a Picture-in-Picture entry handler.
+ *
+ * Called when the browser automatically enters PiP (e.g., on tab switch for
+ * Chromium's "video conferencing" heuristic, Chrome 120+) or when the user
+ * manually requests it via the panel's button.
+ *
+ * The handler should call video.requestPictureInPicture() to enter PiP.
+ */
+export function setOnPictureInPictureEnter(
+  handler: (() => void) | null
+): void {
+  _pipEnterHandler = handler;
+
+  // Register the handler with navigator.mediaSession so Chromium calls it
+  // when auto-entering PiP on tab switch.
+  const ms = navigator.mediaSession;
+  if (!ms) return;
+
+  if (handler) {
+    try {
+      // enterpictureinpicture is a non-standard action, so cast to any.
+      ms.setActionHandler("enterpictureinpicture" as MediaSessionAction, () => {
+        handler();
+      });
+    } catch {
+      // enterpictureinpicture is not supported on this browser.
+    }
+  } else {
+    // Clear the handler.
+    try {
+      ms.setActionHandler("enterpictureinpicture" as MediaSessionAction, null);
+    } catch {
+      // Ignore if unsupported.
+    }
+  }
+}

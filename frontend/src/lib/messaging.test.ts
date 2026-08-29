@@ -4,10 +4,12 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import {
   canonicalContent,
   canonicalContentV2,
+  canonicalContentV3,
   computeSharedSecret,
   encryptForRecipient,
   signMessage,
   verifyMessage,
+  verifyPeerBinding,
   verifySignature,
 } from "./messaging";
 import {
@@ -138,6 +140,66 @@ describe("sign / verify", () => {
       meta: { files: [{ ...meta.files[0], infoHash: "bb" }] },
     };
     expect(await verifyMessage(swapped)).toBe(false);
+  });
+
+  // @noble/curves verifies in ZIP215 mode by default, which accepts
+  // small-order public keys. Under the cofactored equation an all-zero
+  // signature then verifies over ANY message for a did:key that names a
+  // torsion point, with no private key involved. verifySignature must pass
+  // zip215:false so these are rejected.
+  describe("small-order did:key forgery (ZIP215)", () => {
+    // The two cheapest torsion points: the neutral element (y = 1) and a
+    // canonical order-8 point.
+    const SMALL_ORDER_KEYS: Record<string, Uint8Array> = {
+      "identity point": Uint8Array.from([1, ...new Array(31).fill(0)]),
+      "order-8 point": unhex(
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"
+      ),
+    };
+
+    for (const [name, publicKey] of Object.entries(SMALL_ORDER_KEYS)) {
+      it(`rejects a keyless forgery from a ${name} did`, async () => {
+        const did = publicKeyToDid(publicKey);
+        // R := A keeps R + [k]A inside the small-order subgroup, S := 0 makes
+        // [8]S*B the identity, so the cofactored check passes for every msg.
+        const forgedSig = new Uint8Array(64);
+        forgedSig.set(publicKey, 0);
+        const sig = hex(forgedSig);
+
+        expect(await verifySignature(did, sig, "anything at all")).toBe(false);
+        expect(
+          await verifySignature(did, sig, "a completely different string")
+        ).toBe(false);
+
+        const forgedMsg = {
+          ...makeMessage({ senderId: did, content: "I never wrote this" }),
+          senderDid: did,
+          sig,
+          sigV: 3,
+        };
+        expect(await verifyMessage(forgedMsg)).toBe(false);
+
+        // Same forgery aimed at the peerId<->did binding, which is what ties
+        // a noise-authenticated connection to an identity.
+        expect(await verifyPeerBinding(did, "12D3KooWvictim", sig)).toBe(false);
+      });
+    }
+
+    it("still accepts a real signature from a real keypair", async () => {
+      // Guards against "fixed" by making verify reject everything.
+      const kp = deriveKeypairFromMnemonic(generateMnemonic());
+      const msg = makeMessage();
+      const sig = hex(
+        ed25519.sign(utf8(canonicalContentV3(msg)), kp.privateKey)
+      );
+      expect(
+        await verifySignature(
+          publicKeyToDid(kp.publicKey),
+          sig,
+          canonicalContentV3(msg)
+        )
+      ).toBe(true);
+    });
   });
 
   it("still verifies legacy v1 signatures (no sigV)", async () => {

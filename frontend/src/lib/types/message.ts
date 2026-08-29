@@ -291,6 +291,19 @@ export type AnyWireMessage =
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/**
+ * The reply snapshot is unsigned and unbounded on the wire, so a sender can
+ * attach an arbitrarily long "quote" to an otherwise ordinary message and have
+ * every recipient store it. Nothing renders more than a truncated line of it.
+ */
+const MAX_REPLY_SNAPSHOT = 2048;
+
+export function boundReplyTo(r: ReplyTo | undefined): ReplyTo | undefined {
+  if (!r || typeof r.content !== "string") return r;
+  if (r.content.length <= MAX_REPLY_SNAPSHOT) return r;
+  return { ...r, content: r.content.slice(0, MAX_REPLY_SNAPSHOT) };
+}
+
 /** Reconstruct a full Message from a WireChatMessage on the receiving end. */
 export function wireToMessage(
   wire: WireChatMessage,
@@ -310,7 +323,7 @@ export function wireToMessage(
     content: wire.content,
     meta: wire.meta,
     attachments: [],
-    replyTo: wire.replyTo,
+    replyTo: boundReplyTo(wire.replyTo),
     reactionTo: wire.reactionTo,
     reactionEmoji: wire.reactionEmoji,
     reactionOp: wire.reactionOp,

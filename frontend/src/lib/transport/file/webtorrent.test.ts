@@ -134,4 +134,44 @@ describe("WebTorrentFileTransport", () => {
     expect(torrents.has(HASH)).toBe(true);
     expect(addedPeers.map((p) => p.id)).toEqual(["alice"]);
   });
+
+  it("caps the distinct infoHashes a single peer may register", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    // None of these ever start a transfer, so every registration is inert
+    // and eligible for eviction - the peer should never exceed the cap.
+    for (let i = 0; i < 70; i++) {
+      const infoHash = i.toString(16).padStart(40, "0");
+      t.registerSeeder({ ...file, infoHash }, "alice");
+    }
+    const peerSeeded = (
+      t as never as { peerSeeded: Map<string, Set<string>> }
+    ).peerSeeded;
+    expect(peerSeeded.get("alice")?.size).toBe(64);
+    // The oldest registrations were evicted, the newest kept.
+    const last = (69).toString(16).padStart(40, "0");
+    const first = (0).toString(16).padStart(40, "0");
+    expect(peerSeeded.get("alice")?.has(last)).toBe(true);
+    expect(peerSeeded.get("alice")?.has(first)).toBe(false);
+  });
+
+  it("does not evict an infoHash with an active transfer under the per-peer cap", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    const activeHash = "b".repeat(40);
+    t.registerSeeder({ ...file, infoHash: activeHash }, "alice");
+    t.onPeerConnect("alice");
+    t.ensureDownload({ ...file, infoHash: activeHash });
+    await tick();
+    expect(t.getTransfer(activeHash)?.status).toBe("downloading");
+
+    for (let i = 0; i < 70; i++) {
+      const infoHash = i.toString(16).padStart(40, "1");
+      t.registerSeeder({ ...file, infoHash }, "alice");
+    }
+
+    const peerSeeded = (
+      t as never as { peerSeeded: Map<string, Set<string>> }
+    ).peerSeeded;
+    // The active transfer survives even though the cap was hit repeatedly.
+    expect(peerSeeded.get("alice")?.has(activeHash)).toBe(true);
+  });
 });

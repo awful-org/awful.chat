@@ -104,6 +104,9 @@
         case "relay-disconnected":
           addStatus("error", status.message, Unplug);
           break;
+        case "relay-dial-retry":
+          addStatus("warning", status.message, RefreshCw);
+          break;
         case "relay-dial-failed":
           addStatus("error", status.message, CircleAlert);
           break;

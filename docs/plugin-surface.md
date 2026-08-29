@@ -16,7 +16,8 @@ this file and the README disagree, the README wins. What has grown since:
   `repository` (the settings page groups plugins by repository origin and
   links it), and `icon` accepts `lucide:*` names, not just emoji.
 - External plugin sources: the frontend Dockerfile fetches extra plugin repos
-  at build time via `PLUGIN_SOURCES` (e.g. `awful-org/awfully-awesome`),
+  at build time via `PLUGIN_SOURCES` (e.g. `awful-org/awfully-awesome#<sha>`; an unpinned
+  entry fails the build unless `PLUGIN_SOURCES_ALLOW_UNPINNED=1`),
   deleting any fetched `.gitignore` so Tailwind scans their markup. A
   pre-commit hook keeps fetched plugins out of the app repo.
 - Host API grew: `cards()` and `sendUpdateImmediately` (host-bound, room

@@ -162,7 +162,17 @@ export async function verifySignature(
 ): Promise<boolean> {
   try {
     const publicKey = didToPublicKey(senderDid);
-    return ed25519.verify(unhex(sig), utf8(content), publicKey);
+    // `zip215: false` is load-bearing. @noble/curves defaults to ZIP215
+    // (blockchain consensus) rules, which deliberately accept small-order
+    // public keys: the cofactored equation [8]S*B == [8]R + [8][k]A holds for
+    // ANY message when A is small order, so a did:key naming a torsion point
+    // verifies an all-zero signature over arbitrary content with no private
+    // key - and every peer can name that same did, so a did would stop
+    // proving key possession. RFC8032/NIST186-5 rules reject small-order A
+    // and non-canonical encodings, and reject nothing a real keypair emits.
+    return ed25519.verify(unhex(sig), utf8(content), publicKey, {
+      zip215: false,
+    });
   } catch {
     return false;
   }

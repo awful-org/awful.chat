@@ -46,6 +46,32 @@ const b64 = (buf: ArrayBuffer | Uint8Array): string =>
 const unb64 = (s: string): Uint8Array<ArrayBuffer> =>
   Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
+/**
+ * XOR-accumulate over two equal-length byte arrays instead of returning on
+ * the first mismatch, so comparison time does not depend on where the two
+ * base64 strings first diverge. Length mismatch returns false immediately -
+ * that leaks nothing a fixed-format PBKDF2 output (32 bytes) does not
+ * already fix.
+ *
+ * Real threat boundary: this hash sits in localStorage, so anyone with
+ * devtools access to this origin can already read the record directly and
+ * does not need to time a comparison to learn anything. The only case this
+ * protects is a scriptable caller driving unlock attempts without devtools
+ * access to storage - e.g. a remote-control or automation surface calling
+ * into this module - where timing the comparison would otherwise be the
+ * only side channel available.
+ */
+function constantTimeEqual(a: string, b: string): boolean {
+  const bytesA = unb64(a);
+  const bytesB = unb64(b);
+  if (bytesA.length !== bytesB.length) return false;
+  let diff = 0;
+  for (let i = 0; i < bytesA.length; i++) {
+    diff |= bytesA[i] ^ bytesB[i];
+  }
+  return diff === 0;
+}
+
 async function derive(
   password: string,
   salt: Uint8Array<ArrayBuffer>,
@@ -114,15 +140,33 @@ export function clearDuressPassword(): void {
   }
 }
 
-/** True when the entered password is the duress password. Constant-shaped:
- *  one PBKDF2 either way once a record exists. */
+/**
+ * True when the entered password is the duress password.
+ *
+ * Exactly one PBKDF2 runs whether or not a duress password is configured.
+ * Returning early on a missing record made an unlock attempt cost one
+ * derivation on a device with no duress password and two on a device with
+ * one - a difference of hundreds of milliseconds that a coercer holding the
+ * device could measure with a stopwatch, learning the feature was armed
+ * before the victim typed anything. The throwaway salt below is worth
+ * nothing cryptographically; it is there to spend the same wall-clock time.
+ *
+ * Callers run this only AFTER a real unlock has failed (identity.svelte.ts):
+ * that is where a duress password can land, and it keeps a successful unlock
+ * at one derivation instead of two.
+ */
 export async function isDuressPassword(password: string): Promise<boolean> {
   const rec = readRecord();
+  const salt = rec
+    ? unb64(rec.salt)
+    : crypto.getRandomValues(new Uint8Array(16));
+  const hash = await derive(password, salt, rec?.iterations ?? ITERATIONS);
   if (!rec) return false;
-  const hash = await derive(password, unb64(rec.salt), rec.iterations);
-  // Non-secret comparison: both sides are PBKDF2 outputs, and a "match"
-  // grants destruction, not access.
-  return hash === rec.hash;
+  // Constant-time comparison - see constantTimeEqual's doc comment for the
+  // actual threat boundary this addresses (it is narrower than it looks:
+  // both sides are PBKDF2 outputs, and a "match" grants destruction, not
+  // access).
+  return constantTimeEqual(hash, rec.hash);
 }
 
 /**

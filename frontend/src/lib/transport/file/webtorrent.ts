@@ -30,6 +30,10 @@ type TorrentLike = {
 const WT_RECONCILE_MS = 5_000;
 /** Ceiling on the per-pair retry wait. */
 const WT_RETRY_MAX_MS = 60_000;
+/** Distinct infoHashes a single peer may have registered with us at once. */
+const MAX_INFOHASHES_PER_PEER = 64;
+/** Distinct infoHashes tracked in total, across every peer. */
+const MAX_INFOHASHES_TOTAL = 4096;
 
 function wtKey(infoHash: string, peerId: string): string {
   return `${infoHash}:${peerId}`;
@@ -67,6 +71,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private localSeedHashes = new Set<string>();
   private connectedPeers = new Set<string>();
   private seedersByHash = new Map<string, Set<string>>();
+  /** infoHashes registered by each peer, oldest-first (Set preserves insertion order) - bounds registerSeeder against a flooding peer. */
+  private peerSeeded = new Map<string, Set<string>>();
   private wtPeers = new Map<string, SimplePeerInstance>();
   /**
    * Per-pair retry state for the WebRTC links that carry file data.
@@ -160,12 +166,27 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       return;
     }
 
+    // Only a NEW (peer, infoHash) pair grows the bounded maps - a repeat
+    // registration (e.g. a reconnect re-announcing) costs nothing extra.
+    const isNewForPeer = !this.peerSeeded.get(seederPeerId)?.has(file.infoHash);
+    if (isNewForPeer) {
+      this._enforcePeerCap(seederPeerId);
+      if (!this.seedersByHash.has(file.infoHash)) this._enforceGlobalCap();
+    }
+
     this.knownFiles.set(file.infoHash, file);
 
     if (!this.seedersByHash.has(file.infoHash)) {
       this.seedersByHash.set(file.infoHash, new Set());
     }
     this.seedersByHash.get(file.infoHash)!.add(seederPeerId);
+
+    let peerSet = this.peerSeeded.get(seederPeerId);
+    if (!peerSet) {
+      peerSet = new Set();
+      this.peerSeeded.set(seederPeerId, peerSet);
+    }
+    peerSet.add(file.infoHash);
 
     const existing = this.transfers.get(file.infoHash);
     if (!existing) {
@@ -193,6 +214,51 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       // coming back was recorded and then ignored, and the file stayed
       // undownloadable until the user hit retry by hand.
       this.ensureDownload(file);
+    }
+  }
+
+  private _isActiveTransfer(infoHash: string): boolean {
+    const status = this.transfers.get(infoHash)?.status;
+    return status === "downloading" || status === "seeding";
+  }
+
+  /** Drop one (peer, infoHash) registration entirely - used by both caps. */
+  private _forgetPeerSeed(peerId: string, infoHash: string): void {
+    this.peerSeeded.get(peerId)?.delete(infoHash);
+    const seeders = this.seedersByHash.get(infoHash);
+    if (!seeders) return;
+    seeders.delete(peerId);
+    if (seeders.size === 0) {
+      this.seedersByHash.delete(infoHash);
+      this.knownFiles.delete(infoHash);
+    }
+  }
+
+  /**
+   * At the per-peer cap, drop that peer's oldest registration that has no
+   * transfer in flight - never an active download/upload, just to make room.
+   * If every one of the peer's registrations is active, let it exceed the
+   * cap rather than kill a live transfer.
+   */
+  private _enforcePeerCap(peerId: string): void {
+    const peerSet = this.peerSeeded.get(peerId);
+    if (!peerSet || peerSet.size < MAX_INFOHASHES_PER_PEER) return;
+    for (const infoHash of peerSet) {
+      if (this._isActiveTransfer(infoHash)) continue;
+      this._forgetPeerSeed(peerId, infoHash);
+      return;
+    }
+  }
+
+  /** Same idea as _enforcePeerCap, but for the total distinct infoHash count. */
+  private _enforceGlobalCap(): void {
+    if (this.seedersByHash.size < MAX_INFOHASHES_TOTAL) return;
+    for (const [infoHash, seeders] of this.seedersByHash) {
+      if (this._isActiveTransfer(infoHash)) continue;
+      for (const peerId of seeders) this.peerSeeded.get(peerId)?.delete(infoHash);
+      this.seedersByHash.delete(infoHash);
+      this.knownFiles.delete(infoHash);
+      return;
     }
   }
 
@@ -275,6 +341,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
   onPeerDisconnect(peerId: string): void {
     this.connectedPeers.delete(peerId);
+    this.peerSeeded.delete(peerId);
     // Their retry state goes with them, so a peer that reconnects is dialled
     // straight away rather than inheriting a wait from before it dropped.
     for (const key of [...this.wtNextTry.keys()]) {
@@ -355,6 +422,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.transfers.clear();
     this.knownFiles.clear();
     this.seedersByHash.clear();
+    this.peerSeeded.clear();
     this.localSeedHashes.clear();
     this.attachedTorrents.clear();
     this.seedingByHash.clear();

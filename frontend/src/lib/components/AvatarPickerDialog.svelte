@@ -392,14 +392,14 @@
               Drop an image or click to browse
             </p>
             <p class="text-xs text-muted-foreground font-mono mt-1">
-              PNG, JPEG, GIF, WebP
+              PNG, JPEG, GIF, WebP, AVIF
             </p>
           </div>
         </button>
         <input
           bind:this={fileInput}
           type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
+          accept="image/png,image/jpeg,image/gif,image/webp,image/avif"
           class="hidden"
           onchange={handleFileChange}
         />

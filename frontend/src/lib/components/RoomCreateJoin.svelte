@@ -1,4 +1,11 @@
 <script lang="ts">
+  import { newRoomCode } from "$lib/room-code";
+  import {
+    createInvite,
+    formatShortCode,
+    looksLikeShortCode,
+    resolveInvite,
+  } from "$lib/invite";
   import { Check, Clipboard, Copy, LogIn, Menu, Plus } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -26,6 +33,12 @@
   let joinCode = $state("");
   let createdCode = $state<string | null>(null);
   let copied = $state(false);
+  // The 5-minute alias of createdCode, once asked for. See $lib/invite.
+  let shortCode = $state<string | null>(null);
+  let shortCodeError = $state<string | null>(null);
+  let shortCopied = $state(false);
+  let copyMenuOpen = $state(false);
+  let joinError = $state<string | null>(null);
   let avatarDialogOpen = $state(false);
 
   let { relayConnected } = $derived(transportState);
@@ -42,11 +55,11 @@
     creating = true;
     try {
       await saveName(profileStore.nickname);
-      const code = Array.from(crypto.getRandomValues(new Uint8Array(3)))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
+      const code = newRoomCode();
       createdCode = code;
       copied = false;
+      shortCode = null;
+      shortCodeError = null;
     } finally {
       creating = false;
     }
@@ -71,12 +84,45 @@
   async function handleJoin() {
     if (!joinCode.trim() || joining) return;
     joining = true;
+    joinError = null;
     try {
       await saveName(profileStore.nickname);
-      onJoin(joinCode.trim(), profileStore.nickname || "Anonymous");
+      let code = joinCode.trim();
+      // Six characters is a short invite - or a legacy hex room code, which
+      // is why a miss falls through to joining the input as typed.
+      if (looksLikeShortCode(code)) {
+        try {
+          code = (await resolveInvite(code)) ?? code;
+        } catch {
+          joinError = "Could not reach the relay to look up that code";
+          return;
+        }
+      }
+      onJoin(code, profileStore.nickname || "Anonymous");
     } finally {
       joining = false;
     }
+  }
+
+  async function handleCopyLink() {
+    copyMenuOpen = false;
+    await handleCopy(createdCode!);
+  }
+
+  // Mint on first use, then copy. The code stays on screen afterwards so it
+  // can be read aloud, which is the point of it.
+  async function handleCopyShort() {
+    copyMenuOpen = false;
+    shortCodeError = null;
+    try {
+      shortCode ??= (await createInvite(createdCode!)).code;
+    } catch {
+      shortCodeError = "The relay is not reachable right now";
+      return;
+    }
+    await navigator.clipboard.writeText(formatShortCode(shortCode));
+    shortCopied = true;
+    setTimeout(() => (shortCopied = false), 2000);
   }
 
   async function handleCopy(code: string) {
@@ -129,7 +175,8 @@
             </CardDescription>
           </div>
 
-          {#if displayPrefs.showConnectionInfo}
+          <!-- Connection status pill: always shown, not gated on showConnectionInfo.
+               That setting controls only the floating panel on the right. -->
           {#if relayConnected}
             <div
               class="flex items-center gap-1.5 px-2 py-1 rounded-full bg-muted text-xs"
@@ -145,16 +192,15 @@
               <span class="text-muted-foreground">Connecting...</span>
             </div>
           {/if}
-          {/if}
         </div>
       </CardHeader>
 
       <CardContent class="grid gap-6">
-        {#if error}
+        {#if error || joinError}
           <div
             class="rounded-lg bg-destructive/10 border border-destructive/30 px-3 py-2 text-sm text-destructive"
           >
-            {error}
+            {error ?? joinError}
           </div>
         {/if}
 
@@ -224,7 +270,7 @@
           <div class="relative">
             <Input
               bind:value={joinCode}
-              placeholder="Room code or room link"
+              placeholder="Room code, short code or link"
               class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-10 focus-visible:ring-ring"
             />
             <button
@@ -267,19 +313,61 @@
           >
             {createdCode}
           </div>
-          <button
-            type="button"
-            onclick={() => handleCopy(createdCode!)}
-            class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
-            aria-label="Copy room code"
-          >
-            {#if copied}
-              <Check class="size-4 text-primary" />
-            {:else}
-              <Copy class="size-4" />
+          <div class="absolute right-2 top-1/2 -translate-y-1/2" data-copy-menu>
+            <button
+              type="button"
+              onclick={() => (copyMenuOpen = !copyMenuOpen)}
+              class="text-muted-foreground hover:text-foreground cursor-pointer"
+              aria-label="Copy"
+              aria-haspopup="menu"
+              aria-expanded={copyMenuOpen}
+            >
+              {#if copied || shortCopied}
+                <Check class="size-4 text-primary" />
+              {:else}
+                <Copy class="size-4" />
+              {/if}
+            </button>
+            {#if copyMenuOpen}
+              <div
+                role="menu"
+                class="absolute right-0 top-full mt-2 z-10 w-56 rounded-lg border border-border bg-popover text-popover-foreground shadow-md p-1"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={handleCopyLink}
+                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
+                >
+                  Copy link
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={handleCopyShort}
+                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
+                >
+                  Copy short code
+                  <span class="block text-xs text-muted-foreground">Works for 5 minutes</span>
+                </button>
+              </div>
             {/if}
-          </button>
+          </div>
         </div>
+
+        {#if shortCode}
+          <div class="rounded-lg bg-muted px-3 py-2">
+            <div class="text-center font-mono text-lg tracking-widest text-foreground">
+              {formatShortCode(shortCode)}
+            </div>
+            <div class="mt-1 text-center text-xs text-muted-foreground">
+              Short code, works for 5 minutes
+            </div>
+          </div>
+        {/if}
+        {#if shortCodeError}
+          <div class="text-center text-xs text-destructive">{shortCodeError}</div>
+        {/if}
 
         <Button
           onclick={handleJoinCreated}
@@ -293,6 +381,16 @@
     </Card>
   </div>
 {/if}
+
+<svelte:window
+  onclick={(e) => {
+    if (copyMenuOpen && !(e.target as HTMLElement).closest("[data-copy-menu]"))
+      copyMenuOpen = false;
+  }}
+  onkeydown={(e) => {
+    if (e.key === "Escape") copyMenuOpen = false;
+  }}
+/>
 
 <AvatarPickerDialog
   open={avatarDialogOpen}

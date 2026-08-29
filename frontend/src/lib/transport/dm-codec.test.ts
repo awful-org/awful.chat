@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DM_ACK_TAG,
+  MAX_DM_TEXT_LENGTH,
   encodeDmAckEnvelope,
   encodeDmChatEnvelope,
   encodeDmReadEnvelope,
@@ -111,6 +112,19 @@ describe("DM envelopes", () => {
   it("rejects malformed chat JSON", () => {
     const bad = new Uint8Array([0x01, ...new TextEncoder().encode("{nope")]);
     expect(parseDmEnvelope(bad)).toBeNull();
+  });
+
+  it("rejects chat text over the size cap", () => {
+    const payload = { id: "m", text: "a".repeat(MAX_DM_TEXT_LENGTH + 1), ts: 1 };
+    expect(parseDmEnvelope(encodeDmChatEnvelope(payload))).toBeNull();
+  });
+
+  it("accepts chat text at exactly the size cap", () => {
+    const payload = { id: "m", text: "a".repeat(MAX_DM_TEXT_LENGTH), ts: 1 };
+    expect(parseDmEnvelope(encodeDmChatEnvelope(payload))).toEqual({
+      type: "chat",
+      payload,
+    });
   });
 
   it("rejects chat payloads with missing fields", () => {

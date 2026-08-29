@@ -14,6 +14,7 @@ import {
   setChatFontSize,
   setItalicOwnName,
   setShowConnectionInfo,
+  setCallPip,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
 } from "$lib/display-prefs.svelte";
@@ -363,6 +364,33 @@ async function loadLocalFonts(): Promise<void> {
   </div>
 </div>
 
+<!-- Calls Section -->
+<div
+  class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+>
+  <div class="flex items-center gap-2">
+    <div class="w-1 h-4 bg-emerald-500 rounded-full"></div>
+    <Label
+      class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+      >Calls</Label
+    >
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Picture-in-picture</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Keeps the call in a small floating panel when you open another room
+        or DM, and in the browser's own window when you switch tabs (Chrome).
+        Also in the call's right-click menu.
+      </span>
+    </div>
+    <Switch
+      checked={displayPrefs.callPip}
+      onCheckedChange={(checked) => setCallPip(checked)}
+    />
+  </div>
+</div>
+
 <!-- Debug Section -->
 <div
   class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
@@ -378,9 +406,8 @@ async function loadLocalFonts(): Promise<void> {
     <div class="flex flex-col gap-1 min-w-0">
       <span class="text-xs font-mono">Connection &amp; relay indicators</span>
       <span class="text-xs font-mono text-muted-foreground leading-relaxed">
-        Off hides the transport status overlay, the "Relayed" peer badges, the
-        sidebar connection dot and the room "Connected" pill. Turn it on to see
-        relay and connection state.
+        Off hides the floating panel on the right that shows relay state and
+        per-peer connection details during a call.
       </span>
     </div>
     <Switch

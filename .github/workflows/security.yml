@@ -1,0 +1,35 @@
+# Weekly dependency sweep. Only govulncheck can fail the run: npm audit on
+# the frontend is dominated by react-native tooling that never ships in the
+# browser bundle, so it is reported, not enforced.
+name: security
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: relay } }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version-file: relay/go.mod, cache-dependency-path: relay/go.sum }
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with: { version: 10 }
+      - uses: actions/setup-node@v7
+        with: { node-version: 24 }
+      - name: sfu (production deps)
+        working-directory: sfu
+        run: npm ci --ignore-scripts && npm audit --omit=dev
+      - name: frontend (production deps, informational)
+        if: always()
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile --ignore-scripts && pnpm audit --prod || true

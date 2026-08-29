@@ -42,6 +42,12 @@ const VOICE_SETUP_DEADLINE_MS = 30_000;
 const VOICE_ASK_TRUMPS_HANDSHAKE_MS = 10_000;
 /** Ceiling on signals buffered while a peer has no signalling stream. */
 const MAX_QUEUED_SIGNALS = 64;
+/**
+ * Ceiling on ICE candidates buffered per peer while waiting on their remote
+ * description. Same shape as MAX_QUEUED_SIGNALS: an admitted peer that never
+ * completes offer/answer should not be able to grow this without bound.
+ */
+const MAX_PENDING_CANDIDATES = 256;
 /** Rate limit on asking the other side to dial us. */
 const VOICE_REDIAL_ASK_MS = 5_000;
 
@@ -61,6 +67,29 @@ type VoiceSignal =
   | { type: "offer"; sdp: string }
   | { type: "answer"; sdp: string }
   | { type: "ice"; candidate: RTCIceCandidateInit };
+
+/**
+ * Narrows a JSON.parse result to VoiceSignal before it touches the
+ * RTCPeerConnection. sdp's length is already bounded by MAX_FRAME_BYTES on
+ * the wire, so there is nothing further to check there beyond "is a string".
+ */
+export function isVoiceSignal(value: unknown): value is VoiceSignal {
+  if (!value || typeof value !== "object") return false;
+  const v = value as { type?: unknown; sdp?: unknown; candidate?: unknown };
+  switch (v.type) {
+    case "offer":
+    case "answer":
+      return typeof v.sdp === "string";
+    case "ice":
+      return (
+        !!v.candidate &&
+        typeof v.candidate === "object" &&
+        typeof (v.candidate as { candidate?: unknown }).candidate === "string"
+      );
+    default:
+      return false;
+  }
+}
 
 interface RemotePeer {
   pc: RTCPeerConnection;
@@ -151,6 +180,7 @@ export class LibP2PVoice implements VoiceTransport {
     offersSent: 0,
     offersIn: 0,
     answersIn: 0,
+    signalsInvalid: 0,
     teardowns: 0,
     redialsAsked: 0,
     redialsServed: 0,
@@ -200,8 +230,13 @@ export class LibP2PVoice implements VoiceTransport {
           // RTCPeerConnection, so accepting a stream from anyone who can reach
           // us over the relay handed our mic to a peer who is not in the call.
           // The roster makes the check a one-liner; identity is the libp2p
-          // peerId the stream arrived on, never anything on the wire.
-          if (this.rosterSeen && !this.callPeers.has(peerId)) {
+          // peerId the stream arrived on, never anything on the wire. Default
+          // deny until the roster has been fed at least once: the handler is
+          // live as soon as join() registers it, which is before _joinCall
+          // has handed us any roster at all, and treating "no roster yet" as
+          // "admit everyone" is exactly the open window this guard exists to
+          // close.
+          if (!this.admitsInboundStream(peerId)) {
             stream.abort(new Error("not in this call"));
             return;
           }
@@ -244,6 +279,15 @@ export class LibP2PVoice implements VoiceTransport {
     this.callPeers = new Set(peerIds);
     this.rosterSeen = true;
     this.reconcileLinks();
+  }
+
+  /**
+   * Whether an inbound /voice/1.0.0 stream from this peer should be admitted.
+   * Default deny: before setCallPeers() has run at least once, nothing is
+   * admitted, roster membership or not.
+   */
+  private admitsInboundStream(peerId: string): boolean {
+    return this.rosterSeen && this.callPeers.has(peerId);
   }
 
   /** Dev-only view of what the voice layer thinks it is holding. */
@@ -863,10 +907,12 @@ export class LibP2PVoice implements VoiceTransport {
         const payload = readBuf.slice(4, 4 + len);
         readBuf = readBuf.slice(4 + len);
         try {
-          const signal = JSON.parse(
-            new TextDecoder().decode(payload)
-          ) as VoiceSignal;
-          this.handleSignal(peerId, signal).catch(() => {});
+          const parsed: unknown = JSON.parse(new TextDecoder().decode(payload));
+          if (isVoiceSignal(parsed)) {
+            this.handleSignal(peerId, parsed).catch(() => {});
+          } else {
+            this.debugStats.signalsInvalid++;
+          }
         } catch {}
       }
     });
@@ -1184,7 +1230,14 @@ export class LibP2PVoice implements VoiceTransport {
       }
       case "ice": {
         if (!remote.pc.remoteDescription) {
-          remote.pendingCandidates.push(signal.candidate);
+          // Bounded: a peer that never completes the handshake would
+          // otherwise buffer every trickled candidate for the life of the
+          // call. Early candidates (host/srflx) are the ones worth keeping,
+          // so once full, drop the newest rather than evict what already
+          // arrived.
+          if (remote.pendingCandidates.length < MAX_PENDING_CANDIDATES) {
+            remote.pendingCandidates.push(signal.candidate);
+          }
           return;
         }
         await remote.pc.addIceCandidate(signal.candidate).catch(() => {});

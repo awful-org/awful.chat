@@ -48,4 +48,14 @@ describe("duress password", () => {
     expect(hasDuressPassword()).toBe(false);
     expect(await isDuressPassword("whatever")).toBe(false);
   });
+
+  it("still rejects a near-miss password (constant-time compare doesn't break matching)", async () => {
+    await setDuressPassword("wipe-me-1234");
+    // One-character-off, one-byte-shorter, and empty - all should still miss.
+    expect(await isDuressPassword("wipe-me-1235")).toBe(false);
+    expect(await isDuressPassword("wipe-me-123")).toBe(false);
+    expect(await isDuressPassword("")).toBe(false);
+    // The real one still matches through the constant-time path.
+    expect(await isDuressPassword("wipe-me-1234")).toBe(true);
+  });
 });

@@ -15,6 +15,13 @@ export interface CardStateEntry {
    *  without this check a member of room X could fold forged data into a
    *  card living in room Y just by naming its id. */
   roomCode: string;
+  /** The plugin that OWNS the card, read from the card row's payload. The
+   *  reducer for a live update is resolved from the UPDATE's pluginId, which
+   *  is peer-supplied: without this, plugin A's payload reached A's reducer
+   *  holding a state object plugin B had built, and every reducer in the
+   *  registry became a type-confusion gadget for any room member. Only the
+   *  owning plugin's updates fold, live and on replay. */
+  pluginId: string;
   /** Fold-order key of the newest PERSISTED update included, null when the
    *  state was built before any update existed. Ephemerals never count: they
    *  are unordered by design (lamport 0) and live outside storage. */
@@ -86,10 +93,18 @@ export async function buildCardState(
     MessageType.PluginUpdate,
   ]);
   let cardData: unknown = undefined;
+  // The card row names the only plugin allowed to write this state. It is
+  // also what the render path resolved `definition` from, so falling back to
+  // the definition when the row is missing or malformed keeps a card that is
+  // rendering (from an in-memory row) foldable rather than inert.
+  let ownerPluginId = definition.manifest.id;
   const cardMsg = allMessages.find((m) => m.id === cardId);
   if (cardMsg) {
     try {
-      cardData = JSON.parse(cardMsg.content).data;
+      const cardPayload = JSON.parse(cardMsg.content);
+      cardData = cardPayload.data;
+      if (typeof cardPayload.pluginId === "string")
+        ownerPluginId = cardPayload.pluginId;
     } catch {
       // Malformed card: state starts unseeded and the card renders empty.
     }
@@ -101,18 +116,23 @@ export async function buildCardState(
         ? definition.initialState(cardData)
         : undefined,
       roomCode,
+      pluginId: ownerPluginId,
       last: null,
     };
   }
 
   let state = definition.initialState(cardData);
 
-  // Filter for PluginUpdate messages for this cardId
+  // Filter for PluginUpdate messages for this cardId. The pluginId has to
+  // match the card's too: the live path picks the reducer from the update's
+  // own pluginId, so replaying on cardId alone made storage and the live
+  // fold disagree about which plugin owns the card - and let a foreign
+  // plugin's payload through this card's reducer on every rebuild.
   const updates = allMessages.filter((msg) => {
     if (msg.type !== MessageType.PluginUpdate) return false;
     try {
       const payload = JSON.parse(msg.content);
-      return payload.cardId === cardId;
+      return payload.cardId === cardId && payload.pluginId === ownerPluginId;
     } catch {
       return false;
     }
@@ -142,6 +162,7 @@ export async function buildCardState(
   return {
     state,
     roomCode,
+    pluginId: ownerPluginId,
     last: newest
       ? { lamport: newest.lamport, senderId: newest.senderId, id: newest.id }
       : null,
@@ -188,7 +209,23 @@ export function foldUpdate(
     // a stale state (a spin lost this way never lands). Flag it so
     // getCardState rebuilds once more after the read; persisted updates only,
     // an ephemeral is not in storage and cannot be recovered by a rebuild.
-    if (!update.ephemeral) _missedFold.add(cardId);
+    // Only while a build is actually running: with no build in flight there
+    // is nothing to catch up with (the update was put before this call, so
+    // the next build reads it anyway), and without the gate a peer naming
+    // cardIds nobody is rendering grew this set without bound.
+    if (!update.ephemeral && _building.has(cardId)) _missedFold.add(cardId);
+    return undefined;
+  }
+
+  // The reducer about to run belongs to the update's pluginId, but the state
+  // it is handed was built by the card's. Refuse the mismatch: a room member
+  // can put any pluginId in an update payload, and folding one plugin's data
+  // through another's reducer is a type confusion the reducers cannot see.
+  if (definition.manifest.id !== entry.pluginId) {
+    console.warn(
+      `[plugins] refused update from ${definition.manifest.id} for card ` +
+        `${cardId}, which belongs to ${entry.pluginId}`
+    );
     return undefined;
   }
 
@@ -259,11 +296,27 @@ export async function getCardState(
     let built = await buildCardState(cardId, roomCode, definition);
     // An update folded while we were reading storage found no entry and was
     // dropped - but its putMessage preceded the fold, so a fresh read sees it.
-    while (_missedFold.delete(cardId)) {
+    // Re-read up to MAX_REBUILD_RETRIES times. Bail out if updates keep landing
+    // faster than the read completes - that state is stale and must not be installed.
+    const MAX_REBUILD_RETRIES = 2;
+    for (let retry = 0; retry < MAX_REBUILD_RETRIES && _missedFold.has(cardId); retry++) {
+      _missedFold.delete(cardId);
       built = await buildCardState(cardId, roomCode, definition);
     }
-    // A concurrent getCardState may have set the entry first; live folds have
-    // been applying to THAT object, so ours must not clobber it.
+    // If still flagged after retries, updates are arriving faster than the read.
+    // The built state is known to be stale - installing it would diverge permanently
+    // from storage until an eviction replayed it. Instead, skip installation and let
+    // the next fold attempt trigger another build once updates stabilize.
+    if (_missedFold.has(cardId)) {
+      _missedFold.delete(cardId);
+      // A concurrent build may have already installed an entry while we were reading;
+      // return that if it exists.
+      const existing = cardStates.get(cardId);
+      return existing?.state;
+    }
+    // No longer flagged after retries: built state matches storage. A concurrent
+    // getCardState may have set the entry first; live folds have been applying to
+    // THAT object, so ours must not clobber it.
     const existing = cardStates.get(cardId);
     if (existing) return existing.state;
     cardStates.set(cardId, built);

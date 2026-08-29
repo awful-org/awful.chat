@@ -119,7 +119,7 @@
   -->
   <div
     class="fixed z-50 flex flex-col overflow-hidden rounded-lg border border-border bg-card font-(family-name:--chat-font-family) shadow-2xl"
-    style="left: {dmPanel.x}px; top: {dmPanel.y}px; width: {WIDTH}px; height: {height}px; --chat-font-size: {displayPrefs.chatFontSize}px; --chat-font-family: {chatFontStack}"
+    style="left: {dmPanel.x}px; top: {dmPanel.y}px; width: {WIDTH}px; height: {height}px; --chat-font-family: {chatFontStack}"
   >
     <div
       use:draggable={{
@@ -180,6 +180,7 @@
     {#if !dmPanel.minimized}
       <div
         bind:this={list}
+        style="--chat-font-size: {displayPrefs.chatFontSize}px"
         class="flex-1 overflow-y-auto px-2 py-1.5 text-(length:--chat-font-size) leading-normal"
       >
         {#if dmPanel.loading}
@@ -198,7 +199,7 @@
                 class="mt-1.5 flex items-baseline gap-1.5 text-xs first:mt-0"
               >
                 <span
-                  class="truncate font-medium {own
+                  class="truncate font-medium text-(length:--chat-font-size) {own
                     ? 'text-primary'
                     : 'text-foreground'}"
                 >

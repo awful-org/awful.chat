@@ -1,0 +1,6 @@
+# A host node_modules would be COPYed over the one npm ci built in the deps
+# stage, shipping a locally-built mediasoup worker binary (wrong libc, wrong
+# architecture) into the image. It also sent ~80 MB of build context.
+node_modules
+dist
+npm-debug.log

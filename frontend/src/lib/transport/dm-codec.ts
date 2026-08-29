@@ -41,6 +41,13 @@ export interface DmPayload {
   reaction?: DmReaction;
 }
 
+/**
+ * Same floor as verify-incoming's MAX_CHAT_CONTENT_LENGTH: no client-side cap
+ * on the composer body itself, so this is a generous multiple that still
+ * stops a peer wedging a pathological amount of text into a DM envelope.
+ */
+export const MAX_DM_TEXT_LENGTH = 16_384;
+
 export const DM_CHAT_TAG = 0x01;
 export const DM_ACK_TAG = 0x02;
 export const DM_READ_TAG = 0x03;
@@ -113,6 +120,7 @@ export function parseDmEnvelope(
       if (
         typeof parsed?.id !== "string" ||
         typeof parsed?.text !== "string" ||
+        parsed.text.length > MAX_DM_TEXT_LENGTH ||
         typeof parsed?.ts !== "number"
       ) {
         return null;

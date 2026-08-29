@@ -182,12 +182,12 @@
             >
           {/if}
         </button>
-        {#if displayPrefs.showConnectionInfo}
-          <div
-            class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full ring-2 ring-card
-            {transportState.relayConnected ? 'bg-primary' : 'bg-yellow-500'}"
-          ></div>
-        {/if}
+        <!-- Connection status dot: always shown, not gated on showConnectionInfo.
+             That setting controls only the floating panel on the right. -->
+        <div
+          class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full ring-2 ring-card
+          {transportState.relayConnected ? 'bg-primary' : 'bg-yellow-500'}"
+        ></div>
       </div>
 
       <!-- Name + status -->
@@ -198,11 +198,11 @@
           >
             {profileStore.nickname}
           </div>
-          {#if displayPrefs.showConnectionInfo}
-            <div class="text-xs text-muted-foreground font-mono leading-tight">
-              {transportState.relayConnected ? "Connected" : "Connecting..."}
-            </div>
-          {/if}
+          <!-- Connection status text: always shown, not gated on showConnectionInfo.
+               That setting controls only the floating panel on the right. -->
+          <div class="text-xs text-muted-foreground font-mono leading-tight">
+            {transportState.relayConnected ? "Connected" : "Connecting..."}
+          </div>
         </div>
       {/if}
     </div>

@@ -170,10 +170,16 @@ export async function openDmFromMailbox(args: {
   if (inner.v !== VERSION) throw new Error("bad version");
   if (inner.to !== args.selfDid) throw new Error("not sealed for us");
   const envelope = unb64(inner.env);
+  // zip215:false for the same reason messaging.ts passes it: @noble defaults
+  // to the cofactored ZIP215 equation, which accepts small-order public keys,
+  // and a did:key naming a torsion point then verifies any signature over any
+  // content with no private key. The sender did in a mailbox blob is the only
+  // thing that attributes an offline DM to somebody.
   const ok = ed25519.verify(
     unb64(inner.sig),
     await sigMessage(inner.to, envelope),
-    didToPublicKey(inner.from)
+    didToPublicKey(inner.from),
+    { zip215: false }
   );
   if (!ok) throw new Error("bad sender signature");
   return { senderDid: inner.from, envelope };

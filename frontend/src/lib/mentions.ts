@@ -101,6 +101,13 @@ export function humanize(
   content: string,
   resolveName: (did: string) => string
 ): string {
+  // Same reason as escapeHtml's coercion, one level up: `content` is a
+  // TypeScript claim about a JSON.parse result, so a peer can send a number or
+  // an object and it still signs and verifies. `.replace` on those throws, and
+  // callers run on paths where one throw loses the message - the DM receive
+  // path's only handler is .catch(console.error), so the throw skips the
+  // append and the DM stays invisible until reload.
+  if (typeof content !== "string") return "";
   // Match @[did] tokens
   // Allow any characters inside the brackets that are valid in a DID
   return content.replace(/@\[([^\[\]]+)\]/g, (match, did) => {
@@ -125,6 +132,10 @@ export function humanizeMentions(
   content: string,
   resolveName: (did: string) => string
 ): string {
+  // Non-string content is treated as empty here for the same reason as in
+  // humanize above: this is the notification-body path, and on DM receive a
+  // throw here skips the rest of the delivery bookkeeping.
+  if (typeof content !== "string") return "";
   // Match @[did] tokens
   return content.replace(/@\[([^\[\]]+)\]/g, (match, did) => {
     const name = resolveName(did);
@@ -226,8 +237,12 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function escapeHtml(str: string): string {
-  return str
+function escapeHtml(str: unknown): string {
+  // Coerced, not assumed: display names come off the wire with no runtime type
+  // check, so resolveName can hand back a number or an object. `.replace` on
+  // those throws, and this is the {@html} mention path - one malformed profile
+  // would kill the render of every message that mentions it.
+  return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

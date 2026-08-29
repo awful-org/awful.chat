@@ -53,6 +53,12 @@ export function sniffImageMime(bytes: Uint8Array): string {
     bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45
   )
     return "image/webp";
+  // AVIF has "ftyp" at offset 4 and "avif" at offset 8.
+  if (
+    bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70 &&
+    bytes[8] === 0x61 && bytes[9] === 0x76 && bytes[10] === 0x69 && bytes[11] === 0x66
+  )
+    return "image/avif";
   return "image/jpeg"; // ponytail: unknown bytes get the sniffing-tolerant default
 }
 
@@ -99,6 +105,20 @@ export function normalizeNicknameColor(value: unknown): string | undefined {
   return NICKNAME_COLOR_RE.test(value) ? value.toLowerCase() : undefined;
 }
 
+/**
+ * KNOWN EXPOSURE, deliberately not closed here: a remote http(s) avatar URL is
+ * chosen by the peer who sent the profile, and every call site renders it as a
+ * live `<img src>` with no interaction. The peer's server therefore sees the
+ * viewer's IP address, User-Agent and rough online schedule - a working
+ * deanonymization beacon against a chat that is otherwise P2P and E2E.
+ *
+ * Closing it properly needs one of two things this function cannot decide on
+ * its own: a relay-side image proxy that refetches the avatar server-side
+ * (the relay has /og and /plugin-proxy but neither returns image bytes), or a
+ * "load remote images" opt-in the user can see and flip. Restricting this to
+ * data: URLs alone is not an option - a linked avatar URL is a documented
+ * feature and the picker offers a URL tab for it.
+ */
 export function normalizeAvatarUrl(url: unknown): string | undefined {
   if (typeof url !== "string") return undefined;
   // An avatar picked from the device is sent inline as a data: URL - rejecting

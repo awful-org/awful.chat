@@ -6,7 +6,7 @@
  * before `vite build`, and a redeploy is what publishes changes.
  *
  * PLUGIN_SOURCES is a comma/whitespace separated list of:
- *   https://github.com/user/repo         default branch (HEAD)
+ *   https://github.com/user/repo         default branch (HEAD) - requires opt-in, see below
  *   https://github.com/user/repo#v1.2    pinned tag / branch / sha
  *   user/repo[#ref]                      shorthand for the above
  *   /abs/path or ./rel/path              local directory (dev, testing)
@@ -20,8 +20,15 @@
  * Trust model: identical to the app itself - the operator ships this code,
  * unsandboxed, to every user of the instance. Only list sources you trust
  * like your own code, and pin refs for reproducible deploys.
+ *
+ * A source with no #ref fails the build by default: it fetches HEAD of a
+ * third-party repo with no integrity check, and the exact same env value can
+ * ship different code on the next build. Set PLUGIN_SOURCES_ALLOW_UNPINNED=1
+ * to opt into that anyway. Every fetched source prints its tarball's sha256
+ * so an operator can confirm two fetches pulled the same bytes.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -87,21 +94,47 @@ async function materialize(source, tmp) {
   }
   let spec = source.replace(/^https:\/\/github\.com\//, "");
   let ref = "HEAD";
+  let pinned = false;
   const hash = spec.indexOf("#");
   if (hash !== -1) {
     ref = spec.slice(hash + 1);
     spec = spec.slice(0, hash);
+    pinned = true;
   }
   spec = spec.replace(/\.git$/, "").replace(/\/$/, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(spec)) {
     fail(`unrecognized source (want github url, user/repo, or a path): ${source}`);
   }
+  // No #ref means "fetch whatever HEAD is right now" - a different build can
+  // ship different code from the exact same PLUGIN_SOURCES value, with no
+  // integrity check on what came back. Loud by default; opt-in to bypass.
+  if (!pinned) {
+    console.error(
+      `[fetch-plugins] WARNING: ${spec} has no #ref - this fetches HEAD of a ` +
+        `third-party repo with no integrity check, and the code that ships ` +
+        `can change between builds with no diff to review.`
+    );
+    if (process.env.PLUGIN_SOURCES_ALLOW_UNPINNED !== "1") {
+      fail(
+        `${spec} is unpinned. Pin it to a reproducible ref: ` +
+          `PLUGIN_SOURCES=${spec}#<commit-sha or tag>. To fetch HEAD anyway, ` +
+          `set PLUGIN_SOURCES_ALLOW_UNPINNED=1 (not recommended for production).`
+      );
+    }
+  }
   const url = `https://codeload.github.com/${spec}/tar.gz/${ref}`;
   console.log(`[fetch-plugins] downloading ${spec}@${ref}`);
   const res = await fetch(url);
   if (!res.ok) fail(`download failed (${res.status}) for ${url}`);
+  const tarBuf = Buffer.from(await res.arrayBuffer());
   const tarPath = join(tmp, "src.tar.gz");
-  writeFileSync(tarPath, Buffer.from(await res.arrayBuffer()));
+  writeFileSync(tarPath, tarBuf);
+  // Only a tarball by ref is downloaded here (no git clone, no GitHub API
+  // call), so there is no commit SHA to resolve for free. The tarball's own
+  // sha256 is the next best thing: it lets an operator confirm two fetches
+  // of the same ref actually pulled the same bytes.
+  const sha256 = createHash("sha256").update(tarBuf).digest("hex");
+  console.log(`[fetch-plugins] ${spec}@${ref} tarball sha256: ${sha256}`);
   const out = join(tmp, "x");
   mkdirSync(out);
   // --strip-components=1 drops the repo-name-ref top folder codeload adds.
