@@ -181,6 +181,18 @@ and a single port already in use aborts the whole container, so a range inside
 Linux's ephemeral window (32768-60999) makes the SFU fail to start at random,
 typically after a reboot.
 
+## Plugin metadata lookups need no server change
+
+Not every plugin needs `PLUGIN_PROXY_HOSTS` or a satellite. The built-in
+`anime-party` watch-party plugin looks up anime and episode metadata from
+AniList's public GraphQL API, called directly from each participant's
+browser: no API key, no `/plugin-proxy` allowlist entry, and no change to
+the relay, the SFU, or coturn. AniList needs no key and already sends the
+CORS header a browser call needs, the same zero-configuration shape as the
+`wheel` and `poll` plugins. See `.env.example` and
+[docs/anidb-watch-party.md](../docs/anidb-watch-party.md) for why AniDB
+itself is not used instead.
+
 ## What cannot be multiplied yet
 
 The **relay** is single. It holds the rendezvous registry (who is in which

@@ -41,6 +41,8 @@
     "plugins/poll/**/*.ts",
     "plugins/poll/**/*.svelte",
     "plugins/wheel/**/*.ts",
-    "plugins/wheel/**/*.svelte"
+    "plugins/wheel/**/*.svelte",
+    "plugins/anime-party/**/*.ts",
+    "plugins/anime-party/**/*.svelte"
   ]
 }
