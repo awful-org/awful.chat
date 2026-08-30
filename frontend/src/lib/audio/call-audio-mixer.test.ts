@@ -24,12 +24,17 @@ function context(duration = 1) {
   const destination = new NodeMock() as NodeMock & { stream: MediaStream };
   destination.stream = { getAudioTracks: () => [{ id: "stable" }] } as unknown as MediaStream;
   const sources: SourceMock[] = [];
+  const gains: NodeMock[] = [];
   const ctx = {
     state: "running",
     destination: new NodeMock(),
     createMediaStreamDestination: () => destination,
     createDynamicsCompressor: () => new NodeMock(),
-    createGain: () => new NodeMock(),
+    createGain: () => {
+      const gain = new NodeMock();
+      gains.push(gain);
+      return gain;
+    },
     createMediaStreamSource: () => new NodeMock(),
     createBufferSource: () => {
       const source = new SourceMock();
@@ -39,7 +44,7 @@ function context(duration = 1) {
     decodeAudioData: vi.fn(async () => ({ duration })),
     resume: vi.fn(async () => undefined),
   } as unknown as AudioContext;
-  return { ctx, sources };
+  return { ctx, sources, gains };
 }
 
 describe("CallAudioMixer", () => {
@@ -70,6 +75,21 @@ describe("CallAudioMixer", () => {
     const mixer = new CallAudioMixer(ctx);
     await expect(mixer.play(new Blob(["x"]))).resolves.toMatchObject({ durationMs: 5000 });
     expect(sources).toHaveLength(1);
+  });
+
+  it("applies the requested volume to outgoing and monitored sound", async () => {
+    const { ctx, gains } = context();
+    const mixer = new CallAudioMixer(ctx);
+    await mixer.play(new Blob(["x"]), { volume: 0.25 });
+    expect(gains[0].gain.value).toBe(0.2);
+    expect(gains[1].gain.value).toBe(0.045);
+  });
+
+  it.each([-0.01, 1.01, Number.NaN])("rejects invalid volume %s", async (volume) => {
+    const { ctx, sources } = context();
+    const mixer = new CallAudioMixer(ctx);
+    await expect(mixer.play(new Blob(["x"]), { volume })).rejects.toThrow("between 0 and 1");
+    expect(sources).toHaveLength(0);
   });
 
   it("rejects decoded clips even one millisecond over five seconds", async () => {

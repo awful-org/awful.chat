@@ -46,7 +46,11 @@ export class CallAudioMixer {
     this.microphoneSource.connect(this.limiter);
   }
 
-  async play(blob: Blob): Promise<CallSoundPlayback> {
+  async play(blob: Blob, options?: { volume?: number }): Promise<CallSoundPlayback> {
+    const volume = options?.volume ?? 1;
+    if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
+      throw new Error("Sound volume must be between 0 and 1");
+    }
     if (this.context.state === "suspended") await this.context.resume();
     const encoded = await blob.arrayBuffer();
     const buffer = await this.context.decodeAudioData(encoded.slice(0));
@@ -58,6 +62,8 @@ export class CallAudioMixer {
     }
 
     this.stop();
+    this.soundGain.gain.value = 0.8 * volume;
+    this.monitorGain.gain.value = 0.18 * volume;
     const source = this.context.createBufferSource();
     const id = `call-sound-${Date.now()}-${this.sequence++}`;
     source.buffer = buffer;

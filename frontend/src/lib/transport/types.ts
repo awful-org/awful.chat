@@ -132,7 +132,7 @@ export interface VoiceTransport {
   getOutputVolume(): number;
 
   // intentional local sounds mixed after microphone processing
-  playCallAudio(blob: Blob): Promise<{ id: string; durationMs: number }>;
+  playCallAudio(blob: Blob, options?: { volume?: number }): Promise<{ id: string; durationMs: number }>;
   stopCallAudio(id?: string): void;
 
   // events

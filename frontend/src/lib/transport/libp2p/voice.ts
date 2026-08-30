@@ -749,9 +749,9 @@ export class LibP2PVoice implements VoiceTransport {
     return this.currentOutputVolume;
   }
 
-  playCallAudio(blob: Blob): Promise<{ id: string; durationMs: number }> {
+  playCallAudio(blob: Blob, options?: { volume?: number }): Promise<{ id: string; durationMs: number }> {
     if (!this.callAudioMixer) throw new Error("Not in a call");
-    return this.callAudioMixer.play(blob);
+    return this.callAudioMixer.play(blob, options);
   }
 
   stopCallAudio(id?: string): void {

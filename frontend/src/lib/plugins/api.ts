@@ -111,7 +111,7 @@ export interface HostApi {
   /** Play a local audio blob through this user's outgoing call track. */
   callAudio: {
     blockedReason(): "not-in-call" | "deafened" | null;
-    play(blob: Blob): Promise<{ id: string; durationMs: number }>;
+    play(blob: Blob, options?: { volume?: number }): Promise<{ id: string; durationMs: number }>;
     stop(id?: string): void;
   };
   seededRandom(seed: string): () => number; // deterministic PRNG
