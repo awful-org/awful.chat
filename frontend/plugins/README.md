@@ -104,6 +104,15 @@ that should not stretch (a banner image, a fixed-size canvas).
 optional components on the definition, all receive the same
 `{ card, cardState, host }` props:
 
+- `localCard` - a private, session-only surface opened with
+  `host.showLocalCard(data)`. It appears in the invoking client's current
+  conversation with an “Only you” marker, but it is not a message: it is
+  never signed, stored, synchronized, counted as unread, notified, previewed,
+  replied to, or reacted to. The component receives
+  `{ localCard, host, close }`. One local card exists per plugin and room;
+  calling `showLocalCard` again replaces its local data and moves it to the
+  bottom. Use it for personal controls such as a device-local soundboard.
+
 - `widget` - a one-row strip for the sidebar slots (dotted "+ pin" boxes
   above the call controls; users pick a card from any of their rooms).
   Design for a single connection-status-sized row of simple controls -
@@ -200,6 +209,16 @@ not through card payloads.
 **Slash commands** register from the `commands` map; `/wheel a, b, c` calls
 your handler with the raw argument string. Commands of disabled plugins do
 not autocomplete and do not fire.
+
+**Call sounds** use `host.callAudio`. `blockedReason()` returns
+`"not-in-call"`, `"deafened"`, or `null`. `play(blob)` decodes a local audio
+blob, rejects decoded content longer than five seconds, stops the plugin
+user's previous call sound, and mixes the clip into their existing outgoing
+P2P voice track after microphone noise suppression. It returns
+`{ id, durationMs }`; `stop(id?)` stops that playback. The host accepts a Blob,
+never a URL, and sends no plugin message or file transfer. Microphone mute
+still gates only microphone samples, so an intentional call sound can play
+while muted. Stop playback when your surface unmounts.
 
 **Disabling**: users can toggle any plugin off in settings. Your cards then
 render as a neutral fallback naming the plugin; nothing else breaks, and
