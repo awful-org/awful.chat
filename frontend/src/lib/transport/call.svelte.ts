@@ -20,7 +20,6 @@ import {
   connect,
   transportState,
 } from "./transport.svelte";
-import type { VideoSource } from "./types";
 import { setTransmissionOutputVolume } from "./transmission.svelte";
 import {
   cancelErrorClear,
@@ -157,15 +156,15 @@ async function _joinCall(): Promise<void> {
     _transport.reconcileNow();
     await _voice.join(transportState.roomCode ?? "");
     throwIfAbandoned();
-    // Close the default-deny window right away: incoming voice signals are
-    // rejected until setCallPeers() is called at least once.
-    // _video.join() below is a network round trip, and without this call the
-    // voice layer would sit rosterless for its
-    // whole duration. transportState.inCall/.callRoomCode are not set yet at
-    // this point, so this first pass syncs an empty roster (default-deny with
-    // nobody admitted) - the real roster lands with the call below, and the
-    // reconcile tick (VOICE_RECONCILE_MS) plus the presence heartbeat pick up
-    // anyone still missing from there.
+    // Set before the first roster sync below: _syncVoiceRoster reads inCall
+    // and callRoomCode to know who belongs in this call. Setting them AFTER
+    // _video.join() used to hand the voice layer an empty roster (default-
+    // deny, nobody admitted) for that whole network round trip - every
+    // offer arriving in that window was silently dropped, sometimes for the
+    // full 30s setup deadline (finding 6). Voice is peer-to-peer and does
+    // not depend on the SFU, so there is no reason this waits for it.
+    transportState.inCall = true;
+    transportState.callRoomCode = transportState.roomCode; // Track which room the call is in
     _syncVoiceRoster();
     // Voice is peer-to-peer; only camera and screen share go through the SFU.
     // Awaiting this unguarded meant a media server that was down (or a VPS
@@ -179,11 +178,8 @@ async function _joinCall(): Promise<void> {
       _video.ensureLive();
     }
     throwIfAbandoned();
-    transportState.inCall = true;
-    transportState.callRoomCode = transportState.roomCode; // Track which room the call is in
     // Peers already in this call are known from their presence heartbeats -
-    // hand them over now rather than waiting for the next heartbeat, which is
-    // the difference between hearing people at once and 20s of silence.
+    // sync again in case one arrived while _video.join() was in flight.
     _syncVoiceRoster();
     acquireWakeLock();
     playJoinSound();
@@ -249,6 +245,12 @@ export function leaveCall(): void {
   }
   stopCamera();
   stopScreenShare();
+  // Deafened, then left: setOutputVolume(0) zeroed _voice's persisted gain
+  // and leave() never resets it, so the NEXT join seeded every peer's gain
+  // node at 0 while the deafen icon read normal (finding 5). setDeafened(
+  // false) restores it to what it was before deafening; guarded so a
+  // non-deafened leave (the common path) does not play the undeafen chime.
+  if (transportState.deafened) setDeafened(false);
   _voice.leave();
   _video.leave();
   transportState.inCall = false;
@@ -261,7 +263,6 @@ export function leaveCall(): void {
   transportState.localMicStream = null;
   transportState.cameraOff = true;
   transportState.screenSharing = false;
-  transportState.sfuPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
   transportState.transmissionViewers = new Map();
   transportState.watchingTransmissionPeerId = null;
@@ -454,13 +455,6 @@ export function stopScreenShare(): void {
   transportState.screenSharing = false;
   playScreenShareStopSound();
   _video.stopScreenShare();
-}
-
-export function pauseVideo(source: VideoSource): void {
-  _video.pauseVideo(source);
-}
-export function resumeVideo(source: VideoSource): void {
-  _video.resumeVideo(source);
 }
 
 export function setDeafened(deafened: boolean): void {

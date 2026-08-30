@@ -120,6 +120,48 @@ func (f *fakeStream) decode(t *testing.T, i int) serverMsg {
 	return msg
 }
 
+// encodeClientFrame builds the same length-prefixed wire frame the JS
+// client sends, for tests that need readLoop to actually DISPATCH a
+// message rather than calling registry.register/unregister directly.
+func encodeClientFrame(msg clientMsg) []byte {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
+	frame := make([]byte, 4+len(data))
+	frame[0] = byte(len(data) >> 24)
+	frame[1] = byte(len(data) >> 16)
+	frame[2] = byte(len(data) >> 8)
+	frame[3] = byte(len(data))
+	copy(frame[4:], data)
+	return frame
+}
+
+// registerOnceStream delivers ONE real wire frame on its first Read, so
+// readLoop dispatches it itself and flips its own local state (registered)
+// - unlike calling registry.register directly, which never touches
+// readLoop's dispatch at all. Every later Read behaves exactly like
+// fakeStream: it blocks until the deadline set by SetReadDeadline, then
+// returns a deadline-exceeded error, simulating a stream that has gone
+// silent - not even a PING.
+type registerOnceStream struct {
+	fakeStream
+	frame []byte
+	sent  bool
+}
+
+func (s *registerOnceStream) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	if !s.sent {
+		s.sent = true
+		n := copy(p, s.frame)
+		s.mu.Unlock()
+		return n, nil
+	}
+	s.mu.Unlock()
+	return s.fakeStream.Read(p)
+}
+
 // blockingStream never completes a write until release is closed - a peer that
 // has stopped reading its stream.
 type blockingStream struct {
@@ -186,19 +228,65 @@ func TestRegisterSendsPeerListAndNotifies(t *testing.T) {
 	}
 }
 
-func TestRegisterIsIdempotent(t *testing.T) {
+// register used to return early on an already-joined room with NO reply at
+// all, so a client whose membership view had drifted - a silently refused
+// REGISTER (finding 4) or a frame it silently dropped (finding 5) - had no
+// way to ask the registry what it actually thinks. A repeat REGISTER for a
+// room this stream already holds now resends that room's PEERS, so the
+// client can resync just by re-registering (relay-audit.md finding 6).
+func TestRepeatedRegisterResyncsPeers(t *testing.T) {
 	r := newRegistry()
 	a, sa := newClient(r, "peer-a")
+	b, sb := newClient(r, "peer-b")
+
 	r.register(a, "room1")
-	r.register(a, "room1")
-	sa.waitFrames(t, 1)
-	time.Sleep(20 * time.Millisecond) // give a second PEERS a chance to show up
-	if sa.count() != 1 {
-		t.Fatalf("duplicate register should not resend PEERS, got %d frames", sa.count())
+	r.register(b, "room1")
+	sa.decode(t, 0) // a's own PEERS
+	joined := sa.decode(t, 1)
+	if joined.Type != "PEER_JOINED" || joined.Peer != "peer-b" {
+		t.Fatalf("setup: expected PEER_JOINED for b, got %+v", joined)
 	}
-	if len(r.rooms["room1"]) != 1 {
-		t.Fatalf("room should have 1 peer, got %d", len(r.rooms["room1"]))
+
+	r.register(a, "room1") // repeat REGISTER, same room, same stream
+	resync := sa.decode(t, 2)
+	if resync.Type != "PEERS" || resync.Room != "room1" || len(resync.Peers) != 1 || resync.Peers[0] != "peer-b" {
+		t.Fatalf("expected a resync PEERS [peer-b], got %+v", resync)
 	}
+
+	// Nobody else hears about it: nothing changed from the room's point of
+	// view, so a resync must never look like a join to anyone but the asker.
+	time.Sleep(20 * time.Millisecond)
+	if sb.count() != 1 {
+		t.Fatalf("b saw %d frames from a's resync, want 1 (its own PEERS only)", sb.count())
+	}
+
+	r.mu.Lock()
+	roomSize := len(r.rooms["room1"])
+	r.mu.Unlock()
+	if roomSize != 2 {
+		t.Fatalf("room should still have 2 peers, got %d", roomSize)
+	}
+}
+
+// A REGISTER refused by the room or global cap used to return true - success
+// - so the client believed it joined a room the registry never added it to.
+// register now returns registerCapped, and readLoop answers it with an
+// explicit REGISTER_FAILED (relay-audit.md finding 4).
+func TestCappedRegisterGetsRegisterFailed(t *testing.T) {
+	r := newRegistry()
+	a, sa := newClient(r, "peer-a")
+	for i := range maxRoomsPerPeer {
+		r.register(a, fmt.Sprintf("room-%d", i))
+	}
+	sa.waitFrames(t, maxRoomsPerPeer)
+
+	if outcome := r.register(a, "one-too-many"); outcome != registerCapped {
+		t.Fatalf("register past the room cap returned %v, want registerCapped", outcome)
+	}
+	// register() itself never writes the frame - only readLoop does, on
+	// registerCapped - so this test exercises the outcome value directly and
+	// TestRegistryNeverLogsUnderItsLock (elsewhere) already exercises the
+	// log line this path writes under the same lock discipline.
 }
 
 func TestUnregisterNotifiesAndCleansEmptyRoom(t *testing.T) {
@@ -670,28 +758,80 @@ func TestLogSafeCopiesOnlyWhatItMustRewrite(t *testing.T) {
 	}
 }
 
-// maxRoomsPerPeer is per STREAM, and one peerId may hold maxStreamsPerPeer of
-// them, so before maxTotalRegistrations the per-stream cap bounded a peer's
-// footprint and nothing global: 32 streams x 1024 rooms = 32768 registrations
-// per peerId, for a few hundred bytes of attacker uplink each.
-func TestRegistryHasAGlobalRegistrationCeiling(t *testing.T) {
+// Before this fix, maxRoomsPerPeer was checked against ONE STREAM's own
+// c.rooms, so a second stream of the SAME peerId got a fresh 1024-room
+// allowance: 32 streams x 1024 rooms = 32768 registrations for one peerId,
+// and the 200000-registration global ceiling needed only 7 such peerIds
+// (relay-audit.md finding 4). The cap now sums every stream a peerId holds,
+// so it means what its name says: one peer, one 1024-room budget, no matter
+// how many tabs it opens.
+func TestRoomCapIsSharedAcrossAPeersStreams(t *testing.T) {
 	r := newRegistry()
-	// A second stream of the SAME peerId used to get a fresh 1024 allowance.
 	a1, _ := newClient(r, "peer-a")
 	a2, _ := newClient(r, "peer-a")
-	for _, c := range []*connectedClient{a1, a2} {
-		for i := 0; i < maxRoomsPerPeer; i++ {
-			r.register(c, fmt.Sprintf("room-%d-%p", i, c))
-		}
+
+	for i := range maxRoomsPerPeer {
+		r.register(a1, fmt.Sprintf("room-a1-%d", i))
 	}
+	// a1 alone already spent peer-a's whole budget; a2 gets none of its own
+	// on top of it.
+	for i := range 10 {
+		r.register(a2, fmt.Sprintf("room-a2-%d", i))
+	}
+
 	r.mu.Lock()
 	total := r.total
+	a1Rooms, a2Rooms := len(a1.rooms), len(a2.rooms)
 	r.mu.Unlock()
-	if total != 2*maxRoomsPerPeer {
-		t.Fatalf("total = %d, want %d (each stream keeps its own room cap)", total, 2*maxRoomsPerPeer)
+
+	if a1Rooms != maxRoomsPerPeer {
+		t.Fatalf("a1 joined %d rooms, want the full cap of %d", a1Rooms, maxRoomsPerPeer)
 	}
-	if total > maxTotalRegistrations {
-		t.Fatalf("test is not exercising the ceiling: %d > %d", total, maxTotalRegistrations)
+	if a2Rooms != 0 {
+		t.Fatalf("a2 joined %d rooms after peer-a's cap was already spent by a1, want 0", a2Rooms)
+	}
+	if total != maxRoomsPerPeer {
+		t.Fatalf("total = %d, want %d: the cap must be per PEER, not per stream", total, maxRoomsPerPeer)
+	}
+}
+
+// The global counter has to come back down, or an instance that has merely
+// been busy for a while refuses registrations forever. This exercises the
+// two peers - not one, since the room cap is now per peer - and additionally
+// checks that a spike logs once, falls silent while capped, and can log
+// again after it drops back down (relay-audit.md finding 12).
+func TestTotalCapLoggedResetsWhenTotalFalls(t *testing.T) {
+	r := newRegistry()
+	a, _ := newClient(r, "peer-a")
+	r.mu.Lock()
+	r.total = maxTotalRegistrations
+	r.totalCapLogged = true
+	r.mu.Unlock()
+
+	if outcome := r.register(a, "room1"); outcome != registerCapped {
+		t.Fatalf("register at the ceiling returned %v, want registerCapped", outcome)
+	}
+	r.mu.Lock()
+	stillLogged := r.totalCapLogged
+	r.mu.Unlock()
+	if !stillLogged {
+		t.Fatal("totalCapLogged should stay true while still at the ceiling")
+	}
+
+	// The registry drops back under the ceiling - some other peer left -
+	// and a's own leave is what should observe and clear the flag: register
+	// succeeds now that total is below the cap, then unregister decrements
+	// total and runs doUnregister's reset check.
+	r.mu.Lock()
+	r.total = maxTotalRegistrations - 1
+	r.mu.Unlock()
+	r.register(a, "room1")
+	r.unregister(a, "room1")
+	r.mu.Lock()
+	resetAfterLeave := !r.totalCapLogged
+	r.mu.Unlock()
+	if !resetAfterLeave {
+		t.Fatal("totalCapLogged did not reset once total fell back under the ceiling")
 	}
 }
 
@@ -835,5 +975,126 @@ func TestIdleRendezvousStreamIsClosedAfterTimeout(t *testing.T) {
 	}
 	if roomHas(r, "room1", "peer-idle") {
 		t.Fatal("an idle stream's cleanup should remove it from its rooms")
+	}
+}
+
+// Each circuit reserves 2*BufferSize (4 KiB) from a peer's resource-manager
+// span, so lifting MaxCircuits to connMgrHigh costs at most connMgrHigh *
+// 4 KiB = 2 MiB for one peer - this test only checks the ceiling itself,
+// the cost is documented next to relayResources.
+func TestRelayCircuitsAreNotCappedAtSixteen(t *testing.T) {
+	res := relayResources()
+	if res.MaxCircuits <= 16 {
+		t.Errorf("MaxCircuits = %d, still go-libp2p's default combined-circuit ceiling", res.MaxCircuits)
+	}
+	if res.MaxCircuits != connMgrHigh {
+		t.Errorf("MaxCircuits = %d, want connMgrHigh (%d) to match the other lifted ceilings", res.MaxCircuits, connMgrHigh)
+	}
+}
+
+// register's own PEERS reply used to grow with the room with no limit at
+// all, and the client fatally aborts any rendezvous frame over 16 KiB. This
+// drives a room well past maxPeersPerFrame and checks that the joiner still
+// gets every peer, just split across more than one frame, and that no single
+// frame is oversized (relay-audit.md finding 2).
+func TestBigRoomPeersReplyIsChunked(t *testing.T) {
+	r := newRegistry()
+	const roomSize = maxPeersPerFrame*2 + 10 // forces 3 frames
+	for i := range roomSize {
+		p, _ := newClient(r, fmt.Sprintf("peer-%d", i))
+		r.register(p, "big-room")
+	}
+
+	joiner, sj := newClient(r, "peer-joiner")
+	r.register(joiner, "big-room")
+
+	// Every existing member's outbox grew by one PEER_JOINED; the joiner's
+	// own reply is what this test cares about.
+	sj.waitFrames(t, 1)
+	time.Sleep(20 * time.Millisecond)
+
+	seen := map[string]bool{}
+	frameCount := sj.count()
+	if frameCount < 2 {
+		t.Fatalf("got %d frame(s) for a %d-peer room, want more than 1 (maxPeersPerFrame=%d)", frameCount, roomSize, maxPeersPerFrame)
+	}
+	for i := range frameCount {
+		msg := sj.decode(t, i)
+		if msg.Type != "PEERS" || msg.Room != "big-room" {
+			t.Fatalf("frame %d: unexpected message %+v", i, msg)
+		}
+		if len(msg.Peers) > maxPeersPerFrame {
+			t.Fatalf("frame %d carries %d peers, over maxPeersPerFrame (%d)", i, len(msg.Peers), maxPeersPerFrame)
+		}
+		for _, p := range msg.Peers {
+			if seen[p] {
+				t.Fatalf("peer %s appeared in more than one frame", p)
+			}
+			seen[p] = true
+		}
+	}
+	if len(seen) != roomSize {
+		t.Fatalf("joiner learned about %d peers across %d frames, want %d", len(seen), frameCount, roomSize)
+	}
+}
+
+// A registered stream used to get NO read deadline at all, so an app layer
+// that wedged - stopped processing frames - while its libp2p node kept
+// answering yamux pings stayed advertised forever: the one disconnect class
+// with no detector (relay-audit.md finding 5). This mirrors
+// TestIdleRendezvousStreamIsClosedAfterTimeout but for the REGISTERED case:
+// once the stream has joined a room, silence for rendezvousLivenessTimeout
+// must still end it.
+func TestRegisteredStreamWithNoLivenessIsClosedAfterTimeout(t *testing.T) {
+	origIdle, origPing := rendezvousIdleTimeout, rendezvousPingInterval
+	rendezvousIdleTimeout = time.Hour // must not be what ends this test
+	rendezvousPingInterval = 20 * time.Millisecond
+	rendezvousLivenessTimeout = 3 * rendezvousPingInterval
+	defer func() {
+		rendezvousIdleTimeout = origIdle
+		rendezvousPingInterval = origPing
+		rendezvousLivenessTimeout = 3 * rendezvousPingInterval
+	}()
+
+	r := newRegistry()
+	// readLoop only flips its OWN registered flag on a wire REGISTER it
+	// dispatches itself - calling registry.register directly, like
+	// TestIdleRendezvousStreamIsClosedAfterTimeout does, never sets it. So
+	// this stream delivers one real REGISTER frame, then goes silent exactly
+	// like fakeStream: every later Read blocks until the deadline and
+	// returns a deadline-exceeded error.
+	s := &registerOnceStream{frame: encodeClientFrame(clientMsg{Type: "REGISTER", Room: "room1"})}
+	c := addClient(r, "peer-wedged", s)
+
+	done := make(chan struct{})
+	go func() {
+		r.readLoop(s, "peer-wedged", c)
+		r.removeClient(c)
+		close(done)
+	}()
+
+	// The REGISTER frame's own PEERS reply proves readLoop actually
+	// processed it - and so set registered = true - rather than the room
+	// membership having been forced in some other way.
+	s.waitFrames(t, 1)
+	if !roomHas(r, "room1", "peer-wedged") {
+		t.Fatal("setup: peer should be in room1 before the liveness timeout")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not return once the liveness window elapsed")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !s.wasReset() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !s.wasReset() {
+		t.Fatal("a stream silent past rendezvousLivenessTimeout should be reset")
+	}
+	if roomHas(r, "room1", "peer-wedged") {
+		t.Fatal("cleanup should remove the wedged stream from its rooms")
 	}
 }

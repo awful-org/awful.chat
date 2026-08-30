@@ -10,6 +10,10 @@
   } from "$lib/transport/transport.svelte";
   import { looksLikePeerId } from "$lib/identity/identity-utils";
   import {
+    derivePeerOnlineState,
+    PEER_PROOF_GRACE_MS,
+  } from "$lib/peer-online-status";
+  import {
     openDmPanel,
     addToPhonebook,
     removeFromPhonebook,
@@ -63,6 +67,7 @@
     tagTextColor: string | null;
     tagChipColor: string | null;
     isOnline: boolean;
+    isConnecting: boolean;
     isSelf: boolean;
     isRelayed: boolean;
     inCall: boolean;
@@ -84,6 +89,41 @@
     getRoomUsers();
   });
 
+  // When each currently-connected peer id was first observed, so the grace
+  // window below measures from the actual connect, not from whenever this
+  // component happened to re-render.
+  let connectedSince = $state(new Map<string, number>());
+  $effect(() => {
+    const nowTs = Date.now();
+    const next = new Map(connectedSince);
+    let changed = false;
+    for (const p of peers) {
+      if (!next.has(p)) {
+        next.set(p, nowTs);
+        changed = true;
+      }
+    }
+    for (const p of [...next.keys()]) {
+      if (!peers.includes(p)) {
+        next.delete(p);
+        changed = true;
+      }
+    }
+    if (changed) connectedSince = next;
+  });
+
+  // A connected-but-unproven peer must downgrade from "online" to
+  // "connecting" on its own once the grace window elapses, not only the
+  // next time some other reactive input happens to change - so this needs
+  // its own clock, not a derivation of state that only ticks on its own.
+  let now = $state(Date.now());
+  $effect(() => {
+    const tick = setInterval(() => {
+      now = Date.now();
+    }, 500);
+    return () => clearInterval(tick);
+  });
+
   const users = $derived.by(() => {
     const allUsers: User[] = [];
 
@@ -97,12 +137,29 @@
         connectedPeerId ??
         didToPeerId(did) ??
         (looksLikePeerId(did) ? did : null);
-      const directlyConnected = peers.includes(did);
-      const isOnline =
-        isSelf ||
-        !!connectedPeerId ||
-        directlyConnected ||
-        (!!mappedPeerId && peers.includes(mappedPeerId));
+      // Which member of `peers` (if any) is this user's connected id -
+      // libp2p's connectedPeers says nothing about whether a frame can
+      // reach them, so "connected" and "proven" are checked separately
+      // (libp2p-audit finding 1).
+      const onlinePeerId = connectedPeerId ??
+        (peers.includes(did)
+          ? did
+          : mappedPeerId && peers.includes(mappedPeerId)
+            ? mappedPeerId
+            : null);
+      const proven = !!onlinePeerId && transportState.provenPeers.has(onlinePeerId);
+      const connectedSinceMs = onlinePeerId
+        ? connectedSince.get(onlinePeerId)
+        : undefined;
+      const { isOnline, isConnecting } = isSelf
+        ? { isOnline: true, isConnecting: false }
+        : derivePeerOnlineState(
+            !!onlinePeerId,
+            proven,
+            connectedSinceMs,
+            now,
+            PEER_PROOF_GRACE_MS
+          );
       const relayedPeerId = connectedPeerId ?? mappedPeerId;
       const userIsRelayed =
         !!relayedPeerId && isOnline && isRelayed(relayedPeerId);
@@ -187,6 +244,7 @@
         nameShimmer,
         nameGlow,
         isOnline,
+        isConnecting,
         isSelf,
         isRelayed: userIsRelayed,
         inCall,
@@ -204,6 +262,8 @@
       if (!a.isSelf && b.isSelf) return 1;
       if (a.isOnline && !b.isOnline) return -1;
       if (!a.isOnline && b.isOnline) return 1;
+      if (a.isConnecting && !b.isConnecting) return -1;
+      if (!a.isConnecting && b.isConnecting) return 1;
       return a.name.localeCompare(b.name);
     });
   });
@@ -348,7 +408,9 @@
       <div
         class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full border-2 border-background {user.isOnline
           ? 'bg-green-500'
-          : 'bg-muted-foreground'}"
+          : user.isConnecting
+            ? 'bg-yellow-500'
+            : 'bg-muted-foreground'}"
       ></div>
     </div>
     <div class="min-w-0 flex-1">
@@ -399,7 +461,9 @@
             ? "In call"
             : user.isOnline
               ? "Online"
-              : "Offline"}
+              : user.isConnecting
+                ? "Connecting"
+                : "Offline"}
       </div>
     </div>
   </div>

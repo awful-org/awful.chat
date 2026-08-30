@@ -43,9 +43,25 @@ function withTurn(turn: RTCIceServer): RTCIceServer[] {
 // credentialled TURN entry.
 let cached: RTCIceServer[] = [...STUN_SERVERS];
 
+// Pending self-refresh timer. connect() calls refreshTurnCredentials() once
+// per session today, but nothing enforces that, and the function also
+// calls itself - so every call clears whatever is already pending first,
+// and only one refresh chain is ever running at a time.
+// The handle type differs between the browser and Node, and @types/node is in
+// scope here, so it is named rather than pinned to `number`.
+type TimerHandle = ReturnType<typeof setTimeout>;
+let refreshTimer: TimerHandle | undefined;
+
 /** ICE servers for a new RTCPeerConnection. Read synchronously at PC creation. */
 export function getIceServers(): RTCIceServer[] {
   return cached;
+}
+
+/** Test seam: a fresh module per case is not worth a vi.resetModules dance. */
+export function _resetIceServersForTest(): void {
+  clearTimeout(refreshTimer);
+  refreshTimer = undefined;
+  cached = [...STUN_SERVERS];
 }
 
 /**
@@ -55,8 +71,20 @@ export function getIceServers(): RTCIceServer[] {
  * peers that can connect directly still do and only relayed ones are
  * affected. Cheap to call on every connect, and worth retrying: without it a
  * mobile or CGNAT peer has no path at all.
+ *
+ * Self-schedules its own next call at HALF the credential's ttl. awful.chat
+ * is a PWA - a tab can live for days - and this used to run once per
+ * session with no timer at all: two hours after connect(), coturn started
+ * rejecting every new allocation because the credential's embedded expiry
+ * timestamp had passed, and every RTCPeerConnection created after that
+ * point gathered zero relay candidates, silently (relay-audit.md
+ * finding 3). Re-arming at half the ttl, not on failure, means a relayed
+ * call already in progress always holds a credential with most of its
+ * lifetime still ahead of it.
  */
 export async function refreshTurnCredentials(): Promise<void> {
+  clearTimeout(refreshTimer);
+  refreshTimer = undefined;
   try {
     const base =
       (import.meta.env.VITE_API_URL as string | undefined) ||
@@ -81,6 +109,7 @@ export async function refreshTurnCredentials(): Promise<void> {
       username?: unknown;
       credential?: unknown;
       urls?: unknown;
+      ttl?: unknown;
     };
     if (
       typeof d?.username !== "string" ||
@@ -96,6 +125,16 @@ export async function refreshTurnCredentials(): Promise<void> {
       username: d.username,
       credential: d.credential,
     });
+    // ttl is in seconds (relay/turn.go). A missing or unusable ttl leaves
+    // this credential unrefreshed until the next connect() - the same
+    // fallback the old, never-refreshed code had - rather than guessing a
+    // number the relay did not send.
+    if (typeof d.ttl === "number" && Number.isFinite(d.ttl) && d.ttl > 0) {
+      refreshTimer = setTimeout(
+        () => void refreshTurnCredentials(),
+        (d.ttl * 1000) / 2
+      );
+    }
   } catch {
     // Stay STUN-only. The next connect() calls this again.
   }

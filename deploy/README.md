@@ -189,3 +189,22 @@ disjoint worlds: peers registered on one would never discover peers on the
 other, and mail left with one would never reach a client polling the other.
 Federating it needs cross-relay peer exchange and a home relay per mailbox,
 which is a design change rather than a config one.
+
+**Do not set `deploy.replicas` on the relay service.** Nothing in the
+compose or the relay's own code stops it, but the registry and mailbox
+above live in this ONE process's memory and on its ONE volume. A second
+replica would load the same `relay.key` from that shared volume and
+announce the same PeerID, while holding a completely separate, empty
+registry - so half of every room's members would land on one replica and
+half on the other, and each half would never see the other half in its
+`PEERS` reply. The relay logs a warning naming this constraint at boot,
+next to its PeerID, but there is no code check that refuses a second
+replica outright.
+
+**Set `TRUSTED_PROXY_CIDRS` before you go live.** The relay's API port is
+reachable by every container on `dokploy-network`, not only Traefik, and the
+default trusted range (see `.env.example`) is the whole private address
+space - so on this compose shape, ANY container can forge `X-Forwarded-For`
+and pick its own bucket for every per-IP rate limit the relay has
+(`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`). Narrow it to
+Traefik's own address on your `dokploy-network`, as a single `/32`.

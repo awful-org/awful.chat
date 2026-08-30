@@ -293,3 +293,41 @@ describe("DtlnProcessor lifecycle", () => {
     await expect(d.waitUntilReady()).rejects.toThrow("crashed during init");
   });
 });
+
+interface CrashableWorklet {
+  onprocessorerror: () => void;
+}
+
+describe("DtlnProcessor fatal callback (finding 1)", () => {
+  it("calls the registered handler when the worklet crashes after init", async () => {
+    const d = await makeProcessor();
+    await d.processStream(micStream);
+    let fatalCalls = 0;
+    d.onFatal(() => {
+      fatalCalls++;
+    });
+
+    // init() rewires node.onprocessorerror to handleFatal once the worklet
+    // is up - this is the browser firing it on a LIVE worklet, not the
+    // init-time crash the other tests cover.
+    const worklet = d.node as unknown as CrashableWorklet;
+    worklet.onprocessorerror();
+
+    expect(fatalCalls).toBe(1);
+    expect(d.isReady()).toBe(false);
+  });
+
+  it("onFatal(null) clears a previously registered handler", async () => {
+    const d = await makeProcessor();
+    let fatalCalls = 0;
+    d.onFatal(() => {
+      fatalCalls++;
+    });
+    d.onFatal(null);
+
+    const worklet = d.node as unknown as CrashableWorklet;
+    worklet.onprocessorerror();
+
+    expect(fatalCalls).toBe(0);
+  });
+});

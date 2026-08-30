@@ -83,9 +83,11 @@ func handleTurnCredentials(w http.ResponseWriter, r *http.Request) {
 	// 2h, not the original 12h: this credential is carried in a plaintext
 	// turn: URL (no TLS TURN is offered - see defaultTurnURLs), so a shorter
 	// TTL bounds how long a credential that leaked off the wire stays usable.
-	// Still comfortably longer than any call or transfer, and the client
-	// refreshes well before expiry rather than waiting it out (see
-	// frontend/src/lib/transport for refreshTurnCredentials).
+	// Still comfortably longer than any call or transfer. The response below
+	// carries this ttl, and the client reads it and re-arms its own refresh
+	// at half of it (frontend/src/lib/transport/ice-server-list.ts,
+	// refreshTurnCredentials), so a tab open for days never runs on a
+	// credential whose embedded expiry timestamp has already passed.
 	const ttl = 2 * 60 * 60 // 2h
 	expiry := time.Now().Unix() + ttl
 	// coturn's REST form is "<expiry>[:<id>]". The id half matters: coturn

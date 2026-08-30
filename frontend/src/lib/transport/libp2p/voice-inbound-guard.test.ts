@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LibP2PVoice, isVoiceSignal } from "./voice";
 
 function makeVoice() {
@@ -201,5 +201,144 @@ describe("pendingCandidates cap", () => {
     expect(
       (remote.pendingCandidates[0] as { candidate: string }).candidate
     ).toBe("candidate:0");
+  });
+});
+
+describe("startMic replaceTrack loop (finding 2)", () => {
+  const fakeMicTrack = { getSettings: () => ({ deviceId: "mic1" }), stop: () => {} };
+  const fakeMicStream = {
+    getAudioTracks: () => [fakeMicTrack],
+    getTracks: () => [fakeMicTrack],
+  };
+  const fakeProcessedTrack = { kind: "audio" };
+  const fakeAudioCtx = {
+    createMediaStreamSource: () => ({ connect: () => {} }),
+    createGain: () => ({ gain: { value: 0 }, connect: () => {} }),
+    createMediaStreamDestination: () => ({
+      stream: { getAudioTracks: () => [fakeProcessedTrack] },
+    }),
+  };
+
+  beforeEach(() => {
+    vi.stubGlobal("navigator", {
+      mediaDevices: { getUserMedia: async () => fakeMicStream },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function fakeSenderRemote(
+    peerId: string,
+    replaceTrack: (track: unknown) => Promise<void>
+  ) {
+    return {
+      peerId,
+      pc: {
+        getSenders: () => [{ track: { kind: "audio" }, replaceTrack }],
+        addTrack: () => {},
+      },
+    };
+  }
+
+  it("a replaceTrack rejection for one peer still updates every other peer", async () => {
+    const { internals } = makeVoice();
+    internals.audioCtx = fakeAudioCtx;
+    const updated: string[] = [];
+    const remotes = new Map<string, unknown>([
+      [
+        "aaa",
+        fakeSenderRemote("aaa", async () => {
+          // A peer torn down mid-switch (reconcile tick, redial) rejects
+          // here with InvalidStateError - the exact failure finding 2 names.
+          throw new DOMException("stopped", "InvalidStateError");
+        }),
+      ],
+      [
+        "bbb",
+        fakeSenderRemote("bbb", async () => {
+          updated.push("bbb");
+        }),
+      ],
+      [
+        "ccc",
+        fakeSenderRemote("ccc", async () => {
+          updated.push("ccc");
+        }),
+      ],
+    ]);
+    internals.remotePeers = remotes;
+
+    // Must resolve, not reject: before the fix, "aaa"'s rejection propagated
+    // out of startMic and skipped applyMuteState() and every peer after it
+    // in Map iteration order.
+    await (internals.startMic as (d?: string) => Promise<void>).call(
+      internals
+    );
+
+    expect(updated).toEqual(["bbb", "ccc"]);
+  });
+});
+
+describe("handleSignal: an offer in an unrecoverable signalling state asks for redial (finding 4)", () => {
+  it("asks for a fresh dial instead of dropping the offer silently", async () => {
+    const { internals } = makeVoice();
+    const asked: string[] = [];
+    internals.askForRedial = (peerId: string) => {
+      asked.push(peerId);
+    };
+    const remote = {
+      pc: {
+        // "have-remote-offer" is neither "stable" nor "have-local-offer" -
+        // the branch the audit calls unrecoverable at this signalling layer.
+        signalingState: "have-remote-offer",
+        setRemoteDescription: async () => {
+          throw new Error("must not be reached");
+        },
+      },
+      pendingCandidates: [],
+    };
+    (internals.remotePeers as Map<string, unknown>).set("aaa", remote);
+
+    await (
+      internals.handleSignal as (
+        peerId: string,
+        signal: unknown
+      ) => Promise<void>
+    ).call(internals, "aaa", { type: "offer", sdp: "v=0..." });
+
+    expect(asked).toEqual(["aaa"]);
+  });
+});
+
+describe("LibP2PVoice.handleDtlnFatal (finding 1)", () => {
+  it("rebuilds the mic on the active input device when a call is active", () => {
+    const { internals } = makeVoice();
+    internals.audioCtx = {}; // a call is active
+    internals.activeInputDevice = "mic-2";
+    const calls: (string | undefined)[] = [];
+    internals.startMic = (deviceId?: string) => {
+      calls.push(deviceId);
+      return Promise.resolve();
+    };
+
+    (internals.handleDtlnFatal as () => void).call(internals);
+
+    expect(calls).toEqual(["mic-2"]);
+  });
+
+  it("does nothing without an active call - no audioCtx, nothing to rebuild", () => {
+    const { internals } = makeVoice();
+    internals.audioCtx = null;
+    let called = false;
+    internals.startMic = () => {
+      called = true;
+      return Promise.resolve();
+    };
+
+    (internals.handleDtlnFatal as () => void).call(internals);
+
+    expect(called).toBe(false);
   });
 });

@@ -8,7 +8,7 @@ import { transportState, _transport } from "./transport.svelte";
 import { encode } from "../utils";
 import { MessageType } from "../types/message";
 import type { MediasoupVideo } from "./mediasoup";
-import { SFU_PUBLISH_UNAVAILABLE, SFU_UNREACHABLE } from "./types";
+import { cancelErrorClear, setErrorWithAutoClear } from "./call-error";
 
 let _video: MediasoupVideo | null = null;
 let _volume = 1;
@@ -26,24 +26,34 @@ export function initTransmission(video: MediasoupVideo): void {
       videoTrack: null,
       screenTrack: null,
       screenAudioTrack: null,
+      videoStalled: false,
+      screenStalled: false,
     };
+    // A landed track is the only recovery signal trackStalled gets (no
+    // separate "recovered" event) - clear the stall for the source that
+    // just produced a track, never the other one.
     transportState.participants = new Map(transportState.participants).set(
       peerId,
       source === "camera"
-        ? { ...existing, videoTrack: track }
+        ? { ...existing, videoTrack: track, videoStalled: false }
         : track.kind === "audio"
-          ? { ...existing, screenAudioTrack: track }
-          : { ...existing, screenTrack: track }
+          ? { ...existing, screenAudioTrack: track, screenStalled: false }
+          : { ...existing, screenTrack: track, screenStalled: false }
     );
-    if (!transportState.sfuPeerIds.has(peerId)) {
-      transportState.sfuPeerIds = new Set([
-        ...transportState.sfuPeerIds,
-        peerId,
-      ]);
-    }
   });
 
-_video.on("trackRemoved", (peerId, source) => {
+  _video.on("trackStalled", (peerId, source) => {
+    const p = transportState.participants.get(peerId);
+    if (!p) return;
+    transportState.participants = new Map(transportState.participants).set(
+      peerId,
+      source === "camera"
+        ? { ...p, videoStalled: true }
+        : { ...p, screenStalled: true }
+    );
+  });
+
+_video.on("trackRemoved", (peerId, source, kind) => {
   // Handle local tracks (screen share stopped via browser button)
   if (peerId === "local") {
     if (source === "screen") {
@@ -55,25 +65,21 @@ _video.on("trackRemoved", (peerId, source) => {
     }
     return;
   }
-  // Handle remote tracks
+  // Handle remote tracks. `kind` distinguishes which underlying track
+  // ended - closing the screen AUDIO producer must not also null the
+  // screen VIDEO track (sfu-audit finding 4: it used to tear down the
+  // viewer's whole watch and leave a dead "click to watch" tile behind).
   const p = transportState.participants.get(peerId);
   if (!p) return;
   transportState.participants = new Map(transportState.participants).set(
     peerId,
     source === "camera"
       ? { ...p, videoTrack: null }
-      : { ...p, screenTrack: null, screenAudioTrack: null }
+      : kind === "audio"
+        ? { ...p, screenAudioTrack: null }
+        : { ...p, screenTrack: null }
   );
 });
-
-  _video.on("peerJoined", (peerId) => {
-    if (!transportState.sfuPeerIds.has(peerId)) {
-      transportState.sfuPeerIds = new Set([
-        ...transportState.sfuPeerIds,
-        peerId,
-      ]);
-    }
-  });
 
   _video.on("peerLeft", (peerId) => {
     const p = transportState.participants.get(peerId);
@@ -88,9 +94,6 @@ _video.on("trackRemoved", (peerId, source) => {
         }
       );
     }
-    const next = new Set(transportState.sfuPeerIds);
-    next.delete(peerId);
-    transportState.sfuPeerIds = next;
 
     const tx = new Map(transportState.pendingTransmissions);
     tx.delete(peerId);
@@ -115,12 +118,6 @@ _video.on("trackRemoved", (peerId, source) => {
     transportState.pendingTransmissions = new Map(
       transportState.pendingTransmissions
     ).set(peerId, producerId);
-    if (!transportState.sfuPeerIds.has(peerId)) {
-      transportState.sfuPeerIds = new Set([
-        ...transportState.sfuPeerIds,
-        peerId,
-      ]);
-    }
   });
 
   _video.on("transmissionEnded", (peerId) => {
@@ -147,19 +144,22 @@ _video.on("trackRemoved", (peerId, source) => {
     playTransmissionLeaveSound();
   });
 
+  let _videoErrorMessage: string | null = null;
   _video.on("error", (err) => {
-    transportState.error = err.message;
+    _videoErrorMessage = err.message;
+    setErrorWithAutoClear(transportState, err.message);
   });
 
-  // Video quietly healing must take its banner with it - only OUR banners,
-  // an unrelated error on screen is not this component's to clear.
+  // Video quietly healing must take its OWN banner with it, whatever the
+  // message was - string-matching two fixed constants missed every
+  // sfuRefusalMessage() variant and both transport-failure strings that the
+  // client and server can produce (sfu-audit finding 15).
   _video.on("healed", () => {
-    if (
-      transportState.error === SFU_UNREACHABLE ||
-      transportState.error === SFU_PUBLISH_UNAVAILABLE
-    ) {
+    if (_videoErrorMessage !== null && transportState.error === _videoErrorMessage) {
+      cancelErrorClear();
       transportState.error = null;
     }
+    _videoErrorMessage = null;
   });
 }
 

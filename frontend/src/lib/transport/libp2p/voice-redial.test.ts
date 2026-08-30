@@ -3,18 +3,27 @@ import { LibP2PVoice } from "./voice";
 
 // handleRedialRequest touches only the link bookkeeping, so the peer
 // connection can be a state holder and the audio graph never comes up.
-function fakeRemote(state: string, ageMs = 0, everConnected = false, okAgoMs = 0) {
+function fakeRemote(
+  state: string,
+  ageMs = 0,
+  everConnected = false,
+  okAgoMs = 0,
+  lastBytesReceived: number | null = 0,
+  bytesReceivedAgoMs = 0
+) {
   return {
     peerId: "aaa",
-    pc: { connectionState: state, close: vi.fn() },
+    pc: { connectionState: state, close: vi.fn(), getStats: () => Promise.resolve(new Map()) },
     stream: null,
-    audio: { srcObject: null },
+    audio: { srcObject: null, play: () => Promise.resolve() },
     sourceNode: null,
     gainNode: null,
     pendingCandidates: [],
     createdAt: Date.now() - ageMs,
     everConnected,
     okAt: Date.now() - okAgoMs,
+    lastBytesReceived,
+    lastBytesReceivedAt: Date.now() - bytesReceivedAgoMs,
   };
 }
 
@@ -181,5 +190,95 @@ describe("reconcileLinks asks for a blipped link, not only a missing one", () =>
     const { internals, sent } = makePassiveVoice(true, 1_000);
     (internals.reconcileLinks as () => void).call(internals);
     expect(sent).toEqual([]);
+  });
+});
+
+describe("linkIsHealthy: inbound-media watchdog (finding 3)", () => {
+  interface TestRemote {
+    okAt: number;
+    lastBytesReceived: number | null;
+    lastBytesReceivedAt: number;
+  }
+
+  function callLinkIsHealthy(internals: Record<string, unknown>, remote: TestRemote, now: number) {
+    return (
+      internals.linkIsHealthy as (r: TestRemote, n: number) => boolean
+    ).call(internals, remote, now);
+  }
+
+  it("does not refresh okAt for a connected link whose bytesReceived has stalled past the threshold", () => {
+    const { internals } = makeVoice("connected");
+    const remote = (internals.remotePeers as Map<string, TestRemote>).get(
+      "aaa"
+    )!;
+    const now = Date.now();
+    remote.lastBytesReceived = 50_000;
+    remote.lastBytesReceivedAt = now - 9_000; // past the 8s stall threshold
+    remote.okAt = now - 9_000; // no progress since the stall started
+    // Still inside the 20s wedge grace, so not unhealthy YET - but okAt must
+    // not have been bumped to "now": that refresh is exactly what hid a
+    // stalled sender (finding 1/2) or a dropped renegotiation (finding 4)
+    // forever, because connectionState alone kept reading "connected".
+    expect(callLinkIsHealthy(internals, remote, now)).toBe(true);
+    expect(remote.okAt).toBe(now - 9_000);
+  });
+
+  it("tears a connected-but-stalled link down once the wedge grace elapses on top of the stall", () => {
+    const { internals } = makeVoice("connected");
+    const remote = (internals.remotePeers as Map<string, TestRemote>).get(
+      "aaa"
+    )!;
+    const now = Date.now();
+    remote.lastBytesReceived = 50_000;
+    remote.lastBytesReceivedAt = now - 25_000;
+    remote.okAt = now - 25_000;
+    expect(callLinkIsHealthy(internals, remote, now)).toBe(false);
+  });
+
+  it("a muted peer does not trip the watchdog - enabled=false still transmits silence frames, so bytesReceived keeps climbing", () => {
+    const { internals } = makeVoice("connected");
+    const remote = (internals.remotePeers as Map<string, TestRemote>).get(
+      "aaa"
+    )!;
+    const now = Date.now();
+    remote.lastBytesReceived = 12_000;
+    remote.lastBytesReceivedAt = now - 500; // increased half a second ago
+    remote.okAt = now - 10_000; // stale from before this sample
+    expect(callLinkIsHealthy(internals, remote, now)).toBe(true);
+    // Refreshed just now: no false positive despite the stale okAt going in.
+    expect(remote.okAt).toBe(now);
+  });
+
+  it("reconcileLinks tears down a stalled connected link end to end, on the side that notices it", () => {
+    const sent: string[] = [];
+    const transport = {
+      selfId: () => "aaa", // lower id: passive side, never dials
+      peers: () => ["zzz"],
+      isRelay: () => false,
+      send: async (peerId: string) => {
+        sent.push(peerId);
+        return true;
+      },
+      on: () => {},
+      off: () => {},
+    };
+    const voice = new LibP2PVoice(transport as never, null);
+    const internals = voice as never as Record<string, unknown>;
+    internals.node = {} as unknown;
+    internals.callPeers = new Set(["zzz"]);
+    internals.rosterSeen = true;
+    const now = Date.now();
+    const remote = {
+      ...fakeRemote("connected", 60_000, true, 25_000, 50_000, 25_000),
+      peerId: "zzz",
+    };
+    (internals.remotePeers as Map<string, TestRemote>).set("zzz", remote);
+    (internals.reconcileLinks as () => void).call(internals);
+    // Torn down (finding 3's watchdog owning the existing tdUnhealthy path),
+    // and the passive side's only further action is to ask - never a second
+    // repair path.
+    expect(
+      (internals.remotePeers as Map<string, TestRemote>).has("zzz")
+    ).toBe(false);
   });
 });
