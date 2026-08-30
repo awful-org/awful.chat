@@ -53,6 +53,19 @@ const VOICE_REDIAL_ASK_MS = 5_000;
  * "disconnects take forever to come back" experience.
  */
 const VOICE_BLIP_GRACE_MS = 5_000;
+/**
+ * Zero-growth window for the inbound-media watchdog (finding 3). A link can
+ * read "connected" - ICE never reports trouble - while the audio it is
+ * supposed to be carrying has stopped arriving entirely: a dead DTLN
+ * worklet, a replaceTrack that rejected mid-switch, a dropped renegotiation.
+ * Nothing but bytesReceived on the inbound-rtp report can tell the
+ * difference between that and a peer who is simply quiet. Twice the
+ * reconcile tick, so one missed sample cannot trip it, and zero growth
+ * rather than slow growth, so DTX/comfort-noise trickle and a legitimately
+ * muted peer (applyMuteState flips `enabled` on live tracks, which keeps
+ * RTP flowing) do not.
+ */
+const VOICE_MEDIA_STALL_MS = 8_000;
 
 // The DTLN set: browser noise suppression OFF (the model replaces it), but
 // echo cancellation ON. DTLN is noise suppression, not echo cancellation - a
@@ -124,6 +137,16 @@ interface RemotePeer {
    * against - the rebuild gets the same budget and the pair never converges.
    */
   okAt: number;
+  /**
+   * Last audio inbound-rtp bytesReceived sample, or null before the first
+   * poll lands. Watchdog state for finding 3 - see pollInboundMedia.
+   */
+  lastBytesReceived: number | null;
+  /**
+   * When bytesReceived last increased. Polled on the reconcile tick, so
+   * this can lag live reality by up to VOICE_RECONCILE_MS.
+   */
+  lastBytesReceivedAt: number;
 }
 
 export class LibP2PVoice implements VoiceTransport {
@@ -227,6 +250,12 @@ export class LibP2PVoice implements VoiceTransport {
     // implicit makeup gain per the Web Audio spec); tune only if voices pump.
     this.outputBus = this.audioCtx.createDynamicsCompressor();
     this.outputBus.connect(this.audioCtx.destination);
+
+    // A worklet that dies after init would otherwise transmit digital
+    // silence forever - the track stays live, RTP keeps flowing, and
+    // connectionState reads "connected" on both ends (finding 1). Rebuild
+    // the mic once instead of leaving that peer permanently unheard.
+    this.dtln?.onFatal(() => this.handleDtlnFatal());
 
     try {
       await this.startMic(this.activeInputDevice ?? undefined);
@@ -334,6 +363,24 @@ export class LibP2PVoice implements VoiceTransport {
     const self = this.transport.selfId();
     const connected = new Set(this.transport.peers());
     const now = Date.now();
+
+    // A browser or OS audio interruption suspends this context, and
+    // nothing else resumes it - the visibility handler only resumes the
+    // analyser context in speakers.svelte.ts, not this one (finding 7).
+    // Every tile keeps reading connected and every speaking ring keeps
+    // animating while the user hears nothing.
+    if (this.audioCtx?.state === "suspended") {
+      void this.audioCtx.resume().catch(() => {});
+    }
+
+    // Finding 3's watchdog: sample inbound bytes for every currently-
+    // connected link on this same tick. Fire-and-forget - see
+    // pollInboundMedia - so it costs nothing when nobody is stalled.
+    for (const remote of this.remotePeers.values()) {
+      if (remote.pc.connectionState === "connected") {
+        void this.pollInboundMedia(remote, now);
+      }
+    }
 
     // Drop links that should not exist or have wedged. Both sides do this:
     // a stale RTCPeerConnection on the passive side rejects the fresh offer
@@ -469,12 +516,22 @@ export class LibP2PVoice implements VoiceTransport {
     if (state === "failed" || state === "closed") return false;
     if (state === "connected") {
       remote.everConnected = true;
-      remote.okAt = now;
-      // A working link is the only proof worth resetting the backoff on:
-      // opening a signalling stream says nothing about whether media flows.
-      this.nextDialAt.delete(remote.peerId);
-      this.dialBackoff.delete(remote.peerId);
-      return true;
+      // Finding 3: "connected" proves nothing about whether audio is
+      // actually arriving. A link whose inbound bytes have gone flat for
+      // VOICE_MEDIA_STALL_MS gets no okAt refresh here - it falls through
+      // to the same blip/wedge grace below that a stalled ICE state would,
+      // instead of this short-circuit hiding the stall forever.
+      if (
+        remote.lastBytesReceived === null ||
+        now - remote.lastBytesReceivedAt < VOICE_MEDIA_STALL_MS
+      ) {
+        remote.okAt = now;
+        // A working link is the only proof worth resetting the backoff on:
+        // opening a signalling stream says nothing about whether media flows.
+        this.nextDialAt.delete(remote.peerId);
+        this.dialBackoff.delete(remote.peerId);
+        return true;
+      }
     }
     // A link that has never worked does not get the benefit of "progress":
     // ICE flapping back into "checking" refreshes okAt forever on a pair
@@ -483,9 +540,35 @@ export class LibP2PVoice implements VoiceTransport {
     if (!remote.everConnected && now - remote.createdAt > VOICE_SETUP_DEADLINE_MS) {
       return false;
     }
-    // "new" / "connecting" / "disconnected": legitimate for a moment, a wedge
-    // once it outlasts a handshake and an ICE restart.
+    // "new" / "connecting" / "disconnected", or "connected" with media
+    // stalled: legitimate for a moment, a wedge once it outlasts a
+    // handshake and an ICE restart.
     return now - remote.okAt < VOICE_LINK_GRACE_MS;
+  }
+
+  /**
+   * Finding 3's watchdog sample. Polled from the existing reconcile tick -
+   * no new timer - so linkIsHealthy always sees a value at most one tick
+   * stale. Fire-and-forget: getStats() is async and reconcileLinks is not,
+   * so this tick's teardown decisions still use the PREVIOUS sample, which
+   * is fine at an 8s stall threshold against a 4s tick.
+   */
+  private async pollInboundMedia(remote: RemotePeer, now: number): Promise<void> {
+    let stats;
+    try {
+      stats = await remote.pc.getStats();
+    } catch {
+      return;
+    }
+    for (const report of stats.values()) {
+      if (report.type !== "inbound-rtp" || report.kind !== "audio") continue;
+      const bytes = report.bytesReceived as number;
+      if (remote.lastBytesReceived === null || bytes > remote.lastBytesReceived) {
+        remote.lastBytesReceivedAt = now;
+      }
+      remote.lastBytesReceived = bytes;
+      return;
+    }
   }
 
   leave(): void {
@@ -506,6 +589,7 @@ export class LibP2PVoice implements VoiceTransport {
 
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.dtln?.releaseTransport();
+    this.dtln?.onFatal(null);
     this.audioCtx?.close();
 
     this.audioCtx = null;
@@ -555,15 +639,6 @@ export class LibP2PVoice implements VoiceTransport {
 
     await this.startMic(deviceId);
 
-    const newTrack = this.processedStream?.getAudioTracks()[0] ?? null;
-    if (!newTrack) return;
-    for (const remote of this.remotePeers.values()) {
-      const sender = remote.pc
-        .getSenders()
-        .find((s) => s.track?.kind === "audio");
-      if (sender) await sender.replaceTrack(newTrack);
-    }
-
     this.activeInputDevice = deviceId;
     this.emit("deviceChanged", "input", deviceId);
   }
@@ -597,9 +672,24 @@ export class LibP2PVoice implements VoiceTransport {
 
   async setOutputDevice(deviceId: string): Promise<void> {
     this.activeOutputDevice = deviceId;
+    // The <audio> elements are pinned to volume=0/muted=true - they exist
+    // only to pump the receiver, not to play anything audible - so routing
+    // THEM changes nothing the user hears. All audible output leaves
+    // through outputBus -> audioCtx.destination; that is the sink that
+    // actually has to move (finding 9).
+    // [INFERENCE] AudioContext.setSinkId is Chromium-only; the feature test
+    // keeps the previous (silent) behaviour on engines without it.
+    if (this.audioCtx && "setSinkId" in this.audioCtx) {
+      await (this.audioCtx as any).setSinkId(deviceId).catch(() => {});
+    }
     for (const remote of this.remotePeers.values()) {
-      if ("setSinkId" in remote.audio) {
+      if (!("setSinkId" in remote.audio)) continue;
+      try {
         await (remote.audio as any).setSinkId(deviceId);
+      } catch (err) {
+        // A vanished or permission-denied device must not abort the loop
+        // and skip deviceChanged for every peer after it (finding 9).
+        console.warn(`[voice] setSinkId failed for ${remote.peerId}:`, err);
       }
     }
     this.emit("deviceChanged", "output", deviceId);
@@ -771,18 +861,40 @@ export class LibP2PVoice implements VoiceTransport {
     const newTrack = this.processedStream.getAudioTracks()[0] ?? null;
     if (newTrack) {
       for (const remote of this.remotePeers.values()) {
-        const sender = remote.pc
-          .getSenders()
-          .find((s) => s.track?.kind === "audio");
-        if (sender) {
-          await sender.replaceTrack(newTrack);
-        } else {
-          remote.pc.addTrack(newTrack, this.processedStream);
+        try {
+          const sender = remote.pc
+            .getSenders()
+            .find((s) => s.track?.kind === "audio");
+          if (sender) {
+            await sender.replaceTrack(newTrack);
+          } else {
+            remote.pc.addTrack(newTrack, this.processedStream);
+          }
+        } catch (err) {
+          // A peer torn down mid-switch (reconcile tick, redial) rejects
+          // here with InvalidStateError. One stopped transceiver must not
+          // starve every peer after it in Map iteration order, nor skip
+          // applyMuteState below (finding 2).
+          console.warn(`[voice] track switch failed for ${remote.peerId}:`, err);
         }
       }
     }
 
     this.applyMuteState();
+  }
+
+  /**
+   * The worklet crashed after init (finding 1): its context is suspended
+   * and the destination node feeding every RTCRtpSender has no input, but
+   * the track itself stays live so nothing else notices. Rebuilding the mic
+   * re-inits DTLN and replaces the track on every peer - same path a manual
+   * device switch takes.
+   */
+  private handleDtlnFatal(): void {
+    if (!this.audioCtx) return;
+    void this.startMic(this.activeInputDevice ?? undefined).catch((err) => {
+      console.error("[voice] mic rebuild after DTLN crash failed:", err);
+    });
   }
 
   private async dialAndOffer(peerId: string): Promise<void> {
@@ -841,7 +953,7 @@ export class LibP2PVoice implements VoiceTransport {
       // letting a pc that offered into the void sit out the 30s deadline.
       this.emit("status", {
         type: "voice-dial-failed",
-        peerId: peerId.slice(-8),
+        peerId,
         message: `Could not reach ${peerId.slice(-8)} for voice - retrying`,
       });
       this.teardownRemotePeer(peerId);
@@ -954,7 +1066,7 @@ export class LibP2PVoice implements VoiceTransport {
       } else if (state === "failed") {
         this.emit("status", {
           type: "voice-connection-failed",
-          peerId: peerId.slice(-8),
+          peerId,
           message: `Voice connection failed for ${peerId.slice(-8)}`,
         });
         this.debugStats.tdPcFailed++;
@@ -963,7 +1075,7 @@ export class LibP2PVoice implements VoiceTransport {
       } else if (state === "disconnected") {
         this.emit("status", {
           type: "voice-degraded",
-          peerId: peerId.slice(-8),
+          peerId,
           message: `Voice signal lost from ${peerId.slice(-8)} - reconnecting...`,
         });
         // attempt ICE restart; signalling rides the app transport, which
@@ -972,10 +1084,17 @@ export class LibP2PVoice implements VoiceTransport {
           remote.pc.restartIce();
           remote.pc
             .createOffer({ iceRestart: true })
-            .then((offer) => {
-              return remote.pc.setLocalDescription(offer).then(() => {
-                void this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! });
-              });
+            .then((offer) =>
+              remote.pc.setLocalDescription(offer).then(() =>
+                this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! })
+              )
+            )
+            .then((sent) => {
+              // A restart offer lost to a transport hiccup is otherwise
+              // unrecoverable until the 5s blip ask - unlike the initial
+              // offer and the answer, this send's result used to be
+              // discarded via `void` (finding 10).
+              if (!sent) this.askForRedial(peerId, Date.now());
             })
             .catch((err) => {
               console.warn(
@@ -984,7 +1103,7 @@ export class LibP2PVoice implements VoiceTransport {
               );
               this.emit("status", {
                 type: "voice-connection-failed",
-                peerId: peerId.slice(-8),
+                peerId,
                 message: `Voice ICE restart failed for ${peerId.slice(-8)}`,
               });
             });
@@ -1009,6 +1128,8 @@ export class LibP2PVoice implements VoiceTransport {
       createdAt: Date.now(),
       everConnected: false,
       okAt: Date.now(),
+      lastBytesReceived: null,
+      lastBytesReceivedAt: Date.now(),
     };
     this.remotePeers.set(peerId, remote);
     return remote;
@@ -1035,6 +1156,13 @@ export class LibP2PVoice implements VoiceTransport {
     remote.audio.srcObject = stream;
     remote.audio.volume = 0;
     remote.audio.muted = true;
+    // autoplay=true above only takes effect on the initial srcObject
+    // assignment - if this element is ever paused (finding 11), nothing
+    // resumes it and that ONE peer goes silent permanently while
+    // connectionState still reads connected. play() is idempotent on an
+    // already-playing element, so calling it here costs nothing on the
+    // common path and repairs the rare one.
+    remote.audio.play().catch(() => {});
 
     remote.stream = stream;
     remote.sourceNode = sourceNode;
@@ -1059,6 +1187,15 @@ export class LibP2PVoice implements VoiceTransport {
     this.active.delete(peerId);
 
     this.emit("trackRemoved", peerId);
+
+    // The single choke point every teardown path passes through (finding
+    // 8): without this, six of seven teardown paths told the UI nothing,
+    // and a torn-down peer rendered as present and connected forever.
+    this.emit("status", {
+      type: "voice-peer-left",
+      peerId,
+      message: `Voice link with ${peerId.slice(-8)} closed`,
+    });
   }
 
   private async handleSignal(
@@ -1081,10 +1218,14 @@ export class LibP2PVoice implements VoiceTransport {
             return;
           }
         } else if (state !== "stable") {
-          // unexpected state - log and bail
+          // unexpected state - the offer is unrecoverable at this
+          // signalling layer, and connectionState still reads "connected"
+          // so linkIsHealthy never notices (finding 4). Ask for a fresh
+          // dial instead of dropping it forever.
           console.warn(
             `[Voice] unexpected signaling state ${state} on offer from ${peerId}`
           );
+          this.askForRedial(peerId, Date.now());
           return;
         }
 

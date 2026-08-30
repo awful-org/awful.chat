@@ -1,18 +1,27 @@
 import * as mediasoup from "mediasoup";
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
+import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 
 // ── Types mirrored from client mediasoup.ts ───────────────────────────────────
 
 interface MSGetCapabilities {
   type: "ms:get-capabilities";
+  requestId: string;
 }
 interface MSCapabilities {
   type: "ms:capabilities";
+  requestId: string;
   rtpCapabilities: mediasoup.types.RtpCapabilities;
+  // How many OTHER peers this room already holds. An interim guard for
+  // finding 13 (build-time SFU placement plus a cached PWA bundle can put
+  // two participants on different SFU nodes) - the caller cross-checks this
+  // against its own roster size.
+  roomPeerCount: number;
 }
 interface MSCreateTransport {
   type: "ms:create-transport";
+  requestId: string;
   direction: "send" | "recv";
 }
 
@@ -26,6 +35,7 @@ interface ClientTransportOptions {
 
 interface MSTransportOptions {
   type: "ms:transport-options";
+  requestId: string;
   direction: "send" | "recv";
   options: ClientTransportOptions;
 }
@@ -36,16 +46,19 @@ interface MSConnectTransport {
 }
 interface MSProduce {
   type: "ms:produce";
+  requestId: string;
   kind: mediasoup.types.MediaKind;
   rtpParameters: mediasoup.types.RtpParameters;
   source: "camera" | "screen";
 }
 interface MSProduced {
   type: "ms:produced";
+  requestId: string;
   producerId: string;
 }
 interface MSConsume {
   type: "ms:consume";
+  requestId: string;
   producerId: string;
   rtpCapabilities: mediasoup.types.RtpCapabilities;
 }
@@ -60,6 +73,7 @@ interface ClientConsumerOptions {
 
 interface MSConsumerOptions {
   type: "ms:consumer-options";
+  requestId: string;
   options: ClientConsumerOptions;
   peerId: string;
   source: "camera" | "screen";
@@ -75,6 +89,11 @@ interface MSProducerClosed {
   peerId: string;
   producerId: string;
   source: "camera" | "screen";
+  // Which track this producer carried (finding 4) - without it, closing a
+  // screen share's AUDIO producer looked identical to closing its VIDEO
+  // producer to the client, and it tore down the whole watch over a peer
+  // merely switching to a window with no audio track.
+  kind: mediasoup.types.MediaKind;
 }
 interface MSProducerConsumed {
   type: "ms:producer-consumed";
@@ -94,6 +113,12 @@ interface MSCloseProducer {
   type: "ms:close-producer";
   producerId: string;
 }
+/** Ask the server to resume a consumer created paused (finding 3) - sent once
+ *  the client's recvTransport.consume() has resolved. */
+interface MSResumeConsumer {
+  type: "ms:resume-consumer";
+  producerId: string;
+}
 interface MSPeerLeft {
   type: "ms:peer-left";
   peerId: string;
@@ -110,7 +135,8 @@ type ClientMsg =
   | MSProduce
   | MSConsume
   | MSCloseConsumer
-  | MSCloseProducer;
+  | MSCloseProducer
+  | MSResumeConsumer;
 
 // ── Per-peer state ────────────────────────────────────────────────────────────
 
@@ -446,7 +472,12 @@ function reapTransport(
   // transport, but check anyway so the intent - drop the reference, don't
   // reissue a worker request - reads directly.
   if (!transport.closed) transport.close();
-  send(peer.ws, { type: "ms:error", reason });
+  // `direction` tells the client which transport died so it can rebuild only
+  // that one (finding 1) - without it, the client could not tell a transport
+  // reap from a session refusal and used to latch a permanent refusal that
+  // killed the OTHER, still-healthy direction too. The socket itself stays
+  // open: this is not a session refusal, and mediasoup.ts must not close it.
+  send(peer.ws, { type: "ms:error", reason, direction });
 }
 
 function armTransportReapTimer(
@@ -474,13 +505,23 @@ function clearTransportReapTimer(peer: PeerState, direction: "send" | "recv"): v
 
 // ── Message handlers ──────────────────────────────────────────────────────────
 
-async function handleGetCapabilities(peer: PeerState): Promise<void> {
+async function handleGetCapabilities(
+  peer: PeerState,
+  msg: MSGetCapabilities,
+): Promise<void> {
   // rtpCapabilities are identical for every router, so serve them from the
   // template router created at boot. This avoids allocating a per-room router
   // and prevents the room ceiling from being exhausted by capability queries.
+  const room = rooms.get(peer.roomCode);
+  // peer is already in its own room by the time this runs - frames on one
+  // connection are handled strictly in the order they arrived, and join()
+  // sends this right behind the join frame that put it there.
+  const roomPeerCount = room ? Math.max(0, room.size - 1) : 0;
   send(peer.ws, {
     type: "ms:capabilities",
+    requestId: msg.requestId,
     rtpCapabilities: templateRouter.rtpCapabilities,
+    roomPeerCount,
   } as MSCapabilities);
 }
 
@@ -585,6 +626,7 @@ async function handleCreateTransport(
 
   send(peer.ws, {
     type: "ms:transport-options",
+    requestId: msg.requestId,
     direction: msg.direction,
     options,
   } as MSTransportOptions);
@@ -701,7 +743,11 @@ async function handleProduce(peer: PeerState, msg: MSProduce): Promise<void> {
     consumers: new Set(),
   });
 
-  send(peer.ws, { type: "ms:produced", producerId: producer.id } as MSProduced);
+  send(peer.ws, {
+    type: "ms:produced",
+    requestId: msg.requestId,
+    producerId: producer.id,
+  } as MSProduced);
 
   // Notify every other peer in the room about the new producer
   const room = rooms.get(peer.roomCode);
@@ -718,7 +764,11 @@ async function handleProduce(peer: PeerState, msg: MSProduce): Promise<void> {
     }
   }
 
-  function notifyProducerClosed(producerId: string, source: "camera" | "screen") {
+  function notifyProducerClosed(
+    producerId: string,
+    source: "camera" | "screen",
+    kind: mediasoup.types.MediaKind,
+  ) {
     // Avoid duplicate notifications
     if (peer.notifiedClosedProducers.has(producerId)) {
       return;
@@ -735,13 +785,18 @@ async function handleProduce(peer: PeerState, msg: MSProduce): Promise<void> {
           peerId: peer.peerId,
           producerId,
           source,
+          kind,
         } as MSProducerClosed);
       }
     }
   }
 
   producer.on("transportclose", () => {
-    notifyProducerClosed(producer.id, producer.appData.source as "camera" | "screen");
+    notifyProducerClosed(
+      producer.id,
+      producer.appData.source as "camera" | "screen",
+      producer.kind,
+    );
   });
 
   console.log(
@@ -787,6 +842,7 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
       }
       send(peer.ws, {
         type: "ms:consumer-options",
+        requestId: msg.requestId,
         options,
         peerId: "", // Not needed for duplicate - client already has this
         source,
@@ -835,7 +891,14 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
     consumer = await peer.recvTransport.consume({
       producerId: msg.producerId,
       rtpCapabilities: msg.rtpCapabilities,
-      paused: false,
+      // Created paused (finding 3): the recv transport's DTLS handshake is
+      // not guaranteed to be done yet, and RTP forwarded before it completes
+      // is discarded - including the producer's next keyframe, which for a
+      // screen share on static content can be tens of seconds away. The
+      // client asks for ms:resume-consumer once its side of consume()
+      // resolves; mediasoup requests a fresh keyframe on resume, so the
+      // first frame the decoder ever sees is always an IDR.
+      paused: true,
     });
   } finally {
     peer.consumersInFlight--;
@@ -863,6 +926,10 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
       if (entry) {
         producerPeerId = pid;
         source = entry.source;
+        // The per-producer viewer set (finding 18) was written nowhere, so
+        // it never told the truth about who was watching; populate it here,
+        // at the one place a viewer is actually recorded.
+        entry.consumers.add(peer.peerId);
         break;
       }
     }
@@ -889,6 +956,7 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
 
   send(peer.ws, {
     type: "ms:consumer-options",
+    requestId: msg.requestId,
     options,
     peerId: producerPeerId,
     source,
@@ -908,6 +976,22 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
   );
 }
 
+function handleResumeConsumer(peer: PeerState, msg: MSResumeConsumer): void {
+  const consumerId = peer.consumersByProducerId.get(msg.producerId);
+  if (!consumerId) return;
+  const entry = peer.consumers.get(consumerId);
+  if (!entry) return;
+  // Idempotent: a retried ms:resume-consumer (or one that raced a producer
+  // close) resuming an already-resumed or already-closed consumer is a
+  // mediasoup no-op, not an error.
+  entry.consumer.resume().catch((err) => {
+    console.warn(
+      `[sfu] resume-consumer failed for peer ${peer.peerId}:`,
+      err,
+    );
+  });
+}
+
 function handleCloseConsumer(peer: PeerState, msg: MSCloseConsumer): void {
   // Look up the consumer by producerId using the index for O(1) lookup and cleanup
   const consumerId = peer.consumersByProducerId.get(msg.producerId);
@@ -922,18 +1006,24 @@ function handleCloseConsumer(peer: PeerState, msg: MSCloseConsumer): void {
     return;
   }
 
-  // Notify the producer owner that this peer stopped watching
+  // Notify the producer owner that this peer stopped watching. The room has
+  // at most one peer holding this producerId, so the loop always stops at
+  // it - previously the break sat inside the screen-only branch, so a
+  // CAMERA producer id (never "screen") scanned every remaining peer in the
+  // room for nothing.
   const room = rooms.get(peer.roomCode);
   if (room) {
     for (const [, p] of room) {
       const prodEntry = p.producers.get(msg.producerId);
-      if (prodEntry && prodEntry.source === "screen") {
-        prodEntry.consumers.delete(peer.peerId);
-        send(p.ws, {
-          type: "ms:producer-consumer-closed",
-          peerId: peer.peerId,
-          producerId: msg.producerId,
-        } as MSProducerConsumerClosed);
+      if (prodEntry) {
+        if (prodEntry.source === "screen") {
+          prodEntry.consumers.delete(peer.peerId);
+          send(p.ws, {
+            type: "ms:producer-consumer-closed",
+            peerId: peer.peerId,
+            producerId: msg.producerId,
+          } as MSProducerConsumerClosed);
+        }
         break;
       }
     }
@@ -948,6 +1038,7 @@ function handleCloseProducer(peer: PeerState, msg: MSCloseProducer): void {
   const entry = peer.producers.get(msg.producerId);
   if (entry) {
     const source = entry.source;
+    const kind = entry.producer.kind;
     entry.producer.close();
     peer.producers.delete(msg.producerId);
 
@@ -961,6 +1052,7 @@ function handleCloseProducer(peer: PeerState, msg: MSCloseProducer): void {
           peerId: peer.peerId,
           producerId: msg.producerId,
           source,
+          kind,
         } as MSProducerClosed);
       }
     }
@@ -1036,7 +1128,26 @@ const MAX_FRAME_BYTES = 256 * 1024;
 // TCP receive window, which is where backpressure belongs. Generous against
 // legitimate use: the largest honest burst is a peer joining a busy room and
 // consuming every existing producer at once, a few dozen frames of ~1 KB.
-const MAX_QUEUED_FRAME_BYTES = 4 * 1024 * 1024;
+const MAX_QUEUED_FRAME_BYTES = parseInt(
+  process.env.SFU_MAX_QUEUED_FRAME_BYTES ?? String(4 * 1024 * 1024),
+  10,
+);
+// How often the heartbeat sweeps every connection. Was 30s; halved so an
+// ordinary silent loss (no FIN - wifi to cellular, a killed tab) is reaped in
+// two ticks - 20s - instead of up to 60s, during which a fresh joiner was
+// still handed the dead peer's producers (finding 6).
+const HEARTBEAT_INTERVAL_MS = parseInt(
+  process.env.SFU_HEARTBEAT_INTERVAL_MS ?? "10000",
+  10,
+);
+// A socket flagged `backpressured` answers no ping and sends no close, so the
+// heartbeat used to skip it forever - correct for a peer that is merely slow,
+// wrong for one that is ALSO gone: nothing else in this file ever revisits a
+// backpressured socket, so it lived (and kept handing out its producers)
+// until the kernel eventually gave up on the TCP connection, sometimes
+// indefinitely. Two heartbeat intervals is generous headroom for a real burst
+// (joining a busy room) to drain before this treats the pause as terminal.
+const BACKPRESSURE_DEADLINE_MS = HEARTBEAT_INTERVAL_MS * 2;
 
 async function main(): Promise<void> {
   worker = await mediasoup.createWorker({
@@ -1086,23 +1197,15 @@ async function main(): Promise<void> {
 
   // Heartbeat to detect and terminate dead connections (silent disconnect, network handover, etc.)
   const heartbeatInterval = setInterval(() => {
+    const now = Date.now();
     wss.clients.forEach((ws: WebSocket) => {
-      // A connection paused for backpressure cannot answer: ws.pause() pauses
-      // the underlying socket, so PONGS AND THE CLOSE HANDSHAKE stop arriving
-      // along with the data frames. Treating that silence as death would have
-      // this heartbeat terminate a peer for the crime of sending too much -
-      // and it is the peers under real load that get paused. They are
-      // demonstrably alive; that is why they were paused.
-      if ((ws as unknown as { backpressured?: boolean }).backpressured) return;
-      const isAlive = (ws as any).isAlive;
-      if (isAlive === false) {
-        ws.terminate();
-      } else {
-        (ws as any).isAlive = false;
-        ws.ping();
-      }
+      sweepHeartbeatConnection(
+        ws as unknown as HeartbeatSocket,
+        now,
+        BACKPRESSURE_DEADLINE_MS,
+      );
     });
-  }, 30000); // 30 second interval
+  }, HEARTBEAT_INTERVAL_MS);
 
   wss.on("close", () => {
     clearInterval(heartbeatInterval);
@@ -1275,12 +1378,13 @@ async function main(): Promise<void> {
           // tiles for it sit frozen on its last frame.
           for (const [otherPeerId, otherPeer] of room) {
             if (otherPeerId === joinMsg.peerId) continue;
-            for (const [producerId, { source }] of oldPeer.producers) {
+            for (const [producerId, { source, producer }] of oldPeer.producers) {
               send(otherPeer.ws, {
                 type: "ms:producer-closed",
                 peerId: joinMsg.peerId,
                 producerId,
                 source,
+                kind: producer.kind,
               } as MSProducerClosed);
             }
           }
@@ -1319,7 +1423,7 @@ async function main(): Promise<void> {
       try {
         switch (msg.type) {
           case "ms:get-capabilities":
-            await handleGetCapabilities(peer);
+            await handleGetCapabilities(peer, msg as MSGetCapabilities);
             break;
           case "ms:create-transport":
             await handleCreateTransport(peer, msg as MSCreateTransport);
@@ -1332,6 +1436,9 @@ async function main(): Promise<void> {
             break;
           case "ms:consume":
             await handleConsume(peer, msg as MSConsume);
+            break;
+          case "ms:resume-consumer":
+            handleResumeConsumer(peer, msg as MSResumeConsumer);
             break;
           case "ms:close-consumer":
             handleCloseConsumer(peer, msg as MSCloseConsumer);
@@ -1368,7 +1475,12 @@ async function main(): Promise<void> {
       // until resume(), so the sender feels the stall through TCP instead of
       // this process growing on its behalf.
       if (queuedBytes >= MAX_QUEUED_FRAME_BYTES) {
-        (ws as unknown as { backpressured?: boolean }).backpressured = true;
+        const w = ws as unknown as {
+          backpressured?: boolean;
+          backpressuredSince?: number;
+        };
+        if (!w.backpressured) w.backpressuredSince = Date.now();
+        w.backpressured = true;
         ws.pause();
       }
       frameChain = frameChain
@@ -1381,7 +1493,12 @@ async function main(): Promise<void> {
           const wasOver = queuedBytes >= MAX_QUEUED_FRAME_BYTES;
           queuedBytes -= raw.length;
           if (wasOver && queuedBytes < MAX_QUEUED_FRAME_BYTES) {
-            (ws as unknown as { backpressured?: boolean }).backpressured = false;
+            const w = ws as unknown as {
+              backpressured?: boolean;
+              backpressuredSince?: number;
+            };
+            w.backpressured = false;
+            w.backpressuredSince = undefined;
             ws.resume();
           }
         });

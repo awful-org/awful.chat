@@ -3,6 +3,7 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
+  import { applyVoiceLinkStatus } from "$lib/voice-link-status";
   import { openDmPanel } from "$lib/transport/dm.svelte";
   import {
     getVoicePeerVolume,
@@ -103,6 +104,10 @@ import {
     deafened?: boolean;
     /** Announced in the call but their voice link is not up yet. */
     connecting?: boolean;
+    /** getStats saw the consumer stop advancing - a track object exists
+     *  but proves nothing about whether RTP is still arriving
+     *  (sfu-audit finding 14). */
+    stalled?: boolean;
     /** True when this is a screen-share transmission tile that hasn't been joined yet. */
     isPending?: boolean;
     /** The SFU producerId - only set on pending transmission tiles. */
@@ -250,23 +255,15 @@ import {
     if (peerId) await openDmPanel(peerId);
   }
 
-  // Peers whose voice ICE actually completed - a roster tile without a track
-  // AND without this is still connecting, and must not render as present.
+  // Peers whose voice ICE actually completed - a roster tile without a
+  // track AND without this is still connecting, and must not render as
+  // present. Insert and delete key are the SAME reducer, so they can never
+  // drift apart the way an insert-by-full-id/delete-by-short-id split once
+  // did (voice-audit finding 8) - a torn-down peer always leaves this set.
   let iceConnectedPeers = $state(new Set<string>());
   $effect(() => {
     const onStatus = (st: { type: string; peerId?: string }) => {
-      if (st.type === "voice-ice-connected" && st.peerId) {
-        iceConnectedPeers = new Set([...iceConnectedPeers, st.peerId]);
-      }
-      if (
-        (st.type === "voice-peer-left" ||
-          st.type === "voice-connection-failed") &&
-        st.peerId
-      ) {
-        const next = new Set(iceConnectedPeers);
-        next.delete(st.peerId);
-        iceConnectedPeers = next;
-      }
+      iceConnectedPeers = new Set(applyVoiceLinkStatus(iceConnectedPeers, st));
     };
     _transport?.on("status", onStatus);
     return () => _transport?.off("status", onStatus);
@@ -357,6 +354,8 @@ import {
         videoTrack: null,
         screenTrack: null,
         screenAudioTrack: null,
+        videoStalled: false,
+        screenStalled: false,
       };
       const label = getPeerLabel(peerId);
       const avatarUrl = getPeerAvatar(peerId);
@@ -374,6 +373,7 @@ import {
         deafened: remoteCallState?.deafened,
         connecting:
           !p.audioTrack && !p.videoTrack && !iceConnectedPeers.has(peerId),
+        stalled: p.videoStalled,
       });
     }
     if (localScreenTrack) {
@@ -399,6 +399,7 @@ import {
           kind: "screen",
           videoTrack: p.screenTrack,
           peerId: p.peerId,
+          stalled: p.screenStalled,
         });
       }
     }
@@ -1176,6 +1177,26 @@ import {
           class="rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm transition-all group-hover:border-primary/50 group-hover:shadow-md"
         >
           Watch {tile.label}'s screen
+        </div>
+      </div>
+    {/if}
+
+    <!-- Stalled overlay: getStats saw the consumer stop advancing. A track
+         object is proof a consumer exists, not that RTP still arrives
+         (sfu-audit finding 14) - this is the honest signal instead. -->
+    {#if tile.stalled && hasVideo}
+      <div
+        class="pointer-events-none absolute inset-0 grid place-items-center bg-background/50"
+      >
+        <div
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm"
+        >
+          {#if tile.kind === "screen"}
+            <MonitorOff class="size-3.5" />
+          {:else}
+            <CameraOff class="size-3.5" />
+          {/if}
+          Frozen - reconnecting
         </div>
       </div>
     {/if}

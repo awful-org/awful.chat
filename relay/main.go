@@ -32,12 +32,12 @@ import (
 const RendezvousProtocol = "/awful/rendezvous/1.0.0"
 
 type clientMsg struct {
-	Type string `json:"type"` // REGISTER | UNREGISTER
+	Type string `json:"type"` // REGISTER | UNREGISTER | PING
 	Room string `json:"room"`
 }
 
 type serverMsg struct {
-	Type  string   `json:"type"` // PEERS | PEER_JOINED | PEER_LEFT
+	Type  string   `json:"type"` // PEERS | PEER_JOINED | PEER_LEFT | REGISTER_FAILED
 	Room  string   `json:"room"`
 	Peers []string `json:"peers"`
 	Peer  string   `json:"peer,omitempty"` // PEER_JOINED | PEER_LEFT
@@ -61,24 +61,51 @@ const (
 	// frames; a peer still behind after this many is not reading its stream at
 	// all and gets dropped.
 	sendQueueDepth = 256
+	// maxMsgLen bounds one rendezvous frame, in both directions. readLoop
+	// resets the stream when a peer's declared length goes over it. sendTo
+	// refuses to build an outbound frame that goes over it too. The client
+	// aborts any inbound frame over its own MAX_RENDEZVOUS_FRAME_BYTES
+	// (16 KiB, libp2p/transport.ts), well above this number. Holding the
+	// relay's own OUTPUT to the same cap it enforces on INPUT stops the
+	// relay from ever tripping that client guard - see maxPeersPerFrame
+	// below, and relay-audit.md finding 2.
+	maxMsgLen = 8192
+	// maxPeersPerFrame bounds how many peerIds one PEERS frame carries.
+	// Without it, register's reply grew with the room, with no limit at
+	// all. A room past about 297 peerIds (52-character Ed25519 ids) built a
+	// frame over maxMsgLen. The client aborted its stream over that
+	// oversized frame, then re-REGISTERed everything on its 2-second
+	// reconnect timer, which produced the same oversized reply again: a
+	// permanent loop that took every one of the victim's OTHER rooms down
+	// with it, because one stream carries all of them. 128 keeps the
+	// relay's own reply inside maxMsgLen with room to spare: the fixed
+	// envelope is about 37 bytes plus up to maxRoomIDLen (128) for the room
+	// id, and each peerId costs about 55 bytes JSON-encoded, so
+	// 37 + 128 + 128*55 = 7205 bytes.
+	maxPeersPerFrame = 128
 	// Room ids the app produces are at most 43 bytes ("dm-" plus 40 hex);
 	// created codes are 6. Anything past this is not a room, it is a payload.
 	maxRoomIDLen = 128
 	// A peer re-joins every saved room and every phonebook DM when it
-	// connects, which can be hundreds. Past this ceiling a single stream is
+	// connects, which can be hundreds. Past this ceiling a single PEER is
 	// only growing the registry, which nothing else bounds: the connection
-	// manager counts connections, not rooms.
+	// manager counts connections, not rooms. This cap sums len(c.rooms)
+	// over EVERY stream a peerId holds (registry.roomsHeldByPeer), not one
+	// stream's own count. Checking one stream let a single peerId hold
+	// maxStreamsPerPeer separate 1024-room budgets at once - see
+	// maxTotalRegistrations below, and relay-audit.md finding 4.
 	maxRoomsPerPeer = 1024
-	// Registrations the whole registry will hold, across every stream of every
-	// peer. maxRoomsPerPeer is per STREAM - connectedClient is one stream, not
-	// one peer - and one peerId may hold maxStreamsPerPeer of them, so the
-	// per-stream cap bounds a peer's footprint and nothing global: 32 x 1024 =
-	// 32768 registrations per peerId for a few hundred bytes of uplink each.
-	// Measured at ~451 bytes of heap per registration, so this ceiling is
-	// ~90 MB: far past what a real instance needs, and far short of what it
-	// takes to OOM the box the relay shares with everything else. The resource
-	// manager cannot see this growth - its memory budget covers streams and
-	// buffers, not our maps.
+	// Registrations the whole registry will hold, across every stream of
+	// every peer. maxRoomsPerPeer now bounds one PEER's footprint, no
+	// matter how many streams (tabs) it holds. Reaching this ceiling now
+	// takes about 200 distinct peerIds, not the 7 it took while the room
+	// cap counted each stream on its own (32 streams x 1024 rooms = 32768
+	// registrations for one identity). Measured at ~451 bytes of heap per
+	// registration, so this ceiling is ~90 MB: far past what a real
+	// instance needs, and far short of what it takes to OOM the box the
+	// relay shares with everything else. The resource manager cannot see
+	// this growth - its memory budget covers streams and buffers, not our
+	// maps.
 	maxTotalRegistrations = 200_000
 	// Rendezvous streams one peerId may hold at once. Several are normal - two
 	// tabs of the app share a peerId because the libp2p key lives in
@@ -159,16 +186,33 @@ const (
 )
 
 // rendezvousIdleTimeout closes a stream that has REGISTERed nothing yet and
-// sends nothing for this long. Only unregistered streams get a deadline: the
-// rendezvous protocol carries no periodic frame of its own - REGISTER and
-// UNREGISTER only fire on a room change - so a registered tab legitimately
-// sends nothing for hours, and cutting it would make its rooms see it leave
-// and rejoin on every timer tick. A registered stream is already bounded
-// (maxRoomsPerPeer, maxStreamsPerPeer, connmgr); what was unbounded was a
-// peer opening up to maxStreamsPerPeer streams and never sending a byte,
-// pinning a goroutine and a registry entry each with nothing to reclaim
-// them. A package-level var, not a const, so tests can shrink it.
+// sends nothing for this long. Only an UNREGISTERED stream gets this
+// deadline. A registered stream gets rendezvousLivenessTimeout instead, see
+// below. A registered stream is already bounded by maxRoomsPerPeer,
+// maxStreamsPerPeer and connmgr. This deadline exists for a different
+// peer: one that opens up to maxStreamsPerPeer streams and never sends a
+// byte, pinning a goroutine and a registry entry that nothing else
+// reclaims. A package-level var, not a const, so tests can shrink it.
 var rendezvousIdleTimeout = time.Minute
+
+// rendezvousPingInterval is how often a REGISTERED client sends a no-op
+// PING frame to prove its app layer is still alive. This number is a
+// contract with the client (libp2p/transport.ts). rendezvousLivenessTimeout
+// below is sized from it: a healthy, room-quiet tab sends one frame - PING
+// included - within this interval, or the relay treats it as dead.
+var rendezvousPingInterval = 20 * time.Second
+
+// rendezvousLivenessTimeout closes a REGISTERED stream that has sent
+// NOTHING - not even a PING - for this long. Before this existed, a
+// registered stream got no deadline at all: the rendezvous protocol
+// carried no periodic frame. A stream whose app layer wedged while its
+// libp2p node kept answering yamux pings (30-50s apart) stayed advertised
+// in every room it held forever - the one disconnect class with no
+// detector at all (relay-audit.md finding 5). 3x the ping interval
+// tolerates a couple of delayed or dropped pings before the relay declares
+// the stream dead, so ordinary jitter never trips it. A package-level var,
+// not a const, so tests can shrink it.
+var rendezvousLivenessTimeout = 3 * rendezvousPingInterval
 
 // connectedClient is ONE rendezvous stream, not one peer. A peerId can hold
 // several at once - the user's other tab - and each one owns only the rooms it
@@ -511,6 +555,16 @@ func (r *registry) sendTo(c *connectedClient, msg serverMsg) {
 	if err != nil {
 		return
 	}
+	// The relay must hold its own OUTBOUND frames to the same maxMsgLen cap
+	// it enforces INBOUND (readLoop) - see maxPeersPerFrame, which is sized
+	// to keep every PEERS reply under this. Reaching here can only be a bug
+	// in a caller's own chunking, so drop the frame loudly instead of
+	// sending something the client's larger MAX_RENDEZVOUS_FRAME_BYTES
+	// guard would abort its stream over anyway.
+	if len(data) > maxMsgLen {
+		log.Printf("[rv] BUG: outbound %s frame to %s is %d bytes (> %d), dropping", msg.Type, short(c.peerId), len(data), maxMsgLen)
+		return
+	}
 	// 4-byte big-endian length prefix to match the JS client framing
 	frame := make([]byte, 4+len(data))
 	frame[0] = byte(len(data) >> 24)
@@ -533,13 +587,82 @@ func (r *registry) sendTo(c *connectedClient, msg serverMsg) {
 	}
 }
 
-// register admits c into room. It returns false only when the room had no
-// OTHER member and this stream's maxEmptyRegisters budget was already spent -
-// the empty-room-guess oracle case - in which case nothing happens: c is not
-// added, no PEERS is sent, and the caller (readLoop) is left to log it. Every
-// other path, including the existing caps above, returns true; they already
-// log their own refusal here and need no extra signal to the caller.
-func (r *registry) register(c *connectedClient, room string) bool {
+// registerOutcome tells readLoop how to answer one REGISTER attempt.
+// registerJoined covers every case the client should be told it joined: a
+// real join, an already-live membership (which gets a resync PEERS - see
+// Finding 6), or a stream the registry has already let go of.
+// registerCapped is the one refusal readLoop answers with REGISTER_FAILED;
+// it is permanent until the peer frees up room, unlike
+// registerOracleSilenced, which stays silent on purpose (see
+// maxEmptyRegisters) so it never becomes the room-code oracle the budget
+// exists to deny.
+type registerOutcome int
+
+const (
+	registerJoined registerOutcome = iota
+	registerCapped
+	registerOracleSilenced
+)
+
+// roomsHeldByPeer sums len(c.rooms) over every stream a peerId currently
+// holds. maxRoomsPerPeer bounds one PEER's footprint in the registry, but
+// checking it against a single stream's own c.rooms let a peerId multiply
+// its footprint by maxStreamsPerPeer just by opening more tabs - up to
+// 32768 registrations for one identity (relay-audit.md finding 4). Summing
+// across r.clients[peerId] closes that. Caller holds r.mu.
+func (r *registry) roomsHeldByPeer(peerId string) int {
+	total := 0
+	for c := range r.clients[peerId] {
+		total += len(c.rooms)
+	}
+	return total
+}
+
+// peersExcept lists the distinct peerIds in members other than excludePeer -
+// one entry per peer, never the asker itself. Caller holds r.mu; the
+// returned slice is a fresh copy, safe to use after unlocking.
+func peersExcept(members map[*connectedClient]struct{}, excludePeer string) []string {
+	seen := make(map[string]struct{}, len(members))
+	others := make([]string, 0, len(members))
+	for m := range members {
+		if m.peerId == excludePeer {
+			continue
+		}
+		if _, dup := seen[m.peerId]; dup {
+			continue
+		}
+		seen[m.peerId] = struct{}{}
+		others = append(others, m.peerId)
+	}
+	return others
+}
+
+// sendPeers answers a REGISTER with a room's member list, split into
+// frames of at most maxPeersPerFrame peerIds each - see that constant for
+// why one unbounded PEERS frame is unsafe. The client's PEERS handler adds
+// every id it receives to a per-room Set (transport.ts), so several frames
+// for one room compose correctly; the wire needs no continuation marker.
+// An empty room still gets exactly one frame, which is what tells the
+// client its REGISTER succeeded.
+func (r *registry) sendPeers(c *connectedClient, room string, others []string) {
+	if len(others) == 0 {
+		r.sendTo(c, serverMsg{Type: "PEERS", Room: room, Peers: others})
+		return
+	}
+	for i := 0; i < len(others); i += maxPeersPerFrame {
+		end := i + maxPeersPerFrame
+		if end > len(others) {
+			end = len(others)
+		}
+		r.sendTo(c, serverMsg{Type: "PEERS", Room: room, Peers: others[i:end]})
+	}
+}
+
+// register admits c into room. readLoop answers registerCapped with an
+// explicit REGISTER_FAILED; registerOracleSilenced stays silent (see
+// maxEmptyRegisters); every other path either really succeeded or is
+// already indistinguishable from success to the client.
+func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	r.mu.Lock()
 
 	// A stream the registry has already let go of - its read loop ended, or the
@@ -548,12 +671,23 @@ func (r *registry) register(c *connectedClient, room string) bool {
 	// that entry again (RELAY-02).
 	if !r.isLive(c) {
 		r.mu.Unlock()
-		return true
+		return registerJoined
 	}
 
 	if _, already := c.rooms[room]; already {
+		// Already a member on THIS stream: resend the room's current PEERS
+		// instead of doing nothing. A repeat REGISTER used to get no reply
+		// at all, so a client whose membership view had drifted - a
+		// silently refused REGISTER (Finding 4) or a frame it silently
+		// dropped (Finding 5) - had no way to ask the registry what it
+		// actually thinks. Idempotent on the client (rememberRoomPeer into
+		// a Set) and metered by the same membershipOps budget as every
+		// other REGISTER, so it adds no new abuse surface (relay-audit.md
+		// finding 6).
+		others := peersExcept(r.rooms[room], c.peerId)
 		r.mu.Unlock()
-		return true
+		r.sendPeers(c, room, others)
+		return registerJoined
 	}
 	if r.total >= maxTotalRegistrations {
 		sayCapped := !r.totalCapLogged
@@ -562,9 +696,9 @@ func (r *registry) register(c *connectedClient, room string) bool {
 		if sayCapped {
 			log.Printf("[rv] registry is at its %d-registration ceiling, ignoring further REGISTERs", maxTotalRegistrations)
 		}
-		return true
+		return registerCapped
 	}
-	if len(c.rooms) >= maxRoomsPerPeer {
+	if r.roomsHeldByPeer(c.peerId) >= maxRoomsPerPeer {
 		sayCapped := !c.roomCapLogged
 		c.roomCapLogged = true
 		r.mu.Unlock()
@@ -576,7 +710,7 @@ func (r *registry) register(c *connectedClient, room string) bool {
 		if sayCapped {
 			log.Printf("[rv] %s hit the %d-room cap, ignoring further REGISTERs", short(c.peerId), maxRoomsPerPeer)
 		}
-		return true
+		return registerCapped
 	}
 
 	members := r.rooms[room]
@@ -588,7 +722,7 @@ func (r *registry) register(c *connectedClient, room string) bool {
 	// REGISTER into a room that already has somebody else in it is free.
 	if len(members) == 0 && !c.emptyRegisters.allow(time.Now()) {
 		r.mu.Unlock()
-		return false
+		return registerOracleSilenced
 	}
 	if members == nil {
 		members = make(map[*connectedClient]struct{})
@@ -636,9 +770,9 @@ func (r *registry) register(c *connectedClient, room string) bool {
 	// Send notifications outside the lock. The joiner's own PEERS goes first:
 	// it is the frame that answers the REGISTER, and queuing it behind a
 	// broadcast to everyone else only delays the join for no reason.
-	r.sendTo(c, serverMsg{Type: "PEERS", Room: room, Peers: others})
+	r.sendPeers(c, room, others)
 	if !announce {
-		return true
+		return registerJoined
 	}
 	for _, tc := range targetClients {
 		r.sendTo(tc, serverMsg{
@@ -647,7 +781,7 @@ func (r *registry) register(c *connectedClient, room string) bool {
 			Peer: c.peerId,
 		})
 	}
-	return true
+	return registerJoined
 }
 
 func (r *registry) unregister(c *connectedClient, room string) {
@@ -690,6 +824,13 @@ func (r *registry) doUnregister(c *connectedClient, room string) ([]*connectedCl
 	delete(members, c)
 	delete(c.rooms, room)
 	r.total--
+	// A transient spike past the ceiling logs one line and sets
+	// totalCapLogged, then falls silent for the rest of the process even
+	// after total drops back down. Clear the flag here so the NEXT spike
+	// gets its own line (relay-audit.md finding 12).
+	if r.total < maxTotalRegistrations {
+		r.totalCapLogged = false
+	}
 
 	line := leaveLine{peerId: c.peerId, room: room}
 	line.write, line.quiet = c.joinLeaveLog.allow(time.Now())
@@ -883,12 +1024,12 @@ func (r *registry) handleStream(s network.Stream) {
 }
 
 // readLoop reassembles length-prefixed frames from a rendezvous stream and
-// dispatches each one, until s.Read errors - including an idle timeout, see
-// rendezvousIdleTimeout. Split out of handleStream so a fake satisfying only
-// rvReadStream can exercise it in tests.
+// dispatches each one, until s.Read errors - including an idle or liveness
+// timeout, see rendezvousIdleTimeout and rendezvousLivenessTimeout. Split
+// out of handleStream so a fake satisfying only rvReadStream can exercise
+// it in tests.
 func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) {
 	// Read loop - reassemble length-prefixed frames
-	const maxMsgLen = 8192 // Max size for a single frame (REGISTER/UNREGISTER payloads are tiny)
 	buf := make([]byte, 0, 512)
 	tmp := make([]byte, 4096)
 
@@ -907,16 +1048,18 @@ func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) {
 		}
 	}
 
-	// Set once the stream has registered a room; from then on it is a
-	// legitimate quiet participant and gets no deadline.
+	// Set once the stream has registered a room; from then on it gets
+	// rendezvousLivenessTimeout instead of rendezvousIdleTimeout.
 	registered := false
 
 readLoop:
 	for {
 		// A stream that never registers would otherwise pin this goroutine
-		// and its registry entry forever - see rendezvousIdleTimeout.
+		// and its registry entry forever - see rendezvousIdleTimeout. A
+		// stream that HAS registered is no longer indefinitely silent
+		// either - see rendezvousLivenessTimeout.
 		if registered {
-			s.SetReadDeadline(time.Time{})
+			s.SetReadDeadline(time.Now().Add(rendezvousLivenessTimeout))
 		} else {
 			s.SetReadDeadline(time.Now().Add(rendezvousIdleTimeout))
 		}
@@ -932,7 +1075,7 @@ readLoop:
 			// stream - a plain `break` here would leave the bad length header in
 			// buf and re-trip on every subsequent read while buf grows unbounded.
 			if msgLen > maxMsgLen {
-				log.Printf("[rv] message too large from %s: %d bytes, closing stream", short(peerId), msgLen)
+				warn("[rv] message too large from %s: %d bytes, closing stream", short(peerId), msgLen)
 				s.Reset()
 				break readLoop
 			}
@@ -951,6 +1094,9 @@ readLoop:
 			if msg.Type == "REGISTER" || msg.Type == "UNREGISTER" {
 				if !validRoom(msg.Room) {
 					warn("[rv] %s sent an unusable room id (%d bytes), ignoring", short(peerId), len(msg.Room))
+					if msg.Type == "REGISTER" {
+						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
+					}
 					continue
 				}
 			}
@@ -966,23 +1112,38 @@ readLoop:
 				// registers each room once per connection.
 				if !membershipOps.allow(time.Now()) {
 					warn("[rv] %s is changing rooms faster than %d/%s, ignoring", short(peerId), maxMembershipOps, membershipOpWindow)
+					if msg.Type == "REGISTER" {
+						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
+					}
 					continue
 				}
 				if msg.Type == "REGISTER" {
-					// register only refuses (false) when the room had no OTHER
-					// member and this stream's empty-register budget - the
-					// room-code-guessing oracle case - was already spent. Warn
-					// and drop the REGISTER exactly like an exhausted
-					// membershipOps above: no PEERS goes out, so the guess
-					// gets no answer, and there is nothing more to do with it.
-					if !r.register(c, msg.Room) {
+					switch r.register(c, msg.Room) {
+					case registerOracleSilenced:
+						// The room-code-guessing oracle case: warn and drop
+						// exactly like an exhausted membershipOps above - no
+						// PEERS goes out, so the guess gets no answer. This
+						// is the one refusal that must never become
+						// REGISTER_FAILED (relay-audit.md finding 4).
 						warn("[rv] %s exhausted its empty-room register budget (%d/%s), ignoring", short(peerId), maxEmptyRegisters, emptyRegisterWindow)
-						continue
+					case registerCapped:
+						// Every other refusal path used to return success by
+						// default, leaving the client believing it joined a
+						// room that never saw it. REGISTER_FAILED is
+						// additive on the wire; handleRendezvousMsg already
+						// ignores unknown types (transport.ts).
+						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
+					case registerJoined:
+						registered = true
 					}
-					registered = true
 				} else {
 					r.unregister(c, msg.Room)
 				}
+			case "PING":
+				// No-op: a registered stream's only proof of life when it
+				// has nothing else to say. Reading it already re-armed the
+				// deadline above; nothing else to do (relay-audit.md
+				// finding 5).
 			default:
 				warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type))
 			}
@@ -1014,6 +1175,26 @@ func relayResources() relayv2.Resources {
 	// see; the global ceiling above is the one that counts.
 	res.MaxReservationsPerIP = connMgrHigh
 	res.MaxReservationsPerASN = connMgrHigh
+	// MaxCircuits is the fourth ceiling relayv2.DefaultResources() sets, and
+	// this function used to leave it alone at the default: 16 COMBINED
+	// circuits per peer, counting both directions (source or destination).
+	// A peer with more than 16 live relayed connections - one per online
+	// phonebook contact, easy in a busy room - got RESOURCE_LIMIT_EXCEEDED
+	// on the 17th dial and every later one, including a mid-call re-dial
+	// after a network flap (relay-audit.md finding 1). WithInfiniteLimits
+	// below does not touch this counter: it only clears the per-circuit
+	// duration and byte Limit, which is why it made the problem worse
+	// instead of fixing it - circuits stopped churning and started
+	// accumulating.
+	//
+	// Lifted to connMgrHigh for the same reason as the three ceilings
+	// above: the resource manager's own memory budget is the real bound,
+	// not this count. Each live circuit reserves 2*BufferSize = 4 KiB from
+	// a peer's resource-manager span (circuitv2/relay/relay.go), so
+	// connMgrHigh (512) circuits cost at most 2 MiB for one peer - small
+	// next to the resource manager's own limits, and nowhere near what it
+	// takes to OOM the box.
+	res.MaxCircuits = connMgrHigh
 	return res
 }
 
@@ -1157,7 +1338,13 @@ func main() {
 			IdleTimeout:       30 * time.Second,
 		}
 		if err := server.ListenAndServe(); err != nil {
-			log.Printf("[http] API server error: %v", err)
+			// A bind failure used to leave this goroutine exit quietly
+			// while libp2p kept serving: the rendezvous registry looked
+			// healthy while /turn-credentials, /invite, /og and /mailbox
+			// were all gone, and every relayed peer stopped connecting with
+			// no logged reason (relay-audit.md finding 10). Fatalf so
+			// `restart: unless-stopped` brings the whole process back.
+			log.Fatalf("[http] API server error: %v", err)
 		}
 	}()
 
@@ -1232,4 +1419,13 @@ func printAddrs(h host.Host) {
 	for _, ma := range h.Addrs() {
 		log.Printf(" %s/p2p/%s", ma, h.ID())
 	}
+	// The rendezvous registry and the mailbox both live in this process's
+	// own memory (registry) and on its own volume (mailbox) - see
+	// deploy/README.md, "What cannot be multiplied yet". A second replica
+	// would load the SAME relay.key from the shared volume and print the
+	// SAME PeerID above, but hold a completely separate registry: half the
+	// peers on this instance would never see the other half in their PEERS
+	// reply, with nothing in either log saying why. There is no code check
+	// for this - only this line.
+	log.Printf("[relay] this service must run as exactly ONE replica; see deploy/README.md")
 }

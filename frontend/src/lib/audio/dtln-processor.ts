@@ -15,6 +15,14 @@ export class DtlnProcessor {
   private initializing = false;
   private noiseGate = AUDIO_PREF_DEFAULTS.noiseGate;
   private inputGain = 1.0;
+  /**
+   * Told once when the worklet dies after init (finding 1 of the voice
+   * audit): RTP keeps flowing on a track fed by a suspended context - the
+   * sender transmits digital silence forever, with connectionState reading
+   * "connected" on both ends the whole time. LibP2PVoice uses this to
+   * rebuild the mic instead of leaving that peer permanently unheard.
+   */
+  private fatalHandler: (() => void) | null = null;
 
   /**
    * The one compensation for the model's attenuation. The worklet itself is
@@ -139,6 +147,12 @@ export class DtlnProcessor {
     this.ready = false;
     this.initializing = false;
     this.armReadyPromise();
+    this.fatalHandler?.();
+  }
+
+  /** Set (or clear with null) the fatal callback. One slot: one caller owns it. */
+  onFatal(handler: (() => void) | null): void {
+    this.fatalHandler = handler;
   }
 
   /**

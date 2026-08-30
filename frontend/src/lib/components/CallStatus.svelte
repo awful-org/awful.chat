@@ -18,6 +18,12 @@
   import { onMount, onDestroy } from "svelte";
   import { cn } from "$lib/utils";
   import type { TransportStatus } from "$lib/transport/types";
+  import {
+    applyCallQualityStatus,
+    noteTrackAdded,
+    worstQuality,
+    type PeerVoiceQuality,
+  } from "$lib/call-quality";
 
   interface Props {
     /** Icon-rail layout: one icon, the whole status in a tooltip. */
@@ -27,7 +33,22 @@
 
   type CallQuality = "connecting" | "p2p" | "relayed" | "degraded" | "failed";
 
-  let quality = $state<CallQuality>("connecting");
+  // Per-peer voice link quality, keyed by peerId. A single shared value let
+  // one peer's "degraded" paint the whole call, and let any OTHER peer's
+  // trackAdded erase it moments later (voice-audit finding 8) - keying by
+  // peerId makes that impossible. transportQuality is a separate axis: the
+  // relay itself can fail while every peer's own verdict is still the
+  // healthy one from before the drop.
+  let peerQuality = $state<Map<string, PeerVoiceQuality>>(new Map());
+  let transportQuality = $state<"ok" | "degraded" | "failed">("ok");
+
+  const QUALITY_RANK: Record<CallQuality, number> = {
+    connecting: 0,
+    p2p: 1,
+    relayed: 1,
+    degraded: 2,
+    failed: 3,
+  };
 
   let handlers: (() => void)[] = [];
 
@@ -82,56 +103,57 @@
 
     const handleStatus = (status: TransportStatus) => {
       switch (status.type) {
+        case "relay-connected":
+          transportQuality = "ok";
+          break;
         case "relay-disconnected":
-          quality = "failed";
+          transportQuality = "failed";
           break;
         case "relay-reconnecting":
-          quality = "degraded";
+          transportQuality = "degraded";
           break;
         case "relay-reconnect-failed":
-          quality = "failed";
+          transportQuality = "failed";
           break;
         case "voice-ice-connected":
-          quality = status.relayed ? "relayed" : "p2p";
-          break;
         case "voice-connection-failed":
-          quality = "failed";
-          break;
-        case "voice-peer-left":
-          if ((_voice?.activePeers().length ?? 0) === 0) {
-            quality = "connecting";
-          }
-          break;
         case "voice-degraded":
-          quality = "degraded";
+        case "voice-peer-left":
+          peerQuality = new Map(applyCallQualityStatus(peerQuality, status));
           break;
       }
     };
 
-    const handleTrackAdded = () => {
+    const handleTrackAdded = (peerId: string) => {
       // A track is proof of connection but says nothing about the path -
-      // never overwrite the ICE event's relayed verdict with "p2p".
-      if (quality === "connecting" || quality === "degraded") quality = "p2p";
-    };
-
-    const handleTrackRemoved = () => {
-      if ((_voice?.activePeers().length ?? 0) === 0) {
-        quality = "connecting";
-      }
+      // never overwrite an existing verdict, ours or another peer's, with
+      // the mere fact that a track arrived.
+      peerQuality = new Map(noteTrackAdded(peerQuality, peerId));
     };
 
     _transport.on("status", handleStatus);
     _voice?.on("trackAdded", handleTrackAdded);
-    _voice?.on("trackRemoved", handleTrackRemoved);
 
     handlers = [
       () => _transport?.off("status", handleStatus),
       () => _voice?.off("trackAdded", handleTrackAdded),
-      () => _voice?.off("trackRemoved", handleTrackRemoved),
     ];
   });
 
   onDestroy(() => handlers.forEach((h) => h()));
+
+  // The one summary badge: the worse of "is the relay itself in trouble"
+  // and "is any peer's own voice link in trouble" - never a value some
+  // unrelated peer's event can stomp.
+  const quality = $derived.by<CallQuality>(() => {
+    const worst = worstQuality(peerQuality);
+    const peerLevel: CallQuality = worst ?? "connecting";
+    const transportLevel: CallQuality =
+      transportQuality === "ok" ? "connecting" : transportQuality;
+    return QUALITY_RANK[transportLevel] >= QUALITY_RANK[peerLevel]
+      ? transportLevel
+      : peerLevel;
+  });
 
   // "Connected" used to flip on the FIRST peer while the rest were still
   // handshaking - true for one friend, false for the call. Compare who is

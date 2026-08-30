@@ -292,6 +292,9 @@ export interface ParticipantState {
   videoTrack: MediaStreamTrack | null;
   screenTrack: MediaStreamTrack | null;
   screenAudioTrack: MediaStreamTrack | null;
+  /** getStats saw 2 consecutive stalled samples on this consumer; see VideoEvents.trackStalled. */
+  videoStalled: boolean;
+  screenStalled: boolean;
 }
 
 interface TransportState {
@@ -356,6 +359,13 @@ interface TransportState {
    * upgrades.
    */
   relayedPeers: Set<string>;
+  /**
+   * Peers whose outbound stream has proof the far side is reading it - a
+   * reactive mirror of the transport's confirmedStreams. `peers` alone
+   * cannot tell a working link from a connected-but-deaf one; this is the
+   * only place that distinction reaches the UI.
+   */
+  provenPeers: Set<string>;
   /** Profile metadata: banners, tags, bios, name effects; keyed by DID. */
   peerProfileMeta: Map<
     string,
@@ -376,7 +386,6 @@ interface TransportState {
   callPeerIds: Set<string>;
   callPeerRooms: Map<string, string>; // peerId -> roomCode they're calling in
   transmissionViewers: Map<string, Set<string>>; // sharer peerId -> viewer peerIds
-  sfuPeerIds: Set<string>;
   pendingTransmissions: Map<string, string>;
   watchingTransmissionPeerId: string | null;
   watchingTransmissionProducerId: string | null;
@@ -417,12 +426,12 @@ export const transportState = $state<TransportState>({
   peerColors: new Map(),
   historyCapped: false,
   relayedPeers: new Set(),
+  provenPeers: new Set(),
   peerProfileMeta: new Map(),
   error: null,
   callPeerIds: new Set(),
   callPeerRooms: new Map(),
   transmissionViewers: new Map(),
-  sfuPeerIds: new Set(),
   pendingTransmissions: new Map(),
   watchingTransmissionPeerId: null,
   watchingTransmissionProducerId: null,
@@ -1880,10 +1889,6 @@ function _handleCallPresence(
     parts.delete(peerId);
     transportState.participants = parts;
 
-    const sfuNext = new Set(transportState.sfuPeerIds);
-    sfuNext.delete(peerId);
-    transportState.sfuPeerIds = sfuNext;
-
     const txNext = new Map(transportState.pendingTransmissions);
     txNext.delete(peerId);
     transportState.pendingTransmissions = txNext;
@@ -2372,6 +2377,22 @@ _transport.on("relayChanged", (peerId, relayed) => {
   transportState.relayedPeers = next;
 });
 
+// A peer's own connection can report "open" while nothing it carries ever
+// arrives - streamProven/streamLost are the only signal that a frame
+// actually got through. transportState.peers keeps meaning "libp2p holds a
+// connection"; provenPeers is the separate, narrower claim.
+_transport.on("streamProven", (peerId) => {
+  const next = new Set(transportState.provenPeers);
+  next.add(peerId);
+  transportState.provenPeers = next;
+});
+
+_transport.on("streamLost", (peerId) => {
+  const next = new Set(transportState.provenPeers);
+  next.delete(peerId);
+  transportState.provenPeers = next;
+});
+
 _transport.on("connect", (peerId) => {
   transportState.peers = _transport.peers();
   // The DID cannot be derived from the peerId any more (devices carry their
@@ -2457,10 +2478,6 @@ _transport.on("disconnect", (peerId) => {
   const callStates = new Map(transportState.callPeerStates);
   callStates.delete(peerId);
   transportState.callPeerStates = callStates;
-
-  const sfuNext = new Set(transportState.sfuPeerIds);
-  sfuNext.delete(peerId);
-  transportState.sfuPeerIds = sfuNext;
 
   const txNext = new Map(transportState.pendingTransmissions);
   txNext.delete(peerId);
@@ -3164,6 +3181,7 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.roomCode = null;
   transportState.roomName = "";
   transportState.peers = [];
+  transportState.provenPeers = new Set();
   transportState.messages = [];
   transportState.participants = new Map();
   transportState.peerNames = new Map();
@@ -3171,7 +3189,6 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerColors = new Map();
   transportState.error = null;
   transportState.callPeerIds = new Set();
-  transportState.sfuPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
   transportState.watchingTransmissionPeerId = null;
   transportState.watchingTransmissionProducerId = null;

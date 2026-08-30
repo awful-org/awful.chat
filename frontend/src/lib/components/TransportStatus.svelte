@@ -144,9 +144,6 @@
         case "voice-dial-failed":
           addStatus("error", status.message, PhoneOff);
           break;
-        case "voice-dial-retrying":
-          addStatus("warning", status.message, RefreshCw);
-          break;
         case "voice-peer-left":
           addStatus("disconnected", status.message, PhoneOff);
           break;
