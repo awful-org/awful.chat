@@ -104,6 +104,16 @@ export interface HostApi {
   ping(did: string, opts?: { timeoutMs?: number }): Promise<number | null>;
   /** Is this peer reached through a relay rather than directly? */
   isRelayed(did: string): boolean;
+  /** Show one session-only plugin surface in this room's conversation.
+   *  It is never a Message: no signing, storage, sync, unread or notification. */
+  showLocalCard(data?: unknown): string;
+  closeLocalCard(id: string): void;
+  /** Play a local audio blob through this user's outgoing call track. */
+  callAudio: {
+    blockedReason(): "not-in-call" | "deafened" | null;
+    play(blob: Blob): Promise<{ id: string; durationMs: number }>;
+    stop(id?: string): void;
+  };
   seededRandom(seed: string): () => number; // deterministic PRNG
   storage: {
     get(k: string): Promise<unknown>;
@@ -117,6 +127,9 @@ export interface PluginDefinition {
   // cardState, not state: a prop called `state` shadows the $state rune in
   // any card that uses runes, and the host has always passed this name.
   card?: PluginComponent;
+  /** Private, session-only surface opened by HostApi.showLocalCard.
+   * Props: { localCard, host, close }. It is not backed by a chat message. */
+  localCard?: PluginComponent;
   /**
    * Compact view for a pinned sidebar widget box. Same props as `card`
    * ({ card, cardState, host }); when absent, pinning falls back to the

@@ -131,6 +131,10 @@ export interface VoiceTransport {
   setOutputVolume(volume: number): void;
   getOutputVolume(): number;
 
+  // intentional local sounds mixed after microphone processing
+  playCallAudio(blob: Blob): Promise<{ id: string; durationMs: number }>;
+  stopCallAudio(id?: string): void;
+
   // events
   on<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void;
   off<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void;

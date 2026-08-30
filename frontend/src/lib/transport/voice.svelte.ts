@@ -256,3 +256,22 @@ export async function setVoiceDtlnEnabled(enabled: boolean): Promise<void> {
 export function getVoiceDtlnEnabled(): boolean {
   return getVoice().isDtlnEnabled();
 }
+
+export function getCallAudioBlockedReason(): "not-in-call" | "deafened" | null {
+  if (!transportState.inCall) return "not-in-call";
+  if (transportState.deafened) return "deafened";
+  return null;
+}
+
+export async function playCallAudio(
+  blob: Blob
+): Promise<{ id: string; durationMs: number }> {
+  const blocked = getCallAudioBlockedReason();
+  if (blocked === "not-in-call") throw new Error("Join the call to play");
+  if (blocked === "deafened") throw new Error("Undeafen to play");
+  return getVoice().playCallAudio(blob);
+}
+
+export function stopCallAudio(id?: string): void {
+  _voice?.stopCallAudio(id);
+}

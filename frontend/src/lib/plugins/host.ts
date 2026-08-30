@@ -21,10 +21,25 @@ import { getPluginCardMessages } from "$lib/storage";
 import { setNowPlayingFor } from "./media-session";
 import { getCardState, onCardStateChange as onPluginCardStateChange } from "./state.svelte";
 import { MessageType } from "$lib/types/message";
+import { closeLocalCard, upsertLocalCard } from "./local-cards.svelte";
+import {
+  getCallAudioBlockedReason,
+  playCallAudio,
+  stopCallAudio,
+} from "$lib/transport/voice.svelte";
 
 export function makeHostApi(pluginId: string, roomCode: string): HostApi {
   const nowPlayingToken = Symbol(pluginId);
   return {
+    showLocalCard(data) {
+      return upsertLocalCard(pluginId, roomCode, data).id;
+    },
+    closeLocalCard,
+    callAudio: {
+      blockedReason: getCallAudioBlockedReason,
+      play: playCallAudio,
+      stop: stopCallAudio,
+    },
     setNowPlaying(info) {
       setNowPlayingFor(nowPlayingToken, info);
     },

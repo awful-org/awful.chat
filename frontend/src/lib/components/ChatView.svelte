@@ -47,6 +47,8 @@
   import { Separator } from "$lib/components/ui/separator";
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import MsgRender from "./MsgRender.svelte";
+  import LocalPluginCard from "./LocalPluginCard.svelte";
+  import { localPluginCards } from "$lib/plugins/local-cards.svelte";
   import GifPicker from "./GifPicker.svelte";
   import GifImage from "./GifImage.svelte";
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
@@ -348,6 +350,9 @@
     messages.filter(
       (m) => RENDERABLE_TYPES.has(m.type) && m.roomCode === roomCode
     )
+  );
+  const visibleLocalCards = $derived(
+    localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
   );
 
   const messageById = $derived(new Map(visibleMessages.map((m) => [m.id, m])));
@@ -1778,7 +1783,7 @@
         </div>
       {/if}
 
-      {#if visibleMessages.length === 0}
+      {#if visibleMessages.length === 0 && visibleLocalCards.length === 0}
         <div class="flex h-full items-center justify-center py-20">
           <p class="select-none text-sm text-muted-foreground italic">
             No messages yet. Say something!
@@ -2065,6 +2070,10 @@
                 </div>
               </div>
             </div>
+          {/each}
+
+          {#each visibleLocalCards as entry (entry.id)}
+            <LocalPluginCard {entry} />
           {/each}
 
           {#if sendingPreviews.length > 0}

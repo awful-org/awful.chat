@@ -5,6 +5,7 @@ import type { DtlnProcessor } from "$lib/audio/dtln-processor";
 import { getIceServers } from "../ice-server-list";
 import { MessageType } from "$lib/types/message";
 import { encode } from "$lib/utils";
+import { CallAudioMixer } from "$lib/audio/call-audio-mixer";
 
 /** Same ceiling as the output slider in audio settings. */
 export const MAX_PEER_VOLUME = 2.5;
@@ -152,6 +153,7 @@ interface RemotePeer {
 export class LibP2PVoice implements VoiceTransport {
   private node: Libp2p<AppServices> | null = null;
   private audioCtx: AudioContext | null = null;
+  private callAudioMixer: CallAudioMixer | null = null;
   /**
    * Shared playback bus: every per-peer gain feeds this compressor, which
    * feeds the speakers. This is the leveling stage the chain never had -
@@ -250,6 +252,8 @@ export class LibP2PVoice implements VoiceTransport {
     // implicit makeup gain per the Web Audio spec); tune only if voices pump.
     this.outputBus = this.audioCtx.createDynamicsCompressor();
     this.outputBus.connect(this.audioCtx.destination);
+    this.callAudioMixer = new CallAudioMixer(this.audioCtx);
+    this.processedStream = this.callAudioMixer.outputStream();
 
     // A worklet that dies after init would otherwise transmit digital
     // silence forever - the track stays live, RTP keeps flowing, and
@@ -590,10 +594,12 @@ export class LibP2PVoice implements VoiceTransport {
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.dtln?.releaseTransport();
     this.dtln?.onFatal(null);
+    this.callAudioMixer?.dispose();
     this.audioCtx?.close();
 
     this.audioCtx = null;
     this.outputBus = null;
+    this.callAudioMixer = null;
     this.micStream = null;
     this.processedStream = null;
     this.inputSource = null;
@@ -743,6 +749,15 @@ export class LibP2PVoice implements VoiceTransport {
     return this.currentOutputVolume;
   }
 
+  playCallAudio(blob: Blob): Promise<{ id: string; durationMs: number }> {
+    if (!this.callAudioMixer) throw new Error("Not in a call");
+    return this.callAudioMixer.play(blob);
+  }
+
+  stopCallAudio(id?: string): void {
+    this.callAudioMixer?.stop(id);
+  }
+
   async setDtlnEnabled(enabled: boolean): Promise<void> {
     if (this.dtlnEnabled === enabled) return;
     this.dtlnEnabled = enabled;
@@ -842,8 +857,9 @@ export class LibP2PVoice implements VoiceTransport {
         }
       }
     }
+    let microphoneProcessed: MediaStream;
     if (processed) {
-      this.processedStream = processed;
+      microphoneProcessed = processed;
     } else {
       // DTLN off: drop its graph so the worklet stops processing the (now
       // stopped) previous mic and peers are fed by the plain path only.
@@ -855,8 +871,12 @@ export class LibP2PVoice implements VoiceTransport {
       const dest = ctx.createMediaStreamDestination();
       this.inputSource.connect(this.inputGain);
       this.inputGain.connect(dest);
-      this.processedStream = dest.stream;
+      microphoneProcessed = dest.stream;
     }
+
+    this.callAudioMixer?.connectMicrophone(microphoneProcessed);
+    this.processedStream =
+      this.callAudioMixer?.outputStream() ?? microphoneProcessed;
 
     const newTrack = this.processedStream.getAudioTracks()[0] ?? null;
     if (newTrack) {
