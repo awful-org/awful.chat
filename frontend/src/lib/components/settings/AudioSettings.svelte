@@ -27,7 +27,12 @@
     setVoiceDtlnNoiseGate,
     getVoiceDtlnNoiseGate,
   } from "$lib/transport/voice.svelte";
-  import { setDeafened, toggleMute } from "$lib/transport/call.svelte";
+  import {
+    setDeafened,
+    toggleMute,
+    getShareAudioDespiteEchoRisk,
+    setShareAudioDespiteEchoRisk,
+  } from "$lib/transport/call.svelte";
   import {
     formatGain,
     gainToSlider,
@@ -62,6 +67,9 @@
   // Restored from the last session, not a fresh default.
   let noiseGateThreshold = $state(getVoiceDtlnNoiseGate());
   let noiseGateSlider = $state<number[]>([getVoiceDtlnNoiseGate() * 10000]);
+  // Off by default: screen-share audio that could not be confirmed
+  // echo-free is withheld unless the sharer opts in here (share-audio.ts).
+  let shareAudioDespiteEchoRisk = $state(getShareAudioDespiteEchoRisk());
 
   let isMicTesting = $state(false);
   // Distinct from isMicTesting: set only during async startup so a second
@@ -505,5 +513,32 @@
         class="w-full"
       />
     </div>
+  </div>
+
+  <!-- Screen Share Audio Section -->
+  <div
+    class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+  >
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <div class="w-1 h-4 bg-purple-500 rounded-full"></div>
+        <Label
+          class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Screen Share Audio</Label
+        >
+      </div>
+      <Switch
+        bind:checked={shareAudioDespiteEchoRisk}
+        onCheckedChange={(checked) => setShareAudioDespiteEchoRisk(checked)}
+      />
+    </div>
+    <p class="text-[10px] text-muted-foreground font-mono">
+      A screen share's audio is only sent when awful.chat can confirm it
+      will not echo everyone's own voice back to them (a per-window share
+      on Windows 11 / macOS 14.2+, or any share with the browser's
+      own-audio filter confirmed on). When it can't confirm that, audio is
+      dropped by default. Turn this on to send it anyway - people may hear
+      themselves with a delay.
+    </p>
   </div>
 </div>

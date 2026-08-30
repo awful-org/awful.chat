@@ -13,7 +13,7 @@
     // Check if already installed
     isStandalone =
       window.matchMedia("(display-mode: standalone)").matches ||
-      (window.navigator as any).standalone === true;
+      window.navigator.standalone === true;
 
     if (isStandalone) return;
 
@@ -32,10 +32,10 @@
       }, 3000); // Show 3 seconds after load
     };
 
-    window.addEventListener("beforeinstallprompt", handler as any);
+    window.addEventListener("beforeinstallprompt", handler);
 
     return () => {
-      window.removeEventListener("beforeinstallprompt", handler as any);
+      window.removeEventListener("beforeinstallprompt", handler);
     };
   });
 

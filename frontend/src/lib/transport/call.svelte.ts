@@ -22,6 +22,8 @@ import {
 } from "./transport.svelte";
 import type { VideoSource } from "./types";
 import { setTransmissionOutputVolume } from "./transmission.svelte";
+import { buildShareOptions, classifyShareAudio } from "./share-audio";
+import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
 import {
   cancelErrorClear,
   describeMediaError,
@@ -378,62 +380,100 @@ export function toggleScreenShare(): Promise<void> {
   return _screenPromise;
 }
 
-export async function startScreenShare(): Promise<void> {
+/**
+ * Starts (or accepts a pre-captured) screen share, then decides whether its
+ * audio track is safe to send.
+ *
+ * `stream` lets a caller that already ran getDisplayMedia hand the result
+ * straight in - the VideoTransport interface has always supported this (see
+ * types.ts) to avoid a second capture prompt. Either way the resulting
+ * track's REAL settings get classified: what we asked for and what the
+ * platform actually did can differ, and only the actual settings say
+ * whether the echo is really gone.
+ */
+export async function startScreenShare(stream?: MediaStream): Promise<void> {
   // Clear any pending error timeout and reset the error state. Attempting
   // the operation again makes any stale error irrelevant.
   cancelErrorClear();
   transportState.error = null;
-  if (!navigator.mediaDevices.getDisplayMedia) {
+  if (!stream && !navigator.mediaDevices.getDisplayMedia) {
     throw new Error("Screen sharing is not supported on this device");
   }
   try {
-    // Game and media audio verbatim: mic-style processing (AEC, noise
-    // suppression, AGC) mangles music and adds nothing to a loopback
-    // capture. The extra hints are Chromium-only and ignored elsewhere:
-    // they surface the audio checkbox for screens, hide our own tab from
-    // the picker, and let the sharer switch surfaces mid-share.
-    const options = {
-      video: { frameRate: { ideal: 30 } },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        // Stereo at full rate: without asking, Chromium hands over mono.
-        channelCount: 2,
-        sampleRate: 48000,
-      },
-      systemAudio: "include",
-      selfBrowserSurface: "exclude",
-      surfaceSwitching: "include",
-    } as MediaStreamConstraints;
-    const stream = await navigator.mediaDevices.getDisplayMedia(options);
-    // Whole-screen audio loops the call itself back into the stream, so
-    // everyone hears their own voice with a delay. Window audio (Chrome or
-    // Edge on Windows) carries only that app's sound - tell the sharer.
-    const surface = stream
-      .getVideoTracks()[0]
-      ?.getSettings?.().displaySurface;
-    if (surface === "monitor" && stream.getAudioTracks().length > 0) {
-      _transport.announce({
-        type: "app-warning",
-        message:
-          "Sharing the whole screen sends ALL system audio - people will hear themselves. Share the game window instead (with 'Also share audio') to send only its sound.",
-      });
-    }
+    const captured =
+      stream ??
+      (await navigator.mediaDevices.getDisplayMedia(
+        buildShareOptions(navigator.mediaDevices.getSupportedConstraints())
+      ));
+
     // "music" keeps the browser's encoder from treating loopback audio as
     // speech. Video hint stays unset: "motion" would smooth games but smear
     // shared text, and we cannot know which this share is.
-    for (const track of stream.getAudioTracks()) track.contentHint = "music";
-    transportState.localScreenStream = stream;
+    for (const track of captured.getAudioTracks())
+      track.contentHint = "music";
+
+    // windowAudio degrades to system audio SILENTLY, and
+    // getSupportedConstraints().restrictOwnAudio lies on platforms (Linux)
+    // that can never honour it - so classify what the live tracks actually
+    // report, never what was requested.
+    const videoTrack = captured.getVideoTracks()[0];
+    let audioTrack: MediaStreamTrack | null =
+      captured.getAudioTracks()[0] ?? null;
+    const verdict = classifyShareAudio(
+      videoTrack?.getSettings() ?? {},
+      audioTrack?.getSettings() ?? null
+    );
+
+    if (verdict.kind === "echo-risk" && audioTrack) {
+      if (loadAudioPrefs().shareAudioDespiteEchoRisk) {
+        _transport.announce({
+          type: "app-warning",
+          message: `${verdict.message} Sending it anyway - "Send screen-share audio despite echo risk" is on in Settings > Audio.`,
+        });
+      } else {
+        // Default to safety: withhold the track so nobody hears themselves.
+        // Stop it too, or the OS-level capture session for audio nobody
+        // gets stays alive for the rest of the share.
+        audioTrack.stop();
+        captured.removeTrack(audioTrack);
+        audioTrack = null;
+        _transport.announce({
+          type: "app-warning",
+          message: verdict.message,
+        });
+      }
+    }
+
+    if (audioTrack) {
+      // The spec mandates a muted track when own-audio suppression leaves
+      // nothing to send, and a default-output-device change mid-share is a
+      // known real cause (crbug 1432877) - either way, tell the sharer
+      // rather than let the share go silently dead.
+      audioTrack.onmute = () => {
+        _transport.announce({
+          type: "app-warning",
+          message:
+            "This share's audio went silent - often caused by switching audio output devices mid-share.",
+        });
+      };
+      audioTrack.onunmute = () => {
+        _transport.announce({
+          type: "app-warning",
+          message: "This share's audio is back.",
+        });
+      };
+    }
+
+    transportState.localScreenStream = captured;
     transportState.screenSharing = true;
     playScreenShareStartSound();
-    stream.getVideoTracks()[0].onended = () => stopScreenShare();
+    videoTrack.onended = () => stopScreenShare();
     try {
-      await _video.startScreenShare(stream);
+      await _video.startScreenShare(captured);
     } catch (err) {
       // As with the camera: otherwise we advertise a transmission that does
       // not exist and the browser keeps the capture indicator up.
-      stream.getTracks().forEach((t) => t.stop());
+      captured.getTracks().forEach((t) => t.stop());
       transportState.localScreenStream = null;
       transportState.screenSharing = false;
       throw err;
@@ -454,6 +494,20 @@ export function stopScreenShare(): void {
   transportState.screenSharing = false;
   playScreenShareStopSound();
   _video.stopScreenShare();
+}
+
+/**
+ * The sharer's device-local choice to send screen-share audio even when it
+ * could not be confirmed echo-free. Off by default (see startScreenShare) -
+ * this never travels to the room, it only decides what THIS device
+ * publishes on its next share.
+ */
+export function getShareAudioDespiteEchoRisk(): boolean {
+  return loadAudioPrefs().shareAudioDespiteEchoRisk;
+}
+
+export function setShareAudioDespiteEchoRisk(enabled: boolean): void {
+  saveAudioPrefs({ shareAudioDespiteEchoRisk: enabled });
 }
 
 export function pauseVideo(source: VideoSource): void {

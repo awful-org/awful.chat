@@ -34,7 +34,11 @@ group video.
   suppression (DTLN) and per-peer volume.
 - **Camera and screen share** at 30 fps through a self-hosted SFU: sharing is
   opt-in to watch, the sharer sees who is watching, and a streamers-only
-  view hides everyone without video.
+  view hides everyone without video. Screen-share audio is scoped to the
+  shared window where the OS/browser allow it (Windows 11 / macOS 14.2+ on
+  a recent Chrome); everywhere else - including Linux and Firefox - audio
+  is only sent once the browser confirms it will not echo, and is withheld
+  by default otherwise (opt-in in Settings > Audio).
 - **Files and media**: WebTorrent transfers with no public trackers, inline
   images, video, audio and GIFs, a GIF picker with saved favorites, and
   small files delivered inside the message itself so they load instantly.

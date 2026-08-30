@@ -14,6 +14,13 @@ export interface AudioPrefs {
   dtlnEnabled: boolean;
   noiseGate: number;
   /**
+   * Screen-share audio that could not be confirmed echo-free (see
+   * share-audio.ts) is withheld by default - the sharer must opt in here
+   * to send it anyway. Device-local and never sent to the room: it is a
+   * choice about what THIS device publishes, not room state.
+   */
+  shareAudioDespiteEchoRisk: boolean;
+  /**
    * How loud each person is for us, keyed by their did:key - the durable
    * identity, so the setting survives them reinstalling or changing devices,
    * where a peerId would not.
@@ -28,6 +35,7 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   outputVolume: 1.0,
   dtlnEnabled: true,
   noiseGate: 0.002,
+  shareAudioDespiteEchoRisk: false,
   peerVolumes: {},
 };
 
@@ -70,6 +78,10 @@ export function loadAudioPrefs(): AudioPrefs {
           ? p.dtlnEnabled
           : AUDIO_PREF_DEFAULTS.dtlnEnabled,
       noiseGate: num(p.noiseGate, AUDIO_PREF_DEFAULTS.noiseGate, 0, 0.01),
+      shareAudioDespiteEchoRisk:
+        typeof p.shareAudioDespiteEchoRisk === "boolean"
+          ? p.shareAudioDespiteEchoRisk
+          : AUDIO_PREF_DEFAULTS.shareAudioDespiteEchoRisk,
       peerVolumes: sanitizePeerVolumes(p.peerVolumes),
     };
   } catch {

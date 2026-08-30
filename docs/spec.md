@@ -640,6 +640,37 @@ Video:
   - unexpected WS drop mid-call → client emits error + one full automatic
     rejoin (device + transports + republish of live local tracks)
 
+Screen share audio (share-audio.ts):
+  - problem: whole-system audio re-captures awful.chat's own playback of
+    every remote participant, so everyone hears themselves echoed back
+  - buildShareOptions() requests windowAudio:"window" + restrictOwnAudio
+    (inside the audio constraint, never at the top level) plus the
+    Chromium picker-shaping options (systemAudio, selfBrowserSurface,
+    surfaceSwitching, monitorTypeSurfaces, audioSelection). One options
+    object, no user-agent sniffing - unsupported members are silently
+    ignored per the WebIDL dictionary spec
+  - classifyShareAudio() checks what was ACTUALLY captured
+    (videoTrack.getSettings().displaySurface,
+    audioTrack.getSettings().restrictOwnAudio) rather than trusting the
+    request: windowAudio degrades to system audio silently, and
+    getSupportedConstraints().restrictOwnAudio reports "supported" even on
+    platforms (Linux) that can never honour it
+  - verdict kinds: "application-scoped" (tab audio, or a window share with
+    own-audio removal confirmed), "system-audio-own-audio-stripped" (whole
+    screen, own-audio removal confirmed), "echo-risk" (own-audio removal
+    NOT confirmed on a non-tab surface), "no-audio" (no audio track at all)
+  - default is fail-closed: an "echo-risk" audio track is stopped and
+    removed before it reaches the SFU, and the sharer is told why in one
+    sentence. Settings > Audio has a device-local, room-invisible opt-in
+    ("send audio despite echo risk") to publish it anyway
+  - real per-application audio (not just own-audio filtering) exists only
+    on Windows 11 with Chrome 146+ and macOS 14.2+ with Chrome 150+; it
+    never exists on Linux, ChromeOS, Firefox, or Safari - those either get
+    a fail-closed silent share or the sharer's explicit opt-in
+  - audioTrack.onmute/onunmute are wired so a share whose audio goes silent
+    mid-call (own-audio suppression leaving nothing to send, or an
+    output-device change) is reported instead of silently dead
+
 Screen share transmissions:
   - remote screen producers emit transmissionAvailable(peerId, producerId)
   - UI shows pending "Click to watch" tile (not auto-consumed)
