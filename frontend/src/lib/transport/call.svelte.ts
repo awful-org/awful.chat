@@ -511,13 +511,6 @@ export function setShareAudioDespiteEchoRisk(enabled: boolean): void {
   saveAudioPrefs({ shareAudioDespiteEchoRisk: enabled });
 }
 
-export function pauseVideo(source: VideoSource): void {
-  _video.pauseVideo(source);
-}
-export function resumeVideo(source: VideoSource): void {
-  _video.resumeVideo(source);
-}
-
 export function setDeafened(deafened: boolean): void {
   if (deafened) {
     // Save current states before deafening
