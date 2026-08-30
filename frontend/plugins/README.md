@@ -246,6 +246,77 @@ manifest. If you need something that is not there, ask - and expect the
 answer to be a `host` method rather than a component where that is possible,
 since data is a smaller promise for the host to keep than layout.
 
+## Synchronizing playback across peers
+
+`$lib/plugins/watch` is a shared, pure library for any plugin that keeps a
+media element in step across peers, so a watch-together plugin does not
+need to re-invent the same control loop. Every export is pure and
+synchronous: no DOM, no timers, no network call, no `$lib/transport`
+import.
+
+```ts
+/** One authoritative playback snapshot. A timestamp and a rate, never a bare position. */
+export type WatchTick = {
+  paused: boolean;
+  /** media position in seconds, true at `atMs` on the sender's clock */
+  position: number;
+  /** sender wall clock, ms since epoch */
+  atMs: number;
+  /** playback rate; 1 is normal */
+  rate: number;
+  /** monotonically increasing per sender, for ordering ticks inside one room */
+  seq: number;
+};
+export type ClockSample = { t0: number; t1: number; t2: number; t3: number };
+export type ClockEstimate = { offsetMs: number; rttMs: number; samples: number };
+/** NTP-style offset from round-trip samples, median-filtered. */
+export function estimateClock(samples: readonly ClockSample[]): ClockEstimate;
+/** Where the tick says playback is, right now, on the local clock. */
+export function projectPosition(tick: WatchTick, nowMs: number, offsetMs: number): number;
+export type CorrectionAction = "none" | "seek" | "rate" | "pause" | "resume";
+export type Correction = { action: CorrectionAction; targetPosition: number; rate: number; driftMs: number };
+/** The control law. Small drift is corrected by rate, large drift by seek. */
+export function decideCorrection(
+  local: { position: number; paused: boolean; rate: number },
+  tick: WatchTick,
+  nowMs: number,
+  offsetMs: number,
+  cfg?: Partial<WatchSyncConfig>,
+): Correction;
+export type WatchSyncConfig = { seekThresholdMs: number; rateThresholdMs: number; slowRate: number; fastRate: number; maxRateCorrectionMs: number };
+export const DEFAULT_WATCH_SYNC: WatchSyncConfig;
+```
+
+A `WatchTick` is a snapshot, never a bare position: a lone number ages the
+moment it is written, and two peers reading it at different instants land
+at different places with nothing to correct the drift afterward. The
+timestamp and rate are what let every peer compute where playback actually
+is right now, on their own clock, via `projectPosition`.
+
+The control law follows Syncplay's published constants
+(`syncplay/constants.py`): ignore drift under `rateThresholdMs`, correct
+larger drift by nudging `rate` instead of seeking - a 5% speed change is
+neither visible nor audible, a seek is both - and only seek once drift
+passes `seekThresholdMs`. `DEFAULT_WATCH_SYNC` carries Syncplay's own
+numbers where Syncplay names one directly: `seekThresholdMs: 4000`
+(`DEFAULT_REWIND_THRESHOLD`), `rateThresholdMs: 1500`
+(`DEFAULT_SLOWDOWN_KICKIN_THRESHOLD`), `slowRate: 0.95` (`SLOWDOWN_RATE`),
+`maxRateCorrectionMs: 100` (`SLOWDOWN_RESET_THRESHOLD`). `fastRate: 1.05` is
+the one value with no matching named constant to quote - Syncplay's own
+fast-forward thresholds carry no paired speedup rate, so this is derived
+from the same "a small rate change is neither visible nor audible" design
+reasoning, applied symmetrically to the behind-schedule case.
+
+Clock offset is a plugin's own job to gather, through `host.ping` (above):
+sample several round trips, fold them into `ClockSample`s, and hand them to
+`estimateClock`, which does the NTP-style math once you have the samples.
+`decideCorrection` never touches the network itself.
+
+The first consumer is `anime-party` in
+[awful-org/awfully-awesome](https://github.com/awful-org/awfully-awesome),
+fetched via `PLUGIN_SOURCES` like any other plugin - see its README for
+the full watch-party built on top of this library.
+
 ## Calling external APIs
 
 Browsers cannot reach most APIs directly (CORS), and API keys must never
