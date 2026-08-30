@@ -1,4 +1,4 @@
-const MAX_CALL_SOUND_SECONDS = 5.001;
+const MAX_CALL_SOUND_SECONDS = 5;
 
 export interface CallSoundPlayback {
   id: string;

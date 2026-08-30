@@ -65,8 +65,15 @@ describe("CallAudioMixer", () => {
     expect(sources[1].start).toHaveBeenCalledOnce();
   });
 
-  it("rejects decoded clips over five seconds", async () => {
-    const { ctx, sources } = context(5.01);
+  it("accepts a clip exactly five seconds long", async () => {
+    const { ctx, sources } = context(5);
+    const mixer = new CallAudioMixer(ctx);
+    await expect(mixer.play(new Blob(["x"]))).resolves.toMatchObject({ durationMs: 5000 });
+    expect(sources).toHaveLength(1);
+  });
+
+  it("rejects decoded clips even one millisecond over five seconds", async () => {
+    const { ctx, sources } = context(5.001);
     const mixer = new CallAudioMixer(ctx);
     await expect(mixer.play(new Blob(["x"]))).rejects.toThrow("5 second");
     expect(sources).toHaveLength(0);
