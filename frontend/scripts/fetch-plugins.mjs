@@ -7,7 +7,10 @@
  *
  * PLUGIN_SOURCES is a comma/whitespace separated list of:
  *   https://github.com/user/repo         default branch (HEAD) - requires opt-in, see below
- *   user/repo@v1.2                       pinned tag / branch / sha
+ *   user/repo@<sha>                      pinned; only a commit sha is
+ *   user/repo@v1.2                       a tag or branch: builds, but is
+ *                                        recorded as NOT reproducible,
+ *                                        because it can be moved
  *   user/repo#v1.2                       the same; # is eaten by .env files,
  *                                        so prefer @ in an environment
  *   /abs/path or ./rel/path              local directory (dev, testing)
@@ -162,7 +165,7 @@ async function materialize(source, tmp) {
   }
   let spec = source.replace(/^https:\/\/github\.com\//, "");
   let ref = "HEAD";
-  let pinned = false;
+  let hasRef = false;
   // Either separator, and @ is the one to reach for in an environment
   // variable. A .env file treats # as the start of a comment, so
   // PLUGIN_SOURCES=owner/repo#sha silently arrives as owner/repo - pinned
@@ -174,7 +177,7 @@ async function materialize(source, tmp) {
   if (sep !== -1) {
     ref = spec.slice(sep + 1);
     spec = spec.slice(0, sep);
-    pinned = true;
+    hasRef = true;
   }
   spec = spec.replace(/\.git$/, "").replace(/\/$/, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(spec)) {
@@ -185,16 +188,36 @@ async function materialize(source, tmp) {
   // No #ref means "fetch whatever HEAD is right now" - a different build can
   // ship different code from the exact same PLUGIN_SOURCES value, with no
   // integrity check on what came back. Loud by default; opt-in to bypass.
-  if (!pinned) {
+  // PINNED MEANS A COMMIT SHA, and nothing else.
+  //
+  // This used to mean "a ref was written", so owner/repo@main recorded
+  // pinned:true in the build declaration - telling anyone checking the
+  // instance that the build was reproducible when the ref moves every time
+  // somebody pushes. A tag is the same promise with better manners: it is
+  // fixed by convention and movable in fact. Only a sha names bytes.
+  //
+  // A named ref still builds. It is a deliberate choice, unlike fetching a
+  // default branch, and refusing it would be a bigger change than the
+  // problem warrants - but it is recorded honestly and said out loud.
+  const pinned = /^[0-9a-f]{7,40}$/i.test(ref);
+  if (hasRef && !pinned) {
     console.error(
-      `[fetch-plugins] WARNING: ${spec} has no #ref - this fetches HEAD of a ` +
+      `[fetch-plugins] WARNING: ${spec}@${ref} is a tag or branch, not a ` +
+        `commit sha. It can be moved, so this build records itself as not ` +
+        `reproducible and cannot be rebuilt from its own declaration later. ` +
+        `Use a sha to pin it.`
+    );
+  }
+  if (!hasRef) {
+    console.error(
+      `[fetch-plugins] WARNING: ${spec} has no ref - this fetches HEAD of a ` +
         `third-party repo with no integrity check, and the code that ships ` +
         `can change between builds with no diff to review.`
     );
     if (process.env.PLUGIN_SOURCES_ALLOW_UNPINNED !== "1") {
       const committed = committedSources();
       fail(
-        `${spec} is unpinned. Pin it to a reproducible ref: ` +
+        `${spec} has no ref. Pin it to a commit sha: ` +
           `${spec}@<commit-sha>.` +
           (committed
             ? `\n  plugins/sources.json already specifies "${committed}" - unset ` +
