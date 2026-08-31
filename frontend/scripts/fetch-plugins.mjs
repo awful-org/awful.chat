@@ -7,8 +7,9 @@
  *
  * PLUGIN_SOURCES is a comma/whitespace separated list of:
  *   https://github.com/user/repo         default branch (HEAD) - requires opt-in, see below
- *   https://github.com/user/repo#v1.2    pinned tag / branch / sha
- *   user/repo[#ref]                      shorthand for the above
+ *   user/repo@v1.2                       pinned tag / branch / sha
+ *   user/repo#v1.2                       the same; # is eaten by .env files,
+ *                                        so prefer @ in an environment
  *   /abs/path or ./rel/path              local directory (dev, testing)
  *
  * Each source may contain ONE plugin (manifest.ts at its root) or a PACK
@@ -162,22 +163,23 @@ async function materialize(source, tmp) {
   let spec = source.replace(/^https:\/\/github\.com\//, "");
   let ref = "HEAD";
   let pinned = false;
-  const hash = spec.indexOf("#");
-  if (hash !== -1) {
-    ref = spec.slice(hash + 1);
-    spec = spec.slice(0, hash);
+  // Either separator, and @ is the one to reach for in an environment
+  // variable. A .env file treats # as the start of a comment, so
+  // PLUGIN_SOURCES=owner/repo#sha silently arrives as owner/repo - pinned
+  // in the file an operator wrote, unpinned by the time the build sees it,
+  // and the build then fails complaining about a pin that is right there.
+  // Neither a repo owner nor a repo name can contain @, so this is
+  // unambiguous.
+  const sep = spec.search(/[#@]/);
+  if (sep !== -1) {
+    ref = spec.slice(sep + 1);
+    spec = spec.slice(0, sep);
     pinned = true;
   }
   spec = spec.replace(/\.git$/, "").replace(/\/$/, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(spec)) {
-    // "user/repo@sha" is the natural guess - it is how npm and go spell it -
-    // and the bare "unrecognized source" left you rereading this file to
-    // find out why. The ref separator is #, as in a url fragment.
-    const at = spec.includes("@")
-      ? ` Did you mean "${spec.replace("@", "#")}"? The ref separator is #, not @.`
-      : "";
     fail(
-      `unrecognized source (want github url, user/repo[#ref], or a path): ${source}.${at}`
+      `unrecognized source (want github url, user/repo[@ref], or a path): ${source}`
     );
   }
   // No #ref means "fetch whatever HEAD is right now" - a different build can
@@ -193,7 +195,7 @@ async function materialize(source, tmp) {
       const committed = committedSources();
       fail(
         `${spec} is unpinned. Pin it to a reproducible ref: ` +
-          `${spec}#<commit-sha>.` +
+          `${spec}@<commit-sha>.` +
           (committed
             ? `\n  plugins/sources.json already specifies "${committed}" - unset ` +
               `PLUGIN_SOURCES in this deployment's environment to use it.`

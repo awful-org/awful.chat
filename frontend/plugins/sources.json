@@ -1,6 +1,6 @@
 {
   "$comment": "The plugin set this project ships. It lives in the repository, not in a deploy's environment, so that it is part of the commit: CI can build exactly what a deploy builds, a published build hash can describe a real instance, and a change to what code reaches users is a reviewable diff rather than an invisible edit in a hosting panel. PLUGIN_SOURCES in the environment still overrides this, for trying something out. Pin every ref - an unpinned source cannot be rebuilt by anyone once that branch moves.",
   "sources": [
-    "awful-org/awfully-awesome#d00d9db"
+    "awful-org/awfully-awesome@d00d9db"
   ]
 }

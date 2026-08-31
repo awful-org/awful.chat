@@ -577,7 +577,7 @@ consequences worth knowing before you publish one:
 - The bundle an instance serves depends on its plugin set, so your code is
   inside the bytes anyone checking that instance will hash. A change you push
   changes what every instance running you serves.
-- An instance is expected to pin you (`PLUGIN_SOURCES=owner/repo#ref`).
+- An instance is expected to pin you (`PLUGIN_SOURCES=owner/repo@sha`).
   Tag releases, and do not rewrite history on a tag people pin - a pinned ref
   that changes underneath is exactly what pinning is meant to prevent.
 
@@ -602,16 +602,18 @@ at build time because plugins compile into the app):
 PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
 ```
 
-- Accepted forms: a github url, `user/repo`, either with `#ref` (tag, branch,
-  or commit - pin refs for reproducible deploys), or a local path in dev.
+- Accepted forms: a github url, `user/repo`, either with `@ref` or `#ref`
+  (tag, branch or commit), or a local path in dev. Prefer `@` in an
+  environment variable: a `.env` file treats `#` as the start of a comment,
+  so `owner/repo#sha` arrives at the build as `owner/repo`.
 - A source can hold ONE plugin (manifest.ts at its root) or a PACK: plugin
   folders at the root or under `plugins/`.
 - Removing an entry removes the plugin on the next deploy. Fetched plugins
   never overwrite the built-in ones, and a broken source fails the build
   loudly rather than silently shipping without it.
-- A source with no `#ref` fails the build: it fetches HEAD of a third-party
+- A source with no ref fails the build: it fetches HEAD of a third-party
   repo with no integrity check, so the same env value can ship different
-  code on the next build. Pin it (`user/repo#<commit-sha or tag>`), or set
+  code on the next build. Pin it (`user/repo@<commit-sha>`), or set
   `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to opt in anyway. Every fetched source
   logs its tarball's sha256 so you can confirm two fetches pulled the same
   bytes.
