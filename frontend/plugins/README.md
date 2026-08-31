@@ -531,9 +531,18 @@ the full watch-party built on top of this library.
 Browsers cannot reach most APIs directly (CORS), and API keys must never
 ship in the bundle. The instance relay exposes a generic proxy for both:
 
+```ts
+import { proxyUrl } from "$lib/plugins/api";
+
+const res = await fetch(proxyUrl("https://api.example.com/thing?key={{secret:NAME}}"));
 ```
-GET  <VITE_API_URL>/plugin-proxy?url=<https upstream url>
-```
+
+Call it per request. Do NOT build the url yourself from `import.meta.env`:
+vite compiles that value into the bundle, which puts the instance's own
+address into code that is supposed to be identical everywhere, and an
+instance that set nothing would silently send your users' requests to
+whichever origin you hardcoded as a fallback. Both of those have happened.
+The host reads its api origin at runtime, so there is nothing to inline.
 
 The upstream host must be in the instance's `PLUGIN_PROXY_HOSTS` allowlist,
 and the url may carry `{{secret:NAME}}` placeholders that the relay fills
@@ -554,6 +563,23 @@ your plugin needs in its README.
   Fetching belongs in command handlers or card components, client-side.
 - State must rebuild from updates alone. If you cache, cache derivations.
 - Test your reducer as a pure function; the repo's vitest setup applies.
+- Never read `import.meta.env`. Vite replaces those reads with their values
+  at build time, so anything instance-specific gets compiled into the bundle -
+  which makes every instance's JavaScript different and its build
+  unverifiable. `fetch-plugins` fails the build on this. Use `apiUrl()` from
+  `$lib/runtime-config`, or `proxyUrl()` below, both read at call time.
+
+### Your plugin is part of what people verify
+
+Plugins compile INTO the app; they are not loaded separately at runtime. Two
+consequences worth knowing before you publish one:
+
+- The bundle an instance serves depends on its plugin set, so your code is
+  inside the bytes anyone checking that instance will hash. A change you push
+  changes what every instance running you serves.
+- An instance is expected to pin you (`PLUGIN_SOURCES=owner/repo#ref`).
+  Tag releases, and do not rewrite history on a tag people pin - a pinned ref
+  that changes underneath is exactly what pinning is meant to prevent.
 
 ## Installing plugins from outside this repo
 
