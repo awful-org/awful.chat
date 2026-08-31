@@ -30,30 +30,16 @@ ARG PLUGIN_SOURCES
 # Set to 1 to let an unpinned source (no #ref) through fetch-plugins.
 ARG PLUGIN_SOURCES_ALLOW_UNPINNED
 
-# Only for a build whose context has no repository in it - a downloaded
-# release archive. Otherwise the commit is read from .git below.
-ARG APP_COMMIT
-
 ENV PLUGIN_SOURCES=$PLUGIN_SOURCES
 ENV PLUGIN_SOURCES_ALLOW_UNPINNED=$PLUGIN_SOURCES_ALLOW_UNPINNED
-ENV APP_COMMIT=$APP_COMMIT
 
 RUN node scripts/fetch-plugins.mjs
 
-# The commit, resolved from the repository rather than remembered by a human.
-#
-# Pre-1.0 there is no version to speak of - package.json is 0.0.0 on purpose -
-# so the commit is the only identity a build has, and for a long time every
-# production image shipped without one: the old build context was ./frontend
-# while .git sits at the repo root, and node:alpine has no git binary anyway.
-# That left APP_COMMIT as something whoever deployed had to remember, and
-# dokploy has no built-in variable to fill it in with.
-#
-# So the refs come in and scripts/git-commit.mjs reads them directly - HEAD,
-# then refs/ or packed-refs, about twenty lines and no git binary. WORKDIR is
+# The repository and commit this image is built from, which pre-1.0 is the
+# only identity it has - package.json is 0.0.0 on purpose. node:alpine ships
+# no git binary, so scripts/git-commit.mjs reads the refs directly. WORKDIR is
 # /app and holds the frontend, so /.git is the repo root's .git exactly as
-# ../.git is in a checkout: one code path, both places. APP_COMMIT still wins
-# when it is set, which is what CI does.
+# ../.git is in a checkout: one code path, both places.
 #
 # Late on purpose: .git changes with every commit, and copying it earlier
 # would invalidate the plugin fetch above on every single build.

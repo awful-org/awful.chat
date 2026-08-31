@@ -266,9 +266,9 @@ services:
 
   frontend:
     build:
-      # The repo root, not ./frontend: the build resolves the commit it came
-      # from by reading .git, so nobody has to remember APP_COMMIT. The root
-      # .dockerignore keeps the context from carrying anything else.
+      # The repo root, not ./frontend: the build reads .git to resolve the
+      # commit and repository it came from. The root .dockerignore keeps the
+      # context from carrying anything else.
       context: .
       dockerfile: frontend/Dockerfile
       args:

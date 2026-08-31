@@ -19,9 +19,9 @@ export default defineConfig(({ mode }) => ({
     // The app's version, straight from package.json at build time.
     __APP_VERSION__: JSON.stringify(pkg.version),
     // Best-effort commit hash: pre-1.0 every deploy shares the version, so
-    // the hash is what actually identifies a build. Read from .git when
-    // APP_COMMIT is not passed - see scripts/git-commit.mjs. Empty when
-    // neither is available; the UI just omits it.
+    // the hash is what actually identifies a build. Read from .git - see
+    // scripts/git-commit.mjs. Empty when the build has no repository to
+    // read, and the UI then omits it.
     __APP_COMMIT__: JSON.stringify(resolveCommit()),
   },
   plugins: [

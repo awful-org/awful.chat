@@ -170,13 +170,10 @@ instance actually serves (see
 belong to the build rather than the instance: the commit itself, inlined as
 `__APP_COMMIT__` so the app can say what it is running, and the plugin set.
 
-Nothing has to be passed for the commit. The frontend image builds from the
-repo root so `.git` is reachable, and the build reads the refs directly - no
-git binary, no `APP_COMMIT` to remember. Neither compose nor CI passes it,
-deliberately: a path nobody exercises is how every production image came to
-ship an empty commit in the first place. `APP_COMMIT` remains as an override
-for the one case `.git` cannot cover, building from a downloaded release
-archive.
+Nothing has to be configured for either. The frontend image builds from the
+repo root so `.git` is reachable, and the build reads the refs and the origin
+remote directly - no git binary, and nothing for a deployment to set. A build
+whose context holds no repository declares no commit.
 
 | Variable | Required | What it is |
 | --- | --- | --- |

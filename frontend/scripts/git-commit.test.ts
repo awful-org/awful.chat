@@ -10,7 +10,6 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gitdir-"));
-  delete process.env.APP_COMMIT;
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -57,13 +56,6 @@ describe("resolveCommit", () => {
     expect(resolveCommit({ gitDir: join(dir, "nope") })).toBe("");
     head("ref: refs/heads/gone\n");
     expect(resolveCommit({ gitDir: dir })).toBe("");
-  });
-
-  it("prefers APP_COMMIT and truncates it", () => {
-    process.env.APP_COMMIT = `  ${"c".repeat(40)}  `;
-    head(`${SHA}\n`);
-    expect(resolveCommit({ gitDir: dir })).toBe("ccccccc");
-    expect(resolveCommit({ gitDir: dir, full: true })).toBe("c".repeat(40));
   });
 });
 

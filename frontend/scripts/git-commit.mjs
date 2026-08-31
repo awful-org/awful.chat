@@ -7,22 +7,11 @@
  * the frontend's build context is the repo root and the Dockerfile copies
  * .git in. So no deployment has to supply the commit by hand.
  *
- * APP_COMMIT still wins when it is set, because CI knows the sha it checked
- * out and a detached or shallow checkout is not always readable.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-/**
- * Seven characters, always.
- *
- * This value is inlined into the bundle, which makes it the one build input
- * that can still make two builds of the same commit differ. CI passes a full
- * 40-character sha; a local checkout resolves the same commit to the same 40
- * characters; git's own short form is 7. Truncating everything means a hash
- * published for a commit describes a build of that commit however the value
- * arrived.
- */
+/** Seven characters in the bundle; the declaration carries the whole sha. */
 const SHORT = 7;
 
 /** Resolve a ref name to a sha, refs/ file first, then packed-refs. */
@@ -60,8 +49,6 @@ export function resolveCommit({
   gitDir = resolve(import.meta.dirname, "../../.git"),
 } = {}) {
   const cut = (sha) => (full ? sha : sha.slice(0, SHORT));
-  const passed = process.env.APP_COMMIT?.trim();
-  if (passed) return cut(passed);
   try {
     const head = readFileSync(join(gitDir, "HEAD"), "utf8").trim();
     // Detached HEAD (what a CI checkout and a tag deploy both look like)
@@ -84,8 +71,7 @@ export function resolveCommit({
  * from the start; the app itself was the one part that never said.
  *
  * Read from the clone's own origin, so a fork declares itself with no
- * configuration - the same reason the commit is read from .git rather than
- * passed in.
+ * configuration, the same way the commit is.
  *
  * ANY credentials in the url are dropped. A clone made with a token in the
  * remote ("https://x-access-token:ghp_...@github.com/o/r") would otherwise
@@ -95,8 +81,6 @@ export function resolveCommit({
 export function resolveRepository({
   gitDir = resolve(import.meta.dirname, "../../.git"),
 } = {}) {
-  const passed = process.env.APP_REPOSITORY?.trim();
-  if (passed) return normalizeRemote(passed);
   try {
     const config = readFileSync(join(gitDir, "config"), "utf8");
     // The first url under [remote "origin"], not merely the first url in the
