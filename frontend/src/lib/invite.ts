@@ -1,3 +1,4 @@
+import { apiUrl } from "$lib/runtime-config";
 /**
  * Short invite codes.
  *
@@ -14,11 +15,13 @@
 const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const SHORT_CODE_RE = new RegExp(`^[${ALPHABET}]{6}$`);
 
+// No hardcoded origin here. An unset apiUrl means this instance did not say
+// where its relay is, and pointing at awful.frav.in instead would send a
+// self-hoster's users - and the urls they open - to a stranger's server
+// without either party knowing. Empty resolves same-origin, which 404s: the
+// feature is off, and it is off HERE.
 function apiBase(): string {
-  return (
-    (import.meta.env.VITE_API_URL as string | undefined) ||
-    "https://awful.frav.in"
-  );
+  return apiUrl();
 }
 
 /** Uppercase, fold the look-alikes, drop separators. Not a validator. */

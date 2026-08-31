@@ -129,27 +129,34 @@ do not forward, so a proxied hostname is a TURN server nobody can reach.
    Caddy gets its own certificate, so it needs `80` and `443` open, plus the
    media range (`61000-61499` udp and tcp by default).
 
-3. On the main instance, list every SFU and **rebuild the frontend**:
+3. On the main instance, list every SFU and **restart the frontend**:
 
    ```sh
    VITE_SFU_URLS=wss://awful.example.com/sfu,wss://sfu-us.example.com/sfu
    ```
 
-   `VITE_*` variables are compiled into the bundle, so unlike `TURN_URLS` this
-   takes effect only on a rebuild.
+   ```sh
+   docker compose up -d frontend
+   ```
+
+   This used to be compiled into the bundle and need a rebuild. It is served
+   as `/config.json` now, written from the container's environment at start,
+   so a restart is enough - and the variable has to reach the container as
+   environment, not as a build arg.
 
 ### Changing the list splits rooms until clients reload
 
 This is the one operational trap. Placement is computed from the list the
-client has, and the app is a PWA whose service worker waits for the user to
-accept an update. So after a rebuild, clients on the old bundle place rooms
-using the old list while updated clients use the new one, and two people in
-the same room can land on different SFUs. Chat and presence are unaffected
-(they go through the relay), so it shows up as "video is broken for some
-people", not as a deploy problem.
+client has, and a client reads that list once, at startup. So a session open
+across the change places rooms using the old list while a freshly loaded one
+uses the new list, and two people in the same room can land on different SFUs.
+Chat and presence are unaffected (they go through the relay), so it shows up
+as "video is broken for some people", not as a deploy problem.
 
-Change the list when the instance is quiet, and leave a removed SFU running
-until you are confident every client has reloaded.
+A plain page reload is enough to pick up the new list - it no longer waits on
+a service worker update prompt, because nothing about the list is in the
+bundle. Still, change it when the instance is quiet, and leave a removed SFU
+running until you are confident every client has reloaded.
 
 ### What this does and does not do
 

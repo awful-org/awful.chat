@@ -1,4 +1,5 @@
 import type { Component } from "svelte";
+import { apiUrl } from "$lib/runtime-config";
 
 /**
  * A component the host renders on a plugin's behalf.
@@ -346,6 +347,27 @@ export interface PluginEphemeralPayload {
 
 export interface PluginUpdate {
   data: unknown;
+}
+
+/**
+ * The instance's plugin proxy, for an upstream a browser cannot reach on its
+ * own - no CORS, or it needs a secret the server holds.
+ *
+ * Exported here, as a FUNCTION, because the alternative is what actually
+ * happened: a plugin wrote its own base from `import.meta.env.VITE_API_URL`,
+ * vite replaced that with the literal value, and one line in one plugin put
+ * the instance's own address back into a bundle that the whole
+ * verify-what-an-instance-serves story needs to be identical everywhere. It
+ * was found by fingerprinting a real deploy and diffing it against a local
+ * build of the same commit.
+ *
+ * There is nothing to inline now even if somebody tries: the api origin is
+ * read from /config.json after the app loads, so it has to be asked for at
+ * the moment it is used. Call this per request, do not hoist it into a
+ * module-level const.
+ */
+export function proxyUrl(upstream: string): string {
+  return `${apiUrl()}/plugin-proxy?url=${encodeURIComponent(upstream)}`;
 }
 
 export function definePlugin(def: PluginDefinition): PluginDefinition {

@@ -1,6 +1,7 @@
 import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
+import { loadRuntimeConfig } from "$lib/runtime-config";
 
 // The service worker has exactly ONE registration: useRegisterSW inside
 // ReloadPrompt.svelte. A second registerSW() here used to race it - each
@@ -22,6 +23,12 @@ window.addEventListener("vite:preloadError", (event) => {
   event.preventDefault();
   window.location.reload();
 });
+
+// Configuration BEFORE the app mounts. Several modules read the relay and
+// api urls while they initialise, and a mount that raced this would have
+// them capture the build-time fallback instead of what the instance
+// actually serves. A missing config.json resolves immediately.
+await loadRuntimeConfig();
 
 const app = mount(App, {
   target: document.getElementById("app")!,

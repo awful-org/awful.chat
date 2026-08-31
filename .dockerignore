@@ -1,0 +1,29 @@
+# Applies to the ONE build whose context is the repo root: the frontend.
+# relay/ and sfu/ keep their own contexts, and docker looks for a
+# .dockerignore inside each of those, so this file does not touch them.
+#
+# The frontend's context is the root, and not for the source - it is for
+# .git, which is what lets the build resolve the commit it came from without
+# anybody passing APP_COMMIT by hand (see frontend/scripts/git-commit.mjs).
+# Everything else is trimmed back out here.
+
+# 569 MB, and installed inside the image anyway. There was no .dockerignore
+# at all before this, so every build shipped it to the daemon.
+**/node_modules
+
+# Build output, rebuilt in the image.
+frontend/dist
+frontend/dev-dist
+
+# Secrets have no business in a build context, even unreferenced: the whole
+# context is uploaded to the daemon and any RUN can read it.
+.env
+.env.*
+!.env.example
+
+# Not an input to the frontend image.
+relay/
+sfu/
+deploy/
+docs/
+.github/

@@ -1,3 +1,4 @@
+import { apiUrl } from "$lib/runtime-config";
 export interface KlipyGif {
   id: string;
   title: string;
@@ -48,8 +49,14 @@ interface KlipyResponse {
   };
 }
 
-const API_URL =
-  (import.meta.env.VITE_API_URL || "https://awful.frav.in") + "/klipy";
+// A function, not a const. Evaluated at import time this captured whatever
+// the build inlined, before /config.json had been read.
+// No hardcoded origin here. An unset apiUrl means this instance did not say
+// where its relay is, and pointing at awful.frav.in instead would send a
+// self-hoster's users - and the urls they open - to a stranger's server
+// without either party knowing. Empty resolves same-origin, which 404s: the
+// feature is off, and it is off HERE.
+const API_URL = () => apiUrl() + "/klipy";
 
 function normalizeGif(item: KlipyResponse["data"]["data"][0]): KlipyGif {
   const file = item.file || {};
@@ -92,7 +99,7 @@ export async function searchGifs(
       limit: String(limit),
       page: String(page),
     });
-    const res = await fetch(`${API_URL}/search?${params}`);
+    const res = await fetch(`${API_URL()}/search?${params}`);
     if (!res.ok) return { gifs: [], hasMore: false };
     const data: KlipyResponse = await res.json();
     if (!data.result) return { gifs: [], hasMore: false };
@@ -116,7 +123,7 @@ export async function getTrendingGifs(
       limit: String(limit),
       page: String(page),
     });
-    const res = await fetch(`${API_URL}/trending?${params}`);
+    const res = await fetch(`${API_URL()}/trending?${params}`);
     if (!res.ok) return { gifs: [], hasMore: false };
     const data: KlipyResponse = await res.json();
     if (!data.result) return { gifs: [], hasMore: false };

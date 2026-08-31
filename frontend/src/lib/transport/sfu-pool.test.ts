@@ -69,18 +69,16 @@ describe("sfuForRoom", () => {
 });
 
 describe("sfuPool default parameter exercise", () => {
-  // The sfuPool() function parses environment variables at runtime and is
-  // called by sfuForRoom as the default parameter. These tests verify that
-  // real callers' reliance on environment variable parsing is exercised.
+  // sfuPool() reads the instance configuration and is called by sfuForRoom
+  // as its default parameter. These tests exercise that path, which real
+  // callers rely on.
 
-  it("handles single SFU from VITE_SFU_URL", () => {
-    // Simulate a caller that does not pass the pool parameter, relying on
-    // sfuPool() to read VITE_SFU_URL. Rather than mocking import.meta.env
-    // at module load time (which is complex), we directly test that the
-    // default parameter path resolves correctly.
-    const singlePool = ["wss://single.example.com/sfu"];
+  it("resolves through the configured pool", () => {
+    // A caller that passes no pool, relying on sfuPool(). Rather than
+    // driving runtime config from here, this checks the default parameter
+    // path resolves at all.
     const result = sfuForRoom("test-room");
-    // If VITE_SFU_URL or VITE_SFU_URLS is not set in the test environment,
+    // With no SFU configured in the test environment,
     // sfuForRoom returns null and falls back to origin. That is expected
     // behavior when no pool is configured; just verify it returns null or a
     // string.

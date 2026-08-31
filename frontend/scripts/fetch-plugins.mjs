@@ -52,7 +52,15 @@ function fail(msg) {
 
 function readFetchedList() {
   try {
-    return JSON.parse(readFileSync(FETCHED_MANIFEST, "utf8"));
+    const parsed = JSON.parse(readFileSync(FETCHED_MANIFEST, "utf8"));
+    if (!Array.isArray(parsed)) return [];
+    // Both shapes. This file used to be a bare list of ids and is now a list
+    // of provenance records, and it is read to decide what to WIPE - so a
+    // reader that only understood the new shape would quietly wipe nothing
+    // on the first build after an upgrade and leave stale plugins installed.
+    return parsed
+      .map((e) => (typeof e === "string" ? e : e?.id))
+      .filter((id) => typeof id === "string" && id.length > 0);
   } catch {
     return [];
   }
@@ -67,6 +75,59 @@ function pluginIdOf(dir) {
     /id:\s*["']([a-z0-9-]{2,32})["']/
   );
   return m ? m[1] : null;
+}
+
+/**
+ * A plugin that reads build-time env puts the instance's own addresses back
+ * into the bundle.
+ *
+ * vite replaces `import.meta.env.VITE_API_URL` with the literal value at
+ * build time, so one line in one plugin makes every instance's JavaScript
+ * different again - which is exactly what a published build hash exists to
+ * rule out, and it is invisible in review because the leak is a value, not
+ * a name. This is not hypothetical: steam-roulette did it, and it was only
+ * found by fingerprinting a deployed instance and diffing it against a
+ * local build of the same commit.
+ *
+ * `import.meta.env.DEV` and friends are constants of the build mode, not of
+ * the instance, so they are fine.
+ *
+ * Whole-line comments are dropped first, so a plugin can document the
+ * hazard - this file's own fix does - without tripping the check. Only
+ * whole lines: stripping from a `//` anywhere would eat the rest of a line
+ * holding a url, and a leak sharing a line with code would go unseen.
+ */
+const ENV_LEAK_RE = /import\s*\.\s*meta\s*\.\s*env\s*(?:\.\s*VITE_|\[)/;
+
+function checkNoEnvReads(dir, id) {
+  const offenders = [];
+  const walk = (d) => {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      const full = join(d, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (/\.(ts|js|svelte|mjs)$/.test(entry.name)) {
+        const code = readFileSync(full, "utf8")
+          .split("\n")
+          .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+          .join("\n");
+        if (ENV_LEAK_RE.test(code)) {
+          offenders.push(full.slice(dir.length + 1));
+        }
+      }
+    }
+  };
+  walk(dir);
+  if (offenders.length) {
+    fail(
+      `plugin "${id}" reads build-time environment in: ${offenders.join(", ")}\n` +
+        `  vite inlines those values, which puts this instance's own addresses ` +
+        `into the bundle and makes its build unverifiable.\n` +
+        `  Use the host api instead: proxyUrl() from "$lib/plugins/api" for ` +
+        `the plugin proxy, or apiUrl() from "$lib/runtime-config".`
+    );
+  }
 }
 
 /** Plugin dirs inside an extracted source: root, root/*, root/plugins/*. */
@@ -90,7 +151,13 @@ async function materialize(source, tmp) {
   if (source.startsWith("/") || source.startsWith("./")) {
     const abs = resolve(source);
     if (!existsSync(abs)) fail(`local source does not exist: ${source}`);
-    return abs;
+    // The same shape the remote branch returns. This used to be a bare
+    // string, so the caller destructured a string, `root` came out undefined
+    // and every local source died in findPlugins - the dev and testing form
+    // this file documents at the top has been broken since provenance
+    // records went in. A directory has no ref and no tarball to hash: it is
+    // whatever is on disk right now, which is the point of it.
+    return { root: abs, spec: abs, ref: "local", pinned: false, sha256: null };
   }
   let spec = source.replace(/^https:\/\/github\.com\//, "");
   let ref = "HEAD";
@@ -103,7 +170,15 @@ async function materialize(source, tmp) {
   }
   spec = spec.replace(/\.git$/, "").replace(/\/$/, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(spec)) {
-    fail(`unrecognized source (want github url, user/repo, or a path): ${source}`);
+    // "user/repo@sha" is the natural guess - it is how npm and go spell it -
+    // and the bare "unrecognized source" left you rereading this file to
+    // find out why. The ref separator is #, as in a url fragment.
+    const at = spec.includes("@")
+      ? ` Did you mean "${spec.replace("@", "#")}"? The ref separator is #, not @.`
+      : "";
+    fail(
+      `unrecognized source (want github url, user/repo[#ref], or a path): ${source}.${at}`
+    );
   }
   // No #ref means "fetch whatever HEAD is right now" - a different build can
   // ship different code from the exact same PLUGIN_SOURCES value, with no
@@ -139,7 +214,7 @@ async function materialize(source, tmp) {
   mkdirSync(out);
   // --strip-components=1 drops the repo-name-ref top folder codeload adds.
   execFileSync("tar", ["-xzf", tarPath, "-C", out, "--strip-components=1"]);
-  return out;
+  return { root: out, spec, ref, pinned, sha256 };
 }
 
 const sources = (process.env.PLUGIN_SOURCES ?? "")
@@ -169,7 +244,7 @@ const fetched = [];
 for (const source of sources) {
   const tmp = mkdtempSync(join(tmpdir(), "awful-plugin-"));
   try {
-    const root = await materialize(source, tmp);
+    const { root, spec, ref, pinned, sha256 } = await materialize(source, tmp);
     const plugins = findPlugins(root);
     if (plugins.length === 0) {
       fail(`no plugin found in ${source} (need manifest.ts + index.ts)`);
@@ -178,11 +253,18 @@ for (const source of sources) {
       if (inRepo.has(id)) {
         fail(`plugin "${id}" from ${source} collides with a built-in plugin`);
       }
-      if (fetched.includes(id)) {
+      if (fetched.some((f) => f.id === id)) {
         fail(`plugin "${id}" provided by two sources`);
       }
+      checkNoEnvReads(dir, id);
       cpSync(dir, join(PLUGINS_DIR, id), { recursive: true });
-      fetched.push(id);
+      // Provenance, not just the name. This file used to record a bare list
+      // of ids, which cannot answer the question anybody actually asks of a
+      // deployed instance: WHICH code is this plugin. The tarball sha is the
+      // only integrity fact available here - no clone, no API call, so there
+      // is no commit sha to resolve for free - and a ref alone is not enough
+      // because a tag or branch can be moved after the fact.
+      fetched.push({ id, source: spec, ref, pinned, sha256 });
       if (!existsSync(join(dir, "README.md"))) {
         console.warn(
           `[fetch-plugins] WARNING: ${id} ships no README.md - operators cannot know its requirements`

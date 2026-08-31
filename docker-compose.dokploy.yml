@@ -266,19 +266,29 @@ services:
 
   frontend:
     build:
-      context: ./frontend
+      # The repo root, not ./frontend: the build resolves the commit it came
+      # from by reading .git, so nobody has to remember APP_COMMIT. The root
+      # .dockerignore keeps the context from carrying anything else.
+      context: .
+      dockerfile: frontend/Dockerfile
       args:
-        - VITE_API_URL=${VITE_API_URL}
-        - VITE_RELAY_MULTIADDR=${VITE_RELAY_MULTIADDR}
-        # One SFU, or a comma-separated list. Rooms are placed across a list
-        # by hashing the room code, so participants agree without a
-        # coordinator. Empty = this origin's own /sfu.
-        - VITE_SFU_URL=${VITE_SFU_URL:-}
-        - VITE_SFU_URLS=${VITE_SFU_URLS:-}
         # External plugins fetched at build time; see frontend/plugins/README.md
         - PLUGIN_SOURCES=${PLUGIN_SOURCES:-}
         # Unpinned sources fail the build unless this is 1 (ships HEAD).
         - PLUGIN_SOURCES_ALLOW_UNPINNED=${PLUGIN_SOURCES_ALLOW_UNPINNED:-}
+    # Instance configuration, read at START and served as /config.json rather
+    # than compiled into the bundle, so two instances of the same commit and
+    # plugin set serve identical bytes however differently they are
+    # configured - which is what a published build hash can be checked
+    # against. Changing a relay here needs a restart, not a rebuild.
+    environment:
+      - APP_API_URL=${VITE_API_URL}
+      - APP_RELAY_MULTIADDR=${VITE_RELAY_MULTIADDR}
+      # One SFU, or a comma-separated list. Rooms are placed across a list by
+      # hashing the room code, so participants agree without a coordinator.
+      # Empty = this origin's own /sfu.
+      - APP_SFU_URL=${VITE_SFU_URL:-}
+      - APP_SFU_URLS=${VITE_SFU_URLS:-}
     restart: unless-stopped
     # Drops every capability except what the stock nginx image needs: the
     # master starts as root and setuid/setgids its workers to the nginx user

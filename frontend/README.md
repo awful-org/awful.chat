@@ -13,7 +13,11 @@ pnpm build
 ```
 
 Env (`../.env`): `VITE_RELAY_MULTIADDR` (libp2p relay), `VITE_API_URL`
-(og/klipy proxies), `VITE_SFU_URL` (mediasoup signaling).
+(og/klipy proxies), `VITE_SFU_URL` (mediasoup signaling). These are read by
+`pnpm dev` only. A built app reads the same three values from `/config.json`,
+which the container writes from its environment at start, so a production
+bundle carries no instance addresses at all, and two differently configured
+instances of the same commit and plugin set serve identical bytes.
 
 Layout: `src/lib/transport/` (libp2p, DMs, sync, files, calls),
 `src/lib/identity/` (keys, unlock, device sync), `src/lib/storage.ts`

@@ -1,37 +1,28 @@
 import tailwindcss from "@tailwindcss/vite";
-import { execSync } from "node:child_process";
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import path from "path";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
 import { VitePWA } from "vite-plugin-pwa";
 import pkg from "./package.json";
+// @ts-expect-error - plain .mjs, no types, and this file is not type-checked
+import { resolveCommit } from "./scripts/git-commit.mjs";
 
 export default defineConfig(({ mode }) => ({
   // Read VITE_* vars from the repo-root .env so bare `pnpm dev` works
-  // outside docker. Only VITE_-prefixed vars are exposed to the client;
-  // in docker builds the values arrive via ARG/ENV instead.
+  // outside docker. A production build must not inline any of them - see
+  // src/lib/runtime-config.ts - so only the DEV branch there reads them, and
+  // CI greps the built output to keep it that way.
   envDir: "..",
   define: {
     global: "globalThis",
     // The app's version, straight from package.json at build time.
     __APP_VERSION__: JSON.stringify(pkg.version),
     // Best-effort commit hash: pre-1.0 every deploy shares the version, so
-    // the hash is what actually identifies a build. Empty when the build
-    // context has no git (some docker contexts) - the UI just omits it.
-    __APP_COMMIT__: JSON.stringify(
-      (() => {
-        try {
-          return execSync("git rev-parse --short HEAD", {
-            stdio: ["ignore", "pipe", "ignore"],
-          })
-            .toString()
-            .trim();
-        } catch {
-          return "";
-        }
-      })()
-    ),
+    // the hash is what actually identifies a build. Read from .git when
+    // APP_COMMIT is not passed - see scripts/git-commit.mjs. Empty when
+    // neither is available; the UI just omits it.
+    __APP_COMMIT__: JSON.stringify(resolveCommit()),
   },
   plugins: [
     tailwindcss(),
@@ -50,9 +41,15 @@ export default defineConfig(({ mode }) => ({
         globIgnores: [
           "**/node_modules/**/*",
           "assets/langs/**", // ~300 shiki language chunks, ~8 MB
-          "assets/lazy/**", // shiki themes+wasm engine, webtorrent: ~2.6 MB
+          "assets/lazy/**", // shiki themes + the oniguruma wasm engine
           "audio-worklet.js", // DTLN wasm, ~8 MB
           "third-party-notices.txt", // ~500 KB of license texts, on demand
+          // Instance configuration, deliberately NOT part of the build. A
+          // precache entry carries the file's revision hash, so including it
+          // would put each instance's own relay and sfu back into sw.js and
+          // undo exactly what serving it separately buys - and the app would
+          // then read a config frozen at install time.
+          "config.json",
         ],
       },
       includeAssets: ["favicon.ico", "apple-touch-icon-180x180.png"],
@@ -191,11 +188,19 @@ export default defineConfig(({ mode }) => ({
           if (/[\\/](@shikijs[\\/]langs|shiki[\\/]dist[\\/]langs)[\\/]/.test(id))
             return "assets/langs/[name]-[hash].js";
           // Same trick for the other on-demand heavyweights: 70 shiki theme
-          // chunks (only github-dark is ever loaded), the oniguruma wasm
-          // engine, and webtorrent. Together they were 46% of the precache,
+          // chunks (only github-dark is ever loaded) and the oniguruma wasm
+          // engine. Together they were a large share of the precache,
           // re-downloaded on every deploy by sessions that never used them.
+          //
+          // webtorrent is deliberately NOT in this list. It was, and it never
+          // actually took effect - this rule reads chunk.facadeModuleId, and
+          // a vendor chunk split out by dependency has none, so the test ran
+          // against "" and the chunk landed eagerly anyway. Keeping it eager
+          // is the right answer regardless: images and files are the common
+          // path, and paying 687 KB at install beats stalling the first time
+          // somebody sends a picture. The config now says what happens.
           if (
-            /[\\/](@shikijs[\\/]themes|shiki[\\/]dist[\\/]themes)[\\/]|[\\/]@shikijs[\\/]engine-oniguruma[\\/]|[\\/]shiki[\\/]dist[\\/]wasm|[\\/]webtorrent[\\/]/.test(
+            /[\\/](@shikijs[\\/]themes|shiki[\\/]dist[\\/]themes)[\\/]|[\\/]@shikijs[\\/]engine-oniguruma[\\/]|[\\/]shiki[\\/]dist[\\/]wasm/.test(
               id
             )
           )

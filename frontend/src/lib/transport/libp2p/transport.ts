@@ -1,3 +1,4 @@
+import { relayMultiaddr } from "$lib/runtime-config";
 import { createLibp2p, type Libp2p } from "libp2p";
 import { webRTC } from "@libp2p/webrtc";
 import { webSockets } from "@libp2p/websockets";
@@ -463,7 +464,7 @@ export class LibP2PTransport implements PeerTransport {
 
     await this.node.start();
 
-    const relayMa = import.meta.env.VITE_RELAY_MULTIADDR as string;
+    const relayMa = relayMultiaddr();
     this.relayPeerId = relayMa.split("/p2p/").pop() ?? null;
 
     const myId = this.node.peerId.toString();
@@ -1202,7 +1203,7 @@ export class LibP2PTransport implements PeerTransport {
     this.debugStats.relayUpgradeAttempts++;
     try {
       if (shouldBlockWebrtcDial()) throw new Error("webrtc dial blocked");
-      const relayAddr = import.meta.env.VITE_RELAY_MULTIADDR as string;
+      const relayAddr = relayMultiaddr();
       await this.node.dial(
         multiaddr(`${relayAddr}/p2p-circuit/webrtc/p2p/${peerId}`)
       );
@@ -1289,7 +1290,7 @@ export class LibP2PTransport implements PeerTransport {
 
   private async dialRelay(): Promise<void> {
     if (!this.node) return;
-    const relayMa = import.meta.env.VITE_RELAY_MULTIADDR as string;
+    const relayMa = relayMultiaddr();
     let lastErr: unknown = null;
 
     for (let attempt = 0; attempt < RELAY_DIAL_ATTEMPTS; attempt++) {
@@ -1350,7 +1351,7 @@ export class LibP2PTransport implements PeerTransport {
 
   private async requestRelayReservation(): Promise<void> {
     if (!this.node) return;
-    const relayMa = import.meta.env.VITE_RELAY_MULTIADDR as string;
+    const relayMa = relayMultiaddr();
     const circuitListenAddr = multiaddr(`${relayMa}/p2p-circuit`);
     try {
       const { transportManager } = (
@@ -1905,7 +1906,7 @@ export class LibP2PTransport implements PeerTransport {
     this.dialingPeers.add(peerId);
 
     try {
-      const relayAddr = import.meta.env.VITE_RELAY_MULTIADDR as string;
+      const relayAddr = relayMultiaddr();
       const withWebRTC = multiaddr(
         `${relayAddr}/p2p-circuit/webrtc/p2p/${peerId}`
       );

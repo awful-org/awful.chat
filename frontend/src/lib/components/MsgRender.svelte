@@ -6,6 +6,7 @@
 </script>
 
 <script lang="ts">
+  import { apiUrl } from "$lib/runtime-config";
   import { Tip } from "$lib/components/ui/tooltip";
   import {
     ChevronDown,
@@ -669,7 +670,11 @@
     if (!shouldShowOg || !linkedUrl) return;
     const ctrl = new AbortController();
     fetch(
-      `${import.meta.env.VITE_API_URL || "https://awful.frav.in"}/og/preview?url=${encodeURIComponent(linkedUrl)}`,
+      // No hardcoded origin: an unset apiUrl means this instance never said
+      // where its relay is, and defaulting to awful.frav.in would hand every
+      // link its users open to a stranger's server. Empty resolves
+      // same-origin and 404s, so previews are simply off.
+      `${apiUrl()}/og/preview?url=${encodeURIComponent(linkedUrl)}`,
       { signal: ctrl.signal }
     )
       .then((r) => r.json())

@@ -1,0 +1,6 @@
+{
+  "$comment": "Instance configuration, read at startup. Editing this needs no rebuild, and keeping it out of the bundle is what lets one published build hash match every instance running it. A production build inlines NO addresses, so an empty value here means the feature is off, not defaulted: an empty relayMultiaddr is an instance that cannot connect. The frontend container overwrites this file from its environment at start; a static host has to edit it.",
+  "apiUrl": "",
+  "relayMultiaddr": "",
+  "sfuUrls": []
+}

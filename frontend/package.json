@@ -7,7 +7,7 @@
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true",
     "dev": "vite",
-    "build": "node scripts/generate-notices.mjs && vite build",
+    "build": "node scripts/generate-notices.mjs && vite build && node scripts/write-build-info.mjs",
     "generate-pwa-assets": "pwa-assets-generator --preset minimal-2023 public/logo.svg",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",

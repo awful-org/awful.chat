@@ -1,3 +1,4 @@
+import { apiUrl } from "$lib/runtime-config";
 // STUN servers - safe to ship, no credentials.
 //
 // Two, not seven. Gathering does not finish until every entry has answered or
@@ -115,9 +116,11 @@ export async function refreshTurnCredentials(): Promise<void> {
   clearTimeout(refreshTimer);
   refreshTimer = undefined;
   try {
-    const base =
-      (import.meta.env.VITE_API_URL as string | undefined) ||
-      "https://awful.frav.in";
+    // No hardcoded origin: fetching TURN credentials from awful.frav.in
+    // would route a self-hosted instance's relayed media through a server
+    // its operator does not run. Empty resolves same-origin and 404s, which
+    // the content-type check below reports as "no TURN available".
+    const base = apiUrl();
     const res = await fetch(`${base}/turn-credentials`);
     if (!res.ok) {
       _scheduleRetry(); // transient server trouble: keep trying
@@ -130,7 +133,7 @@ export async function refreshTurnCredentials(): Promise<void> {
     // A host that answers an unrouted path with index.html returns 200 too, so
     // res.ok is not enough on its own: the JSON parse below would throw into
     // the silent catch and leave the list STUN-only with nothing logged. That
-    // is what a deploy without VITE_API_URL looks like.
+    // is what a deploy with no apiUrl configured looks like.
     if (!res.headers.get("content-type")?.includes("application/json")) {
       console.warn(
         "[ice] /turn-credentials did not return JSON - no TURN available, relayed peers will not connect"

@@ -16,9 +16,13 @@ import {
 } from "$lib/mailbox-crypto";
 import { parseDmEnvelope } from "./dm-codec";
 import { deliverMailboxDm } from "./transport.svelte";
+import { apiUrl } from "$lib/runtime-config";
 
 const OPTIN_KEY = "awful:mailbox-optin:v1";
-const API = import.meta.env.VITE_API_URL ?? "";
+// A call, not a const: this module is imported while the app is still
+// starting, and a value captured here would freeze whatever the build baked
+// in before /config.json had been read.
+const API = () => apiUrl();
 const COLLECT_EVERY = 5 * 60 * 1000;
 
 export const mailboxPrefs = $state({
@@ -49,7 +53,7 @@ export async function depositDmToMailbox(
   recipientDid: string,
   envelope: Uint8Array
 ): Promise<void> {
-  if (!mailboxPrefs.enabled || !API || !isUnlocked()) return;
+  if (!mailboxPrefs.enabled || !API() || !isUnlocked()) return;
   if (!recipientDid.startsWith("did:key:")) return;
   try {
     const session = requireSession();
@@ -60,7 +64,7 @@ export async function depositDmToMailbox(
       envelope,
     });
     if (!blob) return; // oversized for the mailbox: P2P retry covers it
-    await fetch(`${API}/mailbox/deposit`, {
+    await fetch(`${API()}/mailbox/deposit`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -87,11 +91,11 @@ let _collecting = false;
 
 /** Fetch, verify, deliver and ack everything waiting for us. */
 export async function collectMailbox(): Promise<void> {
-  if (!mailboxPrefs.enabled || !API || !isUnlocked() || _collecting) return;
+  if (!mailboxPrefs.enabled || !API() || !isUnlocked() || _collecting) return;
   _collecting = true;
   try {
     const session = requireSession();
-    const res = await fetch(`${API}/mailbox/collect`, {
+    const res = await fetch(`${API()}/mailbox/collect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(authFields()),
@@ -134,7 +138,7 @@ export async function collectMailbox(): Promise<void> {
       }
     }
     if (done.length > 0) {
-      await fetch(`${API}/mailbox/ack`, {
+      await fetch(`${API()}/mailbox/ack`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...authFields(), ids: done }),

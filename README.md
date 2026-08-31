@@ -156,6 +156,28 @@ The SFU media range (500 ports, published for both UDP and TCP) measured at 2000
 processes and 8.4 GB of RAM, which will OOM a small VPS. With the flag off, the range uses
 iptables DNAT instead, which costs nothing.
 
+`VITE_API_URL`, `VITE_RELAY_MULTIADDR` and the two SFU variables are the
+instance's own addresses. They are NOT compiled into the app: the frontend
+container writes them to `/config.json` when it starts and the app reads that
+before it mounts, so changing one takes a restart rather than a rebuild.
+
+That is also what makes a build checkable. Two instances running the *same
+build* - same commit and the same `PLUGIN_SOURCES`, since plugins compile in -
+now serve byte-identical JavaScript however differently they are configured,
+so a hash published for a commit can be compared against what a running
+instance actually serves (see
+[awful-verify](https://github.com/awful-org/awful-verify)). Two things still
+belong to the build rather than the instance: the commit itself, inlined as
+`__APP_COMMIT__` so the app can say what it is running, and the plugin set.
+
+Nothing has to be passed for the commit. The frontend image builds from the
+repo root so `.git` is reachable, and the build reads the refs directly - no
+git binary, no `APP_COMMIT` to remember. Neither compose nor CI passes it,
+deliberately: a path nobody exercises is how every production image came to
+ship an empty commit in the first place. `APP_COMMIT` remains as an override
+for the one case `.git` cannot cover, building from a downloaded release
+archive.
+
 | Variable | Required | What it is |
 | --- | --- | --- |
 | `DOMAIN` | yes | public domain of the instance |

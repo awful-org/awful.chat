@@ -27,9 +27,46 @@ jobs:
       - run: pnpm test
       # The real build, plugin fetch included, so a broken Dockerfile input
       # fails here and not on the VPS.
+      # No APP_COMMIT. The build resolves the commit out of .git itself
+      # (frontend/scripts/git-commit.mjs), and passing it here would mean CI
+      # never exercised the path every real deploy takes - which is how the
+      # commit came to be empty in every production image in the first place.
       - run: pnpm build
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+
+      # The regression this repo's instance configuration exists to prevent,
+      # checked from both ends because neither end catches both shapes.
+      #
+      # A DYNAMIC read (import.meta.env, the whole object) is replaced by an
+      # object literal carrying every VITE_ variable, so the names show up in
+      # the output. A STATIC read (import.meta.env.VITE_API_URL) is replaced
+      # by the value alone, and the name never appears - grepping dist would
+      # not have seen it. That is not hypothetical: a plugin did exactly
+      # that, and it took fingerprinting a deployed instance and diffing it
+      # against a local build of the same commit to find.
+      #
+      # Fetched plugins are checked at fetch time instead, in
+      # scripts/fetch-plugins.mjs, since PLUGIN_SOURCES is empty here.
+      - name: no build-time env reads outside runtime-config
+        run: |
+          # Whole-line comments are dropped so the code that documents this
+          # hazard does not trip the check that enforces it. Only whole
+          # lines: a leak sharing a line with code still has to be seen.
+          if grep -rn --include='*.ts' --include='*.svelte' \
+              'import\.meta\.env\.VITE_\|import\.meta\.env\[' src plugins \
+              | grep -v 'src/lib/runtime-config.ts' \
+              | grep -vE ':[0-9]+: *(//|\*|/\*)'; then
+            echo "::error::vite inlines these, which puts the instance's own addresses into the bundle. Use runtime-config.ts."
+            exit 1
+          fi
+
+      - name: no instance configuration in the bundle
+        run: |
+          if grep -rl 'VITE_API_URL\|VITE_RELAY_MULTIADDR\|VITE_SFU_URL' dist/; then
+            echo "::error::build-time env leaked into the bundle - see src/lib/runtime-config.ts"
+            exit 1
+          fi
 
   relay:
     runs-on: ubuntu-latest
@@ -58,22 +95,27 @@ jobs:
   # Every image builds from a clean context. Catches a Dockerfile that only
   # worked because of something lying around on the VPS.
   images:
+    # Named explicitly. Without this the check name is built from every
+    # matrix value ("images (relay, relay)"), so adding one key renames it -
+    # and a renamed check that is required in branch protection never
+    # reports, blocking every PR on a job that no longer exists.
+    name: images (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - { name: relay, context: relay }
-          - { name: sfu, context: sfu }
-          - { name: frontend, context: frontend }
+          - { name: relay, context: relay, dockerfile: relay/Dockerfile }
+          - { name: sfu, context: sfu, dockerfile: sfu/Dockerfile }
+          # The repo root, so the build can read .git and resolve its own
+          # commit. See frontend/Dockerfile.
+          - { name: frontend, context: ".", dockerfile: frontend/Dockerfile }
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: false
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,scope=${{ matrix.name }},mode=max
-          build-args: |
-            VITE_API_URL=https://relay.example.com
-            VITE_RELAY_MULTIADDR=/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooWExampleExampleExampleExampleExampleExampleExample

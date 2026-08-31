@@ -13,6 +13,12 @@ export default defineConfig({
   test: {
     environment: "node",
     setupFiles: ["./src/test-setup.ts"],
-    include: ["src/**/*.test.ts", "plugins/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts",
+      "plugins/**/*.test.ts",
+      // The build scripts decide what a deployed instance says it is, and
+      // they only ever ran on a developer's own checkout.
+      "scripts/**/*.test.ts",
+    ],
   },
 });
