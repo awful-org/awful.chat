@@ -190,10 +190,17 @@ async function materialize(source, tmp) {
         `can change between builds with no diff to review.`
     );
     if (process.env.PLUGIN_SOURCES_ALLOW_UNPINNED !== "1") {
+      const committed = committedSources();
       fail(
         `${spec} is unpinned. Pin it to a reproducible ref: ` +
-          `PLUGIN_SOURCES=${spec}#<commit-sha or tag>. To fetch HEAD anyway, ` +
-          `set PLUGIN_SOURCES_ALLOW_UNPINNED=1 (not recommended for production).`
+          `${spec}#<commit-sha>.` +
+          (committed
+            ? `\n  plugins/sources.json already specifies "${committed}" - unset ` +
+              `PLUGIN_SOURCES in this deployment's environment to use it.`
+            : "") +
+          `\n  To fetch HEAD anyway, set PLUGIN_SOURCES_ALLOW_UNPINNED=1 ` +
+          `(fine for testing; such a build cannot be reproduced by anyone once ` +
+          `that branch moves).`
       );
     }
   }
@@ -227,9 +234,7 @@ async function materialize(source, tmp) {
  * that wants to publish a hash describing the instance. The env still wins,
  * so trying a plugin out locally needs no commit.
  */
-function configuredSources() {
-  const env = process.env.PLUGIN_SOURCES;
-  if (env !== undefined && env.trim() !== "") return env;
+function committedSources() {
   try {
     const file = JSON.parse(
       readFileSync(join(PLUGINS_DIR, "sources.json"), "utf8")
@@ -239,6 +244,29 @@ function configuredSources() {
     // Absent or malformed: built-ins only, which is a working app.
     return "";
   }
+}
+
+function configuredSources() {
+  const env = process.env.PLUGIN_SOURCES;
+  if (env !== undefined && env.trim() !== "") {
+    const committed = committedSources();
+    // Say it out loud. An operator who set this months ago in a hosting
+    // panel has no way to see that a committed file now exists and is being
+    // ignored - and the failure that follows an unpinned override reads as
+    // "pin this", with no hint that the repository already did.
+    if (committed && committed !== env.trim()) {
+      console.warn(
+        `[fetch-plugins] NOTE: PLUGIN_SOURCES in the environment is overriding ` +
+          `plugins/sources.json.\n` +
+          `  environment: ${env.trim()}\n` +
+          `  committed:   ${committed}\n` +
+          `  Unset PLUGIN_SOURCES to build what the repository specifies. An ` +
+          `instance built with an override matches no published build hash.`
+      );
+    }
+    return env;
+  }
+  return committedSources();
 }
 
 const sources = configuredSources()
