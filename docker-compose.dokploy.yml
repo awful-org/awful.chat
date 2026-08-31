@@ -53,67 +53,67 @@ services:
       - dokploy-network
     labels:
       - traefik.enable=true
-      - traefik.http.routers.relay-http.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
-      - traefik.http.routers.relay-http.entrypoints=web
-      - traefik.http.routers.relay-http.middlewares=relay-redirect
-      - traefik.http.routers.relay-https.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
-      - traefik.http.routers.relay-https.entrypoints=websecure
-      - traefik.http.routers.relay-https.middlewares=relay-sec
-      - traefik.http.routers.relay-https.tls=true
-      - traefik.http.routers.relay-https.tls.certresolver=letsencrypt
-      - traefik.http.services.relay-service.loadbalancer.server.port=8080
-      - traefik.http.routers.relay-https.service=relay-service
-      - traefik.http.routers.relay-http.service=relay-service
-      - traefik.http.middlewares.relay-redirect.redirectscheme.scheme=https
+      - traefik.http.routers.${STACK:-awful}-relay-http.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
+      - traefik.http.routers.${STACK:-awful}-relay-http.entrypoints=web
+      - traefik.http.routers.${STACK:-awful}-relay-http.middlewares=${STACK:-awful}-relay-redirect
+      - traefik.http.routers.${STACK:-awful}-relay-https.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
+      - traefik.http.routers.${STACK:-awful}-relay-https.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-relay-https.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-relay-https.tls=true
+      - traefik.http.routers.${STACK:-awful}-relay-https.tls.certresolver=letsencrypt
+      - traefik.http.services.${STACK:-awful}-relay-service.loadbalancer.server.port=8080
+      - traefik.http.routers.${STACK:-awful}-relay-https.service=${STACK:-awful}-relay-service
+      - traefik.http.routers.${STACK:-awful}-relay-http.service=${STACK:-awful}-relay-service
+      - traefik.http.middlewares.${STACK:-awful}-relay-redirect.redirectscheme.scheme=https
       # The redirectscheme above upgrades one request; HSTS is what makes the
       # browser remember to. It has to hang off the https routers - a browser
       # ignores Strict-Transport-Security on a plain-http response - and off
       # every one of them, because a client that only ever calls /klipy would
       # otherwise never be told. stsPreload just sets the header flag;
       # submitting the domain to the preload list is a separate manual step.
-      - traefik.http.middlewares.relay-sec.headers.stsSeconds=63072000
-      - traefik.http.middlewares.relay-sec.headers.stsIncludeSubdomains=true
-      - traefik.http.middlewares.relay-sec.headers.stsPreload=true
-      - traefik.http.middlewares.relay-sec.headers.contentTypeNosniff=true
-      - traefik.http.middlewares.relay-sec.headers.referrerPolicy=strict-origin-when-cross-origin
-      - traefik.http.middlewares.relay-sec.headers.frameDeny=true
-      - traefik.http.routers.og.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/og`)
-      - traefik.http.routers.og.entrypoints=websecure
-      - traefik.http.routers.og.middlewares=relay-sec
-      - traefik.http.routers.og.tls=true
-      - traefik.http.routers.og.tls.certresolver=letsencrypt
-      - traefik.http.routers.og.service=relay-api-service
-      - traefik.http.services.relay-api-service.loadbalancer.server.port=8081
-      - traefik.http.routers.klipy.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/klipy`)
-      - traefik.http.routers.klipy.entrypoints=websecure
-      - traefik.http.routers.klipy.middlewares=relay-sec
-      - traefik.http.routers.klipy.tls=true
-      - traefik.http.routers.klipy.tls.certresolver=letsencrypt
-      - traefik.http.routers.klipy.service=relay-api-service
-      - traefik.http.routers.turn.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/turn-credentials`)
-      - traefik.http.routers.turn.entrypoints=websecure
-      - traefik.http.routers.turn.middlewares=relay-sec
-      - traefik.http.routers.turn.tls=true
-      - traefik.http.routers.turn.tls.certresolver=letsencrypt
-      - traefik.http.routers.turn.service=relay-api-service
-      - traefik.http.routers.steam.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/plugin-proxy`)
-      - traefik.http.routers.steam.entrypoints=websecure
-      - traefik.http.routers.steam.middlewares=relay-sec
-      - traefik.http.routers.steam.tls=true
-      - traefik.http.routers.steam.tls.certresolver=letsencrypt
-      - traefik.http.routers.steam.service=relay-api-service
-      - traefik.http.routers.invite.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/invite`)
-      - traefik.http.routers.invite.entrypoints=websecure
-      - traefik.http.routers.invite.middlewares=relay-sec
-      - traefik.http.routers.invite.tls=true
-      - traefik.http.routers.invite.tls.certresolver=letsencrypt
-      - traefik.http.routers.invite.service=relay-api-service
-      - traefik.http.routers.mailbox.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/mailbox`)
-      - traefik.http.routers.mailbox.entrypoints=websecure
-      - traefik.http.routers.mailbox.middlewares=relay-sec
-      - traefik.http.routers.mailbox.tls=true
-      - traefik.http.routers.mailbox.tls.certresolver=letsencrypt
-      - traefik.http.routers.mailbox.service=relay-api-service
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.stsSeconds=63072000
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.stsPreload=true
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.frameDeny=true
+      - traefik.http.routers.${STACK:-awful}-og.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/og`)
+      - traefik.http.routers.${STACK:-awful}-og.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-og.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-og.tls=true
+      - traefik.http.routers.${STACK:-awful}-og.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-og.service=${STACK:-awful}-relay-api-service
+      - traefik.http.services.${STACK:-awful}-relay-api-service.loadbalancer.server.port=8081
+      - traefik.http.routers.${STACK:-awful}-klipy.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/klipy`)
+      - traefik.http.routers.${STACK:-awful}-klipy.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-klipy.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-klipy.tls=true
+      - traefik.http.routers.${STACK:-awful}-klipy.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-klipy.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-turn.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/turn-credentials`)
+      - traefik.http.routers.${STACK:-awful}-turn.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-turn.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-turn.tls=true
+      - traefik.http.routers.${STACK:-awful}-turn.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-turn.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-steam.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/plugin-proxy`)
+      - traefik.http.routers.${STACK:-awful}-steam.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-steam.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-steam.tls=true
+      - traefik.http.routers.${STACK:-awful}-steam.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-steam.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-invite.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/invite`)
+      - traefik.http.routers.${STACK:-awful}-invite.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-invite.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-invite.tls=true
+      - traefik.http.routers.${STACK:-awful}-invite.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-invite.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-mailbox.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/mailbox`)
+      - traefik.http.routers.${STACK:-awful}-mailbox.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-mailbox.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-mailbox.tls=true
+      - traefik.http.routers.${STACK:-awful}-mailbox.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-mailbox.service=${STACK:-awful}-relay-api-service
 
   sfu:
     build:
@@ -243,6 +243,7 @@ services:
       --fingerprint
       --no-multicast-peers
       --no-tcp-relay
+      --listening-port=${TURN_PORT:-3478}
       --alt-listening-port=5349
       --denied-peer-ip=${ANNOUNCED_IP}
       --denied-peer-ip=100.64.0.0-100.127.255.255
@@ -308,28 +309,28 @@ services:
       - dokploy-network
     labels:
       - traefik.enable=true
-      - traefik.http.routers.awful2-http.rule=Host(`${DOMAIN}`)
-      - traefik.http.routers.awful2-http.entrypoints=web
-      - traefik.http.routers.awful2-http.middlewares=awful2-redirect
-      - traefik.http.middlewares.awful2-redirect.redirectscheme.scheme=https
+      - traefik.http.routers.${STACK:-awful}-awful2-http.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.${STACK:-awful}-awful2-http.entrypoints=web
+      - traefik.http.routers.${STACK:-awful}-awful2-http.middlewares=${STACK:-awful}-awful2-redirect
+      - traefik.http.middlewares.${STACK:-awful}-awful2-redirect.redirectscheme.scheme=https
       # Same reasoning as relay-sec above: the 301 upgrades one request, this
       # is what stops the next one starting in plain text. Content-Security-
       # Policy is not here - it lives in frontend/nginx.conf, next to the app
       # whose sources it describes.
-      - traefik.http.middlewares.awful2-sec.headers.stsSeconds=63072000
-      - traefik.http.middlewares.awful2-sec.headers.stsIncludeSubdomains=true
-      - traefik.http.middlewares.awful2-sec.headers.stsPreload=true
-      - traefik.http.middlewares.awful2-sec.headers.contentTypeNosniff=true
-      - traefik.http.middlewares.awful2-sec.headers.referrerPolicy=strict-origin-when-cross-origin
-      - traefik.http.middlewares.awful2-sec.headers.frameDeny=true
-      - traefik.http.routers.awful2-https.rule=Host(`${DOMAIN}`)
-      - traefik.http.routers.awful2-https.entrypoints=websecure
-      - traefik.http.routers.awful2-https.middlewares=awful2-sec
-      - traefik.http.routers.awful2-https.tls=true
-      - traefik.http.routers.awful2-https.tls.certresolver=letsencrypt
-      - traefik.http.services.awful2-service.loadbalancer.server.port=80
-      - traefik.http.routers.awful2-https.service=awful2-service
-      - traefik.http.routers.awful2-http.service=awful2-service
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.stsSeconds=63072000
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.stsPreload=true
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.frameDeny=true
+      - traefik.http.routers.${STACK:-awful}-awful2-https.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.${STACK:-awful}-awful2-https.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-awful2-https.middlewares=${STACK:-awful}-awful2-sec
+      - traefik.http.routers.${STACK:-awful}-awful2-https.tls=true
+      - traefik.http.routers.${STACK:-awful}-awful2-https.tls.certresolver=letsencrypt
+      - traefik.http.services.${STACK:-awful}-awful2-service.loadbalancer.server.port=80
+      - traefik.http.routers.${STACK:-awful}-awful2-https.service=${STACK:-awful}-awful2-service
+      - traefik.http.routers.${STACK:-awful}-awful2-http.service=${STACK:-awful}-awful2-service
 
 volumes:
   relay_data:

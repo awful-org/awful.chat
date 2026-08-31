@@ -160,6 +160,7 @@ iptables DNAT instead, which costs nothing.
 | --- | --- | --- |
 | `DOMAIN` | yes | public domain of the instance |
 | `RELAY_DOMAIN` | no | hostname the relay is served on; defaults to `relay.<DOMAIN>`. Set it when the relay lives under another name (a `dev-relay.example.com`), and point `VITE_API_URL` and `VITE_RELAY_MULTIADDR` at the same name |
+| `STACK` | no (yes if two stacks share one server) | unique prefix for this deployment's traefik router/service/middleware names, default `awful`. Traefik names are GLOBAL across every compose project behind one dokploy - a second stack reusing them takes the first one down. A second stack on the same box must also move its ports: `SFU_RTC_MIN_PORT`/`SFU_RTC_MAX_PORT`, `TURN_PORT` + `TURN_MIN_PORT`/`TURN_MAX_PORT` (coturn is host-network; set `TURN_URLS` to match the moved `TURN_PORT`) |
 | `ANNOUNCED_IP` | yes | the server's public IP (SFU and coturn announce it) |
 | `VITE_API_URL` | yes | relay API origin, e.g. `https://relay.<domain>` |
 | `VITE_RELAY_MULTIADDR` | yes | the relay's libp2p multiaddr shown on boot |
