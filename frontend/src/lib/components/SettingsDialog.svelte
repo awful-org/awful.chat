@@ -13,6 +13,27 @@
     DrawerTitle,
   } from "$lib/components/ui/drawer";
   import { viewportHeight } from "$lib/actions/viewport-height";
+
+  // Filled in with the host the page is actually served from, so the command
+  // is runnable as printed rather than a template to edit.
+  const verifyCommand = $derived(
+    `npx github:awful-org/awful-verify ${
+      typeof window === "undefined" ? "your-instance" : window.location.host
+    }`
+  );
+  let verifyCopied = $state(false);
+  let verifyCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+  async function copyVerifyCommand() {
+    try {
+      await navigator.clipboard.writeText(verifyCommand);
+      verifyCopied = true;
+      clearTimeout(verifyCopiedTimer);
+      verifyCopiedTimer = setTimeout(() => (verifyCopied = false), 1600);
+    } catch {
+      // Clipboard denied, or no permission. The command is on screen and
+      // selectable either way.
+    }
+  }
   import { Button } from "$lib/components/ui/button";
   import { lock } from "$lib/identity/identity.svelte";
   import {
@@ -26,6 +47,8 @@
     Heart,
     Puzzle,
     Github,
+    Check,
+    Copy,
   } from "@lucide/svelte";
 
   import ProfileSettings from "./settings/ProfileSettings.svelte";
@@ -177,6 +200,39 @@
         class="shrink-0 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:border-primary/60 hover:text-foreground"
       >
         v{__APP_VERSION__}{__APP_COMMIT__ ? `-${__APP_COMMIT__}` : ""}
+      </a>
+    </div>
+    <!-- The badge above is a CLAIM: this page saying which commit it was
+         built from. Nothing about it is evidence, so the way to check it
+         belongs directly underneath, with the host already filled in. -->
+    <div
+      class="flex flex-col gap-2 rounded-lg border border-border/50 bg-muted/30 p-3"
+    >
+      <p class="font-mono text-xs leading-relaxed text-muted-foreground">
+        That version is what this page says it is running. A server can serve
+        anything, so check it:
+      </p>
+      <button
+        type="button"
+        onclick={copyVerifyCommand}
+        class="flex items-center justify-between gap-2 rounded-md border border-border
+          bg-background/60 px-2 py-1.5 text-left font-mono text-[11px]
+          text-foreground transition-colors hover:border-primary/60"
+      >
+        <span class="truncate">{verifyCommand}</span>
+        {#if verifyCopied}
+          <Check class="size-3.5 shrink-0 text-primary" />
+        {:else}
+          <Copy class="size-3.5 shrink-0 text-muted-foreground" />
+        {/if}
+      </button>
+      <a
+        href="https://github.com/awful-org/awful-verify"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="font-mono text-[11px] text-muted-foreground hover:text-primary hover:underline"
+      >
+        what this checks, and what it cannot
       </a>
     </div>
     <p class="text-xs font-mono text-muted-foreground leading-relaxed">
