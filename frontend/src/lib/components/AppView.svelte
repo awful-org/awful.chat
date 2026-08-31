@@ -46,6 +46,7 @@
   import InstallPrompt from "./InstallPrompt.svelte";
   import CommandPalette from "./palette/CommandPalette.svelte";
   import SearchOverlay from "./SearchOverlay.svelte";
+  import PluginConfirmModal from "./PluginConfirmModal.svelte";
   import { openSearch } from "$lib/search/ui.svelte";
   import type { PaletteHost } from "$lib/palette/host";
   import { Dialog } from "bits-ui";
@@ -1680,5 +1681,6 @@
   {#if identityStore.isUnlocked}
     <CommandPalette bind:open={paletteOpen} host={paletteHost} />
     <SearchOverlay openRoom={(code) => handleSelectRoom(code)} />
+    <PluginConfirmModal />
   {/if}
 </QueryClientProvider>

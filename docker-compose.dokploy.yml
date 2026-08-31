@@ -25,6 +25,10 @@ services:
       - HTTP_PORT=8080
       - KLIPY_API_KEY=${KLIPY_API_KEY}
       - NODE_ENV=production
+      # DOMAIN is the FRONTEND origin (CORS gate). The relay's own hostname
+      # is RELAY_DOMAIN below and defaults to relay.${DOMAIN} - set it when
+      # the relay lives under another name (a dev-relay.example.com), and
+      # keep VITE_API_URL / VITE_RELAY_MULTIADDR pointing at the same name.
       - DOMAIN=${DOMAIN}
       # Shared with coturn below, which now REQUIRES it (--use-auth-secret).
       # The relay mints a short-lived HMAC credential per client; there are no
@@ -49,10 +53,10 @@ services:
       - dokploy-network
     labels:
       - traefik.enable=true
-      - traefik.http.routers.relay-http.rule=Host(`relay.${DOMAIN}`)
+      - traefik.http.routers.relay-http.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
       - traefik.http.routers.relay-http.entrypoints=web
       - traefik.http.routers.relay-http.middlewares=relay-redirect
-      - traefik.http.routers.relay-https.rule=Host(`relay.${DOMAIN}`)
+      - traefik.http.routers.relay-https.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
       - traefik.http.routers.relay-https.entrypoints=websecure
       - traefik.http.routers.relay-https.middlewares=relay-sec
       - traefik.http.routers.relay-https.tls=true
@@ -73,38 +77,38 @@ services:
       - traefik.http.middlewares.relay-sec.headers.contentTypeNosniff=true
       - traefik.http.middlewares.relay-sec.headers.referrerPolicy=strict-origin-when-cross-origin
       - traefik.http.middlewares.relay-sec.headers.frameDeny=true
-      - traefik.http.routers.og.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/og`)
+      - traefik.http.routers.og.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/og`)
       - traefik.http.routers.og.entrypoints=websecure
       - traefik.http.routers.og.middlewares=relay-sec
       - traefik.http.routers.og.tls=true
       - traefik.http.routers.og.tls.certresolver=letsencrypt
       - traefik.http.routers.og.service=relay-api-service
       - traefik.http.services.relay-api-service.loadbalancer.server.port=8081
-      - traefik.http.routers.klipy.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/klipy`)
+      - traefik.http.routers.klipy.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/klipy`)
       - traefik.http.routers.klipy.entrypoints=websecure
       - traefik.http.routers.klipy.middlewares=relay-sec
       - traefik.http.routers.klipy.tls=true
       - traefik.http.routers.klipy.tls.certresolver=letsencrypt
       - traefik.http.routers.klipy.service=relay-api-service
-      - traefik.http.routers.turn.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/turn-credentials`)
+      - traefik.http.routers.turn.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/turn-credentials`)
       - traefik.http.routers.turn.entrypoints=websecure
       - traefik.http.routers.turn.middlewares=relay-sec
       - traefik.http.routers.turn.tls=true
       - traefik.http.routers.turn.tls.certresolver=letsencrypt
       - traefik.http.routers.turn.service=relay-api-service
-      - traefik.http.routers.steam.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/plugin-proxy`)
+      - traefik.http.routers.steam.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/plugin-proxy`)
       - traefik.http.routers.steam.entrypoints=websecure
       - traefik.http.routers.steam.middlewares=relay-sec
       - traefik.http.routers.steam.tls=true
       - traefik.http.routers.steam.tls.certresolver=letsencrypt
       - traefik.http.routers.steam.service=relay-api-service
-      - traefik.http.routers.invite.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/invite`)
+      - traefik.http.routers.invite.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/invite`)
       - traefik.http.routers.invite.entrypoints=websecure
       - traefik.http.routers.invite.middlewares=relay-sec
       - traefik.http.routers.invite.tls=true
       - traefik.http.routers.invite.tls.certresolver=letsencrypt
       - traefik.http.routers.invite.service=relay-api-service
-      - traefik.http.routers.mailbox.rule=Host(`relay.${DOMAIN}`) && PathPrefix(`/mailbox`)
+      - traefik.http.routers.mailbox.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/mailbox`)
       - traefik.http.routers.mailbox.entrypoints=websecure
       - traefik.http.routers.mailbox.middlewares=relay-sec
       - traefik.http.routers.mailbox.tls=true

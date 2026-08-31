@@ -112,9 +112,50 @@ covers it:
 | `setNowPlaying(info \| null)` | OS media surface (lock screen, media keys) |
 | `ping(did, opts?)` / `isRelayed(did)` | One link probe / is this peer relayed |
 | `clockSample(did, opts?)` | One NTP-style clock probe for `estimateClock` |
+| `roomContext(opts?)` | Recent human messages of this room, bounded and sanitized |
+| `resolveRoomImage(infoHash, opts?)` | An image from `roomContext` as a `Blob`, or null |
+| `openMessage(messageId)` | Scroll the chat to a message of this room and flash it |
+| `confirm(opts)` | Host-drawn yes/no dialog for THIS user; resolves the choice |
 | `callAudio` / `callCapture` | Play into the call / tap the call locally |
 | `seededRandom(seed)` | Deterministic PRNG |
 | `storage.get(k)` / `storage.set(k, v)` | Device-local key-value store |
+
+**Room context (bots)**: `host.roomContext({ limit? })` returns the recent
+HUMAN conversation of the host's room, ascending: text, replies, file
+captions, and image METADATA (`{ infoHash, filename, mimeType, width?,
+height? }`). Plugin cards and updates, system rows, and other rooms are
+never included, and the host enforces hard caps (200 messages, 2000 chars
+per message, 32 image entries) whatever `limit` says. Feed an image's
+`infoHash` to `host.resolveRoomImage(infoHash, { timeoutMs? })` to get a
+displayable `Blob` through the normal attachment path - stored bytes, a
+live transfer, or a fresh download from whoever seeds it - or null when
+the bytes cannot be produced. `host.openMessage(id)` jumps the chat to a
+cited message ("view evidence"); false if it is not this room's message.
+
+**Asking the user**: `host.confirm({ title, message, acceptLabel?,
+declineLabel? })` shows a yes/no dialog in HOST chrome (your plugin's name
+and icon are drawn by the host, so the user always knows who is asking)
+and resolves the choice; dismissal declines. One dialog shows at a time
+and one request may be PENDING per plugin - asking again resolves false
+immediately. For cross-peer consent (say, a transcriber asking everyone in
+the call for permission to record): send the request as a plugin update,
+have each peer's copy of your plugin relay it to `host.confirm`, and send
+the answer back as another update. Only the ANSWER travels; the dialog
+itself is always local and host-drawn.
+
+**Settings surface**: ship a `settings` component on your definition
+(props: `{ host }` - no card, and the host's `roomCode()` is `""`) and set
+`hasSettings: true` in the manifest; the plugins tab then shows a gear
+that opens it in a modal. Persist through `host.storage`.
+
+**Requiring host features**: a plugin that cannot run without newer host
+APIs declares them in the manifest - `requires: ["room-context",
+"resolve-room-image"]` - and a host build that lacks any of them refuses
+to load the plugin with a clear "needs a newer awful.chat" line instead of
+mounting code that crashes. Current feature names: `room-context`,
+`resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
+`call-audio`, `call-capture`, `clock-sample`, `local-card`, `now-playing`.
+Declare only what you truly cannot function without.
 
 **Per-plugin storage**: `host.storage` is a device-local key-value store,
 namespaced per PLUGIN (not per room - prefix your keys with

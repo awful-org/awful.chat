@@ -35,7 +35,35 @@ export interface PluginManifest {
    * plugin code. Names must match the keys of the definition's `commands`.
    */
   commands?: Array<{ name: string; usage: string }>;
+  /** This plugin ships a `settings` component; draws the gear in the
+   *  plugins tab without loading plugin code. */
+  hasSettings?: boolean;
+  /**
+   * Host features this plugin cannot run without, from HOST_FEATURES. A
+   * host that does not know one of them refuses to LOAD the plugin and
+   * says so, instead of mounting code that crashes on a missing API - the
+   * graceful path for a plugin newer than the app running it.
+   */
+  requires?: string[];
 }
+
+/**
+ * Every capability this host build can satisfy in a manifest's `requires`.
+ * Grows a name per new host API; old builds simply not containing a name
+ * is exactly what makes the gate work.
+ */
+export const HOST_FEATURES: ReadonlySet<string> = new Set([
+  "room-context",
+  "resolve-room-image",
+  "open-message",
+  "call-audio",
+  "call-capture",
+  "clock-sample",
+  "local-card",
+  "now-playing",
+  "confirm",
+  "plugin-settings",
+]);
 
 export interface UpdateCtx {
   senderDid: string; // host-verified, never from payload
@@ -115,6 +143,48 @@ export interface HostApi {
   ): Promise<{ t0: number; t1: number; t2: number; t3: number } | null>;
   /** Is this peer reached through a relay rather than directly? */
   isRelayed(did: string): boolean;
+  /**
+   * Recent HUMAN conversation of this host's room, bounded and sanitized:
+   * text, replies, file captions, image METADATA. Never plugin cards or
+   * updates, never system rows, never another room, and never more than the
+   * host's caps (see $lib/plugins/room-context) regardless of `limit`.
+   * Ascending order; `limit` counts kept messages, newest-first.
+   */
+  roomContext(options?: {
+    limit?: number;
+  }): Promise<import("./room-context").RoomContextMessage[]>;
+  /**
+   * Resolve an image reference from roomContext() into a displayable Blob,
+   * through the host's normal attachment path (stored bytes, a live
+   * transfer, or a fresh download from whoever seeds it). Null when the
+   * bytes cannot be produced - not stored, nobody seeding, not an image,
+   * or the hash does not belong to this room.
+   */
+  resolveRoomImage(
+    infoHash: string,
+    options?: { timeoutMs?: number }
+  ): Promise<Blob | null>;
+  /**
+   * Scroll the conversation to a message of this room and flash it - the
+   * "view evidence" affordance. Resolves false when the message does not
+   * exist or belongs to another room.
+   */
+  openMessage(messageId: string): Promise<boolean>;
+  /**
+   * Ask THIS user a yes/no question in host-drawn chrome (plugin name and
+   * icon shown by the host, content by the caller). Resolves the choice;
+   * declines on dismissal. The host queues one dialog at a time and allows
+   * one PENDING request per plugin - a second while one waits resolves
+   * false immediately, so a plugin cannot stack popups. Built for consent
+   * flows: a peer's plugin asks over plugin updates, the local plugin
+   * relays the question here, and only the answer travels back.
+   */
+  confirm(options: {
+    title: string;
+    message: string;
+    acceptLabel?: string;
+    declineLabel?: string;
+  }): Promise<boolean>;
   /** Show one session-only plugin surface in this room's conversation.
    *  It is never a Message: no signing, storage, sync, unread or notification. */
   showLocalCard(data?: unknown): string;
@@ -168,6 +238,13 @@ export interface PluginDefinition {
   /** Private, session-only surface opened by HostApi.showLocalCard.
    * Props: { localCard, host, close }. It is not backed by a chat message. */
   localCard?: PluginComponent;
+  /**
+   * Settings UI, opened from the gear on this plugin's row in the plugins
+   * tab. Props: { host } - no card, no room (the host's roomCode is "").
+   * Announce it via manifest.hasSettings so the gear renders without
+   * loading plugin code.
+   */
+  settings?: PluginComponent;
   /**
    * Compact view for a pinned sidebar widget box. Pins name the PLUGIN, not
    * a card: the box resolves the current subject live - the newest card

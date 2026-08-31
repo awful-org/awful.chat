@@ -159,6 +159,7 @@ iptables DNAT instead, which costs nothing.
 | Variable | Required | What it is |
 | --- | --- | --- |
 | `DOMAIN` | yes | public domain of the instance |
+| `RELAY_DOMAIN` | no | hostname the relay is served on; defaults to `relay.<DOMAIN>`. Set it when the relay lives under another name (a `dev-relay.example.com`), and point `VITE_API_URL` and `VITE_RELAY_MULTIADDR` at the same name |
 | `ANNOUNCED_IP` | yes | the server's public IP (SFU and coturn announce it) |
 | `VITE_API_URL` | yes | relay API origin, e.g. `https://relay.<domain>` |
 | `VITE_RELAY_MULTIADDR` | yes | the relay's libp2p multiaddr shown on boot |

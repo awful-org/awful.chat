@@ -64,7 +64,11 @@
   } from "$lib/text-preview";
   import { makeHostApi } from "$lib/plugins/host";
   import { peerIdToDid, transportState, resolveMentionDisplayName } from "$lib/transport/transport.svelte";
-  import { getPlugin, getManifest } from "$lib/plugins/registry";
+  import {
+    getPlugin,
+    getManifest,
+    unsupportedRequirements,
+  } from "$lib/plugins/registry";
   import { getCardState, onCardStateChange } from "$lib/plugins/state.svelte";
   import {
     isPluginEnabled,
@@ -509,6 +513,13 @@
           return;
         }
         pluginCardDisabled = false;
+        // Before loading any code: a plugin requiring host features this
+        // build lacks gets a clear "update the app" line, not a crash.
+        const missing = unsupportedRequirements(getManifest(pluginId));
+        if (missing.length) {
+          pluginCardError = `${getManifest(pluginId)?.name ?? pluginId} needs a newer awful.chat (missing: ${missing.join(", ")})`;
+          return;
+        }
         const plugin = await getPlugin(pluginId);
         if (!plugin) {
           pluginCardError = `Plugin ${pluginId} not found`;

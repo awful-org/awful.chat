@@ -18,7 +18,18 @@ import {
   sendUpdateImmediately,
   transportState,
 } from "$lib/transport/transport.svelte";
-import { getPluginCardMessages } from "$lib/storage";
+import {
+  getAttachmentsByInfoHash,
+  getMessage,
+  getMessages,
+  getPluginCardMessages,
+} from "$lib/storage";
+import {
+  ROOM_CONTEXT_MAX_MESSAGES,
+  buildRoomContext,
+} from "./room-context";
+import { requestJumpToMessage } from "$lib/ui-state.svelte";
+import type { Message } from "$lib/types/message";
 import { setNowPlayingFor } from "./media-session";
 import { getCardState, onCardStateChange as onPluginCardStateChange } from "./state.svelte";
 import { MessageType } from "$lib/types/message";
@@ -71,6 +82,91 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       return sendUpdate(pluginId, cardId, payload, opts, roomCode);
     },
     roomCode: () => roomCode,
+    async roomContext(options) {
+      // Paged like the chat's own history read, newest-first, until the cap
+      // or the room's start. Filtering and bounding live in room-context.ts.
+      const wanted = Math.min(
+        ROOM_CONTEXT_MAX_MESSAGES,
+        Math.max(1, options?.limit ?? 50)
+      );
+      const collected: Message[] = [];
+      let before: number | undefined = undefined;
+      for (;;) {
+        const page = { capped: false };
+        const msgs: Message[] = await getMessages(roomCode, before, page);
+        if (!msgs.length) break;
+        collected.unshift(...msgs);
+        // Overshoot a little: the filter drops rows, so a page of raw
+        // messages does not guarantee a page of context.
+        if (collected.length >= wanted * 2 || !page.capped) break;
+        before = msgs[0].lamport;
+      }
+      return buildRoomContext(collected, { limit: wanted });
+    },
+    async resolveRoomImage(infoHash, options) {
+      if (typeof infoHash !== "string" || !infoHash) return null;
+      // The reference must be an IMAGE attachment of THIS room - a plugin
+      // must not use this to pull arbitrary hashes from other rooms.
+      const rows = await getAttachmentsByInfoHash(infoHash);
+      const row = rows.find(
+        (a) => a.roomCode === roomCode && a.mimeType.startsWith("image/")
+      );
+      if (!row) return null;
+      if (row.data) return new Blob([row.data], { type: row.mimeType });
+
+      const { requestFileDownload } = await import(
+        "$lib/transport/transport.svelte"
+      );
+      const fromTransfer = async (): Promise<Blob | null> => {
+        const url = transportState.fileTransfers.get(infoHash)?.blobURL;
+        if (!url) return null;
+        try {
+          return await (await fetch(url)).blob();
+        } catch {
+          return null;
+        }
+      };
+      const local = await fromTransfer();
+      if (local) return local;
+      requestFileDownload({
+        infoHash,
+        filename: row.filename,
+        mimeType: row.mimeType,
+        size: row.size,
+      });
+      const deadline =
+        Date.now() + Math.min(30_000, Math.max(0, options?.timeoutMs ?? 15_000));
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        const blob = await fromTransfer();
+        if (blob) return blob;
+        if (transportState.fileTransfers.get(infoHash)?.status === "failed")
+          return null;
+      }
+      return null;
+    },
+    async confirm(options) {
+      const { getManifest } = await import("./registry");
+      const manifest = getManifest(pluginId);
+      const { requestPluginConfirm } = await import("./confirm.svelte");
+      return requestPluginConfirm(
+        {
+          id: pluginId,
+          name: manifest?.name ?? pluginId,
+          icon: manifest?.icon ?? "lucide:unplug",
+        },
+        options
+      );
+    },
+    async openMessage(messageId) {
+      if (typeof messageId !== "string" || !messageId) return false;
+      const msg = await getMessage(messageId);
+      // Bound to this host's room: a card must not navigate the user into
+      // some other conversation.
+      if (!msg || msg.roomCode !== roomCode) return false;
+      requestJumpToMessage(roomCode, messageId);
+      return true;
+    },
     selfDid: () => identityStore.did || "",
     peers: () =>
       transportState.peers.map((peerId) => {

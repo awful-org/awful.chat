@@ -3,7 +3,11 @@
  * Manifests loaded eagerly at boot, plugin code loaded lazily on first use.
  */
 
-import type { PluginDefinition, PluginManifest } from "./api";
+import {
+  HOST_FEATURES,
+  type PluginDefinition,
+  type PluginManifest,
+} from "./api";
 import { validatePluginId } from "./validate";
 
 interface ManifestModule {
@@ -94,9 +98,30 @@ export function initializeRegistry(): void {
 }
 
 // Lazy-load plugin definition on first access
+/**
+ * Manifest `requires` entries this host build cannot satisfy. Non-empty
+ * means the plugin must not LOAD: executing code that assumes a missing
+ * host API crashes at some later, confusing moment; refusing up front with
+ * the feature names is the graceful degradation the field exists for.
+ */
+export function unsupportedRequirements(
+  manifest: PluginManifest | null
+): string[] {
+  if (!manifest?.requires) return [];
+  return manifest.requires.filter((feature) => !HOST_FEATURES.has(feature));
+}
+
 async function loadPlugin(pluginId: string): Promise<PluginDefinition | null> {
   const registered = registry.get(pluginId);
   if (!registered) return null;
+
+  const missing = unsupportedRequirements(registered.manifest);
+  if (missing.length) {
+    console.warn(
+      `[plugins] ${pluginId} requires host features this build lacks: ${missing.join(", ")}`
+    );
+    return null;
+  }
 
   if (registered.loaded && registered.definition) {
     return registered.definition;

@@ -1,12 +1,29 @@
 <script lang="ts">
   import PluginIcon from "$lib/plugins/PluginIcon.svelte";
-  import { ExternalLink } from "@lucide/svelte";
+  import { ExternalLink, Settings2, X } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
   import { Switch } from "$lib/components/ui/switch";
-  import { getRegistry } from "$lib/plugins/registry";
+  import { getPlugin, getRegistry } from "$lib/plugins/registry";
   import { pluginPrefs, togglePlugin } from "$lib/plugins/prefs.svelte";
+  import { makeHostApi } from "$lib/plugins/host";
+  import type { PluginComponent } from "$lib/plugins/api";
+  import { Tip } from "$lib/components/ui/tooltip";
 
   const registry = getRegistry();
+
+  // The open settings modal: which plugin, and its loaded component.
+  let settingsFor = $state<string | null>(null);
+  let settingsComponent = $state<PluginComponent | null>(null);
+  async function openPluginSettings(pluginId: string) {
+    const plugin = await getPlugin(pluginId);
+    if (!plugin?.settings) return;
+    settingsComponent = plugin.settings;
+    settingsFor = pluginId;
+  }
+  function closePluginSettings() {
+    settingsFor = null;
+    settingsComponent = null;
+  }
 
   // Grouped by ORIGIN, because that is the trust boundary the intro above
   // describes: plugins without a repository are built into this instance's
@@ -139,10 +156,27 @@
               {/if}
             </div>
           </div>
-          <Switch
-            checked={!pluginPrefs.disabledPluginIds.includes(pluginId)}
-            onCheckedChange={(checked) => togglePlugin(pluginId, checked)}
-          />
+          <div class="flex shrink-0 items-center gap-2">
+            {#if registered.manifest.hasSettings && !pluginPrefs.disabledPluginIds.includes(pluginId)}
+              <Tip text={`${registered.manifest.name} settings`}>
+                {#snippet children(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    onclick={() => void openPluginSettings(pluginId)}
+                    aria-label={`${registered.manifest.name} settings`}
+                    class="cursor-pointer rounded p-1 text-muted-foreground hover:text-foreground"
+                  >
+                    <Settings2 class="size-4" />
+                  </button>
+                {/snippet}
+              </Tip>
+            {/if}
+            <Switch
+              checked={!pluginPrefs.disabledPluginIds.includes(pluginId)}
+              onCheckedChange={(checked) => togglePlugin(pluginId, checked)}
+            />
+          </div>
         </div>
       {/each}
     </div>
@@ -168,3 +202,42 @@
     </a>
   </div>
 </div>
+
+{#if settingsFor && settingsComponent}
+  {@const SettingsUi = settingsComponent}
+  {@const m = registry.get(settingsFor)?.manifest}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4"
+    onclick={closePluginSettings}
+  >
+    <div
+      class="flex max-h-[80vh] w-full max-w-md flex-col overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
+      onclick={(e) => e.stopPropagation()}
+      role="dialog"
+      aria-label={`${m?.name ?? settingsFor} settings`}
+      tabindex="-1"
+    >
+      <div class="flex items-center gap-2 border-b border-border px-4 py-2.5">
+        <PluginIcon icon={m?.icon ?? "lucide:unplug"} class="size-4" />
+        <span class="font-mono text-sm font-semibold">
+          {m?.name ?? settingsFor} settings
+        </span>
+        <button
+          type="button"
+          onclick={closePluginSettings}
+          aria-label="Close settings"
+          class="ml-auto cursor-pointer rounded p-1 text-muted-foreground hover:text-destructive"
+        >
+          <X class="size-3.5" />
+        </button>
+      </div>
+      <div class="min-h-0 flex-1 overflow-y-auto p-4">
+        <!-- App-level settings: no card, no room - the host is bound to "" so
+             sends are impossible and storage is the plugin's own. -->
+        <SettingsUi host={makeHostApi(settingsFor, "")} />
+      </div>
+    </div>
+  </div>
+{/if}
