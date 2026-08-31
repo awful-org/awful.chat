@@ -184,7 +184,25 @@ export interface HostApi {
     message: string;
     acceptLabel?: string;
     declineLabel?: string;
-  }): Promise<boolean>;
+    /**
+     * Give up after this long (clamped 1s..10min) and resolve "timeout".
+     * Without it the promise waits for as long as the user ignores it -
+     * which for a group consent flow means one silent person stalls the
+     * asker forever.
+     */
+    timeoutMs?: number;
+    /** Withdraw the question when it stops applying (the asker left, the
+     *  recording already ended): the dialog closes and it resolves
+     *  "withdrawn". */
+    signal?: AbortSignal;
+    /**
+     * The PEER this question is on behalf of. The host resolves it to a
+     * name against the room's own peers and renders that in ITS chrome -
+     * so "Bob wants to record" is a fact the host vouches for, not a
+     * string the plugin can forge. Unknown DIDs are simply not shown.
+     */
+    fromDid?: string;
+  }): Promise<import("./confirm.svelte").PluginConfirmResult>;
   /** Show one session-only plugin surface in this room's conversation.
    *  It is never a Message: no signing, storage, sync, unread or notification. */
   showLocalCard(data?: unknown): string;

@@ -57,6 +57,10 @@ export const manifest: PluginManifest = {
   repository: "https://github.com/you/your-plugin",
   apiVersion: 1,           // must be 1; the registry skips (and logs) anything else
   commands: [{ name: "wheel", usage: "/wheel Question? option1, option2" }],
+  hasSettings: true,      // optional: draws the gear for your `settings` surface
+  // Optional. Host features you cannot run without: an older app refuses to
+  // LOAD the plugin and says so, instead of mounting code that crashes.
+  requires: ["confirm"],
 };
 ```
 
@@ -133,20 +137,61 @@ the bytes cannot be produced. `host.openMessage(id)` jumps the chat to a
 cited message ("view evidence"); false if it is not this room's message.
 
 **Asking the user**: `host.confirm({ title, message, acceptLabel?,
-declineLabel? })` shows a yes/no dialog in HOST chrome (your plugin's name
-and icon are drawn by the host, so the user always knows who is asking)
-and resolves the choice; dismissal declines. One dialog shows at a time
-and one request may be PENDING per plugin - asking again resolves false
-immediately. For cross-peer consent (say, a transcriber asking everyone in
-the call for permission to record): send the request as a plugin update,
-have each peer's copy of your plugin relay it to `host.confirm`, and send
-the answer back as another update. Only the ANSWER travels; the dialog
-itself is always local and host-drawn.
+declineLabel?, timeoutMs?, signal?, fromDid? })` shows a yes/no dialog in
+HOST chrome and resolves one of four named results:
 
-**Settings surface**: ship a `settings` component on your definition
-(props: `{ host }` - no card, and the host's `roomCode()` is `""`) and set
-`hasSettings: true` in the manifest; the plugins tab then shows a gear
-that opens it in a modal. Persist through `host.storage`.
+| Result | Means |
+| --- | --- |
+| `"accepted"` | they pressed accept |
+| `"declined"` | they pressed decline, or dismissed it |
+| `"timeout"` | `timeoutMs` elapsed with no answer |
+| `"withdrawn"` | your `signal` aborted, or the session tore down |
+
+Never a bare boolean: "they said no" and "they never looked at it" are
+different facts, and a consent flow that cannot tell them apart reports a
+silent peer as a refusal. `timeoutMs` (clamped 1s..10min) is what keeps a
+group flow from waiting on one person forever, and the host renders the
+countdown. Pass a `signal` to withdraw a question that stopped applying -
+the asker hung up, the recording already ended - and the dialog closes
+itself.
+
+Your plugin's name and icon are drawn by the HOST, so a plugin cannot
+impersonate the app or another plugin. `fromDid` extends that to the
+cross-peer case: the host resolves the DID against the room's own peers
+and renders the name itself, showing nothing when it cannot resolve it -
+so "for Bob" is a fact the host vouches for, not a string you supplied.
+
+One dialog shows at a time and one request may be PENDING per plugin;
+asking again **rejects** (a `PluginConfirmBusyError`) rather than
+resolving, precisely so a dropped request can never read as consent
+refused. Catch it, or do not ask twice.
+
+For cross-peer consent (a transcriber asking everyone for permission to
+record): send the request as a plugin update, have each peer's copy of
+your plugin relay it to `host.confirm` with a `timeoutMs` and
+`fromDid: <asker>`, and send the RESULT back as another update, keyed in
+your reducer by the host-verified `ctx.senderDid`. Answers then arrive
+one by one, live, as each person responds, and a silent peer resolves
+`"timeout"` on its own instead of stalling the asker. Only the result
+travels; the dialog itself is always local and host-drawn.
+
+Two rules that flow's correctness depends on:
+
+- **The answering side owns the deadline.** An asker may PROPOSE a window
+  by putting it in the request, but the receiver decides what its own user
+  actually gets - clamp the proposal to a sane floor, or override it
+  outright. A peer proposing a one-second window must not be able to make
+  your user's dialog unanswerable.
+- **An answer is a current state, not a signature.** Consent is revocable:
+  the same person can accept, revoke, and accept again, and each answer
+  legitimately replaces the last (in the fold order described above, so
+  everyone converges on the same latest one). Whatever you gate on the
+  answer - a recording, a transcript - must watch the CURRENT value and
+  stop the moment it flips, never treat a past `"accepted"` as permanent.
+
+**Settings surface**: a consent flow usually wants preferences to go with
+it (an auto-decline, an answering window). Ship a `settings` component and
+set `hasSettings: true` - see Surfaces below for the full contract.
 
 **Requiring host features**: a plugin that cannot run without newer host
 APIs declares them in the manifest - `requires: ["room-context",
@@ -205,9 +250,11 @@ card props (`{ card, cardState, host }`); `localCard` has its own (below):
   Widgets act on their card's own room even while another room is open.
   Card-backed plugins get the newest card `widgetMine(cardState,
   selfDid)` claims (a PURE predicate: "is this card currently the
-  user's" - a party they are a member of), falling back to the plugin's
-  newest card so an unjoined party is still one click away; with no card
-  anywhere the strip waits under a plain label. A plugin with no `card`
+  user's" - a party they are a member of). When nothing is yours the
+  strip waits under a plain "idle" label and RELEASES whatever it last
+  followed: a pin that kept showing controls for a party the user had
+  left was a remote control for someone else's music. A plugin with no
+  `widgetMine` follows its newest card instead. A plugin with no `card`
   surface at all (a device-local soundboard) mounts its widget with
   `card: null` and `cardState: undefined`. `singletonWidget` is
   deprecated and ignored - one pin per plugin is true by construction.
@@ -228,6 +275,18 @@ card props (`{ card, cardState, host }`); `localCard` has its own (below):
   `chromeVisible` - it mirrors the call's own controls (shown while the
   mouse moves over the call section, hidden on idle in fullscreen); gate
   your control overlays on it so all chrome moves together.
+- `settings` - app-level configuration, opened from a gear on this
+  plugin's row in Settings > Plugins. Announce it with
+  `hasSettings: true` in the MANIFEST so the host can draw the gear
+  without loading your code; the component is imported on the first
+  click. It receives `{ host }` only - no card, no cardState - and the
+  host draws the modal chrome (your name, icon and close button), so
+  render just the body. The host is not bound to a room here:
+  `host.roomCode()` is `""`, which makes the room-scoped calls
+  (`sendCard`, `sendUpdate`, `roomContext`, `resolveRoomImage`,
+  `openMessage`) meaningless - keep this surface to device-local
+  preferences in `host.storage`. The gear only shows while the plugin is
+  enabled, and settings persist per device, never synced.
 
 For playback plugins, `host.setNowPlaying({...})` puts the track on the
 OS media surface (lock screen, media keys, headsets); the host owns
@@ -246,6 +305,19 @@ function of its inputs, and the same state materializes on every client and
 every reload. The context carries `{ senderDid, senderName, updateId,
 lamport, ephemeral }` - the identity fields are host-verified, and
 `ephemeral` tells a reducer this update will never replay.
+
+**That deterministic order is (lamport, senderId, updateId)** - not arrival
+order, and not wall-clock time. It is why "allow, then deny, then allow"
+ends as *allow* on every screen instead of "whichever packet landed last",
+and why a reducer may simply overwrite: the last write in fold order is the
+same one everywhere.
+
+**There is deliberately no timestamp in the context.** If you want to show
+*when* something happened, put your own `atMs: Date.now()` in the update
+payload and bound it in the reducer (`> 1e12 && < 1e13`), the way the watch
+tick below does. The host could hand you the message's `timestamp`, but it
+would not be worth more: that field is sender-supplied too. So order by
+`lamport`, display `atMs`, and treat neither as proof of anything.
 
 The starting state comes from `initialState(cardData)`, which receives the
 payload passed to `sendCard` - seed options and questions from it. A

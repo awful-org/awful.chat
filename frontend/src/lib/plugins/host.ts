@@ -149,13 +149,22 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       const { getManifest } = await import("./registry");
       const manifest = getManifest(pluginId);
       const { requestPluginConfirm } = await import("./confirm.svelte");
+      // fromDid is resolved HERE, against peers the transport actually
+      // knows, and only a resolved name is passed on. A plugin naming an
+      // unknown (or invented) DID gets no attribution line rather than an
+      // unverified one - the whole point of the host drawing it.
+      const { fromDid, ...rest } = options;
+      const fromPeerName =
+        typeof fromDid === "string" && fromDid
+          ? transportState.peerNames.get(fromDid)
+          : undefined;
       return requestPluginConfirm(
         {
           id: pluginId,
           name: manifest?.name ?? pluginId,
           icon: manifest?.icon ?? "lucide:unplug",
         },
-        options
+        { ...rest, ...(fromPeerName ? { fromPeerName } : {}) }
       );
     },
     async openMessage(messageId) {
