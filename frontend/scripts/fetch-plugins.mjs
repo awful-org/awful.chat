@@ -217,7 +217,31 @@ async function materialize(source, tmp) {
   return { root: out, spec, ref, pinned, sha256 };
 }
 
-const sources = (process.env.PLUGIN_SOURCES ?? "")
+/**
+ * What to fetch: the environment if it says anything, otherwise the set
+ * committed alongside this script.
+ *
+ * The committed file is the default because the plugin set decides what code
+ * reaches users, and leaving that in a deploy's environment made it
+ * invisible: not in any commit, not reviewable, and unknowable to a CI job
+ * that wants to publish a hash describing the instance. The env still wins,
+ * so trying a plugin out locally needs no commit.
+ */
+function configuredSources() {
+  const env = process.env.PLUGIN_SOURCES;
+  if (env !== undefined && env.trim() !== "") return env;
+  try {
+    const file = JSON.parse(
+      readFileSync(join(PLUGINS_DIR, "sources.json"), "utf8")
+    );
+    return Array.isArray(file.sources) ? file.sources.join(",") : "";
+  } catch {
+    // Absent or malformed: built-ins only, which is a working app.
+    return "";
+  }
+}
+
+const sources = configuredSources()
   .split(/[\s,]+/)
   .map((s) => s.trim())
   .filter(Boolean);

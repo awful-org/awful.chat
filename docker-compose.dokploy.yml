@@ -272,7 +272,11 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
       args:
-        # External plugins fetched at build time; see frontend/plugins/README.md
+        # Normally EMPTY. The plugin set lives in the repository, at
+        # frontend/plugins/sources.json, so that it is part of the commit and
+        # a published build hash can describe this instance. Setting this in
+        # .env overrides that file and makes the instance match no published
+        # build. See frontend/plugins/README.md.
         - PLUGIN_SOURCES=${PLUGIN_SOURCES:-}
         # Unpinned sources fail the build unless this is 1 (ships HEAD).
         - PLUGIN_SOURCES_ALLOW_UNPINNED=${PLUGIN_SOURCES_ALLOW_UNPINNED:-}

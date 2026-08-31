@@ -12,6 +12,12 @@ blocked=""
 for f in $(git diff --cached --name-only -- frontend/plugins/); do
   entry=${f#frontend/plugins/}
   entry=${entry%%/*}
+  # Files that sit directly in plugins/ are the directory's own, not a
+  # plugin: the guide, and sources.json, which is the committed plugin set
+  # itself. A plugin is always a subdirectory.
+  case "$entry" in
+    *.json | *.md) continue ;;
+  esac
   if ! git ls-tree --name-only HEAD "frontend/plugins/$entry" | grep -q .; then
     blocked="$blocked\n  $f"
   fi

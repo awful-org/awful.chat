@@ -583,6 +583,17 @@ consequences worth knowing before you publish one:
 
 ## Installing plugins from outside this repo
 
+The set this project ships is committed at `plugins/sources.json`, and that
+is what a build uses when nothing overrides it. It lives in the repository on
+purpose: the plugin set decides which code reaches users, so it belongs in a
+commit somebody can review and in a build CI can reproduce, rather than in a
+hosting panel where it is invisible and unknowable to anyone checking the
+instance.
+
+`PLUGIN_SOURCES` in the environment overrides the file. Use it to try
+something out; an instance deployed with an override matches no published
+build hash and can only be checked by rebuilding it.
+
 Set `PLUGIN_SOURCES` on the instance and redeploy - the build fetches each
 source into this folder before bundling (the docker-minecraft-server model,
 at build time because plugins compile into the app):

@@ -1,0 +1,152 @@
+# Publishes a hash of what each commit on main builds to, so that anyone can
+# check an instance without building anything themselves.
+#
+# The digest is taken by running awful-verify against the real frontend image,
+# started and served by its own nginx - not against a directory of files. A
+# published hash is only worth anything if it describes what an instance
+# actually serves, and the only way to be sure of that is to serve it.
+#
+# Records land on the `builds` branch as builds/<commit>.json and are attested
+# with GitHub's build provenance, so the record itself cannot be quietly
+# rewritten later.
+name: publish-build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: publish-build
+  cancel-in-progress: false
+
+jobs:
+  # Everything downstream rests on one commit producing one set of bytes. If a
+  # dependency ever introduces a timestamp or an unordered map, every instance
+  # would start failing verification at once and it would look exactly like
+  # tampering. Cheaper to find here.
+  reproducible:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: frontend } }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with: { version: 10 }
+      - uses: actions/setup-node@v7
+        with: { node-version: 24, cache: pnpm, cache-dependency-path: frontend/pnpm-lock.yaml }
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/fetch-plugins.mjs
+
+      - name: build twice and compare
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          set -euo pipefail
+          hash_dist() {
+            # .well-known/awful-build.json carries a build timestamp on
+            # purpose. It is a declaration, not code, and nothing hashed
+            # depends on it.
+            find dist -type f ! -path 'dist/.well-known/*' -print0 \
+              | sort -z | xargs -0 sha256sum | sed 's| dist/| |'
+          }
+          pnpm build >/dev/null
+          hash_dist > /tmp/a.txt
+          rm -rf dist
+          pnpm build >/dev/null
+          hash_dist > /tmp/b.txt
+          if ! diff -u /tmp/a.txt /tmp/b.txt; then
+            echo "::error::this commit does not build reproducibly - a published hash would describe neither build, and every instance would fail verification"
+            exit 1
+          fi
+          echo "reproducible: $(wc -l < /tmp/a.txt) files identical across two builds"
+
+  publish:
+    needs: reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The image, not a directory: this is the artifact that deploys, and it
+      # brings its own nginx, so the fingerprint is taken over the same
+      # request paths and headers a real visitor gets.
+      - name: build the frontend image
+        run: docker build -f frontend/Dockerfile -t awful-frontend:ci .
+
+      - name: run it
+        run: |
+          docker run -d --name awful-ci -p 8123:80 awful-frontend:ci
+          for _ in $(seq 1 60); do
+            curl -sf http://localhost:8123/sw.js >/dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::the image never started serving"
+          docker logs awful-ci
+          exit 1
+
+      # The verifier itself, so the published digest is computed by exactly
+      # the code that will later check it. A second implementation here would
+      # drift, and the drift would look like a failed verification.
+      - name: fingerprint it
+        run: |
+          npx --yes github:awful-org/awful-verify http://localhost:8123 \
+            --no-rebuild --json > /tmp/fingerprint.json
+          node -e '
+            const fs = require("fs");
+            const fp = JSON.parse(fs.readFileSync("/tmp/fingerprint.json", "utf8"));
+            if (!fp.claim) throw new Error("the image served no build declaration");
+            if (fp.files.some((f) => !f.hash)) throw new Error("some files could not be read");
+            const record = {
+              schema: "awful-build-record/1",
+              repository: fp.claim.repository,
+              commit: fp.claim.commit,
+              // What was built, so a verifier can tell whether this record
+              // describes the configuration an instance is running.
+              plugins: fp.claim.plugins,
+              builtAt: new Date().toISOString(),
+              runId: process.env.GITHUB_RUN_ID,
+              digest: fp.digest,
+              // Per file, not just the total: a mismatch should say WHICH
+              // file, which is the difference between "something is wrong"
+              // and somewhere to look.
+              files: Object.fromEntries(fp.files.map((f) => [f.path, f.hash])),
+            };
+            fs.mkdirSync("/tmp/record", { recursive: true });
+            fs.writeFileSync(`/tmp/record/${record.commit}.json`, JSON.stringify(record, null, 2));
+            console.log(`${record.commit} -> ${record.digest} (${fp.files.length} files)`);
+          '
+
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: /tmp/record/*.json
+
+      - name: publish to the builds branch
+        env:
+          GIT_AUTHOR_NAME: github-actions
+          GIT_AUTHOR_EMAIL: github-actions@github.com
+          GIT_COMMITTER_NAME: github-actions
+          GIT_COMMITTER_EMAIL: github-actions@github.com
+        run: |
+          set -euo pipefail
+          # An orphan branch: these records are not source, they are output,
+          # and mixing them into main's history would put a commit on main
+          # for every commit on main.
+          git fetch origin builds:builds || git branch builds $(git commit-tree -m init $(git hash-object -t tree /dev/null))
+          git worktree add /tmp/builds builds
+          mkdir -p /tmp/builds/builds
+          cp /tmp/record/*.json /tmp/builds/builds/
+          cd /tmp/builds
+          git add builds
+          if git diff --cached --quiet; then
+            echo "already published"
+            exit 0
+          fi
+          git commit -m "build record for ${GITHUB_SHA}"
+          git push origin builds
+
+      - if: always()
+        run: docker rm -f awful-ci || true
