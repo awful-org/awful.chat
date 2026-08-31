@@ -1,17 +1,11 @@
 /**
  * The commit a build came from, without needing git on PATH.
  *
- * This used to shell out to `git rev-parse`, which cannot work inside the
- * docker build: node:alpine ships no git binary, and for a long time the
- * build context did not even contain .git. Every production image therefore
- * declared an empty commit - in exactly the builds somebody would want to
- * identify - and the only fix was for whoever deployed to remember to pass
- * APP_COMMIT by hand.
- *
- * Reading the refs directly costs about twenty lines and works everywhere
- * the repository is present, which now includes the image build: the
- * frontend's build context is the repo root and the Dockerfile copies .git
- * in. Nobody has to remember anything.
+ * `git rev-parse` cannot answer inside the docker build: node:alpine ships
+ * no git binary. Reading the refs directly costs about twenty lines and
+ * works anywhere the repository is present, which includes the image build -
+ * the frontend's build context is the repo root and the Dockerfile copies
+ * .git in. So no deployment has to supply the commit by hand.
  *
  * APP_COMMIT still wins when it is set, because CI knows the sha it checked
  * out and a detached or shallow checkout is not always readable.

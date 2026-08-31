@@ -6,14 +6,17 @@
  * before `vite build`, and a redeploy is what publishes changes.
  *
  * PLUGIN_SOURCES is a comma/whitespace separated list of:
- *   https://github.com/user/repo         default branch (HEAD) - requires opt-in, see below
- *   user/repo@<sha>                      pinned; only a commit sha is
- *   user/repo@v1.2                       a tag or branch: builds, but is
- *                                        recorded as NOT reproducible,
- *                                        because it can be moved
- *   user/repo#v1.2                       the same; # is eaten by .env files,
- *                                        so prefer @ in an environment
- *   /abs/path or ./rel/path              local directory (dev, testing)
+ *
+ *   user/repo@<commit-sha>   pinned. The only form that can be rebuilt later.
+ *   user/repo@v1.2           a tag or branch. Builds, but is recorded as not
+ *                            reproducible, because either can be moved.
+ *   user/repo                the default branch. Needs opt-in, see below.
+ *   https://github.com/user/repo   the same, written out in full.
+ *   /abs/path or ./rel/path  a local directory, for development.
+ *
+ * The ref separator is @ or #, and @ is the one to use in an environment
+ * variable: a .env file treats # as the start of a comment, so owner/repo#sha
+ * arrives here as owner/repo.
  *
  * Each source may contain ONE plugin (manifest.ts at its root) or a PACK
  * (plugin folders at the root or under plugins/). Anything fetched is
@@ -58,10 +61,10 @@ function readFetchedList() {
   try {
     const parsed = JSON.parse(readFileSync(FETCHED_MANIFEST, "utf8"));
     if (!Array.isArray(parsed)) return [];
-    // Both shapes. This file used to be a bare list of ids and is now a list
-    // of provenance records, and it is read to decide what to WIPE - so a
-    // reader that only understood the new shape would quietly wipe nothing
-    // on the first build after an upgrade and leave stale plugins installed.
+    // Both shapes: a bare list of ids, and the list of provenance records
+    // that replaced it. This drives the WIPE, so a reader that understood
+    // only the newer shape would wipe nothing on the first build after an
+    // upgrade and leave stale plugins installed.
     return parsed
       .map((e) => (typeof e === "string" ? e : e?.id))
       .filter((id) => typeof id === "string" && id.length > 0);
@@ -155,12 +158,9 @@ async function materialize(source, tmp) {
   if (source.startsWith("/") || source.startsWith("./")) {
     const abs = resolve(source);
     if (!existsSync(abs)) fail(`local source does not exist: ${source}`);
-    // The same shape the remote branch returns. This used to be a bare
-    // string, so the caller destructured a string, `root` came out undefined
-    // and every local source died in findPlugins - the dev and testing form
-    // this file documents at the top has been broken since provenance
-    // records went in. A directory has no ref and no tarball to hash: it is
-    // whatever is on disk right now, which is the point of it.
+    // The same shape the remote branch returns; the caller destructures it.
+    // A directory has no ref and no tarball to hash - it is whatever is on
+    // disk right now, which is the point of it.
     return { root: abs, spec: abs, ref: "local", pinned: false, sha256: null };
   }
   let spec = source.replace(/^https:\/\/github\.com\//, "");
@@ -188,17 +188,12 @@ async function materialize(source, tmp) {
   // No #ref means "fetch whatever HEAD is right now" - a different build can
   // ship different code from the exact same PLUGIN_SOURCES value, with no
   // integrity check on what came back. Loud by default; opt-in to bypass.
-  // PINNED MEANS A COMMIT SHA, and nothing else.
-  //
-  // This used to mean "a ref was written", so owner/repo@main recorded
-  // pinned:true in the build declaration - telling anyone checking the
-  // instance that the build was reproducible when the ref moves every time
-  // somebody pushes. A tag is the same promise with better manners: it is
-  // fixed by convention and movable in fact. Only a sha names bytes.
-  //
-  // A named ref still builds. It is a deliberate choice, unlike fetching a
-  // default branch, and refusing it would be a bigger change than the
-  // problem warrants - but it is recorded honestly and said out loud.
+  // Pinned means a commit sha, and nothing else. A tag or a branch can be
+  // moved after the fact, so a build that used one cannot be reproduced from
+  // its own declaration later - which is what anyone checking the instance
+  // reads `pinned` to mean. Such a ref still builds: choosing one is
+  // deliberate in a way that fetching a default branch is not. It is
+  // recorded honestly and warned about.
   const pinned = /^[0-9a-f]{7,40}$/i.test(ref);
   if (hasRef && !pinned) {
     console.error(
@@ -295,11 +290,10 @@ for (const source of sources) {
       }
       checkNoEnvReads(dir, id);
       cpSync(dir, join(PLUGINS_DIR, id), { recursive: true });
-      // Provenance, not just the name. This file used to record a bare list
-      // of ids, which cannot answer the question anybody actually asks of a
-      // deployed instance: WHICH code is this plugin. The tarball sha is the
-      // only integrity fact available here - no clone, no API call, so there
-      // is no commit sha to resolve for free - and a ref alone is not enough
+      // Provenance, not just the name: what a deployed instance gets asked
+      // is WHICH code this plugin is. The tarball sha is the only integrity
+      // fact available here - no clone and no API call, so there is no
+      // commit sha to resolve for free - and a ref alone is not enough,
       // because a tag or branch can be moved after the fact.
       fetched.push({ id, source: spec, ref, pinned, sha256 });
       if (!existsSync(join(dir, "README.md"))) {

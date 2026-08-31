@@ -27,10 +27,8 @@ jobs:
       - run: pnpm test
       # The real build, plugin fetch included, so a broken Dockerfile input
       # fails here and not on the VPS.
-      # No APP_COMMIT. The build resolves the commit out of .git itself
-      # (frontend/scripts/git-commit.mjs), and passing it here would mean CI
-      # never exercised the path every real deploy takes - which is how the
-      # commit came to be empty in every production image in the first place.
+      # Builds the way a deploy does, so the commit is resolved from .git by
+      # frontend/scripts/git-commit.mjs and that path is exercised here.
       - run: pnpm build
         env:
           NODE_OPTIONS: --max-old-space-size=4096

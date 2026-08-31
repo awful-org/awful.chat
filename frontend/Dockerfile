@@ -18,25 +18,20 @@ FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY frontend/ .
 
-# NO instance configuration reaches this build, on purpose. The relay and SFU
-# addresses used to arrive as VITE_* build args and were inlined into the
-# bundle by vite, which made every instance's JavaScript different even when it
-# built identical source - so a published hash of a release matched no running
-# instance, and nobody could check that an instance serves what it claims to.
-# They are written to /config.json at container start instead
+# No instance configuration reaches this build, on purpose: vite would inline
+# it, and every instance would then ship different JavaScript from identical
+# source, which no published build hash could describe. The relay and SFU
+# addresses are written to /config.json at container start instead
 # (docker-entrypoint.d/40-awful-config.sh) and read before the app mounts.
 #
-# Comma/space separated plugin sources (github urls, user/repo[#ref]) fetched
+# Comma/space separated plugin sources (github urls, user/repo[@ref]) fetched
 # into plugins/ before the build - see plugins/README.md. Empty = built-ins only.
 ARG PLUGIN_SOURCES
 # Set to 1 to let an unpinned source (no #ref) through fetch-plugins.
 ARG PLUGIN_SOURCES_ALLOW_UNPINNED
 
-# Escape hatch, and nothing sets it: neither compose nor CI passes this any
-# more, because the build resolves the commit from .git below and a path
-# nobody exercises is how every production image came to ship an empty commit
-# in the first place. It stays for the one case .git cannot cover - building
-# from a downloaded release archive, which has no repository in it.
+# Only for a build whose context has no repository in it - a downloaded
+# release archive. Otherwise the commit is read from .git below.
 ARG APP_COMMIT
 
 ENV PLUGIN_SOURCES=$PLUGIN_SOURCES

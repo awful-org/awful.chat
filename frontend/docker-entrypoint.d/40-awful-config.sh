@@ -1,11 +1,10 @@
 #!/bin/sh
 # Write /config.json from the container's environment, at start.
 #
-# The relay and SFU addresses used to be baked into the JavaScript by vite,
-# which meant every instance shipped a different bundle even when it built the
-# exact same source - so a published per-commit hash matched nobody, and
-# nobody could check that an instance runs what it claims to run. They are
-# served as a separate file instead: one build, many instances.
+# The relay and SFU addresses are served as a file rather than compiled in.
+# Inlined, they would make every instance ship a different bundle from
+# identical source, so no published per-commit hash could describe any of
+# them. One build, many instances.
 #
 # nginx's own entrypoint runs every /docker-entrypoint.d/*.sh before it starts
 # the server, so there is nothing to wire up beyond the executable bit.
