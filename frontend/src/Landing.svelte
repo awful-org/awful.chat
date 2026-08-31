@@ -585,6 +585,11 @@
           target="_blank"
           rel="noopener">Curated plugins</a
         >
+        <a
+          href="https://github.com/awful-org/awful-verify"
+          target="_blank"
+          rel="noopener">Verify this instance</a
+        >
       </div>
       <div class="footer-license font-mono text-muted">
         100% OPEN SOURCE · APACHE-2.0 LICENSE
