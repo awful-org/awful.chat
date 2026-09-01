@@ -13,14 +13,19 @@ import { mkdirSync, writeFileSync } from "node:fs";
 
 const DIR = new URL("./captures/", import.meta.url).pathname;
 
+/** Capture even when a run passed. A failing bundle means little without one
+ *  from a healthy run beside it - "roomPeerCount is 0 when it breaks" is only
+ *  evidence if it is 1 when it works. */
+const ALWAYS = process.env.LAB_CAPTURE_ALWAYS === "1";
+
 export async function captureOnFailure(scenario, peers, failures) {
-  if (failures.length === 0) return null;
+  if (failures.length === 0 && !ALWAYS) return null;
   try {
     mkdirSync(DIR, { recursive: true });
   } catch {
     return null;
   }
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const stamp = `${new Date().toISOString().replace(/[:.]/g, "-")}-${failures.length === 0 ? "PASS" : "FAIL"}`;
   const saved = [];
   for (const peer of peers) {
     let json = null;
