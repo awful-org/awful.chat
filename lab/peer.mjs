@@ -197,16 +197,24 @@ export class LabPeer extends Cdp {
   }
 
   /**
-   * Did audio actually arrive at this browser?
+   * Did media actually arrive at this browser, and over what path?
    *
    * Read from every RTCPeerConnection the page built, so it needs no app
-   * handle and works against a deployed build. Bytes are summed across
-   * connections: which one carries the voice is an implementation detail, and
-   * "any audio at all" is the question a listener would ask.
+   * handle and works against a deployed build. Audio and video are counted
+   * SEPARATELY and their paths reported separately, because they do not
+   * travel together: voice is peer to peer, and camera and screen share go
+   * through the SFU on a different connection entirely. A single "is media
+   * flowing" number would hide the case where one works and the other does
+   * not, which is the case worth catching.
    */
   media() {
     return this.eval(`(async () => {
-      const out = { pcs: 0, live: 0, audioBytes: 0, relayed: false, path: null, rtt: null };
+      const out = {
+        pcs: 0, live: 0,
+        audioBytes: 0, videoBytes: 0,
+        relayed: false, path: null, rtt: null,
+        videoPath: null, videoRelayed: false, videoProto: null,
+      };
       for (const pc of (window.__labPcs || [])) {
         out.pcs++;
         if (pc.connectionState === "closed") continue;
@@ -214,74 +222,56 @@ export class LabPeer extends Cdp {
         let stats;
         try { stats = await pc.getStats(); } catch (e) { continue; }
         const cands = {};
-        let best = null;
+        let best = null, audio = 0, video = 0;
         for (const r of stats.values()) {
-          if (r.type === "inbound-rtp" && r.kind === "audio") out.audioBytes += (r.bytesReceived || 0);
+          if (r.type === "inbound-rtp" && r.kind === "audio") audio += (r.bytesReceived || 0);
+          if (r.type === "inbound-rtp" && r.kind === "video") video += (r.bytesReceived || 0);
           if (r.type === "local-candidate" || r.type === "remote-candidate") cands[r.id] = r;
           if (r.type === "candidate-pair" && r.state === "succeeded" && (!best || r.nominated)) best = r;
         }
+        out.audioBytes += audio;
+        out.videoBytes += video;
+        let path = null, relayed = false, proto = null;
         if (best) {
           const t = (inline, id) => inline || (cands[id] && cands[id].candidateType) || "?";
           const l = t(best.localCandidateType, best.localCandidateId);
           const rm = t(best.remoteCandidateType, best.remoteCandidateId);
-          if (!out.path) {
-            out.path = l + "/" + rm;
-            out.rtt = Math.round((best.currentRoundTripTime || 0) * 1000);
-          }
-          if (l === "relay" || rm === "relay") out.relayed = true;
+          path = l + "/" + rm;
+          relayed = l === "relay" || rm === "relay";
+          // The TRANSPORT, which a candidate type does not tell you. Under
+          // udp-block this is the whole claim: media reached us over TCP.
+          const lc = cands[best.localCandidateId];
+          proto = (lc && lc.protocol) || null;
+        }
+        // Attribute the path to the connection that carried each kind, so a
+        // relayed voice link next to a direct SFU link reads correctly.
+        if (path && !out.path) { out.path = path; out.rtt = Math.round((best.currentRoundTripTime || 0) * 1000); }
+        if (path && relayed) out.relayed = true;
+        if (video > 0 && path) {
+          out.videoPath = path;
+          out.videoRelayed = relayed;
+          out.videoProto = proto;
         }
       }
       return JSON.stringify(out);
     })()`).then(JSON.parse);
   }
 
-  /** The recorder's whole ring, which is how the lab reads media truth. */
-  diag() {
-    return this.eval(
-      `window.__awful ? JSON.stringify(window.__awful.diag()) : "null"`
-    ).then(JSON.parse);
+  /** Turn the camera on and wait until the app agrees that it is on. */
+  async startCamera() {
+    await this.waitFor("camera on", `(() => {
+      const btn = (label) => [...document.querySelectorAll('button')]
+        .find((x) => (x.getAttribute('aria-label') || '') === label);
+      if (btn('Turn off camera')) return true;   // label flips once it is on
+      const on = btn('Turn on camera');
+      if (on && !on.disabled) on.click();
+      return false;
+    })()`, { timeout: 60_000 });
+    return this;
   }
 
-  /**
-   * Did audio actually arrive at this browser?
-   *
-   * Read from every RTCPeerConnection the page built, so it needs no app
-   * handle and works against a deployed build. Bytes are summed across
-   * connections: which one carries the voice is an implementation detail, and
-   * "any audio at all" is the question a listener would ask.
-   */
-  media() {
-    return this.eval(`(async () => {
-      const out = { pcs: 0, live: 0, audioBytes: 0, relayed: false, path: null, rtt: null };
-      for (const pc of (window.__labPcs || [])) {
-        out.pcs++;
-        if (pc.connectionState === "closed") continue;
-        out.live++;
-        let stats;
-        try { stats = await pc.getStats(); } catch (e) { continue; }
-        const cands = {};
-        let best = null;
-        for (const r of stats.values()) {
-          if (r.type === "inbound-rtp" && r.kind === "audio") out.audioBytes += (r.bytesReceived || 0);
-          if (r.type === "local-candidate" || r.type === "remote-candidate") cands[r.id] = r;
-          if (r.type === "candidate-pair" && r.state === "succeeded" && (!best || r.nominated)) best = r;
-        }
-        if (best) {
-          const t = (inline, id) => inline || (cands[id] && cands[id].candidateType) || "?";
-          const l = t(best.localCandidateType, best.localCandidateId);
-          const rm = t(best.remoteCandidateType, best.remoteCandidateId);
-          if (!out.path) {
-            out.path = l + "/" + rm;
-            out.rtt = Math.round((best.currentRoundTripTime || 0) * 1000);
-          }
-          if (l === "relay" || rm === "relay") out.relayed = true;
-        }
-      }
-      return JSON.stringify(out);
-    })()`).then(JSON.parse);
-  }
-
-  /** The recorder's whole ring, which is how the lab reads media truth. */
+  /** The recorder's whole ring. Null on a deployed build, which has no
+   *  `__awful` handle - see the note on selfId above. */
   diag() {
     return this.eval(
       `window.__awful ? JSON.stringify(window.__awful.diag()) : "null"`
