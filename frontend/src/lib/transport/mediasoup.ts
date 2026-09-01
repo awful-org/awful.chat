@@ -1217,6 +1217,20 @@ export class MediasoupVideo implements VideoTransport {
 
     switch (msg.type) {
       case "ms:new-producer":
+        // Recorded BEFORE the queue check, so an announcement that arrives
+        // early is still half of the pair a reader needs: every producer
+        // announced to us should end in a consumer, and the gap between the
+        // two is where a wedged recv transport hides.
+        rec(
+          ev("sfu.consume", {
+            peer: msg.peerId,
+            d: {
+              phase: "announced",
+              producer: msg.producerId,
+              source: msg.source,
+            },
+          })
+        );
         // Not joined yet (no device): queue and process after join() completes.
         if (!this.device) {
           this.queuedProducers.push(msg);
@@ -1362,7 +1376,20 @@ export class MediasoupVideo implements VideoTransport {
     source: VideoSource
   ): Promise<void> {
     const inflight = this.inflightConsumes.get(producerId);
-    if (inflight) return inflight;
+    if (inflight) {
+      // Two consumes for one producer are not merely wasteful: the SFU answers
+      // the second with the SAME consumer id and mid, and the duplicate media
+      // section makes the browser reject the whole offer permanently. This
+      // event is how a reader knows the guard held rather than that the race
+      // never happened.
+      rec(
+        ev("sfu.consume", {
+          peer: peerId,
+          d: { phase: "dedup", producer: producerId, source },
+        })
+      );
+      return inflight;
+    }
     const p = this.consumeProducerInner(peerId, producerId, source).finally(
       () => {
         // Identity-checked: a rebuild may have already replaced this entry
@@ -1432,6 +1459,18 @@ export class MediasoupVideo implements VideoTransport {
     // arbitrary point in a GOP the client never asked for (finding 3).
     this.signal({ type: "ms:resume-consumer", producerId });
 
+    rec(
+      ev("sfu.consume", {
+        peer: peerId,
+        d: {
+          phase: "ok",
+          producer: producerId,
+          source,
+          kind: consumer.kind,
+        },
+      })
+    );
+
     if (!this.consumers.has(peerId)) this.consumers.set(peerId, []);
     this.consumers.get(peerId)!.push({ consumer, source });
 
@@ -1468,12 +1507,22 @@ export class MediasoupVideo implements VideoTransport {
     try {
       await this.consumeProducer(peerId, producerId, source);
     } catch (err) {
-      rec(ev("sfu.consume.failed", { peer: peerId, d: { err: errText(err), attempt: 1 } }));
+      rec(
+        ev("sfu.consume.failed", {
+          peer: peerId,
+          d: { err: errText(err), attempt: 1, producer: producerId },
+        })
+      );
       await new Promise((resolve) => setTimeout(resolve, 3_000));
       try {
         await this.consumeProducer(peerId, producerId, source);
       } catch (err) {
-        rec(ev("sfu.consume.failed", { peer: peerId, d: { err: errText(err), attempt: 2 } }));
+        rec(
+          ev("sfu.consume.failed", {
+            peer: peerId,
+            d: { err: errText(err), attempt: 2, producer: producerId },
+          })
+        );
         this.emit(
           "error",
           err instanceof Error ? err : new Error(String(err))

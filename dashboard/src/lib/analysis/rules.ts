@@ -43,7 +43,8 @@ export type FindingId =
   | "capture-incomplete"
   | "relay-close-unclean"
   | "peerconnection-leak"
-  | "uncaught-error";
+  | "uncaught-error"
+  | "producer-never-consumed";
 
 export interface Rule {
   id: FindingId;
@@ -289,6 +290,17 @@ export const RULES: Readonly<Record<FindingId, Rule>> = {
     meaning: "Some events were dropped or throttled before capture. Findings before the first surviving event can be wrong.",
     remedy: "Raise the ring capacity or the throttle budget for the noisy kind.",
     aiHint: "Check the suppressed kind counts to find which signal was lost.",
+  },
+  "producer-never-consumed": {
+    id: "producer-never-consumed",
+    title: "Producer never consumed",
+    severity: "block",
+    meaning:
+      "The SFU announced a camera producer to this peer. No consumer was ever built for it, so the tile stayed empty while everything reported connected.",
+    remedy:
+      "Check whether the receive transport still accepts a consume. One rejected consume can leave it unable to accept any later one.",
+    aiHint:
+      "Find the sfu.consume announced event, then read every sfu.consume.failed and sfu.transport.state for the same vantage after it.",
   },
   "peerconnection-leak": {
     id: "peerconnection-leak",

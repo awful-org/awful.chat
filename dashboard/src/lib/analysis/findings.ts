@@ -95,6 +95,9 @@ export const SFU_ROOM_SPLIT_MS = 30_000;
 /** Live RTCPeerConnections that mean a leak, not a busy call. */
 export const PC_LIVE_ALARM = 50;
 
+/** How long a camera producer may stay announced and unconsumed. */
+export const PRODUCER_CONSUME_DEADLINE_MS = 15_000;
+
 // ---------------------------------------------------------------------------
 // Small, side-effect-free readers for the `d` bag. Never throw.
 // ---------------------------------------------------------------------------
@@ -534,6 +537,61 @@ function peerConnectionLeak(timeline: MergedEvent[]): Finding[] {
   return out;
 }
 
+/**
+ * A camera producer was announced and no consumer ever followed.
+ *
+ * Camera is consumed automatically, so the announcement is a promise the
+ * client makes to itself. Screen share is deliberately NOT covered here: it
+ * is opt-in, and a share nobody clicks is the normal case, not a fault.
+ *
+ * This is the shape a wedged receive transport takes from the outside. Every
+ * other signal stays healthy - the socket is open, the transport reads
+ * connected, the roster is right - and the only visible fact is that a stream
+ * everyone else can see never arrives.
+ */
+function producerNeverConsumed(c: Capture, timeline: MergedEvent[]): Finding[] {
+  const announced = new Map<
+    string,
+    { at: number; index: number; peer: string | null; observer: string }
+  >();
+  const satisfied = new Set<string>();
+
+  timeline.forEach((e, i) => {
+    if (e.kind !== "sfu.consume") return;
+    const producer = str(e.d, "producer");
+    if (!producer) return;
+    const key = `${e.observer}|${producer}`;
+    const phase = str(e.d, "phase");
+    if (phase === "announced") {
+      if (str(e.d, "source") === "screen") return;
+      if (!announced.has(key)) {
+        announced.set(key, { at: e.at, index: i, peer: e.peer, observer: e.observer });
+      }
+      return;
+    }
+    // "ok" is a consumer that exists; "dedup" means another consume for the
+    // same producer was already in flight and will report its own outcome.
+    if (phase === "ok" || phase === "dedup") satisfied.add(key);
+  });
+
+  const out: Finding[] = [];
+  for (const [key, hit] of announced) {
+    if (satisfied.has(key)) continue;
+    // A capture that ends inside the deadline proves nothing: the consume
+    // may have been seconds away when the recording stopped.
+    if (c.window.to - hit.at < PRODUCER_CONSUME_DEADLINE_MS) continue;
+    out.push(
+      make(
+        "producer-never-consumed",
+        { vantage: hit.observer, peer: hit.peer ?? undefined },
+        [hit.index],
+        { producer: key.split("|")[1] ?? "", waitedMs: c.window.to - hit.at }
+      )
+    );
+  }
+  return out;
+}
+
 /** Per-`(observer, peer)` proof transitions, in time order. */
 function provenTransitions(timeline: MergedEvent[]): Map<string, Array<{ at: number; proven: boolean }>> {
   const map = new Map<string, Array<{ at: number; proven: boolean }>>();
@@ -907,6 +965,7 @@ export function runFindings(c: Capture): Finding[] {
     ...captureIncomplete(c),
     ...relayCloseUnclean(timeline),
     ...peerConnectionLeak(timeline),
+    ...producerNeverConsumed(c, timeline),
     ...thresholdByObserver(timeline, "runtime.error", 1, "uncaught-error"),
   ];
 

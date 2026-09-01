@@ -15,6 +15,7 @@ import {
   SFU_CONSUMER_STALL_THRESHOLD,
   SFU_REJOIN_LOOP_THRESHOLD,
   PC_LIVE_ALARM,
+  PRODUCER_CONSUME_DEADLINE_MS,
   SFU_ROOM_SPLIT_MS,
   SYNC_STALL_MS,
   UPGRADE_FAIL_THRESHOLD,
@@ -127,8 +128,8 @@ function expectEvidenceValid(capture: Capture, findings: Finding[]): void {
 // ---------------------------------------------------------------------------
 
 describe("RULES", () => {
-  it("has exactly 31 entries, one per FindingId", () => {
-    expect(Object.keys(RULES).length).toBe(31);
+  it("has exactly 32 entries, one per FindingId", () => {
+    expect(Object.keys(RULES).length).toBe(32);
   });
 
   it("every rule has a matching id and non-empty prose", () => {
@@ -896,5 +897,66 @@ describe("uncaught-error", () => {
   it("stays quiet when nothing threw", () => {
     const capture = makeCapture([ev({ kind: "peer.connect", at: 10 })]);
     expect(idsOf(runFindings(capture))).not.toContain("uncaught-error");
+  });
+});
+
+describe("producer-never-consumed", () => {
+  const announce = (at: number, producer: string, source = "camera") =>
+    ev({
+      kind: "sfu.consume",
+      at,
+      peer: "12D3KooWBBB",
+      d: { phase: "announced", producer, source },
+    });
+
+  it("fires when a camera producer is announced and nothing consumes it", () => {
+    const capture = makeCapture([announce(1000, "prod-1")]);
+    const findings = runFindings(capture);
+    const hit = findOf(findings, "producer-never-consumed");
+    expect(hit).toBeDefined();
+    expect(hit?.detail.producer).toBe("prod-1");
+    expectEvidenceValid(capture, findings);
+  });
+
+  it("stays quiet once a consumer exists for it", () => {
+    const capture = makeCapture([
+      announce(1000, "prod-1"),
+      ev({
+        kind: "sfu.consume",
+        at: 1500,
+        peer: "12D3KooWBBB",
+        d: { phase: "ok", producer: "prod-1", source: "camera", kind: "video" },
+      }),
+    ]);
+    expect(idsOf(runFindings(capture))).not.toContain("producer-never-consumed");
+  });
+
+  it("stays quiet for a screen share nobody clicked", () => {
+    // Screen share is opt-in. An unwatched share is the normal case, and a
+    // console that calls it a fault would cry wolf in every single capture.
+    const capture = makeCapture([announce(1000, "prod-screen", "screen")]);
+    expect(idsOf(runFindings(capture))).not.toContain("producer-never-consumed");
+  });
+
+  it("stays quiet when the capture ended before the deadline", () => {
+    const at = 1_000_000 - PRODUCER_CONSUME_DEADLINE_MS + 1000;
+    const capture = makeCapture([announce(at, "prod-late")]);
+    // The consume may have been one second away when the recording stopped.
+    expect(idsOf(runFindings(capture))).not.toContain("producer-never-consumed");
+  });
+
+  it("treats a deduped consume as satisfied", () => {
+    // The in-flight guard shares one consume between two callers: the OTHER
+    // caller reports the outcome, so a dedup is not a missing consumer.
+    const capture = makeCapture([
+      announce(1000, "prod-1"),
+      ev({
+        kind: "sfu.consume",
+        at: 1200,
+        peer: "12D3KooWBBB",
+        d: { phase: "dedup", producer: "prod-1", source: "camera" },
+      }),
+    ]);
+    expect(idsOf(runFindings(capture))).not.toContain("producer-never-consumed");
   });
 });
