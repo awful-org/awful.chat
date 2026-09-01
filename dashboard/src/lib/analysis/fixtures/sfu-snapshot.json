@@ -1,0 +1,57 @@
+{
+ "schemaVersion": 1,
+ "takenAt": 1788234314587,
+ "roomPeerCount": 2,
+ "self": {
+  "peerId": "capture-peer-a",
+  "transports": [
+   {
+    "dir": "send",
+    "iceState": "new",
+    "dtlsState": "new",
+    "tuple": null,
+    "bytesSent": 0,
+    "bytesReceived": 0,
+    "rtt": null
+   }
+  ],
+  "producers": [
+   {
+    "id": "20ad9aff-ed40-49c8-a747-086c07d0192b",
+    "kind": "audio",
+    "source": "camera",
+    "score": 0,
+    "consumers": 0,
+    "bitrate": 0,
+    "packetsLost": 0
+   }
+  ],
+  "consumers": [],
+  "cumulativeProduces": 1,
+  "backpressured": false
+ },
+ "room": [
+  {
+   "peerId": "capture-peer-a",
+   "producers": [
+    {
+     "id": "20ad9aff-ed40-49c8-a747-086c07d0192b",
+     "source": "camera",
+     "kind": "audio",
+     "consumers": 0
+    }
+   ]
+  },
+  {
+   "peerId": "capture-peer-b",
+   "producers": []
+  }
+ ],
+ "ceilings": {
+  "peersPerRoom": 32,
+  "producersPerPeer": 8,
+  "consumersPerPeer": 256,
+  "rooms": 1,
+  "maxRooms": 250
+ }
+}

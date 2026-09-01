@@ -54,6 +54,18 @@ services:
       # receive them. What keeps API-using plugins "env + redeploy".
       - PLUGIN_PROXY_HOSTS=${PLUGIN_PROXY_HOSTS:-}
       - PLUGIN_PROXY_SECRETS=${PLUGIN_PROXY_SECRETS:-}
+      # Optional diagnostic collector. Unset means the /telemetry route
+      # answers 204 and stores nothing, so an upload silently does nothing and
+      # the app hides its Upload button. See docs/spec.md "Telemetry".
+      - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-}
+      # The operator console's bearer token. Unset means /telemetry/list and
+      # /telemetry/get answer 404, so a console that is not there is never
+      # advertised. A weak token here hands every uploaded bundle to anyone.
+      - TELEMETRY_ADMIN_TOKEN=${TELEMETRY_ADMIN_TOKEN:-}
+      # Where bundles land. Defaults to /app/data/telemetry, inside the
+      # relay_data volume below - point it outside and bundles do not survive
+      # a redeploy.
+      - TELEMETRY_DIR=${TELEMETRY_DIR:-}
     volumes:
       - relay_data:/app/data
     networks:
@@ -121,6 +133,14 @@ services:
       - traefik.http.routers.${STACK:-awful}-mailbox.tls=true
       - traefik.http.routers.${STACK:-awful}-mailbox.tls.certresolver=letsencrypt
       - traefik.http.routers.${STACK:-awful}-mailbox.service=${STACK:-awful}-relay-api-service
+      # Port 8081 is routed per PathPrefix, so a route registered in main.go
+      # is unreachable in production without its own six labels here.
+      - traefik.http.routers.${STACK:-awful}-telemetry.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/telemetry`)
+      - traefik.http.routers.${STACK:-awful}-telemetry.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-telemetry.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-telemetry.tls=true
+      - traefik.http.routers.${STACK:-awful}-telemetry.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-telemetry.service=${STACK:-awful}-relay-api-service
 
   sfu:
     build:
@@ -174,6 +194,13 @@ services:
       # Documented as an instance variable but never passed through, so
       # setting it in .env did nothing and the SFU kept its built-in default.
       SFU_MAX_ROOMS: ${SFU_MAX_ROOMS:-250}
+      # Optional. "1" answers ms:diag with a live snapshot and adds one
+      # [sfu-telemetry] JSON line per room per 10s sweep to this container's
+      # log. Unset leaves both inert, and ms:diag answers "disabled".
+      SFU_TELEMETRY: ${SFU_TELEMETRY:-}
+      # Floor between one peer's ms:diag requests. Default 10000. Too low and
+      # a client can make the mediasoup worker sample stats continuously.
+      SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-}
     networks:
       - dokploy-network
 

@@ -702,6 +702,133 @@ DM:    "dm-" + hex(sha256(sort([didA, didB]).join("|")))[0..40]
 
 ---
 
+## Telemetry
+
+A bounded in-memory flight recorder, always on from boot, plus three vantages
+on one session and a separate analysis application. Nothing leaves the tab
+unless the user exports a bundle or turns the opt-in on.
+
+```typescript
+// frontend/src/lib/telemetry/schema.ts - mirrored in dashboard/src/lib/schema.ts
+interface DiagEvent {
+  seq: number; // 1-based per session; a gap means the ring or throttle dropped
+  t: number; // ms since the session's startedAt, integer
+  kind: DiagKind; // 112 frozen literals: session.*, relay.*, rv.*, peer.*,
+  // stream.*, app.*, dm.*, ice.*, voice.*, sfu.*, file.*,
+  // storage.*, counters, fault.injected, meta.suppressed
+  sev: "debug" | "info" | "warn" | "error";
+  peer: string | null; // FULL peerId, or null
+  room: string | null; // a bundle-local ordinal ("r1"), NEVER a room code
+  d?: Record<string, string | number | boolean | null>; // <=12 keys, strings <=200
+}
+
+interface ClientBundle {
+  schemaVersion: 1;
+  bundleId: string; // 16 random bytes, minted at export
+  sessionId: string; // 16 random bytes, minted in LibP2PTransport.connect()
+  createdAt: number;
+  startedAt: number;
+  vantage: "client";
+  app: { version: string; commit: string };
+  env: { ua: string };
+  config: {
+    apiHost: string; // a HOST, never a URL with a path
+    relayPeerId: string;
+    sfuHosts: string[];
+    configured: boolean;
+  };
+  self: { peerId: string }; // NO did, not even the uploader's own
+  rooms: Array<{ ref: string; kind: "text" | "dm" | "sync"; joinedAt: number }>;
+  peers: Array<{
+    peerId: string;
+    identityRef: string | null; // "i1" - peerIds that PROVED one DID
+    firstSeen: number;
+    lastSeen: number;
+  }>;
+  counters: Record<string, number>; // t.* transport, a.* app, f.* faults
+  events: DiagEvent[];
+  sfuSnapshots: SfuSnapshot[]; // the last 8; too large for a d bag
+  meta: {
+    ringCapacity: number;
+    dropped: number; // evicted by wraparound
+    suppressed: Record<string, number>; // per kind, by the throttle
+    faultsActive: boolean;
+    truncated: boolean; // trimmed to fit an upload
+  };
+  relayView?: RelayVantage; // stapled by the relay at ingest
+}
+```
+
+```txt
+RECORDING
+  always on, in memory, from boot - a bug is over by the time anyone thinks
+  to flip a switch, so the switch is on every EXIT, never on the recording
+  ring:      4096 events, wraparound, per-kind budget of 20/s (60/s for an
+             error kind; 5/s for app.msg.*, 2/s for peer.rtt and
+             file.progress). One hot kind must not evict every rare event.
+             frontend/src/lib/telemetry/ring.ts
+  taps:      one edit inside each of the three buses' private emit, so every
+             event is recorded - including the nine TransportStatus variants
+             that reach no UI at all.
+             frontend/src/lib/telemetry/taps.ts
+  probes:    ~60 hand-placed rec(ev(...)) lines at the sites where the
+             information exists nowhere else: a silent catch, a console.warn,
+             a bare return.
+
+EXITS (each gated, all off by default)
+  disk:      diagPrefs.persist - sealed chunks in the `diagnostics` store,
+             3 sessions and 8 MB, never synced and never backed up.
+             frontend/src/lib/telemetry/store.ts
+  file:      the Diagnostics settings pane exports awful-diag-<id>.json.
+             frontend/src/lib/telemetry/bundle.ts
+  network:   diagPrefs.upload - POST <apiUrl>/telemetry, signed with the
+             DEVICE libp2p key. Without TELEMETRY_ENABLED=1 the relay answers
+             204 and the button hides.
+             frontend/src/lib/telemetry/upload.ts
+
+THREE VANTAGES ON ONE SESSION
+  client:    the bundle above
+  relay:     stapled at ingest - registry counts, per-stream open/close with
+             the REAL close reason, and a per-peer event ring.
+             relay/telemetry.go
+  sfu:       ms:diag returns a live snapshot (transports, producers,
+             consumers, room siblings); SFU_TELEMETRY=1 also prints one
+             [sfu-telemetry] JSON line per room per 10s sweep.
+             sfu/telemetry.ts
+  joined by peerId: no shared secret and no new wire message. Clock skew is
+  solved from peer.clock samples by least squares.
+  dashboard/src/lib/analysis/merge.ts
+
+REDACTION (enforced by tests, not by convention)
+  room code:      NEVER. A client bundle uses an ordinal ("r1"); a relay
+                  bundle uses "h:"+HMAC(bootSecret, code)[0..12], and the
+                  boot secret is never persisted.
+  did:key:        NEVER, not even the uploader's own. Devices that proved one
+                  DID share an ordinal ("i1") instead.
+  content:        NEVER. No content, no meta.files, no infoHash, no
+                  attachment bytes, no nickname, no avatar. A message becomes
+                  a byte length; a file becomes an ordinal ("f1").
+  peerId:         allowed in full - the relay and the SFU already have it.
+  ICE:            candidate TYPES and the selected tuple's protocol and LOCAL
+                  port only. Never a candidate address.
+  errors:         name and message only. Never a stack: a stack carries local
+                  filesystem paths.
+  upload auth:    the DEVICE libp2p key. An Ed25519 peerId is an identity
+                  multihash, so the public key is inside it and the relay can
+                  check a signature against the claimed peerId. Signing with
+                  the identity key would disclose a did:key -> peerId binding.
+  frontend/src/lib/telemetry/redact.ts, bundle.test.ts
+
+ANALYSIS
+  the frontend runs NONE. It records, persists, exports and uploads. A
+  separate operator console ingests bundles and raw container logs,
+  reconstructs the topology over time, runs 29 deterministic rules that name
+  what went wrong and where, and builds a prompt pack that asks an AI why.
+  dashboard/ - not deployed, run locally against a relay admin token.
+```
+
+---
+
 ## Server Privacy
 
 ```txt
@@ -714,6 +841,19 @@ never knows:   message content, file content, who sent a mailbox blob -
 SFU knows:     video/screen streams it routes (see landing page disclosure);
                voice never touches it
 all p2p:       messages, files, voice - direct between peers
+```
+
+```txt
+with telemetry (TELEMETRY_ENABLED=1, and the user opted in) the relay
+additionally knows: that peerId's own connection diagnostics - dial and
+reservation outcomes, ICE candidate TYPES, transport states, timings,
+counters and error codes. Never message or file content, never a did:key,
+never a room code (a bundle carries opaque room refs), never an ICE
+candidate address. Bundles expire after 7 days.
+with SFU telemetry (SFU_TELEMETRY=1) the SFU additionally LOGS, to its own
+container log, the room codes and peerIds it already routes for, plus its
+transport states and producer/consumer scores. Never a remote candidate
+address.
 ```
 
 ---

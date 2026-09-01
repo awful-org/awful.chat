@@ -59,6 +59,8 @@ import {
   storageCryptoReady,
   type StoreCryptoSpec,
 } from "$lib/storage-crypto";
+import { ev, errText } from "$lib/telemetry/event";
+import { rec } from "$lib/telemetry/recorder";
 
 interface QueuedMessage {
   to: string;
@@ -140,6 +142,7 @@ async function saveQueuedDmMessages(queue: QueuedMessage[]): Promise<void> {
     // and to allocate a lamport out of IndexedDB, so the key is armed by the
     // time anything can be queued.
     console.warn("[dm] storage locked: offline queue not persisted");
+    rec(ev("storage.locked", { d: { what: "dm-queue" } }));
     return;
   }
   try {
@@ -151,9 +154,10 @@ async function saveQueuedDmMessages(queue: QueuedMessage[]): Promise<void> {
         ct: bytesToBase64(new Uint8Array(sealed._enc.ct)),
       })
     );
-  } catch {
+  } catch (err) {
     // Storage full or blocked: the message still sent or sits in memory;
     // a quota error must not blow up out of sendDirectMessage.
+    rec(ev("storage.quota", { d: { err: errText(err) } }));
   }
 }
 
@@ -441,6 +445,7 @@ export async function sendDirectMessage(
   let delivered = false;
   if (isOnline) {
     delivered = await _transport.send(resolvedPeerId!, envelope);
+    rec(ev("dm.send", { peer: resolvedPeerId, d: { delivered } }));
   }
   // STARTED here, awaited after the local echo. The queue write is now a
   // sealed read-modify-write of the whole queue (AES-GCM both ways), and
@@ -449,6 +454,15 @@ export async function sendDirectMessage(
   let queued: Promise<void> | null = null;
   if (!delivered) {
     queued = queueDmMessage(peerDid, envelope, id);
+    rec(
+      ev("dm.queue", {
+        peer:
+          resolvedPeerId && !looksLikeDid(resolvedPeerId)
+            ? resolvedPeerId
+            : null,
+        d: { delivered: false },
+      })
+    );
     // Opt-in relay mailbox: a sealed copy waits for the offline peer so
     // delivery does not require both of you online at once. Best-effort -
     // the queue keeps retrying P2P either way.
@@ -567,6 +581,7 @@ async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
   await mutateDmQueue((queue) =>
     queue.filter((e) => !sent.has(queueEntryKey(e)))
   );
+  rec(ev("dm.flush", { peer: peerId, d: { removed: sent.size } }));
 }
 
 /**

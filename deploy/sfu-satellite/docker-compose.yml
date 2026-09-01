@@ -58,6 +58,13 @@ services:
       ANNOUNCED_IP: ${PUBLIC_IP:?PUBLIC_IP must be the public address of THIS server}
       RTC_MIN_PORT: ${SFU_RTC_MIN_PORT:-61000}
       RTC_MAX_PORT: ${SFU_RTC_MAX_PORT:-61499}
+      # Optional diagnostics. "1" answers ms:diag with a live snapshot and
+      # prints one [sfu-telemetry] line per room per 10s sweep. Unset leaves
+      # both inert, and a client that asks gets "disabled".
+      SFU_TELEMETRY: ${SFU_TELEMETRY:-}
+      # Floor between one peer's ms:diag requests. Default 10000. Too low
+      # and one client can make the worker sample stats continuously.
+      SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-}
       # Rooms holding a live router. The port range above is the real ceiling
       # (roughly one port per transport, two per participant in a call), so
       # keep the two in step.

@@ -17,6 +17,8 @@ import {
 import { parseDmEnvelope } from "./dm-codec";
 import { deliverMailboxDm } from "./transport.svelte";
 import { apiUrl } from "$lib/runtime-config";
+import { ev, errText } from "$lib/telemetry/event";
+import { rec } from "$lib/telemetry/recorder";
 
 const OPTIN_KEY = "awful:mailbox-optin:v1";
 // A call, not a const: this module is imported while the app is still
@@ -72,8 +74,9 @@ export async function depositDmToMailbox(
         blob: b64(blob),
       }),
     });
-  } catch {
+  } catch (err) {
     // Relay down or box full: nothing lost, only slower.
+    rec(ev("dm.mailbox.deposit", { d: { err: errText(err) } }));
   }
 }
 
@@ -123,6 +126,7 @@ export async function collectMailbox(): Promise<void> {
           job = { senderDid, payload: parsed.payload };
       } catch (err) {
         console.warn("[mailbox] dropped blob:", err);
+        rec(ev("dm.mailbox.drop", { d: { err: errText(err) } }));
         done.push(entry.id);
         continue;
       }
@@ -135,6 +139,7 @@ export async function collectMailbox(): Promise<void> {
         done.push(entry.id);
       } catch (err) {
         console.warn("[mailbox] delivery failed, keeping blob:", err);
+        rec(ev("dm.mailbox.collect", { d: { err: errText(err), delivered: false } }));
       }
     }
     if (done.length > 0) {
@@ -144,6 +149,7 @@ export async function collectMailbox(): Promise<void> {
         body: JSON.stringify({ ...authFields(), ids: done }),
       });
       console.log(`[mailbox] collected ${done.length} offline DM(s)`);
+      rec(ev("dm.mailbox.collect", { d: { count: done.length } }));
     }
   } catch {
     // Offline or relay down: the next tick retries.

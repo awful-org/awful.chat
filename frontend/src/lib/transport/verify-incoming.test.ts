@@ -46,7 +46,7 @@ describe("verifyIncoming", () => {
       wire({ senderId: alice.did, senderDid: alice.did }),
       alice.priv
     );
-    expect(await verifyIncoming(w, { room: ROOM })).toBe(true);
+    expect(await verifyIncoming(w, { room: ROOM })).toEqual({ ok: true });
   });
 
   it("rejects a signature over a DIFFERENT room (v3 binds the room)", async () => {
@@ -55,7 +55,10 @@ describe("verifyIncoming", () => {
       alice.priv,
       "other-room"
     );
-    expect(await verifyIncoming(w, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "bad-signature",
+    });
   });
 
   it("rejects a flipped type on a valid signature (v3 binds the type)", async () => {
@@ -67,7 +70,10 @@ describe("verifyIncoming", () => {
       ...w,
       type: MessageType.PluginUpdate,
     } as WireChatMessage;
-    expect(await verifyIncoming(flipped, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(flipped, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "bad-signature",
+    });
   });
 
   // The forgery this module exists for: a senderId that is NOT in did:key
@@ -79,7 +85,10 @@ describe("verifyIncoming", () => {
       wire({ senderId: alicePeerId, senderDid: mallory.did }),
       mallory.priv
     );
-    expect(await verifyIncoming(w, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "did-mismatch",
+    });
   });
 
   it("rejects any mismatch between senderDid and senderId", async () => {
@@ -87,14 +96,20 @@ describe("verifyIncoming", () => {
       wire({ senderId: alice.did, senderDid: mallory.did }),
       mallory.priv
     );
-    expect(await verifyIncoming(w, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "did-mismatch",
+    });
   });
 
   it("rejects every signature version but 3", async () => {
     const base = wire({ senderId: alice.did, senderDid: alice.did });
     for (const sigV of [undefined, 1, 2, 4, 99]) {
       const w = { ...base, sig: "00".repeat(64), sigV } as WireChatMessage;
-      expect(await verifyIncoming(w, { room: ROOM })).toBe(false);
+      expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+        ok: false,
+        reason: "sig-version",
+      });
     }
   });
 
@@ -106,7 +121,10 @@ describe("verifyIncoming", () => {
     const w = wire({ senderId: alice.did, senderDid: alice.did });
     const sig = ed25519.sign(utf8(canonicalContentV2(w as never)), alice.priv);
     const signed = { ...w, sig: hex(sig), sigV: 2 } as WireChatMessage;
-    expect(await verifyIncoming(signed, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(signed, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "sig-version",
+    });
   });
 
   it("rejects content over the size cap, even genuinely signed", async () => {
@@ -118,7 +136,10 @@ describe("verifyIncoming", () => {
       }),
       alice.priv
     );
-    expect(await verifyIncoming(w, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "content-oversize",
+    });
   });
 
   it("rejects a non-string content field", async () => {
@@ -126,7 +147,10 @@ describe("verifyIncoming", () => {
       ...signV3(wire({ senderId: alice.did, senderDid: alice.did }), alice.priv),
       content: 12345,
     } as unknown as WireChatMessage;
-    expect(await verifyIncoming(w, { room: ROOM })).toBe(false);
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "content-type",
+    });
   });
 
   it("needs an authenticated room for v3 - never trusts the wire for it", async () => {
@@ -134,20 +158,39 @@ describe("verifyIncoming", () => {
       wire({ senderId: alice.did, senderDid: alice.did }),
       alice.priv
     );
-    expect(await verifyIncoming(w, {})).toBe(false);
+    expect(await verifyIncoming(w, {})).toMatchObject({
+      ok: false,
+      reason: "no-room",
+    });
+  });
+
+  it("rejects a message with no senderDid at all", async () => {
+    const base = wire({ senderId: alice.did });
+    const sig = ed25519.sign(
+      utf8(canonicalContentV3({ ...base, roomCode: ROOM } as never)),
+      alice.priv
+    );
+    const w = { ...base, sig: hex(sig), sigV: 3 } as WireChatMessage;
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "no-did",
+    });
   });
 
   describe("unsigned rows", () => {
     const unsigned = wire({ senderId: alice.did, senderDid: alice.did });
 
     it("are rejected by default", async () => {
-      expect(await verifyIncoming(unsigned, { room: ROOM })).toBe(false);
+      expect(await verifyIncoming(unsigned, { room: ROOM })).toMatchObject({
+        ok: false,
+        reason: "unsigned",
+      });
     });
 
     it("are allowed only where the caller opts in (DM sync)", async () => {
       expect(
         await verifyIncoming(unsigned, { room: ROOM, allowUnsigned: true })
-      ).toBe(true);
+      ).toEqual({ ok: true });
     });
   });
 });

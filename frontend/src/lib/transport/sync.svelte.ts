@@ -479,7 +479,7 @@ async function startSyncServer(): Promise<void> {
 
   console.log("[Sync][Source] Starting sync server for room:", _syncRoomCode);
 
-  _transport = new LibP2PTransport();
+  _transport = new LibP2PTransport({ diagBus: "sync" });
 
   // Set up handlers
   _transport.on("connect", (peerId: string) => {
@@ -759,7 +759,7 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
     _syncRoomCode = payload.roomCode;
     _isSourceDevice = false;
 
-    _transport = new LibP2PTransport();
+    _transport = new LibP2PTransport({ diagBus: "sync" });
 
     let receivedIdentity: DatabaseExport["identity"] | null = null;
     const receivedData: Partial<DatabaseExport> = {};

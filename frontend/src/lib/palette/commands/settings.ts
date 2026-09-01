@@ -1,4 +1,5 @@
 import {
+  Activity,
   ChartPie,
   Heart,
   Info,
@@ -63,6 +64,7 @@ const SETTINGS_TABS = [
   { id: "app", label: "App", icon: SlidersHorizontal },
   { id: "session", label: "Session/Sync", icon: RefreshCw },
   { id: "data", label: "Data", icon: ChartPie },
+  { id: "diagnostics", label: "Diagnostics", icon: Activity },
   { id: "plugins", label: "Plugins", icon: Puzzle },
   { id: "quirks", label: "Quirks", icon: Info },
   { id: "oss", label: "OSS", icon: Heart },

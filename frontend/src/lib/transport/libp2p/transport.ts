@@ -1,4 +1,4 @@
-import { relayMultiaddr } from "$lib/runtime-config";
+import { isConfigured, relayMultiaddr } from "$lib/runtime-config";
 import { createLibp2p, type Libp2p } from "libp2p";
 import { webRTC } from "@libp2p/webrtc";
 import { webSockets } from "@libp2p/websockets";
@@ -12,6 +12,9 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import { multiaddr, type Multiaddr } from "@multiformats/multiaddr";
 import type { Connection, Stream } from "@libp2p/interface";
 import type { StreamMessageEvent, StreamCloseEvent } from "@libp2p/interface";
+import { errText, ev } from "$lib/telemetry/event";
+import { beginSession, rec, refs } from "$lib/telemetry/recorder";
+import { recTransportEvent } from "$lib/telemetry/taps";
 
 // js-libp2p exposes no public "reserve a relay slot now" API. Listening on a
 // `<relay>/p2p-circuit` address is what triggers a reservation, and we need to
@@ -319,9 +322,15 @@ export class LibP2PTransport implements PeerTransport {
   private relayReconnectTimer: TimerHandle | null = null;
   private reconcileTimer: TimerHandle | null = null;
   private privateKeyBytes: Uint8Array | null = null;
+  /** Distinguishes chat-session events from a device-sync instance's. Only
+   *  the main bus may call `beginSession`, or a sync session erases the
+   *  chat session's history. */
+  private readonly diagBus: string;
+  private diagSessionId: string | null = null;
 
-  constructor() {
+  constructor(opts?: { diagBus?: string }) {
     installFaultHook();
+    this.diagBus = opts?.diagBus ?? "main";
   }
 
   get p2pNode(): Libp2p<AppServices> | null {
@@ -345,6 +354,11 @@ export class LibP2PTransport implements PeerTransport {
         /stream that is closed/i.test(r?.message ?? "")
       ) {
         this.debugStats.suppressedStreamErrors++;
+        rec(
+          ev("stream.reset", {
+            d: { suppressed: true, err: errText(e.reason) },
+          })
+        );
         e.preventDefault();
       }
     });
@@ -354,6 +368,18 @@ export class LibP2PTransport implements PeerTransport {
   async connect(privateKeyBytes?: Uint8Array | null): Promise<void> {
     this.installStreamNoiseFilter();
     this.intentionalDisconnect = false;
+
+    // Minted once per connect(); a reconnect keeps the session so a bundle
+    // tells the whole story. Only main resets the ring - a sync instance
+    // must never erase the chat session's history.
+    this.diagSessionId = Array.from(
+      crypto.getRandomValues(new Uint8Array(16)),
+      (b) => b.toString(16).padStart(2, "0")
+    ).join("");
+    if (this.diagBus === "main") {
+      beginSession(this.diagSessionId, Date.now());
+    }
+    rec(ev("session.start", { d: { bus: this.diagBus } }));
 
     // A reconnect used to leak the previous node's timers: reconcileTimer was
     // overwritten (leaving an interval running against a dead node forever)
@@ -469,6 +495,15 @@ export class LibP2PTransport implements PeerTransport {
 
     const myId = this.node.peerId.toString();
     console.log("[LibP2PTransport] node started, selfId:", myId);
+    rec(
+      ev("session.config", {
+        d: {
+          selfId: myId,
+          relayPeerId: this.relayPeerId ?? "",
+          configured: isConfigured(),
+        },
+      })
+    );
 
     // These MUST be attached before the relay dial. waitForRelayReservation()
     // can block for seconds while the node is already reachable, and any peer
@@ -973,7 +1008,15 @@ export class LibP2PTransport implements PeerTransport {
         if (misses < PING_MISSES_ALLOWED) return;
         console.log("[Transport] peer stopped answering:", peerId.slice(-8));
         this.debugStats.livenessDrops++;
-        this.pingMisses.delete(peerId);
+        rec(
+          ev("peer.drop.liveness", {
+            peer: peerId,
+            d: {
+              misses,
+              silentMs: Date.now() - (this.lastInbound.get(peerId) ?? askedAt),
+            },
+          })
+        );
         this.dropPeer(peerId);
       }, PEER_PROBE_RELEASE_MS);
     }
@@ -997,7 +1040,7 @@ export class LibP2PTransport implements PeerTransport {
         done = true;
         clearTimeout(timer);
         this.rttProbes.delete(nonce);
-        resolve(rtt);
+        rec(ev("peer.rtt", { peer: peerId, d: { ms: rtt } }));
       };
       const timer = setTimeout(() => settle(null), timeoutMs);
       // sentAt is recorded as late as possible - after the frame is built,
@@ -1034,7 +1077,14 @@ export class LibP2PTransport implements PeerTransport {
         done = true;
         clearTimeout(timer);
         this.rttProbes.delete(nonce);
-        resolve(sample);
+        if (sample) {
+          rec(
+            ev("peer.clock", {
+              peer: peerId,
+              d: { t0: sample.t0, t1: sample.t1, t2: sample.t2, t3: sample.t3 },
+            })
+          );
+        }
       };
       const timer = setTimeout(() => finish(null), timeoutMs);
       const sentWallAt = Date.now();
@@ -1111,6 +1161,15 @@ export class LibP2PTransport implements PeerTransport {
       console.warn(
         `[Transport] high connection count: ${connections.length} ` +
           `(${this.connectedPeers.size} peers)`
+      );
+      rec(
+        ev("session.config", {
+          sev: "warn",
+          d: {
+            connections: connections.length,
+            peers: this.connectedPeers.size,
+          },
+        })
       );
     }
     const byPeer = new Map<string, Connection[]>();
@@ -1201,18 +1260,23 @@ export class LibP2PTransport implements PeerTransport {
     if (this.dialingPeers.has(peerId)) return;
     this.dialingPeers.add(peerId);
     this.debugStats.relayUpgradeAttempts++;
+    rec(ev("peer.upgrade.attempt", { peer: peerId }));
     try {
       if (shouldBlockWebrtcDial()) throw new Error("webrtc dial blocked");
       const relayAddr = relayMultiaddr();
       await this.node.dial(
         multiaddr(`${relayAddr}/p2p-circuit/webrtc/p2p/${peerId}`)
       );
-    } catch {
+    } catch (err) {
+      rec(
+        ev("peer.upgrade.fail", { peer: peerId, d: { reason: errText(err) } })
+      );
       return; // still relayed; the backoff decides when to try again
     } finally {
       this.dialingPeers.delete(peerId);
     }
 
+    rec(ev("peer.upgrade.ok", { peer: peerId }));
     this.updateRelayedStatus(peerId);
     // The dial can resolve while still handing back something relayed.
     if (this.relayedPeers.has(peerId)) return;
@@ -1325,6 +1389,11 @@ export class LibP2PTransport implements PeerTransport {
           type: "relay-dial-retry",
           message: `Relay unreachable - retrying (${attempt + 1}/${RELAY_DIAL_ATTEMPTS})`,
         });
+        rec(
+          ev("relay.dial.attempt", {
+            d: { attempt: attempt + 1, delayMs: Math.round(delay) },
+          })
+        );
         await new Promise((r) => setTimeout(r, delay));
       }
     }
@@ -1351,6 +1420,7 @@ export class LibP2PTransport implements PeerTransport {
 
   private async requestRelayReservation(): Promise<void> {
     if (!this.node) return;
+    rec(ev("relay.reservation.request"));
     const relayMa = relayMultiaddr();
     const circuitListenAddr = multiaddr(`${relayMa}/p2p-circuit`);
     try {
@@ -1360,6 +1430,7 @@ export class LibP2PTransport implements PeerTransport {
       await transportManager.listen([circuitListenAddr]);
     } catch (err) {
       console.warn("[Transport] reservation request failed:", err);
+      rec(ev("relay.reservation.timeout", { d: { err: errText(err) } }));
     }
   }
 
@@ -1511,6 +1582,7 @@ export class LibP2PTransport implements PeerTransport {
         }
         console.log("[Transport] stream never confirmed for", peerId.slice(-8));
         this.debugStats.confirmFailures++;
+        rec(ev("stream.confirm.fail", { peer: peerId, d: { attempts } }));
         this.cleanupPeerStream(peerId);
         if (openedOn && this.liveConnections.get(peerId) === openedOn) {
           // Stop preferring the connection that just failed us.
@@ -1581,6 +1653,12 @@ export class LibP2PTransport implements PeerTransport {
       );
     } catch (err) {
       console.warn(`[LibP2PTransport] write failed for ${peerId}:`, err);
+      rec(
+        ev("stream.write.fail", {
+          peer: peerId,
+          d: { err: errText(err), bytes: data.byteLength },
+        })
+      );
       this.cleanupPeerStream(peerId);
       return false;
     }
@@ -1625,6 +1703,7 @@ export class LibP2PTransport implements PeerTransport {
           console.warn(
             `[LibP2PTransport] oversized direct frame (${len}b) from ${fromId.slice(-8)}, aborting stream`
           );
+          rec(ev("rv.frame.oversize", { peer: fromId, d: { bytes: len } }));
           this.cleanupPeerStream(fromId);
           stream.abort(new Error("frame too large"));
           return;
@@ -1706,6 +1785,7 @@ export class LibP2PTransport implements PeerTransport {
     const stream = this.peerStreams.get(peerId);
     if (!stream) return;
     this.debugStats.outboundResets++;
+    rec(ev("stream.reset", { peer: peerId }));
     const wasProven = this.confirmedStreams.has(stream);
     this.peerStreams.delete(peerId);
     this.confirmNonces.delete(peerId);
@@ -1830,6 +1910,11 @@ export class LibP2PTransport implements PeerTransport {
             "[Rendezvous] failed to process frame, aborting stream:",
             err
           );
+          rec(
+            ev("rv.send.fail", {
+              d: { phase: "inbound", err: errText(err) },
+            })
+          );
           this.rendezvousReadBuf = new Uint8Array(0);
           stream.abort(
             err instanceof Error
@@ -1849,6 +1934,7 @@ export class LibP2PTransport implements PeerTransport {
       // then silently no-opped, so a leaveRoom UNREGISTER was lost with no
       // retry and the relay kept telling peers we were still in the room.
       if (this.rendezvousStream !== stream) return;
+      rec(ev("rv.close"));
       this.stopRendezvousPing();
       this.rendezvousStream = null;
       if (!this.intentionalDisconnect && this.node) {
@@ -1888,6 +1974,13 @@ export class LibP2PTransport implements PeerTransport {
 
   private rendezvousSend(msg: RendezvousClientMsg): void {
     if (!this.rendezvousStream) return;
+    if (msg.type === "REGISTER" || msg.type === "UNREGISTER") {
+      rec(
+        ev(msg.type === "REGISTER" ? "rv.register" : "rv.unregister", {
+          room: refs().roomRef(msg.room),
+        })
+      );
+    }
     const payload = new TextEncoder().encode(JSON.stringify(msg));
     const frame = new Uint8Array(4 + payload.byteLength);
     new DataView(frame.buffer).setUint32(0, payload.byteLength, false);
@@ -1896,6 +1989,7 @@ export class LibP2PTransport implements PeerTransport {
       this.rendezvousStream.send(frame);
     } catch (err) {
       console.warn("[Rendezvous] send failed:", err);
+      rec(ev("rv.send.fail", { d: { err: errText(err) } }));
     }
   }
 
@@ -1904,6 +1998,9 @@ export class LibP2PTransport implements PeerTransport {
     if (shouldBlockDial(peerId)) return;
     if (this.dialingPeers.has(peerId)) return;
     this.dialingPeers.add(peerId);
+    rec(
+      ev("peer.dial.start", { peer: peerId, d: { attempt, viaWebrtc: true } })
+    );
 
     try {
       const relayAddr = relayMultiaddr();
@@ -1916,7 +2013,14 @@ export class LibP2PTransport implements PeerTransport {
         if (shouldBlockWebrtcDial()) throw new Error("webrtc dial blocked");
         await this.node.dial(withWebRTC);
         return;
-      } catch {}
+      } catch (err) {
+        rec(
+          ev("peer.dial.fail", {
+            peer: peerId,
+            d: { form: "webrtc", err: errText(err) },
+          })
+        );
+      }
 
       try {
         await this.node.dial(withoutWebRTC);
@@ -2022,6 +2126,7 @@ export class LibP2PTransport implements PeerTransport {
         });
         if (circuit) {
           console.log("[Transport] relay reservation ok:", circuit.toString());
+          rec(ev("relay.reservation.ok", { d: { circuit: true } }));
           clearTimeout(deadline);
           node.removeEventListener("self:peer:update", check);
           resolve(true);
@@ -2080,7 +2185,9 @@ export class LibP2PTransport implements PeerTransport {
   ): void {
     // Suppressing "connect" reproduces the case where one side reloads and the
     // other never notices, so it never re-sends anything about itself.
-    if (shouldSuppressEvent(event as string)) return;
+    const suppressed = shouldSuppressEvent(event as string);
+    recTransportEvent(event as string, args, suppressed, this.diagBus);
+    if (suppressed) return;
     this.handlers.get(event)?.forEach((h) => (h as Function)(...args));
   }
 }

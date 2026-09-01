@@ -3,9 +3,13 @@
 // turn a camera on.
 import type * as mediasoupClient from "mediasoup-client";
 import type { VideoTransport, VideoEvents, VideoSource } from "./types";
-import { sfuForRoom } from "./sfu-pool";
+import { sfuForRoom, sfuPool } from "./sfu-pool";
 import { shouldBlockSfu } from "./faults";
 import { getIceServers } from "./ice-server-list";
+import { errText, ev } from "$lib/telemetry/event";
+import { rec } from "$lib/telemetry/recorder";
+import { recVideoEvent } from "$lib/telemetry/taps";
+import type { SfuSnapshot } from "$lib/telemetry/schema";
 
 /**
  * Reaches the user verbatim - transmission.svelte assigns an error event's
@@ -151,6 +155,32 @@ interface MSError {
   direction?: "send" | "recv";
 }
 
+/**
+ * `ms:diag` request/reply pair for a live SFU snapshot. Mirrored in
+ * `sfu/index.ts` and `frontend/src/lib/telemetry/schema.ts` - change all
+ * three together.
+ */
+interface MSDiag {
+  type: "ms:diag";
+  requestId: string;
+} // client -> server
+interface MSDiagReply {
+  type: "ms:diag";
+  requestId: string;
+  snapshot: SfuSnapshot;
+} // server -> client
+/**
+ * The SFU refuses a diag request with THIS frame, never with `ms:error`.
+ * An `ms:error` with no `direction` latches `this.refusal` and ends the
+ * whole session (see `failSession`). A refused session is the one most
+ * worth inspecting, so a diag refusal must not also kill the session.
+ */
+interface MSDiagUnavailable {
+  type: "ms:diag-unavailable";
+  requestId: string;
+  reason: "disabled" | "rate-limited";
+}
+
 type MSMessage =
   | MSGetCapabilities
   | MSCapabilities
@@ -170,7 +200,10 @@ type MSMessage =
   | MSCloseConsumer
   | MSCloseProducer
   | MSResumeConsumer
-  | MSError;
+  | MSError
+  | MSDiag
+  | MSDiagReply
+  | MSDiagUnavailable;
 
 /**
  * Turns an SFU refusal into a sentence for the person in the call. It reaches
@@ -309,12 +342,14 @@ export class MediasoupVideo implements VideoTransport {
       this.currentRoomCode = roomCode;
       this.currentPeerId = peerId;
       await this.connectSfu(roomCode, peerId);
+      rec(ev("sfu.join", { peer: peerId }));
 
       const capMsg = await this.request<MSCapabilities>(
         { type: "ms:get-capabilities", requestId: this.nextRequestId() },
         "ms:capabilities"
       );
       this.lastRoomPeerCount = capMsg.roomPeerCount;
+      rec(ev("sfu.caps", { d: { roomPeerCount: capMsg.roomPeerCount } }));
 
       const { Device } = await import("mediasoup-client");
       this.device = new Device();
@@ -546,6 +581,13 @@ export class MediasoupVideo implements VideoTransport {
       const sfuUrl =
         sfuForRoom(roomCode) ??
         `${location.origin.replace(/^http/, "ws")}/sfu`;
+      let sfuHost: string | null;
+      try {
+        sfuHost = new URL(sfuUrl).host;
+      } catch {
+        sfuHost = null;
+      }
+      rec(ev("sfu.pick", { d: { host: sfuHost, poolSize: sfuPool().length } }));
 
       // A fresh socket starts clean: the previous session's refusal must not
       // fail the requests this one is about to make.
@@ -555,6 +597,7 @@ export class MediasoupVideo implements VideoTransport {
       this.sfuWs = ws;
 
       ws.onopen = () => {
+        rec(ev("sfu.ws.open"));
         // Identify ourselves to the SFU with a stable anonymous peer id.
         // We reuse a per-page session id so the SFU can correlate transports.
         ws.send(
@@ -568,6 +611,7 @@ export class MediasoupVideo implements VideoTransport {
       };
 
       ws.onerror = () => {
+        rec(ev("sfu.ws.error"));
         reject(new Error(SFU_UNREACHABLE));
       };
 
@@ -580,14 +624,34 @@ export class MediasoupVideo implements VideoTransport {
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (closeEvent: CloseEvent) => {
         // Only the CURRENT socket's close means anything. A rebuild closes the
         // old socket and opens a new one, and the old close event lands after
         // that - rejecting the fresh socket's in-flight requests (they share
         // one pendingById map) and scheduling a rejoin behind a session that is
         // already healthy. That is a join failing with "SFU connection closed"
         // for no reason anyone can see.
-        if (this.sfuWs !== ws) return;
+        //
+        // The probe obeys the same rule and tags the superseded case, because
+        // an untagged sfu.ws.close folds into the topology as a disconnected
+        // SFU sitting behind a session that is actually fine.
+        if (this.sfuWs !== ws) {
+          rec(
+            ev("sfu.ws.close", {
+              d: {
+                code: closeEvent.code,
+                reason: closeEvent.reason,
+                stale: true,
+              },
+            })
+          );
+          return;
+        }
+        rec(
+          ev("sfu.ws.close", {
+            d: { code: closeEvent.code, reason: closeEvent.reason },
+          })
+        );
         const wasJoined = this.device !== null;
 
         // Reject all pending requests when connection drops
@@ -629,6 +693,7 @@ export class MediasoupVideo implements VideoTransport {
     // Chrome caps a page at 500 live ones; that is the "Cannot create so many
     // PeerConnections" that eventually takes voice, video and libp2p's own
     // WebRTC dials down together.
+    rec(ev("sfu.rejoin", { d: { attempt, delayMs: delay } }));
     if (this.rejoinTimer) clearTimeout(this.rejoinTimer);
     this.rejoinTimer = setTimeout(() => {
       this.rejoinTimer = null;
@@ -783,6 +848,7 @@ export class MediasoupVideo implements VideoTransport {
    * direction instead of the whole session.
    */
   private handleTransportTimeout(direction: "send" | "recv" | undefined): void {
+    rec(ev("sfu.transport.timeout", { d: { direction: direction ?? "unknown" } }));
     this.emit(
       "error",
       new Error(
@@ -923,6 +989,7 @@ export class MediasoupVideo implements VideoTransport {
               }
             : {}),
         });
+        rec(ev("sfu.produce", { d: { source, kind: track.kind } }));
 
         const entry: Producer = { producer, source, stream };
         produced.push(entry);
@@ -1013,6 +1080,7 @@ export class MediasoupVideo implements VideoTransport {
       // libp2p/voice.ts) worked and video silently never did (finding 7).
       iceServers: getIceServers(),
     });
+    rec(ev("sfu.transport.create", { d: { direction: "send" } }));
 
     this.sendTransport.on(
       "connect",
@@ -1049,6 +1117,7 @@ export class MediasoupVideo implements VideoTransport {
     );
 
     this.sendTransport.on("connectionstatechange", (state: string) => {
+      rec(ev("sfu.transport.state", { d: { direction: "send", state } }));
       if (state === "failed" || state === "closed") {
         this.emit("error", new Error("Send transport connection failed"));
         this.scheduleRejoin(this.joinGeneration);
@@ -1072,6 +1141,7 @@ export class MediasoupVideo implements VideoTransport {
       // (finding 7).
       iceServers: getIceServers(),
     });
+    rec(ev("sfu.transport.create", { d: { direction: "recv" } }));
 
     this.recvTransport.on(
       "connect",
@@ -1086,6 +1156,7 @@ export class MediasoupVideo implements VideoTransport {
     );
 
     this.recvTransport.on("connectionstatechange", (state: string) => {
+      rec(ev("sfu.transport.state", { d: { direction: "recv", state } }));
       if (state === "failed" || state === "closed") {
         this.emit("error", new Error("Receive transport connection failed"));
         this.scheduleRejoin(this.joinGeneration);
@@ -1112,6 +1183,15 @@ export class MediasoupVideo implements VideoTransport {
     // pending lookup: every reason the SFU sends lands during the join
     // handshake, where a request is waiting for a frame that is never coming.
     if (msg.type === "ms:error") {
+      rec(
+        ev("sfu.error", {
+          d: {
+            reason: msg.reason,
+            direction: msg.direction ?? null,
+            latched: msg.reason !== "transport-timeout",
+          },
+        })
+      );
       if (msg.reason === "transport-timeout") {
         this.handleTransportTimeout(msg.direction);
       } else {
@@ -1137,6 +1217,20 @@ export class MediasoupVideo implements VideoTransport {
 
     switch (msg.type) {
       case "ms:new-producer":
+        // Recorded BEFORE the queue check, so an announcement that arrives
+        // early is still half of the pair a reader needs: every producer
+        // announced to us should end in a consumer, and the gap between the
+        // two is where a wedged recv transport hides.
+        rec(
+          ev("sfu.consume", {
+            peer: msg.peerId,
+            d: {
+              phase: "announced",
+              producer: msg.producerId,
+              source: msg.source,
+            },
+          })
+        );
         // Not joined yet (no device): queue and process after join() completes.
         if (!this.device) {
           this.queuedProducers.push(msg);
@@ -1282,7 +1376,20 @@ export class MediasoupVideo implements VideoTransport {
     source: VideoSource
   ): Promise<void> {
     const inflight = this.inflightConsumes.get(producerId);
-    if (inflight) return inflight;
+    if (inflight) {
+      // Two consumes for one producer are not merely wasteful: the SFU answers
+      // the second with the SAME consumer id and mid, and the duplicate media
+      // section makes the browser reject the whole offer permanently. This
+      // event is how a reader knows the guard held rather than that the race
+      // never happened.
+      rec(
+        ev("sfu.consume", {
+          peer: peerId,
+          d: { phase: "dedup", producer: producerId, source },
+        })
+      );
+      return inflight;
+    }
     const p = this.consumeProducerInner(peerId, producerId, source).finally(
       () => {
         // Identity-checked: a rebuild may have already replaced this entry
@@ -1352,6 +1459,18 @@ export class MediasoupVideo implements VideoTransport {
     // arbitrary point in a GOP the client never asked for (finding 3).
     this.signal({ type: "ms:resume-consumer", producerId });
 
+    rec(
+      ev("sfu.consume", {
+        peer: peerId,
+        d: {
+          phase: "ok",
+          producer: producerId,
+          source,
+          kind: consumer.kind,
+        },
+      })
+    );
+
     if (!this.consumers.has(peerId)) this.consumers.set(peerId, []);
     this.consumers.get(peerId)!.push({ consumer, source });
 
@@ -1387,11 +1506,23 @@ export class MediasoupVideo implements VideoTransport {
   ): Promise<void> {
     try {
       await this.consumeProducer(peerId, producerId, source);
-    } catch {
+    } catch (err) {
+      rec(
+        ev("sfu.consume.failed", {
+          peer: peerId,
+          d: { err: errText(err), attempt: 1, producer: producerId },
+        })
+      );
       await new Promise((resolve) => setTimeout(resolve, 3_000));
       try {
         await this.consumeProducer(peerId, producerId, source);
       } catch (err) {
+        rec(
+          ev("sfu.consume.failed", {
+            peer: peerId,
+            d: { err: errText(err), attempt: 2, producer: producerId },
+          })
+        );
         this.emit(
           "error",
           err instanceof Error ? err : new Error(String(err))
@@ -1416,12 +1547,23 @@ export class MediasoupVideo implements VideoTransport {
     this.emit("error", err);
   }
 
-  private request<T>(msg: MSMessage, responseType: string): Promise<T> {
+  /**
+   * `opts.ignoreRefusal` skips the refusal check below: a refused session
+   * is exactly the one `requestDiag` needs to inspect. `opts.alsoAccept`
+   * documents a second acceptable response type; it needs no extra check
+   * here, because resolution below matches a response by its `requestId`
+   * alone, never by `responseType`.
+   */
+  private request<T>(
+    msg: MSMessage,
+    responseType: string,
+    opts?: { alsoAccept?: string; ignoreRefusal?: boolean }
+  ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       // A refused session never answers anything: the SFU closed the socket
       // right after its ms:error, so signal() below would drop this frame
       // and the caller would wait out the full timeout for nothing.
-      if (this.refusal) {
+      if (this.refusal && !opts?.ignoreRefusal) {
         reject(this.refusal);
         return;
       }
@@ -1448,6 +1590,25 @@ export class MediasoupVideo implements VideoTransport {
 
       this.signal(msg);
     });
+  }
+
+  /**
+   * One `ms:diag` snapshot, or null. Never throws: a refused session, a
+   * timeout, and `ms:diag-unavailable` all resolve to null, so a caller on
+   * a periodic tick needs no try/catch of its own.
+   */
+  async requestDiag(): Promise<SfuSnapshot | null> {
+    try {
+      const msg = await this.request<MSDiagReply | MSDiagUnavailable>(
+        { type: "ms:diag", requestId: this.nextRequestId() },
+        "ms:diag",
+        { alsoAccept: "ms:diag-unavailable", ignoreRefusal: true }
+      );
+      if (msg.type === "ms:diag-unavailable") return null;
+      return msg.snapshot;
+    } catch {
+      return null;
+    }
   }
 
   /** Start the getStats() sweep (finding 5). Idempotent - join() calls this
@@ -1538,6 +1699,7 @@ export class MediasoupVideo implements VideoTransport {
     event: K,
     ...args: Parameters<VideoEvents[K]>
   ): void {
+    recVideoEvent(event as string, args);
     this.handlers.get(event)?.forEach((h) => (h as Function)(...args));
   }
 }
