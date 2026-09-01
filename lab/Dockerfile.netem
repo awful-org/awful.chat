@@ -1,0 +1,9 @@
+# Network shaping for a browser container, run in that container's namespace.
+#
+# The browser image has neither tc nor iptables, and adding them to it would
+# mean maintaining a fork of an image whose only job is to be a browser. A
+# sidecar started with `--network container:<browser>` shares the same network
+# namespace, so `tc qdisc` here shapes exactly the interface the browser uses.
+FROM alpine:3.20
+RUN apk add --no-cache iproute2 iptables
+ENTRYPOINT ["/bin/sh", "-c"]
