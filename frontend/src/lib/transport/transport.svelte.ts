@@ -782,17 +782,74 @@ if (typeof window !== "undefined") {
   window.addEventListener("beforeunload", onUnload);
 }
 
+/**
+ * Publish to a room's topic AND hand a direct copy to every peer the relay
+ * places in that room.
+ *
+ * A bare publish into a mesh that has not formed is silently dropped
+ * (allowPublishToZeroTopicPeers), and for a small room that is the normal case
+ * rather than the edge one - _sendProfile and _broadcastChatWire both already
+ * carry exactly this insurance, and everything that skipped it (room names,
+ * room icons, JoinRoom, LeaveRoom) was measurably lossy.
+ *
+ * Recipients are membership-checked because a roomCode rides in every one of
+ * these payloads and it is the room's whole membership secret - the gossipsub
+ * topic, the rendezvous key and the SFU join key at once. peersInRoom is the
+ * same authority _sendDigestForRoom uses, and it beats a DID roster: rendezvous
+ * membership is known as soon as the joiner registers, while a DID binding
+ * arrives with a Profile that a join usually precedes.
+ */
+function _publishToRoom(payload: Uint8Array, roomCode: string): Promise<void> {
+  const published = _transport.broadcast(payload, roomCode);
+  for (const pid of _transport.peersInRoom(roomCode)) {
+    _transport.send(pid, payload).catch(() => {});
+  }
+  return published;
+}
+
 // ── Senders ───────────────────────────────────────────────────────────────────
 
-function _sendRoomName(peerId?: string): void {
-  const roomCode = transportState.roomCode;
-  const name = transportState.roomName.trim().slice(0, 64);
-  if (!name || !roomCode) return;
+/**
+ * Send one room's name: to the whole room, or to a single peer.
+ *
+ * Shaped like _sendRoomIcon below, deliberately. The two travel together and
+ * used to differ only in that the name had no delivery insurance, which showed:
+ * a peer joining a room over a connection that already existed saw the raw room
+ * code where the name belonged, because the only triggers were the connect
+ * event (which does not fire for an already-connected peer) and a bare
+ * broadcast (which an unformed mesh drops).
+ *
+ * An empty name never goes out, and neither does the room code as a name: a
+ * peer who joined from a bare invite link has neither, and sending either would
+ * overwrite the real name for everyone already in the room.
+ */
+function _sendRoomName(
+  roomCode: string | null,
+  peerId?: string,
+  opts: { peerKnowsRoom?: boolean } = {}
+): void {
+  if (!roomCode) return;
+  // transportState holds the freshest name for the room on screen; the mirror is
+  // the only source for any other room we are subscribed to.
+  const live =
+    roomCode === transportState.roomCode ? transportState.roomName : "";
+  const stored = roomsStore.rooms.find((r) => r.roomCode === roomCode)?.name;
+  const name = (live || stored || "").trim().slice(0, 64);
+  if (!name || name === roomCode) return;
   // roomCode travels with it: a direct send has no topic to infer it from, so
   // the receiver used to apply the name to whatever room they had open.
   const payload = encode({ type: MessageType.RoomName, name, roomCode });
-  if (peerId) _transport.send(peerId, payload);
-  else _transport.broadcast(payload, roomCode);
+  if (peerId) {
+    if (
+      !opts.peerKnowsRoom &&
+      !_transport.peersInRoom(roomCode).includes(peerId)
+    ) {
+      return;
+    }
+    _transport.send(peerId, payload).catch(() => {});
+    return;
+  }
+  _publishToRoom(payload, roomCode);
 }
 
 /**
@@ -812,17 +869,10 @@ function _sendRoomName(peerId?: string): void {
  * in _sendRoomName avoids. `cleared` is the one exception: a local removal is
  * an intent rather than an absence, so it states the nulls.
  *
- * EVERY recipient is membership-checked, exactly as _sendDigestForRoom checks,
- * and for the same reason: the roomCode rides in this payload and it is the
- * room's whole membership secret - the gossipsub topic, the rendezvous key and
- * the SFU join key at once. Handing it to a peer who merely shares some other
- * room with us would give them the keys to this one. The relay's view is the
- * right authority here, and it beats a DID roster: rendezvous membership is
- * known as soon as the joiner registers, while the DID binding arrives with a
- * Profile that a join usually precedes.
- *
- * peerKnowsRoom is the one bypass, and it means what it does for a digest:
- * this peer named the room to US first, so they already hold the code.
+ * A single recipient is membership-checked the same way _publishToRoom checks
+ * its own, and for the same reason. peerKnowsRoom is the one bypass, and it
+ * means what it does for a digest: this peer named the room to US first on its
+ * authenticated topic, so they already hold the code.
  */
 function _sendRoomIcon(
   roomCode: string | null,
@@ -850,14 +900,7 @@ function _sendRoomIcon(
     _transport.send(peerId, payload).catch(() => {});
     return;
   }
-  _transport.broadcast(payload, roomCode);
-  // Belt and braces, the same insurance _sendProfile and _broadcastChatWire
-  // carry: a publish into a mesh that has not formed yet is silently dropped
-  // (allowPublishToZeroTopicPeers), and for a two-peer room that is the normal
-  // case, not the edge one - measured, the broadcast alone reached nobody.
-  for (const pid of _transport.peersInRoom(roomCode)) {
-    _transport.send(pid, payload).catch(() => {});
-  }
+  _publishToRoom(payload, roomCode);
 }
 
 async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
@@ -1840,12 +1883,13 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   // anyone is, no names, no presence and no history.
   if (!msg.reply) {
     _sendProfile(peerId, true);
-    // The room's icon belongs in "everything about our current state". This is
-    // the one trigger that actually reaches a joiner: a joining peer direct-
-    // sends its Profile to every connected peer, so this fires even when no
-    // connect event does (peers who already share a connection) and even when
-    // the room's gossipsub mesh has not formed. JoinRoom cannot do the job -
-    // it is a bare broadcast, so the trigger itself gets dropped.
+    // The room's name and icon belong in "everything about our current state".
+    // This is the one trigger that actually reaches a joiner: a joining peer
+    // direct-sends its Profile to every connected peer, so this fires even when
+    // no connect event does (peers who already share a connection) and even
+    // when the room's gossipsub mesh has not formed. JoinRoom cannot do the job
+    // on its own - it is a broadcast, so the trigger can be dropped too.
+    _sendRoomName(transportState.roomCode, peerId);
     _sendRoomIcon(transportState.roomCode, peerId);
     if (transportState.inCall) {
       _sendCallPresence(peerId);
@@ -2168,18 +2212,19 @@ function _handleJoinRoom(
   // entry reaches nobody until that identity actually connects.
   if (!looksLikeDid(claimedDid) && !looksLikePeerId(claimedDid)) return;
   _admitRoomMember(room, claimedDid);
-  // Hand the joiner this room's icon. The connect-time welcome does not cover
-  // them: peers who already share a connection - anyone switching rooms with
-  // the same people - fire no connect event, so without this a joiner sat on
-  // the bare hash until something else happened to resend.
+  // Hand the joiner this room's name and icon. The connect-time welcome does
+  // not cover them: peers who already share a connection - anyone switching
+  // rooms with the same people - fire no connect event, so without this a joiner
+  // sat on the raw room code and a bare hash until something else resent.
   //
   // Direct to the peer this arrived on, not only the topic broadcast. `room`
   // being set means this came in on the room's AUTHENTICATED pubsub topic, so
-  // that peer demonstrably already holds the roomCode this payload carries -
-  // nothing leaks. The broadcast alone is not enough twice over: a publish
-  // into a mesh that has not formed is dropped, and _sendRoomIcon's direct
-  // copies are roster-gated on a DID binding that a join usually PRECEDES
-  // (see the note above). Measured: without this the joiner got nothing.
+  // that peer demonstrably already holds the roomCode these payloads carry -
+  // nothing leaks. peerKnowsRoom says exactly that, and it matters because the
+  // ordinary membership gate needs a DID binding that a join usually PRECEDES
+  // (see the note above).
+  _sendRoomName(room);
+  _sendRoomName(room, fromPeerId, { peerKnowsRoom: true });
   _sendRoomIcon(room);
   _sendRoomIcon(room, fromPeerId, { peerKnowsRoom: true });
 }
@@ -2259,19 +2304,26 @@ function _handleRoomUsersSync(
 
 function _broadcastJoinRoom(): void {
   const selfDid = identityStore.did ?? _transport.selfId();
-  if (!selfDid || !transportState.roomCode) return;
-  _transport.broadcast(
+  const roomCode = transportState.roomCode;
+  if (!selfDid || !roomCode) return;
+  // Direct copies too, or the announcement itself is lost in an unformed mesh
+  // and nobody in the room learns you arrived - which also silenced every reply
+  // keyed on a join, room name and room icon included.
+  _publishToRoom(
     encode({ type: MessageType.JoinRoom, peerId: selfDid }),
-    transportState.roomCode
+    roomCode
   );
 }
 
 function _broadcastLeaveRoom(): Promise<void> {
   const selfDid = identityStore.did ?? _transport.selfId();
-  if (!selfDid || !transportState.roomCode) return Promise.resolve();
-  return _transport.broadcast(
+  const roomCode = transportState.roomCode;
+  if (!selfDid || !roomCode) return Promise.resolve();
+  // Same insurance. A dropped leave leaves you in everyone's member list as a
+  // ghost until the 30-day inactive sweep collects you.
+  return _publishToRoom(
     encode({ type: MessageType.LeaveRoom, peerId: selfDid }),
-    transportState.roomCode
+    roomCode
   );
 }
 
@@ -2559,7 +2611,7 @@ _transport.on("connect", (peerId) => {
   // short-circuits.
   _announceStoredFilesTo(peerId).catch(() => {});
   _sendProfile(peerId);
-  _sendRoomName(peerId);
+  _sendRoomName(transportState.roomCode, peerId);
   _sendRoomIcon(transportState.roomCode, peerId);
   if (transportState.inCall) _sendCallPresence(peerId);
   if (transportState.inCall) _sendCallState(peerId);
@@ -3966,7 +4018,7 @@ export function broadcastProfile(): void {
 
 export function setRoomName(name: string): void {
   transportState.roomName = name.trim().slice(0, 64);
-  _sendRoomName();
+  _sendRoomName(transportState.roomCode);
 }
 
 /**
