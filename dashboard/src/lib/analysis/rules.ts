@@ -45,7 +45,8 @@ export type FindingId =
   | "peerconnection-leak"
   | "uncaught-error"
   | "producer-never-consumed"
-  | "turn-unreachable";
+  | "turn-unreachable"
+  | "sfu-misplaced";
 
 export interface Rule {
   id: FindingId;
@@ -291,6 +292,17 @@ export const RULES: Readonly<Record<FindingId, Rule>> = {
     meaning: "Some events were dropped or throttled before capture. Findings before the first surviving event can be wrong.",
     remedy: "Raise the ring capacity or the throttle budget for the noisy kind.",
     aiHint: "Check the suppressed kind counts to find which signal was lost.",
+  },
+  "sfu-misplaced": {
+    id: "sfu-misplaced",
+    title: "Call split across SFU nodes",
+    severity: "block",
+    meaning:
+      "This peer joined an SFU room the server says is empty, while presence placed other people in it. The call is spread over two nodes, which keep separate rooms, so no camera or screen share can cross between them.",
+    remedy:
+      "Put one SFU behind each hostname. Rooms live in one process and do not cascade, so several instances behind one name cannot serve one room - list each instance in VITE_SFU_URLS and let the room code choose.",
+    aiHint:
+      "Compare expectedOthers against reportedByServer on the sfu.misplaced event, then check sfu.pick host across the vantages - a split behind ONE hostname is a load balancer, not a misconfigured pool.",
   },
   "turn-unreachable": {
     id: "turn-unreachable",

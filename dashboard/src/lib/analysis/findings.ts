@@ -998,6 +998,9 @@ export function runFindings(c: Capture): Finding[] {
     ...peerConnectionLeak(timeline),
     ...producerNeverConsumed(c, timeline),
     ...turnUnreachable(timeline),
+    // One event, one finding: the client only emits it when the disagreement
+    // is unambiguous, so there is nothing left to threshold here.
+    ...thresholdByObserver(timeline, "sfu.misplaced", 1, "sfu-misplaced"),
     ...thresholdByObserver(timeline, "runtime.error", 1, "uncaught-error"),
   ];
 

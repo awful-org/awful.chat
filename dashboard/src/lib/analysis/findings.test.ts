@@ -128,8 +128,8 @@ function expectEvidenceValid(capture: Capture, findings: Finding[]): void {
 // ---------------------------------------------------------------------------
 
 describe("RULES", () => {
-  it("has exactly 33 entries, one per FindingId", () => {
-    expect(Object.keys(RULES).length).toBe(33);
+  it("has exactly 34 entries, one per FindingId", () => {
+    expect(Object.keys(RULES).length).toBe(34);
   });
 
   it("every rule has a matching id and non-empty prose", () => {
@@ -992,5 +992,31 @@ describe("turn-unreachable", () => {
       ev({ kind: "ice.turn.ok", at: 100, d: { branch: "allocate", ms: 120 } }),
     ]);
     expect(idsOf(runFindings(capture))).not.toContain("turn-unreachable");
+  });
+});
+
+describe("sfu-misplaced", () => {
+  it("fires when the client reports a room the server thinks is empty", () => {
+    const capture = makeCapture([
+      ev({
+        kind: "sfu.misplaced",
+        at: 4000,
+        sev: "error",
+        d: { expectedOthers: 1, reportedByServer: 0 },
+      }),
+    ]);
+    const findings = runFindings(capture);
+    expect(idsOf(findings)).toContain("sfu-misplaced");
+    expectEvidenceValid(capture, findings);
+  });
+
+  it("stays quiet on an ordinary session", () => {
+    // The client only emits when the disagreement is unambiguous, so the
+    // absence of the event is itself the healthy signal.
+    const capture = makeCapture([
+      ev({ kind: "sfu.caps", at: 100, d: { roomPeerCount: 1 } }),
+      ev({ kind: "sfu.join", at: 120 }),
+    ]);
+    expect(idsOf(runFindings(capture))).not.toContain("sfu-misplaced");
   });
 });

@@ -443,6 +443,9 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "meta.suppressed":
     // Local to one tab: an uncaught throw, the connection gauge and a media
     // sample say nothing about who can reach whom.
+    // A placement fault is about which SERVER this tab reached, not about who
+    // can reach whom, so the graph is unchanged by it.
+    case "sfu.misplaced":
     case "voice.media.sample":
     case "runtime.error":
     case "runtime.resources":
