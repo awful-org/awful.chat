@@ -163,6 +163,8 @@ export type DiagKind =
   | "storage.locked"
   | "storage.quota"
   | "storage.drop"
+  | "runtime.error"
+  | "runtime.resources"
   | "counters"
   | "fault.injected"
   | "meta.suppressed";
@@ -172,7 +174,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 112;
+export const DIAG_KIND_COUNT = 114;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -181,11 +183,12 @@ export const DIAG_KIND_COUNT = 112;
  *   `*.drop*`, `*.invalid`, `*.oversize`, plus `storage.locked` (an offline
  *   queue write was silently lost), `sfu.error` and `sfu.ws.error` (both are
  *   failures whose names predate this table), and `ice.turn.unavailable` (no
- *   TURN is a hard failure for a peer behind a symmetric NAT).
+ *   TURN is a hard failure for a peer behind a symmetric NAT), and
+ *   `runtime.error` (an exception nothing in the app caught).
  * - "warn": a degradation that still works - `*.degraded`, `*.stall*`,
  *   `*.retry`, `rv.close`, `peer.disconnect`, `storage.quota`.
  * - "debug": high-rate sampling - `peer.rtt`, `peer.clock`, `counters`,
- *   `sfu.diag`, `voice.ice.state`.
+ *   `sfu.diag`, `voice.ice.state`, `runtime.resources`.
  * - "info": everything else.
  *
  * `sev` decides the order `trimBundleForUpload` sacrifices events in, and it
@@ -314,6 +317,8 @@ export const KIND_SEV = {
   "storage.locked": "error",
   "storage.quota": "warn",
   "storage.drop": "error",
+  "runtime.error": "error",
+  "runtime.resources": "debug",
   counters: "debug",
   "fault.injected": "info",
   "meta.suppressed": "info",
@@ -335,6 +340,11 @@ export const KIND_BUDGET: Readonly<Partial<Record<DiagKind, number>>> = {
   "file.progress": 2,
   "voice.ice.state": 5,
   "peer.rtt": 2,
+  // One broken frame can throw on every animation tick. A storm of the same
+  // error says nothing the first five did not, and it would evict the ring
+  // that explains WHY it started.
+  "runtime.error": 5,
+  "runtime.resources": 2,
 };
 
 // ---------------------------------------------------------------------------

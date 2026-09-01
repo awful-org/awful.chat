@@ -441,6 +441,10 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "counters":
     case "fault.injected":
     case "meta.suppressed":
+    // Local to one tab: an uncaught throw and the connection gauge say
+    // nothing about who can reach whom.
+    case "runtime.error":
+    case "runtime.resources":
     // A log line that no template matched. It carries no structure to fold,
     // but it is listed so the switch stays total over `MergedKind`.
     case LOG_RAW_KIND:

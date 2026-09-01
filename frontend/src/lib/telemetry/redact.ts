@@ -92,4 +92,35 @@ export class RefTable {
   rooms(): DiagRoomRef[] {
     return [...this.#rooms.values()].map((r) => ({ ...r }));
   }
+
+  /**
+   * Replace everything this table knows to be sensitive with its ordinal, and
+   * every URL with a placeholder.
+   *
+   * For text this bundle did not compose: a thrown error's message, which can
+   * quote the very things the schema has no field for. "Failed to fetch
+   * https://relay.example/invite/<code>" is a real message from a real failure
+   * path, and it would carry a room code out of a bundle that redacts room
+   * codes everywhere else. URLs go first, so a code inside one is gone before
+   * the per-code pass even looks.
+   *
+   * Only what this session actually touched can be replaced by an ordinal, so
+   * a bare `did:key:` gets a blanket placeholder instead: an unbound identity
+   * has no ordinal to become.
+   */
+  scrub(text: string): string {
+    try {
+      let out = text.replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>");
+      for (const [code, entry] of this.#rooms) {
+        out = out.split(code).join(entry.ref);
+      }
+      for (const [did, ref] of this.#identities) {
+        out = out.split(did).join(ref);
+      }
+      return out.replace(/did:key:[A-Za-z0-9]+/g, "<did>");
+    } catch {
+      // A hostile string subclass can throw from replace via Symbol.replace.
+      return "<unprintable>";
+    }
+  }
 }

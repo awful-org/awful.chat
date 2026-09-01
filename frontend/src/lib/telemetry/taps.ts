@@ -14,6 +14,7 @@
  */
 
 import { errText, ev, MAX_DETAIL_KEYS } from "./event";
+import { installPcCensus, pcCensus } from "./pc-census";
 import {
   initRecorder,
   rec,
@@ -303,6 +304,60 @@ export function counterEvents(delta: Record<string, number>): Body[] {
 }
 
 // ---------------------------------------------------------------------------
+// Uncaught failures and the resource gauge
+// ---------------------------------------------------------------------------
+
+/**
+ * An exception nothing in the app caught.
+ *
+ * Every other probe here records a decision the code made ON PURPOSE. This one
+ * records the ones it did not: a `DOMException` from `setRemoteDescription`, a
+ * constructor refusing because a browser budget is spent, a rejection in a
+ * `void`-ed promise. Those are exactly the failures with no handler to tap,
+ * which is why they are also the ones that reach a user with nothing written
+ * down anywhere.
+ *
+ * The message is SCRUBBED, not merely truncated: an error composed by the
+ * platform quotes whatever the app passed it, and a failed fetch quotes its
+ * URL - which is how a room code gets into text that has no field for one.
+ */
+export function errorEvent(source: "uncaught" | "rejection", value: unknown): Body {
+  return ev("runtime.error", {
+    d: { source, err: refs().scrub(errText(value)) },
+  });
+}
+
+let lastCensus = "";
+
+/**
+ * The `RTCPeerConnection` gauge, on change only.
+ *
+ * A silent gauge means a steady one: at four connections per peer this would
+ * otherwise repeat the same three numbers every tick for the whole session,
+ * and the ring is the scarce thing here. What matters is the shape over time -
+ * `live` that only ever climbs is a leak, and `created` climbing while `live`
+ * holds is a rebuild loop.
+ */
+export function censusEvent(): Body | null {
+  const c = pcCensus();
+  if (!c.installed) return null;
+  const key = `${c.live}/${c.created}`;
+  if (key === lastCensus) return null;
+  lastCensus = key;
+  return ev("runtime.resources", {
+    d: { pcLive: c.live, pcCreated: c.created, pcPeak: c.peak },
+  });
+}
+
+function onWindowError(e: ErrorEvent): void {
+  rec(errorEvent("uncaught", e.error ?? e.message));
+}
+
+function onRejection(e: PromiseRejectionEvent): void {
+  rec(errorEvent("rejection", e.reason));
+}
+
+// ---------------------------------------------------------------------------
 // Installation
 // ---------------------------------------------------------------------------
 
@@ -336,6 +391,14 @@ export function installTelemetryTaps(opts: TelemetryTapOptions): void {
   stopTelemetryTaps();
   initRecorder(opts);
   lastCounters = {};
+  lastCensus = "";
+  // Before the first dial: a connection built earlier than this is invisible
+  // to the gauge for the rest of the session.
+  installPcCensus();
+  if (typeof window !== "undefined") {
+    window.addEventListener("error", onWindowError);
+    window.addEventListener("unhandledrejection", onRejection);
+  }
 
   counterTimer = setInterval(() => {
     try {
@@ -348,6 +411,8 @@ export function installTelemetryTaps(opts: TelemetryTapOptions): void {
       lastCounters = now;
       recordCounters(now);
       for (const body of counterEvents(delta)) rec(body);
+      const census = censusEvent();
+      if (census) rec(census);
     } catch {
       // A sampler never breaks the app.
     }
@@ -386,6 +451,10 @@ export async function sampleSfu(
 }
 
 export function stopTelemetryTaps(): void {
+  if (typeof window !== "undefined") {
+    window.removeEventListener("error", onWindowError);
+    window.removeEventListener("unhandledrejection", onRejection);
+  }
   if (counterTimer !== null) clearInterval(counterTimer);
   if (sfuTimer !== null) clearInterval(sfuTimer);
   counterTimer = null;
@@ -416,4 +485,6 @@ export const TAP_KINDS: readonly DiagKind[] = [
   "counters",
   "sfu.diag",
   "fault.injected",
+  "runtime.error",
+  "runtime.resources",
 ];

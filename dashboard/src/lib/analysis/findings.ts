@@ -92,6 +92,9 @@ export const SFU_CONSUMER_STALL_THRESHOLD = 2;
 /** How long the SFU room count and the voice roster may disagree. */
 export const SFU_ROOM_SPLIT_MS = 30_000;
 
+/** Live RTCPeerConnections that mean a leak, not a busy call. */
+export const PC_LIVE_ALARM = 50;
+
 // ---------------------------------------------------------------------------
 // Small, side-effect-free readers for the `d` bag. Never throw.
 // ---------------------------------------------------------------------------
@@ -494,6 +497,43 @@ function messageRejected(timeline: MergedEvent[]): Finding[] {
   return out;
 }
 
+/**
+ * The gauge climbed past anything a real call needs.
+ *
+ * A call holds a few connections per peer: one for voice, one or two for
+ * libp2p, two for the SFU. Fifty is far above every legitimate shape and far
+ * below the 500 at which the browser starts to refuse them, so this fires
+ * while the session can still be explained rather than after voice, the SFU
+ * and libp2p have all failed on the same line.
+ */
+function peerConnectionLeak(timeline: MergedEvent[]): Finding[] {
+  const seen = new Map<
+    string,
+    { evidence: number[]; peak: number; created: number }
+  >();
+  timeline.forEach((e, i) => {
+    if (e.kind !== "runtime.resources") return;
+    const live = num(e.d, "pcLive");
+    if (live === null) return;
+    const hit = seen.get(e.observer) ?? { evidence: [], peak: 0, created: 0 };
+    if (live >= PC_LIVE_ALARM) hit.evidence.push(i);
+    hit.peak = Math.max(hit.peak, live);
+    hit.created = Math.max(hit.created, num(e.d, "pcCreated") ?? 0);
+    seen.set(e.observer, hit);
+  });
+  const out: Finding[] = [];
+  for (const [observer, hit] of seen) {
+    if (hit.evidence.length === 0) continue;
+    out.push(
+      make("peerconnection-leak", { vantage: observer }, hit.evidence, {
+        peakLive: hit.peak,
+        created: hit.created,
+      })
+    );
+  }
+  return out;
+}
+
 /** Per-`(observer, peer)` proof transitions, in time order. */
 function provenTransitions(timeline: MergedEvent[]): Map<string, Array<{ at: number; proven: boolean }>> {
   const map = new Map<string, Array<{ at: number; proven: boolean }>>();
@@ -866,6 +906,8 @@ export function runFindings(c: Capture): Finding[] {
     ...storageLockedWrites(timeline),
     ...captureIncomplete(c),
     ...relayCloseUnclean(timeline),
+    ...peerConnectionLeak(timeline),
+    ...thresholdByObserver(timeline, "runtime.error", 1, "uncaught-error"),
   ];
 
   return findings

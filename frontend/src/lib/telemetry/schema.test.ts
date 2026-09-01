@@ -70,6 +70,8 @@ describe("KIND_SEV", () => {
 describe("KIND_BUDGET", () => {
   it("throttles only the kinds that can storm", () => {
     expect(KIND_BUDGET).toEqual({
+      "runtime.error": 5,
+      "runtime.resources": 2,
       "app.msg.in": 5,
       "app.msg.out": 5,
       "file.progress": 2,

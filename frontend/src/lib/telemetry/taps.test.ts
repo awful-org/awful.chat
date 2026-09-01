@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
+  censusEvent,
   counterEvents,
+  errorEvent,
   diffCounters,
   flattenBags,
   statusEvent,
@@ -280,5 +282,82 @@ describe("counter sampling", () => {
     expect(Object.keys(events[2].d ?? {})).toHaveLength(1);
     const seen = events.flatMap((e) => Object.keys(e.d ?? {}));
     expect(new Set(seen).size).toBe(25);
+  });
+});
+
+describe("uncaught failures", () => {
+  beforeEach(() => {
+    resetRecorderForTest();
+    beginSession("s1", 0);
+  });
+
+  it("records a thrown DOMException with its name and message", () => {
+    // The two that actually reached users, verbatim from the console.
+    const body = errorEvent(
+      "uncaught",
+      new DOMException(
+        "Failed to construct 'RTCPeerConnection': Cannot create so many PeerConnections",
+        "UnknownError"
+      )
+    );
+    expect(body.kind).toBe("runtime.error");
+    expect(body.sev).toBe("error");
+    expect(body.d?.source).toBe("uncaught");
+    expect(String(body.d?.err)).toContain("so many PeerConnections");
+  });
+
+  it("records a rejection whose reason is not an Error", () => {
+    const body = errorEvent("rejection", "duplicated a=msid detected");
+    expect(String(body.d?.err)).toContain("duplicated a=msid");
+  });
+
+  it("scrubs a room code the platform quoted back at us", () => {
+    const code = "a1b2c3d4e5f60718";
+    const ref = refs().roomRef(code);
+    // A real message from a real failure path: the URL carries the code.
+    const body = errorEvent(
+      "uncaught",
+      new TypeError(`Failed to fetch https://relay.example/invite/${code}`)
+    );
+    const text = String(body.d?.err);
+    expect(text).not.toContain(code);
+    expect(text).toContain("<url>");
+    // And outside a URL, where the ordinal is the useful replacement.
+    const bare = errorEvent("uncaught", new Error(`room ${code} is wedged`));
+    expect(String(bare.d?.err)).not.toContain(code);
+    expect(String(bare.d?.err)).toContain(ref);
+  });
+
+  it("scrubs a did:key even when this session never bound it", () => {
+    const body = errorEvent(
+      "rejection",
+      new Error(
+        "no route to did:key:z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG"
+      )
+    );
+    expect(String(body.d?.err)).not.toContain("z6Mkjchh");
+    expect(String(body.d?.err)).toContain("<did>");
+  });
+
+  it("never throws, whatever was thrown at it", () => {
+    const hostile = {
+      get message() {
+        throw new Error("nope");
+      },
+      toString() {
+        throw new Error("nope");
+      },
+    };
+    expect(() => errorEvent("uncaught", hostile)).not.toThrow();
+    expect(() => errorEvent("rejection", undefined)).not.toThrow();
+  });
+});
+
+describe("the resource gauge", () => {
+  it("says nothing while the gauge is not installed", () => {
+    // jsdom has no RTCPeerConnection, so the census never installs here -
+    // and a sampler with nothing to sample must stay quiet rather than
+    // record a misleading zero.
+    expect(censusEvent()).toBeNull();
   });
 });

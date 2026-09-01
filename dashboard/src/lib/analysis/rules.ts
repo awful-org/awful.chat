@@ -41,7 +41,9 @@ export type FindingId =
   | "unconfigured-instance"
   | "storage-locked-writes"
   | "capture-incomplete"
-  | "relay-close-unclean";
+  | "relay-close-unclean"
+  | "peerconnection-leak"
+  | "uncaught-error";
 
 export interface Rule {
   id: FindingId;
@@ -287,6 +289,26 @@ export const RULES: Readonly<Record<FindingId, Rule>> = {
     meaning: "Some events were dropped or throttled before capture. Findings before the first surviving event can be wrong.",
     remedy: "Raise the ring capacity or the throttle budget for the noisy kind.",
     aiHint: "Check the suppressed kind counts to find which signal was lost.",
+  },
+  "peerconnection-leak": {
+    id: "peerconnection-leak",
+    title: "PeerConnection leak",
+    severity: "block",
+    meaning:
+      "This tab held too many RTCPeerConnections at once. The browser refuses new connections at 500, and then voice, the SFU and libp2p all fail together.",
+    remedy:
+      "Find the loop that builds connections and does not close them. Compare pcCreated against pcLive over time.",
+    aiHint:
+      "Read pcLive across the runtime.resources samples. A count that only climbs is a leak. A pcCreated that climbs while pcLive holds is a rebuild loop.",
+  },
+  "uncaught-error": {
+    id: "uncaught-error",
+    title: "Uncaught error",
+    severity: "warn",
+    meaning: "An exception reached the window. No code in the app caught it.",
+    remedy: "Add a handler at the throw site, or fix the condition that throws.",
+    aiHint:
+      "Read the err text and the events immediately before it in the same vantage.",
   },
   "relay-close-unclean": {
     id: "relay-close-unclean",

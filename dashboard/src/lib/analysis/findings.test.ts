@@ -14,6 +14,7 @@ import {
   ROOM_VIEW_SPLIT_MS,
   SFU_CONSUMER_STALL_THRESHOLD,
   SFU_REJOIN_LOOP_THRESHOLD,
+  PC_LIVE_ALARM,
   SFU_ROOM_SPLIT_MS,
   SYNC_STALL_MS,
   UPGRADE_FAIL_THRESHOLD,
@@ -126,8 +127,8 @@ function expectEvidenceValid(capture: Capture, findings: Finding[]): void {
 // ---------------------------------------------------------------------------
 
 describe("RULES", () => {
-  it("has exactly 29 entries, one per FindingId", () => {
-    expect(Object.keys(RULES).length).toBe(29);
+  it("has exactly 31 entries, one per FindingId", () => {
+    expect(Object.keys(RULES).length).toBe(31);
   });
 
   it("every rule has a matching id and non-empty prose", () => {
@@ -844,5 +845,56 @@ describe("relay-close-unclean", () => {
       ev({ kind: "rv.close", at: 0, vantage: "relay", d: { reason: "graceful" } }),
     ]);
     expect(idsOf(runFindings(c))).not.toContain("relay-close-unclean");
+  });
+});
+
+describe("peerconnection-leak", () => {
+  it("fires once the live gauge crosses the alarm", () => {
+    const capture = makeCapture([
+      ev({ kind: "runtime.resources", at: 1000, d: { pcLive: 4, pcCreated: 4, pcPeak: 4 } }),
+      ev({
+        kind: "runtime.resources",
+        at: 60_000,
+        d: { pcLive: PC_LIVE_ALARM, pcCreated: 300, pcPeak: PC_LIVE_ALARM },
+      }),
+    ]);
+    const findings = runFindings(capture);
+    const hit = findOf(findings, "peerconnection-leak");
+    expect(hit).toBeDefined();
+    // `created` far above `peak` is the rebuild-loop shape, and it is the
+    // number that says which of the two this was.
+    expect(hit?.detail).toMatchObject({ peakLive: PC_LIVE_ALARM, created: 300 });
+    expectEvidenceValid(capture, findings);
+  });
+
+  it("stays quiet for a busy call that closes what it opens", () => {
+    const capture = makeCapture([
+      ev({ kind: "runtime.resources", at: 1000, d: { pcLive: 12, pcCreated: 12, pcPeak: 12 } }),
+      ev({ kind: "runtime.resources", at: 9000, d: { pcLive: 8, pcCreated: 20, pcPeak: 12 } }),
+    ]);
+    // A console that invents a leak is worse than no console: eight peers
+    // joining and leaving is not a fault.
+    expect(idsOf(runFindings(capture))).not.toContain("peerconnection-leak");
+  });
+});
+
+describe("uncaught-error", () => {
+  it("surfaces a single uncaught exception", () => {
+    const capture = makeCapture([
+      ev({
+        kind: "runtime.error",
+        at: 500,
+        sev: "error",
+        d: { source: "uncaught", err: "UnknownError: Cannot create so many PeerConnections" },
+      }),
+    ]);
+    const findings = runFindings(capture);
+    expect(idsOf(findings)).toContain("uncaught-error");
+    expectEvidenceValid(capture, findings);
+  });
+
+  it("stays quiet when nothing threw", () => {
+    const capture = makeCapture([ev({ kind: "peer.connect", at: 10 })]);
+    expect(idsOf(runFindings(capture))).not.toContain("uncaught-error");
   });
 });
