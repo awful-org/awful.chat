@@ -131,6 +131,7 @@ enum MessageType {
   WatchPresence   = "watch_presence",
   VoiceRedial     = "voice_redial",
   RoomName        = "room_name",
+  RoomIcon        = "room_icon",
   PluginEphemeral = "plugin_ephemeral",
   JoinRoom        = "join_room",
   LeaveRoom       = "leave_room",
@@ -205,9 +206,16 @@ interface Room {
   name: string
   lastSeenLamport: number  // unread count derived from this
   createdAt: number
-  pfpData?: ArrayBuffer    // local upload - blobURL generated at runtime
-  pfpURL?: string          // external URL (tenor, giphy, etc) - stored as-is
-  // pfpData and pfpURL mutually exclusive
+  participants: string[]                        // DIDs known to be in the room
+  participantLastSeen?: Record<string, number>  // DID -> last seen ms
+  // Room icon. One of three states: an emoji, a picture, or neither (the
+  // sidebar and the chat header fall back to a hash glyph).
+  emoji?: string           // exactly one emoji, validated by normalizeRoomEmoji
+  pfpData?: ArrayBuffer    // legacy local upload - blobURL generated at runtime
+  pfpURL?: string          // data: URL from the picker, or a linked GIF
+  // emoji, pfpURL and pfpData are mutually exclusive: setRoomIcon() clears the
+  // others when it writes one. A room icon is always carried as a URL, so
+  // pfpURL is what the picker writes and pfpData is only ever read.
 }
 
 interface DMRoom extends Room {
@@ -309,7 +317,12 @@ interface WireProfile      { type: MessageType.Profile;      name: string; did: 
                              // proof that `did` owns the sending peerId, see Peer Identity Binding
                              peerId?: string; bindingSig?: string }
 interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
-interface WireRoomName     { type: MessageType.RoomName;     name: string }
+interface WireRoomName     { type: MessageType.RoomName;     name: string; roomCode?: string }
+// Room icon. Separate from WireRoomName so setting one does not rebroadcast the
+// other, and so a removal can be stated: an explicit `null` means "no icon any
+// more", while an absent field means "this build has nothing to say about it".
+// Both fields always go out together, because the two forms are exclusive.
+interface WireRoomIcon     { type: MessageType.RoomIcon;     emoji?: string | null; iconUrl?: string | null; roomCode?: string }
 
 // sync - wire only
 interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
@@ -317,7 +330,7 @@ interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatM
 interface WireSyncComplete { type: MessageType.SyncComplete }
 
 type AnyWireMessage =
-  | WireChatMessage | WireProfile | WireCallPresence | WireRoomName
+  | WireChatMessage | WireProfile | WireCallPresence | WireRoomName | WireRoomIcon
   | WireSyncDigest | WireSyncBatch | WireSyncComplete
 
 // helpers
@@ -449,6 +462,53 @@ signature policy on receive (MANDATORY since 2026-08):
   → deterministic rejects (no sig, sigV outside {2,3}) CLAIM watermarks
     so the sender stops re-pushing the same dead backlog every digest;
     only signed-but-failing rows keep the floor open for retry
+```
+
+### Room metadata (name and icon)
+
+A room's name and icon are peer-gossiped presence, never persisted messages and
+never known to the relay. Both converge last-write-wins: there is no vector
+clock for them, so whoever spoke most recently wins.
+
+```txt
+room_icon is sent:
+  → on a local set or removal        (broadcast to the room)
+  → on joinRoom                      (broadcast; only if we hold an icon)
+  → on a peer's connect              (direct to that peer)
+  → on a peer's JoinRoom             (broadcast + direct to the announcer)
+  → on a peer's Profile we did not   (direct to that peer) - THE reliable one
+    provoke
+
+why that many triggers: a bare gossipsub publish into a mesh that has not
+formed is silently dropped (allowPublishToZeroTopicPeers), which for a two-peer
+room is the normal case. JoinRoom cannot be the trigger on its own because it
+is itself a bare broadcast, so the trigger gets dropped. The Profile exchange
+is the one path that always lands: a joining peer direct-sends its Profile to
+every connected peer, so it fires even when no connect event does (peers who
+already share a connection) and even with no mesh. Every send is also mirrored
+direct to each peer the RELAY places in the room, the same belt-and-braces
+_sendProfile and _broadcastChatWire carry.
+
+recipient gating: the roomCode rides in the payload and it IS the room's whole
+membership secret, so a recipient must already be in _transport.peersInRoom()
+- the same authority _sendDigestForRoom uses. The one bypass is a peer who
+named the room to US first (their JoinRoom arrived on its authenticated topic),
+who therefore already holds the code.
+
+silence vs. a stated null: having no icon sends NOTHING, so a peer joining from
+a bare invite link cannot greet the room by wiping the icon everyone else sees.
+A removal is an intent rather than an absence, so it states both nulls.
+
+on receive:
+  → the AUTHENTICATED topic wins over the body's roomCode; a direct send may
+    only touch a room we have actually joined
+  → both fields absent = a build with nothing to say; keep what we have
+  → emoji through normalizeRoomEmoji (one grapheme, emoji code points only),
+    iconUrl through normalizeAvatarUrl. Junk reads as a clear, which is the
+    safe way round: better a bare room than a peer-chosen string in the slot
+  → an icon for a room this device has not created yet is HELD (bounded) and
+    replayed by saveRoom, because a peer's answer routinely beats the joiner's
+    own record being written
 ```
 
 ---

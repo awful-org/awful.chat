@@ -15,6 +15,7 @@ import {
   type Room,
 } from "./storage";
 import { identityStore } from "./identity/identity.svelte";
+import { normalizeAvatarUrl, normalizeRoomEmoji } from "./utils";
 import { dropRoomCorpus } from "./search/corpus.svelte";
 
 /**
@@ -181,23 +182,40 @@ export async function saveRoom(roomCode: string, name: string): Promise<void> {
     if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
       roomsStore.rooms = [...roomsStore.rooms, stored];
     }
+    await _applyPendingMeta(roomCode);
     return;
   }
 
+  // Seed ourselves as a member. joinRoom's own addRoomParticipant(self) call
+  // runs BEFORE this record exists - AppView creates it only once the join has
+  // resolved - and _patchRoom is a no-op on a missing row, so on a FIRST join
+  // our membership was never written down and only a second join repaired it.
+  const self = selfSenderId();
+  const now = Date.now();
   const room: Room = {
     roomCode,
     name,
     type: "text",
     lastSeenLamport: 0,
-    createdAt: Date.now(),
-    participants: [],
-    participantLastSeen: {},
+    createdAt: now,
+    participants: self ? [self] : [],
+    participantLastSeen: self ? { [self]: now } : {},
   };
 
   await putRoom(room);
   if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
     roomsStore.rooms = [...roomsStore.rooms, room];
   }
+  // A peer's answer to our join can land before this record existed.
+  await _applyPendingMeta(roomCode);
+}
+
+async function _applyPendingMeta(roomCode: string): Promise<void> {
+  const pending = _pendingMeta.get(roomCode);
+  if (!pending) return;
+  _pendingMeta.delete(roomCode);
+  if (pending.name) await renameRoom(roomCode, pending.name);
+  if (pending.icon) await setRoomIcon(roomCode, pending.icon);
 }
 
 /**
@@ -210,18 +228,100 @@ export async function renameRoom(
   name: string
 ): Promise<void> {
   const trimmed = name.trim().slice(0, 64);
+  // A peer that joined from a bare invite link has no name yet and sends the
+  // room code as a placeholder; accepting it would blank the real name.
   if (!trimmed || trimmed === roomCode) return;
-  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
-  if (idx === -1) return;
-  if (roomsStore.rooms[idx].name === trimmed) return;
+  // Storage is the authority, not the mirror. A peer answers a join with the
+  // room's name the instant it sees the announcement, which routinely beats the
+  // joiner's own saveRoom(); keying off the mirror dropped that name for good -
+  // the header took it from transportState and looked right, while the sidebar
+  // and every later reload kept showing the raw room code.
+  const stored = await getRoom(roomCode);
+  if (!stored) {
+    _remember(roomCode, { name: trimmed });
+    return;
+  }
+  if (stored.name === trimmed) return;
   // Patch the STORED record: the mirror is refreshed rarely, and writing a
   // whole room from it rolled back participants and the seen watermark that
   // other writers had advanced since page load (evicting members days early).
-  const stored = await getRoom(roomCode);
-  if (!stored) return;
   const updated = { ...stored, name: trimmed };
-  roomsStore.rooms[idx] = updated;
   await putRoom(updated);
+  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
+  if (idx !== -1) roomsStore.rooms[idx] = updated;
+}
+
+/**
+ * A room's icon: one emoji, or one image/GIF URL. Both fields optional so the
+ * wire and the pickers can share the shape; `null` at a call site means "no
+ * icon". A url wins over an emoji when a caller somehow supplies both.
+ */
+export interface RoomIcon {
+  emoji?: string | null;
+  url?: string | null;
+}
+
+/**
+ * Persist a room icon, set locally or learned from a peer.
+ *
+ * The two forms are mutually exclusive, as they are for a profile avatar: a
+ * room shows a glyph or a picture, so setting one clears the other. Without
+ * that an old emoji kept rendering underneath a newly picked GIF.
+ */
+export async function setRoomIcon(
+  roomCode: string,
+  icon: RoomIcon | null
+): Promise<void> {
+  const url = normalizeAvatarUrl(icon?.url);
+  const emoji = url ? undefined : normalizeRoomEmoji(icon?.emoji);
+  // Storage is the authority, not the mirror. A peer answers a join with the
+  // room's icon the instant it sees the announcement, which routinely beats the
+  // joiner's own saveRoom(); keying off the mirror dropped that icon and left
+  // the room bare until something happened to resend. Hold it instead, and let
+  // saveRoom apply it the moment the record exists.
+  const stored = await getRoom(roomCode);
+  if (!stored) {
+    // Only something worth replaying. A clear for a room we do not have, and
+    // junk that failed sanitizing, both mean "no icon" - which is already true.
+    if (emoji || url) _remember(roomCode, { icon: { emoji, url } });
+    return;
+  }
+  if (stored.emoji === emoji && stored.pfpURL === url) return;
+  // Patch the STORED record for the same reason renameRoom does: the mirror is
+  // refreshed rarely, and writing a whole room from it rolls back participants
+  // and the seen watermark that other writers have advanced since page load.
+  //
+  // pfpData is the legacy byte form; an icon is always carried as a URL, so it
+  // has to go too or a stale upload would outrank the new icon on render.
+  const updated = { ...stored, emoji, pfpURL: url, pfpData: undefined };
+  await putRoom(updated);
+  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
+  if (idx !== -1) roomsStore.rooms[idx] = updated;
+}
+
+/**
+ * Room metadata that arrived for a room this device has not created yet,
+ * replayed by saveRoom.
+ *
+ * Both halves need this. A peer answers a join announcement the instant it sees
+ * one, and that answer routinely beats the joiner's own record being written -
+ * so without holding it, a room kept the raw code for a name and no icon at
+ * all, permanently, because nothing resends either.
+ *
+ * Bounded: an unknown room code costs one entry, and a peer must not be able to
+ * make us hold metadata without limit.
+ */
+interface PendingMeta {
+  name?: string;
+  icon?: RoomIcon;
+}
+const MAX_PENDING_META = 16;
+const _pendingMeta = new Map<string, PendingMeta>();
+
+function _remember(roomCode: string, patch: PendingMeta): void {
+  const held = _pendingMeta.get(roomCode);
+  if (!held && _pendingMeta.size >= MAX_PENDING_META) return;
+  _pendingMeta.set(roomCode, { ...held, ...patch });
 }
 
 /**
@@ -233,6 +333,8 @@ export async function removeRoom(roomCode: string): Promise<void> {
   // Before the storage delete: an in-flight search sweep must see the drop
   // and abandon its final index write for this room.
   dropRoomCorpus(roomCode);
+  // Held metadata for this room is stale now; a rejoin gets it fresh.
+  _pendingMeta.delete(roomCode);
   await deleteMessagesForRoom(roomCode);
   await deleteRoom(roomCode);
   roomsStore.rooms = roomsStore.rooms.filter((r) => r.roomCode !== roomCode);

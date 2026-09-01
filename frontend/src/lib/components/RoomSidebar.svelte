@@ -2,6 +2,7 @@
   import type { Room } from "$lib/storage";
   import {
     Hash,
+    ImagePlus,
     MessageSquare,
     PanelLeftClose,
     PanelLeftOpen,
@@ -13,6 +14,7 @@
   import SidebarControls from "./SidebarControls.svelte";
   import PluginWidgetSlots from "./PluginWidgetSlots.svelte";
   import GifImage from "./GifImage.svelte";
+  import RoomIcon from "./RoomIcon.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import CallStatus from "./CallStatus.svelte";
   import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
@@ -60,6 +62,7 @@
     onRemoveDmConversation: (peerId: string) => void;
     dmContextActions?: DmContextAction[];
     onRemoveRoom: (code: string) => void;
+    onSetRoomIcon: (code: string) => void;
     onOpenCreateJoin?: () => void;
     onOpenPhonebook?: () => void;
   }
@@ -87,6 +90,7 @@
     onRemoveDmConversation,
     dmContextActions,
     onRemoveRoom,
+    onSetRoomIcon,
     onOpenCreateJoin,
     onOpenPhonebook,
   }: Props = $props();
@@ -433,7 +437,13 @@
                     ? 'bg-accent text-accent-foreground'
                     : 'text-muted-foreground'}"
                 >
-                  <Hash class="size-4 shrink-0 opacity-70" />
+                  <RoomIcon
+                    url={room.pfpURL}
+                    emoji={room.emoji}
+                    name={room.name}
+                    class="size-4 text-base"
+                    fallbackClass="opacity-70"
+                  />
                   {#if (unreadCounts.get(room.roomCode) ?? 0) > 0 && activeRoomCode !== room.roomCode}
                     <span
                       class="absolute -top-0.5 -right-0.5 min-w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] font-bold flex items-center justify-center px-1 tabular-nums"
@@ -531,7 +541,13 @@
               ? 'bg-accent text-accent-foreground'
               : 'text-muted-foreground'}"
           >
-            <Hash class="mt-0.5 size-3.5 shrink-0 opacity-50" />
+            <RoomIcon
+              url={room.pfpURL}
+              emoji={room.emoji}
+              name={room.name}
+              class="mt-0.5 size-3.5 text-sm"
+              fallbackClass="opacity-50"
+            />
             <div class="min-w-0 flex-1">
               <div class="select-text truncate text-sm font-medium font-mono">
                 {room.name || room.roomCode}
@@ -633,6 +649,17 @@
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
   >
+    <button
+      type="button"
+      onclick={() => {
+        onSetRoomIcon(contextMenu!.code);
+        closeContextMenu();
+      }}
+      class="flex w-full items-center gap-2 px-3 py-1.5 text-sm text-foreground hover:bg-muted cursor-pointer font-mono"
+    >
+      <ImagePlus class="size-4" />
+      Set room icon
+    </button>
     <button
       type="button"
       onclick={() => {

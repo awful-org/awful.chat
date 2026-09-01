@@ -78,6 +78,7 @@
   } from "$lib/transport/transport.svelte";
   import { humanizeMentions } from "$lib/mentions";
   import { roomsStore, refreshPhonebook } from "$lib/rooms.svelte";
+  import RoomIcon from "./RoomIcon.svelte";
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
@@ -1485,6 +1486,13 @@
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
 
+  // Read from the rooms mirror rather than taking a prop: an icon a peer sets
+  // lands there through setRoomIcon, so the header repaints with the sidebar
+  // instead of waiting for AppView to notice.
+  const activeRoom = $derived(
+    roomsStore.rooms.find((r) => r.roomCode === roomCode)
+  );
+
   // Desktop only: below sm there is no room for two columns, and the call
   // stage would squeeze the messages to nothing.
   const callBeside = $derived(displayPrefs.callChatBeside && !isMobile);
@@ -1582,6 +1590,15 @@
           >
             <Menu class="size-4" />
           </Button>
+        {/if}
+        {#if !isDmChat}
+          <RoomIcon
+            url={activeRoom?.pfpURL}
+            emoji={activeRoom?.emoji}
+            name={roomName || roomCode}
+            class="size-5 text-lg"
+            fallbackClass="text-muted-foreground opacity-60"
+          />
         {/if}
         <!-- select-text, against the heading rule in app.css: a room name is
              something people copy and paste to each other, not a label. -->

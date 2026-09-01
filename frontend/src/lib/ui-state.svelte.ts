@@ -23,6 +23,11 @@ export const uiState = $state({
    * ChatView scrolls to the row once the history is on screen and clears it.
    */
   jumpToMessage: null as { roomCode: string; messageId: string } | null,
+  /**
+   * Somebody asked to set a room's icon, by room code. AppView owns the picker
+   * dialog, so the command palette asks for it through here.
+   */
+  roomIconRequested: null as string | null,
 });
 
 export function openSettings(tab: string | null = null): void {
@@ -47,4 +52,8 @@ export function requestJumpToMessage(
   messageId: string
 ): void {
   uiState.jumpToMessage = { roomCode, messageId };
+}
+
+export function requestRoomIcon(roomCode: string): void {
+  uiState.roomIconRequested = roomCode;
 }

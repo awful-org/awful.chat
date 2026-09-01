@@ -1,6 +1,18 @@
-import { DoorOpen, LogIn, LogOut, Link, Pencil, Plus, Trash2, Users } from "@lucide/svelte";
-import { roomsStore, renameRoom } from "$lib/rooms.svelte";
-import { setRoomName } from "$lib/transport/transport.svelte";
+import {
+  DoorOpen,
+  ImageOff,
+  ImagePlus,
+  LogIn,
+  LogOut,
+  Link,
+  Pencil,
+  Plus,
+  Trash2,
+  Users,
+} from "@lucide/svelte";
+import { roomsStore, renameRoom, setRoomIcon } from "$lib/rooms.svelte";
+import { setRoomName, broadcastRoomIcon } from "$lib/transport/transport.svelte";
+import { requestRoomIcon } from "$lib/ui-state.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
 import { parseRoomCode } from "../query";
@@ -131,6 +143,35 @@ export const roomCommands: CmdSource = (host) => {
         }),
       },
     });
+
+    cmds.push({
+      id: "room.icon",
+      title: "Set room icon",
+      group: "Rooms",
+      icon: ImagePlus,
+      action: { kind: "act", perform: () => requestRoomIcon(activeCode) },
+    });
+
+    if (current?.emoji || current?.pfpURL) {
+      cmds.push({
+        id: "room.icon.remove",
+        title: "Remove room icon",
+        group: "Rooms",
+        icon: ImageOff,
+        action: {
+          kind: "act",
+          perform: async () => {
+            try {
+              await setRoomIcon(activeCode, null);
+              // Stated nulls, not silence: this is a removal others must see.
+              broadcastRoomIcon(true);
+            } catch (err) {
+              console.warn("remove room icon failed", err);
+            }
+          },
+        },
+      });
+    }
 
     cmds.push({
       id: "room.leave",

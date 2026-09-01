@@ -16,6 +16,7 @@ export enum MessageType {
   VoiceRedial = "voice_redial",
   VoiceSignal = "voice_signal",
   RoomName = "room_name",
+  RoomIcon = "room_icon",
   PluginEphemeral = "plugin_ephemeral",
   // room users - wire only, never persisted
   JoinRoom = "join_room",
@@ -257,6 +258,20 @@ export interface WireRoomName {
   roomCode?: string;
 }
 
+/**
+ * A room's icon: one emoji, or one image/GIF URL. Separate from WireRoomName
+ * so that setting an icon does not rebroadcast the name (and vice versa), and
+ * so a clear can be stated: an explicit `null` means "no icon any more", while
+ * an absent field means "this build has nothing to say about it".
+ */
+export interface WireRoomIcon {
+  type: MessageType.RoomIcon;
+  emoji?: string | null;
+  iconUrl?: string | null;
+  /** Which room this icon is for - see WireRoomName.roomCode. */
+  roomCode?: string;
+}
+
 export interface WireJoinRoom {
   type: MessageType.JoinRoom;
   peerId: string;
@@ -320,6 +335,7 @@ export type AnyWireMessage =
   | WireCallState
   | WirePluginEphemeral
   | WireRoomName
+  | WireRoomIcon
   | WireJoinRoom
   | WireLeaveRoom
   | WireRoomUsersSync
