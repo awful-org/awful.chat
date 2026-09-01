@@ -244,7 +244,7 @@ services:
       --no-multicast-peers
       --no-tcp-relay
       --listening-port=${TURN_PORT:-3478}
-      --alt-listening-port=5349
+      --alt-listening-port=${TURN_ALT_PORT:-5349}
       --denied-peer-ip=${ANNOUNCED_IP}
       --denied-peer-ip=100.64.0.0-100.127.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
