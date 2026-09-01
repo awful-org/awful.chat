@@ -3,6 +3,7 @@ import type { VoiceTransport, VoiceEvents } from "../types";
 import type { AppServices, LibP2PTransport } from "./transport";
 import type { DtlnProcessor } from "$lib/audio/dtln-processor";
 import { getIceServers, onIceServersChanged } from "../ice-server-list";
+import { succeededPair } from "../ice-stats";
 import { MessageType } from "$lib/types/message";
 import { encode } from "$lib/utils";
 import { CallAudioMixer } from "$lib/audio/call-audio-mixer";
@@ -718,15 +719,11 @@ export class LibP2PVoice implements VoiceTransport {
     // `getStats` yields loosely typed rows; only these fields are read.
     type Row = Record<string, unknown> & { type?: string; kind?: string };
     let inbound: Row | null = null;
-    let pair: Row | null = null;
     for (const report of stats.values()) {
       const row = report as Row;
-      if (row.type === "inbound-rtp" && row.kind === "audio") {
-        inbound = row;
-      } else if (row.type === "candidate-pair" && row.state === "succeeded") {
-        pair = row;
-      }
+      if (row.type === "inbound-rtp" && row.kind === "audio") inbound = row;
     }
+    const pair = succeededPair(stats);
     if (!inbound) return;
     const bytes = Number(inbound.bytesReceived) || 0;
     const previous = remote.lastBytesReceived;
@@ -754,13 +751,8 @@ export class LibP2PVoice implements VoiceTransport {
             typeof inbound.packetsLost === "number" ? inbound.packetsLost : null,
           // The path itself: "relay" next to loss is the network, and the
           // same loss on a direct pair is a different conversation.
-          path: pair
-            ? `${String(pair.localCandidateType ?? "?")}/${String(pair.remoteCandidateType ?? "?")}`
-            : null,
-          rtt:
-            typeof pair?.currentRoundTripTime === "number"
-              ? Math.round(pair.currentRoundTripTime * 1000)
-              : null,
+          path: pair ? `${pair.local ?? "?"}/${pair.remote ?? "?"}` : null,
+          rtt: pair?.rttMs ?? null,
         },
       })
     );
@@ -1284,27 +1276,23 @@ export class LibP2PVoice implements VoiceTransport {
         // check if relayed via TURN
         pc.getStats()
           .then((stats) => {
-            for (const report of stats.values()) {
-              if (
-                report.type === "candidate-pair" &&
-                report.state === "succeeded"
-              ) {
-                const isRelay =
-                  report.localCandidateType === "relay" ||
-                  report.remoteCandidateType === "relay";
-                remote.relayed = isRelay;
-                this.emit("status", {
-                  type: "voice-ice-connected",
-                  // Full id: consumers match tiles against it; the human-
-                  // readable part is the message.
-                  peerId,
-                  relayed: isRelay,
-                  message: isRelay
-                    ? "Voice connected via relay (TURN)"
-                    : "Voice connected directly (P2P)",
-                });
-              }
-            }
+            // Chrome puts no candidate TYPE on a candidate-pair - only ids
+            // pointing at separate entries - so the old inline read was
+            // `undefined === "relay"` for every Chromium user, and every
+            // relayed call told them it was direct. See ice-stats.ts.
+            const pair = succeededPair(stats);
+            if (!pair) return;
+            remote.relayed = pair.relayed;
+            this.emit("status", {
+              type: "voice-ice-connected",
+              // Full id: consumers match tiles against it; the human-
+              // readable part is the message.
+              peerId,
+              relayed: pair.relayed,
+              message: pair.relayed
+                ? "Voice connected via relay (TURN)"
+                : "Voice connected directly (P2P)",
+            });
           })
           .catch(() => {});
       } else if (state === "failed") {
