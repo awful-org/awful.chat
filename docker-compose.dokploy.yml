@@ -40,6 +40,13 @@ services:
       # forwards neither UDP nor raw TCP, so TURN silently points at something
       # that cannot serve it and mobile/CGNAT peers just time out.
       - TURN_HOST=${TURN_HOST:-}
+      # The port coturn below was told to listen on. The relay builds its
+      # default TURN urls from it, and compose does NOT inject a variable into
+      # a container just because the .env defines it - so without this line
+      # TURN_PORT moves coturn while the relay keeps advertising 3478, and
+      # every client is sent to a port this stack is not on. On a host running
+      # two stacks that port belongs to the other one, which answers 401.
+      - TURN_PORT=${TURN_PORT:-}
       - TURN_URLS=${TURN_URLS:-}
       # Generic plugin proxy: allowlisted upstream hosts and named secrets
       # substituted server-side ({{secret:NAME}}). Bind secrets to their
