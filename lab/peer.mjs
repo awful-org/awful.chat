@@ -277,4 +277,70 @@ export class LabPeer extends Cdp {
       `window.__awful ? JSON.stringify(window.__awful.diag()) : "null"`
     ).then(JSON.parse);
   }
+
+  /**
+   * The app's OWN flight recorder for this session, as JSON.
+   *
+   * When a scenario fails, "the lab saw no video" and "here is why" are still
+   * far apart. This closes that gap: the bundle carries the client's view of
+   * every producer announced, every consume attempted and every one that
+   * failed, so a failing run stops being merely reproducible and becomes
+   * diagnosable.
+   *
+   * It drives Settings -> Diagnostics -> Export, the same path a user would,
+   * so it works on a DEPLOYED build where `window.__awful` does not exist.
+   * The export normally hands the browser a download; instead the Blob is
+   * intercepted at URL.createObjectURL and read in the page, which needs no
+   * download directory, no file plumbing and no container round trip.
+   *
+   * Returns null when the pane is not there - an instance built before the
+   * recorder shipped, or one where the feature is off. A capture that cannot
+   * happen must not turn a real finding into a harness error.
+   */
+  async captureDiagBundle() {
+    try {
+      await this.eval(`(() => {
+        if (window.__labBlobs) return true;
+        window.__labBlobs = [];
+        const orig = URL.createObjectURL.bind(URL);
+        URL.createObjectURL = (blob) => {
+          try { window.__labBlobs.push(blob); } catch (e) {}
+          return orig(blob);
+        };
+        return true;
+      })()`);
+
+      const opened = await this.waitFor(
+        "settings open",
+        `(() => {
+          if ([...document.querySelectorAll('button')].some((b) => /Export bundle/i.test(b.textContent))) return "diagnostics";
+          const diag = [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Diagnostics');
+          if (diag) { diag.click(); return null; }
+          const settings = [...document.querySelectorAll('button')]
+            .find((b) => (b.getAttribute('aria-label') || '') === 'Settings');
+          if (settings) { settings.click(); return null; }
+          return null;
+        })()`,
+        { timeout: 20_000 }
+      ).catch(() => null);
+      if (!opened) return null;
+
+      const json = await this.eval(`(async () => {
+        const btn = [...document.querySelectorAll('button')]
+          .find((b) => /Export bundle/i.test(b.textContent));
+        if (!btn) return null;
+        window.__labBlobs.length = 0;
+        btn.click();
+        // The click builds the bundle synchronously and hands it straight to
+        // createObjectURL, but give the frame a beat rather than assume.
+        await new Promise((r) => setTimeout(r, 750));
+        const blob = window.__labBlobs[window.__labBlobs.length - 1];
+        return blob ? await blob.text() : null;
+      })()`);
+      return json;
+    } catch {
+      // Diagnosis is a bonus; it must never become the reason a run fails.
+      return null;
+    }
+  }
 }

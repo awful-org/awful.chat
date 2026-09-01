@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { LabPeer } from "../peer.mjs";
 import { EXIT_ENVIRONMENT, requireReachableTarget } from "../preflight.mjs";
+import { captureOnFailure } from "../capture.mjs";
 
 function appUrl() {
   if (process.env.LAB_APP_URL) return process.env.LAB_APP_URL;
@@ -145,6 +146,8 @@ try {
   }
   ok(false, `aborted: ${err.message}`);
 } finally {
+  // Before the tabs are closed: the recorder lives in the page.
+  await captureOnFailure("recovery", [alice, bob], fail);
   alice.close();
   bob.close();
   impair("lab-browser-2", "clean");

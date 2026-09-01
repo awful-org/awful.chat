@@ -16,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { LabPeer } from "../peer.mjs";
 import { EXIT_ENVIRONMENT, requireReachableTarget } from "../preflight.mjs";
+import { captureOnFailure } from "../capture.mjs";
 
 // Mode A points at the lab's own stack (./stack.sh writes .app-url); Mode B
 // points at a deployed instance:
@@ -147,6 +148,8 @@ try {
   // speaks as though the assertions had run and disagreed.
   ok(false, `aborted: ${err.message}`);
 } finally {
+  // Before the tabs are closed: the recorder lives in the page.
+  await captureOnFailure("audio", [alice, bob], fail);
   alice.close();
   bob.close();
   impair("lab-browser-2", "clean");
