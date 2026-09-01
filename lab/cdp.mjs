@@ -130,10 +130,21 @@ export class Cdp {
   }
 
   async goto(url) {
-    await this.send("Page.navigate", { url });
+    const res = await this.send("Page.navigate", { url });
     // Wait for the document rather than a fixed sleep, the same rule the e2e
     // driver follows: a slow container makes a run slower, not wrong.
     await this.waitFor("document ready", `document.readyState === "complete"`);
+    // A navigation that failed leaves the browser on chrome-error://, where
+    // every later step fails in some unrelated way - the first symptom was a
+    // localStorage exception three calls downstream. Chrome does not always
+    // set errorText, so the URL is checked too. This must be loud: a target
+    // that did not load is not a fault in the app being tested.
+    const landed = await this.eval(`location.href`);
+    if (res.errorText || String(landed).startsWith("chrome-error://")) {
+      throw new Error(
+        `UNREACHABLE: ${url} did not load (${res.errorText ?? landed})`
+      );
+    }
   }
 
   /**

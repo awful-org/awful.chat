@@ -18,6 +18,7 @@
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { LabPeer } from "../peer.mjs";
+import { EXIT_ENVIRONMENT, requireReachableTarget } from "../preflight.mjs";
 
 function appUrl() {
   if (process.env.LAB_APP_URL) return process.env.LAB_APP_URL;
@@ -53,6 +54,10 @@ const ok = (cond, label, extra) => {
 impair("lab-browser-1", "clean");
 impair("lab-browser-2", IMPAIR === "clean" ? "clean" : IMPAIR);
 console.log(`network: sharer=clean watcher=${IMPAIR}`);
+
+// Before anything is impaired or asserted: if the target is not serving the
+// app, this run has no claim to make about it.
+await requireReachableTarget(PORTS[0], APP);
 
 const alice = new LabPeer(PORTS[0], "Alice", APP);
 const bob = new LabPeer(PORTS[1], "Bob", APP);
@@ -138,6 +143,14 @@ try {
     ok(errs.length === 0, `${peer.name}: no uncaught errors`, errs);
   }
 } catch (err) {
+  // An unreachable target mid-run is the environment, not the app.
+  if (/UNREACHABLE/.test(err.message)) {
+    console.log(`ENVIRONMENT ${err.message}`);
+    alice.close();
+    bob.close();
+    impair("lab-browser-2", "clean");
+    process.exit(EXIT_ENVIRONMENT);
+  }
   ok(false, `aborted: ${err.message}`);
 } finally {
   alice.close();

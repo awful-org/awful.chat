@@ -14,6 +14,13 @@ IMAGE="${LAB_BROWSER_IMAGE:-zenika/alpine-chrome:latest}"
 # "http://localhost:5173" - see the resolver rule below.
 APP_IP="${LAB_APP_IP:-172.30.0.12}"
 
+# --disable-features=AsyncDns: Chrome's built-in resolver cannot reliably use
+# Docker's embedded DNS, which is a NAT'd loopback listener at 127.0.0.11.
+# When it gives up, every external name fails with ERR_NAME_NOT_RESOLVED while
+# nslookup and curl in the SAME container resolve fine - so the app looks
+# unreachable and the run looks like a product failure. This forces the OS
+# resolver, which is what those tools already use.
+#
 # Why the resolver rule: WebRTC and WebCrypto need a SECURE CONTEXT, and
 # http://<container-ip>:5173 is not one - crypto.subtle and
 # navigator.mediaDevices are simply absent there, so the app cannot even
@@ -58,6 +65,7 @@ for i in $(seq 1 "$COUNT"); do
       --use-fake-device-for-media-stream --use-fake-ui-for-media-stream \
       --autoplay-policy=no-user-gesture-required \
       --host-resolver-rules="MAP localhost $APP_IP" \
+      --disable-features=AsyncDns \
       --user-data-dir="/tmp/prof-$i" \
       about:blank >/dev/null
 done

@@ -15,6 +15,7 @@
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { LabPeer } from "../peer.mjs";
+import { EXIT_ENVIRONMENT, requireReachableTarget } from "../preflight.mjs";
 
 // Mode A points at the lab's own stack (./stack.sh writes .app-url); Mode B
 // points at a deployed instance:
@@ -52,6 +53,10 @@ const ok = (cond, label, extra) => {
 impair("lab-browser-1", "clean");
 impair("lab-browser-2", IMPAIR === "clean" ? "clean" : IMPAIR);
 console.log(`network: peer1=clean peer2=${IMPAIR}`);
+
+// Before anything is impaired or asserted: if the target is not serving the
+// app, this run has no claim to make about it.
+await requireReachableTarget(PORTS[0], APP);
 
 const alice = new LabPeer(PORTS[0], "Alice", APP);
 const bob = new LabPeer(PORTS[1], "Bob", APP);
@@ -129,6 +134,15 @@ try {
     ok(errs.length === 0, `${peer.name}: no uncaught errors`, errs);
   }
 } catch (err) {
+  // An unreachable target mid-run is the environment, not the app - the same
+  // distinction preflight makes, applied to a blip that lands after it.
+  if (/UNREACHABLE/.test(err.message)) {
+    console.log(`ENVIRONMENT ${err.message}`);
+    alice.close();
+    bob.close();
+    impair("lab-browser-2", "clean");
+    process.exit(EXIT_ENVIRONMENT);
+  }
   // Without this the matrix shows a bare FAIL with no reason, and its verdict
   // speaks as though the assertions had run and disagreed.
   ok(false, `aborted: ${err.message}`);
