@@ -8,6 +8,7 @@ import { encode } from "$lib/utils";
 import { CallAudioMixer } from "$lib/audio/call-audio-mixer";
 import { ev } from "$lib/telemetry/event";
 import { rec } from "$lib/telemetry/recorder";
+import { probeTurn } from "$lib/telemetry/taps";
 import { recVoiceEvent } from "$lib/telemetry/taps";
 
 /** Same ceiling as the output slider in audio settings. */
@@ -1270,6 +1271,13 @@ export class LibP2PVoice implements VoiceTransport {
           peerId,
           message: `Voice connection failed for ${peerId.slice(-8)}`,
         });
+        // Ask the network at the instant the app gave up. A TURN allocation
+        // taken now is what separates "TURN was down for this user" from "the
+        // app never used it" - the two look identical in every other event,
+        // and they are the two halves of "is it my internet or your code".
+        // Rate-limited inside probeTurn, so a room full of failing links
+        // still costs one allocation a minute.
+        void probeTurn(getIceServers());
         this.debugStats.tdPcFailed++;
         this.teardownRemotePeer(peerId);
         this.emit("peerLeft", peerId);

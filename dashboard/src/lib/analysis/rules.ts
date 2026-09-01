@@ -44,7 +44,8 @@ export type FindingId =
   | "relay-close-unclean"
   | "peerconnection-leak"
   | "uncaught-error"
-  | "producer-never-consumed";
+  | "producer-never-consumed"
+  | "turn-unreachable";
 
 export interface Rule {
   id: FindingId;
@@ -290,6 +291,17 @@ export const RULES: Readonly<Record<FindingId, Rule>> = {
     meaning: "Some events were dropped or throttled before capture. Findings before the first surviving event can be wrong.",
     remedy: "Raise the ring capacity or the throttle budget for the noisy kind.",
     aiHint: "Check the suppressed kind counts to find which signal was lost.",
+  },
+  "turn-unreachable": {
+    id: "turn-unreachable",
+    title: "TURN unreachable from this network",
+    severity: "block",
+    meaning:
+      "The client held valid TURN credentials and the server still gave it no allocation. This peer has no relayed path, and the cause is outside the app.",
+    remedy:
+      "Check that the TURN host is reachable on its UDP and TCP ports from this network, and that coturn is running.",
+    aiHint:
+      "Compare this against the app's own ICE results. A failed probe explains a failed connection. A probe that passed next to a connection that failed points at the app instead.",
   },
   "producer-never-consumed": {
     id: "producer-never-consumed",

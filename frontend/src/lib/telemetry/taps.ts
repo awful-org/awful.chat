@@ -15,6 +15,7 @@
 
 import { errText, ev, MAX_DETAIL_KEYS } from "./event";
 import { installPcCensus, pcCensus } from "./pc-census";
+import { probeTurnAllocation } from "./net-probe";
 import {
   initRecorder,
   rec,
@@ -347,6 +348,55 @@ export function censusEvent(): Body | null {
   return ev("runtime.resources", {
     d: { pcLive: c.live, pcCreated: c.created, pcPeak: c.peak },
   });
+}
+
+/**
+ * Not more often than this, however many links fail at once: one allocation
+ * per minute is enough to date a TURN outage, and the probe builds a
+ * connection of its own.
+ */
+export const TURN_PROBE_MIN_INTERVAL_MS = 60_000;
+
+let lastTurnProbeAt = -Infinity;
+
+/**
+ * Ask the network directly, and record the answer next to the app's own.
+ *
+ * Called at the two moments the answer is worth having: when credentials
+ * first land, and when a voice link gives up. The second is the one that
+ * matters - a probe taken at the instant the app failed is what separates
+ * "TURN was down for this user" from "the app never used it".
+ */
+export async function probeTurn(
+  servers: readonly RTCIceServer[],
+  now: number = Date.now()
+): Promise<void> {
+  try {
+    if (now - lastTurnProbeAt < TURN_PROBE_MIN_INTERVAL_MS) return;
+    lastTurnProbeAt = now;
+    const res = await probeTurnAllocation(servers);
+    // Nothing to ask: the credential path reports that on its own.
+    if (!res) return;
+    rec(
+      res.ok
+        ? ev("ice.turn.ok", { d: { branch: "allocate", ms: res.ms } })
+        : ev("ice.turn.fail", {
+            d: {
+              branch: "allocate",
+              ms: res.ms,
+              outcome: res.outcome,
+              err: res.err ?? null,
+            },
+          })
+    );
+  } catch {
+    // A sampler never breaks the app.
+  }
+}
+
+/** The rate limiter is module state; a test needs to clear it. */
+export function resetTurnProbeForTest(): void {
+  lastTurnProbeAt = -Infinity;
 }
 
 function onWindowError(e: ErrorEvent): void {

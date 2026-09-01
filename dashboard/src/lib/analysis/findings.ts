@@ -592,6 +592,37 @@ function producerNeverConsumed(c: Capture, timeline: MergedEvent[]): Finding[] {
   return out;
 }
 
+/**
+ * The one verdict in this table that does not depend on the app being correct.
+ *
+ * `probeTurn` asks the TURN server for an allocation over a connection that
+ * uses no transport code, no signalling and no peer, so a failure here is the
+ * network and nothing else. Its true value is the opposite case: a probe that
+ * PASSED, next to voice that never connected, removes the network from the
+ * list of suspects entirely - which no other event in this bundle can do.
+ */
+function turnUnreachable(timeline: MergedEvent[]): Finding[] {
+  const byObserver = new Map<string, number[]>();
+  timeline.forEach((e, i) => {
+    if (e.kind !== "ice.turn.fail") return;
+    if (str(e.d, "branch") !== "allocate") return;
+    const list = byObserver.get(e.observer);
+    if (list) list.push(i);
+    else byObserver.set(e.observer, [i]);
+  });
+  const out: Finding[] = [];
+  for (const [observer, evidence] of byObserver) {
+    const last = timeline[evidence[evidence.length - 1]];
+    out.push(
+      make("turn-unreachable", { vantage: observer }, evidence, {
+        attempts: evidence.length,
+        outcome: str(last.d, "outcome") ?? "",
+      })
+    );
+  }
+  return out;
+}
+
 /** Per-`(observer, peer)` proof transitions, in time order. */
 function provenTransitions(timeline: MergedEvent[]): Map<string, Array<{ at: number; proven: boolean }>> {
   const map = new Map<string, Array<{ at: number; proven: boolean }>>();
@@ -966,6 +997,7 @@ export function runFindings(c: Capture): Finding[] {
     ...relayCloseUnclean(timeline),
     ...peerConnectionLeak(timeline),
     ...producerNeverConsumed(c, timeline),
+    ...turnUnreachable(timeline),
     ...thresholdByObserver(timeline, "runtime.error", 1, "uncaught-error"),
   ];
 

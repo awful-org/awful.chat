@@ -1,6 +1,7 @@
 import { apiUrl } from "$lib/runtime-config";
 import { ev, errText } from "$lib/telemetry/event";
 import { rec } from "$lib/telemetry/recorder";
+import { probeTurn } from "$lib/telemetry/taps";
 // STUN servers - safe to ship, no credentials.
 //
 // Two, not seven. Gathering does not finish until every entry has answered or
@@ -171,6 +172,9 @@ export async function refreshTurnCredentials(): Promise<void> {
       credential: d.credential,
     });
     _notifyChanged();
+    // Credentials are not reachability: a mint that succeeds says nothing
+    // about whether coturn will actually allocate from this network. Ask it.
+    void probeTurn(cached);
     rec(
       ev("ice.turn.ok", {
         d: {

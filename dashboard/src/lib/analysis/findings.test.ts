@@ -128,8 +128,8 @@ function expectEvidenceValid(capture: Capture, findings: Finding[]): void {
 // ---------------------------------------------------------------------------
 
 describe("RULES", () => {
-  it("has exactly 32 entries, one per FindingId", () => {
-    expect(Object.keys(RULES).length).toBe(32);
+  it("has exactly 33 entries, one per FindingId", () => {
+    expect(Object.keys(RULES).length).toBe(33);
   });
 
   it("every rule has a matching id and non-empty prose", () => {
@@ -958,5 +958,39 @@ describe("producer-never-consumed", () => {
       }),
     ]);
     expect(idsOf(runFindings(capture))).not.toContain("producer-never-consumed");
+  });
+});
+
+describe("turn-unreachable", () => {
+  it("fires when an allocation probe failed", () => {
+    const capture = makeCapture([
+      ev({
+        kind: "ice.turn.fail",
+        at: 2000,
+        sev: "error",
+        d: { branch: "allocate", outcome: "gathered-none", ms: 5000 },
+      }),
+    ]);
+    const findings = runFindings(capture);
+    const hit = findOf(findings, "turn-unreachable");
+    expect(hit).toBeDefined();
+    expect(hit?.detail).toMatchObject({ attempts: 1, outcome: "gathered-none" });
+    expectEvidenceValid(capture, findings);
+  });
+
+  it("ignores a credential failure, which is a different fault", () => {
+    // No credential is a configuration problem and already has its own rule.
+    // Only a refused ALLOCATION is evidence about the network itself.
+    const capture = makeCapture([
+      ev({ kind: "ice.turn.fail", at: 100, sev: "error", d: { branch: "not-ok", status: 500 } }),
+    ]);
+    expect(idsOf(runFindings(capture))).not.toContain("turn-unreachable");
+  });
+
+  it("stays quiet when the probe passed", () => {
+    const capture = makeCapture([
+      ev({ kind: "ice.turn.ok", at: 100, d: { branch: "allocate", ms: 120 } }),
+    ]);
+    expect(idsOf(runFindings(capture))).not.toContain("turn-unreachable");
   });
 });

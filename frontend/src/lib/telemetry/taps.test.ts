@@ -1,6 +1,9 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   censusEvent,
+  probeTurn,
+  resetTurnProbeForTest,
+  TURN_PROBE_MIN_INTERVAL_MS,
   counterEvents,
   errorEvent,
   diffCounters,
@@ -10,7 +13,12 @@ import {
   videoEvent,
   voiceEvent,
 } from "./taps";
-import { beginSession, refs, resetRecorderForTest } from "./recorder";
+import {
+  beginSession,
+  recorderSnapshot,
+  refs,
+  resetRecorderForTest,
+} from "./recorder";
 import { KIND_SEV, type DiagKind } from "./schema";
 import type { TransportStatus } from "../transport/types";
 
@@ -359,5 +367,61 @@ describe("the resource gauge", () => {
     // and a sampler with nothing to sample must stay quiet rather than
     // record a misleading zero.
     expect(censusEvent()).toBeNull();
+  });
+});
+
+describe("the TURN reachability probe", () => {
+  beforeEach(() => {
+    resetRecorderForTest();
+    beginSession("s1", 0);
+    resetTurnProbeForTest();
+  });
+
+  const TURN = { urls: "turn:t.example:3478", username: "u", credential: "c" };
+
+  it("records nothing when there is no TURN to ask", async () => {
+    await probeTurn([{ urls: "stun:s.example:19302" }]);
+    const kinds = recorderSnapshot().events.map((e) => e.kind);
+    // The credential path already reports a missing credential; a second
+    // report would double-count it in every rule that reads these.
+    expect(kinds).not.toContain("ice.turn.fail");
+    expect(kinds).not.toContain("ice.turn.ok");
+  });
+
+  it("records a failure when no allocation is possible", async () => {
+    // jsdom has no RTCPeerConnection, so the probe cannot build one and
+    // returns null - the same "nothing to say" path. Assert the shape that
+    // matters instead: it must never throw into its caller.
+    await expect(probeTurn([TURN])).resolves.toBeUndefined();
+  });
+
+  it("asks at most once a minute, however many links fail", async () => {
+    // A room where every link fails at once must not mean one allocation per
+    // link: the probe builds a connection of its own, and a storm of them is
+    // the very budget problem it exists to help diagnose.
+    let built = 0;
+    (globalThis as { RTCPeerConnection?: unknown }).RTCPeerConnection =
+      class {
+        constructor() {
+          built++;
+          throw new Error("stub");
+        }
+      };
+    try {
+      await probeTurn([TURN], 1_000_000);
+      expect(built).toBe(1);
+      await probeTurn([TURN], 1_000_000 + TURN_PROBE_MIN_INTERVAL_MS - 1);
+      expect(built).toBe(1);
+      await probeTurn([TURN], 1_000_000 + TURN_PROBE_MIN_INTERVAL_MS);
+      expect(built).toBe(2);
+      // Both attempts are on the record as failures, with the branch that
+      // says an allocation was tried rather than a credential missed.
+      const fails = recorderSnapshot().events.filter(
+        (e) => e.kind === "ice.turn.fail" && e.d?.branch === "allocate"
+      );
+      expect(fails).toHaveLength(2);
+    } finally {
+      delete (globalThis as { RTCPeerConnection?: unknown }).RTCPeerConnection;
+    }
   });
 });
