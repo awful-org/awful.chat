@@ -94,7 +94,7 @@ export class Peer {
       () => this.eval(`(() => {
         const t = document.body.innerText;
         if (/Welcome back/i.test(t)) return 'locked';
-        if (document.querySelector('input[placeholder="Room code or room link"]')) return 'ready';
+        if (document.querySelector('input[placeholder="Room code, short code or link"]')) return 'ready';
         if (document.querySelector('textarea')) return 'ready';
         if (/Create new identity/i.test(t)) return 'ready';
         return false;
@@ -236,7 +236,7 @@ export class Peer {
     await sleep(800);
     await this.clickText("skip for now");
     await this.waitFor("landing", () =>
-      this.eval(`!!document.querySelector('input[placeholder="Room code or room link"]')`));
+      this.eval(`!!document.querySelector('input[placeholder="Room code, short code or link"]')`));
     await this.clickText("Got it");
     return this;
   }
@@ -284,10 +284,10 @@ export class Peer {
     if (await this.eval(`!!window.__awful?.state.roomCode`)) {
       await this.clickLabel("Create or join room");
     }
-    await this.waitFor("join field", () => this.fill("Room code or room link", code));
+    await this.waitFor("join field", () => this.fill("Room code, short code or link", code));
     return this.waitFor(`room ${code}`, async () => {
       if ((await this.eval(`window.__awful?.state.roomCode`)) === code) return true;
-      await this.fill("Room code or room link", code);
+      await this.fill("Room code, short code or link", code);
       await this.clickText("Join Room");
       return false;
     });
