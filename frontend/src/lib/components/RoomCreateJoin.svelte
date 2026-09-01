@@ -6,7 +6,7 @@
     looksLikeShortCode,
     resolveInvite,
   } from "$lib/invite";
-  import { Check, Clipboard, Copy, LogIn, Menu, Plus } from "@lucide/svelte";
+  import { Check, Clipboard, Copy, ImagePlus, LogIn, Menu, Plus } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import {
@@ -18,11 +18,19 @@
   } from "$lib/components/ui/card";
   import { profileStore, loadProfile, saveName } from "$lib/profile.svelte";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import RoomIcon from "$lib/components/RoomIcon.svelte";
+  // Aliased: the component in scope already owns the name `RoomIcon`.
+  import type { RoomIcon as RoomIconValue } from "$lib/rooms.svelte";
   import { transportState } from "$lib/transport/transport.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
 
   interface Props {
-    onJoin: (roomCode: string, displayName: string, roomName?: string) => void;
+    onJoin: (
+      roomCode: string,
+      displayName: string,
+      roomName?: string,
+      roomIcon?: RoomIconValue | null
+    ) => void;
     error?: string | null;
     toggleSidebar?: () => void;
   }
@@ -30,6 +38,9 @@
   let { onJoin, error = null, toggleSidebar }: Props = $props();
 
   let roomName = $state("");
+  /** Icon picked for the room being created, before the room exists. */
+  let roomIcon = $state<RoomIconValue | null>(null);
+  let roomIconDialogOpen = $state(false);
   let joinCode = $state("");
   let createdCode = $state<string | null>(null);
   let copied = $state(false);
@@ -73,7 +84,8 @@
       onJoin(
         createdCode,
         profileStore.nickname || "Anonymous",
-        roomName.trim() || undefined
+        roomName.trim() || undefined,
+        roomIcon
       );
       createdCode = null;
     } finally {
@@ -242,11 +254,32 @@
         </div>
 
         <div class="grid gap-2">
-          <Input
-            bind:value={roomName}
-            placeholder="Room name (optional)"
-            class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono focus-visible:ring-ring"
-          />
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              onclick={() => (roomIconDialogOpen = true)}
+              aria-label="Set room icon"
+              class="group relative flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-md border border-input bg-background text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground cursor-pointer focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <RoomIcon
+                url={roomIcon?.url}
+                emoji={roomIcon?.emoji}
+                name={roomName}
+                class="size-5 text-lg"
+                fallbackClass="opacity-60"
+              />
+              <span
+                class="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 transition-opacity group-hover:opacity-100"
+              >
+                <ImagePlus class="size-4 text-white" />
+              </span>
+            </button>
+            <Input
+              bind:value={roomName}
+              placeholder="Room name (optional)"
+              class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono focus-visible:ring-ring"
+            />
+          </div>
           <Button
             onclick={handleCreate}
             disabled={creating}
@@ -396,5 +429,15 @@
   open={avatarDialogOpen}
   onClose={() => {
     avatarDialogOpen = false;
+  }}
+/>
+
+<AvatarPickerDialog
+  open={roomIconDialogOpen}
+  target="room"
+  initial={{ emoji: roomIcon?.emoji, url: roomIcon?.url }}
+  onPick={(icon) => (roomIcon = icon)}
+  onClose={() => {
+    roomIconDialogOpen = false;
   }}
 />

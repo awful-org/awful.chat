@@ -18,20 +18,59 @@
   interface Props {
     open: boolean;
     onClose: () => void;
-    /** What the picked image becomes. Same picker, two destinations. */
-    target?: "avatar" | "banner";
+    /** What the picked image becomes. Same picker, three destinations. */
+    target?: "avatar" | "banner" | "room";
+    /**
+     * Where a room's current icon comes from, since a room is not the
+     * singleton profileStore this dialog otherwise reads.
+     */
+    initial?: { emoji?: string | null; url?: string | null };
+    /**
+     * Takes the pick instead of the profile store, `null` for "no icon".
+     * A room icon is per-room state the caller owns, so it cannot be saved
+     * from in here the way an avatar or a banner can.
+     */
+    onPick?: (icon: { emoji?: string; url?: string } | null) => void;
   }
 
-  let { open, onClose, target = "avatar" }: Props = $props();
+  let {
+    open,
+    onClose,
+    target = "avatar",
+    initial,
+    onPick,
+  }: Props = $props();
   const isBanner = $derived(target === "banner");
-  const dialogTitle = $derived(isBanner ? "Set banner" : "Set profile picture");
+  const isRoom = $derived(target === "room");
+  const dialogTitle = $derived(
+    isRoom ? "Set room icon" : isBanner ? "Set banner" : "Set profile picture"
+  );
 
-  type Tab = "upload" | "klipy" | "url";
+  type Tab = "emoji" | "upload" | "klipy" | "url";
+  /** A room leads with emoji - one tap, no bytes on the wire. */
+  const defaultTab = $derived<Tab>(isRoom ? "emoji" : "klipy");
+  const tabs = $derived<[Tab, string][]>(
+    isRoom
+      ? [
+          ["emoji", "Emoji"],
+          ["upload", "Upload"],
+          ["klipy", "GIF"],
+          ["url", "URL"],
+        ]
+      : [
+          ["upload", "Upload"],
+          ["klipy", "GIF"],
+          ["url", "URL"],
+        ]
+  );
   let activeTab = $state<Tab>("klipy");
   let preview = $state<string | undefined>(undefined);
+  /** The emoji form of the pick. Mutually exclusive with `preview`. */
+  let previewEmoji = $state<string | undefined>(undefined);
   let error = $state<string | undefined>(undefined);
 
   const MAX_AVATAR_BYTES = $derived(isBanner ? 1_000_000 : 512 * 1024);
+  const maxBytesLabel = $derived(`${Math.round(MAX_AVATAR_BYTES / 1024)} KB`);
 
   // Crop editor state. The output aspect and the byte budget differ per target:
   // a square avatar shown as a circle, a 7:3 banner matching the card layout
@@ -70,10 +109,34 @@
     }
   }
 
+  // Seed once per open, not on every prop change. `initial` is a fresh object
+  // literal from the caller each render, so a tracked re-run would wipe the
+  // pick the user just made in here. Plain `let`, not $state: nothing should
+  // react to the latch itself.
+  let seeded = false;
   $effect(() => {
-    if (open) {
-      preview = isBanner ? (profileStore.bannerUrl ?? undefined) : profileStore.avatarUrl;
+    if (!open) {
+      seeded = false;
+      return;
     }
+    if (seeded) return;
+    seeded = true;
+    activeTab = defaultTab;
+    if (isRoom) {
+      preview = initial?.url ?? undefined;
+      previewEmoji = initial?.emoji ?? undefined;
+      return;
+    }
+    previewEmoji = undefined;
+    preview = isBanner
+      ? (profileStore.bannerUrl ?? undefined)
+      : profileStore.avatarUrl;
+  });
+
+  // The picker is a custom element, so it upgrades in place once the definition
+  // loads - the library never has to ride in the initial bundle.
+  $effect(() => {
+    if (open && activeTab === "emoji") void import("emoji-picker-element");
   });
 
   let urlInput = $state("");
@@ -175,13 +238,14 @@
       return;
     }
     if (file.size > MAX_AVATAR_BYTES) {
-      error = `File size must be less than 512 KB (your file is ${Math.round(file.size / 1024)} KB)`;
+      error = `File size must be less than ${maxBytesLabel} (your file is ${Math.round(file.size / 1024)} KB)`;
       return;
     }
 
     const reader = new FileReader();
     reader.onload = () => {
       preview = reader.result as string;
+      previewEmoji = undefined;
       error = undefined;
     };
     reader.onerror = () => {
@@ -202,13 +266,14 @@
       return;
     }
     if (file.size > MAX_AVATAR_BYTES) {
-      error = `File size must be less than 512 KB (your file is ${Math.round(file.size / 1024)} KB)`;
+      error = `File size must be less than ${maxBytesLabel} (your file is ${Math.round(file.size / 1024)} KB)`;
       return;
     }
 
     const reader = new FileReader();
     reader.onload = () => {
       preview = reader.result as string;
+      previewEmoji = undefined;
       error = undefined;
     };
     reader.onerror = () => {
@@ -219,10 +284,19 @@
 
   function selectGif(gif: KlipyGif) {
     preview = gif.urls.mediumgif || gif.urls.tinygif;
+    previewEmoji = undefined;
   }
 
   function applyUrl() {
-    if (urlInput.trim()) preview = urlInput.trim();
+    if (!urlInput.trim()) return;
+    preview = urlInput.trim();
+    previewEmoji = undefined;
+  }
+
+  function selectEmoji(emoji: string) {
+    previewEmoji = emoji;
+    preview = undefined;
+    error = undefined;
   }
 
   let saving = $state(false);
@@ -231,8 +305,19 @@
     if (saving) return;
     saving = true;
     try {
-      if (isBanner) await saveBanner(preview);
-      else await saveAvatar(preview);
+      if (onPick) {
+        onPick(
+          previewEmoji
+            ? { emoji: previewEmoji }
+            : preview
+              ? { url: preview }
+              : null
+        );
+      } else if (isBanner) {
+        await saveBanner(preview);
+      } else {
+        await saveAvatar(preview);
+      }
       onClose();
     } finally {
       saving = false;
@@ -241,10 +326,11 @@
 
   function handleCancel() {
     preview = undefined;
+    previewEmoji = undefined;
     urlInput = "";
     searchQuery = "";
     debouncedQuery = "";
-    activeTab = "upload";
+    activeTab = defaultTab;
     cropping = false;
     cropBusy = false;
     error = undefined;
@@ -315,9 +401,15 @@
         {#if preview}
           <img
             src={preview}
-            alt={isBanner ? "Banner preview" : "Avatar preview"}
+            alt={isBanner
+              ? "Banner preview"
+              : isRoom
+                ? "Room icon preview"
+                : "Avatar preview"}
             class="size-full object-cover"
           />
+        {:else if previewEmoji}
+          <span class="text-5xl leading-none select-none">{previewEmoji}</span>
         {:else}
           <span
             class="text-3xl font-semibold text-primary font-mono select-none"
@@ -325,13 +417,18 @@
           >
         {/if}
       </div>
-      {#if preview}
+      {#if preview || previewEmoji}
         <button
           type="button"
           onclick={() => {
             preview = undefined;
+            previewEmoji = undefined;
           }}
-          aria-label={isBanner ? "Remove banner" : "Remove avatar"}
+          aria-label={isBanner
+            ? "Remove banner"
+            : isRoom
+              ? "Remove room icon"
+              : "Remove avatar"}
           class="absolute inset-0 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity"
         >
           <X class="size-5 text-white" />
@@ -356,7 +453,7 @@
 
   <!-- Tabs -->
   <div class="flex px-4 gap-1 shrink-0 border-b border-border">
-    {#each [["upload", "Upload"] as const, ["klipy", "GIF"] as const, ["url", "URL"] as const] as [id, label]}
+    {#each tabs as [id, label]}
       <button
         type="button"
         onclick={() => {
@@ -374,7 +471,17 @@
 
   <!-- Tab content -->
   <div class="h-86">
-    {#if activeTab === "upload"}
+    {#if activeTab === "emoji"}
+      <!-- The library is imported for its side effect of defining the custom
+           element, so an un-upgraded <emoji-picker> is an inline box that
+           ignores height - display:block is what gives it the panel's height,
+           same as in EmojiPickerPopup. -->
+      <emoji-picker
+        style="display:block;height:100%;width:100%;"
+        onemoji-click={(e: CustomEvent<{ unicode: string }>) =>
+          selectEmoji(e.detail.unicode)}
+      ></emoji-picker>
+    {:else if activeTab === "upload"}
       <div class="p-4">
         {#if error}
           <div class="mb-3 p-3 bg-destructive/10 border border-destructive/30 rounded-lg text-sm text-destructive font-mono">

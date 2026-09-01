@@ -138,6 +138,53 @@ export function normalizeAvatarUrl(url: unknown): string | undefined {
 }
 
 /**
+ * One emoji, and nothing else.
+ *
+ * A room icon arrives from any peer in the room and renders beside the room
+ * name, so this has to refuse free text: without the shape check a peer could
+ * push a 30-character label into the sidebar's icon slot, or pass plain
+ * letters off as an icon.
+ *
+ * The allowlist is shaped by code point rather than listed emoji by emoji,
+ * because the emoji set grows with every Unicode release. Only pictographs,
+ * emoji components (skin tones, regional indicators, keycap digits), the
+ * zero-width joiner and the variation selector may appear - and at least one
+ * of them must be a real pictograph, a two-letter flag or a keycap, or else
+ * `1`, `#` and `AB` would pass as components on their own.
+ */
+const EMOJI_CODEPOINTS_RE =
+  /^[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f]+$/u;
+const EMOJI_PICTOGRAPH_RE = /\p{Extended_Pictographic}/u;
+const EMOJI_FLAG_RE = /^\p{Regional_Indicator}\p{Regional_Indicator}$/u;
+const EMOJI_KEYCAP_RE = /^[0-9#*]\ufe0f?\u20e3$/u;
+
+/** A family ZWJ sequence with skin tones is 25 UTF-16 units; 32 is slack. */
+const MAX_ROOM_EMOJI_LEN = 32;
+
+export function normalizeRoomEmoji(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_ROOM_EMOJI_LEN) return undefined;
+  if (!EMOJI_CODEPOINTS_RE.test(trimmed)) return undefined;
+  if (
+    !EMOJI_PICTOGRAPH_RE.test(trimmed) &&
+    !EMOJI_FLAG_RE.test(trimmed) &&
+    !EMOJI_KEYCAP_RE.test(trimmed)
+  ) {
+    return undefined;
+  }
+  // One glyph, not a strip of them. Intl.Segmenter is the only correct way to
+  // count that: a code-point count splits every flag, keycap and ZWJ sequence
+  // into pieces. Where the engine lacks it the checks above still bound the
+  // value to emoji code points under 32 UTF-16 units.
+  if (typeof Intl.Segmenter === "undefined") return trimmed;
+  const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  let clusters = 0;
+  for (const _ of seg.segment(trimmed)) clusters++;
+  return clusters === 1 ? trimmed : undefined;
+}
+
+/**
  * Simple deterministic PRNG seeded from a string.
  * Uses mulberry32-style algorithm for determinism.
  * Same seed always produces the same sequence.

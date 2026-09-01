@@ -4,6 +4,7 @@ import {
   encode,
   hex,
   normalizeAvatarUrl,
+  normalizeRoomEmoji,
   normalizeNicknameColor,
   sniffImageMime,
   unhex,
@@ -75,6 +76,73 @@ describe("normalizeAvatarUrl", () => {
   it("rejects malformed and non-base64 data: images", () => {
     expect(normalizeAvatarUrl("data:image/png,notbase64")).toBeUndefined();
     expect(normalizeAvatarUrl("data:image/png;base64,ab cd")).toBeUndefined();
+  });
+});
+
+describe("normalizeRoomEmoji", () => {
+  it("accepts a single emoji", () => {
+    expect(normalizeRoomEmoji("😀")).toBe("😀");
+    expect(normalizeRoomEmoji("🎉")).toBe("🎉");
+    expect(normalizeRoomEmoji("☕")).toBe("☕");
+    expect(normalizeRoomEmoji("✅")).toBe("✅");
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(normalizeRoomEmoji("  🎉 ")).toBe("🎉");
+    expect(normalizeRoomEmoji("😀\n")).toBe("😀");
+  });
+
+  // These are one glyph each but several code points, so a code-point count
+  // would reject every one of them.
+  it("accepts multi-code-point sequences", () => {
+    expect(normalizeRoomEmoji("👨‍👩‍👧‍👦")).toBe("👨‍👩‍👧‍👦");
+    expect(normalizeRoomEmoji("👋🏽")).toBe("👋🏽");
+    expect(normalizeRoomEmoji("🧑🏿‍🚀")).toBe("🧑🏿‍🚀");
+    expect(normalizeRoomEmoji("🕵️‍♀️")).toBe("🕵️‍♀️");
+    expect(normalizeRoomEmoji("🏳️‍🌈")).toBe("🏳️‍🌈");
+    expect(normalizeRoomEmoji("❤️")).toBe("❤️");
+  });
+
+  it("accepts flags and keycaps", () => {
+    expect(normalizeRoomEmoji("🇫🇷")).toBe("🇫🇷");
+    expect(normalizeRoomEmoji("1️⃣")).toBe("1️⃣");
+    expect(normalizeRoomEmoji("#️⃣")).toBe("#️⃣");
+  });
+
+  // The icon slot renders beside the room name for everyone in the room, and
+  // the value arrives from any peer. Text in it is a spoofing surface.
+  it("rejects text, markup and lone emoji components", () => {
+    for (const bad of [
+      "a",
+      "abc",
+      "room",
+      "hi 😀",
+      "x😀",
+      "<script>",
+      "1",
+      "#",
+      "AB",
+      "\u{1F1EB}", // one regional indicator - half a flag
+      "\u200d", // a bare zero-width joiner
+      "日本",
+      "très",
+    ]) {
+      expect(normalizeRoomEmoji(bad)).toBeUndefined();
+    }
+  });
+
+  it("rejects a strip of emoji", () => {
+    expect(normalizeRoomEmoji("😀😀")).toBeUndefined();
+    expect(normalizeRoomEmoji("👍🏽👍🏽")).toBeUndefined();
+    expect(normalizeRoomEmoji("😀".repeat(20))).toBeUndefined();
+  });
+
+  it("rejects non-strings and empties", () => {
+    expect(normalizeRoomEmoji(undefined)).toBeUndefined();
+    expect(normalizeRoomEmoji(null)).toBeUndefined();
+    expect(normalizeRoomEmoji(42)).toBeUndefined();
+    expect(normalizeRoomEmoji("")).toBeUndefined();
+    expect(normalizeRoomEmoji("   ")).toBeUndefined();
   });
 });
 

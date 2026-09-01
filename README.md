@@ -24,7 +24,8 @@ group video.
 
 - **Rooms** with shareable invite links, message history that syncs
   peer-to-peer, replies, emoji reactions, code blocks with syntax
-  highlighting, and link previews.
+  highlighting, and link previews. Each room can wear an icon next to its
+  name - an emoji, or an image or GIF - which everyone in the room sees.
 - **Direct messages** with an offline queue, delivery and read receipts, and
   a phonebook of saved contacts.
 - **@Mentions** with autocomplete: tamper-proof (they ride inside the signed

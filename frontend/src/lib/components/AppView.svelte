@@ -9,6 +9,8 @@
   import RoomCreateJoin from "$lib/components/RoomCreateJoin.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import RoomSidebar from "$lib/components/RoomSidebar.svelte";
+  import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import RoomIcon from "$lib/components/RoomIcon.svelte";
   import TransportStatus from "$lib/components/TransportStatus.svelte";
   import {
     transportState,
@@ -16,6 +18,7 @@
     leaveRoom,
     selfId,
     setRoomName,
+    broadcastRoomIcon,
     removeRoomCompletely,
     connect,
     peerIdToDid, resolveMentionDisplayName} from "$lib/transport/transport.svelte";
@@ -23,6 +26,9 @@
     roomsStore,
     loadRooms,
     saveRoom,
+    setRoomIcon,
+    // Aliased: the component below already owns the name `RoomIcon`.
+    type RoomIcon as RoomIconValue,
     refreshPhonebook,
     refreshDmRooms,
   } from "$lib/rooms.svelte";
@@ -333,7 +339,8 @@
   async function handleJoin(
     roomCode: string,
     _displayName: string,
-    roomName?: string
+    roomName?: string,
+    roomIcon?: RoomIconValue | null
   ) {
     joinError = null;
     try {
@@ -354,6 +361,13 @@
         transportState.roomName = label;
       }
       await saveRoom(roomCode, label);
+      // After saveRoom: setRoomIcon patches the stored record, so the record
+      // has to exist. Only for an icon picked in the create dialog - a plain
+      // join must not overwrite what the room already wears.
+      if (roomIcon) {
+        await setRoomIcon(roomCode, roomIcon);
+        broadcastRoomIcon();
+      }
       history.pushState({ roomCode }, "", `/r/${roomCode}`);
     } catch (err) {
       joinError = err instanceof Error ? err.message : String(err);
@@ -612,6 +626,23 @@
     await refreshDmRooms();
   }
 
+  /** Which room the icon picker is editing, or null when it is closed. */
+  let roomIconFor = $state<string | null>(null);
+  const roomIconTarget = $derived(
+    roomsStore.rooms.find((r) => r.roomCode === roomIconFor)
+  );
+
+  async function applyRoomIcon(icon: RoomIconValue | null) {
+    const code = roomIconFor;
+    roomIconFor = null;
+    if (!code) return;
+    await setRoomIcon(code, icon);
+    // Only the room we are actually in has a topic to publish on. An icon set
+    // on a room from the sidebar while sitting elsewhere stays local until the
+    // next join broadcasts it - which _sendRoomIcon does on joinRoom.
+    if (transportState.roomCode === code) broadcastRoomIcon(!icon);
+  }
+
   function openCreateJoin() {
     createJoinOpen = true;
   }
@@ -624,6 +655,14 @@
     if (!uiState.paletteOpenRequested) return;
     uiState.paletteOpenRequested = false;
     if (identityStore.isUnlocked) paletteOpen = true;
+  });
+
+  // Same channel, for the palette's "Set room icon".
+  $effect(() => {
+    const code = uiState.roomIconRequested;
+    if (!code) return;
+    uiState.roomIconRequested = null;
+    if (identityStore.isUnlocked) roomIconFor = code;
   });
 
   // Manage the spotlight state: build tiles, calculate spotlight, and manage video.
@@ -827,9 +866,10 @@
   async function handleJoinFromModal(
     roomCode: string,
     displayName: string,
-    roomName?: string
+    roomName?: string,
+    roomIcon?: RoomIconValue | null
   ) {
-    await handleJoin(roomCode, displayName, roomName);
+    await handleJoin(roomCode, displayName, roomName, roomIcon);
     createJoinOpen = false;
     sidebarOpen = false;
   }
@@ -1171,6 +1211,7 @@
         onRemoveFromPhonebook={handleRemoveFromPhonebook}
         onRemoveDmConversation={handleRemoveDm}
         onRemoveRoom={handleRemoveRoom}
+        onSetRoomIcon={(code) => (roomIconFor = code)}
         onOpenCreateJoin={openCreateJoin}
         onOpenPhonebook={() => (phonebookOpen = true)}
         collapsed={!isMobile && displayPrefs.sidebarCollapsed}
@@ -1231,9 +1272,18 @@
                           class="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-sm font-mono text-foreground hover:bg-muted cursor-pointer"
                           onclick={() => handleSelectRoom(room.roomCode)}
                         >
-                          <span class="font-medium"
-                            >{room.name || room.roomCode}</span
-                          >
+                          <span class="flex min-w-0 items-center gap-2">
+                            <RoomIcon
+                              url={room.pfpURL}
+                              emoji={room.emoji}
+                              name={room.name}
+                              class="size-4 text-base"
+                              fallbackClass="opacity-50"
+                            />
+                            <span class="truncate font-medium"
+                              >{room.name || room.roomCode}</span
+                            >
+                          </span>
                           <span class="text-xs text-muted-foreground"
                             >{room.roomCode.slice(0, 8)}...</span
                           >
@@ -1682,5 +1732,18 @@
     <CommandPalette bind:open={paletteOpen} host={paletteHost} />
     <SearchOverlay openRoom={(code) => handleSelectRoom(code)} />
     <PluginConfirmModal />
+    <!-- One picker for every room, mounted here rather than per sidebar row:
+         the sidebar unmounts its rows as the list reorders, and a dialog that
+         goes with them closes itself mid-pick. -->
+    <AvatarPickerDialog
+      open={roomIconFor !== null}
+      target="room"
+      initial={{
+        emoji: roomIconTarget?.emoji,
+        url: roomIconTarget?.pfpURL,
+      }}
+      onPick={applyRoomIcon}
+      onClose={() => (roomIconFor = null)}
+    />
   {/if}
 </QueryClientProvider>

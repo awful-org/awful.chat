@@ -15,6 +15,7 @@ import {
   type Room,
 } from "./storage";
 import { identityStore } from "./identity/identity.svelte";
+import { normalizeAvatarUrl, normalizeRoomEmoji } from "./utils";
 import { dropRoomCorpus } from "./search/corpus.svelte";
 
 /**
@@ -181,6 +182,7 @@ export async function saveRoom(roomCode: string, name: string): Promise<void> {
     if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
       roomsStore.rooms = [...roomsStore.rooms, stored];
     }
+    await _applyPendingIcon(roomCode);
     return;
   }
 
@@ -198,6 +200,15 @@ export async function saveRoom(roomCode: string, name: string): Promise<void> {
   if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
     roomsStore.rooms = [...roomsStore.rooms, room];
   }
+  // A peer's answer to our join can land before this record existed.
+  await _applyPendingIcon(roomCode);
+}
+
+async function _applyPendingIcon(roomCode: string): Promise<void> {
+  const pending = _pendingIcons.get(roomCode);
+  if (!pending) return;
+  _pendingIcons.delete(roomCode);
+  await setRoomIcon(roomCode, pending);
 }
 
 /**
@@ -225,6 +236,72 @@ export async function renameRoom(
 }
 
 /**
+ * A room's icon: one emoji, or one image/GIF URL. Both fields optional so the
+ * wire and the pickers can share the shape; `null` at a call site means "no
+ * icon". A url wins over an emoji when a caller somehow supplies both.
+ */
+export interface RoomIcon {
+  emoji?: string | null;
+  url?: string | null;
+}
+
+/**
+ * Persist a room icon, set locally or learned from a peer.
+ *
+ * The two forms are mutually exclusive, as they are for a profile avatar: a
+ * room shows a glyph or a picture, so setting one clears the other. Without
+ * that an old emoji kept rendering underneath a newly picked GIF.
+ */
+export async function setRoomIcon(
+  roomCode: string,
+  icon: RoomIcon | null
+): Promise<void> {
+  const url = normalizeAvatarUrl(icon?.url);
+  const emoji = url ? undefined : normalizeRoomEmoji(icon?.emoji);
+  // Storage is the authority, not the mirror. A peer answers a join with the
+  // room's icon the instant it sees the announcement, which routinely beats the
+  // joiner's own saveRoom(); keying off the mirror dropped that icon and left
+  // the room bare until something happened to resend. Hold it instead, and let
+  // saveRoom apply it the moment the record exists.
+  const stored = await getRoom(roomCode);
+  if (!stored) {
+    // Only something worth replaying. A clear for a room we do not have, and
+    // junk that failed sanitizing, both mean "no icon" - which is already true.
+    if (emoji || url) _rememberIcon(roomCode, { emoji, url });
+    return;
+  }
+  if (stored.emoji === emoji && stored.pfpURL === url) return;
+  // Patch the STORED record for the same reason renameRoom does: the mirror is
+  // refreshed rarely, and writing a whole room from it rolls back participants
+  // and the seen watermark that other writers have advanced since page load.
+  //
+  // pfpData is the legacy byte form; an icon is always carried as a URL, so it
+  // has to go too or a stale upload would outrank the new icon on render.
+  const updated = { ...stored, emoji, pfpURL: url, pfpData: undefined };
+  await putRoom(updated);
+  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
+  if (idx !== -1) roomsStore.rooms[idx] = updated;
+}
+
+/**
+ * Icons that arrived for a room this device has not created yet, replayed by
+ * saveRoom. Bounded: an unknown room code costs one entry, and a peer must not
+ * be able to make us hold icons without limit.
+ */
+const MAX_PENDING_ICONS = 16;
+const _pendingIcons = new Map<string, RoomIcon>();
+
+function _rememberIcon(roomCode: string, icon: RoomIcon): void {
+  if (
+    _pendingIcons.size >= MAX_PENDING_ICONS &&
+    !_pendingIcons.has(roomCode)
+  ) {
+    return;
+  }
+  _pendingIcons.set(roomCode, icon);
+}
+
+/**
  * Storage/store half of room removal. On its own this leaves the transport
  * subscribed and the history behind - use removeRoomCompletely() from
  * transport.svelte for the real thing.
@@ -233,6 +310,8 @@ export async function removeRoom(roomCode: string): Promise<void> {
   // Before the storage delete: an in-flight search sweep must see the drop
   // and abandon its final index write for this room.
   dropRoomCorpus(roomCode);
+  // A held icon for this room is stale now; a rejoin gets a fresh one.
+  _pendingIcons.delete(roomCode);
   await deleteMessagesForRoom(roomCode);
   await deleteRoom(roomCode);
   roomsStore.rooms = roomsStore.rooms.filter((r) => r.roomCode !== roomCode);

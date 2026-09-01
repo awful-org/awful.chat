@@ -39,6 +39,11 @@ export interface Room {
   name: string;
   lastSeenLamport: number; // unread count = messages with lamport > this
   createdAt: number;
+  /**
+   * Room icon, one emoji. Mutually exclusive with pfpURL/pfpData: a room shows
+   * either a glyph or a picture, never both, so the setter clears the other.
+   */
+  emoji?: string;
   pfpData?: ArrayBuffer; // local upload - blobURL generated at runtime, never stored
   pfpURL?: string; // external URL (tenor, giphy, etc) - stored as-is
   participants: string[]; // DIDs of users in the room (stable identity)
