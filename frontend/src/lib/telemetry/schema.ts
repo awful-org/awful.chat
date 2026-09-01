@@ -134,6 +134,7 @@ export type DiagKind =
   | "voice.teardown"
   | "voice.redial.ask"
   | "voice.redial.serve"
+  | "voice.media.sample"
   | "voice.media.stall"
   | "voice.media.resume"
   // sfu
@@ -174,7 +175,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 114;
+export const DIAG_KIND_COUNT = 115;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -188,7 +189,8 @@ export const DIAG_KIND_COUNT = 114;
  * - "warn": a degradation that still works - `*.degraded`, `*.stall*`,
  *   `*.retry`, `rv.close`, `peer.disconnect`, `storage.quota`.
  * - "debug": high-rate sampling - `peer.rtt`, `peer.clock`, `counters`,
- *   `sfu.diag`, `voice.ice.state`, `runtime.resources`.
+ *   `sfu.diag`, `voice.ice.state`, `runtime.resources`,
+ *   `voice.media.sample`.
  * - "info": everything else.
  *
  * `sev` decides the order `trimBundleForUpload` sacrifices events in, and it
@@ -288,6 +290,7 @@ export const KIND_SEV = {
   "voice.teardown": "info",
   "voice.redial.ask": "info",
   "voice.redial.serve": "info",
+  "voice.media.sample": "debug",
   "voice.media.stall": "warn",
   "voice.media.resume": "info",
   // sfu
@@ -343,6 +346,7 @@ export const KIND_BUDGET: Readonly<Partial<Record<DiagKind, number>>> = {
   // One broken frame can throw on every animation tick. A storm of the same
   // error says nothing the first five did not, and it would evict the ring
   // that explains WHY it started.
+  "voice.media.sample": 4,
   "runtime.error": 5,
   "runtime.resources": 2,
 };

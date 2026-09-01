@@ -166,6 +166,8 @@ interface RemotePeer {
   /** Whether the succeeded candidate pair went via TURN, remembered from the
    *  connected probe so the stall-recovery emit reports the same path. */
   relayed: boolean;
+  /** Polls taken; only every third one is recorded. */
+  sampleTick?: number;
 }
 
 export class LibP2PVoice implements VoiceTransport {
@@ -713,15 +715,55 @@ export class LibP2PVoice implements VoiceTransport {
     } catch {
       return;
     }
+    // `getStats` yields loosely typed rows; only these fields are read.
+    type Row = Record<string, unknown> & { type?: string; kind?: string };
+    let inbound: Row | null = null;
+    let pair: Row | null = null;
     for (const report of stats.values()) {
-      if (report.type !== "inbound-rtp" || report.kind !== "audio") continue;
-      const bytes = report.bytesReceived as number;
-      if (remote.lastBytesReceived === null || bytes > remote.lastBytesReceived) {
-        remote.lastBytesReceivedAt = now;
+      const row = report as Row;
+      if (row.type === "inbound-rtp" && row.kind === "audio") {
+        inbound = row;
+      } else if (row.type === "candidate-pair" && row.state === "succeeded") {
+        pair = row;
       }
-      remote.lastBytesReceived = bytes;
-      return;
     }
+    if (!inbound) return;
+    const bytes = Number(inbound.bytesReceived) || 0;
+    const previous = remote.lastBytesReceived;
+    if (previous === null || bytes > previous) remote.lastBytesReceivedAt = now;
+    remote.lastBytesReceived = bytes;
+
+    // The watchdog above turns all of this into one verdict after 8s of
+    // silence. The verdict is what repairs the link; the samples are what
+    // explain it afterwards - they show WHEN audio thinned out, and whether
+    // the path was relayed and losing packets while it happened, which a
+    // single "stalled" event at the end cannot.
+    //
+    // Every third poll, so a timeline costs about one event per peer per
+    // 12s rather than a third of the ring.
+    remote.sampleTick = (remote.sampleTick ?? 0) + 1;
+    if (remote.sampleTick % 3 !== 0) return;
+    rec(
+      ev("voice.media.sample", {
+        peer: remote.peerId,
+        d: {
+          bytes,
+          delta: previous === null ? 0 : bytes - previous,
+          jitter: typeof inbound.jitter === "number" ? inbound.jitter : null,
+          lost:
+            typeof inbound.packetsLost === "number" ? inbound.packetsLost : null,
+          // The path itself: "relay" next to loss is the network, and the
+          // same loss on a direct pair is a different conversation.
+          path: pair
+            ? `${String(pair.localCandidateType ?? "?")}/${String(pair.remoteCandidateType ?? "?")}`
+            : null,
+          rtt:
+            typeof pair?.currentRoundTripTime === "number"
+              ? Math.round(pair.currentRoundTripTime * 1000)
+              : null,
+        },
+      })
+    );
   }
 
   leave(): void {

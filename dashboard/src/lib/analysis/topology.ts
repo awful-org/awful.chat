@@ -441,8 +441,9 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "counters":
     case "fault.injected":
     case "meta.suppressed":
-    // Local to one tab: an uncaught throw and the connection gauge say
-    // nothing about who can reach whom.
+    // Local to one tab: an uncaught throw, the connection gauge and a media
+    // sample say nothing about who can reach whom.
+    case "voice.media.sample":
     case "runtime.error":
     case "runtime.resources":
     // A log line that no template matched. It carries no structure to fold,

@@ -70,6 +70,7 @@ describe("KIND_SEV", () => {
 describe("KIND_BUDGET", () => {
   it("throttles only the kinds that can storm", () => {
     expect(KIND_BUDGET).toEqual({
+      "voice.media.sample": 4,
       "runtime.error": 5,
       "runtime.resources": 2,
       "app.msg.in": 5,
