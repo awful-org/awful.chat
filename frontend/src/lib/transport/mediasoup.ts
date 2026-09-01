@@ -261,11 +261,22 @@ export class MediasoupVideo implements VideoTransport {
   // ms:new-producer messages that arrived before recvTransport was ready
   private queuedProducers: MSNewProducer[] = [];
 
+  // Consumes in flight, keyed by producer id. See consumeProducer.
+  private inflightConsumes: Map<string, Promise<void>> = new Map();
+  // Last time a broken recv transport was rebuilt, so the rebuild (which
+  // re-consumes, and so can fail again) cannot become its own loop.
+  private lastRecvRecoveryAt = 0;
+  private readonly RECV_RECOVERY_MIN_MS = 10_000;
+
   // SFU WebSocket - opened on join(), closed on leave()
   private sfuWs: WebSocket | null = null;
   private currentRoomCode: string | null = null;
   private currentPeerId: string | null = null;
   private joinGeneration = 0; // incremented on each join() to guard against stale attemptRejoin
+  // The one pending rejoin, and the one rebuild in flight. Both are single by
+  // construction now - see scheduleRejoin and attemptRejoin.
+  private rejoinTimer: ReturnType<typeof setTimeout> | null = null;
+  private rejoinP: Promise<void> | null = null;
 
   // How many OTHER peers the SFU room held at join time (finding 13's interim
   // split-brain guard; the real fix is serving the pool at runtime, which is
@@ -344,8 +355,16 @@ export class MediasoupVideo implements VideoTransport {
     this.sfuWs = null;
 
     this.stopStatsSweep();
+    // Leaving ends the ladder outright. It used to only be neutered - every
+    // rung became a no-op because currentRoomCode was null - so the timers
+    // ran for the life of the page and came back to life on the next join().
+    if (this.rejoinTimer) {
+      clearTimeout(this.rejoinTimer);
+      this.rejoinTimer = null;
+    }
     this.producers.clear();
     this.consumers.clear();
+    this.inflightConsumes.clear();
     this.active.clear();
     this.pendingTransmissions.clear();
     this.pendingScreenProducerIds.clear();
@@ -562,6 +581,13 @@ export class MediasoupVideo implements VideoTransport {
       };
 
       ws.onclose = () => {
+        // Only the CURRENT socket's close means anything. A rebuild closes the
+        // old socket and opens a new one, and the old close event lands after
+        // that - rejecting the fresh socket's in-flight requests (they share
+        // one pendingById map) and scheduling a rejoin behind a session that is
+        // already healthy. That is a join failing with "SFU connection closed"
+        // for no reason anyone can see.
+        if (this.sfuWs !== ws) return;
         const wasJoined = this.device !== null;
 
         // Reject all pending requests when connection drops
@@ -592,7 +618,20 @@ export class MediasoupVideo implements VideoTransport {
    */
   private scheduleRejoin(expectedGeneration: number, attempt = 1): void {
     const delay = Math.min(2000 * 2 ** (attempt - 1), 30_000);
-    setTimeout(() => {
+    // ONE ladder, not one per failure. Four call sites schedule a rejoin (the
+    // socket closing, either transport going failed/closed, ensureLive) and
+    // every rung schedules the next one forever, so a single bad minute forked
+    // several endless ladders that ran side by side for the rest of the page's
+    // life - leave() did not stop them either, and a later join() made them
+    // effective again. Every rung of every ladder runs a FULL join: a socket, a
+    // Device (which builds and discards an RTCPeerConnection to read the native
+    // capabilities) and up to two transports, each its own RTCPeerConnection.
+    // Chrome caps a page at 500 live ones; that is the "Cannot create so many
+    // PeerConnections" that eventually takes voice, video and libp2p's own
+    // WebRTC dials down together.
+    if (this.rejoinTimer) clearTimeout(this.rejoinTimer);
+    this.rejoinTimer = setTimeout(() => {
+      this.rejoinTimer = null;
       this.attemptRejoin(expectedGeneration).catch((err) => {
         console.warn(`[MediasoupVideo] rejoin attempt ${attempt} failed:`, err);
         // No attempt cap: the banner promises "retrying in the background",
@@ -652,7 +691,19 @@ export class MediasoupVideo implements VideoTransport {
    * join handshake again, then republish local sources whose tracks are
    * still live. Remote consumers come back via the SFU's producer replay.
    */
-  private async attemptRejoin(expectedGeneration: number): Promise<void> {
+  private attemptRejoin(expectedGeneration: number): Promise<void> {
+    // Never two rebuilds at once. ensureLive() calls this directly on every
+    // app resync (tab foregrounded, relay reconnect) while a ladder rung may
+    // already be inside join(), and each concurrent rebuild opens its own
+    // socket, Device and transports - the same PeerConnection bleed as above,
+    // reached without any ladder forking.
+    this.rejoinP ??= this.attemptRejoinInner(expectedGeneration).finally(() => {
+      this.rejoinP = null;
+    });
+    return this.rejoinP;
+  }
+
+  private async attemptRejoinInner(expectedGeneration: number): Promise<void> {
     const roomCode = this.currentRoomCode;
     const peerId = this.currentPeerId;
     if (!roomCode || !peerId) return;
@@ -680,6 +731,7 @@ export class MediasoupVideo implements VideoTransport {
     }
     this.consumers.clear();
     this.consumerStats.clear();
+    this.inflightConsumes.clear();
     this.producers.forEach((ps) => ps.forEach((p) => p.producer.close()));
     this.producers.clear();
     this.active.clear();
@@ -779,10 +831,23 @@ export class MediasoupVideo implements VideoTransport {
    *  their own state says. Re-consume the same producer ids on a fresh
    *  transport instead of leaving frozen tiles with nothing left to retry
    *  them. */
+  /** rebuildRecvTransport, rate-limited: the rebuild re-consumes, and those
+   *  consumes can fail for their own reasons, so an unguarded call from the
+   *  consume path would rebuild in a loop - one RTCPeerConnection per turn. */
+  private recoverRecvTransport(): void {
+    const now = Date.now();
+    if (now - this.lastRecvRecoveryAt < this.RECV_RECOVERY_MIN_MS) return;
+    this.lastRecvRecoveryAt = now;
+    this.rebuildRecvTransport();
+  }
+
   private rebuildRecvTransport(): void {
     if (!this.recvTransport) return;
     this.recvTransport.close();
     this.recvTransport = null;
+    // Every in-flight consume belongs to the transport just closed; a re-
+    // consume below must not be handed one of those promises.
+    this.inflightConsumes.clear();
     const toRestore: {
       peerId: string;
       producerId: string;
@@ -1194,7 +1259,44 @@ export class MediasoupVideo implements VideoTransport {
     }
   }
 
-  private async consumeProducer(
+  /**
+   * One consume per producer at a time, shared by every caller.
+   *
+   * The completed-consumer check in consumeProducerInner cannot see a consume
+   * that is still in flight, and several paths legitimately overlap: a click
+   * on a tile racing the auto-consume for a peer already being watched, the
+   * join replay re-announcing a producer a retry is mid-way through, the
+   * stalled-consumer re-consume. Two overlapping consumes for one producer are
+   * fatal, not merely wasteful: the SFU answers a duplicate ms:consume with
+   * the SAME consumer id and the SAME rtpParameters.mid (sfu/index.ts
+   * handleConsume), mediasoup-client appends one m-section per consume with no
+   * dedupe of its own, and the browser rejects the resulting offer outright -
+   * "duplicated a=msid". Worse, the duplicate section stays in RemoteSdp, which
+   * regenerates the WHOLE offer on every later consume, so from then on no
+   * remote stream can ever be added again: the exact "stop the stream, try
+   * again, nobody can connect" shape.
+   */
+  private consumeProducer(
+    peerId: string,
+    producerId: string,
+    source: VideoSource
+  ): Promise<void> {
+    const inflight = this.inflightConsumes.get(producerId);
+    if (inflight) return inflight;
+    const p = this.consumeProducerInner(peerId, producerId, source).finally(
+      () => {
+        // Identity-checked: a rebuild may have already replaced this entry
+        // with a consume against the fresh transport.
+        if (this.inflightConsumes.get(producerId) === p) {
+          this.inflightConsumes.delete(producerId);
+        }
+      }
+    );
+    this.inflightConsumes.set(producerId, p);
+    return p;
+  }
+
+  private async consumeProducerInner(
     peerId: string,
     producerId: string,
     source: VideoSource
@@ -1230,7 +1332,18 @@ export class MediasoupVideo implements VideoTransport {
       throw new Error(PRODUCER_GONE);
     }
 
-    const consumer = await this.recvTransport.consume(response.options);
+    let consumer: mediasoupClient.types.Consumer;
+    try {
+      consumer = await this.recvTransport.consume(response.options);
+    } catch (err) {
+      // A rejected consume leaves mediasoup-client's RemoteSdp holding the
+      // media section the browser refused, and it rebuilds the whole offer
+      // from that state every time - so one failure here is permanent for
+      // this transport and every later stream silently never appears. Rebuild
+      // the recv side rather than leave the session quietly one-way.
+      this.recoverRecvTransport();
+      throw err;
+    }
     // The server creates every consumer paused (see handleConsume) so no RTP
     // is wasted - and no keyframe lost - while the recv transport's DTLS
     // handshake is still in flight. Resuming here is what actually starts

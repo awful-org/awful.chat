@@ -38,9 +38,21 @@ func defaultTurnURLs() []string {
 	if host == "" {
 		return nil
 	}
+	// TURN_PORT moves coturn (compose passes it to --listening-port), and
+	// this used to keep advertising 3478 regardless. The failure is silent
+	// and total: clients get credentials for a port coturn is not on, so
+	// gathering yields no relay candidate at all, while every health signal
+	// - the credential fetch included - still reports success. Worse on a
+	// host running two stacks, where 3478 belongs to whichever bound it
+	// first: the credentials then reach a DIFFERENT instance's coturn, which
+	// rejects them with 401 because it was minted with another secret.
+	port := strings.TrimSpace(os.Getenv("TURN_PORT"))
+	if port == "" {
+		port = "3478"
+	}
 	return []string{
-		"turn:" + host + ":3478?transport=udp",
-		"turn:" + host + ":3478?transport=tcp",
+		"turn:" + host + ":" + port + "?transport=udp",
+		"turn:" + host + ":" + port + "?transport=tcp",
 	}
 }
 

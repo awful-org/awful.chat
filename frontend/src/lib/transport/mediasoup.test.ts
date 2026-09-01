@@ -344,3 +344,60 @@ describe("a share that ended while we were away cannot leave a dead tile", () =>
     ).toBe(false);
   });
 });
+
+describe("overlapping consumes for one producer", () => {
+  it("shares the in-flight consume instead of asking the SFU twice", async () => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+
+    let answer: (msg: unknown) => void = () => {};
+    const request = vi.fn(
+      () => new Promise((resolve) => (answer = resolve))
+    );
+    const consume = vi.fn(async () => ({
+      id: "c1",
+      producerId: "p1",
+      kind: "video",
+      track: {},
+      closed: false,
+      on: vi.fn(),
+    }));
+    internals.device = { recvRtpCapabilities: {} };
+    internals.request = request;
+    internals.recvTransport = { ...fakeTransport(), consume };
+
+    const consumeProducer = internals.consumeProducer as (
+      peerId: string,
+      producerId: string,
+      source: string
+    ) => Promise<void>;
+    // A click on the tile racing the auto-consume for the same producer -
+    // and the same shape the join replay and the retry ladder produce.
+    const first = consumeProducer.call(video, "sharer", "p1", "screen");
+    const second = consumeProducer.call(video, "sharer", "p1", "screen");
+
+    await Promise.resolve();
+    // The bug: both passed the completed-consumer check (neither had
+    // completed), the SFU answered the second with the SAME consumer id and
+    // mid, and the second m-section made the browser reject the whole offer
+    // with "duplicated a=msid" - permanently, since mediasoup-client keeps
+    // the duplicate section and rebuilds every later offer from it.
+    expect(request).toHaveBeenCalledTimes(1);
+
+    answer({
+      type: "ms:consumer-options",
+      options: { id: "c1", producerId: "p1", kind: "video", rtpParameters: {} },
+      peerId: "sharer",
+      source: "screen",
+    });
+    await Promise.all([first, second]);
+
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(
+      (internals.consumers as Map<string, unknown[]>).get("sharer")
+    ).toHaveLength(1);
+    // Released once settled, so a later re-consume (a stall, a rebuild) is
+    // not answered with a stale promise.
+    expect((internals.inflightConsumes as Map<string, unknown>).size).toBe(0);
+  });
+});
