@@ -1,0 +1,35 @@
+2026/09/01 00:35:52 [relay] connection limits: connmgr 256/512, per-subnet cap 1024
+2026/09/01 00:35:52 PeerID: 12D3KooWMM79wZwhXBK6yfwaFoGumZNRxrZVWdyc3eVzvyuEEgaD
+2026/09/01 00:35:52  /ip4/127.0.0.1/tcp/8080/ws/p2p/12D3KooWMM79wZwhXBK6yfwaFoGumZNRxrZVWdyc3eVzvyuEEgaD
+2026/09/01 00:35:52 [relay] this service must run as exactly ONE replica; see deploy/README.md
+2026/09/01 00:35:52 [http] Starting API server on port 8081
+2026/09/01 00:37:00 [peer] connect TBsh4Aqx
+2026/09/01 00:37:00 [peer] connect SH4gDmtC
+2026/09/01 00:37:00 [rv] TBsh4Aqx opened rendezvous stream
+2026/09/01 00:37:00 [rv] SH4gDmtC opened rendezvous stream
+2026/09/01 00:37:00 [rv] TBsh4Aqx joined room [ROOMCODEFIXTURE] (1 peers)
+2026/09/01 00:37:00 [rv] TBsh4Aqx opened rendezvous stream
+2026/09/01 00:37:00 [rv] TBsh4Aqx left room [ROOMCODEFIXTURE] (0 peers)
+2026/09/01 00:37:00 [rv] TBsh4Aqx stream closed (1 still open, reason=read-error)
+2026/09/01 00:37:00 [rv] TBsh4Aqx joined room [ROOMCODEFIXTURE] (1 peers)
+2026/09/01 00:37:00 [rv] SH4gDmtC joined room [ROOMCODEFIXTURE] (2 peers)
+2026/09/01 00:37:00 [rv] SH4gDmtC opened rendezvous stream
+2026/09/01 00:37:00 [rv] SH4gDmtC left room [ROOMCODEFIXTURE] (1 peers)
+2026/09/01 00:37:00 [rv] SH4gDmtC stream closed (1 still open, reason=read-error)
+2026/09/01 00:37:00 [rv] SH4gDmtC joined room [ROOMCODEFIXTURE] (2 peers)
+2026/09/01 00:38:41 [relay] connection limits: connmgr 256/512, per-subnet cap 1024
+2026/09/01 00:38:41 [http] Starting API server on port 8081
+2026/09/01 00:39:53 [peer] connect TBsh4Aqx
+2026/09/01 00:39:53 [peer] connect SH4gDmtC
+2026/09/01 00:39:53 [rv] TBsh4Aqx opened rendezvous stream
+2026/09/01 00:39:53 [rv] SH4gDmtC opened rendezvous stream
+2026/09/01 00:39:53 [rv] SH4gDmtC joined room [ROOMCODEFIXTURE] (1 peers)
+2026/09/01 00:39:53 [rv] TBsh4Aqx joined room [ROOMCODEFIXTURE] (2 peers)
+2026/09/01 00:39:53 [rv] SH4gDmtC opened rendezvous stream
+2026/09/01 00:39:53 [rv] SH4gDmtC left room [ROOMCODEFIXTURE] (1 peers)
+2026/09/01 00:39:53 [rv] SH4gDmtC stream closed (1 still open, reason=read-error)
+2026/09/01 00:39:53 [rv] SH4gDmtC joined room [ROOMCODEFIXTURE] (2 peers)
+2026/09/01 00:39:53 [rv] TBsh4Aqx opened rendezvous stream
+2026/09/01 00:39:53 [rv] TBsh4Aqx left room [ROOMCODEFIXTURE] (1 peers)
+2026/09/01 00:39:53 [rv] TBsh4Aqx stream closed (1 still open, reason=read-error)
+2026/09/01 00:39:53 [rv] TBsh4Aqx joined room [ROOMCODEFIXTURE] (2 peers)

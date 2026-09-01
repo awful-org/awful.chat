@@ -61,8 +61,18 @@ func corsHeaders(r *http.Request) http.Header {
 
 	headers := http.Header{}
 	headers.Set("Access-Control-Allow-Origin", allowOrigin)
-	headers.Set("Access-Control-Allow-Methods", "GET,OPTIONS")
-	headers.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	// POST is here for the routes that take a body - the mailbox pair and the
+	// telemetry ingest. A preflight that omits the method blocks the request
+	// before the handler ever runs.
+	headers.Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+	// X-Awful-Peer/Ts/Sig are the telemetry upload's auth triple. A browser
+	// preflights any request that carries a non-simple header, so an upload from
+	// an app on another origin fails outright when they are missing here - not
+	// with a 401, but with a blocked fetch that reports only "Failed to fetch".
+	headers.Set(
+		"Access-Control-Allow-Headers",
+		"Content-Type, Authorization, X-Awful-Peer, X-Awful-Ts, X-Awful-Sig",
+	)
 	headers.Set("Access-Control-Max-Age", "86400")
 	headers.Set("Vary", "Origin")
 	return headers

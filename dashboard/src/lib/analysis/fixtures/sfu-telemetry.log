@@ -1,0 +1,1 @@
+[sfu-telemetry] {"v":1,"t":1788234311057,"room":"fixturecapture01","peers":[{"peerId":"capture-peer-a","producers":[{"id":"20ad9aff-ed40-49c8-a747-086c07d0192b","source":"camera","kind":"audio","consumers":0}],"send":{"iceState":"new","dtlsState":"new"},"recv":null},{"peerId":"capture-peer-b","producers":[],"send":null,"recv":null}]}

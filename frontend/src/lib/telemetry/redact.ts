@@ -1,0 +1,95 @@
+/**
+ * Redaction primitives. Every identifier that must never leave the tab is
+ * replaced by a bundle-local ordinal here, and nowhere else.
+ *
+ * Why ordinals and not a hash: a hash of a room code is a guessable
+ * commitment - the code is only 64 bits and the hash would be stable across
+ * bundles, so a collector holding two bundles could link rooms and, with a
+ * dictionary, invert the code. An ordinal is meaningful only inside the one
+ * bundle that defines it, which is exactly the amount of meaning a reader
+ * needs: "these events are about the same room".
+ */
+
+import type { DiagRoomRef } from "./schema";
+
+/** `"dm-" + hex(sha256(...))` - see `docs/spec.md` "Room Codes". */
+const DM_PREFIX = "dm-";
+/** The device-sync pseudo-room - see `transport/sync.svelte.ts`. */
+const SYNC_PREFIX = "__sync_";
+
+/**
+ * Classify a room without revealing it. The prefix is the only thing read, and
+ * the prefix is a documented structural fact, not a secret.
+ */
+export function roomKind(roomCode: string): "text" | "dm" | "sync" {
+  if (roomCode.startsWith(SYNC_PREFIX)) return "sync";
+  if (roomCode.startsWith(DM_PREFIX)) return "dm";
+  return "text";
+}
+
+/**
+ * Assigns and remembers bundle-local ordinals. One instance per session; a new
+ * session gets a new table so ordinals never correlate across sessions.
+ */
+export class RefTable {
+  #rooms = new Map<string, DiagRoomRef>();
+  #identities = new Map<string, string>();
+  #files = new Map<string, string>();
+  #now: () => number;
+
+  constructor(now: () => number = () => Date.now()) {
+    this.#now = now;
+  }
+
+  /** "r1", "r2", ... Stable for the life of the table. */
+  roomRef(roomCode: string): string {
+    const hit = this.#rooms.get(roomCode);
+    if (hit) return hit.ref;
+    const ref = `r${this.#rooms.size + 1}`;
+    this.#rooms.set(roomCode, {
+      ref,
+      kind: roomKind(roomCode),
+      joinedAt: this.#now(),
+    });
+    return ref;
+  }
+
+  /**
+   * "i1", "i2", ... Only a PROVEN peerId -> DID binding may call this: it is
+   * what groups one person's devices, and a forged binding would group two
+   * different people.
+   */
+  identityRef(did: string): string {
+    const hit = this.#identities.get(did);
+    if (hit) return hit;
+    const ref = `i${this.#identities.size + 1}`;
+    this.#identities.set(did, ref);
+    return ref;
+  }
+
+  /** "f1", "f2", ... An infoHash names retrievable content, so it is redacted. */
+  fileRef(infoHash: string): string {
+    const hit = this.#files.get(infoHash);
+    if (hit) return hit;
+    const ref = `f${this.#files.size + 1}`;
+    this.#files.set(infoHash, ref);
+    return ref;
+  }
+
+  /**
+   * The room table, INCLUDING the codes. NEVER serialized - `bundle.ts` copies
+   * the `DiagRoomRef` half and drops the code.
+   */
+  knownRooms(): Array<{ ref: string; code: string; entry: DiagRoomRef }> {
+    const out: Array<{ ref: string; code: string; entry: DiagRoomRef }> = [];
+    for (const [code, entry] of this.#rooms) {
+      out.push({ ref: entry.ref, code, entry });
+    }
+    return out;
+  }
+
+  /** The serializable room list. */
+  rooms(): DiagRoomRef[] {
+    return [...this.#rooms.values()].map((r) => ({ ...r }));
+  }
+}

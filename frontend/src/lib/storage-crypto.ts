@@ -37,6 +37,9 @@
  * path this file already relies on for the blinding migration.
  */
 
+import { ev } from "./telemetry/event";
+import { rec } from "./telemetry/recorder";
+
 interface EncBlob {
   iv: Uint8Array;
   ct: ArrayBuffer;
@@ -429,6 +432,11 @@ export async function openRows<T>(
   }
   if (dropped > 0) {
     console.warn(`[storage] dropped ${dropped} undecryptable row(s)`);
+    rec(
+      ev("storage.drop", {
+        d: { store: spec.storeName ?? "unknown", count: dropped },
+      })
+    );
   }
   return out;
 }
@@ -550,6 +558,18 @@ export const STORE_SPECS = {
     key: "roomCode",
     clear: ["lastLamport"],
     blind: ["roomCode"],
+    bytes: ["data"],
+  },
+  // Diagnostic event chunks. sessionId and startedAt are random or opaque, so
+  // they stay clear for the prune query. The events carry peer ids and error
+  // strings, so they ride in `bytes` and are sealed like attachment data.
+  //
+  // Nothing needs `blind`: no room code and no DID ever enters this store, and
+  // nothing is queried by an identifier a blind would have to match.
+  diagnostics: {
+    storeName: "diagnostics",
+    key: "id",
+    clear: ["id", "sessionId", "startedAt", "seqFrom", "seqTo"],
     bytes: ["data"],
   },
 } as const satisfies Record<string, StoreCryptoSpec>;

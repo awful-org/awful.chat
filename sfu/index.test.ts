@@ -5,7 +5,8 @@
 //   - the unconnected-transport reaper (Task 1)
 //   - ms:produce source validation (Task 3)
 //   - the dead-socket and stuck-backpressured producer reap (finding 6)
-import { test } from "node:test";
+//   - ms:diag (SFU telemetry vantage) enabled/rate-limited/disabled
+import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, ChildProcess } from "node:child_process";
 import path from "node:path";
@@ -27,18 +28,17 @@ const HEARTBEAT_INTERVAL_MS = 100;
 const MAX_QUEUED_FRAME_BYTES = 2000;
 
 let child: ChildProcess;
-let stoppingChild = false;
 
-function wsUrl(): string {
-  return `ws://127.0.0.1:${PORT}`;
+function wsUrl(port: number = PORT): string {
+  return `ws://127.0.0.1:${port}`;
 }
 
-async function waitForServer(): Promise<void> {
+async function waitForServer(port: number = PORT): Promise<void> {
   const deadline = Date.now() + 20_000;
   for (;;) {
     try {
       await new Promise<void>((resolve, reject) => {
-        const ws = new WebSocket(wsUrl());
+        const ws = new WebSocket(wsUrl(port));
         ws.once("open", () => {
           ws.close();
           resolve();
@@ -50,46 +50,75 @@ async function waitForServer(): Promise<void> {
       if (Date.now() > deadline) {
         throw new Error("sfu process never started listening");
       }
+      // Polling a real subprocess's real listening socket, not a guessed
+      // test delay - there is no event to await here until it exists.
       await new Promise((r) => setTimeout(r, 200));
     }
   }
 }
 
-test.before(async () => {
-  child = spawn(
+interface SpawnedSfu {
+  proc: ChildProcess;
+  stop(): Promise<void>;
+}
+
+// Spawns a real SFU process on `port` with `extraEnv` layered on top of the
+// baseline test env, and returns a handle to stop it. Shared by the
+// module's main child (below) and the SFU_TELEMETRY-disabled describe
+// block, which needs its own process because SFU_TELEMETRY is read once at
+// module load and cannot be toggled on a running server.
+function spawnSfu(port: number, extraEnv: Record<string, string>): SpawnedSfu {
+  const proc = spawn(
     process.execPath,
     [path.join(__dirname, "node_modules", ".bin", "tsx"), path.join(__dirname, "index.ts")],
     {
       env: {
         ...process.env,
-        SFU_PORT: String(PORT),
+        SFU_PORT: String(port),
         SFU_TRANSPORT_CONNECT_TIMEOUT_MS: String(TRANSPORT_CONNECT_TIMEOUT_MS),
         SFU_HEARTBEAT_INTERVAL_MS: String(HEARTBEAT_INTERVAL_MS),
         SFU_MAX_QUEUED_FRAME_BYTES: String(MAX_QUEUED_FRAME_BYTES),
         ANNOUNCED_IP: "127.0.0.1",
+        ...extraEnv,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
   let output = "";
-  child.stdout?.on("data", (d) => (output += d.toString()));
-  child.stderr?.on("data", (d) => (output += d.toString()));
-  child.on("exit", (code) => {
-    if (!stoppingChild && code !== null && code !== 0) {
-      console.error(`[sfu test] server exited early (${code}):\n${output}`);
+  let stopping = false;
+  proc.stdout?.on("data", (d) => (output += d.toString()));
+  proc.stderr?.on("data", (d) => (output += d.toString()));
+  proc.on("exit", (code) => {
+    if (!stopping && code !== null && code !== 0) {
+      console.error(`[sfu test] server on port ${port} exited early (${code}):\n${output}`);
     }
   });
-  await waitForServer();
+  return {
+    proc,
+    async stop() {
+      if (proc.exitCode !== null) return;
+      stopping = true;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      proc.once("exit", () => resolve());
+      proc.kill("SIGTERM");
+      // A real child process against the real OS scheduler, not something a
+      // fake clock drives - the genuine-delay exception for a hung exit.
+      setTimeout(() => proc.kill("SIGKILL"), 3000).unref();
+      await promise;
+    },
+  };
+}
+
+let sfu: SpawnedSfu;
+
+test.before(async () => {
+  sfu = spawnSfu(PORT, { SFU_TELEMETRY: "1" });
+  child = sfu.proc;
+  await waitForServer(PORT);
 });
 
 test.after(async () => {
-  if (!child || child.exitCode !== null) return;
-  stoppingChild = true;
-  await new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
-    child.kill("SIGTERM");
-    setTimeout(() => child.kill("SIGKILL"), 3000).unref();
-  });
+  await sfu.stop();
 });
 
 // Waits for the next message matching `filter` (or any message, if omitted).
@@ -114,8 +143,12 @@ function nextMessage(
   });
 }
 
-async function connectAndJoin(roomCode: string, peerId: string): Promise<WebSocket> {
-  const ws = new WebSocket(wsUrl());
+async function connectAndJoin(
+  roomCode: string,
+  peerId: string,
+  port: number = PORT,
+): Promise<WebSocket> {
+  const ws = new WebSocket(wsUrl(port));
   await new Promise<void>((resolve, reject) => {
     ws.once("open", () => resolve());
     ws.once("error", reject);
@@ -323,4 +356,95 @@ test("sweepHeartbeatConnection: a non-backpressured socket still uses the ordina
   // pre-existing isAlive contract always has.
   sweepHeartbeatConnection(w, 2_000, 200);
   assert.equal(terminated, 1);
+});
+
+test("ms:diag returns a snapshot naming this peer's own transport and producer", async () => {
+  const ws = await connectAndJoin("room-diag", "peer-diag-a");
+  try {
+    const producerId = await produceRealAudio(ws, 44444444);
+
+    ws.send(JSON.stringify({ type: "ms:diag", requestId: "diag-1" }));
+    const reply = await nextMessage(
+      ws,
+      (m) => m.type === "ms:diag" && m.requestId === "diag-1",
+    );
+
+    assert.equal(reply.snapshot.self.peerId, "peer-diag-a");
+    const sendTransport = reply.snapshot.self.transports.find(
+      (t: { dir: string }) => t.dir === "send",
+    );
+    assert.ok(sendTransport, "expected the send transport to be in the snapshot");
+    // PRIVACY: never a remote ICE candidate address anywhere in the reply.
+    assert.ok(!JSON.stringify(reply).includes("remoteIp"));
+    const producer = reply.snapshot.self.producers.find(
+      (p: { id: string }) => p.id === producerId,
+    );
+    assert.ok(producer, "expected the produced audio track to be in the snapshot");
+    assert.equal(producer.source, "camera");
+  } finally {
+    ws.close();
+  }
+});
+
+test("a second immediate ms:diag is refused as rate-limited, not answered again", async () => {
+  const ws = await connectAndJoin("room-diag-rate", "peer-diag-rate");
+  try {
+    ws.send(JSON.stringify({ type: "ms:diag", requestId: "diag-a" }));
+    const first = await nextMessage(
+      ws,
+      (m) => m.requestId === "diag-a",
+    );
+    assert.equal(first.type, "ms:diag");
+
+    ws.send(JSON.stringify({ type: "ms:diag", requestId: "diag-b" }));
+    const second = await nextMessage(
+      ws,
+      (m) => m.requestId === "diag-b",
+    );
+    assert.equal(second.type, "ms:diag-unavailable");
+    assert.equal(second.reason, "rate-limited");
+  } finally {
+    ws.close();
+  }
+});
+
+// SFU_TELEMETRY is read once at module load (DIAG_ENABLED, sfu/index.ts), so
+// the "disabled" behaviour needs a SEPARATE process from the one above,
+// which runs with SFU_TELEMETRY=1 for the whole file.
+describe("ms:diag with SFU_TELEMETRY unset", () => {
+  const DISABLED_PORT = PORT + 500;
+  let disabledSfu: SpawnedSfu;
+
+  before(async () => {
+    disabledSfu = spawnSfu(DISABLED_PORT, {});
+    await waitForServer(DISABLED_PORT);
+  });
+
+  after(async () => {
+    await disabledSfu.stop();
+  });
+
+  test("ms:diag answers disabled, and the session is not latched by it", async () => {
+    const ws = await connectAndJoin("room-diag-disabled", "peer-diag-disabled", DISABLED_PORT);
+    try {
+      ws.send(JSON.stringify({ type: "ms:diag", requestId: "diag-1" }));
+      const reply = await nextMessage(
+        ws,
+        (m) => m.requestId === "diag-1",
+      );
+      assert.equal(reply.type, "ms:diag-unavailable");
+      assert.equal(reply.reason, "disabled");
+
+      // The regression this guards: ms:diag must answer with
+      // ms:diag-unavailable, NEVER ms:error - the client treats a bare
+      // ms:error as a whole-session refusal and latches it permanently. A
+      // still-working ms:get-capabilities after the "disabled" reply proves
+      // this session was not latched.
+      ws.send(JSON.stringify({ type: "ms:get-capabilities" }));
+      const caps = await nextMessage(ws, (m) => m.type === "ms:capabilities");
+      assert.ok(caps.rtpCapabilities);
+    } finally {
+      ws.close();
+    }
+  });
 });

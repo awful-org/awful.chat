@@ -1,4 +1,6 @@
 import { apiUrl } from "$lib/runtime-config";
+import { ev, errText } from "$lib/telemetry/event";
+import { rec } from "$lib/telemetry/recorder";
 // STUN servers - safe to ship, no credentials.
 //
 // Two, not seven. Gathering does not finish until every entry has answered or
@@ -123,13 +125,17 @@ export async function refreshTurnCredentials(): Promise<void> {
     const base = apiUrl();
     const res = await fetch(`${base}/turn-credentials`);
     if (!res.ok) {
+      rec(ev("ice.turn.fail", { d: { branch: "not-ok", status: res.status } }));
       _scheduleRetry(); // transient server trouble: keep trying
       return;
     }
     // 204 is the relay saying TURN_SECRET is unset. It is a documented,
     // supported state, not a fault - and it is `ok`, so it has to be caught
     // here or it falls through to a JSON parse of an empty body.
-    if (res.status === 204) return;
+    if (res.status === 204) {
+      rec(ev("ice.turn.unavailable", { d: { branch: "no-secret", status: 204 } }));
+      return;
+    }
     // A host that answers an unrouted path with index.html returns 200 too, so
     // res.ok is not enough on its own: the JSON parse below would throw into
     // the silent catch and leave the list STUN-only with nothing logged. That
@@ -138,6 +144,7 @@ export async function refreshTurnCredentials(): Promise<void> {
       console.warn(
         "[ice] /turn-credentials did not return JSON - no TURN available, relayed peers will not connect"
       );
+      rec(ev("ice.turn.fail", { d: { branch: "not-json", status: res.status } }));
       _scheduleRetry();
       return;
     }
@@ -154,6 +161,7 @@ export async function refreshTurnCredentials(): Promise<void> {
       d.urls.length === 0 ||
       !d.urls.every((u) => typeof u === "string")
     ) {
+      rec(ev("ice.turn.fail", { d: { branch: "malformed" } }));
       _scheduleRetry();
       return;
     }
@@ -163,6 +171,14 @@ export async function refreshTurnCredentials(): Promise<void> {
       credential: d.credential,
     });
     _notifyChanged();
+    rec(
+      ev("ice.turn.ok", {
+        d: {
+          ttl: typeof d.ttl === "number" && Number.isFinite(d.ttl) ? d.ttl : null,
+          urlCount: d.urls.length,
+        },
+      })
+    );
     // ttl is in seconds (relay/turn.go). A missing or unusable ttl leaves
     // this credential unrefreshed until the next connect() - the same
     // fallback the old, never-refreshed code had - rather than guessing a
@@ -173,8 +189,9 @@ export async function refreshTurnCredentials(): Promise<void> {
         (d.ttl * 1000) / 2
       );
     }
-  } catch {
+  } catch (err) {
     // Stay STUN-only for now, but keep trying - see RETRY_MS.
+    rec(ev("ice.turn.fail", { d: { branch: "threw", err: errText(err) } }));
     _scheduleRetry();
   }
 }

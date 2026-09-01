@@ -236,6 +236,19 @@ type connectedClient struct {
 	// membershipOps in readLoop - it needs no lock of its own even though
 	// register() happens to touch it while holding registry.mu.
 	emptyRegisters opBudget
+
+	// Telemetry-only bookkeeping (relay/telemetry.go), guarded by
+	// registry.mu exactly like roomCapLogged and joinLeaveLog above - written
+	// by register/unregister, read by relayViewFor. Cheap to maintain
+	// unconditionally: none of it changes any wire-visible or logged
+	// behavior when TELEMETRY_ENABLED is unset, so the "inert by default"
+	// contract holds without gating these increments.
+	diagRef            string
+	diagOpenedAt       time.Time
+	diagRegisters      int
+	diagUnregisters    int
+	diagCapped         int
+	diagOracleSilenced int
 }
 
 // newConnectedClient starts the client's writer goroutine. The client must
@@ -243,11 +256,13 @@ type connectedClient struct {
 // stays alive for the life of the process.
 func newConnectedClient(peerId string, s rvStream) *connectedClient {
 	c := &connectedClient{
-		peerId: peerId,
-		stream: s,
-		rooms:  make(map[string]struct{}),
-		out:    make(chan []byte, sendQueueDepth),
-		done:   make(chan struct{}),
+		peerId:       peerId,
+		stream:       s,
+		rooms:        make(map[string]struct{}),
+		out:          make(chan []byte, sendQueueDepth),
+		done:         make(chan struct{}),
+		diagRef:      fmt.Sprintf("s%x", time.Now().UnixNano()),
+		diagOpenedAt: time.Now(),
 	}
 	go c.writeLoop()
 	return c
@@ -583,6 +598,7 @@ func (r *registry) sendTo(c *connectedClient, msg serverMsg) {
 		// will not complete, which is how one dead tab stalled a whole room.
 		// It has missed frames either way, so it has to reconnect to resync.
 		log.Printf("[rv] %s is not reading its stream, dropping it", short(c.peerId))
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseOutboxFull}})
 		c.shutdown()
 	}
 }
@@ -664,6 +680,7 @@ func (r *registry) sendPeers(c *connectedClient, room string, others []string) {
 // already indistinguishable from success to the client.
 func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	r.mu.Lock()
+	c.diagRegisters++
 
 	// A stream the registry has already let go of - its read loop ended, or the
 	// peer's last connection dropped and the libp2p backup cleaned up after it -
@@ -687,20 +704,24 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		others := peersExcept(r.rooms[room], c.peerId)
 		r.mu.Unlock()
 		r.sendPeers(c, room, others)
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room)})
 		return registerJoined
 	}
 	if r.total >= maxTotalRegistrations {
 		sayCapped := !r.totalCapLogged
 		r.totalCapLogged = true
+		c.diagCapped++
 		r.mu.Unlock()
 		if sayCapped {
 			log.Printf("[rv] registry is at its %d-registration ceiling, ignoring further REGISTERs", maxTotalRegistrations)
 		}
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
 		return registerCapped
 	}
 	if r.roomsHeldByPeer(c.peerId) >= maxRoomsPerPeer {
 		sayCapped := !c.roomCapLogged
 		c.roomCapLogged = true
+		c.diagCapped++
 		r.mu.Unlock()
 		// Every line the registry writes is emitted with the lock released.
 		// log.Printf takes its own mutex and then writes to stderr
@@ -710,6 +731,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		if sayCapped {
 			log.Printf("[rv] %s hit the %d-room cap, ignoring further REGISTERs", short(c.peerId), maxRoomsPerPeer)
 		}
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
 		return registerCapped
 	}
 
@@ -721,7 +743,9 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	// code guesser is fishing for, so only THAT case spends the budget; a
 	// REGISTER into a room that already has somebody else in it is free.
 	if len(members) == 0 && !c.emptyRegisters.allow(time.Now()) {
+		c.diagOracleSilenced++
 		r.mu.Unlock()
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "oracle"}})
 		return registerOracleSilenced
 	}
 	if members == nil {
@@ -771,6 +795,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	// it is the frame that answers the REGISTER, and queuing it behind a
 	// broadcast to everyone else only delays the join for no reason.
 	r.sendPeers(c, room, others)
+	diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room)})
 	if !announce {
 		return registerJoined
 	}
@@ -786,6 +811,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 
 func (r *registry) unregister(c *connectedClient, room string) {
 	r.mu.Lock()
+	c.diagUnregisters++
 	// Same guard as register: a stream the registry has let go of no longer
 	// speaks for anyone.
 	if !r.isLive(c) {
@@ -796,6 +822,7 @@ func (r *registry) unregister(c *connectedClient, room string) {
 	r.mu.Unlock()
 
 	line.emit()
+	diagRecord(c.peerId, relayDiagEvent{Kind: "rv.unregister", Room: diagRoomRef(room)})
 
 	// Send notifications outside the lock
 	for _, tc := range targets {
@@ -966,6 +993,14 @@ func (r *registry) disconnectPeer(peerId string) {
 		l.emit()
 	}
 	lifecycleLogf("[rv] %s disconnected", short(peerId))
+	// One rv.close per evicted stream, plus one peer.disconnect for the
+	// libp2p-level event itself: this is the ONE case where a stream's
+	// rooms are torn down before its own readLoop had a chance to notice
+	// and record its own close reason - "evicted" names exactly that.
+	for range doomed {
+		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseEvicted}})
+	}
+	diagRecord(peerId, relayDiagEvent{Kind: "peer.disconnect"})
 
 	// Stop the writer goroutines, otherwise they outlive the session for as
 	// long as the process runs.
@@ -999,6 +1034,7 @@ type rvReadStream interface {
 func (r *registry) handleStream(s network.Stream) {
 	peerId := s.Conn().RemotePeer().String()
 	lifecycleLogf("[rv] %s opened rendezvous stream", short(peerId))
+	diagRecord(peerId, relayDiagEvent{Kind: "rv.open"})
 
 	// Every stream stands on its own; an earlier stream from the same peerId is
 	// left alone. Two tabs of the app share a peerId (the libp2p key lives in
@@ -1010,17 +1046,18 @@ func (r *registry) handleStream(s network.Stream) {
 	c := r.addStream(peerId, s)
 	if c == nil {
 		lifecycleLogf("[rv] %s already holds %d rendezvous streams, refusing another", short(peerId), maxStreamsPerPeer)
+		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseStreamCap}})
 		s.Reset()
 		return
 	}
 
-	r.readLoop(s, peerId, c)
+	reason := r.readLoop(s, peerId, c)
 
 	// The count matters now that a peerId can hold several streams: "stream
 	// closed" alone no longer means the peer is gone. removeClient is also
 	// what tears the stream down (via c.shutdown) - the idle-timeout case
 	// above ends up here exactly like any other read error.
-	lifecycleLogf("[rv] %s stream closed (%d still open)", short(peerId), r.removeClient(c))
+	lifecycleLogf("[rv] %s stream closed (%d still open, reason=%s)", short(peerId), r.removeClient(c), reason)
 }
 
 // readLoop reassembles length-prefixed frames from a rendezvous stream and
@@ -1028,7 +1065,7 @@ func (r *registry) handleStream(s network.Stream) {
 // timeout, see rendezvousIdleTimeout and rendezvousLivenessTimeout. Split
 // out of handleStream so a fake satisfying only rvReadStream can exercise
 // it in tests.
-func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) {
+func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) string {
 	// Read loop - reassemble length-prefixed frames
 	buf := make([]byte, 0, 512)
 	tmp := make([]byte, 4096)
@@ -1051,6 +1088,10 @@ func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) {
 	// Set once the stream has registered a room; from then on it gets
 	// rendezvousLivenessTimeout instead of rendezvousIdleTimeout.
 	registered := false
+	// The reason this loop eventually exits with, recorded once below as one
+	// rv.close event - see readLoopCloseReason (telemetry.go) and
+	// relayCloseGraceful and its siblings for the vocabulary.
+	reason := relayCloseGraceful
 
 readLoop:
 	for {
@@ -1065,6 +1106,7 @@ readLoop:
 		}
 		n, err := s.Read(tmp)
 		if err != nil {
+			reason = readLoopCloseReason(err, registered)
 			break
 		}
 		buf = append(buf, tmp[:n]...)
@@ -1076,7 +1118,9 @@ readLoop:
 			// buf and re-trip on every subsequent read while buf grows unbounded.
 			if msgLen > maxMsgLen {
 				warn("[rv] message too large from %s: %d bytes, closing stream", short(peerId), msgLen)
+				diagRecord(peerId, relayDiagEvent{Kind: "rv.frame.oversize", D: map[string]any{"bytes": msgLen}})
 				s.Reset()
+				reason = relayCloseFrameOversize
 				break readLoop
 			}
 			if len(buf) < 4+msgLen {
@@ -1088,12 +1132,14 @@ readLoop:
 			var msg clientMsg
 			if err := json.Unmarshal(payload, &msg); err != nil {
 				warn("[rv] bad message from %s: %v", short(peerId), err)
+				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "malformed"}})
 				continue
 			}
 
 			if msg.Type == "REGISTER" || msg.Type == "UNREGISTER" {
 				if !validRoom(msg.Room) {
 					warn("[rv] %s sent an unusable room id (%d bytes), ignoring", short(peerId), len(msg.Room))
+					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "bad-room"}})
 					if msg.Type == "REGISTER" {
 						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
 					}
@@ -1112,6 +1158,7 @@ readLoop:
 				// registers each room once per connection.
 				if !membershipOps.allow(time.Now()) {
 					warn("[rv] %s is changing rooms faster than %d/%s, ignoring", short(peerId), maxMembershipOps, membershipOpWindow)
+					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", Room: diagRoomRef(msg.Room), D: map[string]any{"reason": "rate-limited"}})
 					if msg.Type == "REGISTER" {
 						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
 					}
@@ -1146,9 +1193,13 @@ readLoop:
 				// finding 5).
 			default:
 				warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type))
+				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "unknown-type"}})
 			}
 		}
 	}
+
+	diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": reason}})
+	return reason
 }
 
 // Connection ceiling for the whole relay. The low mark is where the connection
@@ -1310,6 +1361,7 @@ func main() {
 
 	reg := newRegistry()
 	h.SetStreamHandler(RendezvousProtocol, reg.handleStream)
+	relaySelfPeerId = h.ID().String()
 
 	// HTTP server for OG and Klipy endpoints (run on separate internal port)
 	apiPort := "8081"
@@ -1328,6 +1380,10 @@ func main() {
 		mux.HandleFunc("/mailbox/collect", handleMailboxCollect)
 		mux.HandleFunc("/mailbox/ack", handleMailboxAck)
 		startMailboxSweeper()
+		mux.HandleFunc("/telemetry", postOnly(handleTelemetryIngest(reg)))
+		mux.HandleFunc("/telemetry/list", handleTelemetryList)
+		mux.HandleFunc("/telemetry/get", handleTelemetryGet)
+		startTelemetrySweeper()
 		log.Printf("[http] Starting API server on port %s", apiPort)
 		server := &http.Server{
 			Addr:              ":" + apiPort,

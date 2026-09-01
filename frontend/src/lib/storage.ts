@@ -30,6 +30,8 @@ import type {
   MnemonicRecord,
   WebAuthnRecord,
 } from "./identity/identity";
+import { ev } from "./telemetry/event";
+import { rec } from "./telemetry/recorder";
 
 export type RoomType = "text" | "dm";
 
@@ -199,6 +201,11 @@ type AppDB = IDBPDatabase<{
     key: Blinded;
     value: SearchIndexRecord;
   };
+  diagnostics: {
+    key: string;
+    value: DiagChunkRecord;
+    indexes: { bySession: string };
+  };
 }>;
 
 /** Sealed per-room search index: entries serialized as encrypted bytes. */
@@ -208,6 +215,29 @@ export interface SearchIndexRecord {
    *  staleness is checkable without a decrypt. */
   lastLamport: number;
   /** JSON bytes of SearchEntry[]; sealed via the `bytes` spec. */
+  data: ArrayBuffer;
+}
+
+/**
+ * One sealed slice of the diagnostic ring.
+ *
+ * Chunked, not one growing row: a flush must not rewrite the whole session,
+ * and a prune must be able to drop the oldest slices without a decrypt.
+ *
+ * NEVER synced and NEVER backed up. `backup.ts`, `backup-restore.ts` and
+ * `sync.svelte.ts` deliberately do not know this store exists - a diagnostic
+ * buffer must not ride an encrypted backup to another device.
+ * `wipeLocalDatabase()` uses `deleteDB`, so duress erase already covers it.
+ */
+export interface DiagChunkRecord {
+  /** `${sessionId}:${chunkSeq}` zero-padded, so a key sort is a time sort. */
+  id: string;
+  sessionId: string;
+  /** The session's wall-clock start. Clear, for the prune query. */
+  startedAt: number;
+  seqFrom: number;
+  seqTo: number;
+  /** JSON bytes of DiagEvent[]; sealed via the `bytes` spec. */
   data: ArrayBuffer;
 }
 
@@ -231,7 +261,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB("awful-chat", 5, {
+  db = (await openDB("awful-chat", 6, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -314,6 +344,12 @@ async function openDatabase(): Promise<AppDB> {
         // Message-search index, one sealed row per room (see STORE_SPECS).
         database.createObjectStore("searchIndex", { keyPath: "roomCode" });
       }
+
+      if (oldVersion < 6) {
+        // Diagnostic event chunks, sealed (see STORE_SPECS). Never synced.
+        const s = database.createObjectStore("diagnostics", { keyPath: "id" });
+        s.createIndex("bySession", "sessionId", { unique: false });
+      }
     },
     blocking() {
       // Someone wants to delete (or upgrade) this database and our open
@@ -365,6 +401,7 @@ async function _open<T>(
     // One undecryptable row (truncated blob, foreign key) degrades to one
     // missing row, never to a thrown query.
     console.warn(`[storage] dropped undecryptable ${store} row:`, err);
+    rec(ev("storage.drop", { d: { store, count: 1 } }));
     return undefined;
   }
 }
@@ -889,6 +926,133 @@ export async function putSearchIndex(record: SearchIndexRecord): Promise<void> {
 export async function deleteSearchIndex(roomCode: string): Promise<void> {
   const database = await getDB();
   await database.delete("searchIndex", await blindValue(roomCode));
+}
+
+// ── diagnostic chunks ────────────────────────────────────────────────────────
+// Every helper here is best-effort by design. A diagnostic buffer that throws
+// would break the app it exists to explain, so the CALLER decides what a
+// failure means; see `telemetry/store.ts`.
+
+export async function putDiagChunk(record: DiagChunkRecord): Promise<void> {
+  const database = await getDB();
+  await database.put("diagnostics", await _seal("diagnostics", record));
+}
+
+/** One session's chunks, oldest first. An undecryptable chunk is dropped. */
+export async function getDiagChunks(
+  sessionId: string
+): Promise<DiagChunkRecord[]> {
+  const database = await getDB();
+  const rows = await database.getAllFromIndex(
+    "diagnostics",
+    "bySession",
+    sessionId
+  );
+  rows.sort((a, b) => a.id.localeCompare(b.id));
+  return _openAll("diagnostics", rows);
+}
+
+export interface DiagSessionSummary {
+  sessionId: string;
+  startedAt: number;
+  chunks: number;
+  /** Sealed size on disk, in bytes. */
+  bytes: number;
+}
+
+/**
+ * On-disk size of one chunk, read without a key.
+ *
+ * A sealed row does NOT carry `data`: `sealRow` moves every `bytes` field into
+ * `_encBytes.<field>.ct`. A plaintext row - one written during a locked import,
+ * before the at-rest sweep - still has `data`. Both shapes are measured, so a
+ * prune is never fooled into thinking the store is empty.
+ */
+function sealedChunkBytes(row: DiagChunkRecord): number {
+  const loose = row as unknown as {
+    data?: unknown;
+    _encBytes?: Record<string, { ct?: unknown }>;
+  };
+  const sealed = loose._encBytes?.data?.ct;
+  if (sealed instanceof ArrayBuffer) return sealed.byteLength;
+  if (loose.data instanceof ArrayBuffer) return loose.data.byteLength;
+  if (ArrayBuffer.isView(loose.data)) return loose.data.byteLength;
+  return 0;
+}
+
+/**
+ * Every stored session, newest first. Reads CLEAR fields only, so it works
+ * before unlock and costs no decrypt.
+ */
+export async function listDiagSessions(): Promise<DiagSessionSummary[]> {
+  const database = await getDB();
+  const byId = new Map<string, DiagSessionSummary>();
+  let cursor = await database.transaction("diagnostics").store.openCursor();
+  while (cursor) {
+    const row = cursor.value;
+    const hit = byId.get(row.sessionId);
+    const bytes = sealedChunkBytes(row);
+    if (hit) {
+      hit.chunks++;
+      hit.bytes += bytes;
+      hit.startedAt = Math.min(hit.startedAt, row.startedAt);
+    } else {
+      byId.set(row.sessionId, {
+        sessionId: row.sessionId,
+        startedAt: row.startedAt,
+        chunks: 1,
+        bytes,
+      });
+    }
+    cursor = await cursor.continue();
+  }
+  return [...byId.values()].sort((a, b) => b.startedAt - a.startedAt);
+}
+
+/**
+ * Keep the newest `keepSessions` sessions, and keep the total under
+ * `maxBytes`. The oldest session goes first, whole, so a surviving session is
+ * never a partial history with an unexplained gap.
+ *
+ * @returns the number of sessions removed
+ */
+export async function pruneDiagnostics(
+  keepSessions: number,
+  maxBytes: number,
+  keepSessionId?: string
+): Promise<number> {
+  const sessions = await listDiagSessions();
+  const doomed: string[] = [];
+  let total = sessions.reduce((n, s) => n + s.bytes, 0);
+
+  for (let i = 0; i < sessions.length; i++) {
+    const s = sessions[i];
+    if (s.sessionId === keepSessionId) continue;
+    const overCount = i >= keepSessions;
+    const overBytes = total > maxBytes;
+    if (!overCount && !overBytes) continue;
+    doomed.push(s.sessionId);
+    total -= s.bytes;
+  }
+
+  for (const sessionId of doomed) await deleteDiagSession(sessionId);
+  return doomed.length;
+}
+
+export async function deleteDiagSession(sessionId: string): Promise<void> {
+  const database = await getDB();
+  const keys = await database.getAllKeysFromIndex(
+    "diagnostics",
+    "bySession",
+    sessionId
+  );
+  const tx = database.transaction("diagnostics", "readwrite");
+  await Promise.all([...keys.map((k) => tx.store.delete(k)), tx.done]);
+}
+
+export async function deleteDiagnostics(): Promise<void> {
+  const database = await getDB();
+  await database.clear("diagnostics");
 }
 
 /**
