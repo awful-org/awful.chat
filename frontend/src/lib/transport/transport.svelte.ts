@@ -148,6 +148,7 @@ import {
   shouldAutoDownload,
   withFileTransfer,
 } from "./files.svelte";
+import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
 import { initVoice } from "./voice.svelte";
 import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
 import { ev } from "../telemetry/event";
@@ -156,10 +157,6 @@ import { apiUrl, isConfigured, relayMultiaddr, sfuUrls } from "../runtime-config
 import { faultStats, faultsActive } from "./faults";
 import { initTransmission } from "./transmission.svelte";
 
-const MSG_ORDER = (a: Message, b: Message) =>
-  a.lamport !== b.lamport
-    ? a.lamport - b.lamport
-    : a.senderId.localeCompare(b.senderId);
 
 /**
  * Check if an ephemeral message can be sent without exceeding flood cap.
@@ -268,23 +265,10 @@ function _parsePluginPayload(
   };
 }
 
-/**
- * Messages almost always arrive in order, so appending is the common case;
- * only fall back to a full sort when the newcomer actually lands out of order.
- * Re-sorting the whole history per incoming message scaled with room size.
- */
-export function appendSorted(
-  list: Message[],
-  msg: Message,
-  cmp: (a: Message, b: Message) => number = MSG_ORDER
-): Message[] {
-  const next = [...list, msg];
-  if (list.length > 0 && cmp(list[list.length - 1], msg) > 0) next.sort(cmp);
-  return next;
-}
 import { playPeerJoinSound, playPeerLeaveSound } from "../sounds";
 import { peerCallChime } from "./call-chime";
 
+export { appendSorted } from "./message-order";
 export type { Message };
 
 // ── State shapes ──────────────────────────────────────────────────────────────

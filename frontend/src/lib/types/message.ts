@@ -57,8 +57,8 @@ export interface Message {
   senderDid?: string;
   sig?: string; // ed25519 over the canonical form (see messaging.ts)
   sigV?: number; // canonical version: absent = v1, 2 = covers reactions/reply/meta
-  timestamp: number; // wall clock, display only
-  lamport: number; // logical clock, ordering source of truth
+  timestamp: number; // wall clock; orders the timeline, and is displayed
+  lamport: number; // logical clock; tiebreaks the timeline, orders plugin folds
   type: ChatMessageType;
   content: string;
   meta?: FileMeta;
