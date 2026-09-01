@@ -62,9 +62,16 @@ case "$PROFILE" in
     # first is what makes this profile test ICE rather than DNS.
     run "iptables -A OUTPUT -o lo -j ACCEPT; iptables -A OUTPUT -p udp --dport 53 -j ACCEPT; iptables -A OUTPUT -p udp -j DROP"
     ;;
+  blackout)
+    # Everything except loopback: the tab keeps running, its network is gone.
+    # A tunnel, a lift, a wifi handover. The question this profile asks is not
+    # whether a call survives the outage - it cannot - but whether it comes
+    # back afterwards, which is repair logic rather than setup logic.
+    run "iptables -A OUTPUT -o lo -j ACCEPT; iptables -A OUTPUT -j DROP"
+    ;;
   *)
     echo "unknown profile: $PROFILE" >&2
-    echo "profiles: clean loss3 loss15 jitter slow reorder udp-block" >&2
+    echo "profiles: clean loss3 loss15 jitter slow reorder udp-block blackout" >&2
     exit 2
     ;;
 esac
