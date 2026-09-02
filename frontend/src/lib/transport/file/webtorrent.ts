@@ -32,6 +32,21 @@ type TorrentLike = {
 const WT_RECONCILE_MS = 5_000;
 /** Ceiling on the per-pair retry wait. */
 const WT_RETRY_MAX_MS = 60_000;
+/**
+ * Live WebRTC links for file transfer, across every (file, peer) pair.
+ *
+ * Each pair gets its own RTCPeerConnection, and the pairs multiply: joining a
+ * room replays its whole history, every image in it starts downloading, and
+ * each one dials every seeder that has it. A room with a few hundred images
+ * and a roomful of people asked for thousands of connections at once - Chrome
+ * caps a tab at 500 and throws "Cannot create so many PeerConnections", which
+ * took the call down with it because voice could no longer get one either.
+ * Capped here rather than at any one caller: reconcile, registerSeeder,
+ * ensureDownload and handleSignal all build links through createWTPeer. Pairs
+ * over the cap are not dropped, just deferred - the reconcile tick dials them
+ * as transfers finish and slots come free.
+ */
+const MAX_WT_PEERS = 32;
 /** Distinct infoHashes a single peer may have registered with us at once. */
 const MAX_INFOHASHES_PER_PEER = 64;
 /** Distinct infoHashes tracked in total, across every peer. */
@@ -92,6 +107,15 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private wtBackoff = new Map<string, number>();
   private wtReconcileTimer: ReturnType<typeof setInterval> | null = null;
   private attachedTorrents = new Set<string>();
+  /**
+   * infoHashes whose torrent is being added right now. ensureDownload reads
+   * client.get() and calls client.add() on the far side of an await, so two
+   * calls for the same file - and there are always two, because a message
+   * arriving and a seeder announcing both trigger one - each saw no torrent
+   * and each added it. webtorrent answers the second with "A torrent with the
+   * same id is already being seeded" on an unhandled rejection.
+   */
+  private addingTorrents = new Set<string>();
   private seedingByHash = new Map<string, boolean>();
 
   private localFileLookup: ((infoHash: string) => Promise<File | null>) | null =
@@ -136,13 +160,16 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         const key = wtKey(infoHash, peerId);
         if (this.wtPeers.has(key)) continue;
         if (now < (this.wtNextTry.get(key) ?? 0)) continue;
+        // Backoff is for a peer that will not answer. A pair held back by the
+        // cap has not been tried at all, so it keeps its place at the front of
+        // the queue instead of being pushed out to the next retry window.
+        if (!this.createWTPeer(infoHash, peerId, true)) continue;
         const wait = Math.min(
           Math.max((this.wtBackoff.get(key) ?? 0) * 2, WT_RECONCILE_MS),
           WT_RETRY_MAX_MS
         );
         this.wtBackoff.set(key, wait);
         this.wtNextTry.set(key, now + wait);
-        this.createWTPeer(infoHash, peerId, true);
       }
     }
   }
@@ -276,19 +303,25 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       return;
     }
 
-    void this.client().then((client) => {
-      const torrent = client.get(
-        file.infoHash
-      ) as unknown as TorrentLike | null;
-      if (!torrent) {
-        const added = client.add(file.infoHash, {
-          announce: [],
-        }) as TorrentLike;
-        this.attachTorrent(added, false, file);
-      } else {
-        this.attachTorrent(torrent, false, file);
-      }
-    });
+    if (!this.addingTorrents.has(file.infoHash)) {
+      this.addingTorrents.add(file.infoHash);
+      void this.client()
+        .then((client) => {
+          const torrent = client.get(
+            file.infoHash
+          ) as unknown as TorrentLike | null;
+          if (torrent) {
+            this.attachTorrent(torrent, false, file);
+            return;
+          }
+          const added = client.add(file.infoHash, {
+            announce: [],
+          }) as TorrentLike;
+          this.attachTorrent(added, false, file);
+        })
+        .catch(() => {})
+        .finally(() => this.addingTorrents.delete(file.infoHash));
+    }
 
     this.upsertTransfer({
       ...file,
@@ -555,9 +588,10 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     infoHash: string,
     peerId: string,
     initiator: boolean
-  ): void {
+  ): boolean {
     const key = wtKey(infoHash, peerId);
-    if (this.wtPeers.has(key)) return;
+    if (this.wtPeers.has(key)) return false;
+    if (this.wtPeers.size >= MAX_WT_PEERS) return false;
 
     const peer = new SimplePeer({
       initiator,
@@ -605,6 +639,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     peer.on("close", () => {
       this.wtPeers.delete(key);
     });
+    return true;
   }
 
   private attachTorrent(

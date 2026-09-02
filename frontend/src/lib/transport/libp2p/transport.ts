@@ -14,7 +14,7 @@ import type { Connection, Stream } from "@libp2p/interface";
 import type { StreamMessageEvent, StreamCloseEvent } from "@libp2p/interface";
 import { errText, ev } from "$lib/telemetry/event";
 import { beginSession, rec, refs } from "$lib/telemetry/recorder";
-import { recTransportEvent } from "$lib/telemetry/taps";
+import { isBenignStreamRejection, recTransportEvent } from "$lib/telemetry/taps";
 
 // js-libp2p exposes no public "reserve a relay slot now" API. Listening on a
 // `<relay>/p2p-circuit` address is what triggers a reservation, and we need to
@@ -348,11 +348,7 @@ export class LibP2PTransport implements PeerTransport {
     if (typeof window === "undefined" || this.noiseFilterInstalled) return;
     this.noiseFilterInstalled = true;
     window.addEventListener("unhandledrejection", (e) => {
-      const r = e.reason as { name?: string; message?: string } | undefined;
-      if (
-        r?.name === "StreamStateError" &&
-        /stream that is closed/i.test(r?.message ?? "")
-      ) {
+      if (isBenignStreamRejection(e.reason)) {
         this.debugStats.suppressedStreamErrors++;
         rec(
           ev("stream.reset", {
