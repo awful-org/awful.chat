@@ -37,6 +37,19 @@ const { FakeTransport, instances } = vi.hoisted(() => {
 });
 vi.mock("./libp2p/transport", () => ({ LibP2PTransport: FakeTransport }));
 
+// The import half is exercised in backup-restore.test.ts against a real
+// database; here only WHAT the target hands it matters.
+const { importCalls } = vi.hoisted(() => ({
+  importCalls: [] as { data: any; mode: string }[],
+}));
+vi.mock("./backup-restore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./backup-restore")>()),
+  importDatabase: async (data: any, mode: any) => {
+    importCalls.push({ data, mode });
+    return { droppedRecords: 0 };
+  },
+}));
+
 import {
   cancelSync,
   connectAsTarget,
@@ -46,6 +59,7 @@ import {
   parseShortCode,
   peerIdShortPrefix,
   syncState,
+  tokenAccepted,
   utf8Length,
 } from "./sync.svelte";
 
@@ -239,5 +253,118 @@ describe("target ExportRequest delivery", () => {
     t.emit("connect", PEER_ID);
     await Promise.resolve();
     expect(requests(t)).toHaveLength(1);
+  });
+});
+
+// The 8-char short code carries 32 bits of the 128-bit token, which is
+// guessable inside the code's 5-minute life. That truncation is the price of
+// a code somebody can type - it is not a price the QR path has to pay too.
+describe("tokenAccepted", () => {
+  const FULL = TOKEN;
+
+  it("accepts the full token whichever form is in play", () => {
+    expect(tokenAccepted(FULL, FULL, false)).toBe(true);
+    expect(tokenAccepted(FULL, FULL, true)).toBe(true);
+  });
+
+  it("accepts the 8-char prefix only when the short code is in play", () => {
+    expect(tokenAccepted(FULL.slice(0, 8), FULL, true)).toBe(true);
+    expect(tokenAccepted(FULL.slice(0, 8), FULL, false)).toBe(false);
+  });
+
+  // The short-code target holds 8 chars while the source echoes all 32, so
+  // the truncated side is not always the received one.
+  it("accepts the source's full echo against a typed short code", () => {
+    expect(tokenAccepted(FULL, FULL.slice(0, 8), true)).toBe(true);
+    expect(tokenAccepted(FULL, FULL.slice(0, 8), false)).toBe(false);
+  });
+
+  it("rejects a wrong token, an empty one, and a longer near-miss", () => {
+    expect(tokenAccepted("00000000", FULL, true)).toBe(false);
+    expect(tokenAccepted("", FULL, true)).toBe(false);
+    expect(tokenAccepted(FULL.slice(0, 16), FULL, true)).toBe(false);
+    expect(tokenAccepted(FULL, null, true)).toBe(false);
+  });
+});
+
+// "Merge" keeps this device's account. The source skips the identity section
+// in add mode, but a source that sends one anyway used to have it written
+// straight over the target's identity - a takeover, not a merge.
+describe("target-side identity handling", () => {
+  afterEach(async () => {
+    importCalls.length = 0;
+    await cancelSync();
+  });
+
+  const frame = (obj: unknown) =>
+    new TextEncoder().encode(JSON.stringify(obj));
+
+  const identitySection = {
+    mnemonic: { salt: [1], iv: [2], encrypted: [3], iterations: 600_000 },
+    keypair: { did: "did:key:zSomebodyElse", publicKey: [4] },
+  };
+
+  async function runTarget(mode: "add" | "replace") {
+    await connectAsTarget({
+      roomCode: ROOM_CODE,
+      token: TOKEN,
+      expires: Date.now() + 60_000,
+      peerId: PEER_ID,
+      mode,
+    });
+    const t = instances.at(-1);
+    t.emit("connect", PEER_ID);
+    t.emit(
+      "message",
+      PEER_ID,
+      frame({
+        type: "sync_export_data",
+        payload: { section: "identity", data: identitySection, token: TOKEN },
+      })
+    );
+    await vi.waitFor(() => expect(t.sent.length).toBeGreaterThan(1));
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete" }));
+    await vi.waitFor(() => expect(importCalls).toHaveLength(1));
+    return importCalls[0];
+  }
+
+  it("drops the identity section in add mode", async () => {
+    const call = await runTarget("add");
+    expect(call.mode).toBe("add");
+    expect(call.data.identity).toBeUndefined();
+  });
+
+  it("keeps the short-code target accepting the source's full-token frames", async () => {
+    await connectAsTarget({
+      roomCode: ROOM_CODE,
+      // What parseShortCode produces: 8 chars of token, 8 of peerId.
+      token: TOKEN.slice(0, 8),
+      peerPrefix: PEER_ID.slice(8, 16),
+      expires: Date.now() + 60_000,
+      mode: "replace",
+    });
+    const t = instances.at(-1);
+    t.emit("connect", PEER_ID);
+    t.emit(
+      "message",
+      PEER_ID,
+      frame({
+        type: "sync_export_data",
+        // The source always echoes the FULL token, never its short form.
+        payload: { section: "identity", data: identitySection, token: TOKEN },
+      })
+    );
+    await vi.waitFor(() => expect(t.sent.length).toBeGreaterThan(1));
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete" }));
+    await vi.waitFor(() => expect(importCalls).toHaveLength(1));
+    expect(importCalls[0].data.identity.keypair.did).toBe(
+      "did:key:zSomebodyElse"
+    );
+  });
+
+  it("still adopts it in replace mode, which is what replace means", async () => {
+    const call = await runTarget("replace");
+    expect(call.mode).toBe("replace");
+    expect(call.data.identity.keypair.did).toBe("did:key:zSomebodyElse");
   });
 });

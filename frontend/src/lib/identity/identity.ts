@@ -34,7 +34,7 @@ const ED25519_MULTICODEC = new Uint8Array([0xed, 0x01]);
  * guidance for PBKDF2-SHA256. The count is stored per-record so existing
  * mnemonics encrypted at the old 100k count still decrypt (see unlockIdentity).
  */
-const PBKDF2_ITERATIONS = 600_000;
+export const PBKDF2_ITERATIONS = 600_000;
 const LEGACY_PBKDF2_ITERATIONS = 100_000;
 
 export interface MnemonicRecord {
@@ -225,8 +225,11 @@ const IDENTITY_SCOPED_KEYS = [
  * That is how a fresh account inherited the previous account's room list.
  */
 async function wipePreviousIdentityData(): Promise<void> {
-  const { wipeLocalDatabase } = await import("../storage");
+  const { wipeLocalDatabase, clearAtRestFlags } = await import("../storage");
   await wipeLocalDatabase();
+  // The at-rest sweep flags are keyed by a hash of the DID, so no literal in
+  // IDENTITY_SCOPED_KEYS can name the previous identity's.
+  clearAtRestFlags();
 
   // The chat database is not the only place the old account left content.
   const { KNOWN_DBS } = await import("../duress");
@@ -253,6 +256,22 @@ async function wipePreviousIdentityData(): Promise<void> {
   }
 }
 
+/** Seal a mnemonic under a password at the CURRENT iteration count. */
+async function _encryptMnemonic(
+  mnemonic: string,
+  password: string
+): Promise<MnemonicRecord> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await AESFromPassword(password, salt, PBKDF2_ITERATIONS);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    utf8(mnemonic)
+  );
+  return { id: "mnemonic", salt, iv, encrypted, iterations: PBKDF2_ITERATIONS };
+}
+
 export async function createIdentity(
   password: string
 ): Promise<{ keypair: KeypairRecord; mnemonic: string }> {
@@ -260,14 +279,7 @@ export async function createIdentity(
   const { privateKey, publicKey } = deriveKeypairFromMnemonic(mnemonic);
   const did = publicKeyToDid(publicKey);
 
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const aesKey = await AESFromPassword(password, salt);
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    aesKey,
-    new TextEncoder().encode(mnemonic)
-  );
+  const mnemonicRecord = await _encryptMnemonic(mnemonic, password);
 
   // A new account on a device that already had one: the old account's data is
   // not this account's to keep. restoreIdentity has always done this; creating
@@ -278,13 +290,6 @@ export async function createIdentity(
     await wipePreviousIdentityData();
   }
 
-  const mnemonicRecord: MnemonicRecord = {
-    id: "mnemonic",
-    salt,
-    iv,
-    encrypted,
-    iterations: PBKDF2_ITERATIONS,
-  };
   const keypairRecord: KeypairRecord = { id: "keypair", did, publicKey };
 
   await putIdentityRecord(mnemonicRecord);
@@ -323,22 +328,7 @@ export async function restoreIdentity(
     await wipePreviousIdentityData();
   }
 
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const aesKey = await AESFromPassword(password, salt);
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    aesKey,
-    new TextEncoder().encode(mnemonic)
-  );
-
-  const mnemonicRecord: MnemonicRecord = {
-    id: "mnemonic",
-    salt,
-    iv,
-    encrypted,
-    iterations: PBKDF2_ITERATIONS,
-  };
+  const mnemonicRecord = await _encryptMnemonic(mnemonic, password);
   const keypairRecord: KeypairRecord = { id: "keypair", did, publicKey };
 
   await putIdentityRecord(mnemonicRecord);
@@ -379,19 +369,49 @@ export async function unlockIdentity(password: string): Promise<void> {
     throw new Error("No identity found. Call createIdentity first.");
   }
 
+  const mnemonic = await _unlockFromMnemonicRecord(mnemonicRecord, password);
+
+  // An identity minted at the legacy 100k count stayed there forever: the
+  // count travels with the record, so nothing ever moved it up. Re-seal at
+  // the current count while the plaintext is in hand. Best effort - the
+  // session is already live, so a failed write must not fail the unlock.
+  if (
+    (mnemonicRecord.iterations ?? LEGACY_PBKDF2_ITERATIONS) < PBKDF2_ITERATIONS
+  ) {
+    try {
+      await putIdentityRecord(await _encryptMnemonic(mnemonic, password));
+    } catch (err) {
+      console.warn("[identity] could not re-seal the mnemonic at 600k:", err);
+    }
+  }
+}
+
+/**
+ * Decrypt a mnemonic record with the password and bring the session up.
+ *
+ * Shared by unlockIdentity and by an import that has to arm the at-rest key
+ * before it writes (unlockWithImportedMnemonic), so the derivation and the
+ * session activation exist in exactly one place.
+ *
+ * @returns the plaintext mnemonic, for callers that re-seal the record.
+ */
+async function _unlockFromMnemonicRecord(
+  record: MnemonicRecord,
+  password: string
+): Promise<string> {
   // Records written before per-record iteration counts existed used 100k.
   const aesKey = await AESFromPassword(
     password,
-    mnemonicRecord.salt,
-    mnemonicRecord.iterations ?? LEGACY_PBKDF2_ITERATIONS
+    record.salt,
+    record.iterations ?? LEGACY_PBKDF2_ITERATIONS
   );
 
   let decrypted: ArrayBuffer;
   try {
     decrypted = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: mnemonicRecord.iv },
+      { name: "AES-GCM", iv: record.iv },
       aesKey,
-      mnemonicRecord.encrypted
+      record.encrypted
     );
   } catch {
     throw new Error("Wrong password");
@@ -403,6 +423,26 @@ export async function unlockIdentity(password: string): Promise<void> {
   const did = publicKeyToDid(publicKey);
 
   await _activateSession(privateKey, publicKey, did);
+  return mnemonic;
+}
+
+/**
+ * Unlock with a mnemonic record that is NOT in storage yet.
+ *
+ * An import carrying an identity (device sync onto a fresh device,
+ * replace-mode restore) has to arm the at-rest key BEFORE the first write:
+ * with no key armed sealRow passes rows through in plaintext, and IndexedDB
+ * does not erase what it later overwrites, so the sweep that seals them
+ * leaves the plaintext copies recoverable on disk. The caller writes the
+ * record itself as part of the import.
+ *
+ * @throws "Wrong password" if the record does not decrypt.
+ */
+export async function unlockWithImportedMnemonic(
+  record: MnemonicRecord,
+  password: string
+): Promise<void> {
+  await _unlockFromMnemonicRecord(record, password);
 }
 
 /**

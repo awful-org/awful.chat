@@ -1,12 +1,15 @@
 /**
  * backup.ts - the on-disk/on-wire shape of a database export.
  *
- * Pure format logic only (no DOM, no IndexedDB, no runes) so it can be unit
- * tested: a backup file is untrusted input, and both the file restore and the
- * QR device sync depend on it round-tripping without silently dropping data.
+ * Format logic only (no DOM, no IndexedDB reads/writes, no runes) so it can be
+ * unit tested: a backup file is untrusted input, and both the file restore and
+ * the QR device sync depend on it round-tripping without silently dropping
+ * data. The one import outside that rule is identity.ts's password-KDF helper,
+ * which the encrypted-file envelope below derives its key with.
  */
 
-import { base64ToBytes, bytesToBase64 } from "../utils";
+import { base64ToBytes, bytesToBase64, utf8 } from "../utils";
+import { AESFromPassword, PBKDF2_ITERATIONS } from "../identity/identity";
 import { MessageType } from "../types/message";
 import type { Message, Attachment, PendingMessage } from "../types/message";
 import type {
@@ -219,6 +222,11 @@ export function parseBackup(text: string): BackupFile {
   } catch {
     throw new Error("That file is not valid JSON");
   }
+  return parseBackupValue(parsed);
+}
+
+/** parseBackup on an already-parsed value, so a file is only parsed once. */
+function parseBackupValue(parsed: unknown): BackupFile {
   const d = parsed as Partial<BackupFile> | null;
   if (!d || typeof d !== "object" || d.format !== BACKUP_FORMAT) {
     throw new Error("That file is not an awful.chat backup");
@@ -241,6 +249,134 @@ export function parseBackup(text: string): BackupFile {
     profiles: arr(d.profiles),
     savedGifs: arr(d.savedGifs),
   };
+}
+
+// ── Encrypted backup file ────────────────────────────────────────────────────
+//
+// The export above is PLAINTEXT apart from the mnemonic: every message, room
+// code, DID and attachment sits in the clear, so a leaked file leaked the
+// whole account's history even though nobody could sign as it. The encrypted
+// file wraps that entire export in one AES-GCM blob under a passphrase the
+// user types at export time.
+//
+// It carries its own `format` marker rather than bumping `version`, because
+// the plaintext format is already at version 2 (base64 attachment bytes).
+// Older plaintext files keep restoring untouched, with no passphrase.
+export const BACKUP_ENC_FORMAT = "awful.chat/backup-encrypted";
+export const BACKUP_ENC_VERSION = 2;
+/** A hostile file must not be able to pin the CPU for hours on PBKDF2. */
+const MAX_KDF_ITERATIONS = 10_000_000;
+
+export interface EncryptedBackupFile {
+  format: typeof BACKUP_ENC_FORMAT;
+  version: number;
+  /** PBKDF2-SHA256 parameters; salt is base64. */
+  kdf: { salt: string; iterations: number };
+  /** Base64 12-byte AES-GCM IV. */
+  iv: string;
+  /** Base64 AES-GCM ciphertext of the JSON of a BackupFile. */
+  ciphertext: string;
+}
+
+export type ParsedBackupFile =
+  | { encrypted: false; backup: BackupFile }
+  | { encrypted: true; envelope: EncryptedBackupFile };
+
+/**
+ * Read a backup file's text without decrypting it: the caller only knows
+ * whether to ask for a passphrase after seeing which of the two shapes it is.
+ *
+ * @throws if the text is not a backup this build understands.
+ */
+export function parseBackupFileText(text: string): ParsedBackupFile {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("That file is not valid JSON");
+  }
+  const d = parsed as Record<string, unknown> | null;
+  if (d && typeof d === "object" && d.format === BACKUP_ENC_FORMAT) {
+    return { encrypted: true, envelope: parseEncryptedBackup(d) };
+  }
+  return { encrypted: false, backup: parseBackupValue(parsed) };
+}
+
+function parseEncryptedBackup(d: Record<string, unknown>): EncryptedBackupFile {
+  if (typeof d.version !== "number" || d.version > BACKUP_ENC_VERSION) {
+    throw new Error("That backup was made by a newer version of the app");
+  }
+  const kdf = d.kdf as { salt?: unknown; iterations?: unknown } | undefined;
+  if (
+    typeof d.iv !== "string" ||
+    typeof d.ciphertext !== "string" ||
+    !kdf ||
+    typeof kdf.salt !== "string" ||
+    typeof kdf.iterations !== "number" ||
+    !Number.isFinite(kdf.iterations) ||
+    kdf.iterations <= 0 ||
+    kdf.iterations > MAX_KDF_ITERATIONS
+  ) {
+    throw new Error("That encrypted backup file is damaged");
+  }
+  return {
+    format: BACKUP_ENC_FORMAT,
+    version: d.version,
+    kdf: { salt: kdf.salt, iterations: kdf.iterations },
+    iv: d.iv,
+    ciphertext: d.ciphertext,
+  };
+}
+
+/** Wrap a backup in AES-GCM under a passphrase-derived key. */
+export async function encryptBackup(
+  backup: BackupFile,
+  passphrase: string
+): Promise<EncryptedBackupFile> {
+  if (!passphrase) throw new Error("A passphrase is required");
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await AESFromPassword(passphrase, salt, PBKDF2_ITERATIONS);
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    utf8(JSON.stringify(backup))
+  );
+  return {
+    format: BACKUP_ENC_FORMAT,
+    version: BACKUP_ENC_VERSION,
+    kdf: { salt: bytesToBase64(salt), iterations: PBKDF2_ITERATIONS },
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(ciphertext)),
+  };
+}
+
+/**
+ * Open an encrypted backup. The AES-GCM tag is what tells a wrong passphrase
+ * from a corrupt file, and neither is worth distinguishing to the user.
+ *
+ * @throws if the passphrase is wrong or the file was tampered with.
+ */
+export async function decryptBackup(
+  envelope: EncryptedBackupFile,
+  passphrase: string
+): Promise<BackupFile> {
+  const aesKey = await AESFromPassword(
+    passphrase,
+    base64ToBytes(envelope.kdf.salt),
+    envelope.kdf.iterations
+  );
+  let plaintext: ArrayBuffer;
+  try {
+    plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(envelope.iv) },
+      aesKey,
+      base64ToBytes(envelope.ciphertext)
+    );
+  } catch {
+    throw new Error("Wrong passphrase for this backup file");
+  }
+  return parseBackup(new TextDecoder().decode(plaintext));
 }
 
 export function summarizeBackup(data: BackupFile): BackupSummary {

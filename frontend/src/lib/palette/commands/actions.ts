@@ -29,7 +29,7 @@ import {
 } from "$lib/transport/call.svelte";
 import { lock } from "$lib/identity/identity.svelte";
 import { requestPersistentStorage, wipeLocalDatabase } from "$lib/storage";
-import { downloadBackup } from "$lib/transport/sync.svelte";
+import { openSettings } from "$lib/ui-state.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
 
@@ -173,11 +173,10 @@ export const actionCommands: CmdSource = () => {
     icon: Download,
     action: {
       kind: "act",
-      perform: () => {
-        downloadBackup().catch((err) =>
-          console.warn("download backup failed", err)
-        );
-      },
+      // The export asks for a passphrase now, and that prompt lives in the
+      // Data settings; a bare download here would fall back to a native
+      // prompt that shows the passphrase in the clear.
+      perform: () => openSettings("data"),
     },
   });
 

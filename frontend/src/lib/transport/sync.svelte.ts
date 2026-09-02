@@ -47,6 +47,7 @@ import {
   BACKUP_FORMAT,
   BACKUP_VERSION,
   bytesFromExport,
+  encryptBackup,
   parseBackup,
   mergeImportedRoom,
   pfpFromJson,
@@ -56,7 +57,7 @@ import {
   type DatabaseExport,
 } from "./backup";
 
-export { summarizeBackup } from "./backup";
+export { summarizeBackup, decryptBackup } from "./backup";
 // The apply/import half lives in a transport-free module so it can be tested;
 // re-exported here because the UI has always imported it from this path.
 export {
@@ -64,8 +65,14 @@ export {
   readBackupFile,
   importDatabase,
 } from "./backup-restore";
-import { importDatabase } from "./backup-restore";
-export type { BackupFile, BackupSummary } from "./backup";
+import { importDatabase, type ImportOptions } from "./backup-restore";
+export type { ImportOptions } from "./backup-restore";
+export type {
+  BackupFile,
+  BackupSummary,
+  EncryptedBackupFile,
+  ParsedBackupFile,
+} from "./backup";
 
 export interface SyncPayload {
   roomCode: string;
@@ -134,6 +141,16 @@ let _syncRoomCode: string | null = null;
 let _syncToken: string | null = null;
 let _syncExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 let _isSourceDevice = false;
+/**
+ * Source-side: has the user asked for the typed short code?
+ *
+ * The short code carries only the first 8 chars of the token, so honouring
+ * that prefix costs 96 bits of the proof-of-scan secret. It is only honoured
+ * once the user has actually revealed the short code on this device (see
+ * revealShortCode) - a sync done by QR, which is the normal path, keeps the
+ * full 128-bit token.
+ */
+let _shortCodeRevealed = false;
 // Target-side: the one source peer we're syncing with, set only once
 // matchesSourcePeer() confirms the connecting peerId is the one the
 // QR/short code names. Once set, data from any other peer that joined the
@@ -141,9 +158,43 @@ let _isSourceDevice = false;
 // (trivially arranged by the relay operator) could impersonate the source.
 let _targetSourcePeerId: string | null = null;
 
+/**
+ * Called by the UI when it shows the typed short code, which is what puts
+ * the truncated token in play. Until then the source demands the full token.
+ */
+export function revealShortCode(): void {
+  _shortCodeRevealed = true;
+}
+
 /** Reduce a full or short-code token to its comparable 8-char prefix. */
 function tokenPrefix(t: string | undefined | null): string {
   return (t ?? "").slice(0, 8);
+}
+
+/**
+ * Does `received` prove the sender holds the token `expected`?
+ *
+ * The short code truncates the 128-bit token to 8 hex chars - 32 bits, which
+ * is guessable inside the code's 5-minute life - so a comparison on those 8
+ * chars is only good enough when the short code is the form actually in play.
+ * Both devices hold the full token otherwise (the QR, and the colon-form
+ * manual code), and settling for a prefix threw the other 96 bits away.
+ *
+ * Either side can be the truncated one: the target that typed a short code
+ * holds 8 chars while the source echoes all 32.
+ */
+export function tokenAccepted(
+  received: string | undefined | null,
+  expected: string | undefined | null,
+  shortCodeInPlay: boolean
+): boolean {
+  if (!received || !expected) return false;
+  if (received === expected) return true;
+  if (!shortCodeInPlay) return false;
+  return (
+    (received.length === 8 || expected.length === 8) &&
+    tokenPrefix(received) === tokenPrefix(expected)
+  );
 }
 
 /**
@@ -352,6 +403,9 @@ export async function generateSyncCode(): Promise<void> {
     _syncRoomCode = generateSyncRoomCode();
     const token = generateToken();
     _syncToken = token;
+    // A fresh code starts QR-only: the short code's truncated token is not
+    // honoured until the user asks to see it.
+    _shortCodeRevealed = false;
     const expires = Date.now() + SYNC_TIMEOUT;
 
     // Enforce expiry on the SOURCE: the QR/short code's own `expires` field
@@ -477,7 +531,9 @@ export function parsePlaintextToken(plaintext: string): SyncPayload | null {
 async function startSyncServer(): Promise<void> {
   if (!_syncRoomCode) return;
 
-  console.log("[Sync][Source] Starting sync server for room:", _syncRoomCode);
+  // The room code is the ephemeral sync room's membership secret; anything
+  // that can read the console can join it, so it never gets printed.
+  console.log("[Sync][Source] Starting sync server");
 
   _transport = new LibP2PTransport({ diagBus: "sync" });
 
@@ -510,12 +566,9 @@ async function startSyncServer(): Promise<void> {
 
         // The room code alone is only 32 bits of entropy - the token from
         // the QR/short code is the actual proof the requester scanned it.
-        // Short codes truncate the token to its first 8 chars, so accept
-        // either the full token or that prefix.
-        const tokenOk =
-          !!_syncToken &&
-          !!token &&
-          (token === _syncToken || token === _syncToken.slice(0, 8));
+        // The truncated short-code prefix only counts once this device has
+        // actually shown the short code (see revealShortCode).
+        const tokenOk = tokenAccepted(token, _syncToken, _shortCodeRevealed);
         if (!tokenOk) {
           console.warn("[Sync][Source] Rejected ExportRequest: bad token");
           _transport?.send(
@@ -735,7 +788,10 @@ async function sendExportData(
  * Connect to a sync room as the target device (receiving data).
  * Call this after scanning a QR code or entering plaintext.
  */
-export async function connectAsTarget(payload: SyncPayload): Promise<void> {
+export async function connectAsTarget(
+  payload: SyncPayload,
+  importOptions: ImportOptions = {}
+): Promise<void> {
   if (payload.expires < Date.now()) {
     throw new Error("Sync code has expired");
   }
@@ -748,9 +804,8 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
   }
 
   const mode = payload.mode ?? "replace";
-  console.log(
-    `[Sync][Target] Starting sync client for room: ${payload.roomCode}, mode: ${mode}`
-  );
+  // Room code redacted for the same reason as on the source side.
+  console.log(`[Sync][Target] Starting sync client, mode: ${mode}`);
 
   syncState.isConnecting = true;
   syncState.syncError = null;
@@ -899,13 +954,24 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
 
           // The source must echo the proof-of-scan token. A peer that never
           // saw the QR/short code can't produce it, so its data is dropped.
-          if (tokenPrefix(echoedToken) !== tokenPrefix(payload.token)) {
+          // Full token when this device scanned the QR, the 8-char prefix
+          // only when the short code is what it was given (see tokenAccepted).
+          if (!tokenAccepted(echoedToken, payload.token, !payload.peerId)) {
             console.warn("[Sync][Target] Dropping ExportData: token mismatch");
             return;
           }
 
           if (section === "identity") {
-            receivedIdentity = sectionData as DatabaseExport["identity"];
+            // A merge keeps THIS device's identity. The source is supposed to
+            // skip the section in add mode, but a source that sends it anyway
+            // would otherwise take the account over, so drop it here too.
+            if (mode === "add") {
+              console.warn(
+                "[Sync][Target] Ignoring identity section: merge keeps this device's identity"
+              );
+            } else {
+              receivedIdentity = sectionData as DatabaseExport["identity"];
+            }
             syncState.syncProgress = 10;
           } else {
             const key = section as keyof DatabaseExport;
@@ -1000,7 +1066,12 @@ export async function connectAsTarget(payload: SyncPayload): Promise<void> {
                   )[],
                   savedGifs: (receivedData.savedGifs || []) as SavedGif[],
                 },
-                mode
+                mode,
+                // Carries the password prompt: with an identity in the export
+                // the at-rest key is armed before the first row is written,
+                // so nothing lands in plaintext on a device that has never
+                // unlocked (see importDatabase).
+                importOptions
               );
               if (droppedRecords > 0) {
                 // The sync itself succeeded - this is a partial-data note,
@@ -1189,10 +1260,26 @@ async function exportDatabase(skipIdentity = false): Promise<DatabaseExport> {
  */
 /**
  * Build a full backup and hand it to the browser as a download.
- * Includes the identity record, which is the AES-GCM encrypted mnemonic - the
- * file is only as safe as the password that encrypts it, so the UI warns.
+ *
+ * The export is the whole account in the clear - every message, room code,
+ * DID and attachment - so the file is AES-GCM encrypted under a passphrase
+ * the user chooses here. Only the mnemonic used to be encrypted, which made
+ * the old files a full history leak to anyone who picked one up.
+ *
+ * @param passphrase - required. Callers with no UI to ask with (the command
+ *        palette) fall back to a browser prompt rather than writing plaintext.
  */
-export async function downloadBackup(): Promise<void> {
+export async function downloadBackup(passphrase?: string): Promise<void> {
+  const secret =
+    passphrase ??
+    (typeof window !== "undefined"
+      ? window.prompt("Passphrase to encrypt this backup file:")
+      : null);
+  if (!secret) {
+    throw new Error(
+      "A backup needs a passphrase to encrypt it - nothing was exported"
+    );
+  }
   const data = await exportDatabase(false);
   const backup: BackupFile = {
     format: BACKUP_FORMAT,
@@ -1200,7 +1287,7 @@ export async function downloadBackup(): Promise<void> {
     exportedAt: Date.now(),
     ...data,
   };
-  const blob = new Blob([JSON.stringify(backup)], {
+  const blob = new Blob([JSON.stringify(await encryptBackup(backup, secret))], {
     type: "application/json",
   });
   const url = URL.createObjectURL(blob);
@@ -1208,8 +1295,8 @@ export async function downloadBackup(): Promise<void> {
   const a = document.createElement("a");
   a.href = url;
   // A dedicated extension so the OS can hand backups straight to the app
-  // (manifest file_handlers); the content is still plain JSON and the
-  // restore picker keeps accepting old .json exports.
+  // (manifest file_handlers); the content is a JSON envelope around the
+  // ciphertext, and the restore picker keeps accepting old .json exports.
   a.download = `awful-backup-${stamp}.awfulbackup`;
   document.body.appendChild(a);
   a.click();
@@ -1332,6 +1419,7 @@ async function cleanup(): Promise<void> {
   }
   _syncRoomCode = null;
   _syncToken = null;
+  _shortCodeRevealed = false;
   _isSourceDevice = false;
   _targetSourcePeerId = null;
   _exportRequested = false;

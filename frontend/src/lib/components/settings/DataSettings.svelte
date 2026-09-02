@@ -23,9 +23,12 @@
     readBackupFile,
     applyBackup,
     summarizeBackup,
+    decryptBackup,
     type BackupFile,
     type BackupSummary,
+    type EncryptedBackupFile,
   } from "$lib/transport/sync.svelte";
+  import { Input } from "$lib/components/ui/input";
   import { roomsStore } from "$lib/rooms.svelte";
   import { transportState } from "$lib/transport/transport.svelte";
   import { resolveDmRoomDisplayName } from "$lib/dm-display-name";
@@ -126,12 +129,42 @@
   // silently does nothing. Only the summary needs to be reactive.
   let pendingBackup: BackupFile | null = null;
   let pendingSummary = $state<BackupSummary | null>(null);
+  // The envelope of an encrypted file, held until the passphrase arrives.
+  let pendingEnvelope: EncryptedBackupFile | null = null;
+  let needsPassphrase = $state(false);
+  let filePassphrase = $state("");
+  // Replace mode adopts the file's identity, and the password unlocks it
+  // BEFORE the import writes anything - see applyBackup's requestPassword.
+  let restorePassword = $state("");
+  let exportPrompt = $state(false);
+  let exportPassphrase = $state("");
+  let exportPassphraseConfirm = $state("");
+
+  function resetPending() {
+    pendingBackup = null;
+    pendingSummary = null;
+    pendingEnvelope = null;
+    needsPassphrase = false;
+    filePassphrase = "";
+    restorePassword = "";
+  }
 
   async function handleDownload() {
     backupError = null;
+    if (exportPassphrase.length < 8) {
+      backupError = "Use a passphrase of at least 8 characters";
+      return;
+    }
+    if (exportPassphrase !== exportPassphraseConfirm) {
+      backupError = "The two passphrases do not match";
+      return;
+    }
     backupBusy = true;
     try {
-      await downloadBackup();
+      await downloadBackup(exportPassphrase);
+      exportPrompt = false;
+      exportPassphrase = "";
+      exportPassphraseConfirm = "";
     } catch (e) {
       backupError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -144,9 +177,34 @@
     backupError = null;
     backupBusy = true;
     try {
-      const data = await readBackupFile(file);
+      const parsed = await readBackupFile(file);
+      if (parsed.encrypted) {
+        // Nothing is readable until the passphrase arrives, not even the
+        // summary - so ask before showing anything about the file.
+        pendingEnvelope = parsed.envelope;
+        needsPassphrase = true;
+      } else {
+        pendingBackup = parsed.backup;
+        pendingSummary = summarizeBackup(parsed.backup);
+      }
+    } catch (e) {
+      backupError = e instanceof Error ? e.message : String(e);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function handleUnlockFile() {
+    if (!pendingEnvelope) return;
+    backupError = null;
+    backupBusy = true;
+    try {
+      const data = await decryptBackup(pendingEnvelope, filePassphrase);
       pendingBackup = data;
       pendingSummary = summarizeBackup(data);
+      pendingEnvelope = null;
+      needsPassphrase = false;
+      filePassphrase = "";
     } catch (e) {
       backupError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -177,7 +235,13 @@
     backupError = null;
     backupBusy = true;
     try {
-      await applyBackup(pendingBackup, mode);
+      await applyBackup(pendingBackup, mode, {
+        // Replace mode adopts the file's identity: unlocking it here arms the
+        // at-rest key before the first row is written, so the import seals as
+        // it goes instead of landing plaintext. Declining the retry turns a
+        // wrong password into an error rather than a second prompt.
+        requestPassword: async (retry) => (retry ? null : restorePassword),
+      });
       window.location.reload();
     } catch (e) {
       backupError = e instanceof Error ? e.message : String(e);
@@ -412,8 +476,9 @@
     <p class="text-xs text-muted-foreground font-mono leading-relaxed">
       Save everything on this device to a file, or restore from one. Same data
       as a QR device sync, without needing both devices online at once. The file
-      contains your encrypted identity: anyone who has it and your password has
-      your account, so keep it somewhere safe.
+      is encrypted with a passphrase you choose when you export it: anyone who
+      has both the file and that passphrase has your whole account, and without
+      the passphrase the file cannot be opened at all - not even by you.
     </p>
 
     {#if backupError}
@@ -424,7 +489,37 @@
       </p>
     {/if}
 
-    {#if pendingSummary}
+    {#if needsPassphrase}
+      <div class="flex flex-col gap-3 bg-muted/50 rounded-lg p-3">
+        <p class="text-xs font-mono text-muted-foreground">
+          This backup is encrypted. Type the passphrase that was chosen when it
+          was exported.
+        </p>
+        <Input
+          type="password"
+          bind:value={filePassphrase}
+          placeholder="Backup passphrase"
+          class="font-mono text-xs"
+        />
+        <div class="flex flex-col gap-2 sm:flex-row">
+          <Button
+            class="flex-1 font-mono text-xs"
+            disabled={backupBusy || !filePassphrase}
+            onclick={handleUnlockFile}
+          >
+            Open this backup
+          </Button>
+          <Button
+            variant="ghost"
+            class="flex-1 font-mono text-xs text-muted-foreground"
+            disabled={backupBusy}
+            onclick={resetPending}
+          >
+            Cancel
+          </Button>
+        </div>
+      </div>
+    {:else if pendingSummary}
       {@const s = pendingSummary}
       <div class="flex flex-col gap-3 bg-muted/50 rounded-lg p-3">
         <p class="text-xs font-mono text-muted-foreground">
@@ -438,6 +533,17 @@
             ? "Includes an identity, so it can replace this device entirely."
             : "No identity in this file, so it can only be merged."}
         </p>
+        {#if s.hasIdentity}
+          <!-- Asked BEFORE the import runs: it unlocks the identity in the
+               file, which arms at-rest encryption so the restored rows are
+               sealed as they are written. -->
+          <Input
+            type="password"
+            bind:value={restorePassword}
+            placeholder="Account password from this backup"
+            class="font-mono text-xs"
+          />
+        {/if}
         <div class="flex flex-col gap-2 sm:flex-row">
           <Button
             variant="outline"
@@ -450,7 +556,7 @@
           <Button
             variant="destructive"
             class="flex-1 font-mono text-xs"
-            disabled={backupBusy || !s.hasIdentity}
+            disabled={backupBusy || !s.hasIdentity || !restorePassword}
             onclick={() => handleApply("replace")}
           >
             Replace everything
@@ -460,13 +566,51 @@
           variant="ghost"
           class="font-mono text-xs text-muted-foreground"
           disabled={backupBusy}
-          onclick={() => {
-            pendingBackup = null;
-            pendingSummary = null;
-          }}
+          onclick={resetPending}
         >
           Cancel
         </Button>
+      </div>
+    {:else if exportPrompt}
+      <div class="flex flex-col gap-3 bg-muted/50 rounded-lg p-3">
+        <p class="text-xs font-mono text-muted-foreground">
+          Choose a passphrase for this file. It is the only thing standing
+          between the file and your messages, and there is no way to recover it.
+        </p>
+        <Input
+          type="password"
+          bind:value={exportPassphrase}
+          placeholder="Passphrase (8 characters or more)"
+          class="font-mono text-xs"
+        />
+        <Input
+          type="password"
+          bind:value={exportPassphraseConfirm}
+          placeholder="Repeat the passphrase"
+          class="font-mono text-xs"
+        />
+        <div class="flex flex-col gap-2 sm:flex-row">
+          <Button
+            class="flex-1 font-mono text-xs"
+            disabled={backupBusy || !exportPassphrase}
+            onclick={handleDownload}
+          >
+            <Download class="w-3.5 h-3.5 mr-2" />
+            {backupBusy ? "Encrypting..." : "Download encrypted backup"}
+          </Button>
+          <Button
+            variant="ghost"
+            class="flex-1 font-mono text-xs text-muted-foreground"
+            disabled={backupBusy}
+            onclick={() => {
+              exportPrompt = false;
+              exportPassphrase = "";
+              exportPassphraseConfirm = "";
+            }}
+          >
+            Cancel
+          </Button>
+        </div>
       </div>
     {:else}
       <div class="flex flex-col gap-2 sm:flex-row">
@@ -474,7 +618,10 @@
           variant="outline"
           class="flex-1 font-mono text-xs"
           disabled={backupBusy}
-          onclick={handleDownload}
+          onclick={() => {
+            backupError = null;
+            exportPrompt = true;
+          }}
         >
           <Download class="w-3.5 h-3.5 mr-2" />
           Download my data

@@ -5,11 +5,13 @@ import {
   lockIdentity,
   unlockIdentity,
   isUnlocked,
+  PBKDF2_ITERATIONS,
 } from "./identity";
 import {
   getAllRooms,
   getDB,
   getMnemonicRecord,
+  putIdentityRecord,
   putRoom,
   wipeLocalDatabase,
 } from "../storage";
@@ -70,6 +72,44 @@ describe("password-derived key", () => {
       ciphertext
     );
     expect(new TextDecoder().decode(out)).toBe("some mnemonic phrase");
+  });
+
+  // The count travels with the record, so an identity minted at 100k stayed
+  // at 100k forever - a stolen database was six times cheaper to grind than a
+  // fresh one. The unlock is the only moment the plaintext mnemonic exists,
+  // so it is the only place the record can be re-sealed.
+  it("re-seals a legacy 100k mnemonic at the current count on unlock", async () => {
+    const { mnemonic } = await createIdentity(PASSWORD);
+
+    // Rewrite the record exactly as a pre-600k build left it: no `iterations`.
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const legacyKey = await AESFromPassword(PASSWORD, salt, 100_000);
+    const encrypted = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      legacyKey,
+      new TextEncoder().encode(mnemonic)
+    );
+    await putIdentityRecord({ id: "mnemonic", salt, iv, encrypted });
+    lockIdentity();
+
+    await unlockIdentity(PASSWORD);
+    const upgraded = await getMnemonicRecord();
+    expect(upgraded?.iterations).toBe(PBKDF2_ITERATIONS);
+
+    // The upgrade must not have changed what the password opens.
+    lockIdentity();
+    await expect(unlockIdentity(PASSWORD)).resolves.toBeUndefined();
+    expect(isUnlocked()).toBe(true);
+  });
+
+  it("leaves a record already at the current count alone", async () => {
+    await createIdentity(PASSWORD);
+    const before = await getMnemonicRecord();
+    lockIdentity();
+    await unlockIdentity(PASSWORD);
+    const after = await getMnemonicRecord();
+    expect(Array.from(after!.salt)).toEqual(Array.from(before!.salt));
   });
 
   it("still opens legacy records written before the count was stored", async () => {
