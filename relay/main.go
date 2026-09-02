@@ -39,7 +39,7 @@ type clientMsg struct {
 }
 
 type serverMsg struct {
-	Type  string   `json:"type"` // PEERS | PEER_JOINED | PEER_LEFT | REGISTER_FAILED
+	Type  string   `json:"type"` // PEERS | PEER_JOINED | PEER_LEFT | REGISTER_FAILED | PONG
 	Room  string   `json:"room"`
 	Peers []string `json:"peers"`
 	Peer  string   `json:"peer,omitempty"` // PEER_JOINED | PEER_LEFT
@@ -1236,10 +1236,16 @@ readLoop:
 					r.unregister(c, msg.Room)
 				}
 			case "PING":
-				// No-op: a registered stream's only proof of life when it
-				// has nothing else to say. Reading it already re-armed the
-				// deadline above; nothing else to do (relay-audit.md
-				// finding 5).
+				// Reading it already re-armed the deadline above; the reply
+				// is for the CLIENT's benefit. A half-open link (a phone
+				// carried from Wi-Fi to cellular) looks identical to an idle
+				// one from the client side, so without an answer it has no
+				// way to tell a live relay from a socket that will never
+				// deliver anything again. Through sendTo like every other
+				// server frame, so it shares the same bounded outbox and a
+				// peer that stops reading is dropped rather than blocking
+				// this loop. Old clients ignore unknown frame types.
+				r.sendTo(c, serverMsg{Type: "PONG"})
 			default:
 				warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type))
 				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "unknown-type"}})
@@ -1478,6 +1484,10 @@ func main() {
 		mux.HandleFunc("/mailbox/collect", handleMailboxCollect)
 		mux.HandleFunc("/mailbox/ack", handleMailboxAck)
 		startMailboxSweeper()
+		mux.HandleFunc("/push/config", getOnly(handlePushConfig))
+		mux.HandleFunc("/push/subscribe", handlePushSubscribe)
+		mux.HandleFunc("/push/unsubscribe", handlePushUnsubscribe)
+		startPushWorker()
 		mux.HandleFunc("/telemetry", postOnly(handleTelemetryIngest(reg)))
 		mux.HandleFunc("/telemetry/list", handleTelemetryList)
 		mux.HandleFunc("/telemetry/get", handleTelemetryGet)

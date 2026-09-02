@@ -1206,3 +1206,35 @@ func TestCircuitLimitIsFiniteButGenerous(t *testing.T) {
 		t.Errorf("per-circuit limit %v / %d bytes is too tight for a session-long circuit", l.Duration, l.Data)
 	}
 }
+
+// A client cannot tell a live relay from a half-open link - a phone carried
+// from Wi-Fi to cellular keeps a socket that will never deliver anything -
+// unless something comes back. PING used to be a pure no-op, so there was
+// nothing to time out on; it has to be answered on the same stream.
+func TestPingIsAnsweredWithPong(t *testing.T) {
+	orig := rendezvousIdleTimeout
+	rendezvousIdleTimeout = 20 * time.Millisecond
+	defer func() { rendezvousIdleTimeout = orig }()
+
+	r := newRegistry()
+	s := &registerOnceStream{frame: encodeClientFrame(clientMsg{Type: "PING"})}
+	c := addClient(r, "peer-ping", s)
+
+	done := make(chan struct{})
+	go func() {
+		r.readLoop(s, "peer-ping", c)
+		close(done)
+	}()
+
+	// Decoded before the client is torn down: the PONG rides the same bounded
+	// outbox as every other server frame, on the client's writer goroutine.
+	if msg := s.decode(t, 0); msg.Type != "PONG" {
+		t.Fatalf("answered a PING with %q, want PONG", msg.Type)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not return once the idle window elapsed")
+	}
+	r.removeClient(c)
+}

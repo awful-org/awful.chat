@@ -212,6 +212,8 @@ whose context holds no repository declares no commit.
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
 | `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |
+| `PUSH_ENABLED` | no | Web Push, **on by default**. The relay wakes a subscribed device when its mailbox receives a DM, with a push carrying no content (`{"t":"mail"}`, at most one per box per minute). `0` turns it off: `/push/config` answers `enabled: false` and the subscribe routes 404. What it discloses is in [deploy/README.md](deploy/README.md) |
+| `PUSH_CONTACT` | no | `mailto:` contact in the VAPID header, which is how a push vendor reaches you about your instance. Defaults to `mailto:admin@<DOMAIN>` |
 | `SFU_MAX_ROOMS` | no | concurrent rooms one SFU will hold, default 250. Past it a join is refused rather than degrading every call already running |
 | `SFU_REJOIN_PROBE_MS` | no | how often a client is probed to confirm its SFU session is still live, default 3000 |
 | `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |

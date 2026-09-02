@@ -4,6 +4,7 @@ go 1.26.6
 
 require (
 	filippo.io/edwards25519 v1.2.0
+	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/mr-tron/base58 v1.2.0
 	github.com/multiformats/go-multiaddr v0.16.0
@@ -19,6 +20,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect

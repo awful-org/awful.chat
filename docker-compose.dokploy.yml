@@ -66,6 +66,15 @@ services:
       # relay_data volume below - point it outside and bundles do not survive
       # a redeploy.
       - TELEMETRY_DIR=${TELEMETRY_DIR:-}
+      # Web Push, ON by default: without it a phone whose app is closed is
+      # never told a DM arrived. "0" turns the whole surface off (/push/config
+      # answers enabled:false, the subscribe routes 404). The push itself
+      # carries no content - see deploy/README.md for what it does disclose.
+      - PUSH_ENABLED=${PUSH_ENABLED:-}
+      # mailto: contact in the VAPID header, which is how a push vendor
+      # reaches an operator whose instance misbehaves. Defaults to
+      # admin@${DOMAIN}.
+      - PUSH_CONTACT=${PUSH_CONTACT:-}
       # Whose X-Forwarded-For the relay believes, for rate limiting and the
       # plugin proxy. Read by relay/pluginproxy.go and documented in
       # .env.example, but never passed in until recently: an operator who added

@@ -771,3 +771,234 @@ func TestMailboxAuthRejectsFarFutureTimestamps(t *testing.T) {
 		t.Errorf("a timestamp inside the past window was rejected: %v", err)
 	}
 }
+
+// deviceID is a stand-in for a libp2p peerId: base58, inside the length band
+// the relay accepts.
+func deviceID(seed byte) string {
+	raw := make([]byte, 34)
+	for i := range raw {
+		raw[i] = seed + byte(i)
+	}
+	return base58.Encode(raw)
+}
+
+// mailboxClient drives the three endpoints from a fresh client IP each call,
+// so a test measures the behaviour under test and not the per-IP limiter.
+type mailboxClient struct {
+	t    *testing.T
+	did  string
+	priv ed25519.PrivateKey
+	n    int
+}
+
+func (m *mailboxClient) request(path string, body any, h http.HandlerFunc) *httptest.ResponseRecorder {
+	m.t.Helper()
+	m.n++
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	req.RemoteAddr = "10.0.0.1:4000"
+	req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.%d.%d", m.n/250, m.n%250))
+	w := httptest.NewRecorder()
+	h(w, req)
+	return w
+}
+
+func (m *mailboxClient) deposit(box string, blob []byte) {
+	m.t.Helper()
+	w := m.request("/mailbox/deposit", map[string]string{
+		"box": box, "blob": base64.StdEncoding.EncodeToString(blob),
+	}, handleMailboxDeposit)
+	if w.Code != 204 {
+		m.t.Fatalf("deposit: got %d %s", w.Code, w.Body.String())
+	}
+}
+
+func (m *mailboxClient) collect(device string) []mailboxEntry {
+	m.t.Helper()
+	ts, sig := authFields(m.priv)
+	w := m.request("/mailbox/collect", map[string]any{
+		"did": m.did, "ts": ts, "sig": sig, "device": device,
+	}, handleMailboxCollect)
+	if w.Code != 200 {
+		m.t.Fatalf("collect: got %d %s", w.Code, w.Body.String())
+	}
+	var out []mailboxEntry
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		m.t.Fatal(err)
+	}
+	return out
+}
+
+func (m *mailboxClient) ack(device string, ids []string) {
+	m.t.Helper()
+	ts, sig := authFields(m.priv)
+	w := m.request("/mailbox/ack", map[string]any{
+		"did": m.did, "ts": ts, "sig": sig, "device": device, "ids": ids,
+	}, handleMailboxAck)
+	if w.Code != 204 {
+		m.t.Fatalf("ack: got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// Two devices on one identity share one box, because the box id is derived
+// from the did alone. The first device to ack used to delete the blob, so a
+// phone sitting next to an always-on desktop never received its offline DMs.
+// A named device acks only for itself, and only TTL frees the blob.
+func TestPerDeviceAckKeepsBlobForTheOtherDevices(t *testing.T) {
+	mailboxDir = t.TempDir()
+	savedBytes, savedFiles, savedBoxes := mailboxUsedBytes, mailboxFiles, mailboxBoxes
+	t.Cleanup(func() {
+		mailboxUsedBytes, mailboxFiles, mailboxBoxes = savedBytes, savedFiles, savedBoxes
+	})
+	mailboxUsedBytes, mailboxFiles, mailboxBoxes = 0, 0, 0
+
+	did, priv := testDid(t)
+	m := &mailboxClient{t: t, did: did, priv: priv}
+	box := mailboxIDForDid(did)
+	phone, desktop := deviceID(1), deviceID(90)
+
+	m.deposit(box, []byte("sealed bytes here"))
+
+	pending := m.collect(phone)
+	if len(pending) != 1 {
+		t.Fatalf("phone collected %d entries, want 1", len(pending))
+	}
+	id := pending[0].ID
+	if len(m.collect(desktop)) != 1 {
+		t.Fatal("the desktop should see the same deposit")
+	}
+
+	// The desktop acks. The phone's copy has to survive it.
+	m.ack(desktop, []string{id})
+	if got := m.collect(desktop); len(got) != 0 {
+		t.Fatalf("the desktop still sees %d entries it acked", len(got))
+	}
+	if got := m.collect(phone); len(got) != 1 {
+		t.Fatalf("the desktop's ack took the phone's copy: phone sees %d", len(got))
+	}
+
+	blobPath := filepath.Join(boxPath(box), id)
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("a per-device ack must not delete the blob: %v", err)
+	}
+
+	// Now the phone acks too. Nobody sees it, and it is still on disk waiting
+	// for TTL - a device ack is never a delete.
+	m.ack(phone, []string{id})
+	if got := m.collect(phone); len(got) != 0 {
+		t.Fatalf("the phone still sees %d entries it acked", len(got))
+	}
+	if _, err := os.Stat(blobPath); err != nil {
+		t.Fatalf("blob gone after both acks: %v", err)
+	}
+
+	// TTL is the only thing left that frees it, and the ack index goes with
+	// the last blob it described.
+	old := time.Now().Add(-mailboxTTL - time.Hour)
+	if err := os.Chtimes(blobPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if removed := sweepMailboxOnce(time.Now()); removed != 1 {
+		t.Fatalf("sweeper removed %d blob(s), want 1", removed)
+	}
+	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+		t.Fatal("an expired blob should be gone from disk")
+	}
+	if _, err := os.Stat(filepath.Join(boxPath(box), ackIndexName)); !os.IsNotExist(err) {
+		t.Fatal("the ack index outlived the last blob it described")
+	}
+	// Every counter has to be back where it started: the index is charged to
+	// the global budget exactly like a blob, so a missed decrement here
+	// silently shrinks the ceiling for the life of the process.
+	if mailboxUsedBytes != 0 || mailboxFiles != 0 || mailboxBoxes != 0 {
+		t.Fatalf("counters left at bytes=%d files=%d boxes=%d, want all zero",
+			mailboxUsedBytes, mailboxFiles, mailboxBoxes)
+	}
+}
+
+// An old client sends no device and must keep the behaviour it was built
+// against: ack deletes, for everyone.
+func TestAckWithoutDeviceStillDeletes(t *testing.T) {
+	mailboxDir = t.TempDir()
+	did, priv := testDid(t)
+	m := &mailboxClient{t: t, did: did, priv: priv}
+	box := mailboxIDForDid(did)
+	phone := deviceID(7)
+
+	m.deposit(box, []byte("one"))
+	pending := m.collect(phone)
+	if len(pending) != 1 {
+		t.Fatalf("collected %d, want 1", len(pending))
+	}
+	// The phone acks for itself first, so an index exists to be cleaned up.
+	m.ack(phone, []string{pending[0].ID})
+	m.ack("", []string{pending[0].ID})
+
+	if _, err := os.Stat(filepath.Join(boxPath(box), pending[0].ID)); !os.IsNotExist(err) {
+		t.Fatal("an ack with no device must still delete the blob")
+	}
+	// The whole box goes, index included - otherwise the directory could
+	// never be rmdir'd again.
+	if _, err := os.Stat(boxPath(box)); !os.IsNotExist(err) {
+		t.Fatal("an emptied box should be removed, ack index and all")
+	}
+}
+
+// The device string is a map key written to disk, so it is validated before
+// anything touches the filesystem.
+func TestMailboxRejectsBadDevice(t *testing.T) {
+	mailboxDir = t.TempDir()
+	did, priv := testDid(t)
+	m := &mailboxClient{t: t, did: did, priv: priv}
+
+	for _, bad := range []string{"short", strings.Repeat("Q", 65), "has-a-dash-in-it-and-is-long-enough-here", "0OIl" + strings.Repeat("A", 40)} {
+		ts, sig := authFields(priv)
+		w := m.request("/mailbox/collect", map[string]any{
+			"did": did, "ts": ts, "sig": sig, "device": bad,
+		}, handleMailboxCollect)
+		if w.Code != 400 {
+			t.Fatalf("collect with device %q: got %d, want 400", bad, w.Code)
+		}
+		ts, sig = authFields(priv)
+		w = m.request("/mailbox/ack", map[string]any{
+			"did": did, "ts": ts, "sig": sig, "device": bad, "ids": []string{},
+		}, handleMailboxAck)
+		if w.Code != 400 {
+			t.Fatalf("ack with device %q: got %d, want 400", bad, w.Code)
+		}
+	}
+}
+
+// The ack index shares the box directory with the blobs. It is not a message,
+// so it must not count against the per-box message cap and must never be the
+// thing eviction unlinks when the box fills up.
+func TestAckIndexIsNotEvictedAsABlob(t *testing.T) {
+	mailboxDir = t.TempDir()
+	did, priv := testDid(t)
+	m := &mailboxClient{t: t, did: did, priv: priv}
+	box := mailboxIDForDid(did)
+	phone := deviceID(30)
+
+	m.deposit(box, []byte("first"))
+	first := m.collect(phone)
+	m.ack(phone, []string{first[0].ID})
+
+	for i := 0; i < mailboxMaxMsgs+5; i++ {
+		m.deposit(box, []byte("filler"))
+	}
+	blobs := 0
+	entries, _ := os.ReadDir(boxPath(box))
+	for _, e := range entries {
+		if mailboxIDRe.MatchString(e.Name()) {
+			blobs++
+		}
+	}
+	if blobs > mailboxMaxMsgs {
+		t.Fatalf("box holds %d blobs, over the %d cap", blobs, mailboxMaxMsgs)
+	}
+	// The evicted blob's device list went with it rather than accumulating.
+	idx := readAckIndex(box)
+	if _, still := idx[first[0].ID]; still {
+		t.Fatal("an evicted blob left its device list behind in the ack index")
+	}
+}
