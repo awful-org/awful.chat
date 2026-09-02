@@ -1,5 +1,6 @@
 import { DoorOpen, LogIn, LogOut, Link, Pencil, Plus, Trash2, Users } from "@lucide/svelte";
 import { roomsStore, renameRoom } from "$lib/rooms.svelte";
+import { hashRef } from "$lib/storage-crypto";
 import { setRoomName } from "$lib/transport/transport.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
@@ -29,7 +30,12 @@ export const roomCommands: CmdSource = (host) => {
   for (const room of rooms) {
     const unread = roomsStore.unreadCounts.get(room.roomCode) ?? 0;
     cmds.push({
-      id: `room.open:${room.roomCode}`,
+      // Hashed, because a command id is not just an id: the MRU persists the
+      // ids you used to localStorage (mru.ts), so a plaintext one wrote the
+      // room code - the room's whole membership secret - into web storage,
+      // where it survives every lock and outlives the room. The real code
+      // stays in the closure below, which is the only place that needs it.
+      id: `room.open:${hashRef(room.roomCode)}`,
       title: room.name || room.roomCode,
       // The room code is shown unconditionally: two rooms can share a name,
       // and the code is the only thing that still tells them apart.
@@ -43,7 +49,9 @@ export const roomCommands: CmdSource = (host) => {
 
   for (const entry of roomsStore.phonebook) {
     cmds.push({
-      id: `room.dm:${entry.peerId}`,
+      // Hashed for the same reason as room.open above: the peer id is the
+      // social graph, and the MRU would persist it verbatim.
+      id: `room.dm:${hashRef(entry.peerId)}`,
       title: entry.nickname,
       group: "People",
       icon: Users,
@@ -93,7 +101,8 @@ export const roomCommands: CmdSource = (host) => {
       action: {
         kind: "act",
         perform: () => {
-          const url = `${window.location.origin}/r/${activeCode}`;
+          // Fragment form - see RoomCreateJoin's handleCopy.
+          const url = `${window.location.origin}/r/#${activeCode}`;
           navigator.clipboard
             .writeText(url)
             .catch((err) => console.warn("copy room link failed", err));

@@ -50,7 +50,11 @@ let { isMobile = false, onClose, onOpenSync }: Props = $props();
   let biometricSuccess = $state(false);
   let confirmRemoveBiometric = $state(false);
 
-  let duressEnabled = $state(hasDuressPassword());
+  let duressEnabled = $state(false);
+  // Async: telling an armed record from its decoy needs the session's key.
+  $effect(() => {
+    void hasDuressPassword().then((armed) => (duressEnabled = armed));
+  });
   let duressPassword = $state("");
   let duressError = $state<string | null>(null);
   let duressLoading = $state(false);

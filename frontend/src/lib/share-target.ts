@@ -1,10 +1,39 @@
-interface SharedPayloadFile {
+/**
+ * Shares waiting for the app to claim them.
+ *
+ * What the OS share sheet hands over - a title, a link, the text of a message,
+ * the bytes of a photo - is exactly the kind of content the at-rest layer
+ * exists for (see storage-crypto.ts: IndexedDB deletion is not erasure, so
+ * anything ever written in the clear must be assumed recoverable). It used to
+ * land here as a plain record, outside that boundary.
+ *
+ * The identity's at-rest key is out of reach: this module runs in the service
+ * worker, with the app locked or closed, which is the same problem
+ * notify-intents.ts already solved. So it seals under the SAME device key -
+ * a non-extractable AES-GCM CryptoKey living in the awful-notify database -
+ * rather than minting a second one. The duress wipe deletes both databases
+ * (duress.ts KNOWN_DBS), so the key going takes both stores' plaintext with it.
+ *
+ * Records an older build wrote in plaintext are still read (and cleared) by
+ * the consumer below; this stops new plaintext writes, it does not shred old
+ * ones.
+ */
+
+import { deviceSealKey } from "./notify-intents";
+
+/** A file's metadata. The bytes are sealed separately, as raw buffers. */
+interface SharedPayloadFileMeta {
   name: string;
   type: string;
   lastModified: number;
+}
+
+interface SharedPayloadFile extends SharedPayloadFileMeta {
   data: ArrayBuffer;
 }
 
+/** The plaintext shape - what an older build stored, and what the sealed
+ *  record's blob holds once opened. */
 interface SharedPayloadRecord {
   id: string;
   title?: string;
@@ -12,6 +41,31 @@ interface SharedPayloadRecord {
   url?: string;
   files: SharedPayloadFile[];
   createdAt: number;
+}
+
+interface EncBlob {
+  iv: Uint8Array<ArrayBuffer>;
+  ct: ArrayBuffer;
+}
+
+/**
+ * What actually goes in the store. `id` and `createdAt` stay in the clear:
+ * one is the key path, the other is the index the eviction and TTL walk needs
+ * to read without a key. Everything the user shared is inside the blobs.
+ */
+interface SealedShareRecord {
+  id: string;
+  createdAt: number;
+  /** AES-GCM over the JSON of title/text/url and the file descriptors. */
+  meta: EncBlob;
+  /** AES-GCM over each file's raw bytes, in the descriptors' order. Raw
+   *  rather than through the JSON, for the reason storage-crypto seals byte
+   *  fields separately: base64ing a 128 MB share would triple the work. */
+  fileData: EncBlob[];
+}
+
+function isSealedShare(row: unknown): row is SealedShareRecord {
+  return !!row && typeof row === "object" && "meta" in row;
 }
 
 const DB_NAME = "awful-share-target";
@@ -80,23 +134,45 @@ export async function storeSharedPayload(input: {
     throw new Error("shared payload exceeds the pending-share size cap");
   }
 
-  const db = await openShareDB();
-  const files: SharedPayloadFile[] = await Promise.all(
-    input.files.map(async (file) => ({
-      name: file.name,
-      type: file.type || "application/octet-stream",
-      lastModified: file.lastModified,
-      data: await file.arrayBuffer(),
-    }))
-  );
+  // Before the database is opened: a share that cannot be sealed must not be
+  // written at all, and the throw lands in the service worker's catch, which
+  // still redirects into the app shell.
+  const key = await deviceSealKey();
+  const seal = async (data: BufferSource): Promise<EncBlob> => {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    return {
+      iv,
+      ct: await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data),
+    };
+  };
 
-  const record: SharedPayloadRecord = {
+  const db = await openShareDB();
+  const meta: SharedPayloadFileMeta[] = input.files.map((file) => ({
+    name: file.name,
+    type: file.type || "application/octet-stream",
+    lastModified: file.lastModified,
+  }));
+  const fileData: EncBlob[] = [];
+  for (const file of input.files) {
+    // One file at a time: the cap allows 128 MB, and holding every share's
+    // plaintext and ciphertext at once doubles that for no reason.
+    fileData.push(await seal(await file.arrayBuffer()));
+  }
+
+  const record: SealedShareRecord = {
     id: crypto.randomUUID(),
-    title: input.title,
-    text: input.text,
-    url: input.url,
-    files,
     createdAt: Date.now(),
+    meta: await seal(
+      new TextEncoder().encode(
+        JSON.stringify({
+          title: input.title,
+          text: input.text,
+          url: input.url,
+          files: meta,
+        })
+      )
+    ),
+    fileData,
   };
 
   await new Promise<void>((resolve, reject) => {
@@ -142,21 +218,21 @@ export async function consumeLatestSharedPayload(): Promise<{
   // Only the newest record is ever returned, so only the newest is read.
   // getAll() materialized every pending share's file bytes at once, which the
   // record cap above turns into a predictable multi-hundred-MB spike.
-  const latest = await new Promise<SharedPayloadRecord | null>(
-    (resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const request = tx
-        .objectStore(STORE)
-        .index(CREATED_AT_INDEX)
-        .openCursor(null, "prev");
-      request.onsuccess = () =>
-        resolve((request.result?.value as SharedPayloadRecord) ?? null);
-      request.onerror = () => reject(request.error);
-    }
-  );
+  const latest = await new Promise<unknown>((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const request = tx
+      .objectStore(STORE)
+      .index(CREATED_AT_INDEX)
+      .openCursor(null, "prev");
+    request.onsuccess = () => resolve(request.result?.value ?? null);
+    request.onerror = () => reject(request.error);
+  });
 
   if (!latest) return null;
 
+  // Cleared whether or not it opens below: a record sealed under a key that no
+  // longer exists is noise, and leaving it would block every later share
+  // behind a cursor that keeps returning it.
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
     tx.objectStore(STORE).clear();
@@ -164,16 +240,56 @@ export async function consumeLatestSharedPayload(): Promise<{
     tx.onerror = () => reject(tx.error);
   });
 
+  const opened = isSealedShare(latest)
+    ? await openSharedPayload(latest)
+    : // Written by a build from before the records were sealed.
+      (latest as SharedPayloadRecord);
+  if (!opened) return null;
+
   return {
-    files: latest.files.map(
+    files: opened.files.map(
       (entry) =>
         new File([entry.data], entry.name, {
           type: entry.type,
           lastModified: entry.lastModified,
         })
     ),
-    text: latest.text,
-    title: latest.title,
-    url: latest.url,
+    text: opened.text,
+    title: opened.title,
+    url: opened.url,
   };
+}
+
+/** Unseal one record. Null when the device key is gone (a wipe, cleared site
+ *  data) or the record is truncated - noise, not an error. */
+async function openSharedPayload(
+  row: SealedShareRecord
+): Promise<SharedPayloadRecord | null> {
+  try {
+    const key = await deviceSealKey();
+    const open = (blob: EncBlob) =>
+      crypto.subtle.decrypt({ name: "AES-GCM", iv: blob.iv }, key, blob.ct);
+    const meta = JSON.parse(
+      new TextDecoder().decode(await open(row.meta))
+    ) as Omit<SharedPayloadRecord, "id" | "createdAt" | "files"> & {
+      files: SharedPayloadFileMeta[];
+    };
+    const files: SharedPayloadFile[] = [];
+    for (let i = 0; i < meta.files.length; i++) {
+      const blob = row.fileData[i];
+      if (!blob) continue;
+      files.push({ ...meta.files[i], data: await open(blob) });
+    }
+    return {
+      id: row.id,
+      createdAt: row.createdAt,
+      title: meta.title,
+      text: meta.text,
+      url: meta.url,
+      files,
+    };
+  } catch {
+    console.warn("[share] a pending share could not be opened; dropping it");
+    return null;
+  }
 }

@@ -24,7 +24,20 @@ vi.mock("./rooms.svelte", () => ({
   },
 }));
 
-const { announceMessage, _resetAnnounced } = await import("./announce");
+// The ref -> room mapping goes to IndexedDB, which node has none of. What it
+// records is asserted in notify-intents.test.ts; here it only has to not fire.
+const remembered: Array<[string, string]> = [];
+vi.mock("./notify-intents", async (orig) => ({
+  ...(await orig<typeof import("./notify-intents")>()),
+  rememberRoomRef: (ref: string, roomCode: string) => {
+    remembered.push([ref, roomCode]);
+    return Promise.resolve();
+  },
+}));
+
+const { announceMessage, _resetAnnounced, conversationRef } = await import(
+  "./announce"
+);
 
 const ME = "did:key:me";
 const THEM = "did:key:them";
@@ -53,6 +66,7 @@ function msg(over: Partial<Message> = {}): Message {
 describe("announceMessage", () => {
   beforeEach(() => {
     notified.length = 0;
+    remembered.length = 0;
     ctx.uiRoomCode = null;
     _resetAnnounced();
   });
@@ -62,11 +76,17 @@ describe("announceMessage", () => {
     expect(notified).toHaveLength(1);
     expect(notified[0].title).toBe("The Room");
     expect(notified[0].body).toBe("Them: hello");
-    expect(notified[0].tag).toBe("room:room-a");
+    // The tag and data name the conversation by its opaque ref, never by the
+    // room code: both outlive the page inside the browser's notification store.
+    const ref = conversationRef("room-a");
+    expect(ref).not.toContain("room-a");
+    expect(notified[0].tag).toBe(`room:${ref}`);
     expect(notified[0].data).toEqual({
-      roomCode: "room-a",
+      roomCode: ref,
       dmPeerDid: undefined,
     });
+    // ...and the mapping back is recorded, or the click could not route.
+    expect(remembered).toEqual([[ref, "room-a"]]);
   });
 
   it("announces the same message once, however many times it is delivered", () => {
@@ -105,9 +125,9 @@ describe("announceMessage", () => {
     announceMessage(msg({ roomCode: "dm-abc" }), ctx);
     expect(notified[0].title).toBe("Them");
     expect(notified[0].body).toBe("hello");
-    expect(notified[0].tag).toBe("dm:dm-abc");
+    expect(notified[0].tag).toBe(`dm:${conversationRef("dm-abc")}`);
     expect(notified[0].data).toEqual({
-      roomCode: "dm-abc",
+      roomCode: conversationRef("dm-abc"),
       dmPeerDid: THEM,
     });
   });
@@ -133,9 +153,11 @@ describe("announceMessage", () => {
     expect(notified[1].viewingConversation).toBe(false);
   });
 
-  it("falls back to the room code for a room it does not know", () => {
+  it("never titles a notification with the room code", () => {
     announceMessage(msg({ roomCode: "room-unknown" }), ctx);
-    expect(notified[0].title).toBe("room-unknown");
+    // A lock-screen title is read by whoever is holding the phone.
+    expect(notified[0].title).toBe("New message");
+    expect(JSON.stringify(notified[0])).not.toContain("room-unknown");
   });
 
   it("describes a file message with no text", () => {

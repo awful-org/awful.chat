@@ -90,13 +90,22 @@ export async function setNotificationsEnabled(on: boolean): Promise<boolean> {
  * window, the message is already visible.
  */
 export function notifyMessage(opts: {
+  /** Shown on a lock screen and over a shoulder. Never a room code. */
   title: string;
   body: string;
-  /** Collapses repeat notifications for the same conversation. */
+  /** Collapses repeat notifications for the same conversation. Built from the
+   *  conversation's opaque ref, not its room code. */
   tag: string;
   /** The conversation this message belongs to is the one on screen. */
   viewingConversation?: boolean;
-  /** Where a click (or inline reply) should land. */
+  /**
+   * Where a click (or inline reply) should land. Both this and `tag` survive
+   * in the browser's (and on Android the OS's) own notification store, which
+   * nothing here can lock or shred - so `roomCode` carries the OPAQUE ref
+   * announce.ts mints, and notify-intents.ts turns it back into a room code
+   * behind the device key when the intent is drained. The field keeps its name
+   * because the service worker copies it straight into the stored intent.
+   */
   data?: { roomCode: string; dmPeerDid?: string };
 }): void {
   // The sound has its own rule, separate from the notification's hidden-only

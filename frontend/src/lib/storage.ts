@@ -5,11 +5,14 @@ import {
   openRow,
   openRows,
   isSealed,
+  isCurrentAad,
   isStorageLockedError,
   isBlinded,
   rowHasBytes,
   storageCryptoReady,
   blindValue,
+  hashRef,
+  setAtRestSweepPending,
   STORE_SPECS,
   type Blinded,
   type EncryptedStoreName,
@@ -2251,37 +2254,53 @@ function isMigrationComplete(): boolean {
   }
 }
 
+// openRow passes an UNSEALED row through while the sweep still has plaintext
+// rows to convert, and refuses it once the sweep is done. The flag lives here,
+// so storage-crypto (which storage.ts imports, not the other way round) is
+// handed the question rather than asked to answer it.
+setAtRestSweepPending(() => !isMigrationComplete());
+
 /** Names the identity whose data the sweep is responsible for. */
 export function setAtRestOwner(did: string | null): void {
-  _atRestOwner = did;
+  // The HASH of the DID, not the DID. The flag has to be checkable with the
+  // identity locked, so it lives in localStorage - where the scoped key
+  // "awful:atrest:v2:did:key:z6Mk..." named the account on the device to
+  // anyone who opened the Application tab. A hash keys it just as well.
+  _atRestOwner = did ? hashRef(did) : null;
+  dropLegacyAtRestFlags();
 }
 
-/** Call after any write that may have landed plaintext (a locked import):
- *  the next unlock's sweep re-scans and seals it. */
-export function markAtRestSweepNeeded(): void {
+/** Flags written under the old plaintext-DID key shape. They are only a
+ *  "sweep done" marker, so dropping one costs a single extra scan. */
+function dropLegacyAtRestFlags(): void {
+  removeAtRestFlags((key) => key.startsWith(`${ATREST_FLAG_PREFIX}:did:`));
+}
+
+/**
+ * Drop EVERY identity's sweep flag.
+ *
+ * Exported for the identity-switch wipe: the flags are per-identity
+ * localStorage the previous account left behind, and they are keyed by a hash
+ * now, so a literal entry in identity.ts's IDENTITY_SCOPED_KEYS cannot name
+ * them.
+ */
+export function clearAtRestFlags(): void {
+  removeAtRestFlags(
+    (key) =>
+      key === ATREST_FLAG_PREFIX || key.startsWith(`${ATREST_FLAG_PREFIX}:`)
+  );
+}
+
+// Enumerated with length/key(i), the spec'd API, rather than
+// Object.keys(localStorage), which relies on the exotic own-property behaviour
+// real Storage objects happen to have. Keys are collected first because
+// removing during the walk shifts the indices under it.
+function removeAtRestFlags(match: (key: string) => boolean): void {
   try {
-    // EVERY identity's flag, not just the current one. The caller that needs
-    // this most is a backup restore from the signup screen, where no identity
-    // is active yet - so _atRestOwner is null and the scoped key we would
-    // clear is not the key the sweep checks after unlock. On a device that had
-    // already migrated this identity, that left "done" standing over freshly
-    // imported plaintext rows: migrateAtRest early-returned, the rows kept
-    // their plaintext roomCode, and isMigrationComplete() suppressed the dual
-    // read that would have found them. Rooms still listed (a plain getAll),
-    // but every message was invisible.
-    // Enumerated with length/key(i), the spec'd API, rather than
-    // Object.keys(localStorage), which relies on the exotic own-property
-    // behaviour real Storage objects happen to have. Keys are collected first
-    // because removing during the walk shifts the indices under it.
     const stale: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (
-        key &&
-        (key === ATREST_FLAG_PREFIX || key.startsWith(`${ATREST_FLAG_PREFIX}:`))
-      ) {
-        stale.push(key);
-      }
+      if (key && match(key)) stale.push(key);
     }
     for (const key of stale) localStorage.removeItem(key);
   } catch {
@@ -2289,16 +2308,34 @@ export function markAtRestSweepNeeded(): void {
   }
 }
 
+/** Call after any write that may have landed plaintext (a locked import):
+ *  the next unlock's sweep re-scans and seals it. */
+export function markAtRestSweepNeeded(): void {
+  // EVERY identity's flag, not just the current one. The caller that needs
+  // this most is a backup restore from the signup screen, where no identity
+  // is active yet - so _atRestOwner is null and the scoped key we would clear
+  // is not the key the sweep checks after unlock. On a device that had already
+  // migrated this identity, that left "done" standing over freshly imported
+  // plaintext rows: migrateAtRest early-returned, the rows kept their
+  // plaintext roomCode, and isMigrationComplete() suppressed the dual read
+  // that would have found them. Rooms still listed (a plain getAll), but every
+  // message was invisible.
+  clearAtRestFlags();
+}
+
 /**
- * Check if a row needs re-sealing for the blinding migration. A row needs
- * blinding if: (1) it is not sealed at all (legacy plaintext), OR (2) it is
- * sealed but contains unblinded values in the blind fields.
+ * Check if a row needs re-sealing. A row does if: (1) it is not sealed at all
+ * (legacy plaintext), (2) it is sealed but contains unblinded values in the
+ * blind fields, or (3) its blobs carry an older AAD binding than the one
+ * sealRow writes today - those still open, but only re-sealing binds the clear
+ * fields beside them.
  */
 function needsBlindingMigration(
   row: unknown,
   spec: StoreCryptoSpec
 ): boolean {
   if (!isSealed(row)) return true; // Legacy plaintext - needs sealing
+  if (!isCurrentAad(row)) return true; // Sealed under an older AAD binding
   const r = row as Record<string, unknown>;
   // Check if any blind field contains an unblinded value (not prefixed with b1:)
   for (const field of spec.blind ?? []) {
@@ -2307,7 +2344,7 @@ function needsBlindingMigration(
       return true; // Sealed but unblinded - needs re-sealing
     }
   }
-  return false; // Already sealed and blinded
+  return false; // Already sealed, blinded and bound
 }
 
 /**

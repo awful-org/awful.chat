@@ -7,10 +7,32 @@ import {
   isSealed,
   rowHasBytes,
   beginPlaintextImport,
+  setAtRestSweepPending,
   STORE_SPECS,
 } from "./storage-crypto";
 
 const KEY = new Uint8Array(32).fill(7);
+
+/** The at-rest key, derived exactly as initStorageCrypto does, so a test can
+ *  hand-build a blob the way an older build wrote it. */
+async function atRestKey(): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  const ikm = await crypto.subtle.importKey("raw", KEY, "HKDF", false, [
+    "deriveKey",
+  ]);
+  return crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: enc.encode("awful.chat storage at-rest v1"),
+      info: enc.encode("storage-key"),
+    },
+    ikm,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
 
 describe("storage at-rest crypto", () => {
   beforeEach(async () => {
@@ -164,6 +186,96 @@ describe("storage at-rest crypto", () => {
     await expect(
       openRow(swapped, STORE_SPECS.attachments)
     ).rejects.toThrow();
+  });
+
+  // ── AAD v3: the clear fields are bound too ──────────────────────────────
+
+  it("seals at v3 and round-trips with the clear fields bound in", async () => {
+    const sealed = await sealRow(
+      {
+        id: "m3",
+        lamport: 1,
+        type: "text",
+        status: "sent",
+        content: "bound to its own row",
+      },
+      STORE_SPECS.messages
+    );
+    expect(sealed._enc.v).toBe(3);
+    const opened = await openRow<{ content: string; status: string }>(
+      sealed,
+      STORE_SPECS.messages
+    );
+    expect(opened.content).toBe("bound to its own row");
+    expect(opened.status).toBe("sent");
+  });
+
+  it("a v3 blob fails when a clear field beside it is swapped", async () => {
+    const sealed = await sealRow(
+      {
+        id: "m3",
+        lamport: 1,
+        type: "text",
+        status: "sent",
+        content: "delivered once",
+      },
+      STORE_SPECS.messages
+    );
+    // Raw database access flipping the receipt status, or moving the message
+    // in the lamport order, without touching the ciphertext.
+    await expect(
+      openRow({ ...sealed, status: "read" }, STORE_SPECS.messages)
+    ).rejects.toThrow();
+    await expect(
+      openRow({ ...sealed, lamport: 99 }, STORE_SPECS.messages)
+    ).rejects.toThrow();
+  });
+
+  it("a v2 blob - bound to store and primary key only - still opens", async () => {
+    // Exactly what a build before this change left on disk: AAD with no clear
+    // fields in it, marked `v: 2`. The v3 AAD for this same row would read
+    // "messages m2 id=m2 lamport=9 type=text status=sent", so this only opens
+    // if decrypt builds the AAD the blob's OWN marker asks for.
+    const key = await atRestKey();
+    const enc = new TextEncoder();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: enc.encode("messages m2") },
+      key,
+      enc.encode(JSON.stringify({ senderName: "Alice", content: "old build" }))
+    );
+    const row = {
+      id: "m2",
+      lamport: 9,
+      type: "text",
+      status: "sent",
+      _enc: { iv, ct, v: 2 },
+    };
+
+    const opened = await openRow<{ content: string; lamport: number }>(
+      row,
+      STORE_SPECS.messages
+    );
+    expect(opened.content).toBe("old build");
+    expect(opened.lamport).toBe(9);
+  });
+
+  it("refuses an unsealed row once the at-rest sweep has finished", async () => {
+    const legacy = { id: "m4", roomCode: "room-a", content: "never sealed" };
+    // While a sweep may still be pending, plaintext rows are the sweep's job
+    // and must stay readable.
+    expect(await openRow(legacy, STORE_SPECS.messages)).toBe(legacy);
+
+    setAtRestSweepPending(() => false);
+    try {
+      await expect(openRow(legacy, STORE_SPECS.messages)).rejects.toThrow(
+        /unsealed row/
+      );
+      // The one spec with no store behind it has no sweep to wait for.
+      expect(await openRow(legacy, { clear: ["id"] })).toBe(legacy);
+    } finally {
+      setAtRestSweepPending(() => true);
+    }
   });
 
   it("a legacy blob with no AAD/version marker still decrypts", async () => {

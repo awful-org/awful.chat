@@ -126,7 +126,14 @@ export function loadMru(): Mru {
   }
 }
 
-/** Persist the history. Silently gives up when storage is unavailable. */
+/**
+ * Persist the history. Silently gives up when storage is unavailable.
+ *
+ * What lands in localStorage is whatever the command ids are, verbatim, and
+ * localStorage survives every lock - so a command id is a published string.
+ * Sources that build an id out of a room code or a peer id hash it first (see
+ * `commands/rooms.ts`); nothing here can undo an id that arrives in the clear.
+ */
 export function saveMru(mru: Mru): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(mru.toJSON()));

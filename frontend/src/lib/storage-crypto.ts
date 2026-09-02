@@ -29,24 +29,44 @@
  * additionalData binding it to "<storeName> <primaryKey>" (bytes fields add
  * a third " <field>" segment), taken from StoreCryptoSpec.storeName/key - so
  * a swapped blob decrypts under the wrong AAD and AES-GCM's auth tag check
- * fails closed. Blobs carry `v: 2` when sealed this way; decrypt only
- * applies AAD when it sees that marker. Rows sealed before this change (no
- * `v`, no AAD) stay swappable between rows of the same store/shape until
- * they are next written - accepted because closing that gap needs no flag or
- * schema bump, just the ordinary "everything gets resealed on next write"
- * path this file already relies on for the blinding migration.
+ * fails closed.
+ *
+ * AAD versions. v2 bound the store and the primary key only, which left the
+ * CLEAR fields beside the blob unbound: raw database access could flip a
+ * message's `status` or `type`, or move its `lamport`, and the blob still
+ * opened - the row came back with the tampered clear field and authentic
+ * content. v3 folds every clear field the spec lists into the AAD too, so the
+ * ciphertext is bound to the whole row as stored. Blobs carry `v: 3` when
+ * sealed that way, `v: 2` for the store+key binding, nothing at all for rows
+ * sealed before AAD existed; decrypt builds whichever AAD the marker asks for,
+ * so nothing already on disk stops opening. The at-rest sweep re-seals
+ * everything to v3 on its next pass, the same path the blinding migration uses.
+ *
+ * Unsealed rows. openRow used to hand any row without `_enc` straight back:
+ * necessary while the sweep still has plaintext rows to convert, and a hole
+ * once it does not, because a row planted in the database in plaintext would
+ * be read as authentic. Once the sweep has finished for this identity (the
+ * flag storage.ts owns, injected through setAtRestSweepPending) an unsealed
+ * row in a store whose spec says it must be sealed is refused instead.
  */
 
+import { sha256 } from "@noble/hashes/sha2.js";
 import { ev } from "./telemetry/event";
 import { rec } from "./telemetry/recorder";
+import { hex, utf8 } from "./utils";
+
+/** Which shape of AAD a blob was sealed with. See the header comment. */
+type AadVersion = 2 | 3;
+/** What sealRow writes today. Everything older still opens. */
+const AAD_VERSION: AadVersion = 3;
 
 interface EncBlob {
   iv: Uint8Array;
   ct: ArrayBuffer;
-  /** Present (2) when `ct` was sealed with AAD binding it to its row (see
-   *  above). Absent on rows sealed before AAD binding existed - those decrypt
-   *  WITHOUT additionalData, exactly as they were sealed. */
-  v?: 2;
+  /** The AAD shape `ct` was sealed with (see above). Absent on rows sealed
+   *  before AAD binding existed - those decrypt WITHOUT additionalData,
+   *  exactly as they were sealed. */
+  v?: AadVersion;
 }
 
 export interface SealedRow {
@@ -123,7 +143,6 @@ export function beginPlaintextImport(): () => void {
 export async function initStorageCrypto(
   privateKey: Uint8Array<ArrayBuffer>
 ): Promise<void> {
-  const utf8 = (s: string) => new TextEncoder().encode(s);
   const ikm = await crypto.subtle.importKey("raw", privateKey, "HKDF", false, [
     "deriveKey",
   ]);
@@ -227,6 +246,22 @@ export async function blindValue(value: string): Promise<Blinded> {
   return out as Blinded;
 }
 
+/**
+ * An UNKEYED opaque reference to an identifier, for the places a value has to
+ * be recognizable without being readable and no at-rest key is available: a
+ * notification tag the browser keeps outside anything this app can shred, a
+ * localStorage key, a palette command id. SHA-256 truncated to 16 hex
+ * characters - collision-free across the handful of rooms and peers one device
+ * ever sees, and it gives back nothing about a 65-bit room code or a DID.
+ *
+ * Not a replacement for blindValue: unkeyed means two identities on one device
+ * produce the SAME ref for the same room, so this belongs nowhere the at-rest
+ * key is available. It is the fallback for the places outside that boundary.
+ */
+export function hashRef(value: string): string {
+  return hex(sha256(utf8(value))).slice(0, 16);
+}
+
 export function storageCryptoReady(): boolean {
   return _key !== null;
 }
@@ -259,18 +294,19 @@ async function encrypt(
     key,
     data
   );
-  return aad ? { iv, ct, v: 2 } : { iv, ct };
+  return aad ? { iv, ct, v: AAD_VERSION } : { iv, ct };
 }
 
 async function decrypt(
   key: CryptoKey,
   blob: EncBlob,
-  aad?: Uint8Array<ArrayBuffer>
+  /** Builds the AAD for one version. Called with the blob's OWN marker, never
+   *  with the current one: an AAD the blob was not sealed under changes the
+   *  auth tag computation and turns a perfectly good older row into a decrypt
+   *  failure. */
+  aadFor?: (version: AadVersion) => Uint8Array<ArrayBuffer> | undefined
 ): Promise<ArrayBuffer> {
-  // Only apply AAD when the blob was sealed with it: passing additionalData
-  // that was never bound in at seal time changes the auth tag computation
-  // and turns a perfectly good legacy (pre-v2) row into a decrypt failure.
-  const useAad = blob.v === 2 ? aad : undefined;
+  const useAad = blob.v ? aadFor?.(blob.v) : undefined;
   return crypto.subtle.decrypt(
     useAad
       ? {
@@ -286,30 +322,55 @@ async function decrypt(
 
 /**
  * The AAD for one blob: "<storeName> <primaryKey>", plus a " <field>"
- * segment for an _encBytes entry. Reads spec.key off the SEALED row - which,
- * for a store whose keyPath is itself blinded (rooms, profiles, phonebook,
- * yjsDocs), is the hash, not the plaintext - because that is the one form
- * available on both sides: sealRow has already written it into `out` by the
- * time this runs, and openRow sees it directly on the stored row. Returns
- * undefined (no AAD) when the spec does not carry storeName/key, or when the
- * row does not (yet) have a value for that field.
+ * segment for an _encBytes entry, plus - at v3 - every clear field the spec
+ * lists, in spec order. Reads spec.key off the SEALED row - which, for a store
+ * whose keyPath is itself blinded (rooms, profiles, phonebook, yjsDocs), is
+ * the hash, not the plaintext - because that is the one form available on both
+ * sides: sealRow has already written it into `out` by the time this runs, and
+ * openRow sees it directly on the stored row. The clear fields come from the
+ * same place for the same reason. Returns undefined (no AAD) when the spec
+ * does not carry storeName/key, or when the row does not (yet) have a value
+ * for that field.
  */
 function rowAad(
   spec: StoreCryptoSpec,
   row: Record<string, unknown>,
-  field?: string
+  field?: string,
+  version: AadVersion = AAD_VERSION
 ): Uint8Array<ArrayBuffer> | undefined {
   if (!spec.storeName || !spec.key) return undefined;
   const keyVal = row[spec.key];
   if (keyVal === undefined || keyVal === null) return undefined;
-  const s = field
+  let s = field
     ? `${spec.storeName} ${String(keyVal)} ${field}`
     : `${spec.storeName} ${String(keyVal)}`;
-  return new TextEncoder().encode(s);
+  if (version === 3) {
+    // Clear fields are scalars (ids, lamports, enum-ish strings), so String()
+    // is stable. An absent field contributes nothing, on both sides.
+    for (const f of spec.clear) {
+      const v = row[f];
+      if (v !== undefined && v !== null) s += ` ${f}=${String(v)}`;
+    }
+  }
+  return utf8(s);
 }
 
 export function isSealed(row: unknown): row is SealedRow {
   return !!row && typeof row === "object" && "_enc" in (row as object);
+}
+
+/**
+ * Whether every blob on a sealed row carries the CURRENT AAD binding. Older
+ * ones still open; this is what tells the at-rest sweep to re-seal them, so a
+ * row written before v3 ends up with its clear fields bound in too.
+ */
+export function isCurrentAad(row: unknown): boolean {
+  if (!isSealed(row)) return false;
+  if (row._enc.v !== AAD_VERSION) return false;
+  for (const blob of Object.values(row._encBytes ?? {})) {
+    if (blob.v !== AAD_VERSION) return false;
+  }
+  return true;
 }
 
 /** Encrypt a record for storage. Clear fields are copied through; the rest
@@ -372,8 +433,23 @@ export async function sealRow<T extends Record<string, unknown>>(
   return out as SealedRow;
 }
 
+/**
+ * Whether the at-rest sweep still has plaintext rows left to seal. Injected by
+ * storage.ts, which owns the per-identity flag - storage.ts imports this
+ * module, so this module cannot import it back. The default says "pending",
+ * which is the pass-through behaviour every caller had before: a wrong "no
+ * sweep needed" would start refusing perfectly good legacy rows.
+ */
+let _sweepPending: () => boolean = () => true;
+
+export function setAtRestSweepPending(pending: () => boolean): void {
+  _sweepPending = pending;
+}
+
 /** Decrypt a stored row back to the full record. Rows written before the
- *  at-rest migration have no _enc and pass through unchanged.
+ *  at-rest migration have no _enc and pass through while a sweep is still
+ *  pending; after it, an unsealed row in a store that must be sealed is
+ *  refused (see the header comment).
  *  skipBytes leaves ArrayBuffer fields out - for scans that only need the
  *  small metadata and must not materialize every file blob. */
 export async function openRow<T>(
@@ -381,11 +457,23 @@ export async function openRow<T>(
   spec: StoreCryptoSpec,
   opts?: { skipBytes?: boolean }
 ): Promise<T> {
-  if (!isSealed(row)) return row as T;
+  if (!isSealed(row)) {
+    // storeName marks a real IndexedDB store, which is the only place the
+    // sweep reaches; the one ad hoc spec (the DM offline queue) seals a blob
+    // that never lands in a store and has no sweep to wait for.
+    if (spec.storeName && _plaintextImportDepth === 0 && !_sweepPending()) {
+      console.warn(
+        `[storage] refused an unsealed ${spec.storeName} row: the at-rest sweep has finished, so nothing should still be in plaintext`
+      );
+      rec(ev("storage.drop", { d: { store: spec.storeName, count: 1 } }));
+      throw new Error(`unsealed row in a sealed store: ${spec.storeName}`);
+    }
+    return row as T;
+  }
   const key = requireKey();
   const rowObj = row as unknown as Record<string, unknown>;
   const json = new TextDecoder().decode(
-    await decrypt(key, row._enc, rowAad(spec, rowObj))
+    await decrypt(key, row._enc, (v) => rowAad(spec, rowObj, undefined, v))
   );
   const rest = JSON.parse(json) as Record<string, unknown>;
   const out: Record<string, unknown> = { ...rest };
@@ -394,7 +482,7 @@ export async function openRow<T>(
   }
   if (row._encBytes && !opts?.skipBytes) {
     for (const [k, blob] of Object.entries(row._encBytes)) {
-      out[k] = await decrypt(key, blob, rowAad(spec, rowObj, k));
+      out[k] = await decrypt(key, blob, (v) => rowAad(spec, rowObj, k, v));
     }
   }
   return out as T;
