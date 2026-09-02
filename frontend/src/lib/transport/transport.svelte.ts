@@ -2146,7 +2146,7 @@ function _admitRoomMember(room: string, did: string): void {
 }
 
 function _handleJoinRoom(
-  _fromPeerId: string,
+  fromPeerId: string,
   claimedDid: string,
   room: string | null
 ): void {
@@ -2173,6 +2173,10 @@ function _handleJoinRoom(
   // entry reaches nobody until that identity actually connects.
   if (!looksLikeDid(claimedDid) && !looksLikePeerId(claimedDid)) return;
   _admitRoomMember(room, claimedDid);
+  // The roster only went out on connect, so a peer switching into this room
+  // over connections that were already up saw nobody but themselves until
+  // the next connect. Answer the join with who is here.
+  _sendRoomUsers(fromPeerId, room).catch(() => {});
 }
 
 /**
@@ -2565,17 +2569,30 @@ _transport.on("connect", (peerId) => {
   if (transportState.inCall) _sendCallState(peerId);
   if (transportState.inCall) _sendWatchPresence(peerId);
   _sendDigest(peerId);
+  if (transportState.roomCode) {
+    _sendRoomUsers(peerId, transportState.roomCode).catch(() => {});
+  }
+});
+
+/**
+ * Hand a peer one room's roster: the on-screen list for the room on screen,
+ * the persisted list for any other room we are subscribed to.
+ */
+async function _sendRoomUsers(
+  peerId: string,
+  roomCode: string
+): Promise<void> {
   const selfDid = identityStore.did ?? _transport.selfId();
-  const participants = [...new Set([...transportState.roomUsers, selfDid])];
+  const known =
+    roomCode === transportState.roomCode
+      ? transportState.roomUsers
+      : await getRoomParticipants(roomCode);
+  const participants = [...new Set([...known, selfDid])];
   _transport.send(
     peerId,
-    encode({
-      type: MessageType.RoomUsersSync,
-      participants,
-      roomCode: transportState.roomCode ?? undefined,
-    })
+    encode({ type: MessageType.RoomUsersSync, participants, roomCode })
   );
-});
+}
 
 _transport.on("disconnect", (peerId) => {
   // The transport drops its own entry on disconnect without announcing it,
@@ -3191,6 +3208,10 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
     // so nothing from the old conversation is on screen under the new name.
     transportState.roomCode = roomCode;
     transportState.messages = [];
+    // The roster too: the union below keeps whoever announces themselves
+    // for THIS room during the awaits, but without this reset it also kept
+    // the room just left, so switching rooms never changed the member list.
+    transportState.roomUsers = [];
     // Only the entered room's cache: wiping everything dropped in-flight
     // ephemerals for pinned widgets and call tiles following OTHER rooms.
     clearCardStates(roomCode);
