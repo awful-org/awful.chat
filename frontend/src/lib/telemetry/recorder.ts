@@ -11,7 +11,7 @@
  */
 
 import { ev } from "./event";
-import { RefTable } from "./redact";
+import { activeRefs, RefTable, setActiveRefs } from "./redact";
 import { DiagRing, RING_CAPACITY } from "./ring";
 import type {
   DiagEvent,
@@ -62,7 +62,6 @@ const NO_CONTEXT: RecorderContext = {
 
 let ctx: RecorderContext = NO_CONTEXT;
 let ring = new DiagRing();
-let refTable = new RefTable();
 let peers = new Map<string, DiagPeerRef>();
 let counters: Record<string, number> = {};
 let sfuSnapshots: SfuSnapshot[] = [];
@@ -85,7 +84,7 @@ export function beginSession(id: string, startedAtMs: number): void {
   startedAt = startedAtMs;
   perfBase = now();
   ring.reset();
-  refTable = new RefTable();
+  setActiveRefs(new RefTable());
   peers = new Map();
   counters = {};
   sfuSnapshots = [];
@@ -97,7 +96,7 @@ export function isRecording(): boolean {
 }
 
 export function refs(): RefTable {
-  return refTable;
+  return activeRefs();
 }
 
 /**
@@ -131,7 +130,7 @@ export function rec(e: Omit<DiagEvent, "seq" | "t">): void {
  */
 export function noteIdentity(peerId: string, did: string): void {
   try {
-    const ref = refTable.identityRef(did);
+    const ref = activeRefs().identityRef(did);
     const hit = peers.get(peerId);
     if (hit) hit.identityRef = ref;
     else {
@@ -173,7 +172,7 @@ export function recorderSnapshot(): RecorderSnapshot {
     suppressed: snap.suppressed,
     nextSeq: snap.nextSeq,
     ringCapacity: RING_CAPACITY,
-    rooms: refTable.rooms(),
+    rooms: activeRefs().rooms(),
     peers: [...peers.values()].map((p) => ({ ...p })),
     counters: { ...counters },
     sfuSnapshots: sfuSnapshots.map((s) => s),
@@ -186,7 +185,7 @@ export function recorderSnapshot(): RecorderSnapshot {
 export function resetRecorderForTest(): void {
   ctx = NO_CONTEXT;
   ring = new DiagRing();
-  refTable = new RefTable();
+  setActiveRefs(new RefTable());
   peers = new Map();
   counters = {};
   sfuSnapshots = [];

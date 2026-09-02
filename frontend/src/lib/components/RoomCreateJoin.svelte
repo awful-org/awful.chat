@@ -126,7 +126,10 @@
   }
 
   async function handleCopy(code: string) {
-    await navigator.clipboard.writeText(`${window.location.origin}/r/${code}`);
+    // `/r/#<code>`, not `/r/<code>`: a fragment never reaches the server, so
+    // the membership secret stays out of access logs and out of the Referer
+    // of every link the room page later opens.
+    await navigator.clipboard.writeText(`${window.location.origin}/r/#${code}`);
     copied = true;
     setTimeout(() => (copied = false), 2000);
   }
@@ -137,7 +140,9 @@
       joinCode = text.trim();
       if (joinCode.includes("/r/")) {
         const parts = joinCode.split("/r/");
-        joinCode = parts[parts.length - 1];
+        // Both link shapes: `#` is the fragment form's separator, not part
+        // of the code.
+        joinCode = parts[parts.length - 1].replace(/^#/, "");
       }
     } catch {
       // clipboard denied

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { errText, ev, MAX_DETAIL_KEYS, MAX_DETAIL_STRING } from "./event";
+import { activeRefs } from "./redact";
 
 describe("ev", () => {
   it("resolves the default severity from the kind", () => {
@@ -121,5 +122,25 @@ describe("errText", () => {
       },
     };
     expect(errText(hostile)).toBe("unknown");
+  });
+
+  // The scrub used to be the caller's job and fifteen callers did not do it.
+  // A thrown message quotes whatever the platform was handed, which on the
+  // invite path is a room code and on the DM path is a DID.
+  it("scrubs a room code and a did:key out of the message", () => {
+    const code = "6BMB3GST2JRJZ";
+    const ref = activeRefs().roomRef(code);
+    const out = errText(
+      new Error(`join ${code} failed for did:key:z6MkExampleIdentity`)
+    );
+    expect(out).not.toContain(code);
+    expect(out).toContain(ref);
+    expect(out).not.toContain("z6MkExampleIdentity");
+    expect(out).toContain("<did>");
+  });
+
+  it("scrubs a url, so a code inside one never survives", () => {
+    const out = errText(new Error("Failed to fetch https://relay.test/i/ABC"));
+    expect(out).toBe("Error: Failed to fetch <url>");
   });
 });

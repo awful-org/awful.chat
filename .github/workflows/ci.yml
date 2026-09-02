@@ -1,6 +1,13 @@
 # Runs on every PR and on every push to main. main is what Dokploy deploys, so
 # nothing reaches it without these five jobs going green: protect the branch
 # and require them as status checks (Settings > Branches > main).
+#
+# Every `uses:` here and in the other two workflows names a COMMIT, with the
+# tag it was cut from in the comment beside it. A tag is a movable pointer in
+# somebody else's repository, so `@v7` is a standing invitation to run whatever
+# that pointer is made to mean tomorrow - in a job that holds this repo's
+# token. Bump one by resolving the tag again:
+#   git ls-remote https://github.com/<owner>/<repo>.git refs/tags/<tag>
 name: ci
 
 on:
@@ -17,10 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: frontend } }
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
         with: { version: 10 }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 24, cache: pnpm, cache-dependency-path: frontend/pnpm-lock.yaml }
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
@@ -70,8 +77,8 @@ jobs:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: relay } }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with: { go-version-file: relay/go.mod, cache-dependency-path: relay/go.sum }
       - run: go vet ./...
       - run: go test -race -count=1 ./...
@@ -82,8 +89,8 @@ jobs:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: sfu } }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 24, cache: npm, cache-dependency-path: sfu/package-lock.json }
       # Downloads mediasoup's prebuilt worker; the tests spawn the real thing.
       - run: npm ci
@@ -98,10 +105,10 @@ jobs:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: dashboard } }
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
         with: { version: 10 }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 24, cache: pnpm, cache-dependency-path: dashboard/pnpm-lock.yaml }
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
@@ -139,9 +146,9 @@ jobs:
           # commit. See frontend/Dockerfile.
           - { name: frontend, context: ".", dockerfile: frontend/Dockerfile }
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}

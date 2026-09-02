@@ -21,6 +21,9 @@ import { SFU_PUBLISH_UNAVAILABLE, SFU_UNREACHABLE } from "./types";
 /** What a click on a tile for a share that no longer exists surfaces. */
 export const PRODUCER_GONE = "That stream has ended";
 
+/** Producer announcements held waiting for a device or a roster entry. */
+const MAX_QUEUED_PRODUCERS = 64;
+
 // ── Message types (mirrored on the SFU server) ────────────────────────────────
 
 interface MSGetCapabilities {
@@ -291,8 +294,32 @@ export class MediasoupVideo implements VideoTransport {
   // Peers whose transmission the user is actively watching.
   private watchingTransmissionPeers: Set<string> = new Set();
 
-  // ms:new-producer messages that arrived before recvTransport was ready
+  // ms:new-producer messages that arrived before recvTransport was ready,
+  // or before the call roster admitted the peer they name.
   private queuedProducers: MSNewProducer[] = [];
+
+  /**
+   * Is this peerId somebody our own call roster places in this call?
+   *
+   * The SFU tells us who produced a stream and we filed it under whatever
+   * peerId it said, so the media server (or anything that can talk to it in
+   * our room) chose which name a camera or screen share appears under. The
+   * roster lives a layer up in transport state, so it is injected rather
+   * than imported: this module must stay loadable without booting libp2p.
+   * Unset means "no opinion" - the check is skipped rather than failing
+   * closed, so a caller that never wires it up behaves exactly as before.
+   */
+  private admitsCallPeer: ((peerId: string) => boolean) | null = null;
+
+  setCallPeerAdmission(fn: (peerId: string) => boolean): void {
+    this.admitsCallPeer = fn;
+  }
+
+  /** Re-run the roster check on producers it deferred. */
+  retryDeferredProducers(): void {
+    if (!this.device) return;
+    this.drainQueuedProducers();
+  }
 
   // Consumes in flight, keyed by producer id. See consumeProducer.
   private inflightConsumes: Map<string, Promise<void>> = new Map();
@@ -1164,7 +1191,23 @@ export class MediasoupVideo implements VideoTransport {
     });
   }
 
-  /** ms:new-producer frames that arrived before join() finished. */
+  /**
+   * Hold a producer announcement for later. Bounded: the deferral is driven
+   * by frames the SFU sends us, and an unbounded list of them is its own
+   * problem. Oldest goes first - a stale announcement is the least useful.
+   */
+  private queueProducer(msg: MSNewProducer): void {
+    if (this.queuedProducers.length >= MAX_QUEUED_PRODUCERS) {
+      this.queuedProducers.shift();
+    }
+    this.queuedProducers.push(msg);
+  }
+
+  /**
+   * ms:new-producer frames that arrived before join() finished, or before the
+   * roster admitted the peer they name. Re-entering handleSignal may re-queue
+   * one that is still not admitted; the splice makes that one pass, not a loop.
+   */
   private drainQueuedProducers(): void {
     const queued = this.queuedProducers.splice(0);
     for (const producer of queued) {
@@ -1233,7 +1276,23 @@ export class MediasoupVideo implements VideoTransport {
         );
         // Not joined yet (no device): queue and process after join() completes.
         if (!this.device) {
-          this.queuedProducers.push(msg);
+          this.queueProducer(msg);
+          break;
+        }
+        // The peerId on this frame is whatever the SFU announced, and it is
+        // the key everything downstream files the stream under - the tile,
+        // the participant entry, the name and avatar shown over it. Only
+        // consume producers from somebody our own call roster (which is
+        // relay-attested membership plus presence) already places in this
+        // call; our own producers are echoed back to us and are exempt.
+        // Deferred rather than dropped: presence and the SFU's announcement
+        // race, so re-check when the roster next changes.
+        if (
+          this.admitsCallPeer &&
+          msg.peerId !== this.currentPeerId &&
+          !this.admitsCallPeer(msg.peerId)
+        ) {
+          this.queueProducer(msg);
           break;
         }
         // Camera is auto-consumed as before.

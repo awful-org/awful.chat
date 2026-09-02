@@ -13,6 +13,7 @@ import {
     generateSyncCode,
     connectAsTarget,
     parsePlaintextToken,
+    revealShortCode,
     startScanning,
     cancelSync,
     type SyncPayload,
@@ -46,6 +47,7 @@ import {
     | "scan"
     | "manual-input"
     | "mode-select"
+    | "password"
     | "progress"
     | "complete"
     | "error"
@@ -67,9 +69,47 @@ import {
     }
   });
 
+  // The typed short code carries only the first 8 chars of the sync token, so
+  // the source stops honouring the full 128-bit one the moment it is shown -
+  // keep it behind a deliberate tap instead of printing it next to every QR.
+  let shortCodeShown = $state(false);
+
+  function handleShowShortCode() {
+    revealShortCode();
+    shortCodeShown = true;
+  }
+
+  // The imported identity is unlocked BEFORE the import writes anything, so
+  // the at-rest key is armed and every row is sealed on the way in. That is
+  // why the password is asked here rather than after the reload.
+  let syncPassword = $state("");
+  let passwordRetry = $state(false);
+  let passwordResolve: ((value: string | null) => void) | null = null;
+
+  function requestSyncPassword(retry: boolean): Promise<string | null> {
+    passwordRetry = retry;
+    syncPassword = "";
+    view = "password";
+    return new Promise((resolve) => {
+      passwordResolve = resolve;
+    });
+  }
+
+  function settlePassword(value: string | null) {
+    const resolve = passwordResolve;
+    passwordResolve = null;
+    syncPassword = "";
+    if (value !== null) view = "progress";
+    resolve?.(value);
+  }
+
   // Reset state when dialog closes
   $effect(() => {
     if (!open) {
+      // A prompt left hanging would leave the import awaiting forever;
+      // answering null aborts it with nothing written.
+      settlePassword(null);
+      shortCodeShown = false;
       (async () => {
         // Wait for any in-flight scan start to complete
         if (startScanPromise) {
@@ -215,6 +255,8 @@ async function handleStartScanning() {
   }
 
   async function handleRetry() {
+    settlePassword(null);
+    shortCodeShown = false;
     await cancelSync();
     if (flowMode === "generate-qr") {
       view = "qr-display";
@@ -238,7 +280,9 @@ async function handleStartScanning() {
 
     view = "progress";
     try {
-      await connectAsTarget(pendingPayload);
+      await connectAsTarget(pendingPayload, {
+        requestPassword: requestSyncPassword,
+      });
     } catch (err) {
       syncState.syncError =
         err instanceof Error ? err.message : "Failed to connect";
@@ -270,6 +314,8 @@ async function handleStartScanning() {
           Enter sync code
         {:else if view === "mode-select"}
           Choose sync mode
+        {:else if view === "password"}
+          Unlock the incoming account
         {:else if view === "progress"}
           Syncing...
         {:else if view === "complete"}
@@ -334,36 +380,47 @@ async function handleStartScanning() {
             </div>
           {/if}
 
-          <div class="w-full space-y-2">
-            <p class="text-xs text-muted-foreground text-center">
-              Or enter this code manually:
-            </p>
-            <div class="flex gap-2">
-              <Input
-                value={syncState.plaintextToken ?? ""}
-                readonly
-                class="font-mono text-center text-sm bg-muted"
-              />
-              <Button
-                onclick={handleCopyToken}
-                variant="outline"
-                size="icon"
-                class="shrink-0"
-                aria-label={tokenCopied ? "Copied" : "Copy sync code"}
-              >
-                {#if tokenCopied}
-                  <Check class="w-4 h-4 text-primary" />
-                {:else}
-                  <Copy class="w-4 h-4" />
-                {/if}
-              </Button>
-            </div>
-            {#if copyFailed}
-              <p class="text-xs text-muted-foreground">
-                Could not reach the clipboard. Type the code instead.
+          {#if shortCodeShown}
+            <div class="w-full space-y-2">
+              <p class="text-xs text-muted-foreground text-center">
+                Or enter this code manually:
               </p>
-            {/if}
-          </div>
+              <div class="flex gap-2">
+                <Input
+                  value={syncState.plaintextToken ?? ""}
+                  readonly
+                  class="font-mono text-center text-sm bg-muted"
+                />
+                <Button
+                  onclick={handleCopyToken}
+                  variant="outline"
+                  size="icon"
+                  class="shrink-0"
+                  aria-label={tokenCopied ? "Copied" : "Copy sync code"}
+                >
+                  {#if tokenCopied}
+                    <Check class="w-4 h-4 text-primary" />
+                  {:else}
+                    <Copy class="w-4 h-4" />
+                  {/if}
+                </Button>
+              </div>
+              {#if copyFailed}
+                <p class="text-xs text-muted-foreground">
+                  Could not reach the clipboard. Type the code instead.
+                </p>
+              {/if}
+            </div>
+          {:else}
+            <Button
+              onclick={handleShowShortCode}
+              variant="ghost"
+              class="w-full font-mono text-xs text-muted-foreground"
+            >
+              <Keyboard class="w-3.5 h-3.5 mr-2" />
+              Can't scan? Show a code to type
+            </Button>
+          {/if}
 
           {#if syncState.isConnecting}
             <p class="text-xs text-muted-foreground">Waiting for device...</p>
@@ -503,6 +560,48 @@ async function handleStartScanning() {
 
           <Button onclick={handleSelectMode} class="w-full font-mono">
             Continue
+          </Button>
+        </div>
+      {:else if view === "password"}
+        <div class="space-y-4">
+          <p class="text-sm text-muted-foreground">
+            {passwordRetry
+              ? "That password did not unlock the account from the other device. Try again."
+              : "Type the password of the account coming from the other device. Nothing is written until it unlocks."}
+          </p>
+          <Input
+            type="password"
+            bind:value={syncPassword}
+            placeholder="Account password"
+            class="font-mono"
+            onkeydown={(e) => {
+              if (e.key === "Enter" && syncPassword) {
+                // Same reason as the manual-code input: the keypress would
+                // otherwise bubble up and close the dialog mid-import.
+                e.preventDefault();
+                e.stopPropagation();
+                settlePassword(syncPassword);
+              }
+            }}
+          />
+          <Button
+            onclick={() => settlePassword(syncPassword)}
+            disabled={!syncPassword}
+            class="w-full font-mono"
+          >
+            Unlock and import
+          </Button>
+          <Button
+            onclick={() => {
+              // Settle first: the import is awaiting this promise, and only a
+              // null answer makes it abort without writing.
+              settlePassword(null);
+              handleClose();
+            }}
+            variant="outline"
+            class="w-full font-mono"
+          >
+            Cancel
           </Button>
         </div>
       {:else if view === "progress"}

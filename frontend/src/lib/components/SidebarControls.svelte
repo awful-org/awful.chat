@@ -64,10 +64,14 @@
     syncDialogOpen = true;
     params.delete("sync");
     const query = params.toString();
+    // The hash carries the room code - rebuilding the url without it would
+    // drop the room out of the address bar along with the query param.
     history.replaceState(
       {},
       "",
-      window.location.pathname + (query ? `?${query}` : "")
+      window.location.pathname +
+        (query ? `?${query}` : "") +
+        window.location.hash
     );
   });
 

@@ -42,13 +42,24 @@ export function hashSeed(seed: string): number {
   return hash >>> 0;
 }
 
+/**
+ * The most options a card can carry.
+ *
+ * The list was filtered by type but never bounded, so one card could seed a
+ * wheel with as many slices as fit in a message and every viewer would try to
+ * draw them. Cards are peer-supplied; a ceiling is cheaper than a repaint.
+ */
+export const MAX_OPTIONS = 32;
+
 export const initialState = (cardData: unknown) => {
     const data = (cardData ?? {}) as { options?: unknown; question?: unknown };
     return {
       question:
         typeof data.question === "string" ? data.question.slice(0, 200) : "",
       options: Array.isArray(data.options)
-        ? data.options.filter((o): o is string => typeof o === "string")
+        ? data.options
+            .filter((o): o is string => typeof o === "string")
+            .slice(0, MAX_OPTIONS)
         : [],
       spun: false,
       winner: null,

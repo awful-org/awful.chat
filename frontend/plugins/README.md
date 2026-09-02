@@ -76,7 +76,9 @@ export default definePlugin({
   card: WheelCard,
   // initialState receives the payload sendCard was given - seed from it.
   // Ignoring the argument while your reducer bounds-checks against state
-  // means every update is rejected against empty data.
+  // means every update is rejected against empty data. Its second argument
+  // is { senderDid }, the host-verified poster; see "The contract" below
+  // before you trust anything in cardData with an owner's name on it.
   initialState: (cardData) => ({
     options: (cardData as { options?: string[] })?.options ?? [],
     spun: false,
@@ -199,7 +201,8 @@ APIs declares them in the manifest - `requires: ["room-context",
 to load the plugin with a clear "needs a newer awful.chat" line instead of
 mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
-`call-audio`, `call-capture`, `clock-sample`, `local-card`, `now-playing`.
+`call-audio`, `call-capture`, `clock-sample`, `local-card`, `now-playing`,
+`plugin-stream`.
 Declare only what you truly cannot function without.
 
 **Per-plugin storage**: `host.storage` is a device-local key-value store,
@@ -319,11 +322,36 @@ tick below does. The host could hand you the message's `timestamp`, but it
 would not be worth more: that field is sender-supplied too. So order by
 `lamport`, display `atMs`, and treat neither as proof of anything.
 
-The starting state comes from `initialState(cardData)`, which receives the
-payload passed to `sendCard` - seed options and questions from it. A
+The starting state comes from `initialState(cardData, ctx)`. `cardData` is
+the payload passed to `sendCard` - seed options and questions from it. A
 reducer that bounds-checks against state while `initialState` ignores its
 argument sees empty data and rejects every update; that exact bug shipped
 once, which is why the parameter is worth this paragraph.
+
+`ctx` is `{ senderDid }`: **the card's host-verified sender, and the only
+trustworthy answer to "whose card is this"**. Anything your reducer later
+tests to decide who may write the card has to come from here. A payload field
+naming an owner is a claim, not a fact - anyone in the room can post a card
+with any `ownerDid` in it, and a plugin that read one handed the owner-only
+path to a forger. Ping's card is the worked example:
+
+```ts
+initialState: (cardData, ctx) => ({
+  targets: parseTargets(cardData),
+  // NEVER `cardData.ownerDid`. Empty means nobody owns it, and the reducer
+  // below then refuses every update, which is the right way to fail.
+  ownerDid: ctx?.senderDid ?? "",
+}),
+reduce(state, update, ctx) {
+  // Strict, never `state.ownerDid && ...`: that reads as "check when there
+  // is an owner" and behaves as "skip the check when there is not".
+  if (ctx.senderDid !== state.ownerDid) return state;
+  ...
+}
+```
+
+The argument is optional, so a plugin that only needs the payload keeps its
+one-argument `initialState` unchanged.
 
 Two related host calls: `host.cards()` lists the plugin's existing cards in
 the host's room (cheap - it reads only card rows), and
@@ -554,6 +582,34 @@ say so in the card. Placeholders belong in QUERY STRINGS (values are
 query-escaped). GET only, https only, 2 MB response cap, responses cached
 ~5 minutes, ~10 requests/minute per client. Document the hosts and secrets
 your plugin needs in its README.
+
+### Streaming media
+
+`proxyUrl` buffers, so it cannot carry a video: 2 MB is under one HLS
+segment and 10 requests/minute is under one minute of playback. For media
+there is a second endpoint, `streamUrl`, gated by the same
+`PLUGIN_PROXY_HOSTS` allowlist:
+
+```ts
+import { streamUrl } from "$lib/plugins/api";
+
+hls.loadSource(streamUrl("https://cdn.example.com/show/master.m3u8"));
+```
+
+It streams the body through instead of buffering it, passes `Range` in both
+directions so a player can seek, and keeps no copy - the upstream's own
+`Cache-Control` is what lets the browser cache segments. Ceilings are 64 MB
+per request, 8 concurrent requests per client (240/minute), and 256 across
+the instance; over either concurrency ceiling you get a 503, so let the
+player retry rather than treating it as fatal. A playlist's segment urls are
+relative to the playlist, so pass each one through `streamUrl` too, which is
+what hls.js does on its own once you give it a proxied source.
+
+No `{{secret:NAME}}` on this path: a player follows urls the playlist hands
+it, and a substituted key would ride along into requests the relay never
+composed. If your upstream needs a key, fetch the signed playlist url
+through `proxyUrl` and stream what it returns. Declare `plugin-stream` in
+`requires`, and a 204 still means "this instance is not configured".
 
 ## Rules
 

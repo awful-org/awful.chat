@@ -609,6 +609,15 @@ func handleTelemetryIngest(reg *registry) http.HandlerFunc {
 		}
 		bundleId, status, err := storeTelemetryBundle(peerId, full)
 		if err != nil {
+			// The 507 message is a fact about the quota and safe to say. The
+			// 500 one is whatever os.MkdirAll or os.WriteFile returned, which
+			// carries the absolute path of the data volume - reported to an
+			// anonymous caller. Log it instead and answer with a constant.
+			if status == http.StatusInternalServerError {
+				log.Printf("[telemetry] storing a bundle for %s failed: %v", peerId, err)
+				apiError(w, r, "internal error", status)
+				return
+			}
 			apiError(w, r, err.Error(), status)
 			return
 		}

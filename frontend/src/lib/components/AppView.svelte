@@ -88,13 +88,23 @@
 
   const queryClient = new QueryClient();
 
-  function parseRoomCode(pathname: string): string | null {
-    const m = pathname.match(/^\/r\/([^/]+)/);
-    if (!m) return null;
+  /**
+   * The room code out of the address bar, fragment form first.
+   *
+   * The code IS the membership secret, so it lives in `/r/#<code>` - a
+   * fragment is never sent to the server, never lands in an access log and
+   * never rides a Referer. `/r/<code>` still parses: links already handed out
+   * do not change, and App.svelte rewrites one to the fragment on load.
+   */
+  function parseRoomCode(pathname: string, hash: string): string | null {
+    if (!pathname.startsWith("/r/")) return null;
+    const raw =
+      hash.length > 1 ? hash.slice(1) : pathname.slice(3).split("/")[0];
+    if (!raw) return null;
     try {
-      return normalizeRoomCode(decodeURIComponent(m[1]));
+      return normalizeRoomCode(decodeURIComponent(raw));
     } catch {
-      return normalizeRoomCode(m[1]);
+      return normalizeRoomCode(raw);
     }
   }
 
@@ -120,7 +130,7 @@
 
 
   let pendingRoomCode = $state<string | null>(
-    parseRoomCode(window.location.pathname)
+    parseRoomCode(window.location.pathname, window.location.hash)
   );
 
   let joiningRoom = $state(false);
@@ -136,6 +146,21 @@
   $effect(() => {
     if (!identityStore.isUnlocked || bootstrapped) return;
     bootstrapped = true;
+    // The at-rest sweep runs at unlock, fire-and-forget, so it reports through
+    // a window event rather than a return value; see migrateAtRest.
+    window.addEventListener(
+      "awful:storage-notice",
+      async (e) => {
+        const dead = (e as CustomEvent<{ dead: number }>).detail?.dead ?? 0;
+        if (!dead) return;
+        const { _transport } = await import("$lib/transport/transport.svelte");
+        _transport.announce({
+          type: "app-warning",
+          message: `A bad update on 2026-09-02 damaged ${dead} stored records on this device and they have been removed. Rooms, messages and profiles come back as peers re-send them; rejoin rooms from their invite links.`,
+        });
+      },
+      { once: true }
+    );
     connect();
     // Offline DMs deposited at the relay while we were away (opt-in).
     import("$lib/transport/mailbox.svelte")
@@ -354,7 +379,7 @@
         transportState.roomName = label;
       }
       await saveRoom(roomCode, label);
-      history.pushState({ roomCode }, "", `/r/${roomCode}`);
+      history.pushState({ roomCode }, "", `/r/#${roomCode}`);
     } catch (err) {
       joinError = err instanceof Error ? err.message : String(err);
     }
@@ -817,10 +842,14 @@
     createJoinOpen = true;
     params.delete("new");
     const query = params.toString();
+    // The hash carries the room code - rebuilding the url without it would
+    // drop the room out of the address bar along with the query param.
     history.replaceState(
       {},
       "",
-      window.location.pathname + (query ? `?${query}` : "")
+      window.location.pathname +
+        (query ? `?${query}` : "") +
+        window.location.hash
     );
   });
 
@@ -840,7 +869,7 @@
   }
 
   function handlePopState() {
-    const code = parseRoomCode(window.location.pathname);
+    const code = parseRoomCode(window.location.pathname, window.location.hash);
     // The URL is the truth: even if the view already names this room, the
     // transport can be elsewhere (a DM opened underneath) - re-join then.
     if (code && (code !== activeRoomCode || transportState.roomCode !== code)) {

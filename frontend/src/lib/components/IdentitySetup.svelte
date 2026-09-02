@@ -20,8 +20,10 @@
     readBackupFile,
     applyBackup,
     summarizeBackup,
+    decryptBackup,
     type BackupFile,
     type BackupSummary,
+    type EncryptedBackupFile,
   } from "$lib/transport/sync.svelte";
   import { saveRememberedPassword } from "$lib/identity/remembered-password";
   import { requestPersistentStorage } from "$lib/storage";
@@ -83,6 +85,16 @@
   let backupSummary = $state<BackupSummary | null>(null);
   let backupError = $state<string | null>(null);
   let backupBusy = $state(false);
+  // An encrypted backup (the current format) gives up nothing, summary
+  // included, until its passphrase arrives. Raw state for the same reason as
+  // backupFile above.
+  let backupEnvelope = $state.raw<EncryptedBackupFile | null>(null);
+  let backupPassphrase = $state("");
+  // The account password inside the file. Asked BEFORE the import, because
+  // unlocking the identity first is what arms at-rest encryption, so the
+  // restored rows are sealed as they are written instead of landing
+  // plaintext and being swept later.
+  let backupPassword = $state("");
 
   // globalThis.File: the lucide File icon shadows the DOM type elsewhere in
   // the app, so this file follows the same convention.
@@ -90,20 +102,44 @@
     backupError = null;
     backupBusy = true;
     try {
-      const data = await readBackupFile(file);
-      if (!data.identity) {
-        // "add" mode merges into an existing identity; there is none here, so
-        // a backup without one cannot start this device.
-        throw new Error(
-          "This backup has no identity in it, so it cannot restore an account. Use a backup taken with 'include identity', or restore from your recovery phrase."
-        );
+      const parsed = await readBackupFile(file);
+      if (parsed.encrypted) {
+        backupEnvelope = parsed.envelope;
+        return;
       }
-      backupFile = data;
-      backupSummary = summarizeBackup(data);
+      acceptBackup(parsed.backup);
     } catch (e) {
       backupError = e instanceof Error ? e.message : String(e);
       backupFile = null;
       backupSummary = null;
+      backupEnvelope = null;
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  function acceptBackup(data: BackupFile) {
+    if (!data.identity) {
+      // "add" mode merges into an existing identity; there is none here, so
+      // a backup without one cannot start this device.
+      throw new Error(
+        "This backup has no identity in it, so it cannot restore an account. Use a backup taken with 'include identity', or restore from your recovery phrase."
+      );
+    }
+    backupFile = data;
+    backupSummary = summarizeBackup(data);
+  }
+
+  async function handleUnlockBackup() {
+    if (!backupEnvelope) return;
+    backupError = null;
+    backupBusy = true;
+    try {
+      acceptBackup(await decryptBackup(backupEnvelope, backupPassphrase));
+      backupEnvelope = null;
+      backupPassphrase = "";
+    } catch (e) {
+      backupError = e instanceof Error ? e.message : String(e);
     } finally {
       backupBusy = false;
     }
@@ -145,10 +181,12 @@
     backupError = null;
     backupBusy = true;
     try {
-      // "replace" adopts the identity stored in the file. The reload then
-      // boots into the unlock screen, where the password is the one that was
-      // in use when the backup was taken.
-      await applyBackup(backupFile, "replace");
+      // "replace" adopts the identity stored in the file. The password is
+      // typed before the import so the identity unlocks first and the rows
+      // land sealed; the reload then boots straight into the unlock screen.
+      await applyBackup(backupFile, "replace", {
+        requestPassword: async (retry) => (retry ? null : backupPassword),
+      });
       window.location.reload();
     } catch (e) {
       backupError = e instanceof Error ? e.message : String(e);
@@ -617,6 +655,9 @@
             backupFile = null;
             backupSummary = null;
             backupError = null;
+            backupEnvelope = null;
+            backupPassphrase = "";
+            backupPassword = "";
           }}
           class="text-muted-foreground hover:text-foreground font-mono mb-2 text-left transition-colors"
         >
@@ -630,12 +671,23 @@
         </CardDescription>
         <p class="text-muted-foreground text-xs font-mono leading-relaxed mt-2">
           Unlike a recovery phrase, this restores your rooms and messages too.
-          You unlock afterwards with the password that was in use when the
-          backup was taken.
+          You need the password that was in use when the backup was taken, and
+          the passphrase the file itself was encrypted with.
         </p>
       </CardHeader>
       <CardContent class="flex flex-col gap-3">
-        {#if !backupSummary}
+        {#if backupEnvelope}
+          <p class="text-muted-foreground text-xs font-mono leading-relaxed">
+            This backup file is encrypted. Type the passphrase chosen when it
+            was exported.
+          </p>
+          <Input
+            type="password"
+            bind:value={backupPassphrase}
+            placeholder="Backup file passphrase"
+            class="bg-background border-input font-mono"
+          />
+        {:else if !backupSummary}
           <label
             class="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed border-input px-4 py-6 cursor-pointer hover:border-primary/60 hover:bg-muted/30 transition-colors"
           >
@@ -674,6 +726,12 @@
           <p class="text-muted-foreground text-xs font-mono leading-relaxed">
             This device is empty, so nothing here is overwritten.
           </p>
+          <Input
+            type="password"
+            bind:value={backupPassword}
+            placeholder="Account password from this backup"
+            class="bg-background border-input font-mono"
+          />
         {/if}
         {#if backupError}
           <p class="text-destructive text-xs font-mono leading-relaxed">
@@ -682,13 +740,23 @@
         {/if}
       </CardContent>
       <CardFooter class="flex flex-col gap-2 pt-0">
-        <Button
-          onclick={handleApplyBackup}
-          disabled={!backupFile || backupBusy}
-          class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
-        >
-          {backupBusy ? "Restoring..." : "Restore this backup"}
-        </Button>
+        {#if backupEnvelope}
+          <Button
+            onclick={handleUnlockBackup}
+            disabled={!backupPassphrase || backupBusy}
+            class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
+          >
+            {backupBusy ? "Opening..." : "Open this backup"}
+          </Button>
+        {:else}
+          <Button
+            onclick={handleApplyBackup}
+            disabled={!backupFile || !backupPassword || backupBusy}
+            class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
+          >
+            {backupBusy ? "Restoring..." : "Restore this backup"}
+          </Button>
+        {/if}
       </CardFooter>
     </Card>
   {:else if step === "restore"}

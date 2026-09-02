@@ -114,7 +114,8 @@ export function normalizeNicknameColor(value: unknown): string | undefined {
  *
  * Closing it properly needs one of two things this function cannot decide on
  * its own: a relay-side image proxy that refetches the avatar server-side
- * (the relay has /og and /plugin-proxy but neither returns image bytes), or a
+ * (the relay has /og, /plugin-proxy and /plugin-stream, but the first two
+ * return no image bytes and the third only reaches allowlisted hosts), or a
  * "load remote images" opt-in the user can see and flip. Restricting this to
  * data: URLs alone is not an option - a linked avatar URL is a documented
  * feature and the picker offers a URL tab for it.

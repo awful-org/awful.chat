@@ -1,3 +1,4 @@
+import { normalizeRoomCode } from "$lib/room-code";
 import { SIGILS, type ParsedQuery, type QueryTerm, type Sigil } from "./types";
 
 /**
@@ -59,8 +60,13 @@ function splitTerms(body: string): QueryTerm[] {
   return terms;
 }
 
-/** A room code is three random bytes rendered as lowercase hex. */
-const ROOM_CODE = /^[0-9a-f]{6}$/;
+/**
+ * Every shape a room code has ever had: 13 chars of Crockford base32 today,
+ * 16 hex chars from 2026-08-28, 6 hex chars before that. Older rooms keep
+ * their code for life (see room-code.ts), so all three must still parse.
+ */
+const HEX_ROOM_CODE = /^(?:[0-9a-f]{6}|[0-9a-f]{16})$/;
+const BASE32_ROOM_CODE = /^[0-9A-HJKMNP-TV-Z]{13}$/;
 
 /**
  * Pull a room code out of whatever the user pasted.
@@ -68,6 +74,11 @@ const ROOM_CODE = /^[0-9a-f]{6}$/;
  * Accepts a bare code, a full invite URL, or a `web+awfl://` link, because all
  * three are things a user will paste into the palette. Mirrors the split that
  * `RoomCreateJoin` already does on its paste handler.
+ *
+ * Invite links carry the code in the FRAGMENT now (`/r/#<code>`), so the
+ * leading `#` has to come off before the split below - that split treats `#`
+ * as a terminator and would otherwise cut the whole code away. Path-form
+ * links keep working.
  *
  * @returns The lowercase room code, or `null` when the text is not one.
  */
@@ -77,14 +88,19 @@ export function parseRoomCode(text: string): string | null {
 
   const candidates = [trimmed];
   const afterPath = trimmed.split("/r/")[1];
-  if (afterPath !== undefined) candidates.push(afterPath);
+  if (afterPath !== undefined) candidates.push(afterPath.replace(/^#/, ""));
   const afterProtocol = trimmed.split("web+awfl://")[1];
   if (afterProtocol !== undefined) candidates.push(afterProtocol);
 
   for (const candidate of candidates) {
     // Drop any trailing path, query, or fragment left on a pasted URL.
-    const code = candidate.split(/[/?#]/)[0].trim().toLowerCase();
-    if (ROOM_CODE.test(code)) return code;
+    const raw = candidate.split(/[/?#]/)[0].trim();
+    // normalizeRoomCode folds separators and look-alikes only for a base32
+    // code and returns anything else trimmed, so legacy hex is untouched.
+    const folded = normalizeRoomCode(raw);
+    if (BASE32_ROOM_CODE.test(folded)) return folded;
+    const hex = raw.toLowerCase();
+    if (HEX_ROOM_CODE.test(hex)) return hex;
   }
   return null;
 }

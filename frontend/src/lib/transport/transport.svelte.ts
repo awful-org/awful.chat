@@ -44,8 +44,10 @@ import {
   updateParticipantLastSeen,
   cleanupInactiveParticipants,
 } from "../storage";
+import { normalizeWireName } from "../wire-name";
 import {
   MessageType,
+  boundReactionEmoji,
   boundReplyTo,
   wireToMessage,
   messageToWire,
@@ -160,11 +162,21 @@ import { initTransmission } from "./transmission.svelte";
 
 
 /**
- * Check if an ephemeral message can be sent without exceeding flood cap.
+ * Check if a plugin message can pass without exceeding its flood cap.
  * Returns true if under limit, false if rate-limited (drop excess).
+ *
+ * `kind` keeps ephemerals and persisted updates in separate windows: they
+ * share this mechanism and its sweep, not their budgets - an ephemeral is a
+ * cursor tick, a persisted update is a human pressing a button.
  */
-function _checkEphemeralFloodCap(pluginId: string, senderId: string): boolean {
-  const key = `${pluginId}|${senderId}`;
+function _checkFloodCap(
+  kind: "e" | "u",
+  pluginId: string,
+  senderId: string,
+  limit: number,
+  window: number
+): boolean {
+  const key = `${kind}|${pluginId}|${senderId}`;
   const now = Date.now();
   const entry = _ephemeralFloodTrack.get(key);
 
@@ -194,18 +206,45 @@ function _checkEphemeralFloodCap(pluginId: string, senderId: string): boolean {
     // Window expired or first message, start new window
     _ephemeralFloodTrack.set(key, {
       count: 1,
-      resetAt: now + EPHEMERAL_FLOOD_WINDOW,
+      resetAt: now + window,
     });
     return true;
   }
 
-  if (entry.count < EPHEMERAL_FLOOD_LIMIT) {
+  if (entry.count < limit) {
     entry.count += 1;
     return true;
   }
 
   // Exceeded limit, drop this message
   return false;
+}
+
+function _checkEphemeralFloodCap(pluginId: string, senderId: string): boolean {
+  return _checkFloodCap(
+    "e",
+    pluginId,
+    senderId,
+    EPHEMERAL_FLOOD_LIMIT,
+    EPHEMERAL_FLOOD_WINDOW
+  );
+}
+
+/**
+ * The same cap for PERSISTED plugin updates, which had none: only ephemerals
+ * were ever rate-limited, so a peer could push PluginUpdate rows at line rate
+ * and each one is a signature verify, an IDB write, a watermark write and a
+ * reducer fold. Looser than the ephemeral window because these are human
+ * actions - a vote, a spin, a card move - not per-frame ticks.
+ */
+function _checkUpdateFloodCap(pluginId: string, senderId: string): boolean {
+  return _checkFloodCap(
+    "u",
+    pluginId,
+    senderId,
+    UPDATE_FLOOD_LIMIT,
+    UPDATE_FLOOD_WINDOW
+  );
 }
 
 /**
@@ -468,6 +507,10 @@ const _ephemeralFloodTrack = new Map<
 let _ephemeralSweepAt = 0;
 const EPHEMERAL_FLOOD_LIMIT = 4;
 const EPHEMERAL_FLOOD_WINDOW = 1000; // milliseconds
+// Persisted updates: 20 per 10s per plugin per sender. A human clicking as
+// fast as they can stays well inside it; a flooder does not.
+const UPDATE_FLOOD_LIMIT = 20;
+const UPDATE_FLOOD_WINDOW = 10_000; // milliseconds
 // Above this many live windows, sweep the expired ones on the next check.
 const EPHEMERAL_FLOOD_MAX_KEYS = 256;
 
@@ -589,6 +632,16 @@ export const _fileTransport = new WebTorrentFileTransport(() =>
 initVoice(_voice, _dtln);
 initTransmission(_video);
 initFiles(_fileTransport);
+
+// Who the SFU is allowed to name as a producer: the same roster the voice
+// layer gets. Without it the media server decides which peerId a camera or
+// screen share is filed under, and that peerId is what the tile, the name
+// and the avatar are drawn from.
+_video.setCallPeerAdmission(
+  (peerId) =>
+    !!transportState.callRoomCode &&
+    transportState.callPeerRooms.get(peerId) === transportState.callRoomCode
+);
 
 /** Resolve the SFU host list once per call; each entry may be unparseable. */
 function _diagSfuHosts(): string[] {
@@ -829,8 +882,15 @@ function _sendRoomName(peerId?: string): void {
   // roomCode travels with it: a direct send has no topic to infer it from, so
   // the receiver used to apply the name to whatever room they had open.
   const payload = encode({ type: MessageType.RoomName, name, roomCode });
-  if (peerId) _transport.send(peerId, payload);
-  else _transport.broadcast(payload, roomCode);
+  if (peerId) {
+    // Same gate as _sendDigestForRoom, and for the same reason: this frame
+    // NAMES the room code, and a room code is the room's entire membership
+    // secret. The "connect" event fires for ANY peer that dials us - anyone
+    // who knows our permanent peerId can - so an ungated welcome handed the
+    // join secret for the room on screen to whoever turned up.
+    if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
+    _transport.send(peerId, payload);
+  } else _transport.broadcast(payload, roomCode);
 }
 
 async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
@@ -1111,6 +1171,29 @@ async function _sendDigest(peerId: string): Promise<void> {
   await _sendDigestForRoom(peerId, roomCode);
 }
 
+/**
+ * The "here is my call" frames a peer gets on connect, or once the relay
+ * places them in the call's room.
+ *
+ * Gated on membership of the CALL's room, same rule as _sendDigestForRoom:
+ * CallPresence carries that room's code, which is the room's entire
+ * membership secret - the gossipsub topic, the rendezvous key and the SFU
+ * join key. These went out on every "connect" (which fires for any peer that
+ * dials us) and again from _handleProfile on any profile, so a stranger who
+ * knew our peerId collected the join key for whatever room we were calling
+ * in. CallState and WatchPresence ride the same gate: they only describe a
+ * call whose existence is itself the thing being kept.
+ */
+function _sendCallFramesTo(peerId: string): void {
+  if (!transportState.inCall) return;
+  const callRoom = transportState.callRoomCode ?? transportState.roomCode;
+  if (!callRoom) return;
+  if (!_transport.peersInRoom(callRoom).includes(peerId)) return;
+  _sendCallPresence(peerId);
+  _sendCallState(peerId);
+  _sendWatchPresence(peerId);
+}
+
 
 async function _sendDigestForRoom(
   peerId: string,
@@ -1250,43 +1333,51 @@ async function _handleDigest(
   }
 
   let mine = await getWatermarksForRoom(roomCode);
-  // History written before watermarks existed for this room (all DMs until
-  // now) leaves `mine` empty, which reads as "nothing to compare" and makes
-  // reconciliation a no-op. Rebuild once from what is actually stored.
-  if (Object.keys(mine).length === 0) {
-    // Clear fields suffice for watermarks too - no decrypt for the rebuild.
-    const rebuilt = await getSenderMaxLamports(roomCode);
-    for (const [sid, lamport] of rebuilt) {
-      await setWatermark(roomCode, sid, lamport);
+
+  // Throttled BEFORE the work, not just before the send.
+  //
+  // Deciding what a peer is missing costs getSenderMaxLamports, which reads
+  // every row in the room off the lamport index (twice, when the watermark
+  // store also needs rebuilding), and the push that follows decrypts and
+  // re-uploads whatever it finds. The window used to sit on the send alone,
+  // so a member looping empty digests still bought a full-room scan per
+  // frame - throttling the reaction while leaving the amplifier running.
+  // Consuming the window on a digest that turns out to need no push is the
+  // deliberate cost: the scan is what has to be rationed, and the two cases
+  // are indistinguishable before it runs. One push hands over everything
+  // missing and the repair tick is slower than this window, so honest flows
+  // are unaffected.
+  if (allowSyncReaction(`push|${peerId}|${roomCode}`)) {
+    // History written before watermarks existed for this room (all DMs until
+    // now) leaves `mine` empty, which reads as "nothing to compare" and makes
+    // reconciliation a no-op. Rebuild once from what is actually stored.
+    if (Object.keys(mine).length === 0) {
+      // Clear fields suffice for watermarks too - no decrypt for the rebuild.
+      const rebuilt = await getSenderMaxLamports(roomCode);
+      for (const [sid, lamport] of rebuilt) {
+        await setWatermark(roomCode, sid, lamport);
+      }
+      if (rebuilt.size) mine = await getWatermarksForRoom(roomCode);
     }
-    if (rebuilt.size) mine = await getWatermarksForRoom(roomCode);
-  }
 
-  // Senders we hold messages from, not senders we happen to have a watermark
-  // row for. A partial watermark map (one row lost, or written before a sender
-  // was known) silently excluded that sender from every push we ever made.
-  // Clear fields only: building this via getAllMessages AES-decrypted the
-  // whole room on every background digest exchange, for two fields that
-  // were never encrypted in the first place.
-  const highest = await getSenderMaxLamports(roomCode);
-  for (const [sid, lamport] of Object.entries(mine)) {
-    const at = highest.get(sid);
-    if (at === undefined || lamport > at) highest.set(sid, lamport);
-  }
-  const theyAreMissing = [...highest.keys()].filter(
-    (sid) => (theirWatermarks[sid] ?? -1) < highest.get(sid)!
-  );
+    // Senders we hold messages from, not senders we happen to have a
+    // watermark row for. A partial watermark map (one row lost, or written
+    // before a sender was known) silently excluded that sender from every
+    // push we ever made. Clear fields only: building this via getAllMessages
+    // AES-decrypted the whole room on every background digest exchange, for
+    // two fields that were never encrypted in the first place.
+    const highest = await getSenderMaxLamports(roomCode);
+    for (const [sid, lamport] of Object.entries(mine)) {
+      const at = highest.get(sid);
+      if (at === undefined || lamport > at) highest.set(sid, lamport);
+    }
+    const theyAreMissing = [...highest.keys()].filter(
+      (sid) => (theirWatermarks[sid] ?? -1) < highest.get(sid)!
+    );
 
-  // The push decrypts every missing row and re-attaches inline bytes - the
-  // single most expensive reaction a frame can trigger. Throttled per
-  // (peer, room): a member looping empty digests got the whole room
-  // re-decrypted and re-uploaded per frame. One push hands over everything
-  // missing, so an honest peer has nothing to ask again inside the window.
-  if (
-    theyAreMissing.length > 0 &&
-    allowSyncReaction(`push|${peerId}|${roomCode}`)
-  ) {
-    await _pushMissingTo(peerId, roomCode, theirWatermarks);
+    if (theyAreMissing.length > 0) {
+      await _pushMissingTo(peerId, roomCode, theirWatermarks);
+    }
   }
 
   // A digest only tells the SENDER what they lack, so one exchange heals one
@@ -1570,7 +1661,23 @@ async function _handleSyncBatch(
   for (const w of verified) {
     const isPlugin =
       w.type === MessageType.PluginCard || w.type === MessageType.PluginUpdate;
-    if (isPlugin && !_parsePluginPayload(w.type, w.content)) {
+    const pluginPayload = isPlugin
+      ? _parsePluginPayload(w.type, w.content)
+      : null;
+    // A LIVE batch is the direct copy of a single live send, so it rides the
+    // same per-sender cap as the gossip copy - otherwise wrapping updates in
+    // live batches routes straight around it. A repair batch is exempt: a
+    // legitimate backfill hands over a room's whole update history at once,
+    // and dropping rows there would lose history rather than delay it.
+    if (
+      live &&
+      w.type === MessageType.PluginUpdate &&
+      pluginPayload &&
+      !_checkUpdateFloodCap(pluginPayload.pluginId, w.senderId)
+    ) {
+      continue;
+    }
+    if (isPlugin && !pluginPayload) {
       // Refused for good, so record it - otherwise every peer holding it
       // re-offers it on every repair tick forever. Recorded the same way as
       // the other deterministic rejects above: in memory, via _noteRefused,
@@ -1646,6 +1753,27 @@ async function _handleSyncBatch(
     usable = usable.filter((w) => !refused.has(w.id));
     if (!usable.length) return;
   }
+
+  // Beyond the hijack check: an id we ALREADY hold is never overwritten, even
+  // when the room and sender match. The v3 canonical covers the id, sender,
+  // lamport, content, reaction, replyTo.id, type and room - but NOT the
+  // timestamp, NOT the sender name, NOT a reply snapshot's text and NOT a
+  // file's dimensions. So a room member could take a row it holds (yours
+  // included), rewrite those, re-push it under the ORIGINAL signature, and
+  // have bulkPutMessages replace your copy on every peer that accepted the
+  // batch - message-order sorts by timestamp first, so that alone relocates
+  // or hides a message for everyone. Signed content cannot legitimately
+  // change, so the row we hold is authoritative and re-delivery is a no-op.
+  const duplicates = usable.filter((w) => known.has(w.id));
+  usable = usable.filter((w) => !known.has(w.id));
+  // One thing a re-push CAN legitimately add to a row we already hold: inline
+  // attachment bytes, which never reach storage with the row itself. Adopt
+  // those before dropping the duplicate - the descriptor they are checked
+  // against (infoHash, size) is inside the signature that just verified.
+  for (const w of duplicates) {
+    stripAndAdoptInlineFiles(wireToMessage(w, roomCode));
+  }
+  if (!usable.length) return;
 
   const fullMessages = usable.map((w) => wireToMessage(w, roomCode));
 
@@ -1814,20 +1942,9 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
 
 // ── Message handlers ──────────────────────────────────────────────────────────
 
-// Control characters (C0/C1) and bidi override/isolate characters: a wire
-// name is rendered as-is in the roster and chat, and either family can hide
-// or reorder text a user never typed - trojan-source-style in a nickname.
-const WIRE_NAME_STRIP_RE = /[\u0000-\u001F\u007F-\u009F\u202A-\u202E\u2066-\u2069]/g;
-
-/**
- * Same cap _handleRoomName already uses for a wire-supplied display string -
- * there is no dedicated client-side max on the nickname field itself, so this
- * mirrors the one precedent in this file rather than inventing a new number.
- */
-function _normalizeWireName(name: unknown): string {
-  if (typeof name !== "string") return "";
-  return name.replace(WIRE_NAME_STRIP_RE, "").trim().slice(0, 64);
-}
+// The strip-and-cap rule for a wire display name now lives in wire-name.ts:
+// every incoming chat row needs exactly the same treatment (wireToMessage),
+// and that path must not import this module - it boots libp2p on import.
 
 async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   // Bind the DID to the peerId only on a signature over THIS connection's
@@ -1871,11 +1988,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   // anyone is, no names, no presence and no history.
   if (!msg.reply) {
     _sendProfile(peerId, true);
-    if (transportState.inCall) {
-      _sendCallPresence(peerId);
-      _sendCallState(peerId);
-      _sendWatchPresence(peerId);
-    }
+    _sendCallFramesTo(peerId);
   }
   // Reconcile history with them either way; debounced, so a burst is one.
   _syncPeer(peerId);
@@ -1885,7 +1998,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   // color. Explicit null (or junk that fails sanitizing) = "no color".
   const hasColorField = msg.color !== undefined;
   const color = hasColorField ? normalizeNicknameColor(msg.color) : undefined;
-  const name = _normalizeWireName(msg.name);
+  const name = normalizeWireName(msg.name);
 
   const names = new Map(transportState.peerNames);
   names.set(did, name);
@@ -1991,7 +2104,17 @@ export function _handleWatchPresence(
     copy.delete(viewerPeerId);
     if (copy.size > 0) next.set(sharer, copy);
   }
-  if (watching) {
+  // REMOVING always runs - the disconnect handler clears a departing peer
+  // through here. ADDING does not: this frame was applied for any peer that
+  // could reach us, naming any string as the peer being watched, so a
+  // stranger could plant themselves in someone's viewer chip and grow this
+  // map with junk keys. A viewer has to be somebody call presence already
+  // places in a room the relay agrees they are in, and the value it names
+  // has to look like a peerId rather than arbitrary text.
+  const theirRoom = transportState.callPeerRooms.get(viewerPeerId);
+  const admitted =
+    !!theirRoom && _transport.isRoomPeer(theirRoom, viewerPeerId);
+  if (watching && admitted && looksLikePeerId(watching)) {
     const set = new Set(next.get(watching) ?? []);
     set.add(viewerPeerId);
     next.set(watching, set);
@@ -2018,7 +2141,21 @@ function _handleCallPresence(
   const wasInCall = next.has(peerId);
   const theirRoom = roomNext.get(peerId);
 
-  if (inCall && roomCode && _transport.rooms().includes(roomCode)) {
+  if (
+    inCall &&
+    roomCode &&
+    _transport.rooms().includes(roomCode) &&
+    // ...and the SENDER has to be in that room too. Only OUR membership was
+    // ever checked, so any peer that could reach us could claim to be in a
+    // call in a room they are not in, land in callPeerRooms, and be handed
+    // straight to _voice.setCallPeers - whose whole admission rule is that
+    // roster. That is an outsider's offer accepted and our microphone
+    // attached to it. Relay-attested membership, deliberately NOT
+    // intersected with the connection list: a presence frame legitimately
+    // reaches us through the gossip mesh from a member we have not dialled,
+    // which is exactly the case the dialNow below exists for.
+    _transport.isRoomPeer(roomCode, peerId)
+  ) {
     // Membership-gated like the handlers above: "in a call" for a room we
     // never joined is unverifiable noise - at best meaningless, at worst a
     // fake ring sound from any connected peer.
@@ -2085,12 +2222,20 @@ export function _syncVoiceRoster(): void {
     if (theirRoom === room) peers.push(peerId);
   }
   _voice.setCallPeers(peers);
+  // Same roster, same moment: the SFU's producer announcements are gated on
+  // it too, and presence routinely lands after the announcement it admits.
+  _video.retryDeferredProducers();
 }
 
 function _handleCallState(peerId: string, msg: WireCallState): void {
-  if (transportState.callPeerRooms.has(peerId)) {
-    _callPeerSeen.set(peerId, Date.now());
-  }
+  // Same membership rule as _handleCallPresence, which is what fills
+  // callPeerRooms in the first place: a mute/deafen badge belongs to somebody
+  // already known to be in a call in a room the relay places them in.
+  // Applying it to any peerId that sent one let a stranger paint badges and
+  // grow this map, and refreshed the TTL that sweeps roster ghosts.
+  const theirRoom = transportState.callPeerRooms.get(peerId);
+  if (!theirRoom || !_transport.isRoomPeer(theirRoom, peerId)) return;
+  _callPeerSeen.set(peerId, Date.now());
   const next = new Map(transportState.callPeerStates);
   next.set(peerId, {
     muted: !!msg.muted,
@@ -2344,6 +2489,17 @@ async function _handleChatMessage(
     );
     return;
   }
+  // The flood cap covered ephemerals only, so persisted updates - which cost
+  // strictly more (a store, a watermark, a fold) - were unlimited. Dropped
+  // rather than stored: nothing here claims a watermark for it, so a row
+  // wrongly caught by the window is still recoverable through history repair.
+  if (
+    wire.type === MessageType.PluginUpdate &&
+    pluginPayload &&
+    !_checkUpdateFloodCap(pluginPayload.pluginId, wire.senderId)
+  ) {
+    return;
+  }
 
   // Per room, so a DM's wall-clock lamport can no longer be absorbed into a
   // chat room's counter - which it was, unguarded, on this path.
@@ -2479,7 +2635,9 @@ async function _handleChatMessage(
     if (seederPeerId) {
       _fileTransport.registerSeeder(file, seederPeerId);
     }
-    if (shouldAutoDownload(file.mimeType)) {
+    // Size passed too: auto-download is on by default, so this is a fetch
+    // nobody asked for and it needs a ceiling (see AUTO_DOWNLOAD_MAX_BYTES).
+    if (shouldAutoDownload(file.mimeType, file.size)) {
       _fileTransport.ensureDownload(file);
     } else {
       withFileTransfer({
@@ -2519,6 +2677,16 @@ _transport.on("status", (status) => {
 _transport.on("roomPeers", (room, peerIds) => {
   if (!_transport.rooms().includes(room)) return;
   for (const pid of peerIds) {
+    // The other half of the connect handler's gate. Everything there that
+    // names a room code is refused for a peer the relay had not yet placed
+    // in the room, and "connect" never fires again for a peer we are already
+    // connected to - so without this a peer who arrived before the relay's
+    // PEERS reply never learned the room's name, never saw its roster, and
+    // never heard about a call in it. All three handlers are idempotent, so
+    // repeating them when the relay re-lists a peer costs a few small frames.
+    _sendRoomName(pid);
+    _sendCallFramesTo(pid);
+    _sendRoomUsers(pid, room).catch(() => {});
     if (!_peerIdToDid.has(pid)) continue;
     const did = _peerIdToDid.get(pid);
     if (!did) continue;
@@ -2564,10 +2732,12 @@ _transport.on("connect", (peerId) => {
   // short-circuits.
   _announceStoredFilesTo(peerId).catch(() => {});
   _sendProfile(peerId);
+  // Everything below is membership-gated inside the sender (a room code is
+  // the room's only join secret and this event fires for any peer that dials
+  // us). A peer that connects BEFORE the relay lists them in the room gets
+  // nothing here; the "roomPeers" handler is what catches them up.
   _sendRoomName(peerId);
-  if (transportState.inCall) _sendCallPresence(peerId);
-  if (transportState.inCall) _sendCallState(peerId);
-  if (transportState.inCall) _sendWatchPresence(peerId);
+  _sendCallFramesTo(peerId);
   _sendDigest(peerId);
   if (transportState.roomCode) {
     _sendRoomUsers(peerId, transportState.roomCode).catch(() => {});
@@ -2582,6 +2752,12 @@ async function _sendRoomUsers(
   peerId: string,
   roomCode: string
 ): Promise<void> {
+  // The roster frame carries its roomCode, so it is gated exactly like a
+  // digest: only somebody the relay already places in that room may be told
+  // the room exists. This went out on every "connect", which fires for any
+  // peer that dials us - so it handed out the join secret AND the member
+  // list to strangers.
+  if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
   const selfDid = identityStore.did ?? _transport.selfId();
   const known =
     roomCode === transportState.roomCode
@@ -2758,7 +2934,10 @@ function _handleDmChatAsync(
     // message in the recipient's store.
     replyTo: boundReplyTo(envelope.payload.replyTo),
       reactionTo: reaction?.to,
-      reactionEmoji: reaction?.emoji,
+      // Same reasoning as the bound beside it: this path builds the Message
+      // by hand rather than through wireToMessage, so it applies the emoji
+      // cap itself or a DM peer can store a megabyte "emoji" per reaction.
+      reactionEmoji: boundReactionEmoji(reaction?.emoji),
       reactionOp: reaction?.op,
       attachments: [],
       status: "delivered",
@@ -2827,6 +3006,17 @@ function _handleDmChatAsync(
         .catch(() => {});
     }
   })();
+}
+
+/**
+ * Do we have any reason to talk about this infoHash? A live transfer, or an
+ * attachment row from a message we hold. Used to refuse file signals for
+ * hashes we never asked about.
+ */
+async function _haveFileFor(infoHash: string): Promise<boolean> {
+  if (transportState.fileTransfers.has(infoHash)) return true;
+  const rows = await getAttachmentsByInfoHash(infoHash).catch(() => []);
+  return rows.length > 0;
 }
 
 /**
@@ -2915,7 +3105,7 @@ _transport.on("message", (peerId, data, room) => {
             if (!shared) return;
             _fileTransport.registerSeeder(file, peerId);
             if (
-              shouldAutoDownload(file.mimeType) &&
+              shouldAutoDownload(file.mimeType, file.size) &&
               transportState.fileTransfers.has(file.infoHash)
             ) {
               _fileTransport.ensureDownload(file);
@@ -2923,7 +3113,19 @@ _transport.on("message", (peerId, data, room) => {
           })
           .catch(() => {});
       } else {
-        _fileTransport.handleSignal(peerId, decoded.payload);
+        // The sibling branch above is membership-gated; this one had no gate
+        // at all, so any peer that could dial us could open a WebRTC link
+        // against us for any infoHash it liked - a full RTCPeerConnection
+        // each, out of a global table of 32, from a peer with no business in
+        // any of our rooms. Same membership rule, plus: a file signal is only
+        // meaningful for a transfer or an attachment we actually hold, so an
+        // infoHash we have never heard of buys nothing.
+        const signal = decoded.payload;
+        void (async () => {
+          if (!(await _peerSharesRoomWithUs(peerId))) return;
+          if (!(await _haveFileFor(signal.infoHash))) return;
+          _fileTransport.handleSignal(peerId, signal);
+        })().catch(() => {});
       }
       return;
     }
@@ -3162,8 +3364,12 @@ async function _joinSavedRooms(): Promise<void> {
   // prevents the participant list from growing unbounded over time.
   for (const room of rooms) {
     const removed = await cleanupInactiveParticipants(room.roomCode);
+    // Count only. This logged the room code and the participant DIDs, and a
+    // room code is the room's entire membership secret - a console line is
+    // exactly the sort of place it leaks out of (screenshots, bug reports,
+    // an extension reading console output).
     if (removed.length > 0) {
-      console.log("[room] removed inactive participants from", room.roomCode, ":", removed);
+      console.log("[room] removed", removed.length, "inactive participant(s)");
     }
   }
   for (const room of rooms) {

@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   drainNotifyIntents,
+  rememberRoomRef,
   storeNotifyIntent,
+  ROOM_REF_PREFIX,
   type NotifyIntent,
 } from "./notify-intents";
 
@@ -42,6 +44,31 @@ describe("notify intents", () => {
     const [got] = await drainNotifyIntents();
     expect(got.dmPeerDid).toBe("did:key:zPeer");
     expect(got.roomCode).toBe("dm-x");
+  });
+
+  it("turns a conversation ref back into the room code it stands for", async () => {
+    const ref = `${ROOM_REF_PREFIX}0123456789abcdef`;
+    await rememberRoomRef(ref, "the-real-room-code");
+    await storeNotifyIntent(intent({ roomCode: ref, text: "reply" }));
+
+    const [got] = await drainNotifyIntents();
+    expect(got.roomCode).toBe("the-real-room-code");
+    expect(got.text).toBe("reply");
+  });
+
+  it("drops an intent whose ref this device cannot resolve", async () => {
+    // The mapping is gone (a wipe, cleared site data). Routing the reply to
+    // the ref itself would send it to a conversation nobody named.
+    await storeNotifyIntent(
+      intent({ roomCode: `${ROOM_REF_PREFIX}deadbeefdeadbeef` })
+    );
+    expect(await drainNotifyIntents()).toEqual([]);
+  });
+
+  it("still routes an intent from a build that stored the room code itself", async () => {
+    await storeNotifyIntent(intent({ roomCode: "plain-room" }));
+    const [got] = await drainNotifyIntents();
+    expect(got.roomCode).toBe("plain-room");
   });
 
   it("drops intents older than 24h but still clears them", async () => {

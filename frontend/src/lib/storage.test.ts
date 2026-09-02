@@ -37,6 +37,8 @@ import {
   getRoomParticipants,
 } from "./storage";
 import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
+import { STORE_SPECS, inspectRow, isCurrentAad, sealRow } from "./storage-crypto";
+import { getAllRooms as allRooms, putRoom as saveRoomRow, getRoom as roomByCode } from "./storage";
 import { MessageType, type Message } from "./types/message";
 
 const TEST_KEY = new Uint8Array(32).fill(42);
@@ -304,6 +306,47 @@ describe("at-rest encryption", () => {
     const back = await getMessage("sealed-1");
     expect(back?.content).toBe("top secret words");
     expect(back?.senderName).toBe("Alice");
+  });
+
+  it("migrateAtRest deletes a row the previous sweep sealed twice, so it can be re-synced", async () => {
+    await saveRoomRow({
+      roomCode: "X5M9PR989E7KA",
+      name: "probe",
+      type: "text",
+      lastSeenLamport: 0,
+      createdAt: 1,
+      participants: [],
+      participantLastSeen: {},
+    });
+    const db = await getDB();
+    const [raw] = await db.getAll("rooms");
+    // The 2026-09-02 sweep: sealRow over the sealed row, written back under
+    // the same (blinded) key. The room now opens to its own hash.
+    const twice = await sealRow(raw as unknown as Record<string, unknown>, STORE_SPECS.rooms);
+    await db.put("rooms", twice as never);
+    const broken = await roomByCode("X5M9PR989E7KA");
+    expect(broken?.roomCode).not.toBe("X5M9PR989E7KA");
+
+    await migrateAtRest();
+
+    // Gone, not duplicated and not crashing the room list.
+    expect(await allRooms()).toEqual([]);
+    expect(await db.getAll("rooms")).toEqual([]);
+    expect(await roomByCode("X5M9PR989E7KA")).toBeUndefined();
+    // The room can be recreated cleanly under the same key.
+    await saveRoomRow({
+      roomCode: "X5M9PR989E7KA",
+      name: "probe again",
+      type: "text",
+      lastSeenLamport: 0,
+      createdAt: 2,
+      participants: [],
+      participantLastSeen: {},
+    });
+    const [fresh] = await db.getAll("rooms");
+    expect(isCurrentAad(fresh)).toBe(true);
+    expect((await inspectRow(fresh, STORE_SPECS.rooms)).value).toMatchObject({ name: "probe again" });
+    expect((await roomByCode("X5M9PR989E7KA"))?.name).toBe("probe again");
   });
 
   it("migrateAtRest seals legacy plaintext rows in place", async () => {

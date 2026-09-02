@@ -64,6 +64,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "now-playing",
   "confirm",
   "plugin-settings",
+  "plugin-stream",
 ]);
 
 export interface UpdateCtx {
@@ -72,6 +73,17 @@ export interface UpdateCtx {
   updateId: string; // message id, stable across peers
   lamport: number;
   ephemeral: boolean;
+}
+
+/**
+ * What the host knows about a card that its payload cannot claim.
+ *
+ * `senderDid` is the signed message's sender, so it is the ONLY trustworthy
+ * answer to "who posted this card". A payload field naming an owner is
+ * peer-supplied: anyone in the room can send a card claiming any DID.
+ */
+export interface CardCtx {
+  senderDid: string; // host-verified, never from payload
 }
 
 export interface HostApi {
@@ -319,8 +331,13 @@ export interface PluginDefinition {
    * object passed to host.sendCard) so options/questions seed the state -
    * without it a reducer bounds-checking against state saw empty data and
    * rejected every update.
+   *
+   * `ctx.senderDid` is the card's host-verified sender. Anything that decides
+   * who may write the card must come from there, NEVER from `cardData`: the
+   * payload is peer-supplied, so an `ownerDid` in it is a claim, not a fact.
+   * Second argument, so a plugin that only needs the payload keeps working.
    */
-  initialState?: (cardData: unknown) => unknown;
+  initialState?: (cardData: unknown, ctx: CardCtx) => unknown;
   commands?: Record<
     string,
     (args: string, host: HostApi) => void | Promise<void>
@@ -368,6 +385,23 @@ export interface PluginUpdate {
  */
 export function proxyUrl(upstream: string): string {
   return `${apiUrl()}/plugin-proxy?url=${encodeURIComponent(upstream)}`;
+}
+
+/**
+ * The instance's STREAMING proxy, for media a browser cannot fetch itself:
+ * an HLS playlist and its segments on a CDN that pins CORS to its own
+ * origin. Same allowlist as `proxyUrl`, but the body is streamed rather than
+ * buffered, `Range` is passed through in both directions, and the relay keeps
+ * no copy, so the upstream's own caching headers are what a browser sees.
+ *
+ * Not a general replacement for `proxyUrl`: no `{{secret:NAME}}` is
+ * substituted here (a player follows playlist-relative urls of its own, which
+ * would carry the key onward), and there is no response cache.
+ *
+ * Read at call time for the same reason `proxyUrl` is, see above.
+ */
+export function streamUrl(upstream: string): string {
+  return `${apiUrl()}/plugin-stream?url=${encodeURIComponent(upstream)}`;
 }
 
 export function definePlugin(def: PluginDefinition): PluginDefinition {

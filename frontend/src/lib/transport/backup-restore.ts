@@ -40,13 +40,16 @@ import type {
 import {
   bytesFromExport,
   mergeImportedRoom,
-  parseBackup,
+  parseBackupFileText,
   pfpFromJson,
   sanitizeCollections,
   type AttachmentExport,
   type BackupFile,
   type DatabaseExport,
+  type ParsedBackupFile,
 } from "./backup";
+import { unlockWithImportedMnemonic } from "../identity/identity";
+import type { MnemonicRecord } from "../identity/identity";
 
 export interface ImportResult {
   /** Records dropped by the per-record shape/size validator (see
@@ -56,11 +59,56 @@ export interface ImportResult {
   droppedRecords: number;
 }
 
+export interface ImportOptions {
+  /**
+   * Asked for the imported identity's password BEFORE anything is wiped or
+   * written, so the at-rest key is armed and sealRow seals every imported row
+   * on write. Return null to abort with nothing changed. `retry` is true when
+   * the previous answer was rejected, so the prompt can say so instead of
+   * looking like it hung.
+   *
+   * Without it an import carrying an identity falls back to the plaintext
+   * window (beginPlaintextImport), which only stays safe because the first
+   * unlock sweeps those rows sealed - and IndexedDB keeps the plaintext it
+   * overwrote.
+   */
+  requestPassword?: (retry: boolean) => Promise<string | null>;
+}
+
+/** The stored mnemonic record that an export's identity section describes. */
+function mnemonicRecordFromExport(
+  identity: NonNullable<DatabaseExport["identity"]>
+): MnemonicRecord {
+  return {
+    id: "mnemonic" as const,
+    salt: new Uint8Array(identity.mnemonic.salt),
+    iv: new Uint8Array(identity.mnemonic.iv),
+    encrypted: new Uint8Array(identity.mnemonic.encrypted).buffer,
+    // Absent = written before per-record counts existed = legacy 100k,
+    // which is exactly what unlockIdentity assumes when it is undefined.
+    ...(typeof identity.mnemonic.iterations === "number"
+      ? { iterations: identity.mnemonic.iterations }
+      : {}),
+  };
+}
+
 export async function importDatabase(
   data: DatabaseExport,
-  mode: "add" | "replace" = "replace"
+  mode: "add" | "replace" = "replace",
+  options: ImportOptions = {}
 ): Promise<ImportResult> {
   console.log(`[Sync] Importing database in ${mode} mode`);
+
+  // "add" merges into the identity this device ALREADY has; an identity
+  // section would overwrite it, which is a takeover, not a merge. Dropped
+  // here rather than at each call site so every caller is covered - the file
+  // restore stripped it, the device-sync target did not.
+  const identity = mode === "add" ? undefined : data.identity;
+  if (mode === "add" && data.identity) {
+    console.warn(
+      "[Sync] Ignoring the identity section: add mode keeps this device's identity"
+    );
+  }
 
   // Every collection below arrived via JSON (a backup file or a
   // device-sync frame) and is untrusted input: drop any record whose shape
@@ -94,6 +142,7 @@ export async function importDatabase(
   }
   const sanitizedData: DatabaseExport = {
     ...data,
+    identity,
     messages,
     attachments,
     pending,
@@ -104,6 +153,35 @@ export async function importDatabase(
     savedGifs,
   };
 
+  // Arm the at-rest key from the INCOMING identity before anything is wiped
+  // or written. Without it the whole import lands in plaintext (no key exists
+  // on a device that has never unlocked), and IndexedDB does not erase what a
+  // later write overwrites - so the sweep that seals these rows leaves the
+  // plaintext originals recoverable, which is exactly what the at-rest design
+  // and the duress wipe assume never happens.
+  let armed = false;
+  if (identity && options.requestPassword) {
+    const record = mnemonicRecordFromExport(identity);
+    for (let retry = false; ; retry = true) {
+      const password = await options.requestPassword(retry);
+      // Cancelled: nothing has been wiped or written yet, and nothing will be.
+      if (password == null) {
+        throw new Error("Import cancelled - nothing on this device changed");
+      }
+      try {
+        await unlockWithImportedMnemonic(record, password);
+        armed = true;
+        break;
+      } catch (err) {
+        // Only a mistyped password is worth asking again for; anything else
+        // (a corrupt record, a broken WebCrypto) is not the user's to fix.
+        if (!(err instanceof Error) || err.message !== "Wrong password") {
+          throw err;
+        }
+      }
+    }
+  }
+
   if (mode === "replace") {
     // Clear existing data first
     console.log("[Sync] Wiping local database (replace mode)");
@@ -113,24 +191,24 @@ export async function importDatabase(
     // identity that owns them, so drop the key: the rows land plaintext and
     // the first unlock as the RIGHT identity derives the right key and
     // sweeps them sealed. (DataSettings reloads after a replace restore, so
-    // the stale session never touches storage again.)
-    clearStorageCrypto();
+    // the stale session never touches storage again.) The armed case above is
+    // the exception: that key IS the imported identity's.
+    if (!armed) clearStorageCrypto();
   }
-  // A fresh sync target has never unlocked, so no at-rest key exists yet -
-  // there is nothing to derive it from until the user types their password.
-  // Inside this window sealRow passes rows through as plaintext instead of
-  // throwing, and the sweep flag makes the first unlock seal all of it.
-  const endPlaintextImport = beginPlaintextImport();
-  // Unconditionally. Replace mode has already dropped the key above, so this
-  // was equivalent in practice, but the sweep flag is what stands between an
-  // import's plaintext rows and permanence: if any future path here writes
-  // while a key IS armed, arming the sweep must not depend on a condition that
-  // happens to be true today.
+  // Fallback for an import with no identity to unlock with - a merge onto a
+  // locked device, or a caller that asks for no password. A fresh sync target
+  // has never unlocked, so no at-rest key exists yet: inside this window
+  // sealRow passes rows through as plaintext instead of throwing, and the
+  // sweep flag makes the first unlock seal all of it.
+  const endPlaintextImport = armed ? null : beginPlaintextImport();
+  // Unconditionally. The sweep flag is what stands between an import's
+  // plaintext rows and permanence, so arming it must not depend on a
+  // condition that happens to be true today.
   markAtRestSweepNeeded();
   try {
     await importDatabaseInner(sanitizedData, mode);
   } finally {
-    endPlaintextImport();
+    endPlaintextImport?.();
   }
   return { droppedRecords };
 }
@@ -140,20 +218,12 @@ async function importDatabaseInner(
   mode: "add" | "replace"
 ): Promise<void> {
 
-  // Import identity only if provided (not provided in "add" mode)
-  if (data.identity) {
+  // Import identity only if provided, and never in "add" mode: a merge keeps
+  // the identity this device already has. Re-checked here rather than trusted
+  // from importDatabase so no future caller can reach this write in add mode.
+  if (data.identity && mode !== "add") {
     console.log("[Sync] Importing identity");
-    const mnemonicRecord = {
-      id: "mnemonic" as const,
-      salt: new Uint8Array(data.identity.mnemonic.salt),
-      iv: new Uint8Array(data.identity.mnemonic.iv),
-      encrypted: new Uint8Array(data.identity.mnemonic.encrypted).buffer,
-      // Absent = written before per-record counts existed = legacy 100k,
-      // which is exactly what unlockIdentity assumes when it is undefined.
-      ...(typeof data.identity.mnemonic.iterations === "number"
-        ? { iterations: data.identity.mnemonic.iterations }
-        : {}),
-    };
+    const mnemonicRecord = mnemonicRecordFromExport(data.identity);
 
     const keypairRecord = {
       id: "keypair" as const,
@@ -283,11 +353,14 @@ async function importDatabaseInner(
 // ── File backup (QR-less alternative to device sync) ─────────────────────────
 
 /**
- * Parse and validate a backup file chosen by the user.
+ * Parse a backup file chosen by the user, WITHOUT decrypting it: an
+ * encrypted file comes back as its envelope, and the caller asks for the
+ * passphrase before calling decryptBackup.
+ *
  * @throws if the file is not a backup this build understands.
  */
-export async function readBackupFile(file: File): Promise<BackupFile> {
-  return parseBackup(await file.text());
+export async function readBackupFile(file: File): Promise<ParsedBackupFile> {
+  return parseBackupFileText(await file.text());
 }
 
 /**
@@ -298,15 +371,14 @@ export async function readBackupFile(file: File): Promise<BackupFile> {
  */
 export async function applyBackup(
   data: BackupFile,
-  mode: "add" | "replace"
+  mode: "add" | "replace",
+  options: ImportOptions = {}
 ): Promise<ImportResult> {
   if (mode === "replace" && !data.identity) {
     throw new Error("This backup has no identity, so it cannot replace yours");
   }
-  return importDatabase(
-    mode === "add" ? { ...data, identity: undefined } : data,
-    mode
-  );
+  // importDatabase drops the identity in add mode itself.
+  return importDatabase(data, mode, options);
 }
 
 /**

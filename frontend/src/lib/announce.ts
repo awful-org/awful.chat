@@ -3,6 +3,8 @@ import { notifyMessage } from "./notify.svelte";
 import { humanizeMentions, mentionsMe } from "./mentions";
 import { getManifest } from "./plugins/registry";
 import { roomsStore } from "./rooms.svelte";
+import { hashRef } from "./storage-crypto";
+import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
 
 /**
  * Telling the user a message arrived: the sound, and the notification when the
@@ -53,6 +55,21 @@ function claim(id: string): boolean {
 /** Test seam: a fresh module per case is not worth a vi.resetModules dance. */
 export function _resetAnnounced(): void {
   announced.clear();
+}
+
+/**
+ * The opaque name a conversation goes by inside a notification.
+ *
+ * A notification's tag and data bag are kept by the browser, and on Android by
+ * the OS, which is storage this app can neither lock nor shred - and the room
+ * code is the room's entire membership secret. Unkeyed on purpose: the ref is
+ * minted while the app is unlocked but has to survive being read back with no
+ * key at all, and a 65-bit room code behind SHA-256 gives nothing away.
+ * notify-intents.ts keeps the sealed ref -> room code mapping so the click
+ * still finds the conversation.
+ */
+export function conversationRef(roomCode: string): string {
+  return `${ROOM_REF_PREFIX}${hashRef(roomCode)}`;
 }
 
 /**
@@ -108,20 +125,28 @@ export function announceMessage(msg: Message, ctx: AnnounceContext): void {
     } else {
       // The message's OWN room, not the one on screen: titling a background
       // room's message with the open room's name pointed the reader at the
-      // wrong conversation.
+      // wrong conversation. An unnamed room falls back to a generic label,
+      // NEVER to the code - a notification is read on a lock screen, over a
+      // shoulder, and the code is the room's membership secret.
       title =
         roomsStore.rooms.find((r) => r.roomCode === msg.roomCode)?.name ||
-        msg.roomCode;
+        "New message";
       preview = `${msg.senderName}: ${body}`;
     }
+
+    const ref = conversationRef(msg.roomCode);
+    // Fire and forget, before the notification goes up so the mapping is on
+    // disk by the time a click can arrive. A failure here costs the click its
+    // routing, never the notification.
+    void rememberRoomRef(ref, msg.roomCode).catch(() => {});
 
     notifyMessage({
       title,
       body: preview,
-      tag: `${isDm ? "dm" : "room"}:${msg.roomCode}`,
+      tag: `${isDm ? "dm" : "room"}:${ref}`,
       viewingConversation: ctx.uiRoomCode === msg.roomCode,
       data: {
-        roomCode: msg.roomCode,
+        roomCode: ref,
         // An inbound DM's sender IS the other side of the conversation, so a
         // click on the notification routes straight back to it.
         dmPeerDid: isDm ? msg.senderDid || msg.senderId : undefined,

@@ -253,3 +253,120 @@ describe("applyBackup drops malformed records instead of importing them", () => 
     expect(result.droppedRecords).toBe(0);
   });
 });
+
+// "Merge" is supposed to keep this device's account and fold the other
+// device's history in. The importer wrote whatever identity section it was
+// handed, and the device-sync target forwarded one in every mode - so a merge
+// silently replaced the identity, and the device it merged onto woke up as
+// somebody else's account.
+describe("a merge never adopts the incoming identity", () => {
+  it("keeps this device's identity records untouched in add mode", async () => {
+    const incoming = await backupFromAnIdentity();
+
+    await wipeLocalDatabase();
+    const { keypair: mine } = await createIdentity("my own password");
+    const mnemonicBefore = await getMnemonicRecord();
+
+    await applyBackup(incoming, "add");
+
+    expect((await getKeypairRecord())?.did).toBe(mine.did);
+    expect(mine.did).not.toBe(incoming.identity?.keypair.did);
+    const mnemonicAfter = await getMnemonicRecord();
+    expect(Array.from(new Uint8Array(mnemonicAfter!.encrypted))).toEqual(
+      Array.from(new Uint8Array(mnemonicBefore!.encrypted))
+    );
+
+    // ...and the data it came for still merged in.
+    expect((await getAllRooms()).map((r) => r.roomCode)).toContain(
+      "restoredroom0001"
+    );
+  });
+});
+
+// The import used to write every row in the clear and rely on the first
+// unlock sweeping them sealed. IndexedDB does not erase what it overwrites,
+// so those plaintext rows stay recoverable on disk - which the at-rest design
+// and the duress wipe both assume never happens. Fix: get the password first,
+// unlock the incoming identity, and only then write.
+describe("an import with an identity unlocks before it writes", () => {
+  beforeEach(async () => {
+    await wipeLocalDatabase();
+    lockIdentity();
+  });
+
+  it("seals the imported rows on write instead of leaving them plaintext", async () => {
+    const backup = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    lockIdentity();
+
+    const asked: boolean[] = [];
+    await applyBackup(backup, "replace", {
+      requestPassword: async (retry) => {
+        asked.push(retry);
+        return PASSWORD;
+      },
+    });
+
+    expect(asked).toEqual([false]);
+    expect(isUnlocked()).toBe(true);
+
+    // Straight to the raw store: no sweep has run, so anything readable here
+    // was written in the clear.
+    const raw = JSON.stringify(await (await getDB()).getAll("rooms"));
+    expect(raw).not.toContain("restoredroom0001");
+    expect(raw).not.toContain("A room from the backup");
+
+    // And the row is still there, readable under the imported identity.
+    expect((await getAllRooms()).map((r) => r.roomCode)).toContain(
+      "restoredroom0001"
+    );
+  });
+
+  it("writes nothing when the prompt is cancelled", async () => {
+    const backup = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    lockIdentity();
+
+    await expect(
+      applyBackup(backup, "replace", { requestPassword: async () => null })
+    ).rejects.toThrow(/cancelled/i);
+
+    expect(await getKeypairRecord()).toBeUndefined();
+    expect(await (await getDB()).getAll("rooms")).toEqual([]);
+    expect(isUnlocked()).toBe(false);
+  });
+
+  it("asks again after a wrong password rather than importing", async () => {
+    const backup = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    lockIdentity();
+
+    const answers = ["not the backup password", PASSWORD];
+    await applyBackup(backup, "replace", {
+      requestPassword: async () => answers.shift() ?? null,
+    });
+
+    expect(answers).toEqual([]);
+    expect((await getKeypairRecord())?.did).toBe(backup.identity?.keypair.did);
+  });
+
+  // A merge runs on a device that is already unlocked, so its key is armed
+  // and sealRow seals as usual - nothing to prompt for, and no plaintext.
+  it("needs no password for a merge, which already runs unlocked", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+
+    let asked = false;
+    await applyBackup(incoming, "add", {
+      requestPassword: async () => {
+        asked = true;
+        return null;
+      },
+    });
+
+    expect(asked).toBe(false);
+    const raw = JSON.stringify(await (await getDB()).getAll("rooms"));
+    expect(raw).not.toContain("restoredroom0001");
+  });
+});

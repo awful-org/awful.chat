@@ -27,6 +27,9 @@ this file and the README disagree, the README wins. What has grown since:
 - A server-side component exists after all: the relay's plugin proxy
   (`PLUGIN_PROXY_HOSTS` / `PLUGIN_PROXY_SECRETS`) so plugins can call
   allowlisted third-party APIs without leaking client IPs or shipping keys.
+  `/plugin-stream` is its streaming sibling on the same allowlist, for media
+  a CDN will not serve cross-origin: no buffering, no cache, no secrets,
+  `Range` passed through so a player can seek.
 - Signatures moved to sigV 3 (canonical binds type + roomCode); the "zero
   signature-format changes" note below describes the v2 era.
 - Settings panel leads with a trust notice (plugins are unvetted, run with

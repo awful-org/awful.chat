@@ -4,7 +4,7 @@
  */
 
 import type { Message } from "$lib/transport/transport.svelte";
-import type { PluginDefinition, UpdateCtx } from "./api";
+import type { CardCtx, PluginDefinition, UpdateCtx } from "./api";
 import { MessageType, type ChatMessageType } from "$lib/types/message";
 import { getMessagesOfTypes } from "$lib/storage";
 
@@ -103,6 +103,10 @@ export async function buildCardState(
     MessageType.PluginUpdate,
   ]);
   let cardData: unknown = undefined;
+  // Who actually posted the card, from the signed row - never from its
+  // payload. A plugin that decides ownership needs this and cannot get it
+  // any other way; an `ownerDid` in the payload is whatever the sender typed.
+  let cardCtx: CardCtx = { senderDid: "" };
   // The card row names the only plugin allowed to write this state. It is
   // also what the render path resolved `definition` from, so falling back to
   // the definition when the row is missing or malformed keeps a card that is
@@ -110,6 +114,7 @@ export async function buildCardState(
   let ownerPluginId = definition.manifest.id;
   const cardMsg = allMessages.find((m) => m.id === cardId);
   if (cardMsg) {
+    cardCtx = { senderDid: cardMsg.senderDid || cardMsg.senderId };
     try {
       const cardPayload = JSON.parse(cardMsg.content);
       cardData = cardPayload.data;
@@ -123,7 +128,7 @@ export async function buildCardState(
   if (!definition.reduce || !definition.initialState) {
     return {
       state: definition.initialState
-        ? definition.initialState(cardData)
+        ? definition.initialState(cardData, cardCtx)
         : undefined,
       roomCode,
       pluginId: ownerPluginId,
@@ -131,7 +136,7 @@ export async function buildCardState(
     };
   }
 
-  let state = definition.initialState(cardData);
+  let state = definition.initialState(cardData, cardCtx);
 
   // Filter for PluginUpdate messages for this cardId. The pluginId has to
   // match the card's too: the live path picks the reducer from the update's

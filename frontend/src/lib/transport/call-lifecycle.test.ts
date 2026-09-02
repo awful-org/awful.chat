@@ -82,6 +82,10 @@ const transportMock = {
   send: vi.fn(),
   broadcast: vi.fn(),
   peers: () => [] as string[],
+  // Relay-attested room membership. The direct fan-out of a call frame is
+  // gated on it: the frame carries the call's room code, which is that
+  // room's whole join secret.
+  peersInRoom: (_room: string) => [] as string[],
   announce: vi.fn(),
 };
 
@@ -213,7 +217,8 @@ describe("mute/deafen state broadcasts into the CALL's room", () => {
     transportState.roomCode = "room1";
     transportMock.send.mockClear();
     const peers = ["peerA", "peerB"];
-    transportMock.peers = () => peers;
+    transportMock.peersInRoom = (room: string) =>
+      room === "room1" ? peers : [];
 
     setDeafened(true);
 
@@ -221,6 +226,23 @@ describe("mute/deafen state broadcasts into the CALL's room", () => {
       "peerA",
       "peerB",
     ]);
+    transportMock.peersInRoom = () => [] as string[];
+  });
+
+  // ...but only down the streams of peers the relay places in the room. The
+  // direct copy used to go to _transport.peers(), which is anybody who dialled
+  // us - handing a stranger the call room's code every 20 seconds.
+  it("does not send call frames to a peer outside the room", () => {
+    transportState.inCall = true;
+    transportState.callRoomCode = "room1";
+    transportState.roomCode = "room1";
+    transportMock.send.mockClear();
+    transportMock.peers = () => ["stranger"];
+    transportMock.peersInRoom = () => [] as string[];
+
+    setDeafened(true);
+
+    expect(transportMock.send).not.toHaveBeenCalled();
     transportMock.peers = () => [] as string[];
   });
 

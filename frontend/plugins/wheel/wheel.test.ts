@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_OPTIONS,
   initialState,
   parseWheelArgs,
   reduce,
@@ -92,5 +93,12 @@ describe("wheel hardening", () => {
       options: ["a", "b", "c"],
     });
     expect(parseWheelArgs("only-one")).toBeNull();
+  });
+});
+
+describe("option cap", () => {
+  it("keeps a peer-supplied list bounded", () => {
+    const many = Array.from({ length: 500 }, (_, i) => `o${i}`);
+    expect(initialState({ options: many }).options.length).toBe(MAX_OPTIONS);
   });
 });

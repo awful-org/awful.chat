@@ -117,6 +117,19 @@ cd relay && go run .
 cd sfu && npm install && npm start
 ```
 
+`frontend`'s `pnpm install` points git at this repo's hooks for you. Anyone
+working only on the relay, the SFU or the dashboard never runs it, so do it
+once by hand:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The one hook there refuses to commit plugin folders that are not already
+tracked: fetched plugins live in `frontend/plugins/` but belong to other
+repositories, and they cannot be gitignored (Tailwind honours ignore rules, so
+an ignored plugin would ship with none of its CSS).
+
 Tests and checks:
 
 ```sh
@@ -194,7 +207,7 @@ whose context holds no repository declares no commit.
 | `SFU_RTC_MIN_PORT` / `SFU_RTC_MAX_PORT` | no | SFU media range, published and allocated from (default 61000-61499) |
 | `TURN_MIN_PORT` / `TURN_MAX_PORT` | no | coturn relay range, one port per allocation (default 49152-50151) |
 | `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide and per credential |
-| `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` |
+| `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` and `/plugin-stream` (the streaming variant, for media a CDN will not serve cross-origin) |
 | `PLUGIN_PROXY_SECRETS` | no | `NAME@host=value` list; plugins reference `{{secret:NAME}}`, substituted server-side only for that host |
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
@@ -203,7 +216,7 @@ whose context holds no repository declares no commit.
 | `SFU_REJOIN_PROBE_MS` | no | how often a client is probed to confirm its SFU session is still live, default 3000 |
 | `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
 | `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
-| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs whose `X-Forwarded-For` the relay believes. Unset means private ranges plus loopback, correct behind traefik alone; add a CDN's ranges when one sits in front |
+| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs whose `X-Forwarded-For` the relay believes. Unset means private ranges plus loopback, correct behind traefik alone. Opt-in hardening: set it to Traefik's own `/32` on `dokploy-network` so a neighbouring container on the same box cannot forge the header and dodge the relay's per-IP limits; add a CDN's ranges when one sits in front |
 | `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |

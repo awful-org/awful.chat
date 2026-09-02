@@ -3,8 +3,8 @@ import { createLibp2p, type Libp2p } from "libp2p";
 import { webRTC } from "@libp2p/webrtc";
 import { webSockets } from "@libp2p/websockets";
 import { circuitRelayTransport } from "@libp2p/circuit-relay-v2";
-import { noise } from "@chainsafe/libp2p-noise";
-import { yamux } from "@chainsafe/libp2p-yamux";
+import { noise } from "@libp2p/noise";
+import { yamux } from "@libp2p/yamux";
 import { identify, type Identify } from "@libp2p/identify";
 import { gossipsub, type GossipSub } from "@libp2p/gossipsub";
 import { keys } from "@libp2p/crypto";
@@ -830,6 +830,20 @@ export class LibP2PTransport implements PeerTransport {
     const known = this.roomPeers.get(room);
     if (!known) return [];
     return [...known].filter((p) => this.connectedPeers.has(p));
+  }
+
+  /**
+   * Is this peer registered in this room with the RELAY? Same attestation as
+   * peersInRoom, WITHOUT the live-connection filter.
+   *
+   * Intersecting with the connection list is right for an outbound send -
+   * there is nothing to send down otherwise. It is wrong for judging an
+   * INBOUND frame: gossipsub relays presence through whoever is in the mesh,
+   * so a genuine member we have not dialled yet legitimately arrives with no
+   * connection of its own, and that is precisely the peer worth dialling.
+   */
+  isRoomPeer(room: string, peerId: string): boolean {
+    return this.roomPeers.get(room)?.has(peerId) === true;
   }
 
   peers(): string[] {

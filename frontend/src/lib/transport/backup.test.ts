@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   mergeImportedRoom,
+  BACKUP_ENC_FORMAT,
   BACKUP_FORMAT,
   BACKUP_VERSION,
+  decryptBackup,
+  encryptBackup,
+  parseBackupFileText,
   isValidMessageRecord,
   MAX_MESSAGE_CONTENT_LENGTH,
   parseBackup,
@@ -278,5 +282,84 @@ describe("bytesFromExport", () => {
   it("returns undefined for absent or garbage data", () => {
     expect(bytesFromExport(undefined)).toBeUndefined();
     expect(bytesFromExport("%%%not-base64%%%")).toBeUndefined();
+  });
+});
+
+// The export is the whole account in the clear once opened - every message,
+// room code, DID and attachment - so the FILE is one AES-GCM blob under a
+// passphrase chosen at export time. Files written before that (plaintext,
+// version 1 and 2) still have to restore, which is why the encrypted form
+// carries its own format marker rather than another version bump.
+describe("encrypted backup files", () => {
+  const PASSPHRASE = "a passphrase for the file itself";
+
+  const secretBackup = () =>
+    parseBackup(
+      backupJson({
+        rooms: [{ roomCode: "cafebabe0000ffff", type: "text" }],
+        messages: [
+          {
+            id: "m1",
+            roomCode: "cafebabe0000ffff",
+            senderId: "did:key:zAlice",
+            type: "text",
+            lamport: 1,
+            content: "the quiet part",
+          },
+        ],
+      })
+    );
+
+  it("round-trips and leaves nothing readable in the file", async () => {
+    const envelope = await encryptBackup(secretBackup(), PASSPHRASE);
+    const onDisk = JSON.stringify(envelope);
+    expect(onDisk).not.toContain("cafebabe0000ffff");
+    expect(onDisk).not.toContain("the quiet part");
+    expect(onDisk).not.toContain("did:key:zAlice");
+
+    const parsed = parseBackupFileText(onDisk);
+    expect(parsed.encrypted).toBe(true);
+    if (parsed.encrypted !== true) throw new Error("expected an envelope");
+    const restored = await decryptBackup(parsed.envelope, PASSPHRASE);
+    expect(restored.rooms).toEqual(secretBackup().rooms);
+    expect(restored.messages[0].content).toBe("the quiet part");
+  });
+
+  it("fails cleanly on the wrong passphrase", async () => {
+    const envelope = await encryptBackup(secretBackup(), PASSPHRASE);
+    await expect(decryptBackup(envelope, "not it")).rejects.toThrow(
+      /passphrase/i
+    );
+  });
+
+  it("refuses a tampered ciphertext rather than importing half of it", async () => {
+    const envelope = await encryptBackup(secretBackup(), PASSPHRASE);
+    const bytes = [...atob(envelope.ciphertext)].map((c) => c.charCodeAt(0));
+    bytes[0] ^= 0xff;
+    envelope.ciphertext = btoa(String.fromCharCode(...bytes));
+    await expect(decryptBackup(envelope, PASSPHRASE)).rejects.toThrow();
+  });
+
+  it("still reads a plaintext file from before encryption existed", () => {
+    const parsed = parseBackupFileText(
+      backupJson({ version: 1, messages: [{ id: "m1" }] })
+    );
+    expect(parsed.encrypted).toBe(false);
+    if (parsed.encrypted !== false) throw new Error("expected a plain backup");
+    expect(parsed.backup.messages).toHaveLength(1);
+  });
+
+  it("rejects an envelope with a KDF cost that would hang the tab", () => {
+    expect(() =>
+      parseBackupFileText(
+        JSON.stringify({
+          format: BACKUP_ENC_FORMAT,
+          version: 1,
+          kdf: { salt: "AAAA", iterations: 1e12 },
+          iv: "AAAA",
+          ciphertext: "AAAA",
+        })
+      )
+    ).toThrow(/damaged/i);
   });
 });

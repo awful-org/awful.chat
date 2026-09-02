@@ -233,9 +233,14 @@ interface PeerState {
   // 256 or more produce calls in a row is a flood attack, not a real call.
   cumulativeProduces: number;
   // Token budget for worker round-trips (create-transport, connect-transport,
-  // produce, consume). Replenished after each operation completes; when budget
-  // hits zero, new operations are rejected and the WebSocket is paused to apply
-  // TCP backpressure.
+  // produce, consume, resume-consumer, close-*): how many this socket has
+  // spent since workerOpsWindowStart, capped at MAX_WORKER_OPS_PER_WINDOW.
+  // Past the cap the frame is refused instead of reaching the worker and the
+  // socket is paused for WORKER_OP_PAUSE_MS; workerOpPauseTimer holds that
+  // pause, so a flood arms one timer rather than one per refused frame.
+  workerOps: number;
+  workerOpsWindowStart: number;
+  workerOpPauseTimer: NodeJS.Timeout | null;
   // The liveness probe outstanding against this session, if any. Shared so
   // that a flood of duplicate joins costs one ping rather than one ping each.
   livenessProbe: Promise<boolean> | null;
@@ -316,6 +321,35 @@ const DIAG_MIN_INTERVAL_MS = parseInt(
   process.env.SFU_DIAG_MIN_INTERVAL_MS ?? "10000",
   10,
 );
+// Worker round-trips one socket may spend per WORKER_OP_WINDOW_MS. Every op
+// counted below reaches the ONE mediasoup worker that every room on this
+// instance shares, so a socket looping any of them stalls transport creation
+// in OTHER rooms - measured at seconds. The honest worst case is a peer
+// joining a full room and consuming every producer in it (a consume plus a
+// resume each), which stays well under this; a loop crosses it in a second.
+const MAX_WORKER_OPS_PER_WINDOW = parseInt(
+  process.env.SFU_MAX_WORKER_OPS ?? "600",
+  10,
+);
+const WORKER_OP_WINDOW_MS = 10_000;
+// How long a socket that spends its budget stops being read. Brief, and it
+// must stay well inside HEARTBEAT_INTERVAL_MS: a paused socket answers no
+// ping either, and two unanswered sweeps terminate it.
+const WORKER_OP_PAUSE_MS = parseInt(
+  process.env.SFU_WORKER_OP_PAUSE_MS ?? "1000",
+  10,
+);
+// The frame types that cost a worker round-trip. join, ms:get-capabilities
+// and ms:diag are answered from this process or carry their own floor.
+const WORKER_OP_TYPES = new Set<string>([
+  "ms:create-transport",
+  "ms:connect-transport",
+  "ms:produce",
+  "ms:consume",
+  "ms:resume-consumer",
+  "ms:close-consumer",
+  "ms:close-producer",
+]);
 
 function isValidId(value: unknown): value is string {
   return (
@@ -409,8 +443,19 @@ function send(ws: WebSocket, msg: object): void {
 // ── mediasoup setup ───────────────────────────────────────────────────────────
 
 const ANNOUNCED_IP = process.env.ANNOUNCED_IP ?? "127.0.0.1";
-const RTC_MIN_PORT = parseInt(process.env.RTC_MIN_PORT ?? "40000", 10);
-const RTC_MAX_PORT = parseInt(process.env.RTC_MAX_PORT ?? "40499", 10);
+// The README and every compose file name these SFU_RTC_MIN_PORT /
+// SFU_RTC_MAX_PORT and compose bridges them to the unprefixed names, so both
+// are accepted here: a bare `npm start` with the documented variables must
+// not silently fall back to the default range and announce ports nothing
+// published.
+const RTC_MIN_PORT = parseInt(
+  process.env.SFU_RTC_MIN_PORT ?? process.env.RTC_MIN_PORT ?? "40000",
+  10,
+);
+const RTC_MAX_PORT = parseInt(
+  process.env.SFU_RTC_MAX_PORT ?? process.env.RTC_MAX_PORT ?? "40499",
+  10,
+);
 
 const mediaCodecs: mediasoup.types.RouterOptions["mediaCodecs"] = [
   {
@@ -565,6 +610,38 @@ function clearTransportReapTimer(peer: PeerState, direction: "send" | "recv"): v
     clearTimeout(timer);
     peer.transportReapTimers.delete(direction);
   }
+}
+
+// Spends one worker-op token for this socket, or refuses the frame. Past the
+// budget the socket is also paused briefly, so a sender that keeps looping
+// feels the stall in TCP instead of filling frameChain with frames we will
+// only refuse.
+function spendWorkerOp(peer: PeerState, ws: WebSocket): boolean {
+  const now = Date.now();
+  if (now - peer.workerOpsWindowStart >= WORKER_OP_WINDOW_MS) {
+    peer.workerOpsWindowStart = now;
+    peer.workerOps = 0;
+  }
+  if (++peer.workerOps <= MAX_WORKER_OPS_PER_WINDOW) return true;
+
+  send(ws, { type: "ms:error", reason: "rate-limited" });
+  if (!peer.workerOpPauseTimer) {
+    console.error(
+      `[sfu] peer ${peer.peerId} is over the worker-op budget (${MAX_WORKER_OPS_PER_WINDOW} per ${WORKER_OP_WINDOW_MS}ms); pausing its socket`,
+    );
+    ws.pause();
+    const timer = setTimeout(() => {
+      peer.workerOpPauseTimer = null;
+      // The backpressure pause owns the socket while it is set - resuming
+      // here would undo it.
+      const w = ws as unknown as { backpressured?: boolean };
+      if (!w.backpressured && ws.readyState === WebSocket.OPEN) ws.resume();
+    }, WORKER_OP_PAUSE_MS);
+    // A pending unpause must not be the reason the process stays alive.
+    timer.unref();
+    peer.workerOpPauseTimer = timer;
+  }
+  return false;
 }
 
 // ── Message handlers ──────────────────────────────────────────────────────────
@@ -1046,20 +1123,27 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
   );
 }
 
-function handleResumeConsumer(peer: PeerState, msg: MSResumeConsumer): void {
+async function handleResumeConsumer(
+  peer: PeerState,
+  msg: MSResumeConsumer,
+): Promise<void> {
   const consumerId = peer.consumersByProducerId.get(msg.producerId);
   if (!consumerId) return;
   const entry = peer.consumers.get(consumerId);
   if (!entry) return;
-  // Idempotent: a retried ms:resume-consumer (or one that raced a producer
-  // close) resuming an already-resumed or already-closed consumer is a
-  // mediasoup no-op, not an error.
-  entry.consumer.resume().catch((err) => {
+  // Consumer.resume() sends a worker request on EVERY call, resumed or not,
+  // so a client looping this frame floods the worker every room shares. A
+  // retry (or a frame that raced a producer close) has nothing to resume:
+  // answer it from this process instead of asking the worker again.
+  if (!entry.consumer.paused) return;
+  try {
+    await entry.consumer.resume();
+  } catch (err) {
     console.warn(
       `[sfu] resume-consumer failed for peer ${peer.peerId}:`,
       err,
     );
-  });
+  }
 }
 
 function handleCloseConsumer(peer: PeerState, msg: MSCloseConsumer): void {
@@ -1166,6 +1250,10 @@ function handlePeerLeft(peer: PeerState): void {
   // current), but there's no reason to let them sit on the event loop.
   clearTransportReapTimer(peer, "send");
   clearTransportReapTimer(peer, "recv");
+  if (peer.workerOpPauseTimer) {
+    clearTimeout(peer.workerOpPauseTimer);
+    peer.workerOpPauseTimer = null;
+  }
 
   room.delete(peer.peerId);
   console.log(
@@ -1328,8 +1416,6 @@ async function handleDiag(peer: PeerState, msg: MSDiag): Promise<void> {
       peersPerRoom: MAX_PEERS_PER_ROOM,
       producersPerPeer: MAX_PRODUCERS_PER_PEER,
       consumersPerPeer: MAX_CONSUMERS_PER_PEER,
-      rooms: rooms.size,
-      maxRooms: MAX_ROOMS,
     },
   };
 
@@ -1642,6 +1728,9 @@ async function main(): Promise<void> {
           producersInFlight: 0,
           consumersInFlight: 0,
           cumulativeProduces: 0,
+          workerOps: 0,
+          workerOpsWindowStart: Date.now(),
+          workerOpPauseTimer: null,
           livenessProbe: null,
           lastDiagAt: 0,
         };
@@ -1702,6 +1791,9 @@ async function main(): Promise<void> {
       }
 
       // Route ms:* messages
+      // Charged before the frame reaches the worker, not after: the budget
+      // exists to stop a loop from getting there at all.
+      if (WORKER_OP_TYPES.has(msg.type) && !spendWorkerOp(peer, ws)) return;
       try {
         switch (msg.type) {
           case "ms:get-capabilities":
@@ -1720,7 +1812,10 @@ async function main(): Promise<void> {
             await handleConsume(peer, msg as MSConsume);
             break;
           case "ms:resume-consumer":
-            handleResumeConsumer(peer, msg as MSResumeConsumer);
+            // Awaited like its siblings: a handler that returns synchronously
+            // never lets frameChain (and the queued-bytes backpressure behind
+            // it) throttle a socket that loops this frame.
+            await handleResumeConsumer(peer, msg as MSResumeConsumer);
             break;
           case "ms:close-consumer":
             handleCloseConsumer(peer, msg as MSCloseConsumer);

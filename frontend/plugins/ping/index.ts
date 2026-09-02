@@ -1,4 +1,4 @@
-import { definePlugin, type HostApi } from "$lib/plugins/api";
+import { definePlugin, type CardCtx, type HostApi } from "$lib/plugins/api";
 import { manifest } from "./manifest";
 import PingCard from "./PingCard.svelte";
 import {
@@ -31,7 +31,10 @@ export interface PingState {
   relayed: string[];
 }
 
-export function initialState(cardData: unknown): PingState {
+/** Key names that mutate an object literal instead of being stored in it. */
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function initialState(cardData: unknown, ctx?: CardCtx): PingState {
   const data = cardData as Record<string, unknown> | undefined;
   const raw = Array.isArray(data?.targets) ? data.targets : [];
   const targets: PingTarget[] = [];
@@ -39,18 +42,51 @@ export function initialState(cardData: unknown): PingState {
     const did = (t as PingTarget)?.did;
     const name = (t as PingTarget)?.name;
     if (typeof did !== "string" || !did) continue;
+    // Targets become KEYS of the results and series objects below. Assigning
+    // `__proto__` on an object literal runs the inherited setter and swaps
+    // the prototype instead of adding a key, so a card naming that as a peer
+    // reached through the reducer into every plain object it built.
+    if (UNSAFE_KEYS.has(did)) continue;
     if (targets.some((x) => x.did === did)) continue;
     targets.push({ did, name: typeof name === "string" ? name : did });
     if (targets.length >= MAX_TARGETS) break;
   }
   return {
     targets,
-    // Empty means nobody owns it, and the reducer below refuses every
-    // update - the same fail-closed shape a forged card should have.
-    ownerDid: typeof data?.ownerDid === "string" ? data.ownerDid : "",
+    // The HOST's sender, never `data.ownerDid`. The payload is peer-supplied,
+    // so a card claiming somebody else's DID used to hand them the owner-only
+    // reducer path. Empty means nobody owns it, and the reducer below refuses
+    // every update - the same fail-closed shape a forged card should have.
+    ownerDid: ctx?.senderDid ?? "",
     results: {},
     series: {},
     relayed: [],
+  };
+}
+
+/**
+ * One peer's summary, rebuilt field by field.
+ *
+ * `typeof x === "object"` accepted an array, a `__proto__` payload and NaN
+ * for every number, and the chart divides by these. Rebuilding drops the
+ * prototype with the rest of the keys.
+ */
+function cleanStats(raw: unknown): Stats | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const s = raw as Record<string, unknown>;
+  const num = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
+  const sent = num(s.sent);
+  const loss = num(s.loss);
+  if (sent === null || sent < 0 || loss === null || loss < 0 || loss > 1) {
+    return null;
+  }
+  return {
+    min: num(s.min),
+    median: num(s.median),
+    max: num(s.max),
+    loss,
+    sent,
   };
 }
 
@@ -71,8 +107,8 @@ export function reduce(
   if (!results || typeof results !== "object") return state;
   const kept: Record<string, Stats> = {};
   for (const t of state.targets) {
-    const s = results[t.did];
-    if (s && typeof s === "object") kept[t.did] = s;
+    const s = cleanStats(results[t.did]);
+    if (s) kept[t.did] = s;
   }
   // Series come off the wire, so they are rebuilt through unpackSeries
   // rather than trusted: a peer can put anything in that array.
@@ -120,7 +156,7 @@ export default definePlugin({
         else console.warn(`[ping] nobody called ${name} is in this room`);
       }
       if (targets.length === 0) return;
-      await host.sendCard({ targets, ownerDid: host.selfDid() });
+      await host.sendCard({ targets });
     },
   },
 });

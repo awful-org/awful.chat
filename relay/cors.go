@@ -69,9 +69,20 @@ func corsHeaders(r *http.Request) http.Header {
 	// preflights any request that carries a non-simple header, so an upload from
 	// an app on another origin fails outright when they are missing here - not
 	// with a 401, but with a blocked fetch that reports only "Failed to fetch".
+	// Range is /plugin-stream's: a media player asks for byte ranges, and a
+	// Range header is not on the CORS safelist, so without it the browser
+	// preflights and blocks every seek before the handler runs.
 	headers.Set(
 		"Access-Control-Allow-Headers",
-		"Content-Type, Authorization, X-Awful-Peer, X-Awful-Ts, X-Awful-Sig",
+		"Content-Type, Authorization, Range, X-Awful-Peer, X-Awful-Ts, X-Awful-Sig",
+	)
+	// Response headers a player needs to read to know what it got back. Only
+	// the CORS-safelisted ones are visible to script by default, and
+	// Content-Range is not among them, so a ranged response looks like a
+	// full one without this.
+	headers.Set(
+		"Access-Control-Expose-Headers",
+		"Content-Length, Content-Range, Accept-Ranges",
 	)
 	headers.Set("Access-Control-Max-Age", "86400")
 	headers.Set("Vary", "Origin")

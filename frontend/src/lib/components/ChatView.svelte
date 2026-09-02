@@ -2,6 +2,7 @@
   import { onDestroy, tick } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
+  import { MAX_MESSAGE_FILES } from "$lib/transport/verify-incoming";
   import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
@@ -886,6 +887,9 @@
     }
 
     for (const file of incoming) {
+      // Receivers refuse a message carrying more than MAX_MESSAGE_FILES, so
+      // stop staging there rather than let a send be rejected on arrival.
+      if (dedup.size >= MAX_MESSAGE_FILES) break;
       const key = fileKey(file);
       const fp = await fingerprintFile(file);
       if (existingFingerprints.has(fp)) continue;

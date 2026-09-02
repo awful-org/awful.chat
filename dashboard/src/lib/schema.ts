@@ -536,7 +536,5 @@ export interface SfuSnapshot {
     peersPerRoom: number;
     producersPerPeer: number;
     consumersPerPeer: number;
-    rooms: number;
-    maxRooms: number;
   };
 }

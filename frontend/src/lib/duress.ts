@@ -14,6 +14,11 @@
  * localStorage - it must be checkable while the identity is LOCKED, and it
  * protects nothing (matching it triggers destruction, not access). The
  * identity's own password is never stored in any form, same as before.
+ *
+ * The record is written whether or not duress is armed (see decoyRecord): a
+ * key that only exists once the feature is on makes its own presence the
+ * answer, and reading a list of localStorage key names is the cheapest look
+ * anyone gets.
  */
 
 const DURESS_KEY = "awful:duress:v1";
@@ -39,7 +44,34 @@ interface DuressRecord {
   salt: string; // base64
   hash: string; // base64 PBKDF2-SHA-256 output
   iterations: number;
+  /** Opaque: the per-identity keyed hash of ARMED_LABEL when duress is armed,
+   *  random bytes of the same shape when it is not. Only an unlocked session
+   *  holds the key that tells the two apart, so a storage dump cannot. */
+  mark?: string;
+  /** Records from before `mark` carried the answer in the clear: false on
+   *  the first decoys, absent on real registrations. Read once, migrated. */
+  armed?: boolean;
 }
+
+const ARMED_LABEL = "awful:duress:armed:v1";
+
+const b64url = (bytes: Uint8Array): string =>
+  btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+
+/** What an armed record carries: blindValue's HMAC over a fixed label, minus
+ *  its prefix so the shape matches randomMark exactly. Throws while locked. */
+async function armedMark(): Promise<string> {
+  const { blindValue } = await import("./storage-crypto");
+  return (await blindValue(ARMED_LABEL)).replace(/^[^:]*:/, "");
+}
+
+/** 32 random bytes in the same encoding: indistinguishable from armedMark
+ *  to anyone without the identity's index key. */
+const randomMark = (): string =>
+  b64url(crypto.getRandomValues(new Uint8Array(32)));
 
 const b64 = (buf: ArrayBuffer | Uint8Array): string =>
   btoa(String.fromCharCode(...new Uint8Array(buf)));
@@ -92,33 +124,95 @@ async function derive(
   return b64(bits);
 }
 
-function readRecord(): DuressRecord | null {
+/**
+ * A record with no duress password behind it: a random salt, 32 random bytes
+ * where the hash goes, the same iteration count. Nothing anyone can type
+ * derives to it.
+ *
+ * Why write one at all: a key that only EXISTS once duress is armed makes its
+ * own presence the answer, and enumerating localStorage key names - a forensic
+ * dump, a glance at the Application tab - is the cheapest look there is. Every
+ * device carries the key now, holding the same shape of material either way.
+ *
+ * The answer itself is not in the record either: `mark` is a keyed hash of a
+ * fixed label when armed and random bytes otherwise, and the key lives only
+ * in an unlocked session. The duress CHECK never needs it (salt and hash are
+ * enough, and a decoy's hash matches nothing), so the check still runs
+ * locked; only the settings toggle, which runs unlocked, asks which it is.
+ */
+function decoyRecord(): DuressRecord {
+  return {
+    salt: b64(crypto.getRandomValues(new Uint8Array(16))),
+    hash: b64(crypto.getRandomValues(new Uint8Array(32))),
+    iterations: ITERATIONS,
+    mark: randomMark(),
+  };
+}
+
+function writeRecord(rec: DuressRecord): void {
   try {
-    const raw = localStorage.getItem(DURESS_KEY);
-    if (!raw) return null;
-    const rec = JSON.parse(raw) as DuressRecord;
-    if (!rec.salt || !rec.hash || !rec.iterations) return null;
-    return rec;
+    localStorage.setItem(DURESS_KEY, JSON.stringify(rec));
   } catch {
-    return null;
+    // Blocked storage holds nothing to give away either.
   }
 }
 
-export function hasDuressPassword(): boolean {
-  return readRecord() !== null;
+/** The stored record, materializing a decoy when there is none or what is
+ *  there is unreadable. Never null: every path below wants a salt and a hash
+ *  to work against, armed or not. */
+function readRecord(): DuressRecord {
+  try {
+    const raw = localStorage.getItem(DURESS_KEY);
+    const rec = raw ? (JSON.parse(raw) as DuressRecord) : null;
+    if (rec?.salt && rec.hash && rec.iterations) return rec;
+  } catch {
+    // Unparseable: replaced below, same as a missing one.
+  }
+  const decoy = decoyRecord();
+  writeRecord(decoy);
+  return decoy;
+}
+
+// At import, so a device where nobody has ever opened the duress settings
+// still carries the key. identity.svelte.ts imports this module at boot.
+readRecord();
+
+/** Whether duress is armed. Needs an unlocked session to read the mark;
+ *  locked, the answer is "no", which is also what a storage dump gets. */
+export async function hasDuressPassword(): Promise<boolean> {
+  const rec = readRecord();
+  if (rec.mark === undefined) {
+    // A record from before the mark: `armed` in the clear, or absent on a
+    // real registration. Rewrite it in the opaque shape while a key exists.
+    const armed = rec.armed !== false;
+    try {
+      writeRecord({
+        salt: rec.salt,
+        hash: rec.hash,
+        iterations: rec.iterations,
+        mark: armed ? await armedMark() : randomMark(),
+      });
+    } catch {
+      /* locked: leave it for a later unlocked read */
+    }
+    return armed;
+  }
+  try {
+    return rec.mark === (await armedMark());
+  } catch {
+    return false;
+  }
 }
 
 export async function setDuressPassword(password: string): Promise<void> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const hash = await derive(password, salt, ITERATIONS);
-  localStorage.setItem(
-    DURESS_KEY,
-    JSON.stringify({
-      salt: b64(salt),
-      hash,
-      iterations: ITERATIONS,
-    } satisfies DuressRecord)
-  );
+  writeRecord({
+    salt: b64(salt),
+    hash,
+    iterations: ITERATIONS,
+    mark: await armedMark(),
+  });
   // A remembered password auto-unlocks past the duress screen - the coerced
   // user would never get to type anything. The two features are mutually
   // exclusive on a device.
@@ -133,23 +227,22 @@ export async function setDuressPassword(password: string): Promise<void> {
 }
 
 export function clearDuressPassword(): void {
-  try {
-    localStorage.removeItem(DURESS_KEY);
-  } catch {
-    // Nothing stored, nothing to clear.
-  }
+  // Replaced, not removed: an absent key would say "this device never armed
+  // duress" as loudly as a present one used to say the opposite.
+  writeRecord(decoyRecord());
 }
 
 /**
  * True when the entered password is the duress password.
  *
- * Exactly one PBKDF2 runs whether or not a duress password is configured.
- * Returning early on a missing record made an unlock attempt cost one
- * derivation on a device with no duress password and two on a device with
- * one - a difference of hundreds of milliseconds that a coercer holding the
- * device could measure with a stopwatch, learning the feature was armed
- * before the victim typed anything. The throwaway salt below is worth
- * nothing cryptographically; it is there to spend the same wall-clock time.
+ * Exactly one PBKDF2 runs, over exactly one code path, whether or not a duress
+ * password is configured. Returning early on a missing record made an unlock
+ * attempt cost one derivation on a device with no duress password and two on a
+ * device with one - a difference of hundreds of milliseconds that a coercer
+ * holding the device could measure with a stopwatch, learning the feature was
+ * armed before the victim typed anything. There is no early return left to
+ * make: the decoy record carries a salt and a hash of the same shape, and its
+ * hash is 32 random bytes that nothing anyone types can match.
  *
  * Callers run this only AFTER a real unlock has failed (identity.svelte.ts):
  * that is where a duress password can land, and it keeps a successful unlock
@@ -157,11 +250,7 @@ export function clearDuressPassword(): void {
  */
 export async function isDuressPassword(password: string): Promise<boolean> {
   const rec = readRecord();
-  const salt = rec
-    ? unb64(rec.salt)
-    : crypto.getRandomValues(new Uint8Array(16));
-  const hash = await derive(password, salt, rec?.iterations ?? ITERATIONS);
-  if (!rec) return false;
+  const hash = await derive(password, unb64(rec.salt), rec.iterations);
   // Constant-time comparison - see constantTimeEqual's doc comment for the
   // actual threat boundary this addresses (it is narrower than it looks:
   // both sides are PBKDF2 outputs, and a "match" grants destruction, not
@@ -188,6 +277,17 @@ export async function executeDuressWipe(): Promise<never> {
     sessionStorage.clear();
   } catch {
     /* same */
+  }
+
+  // Delivered notifications outlive the page that showed them: they sit in the
+  // shade naming the conversations this device is about to claim it never had,
+  // and their tap targets survive the wipe. getNotifications only reaches this
+  // origin's own.
+  try {
+    const reg = await navigator.serviceWorker?.getRegistration();
+    for (const shown of (await reg?.getNotifications()) ?? []) shown.close();
+  } catch {
+    /* no service worker, or nothing showing */
   }
 
   // Our own open connection would block deleteDatabase forever - boot

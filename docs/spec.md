@@ -16,14 +16,16 @@ with reactionTo/reactionEmoji/reactionOp), resolved at render time.
 ## IndexedDB Schema (idb)
 
 ```typescript
-// Current schema is v4 - v2 added savedGifs, v3 re-keyed profiles by did,
-// v4 added phonebook. See storage.ts for the authoritative upgrade path.
+// Current schema is v6 - v2 added savedGifs, v3 re-keyed profiles by did,
+// v4 added phonebook, v5 and v6 added the searchIndex and diagnostics stores
+// and the blinded indexes below. This listing is the v1 shape for
+// orientation; storage.ts is the authoritative upgrade path.
 export async function getDB(): Promise<AppDB> {
   // singleton - one connection for app lifetime
   // NOTE: rows in messages/attachments/profiles/rooms are SEALED at rest -
   // see "At-Rest Encryption" below. The keyPath and indexed fields shown
   // here stay in clear; everything else lives inside an AES-GCM blob.
-  return openDB("awful-chat", 4, {
+  return openDB("awful-chat", 6, {
     upgrade(db) {
       // messages
       const msg = db.createObjectStore("messages", { keyPath: "id" })
@@ -78,11 +80,19 @@ Layout: per row, keyPath + indexed/query fields stay in clear ("clear
         fields"); everything else is one AES-GCM blob (_enc, fresh IV per
         write); ArrayBuffer fields (file bytes, avatars) sealed as raw
         buffers beside it (_encBytes). Each blob is bound to its row with
-        AAD ("<store> <primaryKey> [field]", blob marked v: 2), so a blob
-        moved to another row or store fails to open. Blobs written before
-        the marker still open without AAD until their next write.
-Clear fields: messages(id, roomCode, lamport, senderId, type, status),
-        attachments add messageId/infoHash, profiles/rooms keep byte
+        AAD: v: 3 blobs bind "<store> <primaryKey> [field]" plus every
+        clear field of the row (type, status, lamport), so a blob moved to
+        another row or store, or a row whose clear fields were edited on
+        disk, fails to open. v: 2 blobs (store and key only) and unmarked
+        blobs still open until the unlock sweep rewrites them as v: 3. A
+        row with no blob at all in a sealed store is refused unless a
+        sweep is pending, so plaintext cannot be planted and laundered.
+Clear fields: messages(id, lamport, type, status). roomCode, senderId,
+        messageId, infoHash, did and peerId are not clear but BLINDED: an
+        HMAC under a separate HKDF index key replaces the value in the
+        row and its indexes, so queries still hit without the disk ever
+        holding a room code or an identity (per identity, so two accounts
+        on one device cannot be correlated). profiles/rooms keep byte
         fields sealed (pfpData/bannerData).
 Query doctrine: bulk index getAll of raw sealed rows, filter on clear
         fields in memory, decrypt only survivors. Cursors only for stores
@@ -458,7 +468,9 @@ signature policy on receive (MANDATORY since 2026-08):
 ### Key Derivation
 
 ```txt
-password → PBKDF2(salt, 100_000, SHA-256) → AES-256-GCM key → decrypt mnemonic
+password → PBKDF2(salt, 600_000, SHA-256) → AES-256-GCM key → decrypt mnemonic
+          (records written at the old 100_000 carry their count and are
+          re-sealed at 600_000 on their next successful unlock)
 mnemonic (BIP39, 12 words) → BIP39 seed, first 32 bytes = ed25519 scalar
 did:key = "did:key:" + base58btc(0xed01 + publicKey)
 
@@ -579,8 +591,12 @@ Client collect: on unlock/startup, fetch + unseal + ack. Undecryptable
   storage stops replays.
 
 What the relay learns: THAT a DID has mail and roughly when - never
-  content, never the sender (ephemeral key, no sender field outside the
-  sealed plaintext).
+  content, never which identity sent it (ephemeral key, no sender field
+  outside the sealed plaintext). It does see the depositor's IP address at
+  the HTTP layer like any request, and the same process holds every peer's
+  libp2p connection, so an operator could tie a deposit to a connected
+  peer by address and time. Anonymity here is against the recipient and
+  the wire, not against the operator.
 ```
 
 ---
@@ -690,12 +706,16 @@ Late join behavior:
 ## Room Codes
 
 ```txt
-text:  8 random bytes as hex (64 bits) - see frontend/src/lib/room-code.ts.
-       Rooms created before 2026-08-28 carry 3 bytes (24 bits) and keep it:
-       a room cannot be re-keyed without becoming a different room. The code
-       is the room's ONLY membership secret - it names the gossipsub topic,
-       keys the relay rendezvous, and is the SFU join key - so it is never
-       disclosed to a peer outside the room (see _sendDigestForRoom).
+text:  13 characters of Crockford base32 (65 bits), shown as
+       XXXX-XXXX-XXXX-X - see frontend/src/lib/room-code.ts. Older rooms
+       keep the code they were born with: 16 hex chars (64 bits) from
+       2026-08-28, 6 hex chars (24 bits) before that. A room cannot be
+       re-keyed without becoming a different room, and every layer treats a
+       code as an opaque string. The code is the room's ONLY membership
+       secret - it names the gossipsub topic, keys the relay rendezvous, and
+       is the SFU join key - so no direct frame that carries it (digest, room
+       name, roster, call presence) goes to a peer the relay has not listed
+       in that room (see _sendDigestForRoom and peersInRoom).
 DM:    "dm-" + hex(sha256(sort([didA, didB]).join("|")))[0..40]
        (deterministic - both peers derive the same room without coordination)
 ```
@@ -929,6 +949,22 @@ Security: URL allowlist/blocklist, size limits, timeout protection
 
 ---
 
+## Backup Files
+
+```txt
+Settings > Data > Download my data writes an encrypted envelope:
+  { format: "awful.chat/backup-encrypted", version: 2,
+    kdf: { salt, iterations: 600_000 }, iv, ciphertext }
+  ciphertext = AES-256-GCM over the JSON export (every store, opened),
+  key = PBKDF2(passphrase chosen at export time). The passphrase is never
+  stored; a lost passphrase is a lost file.
+Restore accepts this envelope and the older plaintext .json/.awfulbackup
+  exports unchanged. Replace-mode restore asks for the account password
+  first so rows are sealed on write (see Device Sync > Security).
+```
+
+---
+
 ## Password Persistence
 
 ```txt
@@ -1050,6 +1086,15 @@ Two buttons added:
 - Imported records are shape-checked (types, sizes, known message types)
   before they touch IndexedDB; malformed ones are dropped and counted.
   Signatures are NOT re-verified on import: pre-v3 history could not pass
+- "Merge devices" never touches the target's identity: an identity section
+  in the payload is dropped, so a hostile source cannot swap the account
+  out from under the device
+- The target asks for the account password BEFORE importing, unlocks the
+  incoming mnemonic, arms the at-rest key, and only then writes: imported
+  rows are sealed on first write, never parked in plaintext for a later
+  sweep. Cancelling the prompt leaves the device untouched
+- The typed short code is shown only on request; until then the source
+  accepts nothing but the full 128-bit token from the QR
 - P2P connection via ephemeral rooms
 - Password required for identity sync
 - Data transferred over encrypted WebRTC

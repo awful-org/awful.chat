@@ -662,3 +662,112 @@ func TestAckNeverDrivesCountersNegative(t *testing.T) {
 			mailboxUsedBytes, mailboxFiles, mailboxBoxes)
 	}
 }
+
+// mailboxGlobalMaxBoxes used to be mailboxGlobalMaxFiles/8: 8192 one-byte
+// deposits, about 32 MiB and an eighth of the byte budget, shut the door on
+// every NEW recipient for a full TTL while existing boxes kept working. The
+// ceiling now tracks the budget it is supposed to measure, and a deposit that
+// does meet it reclaims a stale box before refusing.
+func TestMailboxBoxCeilingTracksBytesAndEvictsStaleBoxes(t *testing.T) {
+	// Reaching the box ceiling has to cost most of the byte budget, not an
+	// eighth of it. A box holds at least one blob, and each costs a block.
+	if spend := int64(mailboxGlobalMaxBoxes) * mailboxBlockSize; spend*2 < mailboxGlobalMaxBytes {
+		t.Errorf("filling every box costs %d bytes, under half the %d-byte budget",
+			spend, int64(mailboxGlobalMaxBytes))
+	}
+
+	mailboxDir = t.TempDir()
+	bytesBefore, filesBefore, boxesBefore := mailboxUsedBytes, mailboxFiles, mailboxBoxes
+	t.Cleanup(func() {
+		mailboxMu.Lock()
+		mailboxUsedBytes, mailboxFiles, mailboxBoxes = bytesBefore, filesBefore, boxesBefore
+		mailboxMu.Unlock()
+	})
+
+	// One box left sitting past the TTL, which the ceiling may reclaim, and
+	// one busy box it must not touch.
+	stale, fresh := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	for _, b := range []struct {
+		name string
+		age  time.Duration
+	}{{stale, mailboxTTL + time.Hour}, {fresh, 0}} {
+		dir := boxPath(b.name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		blob := filepath.Join(dir, "1")
+		if err := os.WriteFile(blob, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := time.Now().Add(-b.age)
+		os.Chtimes(blob, when, when)
+		os.Chtimes(dir, when, when)
+	}
+
+	mailboxMu.Lock()
+	mailboxBoxes = mailboxGlobalMaxBoxes
+	mailboxFiles, mailboxUsedBytes = 2, 2*mailboxBlockSize
+	mailboxMu.Unlock()
+
+	n := 0
+	deposit := func(box string) int {
+		n++
+		body, _ := json.Marshal(map[string]string{
+			"box":  box,
+			"blob": base64.StdEncoding.EncodeToString([]byte("hello")),
+		})
+		req := httptest.NewRequest("POST", "/mailbox/deposit", bytes.NewReader(body))
+		req.RemoteAddr = "10.0.0.1:4000"
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("203.0.%d.%d", n/250, n%250))
+		w := httptest.NewRecorder()
+		handleMailboxDeposit(w, req)
+		return w.Code
+	}
+
+	did, _ := testDid(t)
+	if code := deposit(mailboxIDForDid(did)); code != 204 {
+		t.Fatalf("a new recipient was refused at the box ceiling with a stale box to reclaim: %d", code)
+	}
+	if _, err := os.Stat(boxPath(stale)); !os.IsNotExist(err) {
+		t.Error("the stale box was not reclaimed")
+	}
+	if _, err := os.Stat(boxPath(fresh)); err != nil {
+		t.Error("a box still inside its TTL was reclaimed")
+	}
+
+	// Nothing left to reclaim, so the ceiling refuses honestly again.
+	other, _ := testDid(t)
+	if code := deposit(mailboxIDForDid(other)); code != http.StatusInsufficientStorage {
+		t.Fatalf("with no stale box left the ceiling returned %d, want 507", code)
+	}
+}
+
+// The freshness window was symmetric, so a captured did/ts/sig triple stayed
+// usable from two minutes before it was signed until two minutes after -
+// twice the life the window was meant to grant.
+func TestMailboxAuthRejectsFarFutureTimestamps(t *testing.T) {
+	did, priv := testDid(t)
+	at := func(d time.Duration) (int64, string) {
+		ts := time.Now().Add(d).Unix()
+		sig := ed25519.Sign(priv, []byte("awful-mailbox:"+strconv.FormatInt(ts, 10)))
+		return ts, base64.StdEncoding.EncodeToString(sig)
+	}
+	verify := func(d time.Duration) error {
+		ts, sig := at(d)
+		_, err := verifyMailboxAuth(did, ts, sig)
+		return err
+	}
+
+	// Small clock skew ahead is still fine.
+	if err := verify(10 * time.Second); err != nil {
+		t.Errorf("a 10s clock skew was rejected: %v", err)
+	}
+	// A timestamp minted well ahead of now is not.
+	if err := verify(mailboxAuthSkew); err == nil {
+		t.Error("a timestamp a full skew in the future was accepted")
+	}
+	// The past window is untouched.
+	if err := verify(-mailboxAuthSkew + 10*time.Second); err != nil {
+		t.Errorf("a timestamp inside the past window was rejected: %v", err)
+	}
+}

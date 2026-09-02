@@ -48,6 +48,17 @@ export interface DmPayload {
  */
 export const MAX_DM_TEXT_LENGTH = 16_384;
 
+/**
+ * Ids in one read receipt.
+ *
+ * A reader acks the page it had loaded, and a page is 50 (PAGE_SIZE), so 200
+ * is four pages of slack. The text got a cap and this did not, yet each id
+ * costs a storage lookup in _acceptableReceipts and another pass through
+ * _cascadeReadAcks - a receipt naming a million ids is a few hundred KB on
+ * the wire and a very long time on the receiver's main thread.
+ */
+export const MAX_DM_READ_IDS = 200;
+
 export const DM_CHAT_TAG = 0x01;
 export const DM_ACK_TAG = 0x02;
 export const DM_READ_TAG = 0x03;
@@ -156,7 +167,11 @@ export function parseDmEnvelope(
     }
     if (tag === DM_READ_TAG) {
       const ids = JSON.parse(new TextDecoder().decode(payload));
-      if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
+      if (
+        !Array.isArray(ids) ||
+        ids.length > MAX_DM_READ_IDS ||
+        ids.some((id) => typeof id !== "string")
+      ) {
         return null;
       }
       return { type: "read", messageIds: ids };

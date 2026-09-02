@@ -53,17 +53,22 @@ async function _persistDownloadedBlob(
   const attachments = await getAttachmentsByInfoHash(infoHash);
   if (!attachments.length) return;
 
-  const shouldPersistData = attachments.some(
-    (attachment) => attachment.size <= MAX_PERSISTED_ATTACHMENT_BYTES
-  );
-  const data = shouldPersistData ? await blob.arrayBuffer() : undefined;
+  // The BLOB's real length decides this, not attachment.size - that is the
+  // sender's claim, taken from a wire descriptor. A row claiming 1 KB passed
+  // the gate and whatever the torrent actually delivered was then read whole
+  // and written to IndexedDB, so the cap bounded nothing an attacker cared
+  // about. The bytes are in hand here; there is no reason to ask anyone else.
+  const data =
+    blob.size <= MAX_PERSISTED_ATTACHMENT_BYTES
+      ? await blob.arrayBuffer()
+      : undefined;
 
   // Patch, never whole-record put: the record read above predates the (long)
   // blob read, and a blind put clobbered whatever status the seeding path
   // wrote in the meantime.
   await Promise.all(
     attachments.map((attachment) =>
-      data && attachment.size <= MAX_PERSISTED_ATTACHMENT_BYTES
+      data
         ? updateAttachmentData(attachment.id, data)
         : updateAttachmentStatus(attachment.id, "complete")
     )
@@ -255,11 +260,24 @@ export function maybePeerIdFromSenderId(senderId: string): string | null {
   return null;
 }
 
-export function shouldAutoDownload(mimeType: string): boolean {
+/**
+ * Ceiling on a fetch nobody asked for.
+ *
+ * Auto-download is ON by default for image/video/audio, so a single message
+ * naming a large file makes every recipient pull it without a click - and the
+ * size that decides "large" is the sender's own claim, checked against the
+ * torrent's real length only once the metadata lands. 64 MB is well past any
+ * ordinary photo, voice note or clip; anything bigger waits for its Download
+ * button, which has no ceiling because a person asked for it.
+ */
+export const AUTO_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024;
+
+export function shouldAutoDownload(mimeType: string, size?: number): boolean {
   // The preference gates every automatic fetch path in one place - message
   // receipt, seeder announce and render-time backfill all route through
   // here. Off means media waits for its Download button like any other file.
   if (!mediaPrefs.autoDownloadMedia) return false;
+  if (typeof size === "number" && size > AUTO_DOWNLOAD_MAX_BYTES) return false;
   // Audio joins the list so a track can just be played: the inline player has
   // nothing to play until the bytes are here, and audio is smaller than the
   // video already being fetched.

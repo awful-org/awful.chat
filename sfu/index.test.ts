@@ -5,6 +5,7 @@
 //   - the unconnected-transport reaper (Task 1)
 //   - ms:produce source validation (Task 3)
 //   - the dead-socket and stuck-backpressured producer reap (finding 6)
+//   - the per-socket worker-op budget under an ms:resume-consumer flood
 //   - ms:diag (SFU telemetry vantage) enabled/rate-limited/disabled
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -26,6 +27,12 @@ const HEARTBEAT_INTERVAL_MS = 100;
 // Small enough that a short burst of frames crosses it well within one
 // heartbeat tick, without tripping on the other tests' ordinary traffic.
 const MAX_QUEUED_FRAME_BYTES = 2000;
+// Small enough that one burst of frames crosses it inside a single test, and
+// far above what any other test in this file spends.
+const MAX_WORKER_OPS = 40;
+// The socket pause a budget overrun applies. Kept under the (short) test
+// heartbeat interval: a paused socket answers no ping either.
+const WORKER_OP_PAUSE_MS = 20;
 
 let child: ChildProcess;
 
@@ -78,6 +85,8 @@ function spawnSfu(port: number, extraEnv: Record<string, string>): SpawnedSfu {
         SFU_TRANSPORT_CONNECT_TIMEOUT_MS: String(TRANSPORT_CONNECT_TIMEOUT_MS),
         SFU_HEARTBEAT_INTERVAL_MS: String(HEARTBEAT_INTERVAL_MS),
         SFU_MAX_QUEUED_FRAME_BYTES: String(MAX_QUEUED_FRAME_BYTES),
+        SFU_MAX_WORKER_OPS: String(MAX_WORKER_OPS),
+        SFU_WORKER_OP_PAUSE_MS: String(WORKER_OP_PAUSE_MS),
         ANNOUNCED_IP: "127.0.0.1",
         ...extraEnv,
       },
@@ -358,6 +367,97 @@ test("sweepHeartbeatConnection: a non-backpressured socket still uses the ordina
   assert.equal(terminated, 1);
 });
 
+test("an ms:resume-consumer flood is refused by the worker-op budget, not forwarded to the worker", async () => {
+  const roomCode = "room-resume-flood";
+  const wsA = await connectAndJoin(roomCode, "peer-resume-a");
+  const wsB = await connectAndJoin(roomCode, "peer-resume-b");
+  try {
+    const producerId = await produceRealAudio(wsA, 66666666);
+
+    // A real consumer for B, so the flood below names a consumer that exists
+    // and is already resumed - the exact frame a retrying client repeats.
+    wsB.send(JSON.stringify({ type: "ms:get-capabilities", requestId: "caps" }));
+    const caps = await nextMessage(wsB, (m) => m.type === "ms:capabilities");
+    wsB.send(JSON.stringify({ type: "ms:create-transport", direction: "recv" }));
+    await nextMessage(
+      wsB,
+      (m) => m.type === "ms:transport-options" && m.direction === "recv",
+    );
+    wsB.send(
+      JSON.stringify({
+        type: "ms:consume",
+        requestId: "consume-1",
+        producerId,
+        rtpCapabilities: caps.rtpCapabilities,
+      }),
+    );
+    await nextMessage(wsB, (m) => m.type === "ms:consumer-options");
+    wsB.send(JSON.stringify({ type: "ms:resume-consumer", producerId }));
+
+    // Every frame from here asks to resume a consumer that is already
+    // resumed. Before the fix each one was a worker round-trip, dispatched
+    // without await so the per-socket frame chain never throttled it.
+    const flood = 500;
+    // Whatever slips under the budget costs nothing (the handler returns
+    // before resume() when the consumer is not paused); the rest never
+    // reaches the worker at all.
+    const wantedRefusals = flood - MAX_WORKER_OPS;
+    let refusals = 0;
+    const refused = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        wsB.off("message", onMessage);
+        reject(new Error(`only ${refusals} refusals of ${wantedRefusals}`));
+      }, 10000);
+      function onMessage(raw: Buffer): void {
+        const m = JSON.parse(raw.toString());
+        if (m.type !== "ms:error") return;
+        assert.equal(m.reason, "rate-limited");
+        if (++refusals < wantedRefusals) return;
+        clearTimeout(timer);
+        wsB.off("message", onMessage);
+        resolve();
+      }
+      wsB.on("message", onMessage);
+    });
+    for (let i = 0; i < flood; i++) {
+      wsB.send(JSON.stringify({ type: "ms:resume-consumer", producerId }));
+    }
+    await refused;
+    assert.ok(refusals >= wantedRefusals);
+
+    // The consumer is resumed and stayed that way, which is why the frames
+    // that did slip under the budget cost the worker nothing: the handler
+    // returns before resume() for a consumer that is not paused.
+    wsB.send(JSON.stringify({ type: "ms:diag", requestId: "flood-diag" }));
+    const diag = await nextMessage(
+      wsB,
+      (m) => m.type === "ms:diag" && m.requestId === "flood-diag",
+    );
+    const consumer = diag.snapshot.self.consumers.find(
+      (c: { producerId: string }) => c.producerId === producerId,
+    );
+    assert.ok(consumer, "expected the consumer to still be in the snapshot");
+    assert.equal(consumer.paused, false);
+
+    // The instance is still serving other rooms, which is what the flood was
+    // costing before: a fresh peer elsewhere still gets a transport.
+    const wsC = await connectAndJoin("room-resume-bystander", "peer-resume-c");
+    try {
+      wsC.send(JSON.stringify({ type: "ms:create-transport", direction: "send" }));
+      const options = await nextMessage(
+        wsC,
+        (m) => m.type === "ms:transport-options",
+      );
+      assert.equal(options.direction, "send");
+    } finally {
+      wsC.close();
+    }
+  } finally {
+    wsA.close();
+    wsB.close();
+  }
+});
+
 test("ms:diag returns a snapshot naming this peer's own transport and producer", async () => {
   const ws = await connectAndJoin("room-diag", "peer-diag-a");
   try {
@@ -381,6 +481,9 @@ test("ms:diag returns a snapshot naming this peer's own transport and producer",
     );
     assert.ok(producer, "expected the produced audio track to be in the snapshot");
     assert.equal(producer.source, "camera");
+    // Instance-wide counts are the operator's, not a room member's.
+    assert.equal(reply.snapshot.ceilings.rooms, undefined);
+    assert.equal(reply.snapshot.ceilings.maxRooms, undefined);
   } finally {
     ws.close();
   }

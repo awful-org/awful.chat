@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -203,6 +204,18 @@ func newClient(r *registry, peerId string) (*connectedClient, *fakeStream) {
 	return addClient(r, peerId, s), s
 }
 
+// liftEmptyRegisterBudget takes the room-code oracle budget out of the way of
+// tests about some OTHER cap. Registering thousands of rooms nobody else is in
+// is exactly what maxEmptyRegisters refuses, so without this those tests would
+// be measuring the oracle budget instead of the cap they name.
+func liftEmptyRegisterBudget(r *registry, peerId string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.emptyRegisterBudget(peerId)
+	b.limit = 1 << 30
+	b.started = false
+}
+
 func TestRegisterSendsPeerListAndNotifies(t *testing.T) {
 	r := newRegistry()
 	a, sa := newClient(r, "peer-a")
@@ -275,6 +288,7 @@ func TestRepeatedRegisterResyncsPeers(t *testing.T) {
 func TestCappedRegisterGetsRegisterFailed(t *testing.T) {
 	r := newRegistry()
 	a, sa := newClient(r, "peer-a")
+	liftEmptyRegisterBudget(r, "peer-a")
 	for i := range maxRoomsPerPeer {
 		r.register(a, fmt.Sprintf("room-%d", i))
 	}
@@ -531,6 +545,7 @@ func TestValidRoomRejectsUnusableIds(t *testing.T) {
 func TestRoomsPerPeerAreCapped(t *testing.T) {
 	r := newRegistry()
 	a, _ := newClient(r, "peer-a")
+	liftEmptyRegisterBudget(r, "peer-a")
 	for i := 0; i < maxRoomsPerPeer+10; i++ {
 		r.register(a, fmt.Sprintf("room-%d", i))
 	}
@@ -769,6 +784,7 @@ func TestRoomCapIsSharedAcrossAPeersStreams(t *testing.T) {
 	r := newRegistry()
 	a1, _ := newClient(r, "peer-a")
 	a2, _ := newClient(r, "peer-a")
+	liftEmptyRegisterBudget(r, "peer-a")
 
 	for i := range maxRoomsPerPeer {
 		r.register(a1, fmt.Sprintf("room-a1-%d", i))
@@ -874,7 +890,7 @@ func TestGlobalRegistrationCountFallsOnLeaveAndDisconnect(t *testing.T) {
 // DM in one burst, and a dropped REGISTER leaves it silently out of its own
 // room. This is the regression guard for that, not for the attack.
 func TestMembershipBudgetAllowsAFullReconnectBurst(t *testing.T) {
-	o := &opBudget{}
+	o := newOpBudget(maxMembershipOps, membershipOpWindow)
 	now := time.Now()
 	for i := 0; i < maxRoomsPerPeer; i++ {
 		if !o.allow(now) {
@@ -888,7 +904,7 @@ func TestMembershipBudgetAllowsAFullReconnectBurst(t *testing.T) {
 // member is dropped from EVERY room it holds - including rooms the flapper was
 // never in.
 func TestMembershipBudgetStopsAFlapperAndRefills(t *testing.T) {
-	o := &opBudget{}
+	o := newOpBudget(maxMembershipOps, membershipOpWindow)
 	now := time.Now()
 	allowed := 0
 	for i := 0; i < maxMembershipOps*4; i++ {
@@ -1096,5 +1112,97 @@ func TestRegisteredStreamWithNoLivenessIsClosedAfterTimeout(t *testing.T) {
 	}
 	if roomHas(r, "room1", "peer-wedged") {
 		t.Fatal("cleanup should remove the wedged stream from its rooms")
+	}
+}
+
+// The empty-register budget used to live on connectedClient, which is ONE
+// stream: a peer holding maxStreamsPerPeer streams got that many separate
+// budgets, and closing a stream and opening another minted a fresh one on
+// demand. Keyed by peerId in the registry, every stream a peer holds spends
+// the same 128/window.
+func TestEmptyRegisterBudgetIsPerPeerNotPerStream(t *testing.T) {
+	r := newRegistry()
+	a1, _ := newClient(r, "peer-a")
+
+	// Every one of these rooms is empty, so every REGISTER is charged. The
+	// budget is exactly maxEmptyRegisters, not the maxMembershipOps the
+	// hardcoded window used to spend.
+	for i := 0; i < maxEmptyRegisters; i++ {
+		if got := r.register(a1, fmt.Sprintf("empty-%d", i)); got != registerJoined {
+			t.Fatalf("register %d of %d returned %v, want registerJoined", i, maxEmptyRegisters, got)
+		}
+	}
+	if got := r.register(a1, "one-too-many"); got != registerOracleSilenced {
+		t.Fatalf("register past the budget returned %v, want registerOracleSilenced", got)
+	}
+
+	// A second stream for the same peerId inherits what the first spent.
+	a2, _ := newClient(r, "peer-a")
+	if got := r.register(a2, "second-stream"); got != registerOracleSilenced {
+		t.Fatalf("a second stream got a budget of its own: %v", got)
+	}
+
+	// Nor does cycling streams refill it: dropping the spent stream while
+	// another remains and opening a replacement is the cheap refill the
+	// per-stream budget allowed.
+	r.removeClient(a1)
+	a3, _ := newClient(r, "peer-a")
+	if got := r.register(a3, "replacement-stream"); got != registerOracleSilenced {
+		t.Fatalf("a replacement stream refilled the budget: %v", got)
+	}
+
+	// A room somebody else is already in is never charged against it, so a
+	// silenced peer can still join real rooms.
+	b, _ := newClient(r, "peer-b")
+	r.register(b, "populated")
+	if got := r.register(a3, "populated"); got != registerJoined {
+		t.Fatalf("joining a populated room returned %v while silenced", got)
+	}
+}
+
+// EnableRelayService with no ACL relays for anybody: two unrelated libp2p
+// nodes could use the deployment as free transit, and the per-IP and per-ASN
+// reservation caps cannot tell them from real users because every client
+// arrives from Traefik's single address.
+func TestCircuitACLRefusesPeersWithoutARendezvousStream(t *testing.T) {
+	r := newRegistry()
+	acl := rendezvousACL{reg: r}
+	src, dst := peer.ID("src-peer"), peer.ID("dst-peer")
+
+	if acl.AllowConnect(src, nil, dst) {
+		t.Fatal("two strangers were granted transit through the relay")
+	}
+	addClient(r, src.String(), &fakeStream{})
+	if acl.AllowConnect(src, nil, dst) {
+		t.Fatal("a circuit to a destination with no rendezvous stream was allowed")
+	}
+	d := addClient(r, dst.String(), &fakeStream{})
+	if !acl.AllowConnect(src, nil, dst) {
+		t.Fatal("a circuit between two of our own peers was refused")
+	}
+	r.removeClient(d)
+	if acl.AllowConnect(src, nil, dst) {
+		t.Fatal("transit outlived the destination's last rendezvous stream")
+	}
+
+	// Reservations stay open on purpose: the client reserves BEFORE it opens
+	// its rendezvous stream (transport.ts connect()), so gating them on a
+	// live stream would refuse every legitimate first reservation.
+	if !acl.AllowReserve(peer.ID("brand-new-client"), nil) {
+		t.Fatal("AllowReserve refused, which breaks every client's first reservation")
+	}
+}
+
+// WithInfiniteLimits gave every circuit unlimited time and unlimited bytes,
+// which is what made an open relay worth abusing. The replacement has to stay
+// generous - chat, DMs and sync ride a circuit for a whole session - but it
+// has to be a number.
+func TestCircuitLimitIsFiniteButGenerous(t *testing.T) {
+	l := relayCircuitLimit()
+	if l == nil || l.Duration <= 0 || l.Data <= 0 {
+		t.Fatalf("per-circuit limit is not finite: %+v", l)
+	}
+	if l.Duration < time.Hour || l.Data < 1<<30 {
+		t.Errorf("per-circuit limit %v / %d bytes is too tight for a session-long circuit", l.Duration, l.Data)
 	}
 }

@@ -110,7 +110,26 @@ export function _sendCallState(peerId?: string): void {
   // frame is not dropped at random, it is dropped because the sender is in
   // nobody's mesh for that topic, and repeating a broadcast down a path that
   // is not there just fails again every 20 seconds.
-  for (const pid of _transport.peers()) _transport.send(pid, payload);
+  for (const pid of _directTargets(rooms)) _transport.send(pid, payload);
+}
+
+/**
+ * The peers a direct copy of a call frame may go to: the members, per the
+ * relay, of the rooms the same frame is being broadcast into.
+ *
+ * These loops used to walk _transport.peers() - EVERY peer holding a
+ * connection to us, and any peer that knows our permanent peerId can open
+ * one. A CallPresence frame carries the call's room code, and a room code is
+ * that room's entire membership secret (gossipsub topic, rendezvous key, SFU
+ * join key), so the belt-and-braces direct copy quietly handed it to
+ * strangers 20 seconds at a time.
+ */
+function _directTargets(rooms: Set<string>): Set<string> {
+  const targets = new Set<string>();
+  for (const room of rooms) {
+    for (const pid of _transport.peersInRoom(room)) targets.add(pid);
+  }
+  return targets;
 }
 
 export function _sendCallPresence(peerId?: string): void {
@@ -142,7 +161,7 @@ export function _sendCallPresence(peerId?: string): void {
   // can dial a voice link to a peer they have not heard is in the call, so a
   // lost announcement is dead air for everyone else. The direct streams are
   // confirmed and already open; the frame is a few bytes.
-  for (const pid of _transport.peers()) _transport.send(pid, payload);
+  for (const pid of _directTargets(rooms)) _transport.send(pid, payload);
 }
 
 // Keep the screen awake for the duration of a call. The browser drops the lock

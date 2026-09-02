@@ -37,7 +37,7 @@
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
-  import { humanize } from "$lib/mentions";
+  import { linkify } from "$lib/mentions";
   import { mediaBoxStyle } from "$lib/image-size";
   import { INLINE_FILE_MAX_BYTES } from "$lib/transport/files.svelte";
 
@@ -784,9 +784,23 @@
     }
   }
 
+  /**
+   * Drop the C0 controls, keeping only newline and tab (and DEL, which behaves
+   * like one).
+   *
+   * A fenced block is peer text on its way to a terminal, and the bytes that
+   * do not show on screen are the dangerous ones: a `\r` rewrites the line the
+   * reader thinks they pasted, and an escape byte can drive the terminal
+   * itself. What was copied has to be what was displayed.
+   */
+  function stripControlChars(text: string): string {
+    // eslint-disable-next-line no-control-regex
+    return text.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "");
+  }
+
   async function copyCodeBlock() {
     if (!asCodeBlock) return;
-    await navigator.clipboard.writeText(asCodeBlock.code);
+    await navigator.clipboard.writeText(stripControlChars(asCodeBlock.code));
     copiedCode = true;
     setTimeout(() => {
       copiedCode = false;
@@ -809,18 +823,7 @@
   }
 
   function linkifyText(text: string): string {
-    // Order is the security property: escape the whole body FIRST, then
-    // decorate. Mention tokens (@[did]) contain no HTML characters so they
-    // survive escaping, and humanize() escapes the resolved display name
-    // itself before emitting the chip.
-    const escaped = escapeHtml(text);
-    const mentionized = humanize(escaped, resolveMentionDisplayName);
-    const urlRegex = /(https?:\/\/[^\s<]+)/gi;
-    return mentionized.replace(
-      urlRegex,
-      (url) =>
-        `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-primary hover:underline">${url}</a>`
-    );
+    return linkify(text, resolveMentionDisplayName);
   }
 
 

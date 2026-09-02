@@ -76,12 +76,13 @@ export interface SfuSnapshot {
       consumers: number;
     }>;
   }>;
+  // Per-peer ceilings only. How many rooms this instance holds, and its room
+  // ceiling, told any room member how busy the whole SFU was - that is the
+  // operator's business, so it stays in the server log.
   ceilings: {
     peersPerRoom: number;
     producersPerPeer: number;
     consumersPerPeer: number;
-    rooms: number;
-    maxRooms: number;
   };
 }
 

@@ -49,8 +49,14 @@ const (
 	// Unclaimed blobs expire; the P2P offline queue still retries forever,
 	// so expiry only delays delivery until both sides co-online.
 	mailboxTTL = 48 * time.Hour
-	// Signed-timestamp freshness window for collect/ack.
+	// Signed-timestamp freshness window for collect/ack, into the PAST: it
+	// has to tolerate a slow client and a slow network.
 	mailboxAuthSkew = 2 * time.Minute
+	// How far AHEAD a signed timestamp may be. Only clock skew needs
+	// tolerating in that direction, and allowing the full mailboxAuthSkew
+	// doubled the life of a captured auth triple - it stayed usable from two
+	// minutes before it was signed until two minutes after.
+	mailboxAuthFutureSkew = 30 * time.Second
 	// Hard ceiling on everything under mailboxDir combined. Per-IP limits
 	// mean nothing to a distributed depositor; without a global cap the
 	// shared data volume could be filled without bound.
@@ -66,7 +72,16 @@ const (
 	// counted explicitly so that raising mailboxGlobalMaxBytes, or ever
 	// dropping the charge, cannot quietly unbound file and directory creation.
 	mailboxGlobalMaxFiles = mailboxGlobalMaxBytes / mailboxBlockSize
-	mailboxGlobalMaxBoxes = mailboxGlobalMaxFiles / 8
+	// A box is a directory, so it costs an inode of its own on top of the
+	// blobs inside it: the inode budget above is shared, and at most half of
+	// it may be directories - exactly the case where every box holds one
+	// blob. This used to be mailboxGlobalMaxFiles/8, which 8192 one-byte
+	// deposits reached with only an EIGHTH of the byte budget spent, after
+	// which every NEW recipient was refused for a full TTL while existing
+	// boxes kept working. Box pressure now arrives with byte pressure, and a
+	// deposit that does meet it evicts a stale box before refusing (see
+	// evictOldestStaleBox).
+	mailboxGlobalMaxBoxes = mailboxGlobalMaxFiles / 2
 	// Deposit/collect/ack per-IP budgets. Deposits get their own bucket so a
 	// chatty plugin proxying data does not starve offline DMs (and vice
 	// versa); collect+ack were previously unlimited, a free CPU/verify sink.
@@ -166,7 +181,7 @@ func isSmallOrderPubKey(pub []byte) bool {
 }
 
 func verifyMailboxAuth(did string, ts int64, sigB64 string) (string, error) {
-	if d := time.Since(time.Unix(ts, 0)); d > mailboxAuthSkew || d < -mailboxAuthSkew {
+	if d := time.Since(time.Unix(ts, 0)); d > mailboxAuthSkew || d < -mailboxAuthFutureSkew {
 		return "", fmt.Errorf("stale timestamp")
 	}
 	pub, err := didToPubKey(did)
@@ -265,6 +280,60 @@ func mailboxInitUsedBytes() {
 	}
 }
 
+// evictOldestStaleBox frees one box directory when the box ceiling is hit, so
+// a flood of tiny deposits cannot close the door on every NEW recipient for a
+// full TTL while the boxes it created sit expired. A directory's mtime moves
+// on every deposit and every ack, so one older than the TTL holds nothing that
+// has not already expired: those are the only candidates, and the oldest goes
+// first. The sweeper collects them too, but only hourly, and refusing real
+// deposits in between is the failure this avoids. Caller holds mailboxMu.
+func evictOldestStaleBox() bool {
+	cutoff := time.Now().Add(-mailboxTTL)
+	var oldest string
+	var oldestMod time.Time
+	boxes, _ := os.ReadDir(mailboxDir)
+	for _, b := range boxes {
+		if !b.IsDir() || !mailboxBoxRe.MatchString(b.Name()) {
+			continue
+		}
+		info, err := b.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if oldest == "" || info.ModTime().Before(oldestMod) {
+			oldest, oldestMod = b.Name(), info.ModTime()
+		}
+	}
+	if oldest == "" {
+		return false
+	}
+	dir := filepath.Join(mailboxDir, oldest)
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if os.Remove(filepath.Join(dir, e.Name())) == nil {
+			// Same non-negative guard as ack: a counter that can go negative
+			// silently disables the ceiling it enforces.
+			if charge := mailboxCharge(info.Size()); mailboxUsedBytes >= charge {
+				mailboxUsedBytes -= charge
+			}
+			if mailboxFiles > 0 {
+				mailboxFiles--
+			}
+		}
+	}
+	if os.Remove(dir) != nil { // succeeds only when empty
+		return false
+	}
+	if mailboxBoxes > 0 {
+		mailboxBoxes--
+	}
+	return true
+}
+
 // handleMailboxDeposit stores one sealed blob. Anonymous by design; only
 // rate limits and caps stand between it and abuse.
 func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +370,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	newBox := false
 	if _, err := os.Stat(dir); err != nil {
 		newBox = true
-		if mailboxBoxes >= mailboxGlobalMaxBoxes {
+		if mailboxBoxes >= mailboxGlobalMaxBoxes && !evictOldestStaleBox() {
 			http.Error(w, "mailbox full", http.StatusInsufficientStorage)
 			return
 		}

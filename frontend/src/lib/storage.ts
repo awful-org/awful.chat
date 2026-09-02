@@ -5,11 +5,16 @@ import {
   openRow,
   openRows,
   isSealed,
+  isCurrentAad,
+  inspectRow,
+  DeadRowError,
   isStorageLockedError,
   isBlinded,
   rowHasBytes,
   storageCryptoReady,
   blindValue,
+  hashRef,
+  setAtRestSweepPending,
   STORE_SPECS,
   type Blinded,
   type EncryptedStoreName,
@@ -2227,7 +2232,11 @@ export function closeDatabase(): void {
 // entirely for the next one, leaving whatever was still plaintext readable -
 // and unsealed rows are readable by ANY identity (openRow returns them before
 // it asks for a key).
-const ATREST_FLAG_PREFIX = "awful:atrest:v2";
+// v3: the v2 sweep sealed already-sealed rows a second time (see inspectRow),
+// so every device has to run one more pass, and a new flag key is what makes
+// the old "done" marker stop counting.
+const ATREST_FLAG_PREFIX = "awful:atrest:v3";
+const ATREST_FLAG_FAMILY = "awful:atrest:";
 let _atRestOwner: string | null = null;
 let _migrationRunning = false;
 
@@ -2251,37 +2260,55 @@ function isMigrationComplete(): boolean {
   }
 }
 
+// openRow passes an UNSEALED row through while the sweep still has plaintext
+// rows to convert, and refuses it once the sweep is done. The flag lives here,
+// so storage-crypto (which storage.ts imports, not the other way round) is
+// handed the question rather than asked to answer it.
+setAtRestSweepPending(() => !isMigrationComplete());
+
 /** Names the identity whose data the sweep is responsible for. */
 export function setAtRestOwner(did: string | null): void {
-  _atRestOwner = did;
+  // The HASH of the DID, not the DID. The flag has to be checkable with the
+  // identity locked, so it lives in localStorage - where the scoped key
+  // "awful:atrest:v2:did:key:z6Mk..." named the account on the device to
+  // anyone who opened the Application tab. A hash keys it just as well.
+  _atRestOwner = did ? hashRef(did) : null;
+  dropLegacyAtRestFlags();
 }
 
-/** Call after any write that may have landed plaintext (a locked import):
- *  the next unlock's sweep re-scans and seals it. */
-export function markAtRestSweepNeeded(): void {
+/** Flags written under the old plaintext-DID key shape. They are only a
+ *  "sweep done" marker, so dropping one costs a single extra scan. */
+function dropLegacyAtRestFlags(): void {
+  removeAtRestFlags(
+    (key) =>
+      key.startsWith(ATREST_FLAG_FAMILY) &&
+      key !== ATREST_FLAG_PREFIX &&
+      !key.startsWith(`${ATREST_FLAG_PREFIX}:`)
+  );
+}
+
+/**
+ * Drop EVERY identity's sweep flag.
+ *
+ * Exported for the identity-switch wipe: the flags are per-identity
+ * localStorage the previous account left behind, and they are keyed by a hash
+ * now, so a literal entry in identity.ts's IDENTITY_SCOPED_KEYS cannot name
+ * them.
+ */
+export function clearAtRestFlags(): void {
+  removeAtRestFlags((key) => key.startsWith(ATREST_FLAG_FAMILY));
+}
+
+// Enumerated with length/key(i), the spec'd API, rather than
+// Object.keys(localStorage), which relies on the exotic own-property behaviour
+// real Storage objects happen to have. Keys are collected first because
+// removing during the walk shifts the indices under it.
+function removeAtRestFlags(match: (key: string) => boolean): void {
   try {
-    // EVERY identity's flag, not just the current one. The caller that needs
-    // this most is a backup restore from the signup screen, where no identity
-    // is active yet - so _atRestOwner is null and the scoped key we would
-    // clear is not the key the sweep checks after unlock. On a device that had
-    // already migrated this identity, that left "done" standing over freshly
-    // imported plaintext rows: migrateAtRest early-returned, the rows kept
-    // their plaintext roomCode, and isMigrationComplete() suppressed the dual
-    // read that would have found them. Rooms still listed (a plain getAll),
-    // but every message was invisible.
-    // Enumerated with length/key(i), the spec'd API, rather than
-    // Object.keys(localStorage), which relies on the exotic own-property
-    // behaviour real Storage objects happen to have. Keys are collected first
-    // because removing during the walk shifts the indices under it.
     const stale: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
-      if (
-        key &&
-        (key === ATREST_FLAG_PREFIX || key.startsWith(`${ATREST_FLAG_PREFIX}:`))
-      ) {
-        stale.push(key);
-      }
+      if (key && match(key)) stale.push(key);
     }
     for (const key of stale) localStorage.removeItem(key);
   } catch {
@@ -2289,16 +2316,34 @@ export function markAtRestSweepNeeded(): void {
   }
 }
 
+/** Call after any write that may have landed plaintext (a locked import):
+ *  the next unlock's sweep re-scans and seals it. */
+export function markAtRestSweepNeeded(): void {
+  // EVERY identity's flag, not just the current one. The caller that needs
+  // this most is a backup restore from the signup screen, where no identity
+  // is active yet - so _atRestOwner is null and the scoped key we would clear
+  // is not the key the sweep checks after unlock. On a device that had already
+  // migrated this identity, that left "done" standing over freshly imported
+  // plaintext rows: migrateAtRest early-returned, the rows kept their
+  // plaintext roomCode, and isMigrationComplete() suppressed the dual read
+  // that would have found them. Rooms still listed (a plain getAll), but every
+  // message was invisible.
+  clearAtRestFlags();
+}
+
 /**
- * Check if a row needs re-sealing for the blinding migration. A row needs
- * blinding if: (1) it is not sealed at all (legacy plaintext), OR (2) it is
- * sealed but contains unblinded values in the blind fields.
+ * Check if a row needs re-sealing. A row does if: (1) it is not sealed at all
+ * (legacy plaintext), (2) it is sealed but contains unblinded values in the
+ * blind fields, or (3) its blobs carry an older AAD binding than the one
+ * sealRow writes today - those still open, but only re-sealing binds the clear
+ * fields beside them.
  */
 function needsBlindingMigration(
   row: unknown,
   spec: StoreCryptoSpec
 ): boolean {
   if (!isSealed(row)) return true; // Legacy plaintext - needs sealing
+  if (!isCurrentAad(row)) return true; // Sealed under an older AAD binding
   const r = row as Record<string, unknown>;
   // Check if any blind field contains an unblinded value (not prefixed with b1:)
   for (const field of spec.blind ?? []) {
@@ -2307,7 +2352,7 @@ function needsBlindingMigration(
       return true; // Sealed but unblinded - needs re-sealing
     }
   }
-  return false; // Already sealed and blinded
+  return false; // Already sealed, blinded and bound
 }
 
 /**
@@ -2320,6 +2365,16 @@ function needsBlindingMigration(
  * nothing needing migration. Chunked so no transaction spans the (async,
  * tx-killing) crypto, and so a mid-sweep close just resumes next unlock.
  */
+/** The row we pre-read is still what is on disk: same blob (the IV is fresh
+ *  per write, so equal IVs mean an untouched row), or both still plaintext. */
+function sameOnDisk(fresh: unknown, before: unknown): boolean {
+  if (isSealed(fresh) !== isSealed(before)) return false;
+  if (!isSealed(fresh) || !isSealed(before)) return true;
+  const a = new Uint8Array(fresh._enc.iv);
+  const b = new Uint8Array(before._enc.iv);
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
 export async function migrateAtRest(): Promise<void> {
   if (_migrationRunning) return;
   try {
@@ -2332,6 +2387,7 @@ export async function migrateAtRest(): Promise<void> {
   try {
     const database = await getDB();
     let migratedCount = 0;
+    let deadCount = 0;
     // Stores whose primary key changed due to blinding: must delete old and
     // insert new to avoid duplicates.
     // Stores whose PRIMARY KEY is a blinded field. Their rows cannot be
@@ -2375,34 +2431,62 @@ export async function migrateAtRest(): Promise<void> {
           );
         while (cursor && toMigrate.length < CHUNK) {
           lastKey = cursor.primaryKey;
-          if (needsBlindingMigration(cursor.value, spec)) {
-            toMigrate.push({
-              key: cursor.primaryKey,
-              row: cursor.value as unknown as Record<string, unknown>,
-            });
-          }
+          // Every row is a candidate. Whether a SEALED row needs rewriting is
+          // only fully known once it is open (inspectRow's nested case), and
+          // this sweep runs once per flag version, so opening each row once
+          // is the whole cost.
+          toMigrate.push({
+            key: cursor.primaryKey,
+            row: cursor.value as unknown as Record<string, unknown>,
+          });
           cursor = await cursor.continue();
         }
         if (toMigrate.length === 0) break;
-        // ...seal/re-seal it outside, write it back conditionally. Every app
-        // write seals, so a row that changed while our crypto ran is migrated
-        // by now - re-checking inside the (atomic) write transaction means the
-        // sweep can never clobber a live update with its stale pre-read.
+        // ...OPEN it outside the transaction, re-seal what needs it, write it
+        // back conditionally. Opening is the step the previous sweep skipped:
+        // it handed the sealed row itself to sealRow, which wrapped the old
+        // blob inside a new one and left every row opening to its own
+        // ciphertext. Every app write seals, so a row that changed while our
+        // crypto ran is current by now - re-checking inside the (atomic)
+        // write transaction means the sweep never clobbers a live update
+        // with its stale pre-read.
         const sealed = await Promise.all(
-          toMigrate.map((m) => sealRow(m.row, spec))
+          toMigrate.map(async (m) => {
+            let opened: Record<string, unknown> = m.row;
+            if (isSealed(m.row)) {
+              try {
+                opened = (await inspectRow<Record<string, unknown>>(m.row, spec)).value;
+              } catch (err) {
+                // A twice-sealed row is dead and blocks repair; delete it.
+                // Anything else undecryptable (another identity's row, a
+                // truncated blob) is not ours to rewrite; reads drop it.
+                if (err instanceof DeadRowError) {
+                  return { key: m.key, before: m.row, row: null };
+                }
+                return null;
+              }
+            }
+            if (!needsBlindingMigration(m.row, spec)) return null;
+            return { key: m.key, before: m.row, row: await sealRow(opened, spec) };
+          })
         );
         const tx = database.transaction(store, "readwrite");
-        for (let i = 0; i < sealed.length; i++) {
-          const fresh = await tx.store.get(toMigrate[i].key as string);
-          if (fresh && needsBlindingMigration(fresh, spec)) {
-            // For stores whose key path changed, delete the old key before
-            // putting the new one (the sealed row's key is now blinded).
-            if (keyPathChangedStores.has(store)) {
-              await tx.store.delete(toMigrate[i].key as string);
-            }
-            await tx.store.put(sealed[i] as never);
-            migratedCount += 1;
+        for (const s of sealed) {
+          if (!s) continue;
+          const fresh = await tx.store.get(s.key as string);
+          if (!fresh || !sameOnDisk(fresh, s.before)) continue;
+          if (s.row === null) {
+            await tx.store.delete(s.key as string);
+            deadCount += 1;
+            continue;
           }
+          // For stores whose key path changed, delete the old key before
+          // putting the new one (the sealed row's key is now blinded).
+          if (keyPathChangedStores.has(store)) {
+            await tx.store.delete(s.key as string);
+          }
+          await tx.store.put(s.row as never);
+          migratedCount += 1;
         }
         await tx.done;
         if (toMigrate.length < CHUNK) break;
@@ -2410,6 +2494,18 @@ export async function migrateAtRest(): Promise<void> {
     }
     if (migratedCount > 0) {
       console.log(`[storage] at-rest migration migrated ${migratedCount} rows`);
+    }
+    if (deadCount > 0) {
+      console.warn(`[storage] deleted ${deadCount} rows the 2026-09-02 sweep sealed twice; their content was unrecoverable`);
+      // storage.ts cannot reach the transport (import order), so the app is
+      // told the way any window listener would be; AppView announces it.
+      try {
+        window.dispatchEvent(
+          new CustomEvent("awful:storage-notice", { detail: { dead: deadCount } })
+        );
+      } catch {
+        /* no window (tests) */
+      }
     }
     try {
       localStorage.setItem(atRestFlagKey(), String(Date.now()));
