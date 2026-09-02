@@ -34,6 +34,16 @@
   let dismissed = $state(snoozed());
   let asking = $state(false);
 
+  // Phones only. A desktop keeps its tab open, so it gets notified without
+  // push and the ask is noise there; the switch stays in Settings for anyone
+  // who wants it. Coarse pointer, a narrow viewport or an installed app are
+  // the three ways a phone looks like one.
+  const phoneLike =
+    typeof window !== "undefined" &&
+    (window.matchMedia?.("(pointer: coarse)").matches ||
+      window.innerWidth < 768 ||
+      isStandalone());
+
   // A browser with no Notification at all and no home-screen install: iOS
   // Safari in a tab. Anywhere else that lacks it can do nothing about it, so
   // it is told nothing.
@@ -42,7 +52,8 @@
   );
 
   const show = $derived(
-    identityStore.isUnlocked &&
+    phoneLike &&
+      identityStore.isUnlocked &&
       !dismissed &&
       pushPrefs.enabled &&
       (needsInstall ||

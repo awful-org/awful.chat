@@ -67,8 +67,10 @@
 </script>
 
 {#if primary && !installState.standalone}
+  <!-- Controlled by bind:open; a Trigger here rendered an empty inline
+       button at the top of the app root, whose line box pushed the whole
+       layout down by a row. -->
   <Dialog.Root bind:open>
-    <Dialog.Trigger />
     <Dialog.Content class="font-mono">
       <Dialog.Header>
         <div class="flex items-center gap-2 justify-center mb-2">
