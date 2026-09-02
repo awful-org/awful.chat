@@ -26,20 +26,36 @@ export interface VerifyOpts {
   allowUnsigned?: boolean;
 }
 
+export type VerifyReason =
+  | "content-type"
+  | "content-oversize"
+  | "unsigned"
+  | "sig-version"
+  | "no-did"
+  | "did-mismatch"
+  | "no-room"
+  | "bad-signature";
+
+export type VerifyVerdict = { ok: true } | { ok: false; reason: VerifyReason };
+
 export async function verifyIncoming(
   wire: WireChatMessage,
   opts: VerifyOpts = {}
-): Promise<boolean> {
+): Promise<VerifyVerdict> {
   // Ahead of everything else, signed or not: a valid signature (or an
   // allowUnsigned sync batch from a trusted counterparty) only proves who
   // sent it, never that it is a reasonable size to store and render.
-  if (
-    typeof wire.content !== "string" ||
-    wire.content.length > MAX_CHAT_CONTENT_LENGTH
-  ) {
-    return false;
+  if (typeof wire.content !== "string") {
+    return { ok: false, reason: "content-type" };
   }
-  if (!wire.sig) return opts.allowUnsigned === true;
+  if (wire.content.length > MAX_CHAT_CONTENT_LENGTH) {
+    return { ok: false, reason: "content-oversize" };
+  }
+  if (!wire.sig) {
+    return opts.allowUnsigned === true
+      ? { ok: true }
+      : { ok: false, reason: "unsigned" };
+  }
   // v3 ONLY, as of the 2026-08-28 sunset.
   //
   // v1's canonical left reaction/reply/file fields unsigned, so a relay could
@@ -55,8 +71,8 @@ export async function verifyIncoming(
   // sync transfers the database wholesale rather than re-verifying it, so
   // nothing already on a device is lost - a peer simply cannot backfill a
   // room's pre-v3 past to a device that never had it.
-  if (wire.sigV !== 3) return false;
-  if (!wire.senderDid) return false;
+  if (wire.sigV !== 3) return { ok: false, reason: "sig-version" };
+  if (!wire.senderDid) return { ok: false, reason: "no-did" };
   // The signing DID must BE the claimed sender, always. This was once checked
   // only when senderId was already in did:key form, so a senderId in any
   // other shape - notably a libp2p peerId, which every peer in the mesh can
@@ -67,15 +83,18 @@ export async function verifyIncoming(
   // signer is the author. Every validly signed message carries
   // senderDid === senderId: signMessage() needs an unlocked session and sets
   // both from it.
-  if (wire.senderDid !== wire.senderId) return false;
+  if (wire.senderDid !== wire.senderId) {
+    return { ok: false, reason: "did-mismatch" };
+  }
   // v3 binds type and room. The wire carries no roomCode, so the canonical is
   // reconstructed with the AUTHENTICATED room this message is being filed
   // under - a message signed for another room (or with its type flipped in
   // transit) fails verification here.
-  if (!opts.room) return false;
-  return verifySignature(
+  if (!opts.room) return { ok: false, reason: "no-room" };
+  const valid = await verifySignature(
     wire.senderDid,
     wire.sig,
     canonicalContentV3({ ...wire, roomCode: opts.room })
   );
+  return valid ? { ok: true } : { ok: false, reason: "bad-signature" };
 }

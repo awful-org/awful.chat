@@ -17,6 +17,10 @@ services:
       NODE_ENV: development
       HTTP_PORT: "8080"
       KLIPY_API_KEY: ${KLIPY_API_KEY:-dev-key}
+      # On locally, so the dashboard works out of the box: the relay stores
+      # uploaded bundles and serves the two operator read endpoints.
+      TELEMETRY_ENABLED: "1"
+      TELEMETRY_ADMIN_TOKEN: dev
     networks:
       - local-network
 
@@ -57,6 +61,9 @@ services:
       ANNOUNCED_IP: "127.0.0.1"
       RTC_MIN_PORT: "40000"
       RTC_MAX_PORT: "40003"
+      # On locally: answers ms:diag and prints one [sfu-telemetry] line per
+      # room per sweep, which `docker logs -t` then feeds to the dashboard.
+      SFU_TELEMETRY: "1"
     networks:
       - local-network
 

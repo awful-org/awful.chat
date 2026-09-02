@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
@@ -251,5 +252,35 @@ func TestTurnCredentialsUsernameCarriesAPerClientID(t *testing.T) {
 	want := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 	if c1 != want {
 		t.Fatalf("credential is not HMAC-SHA1 over the full username")
+	}
+}
+
+func TestDefaultTurnURLsUsesConfiguredPort(t *testing.T) {
+	t.Setenv("TURN_HOST", "")
+	t.Setenv("DOMAIN", "dev.example.chat")
+
+	// Unset: the long-standing default, which every existing deploy relies on.
+	t.Setenv("TURN_PORT", "")
+	got := defaultTurnURLs()
+	want := []string{
+		"turn:dev.example.chat:3478?transport=udp",
+		"turn:dev.example.chat:3478?transport=tcp",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("default port: got %v, want %v", got, want)
+	}
+
+	// Set: coturn has been moved, usually because another stack on the same
+	// host already owns 3478. Advertising 3478 anyway sends clients to that
+	// other instance's coturn, which rejects the credentials with 401 - and
+	// nothing in the app can tell that apart from "no TURN".
+	t.Setenv("TURN_PORT", "3479")
+	got = defaultTurnURLs()
+	want = []string{
+		"turn:dev.example.chat:3479?transport=udp",
+		"turn:dev.example.chat:3479?transport=tcp",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("configured port: got %v, want %v", got, want)
 	}
 }

@@ -3,9 +3,14 @@ import type { VoiceTransport, VoiceEvents } from "../types";
 import type { AppServices, LibP2PTransport } from "./transport";
 import type { DtlnProcessor } from "$lib/audio/dtln-processor";
 import { getIceServers, onIceServersChanged } from "../ice-server-list";
+import { succeededPair } from "../ice-stats";
 import { MessageType } from "$lib/types/message";
 import { encode } from "$lib/utils";
 import { CallAudioMixer } from "$lib/audio/call-audio-mixer";
+import { ev } from "$lib/telemetry/event";
+import { rec } from "$lib/telemetry/recorder";
+import { probeTurn } from "$lib/telemetry/taps";
+import { recVoiceEvent } from "$lib/telemetry/taps";
 
 /** Same ceiling as the output slider in audio settings. */
 export const MAX_PEER_VOLUME = 2.5;
@@ -162,6 +167,8 @@ interface RemotePeer {
   /** Whether the succeeded candidate pair went via TURN, remembered from the
    *  connected probe so the stall-recovery emit reports the same path. */
   relayed: boolean;
+  /** Polls taken; only every third one is recorded. */
+  sampleTick?: number;
 }
 
 export class LibP2PVoice implements VoiceTransport {
@@ -366,6 +373,7 @@ export class LibP2PVoice implements VoiceTransport {
   handleWireSignal(peerId: string, signal: unknown): void {
     if (!isVoiceSignal(signal)) {
       this.debugStats.signalsInvalid++;
+      rec(ev("voice.signal.invalid", { peer: peerId }));
       return;
     }
     // Same default-deny the /voice/1.0.0 inbound handler enforced: an offer
@@ -532,6 +540,7 @@ export class LibP2PVoice implements VoiceTransport {
     if (now - (this.lastRedialAsk.get(peerId) ?? 0) < VOICE_REDIAL_ASK_MS) return;
     this.lastRedialAsk.set(peerId, now);
     this.debugStats.redialsAsked++;
+    rec(ev("voice.redial.ask", { peer: peerId }));
     void this.transport
       .send(peerId, encode({ type: MessageType.VoiceRedial }))
       .catch(() => {});
@@ -539,14 +548,23 @@ export class LibP2PVoice implements VoiceTransport {
 
   /** The other side says its voice link to us is dead. Rebuild it now. */
   handleRedialRequest(peerId: string): void {
-    if (!this.node || !this.callPeers.has(peerId)) return;
-    if (peerId > this.transport.selfId()) return; // we are not their dialer
+    // Each return below refuses the redial ask. This probe names the
+    // reason. No reason had a name before this probe.
+    if (!this.node || !this.callPeers.has(peerId)) {
+      rec(ev("voice.redial.serve", { peer: peerId, d: { refused: "inactive" } }));
+      return;
+    }
+    if (peerId > this.transport.selfId()) {
+      rec(ev("voice.redial.serve", { peer: peerId, d: { refused: "not-dialer" } }));
+      return; // we are not their dialer
+    }
     // Rate limit the RECEIVING side too. The sender's limit is no protection
     // at all: a peer stuck in a redial loop (or one that simply means us harm)
     // would otherwise tear our link down on every message, and since only the
     // rebuild was rate limited, a healthy call could be flapped from outside.
     const now = Date.now();
     if (now - (this.lastRedialServed.get(peerId) ?? 0) < VOICE_REDIAL_ASK_MS) {
+      rec(ev("voice.redial.serve", { peer: peerId, d: { refused: "rate-limited" } }));
       return;
     }
     const remote = this.remotePeers.get(peerId);
@@ -577,6 +595,7 @@ export class LibP2PVoice implements VoiceTransport {
       ) &&
       this.linkIsHealthy(remote, now)
     ) {
+      rec(ev("voice.redial.serve", { peer: peerId, d: { refused: "mid-handshake" } }));
       return;
     }
     // An ESTABLISHED link that has merely blipped: their ask must beat our
@@ -591,6 +610,7 @@ export class LibP2PVoice implements VoiceTransport {
       remote.pc.connectionState !== "connected" &&
       now - remote.okAt < VOICE_BLIP_GRACE_MS
     ) {
+      rec(ev("voice.redial.serve", { peer: peerId, d: { refused: "blip-grace" } }));
       return;
     }
     // Stamped only once we act, so a refused ask does not spend the slot the
@@ -598,6 +618,7 @@ export class LibP2PVoice implements VoiceTransport {
     // and that is still one per interval however often they ask.
     this.lastRedialServed.set(peerId, now);
     this.debugStats.redialsServed++;
+    rec(ev("voice.redial.serve", { peer: peerId, d: { refused: false } }));
     if (remote) {
       this.teardownRemotePeer(peerId);
       this.emit("peerLeft", peerId);
@@ -634,6 +655,7 @@ export class LibP2PVoice implements VoiceTransport {
         remote.okAt = now;
         if (remote.stallSignaled) {
           remote.stallSignaled = false;
+          rec(ev("voice.media.resume", { peer: remote.peerId }));
           // Audio resumed WITHOUT a rebuild, so no connectionstatechange
           // will ever fire - without this emit the degraded verdict (amber
           // tile ring) latches until the next reconnect.
@@ -655,6 +677,7 @@ export class LibP2PVoice implements VoiceTransport {
       // instead of showing a healthy pair that cannot hear each other.
       if (!remote.stallSignaled) {
         remote.stallSignaled = true;
+        rec(ev("voice.media.stall", { peer: remote.peerId, d: { silentMs: now - remote.lastBytesReceivedAt } }));
         this.emit("status", {
           type: "voice-degraded",
           peerId: remote.peerId,
@@ -693,15 +716,46 @@ export class LibP2PVoice implements VoiceTransport {
     } catch {
       return;
     }
+    // `getStats` yields loosely typed rows; only these fields are read.
+    type Row = Record<string, unknown> & { type?: string; kind?: string };
+    let inbound: Row | null = null;
     for (const report of stats.values()) {
-      if (report.type !== "inbound-rtp" || report.kind !== "audio") continue;
-      const bytes = report.bytesReceived as number;
-      if (remote.lastBytesReceived === null || bytes > remote.lastBytesReceived) {
-        remote.lastBytesReceivedAt = now;
-      }
-      remote.lastBytesReceived = bytes;
-      return;
+      const row = report as Row;
+      if (row.type === "inbound-rtp" && row.kind === "audio") inbound = row;
     }
+    const pair = succeededPair(stats);
+    if (!inbound) return;
+    const bytes = Number(inbound.bytesReceived) || 0;
+    const previous = remote.lastBytesReceived;
+    if (previous === null || bytes > previous) remote.lastBytesReceivedAt = now;
+    remote.lastBytesReceived = bytes;
+
+    // The watchdog above turns all of this into one verdict after 8s of
+    // silence. The verdict is what repairs the link; the samples are what
+    // explain it afterwards - they show WHEN audio thinned out, and whether
+    // the path was relayed and losing packets while it happened, which a
+    // single "stalled" event at the end cannot.
+    //
+    // Every third poll, so a timeline costs about one event per peer per
+    // 12s rather than a third of the ring.
+    remote.sampleTick = (remote.sampleTick ?? 0) + 1;
+    if (remote.sampleTick % 3 !== 0) return;
+    rec(
+      ev("voice.media.sample", {
+        peer: remote.peerId,
+        d: {
+          bytes,
+          delta: previous === null ? 0 : bytes - previous,
+          jitter: typeof inbound.jitter === "number" ? inbound.jitter : null,
+          lost:
+            typeof inbound.packetsLost === "number" ? inbound.packetsLost : null,
+          // The path itself: "relay" next to loss is the network, and the
+          // same loss on a direct pair is a different conversation.
+          path: pair ? `${pair.local ?? "?"}/${pair.remote ?? "?"}` : null,
+          rtt: pair?.rttMs ?? null,
+        },
+      })
+    );
   }
 
   leave(): void {
@@ -1121,6 +1175,7 @@ export class LibP2PVoice implements VoiceTransport {
     if (!sdp) return;
 
     this.debugStats.offersSent++;
+    rec(ev("voice.offer.out", { peer: peerId, d: { via: "dial" } }));
     const ok = await this.sendSignal(peerId, { type: "offer", sdp });
     if (!ok) {
       // send() resolving false means the app stream to this peer is provably
@@ -1158,6 +1213,7 @@ export class LibP2PVoice implements VoiceTransport {
     const pc = new RTCPeerConnection({
       iceServers: getIceServers(),
     });
+    rec(ev("voice.pc.new", { peer: peerId }));
 
     if (this.processedStream) {
       for (const track of this.processedStream.getAudioTracks()) {
@@ -1195,6 +1251,7 @@ export class LibP2PVoice implements VoiceTransport {
           if (pc.signalingState !== "stable") return;
           await pc.setLocalDescription(offer);
           this.debugStats.offersSent++;
+          rec(ev("voice.offer.out", { peer: peerId, d: { via: "renegotiate" } }));
           void this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! });
         } catch (err) {
           console.warn(`[LibP2PVoice] renegotiation failed for ${peerId}:`, err);
@@ -1206,6 +1263,7 @@ export class LibP2PVoice implements VoiceTransport {
     // the wedge check counts from before the dial even started.
     pc.oniceconnectionstatechange = () => {
       const st = pc.iceConnectionState;
+      rec(ev("voice.ice.state", { peer: peerId, d: { state: st } }));
       if (st === "checking" || st === "connected" || st === "completed") {
         this.touchLink(peerId);
       }
@@ -1213,31 +1271,28 @@ export class LibP2PVoice implements VoiceTransport {
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
+      rec(ev("voice.pc.state", { peer: peerId, d: { state } }));
       if (state === "connected") {
         // check if relayed via TURN
         pc.getStats()
           .then((stats) => {
-            for (const report of stats.values()) {
-              if (
-                report.type === "candidate-pair" &&
-                report.state === "succeeded"
-              ) {
-                const isRelay =
-                  report.localCandidateType === "relay" ||
-                  report.remoteCandidateType === "relay";
-                remote.relayed = isRelay;
-                this.emit("status", {
-                  type: "voice-ice-connected",
-                  // Full id: consumers match tiles against it; the human-
-                  // readable part is the message.
-                  peerId,
-                  relayed: isRelay,
-                  message: isRelay
-                    ? "Voice connected via relay (TURN)"
-                    : "Voice connected directly (P2P)",
-                });
-              }
-            }
+            // Chrome puts no candidate TYPE on a candidate-pair - only ids
+            // pointing at separate entries - so the old inline read was
+            // `undefined === "relay"` for every Chromium user, and every
+            // relayed call told them it was direct. See ice-stats.ts.
+            const pair = succeededPair(stats);
+            if (!pair) return;
+            remote.relayed = pair.relayed;
+            this.emit("status", {
+              type: "voice-ice-connected",
+              // Full id: consumers match tiles against it; the human-
+              // readable part is the message.
+              peerId,
+              relayed: pair.relayed,
+              message: pair.relayed
+                ? "Voice connected via relay (TURN)"
+                : "Voice connected directly (P2P)",
+            });
           })
           .catch(() => {});
       } else if (state === "failed") {
@@ -1246,6 +1301,13 @@ export class LibP2PVoice implements VoiceTransport {
           peerId,
           message: `Voice connection failed for ${peerId.slice(-8)}`,
         });
+        // Ask the network at the instant the app gave up. A TURN allocation
+        // taken now is what separates "TURN was down for this user" from "the
+        // app never used it" - the two look identical in every other event,
+        // and they are the two halves of "is it my internet or your code".
+        // Rate-limited inside probeTurn, so a room full of failing links
+        // still costs one allocation a minute.
+        void probeTurn(getIceServers());
         this.debugStats.tdPcFailed++;
         this.teardownRemotePeer(peerId);
         this.emit("peerLeft", peerId);
@@ -1258,14 +1320,16 @@ export class LibP2PVoice implements VoiceTransport {
         // attempt ICE restart; signalling rides the app transport, which
         // queues and confirms delivery itself
         if (remote.pc.signalingState === "stable") {
+          rec(ev("voice.restart", { peer: peerId }));
           remote.pc.restartIce();
           remote.pc
             .createOffer({ iceRestart: true })
-            .then((offer) =>
-              remote.pc.setLocalDescription(offer).then(() =>
+            .then((offer) => {
+              rec(ev("voice.offer.out", { peer: peerId, d: { via: "ice-restart" } }));
+              return remote.pc.setLocalDescription(offer).then(() =>
                 this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! })
-              )
-            )
+              );
+            })
             .then((sent) => {
               // A restart offer lost to a transport hiccup is otherwise
               // unrecoverable until the 5s blip ask - unlike the initial
@@ -1355,6 +1419,7 @@ export class LibP2PVoice implements VoiceTransport {
     const remote = this.remotePeers.get(peerId);
     if (!remote) return;
     this.debugStats.teardowns++;
+    rec(ev("voice.teardown", { peer: peerId }));
 
     remote.sourceNode?.disconnect();
     remote.gainNode?.disconnect();
@@ -1387,6 +1452,7 @@ export class LibP2PVoice implements VoiceTransport {
     switch (signal.type) {
       case "offer": {
         this.debugStats.offersIn++;
+        rec(ev("voice.offer.in", { peer: peerId }));
         const state = remote.pc.signalingState;
 
         if (state === "have-local-offer") {
@@ -1433,6 +1499,7 @@ export class LibP2PVoice implements VoiceTransport {
 
       case "answer": {
         this.debugStats.answersIn++;
+        rec(ev("voice.answer.in", { peer: peerId }));
         await remote.pc.setRemoteDescription({
           type: "answer",
           sdp: signal.sdp,
@@ -1476,6 +1543,7 @@ export class LibP2PVoice implements VoiceTransport {
     event: K,
     ...args: Parameters<VoiceEvents[K]>
   ): void {
+    recVoiceEvent(event as string, args);
     this.handlers.get(event)?.forEach((h) => (h as Function)(...args));
   }
 }

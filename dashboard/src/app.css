@@ -1,0 +1,219 @@
+@import "tailwindcss";
+
+/*
+ * The operator console's own small theme.
+ *
+ * It deliberately does not copy the chat app's shadcn token set. This app has
+ * one surface, one density and one colour mode, so a short palette is easier
+ * to audit than a long one. Every colour a view needs lives here, so no view
+ * needs a raw hex value and the two scales below stay consistent.
+ *
+ * Two scales carry all the meaning:
+ *   sev-*  event severity, from `DiagEvent.sev`
+ *   ls-*   link state, from `LinkState` in analysis/topology.ts
+ * A view maps a value to `var(--color-ls-proven)` and never to a literal.
+ *
+ * `static` is load-bearing. A view maps a runtime value to a token NAME, so
+ * Tailwind cannot see `--color-ls-lost` in the source and would prune it from
+ * `:root`. A pruned token paints nothing, which silently hides a link.
+ */
+@theme static {
+  /* Neutrals are tinted toward blue, so the console never looks like raw #000. */
+  --color-ink: oklch(0.145 0.012 264);
+  --color-surface: oklch(0.192 0.013 264);
+  --color-raise: oklch(0.248 0.014 264);
+  --color-line: oklch(0.33 0.014 264);
+  --color-text: oklch(0.94 0.006 264);
+  --color-dim: oklch(0.7 0.012 264);
+  --color-faint: oklch(0.52 0.013 264);
+
+  /* One accent. It marks the active tab and the current selection, nothing else. */
+  --color-key: oklch(0.82 0.16 148);
+
+  --color-sev-debug: oklch(0.56 0.015 264);
+  --color-sev-info: oklch(0.74 0.1 232);
+  --color-sev-warn: oklch(0.82 0.15 80);
+  --color-sev-error: oklch(0.68 0.2 18);
+
+  --color-ls-none: oklch(0.4 0.012 264);
+  --color-ls-dialing: oklch(0.72 0.11 240);
+  --color-ls-dial-failed: oklch(0.58 0.19 22);
+  --color-ls-relayed: oklch(0.81 0.14 82);
+  --color-ls-direct: oklch(0.78 0.1 190);
+  --color-ls-proven: oklch(0.82 0.17 148);
+  --color-ls-lost: oklch(0.73 0.17 46);
+  --color-ls-dropped: oklch(0.63 0.19 6);
+
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-ink);
+    color: var(--color-text);
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    /* 13px, because an operator reads tables, not prose. */
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Numbers and identifiers must line up, so all data is mono by default. */
+  table,
+  code,
+  pre,
+  input,
+  select,
+  textarea {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  /* Plain elements only, so the focus ring must be explicit. */
+  :focus-visible {
+    outline: 2px solid var(--color-key);
+    outline-offset: 1px;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklch, var(--color-key) 35%, transparent);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background-color: var(--color-ink);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--color-raise);
+    border: 2px solid var(--color-ink);
+    border-radius: 5px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-line);
+  }
+}
+
+/*
+ * Five recurring shapes. They exist so nine views describe a panel, a button,
+ * a field, a table and a chip the same way, and so no view repeats a dozen
+ * utilities per element. Every value below is a token from `@theme`.
+ */
+@layer components {
+  .panel {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    min-width: 0;
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.625rem;
+    border-bottom: 1px solid var(--color-line);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-dim);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.6rem;
+    border: 1px solid var(--color-line);
+    border-radius: 4px;
+    background-color: var(--color-raise);
+    color: var(--color-text);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .btn:hover:not(:disabled) {
+    border-color: var(--color-key);
+    color: var(--color-key);
+  }
+
+  .btn:disabled {
+    color: var(--color-faint);
+    cursor: not-allowed;
+  }
+
+  .btn-on {
+    border-color: var(--color-key);
+    color: var(--color-key);
+  }
+
+  .field {
+    background-color: var(--color-ink);
+    border: 1px solid var(--color-line);
+    border-radius: 4px;
+    padding: 0.2rem 0.45rem;
+    color: var(--color-text);
+    min-width: 0;
+  }
+
+  .field::placeholder {
+    color: var(--color-faint);
+  }
+
+  .tbl {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .tbl th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background-color: var(--color-surface);
+    border-bottom: 1px solid var(--color-line);
+    padding: 0.25rem 0.5rem;
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-faint);
+    white-space: nowrap;
+  }
+
+  .tbl td {
+    padding: 0.15rem 0.5rem;
+    border-bottom: 1px solid color-mix(in oklch, var(--color-line) 40%, transparent);
+    vertical-align: top;
+  }
+
+  .tbl tbody tr:hover {
+    background-color: var(--color-raise);
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0 0.35rem;
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.5;
+    white-space: nowrap;
+  }
+}

@@ -11,6 +11,8 @@ import type {
   FileTransferTransport,
 } from "../types";
 import { getIceServers } from "../ice-server-list";
+import { ev, errText } from "../../telemetry/event";
+import { rec, refs } from "../../telemetry/recorder";
 
 type TorrentLike = {
   infoHash: string;
@@ -301,6 +303,14 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     });
 
     const seeders = this.seedersByHash.get(file.infoHash);
+    rec(
+      ev("file.request", {
+        d: {
+          peers: seeders?.size ?? 0,
+          fileRef: refs().fileRef(file.infoHash),
+        },
+      })
+    );
     if (!seeders || seeders.size === 0) return;
 
     for (const peerId of seeders) {
@@ -463,6 +473,11 @@ export class WebTorrentFileTransport implements FileTransferTransport {
             peers: created.numPeers ?? 0,
             seeders: this.seedersByHash.get(descriptor.infoHash)?.size ?? 1,
           });
+          rec(
+            ev("file.announce", {
+              d: { fileRef: refs().fileRef(descriptor.infoHash) },
+            })
+          );
 
           resolve(descriptor);
         }
@@ -674,6 +689,11 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     torrent.on("error", (...args: unknown[]) => {
       const err = args[0] as Error;
       const prev = this.transfers.get(infoHash);
+      rec(
+        ev("file.fail", {
+          d: { err: errText(err), fileRef: refs().fileRef(infoHash) },
+        })
+      );
       // If currently seeding, keep it as seeding and just log the error
       if (prev?.seeding || prev?.status === "seeding") {
         console.error(`Transient error on seeded torrent ${infoHash}:`, err.message);

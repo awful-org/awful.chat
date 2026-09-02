@@ -2,6 +2,16 @@ import * as mediasoup from "mediasoup";
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
 import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
+import {
+  SFU_DIAG_SCHEMA_VERSION,
+  pickTransportStats,
+  pickRtpStats,
+  serializeSnapshot,
+  type SfuSnapshot,
+  type DiagTransportView,
+  type DiagProducerView,
+  type DiagConsumerView,
+} from "./telemetry";
 
 // ── Types mirrored from client mediasoup.ts ───────────────────────────────────
 
@@ -134,6 +144,30 @@ interface MSPeerLeft {
   peerId: string;
 }
 
+// Client -> server: ask for a point-in-time diagnostic snapshot of this
+// peer's own transports/producers/consumers plus the room's producer roster.
+interface MSDiag {
+  type: "ms:diag";
+  requestId: string;
+}
+// Server -> client: the snapshot answering an MSDiag.
+interface MSDiagReply {
+  type: "ms:diag";
+  requestId: string;
+  snapshot: SfuSnapshot;
+}
+// Server -> client: MSDiag was refused. Deliberately NOT ms:error - the
+// client treats an ms:error with no `direction` as a refusal of the WHOLE
+// SESSION and latches it permanently (mediasoup.ts failSession). A refused
+// diag request must fail only that one request, exactly like
+// MSConsumeFailed above, or asking for diagnostics on a session the operator
+// never enabled telemetry for would itself end the call.
+interface MSDiagUnavailable {
+  type: "ms:diag-unavailable";
+  requestId: string;
+  reason: "disabled" | "rate-limited";
+}
+
 // Envelope sent by the client over this WebSocket connection.
 // All messages from client arrive as: { type: "join" } or { type: "ms:*", ... }
 type ClientJoin = { type: "join"; roomCode: string; peerId: string };
@@ -146,7 +180,8 @@ type ClientMsg =
   | MSConsume
   | MSCloseConsumer
   | MSCloseProducer
-  | MSResumeConsumer;
+  | MSResumeConsumer
+  | MSDiag;
 
 // ── Per-peer state ────────────────────────────────────────────────────────────
 
@@ -204,6 +239,11 @@ interface PeerState {
   // The liveness probe outstanding against this session, if any. Shared so
   // that a flood of duplicate joins costs one ping rather than one ping each.
   livenessProbe: Promise<boolean> | null;
+  // Wall-clock ms of the last accepted ms:diag reply, 0 until the first one.
+  // Rate-limits diag requests to DIAG_MIN_INTERVAL_MS apart so a peer cannot
+  // poll snapshots - and the getStats() worker round-trips each one costs -
+  // faster than that.
+  lastDiagAt: number;
 }
 
 // ── Resource ceilings ─────────────────────────────────────────────────────────
@@ -262,6 +302,20 @@ const TRANSPORT_CONNECT_TIMEOUT_MS = parseInt(
 // base58 libp2p peer id; anything long, non-string or carrying control
 // characters is junk.
 const MAX_ID_LENGTH = 128;
+// Telemetry is an operator-configured disclosure change (it walks every
+// retained transport/producer/consumer and reports ICE/DTLS state, bitrate
+// and loss to the requesting peer), so it defaults OFF: without this flag
+// set, ms:diag always answers ms:diag-unavailable and the heartbeat sweep
+// never logs a [sfu-telemetry] line.
+const DIAG_ENABLED = process.env.SFU_TELEMETRY === "1";
+// Floor between one peer's ms:diag requests. Each one calls getStats() on
+// every retained transport/producer/consumer - a worker round-trip apiece -
+// so a peer with no floor could poll fast enough to compete with the room's
+// real media traffic for the same worker thread.
+const DIAG_MIN_INTERVAL_MS = parseInt(
+  process.env.SFU_DIAG_MIN_INTERVAL_MS ?? "10000",
+  10,
+);
 
 function isValidId(value: unknown): value is string {
   return (
@@ -1091,6 +1145,20 @@ function handlePeerLeft(peer: PeerState): void {
   }
   peer.consumers.clear();
 
+  // Other peers' producers can still list this peer in their viewer set
+  // (entry.consumers, populated in handleConsume) if this peer was watching
+  // them. Nothing else removes a departed viewer from a SURVIVING peer's
+  // producer, so without this the reported viewer count over-reports after
+  // every disconnect - it only ever shrank via an explicit
+  // ms:close-consumer (handleCloseConsumer), never via the implicit close
+  // a peer leaving performs on its own consumers above.
+  for (const [otherPeerId, otherPeer] of room) {
+    if (otherPeerId === peer.peerId) continue;
+    for (const entry of otherPeer.producers.values()) {
+      entry.consumers.delete(peer.peerId);
+    }
+  }
+
   peer.sendTransport?.close();
   peer.recvTransport?.close();
   // Both transports are gone (or were never built); their reap timers would
@@ -1125,6 +1193,202 @@ function handlePeerLeft(peer: PeerState): void {
         console.error(`[sfu] error closing router for room ${peer.roomCode}:`, err);
       });
     }
+  }
+}
+
+// Answers ms:diag with a point-in-time SfuSnapshot of this peer's own
+// transports/producers/consumers plus the room's producer roster. Scoped to
+// the REQUESTER'S ROOM ONLY - never a whole-instance dump - and gated by
+// DIAG_ENABLED / DIAG_MIN_INTERVAL_MS so an anonymous client cannot use it to
+// keep this peer's worker round-trips busier than its real media traffic
+// does.
+async function handleDiag(peer: PeerState, msg: MSDiag): Promise<void> {
+  if (!DIAG_ENABLED) {
+    send(peer.ws, {
+      type: "ms:diag-unavailable",
+      requestId: msg.requestId,
+      reason: "disabled",
+    } as MSDiagUnavailable);
+    return;
+  }
+
+  const now = Date.now();
+  if (now - peer.lastDiagAt < DIAG_MIN_INTERVAL_MS) {
+    send(peer.ws, {
+      type: "ms:diag-unavailable",
+      requestId: msg.requestId,
+      reason: "rate-limited",
+    } as MSDiagUnavailable);
+    return;
+  }
+  peer.lastDiagAt = now;
+
+  // Every getStats() below is a worker round-trip; the session can be
+  // replaced or closed while any one of them is in flight, the same window
+  // guarded at ":580", ":745" and ":926" for produce()/consume(). Re-checked
+  // after each await, and the whole reply is dropped silently when stale -
+  // exactly like those three call sites.
+  const isStale = (): boolean =>
+    rooms.get(peer.roomCode)?.get(peer.peerId) !== peer;
+
+  const transports: DiagTransportView[] = [];
+  for (const dir of ["send", "recv"] as const) {
+    const transport = dir === "send" ? peer.sendTransport : peer.recvTransport;
+    if (!transport) continue;
+    let picked: Pick<DiagTransportView, "tuple" | "bytesSent" | "bytesReceived" | "rtt">;
+    try {
+      picked = pickTransportStats(await transport.getStats());
+    } catch {
+      picked = { tuple: null, bytesSent: 0, bytesReceived: 0, rtt: null };
+    }
+    if (isStale()) return;
+    transports.push({
+      dir,
+      iceState: transport.iceState,
+      dtlsState: transport.dtlsState,
+      ...picked,
+    });
+  }
+
+  const producers: DiagProducerView[] = [];
+  for (const [producerId, entry] of peer.producers) {
+    let rtp = { bitrate: 0, packetsLost: 0 };
+    try {
+      rtp = pickRtpStats(await entry.producer.getStats());
+    } catch {
+      // keep the zeroed default
+    }
+    if (isStale()) return;
+    let score = 0;
+    for (const s of entry.producer.score) score = Math.max(score, s.score);
+    producers.push({
+      id: producerId,
+      kind: entry.producer.kind,
+      source: entry.source,
+      score,
+      consumers: entry.consumers.size,
+      bitrate: rtp.bitrate,
+      packetsLost: rtp.packetsLost,
+    });
+  }
+
+  const consumers: DiagConsumerView[] = [];
+  for (const [consumerId, entry] of peer.consumers) {
+    let rtp = { bitrate: 0, packetsLost: 0 };
+    try {
+      rtp = pickRtpStats(await entry.consumer.getStats());
+    } catch {
+      // keep the zeroed default
+    }
+    if (isStale()) return;
+    consumers.push({
+      id: consumerId,
+      producerId: entry.producerId,
+      kind: entry.consumer.kind,
+      score: entry.consumer.score.score,
+      paused: entry.consumer.paused,
+      producerPaused: entry.consumer.producerPaused,
+      bitrate: rtp.bitrate,
+      packetsLost: rtp.packetsLost,
+    });
+  }
+
+  const room = rooms.get(peer.roomCode);
+  if (!room || room.get(peer.peerId) !== peer) return;
+
+  const roomView: SfuSnapshot["room"] = [];
+  for (const [otherPeerId, otherPeer] of room) {
+    roomView.push({
+      peerId: otherPeerId,
+      producers: Array.from(otherPeer.producers.entries()).map(([id, e]) => ({
+        id,
+        source: e.source,
+        kind: e.producer.kind,
+        consumers: e.consumers.size,
+      })),
+    });
+  }
+
+  const snapshot: SfuSnapshot = {
+    schemaVersion: SFU_DIAG_SCHEMA_VERSION,
+    takenAt: now,
+    roomPeerCount: room.size,
+    self: {
+      peerId: peer.peerId,
+      transports,
+      producers,
+      consumers,
+      cumulativeProduces: peer.cumulativeProduces,
+      backpressured: Boolean(
+        (peer.ws as unknown as { backpressured?: boolean }).backpressured,
+      ),
+    },
+    room: roomView,
+    ceilings: {
+      peersPerRoom: MAX_PEERS_PER_ROOM,
+      producersPerPeer: MAX_PRODUCERS_PER_PEER,
+      consumersPerPeer: MAX_CONSUMERS_PER_PEER,
+      rooms: rooms.size,
+      maxRooms: MAX_ROOMS,
+    },
+  };
+
+  send(peer.ws, {
+    type: "ms:diag",
+    requestId: msg.requestId,
+    snapshot: serializeSnapshot(snapshot, MAX_PEERS_PER_ROOM, MAX_PRODUCERS_PER_PEER),
+  } as MSDiagReply);
+}
+
+// Emits one structured line per room per heartbeat sweep, gated by
+// DIAG_ENABLED. Cheap enough to run every tick because it reads only
+// synchronous getters (iceState/dtlsState) - never getStats(), which is a
+// worker round-trip; the richer per-peer snapshot with bitrate/loss is what
+// ms:diag is for. Room codes and peer ids are in CLEAR here: that is the
+// established precedent for the SFU's own log (see the join/leave lines
+// above) and this is the operator's own container log, not a client-facing
+// surface.
+function emitSfuTelemetrySweep(): void {
+  if (!DIAG_ENABLED) return;
+  let emitted = 0;
+  for (const [roomCode, room] of rooms) {
+    if (emitted >= MAX_ROOMS) break;
+
+    const peers: Array<{
+      peerId: string;
+      producers: Array<{ id: string; source: string; kind: string; consumers: number }>;
+      send: { iceState: string; dtlsState: string } | null;
+      recv: { iceState: string; dtlsState: string } | null;
+    }> = [];
+    let producerCount = 0;
+    for (const [peerId, roomPeer] of room) {
+      const producers = Array.from(roomPeer.producers.entries()).map(([id, entry]) => ({
+        id,
+        source: entry.source,
+        kind: entry.producer.kind,
+        consumers: entry.consumers.size,
+      }));
+      producerCount += producers.length;
+      peers.push({
+        peerId,
+        producers,
+        send: roomPeer.sendTransport
+          ? { iceState: roomPeer.sendTransport.iceState, dtlsState: roomPeer.sendTransport.dtlsState }
+          : null,
+        recv: roomPeer.recvTransport
+          ? { iceState: roomPeer.recvTransport.iceState, dtlsState: roomPeer.recvTransport.dtlsState }
+          : null,
+      });
+    }
+
+    // A room with no producers is a bare join with nothing to route yet;
+    // logging it every sweep for the life of an idle call adds noise with
+    // no diagnostic value.
+    if (producerCount === 0) continue;
+    emitted++;
+    console.log(
+      `[sfu-telemetry] ${JSON.stringify({ v: 1, t: Date.now(), room: roomCode, peers })}`,
+    );
   }
 }
 
@@ -1221,6 +1485,7 @@ async function main(): Promise<void> {
         BACKPRESSURE_DEADLINE_MS,
       );
     });
+    emitSfuTelemetrySweep();
   }, HEARTBEAT_INTERVAL_MS);
 
   wss.on("close", () => {
@@ -1378,6 +1643,7 @@ async function main(): Promise<void> {
           consumersInFlight: 0,
           cumulativeProduces: 0,
           livenessProbe: null,
+          lastDiagAt: 0,
         };
         const room = getOrCreateRoom(joinMsg.roomCode);
         if (oldPeer) {
@@ -1461,6 +1727,9 @@ async function main(): Promise<void> {
             break;
           case "ms:close-producer":
             handleCloseProducer(peer, msg as MSCloseProducer);
+            break;
+          case "ms:diag":
+            await handleDiag(peer, msg as MSDiag);
             break;
           default:
             console.warn("[sfu] unknown message type:", (msg as any).type);

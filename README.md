@@ -194,6 +194,11 @@ whose context holds no repository declares no commit.
 | `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide and per credential |
 | `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` |
 | `PLUGIN_PROXY_SECRETS` | no | `NAME@host=value` list; plugins reference `{{secret:NAME}}`, substituted server-side only for that host |
+| `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
+| `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
+| `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |
+| `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
+| `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |
 
 Firewall: open 80/443 (web), 3478 tcp+udp (TURN), 5349 tcp+udp (TURN TLS,
 when configured), the SFU media range (`SFU_RTC_MIN_PORT`-`SFU_RTC_MAX_PORT`,
@@ -268,6 +273,46 @@ the URL is resolved once at join.
 
 Each SFU needs its own host, its own `ANNOUNCED_IP` and its own open media
 range.
+
+### Diagnosing a connection bug
+
+Connection, peer and call failures used to be undiagnosable after the fact. The
+detail existed - a 17-variant status union, three counter bags, per-peer WebRTC
+state - and every bit of it was destroyed within ten seconds, or swallowed in an
+empty `catch`.
+
+Each tab now keeps a bounded flight recorder in memory, always on from boot. It
+holds the last 4096 structured events and nothing leaves the tab until you say
+so. To read one:
+
+1. Reproduce the failure. Do not reload: a reload starts a new session.
+2. Open **Settings > Diagnostics** and press **Export bundle**. Do this in every
+   tab that saw the problem - the interesting failures are the asymmetric ones,
+   where A sees B and B never saw A, and one bundle cannot show that.
+3. Optional, for a crash or a wedge you cannot catch live: turn **Keep
+   diagnostics across reloads** on first. Chunks are sealed on disk like every
+   other store, three sessions and 8 MB, and never ride device sync or a backup.
+4. Optional, on your own instance: set `TELEMETRY_ENABLED=1` on the relay, and
+   the user turns **Allow upload to this instance** on. The relay then staples
+   its OWN view of that peer to the bundle - registration outcomes and the real
+   reason a rendezvous stream closed, which the client cannot know. Read
+   `docs/spec.md` "Server Privacy" first: this is a real disclosure change.
+5. Set `SFU_TELEMETRY=1` for the third vantage, and capture the container logs
+   with timestamps: `docker logs -t <sfu>` and `docker logs -t <relay>`.
+
+Then open the operator console and drop the bundles and the logs in:
+
+```sh
+cd dashboard && pnpm install && pnpm dev     # http://localhost:5174
+```
+
+It merges the vantages into one clock-corrected timeline, reconstructs the
+topology over time, and names what failed. See [dashboard/README.md](dashboard/README.md).
+The console is NOT deployed and must never be exposed publicly.
+
+A bundle carries no room code, no `did:key`, no message or file content and no
+ICE candidate address. It does carry full peerIds, which the relay and the SFU
+already have.
 
 ## License
 

@@ -1,0 +1,122 @@
+# The lab's own stack: the whole app on one network the browsers can reach.
+#
+# Not `docker-compose.dev.yml` with browsers bolted on. That file publishes
+# ports to the host and tells the SFU to announce 127.0.0.1, which is correct
+# for a developer with a browser on their desktop and impossible for a browser
+# in a container: it would be handed its OWN loopback as the media address and
+# every ICE check would fail against itself. Static addresses on a private
+# subnet are what make the SFU announceable, and they make a run reproducible
+# on any host, which a lab needs more than convenience.
+#
+# DOMAIN is deliberately unset: the relay's origin gate is strict only when
+# DOMAIN is set or NODE_ENV is production (relay/cors.go), so the lab's
+# http://frontend:5173 origin is accepted without weakening anything that
+# ships.
+name: awful-lab
+
+services:
+  relay:
+    image: awful2-relay:latest
+    build:
+      context: ../relay
+      dockerfile: Dockerfile.dev
+    environment:
+      NODE_ENV: development
+      HTTP_PORT: "8080"
+      KLIPY_API_KEY: dev-key
+      # The lab's whole point is bundles that can be read back, so both the
+      # ingest endpoint and the operator read endpoints are on.
+      TELEMETRY_ENABLED: "1"
+      TELEMETRY_ADMIN_TOKEN: ${LAB_ADMIN_TOKEN:-lab}
+      # Shared with coturn below. Without it the relay answers 204, the client
+      # stays STUN-only, and the udp-block profile tests nothing at all - the
+      # peer simply has no path, which is the lab failing rather than the app.
+      TURN_SECRET: ${LAB_TURN_SECRET:-lab-turn-secret}
+      TURN_HOST: "172.30.0.13"
+    volumes:
+      - lab_relay_data:/app/data
+      - ../relay:/app
+    ports:
+      # Published so the controller on the host can pull bundles back out.
+      - "127.0.0.1:18081:8081"
+    networks:
+      lab:
+        ipv4_address: 172.30.0.10
+
+  sfu:
+    image: awful2-sfu:latest
+    build:
+      context: ../sfu
+    environment:
+      NODE_ENV: development
+      SFU_PORT: "3000"
+      # The address the browsers must actually reach. This is the line the
+      # dev compose cannot get right.
+      ANNOUNCED_IP: "172.30.0.11"
+      RTC_MIN_PORT: "40000"
+      RTC_MAX_PORT: "40019"
+      SFU_TELEMETRY: "1"
+    networks:
+      lab:
+        ipv4_address: 172.30.0.11
+
+  coturn:
+    image: coturn/coturn:4.17.2-alpine
+    # One deliberate deviation from the production flags, and it has to be
+    # said out loud: prod denies relaying to RFC1918 ranges, and the lab's own
+    # subnet is inside 172.16/12. Denying it here would make every relayed
+    # candidate useless and the udp-block profile would "fail" for a reason
+    # that exists only in the lab. The one range this lab uses is allowed back
+    # in; every other private range stays denied, exactly as it ships.
+    command: >
+      --log-file=stdout
+      --realm=lab
+      --external-ip=172.30.0.13
+      --listening-ip=0.0.0.0
+      --use-auth-secret
+      --static-auth-secret=${LAB_TURN_SECRET:-lab-turn-secret}
+      --fingerprint
+      --no-multicast-peers
+      --no-tcp-relay
+      --listening-port=3478
+      --allowed-peer-ip=172.30.0.0-172.30.0.255
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=127.0.0.0-127.255.255.255
+      --denied-peer-ip=169.254.0.0-169.254.255.255
+      --min-port=49152
+      --max-port=49200
+    networks:
+      lab:
+        ipv4_address: 172.30.0.13
+
+  frontend:
+    image: awful2-frontend:latest
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.dev
+    environment:
+      # Service names, not localhost: these are resolved by the BROWSER, and
+      # the browser is in a container on this network.
+      VITE_API_URL: http://relay:8081
+      VITE_SFU_URL: http://sfu:3000
+      # Written by stack.sh once the relay has reported its identity.
+      VITE_RELAY_MULTIADDR: ${LAB_RELAY_MULTIADDR:?run ./stack.sh, which discovers this}
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    depends_on:
+      - relay
+    networks:
+      lab:
+        ipv4_address: 172.30.0.12
+
+volumes:
+  lab_relay_data:
+
+networks:
+  lab:
+    name: awful-lab
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

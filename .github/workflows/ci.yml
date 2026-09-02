@@ -1,5 +1,5 @@
 # Runs on every PR and on every push to main. main is what Dokploy deploys, so
-# nothing reaches it without these four jobs going green: protect the branch
+# nothing reaches it without these five jobs going green: protect the branch
 # and require them as status checks (Settings > Branches > main).
 name: ci
 
@@ -89,6 +89,37 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm test
+
+  # The operator console. NOT in the images matrix below: it is not deployed,
+  # so there is no Dockerfile to build. It is gated here because its analysis
+  # engine is the thing that reads a bundle, and a broken engine is worse than
+  # no engine - it names the wrong root cause.
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: dashboard } }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with: { version: 10 }
+      - uses: actions/setup-node@v7
+        with: { node-version: 24, cache: pnpm, cache-dependency-path: dashboard/pnpm-lock.yaml }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+
+      # The dashboard has no runtime-config file at all: it is served from a
+      # developer's own machine and the operator types the relay address in.
+      # The same guard as the frontend's, so a build-time address cannot creep
+      # in later.
+      - name: no build-time env reads
+        run: |
+          if grep -rn --include='*.ts' --include='*.svelte' \
+              'import\.meta\.env\.VITE_\|import\.meta\.env\[' src \
+              | grep -vE ':[0-9]+: *(//|\*|/\*)'; then
+            echo "::error::the dashboard has no runtime configuration - the operator supplies the relay address at run time."
+            exit 1
+          fi
 
   # Every image builds from a clean context. Catches a Dockerfile that only
   # worked because of something lying around on the VPS.

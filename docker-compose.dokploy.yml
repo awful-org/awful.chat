@@ -40,6 +40,13 @@ services:
       # forwards neither UDP nor raw TCP, so TURN silently points at something
       # that cannot serve it and mobile/CGNAT peers just time out.
       - TURN_HOST=${TURN_HOST:-}
+      # The port coturn below was told to listen on. The relay builds its
+      # default TURN urls from it, and compose does NOT inject a variable into
+      # a container just because the .env defines it - so without this line
+      # TURN_PORT moves coturn while the relay keeps advertising 3478, and
+      # every client is sent to a port this stack is not on. On a host running
+      # two stacks that port belongs to the other one, which answers 401.
+      - TURN_PORT=${TURN_PORT:-}
       - TURN_URLS=${TURN_URLS:-}
       # Generic plugin proxy: allowlisted upstream hosts and named secrets
       # substituted server-side ({{secret:NAME}}). Bind secrets to their
@@ -47,6 +54,18 @@ services:
       # receive them. What keeps API-using plugins "env + redeploy".
       - PLUGIN_PROXY_HOSTS=${PLUGIN_PROXY_HOSTS:-}
       - PLUGIN_PROXY_SECRETS=${PLUGIN_PROXY_SECRETS:-}
+      # Optional diagnostic collector. Unset means the /telemetry route
+      # answers 204 and stores nothing, so an upload silently does nothing and
+      # the app hides its Upload button. See docs/spec.md "Telemetry".
+      - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-}
+      # The operator console's bearer token. Unset means /telemetry/list and
+      # /telemetry/get answer 404, so a console that is not there is never
+      # advertised. A weak token here hands every uploaded bundle to anyone.
+      - TELEMETRY_ADMIN_TOKEN=${TELEMETRY_ADMIN_TOKEN:-}
+      # Where bundles land. Defaults to /app/data/telemetry, inside the
+      # relay_data volume below - point it outside and bundles do not survive
+      # a redeploy.
+      - TELEMETRY_DIR=${TELEMETRY_DIR:-}
     volumes:
       - relay_data:/app/data
     networks:
@@ -114,6 +133,14 @@ services:
       - traefik.http.routers.${STACK:-awful}-mailbox.tls=true
       - traefik.http.routers.${STACK:-awful}-mailbox.tls.certresolver=letsencrypt
       - traefik.http.routers.${STACK:-awful}-mailbox.service=${STACK:-awful}-relay-api-service
+      # Port 8081 is routed per PathPrefix, so a route registered in main.go
+      # is unreachable in production without its own six labels here.
+      - traefik.http.routers.${STACK:-awful}-telemetry.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/telemetry`)
+      - traefik.http.routers.${STACK:-awful}-telemetry.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-telemetry.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-telemetry.tls=true
+      - traefik.http.routers.${STACK:-awful}-telemetry.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-telemetry.service=${STACK:-awful}-relay-api-service
 
   sfu:
     build:
@@ -167,8 +194,26 @@ services:
       # Documented as an instance variable but never passed through, so
       # setting it in .env did nothing and the SFU kept its built-in default.
       SFU_MAX_ROOMS: ${SFU_MAX_ROOMS:-250}
+      # Optional. "1" answers ms:diag with a live snapshot and adds one
+      # [sfu-telemetry] JSON line per room per 10s sweep to this container's
+      # log. Unset leaves both inert, and ms:diag answers "disabled".
+      SFU_TELEMETRY: ${SFU_TELEMETRY:-}
+      # Floor between one peer's ms:diag requests. Default 10000. Too low and
+      # a client can make the mediasoup worker sample stats continuously.
+      SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-}
+    # NOT dokploy-network. Nothing routes to this service by hostname from
+    # outside - it has no traefik labels, and its media ports are published
+    # straight to the host - so the only thing the shared network bought was
+    # a name collision. Every stack on that network registers the alias "sfu"
+    # for its own container, docker's DNS then returns all of them and rotates,
+    # and the frontend's /sfu proxy re-resolves per request. Two people in one
+    # call land on two different SFUs about half the time, each gets a room
+    # holding only themselves, and no camera or screen share can cross. Voice
+    # is peer to peer, so it keeps working and the failure looks like nothing
+    # at all. Measured on the dev host: six lookups of "sfu" from the frontend
+    # returned 10.0.1.129 four times and 10.0.1.118 twice.
     networks:
-      - dokploy-network
+      - internal
 
   # For TLS TURN (turns: - strongly recommended for mobile-carrier users):
   # put fullchain.pem + privkey.pem for the domain in a directory, set
@@ -244,7 +289,7 @@ services:
       --no-multicast-peers
       --no-tcp-relay
       --listening-port=${TURN_PORT:-3478}
-      --alt-listening-port=5349
+      --alt-listening-port=${TURN_ALT_PORT:-5349}
       --denied-peer-ip=${ANNOUNCED_IP}
       --denied-peer-ip=100.64.0.0-100.127.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
@@ -318,7 +363,10 @@ services:
     depends_on:
       - relay
     networks:
+      # dokploy-network for traefik; internal to reach the SFU it proxies /sfu
+      # to. It is the only service that needs both.
       - dokploy-network
+      - internal
     labels:
       - traefik.enable=true
       - traefik.http.routers.${STACK:-awful}-awful2-http.rule=Host(`${DOMAIN}`)
@@ -350,3 +398,9 @@ volumes:
 networks:
   dokploy-network:
     external: true
+  # Created per project, so its real name carries the compose project prefix
+  # and the "sfu" alias inside it belongs to THIS stack alone. That is the
+  # whole fix: two stacks on one host stop sharing a namespace they were never
+  # meant to share.
+  internal:
+    driver: bridge

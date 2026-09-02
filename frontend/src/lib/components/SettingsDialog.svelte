@@ -43,6 +43,7 @@
     Volume2,
     RefreshCw,
     ChartPie,
+    Activity,
     Info,
     Heart,
     Puzzle,
@@ -56,6 +57,7 @@
   import SessionSettings from "./settings/SessionSettings.svelte";
   import AppSettings from "./settings/AppSettings.svelte";
   import DataSettings from "./settings/DataSettings.svelte";
+  import DiagnosticsSettings from "./settings/DiagnosticsSettings.svelte";
   import PluginSettings from "./settings/PluginSettings.svelte";
   import AvatarPickerDialog from "./AvatarPickerDialog.svelte";
   import QuirksNotice from "./QuirksNotice.svelte";
@@ -67,6 +69,7 @@
     | "app"
     | "session"
     | "data"
+    | "diagnostics"
     | "plugins"
     | "quirks"
     | "oss";
@@ -98,6 +101,11 @@
     { id: "app" as SettingsTab, label: "App", icon: SlidersHorizontal },
     { id: "session" as SettingsTab, label: "Session/Sync", icon: RefreshCw },
     { id: "data" as SettingsTab, label: "Data", icon: ChartPie },
+    {
+      id: "diagnostics" as SettingsTab,
+      label: "Diagnostics",
+      icon: Activity,
+    },
     { id: "plugins" as SettingsTab, label: "Plugins", icon: Puzzle },
     { id: "quirks" as SettingsTab, label: "Quirks", icon: Info },
     { id: "oss" as SettingsTab, label: "OSS", icon: Heart },
@@ -283,6 +291,8 @@
         <SessionSettings {isMobile} {onClose} {onOpenSync} />
       {:else if activeTab === "data"}
         <DataSettings {activeTab} />
+      {:else if activeTab === "diagnostics"}
+        <DiagnosticsSettings {activeTab} />
       {:else if activeTab === "plugins"}
         <PluginSettings />
       {:else if activeTab === "quirks"}
@@ -319,6 +329,8 @@
             <SessionSettings {isMobile} {onClose} {onOpenSync} />
           {:else if activeTab === "data"}
             <DataSettings {activeTab} />
+          {:else if activeTab === "diagnostics"}
+            <DiagnosticsSettings {activeTab} />
           {:else if activeTab === "plugins"}
             <PluginSettings />
           {:else if activeTab === "quirks"}

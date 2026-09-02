@@ -149,6 +149,11 @@ import {
   withFileTransfer,
 } from "./files.svelte";
 import { initVoice } from "./voice.svelte";
+import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
+import { ev } from "../telemetry/event";
+import { noteIdentity, rec, recorderSnapshot, refs } from "../telemetry/recorder";
+import { apiUrl, isConfigured, relayMultiaddr, sfuUrls } from "../runtime-config";
+import { faultStats, faultsActive } from "./faults";
 import { initTransmission } from "./transmission.svelte";
 
 const MSG_ORDER = (a: Message, b: Message) =>
@@ -529,6 +534,7 @@ if (import.meta.env.DEV && typeof window !== "undefined") {
     sendFiles,
     sendMessage,
     _handleCallPresence,
+    diag: () => recorderSnapshot(),
   };
 }
 
@@ -596,6 +602,56 @@ export const _fileTransport = new WebTorrentFileTransport(() =>
 initVoice(_voice, _dtln);
 initTransmission(_video);
 initFiles(_fileTransport);
+
+/** Resolve the SFU host list once per call; each entry may be unparseable. */
+function _diagSfuHosts(): string[] {
+  const hosts: string[] = [];
+  for (const url of sfuUrls()) {
+    try {
+      hosts.push(new URL(url).host);
+    } catch {
+      // An unparseable configured URL is dropped, not fatal to the sample.
+    }
+  }
+  return hosts;
+}
+
+/** The HOST only, never a URL with a path or query. */
+function _diagApiHost(): string {
+  const url = apiUrl();
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
+/** The trailing `/p2p/<id>` segment of the relay multiaddr, id only. */
+function _diagRelayPeerId(): string {
+  const marker = "/p2p/";
+  const addr = relayMultiaddr();
+  const at = addr.lastIndexOf(marker);
+  if (at === -1) return "";
+  const rest = addr.slice(at + marker.length);
+  const nextSlash = rest.indexOf("/");
+  return nextSlash === -1 ? rest : rest.slice(0, nextSlash);
+}
+
+installTelemetryTaps({
+  selfPeerId: () => _transport.selfId(),
+  runtime: () => ({
+    apiHost: _diagApiHost(),
+    relayPeerId: _diagRelayPeerId(),
+    sfuHosts: _diagSfuHosts(),
+    configured: isConfigured(),
+  }),
+  faultsActive,
+  counterBags: () => ({ t: _transport.debugStats, a: _stats, f: faultStats }),
+  inCall: () => transportState.inCall,
+  hidden: () => typeof document !== "undefined" && document.hidden,
+  requestSfuDiag: () => _video.requestDiag(),
+});
 
 // Stored peer profile metadata is invisible until the peer re-broadcasts:
 // the reactive map only ever filled from live messages, so a reload emptied
@@ -1032,10 +1088,12 @@ if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       _hiddenSince = Date.now();
+      rec(ev("session.visibility", { d: { hidden: true } }));
       return;
     }
     const away = _hiddenSince ? Date.now() - _hiddenSince : 0;
     _hiddenSince = 0;
+    rec(ev("session.visibility", { d: { hidden: false, hiddenMs: away } }));
     // A glance away only needs history reconciled. A long absence means the
     // connections themselves may be stale, so re-announce and re-dial too.
     if (away > AWAY_FULL_RESYNC_MS) _resyncEverything();
@@ -1043,7 +1101,10 @@ if (typeof document !== "undefined") {
   });
 }
 if (typeof window !== "undefined") {
-  window.addEventListener("online", () => _resyncEverything());
+  window.addEventListener("online", () => {
+    rec(ev("session.online"));
+    _resyncEverything();
+  });
 }
 
 async function _sendDigest(peerId: string): Promise<void> {
@@ -1075,6 +1136,13 @@ async function _sendDigestForRoom(
     await getWatermarksForRoom(roomCode)
   );
   _stats.digestsOut++;
+  rec(
+    ev("app.digest.out", {
+      peer: peerId,
+      room: refs().roomRef(roomCode),
+      d: { watermarks: Object.keys(watermarks).length },
+    })
+  );
   await _transport.send(
     peerId,
     encode({ type: MessageType.SyncDigest, roomCode, watermarks })
@@ -1145,6 +1213,13 @@ async function _handleDigest(
   // merely named, and never fall back to whatever room the UI has open.
   _stats.digestsIn++;
   if (!roomCode || !_transport.rooms().includes(roomCode)) return;
+  rec(
+    ev("app.digest.in", {
+      peer: peerId,
+      room: refs().roomRef(roomCode),
+      d: { watermarks: Object.keys(theirWatermarks).length },
+    })
+  );
   // Senders in a digest are peer-chosen strings, and every entry costs a
   // blindValue plus map work downstream. A room never accumulates anywhere
   // near this many senders honestly; a digest that does is dropped whole.
@@ -1378,10 +1453,22 @@ async function _handleSyncBatch(
       _verifyIncoming(m, { room: roomCode, allowUnsigned: allowUnsignedFor(m) })
     )
   );
-  const verified = messages.filter((_, i) => verdicts[i]);
+  const verified = messages.filter((_, i) => verdicts[i].ok);
   if (verified.length < messages.length) {
+    const reasons: Record<string, number> = {};
+    for (const v of verdicts) {
+      if (!v.ok) reasons[v.reason] = (reasons[v.reason] ?? 0) + 1;
+    }
     console.warn(
-      `[sync] dropped ${messages.length - verified.length} message(s) with invalid signatures`
+      `[sync] dropped ${messages.length - verified.length} message(s) with invalid signatures`,
+      reasons
+    );
+    rec(
+      ev("app.sync.drop", {
+        peer: fromPeerId ?? null,
+        room: refs().roomRef(roomCode),
+        d: { count: messages.length - verified.length, reason: "bad-signature" },
+      })
     );
   }
   // Two kinds of rejection. A SIGNED (v2/v3) message that failed verify is
@@ -1414,7 +1501,7 @@ async function _handleSyncBatch(
   const rejectedFloor = new Map<string, number>();
   const permanentMax = new Map<string, number>();
   messages.forEach((m, i) => {
-    if (verdicts[i]) return;
+    if (verdicts[i].ok) return;
     if (typeof m.senderId !== "string" || !m.senderId) return;
     if (!Number.isSafeInteger(m.lamport) || m.lamport < 0) return;
     // v2 joined v1 as a DETERMINISTIC reject at the 2026-08-28 sunset. This
@@ -1545,6 +1632,13 @@ async function _handleSyncBatch(
   if (hijacks.length) {
     console.warn(
       `[sync] refused ${hijacks.length} message(s) reusing the id of one we already hold`
+    );
+    rec(
+      ev("app.sync.drop", {
+        peer: fromPeerId ?? null,
+        room: refs().roomRef(roomCode),
+        d: { count: hijacks.length, reason: "id-reuse" },
+      })
     );
     const refused = new Set(hijacks.map((w) => w.id));
     usable = usable.filter((w) => !refused.has(w.id));
@@ -1747,9 +1841,14 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
     (await verifyPeerBinding(claimed, peerId, msg.bindingSig));
   if (!proven) {
     _stats.profilesRejected++;
+    rec(ev("app.profile.reject", { peer: peerId, d: { reason: "binding" } }));
     return;
   }
   const did = claimed as string;
+  rec(ev("app.profile.in", { peer: peerId }));
+  // A proven peerId->DID binding is the only thing allowed to group two
+  // peerIds under one identity ordinal - see the recorder's own warning.
+  noteIdentity(peerId, did);
   const isNewMapping = _peerIdToDid.get(peerId) !== did;
   _setPeerDid(peerId, did);
 
@@ -2121,6 +2220,12 @@ function _handleRoomUsersSync(
   const valid = participants.filter(
     (p) => typeof p === "string" && (looksLikeDid(p) || looksLikePeerId(p))
   );
+  rec(
+    ev("app.roomusers", {
+      room: refs().roomRef(roomCode),
+      d: { count: valid.length },
+    })
+  );
   if (roomCode !== transportState.roomCode) {
     // A list for a room we are subscribed to but not looking at. Persist it,
     // but leave the on-screen member list alone - merging it in was how one
@@ -2149,19 +2254,23 @@ function _handleRoomUsersSync(
 
 function _broadcastJoinRoom(): void {
   const selfDid = identityStore.did ?? _transport.selfId();
-  if (!selfDid || !transportState.roomCode) return;
+  const roomCode = transportState.roomCode;
+  if (!selfDid || !roomCode) return;
   _transport.broadcast(
     encode({ type: MessageType.JoinRoom, peerId: selfDid }),
-    transportState.roomCode
+    roomCode
   );
+  rec(ev("app.join", { room: refs().roomRef(roomCode) }));
 }
 
 function _broadcastLeaveRoom(): Promise<void> {
   const selfDid = identityStore.did ?? _transport.selfId();
-  if (!selfDid || !transportState.roomCode) return Promise.resolve();
+  const roomCode = transportState.roomCode;
+  if (!selfDid || !roomCode) return Promise.resolve();
+  rec(ev("app.leave", { room: refs().roomRef(roomCode) }));
   return _transport.broadcast(
     encode({ type: MessageType.LeaveRoom, peerId: selfDid }),
-    transportState.roomCode
+    roomCode
   );
 }
 
@@ -2834,11 +2943,17 @@ _transport.on("message", (peerId, data, room) => {
         // No watermark, lamport, or storage side effects.
         const ephemeralMsg = msg as WirePluginEphemeral;
         _verifyIncoming(ephemeralMsg as unknown as WireChatMessage, { room })
-          .then((ok) => {
-            if (!ok) {
+          .then((v) => {
+            if (!v.ok) {
               console.warn(
                 "[app] dropped ephemeral plugin message with invalid signature from",
                 ephemeralMsg.senderId
+              );
+              rec(
+                ev("app.msg.reject", {
+                  peer: peerId,
+                  d: { reason: v.reason, wire: "plugin_ephemeral" },
+                })
               );
               return;
             }
@@ -2928,13 +3043,21 @@ _transport.on("message", (peerId, data, room) => {
           break;
         }
         _verifyIncoming(msg, { room })
-          .then((ok) => {
-            if (ok) _handleChatMessage(msg, room, peerId).catch(() => {});
-            else
-              console.warn(
-                "[app] dropped message with invalid signature from",
-                msg.senderId
-              );
+          .then((v) => {
+            if (v.ok) {
+              _handleChatMessage(msg, room, peerId).catch(() => {});
+              return;
+            }
+            console.warn(
+              "[app] dropped message with invalid signature from",
+              msg.senderId
+            );
+            rec(
+              ev("app.msg.reject", {
+                peer: peerId,
+                d: { reason: v.reason, wire: msg.type },
+              })
+            );
           })
           .catch(() => {});
         break;
@@ -3206,6 +3329,7 @@ export function disconnectTransport(): void {
 }
 
 function _disconnectWithoutBroadcasting(): void {
+  rec(ev("session.end"));
   for (const transfer of transportState.fileTransfers.values()) {
     if (transfer.blobURL) URL.revokeObjectURL(transfer.blobURL);
   }
@@ -3215,6 +3339,7 @@ function _disconnectWithoutBroadcasting(): void {
   _fileTransport.resetTransfers();
   leaveCall();
   _transport.disconnect();
+  stopTelemetryTaps();
   _peerIdToDid.clear();
   clearCardStates();
   // The search corpus is decrypted message text; it dies with the session
@@ -3269,7 +3394,14 @@ function _disconnectWithoutBroadcasting(): void {
  * peer gets no copy - gossip and sync still cover them.
  */
 function _broadcastChatWire(wire: WireChatMessage, roomCode: string): void {
-  _transport.broadcast(encode(wire), roomCode);
+  const payload = encode(wire);
+  _transport.broadcast(payload, roomCode);
+  rec(
+    ev("app.msg.out", {
+      room: refs().roomRef(roomCode),
+      d: { bytes: payload.byteLength },
+    })
+  );
   const batch = encode({
     type: MessageType.SyncBatch,
     roomCode,
