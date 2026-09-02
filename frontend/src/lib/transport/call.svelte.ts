@@ -104,6 +104,13 @@ export function _sendCallState(peerId?: string): void {
     )
   );
   for (const room of rooms) _transport.broadcast(payload, room);
+  // ...and directly, for the reason _sendCallPresence spells out below. This
+  // one never got that half, so a mute that lost its gossip frame stayed
+  // wrong on everyone else's screen. The 20s heartbeat did not save it: a
+  // frame is not dropped at random, it is dropped because the sender is in
+  // nobody's mesh for that topic, and repeating a broadcast down a path that
+  // is not there just fails again every 20 seconds.
+  for (const pid of _transport.peers()) _transport.send(pid, payload);
 }
 
 export function _sendCallPresence(peerId?: string): void {

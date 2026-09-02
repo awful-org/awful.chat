@@ -200,6 +200,14 @@ export function _sendWatchPresence(peerId?: string): void {
     )
   );
   for (const room of rooms) _transport.broadcast(payload, room);
+  // ...and directly to every connected peer, the same way call presence goes
+  // out. Gossipsub is best effort and needs a formed mesh: a peer that just
+  // joined the topic is in nobody's yet, and its frame is dropped with no
+  // error. That is why a viewer could be watching and never appear in the
+  // sharer's chip - and why the 20s heartbeat did not rescue it, since it
+  // repeated the same broadcast down the same missing path. The direct
+  // streams are already open and the frame is a few bytes.
+  for (const pid of _transport.peers()) _transport.send(pid, payload);
 }
 
 export async function watchTransmission(
