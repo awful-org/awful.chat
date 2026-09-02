@@ -584,6 +584,15 @@ Relay side (relay/mailbox.go):
   caps total mailbox disk. Collection authenticates with an ed25519
   signature over "awful-mailbox:<unix-ts>" by the recipient DID (accepted
   with or without the multibase z prefix).
+  Devices: collect and ack carry the device's libp2p peerId. An ack hides
+  the blob from THAT device only; the blob leaves at TTL or quota
+  eviction, so a phone and a desktop on one identity each collect it
+  (the client dedups by message id against storage). A client that sends
+  no device gets the old delete-on-ack.
+  Kinds: the sealed plaintext carries a kind - a chat envelope, a DM
+  sync batch (files, plugin cards, without inline bytes), or a delivery
+  or read receipt - so receipts and attachments reach a sleeping phone
+  too, not only text. Blobs without a kind are chat.
 
 Client collect: on unlock/startup, fetch + unseal + ack. Undecryptable
   blobs are poison-acked (deleted) so they cannot wedge the box; transient
@@ -854,7 +863,15 @@ ANALYSIS
 ```txt
 relay knows:   libp2p peerId + which roomCodes it registered (rendezvous);
                with the offline mailbox, THAT a DID has pending mail
-               (sealed blobs, padded sizes, no sender attribution)
+               (sealed blobs, padded sizes, no sender attribution);
+               with Web Push (on by default, per-device switch in Settings),
+               one push endpoint per device - a stable identifier issued by
+               the phone's push vendor (Apple, Google, Mozilla) - and it
+               sends that vendor a content-free "check your box" at most
+               once a minute per identity when mail arrives. The vendor
+               learns the timing of those wake-ups, never what they are
+               about; the relay learns how many devices an identity has
+               subscribed
 never knows:   message content, file content, who sent a mailbox blob -
                all traffic it forwards is noise-encrypted end-to-end
                between peers, mailbox blobs are sealed to the recipient
@@ -925,13 +942,25 @@ known limitation:
 ## PWA
 
 ```txt
-Manifest: /app/manifest.json with theme color #00FF88, background #09090b
-Service Worker: /app/sw.js handles offline caching, static assets, navigation fallback
-Install: Custom install prompt with deferred browser prompt
-Share Target: Accepts files and text via system share menu
-  - Files: GET/POST /app/ action="share" with enctype="multipart/form-data"
-  - Text: Shared text pre-populates message composer
-Scope: /app/ for all PWA routes
+Manifest: /manifest.webmanifest (vite-plugin-pwa), id "/", scope "/",
+  start_url /app, theme and background #09090b, maskable icon, wide and
+  narrow screenshots, launch_handler navigate-existing, two shortcuts
+  (?new=1 new room, ?sync=1 device sync)
+Service Worker: /sw.js. Precaches the shell and hashed assets (not the
+  DTLN worklet or shiki grammars, cached on first use); every in-scope
+  navigation is answered from the precached index.html, revalidated in the
+  background; /config.json is never cached. registerType "prompt": a new
+  build waits until the user accepts the reload.
+Install: the deferred beforeinstallprompt is captured at boot and offered
+  once the app is usable; iOS gets Share > Add to Home Screen guidance.
+Share Target: POST /share-target (multipart: title, text, url, files),
+  intercepted by the service worker, sealed under the device key in the
+  awful-share-target database, consumed at unlock into the open room or a
+  room picker. nginx also serves the shell at that path for the case where
+  no worker controls the page yet.
+File handler: .awfulbackup opens the app with the file parked for restore.
+Protocol handler: web+awfl://<code> maps to /r/<encoded url>; the router
+  strips the scheme and joins the room.
 ```
 
 ---
