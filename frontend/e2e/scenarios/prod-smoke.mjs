@@ -39,9 +39,9 @@ try {
   console.log("room:", code);
 
   // Bob joins by code through the UI.
-  await bob.waitFor("join field", () => bob.fill("Room code or room link", code));
+  await bob.waitFor("join field", () => bob.fill("Room code, short code or link", code));
   await bob.waitFor("room joined", async () => {
-    await bob.fill("Room code or room link", code);
+    await bob.fill("Room code, short code or link", code);
     await bob.clickText("Join Room");
     return bob.eval(`location.pathname.startsWith('/r/') ? true : null`);
   });
