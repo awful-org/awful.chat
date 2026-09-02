@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const HASH = "a".repeat(40);
 const addedPeers: Array<{ id?: string }> = [];
+const livePeers: Array<unknown> = [];
+const addCalls: string[] = [];
 
 class FakeTorrent extends EventEmitter {
   infoHash = "";
@@ -21,6 +23,10 @@ const torrents = new Map<string, FakeTorrent>();
 vi.mock("simple-peer", () => {
   class FakePeer extends EventEmitter {
     destroyed = false;
+    constructor() {
+      super();
+      livePeers.push(this as never);
+    }
     signal(): void {}
     destroy(): void {
       this.destroyed = true;
@@ -36,9 +42,13 @@ vi.mock("webtorrent", () => {
       return torrents.get(infoHash) ?? null;
     }
     add(infoHash: string) {
+      addCalls.push(infoHash);
       const torrent = new FakeTorrent();
       torrent.infoHash = infoHash;
-      torrents.set(infoHash, torrent);
+      // webtorrent parses the torrent id asynchronously, so client.get() does
+      // not find a just-added torrent on the same tick - the window a second
+      // add() lands in and gets destroyed with "Cannot add duplicate torrent".
+      setTimeout(() => torrents.set(infoHash, torrent), 0);
       return torrent;
     }
     seed(_file: File, _opts: unknown, cb: (t: FakeTorrent) => void) {
@@ -72,7 +82,33 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 describe("WebTorrentFileTransport", () => {
   beforeEach(() => {
     addedPeers.length = 0;
+    livePeers.length = 0;
+    addCalls.length = 0;
     torrents.clear();
+  });
+
+  it("caps the WebRTC links a roomful of files can open at once", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    // One file, more seeders for it than the cap allows.
+    for (let i = 0; i < 50; i++) {
+      const peerId = `peer${i}`;
+      t.onPeerConnect(peerId);
+      t.registerSeeder(file, peerId);
+    }
+    t.ensureDownload(file);
+    await tick();
+    expect(livePeers.length).toBeLessThanOrEqual(32);
+    expect(livePeers.length).toBe(32);
+  });
+
+  it("adds a torrent once when the same file is requested twice at once", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    // A message arriving and a seeder announcing both ask for the same file.
+    t.ensureDownload(file);
+    t.ensureDownload(file);
+    await tick();
+    await tick();
+    expect(addCalls).toEqual([HASH]);
   });
 
   it("gives every wire a distinct id so webtorrent can hold more than one", async () => {
@@ -82,6 +118,7 @@ describe("WebTorrentFileTransport", () => {
     t.registerSeeder(file, "alice");
     t.registerSeeder(file, "bob");
     t.ensureDownload(file);
+    await tick();
     await tick();
 
     const peers = (t as never as { wtPeers: Map<string, EventEmitter> }).wtPeers;
