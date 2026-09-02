@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -1164,34 +1163,6 @@ func TestEmptyRegisterBudgetIsPerPeerNotPerStream(t *testing.T) {
 // nodes could use the deployment as free transit, and the per-IP and per-ASN
 // reservation caps cannot tell them from real users because every client
 // arrives from Traefik's single address.
-func TestCircuitACLRefusesPeersWithoutARendezvousStream(t *testing.T) {
-	r := newRegistry()
-	acl := rendezvousACL{reg: r}
-	src, dst := peer.ID("src-peer"), peer.ID("dst-peer")
-
-	if acl.AllowConnect(src, nil, dst) {
-		t.Fatal("two strangers were granted transit through the relay")
-	}
-	addClient(r, src.String(), &fakeStream{})
-	if acl.AllowConnect(src, nil, dst) {
-		t.Fatal("a circuit to a destination with no rendezvous stream was allowed")
-	}
-	d := addClient(r, dst.String(), &fakeStream{})
-	if !acl.AllowConnect(src, nil, dst) {
-		t.Fatal("a circuit between two of our own peers was refused")
-	}
-	r.removeClient(d)
-	if acl.AllowConnect(src, nil, dst) {
-		t.Fatal("transit outlived the destination's last rendezvous stream")
-	}
-
-	// Reservations stay open on purpose: the client reserves BEFORE it opens
-	// its rendezvous stream (transport.ts connect()), so gating them on a
-	// live stream would refuse every legitimate first reservation.
-	if !acl.AllowReserve(peer.ID("brand-new-client"), nil) {
-		t.Fatal("AllowReserve refused, which breaks every client's first reservation")
-	}
-}
 
 // WithInfiniteLimits gave every circuit unlimited time and unlimited bytes,
 // which is what made an open relay worth abusing. The replacement has to stay

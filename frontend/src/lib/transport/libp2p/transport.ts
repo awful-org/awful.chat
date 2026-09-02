@@ -940,7 +940,12 @@ export class LibP2PTransport implements PeerTransport {
           message: `Failed to open stream to peer ${peerId.slice(-8)}`,
           // The bundle used to record only THAT it failed; a phone's bundle
           // full of these said nothing about why.
-          err: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+          err:
+            err instanceof Error
+              ? `${err.name}: ${err.message}`
+              : typeof Event !== "undefined" && err instanceof Event
+                ? `Event: ${err.type}`
+                : String(err),
         });
         this.failPendingQueue(peerId);
       })

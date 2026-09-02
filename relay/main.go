@@ -19,7 +19,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -28,7 +27,6 @@ import (
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/libp2p/go-libp2p/x/rate"
-	ma "github.com/multiformats/go-multiaddr"
 )
 
 const RendezvousProtocol = "/awful/rendezvous/1.0.0"
@@ -574,15 +572,6 @@ func (r *registry) emptyRegisterBudget(peerId string) *opBudget {
 		r.emptyRegisters[peerId] = b
 	}
 	return b
-}
-
-// hasLiveStream reports whether a peerId holds any rendezvous stream right
-// now. This is what the circuit-relay ACL asks: a peer that has not spoken
-// the rendezvous protocol is not a client of this app and gets no circuit.
-func (r *registry) hasLiveStream(peerId string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.clients[peerId]) > 0
 }
 
 // isLive reports whether this stream is still in the registry; caller holds
@@ -1320,30 +1309,19 @@ func relayCircuitLimit() *relayv2.RelayLimit {
 	}
 }
 
-// rendezvousACL restricts the circuit relay service to this app's own peers.
-// Without an ACL, EnableRelayService relays for anybody: two unrelated libp2p
-// nodes could use this deployment as free transit, and the per-IP and per-ASN
-// reservation caps cannot separate them from real users because every client
-// arrives from Traefik's single address (see relayResources).
-//
-// AllowConnect is the gate that matters: both ends of a circuit must hold a
-// live rendezvous stream, which only an awful client opens, so transit for a
-// pair of strangers is refused before any bytes flow.
-//
-// AllowReserve stays permissive on purpose. The client reserves BEFORE it
-// opens its rendezvous stream (transport.ts connect(): dialRelay,
-// requestRelayReservation, waitForRelayReservation, then startRendezvous, and
-// scheduleRelayReconnect repeats that order), so gating reservations on a
-// live stream would refuse every legitimate first reservation. A reservation
-// on its own carries no traffic; relayResources' MaxReservations is what
-// bounds it.
-type rendezvousACL struct{ reg *registry }
-
-func (a rendezvousACL) AllowReserve(peer.ID, ma.Multiaddr) bool { return true }
-
-func (a rendezvousACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {
-	return a.reg.hasLiveStream(src.String()) && a.reg.hasLiveStream(dest.String())
-}
+// No circuit ACL. One was tried on 2026-09-02: AllowConnect required both
+// ends of a circuit to hold a live rendezvous stream, which is how an app
+// peer looks from here. It broke calls between a phone and a browser the
+// same day. A rendezvous stream is not live at the instant a circuit is
+// asked for far more often than it looks: a page reload closes it
+// gracefully and reopens it a second or two later, and a backgrounded
+// Android tab throttles its 20 s PING to once a minute, so the liveness
+// timeout evicts the stream every 60 s while the phone is in a pocket.
+// Every such gap refused or closed the circuit that the WebRTC signalling
+// and the relayed stream ride on, and the two sides never got a proven
+// stream. The finite per-circuit limit (relayCircuitLimit) stays as the
+// abuse bound; gating connects on registry state would need a grace window
+// keyed by peerId, not by stream, and that is a different design.
 
 // newResourceManager builds the libp2p resource manager for the relay.
 // Extracted so main_test.go can assert the ceiling it lifts.
@@ -1453,7 +1431,6 @@ func main() {
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
 			relayv2.WithResources(relayResources()),
-			relayv2.WithACL(rendezvousACL{reg: reg}),
 			relayv2.WithLimit(relayCircuitLimit()),
 		),
 		libp2p.EnableHolePunching(),
