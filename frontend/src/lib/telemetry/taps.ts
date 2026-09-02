@@ -403,7 +403,23 @@ function onWindowError(e: ErrorEvent): void {
   rec(errorEvent("uncaught", e.error ?? e.message));
 }
 
+/**
+ * Gossipsub writing GRAFT/PRUNE to a stream a departing peer just closed.
+ * The transport suppresses it as known-benign noise and records it as
+ * `stream.reset`; without this the same rejection was also logged as a
+ * `runtime.error`, and a bundle from a perfectly healthy session opened on
+ * two dozen "errors" that were one harmless race counted twice.
+ */
+export function isBenignStreamRejection(reason: unknown): boolean {
+  const r = reason as { name?: string; message?: string } | undefined;
+  return (
+    r?.name === "StreamStateError" &&
+    /stream that is closed/i.test(r?.message ?? "")
+  );
+}
+
 function onRejection(e: PromiseRejectionEvent): void {
+  if (isBenignStreamRejection(e.reason)) return;
   rec(errorEvent("rejection", e.reason));
 }
 
