@@ -76,7 +76,9 @@ export default definePlugin({
   card: WheelCard,
   // initialState receives the payload sendCard was given - seed from it.
   // Ignoring the argument while your reducer bounds-checks against state
-  // means every update is rejected against empty data.
+  // means every update is rejected against empty data. Its second argument
+  // is { senderDid }, the host-verified poster; see "The contract" below
+  // before you trust anything in cardData with an owner's name on it.
   initialState: (cardData) => ({
     options: (cardData as { options?: string[] })?.options ?? [],
     spun: false,
@@ -320,11 +322,36 @@ tick below does. The host could hand you the message's `timestamp`, but it
 would not be worth more: that field is sender-supplied too. So order by
 `lamport`, display `atMs`, and treat neither as proof of anything.
 
-The starting state comes from `initialState(cardData)`, which receives the
-payload passed to `sendCard` - seed options and questions from it. A
+The starting state comes from `initialState(cardData, ctx)`. `cardData` is
+the payload passed to `sendCard` - seed options and questions from it. A
 reducer that bounds-checks against state while `initialState` ignores its
 argument sees empty data and rejects every update; that exact bug shipped
 once, which is why the parameter is worth this paragraph.
+
+`ctx` is `{ senderDid }`: **the card's host-verified sender, and the only
+trustworthy answer to "whose card is this"**. Anything your reducer later
+tests to decide who may write the card has to come from here. A payload field
+naming an owner is a claim, not a fact - anyone in the room can post a card
+with any `ownerDid` in it, and a plugin that read one handed the owner-only
+path to a forger. Ping's card is the worked example:
+
+```ts
+initialState: (cardData, ctx) => ({
+  targets: parseTargets(cardData),
+  // NEVER `cardData.ownerDid`. Empty means nobody owns it, and the reducer
+  // below then refuses every update, which is the right way to fail.
+  ownerDid: ctx?.senderDid ?? "",
+}),
+reduce(state, update, ctx) {
+  // Strict, never `state.ownerDid && ...`: that reads as "check when there
+  // is an owner" and behaves as "skip the check when there is not".
+  if (ctx.senderDid !== state.ownerDid) return state;
+  ...
+}
+```
+
+The argument is optional, so a plugin that only needs the payload keeps its
+one-argument `initialState` unchanged.
 
 Two related host calls: `host.cards()` lists the plugin's existing cards in
 the host's room (cheap - it reads only card rows), and

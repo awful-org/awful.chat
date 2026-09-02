@@ -11,6 +11,7 @@ import {
   MAX_PUBLISHED_POINTS,
   MAX_TARGETS,
 } from "./logic";
+import { initialState, reduce, type PingState } from "./index";
 
 describe("nextInterval", () => {
   it("holds the base cadence while the link is fast", () => {
@@ -171,5 +172,86 @@ describe("packSeries / unpackSeries", () => {
   it("is empty for anything that is not an array", () => {
     expect(unpackSeries(null)).toEqual([]);
     expect(unpackSeries({ 0: [1, 2] })).toEqual([]);
+  });
+});
+
+describe("card ownership", () => {
+  const ALICE = "did:key:z6MkAlice";
+  const MALLORY = "did:key:z6MkMallory";
+  const targets = [{ did: "did:key:z6MkBob", name: "Bob" }];
+  const result = {
+    action: "result",
+    results: { "did:key:z6MkBob": { min: 1, median: 2, max: 3, loss: 0, sent: 9 } },
+  };
+
+  it("takes the owner from the host, not from the payload", () => {
+    // Mallory posts the card and names Alice as the owner.
+    const state = initialState(
+      { targets, ownerDid: ALICE },
+      { senderDid: MALLORY }
+    ) as PingState;
+    expect(state.ownerDid).toBe(MALLORY);
+  });
+
+  it("refuses a result from the DID the payload named", () => {
+    const state = initialState(
+      { targets, ownerDid: ALICE },
+      { senderDid: MALLORY }
+    ) as PingState;
+    // Alice never posted this card, so her update is not the owner's.
+    expect(reduce(state, { data: result }, { senderDid: ALICE })).toBe(state);
+  });
+
+  it("accepts the result from whoever actually posted the card", () => {
+    const state = initialState({ targets }, { senderDid: ALICE }) as PingState;
+    const next = reduce(state, { data: result }, { senderDid: ALICE });
+    expect(Object.keys(next.results)).toEqual(["did:key:z6MkBob"]);
+  });
+
+  it("owns nothing when there is no verified sender", () => {
+    const state = initialState({ targets, ownerDid: ALICE }) as PingState;
+    expect(state.ownerDid).toBe("");
+    expect(reduce(state, { data: result }, { senderDid: ALICE })).toBe(state);
+  });
+});
+
+describe("result hardening", () => {
+  const OWNER = "did:key:z6MkOwner";
+  const BOB = "did:key:z6MkBob";
+  const seed = () =>
+    initialState(
+      { targets: [{ did: BOB, name: "Bob" }] },
+      { senderDid: OWNER }
+    ) as PingState;
+
+  it("drops a summary whose numbers are not numbers", () => {
+    const next = reduce(
+      seed(),
+      { data: { action: "result", results: { [BOB]: { loss: "0", sent: 9 } } } },
+      { senderDid: OWNER }
+    );
+    expect(next.results).toEqual({});
+  });
+
+  it("drops NaN, which slips past every range check", () => {
+    const next = reduce(
+      seed(),
+      {
+        data: {
+          action: "result",
+          results: { [BOB]: { min: 1, median: 2, max: 3, loss: NaN, sent: 9 } },
+        },
+      },
+      { senderDid: OWNER }
+    );
+    expect(next.results).toEqual({});
+  });
+
+  it("refuses a target named __proto__, which would set a prototype", () => {
+    const state = initialState(
+      { targets: [{ did: "__proto__", name: "x" }] },
+      { senderDid: OWNER }
+    ) as PingState;
+    expect(state.targets).toEqual([]);
   });
 });

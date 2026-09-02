@@ -30,13 +30,24 @@ export function parsePollArgs(
   return { question, options };
 }
 
+/**
+ * The most options a card can carry.
+ *
+ * The list was filtered by type but never bounded, so one card could seed a
+ * poll with as many choices as fit in a message and every viewer would render
+ * all of them. Cards are peer-supplied; a ceiling is cheaper than a repaint.
+ */
+export const MAX_OPTIONS = 32;
+
 export const initialState = (cardData: unknown) => {
     const data = (cardData ?? {}) as { question?: unknown; options?: unknown };
     return {
       question:
         typeof data.question === "string" ? data.question.slice(0, 200) : "",
       options: Array.isArray(data.options)
-        ? data.options.filter((o): o is string => typeof o === "string")
+        ? data.options
+            .filter((o): o is string => typeof o === "string")
+            .slice(0, MAX_OPTIONS)
         : [],
       votes: new Map<string, { did: string; name: string; vote: number }>(),
     };

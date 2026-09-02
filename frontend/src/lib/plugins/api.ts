@@ -75,6 +75,17 @@ export interface UpdateCtx {
   ephemeral: boolean;
 }
 
+/**
+ * What the host knows about a card that its payload cannot claim.
+ *
+ * `senderDid` is the signed message's sender, so it is the ONLY trustworthy
+ * answer to "who posted this card". A payload field naming an owner is
+ * peer-supplied: anyone in the room can send a card claiming any DID.
+ */
+export interface CardCtx {
+  senderDid: string; // host-verified, never from payload
+}
+
 export interface HostApi {
   // Built by GENERALIZING sendMessage, never as a parallel path: signing
   // (sigV2), lamport assignment (room counter vs wall-clock nextDmLamport
@@ -320,8 +331,13 @@ export interface PluginDefinition {
    * object passed to host.sendCard) so options/questions seed the state -
    * without it a reducer bounds-checking against state saw empty data and
    * rejected every update.
+   *
+   * `ctx.senderDid` is the card's host-verified sender. Anything that decides
+   * who may write the card must come from there, NEVER from `cardData`: the
+   * payload is peer-supplied, so an `ownerDid` in it is a claim, not a fact.
+   * Second argument, so a plugin that only needs the payload keeps working.
    */
-  initialState?: (cardData: unknown) => unknown;
+  initialState?: (cardData: unknown, ctx: CardCtx) => unknown;
   commands?: Record<
     string,
     (args: string, host: HostApi) => void | Promise<void>

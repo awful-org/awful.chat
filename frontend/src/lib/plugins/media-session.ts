@@ -19,6 +19,27 @@ export interface NowPlayingInfo {
 
 let _owner: symbol | null = null;
 
+/**
+ * Metadata caps. What a plugin passes here is peer-supplied (a title from a
+ * shared playlist, artwork from a card), and it lands on the OS lock screen
+ * and in the notification shade, outside anything the page can style or take
+ * back. An unbounded title pushes the controls off the surface; the artwork
+ * source is a URL the platform fetches on its own, so `http:` would be a
+ * silent mixed-content fetch and any other scheme is not an image at all.
+ */
+const MAX_TEXT = 200;
+const ARTWORK_SCHEMES = ["https:", "blob:", "data:image/"];
+
+function cap(text: unknown): string {
+  return typeof text === "string" ? text.slice(0, MAX_TEXT) : "";
+}
+
+function safeArtwork(url: string | undefined): string | null {
+  if (!url) return null;
+  const lower = url.trim().toLowerCase();
+  return ARTWORK_SCHEMES.some((s) => lower.startsWith(s)) ? url : null;
+}
+
 function apply(info: NowPlayingInfo | null): void {
   const ms = navigator.mediaSession;
   if (!ms) return;
@@ -35,11 +56,12 @@ function apply(info: NowPlayingInfo | null): void {
       }
       return;
     }
+    const artwork = safeArtwork(info.artworkUrl);
     ms.metadata = new MediaMetadata({
-      title: info.title,
-      artist: info.artist ?? "",
-      artwork: info.artworkUrl
-        ? [{ src: info.artworkUrl, sizes: "480x360", type: "image/jpeg" }]
+      title: cap(info.title),
+      artist: cap(info.artist),
+      artwork: artwork
+        ? [{ src: artwork, sizes: "480x360", type: "image/jpeg" }]
         : [],
     });
     ms.playbackState = info.playing ? "playing" : "paused";

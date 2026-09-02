@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { initialState, parsePollArgs, reduce, type PollState } from "./logic";
+import {
+  initialState,
+  MAX_OPTIONS,
+  parsePollArgs,
+  reduce,
+  type PollState,
+} from "./logic";
 
 const ctx = (did: string, name = "N", id = "u1", lamport = 1) => ({
   senderDid: did,
@@ -82,5 +88,14 @@ describe("poll command parsing", () => {
     expect(parsePollArgs("no question here")).toBeNull();
     expect(parsePollArgs("Question? only-one")).toBeNull();
     expect(parsePollArgs("Question? , ,")).toBeNull();
+  });
+});
+
+describe("option cap", () => {
+  it("keeps a peer-supplied list bounded", () => {
+    const many = Array.from({ length: 500 }, (_, i) => `o${i}`);
+    expect(
+      initialState({ question: "q", options: many }).options.length
+    ).toBe(MAX_OPTIONS);
   });
 });
