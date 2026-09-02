@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -223,5 +225,87 @@ func TestPluginProxyClientsShareOneTransport(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "https://b.example/x", nil)
 	if err := a.CheckRedirect(req, nil); err == nil {
 		t.Fatal("client a accepted a redirect to b.example; the closures got shared")
+	}
+}
+
+// proxyUpstream points the shared outbound transport at a local test server.
+// pluginProxySafeDial refuses loopback by design, so an httptest upstream is
+// unreachable through the real one; a TLS test server's own client transport
+// dials it and trusts its certificate, which lets these tests drive the real
+// handler over a real https url.
+func proxyUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(h)
+	prev := pluginProxyTransport
+	pluginProxyTransport = srv.Client().Transport.(*http.Transport)
+	t.Cleanup(func() {
+		pluginProxyTransport = prev
+		srv.Close()
+	})
+	t.Setenv("PLUGIN_PROXY_HOSTS", "127.0.0.1")
+	return srv
+}
+
+// This endpoint passes the upstream's own Content-Type through, and a
+// top-level navigation carries no Origin, which isAllowedOrigin permits on
+// purpose - so an allowlisted host's HTML or SVG would otherwise render as a
+// document on the relay's own origin. Both the fresh and the cached answer
+// have to say attachment; pluginstream.go already does the same on its path.
+func TestPluginProxyForcesDownloadOnBothPaths(t *testing.T) {
+	resetRateLimiter(t)
+	srv := proxyUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<script>alert(document.domain)</script>"))
+	})
+
+	// A key nothing else in this process has cached.
+	raw := srv.URL + "/page.html?disposition=" + t.Name()
+	for _, path := range []string{"fresh", "cached"} {
+		req := httptest.NewRequest(http.MethodGet, "/plugin-proxy?url="+url.QueryEscape(raw), nil)
+		rec := httptest.NewRecorder()
+		handlePluginProxy(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Content-Disposition"); got != "attachment" {
+			t.Errorf("%s: Content-Disposition = %q, want attachment", path, got)
+		}
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("%s: X-Content-Type-Options = %q, want nosniff", path, got)
+		}
+	}
+	if _, ok := pluginProxyCached("pp:" + raw); !ok {
+		t.Fatal("the second request did not come from the cache, so only one path was covered")
+	}
+}
+
+// Placeholders have always belonged in the query - values are query-escaped,
+// which is the wrong escaping anywhere else - but the substitution ran over
+// the whole url string. A secret spliced into the PATH is not escaped for one
+// (QueryEscape leaves '/' alone), so it could steer the request elsewhere on
+// the allowlisted host and land the key in that host's own logs.
+func TestPluginProxyRefusesSecretPlaceholderOutsideTheQuery(t *testing.T) {
+	secrets := map[string]pluginSecret{"KEY": {value: "s3cret"}}
+	for _, raw := range []string{
+		"https://allowed.host/v1/{{secret:key}}/data",
+		"https://allowed.host/x#{{secret:key}}",
+	} {
+		if out, err := substituteSecrets(raw, secrets, "allowed.host"); !errors.Is(err, errSecretOutsideQuery) {
+			t.Errorf("%s: got %q, %v; want errSecretOutsideQuery", raw, out, err)
+		}
+	}
+
+	resetRateLimiter(t)
+	t.Setenv("PLUGIN_PROXY_HOSTS", "allowed.host")
+	t.Setenv("PLUGIN_PROXY_SECRETS", "KEY@allowed.host=s3cret")
+	req := httptest.NewRequest(http.MethodGet,
+		"/plugin-proxy?url="+url.QueryEscape("https://allowed.host/v1/{{secret:key}}/data"), nil)
+	rec := httptest.NewRecorder()
+	handlePluginProxy(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a placeholder in the path got %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "s3cret") {
+		t.Error("the refusal echoed the secret")
 	}
 }

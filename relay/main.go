@@ -19,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -27,6 +28,7 @@ import (
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/libp2p/go-libp2p/x/rate"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 const RendezvousProtocol = "/awful/rendezvous/1.0.0"
@@ -156,31 +158,39 @@ const (
 	membershipOpWindow = time.Minute
 	// registry.register is the only oracle a room-code guesser has: an empty
 	// PEERS reply means the room it guessed is empty, a populated one means
-	// it hit a real room. Codes are moving to 48 bits, so the relay has to
-	// make that oracle expensive without refusing REGISTER outright - a
-	// legitimate reconnect re-registers every saved room too, and most of
-	// them have nobody else online.
+	// it hit a real room. A current code is 13 Crockford base32 characters,
+	// 65 bits, but the legacy 3-byte codes are still valid and still in
+	// people's bookmarks, so the space actually worth guessing is 2^24. That
+	// is what makes this oracle worth denying, without refusing REGISTER
+	// outright - a legitimate reconnect re-registers every saved room too,
+	// and most of them have nobody else online.
 	//
 	// maxEmptyRegisters bounds REGISTERs into a room with no OTHER member at
-	// registration time, per stream, per emptyRegisterWindow; a REGISTER
-	// into a populated room costs nothing against it. Exhausting the budget
-	// drops the REGISTER - no PEERS reply, no join - the same way an
-	// exhausted membershipOps drops the op above, rather than resetting the
-	// stream: the drop alone already silences the oracle for the rest of the
-	// window, so paying the cost of a reconnect on top buys nothing.
+	// registration time, per PEER, per emptyRegisterWindow; a REGISTER into
+	// a populated room costs nothing against it. The budget lives in the
+	// registry keyed by peerId, not on connectedClient: per STREAM, one peer
+	// got maxStreamsPerPeer separate budgets, and could mint a fresh one at
+	// will by closing a stream and opening another, so the 128/min this is
+	// declared to be was really 4,096/min and refillable on demand.
+	// Exhausting it drops the REGISTER - no PEERS reply, no join - the same
+	// way an exhausted membershipOps drops the op above, rather than
+	// resetting the stream: the drop alone already silences the oracle for
+	// the rest of the window, so paying the cost of a reconnect on top buys
+	// nothing.
 	//
-	// 128/min/stream x maxStreamsPerPeer x connMgrHigh bounds the system-wide
-	// guess rate: 128 x 32 x 512 = 2,097,152 empty-room REGISTERs/minute at
-	// the absolute worst case (connMgrHigh connections, each holding
-	// maxStreamsPerPeer streams, every one saturating this budget) - a
-	// vanishing fraction of the 2^48 code space per minute.
+	// 128/min/peer x connMgrHigh bounds the system-wide guess rate: 128 x
+	// 512 = 65,536 empty-room REGISTERs/minute at the absolute worst case
+	// (every connection the relay will hold saturating its budget). That is
+	// a ~4h sweep of the legacy 2^24 space and nothing at all against 2^65,
+	// and a peer only refills early by dropping every stream it holds and
+	// reconnecting, which costs a fresh libp2p connection.
 	//
 	// maxRoomsPerPeer is 1024, so a peer with more than 128 saved EMPTY rooms
 	// will exhaust this partway through a reconnect burst and have the rest
 	// of that burst silently dropped until the window refills; the budget
-	// refills on the same still-open stream without a reconnect, same as
-	// every other per-stream budget here. 128 is picked so a realistic user -
-	// dozens of rooms, not four figures of them - never gets near it.
+	// refills on its own without a reconnect, same as every other budget
+	// here. 128 is picked so a realistic user - dozens of rooms, not four
+	// figures of them - never gets near it.
 	maxEmptyRegisters   = 128
 	emptyRegisterWindow = time.Minute
 )
@@ -230,12 +240,6 @@ type connectedClient struct {
 	closeOnce     sync.Once
 	roomCapLogged bool          // guarded by registry.mu; keeps a capped peer from flooding the log
 	joinLeaveLog  membershipLog // guarded by registry.mu; caps the join/leave lines this stream can write
-	// emptyRegisters bounds REGISTERs this stream makes into a room with no
-	// OTHER member - see maxEmptyRegisters. Set only inside registry.register,
-	// which is only ever called from this stream's own read loop, so - like
-	// membershipOps in readLoop - it needs no lock of its own even though
-	// register() happens to touch it while holding registry.mu.
-	emptyRegisters opBudget
 
 	// Telemetry-only bookkeeping (relay/telemetry.go), guarded by
 	// registry.mu exactly like roomCapLogged and joinLeaveLog above - written
@@ -415,21 +419,31 @@ func lifecycleLogf(format string, args ...any) {
 	}
 }
 
-// opBudget is a per-stream refilling allowance for membership changes. It is
-// the same shape as membershipLog but gates the WORK rather than the logging,
-// and it is touched only from that stream's own read loop, so it needs no
-// lock. The zero value is a full budget whose window opens on first use.
+// opBudget is a refilling allowance for work rather than logging. It is the
+// same shape as membershipLog, and carries its own limit and window: they used
+// to be hardcoded to maxMembershipOps/membershipOpWindow, so the one other
+// user of this type - the empty-register budget, declared at 128/min - was
+// silently running at maxMembershipOps (2048) a minute instead. Build one with
+// newOpBudget; each budget is touched under exactly one lock (readLoop's own
+// goroutine for membership ops, registry.mu for empty registers), so it needs
+// none of its own.
 type opBudget struct {
+	limit       int
+	window      time.Duration
 	left        int
 	windowStart time.Time
 	started     bool
 }
 
+func newOpBudget(limit int, window time.Duration) *opBudget {
+	return &opBudget{limit: limit, window: window}
+}
+
 func (o *opBudget) allow(now time.Time) bool {
-	if !o.started || now.Sub(o.windowStart) >= membershipOpWindow {
+	if !o.started || now.Sub(o.windowStart) >= o.window {
 		o.started = true
 		o.windowStart = now
-		o.left = maxMembershipOps
+		o.left = o.limit
 	}
 	if o.left <= 0 {
 		return false
@@ -503,6 +517,13 @@ type registry struct {
 	rooms map[string]map[*connectedClient]struct{}
 	// peerId → that peer's live rendezvous streams.
 	clients map[string]map[*connectedClient]struct{}
+	// peerId → the room-code oracle budget SHARED by every stream that peer
+	// holds, see maxEmptyRegisters. Kept here rather than on connectedClient
+	// for the same reason roomsHeldByPeer sums across streams: a per-stream
+	// budget is one a peer multiplies, and refills, by opening streams.
+	// Entries live exactly as long as clients[peerId] does, so the map stays
+	// bounded by the connection ceiling and not by anything a peer chooses.
+	emptyRegisters map[string]*opBudget
 	// Sum of len(c.rooms) over every live stream, kept incrementally because
 	// the only alternative is walking the whole registry on every REGISTER.
 	total int
@@ -513,8 +534,9 @@ type registry struct {
 
 func newRegistry() *registry {
 	return &registry{
-		rooms:   make(map[string]map[*connectedClient]struct{}),
-		clients: make(map[string]map[*connectedClient]struct{}),
+		rooms:          make(map[string]map[*connectedClient]struct{}),
+		clients:        make(map[string]map[*connectedClient]struct{}),
+		emptyRegisters: make(map[string]*opBudget),
 	}
 }
 
@@ -535,9 +557,32 @@ func (r *registry) addStream(peerId string, s rvStream) *connectedClient {
 		streams = make(map[*connectedClient]struct{})
 		r.clients[peerId] = streams
 	}
+	// A second stream joins the budget the peer already has; it never gets a
+	// fresh one.
+	r.emptyRegisterBudget(peerId)
 	c := newConnectedClient(peerId, s)
 	streams[c] = struct{}{}
 	return c
+}
+
+// emptyRegisterBudget returns the peerId's shared empty-register budget,
+// creating it on the peer's first stream. Caller holds r.mu.
+func (r *registry) emptyRegisterBudget(peerId string) *opBudget {
+	b := r.emptyRegisters[peerId]
+	if b == nil {
+		b = newOpBudget(maxEmptyRegisters, emptyRegisterWindow)
+		r.emptyRegisters[peerId] = b
+	}
+	return b
+}
+
+// hasLiveStream reports whether a peerId holds any rendezvous stream right
+// now. This is what the circuit-relay ACL asks: a peer that has not spoken
+// the rendezvous protocol is not a client of this app and gets no circuit.
+func (r *registry) hasLiveStream(peerId string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.clients[peerId]) > 0
 }
 
 // isLive reports whether this stream is still in the registry; caller holds
@@ -742,7 +787,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	// charge (or spare) the wrong REGISTER. An empty room is the oracle a
 	// code guesser is fishing for, so only THAT case spends the budget; a
 	// REGISTER into a room that already has somebody else in it is free.
-	if len(members) == 0 && !c.emptyRegisters.allow(time.Now()) {
+	if len(members) == 0 && !r.emptyRegisterBudget(c.peerId).allow(time.Now()) {
 		c.diagOracleSilenced++
 		r.mu.Unlock()
 		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "oracle"}})
@@ -923,6 +968,10 @@ func (r *registry) evict(c *connectedClient) ([]departure, []leaveLine) {
 	delete(streams, c)
 	if len(streams) == 0 {
 		delete(r.clients, c.peerId)
+		// The budget outlives every stream but the last, so cycling streams
+		// buys no refill; only a full reconnect does, and that costs a libp2p
+		// connection the connection manager already bounds.
+		delete(r.emptyRegisters, c.peerId)
 	}
 	return notifications, lines
 }
@@ -1074,7 +1123,7 @@ func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) s
 	// maxMsgLen has no lower bound, so a peer can stream tiny junk frames at
 	// line rate and would otherwise get a log line for each one.
 	budget := &logBudget{left: maxStreamLogLines}
-	membershipOps := &opBudget{}
+	membershipOps := newOpBudget(maxMembershipOps, membershipOpWindow)
 	warn := func(format string, args ...any) {
 		if !budget.allow() {
 			return
@@ -1249,6 +1298,47 @@ func relayResources() relayv2.Resources {
 	return res
 }
 
+// relayCircuitLimit is the per-circuit ceiling the relay service enforces.
+// This used to be relayv2.WithInfiniteLimits(): no duration and no byte cap
+// at all, which turned an open circuit relay into free unmetered bandwidth
+// for anyone who found the multiaddr. The defaults (2 minutes, 128 KiB) are
+// far too small for this app - chat, DMs and the sync stream all ride a
+// circuit for as long as a tab is open, while files go peer-to-peer over
+// WebRTC and never touch it - so the numbers are generous rather than tight.
+// A day covers the longest plausible session, and 4 GiB each way is orders of
+// magnitude past what text traffic uses while still being a number.
+func relayCircuitLimit() *relayv2.RelayLimit {
+	return &relayv2.RelayLimit{
+		Duration: 24 * time.Hour,
+		Data:     4 << 30,
+	}
+}
+
+// rendezvousACL restricts the circuit relay service to this app's own peers.
+// Without an ACL, EnableRelayService relays for anybody: two unrelated libp2p
+// nodes could use this deployment as free transit, and the per-IP and per-ASN
+// reservation caps cannot separate them from real users because every client
+// arrives from Traefik's single address (see relayResources).
+//
+// AllowConnect is the gate that matters: both ends of a circuit must hold a
+// live rendezvous stream, which only an awful client opens, so transit for a
+// pair of strangers is refused before any bytes flow.
+//
+// AllowReserve stays permissive on purpose. The client reserves BEFORE it
+// opens its rendezvous stream (transport.ts connect(): dialRelay,
+// requestRelayReservation, waitForRelayReservation, then startRendezvous, and
+// scheduleRelayReconnect repeats that order), so gating reservations on a
+// live stream would refuse every legitimate first reservation. A reservation
+// on its own carries no traffic; relayResources' MaxReservations is what
+// bounds it.
+type rendezvousACL struct{ reg *registry }
+
+func (a rendezvousACL) AllowReserve(peer.ID, ma.Multiaddr) bool { return true }
+
+func (a rendezvousACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {
+	return a.reg.hasLiveStream(src.String()) && a.reg.hasLiveStream(dest.String())
+}
+
 // newResourceManager builds the libp2p resource manager for the relay.
 // Extracted so main_test.go can assert the ceiling it lifts.
 func newResourceManager() (network.ResourceManager, error) {
@@ -1314,7 +1404,10 @@ func newResourceManager() (network.ResourceManager, error) {
 func main() {
 	flag.Parse()
 
-	os.MkdirAll("/app/data", os.ModePerm)
+	// 0o700, not os.ModePerm: this directory holds the relay's private key
+	// and every mailbox and telemetry bundle under it, and 0777 made all of
+	// that writable by anything else sharing the volume.
+	os.MkdirAll("/app/data", 0o700)
 	priv := loadOrGenKey("/app/data/relay.key")
 
 	connMgr, _ := connmgr.NewConnManager(connMgrLow, connMgrHigh)
@@ -1336,6 +1429,10 @@ func main() {
 		httpPort = "8080"
 	}
 
+	// Built before the host: the circuit-relay ACL below asks it whether a
+	// peer is one of ours.
+	reg := newRegistry()
+
 	// libp2p WebSocket
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
@@ -1350,7 +1447,8 @@ func main() {
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
 			relayv2.WithResources(relayResources()),
-			relayv2.WithInfiniteLimits(),
+			relayv2.WithACL(rendezvousACL{reg: reg}),
+			relayv2.WithLimit(relayCircuitLimit()),
 		),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
@@ -1359,7 +1457,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	reg := newRegistry()
 	h.SetStreamHandler(RendezvousProtocol, reg.handleStream)
 	relaySelfPeerId = h.ID().String()
 

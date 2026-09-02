@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -301,15 +302,39 @@ func pluginProxySecrets() map[string]pluginSecret {
 	return out
 }
 
+// errSecretOutsideQuery marks a url whose placeholder is not in the query.
+// It is answered 400, not the 204 an unconfigured secret gets: the caller
+// asked for something this endpoint does not do, rather than for a key the
+// operator has not set up.
+var errSecretOutsideQuery = errors.New("secret placeholder outside the query")
+
 // substituteSecrets replaces {{secret:NAME}} placeholders for a request
 // bound for targetHost. A secret bound to a different host counts as
 // missing: the caller answers 204 and no upstream ever sees a key that was
-// not meant for it. Placeholders belong in query strings (values are
-// query-escaped).
+// not meant for it.
+//
+// Only the QUERY is substituted, and a placeholder anywhere else is refused.
+// The doc always said placeholders belong in the query - values are
+// query-escaped, which is the wrong escaping everywhere else - but the
+// substitution ran over the whole url string, so a caller could put a secret
+// in the PATH and have it spliced in there: url.QueryEscape leaves '/'
+// unescaped, which is enough to steer the request to another path on the
+// allowlisted host and, for a secret containing one, to reveal it in the
+// upstream's own logs and error pages.
 func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	// The query is a substring of raw and a placeholder cannot straddle the
+	// '?', so counting matches in each is an exact test for "every
+	// placeholder is in the query".
+	if len(secretPlaceholderRe.FindAllString(raw, -1)) != len(secretPlaceholderRe.FindAllString(u.RawQuery, -1)) {
+		return "", errSecretOutsideQuery
+	}
 	targetHost = strings.ToLower(targetHost)
 	var missing string
-	replaced := secretPlaceholderRe.ReplaceAllStringFunc(raw, func(m string) string {
+	u.RawQuery = secretPlaceholderRe.ReplaceAllStringFunc(u.RawQuery, func(m string) string {
 		name := strings.ToUpper(secretPlaceholderRe.FindStringSubmatch(m)[1])
 		if sec, ok := secrets[name]; ok && (sec.host == "" || sec.host == targetHost) {
 			return url.QueryEscape(sec.value)
@@ -322,7 +347,7 @@ func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost s
 	if missing != "" {
 		return "", fmt.Errorf("secret %s not configured for %s", missing, targetHost)
 	}
-	return replaced, nil
+	return u.String(), nil
 }
 
 // pluginProxyClient builds the outbound client. pinHost, when non-empty, is
@@ -432,6 +457,10 @@ func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	substituted, err := substituteSecrets(raw, pluginProxySecrets(), host)
+	if errors.Is(err, errSecretOutsideQuery) {
+		apiError(w, r, "Secret placeholders belong in the query string", http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		// Unconfigured or host-mismatched secret = "not set up".
 		withCors(w, r, func(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) })
@@ -451,7 +480,7 @@ func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 	if entry, ok := pluginProxyCached(cacheKey); ok {
 		withCors(w, r, func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", entry.contentType)
-			w.Header().Set("X-Content-Type-Options", "nosniff")
+			pluginProxyNoDocument(w)
 			w.Write(entry.body)
 		})
 		return
@@ -486,7 +515,19 @@ func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 	pluginProxyStore(cacheKey, body, contentType)
 	withCors(w, r, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
+		pluginProxyNoDocument(w)
 		w.Write(body)
 	})
+}
+
+// pluginProxyNoDocument keeps an upstream's own Content-Type from rendering as
+// a document on the relay's origin. A top-level navigation carries no Origin
+// and the empty Origin is allowed by design here, so /plugin-proxy?url=... can
+// be opened straight in a tab: without this an allowlisted host's HTML or SVG
+// would run as same-origin script on the relay. XHR and fetch, the only real
+// callers, ignore the header entirely. pluginstream.go does the same for its
+// streaming path and for the same reason.
+func pluginProxyNoDocument(w http.ResponseWriter) {
+	w.Header().Set("Content-Disposition", "attachment")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 }
