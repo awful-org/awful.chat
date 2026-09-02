@@ -42,8 +42,12 @@ const pluginStreamRateLimit = 240
 
 // Bounds the whole exchange including the body. Client.Timeout is deliberately
 // NOT used: it covers the body read too, and a large segment on a slow link is
-// a legitimate long transfer, not a hung upstream.
-const pluginStreamTimeout = 120 * time.Second
+// a legitimate long transfer, not a hung upstream. Generous on purpose:
+// anidb.app throttles a cache-cold segment to ~5 KB/s, so a first-viewer pull
+// can legitimately run past two minutes. Cutting it there is what surfaced as
+// a "canceled" segment and a stalled player; the per-client concurrency cap,
+// not this deadline, is what bounds abuse.
+const pluginStreamTimeout = 300 * time.Second
 
 // The Transport is the process-wide one /plugin-proxy already uses, for the
 // reason documented there (a per-request Transport leaks goroutines and
