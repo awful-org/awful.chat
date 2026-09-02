@@ -152,8 +152,29 @@ export function ensurePushSubscription(): Promise<boolean> {
   }));
 }
 
+/**
+ * What the last attempt found, for Settings to say so. "push-service" is the
+ * browser's own service refusing to mint an endpoint: Brave ships with
+ * Google's push service switched off, and Chromium reports that as
+ * "Registration failed - push service error".
+ */
+export const pushState = $state<{
+  status: "unknown" | "subscribed" | "unavailable";
+  reason: "push-service" | "relay" | "other" | null;
+}>({ status: "unknown", reason: null });
+
+function classify(err: unknown): "push-service" | "other" {
+  const text = err instanceof Error ? `${err.name} ${err.message}` : String(err);
+  return /push service|AbortError|NotSupportedError/i.test(text)
+    ? "push-service"
+    : "other";
+}
+
 async function subscribe(): Promise<boolean> {
   if (!pushPrefs.enabled) return false;
+  // A push service that refused once refuses every unlock in this session;
+  // asking again only fills the console. A toggle in Settings retries.
+  if (pushState.reason === "push-service") return false;
   if (typeof window === "undefined") return false;
   if (typeof Notification === "undefined") return false;
   // Asking here would be rejected anyway: the prompt needs a user gesture,
@@ -201,15 +222,23 @@ async function subscribe(): Promise<boolean> {
         keys: { p256dh: keys.p256dh, auth: keys.auth },
       },
     });
-    if (!ok) return false;
+    if (!ok) {
+      pushState.status = "unavailable";
+      pushState.reason = "relay";
+      return false;
+    }
     lastPosted = marker;
     remember(KEY_KEY, config.publicKey);
+    pushState.status = "subscribed";
+    pushState.reason = null;
     return true;
   } catch (err) {
     // A push service that refuses to mint an endpoint (no network, a browser
     // with push disabled at build time) costs nothing here: the app still
-    // notifies locally while it is running.
+    // notifies locally while it is running. Settings says why.
     console.warn("[push] subscribe failed:", err);
+    pushState.status = "unavailable";
+    pushState.reason = classify(err);
     return false;
   }
 }
@@ -256,7 +285,10 @@ export function setPushEnabled(on: boolean): void {
   } catch {
     // Storage blocked: the choice just does not survive a reload.
   }
-  if (on) void ensurePushSubscription();
+  if (on) {
+    pushState.reason = null;
+    void ensurePushSubscription();
+  }
   else void disablePush();
 }
 

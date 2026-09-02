@@ -60,7 +60,7 @@
         (notifyState.supported && notifyState.permission === "default"))
   );
 
-  function notNow() {
+  function snooze() {
     dismissed = true;
     try {
       localStorage.setItem(SNOOZE_KEY, String(Date.now()));
@@ -69,15 +69,21 @@
     }
   }
 
+  function notNow() {
+    snooze();
+  }
+
   async function turnOn() {
     asking = true;
     try {
       // Runs inside the click, which is the only place a browser will accept
       // a permission request.
+      // Asked is asked: a prompt the browser dismissed without an answer
+      // leaves the permission at "default", and re-asking on every launch is
+      // what turns a helpful banner into a nag. Snooze first, then ask.
+      snooze();
       const granted = await setNotificationsEnabled(true);
       if (granted) await ensurePushSubscription();
-      // Granted or denied, the question has been answered.
-      dismissed = true;
     } finally {
       asking = false;
     }

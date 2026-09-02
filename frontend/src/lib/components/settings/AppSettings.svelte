@@ -7,7 +7,7 @@ import {
   setMessageSoundsEnabled,
   setNotificationsEnabled,
 } from "$lib/notify.svelte";
-import { pushPrefs, setPushEnabled } from "$lib/push.svelte";
+import { pushPrefs, setPushEnabled, pushState } from "$lib/push.svelte";
 import {
   mediaPrefs,
   setGifAutoplay,
@@ -118,6 +118,9 @@ async function loadLocalFonts(): Promise<void> {
     loadingFonts = false;
   }
 }
+  // Brave exposes navigator.brave; the hint below names its setting.
+  const isBrave =
+    typeof navigator !== "undefined" && "brave" in navigator;
 </script>
 
 <div class="flex flex-col gap-6">
@@ -174,6 +177,26 @@ async function loadLocalFonts(): Promise<void> {
       onCheckedChange={(checked) => setPushEnabled(checked)}
     />
   </div>
+  {#if pushPrefs.enabled && pushState.status === "unavailable"}
+    <p class="text-xs font-mono text-amber-500 leading-relaxed">
+      {#if pushState.reason === "push-service"}
+        {#if isBrave}
+          This browser cannot reach a push service. Brave ships with it off:
+          turn on "Use Google services for push messaging" in
+          brave://settings/privacy, then reload.
+        {:else}
+          This browser cannot reach a push service, so this device is only
+          notified while the app is open.
+        {/if}
+      {:else if pushState.reason === "relay"}
+        The relay refused the push registration. Notifications still work
+        while the app is open.
+      {:else}
+        Push registration failed. Notifications still work while the app is
+        open.
+      {/if}
+    </p>
+  {/if}
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">
       <span class="text-xs font-mono">Hide message text on the lock screen</span
