@@ -96,6 +96,15 @@ const CREATED_AT_INDEX = "createdAt";
  */
 const MAX_SHARE_BYTES = 128 * 1024 * 1024;
 const MAX_PENDING_RECORDS = 3;
+
+// "Newest" is decided by the createdAt index, so two shares in the same
+// millisecond would order by their random ids instead. Strictly increasing
+// within a session keeps that deterministic (CI hit the tie).
+let _lastCreatedAt = 0;
+function nextCreatedAt(): number {
+  _lastCreatedAt = Math.max(Date.now(), _lastCreatedAt + 1);
+  return _lastCreatedAt;
+}
 const MAX_PENDING_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function openShareDB(): Promise<IDBDatabase> {
@@ -161,7 +170,7 @@ export async function storeSharedPayload(input: {
 
   const record: SealedShareRecord = {
     id: crypto.randomUUID(),
-    createdAt: Date.now(),
+    createdAt: nextCreatedAt(),
     meta: await seal(
       new TextEncoder().encode(
         JSON.stringify({
