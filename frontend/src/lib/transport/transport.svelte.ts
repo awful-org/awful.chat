@@ -148,6 +148,8 @@ import {
   shouldAutoDownload,
   withFileTransfer,
 } from "./files.svelte";
+import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
+import { ProfileEcho, frameHash } from "./profile-echo";
 import { initVoice } from "./voice.svelte";
 import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
 import { ev } from "../telemetry/event";
@@ -156,10 +158,6 @@ import { apiUrl, isConfigured, relayMultiaddr, sfuUrls } from "../runtime-config
 import { faultStats, faultsActive } from "./faults";
 import { initTransmission } from "./transmission.svelte";
 
-const MSG_ORDER = (a: Message, b: Message) =>
-  a.lamport !== b.lamport
-    ? a.lamport - b.lamport
-    : a.senderId.localeCompare(b.senderId);
 
 /**
  * Check if an ephemeral message can be sent without exceeding flood cap.
@@ -268,23 +266,10 @@ function _parsePluginPayload(
   };
 }
 
-/**
- * Messages almost always arrive in order, so appending is the common case;
- * only fall back to a full sort when the newcomer actually lands out of order.
- * Re-sorting the whole history per incoming message scaled with room size.
- */
-export function appendSorted(
-  list: Message[],
-  msg: Message,
-  cmp: (a: Message, b: Message) => number = MSG_ORDER
-): Message[] {
-  const next = [...list, msg];
-  if (list.length > 0 && cmp(list[list.length - 1], msg) > 0) next.sort(cmp);
-  return next;
-}
 import { playPeerJoinSound, playPeerLeaveSound } from "../sounds";
 import { peerCallChime } from "./call-chime";
 
+export { appendSorted } from "./message-order";
 export type { Message };
 
 // ── State shapes ──────────────────────────────────────────────────────────────
@@ -510,6 +495,8 @@ export function onBeforeDisconnect(listener: () => void): () => void {
  *  looks connected while a profile is quietly rejected. */
 const _stats = {
   profilesOut: 0,
+  /** Duplicate profiles a connection burst asked for and did not need. */
+  profilesSkipped: 0,
   profilesIn: 0,
   profilesRejected: 0,
   digestsOut: 0,
@@ -870,7 +857,6 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     binding = null; // identity locked: the peer just will not bind us yet
   }
 
-  _stats.profilesOut++;
   const payload = encode({
     type: MessageType.Profile,
     name,
@@ -892,8 +878,18 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     nameGlow: profile?.nameGlow ?? undefined,
   });
 
+  const hash = frameHash(payload);
+  const sendTo = (pid: string): boolean => {
+    if (!_profileEcho.shouldSend(pid, hash)) {
+      _stats.profilesSkipped++;
+      return false;
+    }
+    _stats.profilesOut++;
+    return true;
+  };
+
   if (peerId) {
-    _transport.send(peerId, payload);
+    if (sendTo(peerId)) _transport.send(peerId, payload);
     return;
   }
 
@@ -906,7 +902,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     _transport.broadcast(payload, room);
   }
   for (const pid of _transport.peers()) {
-    _transport.send(pid, payload).catch(() => {});
+    if (sendTo(pid)) _transport.send(pid, payload).catch(() => {});
   }
 }
 
@@ -955,6 +951,8 @@ const APP_SILENCE_MS = 15_000;
 const PROFILE_REPAIR_MAX_MS = 5 * 60_000;
 const _lastAppInbound = new Map<string, number>();
 const _profileRepair = new Map<string, { next: number; delay: number }>();
+/** One copy of an unchanged profile per peer per burst - see profile-echo.ts. */
+const _profileEcho = new ProfileEcho();
 
 if (typeof window !== "undefined") {
   setInterval(() => {
@@ -1161,7 +1159,11 @@ export async function _loadHistory(
     getAllPeerProfiles(),
   ]);
   if (!stillCurrent()) return;
-  transportState.messages = msgs;
+  // Storage pages on the lamport index, which is not the order this is read
+  // in - see compareMessages. Every other path into transportState.messages
+  // sorts; this one assigned the page raw, so opening a room showed causal
+  // order and only a later sync or a scroll-up put it right.
+  transportState.messages = [...msgs].sort(MSG_ORDER);
   // Whether a first read filled a page is the only honest answer to "is
   // there more?", and it is known here and nowhere else.
   transportState.historyCapped = page.capped;
@@ -2587,6 +2589,7 @@ _transport.on("disconnect", (peerId) => {
   const did = peerIdToDid(peerId);
   _lastAppInbound.delete(peerId);
   _profileRepair.delete(peerId);
+  _profileEcho.forget(peerId);
   // Same lifetime as the two above, and it was not being pruned. Deliberately
   // NOT _pendingDmByPeer: those are DMs already delivered to us and held only
   // until the sender's DID binds, so dropping them on a disconnect would throw

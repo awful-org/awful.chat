@@ -1169,7 +1169,7 @@ import {
               class="absolute top-1.5 right-1.5 z-10 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[11px] font-mono text-white"
             >
               <Eye class="size-3" />
-              {tile.isLocal ? `${audience.count} watching` : audience.count}
+              {audience.count}
             </div>
           {/snippet}
         </Tip>

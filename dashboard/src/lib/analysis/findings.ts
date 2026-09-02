@@ -145,12 +145,54 @@ function keyOf(e: MergedEvent, mode: KeyMode): string | null {
  * within `deadlineMs` at or after it. `deadlineMs` may be `Infinity` for "no
  * following event at all, ever".
  */
+/**
+ * Indices of `peer.connect` events where the observer ALREADY held a proven
+ * stream to that peer.
+ *
+ * The transport keys its outbound stream by peerId, not by connection: one
+ * stream per peer, reused. libp2p meanwhile fires a connect per connection,
+ * and a pair that dials each other while also upgrading to direct holds two
+ * or three at once - so pairing every connect with a fresh `stream.proven`
+ * reported the app's own design as a blocking failure, three times in one
+ * healthy capture. Only a connect that finds no live proof, and then gets
+ * none, means a peer we cannot actually talk to.
+ *
+ * A proof dies with the stream it belongs to: `stream.reset` drops the
+ * outbound stream, `stream.lost` is the confirmation going away, and
+ * `peer.disconnect` takes both. The suppressed gossipsub `stream.reset`
+ * carries no peer, so it is not one of these and never clears a proof.
+ */
+function connectsAlreadyProven(timeline: MergedEvent[]): Set<number> {
+  const proven = new Set<string>();
+  const out = new Set<number>();
+  timeline.forEach((e, i) => {
+    const k = keyOf(e, "observer+peer");
+    if (k === null) return;
+    switch (e.kind) {
+      case "stream.proven":
+        proven.add(k);
+        break;
+      case "stream.lost":
+      case "stream.reset":
+      case "peer.disconnect":
+        proven.delete(k);
+        break;
+      case "peer.connect":
+        if (proven.has(k)) out.add(i);
+        break;
+    }
+  });
+  return out;
+}
+
 function findUnmatchedDeadline(
   timeline: MergedEvent[],
   startKind: DiagKind,
   endKinds: DiagKind[],
   deadlineMs: number,
-  keyMode: KeyMode
+  keyMode: KeyMode,
+  /** Start indices to ignore, for a start that carries no obligation. */
+  skipStarts?: Set<number>
 ): Array<{ startIndex: number; key: string }> {
   const endsByKey = new Map<string, number[]>();
   timeline.forEach((e, i) => {
@@ -167,6 +209,7 @@ function findUnmatchedDeadline(
   const out: Array<{ startIndex: number; key: string }> = [];
   timeline.forEach((e, i) => {
     if (e.kind !== startKind) return;
+    if (skipStarts?.has(i)) return;
     const k = keyOf(e, keyMode);
     if (k === null) return;
     const ends = endsByKey.get(k) ?? [];
@@ -185,9 +228,17 @@ function unmatchedDeadlineFindings(
   endKinds: DiagKind[],
   deadlineMs: number,
   keyMode: KeyMode,
-  id: FindingId
+  id: FindingId,
+  skipStarts?: Set<number>
 ): Finding[] {
-  return findUnmatchedDeadline(timeline, startKind, endKinds, deadlineMs, keyMode).map(
+  return findUnmatchedDeadline(
+    timeline,
+    startKind,
+    endKinds,
+    deadlineMs,
+    keyMode,
+    skipStarts
+  ).map(
     ({ startIndex, key }) => {
       const parts = key.split("|");
       const subject: Finding["subject"] =
@@ -934,7 +985,8 @@ export function runFindings(c: Capture): Finding[] {
       ["stream.proven"],
       PROOF_DEADLINE_MS,
       "observer+peer",
-      "connected-not-proven"
+      "connected-not-proven",
+      connectsAlreadyProven(timeline)
     ),
     ...asymmetricLink(c),
     ...thresholdByPeerObserver(timeline, "peer.upgrade.fail", UPGRADE_FAIL_THRESHOLD, "upgrade-starved"),

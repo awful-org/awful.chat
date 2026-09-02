@@ -567,6 +567,10 @@ export function mergeSources(
 ): Workspace {
   const warnings: string[] = [];
   const vantages: LoadedVantage[] = [];
+  /** bundleId -> the source that brought it in first. */
+  const seenBundles = new Map<string, string>();
+  /** sessionId -> the source that brought it in first. */
+  const seenSessions = new Map<string, string>();
 
   for (const { bundle, source } of bundles) {
     if (bundle.schemaVersion !== 1) {
@@ -574,6 +578,30 @@ export function mergeSources(
         `${source}: schema version ${bundle.schemaVersion} is not understood, so it was refused.`
       );
       continue;
+    }
+    // One export loaded twice - dropped on a file AND pulled from the relay,
+    // or simply dragged in again - used to become two vantages of one peer.
+    // Every event then appeared twice and every per-event finding doubled,
+    // which reads as a real burst. `bundleId` is minted at export, so an
+    // identical id is the same file and never carries anything new.
+    const first = seenBundles.get(bundle.bundleId);
+    if (first !== undefined) {
+      warnings.push(
+        `${source}: the same export is already loaded from ${first}, so this copy was ignored. Loading it twice would double every count.`
+      );
+      continue;
+    }
+    seenBundles.set(bundle.bundleId, source);
+    // Two DIFFERENT exports of one session are kept: the later one can hold
+    // events the ring had already evicted when the first was taken. They do
+    // overlap, so say so rather than let the counts surprise the reader.
+    const sameSession = seenSessions.get(bundle.sessionId);
+    if (sameSession !== undefined) {
+      warnings.push(
+        `${source}: a second export of the session already loaded from ${sameSession}. Both are kept, so events they share are counted once per export.`
+      );
+    } else {
+      seenSessions.set(bundle.sessionId, source);
     }
     vantages.push(...vantagesOf(bundle, source));
   }
