@@ -18,3 +18,24 @@ export function shouldPlayMessageSound(input: {
   // including viewing-but-unfocused, where "on screen" means nothing.
   return !(input.viewingConversation && input.focused);
 }
+
+/**
+ * When does an incoming message raise a NOTIFICATION?
+ *
+ * The same rule as the sound, and for the same reason. It used to be
+ * `document.hidden` alone, which is wrong on exactly the device this matters
+ * most on: a phone showing one room while a DM arrives in another is not
+ * hidden, so the DM went unannounced until the user thought to look. What the
+ * reader can already see is the conversation ON SCREEN, not the app.
+ */
+export function shouldShowNotification(input: {
+  /** The conversation this message belongs to is the one on screen. */
+  viewingConversation: boolean;
+  /** The window has focus. */
+  focused: boolean;
+  /** The page is not being rendered at all (another tab, minimised). */
+  hidden: boolean;
+}): boolean {
+  if (input.hidden) return true;
+  return !(input.viewingConversation && input.focused);
+}

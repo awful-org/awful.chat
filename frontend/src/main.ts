@@ -2,13 +2,25 @@ import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
 import { loadRuntimeConfig } from "$lib/runtime-config";
+import { captureInstallPrompt } from "$lib/install-prompt.svelte";
 
-// The service worker has exactly ONE registration: useRegisterSW inside
+// The service worker still has exactly ONE registration: useRegisterSW inside
 // ReloadPrompt.svelte. A second registerSW() here used to race it - each
 // registration attached its own updatefound listener, and whichever caught
 // the update decided what the user saw: sometimes the reload popup,
 // sometimes only a transport toast (silently lost when transport was not up
 // yet), sometimes nothing. One registration, one UI.
+//
+// What DID move is where that one registration lives: App.svelte mounts
+// ReloadPrompt above the route switch, so the worker is registered on the
+// landing page and while the identity is still locked. Registering only from
+// inside AppView meant the page most first-time visitors ever see had no
+// worker at all, and a site with no worker is a site the browser will not
+// offer to install.
+
+// The install event fires once, early, and cannot be replayed - before the
+// app mounts is the only place that reliably catches it.
+captureInstallPrompt();
 
 // A tab that loaded before a deploy holds the old index.html, and its lazy
 // imports (webtorrent, mediasoup-client, shiki...) point at hashed chunks the

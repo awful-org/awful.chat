@@ -2,9 +2,23 @@
   import { identityStore, init } from "$lib/identity/identity.svelte";
   import AppView from "$lib/components/AppView.svelte";
   import Landing from "./Landing.svelte";
-  import { normalizeRoomCode } from "$lib/room-code";
+  import InstallPrompt from "$lib/components/InstallPrompt.svelte";
+  import NotifyPrompt from "$lib/components/NotifyPrompt.svelte";
+  import ReloadPrompt from "$lib/components/ReloadPrompt.svelte";
+  import { notifyState } from "$lib/notify.svelte";
+  import { ensurePushSubscription } from "$lib/push.svelte";
+  import { parseRoomCode } from "$lib/palette/query";
 
   let currentRoute = $state<"landing" | "app">("landing");
+
+  /** A percent-encoded URL piece, or the piece itself when it is malformed. */
+  function decode(part: string): string {
+    try {
+      return decodeURIComponent(part);
+    } catch {
+      return part;
+    }
+  }
 
   /**
    * The room code out of the address bar, fragment form first.
@@ -13,17 +27,18 @@
    * fragment does not: the server's access log, the Referer of every outbound
    * link, and nginx's own og:url rewrite. Invite links are `/r/#<code>` now.
    * `/r/<code>` still parses, because links already handed out do not change.
+   *
+   * The palette's parser rather than a local one: it is the only parser that
+   * knows every shape a code has ever had AND strips the `web+awfl://` scheme.
+   * The manifest registers that protocol as `/r/%s`, so a tapped `web+awfl://`
+   * link arrives as an ENCODED url inside the path - which the local parser
+   * handed to normalizeRoomCode whole, and every such link opened the landing
+   * page instead of the room.
    */
-  function parseRoomCode(pathname: string, hash: string): string | null {
+  function urlRoomCode(): string | null {
+    const { pathname, hash } = window.location;
     if (!pathname.startsWith("/r/")) return null;
-    const raw =
-      hash.length > 1 ? hash.slice(1) : pathname.slice(3).split("/")[0];
-    if (!raw) return null;
-    try {
-      return normalizeRoomCode(decodeURIComponent(raw));
-    } catch {
-      return normalizeRoomCode(raw);
-    }
+    return parseRoomCode(decode(pathname) + decode(hash));
   }
 
   /**
@@ -34,7 +49,10 @@
   function upgradeLegacyPath(): void {
     const { pathname, hash, search } = window.location;
     if (!pathname.startsWith("/r/") || hash.length > 1) return;
-    const code = pathname.slice(3).split("/")[0];
+    // The parsed code when there is one, so a protocol-handler link is
+    // rewritten to the plain `/r/#<code>` form rather than to itself.
+    const code =
+      parseRoomCode(decode(pathname)) ?? pathname.slice(3).split("/")[0];
     if (code) history.replaceState(history.state, "", `/r/${search}#${code}`);
   }
 
@@ -42,16 +60,28 @@
     init();
   });
 
+  // Push, once there is an identity to be pushed to. Reads the permission so
+  // that allowing notifications in the browser's own site settings subscribes
+  // this device without a reload.
+  $effect(() => {
+    if (!identityStore.isUnlocked) return;
+    void notifyState.permission;
+    void ensurePushSubscription();
+  });
+
   $effect(() => {
     if (identityStore.initializing) return;
 
     upgradeLegacyPath();
     const pathname = window.location.pathname;
-    const roomCode = parseRoomCode(pathname, window.location.hash);
+    const roomCode = urlRoomCode();
 
     if (roomCode) {
       currentRoute = "app";
-    } else if (pathname === "/app") {
+    } else if (pathname === "/app" || pathname === "/share-target") {
+      // /share-target is normally a POST the service worker answers; a GET
+      // reaches nginx only when no worker controls the page yet, and the
+      // shared payload is already parked in IndexedDB for the app to claim.
       currentRoute = "app";
     } else {
       currentRoute = "landing";
@@ -62,9 +92,8 @@
     if (identityStore.initializing) return;
 
     const pathname = window.location.pathname;
-    const roomCode = parseRoomCode(pathname, window.location.hash);
 
-    if (roomCode || pathname === "/app") {
+    if (urlRoomCode() || pathname === "/app" || pathname === "/share-target") {
       currentRoute = "app";
     } else {
       currentRoute = "landing";
@@ -73,6 +102,18 @@
 </script>
 
 <svelte:window onpopstate={handlePopState} />
+
+<!--
+  Above the route switch, and outside the initializing branch, on purpose.
+  These three used to live inside AppView, which means the landing page and
+  the locked app had no service worker (so the browser would not offer to
+  install the site anybody arrives at) and never asked for notifications.
+  ReloadPrompt registers the worker; both prompts are self-limiting, so the
+  copies AppView still renders are inert.
+-->
+<ReloadPrompt />
+<InstallPrompt />
+<NotifyPrompt />
 
 {#if identityStore.initializing}
   <div class="min-h-screen bg-background flex items-center justify-center">

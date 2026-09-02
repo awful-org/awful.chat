@@ -25,6 +25,11 @@ if (typeof window !== "undefined") {
   };
   window.addEventListener("pointerdown", unlock, { passive: true });
   window.addEventListener("keydown", unlock, { passive: true });
+  // iOS Safari does not always dispatch pointerdown for a plain tap on a
+  // non-interactive element, and a phone that never fires one runs the whole
+  // session with a suspended context - which is every incoming-message beep
+  // on the device where beeps matter most.
+  window.addEventListener("touchstart", unlock, { passive: true });
 }
 
 function playOsc(

@@ -3,9 +3,11 @@ import { Label } from "$lib/components/ui/label";
 import { Switch } from "$lib/components/ui/switch";
 import {
   notifyState,
+  setHidePreview,
   setMessageSoundsEnabled,
   setNotificationsEnabled,
 } from "$lib/notify.svelte";
+import { pushPrefs, setPushEnabled } from "$lib/push.svelte";
 import {
   mediaPrefs,
   setGifAutoplay,
@@ -33,6 +35,29 @@ import {
   resolveChatFontStack,
   sanitizeFontFamily,
 } from "$lib/chat-font";
+
+/**
+ * Where the switch the BROWSER is holding actually lives. A blocked site
+ * permission cannot be undone from inside the page, so the only useful thing
+ * to show is the path - and a path is only useful if it names the browser the
+ * reader is actually holding.
+ */
+function permissionPath(): string {
+  const ua = typeof navigator === "undefined" ? "" : navigator.userAgent;
+  if (/Firefox\//.test(ua)) {
+    return "Firefox: the padlock in the address bar, then Clear permission.";
+  }
+  if (/Edg\//.test(ua)) {
+    return "Edge: the padlock in the address bar, then Permissions for this site.";
+  }
+  if (/Chrome|Chromium|CriOS/.test(ua)) {
+    return "Chrome: the icon at the left of the address bar, then Notifications.";
+  }
+  if (/Safari\//.test(ua)) {
+    return "Safari: Settings, then Websites, then Notifications.";
+  }
+  return "Look for notification permissions in this site's settings.";
+}
 
 /** Three short lines: the desktop dialog is a fixed height, mobile is a drawer. */
 const PREVIEW_LINES = [
@@ -112,8 +137,8 @@ async function loadLocalFonts(): Promise<void> {
       <div class="flex flex-col gap-1 min-w-0">
         <span class="text-xs font-mono">Notify me about new messages</span>
         <span class="text-xs font-mono text-muted-foreground leading-relaxed">
-          Only while the app is running and off screen. Nothing can reach you
-          once it is fully closed: no server is holding your messages.
+          For any conversation you are not reading, whether the app is on
+          screen or not.
         </span>
       </div>
       <Switch
@@ -122,12 +147,47 @@ async function loadLocalFonts(): Promise<void> {
       />
     </div>
     {#if notifyState.permission === "denied"}
-      <p class="text-xs font-mono text-muted-foreground">
-        Your browser is blocking notifications for this site. Allow them in the
-        site permissions to turn this on.
+      <p class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Your browser is blocking notifications for this site, and only the
+        browser can unblock them. {permissionPath()}
       </p>
     {/if}
+  {:else}
+    <!-- Rendered rather than hidden: a phone that cannot notify is exactly
+         the device whose owner needs to be told why, and what to do. -->
+    <p class="text-xs font-mono text-muted-foreground leading-relaxed">
+      This browser will not show notifications for a page. On iPhone and iPad
+      only an installed app can: tap Share, then "Add to Home Screen", and open
+      Awful.chat from there.
+    </p>
   {/if}
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Wake this device for new messages</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        The relay learns a push address for this device and tells it when you
+        have mail waiting, never what the mail says.
+      </span>
+    </div>
+    <Switch
+      checked={pushPrefs.enabled}
+      onCheckedChange={(checked) => setPushEnabled(checked)}
+    />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Hide message text on the lock screen</span
+      >
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Notifications say who wrote and not what they wrote, for a phone that
+        gets read over your shoulder.
+      </span>
+    </div>
+    <Switch
+      checked={notifyState.hidePreview}
+      onCheckedChange={(checked) => setHidePreview(checked)}
+    />
+  </div>
   <!-- Sounds need no notification permission, so they are not behind the
        supported gate. -->
   <div class="flex items-center justify-between gap-3">
