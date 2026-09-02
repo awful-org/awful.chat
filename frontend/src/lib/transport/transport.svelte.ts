@@ -809,39 +809,51 @@ async function _receiptsForDmWith(
   // and openDmConversation acks a whole page (50) at once.
   const ids = messageIds.filter((id) => typeof id === "string" && id);
   const clear = await messageClearFieldsByIds(ids);
-  // messageClearFieldsByIds returns blinded roomCode, so blind the wire value
-  // before comparing.
+  // Two forms of the same room code: the in-memory copy carries it plain,
+  // the clear-field read returns the blinded value the row is indexed
+  // under. Each must be compared against its own form. One compare against
+  // the blinded value for both rejected every receipt for a message the
+  // sender currently had on screen, which is exactly when they are watching
+  // the ticks.
   const blindedRoomCode = await blindValue(roomCode);
   return ids.filter((id) => {
     const local = transportState.messages.find((m) => m.id === id);
-    return (local?.roomCode ?? clear.get(id)?.roomCode) === blindedRoomCode;
+    if (local) return local.roomCode === roomCode;
+    return clear.get(id)?.roomCode === blindedRoomCode;
   });
 }
 
-async function _cascadeReadAcks(messageIds: string[]): Promise<void> {
+/**
+ * `who` names the other party, so the room is the DM with them: every id
+ * here already passed _receiptsForDmWith for that room. The room code has to
+ * be derived again rather than read off the rows, because the rows hold it
+ * blinded and markOwnMessagesReadUpTo blinds what it is given - passing the
+ * stored value blinded it twice and the cascade matched nothing.
+ */
+async function _cascadeReadAcks(
+  who: string,
+  messageIds: string[]
+): Promise<void> {
+  const roomCode = await dmConversationCodeAsync(who).catch(() => null);
+  if (!roomCode) return;
   const self = selfId();
-  const maxByRoom = new Map<string, number>();
-  // senderId, roomCode and lamport are all clear fields, so this needs no
-  // decryption and one transaction rather than one per id.
+  // senderId and lamport are clear fields, so this needs no decryption and
+  // one transaction rather than one per id.
   const clear = await messageClearFieldsByIds(messageIds);
-  // messageClearFieldsByIds returns blinded roomCode and senderId, so blind
-  // the self value before comparing.
+  // senderId is stored blinded, so blind the self value before comparing.
   const blindedSelf = await blindValue(self);
+  let lamport = 0;
   for (const m of clear.values()) {
     if (m.senderId !== blindedSelf) continue;
-    maxByRoom.set(
-      m.roomCode,
-      Math.max(maxByRoom.get(m.roomCode) ?? 0, m.lamport)
-    );
+    lamport = Math.max(lamport, m.lamport);
   }
-  for (const [roomCode, lamport] of maxByRoom) {
-    const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport);
-    if (!changed.length) continue;
-    const changedSet = new Set(changed);
-    transportState.messages = transportState.messages.map((m) =>
-      changedSet.has(m.id) ? { ...m, status: "read" } : m
-    );
-  }
+  if (!lamport) return;
+  const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport);
+  if (!changed.length) return;
+  const changedSet = new Set(changed);
+  transportState.messages = transportState.messages.map((m) =>
+    changedSet.has(m.id) ? { ...m, status: "read" } : m
+  );
 }
 
 function lamportSend(roomCode: string): number {
@@ -3095,7 +3107,7 @@ export async function deliverMailboxReceipt(
   for (const id of acceptable) {
     applyMessageStatus(id, envelope.type === "ack" ? "delivered" : "read");
   }
-  if (envelope.type === "read") await _cascadeReadAcks(acceptable);
+  if (envelope.type === "read") await _cascadeReadAcks(senderDid, acceptable);
 }
 
 /** Deposit a receipt for a peer who is not on a stream - the mailbox path,
@@ -3311,7 +3323,7 @@ _transport.on("message", (peerId, data, room) => {
             for (const id of ids) applyMessageStatus(id, "read");
             // The reader only acks the page they had loaded; a read at lamport
             // L implies everything we sent before L in that room was read too.
-            _cascadeReadAcks(ids).catch(() => {});
+            _cascadeReadAcks(peerId, ids).catch(() => {});
           })
           .catch(() => {});
         return;

@@ -1159,25 +1159,6 @@ func TestEmptyRegisterBudgetIsPerPeerNotPerStream(t *testing.T) {
 	}
 }
 
-// EnableRelayService with no ACL relays for anybody: two unrelated libp2p
-// nodes could use the deployment as free transit, and the per-IP and per-ASN
-// reservation caps cannot tell them from real users because every client
-// arrives from Traefik's single address.
-
-// WithInfiniteLimits gave every circuit unlimited time and unlimited bytes,
-// which is what made an open relay worth abusing. The replacement has to stay
-// generous - chat, DMs and sync ride a circuit for a whole session - but it
-// has to be a number.
-func TestCircuitLimitIsFiniteButGenerous(t *testing.T) {
-	l := relayCircuitLimit()
-	if l == nil || l.Duration <= 0 || l.Data <= 0 {
-		t.Fatalf("per-circuit limit is not finite: %+v", l)
-	}
-	if l.Duration < time.Hour || l.Data < 1<<30 {
-		t.Errorf("per-circuit limit %v / %d bytes is too tight for a session-long circuit", l.Duration, l.Data)
-	}
-}
-
 // A client cannot tell a live relay from a half-open link - a phone carried
 // from Wi-Fi to cellular keeps a socket that will never deliver anything -
 // unless something comes back. PING used to be a pure no-op, so there was

@@ -1293,21 +1293,30 @@ func relayResources() relayv2.Resources {
 	return res
 }
 
-// relayCircuitLimit is the per-circuit ceiling the relay service enforces.
-// This used to be relayv2.WithInfiniteLimits(): no duration and no byte cap
-// at all, which turned an open circuit relay into free unmetered bandwidth
-// for anyone who found the multiaddr. The defaults (2 minutes, 128 KiB) are
-// far too small for this app - chat, DMs and the sync stream all ride a
-// circuit for as long as a tab is open, while files go peer-to-peer over
-// WebRTC and never touch it - so the numbers are generous rather than tight.
-// A day covers the longest plausible session, and 4 GiB each way is orders of
-// magnitude past what text traffic uses while still being a number.
-func relayCircuitLimit() *relayv2.RelayLimit {
-	return &relayv2.RelayLimit{
-		Duration: 24 * time.Hour,
-		Data:     4 << 30,
-	}
-}
+// Circuits are unlimited on purpose, and this has been tried the other way.
+// A finite per-circuit limit (24 h and 4 GiB, from the 2026-09-02 review)
+// looked like a free abuse bound: a day covers any session and nothing in
+// this app moves gigabytes over a circuit. It is not free. The relay copies
+// the limit into the HOP and STOP replies, and js-libp2p marks a circuit
+// that carries ANY limit as "limited", which changes how every browser
+// treats it:
+//
+//   - dialProtocol only reuses an existing connection when it has no limit
+//     (connection-manager/utils.js findExistingConnection). With every
+//     circuit limited, each stream open started a fresh dial through the
+//     relay instead of using the circuit both peers already had. Those
+//     dials timed out, and the app's direct stream, which carries profiles,
+//     DMs, read receipts and call presence, took thirty seconds to come up
+//     instead of three. On a phone that never managed a WebRTC upgrade it
+//     never came up at all.
+//   - gossipsub does not peer over a limited connection unless told to, so
+//     room messages waited for the WebRTC upgrade as well.
+//
+// Circuits here are the primary transport for the life of a tab, not the
+// hole-punching stepping stone the "limited" flag was designed around, so
+// they must not carry a limit at all. The abuse bound is the resource
+// manager and relayResources above: per-peer and global reservation and
+// circuit counts, and the memory budget behind them.
 
 // No circuit ACL. One was tried on 2026-09-02: AllowConnect required both
 // ends of a circuit to hold a live rendezvous stream, which is how an app
@@ -1319,9 +1328,9 @@ func relayCircuitLimit() *relayv2.RelayLimit {
 // timeout evicts the stream every 60 s while the phone is in a pocket.
 // Every such gap refused or closed the circuit that the WebRTC signalling
 // and the relayed stream ride on, and the two sides never got a proven
-// stream. The finite per-circuit limit (relayCircuitLimit) stays as the
-// abuse bound; gating connects on registry state would need a grace window
-// keyed by peerId, not by stream, and that is a different design.
+// stream. Gating connects on registry state would need a grace window
+// keyed by peerId, not by stream, and that is a different design; the
+// abuse bound is the resource manager, see the note on unlimited circuits.
 
 // newResourceManager builds the libp2p resource manager for the relay.
 // Extracted so main_test.go can assert the ceiling it lifts.
@@ -1431,7 +1440,7 @@ func main() {
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
 			relayv2.WithResources(relayResources()),
-			relayv2.WithLimit(relayCircuitLimit()),
+			relayv2.WithInfiniteLimits(),
 		),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
