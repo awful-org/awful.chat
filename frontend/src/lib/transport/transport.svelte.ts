@@ -132,6 +132,7 @@ import {
 } from "./dm-codec";
 import {
   depositDmReceipt,
+  sendDmReadAcks,
   dmConversationCodeAsync,
   dmPeerDid,
   dmPeerDidForRoom,
@@ -3198,6 +3199,7 @@ function _handleDmChatAsync(
     // Against storage, not the on-screen list: that list holds whichever
     // conversation is open, so a redelivered message was only recognised
     // as a duplicate when you happened to be looking at that DM.
+    let readSent = false;
     if (!(await getMessage(msg.id))) {
       await putMessage(msg);
       // Without a watermark row a DM digest carries an empty map on both
@@ -3223,8 +3225,18 @@ function _handleDmChatAsync(
       if (isViewingThisDm) {
         transportState.messages = appendSorted(transportState.messages, msg);
       }
-      // Visible in either surface means read, not merely delivered.
-      if (isViewingThisDm || dmPanelIsShowing(roomCode)) {
+      // The floating panel is the one surface the pane's markSeen() never
+      // covers, so a message it is showing gets its read receipt here. The
+      // pane's own conversation is left to markSeen(), which runs when the
+      // list changes and again when the page comes back, and which is the
+      // only place that knows the page is actually on screen: a DM that
+      // landed while the tab was hidden or the phone was in a pocket used
+      // to go straight to "read".
+      const onScreen =
+        typeof document === "undefined" ||
+        document.visibilityState === "visible";
+      if (onScreen && !isViewingThisDm && dmPanelIsShowing(roomCode)) {
+        readSent = true;
         await markRoomSeen(roomCode, msg.lamport);
         const roomIndex = roomsStore.dmRooms.findIndex(
           (r) => r.roomCode === roomCode
@@ -3260,6 +3272,9 @@ function _handleDmChatAsync(
       }
     }
 
+    // A read outranks an ack on the sender's side, so when one just went
+    // out the ack would only cost a second mailbox deposit.
+    if (readSent) return;
     if (viaMailbox) {
       _depositDmReceipt(senderDid, encodeDmAckEnvelope(envelope.payload.id));
     } else {
@@ -4532,16 +4547,30 @@ export async function markSeen(): Promise<void> {
     // DM rooms live in their own mirror, and the DM badge recomputes on
     // dmVersion - the rooms maps below never carried them.
     const idx = roomsStore.dmRooms.findIndex((r) => r.roomCode === roomCode);
+    const prevSeen =
+      idx !== -1 ? (roomsStore.dmRooms[idx].lastSeenLamport ?? 0) : 0;
     if (idx !== -1) {
       roomsStore.dmRooms[idx] = {
         ...roomsStore.dmRooms[idx],
-        lastSeenLamport: Math.max(
-          roomsStore.dmRooms[idx].lastSeenLamport ?? 0,
-          maxLamport
-        ),
+        lastSeenLamport: Math.max(prevSeen, maxLamport),
       };
     }
     transportState.dmVersion += 1;
+    // Their messages seen for the first time get one read receipt, all ids
+    // in a single envelope. This is the only place that knows the page is
+    // on screen, so it is where "read" is decided; the arrival path only
+    // ever says "delivered" for the conversation in the pane.
+    const self = identityStore.did ?? selfId();
+    const theirs = transportState.messages
+      .filter(
+        (m) =>
+          m.roomCode === roomCode &&
+          m.senderId !== self &&
+          m.lamport > prevSeen
+      )
+      .map((m) => m.id);
+    const peer = transportState.activeDmPeerId;
+    if (theirs.length && peer) sendDmReadAcks(peer, theirs);
     return;
   }
   const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);

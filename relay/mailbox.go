@@ -92,11 +92,19 @@ const (
 	// deposit that does meet it evicts a stale box before refusing (see
 	// evictOldestStaleBox).
 	mailboxGlobalMaxBoxes = mailboxGlobalMaxFiles / 2
-	// Deposit/collect/ack per-IP budgets. Deposits get their own bucket so a
-	// chatty plugin proxying data does not starve offline DMs (and vice
-	// versa); collect+ack were previously unlimited, a free CPU/verify sink.
-	mailboxDepositLimit = 10
-	mailboxAuthedLimit  = 30
+	// Deposit/collect/ack per-IP budgets, per minute. Deposits get their own
+	// bucket so a chatty plugin proxying data does not starve offline DMs
+	// (and vice versa); collect+ack were previously unlimited, a free
+	// CPU/verify sink.
+	//
+	// Receipts are deposits too: collecting a box of N DMs sends N acks
+	// back through here, and a conversation opened on a page of unread
+	// sends one read receipt. At 10 a minute the acks for one collect ate
+	// the whole budget and the sender's ticks never moved. The IP is also
+	// shared by a household behind one NAT and by every phone on a
+	// carrier's CGNAT, so the number has to cover several people at once.
+	mailboxDepositLimit = 120
+	mailboxAuthedLimit  = 240
 	// Maximum IDs one ack request may carry. A real client acks what it just
 	// collected, which is a small number bounded by mailboxMaxMsgs. This limit
 	// leaves clear headroom and prevents the ack loop from doing unbounded
