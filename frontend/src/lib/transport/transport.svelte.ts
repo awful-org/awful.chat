@@ -149,6 +149,7 @@ import {
   withFileTransfer,
 } from "./files.svelte";
 import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
+import { ProfileEcho, frameHash } from "./profile-echo";
 import { initVoice } from "./voice.svelte";
 import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
 import { ev } from "../telemetry/event";
@@ -494,6 +495,8 @@ export function onBeforeDisconnect(listener: () => void): () => void {
  *  looks connected while a profile is quietly rejected. */
 const _stats = {
   profilesOut: 0,
+  /** Duplicate profiles a connection burst asked for and did not need. */
+  profilesSkipped: 0,
   profilesIn: 0,
   profilesRejected: 0,
   digestsOut: 0,
@@ -854,7 +857,6 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     binding = null; // identity locked: the peer just will not bind us yet
   }
 
-  _stats.profilesOut++;
   const payload = encode({
     type: MessageType.Profile,
     name,
@@ -876,8 +878,18 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     nameGlow: profile?.nameGlow ?? undefined,
   });
 
+  const hash = frameHash(payload);
+  const sendTo = (pid: string): boolean => {
+    if (!_profileEcho.shouldSend(pid, hash)) {
+      _stats.profilesSkipped++;
+      return false;
+    }
+    _stats.profilesOut++;
+    return true;
+  };
+
   if (peerId) {
-    _transport.send(peerId, payload);
+    if (sendTo(peerId)) _transport.send(peerId, payload);
     return;
   }
 
@@ -890,7 +902,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     _transport.broadcast(payload, room);
   }
   for (const pid of _transport.peers()) {
-    _transport.send(pid, payload).catch(() => {});
+    if (sendTo(pid)) _transport.send(pid, payload).catch(() => {});
   }
 }
 
@@ -939,6 +951,8 @@ const APP_SILENCE_MS = 15_000;
 const PROFILE_REPAIR_MAX_MS = 5 * 60_000;
 const _lastAppInbound = new Map<string, number>();
 const _profileRepair = new Map<string, { next: number; delay: number }>();
+/** One copy of an unchanged profile per peer per burst - see profile-echo.ts. */
+const _profileEcho = new ProfileEcho();
 
 if (typeof window !== "undefined") {
   setInterval(() => {
@@ -2575,6 +2589,7 @@ _transport.on("disconnect", (peerId) => {
   const did = peerIdToDid(peerId);
   _lastAppInbound.delete(peerId);
   _profileRepair.delete(peerId);
+  _profileEcho.forget(peerId);
   // Same lifetime as the two above, and it was not being pruned. Deliberately
   // NOT _pendingDmByPeer: those are DMs already delivered to us and held only
   // until the sender's DID binds, so dropping them on a disconnect would throw

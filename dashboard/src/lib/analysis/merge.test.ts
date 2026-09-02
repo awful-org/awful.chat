@@ -408,3 +408,58 @@ describe("mergeSources", () => {
     expect(bEvent?.at).toBeCloseTo(1010, 0);
   });
 });
+
+describe("mergeSources deduplication", () => {
+  // The bug: an export dropped on the console AND pulled from the relay
+  // became two vantages of one peer. Every event appeared twice and every
+  // per-event finding doubled, which reads as a real burst.
+  it("ignores the same export loaded twice", () => {
+    const b = bundleOf("12D3KooWA", 1_000, [
+      event("peer.connect", 10),
+      event("stream.proven", 20),
+    ]);
+    const once = mergeSources([{ bundle: b, source: "a.json" }]);
+    const twice = mergeSources([
+      { bundle: b, source: "a.json" },
+      { bundle: b, source: "relay-copy.json" },
+    ]);
+
+    expect(once.captures[0].vantages).toHaveLength(1);
+    expect(twice.captures[0].vantages).toHaveLength(1);
+    expect(twice.captures[0].timeline).toHaveLength(
+      once.captures[0].timeline.length
+    );
+    expect(twice.warnings.join(" ")).toContain("already loaded from a.json");
+  });
+
+  it("keeps two different exports of one session, and says they overlap", () => {
+    const early = bundleOf("12D3KooWA", 1_000, [event("peer.connect", 10)]);
+    const later = bundleOf("12D3KooWA", 1_000, [event("peer.connect", 10)], {
+      bundleId: "bundle-second-export",
+    });
+    const ws = mergeSources([
+      { bundle: early, source: "early.json" },
+      { bundle: later, source: "later.json" },
+    ]);
+
+    // Both kept: the later export can hold events the ring had evicted.
+    expect(ws.captures[0].vantages).toHaveLength(2);
+    expect(ws.warnings.join(" ")).toContain("second export of the session");
+  });
+
+  it("does not confuse two peers for one export loaded twice", () => {
+    // Each names the other, so they are one session seen from both sides.
+    const a = bundleOf("12D3KooWA", 1_000, [
+      event("peer.connect", 10, { peer: "12D3KooWB" }),
+    ]);
+    const b = bundleOf("12D3KooWB", 1_000, [
+      event("peer.connect", 10, { peer: "12D3KooWA" }),
+    ]);
+    const ws = mergeSources([
+      { bundle: a, source: "a.json" },
+      { bundle: b, source: "b.json" },
+    ]);
+    expect(ws.captures[0].vantages).toHaveLength(2);
+    expect(ws.warnings).toEqual([]);
+  });
+});
