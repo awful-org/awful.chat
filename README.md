@@ -184,6 +184,8 @@ whose context holds no repository declares no commit.
 | `VITE_API_URL` | yes | relay API origin, e.g. `https://relay.<domain>` |
 | `VITE_RELAY_MULTIADDR` | yes | the relay's libp2p multiaddr shown on boot |
 | `TURN_SECRET` | yes | shared secret between the relay and coturn (`openssl rand -hex 32`); coturn refuses to start without it |
+| `TURN_HOST` | no (yes behind a CDN) | hostname the relay puts in the TURN urls it mints; defaults to `DOMAIN`. Set it whenever `DOMAIN` is proxied: a CDN forwards HTTP, not UDP or raw TCP, so TURN points at something that cannot serve it and every allocation times out while the credential fetch still succeeds. Point it at a name that resolves to the server itself, usually the relay's |
+| `TURN_PORT` | no | port coturn listens on, default 3478. The relay builds its TURN urls from it, so moving one moves both |
 | `VITE_SFU_URL` | no | SFU websocket URL, defaults to `/sfu` on the app origin |
 | `VITE_SFU_URLS` | no | several SFUs, comma-separated (below) |
 | `KLIPY_API_KEY` | no | enables the GIF picker (klipy.co) |
@@ -197,13 +199,25 @@ whose context holds no repository declares no commit.
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
 | `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |
+| `SFU_MAX_ROOMS` | no | concurrent rooms one SFU will hold, default 250. Past it a join is refused rather than degrading every call already running |
+| `SFU_REJOIN_PROBE_MS` | no | how often a client is probed to confirm its SFU session is still live, default 3000 |
+| `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
+| `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
+| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs whose `X-Forwarded-For` the relay believes. Unset means private ranges plus loopback, correct behind traefik alone; add a CDN's ranges when one sits in front |
+| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |
 
 Firewall: open 80/443 (web), 3478 tcp+udp (TURN), 5349 tcp+udp (TURN TLS,
-when configured), the SFU media range (`SFU_RTC_MIN_PORT`-`SFU_RTC_MAX_PORT`,
-61000-61499 by default) and coturn's relay range (`TURN_MIN_PORT`-
-`TURN_MAX_PORT`, 49152-50151 by default).
+when configured), the SFU media range **tcp and udp**
+(`SFU_RTC_MIN_PORT`-`SFU_RTC_MAX_PORT`, 61000-61499 by default) and coturn's
+relay range udp only (`TURN_MIN_PORT`-`TURN_MAX_PORT`, 49152-50151 by
+default; coturn runs with `--no-tcp-relay`).
+
+Both protocols on the SFU range, not just udp. Udp carries the media for
+almost everyone, so a udp-only rule looks healthy right up until a peer
+behind a firewall that permits nothing else needs ice-tcp, and then that one
+peer has no path while every other peer in the call is fine.
 
 The SFU media range must stay above 60999. Linux ephemeral ports span 32768-60999
 by default, and docker binds every port in the range when the container starts.
@@ -245,6 +259,14 @@ open relay for the whole internet - and the people that hurts first are the
 ones who need TURN at all. Mobile and CGNAT users cannot connect directly, so
 they are the ones who end up relayed, and the relay port range is finite: a
 stranger exhausting it does not slow them down, it locks them out.
+
+**When TURN times out.** The credential fetch succeeding proves nothing: it
+comes from the relay, and the allocation goes to coturn. If a bundle shows
+`ice.turn.fail` with `branch: "allocate"` and `outcome: "timeout"` while
+`ice.turn.ok` is right beside it, check where the minted url actually points
+before touching coturn. `dig +short <the TURN host>` against the server's own
+IP answers it: a CDN address there means clients are sending STUN to a proxy
+that only speaks HTTP, and `TURN_HOST` is the fix, not the firewall.
 
 **More than one TURN server.** Put a comma-separated list in `TURN_URLS`. ICE
 gathers a candidate from every entry at once and uses whichever connects

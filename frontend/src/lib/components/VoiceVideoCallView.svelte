@@ -130,7 +130,6 @@ import {
     peerNames,
     peerAvatars,
     transmissionOutputVolume,
-    callPeerIds,
     participants,
     localCameraStream,
     localScreenStream,
@@ -145,6 +144,17 @@ import {
     callPeerStates = new Map<string, { muted: boolean; deafened: boolean }>(),
     error = null,
   } = $derived(transportState);
+
+  // Only the call in the room on screen. Peers of another room's call are
+  // still tracked (we stay subscribed to rooms we switched away from), and
+  // reading the whole set drew them as tiles in whatever call this view showed.
+  const callPeerIds = $derived(
+    new Set(
+      [...transportState.callPeerIds].filter(
+        (p) => transportState.callPeerRooms.get(p) === transportState.roomCode
+      )
+    )
+  );
 
   function getPeerLabel(peerId: string): string {
     const did = peerIdToDid(peerId);

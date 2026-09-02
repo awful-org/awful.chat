@@ -66,6 +66,13 @@ services:
       # relay_data volume below - point it outside and bundles do not survive
       # a redeploy.
       - TELEMETRY_DIR=${TELEMETRY_DIR:-}
+      # Whose X-Forwarded-For the relay believes, for rate limiting and the
+      # plugin proxy. Unset means private ranges plus loopback, which is right
+      # behind traefik alone. Read by relay/pluginproxy.go and documented in
+      # .env.example, but never passed in until now: an operator who added a
+      # CDN's ranges here got no error and no effect, which on a control that
+      # decides which client ip is believed is the worst way to fail.
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-}
     volumes:
       - relay_data:/app/data
     networks:
@@ -201,6 +208,9 @@ services:
       # Floor between one peer's ms:diag requests. Default 10000. Too low and
       # a client can make the mediasoup worker sample stats continuously.
       SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-}
+      # Same omission SFU_MAX_ROOMS had: read by sfu/index.ts, documented in
+      # .env.example, never passed in - so setting it did nothing at all.
+      SFU_REJOIN_PROBE_MS: ${SFU_REJOIN_PROBE_MS:-}
     # NOT dokploy-network. Nothing routes to this service by hostname from
     # outside - it has no traefik labels, and its media ports are published
     # straight to the host - so the only thing the shared network bought was
