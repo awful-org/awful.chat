@@ -1145,7 +1145,11 @@ export async function _loadHistory(
     getAllPeerProfiles(),
   ]);
   if (!stillCurrent()) return;
-  transportState.messages = msgs;
+  // Storage pages on the lamport index, which is not the order this is read
+  // in - see compareMessages. Every other path into transportState.messages
+  // sorts; this one assigned the page raw, so opening a room showed causal
+  // order and only a later sync or a scroll-up put it right.
+  transportState.messages = [...msgs].sort(MSG_ORDER);
   // Whether a first read filled a page is the only honest answer to "is
   // there more?", and it is known here and nowhere else.
   transportState.historyCapped = page.capped;
