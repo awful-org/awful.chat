@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildMentionCandidates,
   humanize,
+  linkify,
   mentionsMe,
   segmentDraft,
   serialize,
@@ -365,5 +366,46 @@ describe("buildMentionCandidates", () => {
 
   it("returns nothing for an empty roster", () => {
     expect(build({ roomUsers: [], peers: [] })).toEqual([]);
+  });
+});
+
+describe("linkify", () => {
+  const resolve = (did: string) =>
+    did === "did:key:zLink" ? "https://evil.example/pwn" : "Alice";
+
+  // The URL pass used to run AFTER the chip was built, over its text, so a
+  // nickname that was a URL became a real anchor in everyone else's messages.
+  it("does not turn a display name that is a URL into a link", () => {
+    const out = linkify("hi @[did:key:zLink]", resolve);
+    expect(out).not.toContain("<a ");
+    expect(out).toContain("@https://evil.example/pwn");
+  });
+
+  it("still links a URL in the message body", () => {
+    const out = linkify("see https://example.com/x", resolve);
+    expect(out).toContain('href="https://example.com/x"');
+    expect(out).toContain('rel="noopener noreferrer"');
+  });
+
+  it("renders a mention chip and a link in the same body", () => {
+    const out = linkify("@[did:key:z6MkAlice] https://example.com", resolve);
+    expect(out).toContain("@Alice");
+    expect(out).toContain('href="https://example.com"');
+  });
+
+  it("escapes the body before decorating it", () => {
+    expect(linkify("<img onerror=x>", resolve)).toBe(
+      "&lt;img onerror=x&gt;"
+    );
+  });
+
+  it("escapes a hostile display name inside the chip", () => {
+    const out = linkify("@[did:key:zEvil]", () => '<img onerror="x">');
+    expect(out).not.toContain("<img");
+    expect(out).toContain("&lt;img");
+  });
+
+  it("treats a non-string body as empty", () => {
+    expect(linkify(42 as unknown as string, resolve)).toBe("");
   });
 });

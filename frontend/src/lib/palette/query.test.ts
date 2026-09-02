@@ -120,6 +120,22 @@ describe("query", () => {
       expect(parseRoomCode("https://awful.chat/r/a1b2c3")).toBe("a1b2c3");
     });
 
+    it("accepts the current 13-char base32 code, bare, dashed, or in a fragment link", () => {
+      expect(parseRoomCode("6BMB3GST2JRJZ")).toBe("6BMB3GST2JRJZ");
+      expect(parseRoomCode("6bmb-3gst-2jrj-z")).toBe("6BMB3GST2JRJZ");
+      expect(parseRoomCode("https://awful.chat/r/#6BMB3GST2JRJZ")).toBe("6BMB3GST2JRJZ");
+    });
+
+    it("accepts a 16-hex code from the 2026-08 era", () => {
+      expect(parseRoomCode("a1b2c3d4e5f60718")).toBe("a1b2c3d4e5f60718");
+    });
+
+    // The link shape invites use now. The split below treats `#` as a
+    // terminator, so without stripping the separator the whole code went.
+    it("pulls the code out of a fragment-form invite URL", () => {
+      expect(parseRoomCode("https://awful.chat/r/#a1b2c3")).toBe("a1b2c3");
+    });
+
     it("pulls the code out of a web+awfl:// link", () => {
       expect(parseRoomCode("web+awfl://a1b2c3")).toBe("a1b2c3");
     });

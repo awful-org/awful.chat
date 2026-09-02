@@ -120,6 +120,37 @@ export function humanize(
 }
 
 /**
+ * A message body as renderable HTML: escaped, with URLs turned into links and
+ * `@[did]` tokens into mention chips.
+ *
+ * ONE pass, deliberately. Linkifying after `humanize` ran the URL pattern over
+ * the resolved display names too, so anyone whose nickname was a URL got a
+ * real, clickable anchor inside the mention chip of every message that
+ * mentioned them - a link of their choosing in someone else's words. Scanning
+ * once means the URL pattern only ever sees the message body.
+ *
+ * Order is still the security property: escape the whole body FIRST, then
+ * decorate. Mention tokens carry no HTML characters so they survive escaping,
+ * and `humanize` escapes the display name itself.
+ */
+export function linkify(
+  content: string,
+  resolveName: (did: string) => string
+): string {
+  if (typeof content !== "string") return "";
+  const escaped = escapeHtml(content);
+  // A url wins at any position it starts, so a token inside one stays part of
+  // the link rather than being rewritten inside an href.
+  return escaped.replace(
+    /(https?:\/\/[^\s<]+)|(@\[[^[\]]+\])/gi,
+    (_m, url: string | undefined, mention: string | undefined) =>
+      url
+        ? `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-primary hover:underline">${url}</a>`
+        : humanize(mention!, resolveName)
+  );
+}
+
+/**
  * Convert @[did] tokens in content to human-readable @Name mentions as plain text.
  * Used for previews and notifications where HTML is not appropriate.
  * Resolves current display names at render time for rename-proof display.

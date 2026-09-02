@@ -176,12 +176,6 @@
     href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
     rel="stylesheet"
   />
-  <!-- landing page only - the app itself stays analytics-free -->
-  <script
-    defer
-    src="https://analytics.frav.in/script.js"
-    data-website-id="cfb221c3-768d-4f3c-86db-0437034f8b00"
-  ></script>
 </svelte:head>
 
 <div class="app scanlines noise">

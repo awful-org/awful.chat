@@ -44,6 +44,21 @@ describe("invite card rewriting", () => {
     expect(matches.some((m) => m.startsWith('href="http'))).toBe(true);
   });
 
+  // $request_uri is the raw request line, and these replacements land inside
+  // an HTML attribute that a scraper parses. A crafted invite link could close
+  // the quote and write its own markup into the card. Nothing per-room needs
+  // saying here either: the room code lives in the fragment, which the server
+  // never sees.
+  it("never interpolates the request line into an attribute", () => {
+    const block = nginx.slice(nginx.indexOf("location ~ ^/r/"));
+    const body = block.slice(0, block.indexOf("\n    }"));
+    // Directives only - the comment above them names the variable it bans.
+    const directives = body
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("#"));
+    expect(directives.join("\n")).not.toContain("$request_uri");
+  });
+
   it("rewrites to the requesting host, so any instance points at itself", () => {
     const block = nginx.slice(nginx.indexOf("location ~ ^/r/"));
     const body = block.slice(0, block.indexOf("\n    }"));
