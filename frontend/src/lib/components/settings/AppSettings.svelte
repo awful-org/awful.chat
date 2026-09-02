@@ -179,15 +179,25 @@ async function loadLocalFonts(): Promise<void> {
   </div>
   {#if pushPrefs.enabled && pushState.status === "unavailable"}
     <p class="text-xs font-mono text-amber-500 leading-relaxed">
-      {#if pushState.reason === "push-service"}
+      {#if pushState.reason === "push-service" || pushState.reason === "unsupported"}
         {#if isBrave}
           This browser cannot reach a push service. Brave ships with it off:
-          turn on "Use Google services for push messaging" in
-          brave://settings/privacy, then reload.
+          turn on "Use Google services for push messaging" under Privacy and
+          security in Brave's settings (brave://settings/privacy), then
+          reload.
+        {:else if pushState.reason === "unsupported"}
+          This browser has no Web Push, so this device is only notified while
+          the app is open.
         {:else}
           This browser cannot reach a push service, so this device is only
           notified while the app is open.
         {/if}
+      {:else if pushState.reason === "permission"}
+        Waking this device needs notification permission first: turn on
+        "Notify me about new messages" above.
+      {:else if pushState.reason === "relay-off"}
+        This relay does not offer push, so this device is only notified while
+        the app is open. The operator can enable it with PUSH_ENABLED.
       {:else if pushState.reason === "relay"}
         The relay refused the push registration. Notifications still work
         while the app is open.

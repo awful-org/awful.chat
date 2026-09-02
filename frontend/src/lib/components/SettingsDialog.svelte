@@ -132,23 +132,31 @@
 </script>
 
 {#snippet TabBar()}
+  <!-- On a phone the bar is a full-width row that scrolls sideways and
+       shows every label: nine icons squeezed into one pill left most tabs
+       unnamed, and the pill read as a control of its own. Desktop keeps
+       the column. -->
   <div
-    class="flex flex-row sm:flex-col gap-1 p-1 bg-muted rounded-lg md:h-full"
+    class={isMobile
+      ? "flex w-full gap-1 overflow-x-auto border-b border-border pb-2"
+      : "flex flex-col gap-1 p-1 bg-muted rounded-lg md:h-full"}
   >
     {#each tabs as tab}
       <button
         type="button"
         onclick={() => (activeTab = tab.id)}
-        class="flex-1 sm:flex-none flex items-center justify-center sm:justify-start gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {activeTab ===
+        class="flex shrink-0 items-center gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {activeTab ===
         tab.id
-          ? 'bg-background text-foreground shadow-sm'
+          ? isMobile
+            ? 'bg-muted text-foreground'
+            : 'bg-background text-foreground shadow-sm'
           : 'text-muted-foreground hover:text-foreground hover:bg-muted-foreground/10'}"
       >
         <!-- shrink-0: without it a long label like "Session/Sync" squeezes its
              own icon narrower than the others, so the labels no longer start
              at the same x and the column looks ragged. -->
         <tab.icon class="w-4 h-4 shrink-0" />
-        <span class="hidden sm:inline truncate">{tab.label}</span>
+        <span class="truncate">{tab.label}</span>
       </button>
     {/each}
   </div>

@@ -160,8 +160,28 @@ export function ensurePushSubscription(): Promise<boolean> {
  */
 export const pushState = $state<{
   status: "unknown" | "subscribed" | "unavailable";
-  reason: "push-service" | "relay" | "other" | null;
+  reason: PushReason | null;
 }>({ status: "unknown", reason: null });
+
+/**
+ * Every way an attempt can end short of a subscription. The early returns in
+ * subscribe() used to leave the state at "unknown", so a phone whose browser
+ * had no push API at all, or whose relay had push switched off, showed no
+ * hint in Settings while the toggle sat there looking healthy.
+ */
+export type PushReason =
+  | "push-service"
+  | "unsupported"
+  | "permission"
+  | "relay-off"
+  | "relay"
+  | "other";
+
+function unavailable(reason: PushReason): false {
+  pushState.status = "unavailable";
+  pushState.reason = reason;
+  return false;
+}
 
 function classify(err: unknown): "push-service" | "other" {
   const text = err instanceof Error ? `${err.name} ${err.message}` : String(err);
@@ -176,21 +196,21 @@ async function subscribe(): Promise<boolean> {
   // asking again only fills the console. A toggle in Settings retries.
   if (pushState.reason === "push-service") return false;
   if (typeof window === "undefined") return false;
-  if (typeof Notification === "undefined") return false;
+  if (typeof Notification === "undefined") return unavailable("unsupported");
   // Asking here would be rejected anyway: the prompt needs a user gesture,
   // which is what the banner is for.
-  if (Notification.permission !== "granted") return false;
+  if (Notification.permission !== "granted") return unavailable("permission");
   if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-    return false;
+    return unavailable("unsupported");
   }
   if (!isUnlocked() || !API()) return false;
 
   try {
     const config = await pushConfig();
-    if (!config) return false;
+    if (!config) return unavailable("relay-off");
 
     const reg = await navigator.serviceWorker.getRegistration();
-    if (!reg?.pushManager) return false;
+    if (!reg?.pushManager) return unavailable("unsupported");
 
     let sub = await reg.pushManager.getSubscription();
     if (sub && stored(KEY_KEY) !== config.publicKey) {
@@ -222,11 +242,7 @@ async function subscribe(): Promise<boolean> {
         keys: { p256dh: keys.p256dh, auth: keys.auth },
       },
     });
-    if (!ok) {
-      pushState.status = "unavailable";
-      pushState.reason = "relay";
-      return false;
-    }
+    if (!ok) return unavailable("relay");
     lastPosted = marker;
     remember(KEY_KEY, config.publicKey);
     pushState.status = "subscribed";
@@ -237,9 +253,7 @@ async function subscribe(): Promise<boolean> {
     // with push disabled at build time) costs nothing here: the app still
     // notifies locally while it is running. Settings says why.
     console.warn("[push] subscribe failed:", err);
-    pushState.status = "unavailable";
-    pushState.reason = classify(err);
-    return false;
+    return unavailable(classify(err));
   }
 }
 

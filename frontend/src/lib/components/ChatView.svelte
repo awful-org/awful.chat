@@ -2498,7 +2498,7 @@
           segments={draftSegments}
           onkeydown={handleKeydown}
           padLeft
-          placeholder="Type a message..."
+          placeholder={isMobile ? "Message..." : "Type a message..."}
           oninput={() => {
             autoResize();
             updateMentionState();
