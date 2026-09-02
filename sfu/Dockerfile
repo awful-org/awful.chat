@@ -1,4 +1,4 @@
-FROM node:22-slim AS base
+FROM node:22.23-slim AS base
 WORKDIR /app
 
 # mediasoup native build deps (needed if prebuilt binary is unavailable)
@@ -15,7 +15,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
 
-FROM node:22-slim AS runner
+FROM node:22.23-slim AS runner
 WORKDIR /app
 
 # Create non-root user to avoid running node and mediasoup native worker as
