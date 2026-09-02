@@ -94,6 +94,43 @@ describe("mailbox sealed box", () => {
     expect(blob).toBeNull();
   });
 
+  it("carries the kind, and defaults to chat for blobs without one", async () => {
+    const alice = identity();
+    const bob = identity();
+    const envelope = new Uint8Array([9, 9, 9]);
+
+    for (const kind of ["chat", "batch", "receipt"] as const) {
+      const blob = await sealDmForMailbox({
+        senderDid: alice.did,
+        senderPrivateKey: alice.priv,
+        recipientDid: bob.did,
+        envelope,
+        kind,
+      });
+      const opened = await openDmFromMailbox({
+        blob: blob!,
+        selfDid: bob.did,
+        selfPrivateKey: bob.priv,
+      });
+      expect(opened.kind).toBe(kind);
+    }
+
+    // A blob from before kinds existed is sealed exactly like an explicit
+    // "chat" one, and reads back as chat.
+    const legacy = await sealDmForMailbox({
+      senderDid: alice.did,
+      senderPrivateKey: alice.priv,
+      recipientDid: bob.did,
+      envelope,
+    });
+    const opened = await openDmFromMailbox({
+      blob: legacy!,
+      selfDid: bob.did,
+      selfPrivateKey: bob.priv,
+    });
+    expect(opened.kind).toBe("chat");
+  });
+
   it("mailbox ids are stable hex hashes, not the did", async () => {
     const a = identity();
     const id1 = await mailboxIdForDid(a.did);

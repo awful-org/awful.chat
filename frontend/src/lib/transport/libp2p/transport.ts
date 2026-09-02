@@ -38,7 +38,16 @@ import {
   shouldSuppressEvent,
 } from "../faults";
 
-const RELAY_RESERVATION_TIMEOUT_MS = 10_000;
+/**
+ * How long to wait for the circuit address to appear. Matched to the
+ * circuit transport's own `reservationCompletionTimeout` below: at 10s this
+ * gave up while libp2p was still legitimately reserving, so a slow relay
+ * (or a phone that just woke its radio) reported "not reachable" for a
+ * reservation that landed a second later.
+ */
+const RELAY_RESERVATION_TIMEOUT_MS = 20_000;
+/** Reservation attempts per relay reconnect before the node is rebuilt. */
+const RELAY_RESERVATION_ATTEMPTS = 3;
 const DIRECT_MSG_PROTOCOL = "/app/direct/1.0.0";
 const RENDEZVOUS_PROTOCOL = "/awful/rendezvous/1.0.0";
 // Upper bound on a single length-prefixed frame. A peer declares the length
@@ -50,7 +59,16 @@ const MAX_DIRECT_FRAME_BYTES = 4 * 1024 * 1024;
 const MAX_RENDEZVOUS_FRAME_BYTES = 16 * 1024;
 const PEER_REDIAL_DELAY_MS = 3_000;
 const PEER_REDIAL_MAX_MS = 60_000;
+/**
+ * First relay-reconnect delay, and the ceiling it backs off to.
+ *
+ * A flat 3s meant a phone whose relay is genuinely down re-dialled twenty
+ * times a minute for as long as the app was open - a radio held awake for
+ * nothing. Jittered like every other backoff here, and reset to the base as
+ * soon as a reconnect actually succeeds.
+ */
 const RELAY_RECONNECT_DELAY_MS = 3_000;
+const RELAY_RECONNECT_MAX_MS = 60_000;
 // The FIRST relay dial gets retries of its own. libp2p's dial has no
 // failure cooldown, so a re-dial genuinely re-attempts, and a browser that
 // just woke a radio, switched networks or lost a TLS handshake fails the
@@ -123,6 +141,17 @@ const RENDEZVOUS_RECONNECT_DELAY_MS = 2_000;
  * contract with the relay: raising it eats the two-miss margin.
  */
 const RENDEZVOUS_PING_INTERVAL_MS = 20_000;
+/**
+ * Unanswered PINGs before the rendezvous stream is called half-open.
+ *
+ * The relay answers PING with PONG. A phone that changes network keeps the
+ * socket looking open in both directions while nothing crosses it, and
+ * nothing else in this file ever notices: the reads simply stop. Two misses
+ * is 40s of silence on a link that should speak every 20s.
+ */
+const RENDEZVOUS_PONG_MISSES_ALLOWED = 2;
+/** Budget for the one-off liveness probe a network change triggers. */
+const RELAY_LIVENESS_TIMEOUT_MS = 5_000;
 
 type RendezvousClientMsg =
   | { type: "REGISTER"; room: string }
@@ -132,7 +161,18 @@ type RendezvousClientMsg =
 type RendezvousServerMsg =
   | { type: "PEERS"; room: string; peers: string[] }
   | { type: "PEER_JOINED"; room: string; peer: string }
-  | { type: "PEER_LEFT"; room: string; peer: string };
+  | { type: "PEER_LEFT"; room: string; peer: string }
+  | { type: "PONG" };
+
+/**
+ * `navigator.connection`, which is not in lib.dom yet. A phone hopping
+ * between wifi and cellular fires `change` here and nothing else - no
+ * offline, no socket close, no error.
+ */
+interface NetworkInformationLike extends EventTarget {
+  readonly type?: string;
+  readonly effectiveType?: string;
+}
 
 function roomTopic(roomCode: string) {
   return `app:room:${roomCode}`;
@@ -193,6 +233,27 @@ export class LibP2PTransport implements PeerTransport {
    */
   private rendezvousStarting = false;
   private rendezvousPingTimer: TimerHandle | null = null;
+  /**
+   * Whether this NODE has ever seen a PONG on the rendezvous stream, and
+   * when the last one arrived.
+   *
+   * The half-open check is armed by the first PONG and not before: a relay
+   * from before the PING/PONG contract answers nothing, and treating its
+   * silence as a dead link would put those deployments into a permanent
+   * reconnect loop.
+   */
+  private rendezvousPongSeen = false;
+  private rendezvousPongAt = 0;
+  private rendezvousPingsSincePong = 0;
+  /**
+   * navigator says the radio is down. Dialling into that is a storm with no
+   * chance of connecting and a phone battery paying for it, so every dial
+   * path checks this. Cleared by "online", which also probes the relay link.
+   */
+  private offline = false;
+  private networkListenersInstalled = false;
+  /** Current relay-reconnect backoff; reset once a reconnect completes. */
+  private relayReconnectDelay = RELAY_RECONNECT_DELAY_MS;
 
   private peerStreams = new Map<string, Stream>();
   /**
@@ -331,10 +392,99 @@ export class LibP2PTransport implements PeerTransport {
   constructor(opts?: { diagBus?: string }) {
     installFaultHook();
     this.diagBus = opts?.diagBus ?? "main";
+    this.installNetworkListeners();
   }
 
   get p2pNode(): Libp2p<AppServices> | null {
     return this.node;
+  }
+
+  /**
+   * Is the relay link actually usable right now?
+   *
+   * Every flag the app keeps says "connected" for a page restored from the
+   * back-forward cache, or a tab the browser froze and thawed: the node
+   * object survives with sockets that are gone. This asks libp2p and the
+   * rendezvous stream instead of asking a flag.
+   */
+  relayLinkLive(): boolean {
+    if (!this.node || !this.relayPeerId) return false;
+    if (!this.rendezvousStream || !streamIsOpen(this.rendezvousStream)) {
+      return false;
+    }
+    try {
+      return this.node
+        .getConnections(peerIdFromString(this.relayPeerId))
+        .some((c) => c.status === "open");
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * One PING, five seconds, and the relay link is judged.
+   *
+   * Called on the events that break a circuit without closing it: coming
+   * back online, and `navigator.connection` reporting a change. Left alone
+   * for a relay that has never answered a PONG, same arming rule as the
+   * periodic check.
+   */
+  async checkRelayLiveness(): Promise<void> {
+    if (this.intentionalDisconnect || !this.node) return;
+    const stream = this.rendezvousStream;
+    if (!stream || !streamIsOpen(stream)) {
+      this.scheduleRelayReconnect();
+      return;
+    }
+    if (!this.rendezvousPongSeen) return;
+    const before = this.rendezvousPongAt;
+    this.rendezvousSend({ type: "PING" });
+    await new Promise((r) => setTimeout(r, RELAY_LIVENESS_TIMEOUT_MS));
+    if (this.rendezvousStream !== stream) return;
+    if (this.rendezvousPongAt > before) return;
+    this.dropHalfOpenRendezvous(stream, "liveness probe");
+  }
+
+  /**
+   * Retire a rendezvous stream the relay has stopped answering on, and take
+   * the whole relay link with it.
+   *
+   * The stream reference is cleared BEFORE the abort so its own close
+   * handler bails out: that handler only re-opens the rendezvous, and a
+   * half-open circuit needs the full re-dial-and-re-reserve path.
+   */
+  private dropHalfOpenRendezvous(stream: Stream, why: string): void {
+    if (this.rendezvousStream !== stream) return;
+    console.warn(`[Rendezvous] relay silent (${why}), rebuilding relay link`);
+    rec(ev("rv.close", { d: { halfOpen: true, why } }));
+    this.stopRendezvousPing();
+    this.rendezvousStream = null;
+    stream.abort(new Error("rendezvous half-open"));
+    this.emit("status", {
+      type: "relay-disconnected",
+      message: "Relay stopped responding - reconnecting...",
+    });
+    this.scheduleRelayReconnect();
+  }
+
+  private installNetworkListeners(): void {
+    if (typeof window === "undefined" || this.networkListenersInstalled) return;
+    this.networkListenersInstalled = true;
+    window.addEventListener("offline", () => {
+      // Only the dial storm is this layer's business; the app owns the
+      // banner and the relayConnected flag.
+      this.offline = true;
+    });
+    window.addEventListener("online", () => {
+      this.offline = false;
+      void this.checkRelayLiveness();
+    });
+    const conn = (navigator as Navigator & { connection?: unknown })
+      .connection as NetworkInformationLike | undefined;
+    conn?.addEventListener?.("change", () => {
+      this.offline = typeof navigator.onLine === "boolean" && !navigator.onLine;
+      if (!this.offline) void this.checkRelayLiveness();
+    });
   }
 
   /**
@@ -397,6 +547,14 @@ export class LibP2PTransport implements PeerTransport {
       } catch {}
       this.node = null;
     }
+    // Stopping the old node fires its own relay peer:disconnect, which
+    // schedules a reconnect against a node that no longer exists - the clear
+    // above happens too early to catch it, and the timer then fired into the
+    // NEW node and re-dialled a relay it was already connected to.
+    if (this.relayReconnectTimer) {
+      clearTimeout(this.relayReconnectTimer);
+      this.relayReconnectTimer = null;
+    }
     // All per-connection state belongs to the old node. Stale connectedPeers
     // would suppress future "connect" events; stale streams can't be reused.
     // joinedRooms is intentionally KEPT - it's re-subscribed below.
@@ -427,6 +585,16 @@ export class LibP2PTransport implements PeerTransport {
     this.stopRendezvousPing();
     this.rendezvousStarting = false;
     this.rendezvousStream = null;
+    // Per NODE: the half-open check arms on the first PONG this node sees,
+    // so a rebuilt node has to earn it again.
+    this.rendezvousPongSeen = false;
+    this.rendezvousPongAt = 0;
+    this.rendezvousPingsSincePong = 0;
+    this.relayReconnectDelay = RELAY_RECONNECT_DELAY_MS;
+    this.offline =
+      typeof navigator !== "undefined" &&
+      typeof navigator.onLine === "boolean" &&
+      !navigator.onLine;
 
     if (privateKeyBytes) this.privateKeyBytes = privateKeyBytes;
 
@@ -696,6 +864,10 @@ export class LibP2PTransport implements PeerTransport {
     this.stopRendezvousPing();
     this.rendezvousStarting = false;
     this.rendezvousStream = null;
+    this.rendezvousPongSeen = false;
+    this.rendezvousPongAt = 0;
+    this.rendezvousPingsSincePong = 0;
+    this.relayReconnectDelay = RELAY_RECONNECT_DELAY_MS;
     this.joinedRooms.clear();
     this.connectedPeers.clear();
     // Announced, not just cleared. The app mirrors this set reactively, and
@@ -1266,7 +1438,7 @@ export class LibP2PTransport implements PeerTransport {
   }
 
   private async upgradeToDirect(peerId: string): Promise<void> {
-    if (!this.node || shouldBlockDial(peerId)) return;
+    if (!this.node || this.offline || shouldBlockDial(peerId)) return;
     if (this.dialingPeers.has(peerId)) return;
     this.dialingPeers.add(peerId);
     this.debugStats.relayUpgradeAttempts++;
@@ -1327,6 +1499,12 @@ export class LibP2PTransport implements PeerTransport {
    */
   private retryMissingRoomPeers(): void {
     if (this.intentionalDisconnect || !this.node) return;
+    // Same rule as upgradeRelayedPeers: a backgrounded tab has no UI to keep
+    // honest, and a dial sweep is the most expensive thing this file can ask
+    // of a sleeping phone's radio. Returning to the page runs reconcileNow,
+    // which clears the backoff and retries everything immediately.
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (this.offline) return;
     const now = Date.now();
     for (const [room, peers] of this.roomPeers) {
       if (!this.joinedRooms.has(room)) continue;
@@ -1452,6 +1630,29 @@ export class LibP2PTransport implements PeerTransport {
     await this.dialPeer(peerId);
   }
 
+  /**
+   * Reserve, and keep trying. A reservation racing the relay's own view of
+   * our connection fails once and works on the next attempt, which is why
+   * connect() already retries; the reconnect path threw the answer away
+   * entirely and carried on as if a circuit existed.
+   */
+  private async reserveWithRetries(
+    attempts = RELAY_RESERVATION_ATTEMPTS
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      await this.requestRelayReservation();
+      if (await this.waitForRelayReservation()) return true;
+      if (this.intentionalDisconnect || !this.node) return false;
+      if (attempt === attempts - 1) break;
+      const wait = Math.min(
+        RELAY_DIAL_BASE_MS * 2 ** attempt,
+        RELAY_DIAL_MAX_MS
+      );
+      await new Promise((r) => setTimeout(r, wait + Math.random() * wait * 0.3));
+    }
+    return false;
+  }
+
   private scheduleRelayReconnect(): void {
     if (this.intentionalDisconnect || this.relayReconnectTimer || !this.node)
       return;
@@ -1461,26 +1662,52 @@ export class LibP2PTransport implements PeerTransport {
       message: "Reconnecting to relay...",
     });
 
+    const base = this.relayReconnectDelay;
+    const delay = base + Math.random() * base * 0.3;
+    this.relayReconnectDelay = Math.min(base * 2, RELAY_RECONNECT_MAX_MS);
+    rec(
+      ev("relay.reconnect.schedule", { d: { delayMs: Math.round(delay) } })
+    );
+
     this.relayReconnectTimer = setTimeout(async () => {
       this.relayReconnectTimer = null;
       if (this.intentionalDisconnect || !this.node) return;
+      // A radio that is down cannot be dialled into; the "online" listener
+      // restarts this the moment it comes back.
+      if (this.offline) {
+        this.scheduleRelayReconnect();
+        return;
+      }
 
       try {
         await this.dialRelay();
-        // re-request reservation after reconnecting to relay
-        await this.requestRelayReservation();
-        await this.waitForRelayReservation();
+        if (!(await this.reserveWithRetries())) {
+          // Dialled but unreachable: a browser cannot listen, so with no
+          // circuit nobody can open a stream to us and this connection is
+          // worth nothing. Say so and let the app rebuild the node - which
+          // is also the only thing that clears libp2p's relay filter after
+          // a reservation DialError poisons it.
+          console.warn("[Transport] relay reconnect got no reservation");
+          rec(ev("relay.reservation.timeout", { d: { phase: "reconnect" } }));
+          this.emit("status", {
+            type: "relay-reservation-failed",
+            message: "Relay would not reserve a slot - reconnecting...",
+          });
+          return;
+        }
+        this.relayReconnectDelay = RELAY_RECONNECT_DELAY_MS;
         // startRendezvous re-registers all joinedRooms internally
         this.startRendezvous();
       } catch (err) {
         console.warn("[Transport] relay reconnect failed, retrying:", err);
+        rec(ev("relay.reconnect.fail", { d: { err: errText(err) } }));
         this.emit("status", {
           type: "relay-reconnect-failed",
           message: "Relay reconnect failed - retrying...",
         });
         this.scheduleRelayReconnect();
       }
-    }, RELAY_RECONNECT_DELAY_MS);
+    }, delay);
   }
 
   private async openOutboundStream(
@@ -1967,11 +2194,27 @@ export class LibP2PTransport implements PeerTransport {
    */
   private startRendezvousPing(stream: Stream): void {
     this.stopRendezvousPing();
+    this.rendezvousPingsSincePong = 0;
     this.rendezvousPingTimer = setInterval(() => {
       if (this.rendezvousStream !== stream) {
         this.stopRendezvousPing();
         return;
       }
+      // The PING proved WE were alive to the relay and nothing proved the
+      // relay was alive to us - so a link that stopped carrying frames in
+      // our direction was invisible, and every peer the rendezvous would
+      // have named simply never appeared.
+      if (
+        this.rendezvousPongSeen &&
+        this.rendezvousPingsSincePong >= RENDEZVOUS_PONG_MISSES_ALLOWED
+      ) {
+        this.dropHalfOpenRendezvous(
+          stream,
+          `${this.rendezvousPingsSincePong} unanswered pings`
+        );
+        return;
+      }
+      this.rendezvousPingsSincePong++;
       this.rendezvousSend({ type: "PING" });
     }, RENDEZVOUS_PING_INTERVAL_MS);
   }
@@ -2005,6 +2248,9 @@ export class LibP2PTransport implements PeerTransport {
 
   private async dialPeer(peerId: string, attempt = 0): Promise<void> {
     if (!this.node || this.connectedPeers.has(peerId)) return;
+    // Every dial below rides the relay circuit, and with no network there is
+    // no circuit - the whole sweep would just burn the radio.
+    if (this.offline) return;
     if (shouldBlockDial(peerId)) return;
     if (this.dialingPeers.has(peerId)) return;
     this.dialingPeers.add(peerId);
@@ -2069,6 +2315,12 @@ export class LibP2PTransport implements PeerTransport {
 
   private handleRendezvousMsg(selfId: string, msg: RendezvousServerMsg): void {
     switch (msg.type) {
+      case "PONG": {
+        this.rendezvousPongSeen = true;
+        this.rendezvousPongAt = Date.now();
+        this.rendezvousPingsSincePong = 0;
+        break;
+      }
       case "PEERS": {
         for (const peerId of msg.peers ?? []) {
           if (peerId === selfId) continue;

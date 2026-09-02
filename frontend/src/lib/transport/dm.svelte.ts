@@ -53,6 +53,7 @@ import {
   encodeDmReadEnvelope,
   hashDmRoomCode,
 } from "./dm-codec";
+import type { MailboxDepositResult } from "./mailbox.svelte";
 import {
   openRow,
   sealRow,
@@ -200,14 +201,30 @@ function mutateDmQueue(
   mutate: (queue: QueuedMessage[]) => QueuedMessage[]
 ): Promise<void> {
   const run = _queueChain.then(async () => {
-    await saveQueuedDmMessages(mutate(await loadQueuedDmMessages()));
+    const apply = async () =>
+      saveQueuedDmMessages(mutate(await loadQueuedDmMessages()));
+    // The chain above only serializes THIS context. The queue lives in
+    // localStorage, which a second tab (or the installed PWA alongside the
+    // browser) shares: both read the same blob, both write blob+1, and the
+    // loser's message is gone with no trace and no retry. Best effort - a
+    // browser without the Lock Manager still gets the in-context chain.
+    if (typeof navigator !== "undefined" && navigator.locks) {
+      await navigator.locks.request("awful:dm-queue", apply);
+      return;
+    }
+    await apply();
   });
   // One failed mutation must not wedge the chain for every later one.
   _queueChain = run.catch(() => {});
   return run;
 }
 
-function queueDmMessage(
+/**
+ * Park a frame for a peer who is not reachable right now. Exported because
+ * DM sync batches (files, plugin cards, plugin updates) get the same
+ * treatment as chat envelopes - they used to be fire-and-forget.
+ */
+export function queueDmMessage(
   toDid: string,
   data: Uint8Array,
   messageId?: string
@@ -222,6 +239,51 @@ function queueDmMessage(
     });
     return queue;
   });
+}
+
+/**
+ * Record that a queued message will only ever go peer to peer.
+ *
+ * `Message["status"]` is a closed union owned elsewhere, so a distinct
+ * "queued-p2p" cannot live there. This set is the same fact by another
+ * route: an id in it is queued, waiting, and too big for the offline inbox.
+ */
+export function noteMailboxDeposit(
+  messageId: string,
+  result: MailboxDepositResult
+): void {
+  const next = new Set(transportState.dmQueuedP2POnly);
+  if (result === "oversized") next.add(messageId);
+  else if (!next.delete(messageId)) return;
+  transportState.dmQueuedP2POnly = next;
+}
+
+/**
+ * Who a DM room is with, from the room code alone.
+ *
+ * The code is a hash of both DIDs, so it cannot be reversed - the stored
+ * room row carries the answer. Needed because the conversation a message
+ * belongs to is not the conversation on screen: a plugin card fired from a
+ * pinned widget, or a file dropped into the floating panel, used to be sent
+ * to whoever the pane happened to be showing.
+ */
+export async function dmPeerDidForRoom(
+  roomCode: string
+): Promise<string | null> {
+  if (!roomCode.startsWith("dm-")) return null;
+  const room = await getRoom(roomCode).catch(() => null);
+  const stored = (room as DMRoom | null | undefined)?.participantDid;
+  if (stored && looksLikeDid(stored)) return stored;
+  // A room row from before participantDid was written: fall back to the two
+  // conversations we can still name, and only if the code matches.
+  const selfDid = identityStore.did ?? _transport.selfId();
+  for (const candidate of [transportState.activeDmPeerId, dmPanel.peerId]) {
+    if (!candidate) continue;
+    const did = dmPeerDid(candidate);
+    if (!did) continue;
+    if ((await hashDmRoomCode(selfDid, did)) === roomCode) return did;
+  }
+  return null;
 }
 
 export async function dmConversationCodeFor(
@@ -468,7 +530,9 @@ export async function sendDirectMessage(
     // the queue keeps retrying P2P either way.
     if (peerDid.startsWith("did:")) {
       const { depositDmToMailbox } = await import("./mailbox.svelte");
-      void depositDmToMailbox(peerDid, envelope);
+      void depositDmToMailbox(peerDid, envelope).then((result) =>
+        noteMailboxDeposit(id, result)
+      );
     }
   }
 
@@ -535,13 +599,30 @@ export async function sendDirectMessage(
  */
 export function sendDmReadAcks(peerId: string, messageIds: string[]): void {
   if (!messageIds.length) return;
+  const envelope = encodeDmReadEnvelope(messageIds);
   let resolved = resolveDmPeerId(peerId);
   if (resolved && looksLikeDid(resolved)) {
     resolved = didToPeerId(resolved, _peerIdToDid) ?? resolved;
   }
-  if (!resolved || looksLikeDid(resolved)) return;
-  if (!_transport.peers().includes(resolved)) return;
-  _transport.send(resolved, encodeDmReadEnvelope(messageIds)).catch(() => {});
+  if (resolved && !looksLikeDid(resolved) && _transport.peers().includes(resolved)) {
+    _transport.send(resolved, envelope).catch(() => {});
+    return;
+  }
+  // Offline: leave the receipt in their mailbox instead of dropping it. The
+  // sender's ticks were stuck at "sent" until the two of you next happened
+  // to be online together, which for an offline-delivered DM could be never.
+  void depositDmReceipt(peerId, envelope);
+}
+
+/** Seal a receipt into the peer's relay mailbox. Best effort by design. */
+export async function depositDmReceipt(
+  peerIdOrDid: string,
+  envelope: Uint8Array
+): Promise<void> {
+  const did = dmPeerDid(peerIdOrDid);
+  if (!did) return;
+  const { depositDmToMailbox } = await import("./mailbox.svelte");
+  await depositDmToMailbox(did, envelope, "receipt").catch(() => "failed");
 }
 
 // Flushes are serialized and sent entries are removed against a FRESH read
@@ -552,6 +633,50 @@ let _flushChain: Promise<void> = Promise.resolve();
 export function flushQueuedDmForPeer(peerId: string): Promise<void> {
   _flushChain = _flushChain.then(() => _flushQueuedDmForPeer(peerId));
   return _flushChain;
+}
+
+/**
+ * Drain everything queued for anybody currently connected.
+ *
+ * The queue only ever drained on a "connect" event, and the event you miss
+ * is exactly the one that leaves a message sitting there - a peer already
+ * connected when the queue was written fires none at all. One pass over the
+ * queue rather than one per peer: this runs on the repair tick, and every
+ * pass costs a decrypt of the whole sealed blob.
+ */
+export function flushQueuedDmForConnectedPeers(): Promise<void> {
+  _flushChain = _flushChain.then(() => _flushAllQueuedDm());
+  return _flushChain;
+}
+
+async function _flushAllQueuedDm(): Promise<void> {
+  const peerIds = _transport.peers();
+  if (peerIds.length === 0) return;
+  const byDid = new Map<string, string>();
+  for (const pid of peerIds) {
+    const did = _peerIdToDid.get(pid);
+    if (did) byDid.set(did, pid);
+  }
+  const connected = new Set(peerIds);
+  const sent = new Set<string>();
+  for (const entry of await loadQueuedDmMessages()) {
+    // Entries are keyed by DID, except the older ones queued before the
+    // binding arrived, which are keyed by the raw peerId.
+    const pid = byDid.get(entry.to) ?? (connected.has(entry.to) ? entry.to : null);
+    if (!pid) continue;
+    const ok = await _transport.send(pid, new Uint8Array(entry.data));
+    if (!ok) continue;
+    sent.add(queueEntryKey(entry));
+    if (entry.messageId) {
+      applyMessageStatus(entry.messageId, "sent");
+      noteMailboxDeposit(entry.messageId, "sent");
+    }
+  }
+  if (sent.size === 0) return;
+  await mutateDmQueue((queue) =>
+    queue.filter((e) => !sent.has(queueEntryKey(e)))
+  );
+  rec(ev("dm.flush", { d: { removed: sent.size } }));
 }
 
 function queueEntryKey(e: QueuedMessage): string {
@@ -571,7 +696,12 @@ async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
     const ok = await _transport.send(peerId, new Uint8Array(entry.data));
     if (ok) {
       sent.add(queueEntryKey(entry));
-      if (entry.messageId) applyMessageStatus(entry.messageId, "sent");
+      if (entry.messageId) {
+        applyMessageStatus(entry.messageId, "sent");
+        // It went peer to peer after all, so the "too long for the offline
+        // inbox" note has to come off with it.
+        noteMailboxDeposit(entry.messageId, "sent");
+      }
     }
   }
   if (sent.size === 0) return;

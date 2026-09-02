@@ -2,6 +2,7 @@ import type { Libp2p } from "libp2p";
 import type { VoiceTransport, VoiceEvents } from "../types";
 import type { AppServices, LibP2PTransport } from "./transport";
 import type { DtlnProcessor } from "$lib/audio/dtln-processor";
+import { describeMediaError } from "../call-error";
 import { getIceServers, onIceServersChanged } from "../ice-server-list";
 import { succeededPair } from "../ice-stats";
 import { MessageType } from "$lib/types/message";
@@ -195,6 +196,13 @@ export class LibP2PVoice implements VoiceTransport {
   private currentInputGain = 1.0;
   private currentOutputVolume = 1.0;
   private muted = false;
+  /**
+   * getUserMedia failed and this call is listen-only. Kept here rather than
+   * derived from micStream: a mic that was denied and a mic that has not been
+   * asked for yet look identical from outside, and only one of them is worth
+   * telling the user about.
+   */
+  private micUnavailable = false;
 
   private remotePeers = new Map<string, RemotePeer>();
   // ponytail: no per-peer signal queue anymore - the app transport's send()
@@ -300,8 +308,17 @@ export class LibP2PVoice implements VoiceTransport {
 
     try {
       await this.startMic(this.activeInputDevice ?? undefined);
-    } catch {
-      // listen-only mode
+    } catch (err) {
+      // Listen-only mode. Swallowing this silently was the bug: the call
+      // joined, everyone else was audible, and nothing anywhere said the
+      // mic never opened - on a phone, where a denied permission is the
+      // common case, the user just looked mute for no visible reason.
+      console.warn("[voice] microphone unavailable, listening only:", err);
+      this.micUnavailable = true;
+      this.emit("status", {
+        type: "mic-unavailable",
+        message: describeMediaError(err),
+      });
     }
 
     // Both edges just re-run the reconcile: a peer appearing or vanishing is
@@ -1111,6 +1128,17 @@ export class LibP2PVoice implements VoiceTransport {
     }
 
     this.applyMuteState();
+
+    // Withdraw the listen-only badge: a device switch, a DTLN rebuild or a
+    // re-grant all land here, and a flag that is only ever raised is worse
+    // than no flag at all.
+    if (this.micUnavailable) {
+      this.micUnavailable = false;
+      this.emit("status", {
+        type: "mic-available",
+        message: "Microphone available",
+      });
+    }
   }
 
   /**

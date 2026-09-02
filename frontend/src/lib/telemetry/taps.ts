@@ -35,7 +35,7 @@ export const SFU_DIAG_SAMPLE_MS = 30_000;
 type Body = Omit<DiagEvent, "seq" | "t">;
 
 // ---------------------------------------------------------------------------
-// TransportStatus - all 17 variants
+// TransportStatus - all 20 variants
 // ---------------------------------------------------------------------------
 
 /**
@@ -84,6 +84,12 @@ export function statusEvent(status: TransportStatus): Body {
       });
     case "voice-degraded":
       return ev("voice.degraded", { peer });
+    case "relay-reservation-failed":
+      return ev("relay.reservation.timeout", { d: { phase: "reconnect" } });
+    case "mic-unavailable":
+      return ev("voice.join", { sev: "error", d: { mic: false } });
+    case "mic-available":
+      return ev("voice.join", { d: { mic: true } });
   }
 }
 
