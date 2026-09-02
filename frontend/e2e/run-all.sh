@@ -11,7 +11,7 @@ cd "$(dirname "$0")"
 SCENARIOS="dm-extras sync-recovers dm-removal title-and-sound dtln-gain clock-skew
 room-removal reconnect-churn audio-prefs peer-volume background-sync rapid-switch
 drag-drop room-clock backfill-below-window call-status call-roster-ttl
-call-late-join call-join-speed call-without-sfu relay-upgrade history-pull"
+call-late-join call-join-speed call-without-sfu relay-upgrade history-pull mobile-shell"
 fail=0
 failed=""
 for sc in $SCENARIOS; do

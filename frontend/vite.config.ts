@@ -52,7 +52,18 @@ export default defineConfig(({ mode }) => ({
           "config.json",
         ],
       },
-      includeAssets: ["favicon.ico", "apple-touch-icon-180x180.png"],
+      // Files in public/ that the precache globs do not pick up on their own.
+      // sounds/ and logo.svg are here because both are wanted at the exact
+      // moment the network is least likely to be there: the ring plays when a
+      // call arrives, and logo.svg is the mask icon. Fetched on demand they
+      // were silent (or blank) on a cold offline launch, which is the launch a
+      // PWA exists for. They total a few KB.
+      includeAssets: [
+        "favicon.ico",
+        "apple-touch-icon-180x180.png",
+        "sounds/*",
+        "logo.svg",
+      ],
       manifest: {
         name: "Awful.chat",
         short_name: "Awful.chat",

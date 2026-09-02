@@ -3,6 +3,7 @@
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { setBadge } from "$lib/notify.svelte";
+  import { clearNotificationsFor } from "$lib/announce";
   import GifImage from "$lib/components/GifImage.svelte";
   import IdentitySetup from "$lib/components/IdentitySetup.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
@@ -10,6 +11,7 @@
   import ChatView from "$lib/components/ChatView.svelte";
   import RoomSidebar from "$lib/components/RoomSidebar.svelte";
   import TransportStatus from "$lib/components/TransportStatus.svelte";
+  import AppNotices from "$lib/components/AppNotices.svelte";
   import {
     transportState,
     joinRoom,
@@ -42,8 +44,6 @@
   import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
   import { consumeLatestSharedPayload } from "$lib/share-target";
   import { humanizeMentions } from "$lib/mentions";
-  import ReloadPrompt from "./ReloadPrompt.svelte";
-  import InstallPrompt from "./InstallPrompt.svelte";
   import CommandPalette from "./palette/CommandPalette.svelte";
   import SearchOverlay from "./SearchOverlay.svelte";
   import PluginConfirmModal from "./PluginConfirmModal.svelte";
@@ -287,6 +287,11 @@
   // Tell the transport what is actually on screen; see uiRoomCode.
   $effect(() => {
     transportState.uiRoomCode = activeRoomCode;
+    // Opening a conversation answers every notification already sitting in
+    // the tray for it. announce.ts clears the ones that arrive WHILE it is
+    // open; this is the other half - the pile that built up before the user
+    // got here, which otherwise stayed on the lock screen after being read.
+    if (activeRoomCode) clearNotificationsFor(activeRoomCode);
   });
 
   // Mirror everything unread onto the installed app icon and the tab title,
@@ -422,7 +427,9 @@
     if (drainingIntents || !identityStore.isUnlocked) return;
     drainingIntents = true;
     try {
-      const { drainNotifyIntents } = await import("$lib/notify-intents");
+      const { drainNotifyIntents, keepDroppedReplyDraft } = await import(
+        "$lib/notify-intents"
+      );
       const intents = await drainNotifyIntents();
       for (const it of intents) {
         if (it.dmPeerDid) await handleSelectDm(it.dmPeerDid);
@@ -445,6 +452,9 @@
               transportState.roomCode === it.roomCode;
           if (!onTarget) {
             console.warn("[notify] reply skipped: conversation changed");
+            // Not thrown away: it becomes the draft the composer prefills
+            // the next time that conversation is opened. Somebody typed it.
+            keepDroppedReplyDraft(it.roomCode, it.text);
             continue;
           }
           await sendMessage(it.text.trim());
@@ -461,6 +471,13 @@
     if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
     const onMsg = (e: MessageEvent) => {
       if (e.data?.type === "notify-intent") void drainNotifyIntents_();
+      // A notification click can also mean "there is mail waiting". The
+      // worker has no transport of its own, so it asks the page to collect.
+      if (e.data?.type === "mailbox-collect") {
+        void import("$lib/transport/mailbox.svelte")
+          .then(({ collectMailbox }) => collectMailbox())
+          .catch(() => {});
+      }
     };
     const onFocus = () => void drainNotifyIntents_();
     navigator.serviceWorker.addEventListener("message", onMsg);
@@ -1158,7 +1175,7 @@
        generated all gone. The genuine first-load spinner is App.svelte's,
        gated on identityStore.initializing, which is what that flag is for. -->
   {#if joiningRoom}
-    <div class="min-h-screen bg-background flex items-center justify-center">
+    <div class="min-h-dvh bg-background flex items-center justify-center">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
     </div>
   {:else if !identityStore.keypair}
@@ -1179,7 +1196,7 @@
       />
     {/if}
   {:else}
-    <div class="min-h-screen bg-background text-foreground font-mono flex">
+    <div class="min-h-dvh bg-background text-foreground font-mono flex">
       <RoomSidebar
         rooms={roomsStore.rooms}
         phonebook={dmEntries}
@@ -1292,7 +1309,6 @@
           />
         {/if}
       </div>
-      <InstallPrompt />
 
       <Dialog.Root bind:open={createJoinOpen}>
         <Dialog.Portal>
@@ -1455,7 +1471,9 @@
                     {#snippet children(props)}
                   <button
                     {...props}
-                    class="size-8 inline-flex items-center justify-center rounded hover:bg-accent opacity-0 group-hover:opacity-100 transition-opacity"
+                    class="size-9 inline-flex items-center justify-center rounded hover:bg-accent cursor-pointer transition-opacity {isMobile
+                      ? 'opacity-100'
+                      : 'opacity-0 group-hover:opacity-100'}"
                     onclick={() => toggleFavorite(entry.peerId)}
                   >
                     <Star class="size-4 text-gray-400" />
@@ -1632,7 +1650,9 @@
                       {#snippet children(props)}
                     <button
                       {...props}
-                      class="size-8 inline-flex items-center justify-center rounded hover:bg-accent cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
+                      class="size-9 inline-flex items-center justify-center rounded hover:bg-accent cursor-pointer transition-opacity {isMobile
+                        ? 'opacity-100'
+                        : 'opacity-0 group-hover:opacity-100'}"
                       onclick={() => toggleFavorite(entry.peerId)}
                     >
                       <Star class="size-4 text-gray-400" />
@@ -1666,13 +1686,16 @@
     </Dialog.Root>
   {/if}
 
-  <!-- OUTSIDE the unlocked branch: this component registers the service
-       worker, and living inside {:else} made every lock/unlock cycle
-       re-register and leak another hourly update poller - the exact
-       duplicate-registration bug main.ts documents as fixed. -->
-  <ReloadPrompt />
-
+  <!-- ReloadPrompt and InstallPrompt used to be mounted here. They live in
+       App.svelte now, above the route switch, so the landing page and the
+       locked app get a service worker and an install offer too; the copies
+       here were inert and are gone. -->
   <TransportStatus />
+
+  <!-- The warnings a user must see whatever their settings are, plus the
+       offline / no-relay bar. TransportStatus above is debug chrome and is
+       hidden by default; see AppNotices. -->
+  <AppNotices />
 
   <!--
     Here, not inside ChatView or the call view: both unmount when the user

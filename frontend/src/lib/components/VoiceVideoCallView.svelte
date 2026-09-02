@@ -36,6 +36,10 @@
     toggleCamera,
     toggleMute,
   } from "$lib/transport/call.svelte";
+  import {
+    getVoiceActiveInputDevice,
+    setVoiceInputDevice,
+  } from "$lib/transport/voice.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
   import { callPipPanel } from "$lib/call-pip.svelte";
@@ -697,23 +701,72 @@ import {
     return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-4";
   });
 
-  const rowClass = $derived.by(() => {
-    // ~20% more height without going fullscreen.
-    if (watchingFocused) {
-      return "h-[54vh]";
+  /**
+   * The height the window really has right now.
+   *
+   * The stage used to be sized in `vh`, which on a phone is the LARGE
+   * viewport: it does not shrink when the URL bar slides in and it knows
+   * nothing at all about the software keyboard. A stage asking for 45% of a
+   * viewport 15% taller than the screen took 52% of the screen, and the
+   * composer below it went off the bottom edge. visualViewport is the only
+   * number that describes the box the tiles actually have to fit in.
+   *
+   * Zero until the first read, and the dvh classes below cover that frame and
+   * any browser without visualViewport.
+   */
+  let viewportPx = $state(0);
+
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const vv = window.visualViewport;
+    const read = () => {
+      viewportPx = vv ? vv.height : window.innerHeight;
+    };
+    read();
+    if (!vv) {
+      window.addEventListener("resize", read);
+      return () => window.removeEventListener("resize", read);
     }
+    vv.addEventListener("resize", read);
+    vv.addEventListener("scroll", read);
+    return () => {
+      vv.removeEventListener("resize", read);
+      vv.removeEventListener("scroll", read);
+    };
+  });
+
+  /** The share of the window this stage wants, stacked above the chat. */
+  const rowFraction = $derived.by(() => {
+    // ~20% more height without going fullscreen.
+    if (watchingFocused) return 0.54;
     const n = visibleTiles.length;
     const cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4;
     const rows = Math.ceil(n / cols);
-    return rows <= 1 ? "h-[35vh]" : "h-[45vh]";
+    return rows <= 1 ? 0.35 : 0.45;
   });
 
-  // rowClass is viewport-height based and only means anything stacked. Beside
+  // The class is the fallback for the frame before the first measurement;
+  // panelSizeStyle below is the real answer and overrides it.
+  const rowClass = $derived(
+    rowFraction === 0.54
+      ? "h-[54dvh]"
+      : rowFraction === 0.35
+        ? "h-[35dvh]"
+        : "h-[45dvh]"
+  );
+
+  // rowClass is window-height based and only means anything stacked. Beside
   // the chat the panel just fills its row.
   const panelSizeClass = $derived.by(() => {
-    if (isFullscreen) return "h-screen";
+    if (isFullscreen) return "h-dvh";
     if (beside) return "min-h-0 flex-1";
     return `shrink-0 border-b border-border ${rowClass}`;
+  });
+
+  const panelSizeStyle = $derived.by(() => {
+    if (beside || !viewportPx) return "";
+    if (isFullscreen) return `height:${viewportPx}px`;
+    return `height:${Math.round(viewportPx * rowFraction)}px`;
   });
 
   // ── Focus ─────────────────────────────────────────────────────────────────
@@ -758,6 +811,15 @@ import {
   let isFullscreen = $state(false);
   let hoveringControls = $state(false);
   let isSmallScreen = $state(false);
+  /**
+   * A finger, not a mouse.
+   *
+   * The small-screen control bar below is sized for touch outright, because
+   * it only ever renders on a phone. This branch also runs on a touch tablet
+   * in landscape, where mouse-sized buttons are the wrong answer, and no
+   * width breakpoint can tell one of those from a laptop.
+   */
+  let coarsePointer = $state(false);
   let showTransmissionVolume = $state(false);
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   let adjustingTransmissionVolume = $state(false);
@@ -775,13 +837,85 @@ import {
   $effect(() => {
     if (typeof window === "undefined") return;
     const media = window.matchMedia("(max-width: 639px)");
+    const pointer = window.matchMedia("(pointer: coarse)");
     const update = () => {
       isSmallScreen = media.matches;
+      coarsePointer = pointer.matches;
     };
     update();
     media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
+    pointer.addEventListener("change", update);
+    return () => {
+      media.removeEventListener("change", update);
+      pointer.removeEventListener("change", update);
+    };
   });
+
+  /**
+   * iOS Safari has no getDisplayMedia at all. The button rendered there
+   * anyway and only failed after the tap, as an error banner - a control
+   * that cannot work should not be offered in the first place.
+   */
+  const canScreenShare =
+    typeof navigator !== "undefined" &&
+    typeof navigator.mediaDevices?.getDisplayMedia === "function";
+
+  /**
+   * In the call, but with no microphone.
+   *
+   * Denied permission, a device already held by another app, hardware that
+   * is not there. Being in a call you cannot speak in and not being told is
+   * the worst version of this, so it gets a badge that does not time out.
+   *
+   * The transport withdraws the flag as soon as a later mic start succeeds,
+   * so this is safe to render as a badge that never times out.
+   */
+  const micUnavailable = $derived(transportState.micUnavailable);
+  let micRetrying = $state(false);
+
+  async function retryMic(): Promise<void> {
+    micRetrying = true;
+    try {
+      // The existing start path: setInputDevice re-runs the same
+      // getUserMedia the join does, with the remembered device (or the
+      // system default when there is none). Nothing here reimplements it.
+      await setVoiceInputDevice(getVoiceActiveInputDevice() ?? "");
+    } catch {
+      // Still no microphone. The badge stays, which is the honest answer.
+    } finally {
+      micRetrying = false;
+    }
+  }
+
+  /**
+   * Say what the tap is about to do BEFORE the browser asks.
+   *
+   * The permission prompt has to hang off a user gesture, and the join
+   * button is that gesture - so the explanation belongs beside the button,
+   * not in a dialog in front of it, which would be a second tap for one
+   * decision. Hidden once the browser reports the microphone as already
+   * granted; a browser with no Permissions API (or no "microphone" name,
+   * which is Firefox) leaves it showing, and one honest sentence is a
+   * cheaper mistake than a prompt out of nowhere.
+   */
+  let micPermission = $state<"granted" | "unknown">("unknown");
+
+  $effect(() => {
+    if (typeof navigator === "undefined" || !navigator.permissions) return;
+    navigator.permissions
+      .query({ name: "microphone" as PermissionName })
+      .then((status) => {
+        micPermission = status.state === "granted" ? "granted" : "unknown";
+      })
+      .catch(() => {
+        micPermission = "unknown";
+      });
+  });
+
+  /** 44px is the smallest box a finger reliably hits. See coarsePointer. */
+  const ctrlSize = $derived(
+    coarsePointer ? "h-11 w-11" : "h-8 w-8 md:h-10 md:w-10"
+  );
 
   $effect(() => {
     if (!isWatchingTransmission) showTransmissionVolume = false;
@@ -1304,7 +1438,7 @@ import {
     class="flex flex-col relative pb-14 bg-background
       {beside
       ? 'min-h-0 flex-1'
-      : 'h-[12vh] sm:h-[16vh] shrink-0 border-b border-border'}"
+      : 'h-[12dvh] sm:h-[16dvh] shrink-0 border-b border-border'}"
   >
     <div class="flex-1 flex items-center justify-center">
       <div class="flex flex-wrap items-center justify-center gap-1">
@@ -1385,17 +1519,44 @@ import {
             ? "Connecting..."
             : "Join call"}
       </button>
+      {#if micPermission !== "granted"}
+        <p class="mt-1.5 text-center text-[11px] text-muted-foreground">
+          Joining turns on your microphone. Your browser will ask first.
+        </p>
+      {/if}
     </div>
   </div>
 {:else if inCall}
+  <!-- The left/right insets matter in landscape, which is how a phone is held
+       for a video call: the notch and the rounded corners eat the edges of the
+       stage otherwise. -->
   <div
     bind:this={panelEl}
     role="group"
     aria-label="Call"
     oncontextmenu={openViewMenu}
-    class="flex flex-col relative bg-background {panelSizeClass}"
+    style={panelSizeStyle}
+    class="flex flex-col relative bg-background pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] {panelSizeClass}"
     class:cursor-hidden={isFullscreen && !controlsVisible}
   >
+    {#if micUnavailable}
+      <div
+        role="status"
+        class="absolute left-1/2 top-2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-amber-500/40 bg-background/95 px-2.5 py-1.5 text-xs shadow-lg backdrop-blur"
+      >
+        <MicOff class="size-3.5 shrink-0 text-amber-500" />
+        <span class="text-foreground">Listen only, no microphone</span>
+        <button
+          type="button"
+          onclick={retryMic}
+          disabled={micRetrying}
+          class="inline-flex h-8 items-center rounded px-2 font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
+        >
+          {micRetrying ? "Trying..." : "Retry"}
+        </button>
+      </div>
+    {/if}
+
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
       <!-- svelte-ignore a11y_media_has_caption -->
@@ -1489,16 +1650,21 @@ import {
       aria-label="Call controls"
       class={cn(
         "transition-all duration-300 z-20",
+        // pb / bottom carry the home-indicator inset in both branches: this
+        // is the lowest thing on the screen in a call, and on a phone it sat
+        // under the gesture bar.
         dockedControls
           ? cn(
-              "relative shrink-0 py-2",
+              "relative shrink-0 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]",
               // Small screens' inner layout is a full-width 3-column grid;
               // desktop is a shrink-to-fit cluster row that wants centering.
               isSmallScreen ? "w-full px-2" : "flex justify-center"
             )
           : cn(
               "absolute left-1/2 -translate-x-1/2",
-              isSmallScreen ? "bottom-2 w-[calc(100%-1rem)] max-w-120" : "bottom-4",
+              isSmallScreen
+                ? "bottom-[max(0.5rem,env(safe-area-inset-bottom))] w-[calc(100%-1rem)] max-w-120"
+                : "bottom-[max(1rem,env(safe-area-inset-bottom))]",
               !controlsVisible &&
                 "opacity-0 pointer-events-none translate-y-4"
             )
@@ -1527,7 +1693,7 @@ import {
                 type="button"
                 onclick={toggleMute}
                 aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-                class="group relative flex h-8 w-8 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                class="group relative flex h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                 {muted
                   ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                   : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
@@ -1550,7 +1716,7 @@ import {
                 aria-busy={transportState.cameraPending}
                 class:animate-pulse={transportState.cameraPending}
                 aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
-                class="group relative flex h-8 w-8 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                class="group relative flex h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                   {!cameraOff
                   ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                   : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
@@ -1563,31 +1729,33 @@ import {
               </button>
                 {/snippet}
               </Tip>
-              <Tip text={screenSharing ? "Stop screen share" : "Share screen"}>
-                {#snippet children(props)}
-              <button
-                {...props}
-                type="button"
-                onclick={toggleScreenShare}
-                disabled={transportState.screenSharePending}
-                aria-busy={transportState.screenSharePending}
-                class:animate-pulse={transportState.screenSharePending}
-                aria-label={screenSharing
-                  ? "Stop screen share"
-                  : "Share screen"}
-                class="flex group relative h-8 w-8 items-center justify-center rounded-lg transition-all duration-200 shrink-0
-                  {screenSharing
-                  ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
-                  : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
-              >
-                {#if screenSharing}
-                  <MonitorOff class="size-4" />
-                {:else}
-                  <Monitor class="size-4" />
-                {/if}
-              </button>
-                {/snippet}
-              </Tip>
+              {#if canScreenShare}
+                <Tip text={screenSharing ? "Stop screen share" : "Share screen"}>
+                  {#snippet children(props)}
+                <button
+                  {...props}
+                  type="button"
+                  onclick={toggleScreenShare}
+                  disabled={transportState.screenSharePending}
+                  aria-busy={transportState.screenSharePending}
+                  class:animate-pulse={transportState.screenSharePending}
+                  aria-label={screenSharing
+                    ? "Stop screen share"
+                    : "Share screen"}
+                  class="flex group relative h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                    {screenSharing
+                    ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                    : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
+                >
+                  {#if screenSharing}
+                    <MonitorOff class="size-4" />
+                  {:else}
+                    <Monitor class="size-4" />
+                  {/if}
+                </button>
+                  {/snippet}
+                </Tip>
+              {/if}
             </div>
           </div>
 
@@ -1599,7 +1767,7 @@ import {
               type="button"
               onclick={leaveCall}
               aria-label="Leave call"
-              class="group relative flex h-8 w-14 items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500"
+              class="group relative flex h-11 w-16 items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500"
             >
               <PhoneOff class="size-4" />
             </button>
@@ -1679,7 +1847,7 @@ import {
               type="button"
               onclick={toggleMute}
               aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-              class="group relative flex h-8 w-8 md:h-10 md:w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+              class="group relative flex {ctrlSize} items-center justify-center rounded-lg transition-all duration-200 shrink-0
               {muted
                 ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                 : 'bg-white/10 text-zinc-100 hover:bg-white/20 hover:scale-105'}"
@@ -1702,7 +1870,7 @@ import {
               aria-busy={transportState.cameraPending}
               class:animate-pulse={transportState.cameraPending}
               aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
-              class="group relative flex h-8 w-8 md:h-10 md:w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+              class="group relative flex {ctrlSize} items-center justify-center rounded-lg transition-all duration-200 shrink-0
                 {!cameraOff
                 ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                 : 'bg-white/10 text-zinc-100 hover:bg-white/20 hover:scale-105'}"
@@ -1716,31 +1884,33 @@ import {
               {/snippet}
             </Tip>
 
-            <Tip text={screenSharing ? "Stop screen share" : "Share screen"}>
-              {#snippet children(props)}
-            <button
-              {...props}
-              type="button"
-              onclick={toggleScreenShare}
-              disabled={transportState.screenSharePending}
-              aria-busy={transportState.screenSharePending}
-              class:animate-pulse={transportState.screenSharePending}
-              aria-label={screenSharing
-                ? "Stop screen share"
-                : "Share screen"}
-              class="flex group relative h-8 w-8 md:h-10 md:w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
-                {screenSharing
-                ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
-                : 'bg-white/10 text-zinc-100 hover:bg-white/20 hover:scale-105'}"
-            >
-              {#if screenSharing}
-                <MonitorOff class="size-4" />
-              {:else}
-                <Monitor class="size-4" />
-              {/if}
-            </button>
-              {/snippet}
-            </Tip>
+            {#if canScreenShare}
+              <Tip text={screenSharing ? "Stop screen share" : "Share screen"}>
+                {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={toggleScreenShare}
+                disabled={transportState.screenSharePending}
+                aria-busy={transportState.screenSharePending}
+                class:animate-pulse={transportState.screenSharePending}
+                aria-label={screenSharing
+                  ? "Stop screen share"
+                  : "Share screen"}
+                class="flex group relative {ctrlSize} items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                  {screenSharing
+                  ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                  : 'bg-white/10 text-zinc-100 hover:bg-white/20 hover:scale-105'}"
+              >
+                {#if screenSharing}
+                  <MonitorOff class="size-4" />
+                {:else}
+                  <Monitor class="size-4" />
+                {/if}
+              </button>
+                {/snippet}
+              </Tip>
+            {/if}
           </div>
 
           <Tip text="Leave call">
@@ -1752,7 +1922,7 @@ import {
             aria-label="Leave call"
             class={cn(
               "group relative flex items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500 hover:scale-105 hover:shadow-red-500/50 shrink-0",
-              "h-8 w-16 md:h-10 md:w-16"
+              coarsePointer ? "h-11 w-16" : "h-8 w-16 md:h-10 md:w-16"
             )}
           >
             <PhoneOff class="md:size-5 size-4" />

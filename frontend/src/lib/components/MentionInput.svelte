@@ -39,8 +39,11 @@
    * Nothing in the mirror may alter glyph advance widths - the mention chips
    * carry colour and background only, never a different weight or spacing.
    *
-   * pr-28 keeps the text clear of the icon buttons the caller overlays on the
-   * right; widen it if a button is added there.
+   * The right padding keeps the text clear of the icon buttons the caller
+   * overlays there; widen it if a button is added. It is responsive because
+   * those buttons are: below `sm` they grow to a 44px touch target (three of
+   * them plus the gaps is 9rem), and back to 32px above it. Same story for
+   * padLeft and the slash-command button on the left.
    *
    * The font comes from the chat font properties so what you type matches what
    * you just read. `leading-normal` replaces the old fixed `leading-5`: a
@@ -62,7 +65,7 @@
    * on purpose, so the composer matches what you are reading.
    */
   const BOX = $derived(
-    `border py-2 ${padLeft ? "pl-11" : "pl-3"} pr-28 font-(family-name:--chat-font-family) text-sm leading-normal`
+    `border py-2 ${padLeft ? "pl-13 sm:pl-11" : "pl-3"} pr-36 sm:pr-28 font-(family-name:--chat-font-family) text-sm leading-normal`
   );
 
   let scrollTop = $state(0);

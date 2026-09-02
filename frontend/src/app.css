@@ -140,6 +140,15 @@ select {
 html,
 body {
   height: 100%;
+  /* No pull-to-refresh and no rubber-band at the ends of the page.
+   *
+   * This is an app shell, not a document: the only scrollable things are the
+   * message list and the sidebars, and they scroll inside themselves. What
+   * the gesture actually did on a phone was reload the whole PWA when
+   * somebody flicked the top of a room, or bounce the fixed composer away
+   * from the bottom edge. `.chat-messages` already contains its own scroll
+   * chaining; this stops the document from reacting at all. */
+  overscroll-behavior-y: none;
 }
 
 .chat-messages {

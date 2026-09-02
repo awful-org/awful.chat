@@ -1,6 +1,7 @@
 <script lang="ts">
   import { restore, identityStore } from "$lib/identity/identity.svelte";
   import { createIdentity } from "$lib/identity/identity";
+  import { viewportHeight } from "$lib/actions/viewport-height";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import {
@@ -337,8 +338,14 @@
   });
 </script>
 
+<!-- viewportHeight, not just a dvh class: every one of these screens centres a
+     card with a text field in it, and dvh does not shrink when the software
+     keyboard opens - so on a phone the field being typed into ended up under
+     the keyboard. overflow-y-auto because the box is now exactly the visible
+     height and a tall card has to be able to scroll inside it. -->
 <div
-  class="min-h-screen bg-background text-foreground flex items-center justify-center p-4 font-mono"
+  use:viewportHeight
+  class="min-h-dvh overflow-y-auto bg-background text-foreground flex items-center justify-center p-4 font-mono"
 >
   {#if step === "entry"}
     <Card class="w-full max-w-sm bg-card border-border text-card-foreground">

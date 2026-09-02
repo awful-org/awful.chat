@@ -220,7 +220,9 @@
   <div
     class={cn(
       "fixed z-50 flex flex-col gap-2 max-w-sm",
-      "bottom-36 right-3.75",
+      // Clear of the home indicator on a phone, same as every other
+      // fixed bottom element in the app.
+      "bottom-[calc(9rem+env(safe-area-inset-bottom))] right-3.75",
       isVisible ? "opacity-100" : "opacity-0 pointer-events-none"
     )}
   >
@@ -281,7 +283,7 @@
 <!-- Toggle button when hidden -->
 {#if displayPrefs.showConnectionInfo && !isVisible && (peerCount > 0 || (!relayConnected && sawRelayEvent))}
   <button
-    class="fixed bottom-36 right-3.75 z-50 p-2 rounded-full bg-background border shadow-lg hover:bg-accent transition-colors"
+    class="fixed bottom-[calc(9rem+env(safe-area-inset-bottom))] right-3.75 z-50 p-2 rounded-full bg-background border shadow-lg hover:bg-accent transition-colors"
     onclick={() => (isVisible = true)}
     aria-label="Show transport status"
   >

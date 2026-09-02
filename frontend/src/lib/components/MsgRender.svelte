@@ -103,6 +103,34 @@
 
   let { msg, isOwn, fileTransfers, onRequestFileDownload }: Props = $props();
 
+  /** DM conversations are keyed "dm-<...>"; see announce.ts. */
+  const isDmMessage = $derived(msg.roomCode.startsWith("dm-"));
+
+  /**
+   * What the tick under your own message means.
+   *
+   * Room messages carry a status now too, and the DM wording was wrong for
+   * them both ways round: a room has no offline inbox to wait in, and no
+   * single recipient to be reachable. In a room, "sending" means nobody in
+   * it has acknowledged the message yet.
+   */
+  const statusTip = $derived.by(() => {
+    const status = msg.status;
+    if (!status) return "";
+    if (status !== "sending") {
+      return status.charAt(0).toUpperCase() + status.slice(1);
+    }
+    if (!isDmMessage) return "Sending - nobody in the room has it yet";
+    // Too large for the mailbox, so it can only ever travel peer to peer:
+    // saying it is waiting in their offline inbox would be a flat lie.
+    if (transportState.dmQueuedP2POnly.has(msg.id)) {
+      return "Too long for the offline inbox, sends when they are online";
+    }
+    return mailboxPrefs.enabled
+      ? "Queued - waiting in their offline inbox"
+      : "Queued - will send when the recipient is reachable";
+  });
+
   /**
    * Whether a not-yet-loaded media file deserves its skeleton. An active
    * download obviously does. A PENDING one does too when it is small enough
@@ -1355,13 +1383,7 @@
   {/if}
 
   {#if isOwn && msg.status}
-    <Tip
-      text={msg.status === "sending"
-        ? mailboxPrefs.enabled
-          ? "Queued - waiting in their offline inbox"
-          : "Queued - will send when the recipient is reachable"
-        : msg.status.charAt(0).toUpperCase() + msg.status.slice(1)}
-    >
+    <Tip text={statusTip}>
       {#snippet children(props)}
         <span
           {...props}
@@ -1374,8 +1396,15 @@
             <Check class="size-3 text-muted-foreground" />
           {:else if msg.status === "delivered"}
             <CheckCheck class="size-3 text-muted-foreground" />
-          {:else}
+          {:else if msg.status === "read"}
             <CheckCheck class="size-3 text-primary" />
+          {:else}
+            <!-- Any status this build does not know about. It used to fall
+                 into the "read" arm, so a new one - a message queued for
+                 direct delivery, say - would have claimed the recipient had
+                 read something they had not received. Unknown means not
+                 delivered yet, which is the safe half to be wrong on. -->
+            <Clock class="size-3 text-muted-foreground" />
           {/if}
         </span>
       {/snippet}

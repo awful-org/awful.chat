@@ -50,6 +50,19 @@ class Bidi {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * A phone-shaped window. 390x844 is the iPhone 14 / Pixel class, and more to
+ * the point it is under the app's own 640px breakpoint, which is what every
+ * mobile branch in the UI keys off.
+ *
+ * What this does NOT do is emulate touch. Firefox's BiDi has no device
+ * emulation, so `(pointer: coarse)` stays false and `ontouchstart` is absent:
+ * a scenario here can test the layout a phone gets, not the input a phone
+ * uses. Anything gated purely on a coarse pointer has to be tested by hand.
+ */
+const MOBILE_VIEWPORT = { width: 390, height: 844 };
+const DESKTOP_VIEWPORT = { width: 1280, height: 900 };
+
 export class Peer {
   constructor(port, name) {
     this.port = port;
@@ -57,11 +70,11 @@ export class Peer {
     this.bidi = new Bidi(port);
   }
 
-  async start({ wipe = true } = {}) {
+  async start({ wipe = true, mobile = false } = {}) {
     await this.bidi.open();
-    await this.bidi.send("browsingContext.setViewport", {
-      context: this.bidi.context,
-      viewport: { width: 1280, height: 900 },
+    this.mobile = mobile;
+    await this.setViewport(mobile ? MOBILE_VIEWPORT : DESKTOP_VIEWPORT, {
+      devicePixelRatio: mobile ? 3 : null,
     });
     await this.go("/app");
     if (wipe) {
@@ -69,6 +82,29 @@ export class Peer {
       await this.go("/app");
     }
     return this;
+  }
+
+  /**
+   * Resize the window.
+   *
+   * devicePixelRatio is a separate parameter and older geckodrivers reject it,
+   * so a failure there retries without it: the pixel ratio is cosmetic here
+   * and the width is the part that matters.
+   */
+  async setViewport(viewport, { devicePixelRatio = null } = {}) {
+    const params = { context: this.bidi.context, viewport };
+    if (devicePixelRatio !== null) {
+      try {
+        await this.bidi.send("browsingContext.setViewport", {
+          ...params,
+          devicePixelRatio,
+        });
+        return;
+      } catch {
+        // Fall through to the plain resize.
+      }
+    }
+    await this.bidi.send("browsingContext.setViewport", params);
   }
 
   async go(path) {
@@ -397,10 +433,13 @@ export class Peer {
 }
 
 /** Boot N peers in parallel on consecutive debug ports. */
-export async function bootPeers(names, { ports = [9307, 9308, 9309] } = {}) {
+export async function bootPeers(
+  names,
+  { ports = [9307, 9308, 9309], mobile = false } = {}
+) {
   const peers = names.map((n, i) => new Peer(ports[i], n));
   try {
-    await Promise.all(peers.map((p) => p.start()));
+    await Promise.all(peers.map((p) => p.start({ mobile })));
     await Promise.all(peers.map((p, i) => p.signUp(names[i])));
     return peers;
   } catch (err) {
