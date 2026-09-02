@@ -6,8 +6,10 @@ import type { DiagKind, DiagSeverity } from "../schema";
 
 const SELF = "12D3KooWSelfPeerAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1";
 const OTHER = "12D3KooWOtherPeerBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB2";
-/** A real 16-hex room code, exactly the format `roomKind` classifies. */
+/** A legacy 16-hex room code - still on disk in old logs. */
 const ROOM_CODE = "a1b2c3d4e5f60718";
+/** A CURRENT room code: 13 Crockford base32 characters (`room-code.ts`). */
+const ROOM_CODE_B32 = "6BMB3GST2JRJZ";
 const DID = "did:key:z6MkjchhfUsD6mmvni8mCdXHw216Xrm9bQe2mBH1P5RDjVJG";
 
 function mkEvent(overrides: {
@@ -108,6 +110,26 @@ describe("buildPromptPack", () => {
     expect(markdown.toLowerCase()).not.toContain("did:key:");
     expect(markdown).toContain("[redacted-room]");
     expect(markdown).toContain("[redacted-did]");
+  });
+
+  it("holds back a CURRENT-format room code, by key and by shape", () => {
+    const timeline = [
+      // The shape the exporter actually meets: `logs.ts` parked the code in
+      // `d.roomRaw`. A regex written for the old 16-hex format matches none of
+      // this, so the key is what has to hold.
+      mkEvent({ at: 0, kind: "sfu.diag", d: { roomRaw: ROOM_CODE_B32, roomPeers: 2 } }),
+      // Second layer: the same code somewhere the key list does not know about.
+      mkEvent({ at: 1000, kind: "sfu.diag", d: { note: `joining ${ROOM_CODE_B32}` } }),
+    ];
+
+    const { markdown } = buildPromptPack(makeCapture(timeline), []);
+
+    expect(markdown).not.toContain(ROOM_CODE_B32);
+    expect(markdown).toContain("[redacted-room]");
+    // Redacting by key must not drop the key itself - the model still needs to
+    // see that the event was about a room, and the other fields survive.
+    expect(markdown).toContain("roomRaw");
+    expect(markdown).toContain('"roomPeers":2');
   });
 
   it("renders the six sections in order", () => {

@@ -28,6 +28,22 @@ export function roomKind(roomCode: string): "text" | "dm" | "sync" {
 }
 
 /**
+ * The session's table, so `errText` in `event.ts` can scrub without importing
+ * the recorder - the recorder imports `event.ts`, and that cycle is why the
+ * scrub used to be the caller's job (and was forgotten at ~15 of them).
+ * `recorder.ts` owns its lifetime and swaps it on every new session.
+ */
+let active: RefTable;
+
+export function activeRefs(): RefTable {
+  return active;
+}
+
+export function setActiveRefs(table: RefTable): void {
+  active = table;
+}
+
+/**
  * Assigns and remembers bundle-local ordinals. One instance per session; a new
  * session gets a new table so ordinals never correlate across sessions.
  */
@@ -124,3 +140,5 @@ export class RefTable {
     }
   }
 }
+
+active = new RefTable();

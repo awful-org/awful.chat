@@ -318,13 +318,14 @@ export function counterEvents(delta: Record<string, number>): Body[] {
  * which is why they are also the ones that reach a user with nothing written
  * down anywhere.
  *
- * The message is SCRUBBED, not merely truncated: an error composed by the
- * platform quotes whatever the app passed it, and a failed fetch quotes its
- * URL - which is how a room code gets into text that has no field for one.
+ * The message is SCRUBBED, not merely truncated - `errText` does that for
+ * every caller now: an error composed by the platform quotes whatever the app
+ * passed it, and a failed fetch quotes its URL, which is how a room code gets
+ * into text that has no field for one.
  */
 export function errorEvent(source: "uncaught" | "rejection", value: unknown): Body {
   return ev("runtime.error", {
-    d: { source, err: refs().scrub(errText(value)) },
+    d: { source, err: errText(value) },
   });
 }
 

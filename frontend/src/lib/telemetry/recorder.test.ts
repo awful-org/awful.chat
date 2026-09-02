@@ -31,8 +31,6 @@ function snapshotFixture(takenAt: number): SfuSnapshot {
       peersPerRoom: 32,
       producersPerPeer: 8,
       consumersPerPeer: 256,
-      rooms: 1,
-      maxRooms: 64,
     },
   };
 }

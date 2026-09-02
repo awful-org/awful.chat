@@ -50,8 +50,6 @@
  "ceilings": {
   "peersPerRoom": 32,
   "producersPerPeer": 8,
-  "consumersPerPeer": 256,
-  "rooms": 1,
-  "maxRooms": 250
+  "consumersPerPeer": 256
  }
 }

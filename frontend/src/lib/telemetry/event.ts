@@ -8,6 +8,7 @@
  * diagnosable bug into an undiagnosable one.
  */
 
+import { activeRefs } from "./redact";
 import {
   KIND_SEV,
   type DiagEvent,
@@ -93,17 +94,29 @@ export function ev(
 }
 
 /**
- * A one-line, bounded description of a thrown value.
+ * A one-line, bounded, SCRUBBED description of a thrown value.
  *
  * NEVER a stack: a stack carries local filesystem paths and, in a bundled
  * build, source-map hints about the user's own machine.
+ *
+ * The scrub is here and not at the call sites because that is where it was:
+ * one of the ~16 places that record an error text remembered it, and the
+ * other fifteen wrote "Failed to fetch https://relay.example/invite/<code>"
+ * into a bundle that redacts room codes everywhere else. A caller cannot
+ * forget something it does not do.
+ *
+ * Scrub BEFORE truncating: cutting at 200 characters first can leave half a
+ * `did:key:` behind, and half an identifier is still an identifier.
+ *
+ * `activeRefs` comes from `redact.ts`, not from the recorder that owns the
+ * table: the recorder imports this module, so reaching for `refs()` here
+ * would close a cycle.
  */
 export function errText(err: unknown): string {
   try {
-    if (err instanceof Error) {
-      return `${err.name}: ${err.message}`.slice(0, MAX_DETAIL_STRING);
-    }
-    return String(err).slice(0, MAX_DETAIL_STRING);
+    const raw =
+      err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    return activeRefs().scrub(raw).slice(0, MAX_DETAIL_STRING);
   } catch {
     // `String()` calls `toString`, which a hostile object can override.
     return "unknown";

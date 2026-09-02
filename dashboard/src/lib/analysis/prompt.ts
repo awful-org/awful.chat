@@ -9,13 +9,24 @@
  * carries either, but `logs.ts` parses raw SFU/relay logs that DO contain
  * room codes and peer ids in clear, and a log-derived `MergedEvent` can end
  * up with a room code sitting in its `d` bag (e.g. `d.roomRaw`) before this
- * module ever sees it. Every string that reaches the rendered markdown -
- * every `d`/`detail` value, every rule sentence - is passed through
- * `sanitizeString`, which strips a `did:key:...` token and any bare run of
- * 16+ hex characters (the room code format; see `redact.ts` in the
- * frontend's telemetry module). This is defense in depth: it is not this
- * module's job to know which upstream parser might slip, only to guarantee
- * its own output never contains the two forbidden shapes.
+ * module ever sees it.
+ *
+ * Two layers, in this order:
+ *  1. BY KEY. `logs.ts` puts a room code lifted verbatim out of a log line in
+ *     `d.roomRaw` and nowhere else, so that key's value is replaced wholesale -
+ *     the same thing `maskValue` in `sources.svelte.ts` does for the
+ *     interactive views. This is the layer that has to hold: the room code
+ *     format has already changed once (16 hex, then 13 Crockford base32), and
+ *     a shape-matching regex that trails the format lets every code minted
+ *     since the change through in silence.
+ *  2. BY SHAPE. Every string that reaches the rendered markdown - every
+ *     `d`/`detail` value, every rule sentence - still goes through
+ *     `sanitizeString`, which strips a `did:key:...` token and both room code
+ *     shapes (see `redact.ts` in the frontend's telemetry module).
+ *
+ * This is defense in depth: it is not this module's job to know which upstream
+ * parser might slip, only to guarantee its own output never contains the two
+ * forbidden shapes.
  */
 
 import type { Capture, MergedEvent } from "./merge";
@@ -64,18 +75,40 @@ export function buildPromptPack(
 // ---------------------------------------------------------------------------
 
 const DID_RE = /did:key:[A-Za-z0-9]+/gi;
-/** 16 hex chars is the room code's own format (8 random bytes, hex-encoded). */
-const HEX_ROOM_CODE_RE = /\b[0-9a-fA-F]{16,}\b/g;
+/**
+ * Both room code shapes: 13 characters of the Crockford base32 alphabet
+ * (`room-code.ts`, 65 bits, minted since 2026-08-28) and the 16+ hex
+ * characters of the codes before it. Shape matching is the SECOND layer -
+ * `RAW_ROOM_KEYS` below is the one that does not go stale when the format
+ * moves again.
+ */
+const ROOM_CODE_RE = /\b(?:[0-9a-fA-F]{16,}|[0-9ABCDEFGHJKMNPQRSTVWXYZ]{13})\b/g;
+
+/**
+ * `d` keys `logs.ts` fills with raw room text (see its module comment: a room
+ * code found in a log line goes into `d.roomRaw` ONLY). Their values never
+ * reach the pack, whatever shape the code happens to have this year.
+ */
+const RAW_ROOM_KEYS = new Set(["roomRaw"]);
+
+const REDACTED_ROOM = "[redacted-room]";
 
 function sanitizeString(s: string): string {
-  return s.replace(DID_RE, "[redacted-did]").replace(HEX_ROOM_CODE_RE, "[redacted-room]");
+  return s.replace(DID_RE, "[redacted-did]").replace(ROOM_CODE_RE, REDACTED_ROOM);
 }
 
 function formatDetail(d?: Record<string, string | number | boolean | null> | null): string {
   if (!d || Object.keys(d).length === 0) return "{}";
   const sanitized: Record<string, string | number | boolean | null> = {};
   for (const [k, v] of Object.entries(d)) {
-    sanitized[sanitizeString(k)] = typeof v === "string" ? sanitizeString(v) : v;
+    const key = sanitizeString(k);
+    // Held back by key, not by shape. The key itself stays, so the model can
+    // still see that the event was about a room.
+    sanitized[key] = RAW_ROOM_KEYS.has(k)
+      ? REDACTED_ROOM
+      : typeof v === "string"
+        ? sanitizeString(v)
+        : v;
   }
   return JSON.stringify(sanitized);
 }
