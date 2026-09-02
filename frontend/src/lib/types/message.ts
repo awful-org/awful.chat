@@ -1,4 +1,5 @@
 import type { FileSignalEnvelope } from "$lib/transport/types";
+import { normalizeWireName, stripWireControls } from "$lib/wire-name";
 
 export enum MessageType {
   // chat - persisted to IDB, sent over wire
@@ -337,9 +338,48 @@ export type AnyWireMessage =
 const MAX_REPLY_SNAPSHOT = 2048;
 
 export function boundReplyTo(r: ReplyTo | undefined): ReplyTo | undefined {
-  if (!r || typeof r.content !== "string") return r;
-  if (r.content.length <= MAX_REPLY_SNAPSHOT) return r;
-  return { ...r, content: r.content.slice(0, MAX_REPLY_SNAPSHOT) };
+  if (!r) return r;
+  // The quoted AUTHOR is unsigned too, and it renders straight above the
+  // quote - so it gets the same strip-and-cap as any other wire name, or a
+  // reply can carry a bidi-reordered name nobody in the room has.
+  const senderName = normalizeWireName(r.senderName);
+  const content =
+    typeof r.content === "string" ? r.content.slice(0, MAX_REPLY_SNAPSHOT) : "";
+  if (senderName === r.senderName && content === r.content) return r;
+  return { ...r, senderName, content };
+}
+
+/**
+ * A reaction emoji IS covered by the v3 canonical, so this is not about
+ * forgery - it is the same lesson as the plugin payload caps: a signature
+ * proves who wrote a field, never that it is a sane size to store, key a Map
+ * by and render as a chip. Nothing honest is longer than a couple of
+ * codepoints plus a variation selector.
+ */
+const MAX_REACTION_EMOJI = 32;
+
+export function boundReactionEmoji(e: unknown): string | undefined {
+  if (typeof e !== "string") return undefined;
+  const clean = stripWireControls(e).slice(0, MAX_REACTION_EMOJI);
+  return clean || undefined;
+}
+
+/**
+ * How far ahead of us a wire timestamp may claim to be.
+ *
+ * `timestamp` is NOT in the v3 canonical (see canonicalContentV3), so any
+ * peer relaying a message can rewrite it and the signature still verifies -
+ * and compareMessages sorts by timestamp FIRST, so an unclamped one pins a
+ * forwarded message to the top or the bottom of everyone's timeline forever.
+ * A few minutes covers honest clock skew; anything past that is a claim, not
+ * a clock.
+ */
+const MAX_TIMESTAMP_SKEW_MS = 5 * 60_000;
+
+function boundTimestamp(ts: unknown): number {
+  const now = Date.now();
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return now;
+  return Math.min(ts, now + MAX_TIMESTAMP_SKEW_MS);
 }
 
 /** Reconstruct a full Message from a WireChatMessage on the receiving end. */
@@ -351,11 +391,14 @@ export function wireToMessage(
     id: wire.id,
     roomCode,
     senderId: wire.senderId,
-    senderName: wire.senderName,
+    // Unsigned, like the timestamp below: senderName is outside the v3
+    // canonical, so it is whatever the last peer to relay this row decided
+    // it should be - and it renders as a display name.
+    senderName: normalizeWireName(wire.senderName),
     senderDid: wire.senderDid,
     sig: wire.sig,
     sigV: wire.sigV,
-    timestamp: wire.timestamp,
+    timestamp: boundTimestamp(wire.timestamp),
     lamport: wire.lamport,
     type: wire.type,
     content: wire.content,
@@ -363,7 +406,7 @@ export function wireToMessage(
     attachments: [],
     replyTo: boundReplyTo(wire.replyTo),
     reactionTo: wire.reactionTo,
-    reactionEmoji: wire.reactionEmoji,
+    reactionEmoji: boundReactionEmoji(wire.reactionEmoji),
     reactionOp: wire.reactionOp,
   };
 }

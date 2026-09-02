@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DM_ACK_TAG,
+  MAX_DM_READ_IDS,
   MAX_DM_TEXT_LENGTH,
   encodeDmAckEnvelope,
   encodeDmChatEnvelope,
@@ -99,6 +100,19 @@ describe("DM envelopes", () => {
       type: "read",
       messageIds: [],
     });
+  });
+
+  it("accepts a read envelope right at the id cap", () => {
+    const ids = Array.from({ length: MAX_DM_READ_IDS }, (_, i) => `m${i}`);
+    expect(parseDmEnvelope(encodeDmReadEnvelope(ids))).toEqual({
+      type: "read",
+      messageIds: ids,
+    });
+  });
+
+  it("rejects a read envelope over the id cap", () => {
+    const ids = Array.from({ length: MAX_DM_READ_IDS + 1 }, (_, i) => `m${i}`);
+    expect(parseDmEnvelope(encodeDmReadEnvelope(ids))).toBeNull();
   });
 
   it("rejects empty data", () => {

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { MAX_CHAT_CONTENT_LENGTH, verifyIncoming } from "./verify-incoming";
+import {
+  MAX_CHAT_CONTENT_LENGTH,
+  MAX_MESSAGE_FILES,
+  verifyIncoming,
+} from "./verify-incoming";
 import { canonicalContentV3, canonicalContentV2 } from "../messaging";
 import { MessageType, type WireChatMessage } from "../types/message";
 import { hex, utf8 } from "../utils";
@@ -140,6 +144,47 @@ describe("verifyIncoming", () => {
       ok: false,
       reason: "content-oversize",
     });
+  });
+
+  it("rejects a validly signed message with too many attachments", async () => {
+    const files = Array.from({ length: MAX_MESSAGE_FILES + 1 }, (_, i) => ({
+      infoHash: `${i}`.padStart(40, "0"),
+      filename: `f${i}.png`,
+      mimeType: "image/png",
+      size: 1,
+    }));
+    const w = signV3(
+      wire({
+        type: MessageType.File,
+        senderId: alice.did,
+        senderDid: alice.did,
+        meta: { files },
+      }),
+      alice.priv
+    );
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
+      ok: false,
+      reason: "too-many-files",
+    });
+  });
+
+  it("accepts a message right at the attachment cap", async () => {
+    const files = Array.from({ length: MAX_MESSAGE_FILES }, (_, i) => ({
+      infoHash: `${i}`.padStart(40, "0"),
+      filename: `f${i}.png`,
+      mimeType: "image/png",
+      size: 1,
+    }));
+    const w = signV3(
+      wire({
+        type: MessageType.File,
+        senderId: alice.did,
+        senderDid: alice.did,
+        meta: { files },
+      }),
+      alice.priv
+    );
+    expect(await verifyIncoming(w, { room: ROOM })).toEqual({ ok: true });
   });
 
   it("rejects a non-string content field", async () => {

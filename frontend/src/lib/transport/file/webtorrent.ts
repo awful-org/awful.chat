@@ -26,6 +26,7 @@ type TorrentLike = {
   }>;
   on: (event: string, cb: (...args: unknown[]) => void) => void;
   addPeer?: (peer: unknown) => void;
+  destroy?: (opts?: unknown, cb?: (err?: Error) => void) => void;
 };
 
 /** How often the file links are compared against the seeders we know of. */
@@ -47,6 +48,16 @@ const WT_RETRY_MAX_MS = 60_000;
  * as transfers finish and slots come free.
  */
 const MAX_WT_PEERS = 32;
+/**
+ * One peer's share of that table.
+ *
+ * The global cap alone is a denial-of-service primitive: a single peer that
+ * signals 32 infoHashes takes every slot, and then nobody else's file can get
+ * a link at all - createWTPeer just returns false for the rest of the room.
+ * A per-peer ceiling keeps one talkative (or hostile) peer from starving
+ * everyone, and the reconcile tick dials the deferred pairs as slots free.
+ */
+const MAX_WT_PEERS_PER_PEER = 8;
 /** Distinct infoHashes a single peer may have registered with us at once. */
 const MAX_INFOHASHES_PER_PEER = 64;
 /** Distinct infoHashes tracked in total, across every peer. */
@@ -592,6 +603,11 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const key = wtKey(infoHash, peerId);
     if (this.wtPeers.has(key)) return false;
     if (this.wtPeers.size >= MAX_WT_PEERS) return false;
+    let mine = 0;
+    for (const existing of this.wtPeers.keys()) {
+      if (existing.endsWith(`:${peerId}`)) mine += 1;
+    }
+    if (mine >= MAX_WT_PEERS_PER_PEER) return false;
 
     const peer = new SimplePeer({
       initiator,
@@ -659,6 +675,54 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
     const descriptor = this.knownFiles.get(infoHash) ?? fallback;
 
+    /**
+     * The torrent's REAL length against the size the sender signed.
+     *
+     * Nothing compared the two, so `size` was a claim the whole pipeline
+     * then trusted: it decides the inline path, the persistence cap and
+     * (now) the auto-download ceiling, while the bytes actually arriving
+     * were whatever the swarm served. A file that announces 1 KB and
+     * delivers 4 GB downloaded to completion. The metadata is authenticated
+     * by the infoHash, so a mismatch is the SENDER lying about the size -
+     * stop, do not keep fetching, and say so.
+     */
+    const enforceSignedLength = (): boolean => {
+      if (seeding) return false;
+      const actual = torrent.length;
+      if (typeof actual !== "number" || actual <= descriptor.size) return false;
+      this.attachedTorrents.delete(infoHash);
+      try {
+        torrent.destroy?.();
+      } catch {
+        // A torrent that will not tear down is still one we stop tracking.
+      }
+      const prev = this.transfers.get(infoHash);
+      this.upsertTransfer({
+        ...(prev ?? descriptor),
+        infoHash,
+        filename: descriptor.filename,
+        mimeType: descriptor.mimeType,
+        size: descriptor.size,
+        status: "failed",
+        progress: 0,
+        done: false,
+        seeding: false,
+        peers: 0,
+        seeders: this.seedersByHash.get(infoHash)?.size ?? prev?.seeders ?? 0,
+        blobURL: prev?.blobURL,
+        error: "File is larger than the sender announced",
+      });
+      rec(
+        ev("file.fail", {
+          d: {
+            err: "size-mismatch",
+            fileRef: refs().fileRef(infoHash),
+          },
+        })
+      );
+      return true;
+    };
+
     const pushUpdate = () => {
       const isSeeding = this.seedingByHash.get(infoHash) ?? seeding;
       const existing = this.transfers.get(infoHash);
@@ -689,6 +753,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     }
 
     this.attachedTorrents.add(infoHash);
+    // Length is unknown until the metadata lands for a hash-only add, and
+    // already known when we picked up a torrent the client held - check both.
+    torrent.on("metadata", () => {
+      if (!enforceSignedLength()) pushUpdate();
+    });
+    if (enforceSignedLength()) return;
     torrent.on("download", pushUpdate);
     torrent.on("upload", pushUpdate);
     torrent.on("wire", pushUpdate);

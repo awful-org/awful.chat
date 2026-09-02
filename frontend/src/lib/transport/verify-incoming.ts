@@ -15,6 +15,18 @@ import type { WireChatMessage } from "../types/message";
  */
 export const MAX_CHAT_CONTENT_LENGTH = 16_384;
 
+/**
+ * Attachments per message.
+ *
+ * The composer has no count limit of its own (only per-file byte thresholds),
+ * so this is a floor picked the same way MAX_CHAT_CONTENT_LENGTH was. It is
+ * not cosmetic: every entry becomes an attachment row, a file transfer, a
+ * seeder registration and a candidate WebRTC link, and the signed canonical
+ * covers the list contents but never its length - so one signed message could
+ * ask every recipient for thousands of them.
+ */
+export const MAX_MESSAGE_FILES = 16;
+
 export interface VerifyOpts {
   /** The AUTHENTICATED room this message is being filed under. */
   room?: string | null;
@@ -29,6 +41,7 @@ export interface VerifyOpts {
 export type VerifyReason =
   | "content-type"
   | "content-oversize"
+  | "too-many-files"
   | "unsigned"
   | "sig-version"
   | "no-did"
@@ -50,6 +63,12 @@ export async function verifyIncoming(
   }
   if (wire.content.length > MAX_CHAT_CONTENT_LENGTH) {
     return { ok: false, reason: "content-oversize" };
+  }
+  // Same rule, the other axis: a signature says who attached the list, never
+  // that its length is one a client should act on.
+  const files = wire.meta?.files;
+  if (Array.isArray(files) && files.length > MAX_MESSAGE_FILES) {
+    return { ok: false, reason: "too-many-files" };
   }
   if (!wire.sig) {
     return opts.allowUnsigned === true
