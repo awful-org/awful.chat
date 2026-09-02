@@ -149,13 +149,21 @@ describe("runFindings on a real capture", () => {
     expect(ids).toContain("fault-injection-active");
   });
 
-  it("names a peer that connected without a proven stream", () => {
-    expect(ids).toContain("connected-not-proven");
-    const subjects = findings
-      .filter((f) => f.id === "connected-not-proven")
-      .map((f) => f.subject.peer);
-    expect(subjects).toContain(PEER_A);
-    expect(subjects).toContain(PEER_B);
+  // A must-not-fire, and it used to be the opposite. Both vantages show the
+  // same healthy shape:
+  //
+  //   36221 peer.connect  B     no proof yet
+  //   36242 peer.connect  B     still none - libp2p fires one per connection
+  //   36813 stream.proven B     one proof answers both, 590ms later
+  //   36897 peer.connect  B     a third connection, reusing the live stream
+  //
+  // The transport keeps ONE stream per peer, so that fourth line owes nothing.
+  // Pairing every connect with its own proof reported it as a blocking
+  // failure anyway, on both sides of a capture whose streams were fine. The
+  // injected fault in this capture is blockWebrtcDial, and it surfaces as
+  // upgrade and dial findings, which is where it belongs.
+  it("does not accuse a peer whose one stream served three connections", () => {
+    expect(ids).not.toContain("connected-not-proven");
   });
 
   it("names the relay stream that closed for a real reason, not gracefully", () => {

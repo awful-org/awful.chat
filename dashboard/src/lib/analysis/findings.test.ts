@@ -312,6 +312,57 @@ describe("connected-not-proven", () => {
     ]);
     expect(idsOf(runFindings(c))).not.toContain("connected-not-proven");
   });
+
+  // The transport keeps ONE stream per peer and reuses it, while libp2p fires
+  // a connect per connection. A pair that dials each other while upgrading to
+  // direct holds two or three at once, and every extra connect used to be
+  // reported as a blocking failure on an app doing exactly what it designs to.
+  it("does not fire on a further connection to an already-proven peer", () => {
+    const c = makeCapture([
+      ev({ kind: "peer.connect", at: 0, peer: "p1" }),
+      ev({ kind: "stream.proven", at: 100, peer: "p1" }),
+      ev({ kind: "peer.connect", at: 1_400, peer: "p1" }),
+      ev({ kind: "peer.connect", at: 2_100, peer: "p1" }),
+    ]);
+    expect(idsOf(runFindings(c))).not.toContain("connected-not-proven");
+  });
+
+  it("fires again once the proven stream is gone", () => {
+    const c = makeCapture([
+      ev({ kind: "peer.connect", at: 0, peer: "p1" }),
+      ev({ kind: "stream.proven", at: 100, peer: "p1" }),
+      ev({ kind: "stream.reset", at: 1_000, peer: "p1" }),
+      ev({ kind: "peer.connect", at: 1_100, peer: "p1" }),
+    ]);
+    const findings = runFindings(c);
+    expect(idsOf(findings)).toContain("connected-not-proven");
+    expectEvidenceValid(c, findings);
+  });
+
+  it("keeps one peer's proof from covering another's", () => {
+    const c = makeCapture([
+      ev({ kind: "peer.connect", at: 0, peer: "p1" }),
+      ev({ kind: "stream.proven", at: 100, peer: "p1" }),
+      ev({ kind: "peer.connect", at: 200, peer: "p2" }),
+    ]);
+    const findings = runFindings(c).filter(
+      (f) => f.id === "connected-not-proven"
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0].subject.peer).toBe("p2");
+  });
+
+  // The noise filter's suppressed gossipsub reset carries no peer, so it must
+  // not be read as the app's own stream going away.
+  it("ignores a peerless stream.reset when deciding if a proof still holds", () => {
+    const c = makeCapture([
+      ev({ kind: "peer.connect", at: 0, peer: "p1" }),
+      ev({ kind: "stream.proven", at: 100, peer: "p1" }),
+      ev({ kind: "stream.reset", at: 1_000 }),
+      ev({ kind: "peer.connect", at: 1_100, peer: "p1" }),
+    ]);
+    expect(idsOf(runFindings(c))).not.toContain("connected-not-proven");
+  });
 });
 
 // ---------------------------------------------------------------------------
