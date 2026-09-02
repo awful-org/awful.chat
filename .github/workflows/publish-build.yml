@@ -93,12 +93,27 @@ jobs:
       # drift, and the drift would look like a failed verification.
       - name: fingerprint it
         run: |
+          # awful-verify's exit code is a verdict: 0 only when the digest
+          # matches a published record. Here there cannot be one - this job is
+          # what publishes it - so "nothing verified" (1) is the expected
+          # answer, and the JSON it wrote is what gets judged below. Anything
+          # above 1 is a usage or fetch failure and still fails the job.
+          # --no-published skips the lookup that would only ever miss.
+          set +e
           npx --yes github:awful-org/awful-verify http://localhost:8123 \
-            --no-rebuild --json > /tmp/fingerprint.json
+            --no-rebuild --no-published --json > /tmp/fingerprint.json
+          code=$?
+          set -e
+          if [ "$code" -gt 1 ]; then
+            echo "::error::awful-verify failed (exit $code)"
+            cat /tmp/fingerprint.json
+            exit "$code"
+          fi
           node -e '
             const fs = require("fs");
             const fp = JSON.parse(fs.readFileSync("/tmp/fingerprint.json", "utf8"));
             if (!fp.claim) throw new Error("the image served no build declaration");
+            if (!Array.isArray(fp.files) || fp.files.length === 0) throw new Error("the fingerprint lists no files");
             if (fp.files.some((f) => !f.hash)) throw new Error("some files could not be read");
             const record = {
               schema: "awful-build-record/1",
