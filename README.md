@@ -199,6 +199,12 @@ whose context holds no repository declares no commit.
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
 | `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |
+| `SFU_MAX_ROOMS` | no | concurrent rooms one SFU will hold, default 250. Past it a join is refused rather than degrading every call already running |
+| `SFU_REJOIN_PROBE_MS` | no | how often a client is probed to confirm its SFU session is still live, default 3000 |
+| `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
+| `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
+| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs whose `X-Forwarded-For` the relay believes. Unset means private ranges plus loopback, correct behind traefik alone; add a CDN's ranges when one sits in front |
+| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |
 
