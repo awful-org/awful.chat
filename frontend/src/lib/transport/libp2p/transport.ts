@@ -938,6 +938,9 @@ export class LibP2PTransport implements PeerTransport {
           type: "stream-open-failed",
           peerId,
           message: `Failed to open stream to peer ${peerId.slice(-8)}`,
+          // The bundle used to record only THAT it failed; a phone's bundle
+          // full of these said nothing about why.
+          err: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
         });
         this.failPendingQueue(peerId);
       })

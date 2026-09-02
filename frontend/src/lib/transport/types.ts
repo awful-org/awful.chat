@@ -45,7 +45,7 @@ export type TransportStatus =
   | { type: "relay-dial-failed"; message: string }
   | { type: "relay-reconnect-failed"; message: string }
   | { type: "relay-reconnecting"; message: string }
-  | { type: "stream-open-failed"; peerId: string; message: string }
+  | { type: "stream-open-failed"; peerId: string; message: string; err?: string }
   | { type: "rendezvous-failed"; message: string }
   | { type: "rendezvous-reconnecting"; message: string }
   | { type: "reservation-timeout"; message: string }

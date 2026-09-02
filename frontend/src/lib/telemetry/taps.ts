@@ -68,7 +68,7 @@ export function statusEvent(status: TransportStatus): Body {
     case "rendezvous-reconnecting":
       return ev("rv.open", { sev: "warn", d: { reconnecting: true } });
     case "stream-open-failed":
-      return ev("stream.open.fail", { peer });
+      return ev("stream.open.fail", { peer, d: { err: errText(status.err) } });
     case "peer-dial-failed":
       return ev("peer.dial.fail", { peer });
     case "voice-dial-failed":
