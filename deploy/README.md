@@ -208,11 +208,15 @@ half on the other, and each half would never see the other half in its
 next to its PeerID, but there is no code check that refuses a second
 replica outright.
 
-**Set `TRUSTED_PROXY_CIDRS` before you go live.** The relay's API port is
+**`TRUSTED_PROXY_CIDRS` is optional hardening.** The relay's API port is
 reachable by every container on `dokploy-network`, not only Traefik, and the
 default trusted range (see `.env.example`) is the whole private address
-space - so on this compose shape, ANY container can forge `X-Forwarded-For`
-and pick its own bucket for every per-IP rate limit the relay has
-(`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`,
-`/plugin-stream`). Narrow it to
-Traefik's own address on your `dokploy-network`, as a single `/32`.
+space - so on this compose shape, another container on the same box can
+forge `X-Forwarded-For` and pick its own bucket for every per-IP rate limit
+the relay has (`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`,
+`/plugin-stream`). That neighbour is something you deployed yourself, so the
+default stays convenient. To close it, set the variable to Traefik's own
+address on your `dokploy-network` as a single `/32` (`docker network inspect
+dokploy-network` lists it), and re-check it whenever Traefik is recreated:
+a stale value makes the relay treat Traefik as the client, and every user
+then shares one rate-limit bucket.

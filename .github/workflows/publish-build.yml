@@ -34,10 +34,10 @@ jobs:
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: frontend } }
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
         with: { version: 10 }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 24, cache: pnpm, cache-dependency-path: frontend/pnpm-lock.yaml }
       - run: pnpm install --frozen-lockfile
       - run: node scripts/fetch-plugins.mjs
@@ -69,7 +69,7 @@ jobs:
     needs: reproducible
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The image, not a directory: this is the artifact that deploys, and it
       # brings its own nginx, so the fingerprint is taken over the same
@@ -120,7 +120,7 @@ jobs:
             console.log(`${record.commit} -> ${record.digest} (${fp.files.length} files)`);
           '
 
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-path: /tmp/record/*.json
 

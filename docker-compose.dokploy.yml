@@ -67,11 +67,18 @@ services:
       # a redeploy.
       - TELEMETRY_DIR=${TELEMETRY_DIR:-}
       # Whose X-Forwarded-For the relay believes, for rate limiting and the
-      # plugin proxy. Unset means private ranges plus loopback, which is right
-      # behind traefik alone. Read by relay/pluginproxy.go and documented in
-      # .env.example, but never passed in until now: an operator who added a
-      # CDN's ranges here got no error and no effect, which on a control that
+      # plugin proxy. Read by relay/pluginproxy.go and documented in
+      # .env.example, but never passed in until recently: an operator who added
+      # a CDN's ranges here got no error and no effect, which on a control that
       # decides which client ip is believed is the worst way to fail.
+      #
+      # Optional. Unset, the relay trusts private ranges plus loopback, which
+      # is right behind Traefik alone. On this compose's shared dokploy-network
+      # every container holds a private address, so another container on the
+      # box could forge X-Forwarded-For and pick its own per-IP rate-limit
+      # bucket; an operator who wants that closed sets Traefik's /32 here (see
+      # .env.example). It is a rate-limit bypass for a neighbour you deployed
+      # yourself, so the default stays convenient rather than strict.
       - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-}
     volumes:
       - relay_data:/app/data
