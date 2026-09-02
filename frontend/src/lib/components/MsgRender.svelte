@@ -1382,7 +1382,10 @@
     {/if}
   {/if}
 
-  {#if isOwn && msg.status}
+  <!-- A room shows only the clock, while a message has reached nobody. A
+       tick there read as a receipt, and rooms track nothing of the kind;
+       the DM ticks (sent, delivered, read) are real and stay. -->
+  {#if isOwn && msg.status && (isDmMessage || msg.status === "sending")}
     <Tip text={statusTip}>
       {#snippet children(props)}
         <span
