@@ -202,6 +202,28 @@ describe("mute/deafen state broadcasts into the CALL's room", () => {
     expect(rooms).toContain("other-room");
   });
 
+  // Gossipsub is best effort and needs a formed mesh, so a peer that has just
+  // joined the topic never sees the frame. Call presence always fanned out
+  // directly as well as broadcasting; mute/deafen did not, and a stale badge
+  // is what that looks like. The heartbeat is no substitute: it repeats the
+  // same broadcast down the same missing path.
+  it("also sends mute state straight down every open stream", () => {
+    transportState.inCall = true;
+    transportState.callRoomCode = "room1";
+    transportState.roomCode = "room1";
+    transportMock.send.mockClear();
+    const peers = ["peerA", "peerB"];
+    transportMock.peers = () => peers;
+
+    setDeafened(true);
+
+    expect(transportMock.send.mock.calls.map((c) => c[0]).sort()).toEqual([
+      "peerA",
+      "peerB",
+    ]);
+    transportMock.peers = () => [] as string[];
+  });
+
   it("broadcasts once when the call room IS the room on screen", () => {
     transportState.inCall = true;
     transportState.callRoomCode = "room1";
