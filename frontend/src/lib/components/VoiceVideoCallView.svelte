@@ -1394,6 +1394,7 @@ import {
     aria-label="Call"
     oncontextmenu={openViewMenu}
     class="flex flex-col relative bg-background {panelSizeClass}"
+    class:cursor-hidden={isFullscreen && !controlsVisible}
   >
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
