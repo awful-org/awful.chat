@@ -1376,6 +1376,7 @@ func main() {
 		mux.HandleFunc("/invite", postOnly(handleInviteCreate))
 		mux.HandleFunc("/invite/", getOnly(handleInviteResolve))
 		mux.HandleFunc("/plugin-proxy", getOnly(handlePluginProxy))
+		mux.HandleFunc("/plugin-stream", getOnly(handlePluginStream))
 		mux.HandleFunc("/mailbox/deposit", handleMailboxDeposit)
 		mux.HandleFunc("/mailbox/collect", handleMailboxCollect)
 		mux.HandleFunc("/mailbox/ack", handleMailboxAck)

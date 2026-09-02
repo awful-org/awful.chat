@@ -64,6 +64,7 @@
     "emoji-picker-element": "^1.29.1",
     "gifenc": "^1.0.3",
     "gifuct-js": "^2.1.2",
+    "hls.js": "^1.7.1",
     "html5-qrcode": "^2.3.8",
     "idb": "^8.0.3",
     "libp2p": "~3.1.7",

@@ -213,5 +213,6 @@ reachable by every container on `dokploy-network`, not only Traefik, and the
 default trusted range (see `.env.example`) is the whole private address
 space - so on this compose shape, ANY container can forge `X-Forwarded-For`
 and pick its own bucket for every per-IP rate limit the relay has
-(`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`). Narrow it to
+(`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`,
+`/plugin-stream`). Narrow it to
 Traefik's own address on your `dokploy-network`, as a single `/32`.

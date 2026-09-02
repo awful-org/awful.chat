@@ -128,6 +128,15 @@ services:
       - traefik.http.routers.${STACK:-awful}-steam.tls=true
       - traefik.http.routers.${STACK:-awful}-steam.tls.certresolver=letsencrypt
       - traefik.http.routers.${STACK:-awful}-steam.service=${STACK:-awful}-relay-api-service
+      # The streaming plugin proxy needs its own router: the -steam rule
+      # matches /plugin-proxy only, so without this /plugin-stream is a 404
+      # at the edge no matter what the relay serves.
+      - traefik.http.routers.${STACK:-awful}-pluginstream.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/plugin-stream`)
+      - traefik.http.routers.${STACK:-awful}-pluginstream.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-pluginstream.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-pluginstream.tls=true
+      - traefik.http.routers.${STACK:-awful}-pluginstream.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-pluginstream.service=${STACK:-awful}-relay-api-service
       - traefik.http.routers.${STACK:-awful}-invite.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/invite`)
       - traefik.http.routers.${STACK:-awful}-invite.entrypoints=websecure
       - traefik.http.routers.${STACK:-awful}-invite.middlewares=${STACK:-awful}-relay-sec

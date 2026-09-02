@@ -64,6 +64,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "now-playing",
   "confirm",
   "plugin-settings",
+  "plugin-stream",
 ]);
 
 export interface UpdateCtx {
@@ -368,6 +369,23 @@ export interface PluginUpdate {
  */
 export function proxyUrl(upstream: string): string {
   return `${apiUrl()}/plugin-proxy?url=${encodeURIComponent(upstream)}`;
+}
+
+/**
+ * The instance's STREAMING proxy, for media a browser cannot fetch itself:
+ * an HLS playlist and its segments on a CDN that pins CORS to its own
+ * origin. Same allowlist as `proxyUrl`, but the body is streamed rather than
+ * buffered, `Range` is passed through in both directions, and the relay keeps
+ * no copy, so the upstream's own caching headers are what a browser sees.
+ *
+ * Not a general replacement for `proxyUrl`: no `{{secret:NAME}}` is
+ * substituted here (a player follows playlist-relative urls of its own, which
+ * would carry the key onward), and there is no response cache.
+ *
+ * Read at call time for the same reason `proxyUrl` is, see above.
+ */
+export function streamUrl(upstream: string): string {
+  return `${apiUrl()}/plugin-stream?url=${encodeURIComponent(upstream)}`;
 }
 
 export function definePlugin(def: PluginDefinition): PluginDefinition {

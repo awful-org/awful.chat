@@ -199,7 +199,8 @@ APIs declares them in the manifest - `requires: ["room-context",
 to load the plugin with a clear "needs a newer awful.chat" line instead of
 mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
-`call-audio`, `call-capture`, `clock-sample`, `local-card`, `now-playing`.
+`call-audio`, `call-capture`, `clock-sample`, `local-card`, `now-playing`,
+`plugin-stream`.
 Declare only what you truly cannot function without.
 
 **Per-plugin storage**: `host.storage` is a device-local key-value store,
@@ -554,6 +555,34 @@ say so in the card. Placeholders belong in QUERY STRINGS (values are
 query-escaped). GET only, https only, 2 MB response cap, responses cached
 ~5 minutes, ~10 requests/minute per client. Document the hosts and secrets
 your plugin needs in its README.
+
+### Streaming media
+
+`proxyUrl` buffers, so it cannot carry a video: 2 MB is under one HLS
+segment and 10 requests/minute is under one minute of playback. For media
+there is a second endpoint, `streamUrl`, gated by the same
+`PLUGIN_PROXY_HOSTS` allowlist:
+
+```ts
+import { streamUrl } from "$lib/plugins/api";
+
+hls.loadSource(streamUrl("https://cdn.example.com/show/master.m3u8"));
+```
+
+It streams the body through instead of buffering it, passes `Range` in both
+directions so a player can seek, and keeps no copy - the upstream's own
+`Cache-Control` is what lets the browser cache segments. Ceilings are 64 MB
+per request, 8 concurrent requests per client (240/minute), and 256 across
+the instance; over either concurrency ceiling you get a 503, so let the
+player retry rather than treating it as fatal. A playlist's segment urls are
+relative to the playlist, so pass each one through `streamUrl` too, which is
+what hls.js does on its own once you give it a proxied source.
+
+No `{{secret:NAME}}` on this path: a player follows urls the playlist hands
+it, and a substituted key would ride along into requests the relay never
+composed. If your upstream needs a key, fetch the signed playlist url
+through `proxyUrl` and stream what it returns. Declare `plugin-stream` in
+`requires`, and a 204 still means "this instance is not configured".
 
 ## Rules
 
