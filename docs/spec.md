@@ -157,8 +157,11 @@ enum MessageType {
 //   0x02 ack   → recipient got it        → status "delivered"
 //   0x03 read  string[] of messageIds    → conversation on screen → "read"
 // (see frontend/src/lib/transport/dm-codec.ts)
-// Status ladder: sending (queued offline) → sent → delivered → read.
+// Status ladder: sending (queued on this device only) → sent (handed to the
+// peer's stream, or a sealed copy accepted by the relay mailbox: one tick)
+// → delivered (their device acked: two ticks) → read (opened: green ticks).
 // Statuses never regress; queued DMs retry when the peer's profile arrives.
+// Only DMs show a status; room messages carry one internally and show none.
 
 // only chat types are persisted to IDB
 type ChatMessageType = MessageType.Text | MessageType.Reply | MessageType.Reaction

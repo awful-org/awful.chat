@@ -530,9 +530,14 @@ export async function sendDirectMessage(
     // the queue keeps retrying P2P either way.
     if (peerDid.startsWith("did:")) {
       const { depositDmToMailbox } = await import("./mailbox.svelte");
-      void depositDmToMailbox(peerDid, envelope).then((result) =>
-        noteMailboxDeposit(id, result)
-      );
+      void depositDmToMailbox(peerDid, envelope).then((result) => {
+        noteMailboxDeposit(id, result);
+        // One tick: the relay holds a sealed copy, so the message is out of
+        // this device's hands even though nobody has it yet. It sat on the
+        // clock until their ack came back, which for an offline peer could
+        // be days, and read as "never left".
+        if (result === "sent") applyMessageStatus(id, "sent");
+      });
     }
   }
 

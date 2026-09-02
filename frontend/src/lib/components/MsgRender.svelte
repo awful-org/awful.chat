@@ -109,18 +109,14 @@
   /**
    * What the tick under your own message means.
    *
-   * Room messages carry a status now too, and the DM wording was wrong for
-   * them both ways round: a room has no offline inbox to wait in, and no
-   * single recipient to be reachable. In a room, "sending" means nobody in
-   * it has acknowledged the message yet.
+   * DM only: rooms carry a status internally but never show one.
    */
   const statusTip = $derived.by(() => {
     const status = msg.status;
     if (!status) return "";
-    if (status !== "sending") {
-      return status.charAt(0).toUpperCase() + status.slice(1);
-    }
-    if (!isDmMessage) return "Sending - nobody in the room has it yet";
+    if (status === "sent") return "Sent - the relay holds it until they are online";
+    if (status === "delivered") return "Delivered to their device";
+    if (status === "read") return "Read";
     // Too large for the mailbox, so it can only ever travel peer to peer:
     // saying it is waiting in their offline inbox would be a flat lie.
     if (transportState.dmQueuedP2POnly.has(msg.id)) {
@@ -1382,10 +1378,11 @@
     {/if}
   {/if}
 
-  <!-- A room shows only the clock, while a message has reached nobody. A
-       tick there read as a receipt, and rooms track nothing of the kind;
-       the DM ticks (sent, delivered, read) are real and stay. -->
-  {#if isOwn && msg.status && (isDmMessage || msg.status === "sending")}
+  <!-- DM only. Rooms track no receipts, and even the clock for "reached
+       nobody yet" read as one, so a room message shows no status at all.
+       One tick: the relay holds it. Two: their device has it. Green: they
+       opened it. -->
+  {#if isOwn && isDmMessage && msg.status}
     <Tip text={statusTip}>
       {#snippet children(props)}
         <span
@@ -1400,7 +1397,7 @@
           {:else if msg.status === "delivered"}
             <CheckCheck class="size-3 text-muted-foreground" />
           {:else if msg.status === "read"}
-            <CheckCheck class="size-3 text-primary" />
+            <CheckCheck class="size-3 text-green-500" />
           {:else}
             <!-- Any status this build does not know about. It used to fall
                  into the "read" arm, so a new one - a message queued for
