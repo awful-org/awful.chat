@@ -152,6 +152,7 @@ export type DiagKind =
   | "sfu.consume.failed"
   | "sfu.error"
   | "sfu.rejoin"
+  | "sfu.misplaced"
   | "sfu.track.added"
   | "sfu.track.stalled"
   | "sfu.diag"
@@ -175,7 +176,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 115;
+export const DIAG_KIND_COUNT = 116;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -308,6 +309,7 @@ export const KIND_SEV = {
   "sfu.consume.failed": "error",
   "sfu.error": "error",
   "sfu.rejoin": "info",
+  "sfu.misplaced": "error",
   "sfu.track.added": "info",
   "sfu.track.stalled": "warn",
   "sfu.diag": "debug",

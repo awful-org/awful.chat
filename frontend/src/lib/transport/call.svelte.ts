@@ -32,10 +32,58 @@ import {
   describeMediaError,
   setErrorWithAutoClear,
 } from "./call-error";
+import { ev } from "$lib/telemetry/event";
+import { rec } from "$lib/telemetry/recorder";
+import { isMisplaced, SFU_MISPLACED_MESSAGE } from "./sfu-placement";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
 let _mutedBeforeDeafen = false;
+/**
+ * How many OTHER people presence already places in this call's room.
+ *
+ * Read at the moment we join the SFU, because that is the only moment its
+ * answer can be checked against anything: `roomPeerCount` is a snapshot taken
+ * at join and never updated, so comparing it against a roster that grew since
+ * would flag the peer who legitimately arrived first.
+ */
+function othersInCallRoom(room: string | null): number {
+  if (!room) return 0;
+  // Defensive on purpose: this runs inside the join path, and a diagnostic
+  // that throws there would break the very call it exists to explain. A
+  // roster that is not there yet reads as "nobody known", which makes the
+  // check below silent rather than wrong.
+  const rooms = transportState.callPeerRooms;
+  if (!rooms || typeof (rooms as { forEach?: unknown }).forEach !== "function") {
+    return 0;
+  }
+  let n = 0;
+  rooms.forEach((theirRoom) => {
+    if (theirRoom === room) n++;
+  });
+  return n;
+}
+
+/**
+ * Report a call whose SFU room does not hold the people presence says are in
+ * it. See sfu-placement.ts for why that is unrecoverable from here, and why
+ * it stays silent in every ambiguous case.
+ */
+function checkSfuPlacement(expectedOthers: number): void {
+  const reportedByServer = _video.roomPeerCount();
+  if (
+    !isMisplaced({
+      expectedOthers,
+      sessionLive: _video.isConnected(),
+      reportedByServer,
+    })
+  ) {
+    return;
+  }
+  rec(ev("sfu.misplaced", { d: { expectedOthers, reportedByServer } }));
+  setErrorWithAutoClear(transportState, SFU_MISPLACED_MESSAGE);
+}
+
 export function _sendCallState(peerId?: string): void {
   const payload = encode({
     type: MessageType.CallState,
@@ -204,8 +252,12 @@ async function _joinCall(): Promise<void> {
     // Awaiting this unguarded meant a media server that was down (or a VPS
     // whose DNS had moved) failed the whole join, taking out calls that never
     // needed it. Keep the call, say what is missing, heal in the background.
+    // Sampled BEFORE the join: this is what the SFU's own count has to agree
+    // with, and only at this instant.
+    const othersAtJoin = othersInCallRoom(transportState.callRoomCode);
     try {
       await _video.join(transportState.roomCode ?? "", _transport.selfId());
+      checkSfuPlacement(othersAtJoin);
     } catch {
       // The error event already put a readable message on transportState;
       // all that is left is to keep trying in the background.
