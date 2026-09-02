@@ -4,6 +4,7 @@ import {
   projectPosition,
   decideCorrection,
   DEFAULT_WATCH_SYNC,
+  watchKeyIntent,
   type WatchTick,
   type ClockSample,
 } from "./sync";
@@ -173,5 +174,17 @@ describe("decideCorrection", () => {
     expect(strict.action).toBe("rate");
     const lenient = decideCorrection(local, baseTick, 0, 0, { rateThresholdMs: 5000 });
     expect(lenient.action).toBe("none");
+  });
+});
+
+describe("watchKeyIntent", () => {
+  it("maps the arrow keys and nothing else", () => {
+    expect(watchKeyIntent("ArrowLeft")).toBe("seek-back");
+    expect(watchKeyIntent("ArrowRight")).toBe("seek-forward");
+    expect(watchKeyIntent("ArrowUp")).toBe("volume-up");
+    expect(watchKeyIntent("ArrowDown")).toBe("volume-down");
+    expect(watchKeyIntent(" ")).toBe("toggle-play");
+    expect(watchKeyIntent("k")).toBe("toggle-play");
+    expect(watchKeyIntent("j")).toBeNull();
   });
 });
