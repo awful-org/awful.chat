@@ -457,6 +457,34 @@ export async function openRow<T>(
   spec: StoreCryptoSpec,
   opts?: { skipBytes?: boolean }
 ): Promise<T> {
+  return (await inspectRow<T>(row, spec, opts)).value;
+}
+
+/**
+ * A row the 2026-09-02 at-rest sweep sealed TWICE. That sweep handed a sealed
+ * row straight to sealRow without opening it, so on every device it upgraded
+ * each existing row became a v3 blob whose plaintext is the previous sealed
+ * row - with the inner ciphertext destroyed on the way (see inspectRow). Read
+ * naively, a room's roomCode was its own hash, which is how the sidebar came
+ * to list one room twice under that hash. Reads drop such a row like any
+ * other undecryptable one; the sweep deletes it, because a dead message row
+ * still answers a sync digest with its clear lamport and would stop peers
+ * from ever re-sending what it used to hold.
+ */
+export class DeadRowError extends Error {
+  constructor(store: string) {
+    super(`row in ${store} was sealed twice by the 2026-09-02 sweep; its content is gone`);
+    this.name = "DeadRowError";
+  }
+}
+
+/** openRow, in the shape the at-rest sweep needs: it throws DeadRowError for
+ *  a twice-sealed row so the sweep can tell "delete" from "not my row". */
+export async function inspectRow<T>(
+  row: unknown,
+  spec: StoreCryptoSpec,
+  opts?: { skipBytes?: boolean }
+): Promise<{ value: T; nested: boolean }> {
   if (!isSealed(row)) {
     // storeName marks a real IndexedDB store, which is the only place the
     // sweep reaches; the one ad hoc spec (the DM offline queue) seals a blob
@@ -468,7 +496,7 @@ export async function openRow<T>(
       rec(ev("storage.drop", { d: { store: spec.storeName, count: 1 } }));
       throw new Error(`unsealed row in a sealed store: ${spec.storeName}`);
     }
-    return row as T;
+    return { value: row as T, nested: false };
   }
   const key = requireKey();
   const rowObj = row as unknown as Record<string, unknown>;
@@ -476,6 +504,12 @@ export async function openRow<T>(
     await decrypt(key, row._enc, (v) => rowAad(spec, rowObj, undefined, v))
   );
   const rest = JSON.parse(json) as Record<string, unknown>;
+  if (isSealed(rest)) {
+    // Nothing inside is recoverable: sealRow ran JSON.stringify over the old
+    // row, and an ArrayBuffer (the inner `ct`) serialises as {}. The clear
+    // fields survived on the outer row, the content did not.
+    throw new DeadRowError(spec.storeName ?? "unknown");
+  }
   const out: Record<string, unknown> = { ...rest };
   for (const k of spec.clear) {
     if (k in row) out[k] = (row as Record<string, unknown>)[k];
@@ -485,7 +519,7 @@ export async function openRow<T>(
       out[k] = await decrypt(key, blob, (v) => rowAad(spec, rowObj, k, v));
     }
   }
-  return out as T;
+  return { value: out as T, nested: false };
 }
 
 /** Whether a row (sealed or legacy) carries bytes for the given field. */

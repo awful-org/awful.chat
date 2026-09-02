@@ -6,6 +6,8 @@ import {
   openRows,
   isSealed,
   isCurrentAad,
+  inspectRow,
+  DeadRowError,
   isStorageLockedError,
   isBlinded,
   rowHasBytes,
@@ -2230,7 +2232,11 @@ export function closeDatabase(): void {
 // entirely for the next one, leaving whatever was still plaintext readable -
 // and unsealed rows are readable by ANY identity (openRow returns them before
 // it asks for a key).
-const ATREST_FLAG_PREFIX = "awful:atrest:v2";
+// v3: the v2 sweep sealed already-sealed rows a second time (see inspectRow),
+// so every device has to run one more pass, and a new flag key is what makes
+// the old "done" marker stop counting.
+const ATREST_FLAG_PREFIX = "awful:atrest:v3";
+const ATREST_FLAG_FAMILY = "awful:atrest:";
 let _atRestOwner: string | null = null;
 let _migrationRunning = false;
 
@@ -2273,7 +2279,12 @@ export function setAtRestOwner(did: string | null): void {
 /** Flags written under the old plaintext-DID key shape. They are only a
  *  "sweep done" marker, so dropping one costs a single extra scan. */
 function dropLegacyAtRestFlags(): void {
-  removeAtRestFlags((key) => key.startsWith(`${ATREST_FLAG_PREFIX}:did:`));
+  removeAtRestFlags(
+    (key) =>
+      key.startsWith(ATREST_FLAG_FAMILY) &&
+      key !== ATREST_FLAG_PREFIX &&
+      !key.startsWith(`${ATREST_FLAG_PREFIX}:`)
+  );
 }
 
 /**
@@ -2285,10 +2296,7 @@ function dropLegacyAtRestFlags(): void {
  * them.
  */
 export function clearAtRestFlags(): void {
-  removeAtRestFlags(
-    (key) =>
-      key === ATREST_FLAG_PREFIX || key.startsWith(`${ATREST_FLAG_PREFIX}:`)
-  );
+  removeAtRestFlags((key) => key.startsWith(ATREST_FLAG_FAMILY));
 }
 
 // Enumerated with length/key(i), the spec'd API, rather than
@@ -2357,6 +2365,16 @@ function needsBlindingMigration(
  * nothing needing migration. Chunked so no transaction spans the (async,
  * tx-killing) crypto, and so a mid-sweep close just resumes next unlock.
  */
+/** The row we pre-read is still what is on disk: same blob (the IV is fresh
+ *  per write, so equal IVs mean an untouched row), or both still plaintext. */
+function sameOnDisk(fresh: unknown, before: unknown): boolean {
+  if (isSealed(fresh) !== isSealed(before)) return false;
+  if (!isSealed(fresh) || !isSealed(before)) return true;
+  const a = new Uint8Array(fresh._enc.iv);
+  const b = new Uint8Array(before._enc.iv);
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
 export async function migrateAtRest(): Promise<void> {
   if (_migrationRunning) return;
   try {
@@ -2369,6 +2387,7 @@ export async function migrateAtRest(): Promise<void> {
   try {
     const database = await getDB();
     let migratedCount = 0;
+    let deadCount = 0;
     // Stores whose primary key changed due to blinding: must delete old and
     // insert new to avoid duplicates.
     // Stores whose PRIMARY KEY is a blinded field. Their rows cannot be
@@ -2412,34 +2431,62 @@ export async function migrateAtRest(): Promise<void> {
           );
         while (cursor && toMigrate.length < CHUNK) {
           lastKey = cursor.primaryKey;
-          if (needsBlindingMigration(cursor.value, spec)) {
-            toMigrate.push({
-              key: cursor.primaryKey,
-              row: cursor.value as unknown as Record<string, unknown>,
-            });
-          }
+          // Every row is a candidate. Whether a SEALED row needs rewriting is
+          // only fully known once it is open (inspectRow's nested case), and
+          // this sweep runs once per flag version, so opening each row once
+          // is the whole cost.
+          toMigrate.push({
+            key: cursor.primaryKey,
+            row: cursor.value as unknown as Record<string, unknown>,
+          });
           cursor = await cursor.continue();
         }
         if (toMigrate.length === 0) break;
-        // ...seal/re-seal it outside, write it back conditionally. Every app
-        // write seals, so a row that changed while our crypto ran is migrated
-        // by now - re-checking inside the (atomic) write transaction means the
-        // sweep can never clobber a live update with its stale pre-read.
+        // ...OPEN it outside the transaction, re-seal what needs it, write it
+        // back conditionally. Opening is the step the previous sweep skipped:
+        // it handed the sealed row itself to sealRow, which wrapped the old
+        // blob inside a new one and left every row opening to its own
+        // ciphertext. Every app write seals, so a row that changed while our
+        // crypto ran is current by now - re-checking inside the (atomic)
+        // write transaction means the sweep never clobbers a live update
+        // with its stale pre-read.
         const sealed = await Promise.all(
-          toMigrate.map((m) => sealRow(m.row, spec))
+          toMigrate.map(async (m) => {
+            let opened: Record<string, unknown> = m.row;
+            if (isSealed(m.row)) {
+              try {
+                opened = (await inspectRow<Record<string, unknown>>(m.row, spec)).value;
+              } catch (err) {
+                // A twice-sealed row is dead and blocks repair; delete it.
+                // Anything else undecryptable (another identity's row, a
+                // truncated blob) is not ours to rewrite; reads drop it.
+                if (err instanceof DeadRowError) {
+                  return { key: m.key, before: m.row, row: null };
+                }
+                return null;
+              }
+            }
+            if (!needsBlindingMigration(m.row, spec)) return null;
+            return { key: m.key, before: m.row, row: await sealRow(opened, spec) };
+          })
         );
         const tx = database.transaction(store, "readwrite");
-        for (let i = 0; i < sealed.length; i++) {
-          const fresh = await tx.store.get(toMigrate[i].key as string);
-          if (fresh && needsBlindingMigration(fresh, spec)) {
-            // For stores whose key path changed, delete the old key before
-            // putting the new one (the sealed row's key is now blinded).
-            if (keyPathChangedStores.has(store)) {
-              await tx.store.delete(toMigrate[i].key as string);
-            }
-            await tx.store.put(sealed[i] as never);
-            migratedCount += 1;
+        for (const s of sealed) {
+          if (!s) continue;
+          const fresh = await tx.store.get(s.key as string);
+          if (!fresh || !sameOnDisk(fresh, s.before)) continue;
+          if (s.row === null) {
+            await tx.store.delete(s.key as string);
+            deadCount += 1;
+            continue;
           }
+          // For stores whose key path changed, delete the old key before
+          // putting the new one (the sealed row's key is now blinded).
+          if (keyPathChangedStores.has(store)) {
+            await tx.store.delete(s.key as string);
+          }
+          await tx.store.put(s.row as never);
+          migratedCount += 1;
         }
         await tx.done;
         if (toMigrate.length < CHUNK) break;
@@ -2447,6 +2494,18 @@ export async function migrateAtRest(): Promise<void> {
     }
     if (migratedCount > 0) {
       console.log(`[storage] at-rest migration migrated ${migratedCount} rows`);
+    }
+    if (deadCount > 0) {
+      console.warn(`[storage] deleted ${deadCount} rows the 2026-09-02 sweep sealed twice; their content was unrecoverable`);
+      // storage.ts cannot reach the transport (import order), so the app is
+      // told the way any window listener would be; AppView announces it.
+      try {
+        window.dispatchEvent(
+          new CustomEvent("awful:storage-notice", { detail: { dead: deadCount } })
+        );
+      } catch {
+        /* no window (tests) */
+      }
     }
     try {
       localStorage.setItem(atRestFlagKey(), String(Date.now()));

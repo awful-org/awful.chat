@@ -9,6 +9,8 @@ import {
   beginPlaintextImport,
   setAtRestSweepPending,
   STORE_SPECS,
+  inspectRow,
+  DeadRowError,
 } from "./storage-crypto";
 
 const KEY = new Uint8Array(32).fill(7);
@@ -229,6 +231,22 @@ describe("storage at-rest crypto", () => {
     await expect(
       openRow({ ...sealed, lamport: 99 }, STORE_SPECS.messages)
     ).rejects.toThrow();
+  });
+
+  it("a row sealed twice is dead: inspectRow throws DeadRowError, openRow rejects", async () => {
+    // What the 2026-09-02 sweep left behind: sealRow applied to a row that
+    // was already sealed. JSON.stringify turned the inner ArrayBuffer `ct`
+    // into {}, so there is nothing to unwrap - only to recognise.
+    const once = await sealRow(
+      { id: "m3", lamport: 3, type: "text", status: "sent", roomCode: "room-z", senderId: "alice", content: "twice" },
+      STORE_SPECS.messages
+    );
+    const twice = await sealRow(once as unknown as Record<string, unknown>, STORE_SPECS.messages);
+    await expect(inspectRow(twice, STORE_SPECS.messages)).rejects.toBeInstanceOf(DeadRowError);
+    await expect(openRow(twice, STORE_SPECS.messages)).rejects.toThrow(/sealed twice/);
+    // A row sealed once is untouched by the check.
+    const single = await inspectRow<{ content: string }>(once, STORE_SPECS.messages);
+    expect(single.value.content).toBe("twice");
   });
 
   it("a v2 blob - bound to store and primary key only - still opens", async () => {

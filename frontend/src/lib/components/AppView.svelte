@@ -146,6 +146,21 @@
   $effect(() => {
     if (!identityStore.isUnlocked || bootstrapped) return;
     bootstrapped = true;
+    // The at-rest sweep runs at unlock, fire-and-forget, so it reports through
+    // a window event rather than a return value; see migrateAtRest.
+    window.addEventListener(
+      "awful:storage-notice",
+      async (e) => {
+        const dead = (e as CustomEvent<{ dead: number }>).detail?.dead ?? 0;
+        if (!dead) return;
+        const { _transport } = await import("$lib/transport/transport.svelte");
+        _transport.announce({
+          type: "app-warning",
+          message: `A bad update on 2026-09-02 damaged ${dead} stored records on this device and they have been removed. Rooms, messages and profiles come back as peers re-send them; rejoin rooms from their invite links.`,
+        });
+      },
+      { once: true }
+    );
     connect();
     // Offline DMs deposited at the relay while we were away (opt-in).
     import("$lib/transport/mailbox.svelte")
