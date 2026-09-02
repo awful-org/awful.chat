@@ -201,8 +201,19 @@ services:
       # Floor between one peer's ms:diag requests. Default 10000. Too low and
       # a client can make the mediasoup worker sample stats continuously.
       SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-}
+    # NOT dokploy-network. Nothing routes to this service by hostname from
+    # outside - it has no traefik labels, and its media ports are published
+    # straight to the host - so the only thing the shared network bought was
+    # a name collision. Every stack on that network registers the alias "sfu"
+    # for its own container, docker's DNS then returns all of them and rotates,
+    # and the frontend's /sfu proxy re-resolves per request. Two people in one
+    # call land on two different SFUs about half the time, each gets a room
+    # holding only themselves, and no camera or screen share can cross. Voice
+    # is peer to peer, so it keeps working and the failure looks like nothing
+    # at all. Measured on the dev host: six lookups of "sfu" from the frontend
+    # returned 10.0.1.129 four times and 10.0.1.118 twice.
     networks:
-      - dokploy-network
+      - internal
 
   # For TLS TURN (turns: - strongly recommended for mobile-carrier users):
   # put fullchain.pem + privkey.pem for the domain in a directory, set
@@ -352,7 +363,10 @@ services:
     depends_on:
       - relay
     networks:
+      # dokploy-network for traefik; internal to reach the SFU it proxies /sfu
+      # to. It is the only service that needs both.
       - dokploy-network
+      - internal
     labels:
       - traefik.enable=true
       - traefik.http.routers.${STACK:-awful}-awful2-http.rule=Host(`${DOMAIN}`)
@@ -384,3 +398,9 @@ volumes:
 networks:
   dokploy-network:
     external: true
+  # Created per project, so its real name carries the compose project prefix
+  # and the "sfu" alias inside it belongs to THIS stack alone. That is the
+  # whole fix: two stacks on one host stop sharing a namespace they were never
+  # meant to share.
+  internal:
+    driver: bridge
