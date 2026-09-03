@@ -43,7 +43,7 @@
   import { speakers } from "$lib/speakers.svelte";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
   import { callPipPanel } from "$lib/call-pip.svelte";
-  import { enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
+  import { browserPipSupported, enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
   import { spotlightStore } from "$lib/call-spotlight.svelte";
 
   import {
@@ -69,7 +69,7 @@
     X as XIcon,
     Tv2,
   } from "@lucide/svelte";
-  import { Check, Columns2, MessageSquare, MonitorIcon, Rows2, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
+  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
 import { displayPrefs, setCallChatBeside, setCallPip } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
@@ -1305,6 +1305,28 @@ import {
 
     {#if tile.kind === "screen" || tile.kind === "transmission" || isPendingTx}
       {@const audience = transmissionAudience(tile.peerId)}
+      {#if hasVideo && !isPendingTx && browserPipSupported()}
+        <!-- The browser's own floating window for this share, not the in-app
+             panel: pin the share so the spotlight follows it, then open the
+             surface AppView already keeps in sync with the spotlight. -->
+        <Tip text="Picture in picture">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              class="absolute top-1.5 left-1.5 z-20 flex size-6 items-center justify-center rounded bg-black/60 text-white hover:bg-black/80 cursor-pointer"
+              aria-label="Picture in picture"
+              onclick={(e: MouseEvent) => {
+                e.stopPropagation();
+                callFocus.pinnedTileId = tile.id;
+                void enterBrowserPip(() => {});
+              }}
+            >
+              <PictureInPicture2 class="size-3.5" />
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
       {#if audience.count > 0}
         <Tip text={audience.label}>
           {#snippet children(props)}

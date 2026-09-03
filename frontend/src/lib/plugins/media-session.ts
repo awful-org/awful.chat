@@ -15,6 +15,12 @@ export interface NowPlayingInfo {
   onPause?: () => void;
   onNext?: () => void;
   onPrevious?: () => void;
+  /**
+   * The element to float when the browser enters picture-in-picture on its
+   * own (Chromium pops the window on a tab switch while media plays). A
+   * call in progress keeps its own spotlight as the target instead.
+   */
+  pipVideo?: HTMLVideoElement;
 }
 
 let _owner: symbol | null = null;
@@ -43,6 +49,8 @@ function safeArtwork(url: string | undefined): string | null {
 function apply(info: NowPlayingInfo | null): void {
   const ms = navigator.mediaSession;
   if (!ms) return;
+  _pluginPipVideo = info?.pipVideo ?? null;
+  syncPipAction();
   try {
     if (!info) {
       ms.metadata = null;
@@ -99,46 +107,70 @@ export function setNowPlayingFor(
   apply(info);
 }
 
-// Picture-in-Picture action handler. The module owns media-related global
-// resources, so PiP action registration goes through here for consistency.
-// When the browser's Media Session initiates PiP (e.g., on tab switch for
-// Chromium), this handler is called to enter browser PiP.
+// Picture-in-Picture. The module owns media-related global resources, so
+// the one enterpictureinpicture action (Chromium's auto-PiP on tab switch)
+// is registered here for whoever should float: a call's spotlight while a
+// call is on, else the video the now-playing plugin named.
 let _pipEnterHandler: (() => void) | null = null;
+let _pluginPipVideo: HTMLVideoElement | null = null;
+
+function syncPipAction(): void {
+  const ms = typeof navigator !== "undefined" ? navigator.mediaSession : null;
+  if (!ms) return;
+  const video = _pluginPipVideo;
+  const fn =
+    _pipEnterHandler ??
+    (video ? () => void requestElementPip(video) : null);
+  try {
+    // enterpictureinpicture is not in the TS action union yet.
+    ms.setActionHandler(
+      "enterpictureinpicture" as MediaSessionAction,
+      fn ? () => fn() : null
+    );
+  } catch {
+    // Not supported here; PiP stays a manual affair.
+  }
+}
 
 /**
- * Register a Picture-in-Picture entry handler.
- *
- * Called when the browser automatically enters PiP (e.g., on tab switch for
- * Chromium's "video conferencing" heuristic, Chrome 120+) or when the user
- * manually requests it via the panel's button.
- *
- * The handler should call video.requestPictureInPicture() to enter PiP.
+ * Register the call's auto-PiP entry handler, or clear it. While set it
+ * wins over any plugin video; clearing it hands the action back to the
+ * plugin's, if one is playing.
  */
 export function setOnPictureInPictureEnter(
   handler: (() => void) | null
 ): void {
   _pipEnterHandler = handler;
+  syncPipAction();
+}
 
-  // Register the handler with navigator.mediaSession so Chromium calls it
-  // when auto-entering PiP on tab switch.
-  const ms = navigator.mediaSession;
-  if (!ms) return;
-
-  if (handler) {
-    try {
-      // enterpictureinpicture is a non-standard action, so cast to any.
-      ms.setActionHandler("enterpictureinpicture" as MediaSessionAction, () => {
-        handler();
-      });
-    } catch {
-      // enterpictureinpicture is not supported on this browser.
+/**
+ * Float one video in the browser's own picture-in-picture window. Needs a
+ * user gesture on most platforms. False where there is no API at all
+ * (Firefox offers only its hover toggle) or the browser refused.
+ */
+export async function requestElementPip(
+  video: HTMLVideoElement
+): Promise<boolean> {
+  try {
+    if (document.pictureInPictureElement === video) return true;
+    if (typeof video.requestPictureInPicture === "function") {
+      await video.requestPictureInPicture();
+      return true;
     }
-  } else {
-    // Clear the handler.
-    try {
-      ms.setActionHandler("enterpictureinpicture" as MediaSessionAction, null);
-    } catch {
-      // Ignore if unsupported.
+    const webkit = video as unknown as {
+      webkitSupportsPresentationMode?: (mode: string) => boolean;
+      webkitSetPresentationMode?: (mode: string) => void;
+    };
+    if (
+      webkit.webkitSetPresentationMode &&
+      webkit.webkitSupportsPresentationMode?.("picture-in-picture")
+    ) {
+      webkit.webkitSetPresentationMode("picture-in-picture");
+      return true;
     }
+  } catch (err) {
+    console.warn("[pip] could not open:", err);
   }
+  return false;
 }

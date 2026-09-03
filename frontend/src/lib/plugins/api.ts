@@ -127,8 +127,23 @@ export interface HostApi {
       onPause?: () => void;
       onNext?: () => void;
       onPrevious?: () => void;
+      /**
+       * The element to float when the browser enters picture-in-picture on
+       * its own (Chromium pops the window on a tab switch while media
+       * plays). A call in progress keeps its spotlight as the target.
+       */
+      pipVideo?: HTMLVideoElement;
     } | null
   ): void;
+  /**
+   * Float this video in the browser's own picture-in-picture window, the
+   * one that survives a tab switch and, on a phone, leaving the app. Call
+   * it from a click: browsers refuse it without a gesture. Resolves false
+   * where the platform has no API (Firefox has only its hover toggle) or
+   * the browser refused. Only for media the plugin renders itself: a video
+   * inside a cross-origin iframe can be floated by nobody but the browser.
+   */
+  pictureInPicture(video: HTMLVideoElement): Promise<boolean>;
   /**
    * One round-trip probe to a peer, in milliseconds, or null if it did not
    * answer in time.

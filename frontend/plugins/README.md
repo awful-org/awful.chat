@@ -115,7 +115,8 @@ covers it:
 | `peers()` | Connected peers as `{ did, name }` |
 | `onPeerDisconnect(cb)` / `onBeforeDisconnect(cb)` | A peer left / this page is going away; both return unsubscribe |
 | `showLocalCard(data?)` / `closeLocalCard(id)` | Open (returns its id) / close the private floating surface |
-| `setNowPlaying(info \| null)` | OS media surface (lock screen, media keys) |
+| `setNowPlaying(info \| null)` | OS media surface (lock screen, media keys); `pipVideo` names the auto-PiP target |
+| `pictureInPicture(video)` | The browser's own floating window for a video the plugin renders |
 | `ping(did, opts?)` / `isRelayed(did)` | One link probe / is this peer relayed |
 | `clockSample(did, opts?)` | One NTP-style clock probe for `estimateClock` |
 | `roomContext(opts?)` | Recent human messages of this room, bounded and sanitized |
@@ -298,7 +299,14 @@ wins, null releases your claim. Call it from the surface that RENDERS
 playback and make the handlers fire your SYNCED actions - a headset pause
 should pause for everyone, exactly like an in-card button. The shape:
 `{ title, artist?, artworkUrl?, playing, onPlay?, onPause?, onNext?,
-onPrevious? }`.
+onPrevious?, pipVideo? }`. `pipVideo` is the `<video>` the browser should
+float when it enters picture-in-picture on its own (Chromium does on a tab
+switch while media plays); a call in progress keeps its spotlight as the
+target. For a button, `host.pictureInPicture(video)` opens the browser's own
+floating window from a click and resolves false where there is no API
+(Firefox has only its hover toggle). Both are for media the plugin renders
+itself: nobody but the browser can float a video inside a cross-origin
+iframe, so the YouTube player stays on the browser's context menu.
 
 **Updates** attach to a card. `host.sendUpdate(cardId, data)` persists and
 replays; `{ ephemeral: true }` sends live-only (cursors, ticks) and is capped
