@@ -24,6 +24,8 @@ export interface NowPlayingInfo {
 }
 
 let _owner: symbol | null = null;
+/** The metadata last handed to the browser, so repeats are not re-fetched. */
+let _metaKey: string | null = null;
 
 /**
  * Metadata caps. What a plugin passes here is peer-supplied (a title from a
@@ -53,6 +55,7 @@ function apply(info: NowPlayingInfo | null): void {
   syncPipAction();
   try {
     if (!info) {
+      _metaKey = null;
       ms.metadata = null;
       ms.playbackState = "none";
       for (const a of ["play", "pause", "nexttrack", "previoustrack"] as const) {
@@ -65,13 +68,23 @@ function apply(info: NowPlayingInfo | null): void {
       return;
     }
     const artwork = safeArtwork(info.artworkUrl);
-    ms.metadata = new MediaMetadata({
-      title: cap(info.title),
-      artist: cap(info.artist),
-      artwork: artwork
-        ? [{ src: artwork, sizes: "480x360", type: "image/jpeg" }]
-        : [],
-    });
+    const title = cap(info.title);
+    const artist = cap(info.artist);
+    // Only a CHANGED metadata object is assigned: every assignment makes
+    // the browser fetch the artwork again, and a playback plugin re-applies
+    // on each play and pause, so a party's cover was fetched per click.
+    // playbackState and the handlers are cheap and always refreshed.
+    const key = `${title}\u0000${artist}\u0000${artwork ?? ""}`;
+    if (key !== _metaKey) {
+      _metaKey = key;
+      ms.metadata = new MediaMetadata({
+        title,
+        artist,
+        artwork: artwork
+          ? [{ src: artwork, sizes: "480x360", type: "image/jpeg" }]
+          : [],
+      });
+    }
     ms.playbackState = info.playing ? "playing" : "paused";
     const bind = (
       action: MediaSessionAction,
