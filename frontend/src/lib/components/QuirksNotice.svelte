@@ -40,13 +40,13 @@
     },
     {
       icon: Send,
-      title: "DMs are delivered device to device",
-      body: "A direct message travels straight between your devices when you are both online. If the other person is offline, an encrypted copy waits at the relay for up to 48 hours and they collect it next time they open the app - the relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn this off in Settings > Session, and then DMs simply queue until you are both online together. Delivery and read receipts exist in DMs only, not in rooms.",
+      title: "DMs are the only messages that wait for you",
+      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms.",
     },
     {
       icon: RefreshCw,
-      title: "Room history comes from whoever is online",
-      body: "There is no archive in the cloud. When you join a room or come back to it, you receive the messages held by the peers online at that moment. Anything they do not have arrives later, when someone who kept it shows up.",
+      title: "A room message needs the other person to have the app open",
+      body: "Room messages are not stored anywhere for later. They go straight to the people whose app is open at the same moment as yours, and nobody else receives them right then - there is no offline inbox for rooms, only for DMs. Someone who was away gets your message when they come back and pull history from a peer who was there and kept it, so it arrives only if such a peer is online. Anything nobody kept is gone.",
     },
     {
       icon: Hash,

@@ -35,7 +35,9 @@ try {
     await alice.clickText("Join Room");
     return alice.eval(`location.pathname.startsWith('/r/') ? location.pathname : null`);
   });
-  const code = await alice.eval(`location.pathname.split('/r/')[1]`);
+  // Invite links carry the code in the fragment now (/r/#code); the path form
+  // is only what an old link looks like.
+  const code = await alice.eval(`location.hash.slice(1) || location.pathname.split('/r/')[1] || ''`);
   console.log("room:", code);
 
   // Bob joins by code through the UI.

@@ -10,6 +10,15 @@ package main
 // fresh timestamp, then acks; acked blobs are deleted immediately and
 // unclaimed ones expire after MailboxTTL.
 //
+// One identity can hold SEVERAL devices, and they share one box because the
+// box id is derived from the did alone. A client may therefore name itself
+// with an optional "device" (its libp2p peerId) on collect and ack: an ack
+// then records that device against the blob instead of deleting it, and
+// collect hides only what that device already has. Without it the old
+// delete-on-ack behaviour stands, which is what made a phone next to an
+// always-on desktop never receive its offline DMs - the desktop acked first
+// and the blob was gone before the phone woke up.
+//
 // What the relay learns: recipient mailbox, deposit times, padded sizes,
 // depositor IP. What it cannot learn: content, sender identity.
 //
@@ -28,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,17 +92,45 @@ const (
 	// deposit that does meet it evicts a stale box before refusing (see
 	// evictOldestStaleBox).
 	mailboxGlobalMaxBoxes = mailboxGlobalMaxFiles / 2
-	// Deposit/collect/ack per-IP budgets. Deposits get their own bucket so a
-	// chatty plugin proxying data does not starve offline DMs (and vice
-	// versa); collect+ack were previously unlimited, a free CPU/verify sink.
-	mailboxDepositLimit = 10
-	mailboxAuthedLimit  = 30
+	// Deposit/collect/ack per-IP budgets, per minute. Deposits get their own
+	// bucket so a chatty plugin proxying data does not starve offline DMs
+	// (and vice versa); collect+ack were previously unlimited, a free
+	// CPU/verify sink.
+	//
+	// Receipts are deposits too: collecting a box of N DMs sends N acks
+	// back through here, and a conversation opened on a page of unread
+	// sends one read receipt. At 10 a minute the acks for one collect ate
+	// the whole budget and the sender's ticks never moved. The IP is also
+	// shared by a household behind one NAT and by every phone on a
+	// carrier's CGNAT, so the number has to cover several people at once.
+	mailboxDepositLimit = 120
+	mailboxAuthedLimit  = 240
 	// Maximum IDs one ack request may carry. A real client acks what it just
 	// collected, which is a small number bounded by mailboxMaxMsgs. This limit
 	// leaves clear headroom and prevents the ack loop from doing unbounded
 	// filesystem syscalls under the global lock.
 	mailboxMaxAckIDs = 256
+	// Devices one blob may be acked by before the earliest is forgotten. A box
+	// is one identity; sixteen is well past a real person's device count, and
+	// the bound is what keeps the ack index a small file rather than something
+	// an identity can grow without limit.
+	mailboxMaxAckDevices = 16
 )
+
+// ackIndexName is the per-box file recording which devices have acked which
+// blob: {"<blob id>": ["<peerId>", ...]}. One extra inode per box rather than
+// a sidecar per blob. The name is deliberately NOT a blob id (mailboxIDRe is
+// hex only), so collect skips it and the deposit scan below excludes it.
+//
+// Losing this file costs a device one duplicate DM, nothing more, so it is
+// written in place with no fsync and no temp-and-rename like everything else
+// here.
+const ackIndexName = "acks.json"
+
+// mailboxDeviceRe matches a libp2p peerId as the frontend sends it: base58,
+// no separators. Length is bounded on both sides because this string is a map
+// key written to disk.
+var mailboxDeviceRe = regexp.MustCompile(`^[1-9A-HJ-NP-Za-km-z]{32,64}$`)
 
 var mailboxDir = func() string {
 	if d := os.Getenv("MAILBOX_DIR"); d != "" {
@@ -280,6 +318,86 @@ func mailboxInitUsedBytes() {
 	}
 }
 
+// readAckIndex returns the box's per-blob device ack sets. A missing or
+// unreadable file means "nothing acked yet", which only ever costs a device a
+// duplicate. Caller holds mailboxMu.
+func readAckIndex(box string) map[string][]string {
+	idx := map[string][]string{}
+	data, err := os.ReadFile(filepath.Join(boxPath(box), ackIndexName))
+	if err != nil {
+		return idx
+	}
+	if json.Unmarshal(data, &idx) != nil {
+		return map[string][]string{}
+	}
+	return idx
+}
+
+// writeAckIndex persists the index, removing the file once nothing is acked so
+// an emptied box can still be rmdir'd. It is charged to the global budget like
+// any other file here, so create/grow/remove all have to move the counters.
+// Caller holds mailboxMu.
+func writeAckIndex(box string, idx map[string][]string) {
+	p := filepath.Join(boxPath(box), ackIndexName)
+	var oldCharge int64
+	existed := false
+	if info, err := os.Stat(p); err == nil {
+		existed, oldCharge = true, mailboxCharge(info.Size())
+	}
+	if len(idx) == 0 {
+		if existed && os.Remove(p) == nil {
+			if mailboxUsedBytes >= oldCharge {
+				mailboxUsedBytes -= oldCharge
+			}
+			if mailboxFiles > 0 {
+				mailboxFiles--
+			}
+		}
+		return
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		return
+	}
+	if os.WriteFile(p, data, 0o600) != nil {
+		return
+	}
+	if !existed {
+		mailboxFiles++
+	}
+	mailboxUsedBytes += mailboxCharge(int64(len(data))) - oldCharge
+	if mailboxUsedBytes < 0 {
+		mailboxUsedBytes = 0
+	}
+}
+
+// pruneAckIndex drops entries for blobs that are no longer on disk and reports
+// whether it changed anything. Without it an expired blob's device list would
+// outlive it and the index would grow for the life of the box.
+func pruneAckIndex(idx map[string][]string, alive map[string]struct{}) bool {
+	changed := false
+	for id := range idx {
+		if _, ok := alive[id]; !ok {
+			delete(idx, id)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// aliveBlobs lists the blob ids currently in a box, excluding the ack index
+// and anything else that is not a blob name.
+func aliveBlobs(box string) map[string]struct{} {
+	alive := map[string]struct{}{}
+	entries, _ := os.ReadDir(boxPath(box))
+	for _, e := range entries {
+		if mailboxIDRe.MatchString(e.Name()) {
+			alive[e.Name()] = struct{}{}
+		}
+	}
+	return alive
+}
+
 // evictOldestStaleBox frees one box directory when the box ceiling is hit, so
 // a flood of tiny deposits cannot close the door on every NEW recipient for a
 // full TTL while the boxes it created sit expired. A directory's mtime moves
@@ -385,6 +503,11 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	var total int64
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
+		// Blobs only: the ack index shares the directory and is neither a
+		// message for the per-box count nor something eviction may unlink.
+		if !mailboxIDRe.MatchString(e.Name()) {
+			continue
+		}
 		info, err := e.Info()
 		if err != nil {
 			continue
@@ -445,6 +568,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	// recoverable: the mailbox is only a latency shortcut, and the sender's
 	// P2P offline queue keeps the message and retries regardless.
 	evicted := 0
+	var evictedIDs []string
 	for len(stored) > 0 &&
 		(len(stored)+1 > mailboxMaxMsgs || total > mailboxMaxBytes) {
 		oldest := stored[0]
@@ -454,11 +578,23 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 			mailboxUsedBytes -= mailboxCharge(oldest.size)
 			mailboxFiles--
 			evicted++
+			evictedIDs = append(evictedIDs, oldest.name)
 		}
 	}
 	if evicted > 0 {
+		// The evicted blobs' device lists go with them; only touch the index
+		// file when something was actually removed.
+		if idx := readAckIndex(req.Box); len(idx) > 0 {
+			for _, id := range evictedIDs {
+				delete(idx, id)
+			}
+			writeAckIndex(req.Box, idx)
+		}
 		log.Printf("[mailbox] evicted %d blob(s) from a full box", evicted)
 	}
+	// The relay only learns THAT this box has mail, and that is all the push
+	// says. Enqueue only - never a push service round trip on this request.
+	pushNotifyBox(req.Box)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -475,12 +611,17 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Did string `json:"did"`
-		Ts  int64  `json:"ts"`
-		Sig string `json:"sig"`
+		Did    string `json:"did"`
+		Ts     int64  `json:"ts"`
+		Sig    string `json:"sig"`
+		Device string `json:"device"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Device != "" && !mailboxDeviceRe.MatchString(req.Device) {
+		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
 	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
@@ -488,10 +629,24 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Under mailboxMu only for the small index read, not for the blob reads
+	// below: collect deliberately does no I/O under the lock that a deposit
+	// would then queue behind.
+	acked := map[string][]string{}
+	if req.Device != "" {
+		mailboxMu.Lock()
+		acked = readAckIndex(box)
+		mailboxMu.Unlock()
+	}
 	entries, _ := os.ReadDir(boxPath(box))
 	out := []mailboxEntry{}
 	for _, e := range entries {
 		if !mailboxIDRe.MatchString(e.Name()) {
+			continue
+		}
+		// A blob this device has already acked is still on disk for the
+		// identity's OTHER devices; it is just not this device's mail any more.
+		if req.Device != "" && slices.Contains(acked[e.Name()], req.Device) {
 			continue
 		}
 		blob, err := os.ReadFile(filepath.Join(boxPath(box), e.Name()))
@@ -522,13 +677,18 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Did string   `json:"did"`
-		Ts  int64    `json:"ts"`
-		Sig string   `json:"sig"`
-		IDs []string `json:"ids"`
+		Did    string   `json:"did"`
+		Ts     int64    `json:"ts"`
+		Sig    string   `json:"sig"`
+		IDs    []string `json:"ids"`
+		Device string   `json:"device"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Device != "" && !mailboxDeviceRe.MatchString(req.Device) {
+		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
 	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
@@ -553,6 +713,36 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 	// deposit's ReadDir->WriteFile window turned that deposit into a
 	// spurious 500 (WriteFile into a just-removed directory).
 	mailboxMu.Lock()
+	defer mailboxMu.Unlock()
+
+	// Per-device ack: record the device and keep the blob for this identity's
+	// other devices. Nothing is deleted here - TTL and the deposit-time quota
+	// eviction remain the only ways a blob leaves the box.
+	if req.Device != "" {
+		alive := aliveBlobs(box)
+		idx := readAckIndex(box)
+		pruneAckIndex(idx, alive)
+		for _, id := range validIDs {
+			if _, ok := alive[id]; !ok {
+				continue
+			}
+			devs := idx[id]
+			if slices.Contains(devs, req.Device) {
+				continue
+			}
+			if len(devs) >= mailboxMaxAckDevices {
+				// Oldest out first. An identity that runs through more than
+				// sixteen devices gets its earliest one re-delivered once,
+				// which is cheaper than an unbounded list on disk.
+				devs = devs[1:]
+			}
+			idx[id] = append(devs, req.Device)
+		}
+		writeAckIndex(box, idx)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	for _, id := range validIDs {
 		p := filepath.Join(boxPath(box), id)
 		if info, err := os.Stat(p); err == nil && os.Remove(p) == nil {
@@ -568,13 +758,67 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// A blob deleted the old way takes its device list with it, and emptying
+	// the index removes the file - without which the box below could never be
+	// rmdir'd again.
+	if idx := readAckIndex(box); len(idx) > 0 {
+		for _, id := range validIDs {
+			delete(idx, id)
+		}
+		writeAckIndex(box, idx)
+	}
 	if os.Remove(boxPath(box)) == nil { // succeeds only when empty
 		if mailboxBoxes > 0 {
 			mailboxBoxes--
 		}
 	}
-	mailboxMu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// sweepMailboxOnce expires blobs past mailboxTTL and returns how many it
+// removed. Split out of startMailboxSweeper so a test can drive one pass;
+// TTL is the only thing that still frees a blob every device has acked.
+func sweepMailboxOnce(now time.Time) int {
+	cutoff := now.Add(-mailboxTTL)
+	boxes, _ := os.ReadDir(mailboxDir)
+	removed := 0
+	for _, b := range boxes {
+		dir := filepath.Join(mailboxDir, b.Name())
+		// Same deposit-vs-remove race as ack: the empty-dir Remove must not
+		// land inside a deposit's quota-check window.
+		mailboxMu.Lock()
+		alive := map[string]struct{}{}
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			// The ack index is expired with its blobs, not on its own mtime:
+			// an ack moves that mtime, so ageing it separately would drop
+			// live ack state while the blobs it describes stayed.
+			if !mailboxIDRe.MatchString(e.Name()) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Before(cutoff) {
+				if os.Remove(filepath.Join(dir, e.Name())) == nil {
+					mailboxUsedBytes -= mailboxCharge(info.Size())
+					mailboxFiles--
+				}
+				removed++
+				continue
+			}
+			alive[e.Name()] = struct{}{}
+		}
+		if idx := readAckIndex(b.Name()); len(idx) > 0 && pruneAckIndex(idx, alive) {
+			writeAckIndex(b.Name(), idx)
+		}
+		if os.Remove(dir) == nil { // only if empty
+			mailboxBoxes--
+		}
+		mailboxMu.Unlock()
+	}
+	return removed
 }
 
 // startMailboxSweeper expires unclaimed blobs. Runs hourly; a restart
@@ -583,30 +827,7 @@ func startMailboxSweeper() {
 	mailboxInitUsedBytes()
 	go func() {
 		for {
-			cutoff := time.Now().Add(-mailboxTTL)
-			boxes, _ := os.ReadDir(mailboxDir)
-			removed := 0
-			for _, b := range boxes {
-				dir := filepath.Join(mailboxDir, b.Name())
-				// Same deposit-vs-remove race as ack: the empty-dir Remove
-				// must not land inside a deposit's quota-check window.
-				mailboxMu.Lock()
-				entries, _ := os.ReadDir(dir)
-				for _, e := range entries {
-					if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
-						if os.Remove(filepath.Join(dir, e.Name())) == nil {
-							mailboxUsedBytes -= mailboxCharge(info.Size())
-							mailboxFiles--
-						}
-						removed++
-					}
-				}
-				if os.Remove(dir) == nil { // only if empty
-					mailboxBoxes--
-				}
-				mailboxMu.Unlock()
-			}
-			if removed > 0 {
+			if removed := sweepMailboxOnce(time.Now()); removed > 0 {
 				log.Printf("[mailbox] expired %d blob(s)", removed)
 			}
 			time.Sleep(time.Hour)

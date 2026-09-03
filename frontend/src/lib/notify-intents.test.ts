@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   drainNotifyIntents,
+  keepDroppedReplyDraft,
   rememberRoomRef,
   storeNotifyIntent,
+  takeDroppedReplyDraft,
   ROOM_REF_PREFIX,
   type NotifyIntent,
 } from "./notify-intents";
@@ -79,5 +81,34 @@ describe("notify intents", () => {
     expect(drained.map((i) => i.text)).toEqual(["fresh"]);
     // The stale one was cleared, not left to reappear.
     expect(await drainNotifyIntents()).toEqual([]);
+  });
+
+  it("keeps a reply too old to send as a draft for its conversation", async () => {
+    await storeNotifyIntent(
+      intent({
+        roomCode: "room-stale",
+        text: "sorry, only seeing this now",
+        ts: Date.now() - 25 * 60 * 60 * 1000,
+      })
+    );
+    expect(await drainNotifyIntents()).toEqual([]);
+    // Not sent, but not silently thrown away either: from the outside a
+    // vanished reply looks exactly like one that was sent and lost.
+    expect(takeDroppedReplyDraft("room-stale")).toBe(
+      "sorry, only seeing this now"
+    );
+    // Taking it clears it: two composers must not both hold the same text.
+    expect(takeDroppedReplyDraft("room-stale")).toBeNull();
+  });
+
+  it("keeps only the newest drafts", () => {
+    for (let i = 0; i < 10; i++) keepDroppedReplyDraft(`room-${i}`, `d${i}`);
+    expect(takeDroppedReplyDraft("room-0")).toBeNull();
+    expect(takeDroppedReplyDraft("room-9")).toBe("d9");
+  });
+
+  it("ignores an empty draft", () => {
+    keepDroppedReplyDraft("room-empty", "   ");
+    expect(takeDroppedReplyDraft("room-empty")).toBeNull();
   });
 });

@@ -24,6 +24,17 @@ import { didToPublicKey } from "./identity/identity";
 const VERSION = 1;
 const INFO = "awful-mailbox-v1";
 const SIG_PREFIX = "awful-mailbox-msg:v1:";
+
+/**
+ * What the sealed envelope IS.
+ *
+ * The mailbox originally carried one thing, a DM chat envelope, so the
+ * collector could assume. It now also carries sync batches (files, plugin
+ * cards, plugin updates) and delivery/read receipts, and a collector that
+ * guesses from the first byte is a collector that guesses wrong. Absent on
+ * blobs sealed before this existed, which were all chat.
+ */
+export type MailboxKind = "chat" | "batch" | "receipt";
 /** Padded plaintext sizes. The largest stays under the relay's 16 KiB blob
  *  cap with sealing overhead - bigger content retries peer-to-peer only. */
 const BUCKETS = [1024, 4096, 15 * 1024];
@@ -59,16 +70,24 @@ async function deriveKey(
   );
 }
 
+/**
+ * The signed statement. The kind is covered for everything but "chat", whose
+ * form has to stay byte-identical to what pre-kind senders signed - so a
+ * blob cannot be re-labelled from a receipt into a batch and routed to the
+ * wrong handler while its signature still verifies.
+ */
 async function sigMessage(
   to: string,
-  env: Uint8Array
+  env: Uint8Array,
+  kind: MailboxKind = "chat"
 ): Promise<Uint8Array<ArrayBuffer>> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     env as Uint8Array<ArrayBuffer>
   );
+  const tag = kind === "chat" ? "" : kind + ":";
   return te.encode(
-    SIG_PREFIX + to + ":" + b64(new Uint8Array(digest))
+    SIG_PREFIX + to + ":" + tag + b64(new Uint8Array(digest))
   ) as Uint8Array<ArrayBuffer>;
 }
 
@@ -100,9 +119,11 @@ export async function sealDmForMailbox(args: {
   senderPrivateKey: Uint8Array<ArrayBuffer>;
   recipientDid: string;
   envelope: Uint8Array;
+  kind?: MailboxKind;
 }): Promise<Uint8Array | null> {
+  const kind: MailboxKind = args.kind ?? "chat";
   const sig = ed25519.sign(
-    await sigMessage(args.recipientDid, args.envelope),
+    await sigMessage(args.recipientDid, args.envelope, kind),
     args.senderPrivateKey
   );
   const inner = te.encode(
@@ -112,6 +133,10 @@ export async function sealDmForMailbox(args: {
       to: args.recipientDid,
       env: b64(args.envelope),
       sig: b64(sig),
+      // Omitted for chat: an older collector ignores unknown fields, but
+      // leaving the common case byte-identical keeps the padding buckets
+      // behaving exactly as they did.
+      ...(kind === "chat" ? {} : { k: kind }),
     })
   );
   let padded: Uint8Array<ArrayBuffer>;
@@ -146,7 +171,7 @@ export async function openDmFromMailbox(args: {
   blob: Uint8Array;
   selfDid: string;
   selfPrivateKey: Uint8Array<ArrayBuffer>;
-}): Promise<{ senderDid: string; envelope: Uint8Array }> {
+}): Promise<{ senderDid: string; envelope: Uint8Array; kind: MailboxKind }> {
   const { blob } = args;
   if (blob.length < 46 || blob[0] !== VERSION) throw new Error("bad blob");
   const ephPub = blob.subarray(1, 33);
@@ -166,9 +191,18 @@ export async function openDmFromMailbox(args: {
     to: string;
     env: string;
     sig: string;
+    k?: string;
   };
   if (inner.v !== VERSION) throw new Error("bad version");
   if (inner.to !== args.selfDid) throw new Error("not sealed for us");
+  // Absent means chat - every blob sealed before kinds existed was one.
+  // Anything unrecognised is refused rather than guessed at: routing an
+  // unknown shape into a handler is how a parser gets fed the wrong bytes.
+  const kind: MailboxKind =
+    inner.k === undefined ? "chat" : (inner.k as MailboxKind);
+  if (kind !== "chat" && kind !== "batch" && kind !== "receipt") {
+    throw new Error("unknown mailbox kind");
+  }
   const envelope = unb64(inner.env);
   // zip215:false for the same reason messaging.ts passes it: @noble defaults
   // to the cofactored ZIP215 equation, which accepts small-order public keys,
@@ -177,12 +211,12 @@ export async function openDmFromMailbox(args: {
   // thing that attributes an offline DM to somebody.
   const ok = ed25519.verify(
     unb64(inner.sig),
-    await sigMessage(inner.to, envelope),
+    await sigMessage(inner.to, envelope, kind),
     didToPublicKey(inner.from),
     { zip215: false }
   );
   if (!ok) throw new Error("bad sender signature");
-  return { senderDid: inner.from, envelope };
+  return { senderDid: inner.from, envelope, kind };
 }
 
 /** Mailbox id: the relay never needs the did itself. */

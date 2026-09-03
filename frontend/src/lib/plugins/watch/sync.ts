@@ -195,3 +195,40 @@ export function decideCorrection(
 
   return { action: "none", targetPosition, rate: 1, driftMs };
 }
+
+/** A keyboard control intent for a watch-party surface. Null for a key that
+ *  is not a shortcut. */
+export type WatchKeyIntent =
+  | "toggle-play"
+  | "seek-back"
+  | "seek-forward"
+  | "volume-up"
+  | "volume-down"
+  | null;
+
+/**
+ * Map a KeyboardEvent.key to a watch-party intent. Pure on purpose, like the
+ * rest of this library: the SURFACE owns the listener, decides where it is
+ * allowed to fire (a focused call tile, never while a text field has focus),
+ * and calls preventDefault. This is only the shared key-to-meaning table so
+ * two watch-together plugins do not disagree about which arrow does what.
+ */
+export function watchKeyIntent(key: string): WatchKeyIntent {
+  switch (key) {
+    // Space and "k" are the two play/pause keys a video player is expected to
+    // honour; " " is what KeyboardEvent.key reports for the space bar.
+    case " ":
+    case "k":
+      return "toggle-play";
+    case "ArrowLeft":
+      return "seek-back";
+    case "ArrowRight":
+      return "seek-forward";
+    case "ArrowUp":
+      return "volume-up";
+    case "ArrowDown":
+      return "volume-down";
+    default:
+      return null;
+  }
+}

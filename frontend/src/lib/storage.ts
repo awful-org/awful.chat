@@ -1547,22 +1547,46 @@ const ATTACHMENT_STATUS_RANK: Record<AttachmentStatus, number> = {
   seeding: 4,
 };
 
-/** Advance an attachment's status. Late progress events must not regress it. */
+/**
+ * Advance an attachment's status. Late progress events must not regress it.
+ *
+ * Open, re-seal, write - never patch the sealed row in place. status is a
+ * clear field and the v3 AAD binds every clear field to the ciphertext, so
+ * a row whose status was rewritten around the seal stopped decrypting: the
+ * next read dropped it as undecryptable, and every image a peer had just
+ * downloaded, and every image the sender was seeding, vanished on the next
+ * room open and showed its skeleton forever.
+ */
 export async function updateAttachmentStatus(
   id: string,
   status: AttachmentStatus
 ): Promise<void> {
   const database = await getDB();
-  const tx = database.transaction("attachments", "readwrite");
-  const attachment = await tx.store.get(id);
+  const attachment = await _open<Attachment>(
+    "attachments",
+    await database.get("attachments", id)
+  );
   if (!attachment) return;
   if (
     ATTACHMENT_STATUS_RANK[attachment.status] >= ATTACHMENT_STATUS_RANK[status]
   ) {
     return;
   }
-  await tx.store.put({ ...attachment, status });
+  const sealed = await _seal("attachments", { ...attachment, status });
+  // The seal ran outside any transaction: re-check against the freshest row
+  // so a later status is never regressed and a deleted row never returns.
+  const tx = database.transaction("attachments", "readwrite");
+  const fresh = await tx.store.get(id);
+  if (
+    !fresh ||
+    ATTACHMENT_STATUS_RANK[fresh.status] >= ATTACHMENT_STATUS_RANK[status]
+  ) {
+    await tx.done;
+    return;
+  }
+  await tx.store.put(sealed);
   await tx.done;
+  _attachmentEpoch += 1;
 }
 
 /**

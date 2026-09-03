@@ -1,7 +1,11 @@
 /// <reference lib="webworker" />
 
-import { clientsClaim } from "workbox-core";
-import { precacheAndRoute, matchPrecache } from "workbox-precaching";
+import { cacheNames, clientsClaim } from "workbox-core";
+import {
+  precacheAndRoute,
+  matchPrecache,
+  getCacheKeyForURL,
+} from "workbox-precaching";
 import { storeSharedPayload } from "$lib/share-target";
 import { storeNotifyIntent } from "$lib/notify-intents";
 
@@ -36,14 +40,25 @@ self.addEventListener("notificationclick", (event) => {
           ts: Date.now(),
         }).catch(() => {});
       }
-      const wins = await self.clients.matchAll({
+      const wins = (await self.clients.matchAll({
         type: "window",
         includeUncontrolled: true,
-      });
-      const win = wins[0] as WindowClient | undefined;
+      })) as WindowClient[];
+      // The window the user is actually looking at, if there is one. matchAll
+      // is otherwise ordered most-recently-focused first, so wins[0] is the
+      // best remaining guess. Taking wins[0] blind could focus a stale
+      // background tab and leave the tap looking like it did nothing.
+      const win =
+        wins.find((w) => w.visibilityState === "visible" || w.focused) ??
+        wins[0];
       if (win) {
         await win.focus().catch(() => {});
         win.postMessage({ type: "notify-intent" });
+        // A push says only that mail is waiting, never what it is, so the tap
+        // has to make the app go and look. The app already collects when it
+        // becomes visible; this covers the window that was visible all along
+        // and therefore never fires that.
+        win.postMessage({ type: "mailbox-collect" });
       } else {
         // Replies too: with no window alive, opening the app is the ONLY
         // way the stored intent ever gets drained and sent - gating this
@@ -59,6 +74,46 @@ self.addEventListener("message", (event) => {
   if (event.data && event.data.type === "SKIP_WAITING") {
     void self.skipWaiting();
   }
+});
+
+/**
+ * A push from the relay. The payload is `{"t":"mail"}` and carries no content
+ * whatsoever - the relay holds sealed envelopes it cannot read, and this
+ * worker holds no key to open one with - so the notification is deliberately
+ * generic. The app fetches and decrypts the mailbox itself once it is open
+ * and unlocked, and replaces this with the real thing.
+ *
+ * userVisibleOnly is not a formality: a push that shows nothing costs the
+ * origin its push permission, so this ALWAYS shows a notification.
+ */
+let pushedSinceStart = 0;
+
+self.addEventListener("push", (event) => {
+  event.waitUntil(
+    (async () => {
+      await self.registration.showNotification("New message", {
+        body: "Open awful.chat to read it",
+        tag: "mail",
+        // The relay sends at most one push a minute per identity, so a
+        // repeat really is new mail and should be felt, not swapped in
+        // silently under the tag above.
+        renotify: true,
+        icon: "/pwa-192x192.png",
+        badge: "/pwa-64x64.png",
+        data: { push: true },
+      } as NotificationOptions);
+
+      // The count restarts whenever the browser has torn this worker down
+      // between pushes: there is no API to read the badge back, and a wrong
+      // small number beats no number at all. The app overwrites it with the
+      // real unread total the moment it opens.
+      const nav = navigator as Navigator & {
+        setAppBadge?: (n?: number) => Promise<void>;
+      };
+      pushedSinceStart += 1;
+      await nav.setAppBadge?.(pushedSinceStart).catch(() => {});
+    })()
+  );
 });
 
 precacheAndRoute(
@@ -145,6 +200,38 @@ async function handleNavigation(request: Request): Promise<Response> {
   return fetch(request);
 }
 
+/** One refresh per worker lifetime: a burst of navigations must not turn into
+ *  a burst of shell fetches. */
+let shellRefreshed = false;
+
+/**
+ * Stale-while-revalidate for the shell.
+ *
+ * The precached index.html only changes when a NEW worker installs, and a
+ * "prompt" registration waits for the user to accept that. Somebody who never
+ * accepts - which on a phone is most people, the popup is at the bottom of a
+ * screen they are not looking at - kept being served the shell from whenever
+ * they installed. Serving the cached copy stays the fast path; this quietly
+ * puts the current one in its place for the NEXT launch.
+ */
+async function refreshShell(): Promise<void> {
+  if (shellRefreshed || !navigator.onLine) return;
+  shellRefreshed = true;
+  try {
+    // The precache is keyed by URL + revision, so the entry has to be
+    // replaced under the key workbox filed it under, not under "/index.html".
+    const key = getCacheKeyForURL("index.html");
+    if (!key) return;
+    const res = await fetch(key, { cache: "no-store" });
+    if (!res.ok) return;
+    const cache = await caches.open(cacheNames.precache);
+    await cache.put(key, res);
+  } catch {
+    // Offline, or a captive portal answering with its own page. The cached
+    // shell is still perfectly good; that is the point of serving it first.
+  }
+}
+
 self.addEventListener("fetch", (event) => {
   const request = event.request;
 
@@ -196,6 +283,9 @@ self.addEventListener("fetch", (event) => {
   if (request.mode === "navigate") {
     if (!/\.[a-z0-9]+$/i.test(new URL(request.url).pathname)) {
       event.respondWith(handleNavigation(request));
+      // After the response, not in front of it: the revalidate half of
+      // stale-while-revalidate must never be something the user waits on.
+      event.waitUntil(refreshShell());
     }
     return;
   }

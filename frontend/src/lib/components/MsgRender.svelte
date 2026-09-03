@@ -103,6 +103,30 @@
 
   let { msg, isOwn, fileTransfers, onRequestFileDownload }: Props = $props();
 
+  /** DM conversations are keyed "dm-<...>"; see announce.ts. */
+  const isDmMessage = $derived(msg.roomCode.startsWith("dm-"));
+
+  /**
+   * What the tick under your own message means.
+   *
+   * DM only: rooms carry a status internally but never show one.
+   */
+  const statusTip = $derived.by(() => {
+    const status = msg.status;
+    if (!status) return "";
+    if (status === "sent") return "Sent - the relay holds it until they are online";
+    if (status === "delivered") return "Delivered to their device";
+    if (status === "read") return "Read";
+    // Too large for the mailbox, so it can only ever travel peer to peer:
+    // saying it is waiting in their offline inbox would be a flat lie.
+    if (transportState.dmQueuedP2POnly.has(msg.id)) {
+      return "Too long for the offline inbox, sends when they are online";
+    }
+    return mailboxPrefs.enabled
+      ? "Queued - waiting in their offline inbox"
+      : "Queued - will send when the recipient is reachable";
+  });
+
   /**
    * Whether a not-yet-loaded media file deserves its skeleton. An active
    * download obviously does. A PENDING one does too when it is small enough
@@ -1354,14 +1378,12 @@
     {/if}
   {/if}
 
-  {#if isOwn && msg.status}
-    <Tip
-      text={msg.status === "sending"
-        ? mailboxPrefs.enabled
-          ? "Queued - waiting in their offline inbox"
-          : "Queued - will send when the recipient is reachable"
-        : msg.status.charAt(0).toUpperCase() + msg.status.slice(1)}
-    >
+  <!-- DM only. Rooms track no receipts, and even the clock for "reached
+       nobody yet" read as one, so a room message shows no status at all.
+       One tick: the relay holds it. Two: their device has it. Green: they
+       opened it. -->
+  {#if isOwn && isDmMessage && msg.status}
+    <Tip text={statusTip}>
       {#snippet children(props)}
         <span
           {...props}
@@ -1374,8 +1396,15 @@
             <Check class="size-3 text-muted-foreground" />
           {:else if msg.status === "delivered"}
             <CheckCheck class="size-3 text-muted-foreground" />
+          {:else if msg.status === "read"}
+            <CheckCheck class="size-3 text-green-500" />
           {:else}
-            <CheckCheck class="size-3 text-primary" />
+            <!-- Any status this build does not know about. It used to fall
+                 into the "read" arm, so a new one - a message queued for
+                 direct delivery, say - would have claimed the recipient had
+                 read something they had not received. Unknown means not
+                 delivered yet, which is the safe half to be wrong on. -->
+            <Clock class="size-3 text-muted-foreground" />
           {/if}
         </span>
       {/snippet}

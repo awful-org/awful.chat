@@ -1,18 +1,22 @@
 import { playMessageSound } from "./sounds";
-import { shouldPlayMessageSound } from "./notify-rules";
+import { shouldPlayMessageSound, shouldShowNotification } from "./notify-rules";
 
 /**
  * notify.svelte.ts - app badge and local notifications.
  *
- * There is no push here and there cannot be: no server holds your messages, so
- * nothing exists to wake the app up when it is closed. What IS possible is
- * telling you about a message that arrived while the app is running but not on
- * screen (another tab, minimised, phone in your pocket with the PWA open), and
- * putting the unread count on the installed icon. Both are local-only.
+ * Local-only, and everything here works with no server at all: a message that
+ * arrived while the app is running but not being read (another tab, minimised,
+ * another conversation on screen) and the unread count on the installed icon.
+ *
+ * Waking a CLOSED app is push, and that lives in push.svelte.ts: the relay
+ * learns a push address and the fact that mail is waiting, never the message.
+ * The two do not overlap - a push shows a generic notification from the
+ * service worker, this one has the text because the app is already running.
  */
 
 const PREF_KEY = "awful:notifications:v1";
 const SOUND_PREF_KEY = "awful:message-sounds:v1";
+const HIDE_PREVIEW_KEY = "awful:notify-hide-preview:v1";
 
 export const notifyState = $state({
   /** User has switched notifications on in settings. */
@@ -22,6 +26,9 @@ export const notifyState = $state({
   supported: false,
   /** Play a sound for incoming messages. On by default; needs no permission. */
   soundsEnabled: true,
+  /** Keep the message text off the lock screen: who it is from, not what it
+   *  says. Off by default - a preview is the point of a notification. */
+  hidePreview: false,
 });
 
 if (typeof window !== "undefined") {
@@ -32,6 +39,7 @@ if (typeof window !== "undefined") {
       localStorage.getItem(PREF_KEY) === "1" &&
       notifyState.permission === "granted";
     notifyState.soundsEnabled = localStorage.getItem(SOUND_PREF_KEY) !== "0";
+    notifyState.hidePreview = localStorage.getItem(HIDE_PREVIEW_KEY) === "1";
   } catch {}
 
   // A second tab flipping a switch should be reflected here, not fought.
@@ -39,17 +47,58 @@ if (typeof window !== "undefined") {
     if (e.key === SOUND_PREF_KEY) {
       notifyState.soundsEnabled = e.newValue !== "0";
     }
+    if (e.key === HIDE_PREVIEW_KEY) {
+      notifyState.hidePreview = e.newValue === "1";
+    }
     if (e.key === PREF_KEY) {
       notifyState.enabled =
         e.newValue === "1" && notifyState.permission === "granted";
     }
   });
+
+  // A permission changed in the browser's own site settings fires nothing on
+  // the page, so the switch stayed stuck at "denied" until a reload - right
+  // after the user went and fixed it, which is the worst possible moment to
+  // look broken. Wrapped in a try as well as a catch: some engines throw
+  // synchronously for a permission name they do not know, and a throw here
+  // would take the whole module - and with it the app - down at import.
+  try {
+    void navigator.permissions
+      ?.query({ name: "notifications" as PermissionName })
+      .then((status) => {
+        const sync = () => {
+          if (!notifyState.supported) return;
+          notifyState.permission = Notification.permission;
+          if (notifyState.permission !== "granted") {
+            notifyState.enabled = false;
+            return;
+          }
+          // Granted again: the switch goes back to what the user had set,
+          // rather than making them find it and turn it on a second time.
+          try {
+            notifyState.enabled = localStorage.getItem(PREF_KEY) === "1";
+          } catch {}
+        };
+        status.addEventListener("change", sync);
+        sync();
+      })
+      .catch(() => {});
+  } catch {
+    // No permissions registry, or no notifications entry in it.
+  }
 }
 
 export function setMessageSoundsEnabled(on: boolean): void {
   notifyState.soundsEnabled = on;
   try {
     localStorage.setItem(SOUND_PREF_KEY, on ? "1" : "0");
+  } catch {}
+}
+
+export function setHidePreview(on: boolean): void {
+  notifyState.hidePreview = on;
+  try {
+    localStorage.setItem(HIDE_PREVIEW_KEY, on ? "1" : "0");
   } catch {}
 }
 
@@ -84,10 +133,15 @@ export async function setNotificationsEnabled(on: boolean): Promise<boolean> {
   return notifyState.enabled;
 }
 
+/** A DM or a mention is worth a buzz in a pocket; a busy room is not. */
+const URGENT_VIBRATE = [80, 40, 80];
+
 /**
  * Notify about an incoming message.
- * Only fires when the app is actually out of sight - if you are looking at the
- * window, the message is already visible.
+ *
+ * Fires whenever the conversation it belongs to is not the one being read -
+ * the app being visible is not the same as this message being visible, and on
+ * a phone it almost never is.
  */
 export function notifyMessage(opts: {
   /** Shown on a lock screen and over a shoulder. Never a room code. */
@@ -98,6 +152,11 @@ export function notifyMessage(opts: {
   tag: string;
   /** The conversation this message belongs to is the one on screen. */
   viewingConversation?: boolean;
+  /** A DM or a mention: worth a vibration, where room chatter is not. */
+  urgent?: boolean;
+  /** `body` is what somebody wrote, so the hide-preview switch replaces it.
+   *  A count ("3 new messages") is not, and is left alone. */
+  isPreview?: boolean;
   /**
    * Where a click (or inline reply) should land. Both this and `tag` survive
    * in the browser's (and on Android the OS's) own notification store, which
@@ -108,9 +167,9 @@ export function notifyMessage(opts: {
    */
   data?: { roomCode: string; dmPeerDid?: string };
 }): void {
-  // The sound has its own rule, separate from the notification's hidden-only
-  // one: it also plays while the app is visible but the message landed in
-  // another room, or the window is unfocused.
+  // Sound and notification now share a rule - what the reader can already
+  // see is the conversation, not the app - but they are asked separately:
+  // sounds need no permission and are on for people who never granted one.
   if (
     shouldPlayMessageSound({
       enabled: notifyState.soundsEnabled,
@@ -123,7 +182,23 @@ export function notifyMessage(opts: {
 
   if (!notifyState.enabled || !notifyState.supported) return;
   if (Notification.permission !== "granted") return;
-  if (typeof document !== "undefined" && !document.hidden) return;
+  if (
+    !shouldShowNotification({
+      viewingConversation: opts.viewingConversation ?? false,
+      focused: typeof document !== "undefined" && document.hasFocus(),
+      hidden: typeof document !== "undefined" && document.hidden,
+    })
+  ) {
+    return;
+  }
+
+  // Hidden previews keep the sender (a lock screen showing who wants you is
+  // most of the value) and drop what they wrote.
+  const body =
+    notifyState.hidePreview && opts.isPreview !== false
+      ? "New message"
+      : opts.body.slice(0, 180);
+  const vibrate = opts.urgent ? URGENT_VIBRATE : undefined;
 
   void (async () => {
     // Through the service worker when there is one: that is what enables
@@ -134,8 +209,13 @@ export function notifyMessage(opts: {
       const reg = await navigator.serviceWorker?.getRegistration();
       if (reg?.showNotification) {
         await reg.showNotification(opts.title, {
-          body: opts.body.slice(0, 180),
+          body,
           tag: opts.tag,
+          // Without renotify, a tag that is already on screen is REPLACED in
+          // silence: the second message in a conversation you are not reading
+          // updated the text and made no sound, buzz or light at all.
+          renotify: true,
+          vibrate,
           icon: "/pwa-192x192.png",
           badge: "/pwa-64x64.png",
           silent: false,
@@ -159,12 +239,13 @@ export function notifyMessage(opts: {
     }
     try {
       const notification = new Notification(opts.title, {
-        body: opts.body.slice(0, 180),
+        body,
         tag: opts.tag,
+        renotify: true,
         icon: "/pwa-192x192.png",
         badge: "/pwa-64x64.png",
         silent: false,
-      });
+      } as NotificationOptions);
       notification.onclick = () => {
         try {
           window.focus();
@@ -173,6 +254,33 @@ export function notifyMessage(opts: {
       };
     } catch {
       // Failing to notify must never break message handling.
+    }
+  })();
+}
+
+/**
+ * Take down notifications that have already been delivered, by tag.
+ *
+ * Opening a conversation answers every notification it ever raised, and
+ * leaving them on the lock screen makes the user dismiss by hand what they
+ * have just read. Only the service worker's registration can list them - a
+ * page-created Notification is not enumerable - so nothing to close is a
+ * normal outcome, not a failure.
+ *
+ * Tags, not room codes: the tag is what the browser's notification store
+ * holds, and announce.ts builds it from the conversation's opaque ref.
+ */
+export function closeNotificationsByTag(tags: string[]): void {
+  if (tags.length === 0) return;
+  void (async () => {
+    try {
+      const reg = await navigator.serviceWorker?.getRegistration();
+      if (!reg?.getNotifications) return;
+      for (const tag of tags) {
+        for (const n of await reg.getNotifications({ tag })) n.close();
+      }
+    } catch {
+      // No worker, or a browser that will not enumerate. Nothing to do.
     }
   })();
 }

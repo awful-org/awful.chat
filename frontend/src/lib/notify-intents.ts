@@ -330,7 +330,57 @@ export async function drainNotifyIntents(): Promise<NotifyIntent[]> {
     db.close();
   }
 
-  // Stale intents (an unlock that never came) are dropped, not replayed.
+  // Stale intents (an unlock that never came) are not replayed: a reply typed
+  // yesterday must not appear in a conversation that has moved on. It is not
+  // thrown away either - see keepDroppedReplyDraft.
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  return out.filter((i) => i.ts > cutoff);
+  const fresh: NotifyIntent[] = [];
+  for (const intent of out) {
+    if (intent.ts > cutoff) fresh.push(intent);
+    else if (intent.kind === "reply") {
+      keepDroppedReplyDraft(intent.roomCode, intent.text);
+    }
+  }
+  return fresh;
+}
+
+/**
+ * Replies that were typed but never sent, waiting for their conversation.
+ *
+ * Two things drop a reply: it aged out above, or the conversation changed
+ * between the tap and the send (the user navigated mid-drain, and a reply
+ * landing in the wrong chat is the one outcome worse than not sending it).
+ * Both used to end with the text simply gone, which from the outside looks
+ * exactly like a message that was sent and lost.
+ *
+ * In memory on purpose. Every drop happens in the same session that will open
+ * the conversation - the drain runs at unlock, the composer mounts after it -
+ * so a reload is the only thing that loses a draft, and the alternative is
+ * writing the user's words to disk to survive a case that does not arise.
+ */
+const droppedDrafts = new Map<string, string>();
+/** Bounded: an app that never opens those conversations must not accumulate
+ *  drafts for the length of the session. */
+const MAX_DROPPED_DRAFTS = 8;
+
+export function keepDroppedReplyDraft(roomCode: string, text: string): void {
+  const draft = text.trim();
+  if (!roomCode || !draft) return;
+  // Re-inserting moves it to the end, so the oldest really is dropped first.
+  droppedDrafts.delete(roomCode);
+  droppedDrafts.set(roomCode, draft);
+  for (const key of droppedDrafts.keys()) {
+    if (droppedDrafts.size <= MAX_DROPPED_DRAFTS) break;
+    droppedDrafts.delete(key);
+  }
+}
+
+/** The pending draft for a conversation, if there is one. Reading it takes
+ *  it: the composer now holds the text, and two composers must not both
+ *  claim to be the one place it lives. */
+export function takeDroppedReplyDraft(roomCode: string): string | null {
+  const draft = droppedDrafts.get(roomCode);
+  if (draft === undefined) return null;
+  droppedDrafts.delete(roomCode);
+  return draft;
 }

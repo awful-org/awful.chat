@@ -12,6 +12,7 @@ import {
   REFUSED_MAX_SENDERS,
 } from "./refused-lamports";
 import { allowSyncReaction } from "./sync-throttle";
+import { setErrorWithAutoClear } from "./call-error";
 import { blindValue } from "../storage-crypto";
 import {
   getOwnProfile,
@@ -130,11 +131,17 @@ import {
   parseDmEnvelope,
 } from "./dm-codec";
 import {
+  depositDmReceipt,
+  sendDmReadAcks,
   dmConversationCodeAsync,
   dmPeerDid,
+  dmPeerDidForRoom,
   ensureDmRoomForPeer,
+  flushQueuedDmForConnectedPeers,
   flushQueuedDmForPeer,
   joinPhonebookDmRooms,
+  noteMailboxDeposit,
+  queueDmMessage,
   resolveDmDisplayName,
   sendDirectMessage,
 } from "./dm.svelte";
@@ -433,6 +440,19 @@ interface TransportState {
   activeDmPeerId: string | null;
   dmVersion: number;
   callRoomCode: string | null;
+  /**
+   * getUserMedia failed, so this call is listen-only. Fed by voice.ts's
+   * mic-unavailable/mic-available statuses; withdrawn as soon as a later mic
+   * start succeeds, so it is safe to render as a persistent badge.
+   */
+  micUnavailable: boolean;
+  /**
+   * Ids of queued DMs too large for the offline mailbox: they will only ever
+   * be delivered peer to peer, so the recipient has to be online at the same
+   * time. `Message["status"]` is a closed union owned by types/message.ts, so
+   * the fact lives here rather than as a "queued-p2p" status.
+   */
+  dmQueuedP2POnly: Set<string>;
 }
 
 export const transportState = $state<TransportState>({
@@ -479,6 +499,8 @@ export const transportState = $state<TransportState>({
   activeDmPeerId: null,
   dmVersion: 0,
   callRoomCode: null,
+  micUnavailable: false,
+  dmQueuedP2POnly: new Set(),
 });
 
 /**
@@ -768,46 +790,71 @@ async function _acceptableReceipts(
   messageIds: string[]
 ): Promise<string[]> {
   if (!_peerIdToDid.get(peerId)) return [];
-  const roomCode = await dmConversationCodeAsync(peerId).catch(() => null);
+  return _receiptsForDmWith(peerId, messageIds);
+}
+
+/**
+ * The room half of the rule above, without the peerId binding.
+ *
+ * The mailbox path has no stream to bind: the sender's identity was proven
+ * by their signature over the sealed envelope, and `who` is that DID.
+ */
+async function _receiptsForDmWith(
+  who: string,
+  messageIds: string[]
+): Promise<string[]> {
+  const roomCode = await dmConversationCodeAsync(who).catch(() => null);
   if (!roomCode) return [];
   // One transaction, no decryption: roomCode is a clear field. Reading these
   // with getMessage per id cost a transaction plus a full row decrypt each,
   // and openDmConversation acks a whole page (50) at once.
   const ids = messageIds.filter((id) => typeof id === "string" && id);
   const clear = await messageClearFieldsByIds(ids);
-  // messageClearFieldsByIds returns blinded roomCode, so blind the wire value
-  // before comparing.
+  // Two forms of the same room code: the in-memory copy carries it plain,
+  // the clear-field read returns the blinded value the row is indexed
+  // under. Each must be compared against its own form. One compare against
+  // the blinded value for both rejected every receipt for a message the
+  // sender currently had on screen, which is exactly when they are watching
+  // the ticks.
   const blindedRoomCode = await blindValue(roomCode);
   return ids.filter((id) => {
     const local = transportState.messages.find((m) => m.id === id);
-    return (local?.roomCode ?? clear.get(id)?.roomCode) === blindedRoomCode;
+    if (local) return local.roomCode === roomCode;
+    return clear.get(id)?.roomCode === blindedRoomCode;
   });
 }
 
-async function _cascadeReadAcks(messageIds: string[]): Promise<void> {
+/**
+ * `who` names the other party, so the room is the DM with them: every id
+ * here already passed _receiptsForDmWith for that room. The room code has to
+ * be derived again rather than read off the rows, because the rows hold it
+ * blinded and markOwnMessagesReadUpTo blinds what it is given - passing the
+ * stored value blinded it twice and the cascade matched nothing.
+ */
+async function _cascadeReadAcks(
+  who: string,
+  messageIds: string[]
+): Promise<void> {
+  const roomCode = await dmConversationCodeAsync(who).catch(() => null);
+  if (!roomCode) return;
   const self = selfId();
-  const maxByRoom = new Map<string, number>();
-  // senderId, roomCode and lamport are all clear fields, so this needs no
-  // decryption and one transaction rather than one per id.
+  // senderId and lamport are clear fields, so this needs no decryption and
+  // one transaction rather than one per id.
   const clear = await messageClearFieldsByIds(messageIds);
-  // messageClearFieldsByIds returns blinded roomCode and senderId, so blind
-  // the self value before comparing.
+  // senderId is stored blinded, so blind the self value before comparing.
   const blindedSelf = await blindValue(self);
+  let lamport = 0;
   for (const m of clear.values()) {
     if (m.senderId !== blindedSelf) continue;
-    maxByRoom.set(
-      m.roomCode,
-      Math.max(maxByRoom.get(m.roomCode) ?? 0, m.lamport)
-    );
+    lamport = Math.max(lamport, m.lamport);
   }
-  for (const [roomCode, lamport] of maxByRoom) {
-    const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport);
-    if (!changed.length) continue;
-    const changedSet = new Set(changed);
-    transportState.messages = transportState.messages.map((m) =>
-      changedSet.has(m.id) ? { ...m, status: "read" } : m
-    );
-  }
+  if (!lamport) return;
+  const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport);
+  if (!changed.length) return;
+  const changedSet = new Set(changed);
+  transportState.messages = transportState.messages.map((m) =>
+    changedSet.has(m.id) ? { ...m, status: "read" } : m
+  );
 }
 
 function lamportSend(roomCode: string): number {
@@ -851,7 +898,7 @@ function lamportReceive(roomCode: string, remote: number): void {
 }
 
 if (typeof window !== "undefined") {
-  const onUnload = () => {
+  const sayGoodbye = () => {
     for (const transfer of transportState.fileTransfers.values()) {
       if (transfer.blobURL) URL.revokeObjectURL(transfer.blobURL);
     }
@@ -867,10 +914,51 @@ if (typeof window !== "undefined") {
         /* unloading must continue */
       }
     }
+  };
+  const onUnload = () => {
+    sayGoodbye();
     _transport.disconnect();
   };
-  window.addEventListener("pagehide", onUnload);
   window.addEventListener("beforeunload", onUnload);
+  window.addEventListener("pagehide", (event) => {
+    sayGoodbye();
+    // A PERSISTED pagehide is not an unload: the page goes into the
+    // back-forward cache with every socket and timer it had, and a back
+    // gesture brings the same JS context back. Tearing the node down here
+    // did it anyway, and disconnect() suppresses the relay status event on
+    // purpose - so relayConnected stayed true over a dead node, connect()
+    // early-returned on the stale flag, and the restored page sat there
+    // reading "Connected" with nothing behind it. pageshow repairs it.
+    if (!event.persisted) _transport.disconnect();
+  });
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) void _resumeFromFrozen("bfcache");
+  });
+}
+if (typeof document !== "undefined") {
+  // Page Lifecycle: a tab Chrome froze thaws through these rather than
+  // through pageshow, and it comes back in the same state - flags intact,
+  // sockets gone.
+  document.addEventListener("freeze", () => {
+    rec(ev("session.visibility", { d: { hidden: true, frozen: true } }));
+  });
+  document.addEventListener("resume", () => void _resumeFromFrozen("resume"));
+}
+
+/**
+ * A page that came back from the dead: check the relay link rather than the
+ * flag that says we have one, and rebuild when it is gone.
+ */
+async function _resumeFromFrozen(why: string): Promise<void> {
+  rec(ev("session.visibility", { d: { hidden: false, restored: why } }));
+  if (_transport.p2pNode && _transport.relayLinkLive()) {
+    // The node survived. Everything else may still be stale.
+    _resyncEverything();
+    return;
+  }
+  transportState.relayConnected = false;
+  await connect().catch(() => {});
+  _resyncEverything();
 }
 
 // ── Senders ───────────────────────────────────────────────────────────────────
@@ -1048,6 +1136,11 @@ if (typeof window !== "undefined") {
       }
     }
 
+    // The offline DM queue only ever drained on a "connect" event, and a
+    // peer who was ALREADY connected when the message was queued fires none.
+    // One pass over the whole queue, not one per peer.
+    flushQueuedDmForConnectedPeers().catch(() => {});
+
     // Call-roster ghosts: an entry neither refreshed by presence heartbeats
     // nor backed by a live voice link within the TTL is gone - remove it so
     // the sidebar group and the call status stop counting a phantom.
@@ -1137,6 +1230,28 @@ function _resyncEverything(): void {
     _video.ensureLive();
   }
   _syncAllPeers(true);
+  _digestJoinedRooms();
+}
+
+/**
+ * A digest for every room we are in, not only the one on screen.
+ *
+ * _syncAllPeers digests transportState.roomCode and nothing else, so coming
+ * back from a sleep repaired the open conversation and left every other room
+ * to the repair tick's one-room-per-15s rotation - minutes of missing
+ * history in rooms the user then scrolls straight into. Membership-gated and
+ * throttled by the same window _handleDigest uses, so a burst of resyncs
+ * (online, netchange, resume can all fire together) sends one round.
+ */
+function _digestJoinedRooms(): void {
+  for (const room of _transport.rooms()) {
+    if (room === transportState.roomCode) continue; // _syncAllPeers has it
+    for (const pid of _transport.peersInRoom(room)) {
+      if (!_peerIdToDid.has(pid)) continue;
+      if (!allowSyncReaction(`resync|${pid}|${room}`)) continue;
+      _sendDigestForRoom(pid, room).catch(() => {});
+    }
+  }
 }
 
 if (typeof document !== "undefined") {
@@ -1161,6 +1276,26 @@ if (typeof document !== "undefined") {
 if (typeof window !== "undefined") {
   window.addEventListener("online", () => {
     rec(ev("session.online"));
+    // A relay circuit does not close when the radio dies, it just stops
+    // carrying frames - so the reconcile below would happily reconcile over
+    // a link that no longer exists. Probe it first.
+    void _transport.checkRelayLiveness();
+    _resyncEverything();
+  });
+  window.addEventListener("offline", () => {
+    rec(ev("session.online", { d: { online: false } }));
+    // Nothing is reachable, and saying so beats a status pill that claims
+    // otherwise until the next failed dial notices.
+    transportState.relayConnected = false;
+  });
+  // A phone moving between wifi and cellular fires this and nothing else:
+  // no offline, no socket close, no error - every connection simply goes
+  // quiet while continuing to look open.
+  const connection = (navigator as Navigator & { connection?: EventTarget })
+    .connection;
+  connection?.addEventListener?.("change", () => {
+    rec(ev("session.online", { d: { reason: "netchange" } }));
+    void _transport.checkRelayLiveness();
     _resyncEverything();
   });
 }
@@ -1332,6 +1467,12 @@ async function _handleDigest(
     }
   }
 
+  // A member's watermark for OUR sender id is the first hard evidence a room
+  // message actually left: it says they hold everything up to that lamport.
+  // Room sends start at "sending" when the mesh had nobody in it, and this
+  // is what retires that clock.
+  _promoteSentByWatermark(roomCode, theirWatermarks);
+
   let mine = await getWatermarksForRoom(roomCode);
 
   // Throttled BEFORE the work, not just before the send.
@@ -1402,6 +1543,26 @@ async function _handleDigest(
     _sendDigestForRoom(peerId, roomCode, { peerKnowsRoom: true }).catch(
       () => {}
     );
+}
+
+/**
+ * Advance our own still-"sending" messages in this room, for messages the
+ * peer's digest proves they already hold. Scoped to the on-screen list: it
+ * is the only place the clock is drawn, and applyMessageStatus writes the
+ * stored row by id anyway.
+ */
+function _promoteSentByWatermark(
+  roomCode: string,
+  theirWatermarks: Record<string, number>
+): void {
+  const self = identityStore.did ?? _transport.selfId();
+  const at = theirWatermarks[self];
+  if (typeof at !== "number") return;
+  for (const m of transportState.messages) {
+    if (m.roomCode !== roomCode || m.senderId !== self) continue;
+    if (m.status !== "sending" || m.lamport > at) continue;
+    applyMessageStatus(m.id, "sent");
+  }
 }
 
 async function _pushMissingTo(
@@ -2447,12 +2608,19 @@ function _selfIds(): string[] {
  * announce.ts decide whether to make a sound about it. The caller has already
  * established that the message is genuinely new.
  */
-function _announceMessage(msg: Message): void {
-  announceMessage(msg, {
-    selfIds: _selfIds(),
-    uiRoomCode: transportState.uiRoomCode,
-    resolveName: resolveMentionDisplayName,
-  });
+function _announceMessage(
+  msg: Message,
+  opts: { viaMailbox?: boolean } = {}
+): void {
+  announceMessage(
+    msg,
+    {
+      selfIds: _selfIds(),
+      uiRoomCode: transportState.uiRoomCode,
+      resolveName: resolveMentionDisplayName,
+    },
+    opts
+  );
 }
 
 async function _handleChatMessage(
@@ -2659,12 +2827,32 @@ _transport.on("status", (status) => {
   switch (status.type) {
     case "relay-connected":
       transportState.relayConnected = true;
+      // A reconnect is a second chance at everything the mailbox holds: the
+      // collector's own timer is five minutes, and the DM that was waiting
+      // is the reason the relay came back at all.
+      void import("./mailbox.svelte")
+        .then((m) => m.collectMailbox())
+        .catch(() => {});
       break;
     case "relay-disconnected":
     case "relay-dial-failed":
     case "relay-reconnecting":
     case "relay-reconnect-failed":
       transportState.relayConnected = false;
+      break;
+    case "relay-reservation-failed":
+      // Dialled, but with no circuit nobody can reach us - and libp2p's
+      // relay filter stays poisoned for the life of this node, so only a
+      // fresh node recovers. connect() builds one.
+      transportState.relayConnected = false;
+      connect().catch(() => {});
+      break;
+    case "mic-unavailable":
+      transportState.micUnavailable = true;
+      setErrorWithAutoClear(transportState, status.message);
+      break;
+    case "mic-available":
+      transportState.micUnavailable = false;
       break;
   }
 });
@@ -2864,6 +3052,71 @@ export function deliverMailboxDm(
   return _handleDmChatAsync(senderDid, senderDid, { payload }, true);
 }
 
+/**
+ * A DM SyncBatch that came out of the mailbox: files, plugin cards and
+ * plugin updates, which ride the room topic rather than the DM envelope.
+ *
+ * The room is derived from BOTH DIDs and compared against what the batch
+ * claims, so a blob sealed by one peer cannot file history into another
+ * conversation. Everything past that is _handleSyncBatch's usual contract:
+ * sigV3 verification per row, refusal of rooms we have not joined, dedup
+ * against storage.
+ */
+export async function deliverMailboxBatch(
+  senderDid: string,
+  data: Uint8Array
+): Promise<void> {
+  const decoded = decode(data) as {
+    type?: string;
+    roomCode?: string;
+    messages?: WireChatMessage[];
+    live?: boolean;
+  };
+  if (decoded?.type !== MessageType.SyncBatch) return;
+  if (!Array.isArray(decoded.messages)) return;
+  const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
+  if (!roomCode || roomCode !== decoded.roomCode) return;
+  // The batch handler refuses a room we have not joined, and a conversation
+  // whose first contact arrives through the mailbox has never been joined.
+  await ensureDmRoomForPeer(senderDid);
+  _transport.joinRoom(roomCode);
+  await _handleSyncBatch(
+    roomCode,
+    decoded.messages,
+    senderDid,
+    decoded.live === true
+  );
+}
+
+/**
+ * A delivery or read receipt collected from the mailbox.
+ *
+ * The mailbox crypto already proved WHO sent it; the room check below is the
+ * same rule the live path applies - a receipt is only meaningful for a
+ * message living in the DM room derived from that sender's DID.
+ */
+export async function deliverMailboxReceipt(
+  senderDid: string,
+  envelope:
+    | { type: "ack"; messageId: string }
+    | { type: "read"; messageIds: string[] }
+): Promise<void> {
+  const ids =
+    envelope.type === "ack" ? [envelope.messageId] : envelope.messageIds;
+  const acceptable = await _receiptsForDmWith(senderDid, ids);
+  if (!acceptable.length) return;
+  for (const id of acceptable) {
+    applyMessageStatus(id, envelope.type === "ack" ? "delivered" : "read");
+  }
+  if (envelope.type === "read") await _cascadeReadAcks(senderDid, acceptable);
+}
+
+/** Deposit a receipt for a peer who is not on a stream - the mailbox path,
+ *  where there is no peerId to reply on at all. */
+function _depositDmReceipt(senderDid: string, envelope: Uint8Array): void {
+  depositDmReceipt(senderDid, envelope).catch(() => {});
+}
+
 function _handleDmChat(
   peerId: string,
   senderDid: string,
@@ -2946,6 +3199,7 @@ function _handleDmChatAsync(
     // Against storage, not the on-screen list: that list holds whichever
     // conversation is open, so a redelivered message was only recognised
     // as a duplicate when you happened to be looking at that DM.
+    let readSent = false;
     if (!(await getMessage(msg.id))) {
       await putMessage(msg);
       // Without a watermark row a DM digest carries an empty map on both
@@ -2959,7 +3213,8 @@ function _handleDmChatAsync(
         transportState.chatMode === "dm" &&
         (activeDid === senderDid || activeDid === peerId);
       // Reactions are filtered inside the funnel, same rule as rooms.
-      _announceMessage(msg);
+      // A mailbox batch collapses into one notification instead of one per DM.
+      _announceMessage(msg, { viaMailbox });
       // The floating panel is a second place this conversation can be on
       // screen, and it can be showing it while the pane behind shows another
       // room entirely. Keyed on the room code, so this is a no-op otherwise.
@@ -2970,8 +3225,18 @@ function _handleDmChatAsync(
       if (isViewingThisDm) {
         transportState.messages = appendSorted(transportState.messages, msg);
       }
-      // Visible in either surface means read, not merely delivered.
-      if (isViewingThisDm || dmPanelIsShowing(roomCode)) {
+      // The floating panel is the one surface the pane's markSeen() never
+      // covers, so a message it is showing gets its read receipt here. The
+      // pane's own conversation is left to markSeen(), which runs when the
+      // list changes and again when the page comes back, and which is the
+      // only place that knows the page is actually on screen: a DM that
+      // landed while the tab was hidden or the phone was in a pocket used
+      // to go straight to "read".
+      const onScreen =
+        typeof document === "undefined" ||
+        document.visibilityState === "visible";
+      if (onScreen && !isViewingThisDm && dmPanelIsShowing(roomCode)) {
+        readSent = true;
         await markRoomSeen(roomCode, msg.lamport);
         const roomIndex = roomsStore.dmRooms.findIndex(
           (r) => r.roomCode === roomCode
@@ -2990,9 +3255,16 @@ function _handleDmChatAsync(
         // No stream to reply on when the DM came out of the mailbox. Calling
         // send() with a DID makes peerIdFromString throw inside libp2p, and
         // that surfaces as a `stream-open-failed` toast the user reads as a
-        // real error - up to two per collected DM. The sender learns the
-        // message landed when the offline queue next reaches them live.
-        if (!viaMailbox) {
+        // real error - up to two per collected DM. So the receipt goes back
+        // through the mailbox instead of being dropped: waiting for the two
+        // of you to be online together is exactly what the mailbox exists to
+        // avoid, and the ticks stayed at "sent" forever meanwhile.
+        if (viaMailbox) {
+          _depositDmReceipt(
+            senderDid,
+            encodeDmReadEnvelope([envelope.payload.id])
+          );
+        } else {
           _transport
             .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
             .catch(() => {});
@@ -3000,7 +3272,12 @@ function _handleDmChatAsync(
       }
     }
 
-    if (!viaMailbox) {
+    // A read outranks an ack on the sender's side, so when one just went
+    // out the ack would only cost a second mailbox deposit.
+    if (readSent) return;
+    if (viaMailbox) {
+      _depositDmReceipt(senderDid, encodeDmAckEnvelope(envelope.payload.id));
+    } else {
       _transport
         .send(peerId, encodeDmAckEnvelope(envelope.payload.id))
         .catch(() => {});
@@ -3061,7 +3338,7 @@ _transport.on("message", (peerId, data, room) => {
             for (const id of ids) applyMessageStatus(id, "read");
             // The reader only acks the page they had loaded; a read at lamport
             // L implies everything we sent before L in that room was read too.
-            _cascadeReadAcks(ids).catch(() => {});
+            _cascadeReadAcks(peerId, ids).catch(() => {});
           })
           .catch(() => {});
         return;
@@ -3312,7 +3589,11 @@ function _scheduleConnectRetry(): void {
 }
 
 export async function connect() {
-  if (transportState.relayConnected) return;
+  // The flag is not proof. A page restored from the back-forward cache, or a
+  // tab the browser froze, keeps relayConnected === true over a node that is
+  // gone - and this early return then made "Reconnect" (and every joinRoom)
+  // a no-op for the rest of the session. Ask the transport, not the mirror.
+  if (transportState.relayConnected && _transport.p2pNode) return;
   // Post-unlock, so sealed profile rows are readable now.
   _hydratePeerProfileMeta();
   // Fetch fresh short-lived TURN credentials for this session (best-effort;
@@ -3358,12 +3639,32 @@ export async function connect() {
  */
 async function _joinSavedRooms(): Promise<void> {
   const rooms = await getAllRooms();
-  // Clean up inactive participants once per session, early. This runs after
-  // connecting but before the user opens any room, so it avoids blocking the
-  // hot path of opening a room. Members not seen in 30 days are removed; this
-  // prevents the participant list from growing unbounded over time.
+  // Subscribe FIRST. The participant sweep below is a sequential IDB pass
+  // over every saved room, and running it ahead of the joins meant the whole
+  // pass happened unsubscribed: gossip for those rooms was not delivered,
+  // the relay had not been told we were in them, and no peer in them could
+  // be dialled. Nothing about the sweep needs to precede a subscription.
   for (const room of rooms) {
-    const removed = await cleanupInactiveParticipants(room.roomCode);
+    // DMs are handled by joinPhonebookDmRooms, which derives the room code
+    // from the DID rather than trusting a stored one.
+    if (room.roomCode.startsWith("dm-")) continue;
+    _transport.joinRoom(room.roomCode);
+  }
+  // Not awaited in the join order any more: housekeeping, once per session.
+  void _sweepInactiveParticipants(rooms);
+}
+
+/**
+ * Members not seen in 30 days are removed, so the participant list does not
+ * grow unbounded. Runs in the background after the joins.
+ */
+async function _sweepInactiveParticipants(
+  rooms: { roomCode: string }[]
+): Promise<void> {
+  for (const room of rooms) {
+    const removed = await cleanupInactiveParticipants(room.roomCode).catch(
+      () => []
+    );
     // Count only. This logged the room code and the participant DIDs, and a
     // room code is the room's entire membership secret - a console line is
     // exactly the sort of place it leaks out of (screenshots, bug reports,
@@ -3371,12 +3672,6 @@ async function _joinSavedRooms(): Promise<void> {
     if (removed.length > 0) {
       console.log("[room] removed", removed.length, "inactive participant(s)");
     }
-  }
-  for (const room of rooms) {
-    // DMs are handled by joinPhonebookDmRooms, which derives the room code
-    // from the DID rather than trusting a stored one.
-    if (room.roomCode.startsWith("dm-")) continue;
-    _transport.joinRoom(room.roomCode);
   }
 }
 
@@ -3605,6 +3900,10 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.callPeerStates = new Map();
   transportState.chatMode = "room";
   transportState.activeDmPeerId = null;
+  transportState.micUnavailable = false;
+  // Both belong to the session that just ended: a new identity must not
+  // inherit the previous one's undelivered-message notes.
+  transportState.dmQueuedP2POnly = new Set();
 }
 
 /**
@@ -3623,7 +3922,7 @@ function _disconnectWithoutBroadcasting(): void {
  * roomUsers holds the DIDs that already possess it. A connected-but-unbound
  * peer gets no copy - gossip and sync still cover them.
  */
-function _broadcastChatWire(wire: WireChatMessage, roomCode: string): void {
+function _broadcastChatWire(wire: WireChatMessage, roomCode: string): boolean {
   const payload = encode(wire);
   _transport.broadcast(payload, roomCode);
   rec(
@@ -3632,30 +3931,89 @@ function _broadcastChatWire(wire: WireChatMessage, roomCode: string): void {
       d: { bytes: payload.byteLength },
     })
   );
-  const batch = encode({
-    type: MessageType.SyncBatch,
-    roomCode,
-    messages: [wire],
-    batchIndex: 0,
-    totalBatches: 1,
-    // Not history repair: whichever copy of this message lands first is the
-    // one that has to announce it, because the publish above is dropped
-    // outright when the mesh has no topic peers for the room.
-    live: true,
-  });
+  const batchOf = (w: WireChatMessage) =>
+    encode({
+      type: MessageType.SyncBatch,
+      roomCode,
+      messages: [w],
+      batchIndex: 0,
+      totalBatches: 1,
+      // Not history repair: whichever copy of this message lands first is the
+      // one that has to announce it, because the publish above is dropped
+      // outright when the mesh has no topic peers for the room.
+      live: true,
+    });
   // DM rooms have no roomUsers roster - the direct copy goes to the one peer
   // the conversation is with (plugin cards and files ride this path too).
   if (roomCode.startsWith("dm-")) {
-    const pid = transportState.activeDmPeerId;
-    if (pid) _transport.send(pid, batch).catch(() => {});
-    return;
+    void _sendDmBatch(roomCode, wire, batchOf).catch(() => {});
+    return false;
   }
+  const batch = batchOf(wire);
   const members = new Set(transportState.roomUsers);
   for (const pid of _transport.peers()) {
     const did = _peerIdToDid.get(pid);
     if (!did || !members.has(did)) continue;
     _transport.send(pid, batch).catch(() => {});
   }
+  // "Handed to the network", not "delivered": a node with at least one peer
+  // the relay places in this room. With neither, the publish went into a
+  // mesh with nobody in it and the message is waiting on the digest - which
+  // is what the room path's "sending" clock now says out loud.
+  return !!_transport.p2pNode && _transport.peersInRoom(roomCode).length > 0;
+}
+
+/** Wire copy with the inline file bytes removed. They are the reason a DM
+ *  with a picture blows past the mailbox's largest padding bucket, and the
+ *  receiver fetches the file over the torrent either way. */
+function _stripInlineFiles(wire: WireChatMessage): WireChatMessage {
+  const files = wire.meta?.files;
+  if (!files?.some((f) => f.inline)) return wire;
+  return {
+    ...wire,
+    meta: {
+      ...wire.meta,
+      files: files.map(({ inline: _inline, ...rest }) => rest),
+    },
+  };
+}
+
+/**
+ * The DM copy of a chat wire: files, plugin cards and plugin updates.
+ *
+ * This was a fire-and-forget send to `activeDmPeerId` - the conversation ON
+ * SCREEN, which is not necessarily the conversation the message belongs to
+ * (a pinned widget's update, or anything sent from the floating panel while
+ * the pane shows another room), and nothing at all when the peer was
+ * offline. It now gets exactly what a DM text envelope gets: the persisted
+ * offline queue, and a sealed copy in the relay mailbox.
+ */
+async function _sendDmBatch(
+  roomCode: string,
+  wire: WireChatMessage,
+  batchOf: (w: WireChatMessage) => Uint8Array
+): Promise<void> {
+  const peerDid = await dmPeerDidForRoom(roomCode);
+  if (!peerDid) return;
+  const batch = batchOf(wire);
+  const peerId = didToPeerId(peerDid);
+  if (peerId && (await _transport.send(peerId, batch))) {
+    applyMessageStatus(wire.id, "sent");
+    return;
+  }
+  // Queued, so the clock stays on the bubble until the flush (or the peer's
+  // own digest) says otherwise.
+  await queueDmMessage(peerDid, batch, wire.id);
+  // The mailbox copy drops the inline bytes: they exist to save a round trip
+  // for a peer who is online, and they are what pushes an ordinary photo
+  // past the largest bucket the mailbox will hold.
+  const { depositDmToMailbox } = await import("./mailbox.svelte");
+  const result = await depositDmToMailbox(
+    peerDid,
+    batchOf(_stripInlineFiles(wire)),
+    "batch"
+  );
+  noteMailboxDeposit(wire.id, result);
 }
 
 export async function sendMessage(
@@ -3693,7 +4051,15 @@ export async function sendMessage(
   // Sign the message before sending
   msg = signMessage(msg);
 
-  _broadcastChatWire(messageToWire(msg), transportState.roomCode);
+  // Same clock a DM gets. A room message sent with no relay - no node, or a
+  // room the relay has placed nobody in - went out looking identical to one
+  // that landed, and only the digest rotation ever carried it. "sending"
+  // says so; _handleDigest promotes it to "sent" once a member's watermark
+  // proves they hold it. Set AFTER signing: status is not in the canonical
+  // and never rides the wire.
+  msg.status = _broadcastChatWire(messageToWire(msg), transportState.roomCode)
+    ? "sent"
+    : "sending";
 
   // Echo BEFORE the storage writes: seal + two IDB round-trips gated the
   // local echo, which read as send lag - the network send already left.
@@ -3844,7 +4210,10 @@ export async function sendFiles(
       }),
     };
   }
-  _broadcastChatWire(wire, transportState.roomCode);
+  // Same clock as a text send; see sendMessage.
+  msg.status = _broadcastChatWire(wire, transportState.roomCode)
+    ? "sent"
+    : "sending";
   await putMessage(msg);
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
 
@@ -4178,16 +4547,30 @@ export async function markSeen(): Promise<void> {
     // DM rooms live in their own mirror, and the DM badge recomputes on
     // dmVersion - the rooms maps below never carried them.
     const idx = roomsStore.dmRooms.findIndex((r) => r.roomCode === roomCode);
+    const prevSeen =
+      idx !== -1 ? (roomsStore.dmRooms[idx].lastSeenLamport ?? 0) : 0;
     if (idx !== -1) {
       roomsStore.dmRooms[idx] = {
         ...roomsStore.dmRooms[idx],
-        lastSeenLamport: Math.max(
-          roomsStore.dmRooms[idx].lastSeenLamport ?? 0,
-          maxLamport
-        ),
+        lastSeenLamport: Math.max(prevSeen, maxLamport),
       };
     }
     transportState.dmVersion += 1;
+    // Their messages seen for the first time get one read receipt, all ids
+    // in a single envelope. This is the only place that knows the page is
+    // on screen, so it is where "read" is decided; the arrival path only
+    // ever says "delivered" for the conversation in the pane.
+    const self = identityStore.did ?? selfId();
+    const theirs = transportState.messages
+      .filter(
+        (m) =>
+          m.roomCode === roomCode &&
+          m.senderId !== self &&
+          m.lamport > prevSeen
+      )
+      .map((m) => m.id);
+    const peer = transportState.activeDmPeerId;
+    if (theirs.length && peer) sendDmReadAcks(peer, theirs);
     return;
   }
   const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);

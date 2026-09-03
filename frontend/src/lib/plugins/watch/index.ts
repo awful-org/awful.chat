@@ -7,6 +7,7 @@ export {
   projectPosition,
   decideCorrection,
   DEFAULT_WATCH_SYNC,
+  watchKeyIntent,
 } from "./sync";
 export type {
   WatchTick,
@@ -15,4 +16,5 @@ export type {
   CorrectionAction,
   Correction,
   WatchSyncConfig,
+  WatchKeyIntent,
 } from "./sync";

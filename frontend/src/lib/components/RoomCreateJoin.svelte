@@ -6,7 +6,8 @@
     looksLikeShortCode,
     resolveInvite,
   } from "$lib/invite";
-  import { Check, Clipboard, Copy, LogIn, Menu, Plus } from "@lucide/svelte";
+  import { Check, Clipboard, Copy, LogIn, Menu, Plus, Share2 } from "@lucide/svelte";
+  import { viewportHeight } from "$lib/actions/viewport-height";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import {
@@ -125,6 +126,27 @@
     setTimeout(() => (shortCopied = false), 2000);
   }
 
+  // The OS share sheet, where there is one. Only offered when the browser
+  // actually has it, or the menu would carry two entries that do the same
+  // thing; the catch still falls back to the clipboard.
+  const canShare = $derived(
+    typeof navigator !== "undefined" && typeof navigator.share === "function"
+  );
+
+  async function handleShareLink() {
+    copyMenuOpen = false;
+    try {
+      await navigator.share({
+        url: `${window.location.origin}/r/#${createdCode!}`,
+      });
+    } catch (err) {
+      // Dismissing the sheet is not a failure and must not silently copy
+      // something the user decided not to send.
+      if ((err as Error)?.name === "AbortError") return;
+      await handleCopy(createdCode!);
+    }
+  }
+
   async function handleCopy(code: string) {
     // `/r/#<code>`, not `/r/<code>`: a fragment never reaches the server, so
     // the membership secret stays out of access logs and out of the Referer
@@ -155,8 +177,14 @@
 </script>
 
 {#if !createdCode}
+  <!-- viewportHeight, not just a dvh class: every one of these screens centres a
+       card with a text field in it, and dvh does not shrink when the software
+       keyboard opens - so on a phone the field being typed into ended up under
+       the keyboard. overflow-y-auto because the box is now exactly the visible
+       height and a tall card has to be able to scroll inside it. -->
   <div
-    class="flex min-h-screen h-full items-center justify-center p-4 bg-background"
+    use:viewportHeight
+    class="flex min-h-dvh h-full overflow-y-auto items-center justify-center p-4 bg-background"
   >
     {#if toggleSidebar != null}
       <Button
@@ -302,7 +330,8 @@
   </div>
 {:else}
   <div
-    class="flex min-h-screen h-full items-center justify-center p-4 bg-background"
+    use:viewportHeight
+    class="flex min-h-dvh h-full overflow-y-auto items-center justify-center p-4 bg-background"
   >
     <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
       <CardHeader>
@@ -346,6 +375,17 @@
                 >
                   Copy link
                 </button>
+                {#if canShare}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onclick={handleShareLink}
+                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted cursor-pointer"
+                  >
+                    <Share2 class="size-3.5" />
+                    Share link
+                  </button>
+                {/if}
                 <button
                   type="button"
                   role="menuitem"

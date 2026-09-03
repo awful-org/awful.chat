@@ -28,6 +28,8 @@ import {
   getSeedableFiles,
   attachmentEpoch,
   putAttachment,
+  getAttachmentsByInfoHash,
+  updateAttachmentStatus,
   getDB,
   migrateAtRest,
   addRoomParticipant,
@@ -484,6 +486,31 @@ describe("getSeedableFiles", () => {
     expect(seedable.map((s) => s.file.infoHash).sort()).toEqual(["h1"]);
     expect(seedable[0].roomCode).toBe("room-a");
     expect(attachmentEpoch()).toBeGreaterThan(before);
+  });
+});
+
+describe("updateAttachmentStatus", () => {
+  it("keeps the row readable: status is AAD-bound, so it must be re-sealed", async () => {
+    await putAttachment({
+      id: "a-status",
+      infoHash: "h-status",
+      roomCode: "room-a",
+      messageId: "m1",
+      filename: "cat.png",
+      mimeType: "image/png",
+      size: 4,
+      status: "downloading",
+      createdAt: 1,
+      data: new ArrayBuffer(4),
+    });
+    await updateAttachmentStatus("a-status", "complete");
+    // A patched-in-place sealed row fails its AAD check and is dropped on
+    // read, which showed up as zero rows here.
+    const rows = await getAttachmentsByInfoHash("h-status");
+    expect(rows.map((r) => r.status)).toEqual(["complete"]);
+    // Never regress.
+    await updateAttachmentStatus("a-status", "downloading");
+    expect((await getAttachmentsByInfoHash("h-status"))[0].status).toBe("complete");
   });
 });
 

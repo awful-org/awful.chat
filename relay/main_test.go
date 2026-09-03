@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -1160,49 +1159,34 @@ func TestEmptyRegisterBudgetIsPerPeerNotPerStream(t *testing.T) {
 	}
 }
 
-// EnableRelayService with no ACL relays for anybody: two unrelated libp2p
-// nodes could use the deployment as free transit, and the per-IP and per-ASN
-// reservation caps cannot tell them from real users because every client
-// arrives from Traefik's single address.
-func TestCircuitACLRefusesPeersWithoutARendezvousStream(t *testing.T) {
+// A client cannot tell a live relay from a half-open link - a phone carried
+// from Wi-Fi to cellular keeps a socket that will never deliver anything -
+// unless something comes back. PING used to be a pure no-op, so there was
+// nothing to time out on; it has to be answered on the same stream.
+func TestPingIsAnsweredWithPong(t *testing.T) {
+	orig := rendezvousIdleTimeout
+	rendezvousIdleTimeout = 20 * time.Millisecond
+	defer func() { rendezvousIdleTimeout = orig }()
+
 	r := newRegistry()
-	acl := rendezvousACL{reg: r}
-	src, dst := peer.ID("src-peer"), peer.ID("dst-peer")
+	s := &registerOnceStream{frame: encodeClientFrame(clientMsg{Type: "PING"})}
+	c := addClient(r, "peer-ping", s)
 
-	if acl.AllowConnect(src, nil, dst) {
-		t.Fatal("two strangers were granted transit through the relay")
-	}
-	addClient(r, src.String(), &fakeStream{})
-	if acl.AllowConnect(src, nil, dst) {
-		t.Fatal("a circuit to a destination with no rendezvous stream was allowed")
-	}
-	d := addClient(r, dst.String(), &fakeStream{})
-	if !acl.AllowConnect(src, nil, dst) {
-		t.Fatal("a circuit between two of our own peers was refused")
-	}
-	r.removeClient(d)
-	if acl.AllowConnect(src, nil, dst) {
-		t.Fatal("transit outlived the destination's last rendezvous stream")
-	}
+	done := make(chan struct{})
+	go func() {
+		r.readLoop(s, "peer-ping", c)
+		close(done)
+	}()
 
-	// Reservations stay open on purpose: the client reserves BEFORE it opens
-	// its rendezvous stream (transport.ts connect()), so gating them on a
-	// live stream would refuse every legitimate first reservation.
-	if !acl.AllowReserve(peer.ID("brand-new-client"), nil) {
-		t.Fatal("AllowReserve refused, which breaks every client's first reservation")
+	// Decoded before the client is torn down: the PONG rides the same bounded
+	// outbox as every other server frame, on the client's writer goroutine.
+	if msg := s.decode(t, 0); msg.Type != "PONG" {
+		t.Fatalf("answered a PING with %q, want PONG", msg.Type)
 	}
-}
-
-// WithInfiniteLimits gave every circuit unlimited time and unlimited bytes,
-// which is what made an open relay worth abusing. The replacement has to stay
-// generous - chat, DMs and sync ride a circuit for a whole session - but it
-// has to be a number.
-func TestCircuitLimitIsFiniteButGenerous(t *testing.T) {
-	l := relayCircuitLimit()
-	if l == nil || l.Duration <= 0 || l.Data <= 0 {
-		t.Fatalf("per-circuit limit is not finite: %+v", l)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not return once the idle window elapsed")
 	}
-	if l.Duration < time.Hour || l.Data < 1<<30 {
-		t.Errorf("per-circuit limit %v / %d bytes is too tight for a session-long circuit", l.Duration, l.Data)
-	}
+	r.removeClient(c)
 }

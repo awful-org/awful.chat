@@ -10,15 +10,10 @@ const check = new Check("dm replies, reactions and files");
 const [alice, bob] = await bootPeers(["Alice", "Bob"], { ports: [9307, 9308] });
 
 const dmMessages = (p, code) => p.json(`(async () => {
-  const db = await new Promise((res, rej) => {
-    const r = indexedDB.open('awful-chat');
-    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
-  });
-  const msgs = await new Promise((r) => {
-    const q = db.transaction('messages').objectStore('messages').getAll();
-    q.onsuccess = () => r(q.result);
-  });
-  return JSON.stringify(msgs.filter((m) => m.roomCode === ${JSON.stringify(code)})
+  // Rows are sealed at rest, so read through the app's own opener.
+  const m = await import('/src/lib/storage.ts');
+  const msgs = await m.getMessages(${JSON.stringify(code)});
+  return JSON.stringify(msgs
     .map((m) => ({ id: m.id, type: m.type, content: m.content, lamport: m.lamport,
       status: m.status ?? null,
       replyTo: m.replyTo ?? null, reactionTo: m.reactionTo ?? null,

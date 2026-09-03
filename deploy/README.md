@@ -60,6 +60,21 @@ So: a TURN server is a reasonable thing to accept from someone you trust to
 run a machine. An SFU is not. Only add an SFU you would be comfortable letting
 watch your calls.
 
+**Web Push adds a third party too, and it is on by default** (`PUSH_ENABLED`).
+A phone with the app closed is only reachable through its push vendor - Google,
+Mozilla or Apple - so a device that opts in hands the relay a push endpoint at
+that vendor, which the relay stores under the same mailbox id it already knows
+(SHA-256 of the recipient's did). That endpoint is a stable per-device
+identifier held by the vendor: while the subscription lives it links the device
+to the identity, and the vendor sees the timing of every wake-up. What the
+relay sends through it is the whole disclosure - `{"t":"mail"}`, meaning "check
+your box", with no sender, no room, no count and no content, at most one per
+mailbox per minute - and everything real stays sealed in the blob the device
+collects once it is awake. Subscribing is per device and opt-in in the app,
+unsubscribing deletes the endpoint, and `PUSH_ENABLED=0` removes the surface
+entirely, at the cost of offline DMs never reaching a closed phone until the
+user opens it.
+
 ## Add a TURN server
 
 Best value per unit of effort, and the one a friend can host: a stock

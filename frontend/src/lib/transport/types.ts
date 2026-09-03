@@ -45,10 +45,24 @@ export type TransportStatus =
   | { type: "relay-dial-failed"; message: string }
   | { type: "relay-reconnect-failed"; message: string }
   | { type: "relay-reconnecting"; message: string }
-  | { type: "stream-open-failed"; peerId: string; message: string }
+  | { type: "stream-open-failed"; peerId: string; message: string; err?: string }
   | { type: "rendezvous-failed"; message: string }
   | { type: "rendezvous-reconnecting"; message: string }
   | { type: "reservation-timeout"; message: string }
+  /**
+   * A relay RECONNECT re-dialled fine but could not re-reserve a circuit.
+   * The socket is up and nobody can reach us through it, so the app treats
+   * this as disconnected and rebuilds the node - which is the only thing
+   * that clears libp2p's poisoned relay filter for this peer.
+   */
+  | { type: "relay-reservation-failed"; message: string }
+  /**
+   * getUserMedia failed, so this call is listen-only. Paired with
+   * "mic-available", which fires whenever a later mic start succeeds - the
+   * flag has to be withdrawn as well as raised.
+   */
+  | { type: "mic-unavailable"; message: string }
+  | { type: "mic-available"; message: string }
   | { type: "voice-dial-failed"; peerId: string; message: string }
   | { type: "voice-peer-left"; peerId: string; message: string }
   | { type: "peer-dial-failed"; peerId: string; message: string }

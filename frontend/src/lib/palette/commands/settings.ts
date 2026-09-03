@@ -26,9 +26,11 @@ import {
 } from "$lib/media-prefs.svelte";
 import {
   notifyState,
+  setHidePreview,
   setMessageSoundsEnabled,
   setNotificationsEnabled,
 } from "$lib/notify.svelte";
+import { pushPrefs, setPushEnabled } from "$lib/push.svelte";
 import { mailboxPrefs, setMailboxEnabled } from "$lib/transport/mailbox.svelte";
 import {
   getVoiceActiveInputDevice,
@@ -226,6 +228,32 @@ export const settingsCommands: CmdSource = () => {
       },
     });
   }
+
+  cmds.push({
+    id: "settings.toggle:push",
+    title: "Wake this device for new messages",
+    keywords: ["toggle", "enable", "disable", "push", "notifications"],
+    group: "Settings",
+    badge: pushPrefs.enabled ? "On" : "Off",
+    action: {
+      kind: "act",
+      keepOpen: true,
+      perform: () => setPushEnabled(!pushPrefs.enabled),
+    },
+  });
+
+  cmds.push({
+    id: "settings.toggle:hidePreview",
+    title: "Hide message text on the lock screen",
+    keywords: ["toggle", "enable", "disable", "preview", "privacy"],
+    group: "Settings",
+    badge: notifyState.hidePreview ? "On" : "Off",
+    action: {
+      kind: "act",
+      keepOpen: true,
+      perform: () => setHidePreview(!notifyState.hidePreview),
+    },
+  });
 
   cmds.push({
     id: "settings.toggle:offlineInbox",

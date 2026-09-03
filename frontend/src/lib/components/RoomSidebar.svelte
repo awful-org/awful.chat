@@ -220,10 +220,15 @@
       {collapsed ? 'sm:w-14' : 'sm:w-68'}
       {isOpen ? 'translate-x-0' : '-translate-x-full'}"
 >
-  <!-- Header - h-13 is shared with the chat header (ChatView) so they align. -->
+  <!-- Header - h-13 is shared with the chat header (ChatView) so they align.
+       The safe-area inset is ADDED to that height rather than eaten out of
+       it: the sidebar is `fixed inset-y-0` on a phone, so with a translucent
+       status bar its first row sat under the clock. Both headers here and
+       the chat header carry the identical expression, which is what keeps
+       the three of them level. -->
   {#if collapsed}
     <div
-      class="flex h-13 shrink-0 items-center justify-center border-b border-sidebar-border"
+      class="flex h-[calc(3.25rem+env(safe-area-inset-top))] shrink-0 items-center justify-center border-b border-sidebar-border pt-[env(safe-area-inset-top)]"
     >
       <Tip text="Expand sidebar" side="right">
         {#snippet children(props)}
@@ -241,7 +246,7 @@
     </div>
   {:else}
   <div
-    class="flex h-13 items-center justify-between border-b border-sidebar-border px-3 shrink-0"
+    class="flex h-[calc(3.25rem+env(safe-area-inset-top))] items-center justify-between border-b border-sidebar-border px-3 pt-[env(safe-area-inset-top)] shrink-0"
   >
     <div class="flex items-center gap-2">
       <Tip text="Collapse sidebar" side="bottom">

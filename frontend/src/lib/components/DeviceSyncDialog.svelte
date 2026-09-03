@@ -15,6 +15,10 @@ import {
     parsePlaintextToken,
     revealShortCode,
     startScanning,
+    scannerState,
+    switchScanCamera,
+    nextScanCameraId,
+    toggleScanTorch,
     cancelSync,
     type SyncPayload,
   } from "$lib/transport/sync.svelte";
@@ -25,6 +29,9 @@ import {
     Check,
     CircleAlert,
     RefreshCw,
+    SwitchCamera,
+    Flashlight,
+    FlashlightOff,
   } from "@lucide/svelte";
 
   interface Props {
@@ -182,13 +189,35 @@ async function handleStartScanning() {
         }
       );
     await startScanPromise;
-    scanPermission = true;
+    // startScanning catches its own failures and reports them through
+    // onError, so it RESOLVES either way - reading the error it recorded is
+    // the only way to tell a running camera from a refused one. Setting this
+    // true unconditionally is why the "camera access denied" panel could
+    // never appear: onError set it false and the next line set it back.
+    scanPermission = !syncState.scanError;
     } catch (err) {
       scanPermission = false;
       console.error("Failed to start scanner:", err);
     } finally {
       startScanPromise = null;
     }
+  }
+
+  async function handleSwitchCamera() {
+    const next = nextScanCameraId();
+    if (!next) return;
+    await switchScanCamera(
+      next,
+      scannerElementId,
+      async (payload) => {
+        await handleScanSuccess(payload);
+      },
+      (error) => {
+        console.error("Scan error:", error);
+        scanPermission = false;
+      }
+    );
+    scanPermission = !syncState.scanError;
   }
 
   function handleManualInput() {
@@ -453,10 +482,59 @@ async function handleStartScanning() {
               Enter code manually
             </Button>
           {:else}
-            <div
-              id={scannerElementId}
-              class="w-full aspect-square bg-black rounded-lg overflow-hidden"
-            ></div>
+            <div class="relative w-full">
+              <div
+                id={scannerElementId}
+                class="w-full aspect-square bg-black rounded-lg overflow-hidden"
+              ></div>
+              <!-- Over the viewfinder, because that is where the user is
+                   looking while they hold two phones up to each other. -->
+              <div class="absolute right-2 top-2 flex flex-col gap-2">
+                {#if scannerState.cameras.length > 1}
+                  <button
+                    type="button"
+                    onclick={handleSwitchCamera}
+                    aria-label="Switch camera"
+                    class="inline-flex size-11 items-center justify-center rounded-lg bg-black/60 text-white backdrop-blur hover:bg-black/80"
+                  >
+                    <SwitchCamera class="size-5" />
+                  </button>
+                {/if}
+                {#if scannerState.torchAvailable}
+                  <button
+                    type="button"
+                    onclick={() => void toggleScanTorch()}
+                    aria-pressed={scannerState.torchOn}
+                    aria-label={scannerState.torchOn
+                      ? "Turn off torch"
+                      : "Turn on torch"}
+                    class="inline-flex size-11 items-center justify-center rounded-lg backdrop-blur {scannerState.torchOn
+                      ? 'bg-white text-black'
+                      : 'bg-black/60 text-white hover:bg-black/80'}"
+                  >
+                    {#if scannerState.torchOn}
+                      <Flashlight class="size-5" />
+                    {:else}
+                      <FlashlightOff class="size-5" />
+                    {/if}
+                  </button>
+                {/if}
+              </div>
+              {#if scannerState.awaitingPermission}
+                <!-- The prompt is open and unanswered. Without this the view
+                     was a black square for however long the user took to
+                     read it, which reads as a scanner that does not work. -->
+                <div
+                  class="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-lg bg-black/80 p-4 text-center"
+                >
+                  <Camera class="size-8 text-white/80" />
+                  <p class="text-xs text-white/80">
+                    Waiting for camera permission - answer your browser's
+                    prompt to start scanning.
+                  </p>
+                </div>
+              {/if}
+            </div>
             <p class="text-xs text-muted-foreground text-center">
               Point your camera at the QR code on your other device.
             </p>

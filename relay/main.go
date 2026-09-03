@@ -19,7 +19,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -28,7 +27,6 @@ import (
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/libp2p/go-libp2p/x/rate"
-	ma "github.com/multiformats/go-multiaddr"
 )
 
 const RendezvousProtocol = "/awful/rendezvous/1.0.0"
@@ -39,7 +37,7 @@ type clientMsg struct {
 }
 
 type serverMsg struct {
-	Type  string   `json:"type"` // PEERS | PEER_JOINED | PEER_LEFT | REGISTER_FAILED
+	Type  string   `json:"type"` // PEERS | PEER_JOINED | PEER_LEFT | REGISTER_FAILED | PONG
 	Room  string   `json:"room"`
 	Peers []string `json:"peers"`
 	Peer  string   `json:"peer,omitempty"` // PEER_JOINED | PEER_LEFT
@@ -574,15 +572,6 @@ func (r *registry) emptyRegisterBudget(peerId string) *opBudget {
 		r.emptyRegisters[peerId] = b
 	}
 	return b
-}
-
-// hasLiveStream reports whether a peerId holds any rendezvous stream right
-// now. This is what the circuit-relay ACL asks: a peer that has not spoken
-// the rendezvous protocol is not a client of this app and gets no circuit.
-func (r *registry) hasLiveStream(peerId string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.clients[peerId]) > 0
 }
 
 // isLive reports whether this stream is still in the registry; caller holds
@@ -1236,10 +1225,16 @@ readLoop:
 					r.unregister(c, msg.Room)
 				}
 			case "PING":
-				// No-op: a registered stream's only proof of life when it
-				// has nothing else to say. Reading it already re-armed the
-				// deadline above; nothing else to do (relay-audit.md
-				// finding 5).
+				// Reading it already re-armed the deadline above; the reply
+				// is for the CLIENT's benefit. A half-open link (a phone
+				// carried from Wi-Fi to cellular) looks identical to an idle
+				// one from the client side, so without an answer it has no
+				// way to tell a live relay from a socket that will never
+				// deliver anything again. Through sendTo like every other
+				// server frame, so it shares the same bounded outbox and a
+				// peer that stops reading is dropped rather than blocking
+				// this loop. Old clients ignore unknown frame types.
+				r.sendTo(c, serverMsg{Type: "PONG"})
 			default:
 				warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type))
 				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "unknown-type"}})
@@ -1298,46 +1293,44 @@ func relayResources() relayv2.Resources {
 	return res
 }
 
-// relayCircuitLimit is the per-circuit ceiling the relay service enforces.
-// This used to be relayv2.WithInfiniteLimits(): no duration and no byte cap
-// at all, which turned an open circuit relay into free unmetered bandwidth
-// for anyone who found the multiaddr. The defaults (2 minutes, 128 KiB) are
-// far too small for this app - chat, DMs and the sync stream all ride a
-// circuit for as long as a tab is open, while files go peer-to-peer over
-// WebRTC and never touch it - so the numbers are generous rather than tight.
-// A day covers the longest plausible session, and 4 GiB each way is orders of
-// magnitude past what text traffic uses while still being a number.
-func relayCircuitLimit() *relayv2.RelayLimit {
-	return &relayv2.RelayLimit{
-		Duration: 24 * time.Hour,
-		Data:     4 << 30,
-	}
-}
-
-// rendezvousACL restricts the circuit relay service to this app's own peers.
-// Without an ACL, EnableRelayService relays for anybody: two unrelated libp2p
-// nodes could use this deployment as free transit, and the per-IP and per-ASN
-// reservation caps cannot separate them from real users because every client
-// arrives from Traefik's single address (see relayResources).
+// Circuits are unlimited on purpose, and this has been tried the other way.
+// A finite per-circuit limit (24 h and 4 GiB, from the 2026-09-02 review)
+// looked like a free abuse bound: a day covers any session and nothing in
+// this app moves gigabytes over a circuit. It is not free. The relay copies
+// the limit into the HOP and STOP replies, and js-libp2p marks a circuit
+// that carries ANY limit as "limited", which changes how every browser
+// treats it:
 //
-// AllowConnect is the gate that matters: both ends of a circuit must hold a
-// live rendezvous stream, which only an awful client opens, so transit for a
-// pair of strangers is refused before any bytes flow.
+//   - dialProtocol only reuses an existing connection when it has no limit
+//     (connection-manager/utils.js findExistingConnection). With every
+//     circuit limited, each stream open started a fresh dial through the
+//     relay instead of using the circuit both peers already had. Those
+//     dials timed out, and the app's direct stream, which carries profiles,
+//     DMs, read receipts and call presence, took thirty seconds to come up
+//     instead of three. On a phone that never managed a WebRTC upgrade it
+//     never came up at all.
+//   - gossipsub does not peer over a limited connection unless told to, so
+//     room messages waited for the WebRTC upgrade as well.
 //
-// AllowReserve stays permissive on purpose. The client reserves BEFORE it
-// opens its rendezvous stream (transport.ts connect(): dialRelay,
-// requestRelayReservation, waitForRelayReservation, then startRendezvous, and
-// scheduleRelayReconnect repeats that order), so gating reservations on a
-// live stream would refuse every legitimate first reservation. A reservation
-// on its own carries no traffic; relayResources' MaxReservations is what
-// bounds it.
-type rendezvousACL struct{ reg *registry }
+// Circuits here are the primary transport for the life of a tab, not the
+// hole-punching stepping stone the "limited" flag was designed around, so
+// they must not carry a limit at all. The abuse bound is the resource
+// manager and relayResources above: per-peer and global reservation and
+// circuit counts, and the memory budget behind them.
 
-func (a rendezvousACL) AllowReserve(peer.ID, ma.Multiaddr) bool { return true }
-
-func (a rendezvousACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {
-	return a.reg.hasLiveStream(src.String()) && a.reg.hasLiveStream(dest.String())
-}
+// No circuit ACL. One was tried on 2026-09-02: AllowConnect required both
+// ends of a circuit to hold a live rendezvous stream, which is how an app
+// peer looks from here. It broke calls between a phone and a browser the
+// same day. A rendezvous stream is not live at the instant a circuit is
+// asked for far more often than it looks: a page reload closes it
+// gracefully and reopens it a second or two later, and a backgrounded
+// Android tab throttles its 20 s PING to once a minute, so the liveness
+// timeout evicts the stream every 60 s while the phone is in a pocket.
+// Every such gap refused or closed the circuit that the WebRTC signalling
+// and the relayed stream ride on, and the two sides never got a proven
+// stream. Gating connects on registry state would need a grace window
+// keyed by peerId, not by stream, and that is a different design; the
+// abuse bound is the resource manager, see the note on unlimited circuits.
 
 // newResourceManager builds the libp2p resource manager for the relay.
 // Extracted so main_test.go can assert the ceiling it lifts.
@@ -1447,8 +1440,7 @@ func main() {
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
 			relayv2.WithResources(relayResources()),
-			relayv2.WithACL(rendezvousACL{reg: reg}),
-			relayv2.WithLimit(relayCircuitLimit()),
+			relayv2.WithInfiniteLimits(),
 		),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
@@ -1478,6 +1470,10 @@ func main() {
 		mux.HandleFunc("/mailbox/collect", handleMailboxCollect)
 		mux.HandleFunc("/mailbox/ack", handleMailboxAck)
 		startMailboxSweeper()
+		mux.HandleFunc("/push/config", getOnly(handlePushConfig))
+		mux.HandleFunc("/push/subscribe", handlePushSubscribe)
+		mux.HandleFunc("/push/unsubscribe", handlePushUnsubscribe)
+		startPushWorker()
 		mux.HandleFunc("/telemetry", postOnly(handleTelemetryIngest(reg)))
 		mux.HandleFunc("/telemetry/list", handleTelemetryList)
 		mux.HandleFunc("/telemetry/get", handleTelemetryGet)

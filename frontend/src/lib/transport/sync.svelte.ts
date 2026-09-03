@@ -1305,19 +1305,110 @@ export async function downloadBackup(passphrase?: string): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
+/** A camera the QR scanner can run on. */
+export interface ScanCamera {
+  id: string;
+  label: string;
+}
+
+/**
+ * Camera state for the QR scanner.
+ *
+ * Its own store rather than more fields on syncState: this is about the
+ * hardware in front of the user, it means nothing outside the scan view, and
+ * it changes several times while a camera is starting.
+ */
+export const scannerState = $state({
+  /**
+   * The camera has been asked for and the user has not answered yet.
+   *
+   * Distinct from scanning and distinct from an error. On a phone the prompt
+   * sits there for as long as it takes somebody to read it, and for that whole
+   * time the view was a black square saying nothing at all - which reads as a
+   * broken scanner, not as a question waiting for an answer.
+   */
+  awaitingPermission: false,
+  /** Every camera on the device, once permission has been granted. */
+  cameras: [] as ScanCamera[],
+  activeCameraId: null as string | null,
+  /** The running camera has a torch, and it can be switched. */
+  torchAvailable: false,
+  torchOn: false,
+});
+
+const BACK_CAMERA = /\b(back|rear|environment)\b/i;
+
+/**
+ * The camera to open first.
+ *
+ * `{ facingMode: "environment" }` was a constraint, not a choice, and a
+ * browser that cannot honour it gets to pick - which on several Androids is
+ * the front camera, pointed at the face of somebody holding their other phone
+ * up to the back of the device. Naming a device id makes the choice explicit,
+ * and it gives the UI something to offer a switch between.
+ */
+function preferBackCamera(cameras: ScanCamera[]): string | null {
+  if (cameras.length === 0) return null;
+  const back = cameras.find((c) => BACK_CAMERA.test(c.label));
+  // Nothing labelled: the last entry is the back camera on most Androids, and
+  // on a single-camera device it is the only one there is.
+  return (back ?? cameras[cameras.length - 1]).id;
+}
+
+/** Read the running camera's torch support; never throws. */
+function readTorchSupport(): void {
+  if (!_html5QrCode) return;
+  try {
+    // The same MediaTrackCapabilities.torch the platform reports, read
+    // through the wrapper that also knows how to apply it.
+    const torch = _html5QrCode
+      .getRunningTrackCameraCapabilities()
+      .torchFeature();
+    scannerState.torchAvailable = torch.isSupported();
+    scannerState.torchOn = torch.value() === true;
+  } catch {
+    // No running camera, or a browser that reports no capabilities.
+    scannerState.torchAvailable = false;
+    scannerState.torchOn = false;
+  }
+}
+
 export async function startScanning(
   elementId: string,
   onScan: (payload: SyncPayload) => void,
-  onError: (error: string) => void
+  onError: (error: string) => void,
+  /** Skip the automatic choice - see switchScanCamera. */
+  cameraId?: string
 ): Promise<void> {
   syncState.isScanning = true;
   syncState.scanError = null;
+  scannerState.torchAvailable = false;
+  scannerState.torchOn = false;
 
   try {
+    // getCameras() is what raises the permission prompt, and it does not
+    // resolve until the user has answered it - so this, and only this, is the
+    // window in which the view should say it is waiting for them.
+    if (scannerState.cameras.length === 0) {
+      scannerState.awaitingPermission = true;
+      try {
+        scannerState.cameras = (await Html5Qrcode.getCameras()).map((c) => ({
+          id: c.id,
+          label: c.label,
+        }));
+      } finally {
+        scannerState.awaitingPermission = false;
+      }
+    }
+    const target = cameraId ?? preferBackCamera(scannerState.cameras);
+    scannerState.activeCameraId = target;
+
     _html5QrCode = new Html5Qrcode(elementId);
 
     await _html5QrCode.start(
-      { facingMode: "environment" },
+      // A device id when the enumeration gave one; the old facingMode
+      // constraint stays as the fallback for a browser that listed nothing.
+      target ?? { facingMode: "environment" },
       {
         fps: 10,
         qrbox: { width: 250, height: 250 },
@@ -1351,9 +1442,51 @@ export async function startScanning(
         // Scan error - usually just means no QR code in frame, ignore
       }
     );
+    readTorchSupport();
   } catch (err) {
     syncState.scanError = err instanceof Error ? err.message : String(err);
     onError(syncState.scanError);
+  }
+}
+
+/**
+ * Move the scan to another camera without leaving the scan view.
+ *
+ * The camera list survives stopScanning, so this never re-prompts.
+ */
+export async function switchScanCamera(
+  cameraId: string,
+  elementId: string,
+  onScan: (payload: SyncPayload) => void,
+  onError: (error: string) => void
+): Promise<void> {
+  await stopScanning();
+  await startScanning(elementId, onScan, onError, cameraId);
+}
+
+/** The next camera in the list, or null when there is only the one. */
+export function nextScanCameraId(): string | null {
+  const { cameras, activeCameraId } = scannerState;
+  if (cameras.length < 2) return null;
+  const at = cameras.findIndex((c) => c.id === activeCameraId);
+  return cameras[(at + 1) % cameras.length].id;
+}
+
+/** Switch the running camera's torch. Silently does nothing without one. */
+export async function toggleScanTorch(): Promise<void> {
+  if (!_html5QrCode || !scannerState.torchAvailable) return;
+  const next = !scannerState.torchOn;
+  try {
+    await _html5QrCode
+      .getRunningTrackCameraCapabilities()
+      .torchFeature()
+      .apply(next);
+    scannerState.torchOn = next;
+  } catch {
+    // Some devices advertise a torch and then refuse to switch it while the
+    // camera is running. Drop the control rather than leave a button that
+    // does nothing.
+    scannerState.torchAvailable = false;
   }
 }
 
@@ -1362,6 +1495,18 @@ export async function startScanning(
  */
 export async function stopScanning(): Promise<void> {
   if (_html5QrCode) {
+    // Off before the stop: some Androids leave the torch burning after the
+    // camera is released, and nothing in the app can reach it again.
+    if (scannerState.torchOn) {
+      try {
+        await _html5QrCode
+          .getRunningTrackCameraCapabilities()
+          .torchFeature()
+          .apply(false);
+      } catch {
+        // Nothing more to try; the stop below releases the device anyway.
+      }
+    }
     try {
       await _html5QrCode.stop();
     } catch {
@@ -1370,6 +1515,11 @@ export async function stopScanning(): Promise<void> {
     _html5QrCode = null;
   }
   syncState.isScanning = false;
+  scannerState.awaitingPermission = false;
+  scannerState.torchAvailable = false;
+  scannerState.torchOn = false;
+  // cameras and activeCameraId deliberately survive: switchScanCamera stops
+  // and restarts, and re-enumerating would re-prompt on some browsers.
 }
 
 /**

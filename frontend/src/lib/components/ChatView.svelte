@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, tick } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
   import { MAX_MESSAGE_FILES } from "$lib/transport/verify-incoming";
@@ -42,6 +42,10 @@
     ChessQueen,
     ThumbsUp,
     CornerUpLeft,
+    Bell,
+    BellOff,
+    AtSign,
+    Share2,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -107,6 +111,12 @@
   import { seededRandom } from "$lib/utils";
   import { getQuotableText } from "$lib/quote-helper";
   import { createInvite, formatShortCode } from "$lib/invite";
+  import {
+    getRoomNotifyMode,
+    setRoomNotifyMode,
+    type RoomNotifyMode,
+  } from "$lib/notify-prefs.svelte";
+  import { takeDroppedReplyDraft } from "$lib/notify-intents";
   import { formatRoomCode } from "$lib/room-code";
 
   $effect(() => {
@@ -995,6 +1005,26 @@
     setTimeout(() => (copied = false), 2000);
   }
 
+  // The OS share sheet, where there is one. Only offered when the browser
+  // actually has it, or the menu would carry two entries that do the same
+  // thing; the catch still falls back to the clipboard, because a share can
+  // fail on a page the sheet refuses to hand on.
+  const canShare = $derived(
+    typeof navigator !== "undefined" && typeof navigator.share === "function"
+  );
+
+  async function shareLink() {
+    copyMenuOpen = false;
+    try {
+      await navigator.share({ url: window.location.href });
+    } catch (err) {
+      // Dismissing the sheet is not a failure and must not silently copy
+      // something the user decided not to send.
+      if ((err as Error)?.name === "AbortError") return;
+      await copyCode();
+    }
+  }
+
   async function copyShortCode() {
     copyMenuOpen = false;
     shortCodeError = null;
@@ -1010,6 +1040,45 @@
     copied = true;
     setTimeout(() => (copied = false), 2000);
   }
+
+  /**
+   * How loud this conversation is allowed to be, cycled from the header.
+   *
+   * Three states rather than a mute toggle: a busy room you still want to be
+   * pulled out of by name is the common case, and it had no expression at all.
+   * The icon carries the state, because "is this room muted" is a question you
+   * ask by glancing at the header, not by opening a menu.
+   */
+  const notifyMode = $derived(getRoomNotifyMode(roomCode));
+  const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
+    all: "All messages",
+    mentions: "Mentions only",
+    muted: "Muted",
+  };
+  const NOTIFY_NEXT: Record<RoomNotifyMode, RoomNotifyMode> = {
+    all: "mentions",
+    mentions: "muted",
+    muted: "all",
+  };
+
+  /**
+   * A reply typed into a notification that could not be sent - the user had
+   * moved on by the time the intent drained - waits as a draft. Opening the
+   * conversation it was meant for hands it back rather than losing it.
+   *
+   * The composer is read through untrack so this is an effect about the room
+   * changing, not one that re-runs on every keystroke, and anything already
+   * in the box wins: clobbering half a sentence somebody is writing is worse
+   * than making them open the conversation twice.
+   */
+  $effect(() => {
+    const code = roomCode;
+    if (untrack(() => draft).trim()) return;
+    const pending = takeDroppedReplyDraft(code);
+    if (!pending) return;
+    draft = pending;
+    void tick().then(autoResize);
+  });
 
   function handleMessageClick(msgId: string) {
     if (!isMobile) return;
@@ -1572,8 +1641,14 @@
     </div>
   {/if}
 
-  <!-- h-13 keeps this row exactly level with the sidebar header (RoomSidebar). -->
-  <header class="flex h-13 items-center border-b border-border px-4 shrink-0">
+  <!-- h-13 keeps this row exactly level with the sidebar header (RoomSidebar),
+       and the status-bar inset is ADDED to that height in both places rather
+       than eaten out of it - the app paints under a translucent status bar
+       (viewport-fit=cover), so without this the room name sat under the
+       clock on a phone. -->
+  <header
+    class="flex h-[calc(3.25rem+env(safe-area-inset-top))] items-center border-b border-border px-4 pt-[env(safe-area-inset-top)] shrink-0"
+  >
     <div class="flex w-full items-center justify-between gap-2">
       <div class="flex items-center gap-2 min-w-0">
         {#if onOpenSidebar}
@@ -1638,6 +1713,17 @@
                 >
                   Copy link
                 </button>
+                {#if canShare}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onclick={shareLink}
+                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted cursor-pointer"
+                  >
+                    <Share2 class="size-3.5" />
+                    Share link
+                  </button>
+                {/if}
                 <button
                   type="button"
                   role="menuitem"
@@ -1659,6 +1745,32 @@
             {/if}
           </div>
         {/if}
+        <Tip text="Notifications: {NOTIFY_LABEL[notifyMode]}">
+          {#snippet children(props)}
+            <Button
+              {...props}
+              variant="ghost"
+              size="icon"
+              onclick={() =>
+                setRoomNotifyMode(roomCode, NOTIFY_NEXT[notifyMode])}
+              aria-label="Notifications: {NOTIFY_LABEL[
+                notifyMode
+              ]}. Tap to change."
+              class="size-11 sm:size-8 cursor-pointer hover:text-foreground {notifyMode ===
+              'all'
+                ? 'text-muted-foreground'
+                : 'text-amber-500'}"
+            >
+              {#if notifyMode === "muted"}
+                <BellOff class="size-4" />
+              {:else if notifyMode === "mentions"}
+                <AtSign class="size-4" />
+              {:else}
+                <Bell class="size-4" />
+              {/if}
+            </Button>
+          {/snippet}
+        </Tip>
         {#if !inCall}
           <Tip text="Join call">
             {#snippet children(props)}
@@ -2111,7 +2223,7 @@
                   <button
                     {...props}
                     type="button"
-                    class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                    class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
                     aria-label="React"
                     onclick={(e) => {
                       e.stopPropagation();
@@ -2132,7 +2244,7 @@
                   <button
                     {...props}
                     type="button"
-                    class="size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                    class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
                     aria-label="Reply"
                     onclick={(e) => {
                       e.stopPropagation();
@@ -2374,7 +2486,7 @@
               size="icon"
               onclick={toggleCommandPalette}
               aria-label="Plugin commands"
-              class="absolute left-1.5 top-1/2 z-10 size-8 shrink-0 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
+              class="absolute left-1.5 top-1/2 z-10 size-11 sm:size-8 shrink-0 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
             >
               <SquareSlash class="size-4" />
             </Button>
@@ -2386,7 +2498,7 @@
           segments={draftSegments}
           onkeydown={handleKeydown}
           padLeft
-          placeholder="Type a message..."
+          placeholder={isMobile ? "Message..." : "Type a message..."}
           oninput={() => {
             autoResize();
             updateMentionState();
@@ -2445,7 +2557,7 @@
           </div>
         {/if}
         <div
-          class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-1"
+          class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 sm:gap-1"
         >
           <Tip text="Attach files">
             {#snippet children(props)}
@@ -2456,7 +2568,7 @@
                 size="icon"
                 onclick={() => fileInputEl?.click()}
                 aria-label="Attach files"
-                class="size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+                class="size-11 sm:size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
               >
                 <Paperclip class="size-4" />
               </Button>
@@ -2476,7 +2588,7 @@
                   composerEmojiOpen = !composerEmojiOpen;
                 }}
                 aria-label="Insert emoji"
-                class="size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+                class="size-11 sm:size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
                 onpointerenter={() =>
                   (emojiCycleIdx = (emojiCycleIdx + 1) % emojiCycle.length)}
               >
@@ -2494,7 +2606,7 @@
                 size="icon"
                 onclick={() => (gifPickerOpen = true)}
                 aria-label="Send a GIF"
-                class="size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+                class="size-11 sm:size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
               >
                 <ImagePlay class="size-4" />
               </Button>
