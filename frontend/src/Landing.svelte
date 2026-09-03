@@ -827,7 +827,6 @@
     gap: 1rem;
     flex-wrap: wrap;
     justify-content: flex-end;
-    padding-right: 250px;
   }
 
   .grid-2col {
@@ -1265,6 +1264,30 @@
     filter: drop-shadow(0 0 3px #00ff8840) drop-shadow(0 0 8px #00ff8850);
   }
 
+  /* Mobile optimization: fix horizontal overflow and improve readability */
+  @media (max-width: 480px) {
+    .display-huge {
+      font-size: clamp(2rem, 11vw, 4rem);
+    }
+    .hero-section {
+      padding: 4rem 1rem 0 1rem;
+    }
+    /* On a phone the brand and GitHub are the nav, centred in the pill by
+       the 768px rule below; the section links are a scroll away and did
+       not fit on one row at this width. */
+    nav a:not(.accent-link):not([target="_blank"]) {
+      display: none;
+    }
+    /* A 120px glow around a three-line headline covers most of a phone
+       screen and the caption under it; a tighter glow reads the same. */
+    .glow-text {
+      text-shadow: 0 0 30px var(--glow);
+    }
+    .cta-section {
+      padding: 0 1.5rem;
+    }
+  }
+
   /* Responsive */
 
   @media (max-width: 900px) {
@@ -1275,15 +1298,36 @@
   }
 
   @media (max-width: 768px) {
+    /* Six links in one pill clipped "Awful.chat" and "GitHub" at both ends
+       on a 390px screen: the pill kept its single row and the overflow hid
+       behind its rounded corners. Let the row wrap and square the corners
+       enough for two rows; every link gets a 44px touch height. */
     nav {
       top: 1rem;
-      padding: 0.5rem 1rem;
-      gap: 0.75rem;
+      padding: 0.25rem 0.75rem;
+      gap: 0 0.75rem;
       width: calc(100% - 2rem);
       justify-content: center;
+      flex-wrap: wrap;
+      border-radius: 1.25rem;
     }
     nav a {
-      font-size: 0.7rem;
+      font-size: 0.75rem;
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      padding: 0 0.25rem;
+    }
+    /* Footer links wrapped word by word ("Write / a / plugin") because each
+       one was allowed to break inside; wrap between links instead. */
+    .footer-links {
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.5rem 1.5rem;
+    }
+    .footer-links a {
+      white-space: nowrap;
+      padding: 0.5rem 0;
     }
     .display-huge {
       font-size: clamp(2.5rem, 12vw, 5rem);
@@ -1318,9 +1362,15 @@
     }
     .terminal {
       font-size: 0.75rem;
+      overflow-x: auto;
     }
     .terminal-body {
       padding: 1rem;
+      overflow-x: auto;
+    }
+    .terminal-cmd {
+      word-break: break-all;
+      overflow-wrap: break-word;
     }
     .marquee-item {
       padding: 0 1.5rem;
@@ -1354,7 +1404,6 @@
     }
     .hero-buttons {
       flex-direction: column;
-      padding-right: 0;
       margin-top: 3rem;
       margin-bottom: 6rem;
     }
