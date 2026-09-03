@@ -50,8 +50,9 @@ let { isMobile = false, onClose, onOpenSync }: Props = $props();
   let biometricSuccess = $state(false);
   let confirmRemoveBiometric = $state(false);
 
-  let duressEnabled = $state(false);
+  let duressEnabled = $state<boolean | undefined>(undefined);
   // Async: telling an armed record from its decoy needs the session's key.
+  // Keep undefined until resolved to prevent layout shift when the value flips.
   $effect(() => {
     void hasDuressPassword().then((armed) => (duressEnabled = armed));
   });
@@ -283,7 +284,16 @@ let { isMobile = false, onClose, onOpenSync }: Props = $props();
     remembered password on this device (auto-unlock would skip the screen
     where you would type it).
   </p>
-  {#if duressEnabled}
+  {#if duressEnabled === undefined}
+    <!-- Loading state: disabled switch reserves space while hasDuressPassword()
+         resolves, preventing the switch from flipping after mount. -->
+    <div class="flex items-start justify-between gap-3">
+      <p class="text-xs text-muted-foreground font-mono">
+        Checking for a duress password...
+      </p>
+      <div class="h-6 w-11 rounded-full bg-muted/60 animate-pulse shrink-0"></div>
+    </div>
+  {:else if duressEnabled}
     <p class="text-xs text-green-500 font-mono">A duress password is set</p>
     <Button
       variant="outline"
