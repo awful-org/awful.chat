@@ -144,24 +144,16 @@ screens) and the plugin name and version in its header. Give your card's
 root `w-full` and let the frame own the sizing; only cap inner elements
 that should not stretch (a banner image, a fixed-size canvas).
 
-Here is a minimal card component (illustrative):
+A minimal card component, typed from the API alone (`CardProps<State>`;
+the widget, call tile, local card and settings surfaces have `WidgetProps`,
+`CallTileProps`, `LocalCardProps` and `SettingsProps`):
 
 ```svelte
 <script lang="ts">
-  import type { Message } from "$lib/transport/transport.svelte";
-  import type { HostApi } from "$lib/plugins/api";
+  import type { CardProps } from "$lib/plugins/api";
+  import type { WheelState } from "./logic";
 
-  interface Props {
-    card: Message;
-    cardState: unknown;
-    host: HostApi;
-  }
-
-  let { card, cardState, host }: Props = $props();
-
-  const wheelState = $derived(
-    cardState as { options: string[]; spun: boolean }
-  );
+  let { card, cardState, host }: CardProps<WheelState> = $props();
 
   async function handleSpin() {
     await host.sendUpdate(card.id, { action: "spin" });
@@ -169,7 +161,7 @@ Here is a minimal card component (illustrative):
 </script>
 
 <div class="w-full">
-  {#if wheelState.spun}
+  {#if cardState.spun}
     <p>Done spinning.</p>
   {:else}
     <button onclick={handleSpin}>Spin</button>
@@ -768,6 +760,14 @@ they show as untracked and stay out of the repo.
 `pnpm dev` in `frontend/` picks the folder up with hot reload. The registry
 skips a plugin with a bad manifest and logs why. Redeploying the instance is
 what publishes a plugin to your users.
+
+Completions come from working inside this checkout with your plugin fetched
+(`PLUGIN_SOURCES=/path/to/your/repo node scripts/fetch-plugins.mjs`):
+`plugins/tsconfig.json` gives every folder here the app's path mapping, so
+`host.` completes and the doc comments show on hover. `definePlugin` infers
+your state type from `initialState`, so `reduce` and the surface predicates
+are typed too. `pnpm check` only covers the built-ins; type-check your own
+folder with `npx svelte-check --tsconfig ./plugins/tsconfig.json`.
 
 ### Testing
 
