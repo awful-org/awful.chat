@@ -157,7 +157,7 @@ Here is a minimal card component (illustrative):
     host: HostApi;
   }
 
-  let { card, cardState, host } = $props();
+  let { card, cardState, host }: Props = $props();
 
   const wheelState = $derived(
     cardState as { options: string[]; spun: boolean }
