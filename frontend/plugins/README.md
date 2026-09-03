@@ -203,8 +203,11 @@ to load the plugin with a clear "needs a newer awful.chat" line instead of
 mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
 `call-audio`, `call-capture`, `clock-sample`, `local-card`, `now-playing`,
-`plugin-stream`.
-Declare only what you truly cannot function without.
+`plugin-stream`, `picture-in-picture`.
+Declare only what you truly cannot function without. A feature that only
+adds a button is better guarded at the call site
+(`typeof host.pictureInPicture === "function"`) so the plugin still loads
+on an older app and just hides the button.
 
 **Per-plugin storage**: `host.storage` is a device-local key-value store,
 namespaced per PLUGIN (not per room - prefix your keys with

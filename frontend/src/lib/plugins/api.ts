@@ -65,6 +65,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "confirm",
   "plugin-settings",
   "plugin-stream",
+  "picture-in-picture",
 ]);
 
 export interface UpdateCtx {
