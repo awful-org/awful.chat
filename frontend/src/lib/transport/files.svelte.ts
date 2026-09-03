@@ -448,9 +448,24 @@ export async function _resumeAttachmentSeeding(
  * WebTorrent - after a restart with a picture-heavy room, that read as the
  * app being dead. Images now pop in as they hydrate instead.
  */
+/**
+ * Which room's stored attachments are being read back right now. Between a
+ * room opening and this finishing, a file this device holds has no transfer
+ * entry yet, and its chip read "0 seeders" as if it would never arrive; the
+ * chip says "loading" instead while this names the room.
+ */
+export const attachmentHydration = $state<{ room: string | null }>({
+  room: null,
+});
+
 export async function _hydrateAndSeedAttachments(
   roomCode: string
 ): Promise<void> {
-  const rows = await _hydrateFileTransfersFromStorage(roomCode);
-  await _resumeAttachmentSeeding(roomCode, rows);
+  attachmentHydration.room = roomCode;
+  try {
+    const rows = await _hydrateFileTransfersFromStorage(roomCode);
+    await _resumeAttachmentSeeding(roomCode, rows);
+  } finally {
+    if (attachmentHydration.room === roomCode) attachmentHydration.room = null;
+  }
 }

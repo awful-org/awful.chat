@@ -39,7 +39,7 @@
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
   import { linkify } from "$lib/mentions";
   import { mediaBoxStyle } from "$lib/image-size";
-  import { INLINE_FILE_MAX_BYTES } from "$lib/transport/files.svelte";
+  import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
 
   import {
     convertImage,
@@ -879,14 +879,16 @@
       {#each msg.meta?.files ?? [] as file, index (transferKey(file, index))}
         {@const transfer = fileTransfers.get(file.infoHash)}
         {@const seederCount = transfer?.seeders ?? (transfer?.seeding ? 1 : 0)}
+        <!-- No transfer entry while this room's stored files are still being
+             read back means "not registered yet", not "nobody has it". -->
+        {@const hydrating = !transfer && attachmentHydration.room === msg.roomCode}
         <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">
               <p class="truncate text-sm text-foreground">{file.filename}</p>
               <p class="text-xs text-muted-foreground">
-                {formatSize(file.size)} • {seederCount} seeder{seederCount === 1
-                  ? ""
-                  : "s"}
+                {formatSize(file.size)} • {#if hydrating}loading...{:else}{seederCount}
+                  seeder{seederCount === 1 ? "" : "s"}{/if}
               </p>
             </div>
 

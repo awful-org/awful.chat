@@ -20,11 +20,26 @@ Key properties:
 - Offline DMs: an encrypted 48-hour relay mailbox (sealed to the recipient,
   padded sizes) delivers direct messages without both peers being online;
   on by default, can be turned off in settings
+- Push notifications that carry no content: the relay wakes a closed phone
+  with "you have mail", the app collects and decrypts locally; on by
+  default, off in settings
+- Installable as a PWA on phones and desktops, with native picture-in-picture
+  for calls and screen shares
 - Instance plugins: watch-together, polls, and more, bundled at build time
-- Device sync via QR code between your own devices
+  and compiled into the app, so they are part of what a build hash covers
+- Device sync via QR code between your own devices; encrypted backup files
+  for restoring elsewhere
+- Verifiable builds: every instance publishes the commit it runs, and
+  awful-verify (https://github.com/awful-org/awful-verify) checks that the
+  served code matches the published source
+- No analytics, no trackers, no third-party scripts beyond an optional
+  YouTube embed inside the watch-together plugin
 - Self-hostable: Docker Compose with a Go relay, mediasoup SFU, coturn
 
 ## Links
 
 - [App](https://awful.chat/app): the chat application (requires JavaScript)
 - [Source code](https://github.com/awful-org/awful.chat): open source, self-hosting instructions in the README
+- [Protocol and storage spec](https://github.com/awful-org/awful.chat/blob/main/docs/spec.md): how identity, messages, the mailbox and at-rest encryption work
+- [Plugins](https://github.com/awful-org/awful.chat/blob/main/frontend/plugins/README.md): writing and installing plugins
+- [Curated plugins](https://github.com/awful-org/awfully-awesome)
