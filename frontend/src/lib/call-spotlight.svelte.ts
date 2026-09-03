@@ -9,6 +9,7 @@ import { buildCallTiles, type CallState } from "./call-tiles";
 import type { SpotlightTile } from "./spotlight";
 import type { SpeakerState } from "./spotlight";
 import { callPipPanel } from "./call-pip.svelte";
+import { requestElementPip } from "./plugins/media-session";
 
 export interface SpotlightState {
   /** Current spotlight tile ID */
@@ -250,14 +251,8 @@ export async function enterBrowserPip(onReturn: () => void): Promise<void> {
     }
     const el = spotlightStore.pipVideoElement;
     if (!el) return;
-    if (document.pictureInPictureElement === el) return;
-    if (el.requestPictureInPicture) {
-      await el.requestPictureInPicture();
-    } else if ("webkitSetPresentationMode" in el) {
-      (el as unknown as { webkitSetPresentationMode(m: string): void })
-        .webkitSetPresentationMode("picture-in-picture");
-    }
-    callPipPanel.browserPip = true;
+    // The same element-PiP dance the plugin API offers, kept in one place.
+    if (await requestElementPip(el)) callPipPanel.browserPip = true;
   } catch (err) {
     console.warn("[pip] could not open:", err);
   }

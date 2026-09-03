@@ -22,6 +22,7 @@ import type {
 } from "$lib/types/message";
 import { base64ToBytes, encode } from "$lib/utils";
 import { mediaPrefs } from "$lib/media-prefs.svelte";
+import { SvelteSet } from "svelte/reactivity";
 import type { FileTransferSnapshot } from "./types";
 import type { WebTorrentFileTransport } from "./file/webtorrent";
 
@@ -454,18 +455,27 @@ export async function _resumeAttachmentSeeding(
  * entry yet, and its chip read "0 seeders" as if it would never arrive; the
  * chip says "loading" instead while this names the room.
  */
-export const attachmentHydration = $state<{ room: string | null }>({
-  room: null,
-});
+export const attachmentHydration = { rooms: new SvelteSet<string>() };
+const _hydrating = new Map<string, number>();
 
 export async function _hydrateAndSeedAttachments(
   roomCode: string
 ): Promise<void> {
-  attachmentHydration.room = roomCode;
+  // Counted per room: a room and a DM hydrate at the same time, and the
+  // same room can be reopened while its first pass is still reading, so a
+  // single flag was cleared by whichever finished first.
+  _hydrating.set(roomCode, (_hydrating.get(roomCode) ?? 0) + 1);
+  attachmentHydration.rooms.add(roomCode);
   try {
     const rows = await _hydrateFileTransfersFromStorage(roomCode);
     await _resumeAttachmentSeeding(roomCode, rows);
   } finally {
-    if (attachmentHydration.room === roomCode) attachmentHydration.room = null;
+    const left = (_hydrating.get(roomCode) ?? 1) - 1;
+    if (left <= 0) {
+      _hydrating.delete(roomCode);
+      attachmentHydration.rooms.delete(roomCode);
+    } else {
+      _hydrating.set(roomCode, left);
+    }
   }
 }

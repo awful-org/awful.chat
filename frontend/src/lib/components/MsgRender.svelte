@@ -881,7 +881,7 @@
         {@const seederCount = transfer?.seeders ?? (transfer?.seeding ? 1 : 0)}
         <!-- No transfer entry while this room's stored files are still being
              read back means "not registered yet", not "nobody has it". -->
-        {@const hydrating = !transfer && attachmentHydration.room === msg.roomCode}
+        {@const hydrating = !transfer && attachmentHydration.rooms.has(msg.roomCode)}
         <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">

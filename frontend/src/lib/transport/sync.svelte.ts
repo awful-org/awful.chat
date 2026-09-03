@@ -55,6 +55,7 @@ import {
   type AttachmentExport,
   type BackupFile,
   type DatabaseExport,
+  EXPORT_SECTIONS,
 } from "./backup";
 
 export { summarizeBackup, decryptBackup } from "./backup";
@@ -311,30 +312,6 @@ function armAckTimer(): void {
   }, ACK_TIMEOUT_MS);
 }
 
-/**
- * One frame's ceiling. send() resolves once the frame is written, and on a
- * stream whose far end stopped reading (a phone that went to sleep mid
- * transfer) yamux never drains, so it never resolves: the source sat at
- * whatever percentage it had reached with no error and no timer. A frame
- * is at most MAX_BATCH_BYTES, so half a minute is generous.
- */
-const SEND_TIMEOUT_MS = 30_000;
-
-async function sendBounded(peerId: string, bytes: Uint8Array): Promise<boolean> {
-  if (!_transport) return false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), SEND_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([
-      _transport.send(peerId, bytes).catch(() => false),
-      timeout,
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 /** Target-side: guards against a second ExportRequest on a re-connect. */
 let _exportRequested = false;
 /** Target-side: the source has to actually show up in the sync room. */
@@ -701,7 +678,7 @@ async function sendExportData(
     // Send identity first. Checked like every other send: this is the one
     // frame whose loss leaves the target sitting at exactly 0%, and it was
     // also the only one whose result was thrown away.
-    const identityOk = await sendBounded(
+    const identityOk = await _transport.send(
       peerId,
       encode({
         type: SyncMessageType.ExportData,
@@ -715,16 +692,10 @@ async function sendExportData(
     syncState.syncProgress = 10;
 
     // Send messages in batches with rate limiting
-    const sections = [
-      { name: "messages" as const, data: exportData.messages },
-      { name: "attachments" as const, data: exportData.attachments },
-      { name: "rooms" as const, data: exportData.rooms },
-      { name: "profiles" as const, data: exportData.profiles },
-      { name: "watermarks" as const, data: exportData.watermarks },
-      { name: "yjsDocs" as const, data: exportData.yjsDocs },
-      { name: "savedGifs" as const, data: exportData.savedGifs },
-      { name: "pending" as const, data: exportData.pending },
-    ];
+    const sections = EXPORT_SECTIONS.map((name) => ({
+      name,
+      data: exportData[name] as unknown[],
+    }));
 
     let processed = 0;
     for (const section of sections) {
@@ -764,8 +735,11 @@ async function sendExportData(
       for (let i = 0; i < batches.length; i++) {
         // send() resolving false means the stream is gone; silently pouring
         // the rest of the export into it is how the source reached 90% with
-        // a target that had stopped hearing anything at 20%.
-        const ok = await sendBounded(
+        // a target that had stopped hearing anything at 20%. It resolves in
+        // bounded time: the transport gives a frame a drain budget scaled to
+        // its size, so a far end that stopped reading (a phone that went to
+        // sleep mid transfer) fails the send instead of parking this loop.
+        const ok = await _transport.send(
           peerId,
           encode({
             type: SyncMessageType.ExportData,
@@ -799,7 +773,7 @@ async function sendExportData(
 
     console.log("[Sync][Source] Sending ExportComplete");
     // Send completion
-    const okComplete = await sendBounded(
+    const okComplete = await _transport.send(
       peerId,
       encode({ type: SyncMessageType.ExportComplete })
     );
@@ -1048,16 +1022,7 @@ export async function connectAsTarget(
             }
 
             // Update progress
-            const sections = [
-              "messages",
-              "attachments",
-              "rooms",
-              "profiles",
-              "watermarks",
-              "yjsDocs",
-              "savedGifs",
-              "pending",
-            ];
+            const sections: readonly string[] = EXPORT_SECTIONS;
             const sectionIndex = sections.indexOf(section);
             if (
               sectionIndex >= 0 &&
@@ -1175,13 +1140,13 @@ export async function connectAsTarget(
               // source often never saw the completion: it sat there until its
               // ack timeout and reported a failure for a sync that had in
               // fact finished.
-              // Bounded: a source that already gave up and left the room
-              // leaves nothing to drain into, and this device's import has
-              // in fact finished whether or not the ack lands.
-              await sendBounded(
-                peerId,
-                encode({ type: SyncMessageType.ExportComplete })
-              );
+              // AWAIT it, then tear down: dropping the promise before
+              // cleanup() disconnected the transport meant the source often
+              // never saw the completion. The transport bounds the wait, so a
+              // source that already gave up cannot hold this side at 99.
+              await _transport
+                ?.send(peerId, encode({ type: SyncMessageType.ExportComplete }))
+                .catch(() => false);
 
               syncState.isSyncing = false;
               syncState.isComplete = true;

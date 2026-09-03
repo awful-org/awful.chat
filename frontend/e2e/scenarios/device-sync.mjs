@@ -44,16 +44,18 @@ try {
   })()`);
 
   const phases = { alice: new Set(), bob: new Set() };
-  const deadline = Date.now() + 120_000;
   let a, b;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 1000));
-    a = await syncSnapshot(alice);
-    b = await syncSnapshot(bob);
-    phases.alice.add(a.phase);
-    phases.bob.add(b.phase);
-    if (a.err || b.err || (a.done && b.done)) break;
-  }
+  await alice.waitFor(
+    "both sides settled",
+    async () => {
+      a = await syncSnapshot(alice);
+      b = await syncSnapshot(bob);
+      phases.alice.add(a.phase);
+      phases.bob.add(b.phase);
+      return a.err || b.err || (a.done && b.done) ? true : null;
+    },
+    { timeout: 120_000, interval: 1000 }
+  );
   check.ok(!a.err, `source finished without error (${a.err ?? "ok"})`);
   check.ok(!b.err, `target finished without error (${b.err ?? "ok"})`);
   check.ok(a.done && a.progress === 100, `source reached 100 (${a.progress})`);

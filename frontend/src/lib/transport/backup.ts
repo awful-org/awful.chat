@@ -39,6 +39,23 @@ export interface AttachmentExport {
   createdAt: number;
 }
 
+/**
+ * The data sections of an export, in the order the device sync sends them
+ * and the import counts them. One list: the transfer's progress, the
+ * import's total and the export itself used to spell it out separately.
+ */
+export const EXPORT_SECTIONS = [
+  "messages",
+  "attachments",
+  "rooms",
+  "profiles",
+  "watermarks",
+  "yjsDocs",
+  "savedGifs",
+  "pending",
+] as const;
+export type ExportSection = (typeof EXPORT_SECTIONS)[number];
+
 export interface DatabaseExport {
   identity?: {
     mnemonic: {

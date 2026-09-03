@@ -42,6 +42,7 @@
   } from "$lib/transport/voice.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
+  import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { callPipPanel } from "$lib/call-pip.svelte";
   import { browserPipSupported, enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
   import { spotlightStore } from "$lib/call-spotlight.svelte";
@@ -1319,7 +1320,7 @@ import {
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
                 callFocus.pinnedTileId = tile.id;
-                void enterBrowserPip(() => {});
+                void enterBrowserPip(() => void requestReturnToCall());
               }}
             >
               <PictureInPicture2 class="size-3.5" />

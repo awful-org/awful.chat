@@ -46,6 +46,7 @@ import {
   type AttachmentExport,
   type BackupFile,
   type DatabaseExport,
+  EXPORT_SECTIONS,
   type ParsedBackupFile,
 } from "./backup";
 import { unlockWithImportedMnemonic } from "../identity/identity";
@@ -219,20 +220,15 @@ export async function importDatabase(
   return { droppedRecords };
 }
 
+/** Messages per import transaction; see the loop in importDatabaseInner. */
+const IMPORT_CHUNK = 200;
+
 async function importDatabaseInner(
   data: DatabaseExport,
   mode: "add" | "replace",
   onProgress?: (done: number, total: number) => void
 ): Promise<void> {
-  const total =
-    data.messages.length +
-    data.attachments.length +
-    data.rooms.length +
-    data.profiles.length +
-    data.savedGifs.length +
-    data.pending.length +
-    data.watermarks.length +
-    data.yjsDocs.length;
+  const total = EXPORT_SECTIONS.reduce((n, k) => n + data[k].length, 0);
   let done = 0;
   const tick = (n = 1): void => {
     done += n;
@@ -263,8 +259,15 @@ async function importDatabaseInner(
   // One transaction for the messages rather than one per message: a device
   // sync carries the whole history, and hundreds of independent transactions
   // are both slower and able to leave the database half-imported if one fails.
-  await bulkPutMessages(data.messages);
-  tick(data.messages.length);
+  // In chunks, each its own transaction, so progress moves while the
+  // longest phase runs: one transaction for the whole history reported
+  // nothing until every row was sealed and written, and on a phone with a
+  // real history that silence outlasted the source's ack clock.
+  for (let i = 0; i < data.messages.length; i += IMPORT_CHUNK) {
+    const chunk = data.messages.slice(i, i + IMPORT_CHUNK);
+    await bulkPutMessages(chunk);
+    tick(chunk.length);
+  }
   const writes: Promise<unknown>[] = [
     ...data.attachments.map((a) =>
       putAttachment({
