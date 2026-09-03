@@ -602,7 +602,9 @@
   }
 
   function firstUrl(text: string): string | null {
-    const match = text.match(/https?:\/\/[^\s]+/i);
+    // Stops at a quote or angle bracket too, so a URL quoted inside other
+    // text does not drag the closing quote and what follows along.
+    const match = text.match(/https?:\/\/[^\s"'<>]+/i);
     return match ? match[0] : null;
   }
 
@@ -636,7 +638,15 @@
   });
   const linkedUrl = $derived(firstUrl(content));
   const isGifMessage = $derived(isGifUrl(content));
-  const shouldShowOg = $derived(!isFileMessage && !!linkedUrl && !isGifMessage);
+  // Plugin cards and updates carry JSON, and a poster URL inside it is not
+  // a link the person posted: the preview fetch was firing for every party
+  // card with the JSON's next characters glued onto the URL.
+  const isPluginMessage = $derived(
+    msg.type === MessageType.PluginCard || msg.type === MessageType.PluginUpdate
+  );
+  const shouldShowOg = $derived(
+    !isFileMessage && !isPluginMessage && !!linkedUrl && !isGifMessage
+  );
 
   const ogDomain = $derived.by(() => {
     if (!linkedUrl) return "";

@@ -143,7 +143,12 @@
     },
   ];
 
+  // The phone nav: brand and a menu button in the pill, links in a panel
+  // under it. Any navigation closes the panel.
+  let menuOpen = $state(false);
+
   function handleNavClick(e: MouseEvent, href: string) {
+    menuOpen = false;
     if (href.startsWith("#")) {
       e.preventDefault();
       document.querySelector(href)?.scrollIntoView({ behavior: "smooth" });
@@ -180,19 +185,41 @@
 
 <div class="app scanlines noise">
   <!-- Floating Nav -->
-  <nav class="nav">
+  <nav class="nav" class:open={menuOpen}>
     {#each navLinks as link}
-      {#if link.external}
-        <a href={link.href} target="_blank" rel="noopener">{link.label}</a>
-      {:else}
+      {#if link.accent}
         <a
           href={link.href}
+          class="accent-link nav-brand"
           class:active={isActiveLink(link.href)}
-          class:accent-link={link.accent}
           onclick={(e) => handleNavClick(e, link.href)}>{link.label}</a
         >
       {/if}
     {/each}
+    <button
+      type="button"
+      class="nav-toggle"
+      aria-label={menuOpen ? "Close menu" : "Open menu"}
+      aria-expanded={menuOpen}
+      onclick={() => (menuOpen = !menuOpen)}
+    >
+      <span class="nav-toggle-bar"></span>
+      <span class="nav-toggle-bar"></span>
+      <span class="nav-toggle-bar"></span>
+    </button>
+    <div class="nav-links">
+      {#each navLinks as link}
+        {#if link.external}
+          <a href={link.href} target="_blank" rel="noopener">{link.label}</a>
+        {:else if !link.accent}
+          <a
+            href={link.href}
+            class:active={isActiveLink(link.href)}
+            onclick={(e) => handleNavClick(e, link.href)}>{link.label}</a
+          >
+        {/if}
+      {/each}
+    </div>
   </nav>
 
   <!-- Hero -->
@@ -801,6 +828,14 @@
     color: var(--accent);
     font-weight: 600;
   }
+  .nav-links {
+    display: flex;
+    align-items: center;
+    gap: 2rem;
+  }
+  .nav-toggle {
+    display: none;
+  }
 
   /* Hero */
   .hero-section {
@@ -1272,12 +1307,6 @@
     .hero-section {
       padding: 4rem 1rem 0 1rem;
     }
-    /* On a phone the brand and GitHub are the nav, centred in the pill by
-       the 768px rule below; the section links are a scroll away and did
-       not fit on one row at this width. */
-    nav a:not(.accent-link):not([target="_blank"]) {
-      display: none;
-    }
     /* A 120px glow around a three-line headline covers most of a phone
        screen and the caption under it; a tighter glow reads the same. */
     .glow-text {
@@ -1298,25 +1327,69 @@
   }
 
   @media (max-width: 768px) {
-    /* Six links in one pill clipped "Awful.chat" and "GitHub" at both ends
-       on a 390px screen: the pill kept its single row and the overflow hid
-       behind its rounded corners. Let the row wrap and square the corners
-       enough for two rows; every link gets a 44px touch height. */
-    nav {
+    /* Six links never fit one pill on a phone: they clipped at both ends,
+       then wrapped into ragged rows. The pill holds the brand and a menu
+       button; the links open in a panel under it, one 44px row each. */
+    .nav {
       top: 1rem;
-      padding: 0.25rem 0.75rem;
-      gap: 0 0.75rem;
       width: calc(100% - 2rem);
-      justify-content: center;
+      padding: 0.375rem 0.5rem 0.375rem 1rem;
+      gap: 0.5rem;
+      justify-content: space-between;
       flex-wrap: wrap;
-      border-radius: 1.25rem;
+      border-radius: 1.5rem;
     }
     nav a {
-      font-size: 0.75rem;
+      font-size: 0.9rem;
+    }
+    .nav-toggle {
       display: inline-flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 5px;
+      width: 44px;
+      height: 44px;
+      padding: 0 12px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+    }
+    .nav-toggle-bar {
+      display: block;
+      width: 100%;
+      height: 2px;
+      border-radius: 2px;
+      background: var(--fg);
+      transition:
+        transform 0.2s,
+        opacity 0.2s;
+    }
+    .nav.open .nav-toggle-bar:nth-child(1) {
+      transform: translateY(7px) rotate(45deg);
+    }
+    .nav.open .nav-toggle-bar:nth-child(2) {
+      opacity: 0;
+    }
+    .nav.open .nav-toggle-bar:nth-child(3) {
+      transform: translateY(-7px) rotate(-45deg);
+    }
+    .nav-links {
+      display: none;
+      width: 100%;
+      flex-direction: column;
+      gap: 0;
+      margin-top: 0.25rem;
+      padding: 0.25rem 0 0.25rem;
+      border-top: 1px solid var(--border);
+    }
+    .nav.open .nav-links {
+      display: flex;
+    }
+    .nav-links a {
+      display: flex;
       align-items: center;
       min-height: 44px;
-      padding: 0 0.25rem;
+      padding: 0 0.5rem;
     }
     /* Footer links wrapped word by word ("Write / a / plugin") because each
        one was allowed to break inside; wrap between links instead. */
