@@ -1,5 +1,7 @@
 import type { Component } from "svelte";
 import { apiUrl } from "$lib/runtime-config";
+import type { Message } from "$lib/types/message";
+import type { LocalPluginCardEntry } from "./local-cards.svelte";
 
 /**
  * A component the host renders on a plugin's behalf.
@@ -65,6 +67,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "confirm",
   "plugin-settings",
   "plugin-stream",
+  "picture-in-picture",
 ]);
 
 export interface UpdateCtx {
@@ -92,20 +95,50 @@ export interface HostApi {
   // for dm- rooms), putMessage, setWatermark, appendSorted, markRoomSeen,
   // noteRoomActivity all live there, and parallel send paths are where this
   // codebase's historical bugs came from.
-  sendCard(payload: unknown): Promise<string>; // returns cardId
+  /**
+   * Post a card to the host's room. `payload` is what `initialState`
+   * receives on every client, so seed options and questions from it; it is
+   * JSON, capped at 16 KB. Resolves to the card's id, which updates name.
+   */
+  sendCard(payload: unknown): Promise<string>;
+  /**
+   * Attach an update to a card. Persisted and replayed in fold order
+   * (lamport, senderId, updateId) on every client, into your `reduce`.
+   * `{ ephemeral: true }` sends live only, never stored or replayed
+   * (cursors, ticks), capped at about four a second per sender. JSON,
+   * 4 KB; anything larger is refused.
+   */
   sendUpdate(
     cardId: string,
     payload: unknown,
     opts?: { ephemeral?: boolean }
   ): Promise<void>;
+  /** The room this host is bound to. "" on the settings surface. */
   roomCode(): string;
+  /** This user's DID, the same value `ctx.senderDid` carries for their own updates. */
   selfDid(): string;
+  /** Peers connected right now, with the display names the host knows. */
   peers(): Array<{ did: string; name: string }>;
+  /** A peer left. Returns unsubscribe; call it when your surface unmounts. */
   onPeerDisconnect(
     listener: (peer: { did: string; name: string }) => void
   ): () => void;
+  /**
+   * This page is going away (close, reload, navigation). Synchronous work
+   * only: send a departure beacon with `sendUpdateImmediately`. Returns
+   * unsubscribe.
+   */
   onBeforeDisconnect(listener: () => void): () => void;
+  /**
+   * The teardown-safe `sendUpdate`: no async work, same room binding, for
+   * the `onBeforeDisconnect` beacon. Fire and forget.
+   */
   sendUpdateImmediately(cardId: string, payload: unknown): void;
+  /**
+   * This plugin's existing cards in the host's room, newest last. Cheap: it
+   * reads card rows only, and `state` is the folded state when the host has
+   * it in memory.
+   */
   cards(): Promise<Array<{ id: string; senderDid: string; state?: unknown }>>;
   /** Notify card surfaces after a persisted plugin state fold. */
   onCardStateChange(listener: () => void): () => void;
@@ -127,8 +160,23 @@ export interface HostApi {
       onPause?: () => void;
       onNext?: () => void;
       onPrevious?: () => void;
+      /**
+       * The element to float when the browser enters picture-in-picture on
+       * its own (Chromium pops the window on a tab switch while media
+       * plays). A call in progress keeps its spotlight as the target.
+       */
+      pipVideo?: HTMLVideoElement;
     } | null
   ): void;
+  /**
+   * Float this video in the browser's own picture-in-picture window, the
+   * one that survives a tab switch and, on a phone, leaving the app. Call
+   * it from a click: browsers refuse it without a gesture. Resolves false
+   * where the platform has no API (Firefox has only its hover toggle) or
+   * the browser refused. Only for media the plugin renders itself: a video
+   * inside a cross-origin iframe can be floated by nobody but the browser.
+   */
+  pictureInPicture(video: HTMLVideoElement): Promise<boolean>;
   /**
    * One round-trip probe to a peer, in milliseconds, or null if it did not
    * answer in time.
@@ -219,6 +267,7 @@ export interface HostApi {
   /** Show one session-only plugin surface in this room's conversation.
    *  It is never a Message: no signing, storage, sync, unread or notification. */
   showLocalCard(data?: unknown): string;
+  /** Close a local card by the id `showLocalCard` returned. */
   closeLocalCard(id: string): void;
   /** Play a local audio blob through this user's outgoing call track.
    *  Sounds are scoped to the calling plugin: several of this plugin's clips
@@ -253,18 +302,84 @@ export interface HostApi {
      *  unsubscribe - call it when your surface unmounts. */
     onChange(cb: () => void): () => void;
   };
-  seededRandom(seed: string): () => number; // deterministic PRNG
+  /**
+   * A deterministic PRNG for `seed`: the same seed gives the same sequence
+   * on every client, which is how an outcome peers must agree on is drawn.
+   * Seed it from ids the host verified (`ctx.updateId`, `ctx.senderDid`),
+   * never from the clock or Math.random.
+   */
+  seededRandom(seed: string): () => number;
+  /**
+   * Device-local key-value store, namespaced per plugin (not per room:
+   * prefix keys with `roomCode()` for that). JSON in localStorage, so keep
+   * values small; a blocked or full store fails silently and `get` returns
+   * undefined. Nothing here syncs anywhere.
+   */
   storage: {
     get(k: string): Promise<unknown>;
     set(k: string, v: unknown): Promise<void>;
   };
 }
 
-export interface PluginDefinition {
+// ── Surface props ───────────────────────────────────────────────────────────
+//
+// What the host passes to each component on a definition, named here so a
+// plugin types its props from the API alone and never reaches into the app.
+
+/** The chat message a card lives in, exactly as the host passes it. */
+export type CardMessage = Message;
+
+/** Props of the `card` surface. */
+export interface CardProps<State = unknown> {
+  card: CardMessage;
+  cardState: State;
+  host: HostApi;
+}
+
+/**
+ * Props of the `widget` surface. `card` is null and `cardState` undefined
+ * for a plugin with no card surface at all, and while no card of yours is
+ * current (see `widgetMine`).
+ */
+export interface WidgetProps<State = unknown> {
+  card: CardMessage | null;
+  cardState: State | undefined;
+  host: HostApi;
+}
+
+/**
+ * Props of the `callTile` surface: the card's, plus whether the call's own
+ * controls are showing, so your overlays move with them.
+ */
+export interface CallTileProps<State = unknown> extends CardProps<State> {
+  chromeVisible: boolean;
+}
+
+/** Props of the `localCard` surface. `localCard.data` is what `showLocalCard` was given. */
+export interface LocalCardProps {
+  localCard: LocalPluginCardEntry;
+  host: HostApi;
+  close: () => void;
+}
+
+/** Props of the `settings` surface. The host is bound to no room here. */
+export interface SettingsProps {
+  host: HostApi;
+}
+
+/**
+ * A plugin. `State` is the shape your reducer keeps per card and `CardData`
+ * the payload `sendCard` is given; `definePlugin` infers both from
+ * `initialState`, so `reduce` and the surface predicates see your own types.
+ */
+export interface PluginDefinition<State = unknown, CardData = unknown> {
   manifest: PluginManifest;
-  // Svelte component rendering a card. Props: { card, cardState, host }.
-  // cardState, not state: a prop called `state` shadows the $state rune in
-  // any card that uses runes, and the host has always passed this name.
+  /**
+   * Svelte component rendering a card. Props: `CardProps<State>`, that is
+   * `{ card, cardState, host }`. cardState, not state: a prop called
+   * `state` shadows the $state rune in any card that uses runes, and the
+   * host has always passed this name.
+   */
   card?: PluginComponent;
   /** Private, session-only surface opened by HostApi.showLocalCard.
    * Props: { localCard, host, close }. It is not backed by a chat message. */
@@ -300,13 +415,13 @@ export interface PluginDefinition {
    * the tile in the same fold. Absent means "always on while the card
    * exists", which is almost never what you want.
    */
-  callTileActive?: (cardState: unknown) => boolean;
+  callTileActive?(cardState: State): boolean;
   /**
    * Display names of the people currently using the tile (party members,
    * board editors), derived from state - PURE. The host shows them in the
    * same audience chip screen-share transmissions get.
    */
-  callTileViewers?: (cardState: unknown) => string[];
+  callTileViewers?(cardState: State): string[];
   /**
    * @deprecated Pins are one-per-plugin by construction now (a pin names
    * the plugin, not a card), which is all this flag ever bought. Accepted
@@ -322,10 +437,17 @@ export interface PluginDefinition {
    * is still one click away. Absent, the strip follows the newest card
    * unconditionally.
    */
-  widgetMine?: (cardState: unknown, selfDid: string) => boolean;
-  // Pure reducer. Host feeds persisted updates in lamport order (history
-  // replay first, then live), ephemeral updates live only.
-  reduce?: (state: unknown, update: PluginUpdate, ctx: UpdateCtx) => unknown;
+  widgetMine?(cardState: State, selfDid: string): boolean;
+  /**
+   * Pure reducer. The host feeds persisted updates in fold order (history
+   * replay first, then live) and ephemeral updates live only. Return the
+   * same state to reject an update. `update.data` is peer-supplied and
+   * untrusted; validate it like network input.
+   *
+   * Method syntax on purpose: it keeps a definition typed with your State
+   * assignable to the host's `PluginDefinition<unknown>`.
+   */
+  reduce?(state: State, update: PluginUpdate, ctx: UpdateCtx): State;
   /**
    * Build the starting state for one card. Receives the card's payload (the
    * object passed to host.sendCard) so options/questions seed the state -
@@ -337,7 +459,7 @@ export interface PluginDefinition {
    * payload is peer-supplied, so an `ownerDid` in it is a claim, not a fact.
    * Second argument, so a plugin that only needs the payload keeps working.
    */
-  initialState?: (cardData: unknown, ctx: CardCtx) => unknown;
+  initialState?(cardData: CardData, ctx: CardCtx): State;
   commands?: Record<
     string,
     (args: string, host: HostApi) => void | Promise<void>
@@ -404,6 +526,12 @@ export function streamUrl(upstream: string): string {
   return `${apiUrl()}/plugin-stream?url=${encodeURIComponent(upstream)}`;
 }
 
-export function definePlugin(def: PluginDefinition): PluginDefinition {
+/**
+ * Identity at runtime; at type level it infers `State` (and `CardData`)
+ * from `initialState`, so annotate that return and the rest follows.
+ */
+export function definePlugin<State = unknown, CardData = unknown>(
+  def: PluginDefinition<State, CardData>
+): PluginDefinition<State, CardData> {
   return def;
 }

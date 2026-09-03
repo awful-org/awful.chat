@@ -101,6 +101,11 @@ const PING_MISSES_ALLOWED = 2;
 /** A fresh stream is pinged this often until its first pong. */
 const STREAM_CONFIRM_INTERVAL_MS = 700;
 const STREAM_CONFIRM_ATTEMPTS = 8;
+const DRAIN_BUDGET_BASE_MS = 30_000;
+const DRAIN_BUDGET_FLOOR_BYTES_PER_MS = 20;
+function drainBudgetMs(bytes: number): number {
+  return DRAIN_BUDGET_BASE_MS + bytes / DRAIN_BUDGET_FLOOR_BYTES_PER_MS;
+}
 /**
  * How long probeSilentPeers waits before judging one missed probe,
  * independent of the send() promise it rides on. A stream that never
@@ -1871,6 +1876,13 @@ export class LibP2PTransport implements PeerTransport {
     }
   }
 
+  /**
+   * How long a buffered frame may take to drain before the stream is
+   * declared dead: half a minute, plus a floor of 20 KB/s for its size. A
+   * 2.5 MB sync batch over a relayed or TURN path gets about two and a half
+   * minutes, which a link that is merely slow meets and a dead one never
+   * does.
+   */
   private async writeFrame(
     peerId: string,
     stream: Stream,
@@ -1888,14 +1900,34 @@ export class LibP2PTransport implements PeerTransport {
       // true here let send() report success for a frame that later dropped
       // on backpressure - and the DM layer deletes a message from its
       // persisted queue on true, so an optimistic true here destroyed it.
-      // Report the real outcome once the stream actually drains.
-      return await stream.onDrain().then(
-        () => true,
-        () => {
-          this.cleanupPeerStream(peerId);
-          return false;
-        }
-      );
+      // Report the real outcome once the stream actually drains - within a
+      // budget. A far end that stopped reading (a phone asleep mid
+      // transfer) never sends the window update yamux waits for, and this
+      // await used to sit forever, which every caller inherited: the device
+      // sync parked at its last percentage with no error. The budget scales
+      // with the frame so a slow, alive link is not mistaken for a dead one.
+      let budget: ReturnType<typeof setTimeout> | null = null;
+      const stalled = new Promise<false>((resolve) => {
+        budget = setTimeout(() => resolve(false), drainBudgetMs(data.byteLength));
+      });
+      const drained = await Promise.race([
+        stream.onDrain().then(
+          () => true,
+          () => false
+        ),
+        stalled,
+      ]);
+      if (budget) clearTimeout(budget);
+      if (!drained) {
+        rec(
+          ev("stream.write.fail", {
+            peer: peerId,
+            d: { err: "drain-timeout", bytes: data.byteLength },
+          })
+        );
+        this.cleanupPeerStream(peerId);
+      }
+      return drained;
     } catch (err) {
       console.warn(`[LibP2PTransport] write failed for ${peerId}:`, err);
       rec(

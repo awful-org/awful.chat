@@ -32,7 +32,9 @@
   // repository is self-declared in the manifest - a label, not a proof.
   // Deep links (".../tree/main/frontend/plugins/poll") group under their
   // REPOSITORY root - two built-ins pointing into the same repo are one
-  // origin, not two. The deep link survives as the row's own source link.
+  // origin, not two. The header is the only source link: a per-row one
+  // showed up on some rows and not others, depending on how deep each
+  // manifest's URL happened to point, and the folder is one click away.
   const repoRoot = (url: string): string => {
     try {
       const u = new URL(url);
@@ -130,17 +132,6 @@
                        constant "v1" for everything. -->
                   <span class="text-xs font-mono text-muted-foreground"
                     >v{registered.manifest.version}</span
-                  >
-                {/if}
-                {#if registered.manifest.repository && group.repo !== null && registered.manifest.repository !== group.repo}
-                  <!-- The group header links the repo; a DEEPER declared
-                       path (the plugin's folder) keeps its own link. -->
-                  <a
-                    href={registered.manifest.repository}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    class="inline-flex items-center gap-0.5 text-xs font-mono text-muted-foreground hover:text-primary hover:underline"
-                    >source<ExternalLink class="size-3" /></a
                   >
                 {/if}
               </div>

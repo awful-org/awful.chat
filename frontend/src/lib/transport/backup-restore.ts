@@ -46,6 +46,7 @@ import {
   type AttachmentExport,
   type BackupFile,
   type DatabaseExport,
+  EXPORT_SECTIONS,
   type ParsedBackupFile,
 } from "./backup";
 import { unlockWithImportedMnemonic } from "../identity/identity";
@@ -73,6 +74,12 @@ export interface ImportOptions {
    * overwrote.
    */
   requestPassword?: (retry: boolean) => Promise<string | null>;
+  /**
+   * Called as records land, with a running count and the total. A device
+   * sync's whole history goes through here, and on a phone that takes
+   * long enough that a bar which stops moving reads as a hang.
+   */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /** The stored mnemonic record that an export's identity section describes. */
@@ -206,17 +213,27 @@ export async function importDatabase(
   // condition that happens to be true today.
   markAtRestSweepNeeded();
   try {
-    await importDatabaseInner(sanitizedData, mode);
+    await importDatabaseInner(sanitizedData, mode, options.onProgress);
   } finally {
     endPlaintextImport?.();
   }
   return { droppedRecords };
 }
 
+/** Messages per import transaction; see the loop in importDatabaseInner. */
+const IMPORT_CHUNK = 200;
+
 async function importDatabaseInner(
   data: DatabaseExport,
-  mode: "add" | "replace"
+  mode: "add" | "replace",
+  onProgress?: (done: number, total: number) => void
 ): Promise<void> {
+  const total = EXPORT_SECTIONS.reduce((n, k) => n + data[k].length, 0);
+  let done = 0;
+  const tick = (n = 1): void => {
+    done += n;
+    onProgress?.(done, total);
+  };
 
   // Import identity only if provided, and never in "add" mode: a merge keeps
   // the identity this device already has. Re-checked here rather than trusted
@@ -242,8 +259,16 @@ async function importDatabaseInner(
   // One transaction for the messages rather than one per message: a device
   // sync carries the whole history, and hundreds of independent transactions
   // are both slower and able to leave the database half-imported if one fails.
-  await bulkPutMessages(data.messages);
-  await Promise.all([
+  // In chunks, each its own transaction, so progress moves while the
+  // longest phase runs: one transaction for the whole history reported
+  // nothing until every row was sealed and written, and on a phone with a
+  // real history that silence outlasted the source's ack clock.
+  for (let i = 0; i < data.messages.length; i += IMPORT_CHUNK) {
+    const chunk = data.messages.slice(i, i + IMPORT_CHUNK);
+    await bulkPutMessages(chunk);
+    tick(chunk.length);
+  }
+  const writes: Promise<unknown>[] = [
     ...data.attachments.map((a) =>
       putAttachment({
         ...a,
@@ -347,7 +372,8 @@ async function importDatabaseInner(
         );
       })();
     }),
-  ]);
+  ];
+  await Promise.all(writes.map((w) => w.then(() => tick())));
 }
 
 // ── File backup (QR-less alternative to device sync) ─────────────────────────

@@ -55,6 +55,7 @@ import {
   type AttachmentExport,
   type BackupFile,
   type DatabaseExport,
+  EXPORT_SECTIONS,
 } from "./backup";
 
 export { summarizeBackup, decryptBackup } from "./backup";
@@ -102,6 +103,8 @@ enum SyncMessageType {
   ExportAck = "sync_export_ack",
   ExportComplete = "sync_export_complete",
   SyncError = "sync_error",
+  /** Target to source while importing: `{ percent }`. Restarts the ack clock. */
+  ImportProgress = "sync_import_progress",
 }
 
 interface SyncMessage {
@@ -118,6 +121,12 @@ export interface SyncState {
   isConnecting: boolean;
   isSyncing: boolean;
   syncProgress: number;
+  /**
+   * What the bar is measuring. "transfer" is frames on the wire; the last
+   * ten percent is the import, on this device or the other one, which used
+   * to sit at a frozen number with the transfer's label on it.
+   */
+  phase: "transfer" | "importing" | "importing-remote";
   syncError: string | null;
   isComplete: boolean;
 }
@@ -131,6 +140,7 @@ export const syncState = $state<SyncState>({
   isConnecting: false,
   isSyncing: false,
   syncProgress: 0,
+  phase: "transfer",
   syncError: null,
   isComplete: false,
 });
@@ -280,9 +290,28 @@ export function utf8Length(s: string): number {
   }
   return bytes;
 }
-/** How long the source waits for the target's import ack before erroring. */
+/**
+ * How long the source waits between signs of life from the target's import
+ * before erroring. Restarted by every ImportProgress frame, so the bound is
+ * on silence, not on the whole import.
+ */
 const ACK_TIMEOUT_MS = 120_000;
 let _ackTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
+function armAckTimer(): void {
+  if (_ackTimeoutTimer) clearTimeout(_ackTimeoutTimer);
+  _ackTimeoutTimer = setTimeout(() => {
+    syncState.syncError =
+      "The other device never confirmed the import - try again";
+    syncState.isSyncing = false;
+    // Without this the transport, the sync-room membership and the
+    // separate code-expiry timer all stay alive, and that expiry later
+    // overwrites this message with "Sync code expired" - a second, wrong
+    // explanation for the same event.
+    cleanup().catch(() => {});
+  }, ACK_TIMEOUT_MS);
+}
+
 /** Target-side: guards against a second ExportRequest on a re-connect. */
 let _exportRequested = false;
 /** Target-side: the source has to actually show up in the sync room. */
@@ -592,6 +621,16 @@ async function startSyncServer(): Promise<void> {
       } else if (msg.type === SyncMessageType.ExportAck) {
         // Target acknowledged receipt (can be used for flow control)
         console.log("[Sync][Source] Received acknowledgment");
+      } else if (msg.type === SyncMessageType.ImportProgress) {
+        // The target is still writing. Each report restarts the ack clock,
+        // so a long import on a slow phone no longer times out a sync that
+        // is finishing, and the bar here follows the one over there.
+        const { percent } = (msg.payload ?? {}) as { percent?: unknown };
+        syncState.phase = "importing-remote";
+        if (typeof percent === "number" && percent > syncState.syncProgress) {
+          syncState.syncProgress = Math.min(99, Math.floor(percent));
+        }
+        if (_ackTimeoutTimer) armAckTimer();
       } else if (msg.type === SyncMessageType.ExportComplete) {
         if (_ackTimeoutTimer) clearTimeout(_ackTimeoutTimer);
         _ackTimeoutTimer = null;
@@ -653,16 +692,10 @@ async function sendExportData(
     syncState.syncProgress = 10;
 
     // Send messages in batches with rate limiting
-    const sections = [
-      { name: "messages" as const, data: exportData.messages },
-      { name: "attachments" as const, data: exportData.attachments },
-      { name: "rooms" as const, data: exportData.rooms },
-      { name: "profiles" as const, data: exportData.profiles },
-      { name: "watermarks" as const, data: exportData.watermarks },
-      { name: "yjsDocs" as const, data: exportData.yjsDocs },
-      { name: "savedGifs" as const, data: exportData.savedGifs },
-      { name: "pending" as const, data: exportData.pending },
-    ];
+    const sections = EXPORT_SECTIONS.map((name) => ({
+      name,
+      data: exportData[name] as unknown[],
+    }));
 
     let processed = 0;
     for (const section of sections) {
@@ -702,7 +735,10 @@ async function sendExportData(
       for (let i = 0; i < batches.length; i++) {
         // send() resolving false means the stream is gone; silently pouring
         // the rest of the export into it is how the source reached 90% with
-        // a target that had stopped hearing anything at 20%.
+        // a target that had stopped hearing anything at 20%. It resolves in
+        // bounded time: the transport gives a frame a drain budget scaled to
+        // its size, so a far end that stopped reading (a phone that went to
+        // sleep mid transfer) fails the send instead of parking this loop.
         const ok = await _transport.send(
           peerId,
           encode({
@@ -745,20 +781,13 @@ async function sendExportData(
       throw new Error("Connection lost before the export finished - try again");
     }
 
-    // Don't set to 100% here - wait for target's acknowledgment, but not
-    // forever: a target that died mid-import used to leave this side parked
-    // at 90% with no error.
-    if (_ackTimeoutTimer) clearTimeout(_ackTimeoutTimer);
-    _ackTimeoutTimer = setTimeout(() => {
-      syncState.syncError =
-        "The other device never confirmed the import - try again";
-      syncState.isSyncing = false;
-      // Without this the transport, the sync-room membership and the
-      // separate code-expiry timer all stay alive, and that expiry later
-      // overwrites this message with "Sync code expired" - a second, wrong
-      // explanation for the same event.
-      cleanup().catch(() => {});
-    }, ACK_TIMEOUT_MS);
+    // Everything is across; what remains is the other device writing it,
+    // which its ImportProgress frames narrate from here on. Not 100% yet:
+    // that waits for its acknowledgment, but not forever - a target that
+    // died mid-import used to leave this side parked at 90% with no error.
+    syncState.syncProgress = 90;
+    syncState.phase = "importing-remote";
+    armAckTimer();
     console.log("[Sync][Source] Waiting for target to finish importing...");
   } catch (err) {
     console.error("[Sync] Error sending export data:", err);
@@ -993,16 +1022,7 @@ export async function connectAsTarget(
             }
 
             // Update progress
-            const sections = [
-              "messages",
-              "attachments",
-              "rooms",
-              "profiles",
-              "watermarks",
-              "yjsDocs",
-              "savedGifs",
-              "pending",
-            ];
+            const sections: readonly string[] = EXPORT_SECTIONS;
             const sectionIndex = sections.indexOf(section);
             if (
               sectionIndex >= 0 &&
@@ -1043,6 +1063,36 @@ export async function connectAsTarget(
           console.log(
             "[Sync][Target] Received ExportComplete, importing data..."
           );
+          // The transfer is done; the last ten percent is this device
+          // writing what arrived. It used to sit at the transfer's final
+          // number (80 when the pending section was empty, which it almost
+          // always is) with "Syncing data" on it for as long as the import
+          // took, which on a phone with a real history is minutes.
+          syncState.phase = "importing";
+          syncState.syncProgress = Math.max(syncState.syncProgress, 90);
+          let lastReport = 0;
+          const onProgress = (done: number, total: number): void => {
+            const percent =
+              total > 0 ? 90 + Math.floor((done / total) * 9) : 99;
+            if (percent > syncState.syncProgress) {
+              syncState.syncProgress = percent;
+            }
+            // The source restarts its ack clock on each of these, so a slow
+            // import is narrated rather than timed out. Throttled: the
+            // frames ride the same stream the import just emptied.
+            const now = Date.now();
+            if (now - lastReport < 2000) return;
+            lastReport = now;
+            void _transport
+              ?.send(
+                peerId,
+                encode({
+                  type: SyncMessageType.ImportProgress,
+                  payload: { percent: syncState.syncProgress },
+                })
+              )
+              .catch(() => false);
+          };
           // Import all received data
           if (receivedIdentity || mode === "add") {
             try {
@@ -1071,7 +1121,7 @@ export async function connectAsTarget(
                 // the at-rest key is armed before the first row is written,
                 // so nothing lands in plaintext on a device that has never
                 // unlocked (see importDatabase).
-                importOptions
+                { ...importOptions, onProgress }
               );
               if (droppedRecords > 0) {
                 // The sync itself succeeded - this is a partial-data note,
@@ -1090,6 +1140,10 @@ export async function connectAsTarget(
               // source often never saw the completion: it sat there until its
               // ack timeout and reported a failure for a sync that had in
               // fact finished.
+              // AWAIT it, then tear down: dropping the promise before
+              // cleanup() disconnected the transport meant the source often
+              // never saw the completion. The transport bounds the wait, so a
+              // source that already gave up cannot hold this side at 99.
               await _transport
                 ?.send(peerId, encode({ type: SyncMessageType.ExportComplete }))
                 .catch(() => false);
@@ -1534,6 +1588,7 @@ export function resetSyncState(): void {
   syncState.isConnecting = false;
   syncState.isSyncing = false;
   syncState.syncProgress = 0;
+  syncState.phase = "transfer";
   syncState.syncError = null;
   syncState.isComplete = false;
 }

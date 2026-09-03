@@ -353,6 +353,17 @@
           >
         </div>
       </div>
+    {:else}
+      <!-- Skeleton that reserves space for recorder stats while the view loads,
+           preventing layout shift when events and session data appear. -->
+      <div class="flex flex-col gap-2 animate-pulse">
+        {#each [1, 2, 3, 4] as _}
+          <div class="flex items-center justify-between">
+            <div class="h-3 w-24 rounded bg-muted/60"></div>
+            <div class="h-3 w-32 rounded bg-muted/60"></div>
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 

@@ -8,7 +8,8 @@
     FileDown,
     Server,
     Smartphone,
-    BellOff,
+    Bell,
+    Wifi,
     Video,
   } from "@lucide/svelte";
 
@@ -64,9 +65,14 @@
       body: "Signing in elsewhere does not pull your history. Pair devices from Settings > Sync with a QR code, which expires after 5 minutes. Pairing copies what exists at that moment, it is not a continuous cloud sync, and it is best to use one device at a time.",
     },
     {
-      icon: BellOff,
-      title: "Nothing reaches you while the app is closed",
-      body: "There are no push notifications: nothing wakes this device while the app is closed. Offline DMs wait for you (encrypted, at the relay) and room messages wait with your peers, but you only find out about any of it once you open the app and it connects.",
+      icon: Bell,
+      title: "A notification can wake this device, and it says nothing",
+      body: "With the app closed, the relay can wake this device when a DM is waiting for you. That push carries no content, only that there is mail; the app then collects it and decrypts it here. It is on by default and can be turned off in Settings > App. Room messages never trigger it: they wait with your peers, not at the relay. Brave ships with its push service switched off, and Settings says so when that is why nothing arrives.",
+    },
+    {
+      icon: Wifi,
+      title: "Your browser may ask about your local network",
+      body: "When another member is on the same Wi-Fi as you, the direct connection between you runs over the local network, and Chrome-based browsers ask before allowing a website to do that. Allowing it keeps calls and file transfers on the fastest path. Denying it still works, through the relay or a TURN server, only slower.",
     },
   ];
 </script>

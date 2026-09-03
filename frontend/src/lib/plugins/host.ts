@@ -30,7 +30,7 @@ import {
 } from "./room-context";
 import { requestJumpToMessage } from "$lib/ui-state.svelte";
 import type { Message } from "$lib/types/message";
-import { setNowPlayingFor } from "./media-session";
+import { requestElementPip, setNowPlayingFor } from "./media-session";
 import { getCardState, onCardStateChange as onPluginCardStateChange } from "./state.svelte";
 import { MessageType } from "$lib/types/message";
 import { closeLocalCard, upsertLocalCard } from "./local-cards.svelte";
@@ -71,6 +71,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
     setNowPlaying(info) {
       setNowPlayingFor(nowPlayingToken, info);
     },
+    pictureInPicture: (video) => requestElementPip(video),
     async sendCard(payload) {
       const { sendCard } = await import("$lib/transport/transport.svelte");
       return sendCard(pluginId, payload);

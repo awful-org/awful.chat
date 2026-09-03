@@ -451,12 +451,69 @@
         </Button>
       </div>
     {:else}
-      <div class="flex items-center justify-center py-8">
-        <div class="flex flex-col items-center gap-2">
-          <Database class="w-8 h-8 text-muted-foreground animate-pulse" />
-          <span class="text-xs text-muted-foreground font-mono"
-            >Loading metrics...</span
-          >
+      <!-- Skeleton layout that reserves the same space as the real metrics to
+           prevent layout shift while data loads. Replaces the centered
+           "Loading metrics..." message that caused flicker. -->
+      <div class="flex flex-col gap-4 animate-pulse">
+        <!-- Stats Grid Skeleton -->
+        <div class="grid grid-cols-2 gap-3">
+          {#each [1, 2, 3, 4] as _}
+            <div class="bg-muted/50 rounded-lg p-3">
+              <div class="flex items-center gap-2 mb-1">
+                <div class="w-3.5 h-3.5 rounded bg-muted/60"></div>
+                <div class="h-3 w-16 rounded bg-muted/60"></div>
+              </div>
+              <div class="h-6 w-20 rounded bg-muted/60"></div>
+            </div>
+          {/each}
+        </div>
+
+        <!-- Eviction Protection Skeleton -->
+        <div class="bg-muted/50 rounded-lg p-3 flex flex-col gap-2">
+          <div class="flex items-center gap-2">
+            <div class="w-4 h-4 rounded bg-muted/60"></div>
+            <div class="h-3 w-32 rounded bg-muted/60"></div>
+          </div>
+          <div class="space-y-1">
+            <div class="h-3 w-full rounded bg-muted/60"></div>
+            <div class="h-3 w-4/5 rounded bg-muted/60"></div>
+          </div>
+        </div>
+
+        <!-- Storage Size Card Skeleton -->
+        <div class="bg-muted/50 rounded-lg p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <div class="w-4 h-4 rounded bg-muted/60"></div>
+              <div class="h-3 w-24 rounded bg-muted/60"></div>
+            </div>
+            <div class="h-6 w-16 rounded bg-muted/60"></div>
+          </div>
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <div class="h-3 w-32 rounded bg-muted/60"></div>
+              <div class="h-3 w-12 rounded bg-muted/60"></div>
+            </div>
+            <div class="h-2 w-full rounded bg-muted/60"></div>
+          </div>
+        </div>
+
+        <!-- Top Rooms Skeleton -->
+        <div class="bg-muted/50 rounded-lg p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-4 h-4 rounded bg-muted/60"></div>
+            <div class="h-3 w-24 rounded bg-muted/60"></div>
+          </div>
+          <div class="flex flex-col gap-2">
+            {#each [1, 2, 3] as _}
+              <div class="flex items-center gap-2 text-xs">
+                <div class="w-4 h-4 rounded bg-muted/60"></div>
+                <div class="w-24 h-3 rounded bg-muted/60"></div>
+                <div class="flex-1 h-2 rounded bg-muted/60"></div>
+                <div class="w-10 h-3 rounded bg-muted/60"></div>
+              </div>
+            {/each}
+          </div>
         </div>
       </div>
     {/if}

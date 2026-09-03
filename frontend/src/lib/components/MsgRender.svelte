@@ -39,7 +39,7 @@
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
   import { linkify } from "$lib/mentions";
   import { mediaBoxStyle } from "$lib/image-size";
-  import { INLINE_FILE_MAX_BYTES } from "$lib/transport/files.svelte";
+  import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
 
   import {
     convertImage,
@@ -602,7 +602,9 @@
   }
 
   function firstUrl(text: string): string | null {
-    const match = text.match(/https?:\/\/[^\s]+/i);
+    // Stops at a quote or angle bracket too, so a URL quoted inside other
+    // text does not drag the closing quote and what follows along.
+    const match = text.match(/https?:\/\/[^\s"'<>]+/i);
     return match ? match[0] : null;
   }
 
@@ -636,7 +638,15 @@
   });
   const linkedUrl = $derived(firstUrl(content));
   const isGifMessage = $derived(isGifUrl(content));
-  const shouldShowOg = $derived(!isFileMessage && !!linkedUrl && !isGifMessage);
+  // Plugin cards and updates carry JSON, and a poster URL inside it is not
+  // a link the person posted: the preview fetch was firing for every party
+  // card with the JSON's next characters glued onto the URL.
+  const isPluginMessage = $derived(
+    msg.type === MessageType.PluginCard || msg.type === MessageType.PluginUpdate
+  );
+  const shouldShowOg = $derived(
+    !isFileMessage && !isPluginMessage && !!linkedUrl && !isGifMessage
+  );
 
   const ogDomain = $derived.by(() => {
     if (!linkedUrl) return "";
@@ -879,14 +889,16 @@
       {#each msg.meta?.files ?? [] as file, index (transferKey(file, index))}
         {@const transfer = fileTransfers.get(file.infoHash)}
         {@const seederCount = transfer?.seeders ?? (transfer?.seeding ? 1 : 0)}
+        <!-- No transfer entry while this room's stored files are still being
+             read back means "not registered yet", not "nobody has it". -->
+        {@const hydrating = !transfer && attachmentHydration.rooms.has(msg.roomCode)}
         <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">
               <p class="truncate text-sm text-foreground">{file.filename}</p>
               <p class="text-xs text-muted-foreground">
-                {formatSize(file.size)} • {seederCount} seeder{seederCount === 1
-                  ? ""
-                  : "s"}
+                {formatSize(file.size)} • {#if hydrating}loading...{:else}{seederCount}
+                  seeder{seederCount === 1 ? "" : "s"}{/if}
               </p>
             </div>
 

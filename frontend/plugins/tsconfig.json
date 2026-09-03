@@ -1,0 +1,11 @@
+{
+  // Editor-only. `pnpm check` runs against ../tsconfig.app.json, which names
+  // the built-ins one by one so a fetched plugin's errors never turn this
+  // repo's check red. Editors pick the nearest tsconfig, so this one gives
+  // every folder here, fetched ones included, the app's path mapping and
+  // completions. Type-check a fetched plugin by hand with
+  //   npx svelte-check --tsconfig ./plugins/tsconfig.json
+  "extends": "../tsconfig.app.json",
+  "include": ["**/*.ts", "**/*.svelte", "../src/**/*.d.ts"],
+  "exclude": ["**/node_modules/**"]
+}
