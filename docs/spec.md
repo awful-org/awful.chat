@@ -1103,6 +1103,22 @@ Two buttons added:
 - Target doesn't wipe database
 - Data merged (deduplication by ID)
 
+**Progress, on both screens:**
+
+- 0 to 10: connected, identity sent. 10 to 90: the eight data sections on
+  the wire, in a fixed order, the bar moving per batch. 90 to 99: the
+  target writing what arrived, which on a phone with a real history takes
+  longer than the transfer did. 100: the target's completion frame landed.
+- The target reports its import (`sync_import_progress { percent }`, at most
+  every two seconds) so the source's bar follows it and the source's ack
+  timeout (120 s) bounds silence rather than the whole import.
+- Every frame the source sends has a 30 s ceiling: a stream whose far end
+  stopped reading never drains, and the source used to park at whatever
+  percentage it had reached with no error. The target's own watchdog is
+  60 s of silence during the transfer, cleared once the import starts.
+- The label says which phase it is: "Syncing data", "Importing on this
+  device", or "The other device is importing".
+
 ### Security
 
 - QR codes expire after 5 minutes - enforced by the SOURCE tearing down its

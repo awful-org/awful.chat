@@ -73,6 +73,12 @@ export interface ImportOptions {
    * overwrote.
    */
   requestPassword?: (retry: boolean) => Promise<string | null>;
+  /**
+   * Called as records land, with a running count and the total. A device
+   * sync's whole history goes through here, and on a phone that takes
+   * long enough that a bar which stops moving reads as a hang.
+   */
+  onProgress?: (done: number, total: number) => void;
 }
 
 /** The stored mnemonic record that an export's identity section describes. */
@@ -206,7 +212,7 @@ export async function importDatabase(
   // condition that happens to be true today.
   markAtRestSweepNeeded();
   try {
-    await importDatabaseInner(sanitizedData, mode);
+    await importDatabaseInner(sanitizedData, mode, options.onProgress);
   } finally {
     endPlaintextImport?.();
   }
@@ -215,8 +221,23 @@ export async function importDatabase(
 
 async function importDatabaseInner(
   data: DatabaseExport,
-  mode: "add" | "replace"
+  mode: "add" | "replace",
+  onProgress?: (done: number, total: number) => void
 ): Promise<void> {
+  const total =
+    data.messages.length +
+    data.attachments.length +
+    data.rooms.length +
+    data.profiles.length +
+    data.savedGifs.length +
+    data.pending.length +
+    data.watermarks.length +
+    data.yjsDocs.length;
+  let done = 0;
+  const tick = (n = 1): void => {
+    done += n;
+    onProgress?.(done, total);
+  };
 
   // Import identity only if provided, and never in "add" mode: a merge keeps
   // the identity this device already has. Re-checked here rather than trusted
@@ -243,7 +264,8 @@ async function importDatabaseInner(
   // sync carries the whole history, and hundreds of independent transactions
   // are both slower and able to leave the database half-imported if one fails.
   await bulkPutMessages(data.messages);
-  await Promise.all([
+  tick(data.messages.length);
+  const writes: Promise<unknown>[] = [
     ...data.attachments.map((a) =>
       putAttachment({
         ...a,
@@ -347,7 +369,8 @@ async function importDatabaseInner(
         );
       })();
     }),
-  ]);
+  ];
+  await Promise.all(writes.map((w) => w.then(() => tick())));
 }
 
 // ── File backup (QR-less alternative to device sync) ─────────────────────────

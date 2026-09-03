@@ -695,6 +695,10 @@ async function handleStartScanning() {
             <p class="text-sm text-center">
               {#if syncState.isConnecting}
                 Connecting to device...
+              {:else if syncState.phase === "importing"}
+                Importing on this device... {syncState.syncProgress}%
+              {:else if syncState.phase === "importing-remote"}
+                The other device is importing... {syncState.syncProgress}%
               {:else if syncState.isSyncing}
                 Syncing data... {syncState.syncProgress}%
               {:else}
