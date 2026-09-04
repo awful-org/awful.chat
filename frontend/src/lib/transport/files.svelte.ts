@@ -457,18 +457,38 @@ export async function _resumeAttachmentSeeding(
  */
 export const attachmentHydration = { rooms: new SvelteSet<string>() };
 const _hydrating = new Map<string, number>();
+/**
+ * Rooms whose attachments have already been decrypted, blob-URL'd and
+ * re-seeded this session. A room switch does NOT clear
+ * transportState.fileTransfers and WebTorrent seeding is global once
+ * started, so all of that work survives a reopen - redoing it (decrypt
+ * every stored image, re-hash each for WebTorrent) on every back-and-forth
+ * was the heaviest thing a room open did, for no gain. New attachments that
+ * arrive while away are hydrated by their own receipt path, not this bulk
+ * pass. Cleared by _resetAttachmentHydration when the transfer map itself is
+ * reset (a new session), so a reconnect rebuilds from scratch.
+ */
+const _hydratedRooms = new Set<string>();
+
+export function _resetAttachmentHydration(): void {
+  _hydratedRooms.clear();
+  _hydrating.clear();
+  attachmentHydration.rooms.clear();
+}
 
 export async function _hydrateAndSeedAttachments(
   roomCode: string
 ): Promise<void> {
-  // Counted per room: a room and a DM hydrate at the same time, and the
-  // same room can be reopened while its first pass is still reading, so a
-  // single flag was cleared by whichever finished first.
+  // Once per room per session. Skip a room already hydrated, and skip one
+  // whose first pass is still running (a reopen mid-read would double the
+  // decrypt work the counter below was only papering over).
+  if (_hydratedRooms.has(roomCode) || _hydrating.has(roomCode)) return;
   _hydrating.set(roomCode, (_hydrating.get(roomCode) ?? 0) + 1);
   attachmentHydration.rooms.add(roomCode);
   try {
     const rows = await _hydrateFileTransfersFromStorage(roomCode);
     await _resumeAttachmentSeeding(roomCode, rows);
+    _hydratedRooms.add(roomCode);
   } finally {
     const left = (_hydrating.get(roomCode) ?? 1) - 1;
     if (left <= 0) {

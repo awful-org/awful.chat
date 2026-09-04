@@ -148,6 +148,7 @@ import {
 import {
   _announceStoredFilesTo,
   _hydrateAndSeedAttachments,
+  _resetAttachmentHydration,
   INLINE_FILE_MAX_BYTES,
   stripAndAdoptInlineFiles,
   fileFingerprint,
@@ -3912,6 +3913,10 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.watchingTransmissionPeerId = null;
   transportState.watchingTransmissionProducerId = null;
   transportState.fileTransfers = new Map();
+  // The per-session "already hydrated this room" guard rides on the transfer
+  // map staying populated across switches; when the map is wiped, the guard
+  // must be too, so the next open rebuilds the blob URLs and seeding.
+  _resetAttachmentHydration();
   transportState.callPeerStates = new Map();
   transportState.chatMode = "room";
   transportState.activeDmPeerId = null;
