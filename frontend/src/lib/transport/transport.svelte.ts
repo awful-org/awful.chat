@@ -3304,6 +3304,21 @@ async function _haveFileFor(infoHash: string): Promise<boolean> {
  * there is no separate DM case to special-case.
  */
 async function _peerSharesRoomWithUs(peerId: string): Promise<boolean> {
+  // Live membership first, and it is the symmetric one: the relay attests who
+  // is in each room (roomPeers), true the moment a peer joins and before they
+  // have posted anything, which is what the other inbound gates in this file
+  // already key off. The persisted participant list only fills in once a peer
+  // sends a signed message, so a peer who joined a room purely to receive a
+  // large image is not in it yet - gating a file signal on that list alone
+  // dropped their WebRTC handshake and stalled the transfer at zero peers (the
+  // over-512 KB path; inline attachments ride inside the message and were
+  // never affected).
+  for (const roomCode of _transport.rooms()) {
+    if (_transport.isRoomPeer(roomCode, peerId)) return true;
+  }
+  // Fallback by DID: a member we know from history even if the live room
+  // subscription has not surfaced them yet (a reopened DM, a just-restored
+  // room).
   const did = _peerIdToDid.get(peerId);
   if (!did) return false;
   for (const roomCode of _transport.rooms()) {
