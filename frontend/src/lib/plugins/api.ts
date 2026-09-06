@@ -68,6 +68,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "plugin-settings",
   "plugin-stream",
   "picture-in-picture",
+  "call-tile-menu",
 ]);
 
 export interface UpdateCtx {
@@ -355,6 +356,47 @@ export interface CallTileProps<State = unknown> extends CardProps<State> {
   chromeVisible: boolean;
 }
 
+/**
+ * One entry a plugin adds to its call tile's right-click menu.
+ *
+ * The host draws it in ITS menu chrome, beside the rows every tile has
+ * (focus, fullscreen, leave), so a watch-together tile offers "Picture in
+ * picture" and "Mute" in the same place a screen share offers them.
+ *
+ * `run` is called on the click, on the client that clicked: use it for the
+ * local surface (float the video, mute this device) or for a SYNCED action
+ * through `sendUpdate`, exactly as an in-tile button would. The host caps
+ * the list at eight items and trims labels to 40 characters, and an item
+ * that throws is logged, never fatal.
+ */
+export interface CallTileMenuItem {
+  /** Stable across rebuilds; the host keys the row on it. */
+  id: string;
+  label: string;
+  /** An emoji, or a lucide icon as "lucide:<kebab-name>". */
+  icon?: string;
+  /** Draws a check mark - for a toggle whose state you already know. */
+  checked?: boolean;
+  disabled?: boolean;
+  /** Destructive, drawn in the host's danger colour. */
+  danger?: boolean;
+  run(): void | Promise<void>;
+}
+
+/**
+ * What `callTileMenu` is given: the same card, state and host the tile
+ * itself has, plus whether this user has joined the tile.
+ */
+export interface CallTileMenuCtx<State = unknown> {
+  card: CardMessage;
+  cardState: State;
+  host: HostApi;
+  /** The tile is only asked for items once joined, so this is always true
+   *  today - it exists so an unjoined menu can grow items without a
+   *  signature change. */
+  joined: boolean;
+}
+
 /** Props of the `localCard` surface. `localCard.data` is what `showLocalCard` was given. */
 export interface LocalCardProps {
   localCard: LocalPluginCardEntry;
@@ -422,6 +464,18 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
    * same audience chip screen-share transmissions get.
    */
   callTileViewers?(cardState: State): string[];
+  /**
+   * Extra rows for the tile's right-click menu, built on demand when the
+   * user opens it - so this one is NOT pure: read whatever the controls need
+   * and close over the host. It is asked per right-click, never cached.
+   *
+   * Put here what the tile's own overlay has no room for, and what a viewer
+   * expects a stream to offer: float this video (`host.pictureInPicture`),
+   * mute it on this device, skip, stop. Say in the label which side the
+   * action lands on - "Mute for me" is local, "Pause" pauses the party for
+   * everyone.
+   */
+  callTileMenu?(ctx: CallTileMenuCtx<State>): CallTileMenuItem[];
   /**
    * @deprecated Pins are one-per-plugin by construction now (a pin names
    * the plugin, not a card), which is all this flag ever bought. Accepted

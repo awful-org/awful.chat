@@ -24,6 +24,10 @@ this file and the README disagree, the README wins. What has grown since:
   targeted), a now-playing media surface (`setNowPlaying`), and call-view
   plugin TILES with join presence - the "no surfaces outside chat" non-goal
   fell (waffle-party exercises all of it).
+- Call tiles gained a per-plugin RIGHT-CLICK menu (`callTileMenu`): the
+  stage's menu is per stream now - a camera, a screen share, an offered
+  share and a plugin tile each get their own rows - and a plugin adds its
+  own (float the video, mute it here, skip) beside the host's.
 - A server-side component exists after all: the relay's plugin proxy
   (`PLUGIN_PROXY_HOSTS` / `PLUGIN_PROXY_SECRETS`) so plugins can call
   allowlisted third-party APIs without leaking client IPs or shipping keys.

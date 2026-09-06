@@ -1982,15 +1982,35 @@ export async function putPeerProfile(profile: PeerProfile): Promise<void> {
   await tx.store.delete(profile.did as Blinded);
   await tx.store.put(sealed);
   await tx.done;
+  invalidatePeerProfilesCache();
+}
+
+/**
+ * Decrypted peer profiles, cached for the session. Every call used to
+ * AES-decrypt every peer's avatar and banner bytes AND mint a fresh object
+ * URL per avatar, and _loadHistory calls this on every room and DM switch,
+ * so switching a busy account re-decrypted every contact's images each time
+ * and leaked a set of blob URLs on every switch. The cache turns repeat
+ * switches into a map lookup; it is dropped whenever a peer profile is
+ * written (putPeerProfile) or the database is wiped, so a changed avatar is
+ * still picked up on the next read.
+ */
+let _peerProfilesCache: PeerProfile[] | null = null;
+
+export function invalidatePeerProfilesCache(): void {
+  _peerProfilesCache = null;
 }
 
 export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
+  if (_peerProfilesCache) return _peerProfilesCache;
   const database = await getDB();
   const all = await database.getAll("profiles");
-  return _openAll(
+  const opened = await _openAll(
     "profiles",
     all.filter((p): p is PeerProfile => p.isMe === false)
   );
+  _peerProfilesCache = opened;
+  return opened;
 }
 
 /**
@@ -2235,6 +2255,7 @@ export async function wipeLocalDatabase(): Promise<void> {
     db.close();
     db = null;
   }
+  invalidatePeerProfilesCache();
   await deleteDB("awful-chat");
 }
 
