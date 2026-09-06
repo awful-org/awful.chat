@@ -35,6 +35,7 @@
     stopScreenShare,
     toggleCamera,
     toggleMute,
+    toggleDeafen,
   } from "$lib/transport/call.svelte";
   import {
     getVoiceActiveInputDevice,
@@ -62,6 +63,7 @@
     Radio,
     CopyX,
     HeadphoneOff,
+    Headphones,
     Volume2,
     Volume1,
     VolumeX,
@@ -1729,6 +1731,33 @@ import {
               </button>
                 {/snippet}
               </Tip>
+              <!-- Deafen only rides here when the controls are UNDOCKED
+                   (fullscreen, or the focused immersive view): docked, the
+                   sidebar's own Deafen is right there, and a second copy
+                   would only add noise. Undocked, that sidebar is out of
+                   reach and this bar is the only control surface. -->
+              {#if !dockedControls}
+              <Tip text={deafened ? "Undeafen" : "Deafen"}>
+                {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={toggleDeafen}
+                aria-label={deafened ? "Undeafen" : "Deafen"}
+                class="group relative flex h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                {deafened
+                  ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                  : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
+              >
+                {#if deafened}
+                  <HeadphoneOff class="size-4" />
+                {:else}
+                  <Headphones class="size-4" />
+                {/if}
+              </button>
+                {/snippet}
+              </Tip>
+              {/if}
               <Tip text={cameraOff ? "Turn on camera" : "Turn off camera"}>
                 {#snippet children(props)}
               <button
@@ -1883,6 +1912,33 @@ import {
             </button>
               {/snippet}
             </Tip>
+              <!-- Deafen only rides here when the controls are UNDOCKED
+                   (fullscreen, or the focused immersive view): docked, the
+                   sidebar's own Deafen is right there, and a second copy
+                   would only add noise. Undocked, that sidebar is out of
+                   reach and this bar is the only control surface. -->
+              {#if !dockedControls}
+              <Tip text={deafened ? "Undeafen" : "Deafen"}>
+                {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={toggleDeafen}
+                aria-label={deafened ? "Undeafen" : "Deafen"}
+                class="group relative flex {ctrlSize} items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                {deafened
+                  ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                  : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
+              >
+                {#if deafened}
+                  <HeadphoneOff class="size-4" />
+                {:else}
+                  <Headphones class="size-4" />
+                {/if}
+              </button>
+                {/snippet}
+              </Tip>
+              {/if}
             <Tip text={cameraOff ? "Turn on camera" : "Turn off camera"}>
               {#snippet children(props)}
             <button
