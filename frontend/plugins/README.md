@@ -262,9 +262,10 @@ and other users are unaffected.
 
 ### Surfaces
 
-A plugin can render in more places than the chat. All are optional
-components on the definition. `widget` and `callTile` receive the card
-props (`{ card, cardState, host }`); `localCard` has its own (below):
+A plugin can render in more places than the chat. All are optional entries
+on the definition - components, except `callTileMenu`, which returns menu
+rows. `widget` and `callTile` receive the card props (`{ card, cardState,
+host }`); `localCard` has its own (below):
 
 - `localCard` - a private, session-only surface opened with
   `host.showLocalCard(data)`. It FLOATS over the invoking client's
@@ -317,6 +318,45 @@ props (`{ card, cardState, host }`); `localCard` has its own (below):
   mouse moves over the call section, hidden on idle in fullscreen); gate
   your control overlays on it so all chrome moves together.
 
+- `callTileMenu` - extra rows for your call tile's RIGHT-CLICK menu, so a
+  viewer finds the controls of a stream where they expect them. The host
+  menu is per stream: a camera offers a per-person volume, a screen share
+  offers picture-in-picture and "stop watching", and your tile offers
+  focus, fullscreen and "Leave" plus whatever you return here. Not a pure
+  hook - it is called on each right-click of a JOINED tile and receives
+  `{ card, cardState, host, joined }`, so close over the host and read
+  your live state:
+
+  ```ts
+  callTileMenu: ({ card, cardState, host }) => [
+    {
+      id: "pip",
+      label: "Picture in picture",
+      icon: "lucide:picture-in-picture-2",
+      run: () => video && host.pictureInPicture(video),
+    },
+    {
+      id: "mute",
+      label: "Mute for me",
+      checked: muted,
+      run: () => (muted = !muted),
+    },
+  ],
+  ```
+
+  Picture-in-picture is YOURS to offer, because the host cannot float
+  media it does not render (and nobody but the browser can float a video
+  inside a cross-origin iframe - there the browser's own menu stays
+  reachable). `run` fires on the client that clicked, inside the click's
+  own gesture, which is what `host.pictureInPicture` needs. Say in the
+  label which side an action lands on: "Mute for me" is this device,
+  "Pause" through `sendUpdate` pauses the party for everyone. `icon`
+  takes the manifest's emoji or `lucide:<kebab-name>` form; `checked`
+  draws a check mark, `disabled` greys the row and `danger` colours it
+  destructive. The host caps the list at eight items, trims labels to 40
+  characters, and drops the whole list (never the menu) if the hook or an
+  item throws.
+
 - `settings` - app-level configuration, opened from a gear on this
   plugin's row in Settings > Plugins. Announce it with `hasSettings:
   true` in the MANIFEST so the host can draw the gear without loading
@@ -348,8 +388,8 @@ to load the plugin with a clear "needs a newer awful.chat" line instead
 of mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
 `call-audio`, `call-capture`, `clock-sample`, `local-card`,
-`now-playing`, `plugin-stream`, `picture-in-picture`. Declare only what
-you truly cannot function without. A feature that only adds a button is
+`now-playing`, `plugin-stream`, `picture-in-picture`, `call-tile-menu`.
+Declare only what you truly cannot function without. A feature that only adds a button is
 better guarded at the call site (`typeof host.pictureInPicture ===
 "function"`) so the plugin still loads on an older app and just hides the
 button. Only `$lib/plugins/api`, `$lib/plugins/ui` and `$lib/plugins/watch`

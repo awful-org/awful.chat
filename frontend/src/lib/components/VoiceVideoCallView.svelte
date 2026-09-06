@@ -71,14 +71,29 @@
     Puzzle,
     X as XIcon,
     Tv2,
+    Pin,
+    PinOff,
+    LogIn,
   } from "@lucide/svelte";
   import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
 import { displayPrefs, setCallChatBeside, setCallPip } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
 import { callTilesState, refreshCallTiles } from "$lib/plugins/call-tiles.svelte";
-import { getManifest } from "$lib/plugins/registry";
-import { onCardStateChange } from "$lib/plugins/state.svelte";
+import { getManifest, getPlugin } from "$lib/plugins/registry";
+import { getCardState, onCardStateChange } from "$lib/plugins/state.svelte";
+import { makeHostApi } from "$lib/plugins/host";
+import { getMessage } from "$lib/storage";
+import type { CallTileMenuItem } from "$lib/plugins/api";
+import {
+  buildTileMenu,
+  tileMenuHeight,
+  tileMenuState,
+  type TileMenuAction,
+  type TileMenuIcon,
+  type TileMenuRow,
+  type TileMenuState,
+} from "$lib/call-tile-menu";
 import PluginCallTileView from "./PluginCallTileView.svelte";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 import { peerQualityState } from "$lib/call-peer-quality.svelte";
@@ -204,78 +219,6 @@ import {
       (did ? transportState.peerColors.get(did) : undefined) ??
       null
     );
-  }
-
-  // ── Context menus ─────────────────────────────────────────────────────────
-
-  let peerMenu = $state<{
-    peerId: string;
-    label: string;
-    x: number;
-    y: number;
-  } | null>(null);
-  /** Right-click on the call background: picks what the grid shows. */
-  let viewMenu = $state<{ x: number; y: number } | null>(null);
-  let peerVolumeSlider = $state(UNITY_STOP);
-
-  const peerVolumePercent = $derived(formatGain(sliderToGain(peerVolumeSlider)));
-
-  /**
-   * Keep a menu of this size inside the viewport. Both menus live inside the
-   * panel so they survive fullscreen, and a fixed child of a fullscreen
-   * element still measures against the viewport - so these coordinates hold
-   * either way.
-   */
-  function clampMenu(
-    e: MouseEvent,
-    width: number,
-    height: number
-  ): { x: number; y: number } {
-    const pad = 8;
-    return {
-      x: Math.max(pad, Math.min(e.clientX, window.innerWidth - width - pad)),
-      y: Math.max(pad, Math.min(e.clientY, window.innerHeight - height - pad)),
-    };
-  }
-
-  function openPeerMenu(e: MouseEvent, tile: TileData): void {
-    // The local tile has nothing to offer here, so the event is left to bubble
-    // to the panel and open the view menu instead. Plugin tiles are not
-    // peers - volume/profile entries would dereference a synthetic id.
-    if (tile.isLocal || !tile.peerId || tile.kind === "plugin") return;
-    e.preventDefault();
-    e.stopPropagation();
-    peerVolumeSlider = gainToSlider(getVoicePeerVolume(tile.peerId));
-    viewMenu = null;
-    peerMenu = { peerId: tile.peerId, label: tile.label, ...clampMenu(e, 224, 132) };
-  }
-
-  function openViewMenu(e: MouseEvent): void {
-    e.preventDefault();
-    peerMenu = null;
-    viewMenu = clampMenu(e, 224, 320);
-  }
-
-  function closeMenus(): void {
-    peerMenu = null;
-    viewMenu = null;
-  }
-
-  function onPeerVolume(value: number): void {
-    peerVolumeSlider = value;
-    if (peerMenu) setVoicePeerVolume(peerMenu.peerId, sliderToGain(value));
-  }
-
-  /**
-   * The floating panel, not the chat pane. Pointing the pane at the DM unmounts
-   * this call stage - the stage is gated on the pane showing the call's room -
-   * and the pane filters messages by the room the VIEW is on, so the DM
-   * rendered as an empty conversation you could send into but never see.
-   */
-  async function dmFromPeerMenu(): Promise<void> {
-    const peerId = peerMenu?.peerId;
-    closeMenus();
-    if (peerId) await openDmPanel(peerId);
   }
 
   // Peers whose voice ICE actually completed - a roster tile without a
@@ -657,6 +600,274 @@ import {
     }
     return tracks;
   });
+
+  // ── Context menus ─────────────────────────────────────────────────────────
+
+  /**
+   * Right-click on a tile. The menu is PER STREAM: what you can do to your
+   * own camera, to somebody's screen share, to an offered share you have not
+   * joined, and to a plugin's tile are four different lists - and this used
+   * to be one "peer menu" (message plus a volume slider) that local and
+   * plugin tiles were excluded from outright, so right-clicking a
+   * watch-together tile configured the whole grid instead.
+   *
+   * The tile id, not the tile: the rows resolve against `tiles` on every
+   * read, so a menu left open while the share ends or the party closes
+   * disappears with its tile instead of acting on something gone.
+   */
+  let tileMenu = $state<{ tileId: string; x: number; y: number } | null>(null);
+  /** Right-click on the call background: picks what the grid shows. */
+  let viewMenu = $state<{ x: number; y: number } | null>(null);
+  let peerVolumeSlider = $state(UNITY_STOP);
+
+  const peerVolumePercent = $derived(formatGain(sliderToGain(peerVolumeSlider)));
+
+  const tileMenuTile = $derived(
+    tileMenu ? (tiles.find((t) => t.id === tileMenu!.tileId) ?? null) : null
+  );
+
+  /** The open menu's plugin-declared rows, in the plugin's own order. */
+  let pluginMenuItems = $state<CallTileMenuItem[]>([]);
+  let pluginMenuSeq = 0;
+
+  const tileMenuRows = $derived(
+    tileMenuTile ? buildTileMenu(tileMenuStateFor(tileMenuTile)) : []
+  );
+
+  // Clamped from the ROW COUNT, so a plugin's items landing a tick after the
+  // menu opened still cannot push it off the bottom edge.
+  const tileMenuPos = $derived(
+    tileMenu
+      ? clampMenu(tileMenu.x, tileMenu.y, 224, tileMenuHeight(tileMenuRows))
+      : { x: 0, y: 0 }
+  );
+
+  /** Everything the menu builder asks about one tile, read live. */
+  function tileMenuStateFor(tile: TileData): TileMenuState {
+    const isShare = tile.kind === "screen" || tile.kind === "transmission";
+    return tileMenuState({
+      kind: tile.kind,
+      label: tile.label,
+      isLocal: tile.isLocal,
+      hasVideo: tile.videoTrack !== null,
+      isPending: !!tile.isPending,
+      isWatched:
+        tile.kind === "transmission" &&
+        watchingTransmissionPeerId === tile.peerId,
+      isFocused: callFocus.pinnedTileId === tile.id,
+      isFullscreen,
+      pipSupported: browserPipSupported(),
+      pipOpen: callPipPanel.browserPip,
+      canMessage: !tile.isLocal && !!tile.peerId,
+      cameraOff,
+      micMuted: muted,
+      // Screen-share audio, not the sharer's voice: it arrives as its own
+      // track and plays through the audio[data-remote] elements.
+      shareAudio:
+        isShare &&
+        !tile.isLocal &&
+        !!participants.get(tile.peerId)?.screenAudioTrack,
+      shareMuted: transmissionOutputVolume === 0,
+      joined: joinedPluginTiles.has(tile.id),
+      pluginItems: pluginMenuItems,
+    });
+  }
+
+  /**
+   * Keep a menu of this size inside the viewport. Every menu lives inside the
+   * panel so it survives fullscreen, and a fixed child of a fullscreen
+   * element still measures against the viewport - so these coordinates hold
+   * either way.
+   */
+  function clampMenu(
+    x: number,
+    y: number,
+    width: number,
+    height: number
+  ): { x: number; y: number } {
+    const pad = 8;
+    return {
+      x: Math.max(pad, Math.min(x, window.innerWidth - width - pad)),
+      y: Math.max(pad, Math.min(y, window.innerHeight - height - pad)),
+    };
+  }
+
+  function openTileMenu(e: MouseEvent, tile: TileData): void {
+    e.preventDefault();
+    e.stopPropagation();
+    // The remembered per-identity volume, so the slider is right even before
+    // this peer's first track arrives.
+    if (!tile.isLocal && tile.peerId && tile.kind === "camera") {
+      peerVolumeSlider = gainToSlider(getVoicePeerVolume(tile.peerId));
+    }
+    viewMenu = null;
+    pluginMenuItems = [];
+    tileMenu = { tileId: tile.id, x: e.clientX, y: e.clientY };
+    void loadPluginMenuItems(tile);
+  }
+
+  /**
+   * A plugin's own menu rows, asked for at right-click time.
+   *
+   * Not cached and not pure: the plugin builds them against its current
+   * state, closing over the host, which is what lets a watch-together tile
+   * offer "Picture in picture" for the video only it holds a reference to.
+   * The menu opens with the host's rows immediately and these append when
+   * the (already loaded, since the tile is mounted) definition, card row and
+   * folded state resolve. Seq-guarded: a second right-click always wins.
+   */
+  async function loadPluginMenuItems(tile: TileData): Promise<void> {
+    const seq = ++pluginMenuSeq;
+    if (tile.kind !== "plugin" || !tile.pluginId || !tile.cardId) return;
+    // Opt-in first: an unjoined tile runs no plugin action.
+    if (!joinedPluginTiles.has(tile.id)) return;
+    const roomCode = tile.pluginRoomCode ?? "";
+    try {
+      const plugin = await getPlugin(tile.pluginId);
+      if (!plugin?.callTileMenu) return;
+      const card = await getMessage(tile.cardId);
+      if (!card) return;
+      const cardState = await getCardState(tile.cardId, roomCode, plugin);
+      const items = plugin.callTileMenu({
+        card,
+        cardState,
+        host: makeHostApi(tile.pluginId, roomCode),
+        joined: true,
+      });
+      if (seq !== pluginMenuSeq) return;
+      pluginMenuItems = (Array.isArray(items) ? items : []).filter(
+        (item) =>
+          !!item &&
+          typeof item.label === "string" &&
+          typeof item.run === "function"
+      );
+    } catch (err) {
+      // A broken hook loses its rows, never the host's.
+      console.warn("[plugins] call tile menu failed:", err);
+    }
+  }
+
+  /**
+   * Run one row of the tile menu.
+   *
+   * Every branch is an existing store action - the menu is a second surface
+   * for controls the tile overlay already has, plus the ones it had no room
+   * for. The menu closes first, and the action runs in the SAME task as the
+   * click, because picture-in-picture needs the user gesture.
+   */
+  async function runTileAction(
+    tile: TileData,
+    action: TileMenuAction
+  ): Promise<void> {
+    const item =
+      action.kind === "plugin" ? pluginMenuItems[action.index] : undefined;
+    closeMenus();
+    switch (action.kind) {
+      case "focus":
+        callFocus.pinnedTileId = tile.id;
+        break;
+      case "unfocus":
+        callFocus.pinnedTileId = null;
+        break;
+      case "pip":
+        // Pin first: the browser's window follows the spotlight, which is
+        // the recipe the per-share overlay button already uses.
+        callFocus.pinnedTileId = tile.id;
+        await enterBrowserPip(() => void requestReturnToCall());
+        break;
+      case "exit-pip":
+        await exitBrowserPip();
+        break;
+      case "fullscreen":
+      case "exit-fullscreen":
+        toggleFullscreen();
+        break;
+      case "message":
+        // The floating panel, not the chat pane: pointing the pane at the DM
+        // unmounts this stage - it is gated on the pane showing the call's
+        // room - and the pane filters by the room the VIEW is on, so the DM
+        // rendered as an empty conversation you could send into but never see.
+        if (tile.peerId) await openDmPanel(tile.peerId);
+        break;
+      case "watch":
+        if (tile.producerId) watchTransmission(tile.peerId, tile.producerId);
+        break;
+      case "stop-watching":
+        stopWatchingTransmission();
+        break;
+      case "stop-sharing":
+        await stopScreenShare();
+        break;
+      case "toggle-camera":
+        await toggleCamera();
+        break;
+      case "toggle-mic":
+        await toggleMute();
+        break;
+      case "mute-share":
+        setTransmissionOutputVolume(0);
+        break;
+      case "unmute-share":
+        setTransmissionOutputVolume(1);
+        break;
+      case "join-plugin":
+        joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+        break;
+      case "leave-plugin":
+        joinedPluginTiles = new Set(
+          [...joinedPluginTiles].filter((id) => id !== tile.id)
+        );
+        break;
+      case "plugin":
+        try {
+          await item?.run();
+        } catch (err) {
+          console.warn("[plugins] call tile menu item failed:", err);
+        }
+        break;
+    }
+  }
+
+  function openViewMenu(e: MouseEvent): void {
+    e.preventDefault();
+    tileMenu = null;
+    viewMenu = clampMenu(e.clientX, e.clientY, 224, 320);
+  }
+
+  function closeMenus(): void {
+    tileMenu = null;
+    viewMenu = null;
+    pluginMenuItems = [];
+  }
+
+  function onPeerVolume(value: number): void {
+    peerVolumeSlider = value;
+    const peerId = tileMenuTile?.peerId;
+    if (peerId) setVoicePeerVolume(peerId, sliderToGain(value));
+  }
+
+  /** Which lucide glyph a menu row's icon key names. */
+  const TILE_MENU_ICONS: Record<TileMenuIcon, typeof Pin> = {
+    pin: Pin,
+    "pin-off": PinOff,
+    pip: PictureInPicture2,
+    fullscreen: Maximize,
+    "fullscreen-exit": Minimize,
+    message: MessageSquare,
+    watch: Eye,
+    "stop-watching": Radio,
+    "screen-off": MonitorOff,
+    camera: Camera,
+    "camera-off": CameraOff,
+    mic: Mic,
+    "mic-off": MicOff,
+    volume: Volume2,
+    "volume-off": VolumeX,
+    join: LogIn,
+    leave: CopyX,
+    plugin: Puzzle,
+  };
+
 
   // What the grid shows. "streaming" keeps anything worth watching - a camera
   // as much as a share - while "screens" narrows to shares alone, which is
@@ -1104,6 +1315,7 @@ import {
       role="button"
       tabindex={0}
       aria-label={isFocused ? "Minimize tile" : `Focus ${tile.label}`}
+      oncontextmenu={(e) => openTileMenu(e, tile)}
       onclick={() => {
         if (isOnlyOne) return;
         if (isFocused) onUnfocus();
@@ -1182,6 +1394,8 @@ import {
          opted you into loading a plugin's content, which is the one thing
          opt-in exists to prevent. -->
     <div
+      role="none"
+      oncontextmenu={(e) => openTileMenu(e, tile)}
       class="relative flex items-center justify-center overflow-hidden rounded-lg bg-muted/30 {isFocused
         ? 'w-full h-full'
         : ''} {compact ? 'aspect-video' : ''}"
@@ -1224,13 +1438,14 @@ import {
        one overlay. The layout classes live on the wrapper; the button fills
        it. -->
   <div
+    role="none"
+    oncontextmenu={(e) => openTileMenu(e, tile)}
     class="relative {isFocused ? 'w-full h-full' : ''} {compact
       ? 'aspect-video'
       : ''}"
   >
   <button
     type="button"
-    oncontextmenu={(e) => openPeerMenu(e, tile)}
     class="group relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
       {tile.connecting ? 'connecting-wave' : ''}
       {isSpeaking
@@ -1647,7 +1862,15 @@ import {
          plugin controls re-enable their own. -->
     {#each joinedPluginTileData as pt (pt.id)}
       {@const rect = pluginRects[pt.id]}
+      <!-- The layer ignores the pointer, so a right-click over the plugin's
+           CONTENT already reaches the placeholder below. This handler is for
+           the plugin's own controls, which re-enable pointer events: without
+           it, a right-click on those bubbled to the panel and opened the
+           grid menu. Content inside a cross-origin iframe never reaches
+           either - the browser keeps its own menu there, by design. -->
       <div
+        role="none"
+        oncontextmenu={(e) => openTileMenu(e, pt)}
         class="pointer-events-none absolute z-10 overflow-hidden rounded-lg"
         style={rect
           ? `left:${rect.x}px; top:${rect.y}px; width:${rect.w}px; height:${rect.h}px;`
@@ -2255,54 +2478,91 @@ import {
       </div>
     {/if}
 
-    {#if peerMenu}
+    {#if tileMenu && tileMenuTile}
+      {@const menuTile = tileMenuTile}
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <div
         role="menu"
         tabindex="-1"
         class="fixed z-50 w-56 rounded-md border border-border bg-popover py-1 shadow-xl font-mono"
-        style="top: {peerMenu.y}px; left: {peerMenu.x}px"
+        style="top: {tileMenuPos.y}px; left: {tileMenuPos.x}px"
         onkeydown={() => {}}
         onclick={(e) => e.stopPropagation()}
         oncontextmenu={(e) => e.preventDefault()}
       >
-        <p class="truncate px-3 pb-1 pt-0.5 text-xs text-muted-foreground">
-          {peerMenu.label}
-        </p>
-
-        <button
-          type="button"
-          class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
-          onclick={dmFromPeerMenu}
-        >
-          <MessageSquare class="size-4" />
-          Message
-        </button>
-
-        <div class="mt-1 border-t border-border px-3 pb-2 pt-2">
-          <div class="flex items-center justify-between pb-1.5">
-            <span class="text-xs text-muted-foreground">Volume</span>
-            <span
-              class="text-xs tabular-nums {peerVolumeSlider <= 0
-                ? 'text-destructive'
-                : 'text-primary'}">{peerVolumePercent}</span
+        {#each tileMenuRows as row, index (index)}
+          {#if row.type === "label"}
+            <p class="truncate px-3 pb-1 pt-0.5 text-xs text-muted-foreground">
+              {row.text}
+            </p>
+          {:else if row.type === "separator"}
+            <div class="my-1 border-t border-border"></div>
+          {:else if row.type === "volume"}
+            {@const isPeer = row.target === "peer"}
+            {@const percent = isPeer
+              ? peerVolumeSlider
+              : Math.round(transmissionOutputVolume * 100)}
+            <!-- A raw range input, deliberately: it is the one control in a
+                 menu that a pointer drags rather than clicks, and the e2e
+                 peer-volume scenario asserts on exactly this element. -->
+            <div class="mt-1 border-t border-border px-3 pb-2 pt-2">
+              <div class="flex items-center justify-between pb-1.5">
+                <span class="text-xs text-muted-foreground">
+                  {isPeer ? "Volume" : "Share volume"}
+                </span>
+                <span
+                  class="text-xs tabular-nums {percent <= 0
+                    ? 'text-destructive'
+                    : 'text-primary'}"
+                  >{isPeer ? peerVolumePercent : `${percent}%`}</span
+                >
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={percent}
+                aria-label={isPeer
+                  ? `Volume for ${menuTile.label}`
+                  : `Volume for ${menuTile.label}'s screen`}
+                oninput={(e) =>
+                  isPeer
+                    ? onPeerVolume(Number(e.currentTarget.value))
+                    : handleTransmissionVolumeChange(
+                        Number(e.currentTarget.value) / 100
+                      )}
+                class="h-1 w-full cursor-pointer appearance-none rounded-full accent-primary"
+                style={`background: linear-gradient(to right, var(--primary) ${percent}%, var(--muted) ${percent}%)`}
+              />
+              <p class="pt-1 text-[10px] text-muted-foreground">
+                Only changes what you hear
+              </p>
+            </div>
+          {:else}
+            {@const Icon = TILE_MENU_ICONS[row.icon]}
+            <button
+              type="button"
+              role={row.checked === undefined ? "menuitem" : "menuitemcheckbox"}
+              aria-checked={row.checked}
+              disabled={row.disabled}
+              class="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 {row.disabled
+                ? ''
+                : 'cursor-pointer'} {row.danger ? 'text-destructive' : ''}"
+              onclick={() => void runTileAction(menuTile, row.action)}
             >
-          </div>
-          <input
-            type="range"
-            min="0"
-            max="100"
-            step="1"
-            value={peerVolumeSlider}
-            aria-label={`Volume for ${peerMenu.label}`}
-            oninput={(e) => onPeerVolume(Number(e.currentTarget.value))}
-            class="h-1 w-full cursor-pointer appearance-none rounded-full accent-primary"
-            style={`background: linear-gradient(to right, var(--primary) ${peerVolumeSlider}%, var(--muted) ${peerVolumeSlider}%)`}
-          />
-          <p class="pt-1 text-[10px] text-muted-foreground">
-            Only changes what you hear
-          </p>
-        </div>
+              {#if row.pluginIcon}
+                <PluginIcon icon={row.pluginIcon} class="size-4 shrink-0" />
+              {:else}
+                <Icon class="size-4 shrink-0" />
+              {/if}
+              <span class="flex-1 truncate text-left">{row.label}</span>
+              {#if row.checked}
+                <Check class="size-3.5 shrink-0 text-primary" />
+              {/if}
+            </button>
+          {/if}
+        {/each}
       </div>
     {/if}
   </div>
