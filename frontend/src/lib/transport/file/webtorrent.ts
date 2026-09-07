@@ -34,6 +34,17 @@ const WT_RECONCILE_MS = 5_000;
 /** Ceiling on the per-pair retry wait. */
 const WT_RETRY_MAX_MS = 60_000;
 /**
+ * Dials per (file, peer) pair before the pair is given up on.
+ *
+ * A peer that reconnects without ever disconnecting (a second tab of the
+ * same profile fighting over one peerId) re-announces its whole inventory
+ * every time, and every announce used to re-dial every stuck file with no
+ * ceiling: 520 file requests and 428 of Chrome's 500 PeerConnections in two
+ * minutes. The backoff already spaces the dials out; this bounds them. A
+ * real disconnect, or the user clicking the file, starts the count over.
+ */
+const WT_MAX_ATTEMPTS = 6;
+/**
  * Live WebRTC links for file transfer, across every (file, peer) pair.
  *
  * Each pair gets its own RTCPeerConnection, and the pairs multiply: joining a
@@ -116,6 +127,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
    */
   private wtNextTry = new Map<string, number>();
   private wtBackoff = new Map<string, number>();
+  /** Consecutive dials that never connected, per pair. See WT_MAX_ATTEMPTS. */
+  private wtAttempts = new Map<string, number>();
   private wtReconcileTimer: ReturnType<typeof setInterval> | null = null;
   private iceUnsubscribe: (() => void) | null = null;
   private attachedTorrents = new Set<string>();
@@ -163,8 +176,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         // Delete before destroy: destroy() fires the close handler, which
         // deletes too, and this keeps the redial below from racing it.
         this.wtPeers.delete(key);
-        this.wtNextTry.delete(key);
-        this.wtBackoff.delete(key);
+        // A dial made without TURN was never going to land; it does not
+        // count against the pair either.
+        this.forgetRetryState(key);
         peer.destroy();
       }
       this.reconcileWtPeers();
@@ -183,31 +197,71 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     if (typeof document !== "undefined" && document.hidden) return;
     const now = Date.now();
     for (const [infoHash, snapshot] of this.transfers) {
-      // Only what we are still trying to fetch.
-      if (snapshot.status !== "downloading" && snapshot.status !== "pending") {
-        continue;
-      }
+      // Only what we are still trying to fetch. "pending" is a file nobody
+      // asked for yet; dialling those built links that attachToTorrent then
+      // dropped for having no torrent, over and over, for every file in the
+      // room.
+      if (snapshot.status !== "downloading") continue;
       const seeders = this.seedersByHash.get(infoHash);
       if (!seeders?.size) continue;
-      for (const peerId of seeders) {
-        if (peerId === this.selfId()) continue;
-        // A seeder we cannot currently reach at all is not worth dialling.
-        if (!this.connectedPeers.has(peerId)) continue;
-        const key = wtKey(infoHash, peerId);
-        if (this.wtPeers.has(key)) continue;
-        if (now < (this.wtNextTry.get(key) ?? 0)) continue;
-        // Backoff is for a peer that will not answer. A pair held back by the
-        // cap has not been tried at all, so it keeps its place at the front of
-        // the queue instead of being pushed out to the next retry window.
-        if (!this.createWTPeer(infoHash, peerId, true)) continue;
-        const wait = Math.min(
-          Math.max((this.wtBackoff.get(key) ?? 0) * 2, WT_RECONCILE_MS),
-          WT_RETRY_MAX_MS
-        );
-        this.wtBackoff.set(key, wait);
-        this.wtNextTry.set(key, now + wait);
+      for (const peerId of seeders) this.dial(infoHash, peerId, now);
+      // Every reachable seeder capped and no link left: stop pretending. The
+      // card shows its download button and a click starts the count over.
+      if (this.allExhausted(infoHash)) {
+        this.upsertTransfer({
+          ...snapshot,
+          status: "failed",
+          error: "Could not reach the sender",
+        });
       }
     }
+  }
+
+  /**
+   * Dial one pair through its backoff. Every initiator-side dial goes
+   * through here - the first request, a re-announce, the reconcile tick - so
+   * none of them can skip the wait the last failure earned. A seeder we
+   * cannot currently reach is not worth a link. False when nothing was built.
+   */
+  private dial(infoHash: string, peerId: string, now: number): boolean {
+    if (peerId === this.selfId()) return false;
+    if (!this.connectedPeers.has(peerId)) return false;
+    const key = wtKey(infoHash, peerId);
+    if (this.wtPeers.has(key)) return false;
+    if (now < (this.wtNextTry.get(key) ?? 0)) return false;
+    const attempts = this.wtAttempts.get(key) ?? 0;
+    if (attempts >= WT_MAX_ATTEMPTS) return false;
+    // Backoff is for a peer that will not answer. A pair held back by the
+    // cap has not been tried at all, so it keeps its place at the front of
+    // the queue instead of being pushed out to the next retry window.
+    if (!this.createWTPeer(infoHash, peerId, true)) return false;
+    const wait = Math.min(
+      Math.max((this.wtBackoff.get(key) ?? 0) * 2, WT_RECONCILE_MS),
+      WT_RETRY_MAX_MS
+    );
+    this.wtBackoff.set(key, wait);
+    this.wtNextTry.set(key, now + wait);
+    this.wtAttempts.set(key, attempts + 1);
+    return true;
+  }
+
+  /** Every reachable seeder of the file is capped and none has a link. */
+  private allExhausted(infoHash: string): boolean {
+    let reachable = 0;
+    for (const peerId of this.seedersByHash.get(infoHash) ?? []) {
+      if (peerId === this.selfId() || !this.connectedPeers.has(peerId)) continue;
+      reachable += 1;
+      const key = wtKey(infoHash, peerId);
+      if (this.wtPeers.has(key)) return false;
+      if ((this.wtAttempts.get(key) ?? 0) < WT_MAX_ATTEMPTS) return false;
+    }
+    return reachable > 0;
+  }
+
+  private forgetRetryState(key: string): void {
+    this.wtNextTry.delete(key);
+    this.wtBackoff.delete(key);
+    this.wtAttempts.delete(key);
   }
 
   async seedFiles(files: File[]): Promise<FileDescriptor[]> {
@@ -273,7 +327,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     }
 
     if (existing?.status === "downloading") {
-      this.createWTPeer(file.infoHash, seederPeerId, true);
+      this.dial(file.infoHash, seederPeerId, Date.now());
     } else if (existing?.status === "failed") {
       // The last seeder leaving fails the transfer; without this a seeder
       // coming back was recorded and then ignored, and the file stayed
@@ -327,7 +381,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     }
   }
 
-  ensureDownload(file: FileDescriptor): void {
+  ensureDownload(file: FileDescriptor, opts?: { retry?: boolean }): void {
     if (!isValidInfoHash(file.infoHash)) {
       console.warn(`Rejecting download with invalid infoHash: ${file.infoHash}`);
       return;
@@ -336,6 +390,18 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.knownFiles.set(file.infoHash, file);
     const existing = this.transfers.get(file.infoHash);
     if (existing?.status === "complete" || existing?.status === "seeding") {
+      return;
+    }
+    const seeders = this.seedersByHash.get(file.infoHash);
+    if (opts?.retry) {
+      // The user asked: whatever the pairs earned before is forgiven.
+      for (const peerId of seeders ?? []) {
+        this.forgetRetryState(wtKey(file.infoHash, peerId));
+      }
+    } else if (existing?.status === "failed" && this.allExhausted(file.infoHash)) {
+      // Given up on stays given up on. A re-announce from the same peer used
+      // to flip this back to "downloading" (skeleton, a fresh file.request,
+      // no dial because every pair is capped) and the tick flipped it back.
       return;
     }
 
@@ -371,21 +437,22 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       blobURL: existing?.blobURL,
     });
 
-    const seeders = this.seedersByHash.get(file.infoHash);
-    rec(
-      ev("file.request", {
-        d: {
-          peers: seeders?.size ?? 0,
-          fileRef: refs().fileRef(file.infoHash),
-        },
-      })
-    );
+    // One request per download, not one per announce: this is called again
+    // for every file every time its sender reconnects.
+    if (existing?.status !== "downloading") {
+      rec(
+        ev("file.request", {
+          d: {
+            peers: seeders?.size ?? 0,
+            fileRef: refs().fileRef(file.infoHash),
+          },
+        })
+      );
+    }
     if (!seeders || seeders.size === 0) return;
 
-    for (const peerId of seeders) {
-      if (peerId === this.selfId()) continue;
-      this.createWTPeer(file.infoHash, peerId, true);
-    }
+    const now = Date.now();
+    for (const peerId of seeders) this.dial(file.infoHash, peerId, now);
   }
 
   handleSignal(fromPeerId: string, envelope: FileSignalEnvelope): void {
@@ -423,11 +490,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.peerSeeded.delete(peerId);
     // Their retry state goes with them, so a peer that reconnects is dialled
     // straight away rather than inheriting a wait from before it dropped.
-    for (const key of [...this.wtNextTry.keys()]) {
-      if (key.endsWith(`:${peerId}`)) {
-        this.wtNextTry.delete(key);
-        this.wtBackoff.delete(key);
-      }
+    for (const key of new Set([...this.wtNextTry.keys(), ...this.wtAttempts.keys()])) {
+      if (key.endsWith(`:${peerId}`)) this.forgetRetryState(key);
     }
 
     for (const [infoHash, seeders] of this.seedersByHash) {
@@ -670,8 +734,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     (peer as unknown as { id: string }).id = peerId;
 
     peer.on("connect", () => {
-      this.wtNextTry.delete(key);
-      this.wtBackoff.delete(key);
+      this.forgetRetryState(key);
       void this.attachToTorrent(infoHash, peer);
     });
 

@@ -370,6 +370,7 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "session.config":
     case "session.unlock":
     case "session.visibility":
+    case "session.node":
     case "session.online":
     case "session.end":
     case "relay.dial.attempt":

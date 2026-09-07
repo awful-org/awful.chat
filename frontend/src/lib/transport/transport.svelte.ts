@@ -83,6 +83,7 @@ import { DtlnProcessor } from "../audio/dtln-processor";
 import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession } from "../identity/identity";
 import { deviceKeySeed } from "./device-key";
+import { acquireNodeLock, releaseNodeLock } from "./node-lock";
 import { looksLikeDid, looksLikePeerId } from "../identity/identity-utils";
 import {
   canonicalContentV3,
@@ -344,6 +345,8 @@ export interface ParticipantState {
 
 interface TransportState {
   relayConnected: boolean;
+  /** Another tab of this browser profile runs the node; this one is queued for it. See node-lock.ts. */
+  nodeHeldElsewhere: boolean;
   connected: boolean;
   connecting: boolean;
   /**
@@ -458,6 +461,7 @@ interface TransportState {
 
 export const transportState = $state<TransportState>({
   relayConnected: false,
+  nodeHeldElsewhere: false,
   connected: false,
   connecting: false,
   joiningCall: false,
@@ -3604,6 +3608,28 @@ function _scheduleConnectRetry(): void {
   _connectRetryDelay = Math.min(_connectRetryDelay * 2, CONNECT_RETRY_MAX_MS);
 }
 
+const _nodeLockEvents = {
+  onWaiting: (waiting: boolean) => {
+    transportState.nodeHeldElsewhere = waiting;
+    rec(ev("session.node", { d: { state: waiting ? "waiting" : "held" } }));
+  },
+  onRelease: () => _stepDown(),
+};
+
+/**
+ * Another tab of this profile asked for the node: tear ours down and queue
+ * behind it, so the seat comes back here when that tab goes. The room on
+ * screen stays as it is; connect() rejoins every saved room on the way back.
+ */
+function _stepDown(): void {
+  rec(ev("session.node", { d: { state: "stepdown" } }));
+  leaveCall();
+  _transport.disconnect();
+  transportState.relayConnected = false;
+  transportState.connected = false;
+  connect().catch(() => {});
+}
+
 export async function connect() {
   // The flag is not proof. A page restored from the back-forward cache, or a
   // tab the browser froze, keeps relayConnected === true over a node that is
@@ -3622,6 +3648,10 @@ export async function connect() {
 
   _connectPromise = (async () => {
     try {
+      // One node per browser profile: a second tab of the same profile would
+      // share this peerId and the two would starve each other (node-lock.ts).
+      // Waits here, for as long as it takes, when another tab has the seat.
+      await acquireNodeLock(_nodeLockEvents);
       // This device's own libp2p key, NOT the identity key: two devices on the
       // same account would otherwise share a peerId and never connect.
       await _transport.connect(deviceKeySeed());
@@ -3880,6 +3910,7 @@ function _disconnectWithoutBroadcasting(): void {
   _fileTransport.resetTransfers();
   leaveCall();
   _transport.disconnect();
+  releaseNodeLock();
   stopTelemetryTaps();
   _peerIdToDid.clear();
   clearCardStates();
@@ -4481,7 +4512,7 @@ export function requestFileDownload(
   if (peerId) {
     _fileTransport.registerSeeder(file, peerId);
   }
-  _fileTransport.ensureDownload(file);
+  _fileTransport.ensureDownload(file, { retry: true });
 }
 
 export async function toggleReaction(

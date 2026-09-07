@@ -84,6 +84,14 @@ vi.mock("../ice-server-list", () => {
   };
 });
 
+const recorded: string[] = [];
+vi.mock("../../telemetry/recorder", () => ({
+  rec: (e: { kind: string }) => {
+    recorded.push(e.kind);
+  },
+  refs: () => ({ fileRef: (h: string) => h }),
+}));
+
 const { WebTorrentFileTransport } = await import("./webtorrent");
 
 const file = {
@@ -100,7 +108,93 @@ describe("WebTorrentFileTransport", () => {
     addedPeers.length = 0;
     livePeers.length = 0;
     addCalls.length = 0;
+    recorded.length = 0;
     torrents.clear();
+  });
+
+  it("a re-announce of a file already downloading neither redials nor re-requests", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.onPeerConnect("alice");
+    t.registerSeeder(file, "alice");
+    t.ensureDownload(file);
+    await tick();
+    expect(livePeers.length).toBe(1);
+    expect(recorded.filter((k) => k === "file.request")).toHaveLength(1);
+
+    // The sender reconnects three times without ever disconnecting (two
+    // tabs on one peerId): each time it announces its inventory again and
+    // the transport asks for the file again.
+    for (let i = 0; i < 3; i++) {
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+    }
+    await tick();
+    expect(livePeers.length).toBe(1);
+    expect(recorded.filter((k) => k === "file.request")).toHaveLength(1);
+  });
+
+  it("gives a pair up after WT_MAX_ATTEMPTS and fails the transfer", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = new WebTorrentFileTransport(() => "me");
+      const reconcile = () =>
+        (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      // Every dial fails; the tick keeps redialling through the backoff.
+      for (let i = 0; i < 12; i++) {
+        (livePeers[livePeers.length - 1] as { destroy: () => void }).destroy();
+        vi.advanceTimersByTime(60_000);
+        reconcile();
+        // A re-announce mid-way changes nothing either.
+        t.registerSeeder(file, "alice");
+        t.ensureDownload(file);
+      }
+      expect(livePeers.length).toBe(6);
+      expect(t.getTransfer(HASH)?.status).toBe("failed");
+      // Nor does another announce once it has been given up on.
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      expect(livePeers.length).toBe(6);
+      expect(t.getTransfer(HASH)?.status).toBe("failed");
+
+      // The user clicks the file: the count starts over.
+      t.ensureDownload(file, { retry: true });
+      expect(livePeers.length).toBe(7);
+      expect(t.getTransfer(HASH)?.status).toBe("downloading");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a real disconnect starts the count over", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = new WebTorrentFileTransport(() => "me");
+      const reconcile = () =>
+        (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      for (let i = 0; i < 8; i++) {
+        (livePeers[livePeers.length - 1] as { destroy: () => void }).destroy();
+        vi.advanceTimersByTime(60_000);
+        reconcile();
+      }
+      expect(livePeers.length).toBe(6);
+      expect(t.getTransfer(HASH)?.status).toBe("failed");
+
+      t.onPeerDisconnect("alice");
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      expect(t.getTransfer(HASH)?.status).toBe("downloading");
+      expect(livePeers.length).toBe(7);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("caps the WebRTC links a roomful of files can open at once", async () => {

@@ -47,6 +47,7 @@ export type DiagKind =
   | "session.config"
   | "session.unlock"
   | "session.visibility"
+  | "session.node"
   | "session.online"
   | "session.end"
   // relay
@@ -204,6 +205,7 @@ export const KIND_SEV = {
   "session.config": "info",
   "session.unlock": "info",
   "session.visibility": "info",
+  "session.node": "info",
   "session.online": "info",
   "session.end": "info",
   // relay

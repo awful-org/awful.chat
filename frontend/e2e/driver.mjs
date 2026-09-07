@@ -107,6 +107,25 @@ export class Peer {
     await this.bidi.send("browsingContext.setViewport", params);
   }
 
+  /**
+   * A second tab of this same browser profile: same identity, same libp2p
+   * seed, same Lock Manager. Drives a browsing context of this session, so
+   * it must be created (browsingContext.create) and closed by the caller.
+   */
+  tab(context) {
+    const other = Object.create(Peer.prototype);
+    other.port = this.port;
+    other.name = `${this.name}#2`;
+    other.mobile = this.mobile;
+    other.bidi = {
+      port: this.port,
+      context,
+      send: (method, params) => this.bidi.send(method, params),
+      close: async () => {},
+    };
+    return other;
+  }
+
   async go(path) {
     await this.bidi.send("browsingContext.navigate", {
       context: this.bidi.context,

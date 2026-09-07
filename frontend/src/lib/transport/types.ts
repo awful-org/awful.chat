@@ -313,7 +313,8 @@ export interface FileTransferEvents {
 export interface FileTransferTransport {
   seedFiles(files: File[]): Promise<FileDescriptor[]>;
   registerSeeder(file: FileDescriptor, seederPeerId: string): void;
-  ensureDownload(file: FileDescriptor): void;
+  /** `retry`: the user asked, so per-pair give-up state is forgotten first. */
+  ensureDownload(file: FileDescriptor, opts?: { retry?: boolean }): void;
   handleSignal(fromPeerId: string, envelope: FileSignalEnvelope): void;
   onPeerConnect(peerId: string): void;
   onPeerDisconnect(peerId: string): void;
