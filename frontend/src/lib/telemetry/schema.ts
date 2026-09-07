@@ -177,7 +177,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 116;
+export const DIAG_KIND_COUNT = 117;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
