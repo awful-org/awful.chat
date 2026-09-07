@@ -82,12 +82,13 @@
     resolveMentionDisplayName,
   } from "$lib/transport/transport.svelte";
   import { humanizeMentions } from "$lib/mentions";
-  import { roomsStore, refreshPhonebook } from "$lib/rooms.svelte";
+  import { refreshPhonebook } from "$lib/rooms.svelte";
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
     openDmPanel,
     removeFromPhonebook,
+    isInPhonebook,
   } from "$lib/transport/dm.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
   import {
@@ -1517,16 +1518,6 @@
   // the reference came from, and a phonebook entry carries both. Compare
   // every form, or the header button shows "Add" for someone already saved
   // (and its toggle then silently removes them).
-  function isInPhonebook(peerId: string): boolean {
-    const did = peerIdToDid(peerId);
-    return roomsStore.phonebook.some(
-      (entry) =>
-        entry.peerId === peerId ||
-        entry.did === peerId ||
-        (!!did && (entry.peerId === did || entry.did === did))
-    );
-  }
-
   async function startDmFromMenu(peerId: string): Promise<void> {
     if (onOpenDm) {
       await onOpenDm(peerId);

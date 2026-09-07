@@ -4,7 +4,14 @@
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
   import { applyVoiceLinkStatus } from "$lib/voice-link-status";
-  import { openDmPanel } from "$lib/transport/dm.svelte";
+  import {
+    addToPhonebook,
+    isInPhonebook,
+    openDmPanel,
+    removeFromPhonebook,
+  } from "$lib/transport/dm.svelte";
+  import { refreshPhonebook } from "$lib/rooms.svelte";
+  import UserProfileCard from "./UserProfileCard.svelte";
   import {
     getVoicePeerVolume,
     setVoicePeerVolume,
@@ -75,7 +82,7 @@
     PinOff,
     LogIn,
   } from "@lucide/svelte";
-  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
+  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
 import { displayPrefs, setCallChatBeside, setCallPip } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
@@ -619,6 +626,16 @@ import {
   /** Right-click on the call background: picks what the grid shows. */
   let viewMenu = $state<{ x: number; y: number } | null>(null);
   let peerVolumeSlider = $state(UNITY_STOP);
+  /** Whose profile card a tile menu opened. */
+  let profileCardFor = $state<{
+    peerId: string;
+    did: string;
+    name: string;
+    avatarUrl?: string;
+    color?: string;
+  } | null>(null);
+  /** The level a person had before Mute, so Unmute brings it back. */
+  const preMuteGain = new Map<string, number>();
 
   const peerVolumePercent = $derived(formatGain(sliderToGain(peerVolumeSlider)));
 
@@ -659,6 +676,13 @@ import {
       pipSupported: browserPipSupported(),
       pipOpen: callPipPanel.browserPip,
       canMessage: !tile.isLocal && !!tile.peerId,
+      inPhonebook: !tile.isLocal && !!tile.peerId && isInPhonebook(tile.peerId),
+      // Off the slider, which openTileMenu seeds from the live gain: it is
+      // reactive, so dragging it to 0 flips the row to Unmute in place.
+      peerMuted:
+        tile.kind === "camera" &&
+        !tile.isLocal &&
+        sliderToGain(peerVolumeSlider) <= 0,
       cameraOff,
       micMuted: muted,
       // Screen-share audio, not the sharer's voice: it arrives as its own
@@ -789,6 +813,37 @@ import {
         // rendered as an empty conversation you could send into but never see.
         if (tile.peerId) await openDmPanel(tile.peerId);
         break;
+      case "profile":
+        if (!tile.peerId) break;
+        // The card is a dialog portalled to the body, which a fullscreen
+        // panel does not show.
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        }
+        profileCardFor = {
+          peerId: tile.peerId,
+          did: peerIdToDid(tile.peerId),
+          name: tile.label,
+          avatarUrl: tile.avatarUrl ?? getPeerAvatar(tile.peerId) ?? undefined,
+          color: getPeerColor(tile.peerId) ?? undefined,
+        };
+        break;
+      case "add-phonebook":
+      case "remove-phonebook":
+        if (tile.peerId) await togglePhonebook(tile.peerId);
+        break;
+      case "mute-peer":
+        if (tile.peerId) {
+          const gain = getVoicePeerVolume(tile.peerId);
+          if (gain > 0) preMuteGain.set(tile.peerId, gain);
+          setVoicePeerVolume(tile.peerId, 0);
+        }
+        break;
+      case "unmute-peer":
+        if (tile.peerId) {
+          setVoicePeerVolume(tile.peerId, preMuteGain.get(tile.peerId) ?? 1);
+        }
+        break;
       case "watch":
         if (tile.producerId) watchTransmission(tile.peerId, tile.producerId);
         break;
@@ -840,6 +895,12 @@ import {
     pluginMenuItems = [];
   }
 
+  async function togglePhonebook(peerId: string): Promise<void> {
+    if (isInPhonebook(peerId)) await removeFromPhonebook(peerId);
+    else await addToPhonebook(peerId);
+    await refreshPhonebook();
+  }
+
   function onPeerVolume(value: number): void {
     peerVolumeSlider = value;
     const peerId = tileMenuTile?.peerId;
@@ -863,6 +924,9 @@ import {
     "mic-off": MicOff,
     volume: Volume2,
     "volume-off": VolumeX,
+    user: UserIcon,
+    "user-plus": UserPlus,
+    "user-minus": UserRoundMinus,
     join: LogIn,
     leave: CopyX,
     plugin: Puzzle,
@@ -2566,6 +2630,26 @@ import {
       </div>
     {/if}
   </div>
+{/if}
+
+{#if profileCardFor}
+  <UserProfileCard
+    open={!!profileCardFor}
+    onOpenChange={(open) => {
+      if (!open) profileCardFor = null;
+    }}
+    did={profileCardFor.did}
+    name={profileCardFor.name}
+    avatarUrl={profileCardFor.avatarUrl}
+    color={profileCardFor.color}
+    onMessage={() => {
+      const pid = profileCardFor!.peerId;
+      profileCardFor = null;
+      void openDmPanel(pid);
+    }}
+    onTogglePhonebook={() => void togglePhonebook(profileCardFor!.peerId)}
+    inPhonebook={isInPhonebook(profileCardFor.peerId)}
+  />
 {/if}
 
 <svelte:window

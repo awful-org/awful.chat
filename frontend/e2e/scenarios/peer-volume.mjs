@@ -31,6 +31,8 @@ const injectCall = async () => {
       videoTrack: null, screenTrack: null, screenAudioTrack: null,
     }]]);
     s.callPeerIds = new Set([${JSON.stringify(FAKE_PEER)}]);
+    // The stage shows only the call of the room on screen.
+    s.callPeerRooms = new Map([[${JSON.stringify(FAKE_PEER)}, s.roomCode]]);
     s.callRoomCode = s.roomCode; s.inCall = true;
     return true;
   })()`);

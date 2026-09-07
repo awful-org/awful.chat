@@ -32,6 +32,9 @@ export type TileMenuIcon =
   | "mic-off"
   | "volume"
   | "volume-off"
+  | "user"
+  | "user-plus"
+  | "user-minus"
   | "join"
   | "leave"
   | "plugin";
@@ -46,6 +49,13 @@ export type TileMenuAction =
   | { kind: "fullscreen" }
   | { kind: "exit-fullscreen" }
   | { kind: "message" }
+  /** The person's profile card. */
+  | { kind: "profile" }
+  | { kind: "add-phonebook" }
+  | { kind: "remove-phonebook" }
+  /** Silence this person for you alone (their volume to 0), and back. */
+  | { kind: "mute-peer" }
+  | { kind: "unmute-peer" }
   /** Subscribe to an offered SFU share / drop the one being watched. */
   | { kind: "watch" }
   | { kind: "stop-watching" }
@@ -113,6 +123,10 @@ export interface TileMenuState {
   pipOpen: boolean;
   /** A remote peer with a real peer id, so a DM can be opened. */
   canMessage: boolean;
+  /** That person is in the phonebook already. */
+  inPhonebook: boolean;
+  /** Their voice is at volume 0 for us. */
+  peerMuted: boolean;
   cameraOff: boolean;
   micMuted: boolean;
   /** The share carries audio at all. */
@@ -139,6 +153,8 @@ export function tileMenuState(
     pipSupported: false,
     pipOpen: false,
     canMessage: false,
+    inPhonebook: false,
+    peerMuted: false,
     cameraOff: false,
     micMuted: false,
     shareAudio: false,
@@ -329,15 +345,53 @@ export function buildTileMenu(s: TileMenuState): TileMenuRow[] {
   const tail: TileMenuRow[] = [];
   if (s.kind === "camera") {
     if (s.canMessage) {
-      tail.push({
-        type: "item",
-        label: "Message",
-        icon: "message",
-        action: { kind: "message" },
-      });
+      tail.push(
+        {
+          type: "item",
+          label: "Message",
+          icon: "message",
+          action: { kind: "message" },
+        },
+        {
+          type: "item",
+          label: "View profile",
+          icon: "user",
+          action: { kind: "profile" },
+        },
+        s.inPhonebook
+          ? {
+              type: "item",
+              label: "Remove from phonebook",
+              icon: "user-minus",
+              action: { kind: "remove-phonebook" },
+              danger: true,
+            }
+          : {
+              type: "item",
+              label: "Add to phonebook",
+              icon: "user-plus",
+              action: { kind: "add-phonebook" },
+            }
+      );
     }
-    // The per-person listening volume, the app's only real "mute them".
-    tail.push({ type: "volume", target: "peer" });
+    // Mute is the slider at 0 with a name: one click instead of a drag, and
+    // Unmute brings back the level they had. Only changes what you hear.
+    tail.push(
+      s.peerMuted
+        ? {
+            type: "item",
+            label: "Unmute",
+            icon: "volume",
+            action: { kind: "unmute-peer" },
+          }
+        : {
+            type: "item",
+            label: "Mute",
+            icon: "volume-off",
+            action: { kind: "mute-peer" },
+          },
+      { type: "volume", target: "peer" }
+    );
   } else {
     tail.push(...shareAudioRows(s));
     if (s.isWatched) {

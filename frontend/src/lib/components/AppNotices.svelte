@@ -1,8 +1,9 @@
 <script lang="ts">
   import { _transport, transportState } from "$lib/transport/transport.svelte";
   import type { TransportStatus } from "$lib/transport/types";
+  import { claimNodeLock } from "$lib/transport/node-lock";
   import { isConfigured } from "$lib/runtime-config";
-  import { CircleAlert, ServerOff, WifiOff, X } from "@lucide/svelte";
+  import { AppWindow, CircleAlert, ServerOff, WifiOff, X } from "@lucide/svelte";
   import { onDestroy, onMount } from "svelte";
 
   /**
@@ -58,6 +59,9 @@
   let configured = $state(true);
 
   const relayConnected = $derived(transportState.relayConnected);
+  // Another tab of this profile has the node; this one waits for it and can
+  // ask for it (node-lock.ts). Nothing else in this tab works until then.
+  const heldElsewhere = $derived(transportState.nodeHeldElsewhere);
 
   let cleanups: (() => void)[] = [];
   const timers = new Map<number, ReturnType<typeof setTimeout>>();
@@ -143,6 +147,7 @@
   });
 
   const barText = $derived.by(() => {
+    if (heldElsewhere) return "awful.chat is open in another tab.";
     if (!online) return "Offline. Messages send when you reconnect.";
     if (!configured) return "This instance has no relay configured.";
     return null;
@@ -179,12 +184,23 @@
       role="status"
       class="pointer-events-auto flex w-full max-w-md items-center justify-center gap-2 rounded-lg border border-border bg-background/95 px-3 py-1.5 text-xs text-muted-foreground shadow-lg backdrop-blur"
     >
-      {#if online}
+      {#if heldElsewhere}
+        <AppWindow class="size-3.5 shrink-0 text-amber-500" />
+      {:else if online}
         <ServerOff class="size-3.5 shrink-0 text-amber-500" />
       {:else}
         <WifiOff class="size-3.5 shrink-0 text-amber-500" />
       {/if}
       <span>{barText}</span>
+      {#if heldElsewhere}
+        <button
+          type="button"
+          onclick={claimNodeLock}
+          class="ml-1 rounded border border-border px-2 py-0.5 font-medium text-foreground hover:bg-accent"
+        >
+          Use here
+        </button>
+      {/if}
     </div>
   {/if}
 </div>
