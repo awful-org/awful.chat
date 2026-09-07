@@ -821,13 +821,17 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         filename: descriptor.filename,
         mimeType: descriptor.mimeType,
         size: descriptor.size,
-        status: torrent.done
-          ? isSeeding
-            ? "seeding"
-            : "complete"
-          : "downloading",
+        // A torrent we seed is "seeding" whatever webtorrent's done flag
+        // says: it stays false for a seed here, and the first wire event
+        // used to rewrite the sender's own file to "downloading" - which
+        // then had the reconcile tick dialling peers for a file we hold.
+        status: isSeeding
+          ? "seeding"
+          : torrent.done
+            ? "complete"
+            : "downloading",
         progress: torrent.progress ?? existing?.progress ?? 0,
-        done: torrent.done,
+        done: isSeeding || torrent.done,
         seeding: isSeeding,
         peers: torrent.numPeers ?? existing?.peers ?? 0,
         seeders:

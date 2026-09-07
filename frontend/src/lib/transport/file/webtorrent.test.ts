@@ -170,6 +170,23 @@ describe("WebTorrentFileTransport", () => {
     }
   });
 
+  it("a seeded file stays seeding whatever the torrent's done flag says", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    await t.seedFiles([new File([new Uint8Array(10)], "cat.png", { type: "image/png" })]);
+    expect(t.getTransfer(HASH)?.status).toBe("seeding");
+    // webtorrent leaves `done` false on a seed; a peer connecting fires "wire".
+    const torrent = torrents.get(HASH)!;
+    torrent.done = false;
+    torrent.emit("wire");
+    expect(t.getTransfer(HASH)?.status).toBe("seeding");
+    expect(t.getTransfer(HASH)?.done).toBe(true);
+    // ...so the reconcile tick has nothing to dial for it.
+    t.onPeerConnect("bob");
+    t.registerSeeder(file, "bob");
+    (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+    expect(livePeers.length).toBe(0);
+  });
+
   it("a real disconnect starts the count over", async () => {
     vi.useFakeTimers();
     try {
