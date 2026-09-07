@@ -3734,6 +3734,9 @@ export function beginConversationOpen(): () => boolean {
 
 export async function joinRoom(roomCode: string): Promise<boolean> {
   const stillCurrent = beginConversationOpen();
+  // Before the relay wait too: the chat view's overlay reads this, and a
+  // room opened while the relay was still dialling showed no sign of it.
+  transportState.connecting = true;
   if (!transportState.relayConnected) {
     await connect();
   }
@@ -3745,7 +3748,6 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
   }
 
   transportState.error = null;
-  transportState.connecting = true;
   try {
     // Claim the room before the awaits, not after. Everything that routes an
     // incoming message compares against transportState.roomCode, so during the
