@@ -37,6 +37,7 @@ import {
   beginConversationOpen,
   _loadHistory,
   _peerIdToDid,
+  peerIdToDid,
   _transport,
   applyMessageStatus,
   transportState,
@@ -816,6 +817,18 @@ export async function addToPhonebook(peerIdOrDid: string): Promise<void> {
     favorite: keeper?.favorite,
   });
   _transport.joinRoom(roomCode);
+}
+
+/** Whether that person is in the phonebook, under any key an entry may carry. */
+export function isInPhonebook(peerId: string): boolean {
+  // An entry may be keyed by peerId or DID; compare every form.
+  const did = peerIdToDid(peerId);
+  return roomsStore.phonebook.some(
+    (entry) =>
+      entry.peerId === peerId ||
+      entry.did === peerId ||
+      (!!did && (entry.peerId === did || entry.did === did))
+  );
 }
 
 export async function removeFromPhonebook(peerIdOrDid: string): Promise<void> {

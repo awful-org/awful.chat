@@ -33,18 +33,45 @@ describe("buildTileMenu", () => {
         canMessage: true,
       })
     );
-    expect(actions(rows)).toEqual(["focus", "pip", "fullscreen", "message"]);
-    // The per-peer slider is the app's only real per-person mute.
+    expect(actions(rows)).toEqual([
+      "focus",
+      "pip",
+      "fullscreen",
+      "message",
+      "profile",
+      "add-phonebook",
+      "mute-peer",
+    ]);
     expect(rows).toContainEqual({ type: "volume", target: "peer" });
     expect(rows[0]).toEqual({ type: "label", text: "Ada" });
   });
 
-  it("drops Message for a peer with no DM route", () => {
+  it("drops the person rows for a peer with no DM route, keeps the mute", () => {
     const rows = buildTileMenu(
       tileMenuState({ kind: "camera", label: "Ada", canMessage: false })
     );
-    expect(actions(rows)).not.toContain("message");
+    expect(actions(rows)).toEqual(["focus", "fullscreen", "mute-peer"]);
     expect(rows).toContainEqual({ type: "volume", target: "peer" });
+  });
+
+  it("flips Mute and the phonebook row by state", () => {
+    const rows = buildTileMenu(
+      tileMenuState({
+        kind: "camera",
+        label: "Ada",
+        canMessage: true,
+        inPhonebook: true,
+        peerMuted: true,
+      })
+    );
+    expect(actions(rows)).toContain("remove-phonebook");
+    expect(actions(rows)).not.toContain("add-phonebook");
+    expect(actions(rows)).toContain("unmute-peer");
+    expect(actions(rows)).not.toContain("mute-peer");
+    const unmute = rows.find(
+      (r) => r.type === "item" && r.action.kind === "unmute-peer"
+    );
+    expect(unmute).toMatchObject({ label: "Unmute", icon: "volume" });
   });
 
   it("gives the local camera its own devices and never a volume slider", () => {

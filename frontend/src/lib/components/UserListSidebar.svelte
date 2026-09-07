@@ -16,6 +16,7 @@
   import {
     openDmPanel,
     addToPhonebook,
+    isInPhonebook,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
@@ -29,7 +30,7 @@
     Users,
     Workflow,
   } from "@lucide/svelte";
-  import { roomsStore, refreshPhonebook } from "$lib/rooms.svelte";
+  import { refreshPhonebook } from "$lib/rooms.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { Tip } from "$lib/components/ui/tooltip";
   import { nameEffectStyle } from "$lib/name-effect";
@@ -319,17 +320,6 @@
 
   function closeUserMenu(): void {
     userMenu = null;
-  }
-
-  function isInPhonebook(peerId: string): boolean {
-    // An entry may be keyed by peerId or DID; compare every form.
-    const did = peerIdToDid(peerId);
-    return roomsStore.phonebook.some(
-      (entry) =>
-        entry.peerId === peerId ||
-        entry.did === peerId ||
-        (!!did && (entry.peerId === did || entry.did === did))
-    );
   }
 
   async function handleAddToPhonebook(peerId: string): Promise<void> {
