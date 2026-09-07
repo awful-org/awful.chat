@@ -10,7 +10,7 @@ import type {
   FileTransferSnapshot,
   FileTransferTransport,
 } from "../types";
-import { getIceServers } from "../ice-server-list";
+import { getIceServers, onIceServersChanged } from "../ice-server-list";
 import { ev, errText } from "../../telemetry/event";
 import { rec, refs } from "../../telemetry/recorder";
 
@@ -117,6 +117,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private wtNextTry = new Map<string, number>();
   private wtBackoff = new Map<string, number>();
   private wtReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  private iceUnsubscribe: (() => void) | null = null;
   private attachedTorrents = new Set<string>();
   /**
    * infoHashes whose torrent is being added right now. ensureDownload reads
@@ -144,6 +145,30 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         WT_RECONCILE_MS
       );
     }
+    // ICE servers are snapshotted when a SimplePeer is built (createWTPeer),
+    // so a file link dialled before the TURN credentials landed is STUN-only
+    // for its whole life - and the first dials of a session happen exactly
+    // then: connect() kicks off the credential fetch and, in the same tick,
+    // opening a room auto-downloads its images and dials their seeders.
+    // Between two NATs (mobile, CGNAT, most home routers) a STUN-only link
+    // never connects, so the transfer sat at zero peers forever with only
+    // the skeleton showing, while voice kept working: it rides the SFU and
+    // rebuilds on this same event (libp2p/voice.ts). Mirror that here: when
+    // the list changes, tear down every link that has not connected yet,
+    // clear its backoff so the redial is immediate, and let the reconcile
+    // pass dial it again with TURN in hand. Established links are left alone.
+    this.iceUnsubscribe = onIceServersChanged(() => {
+      for (const [key, peer] of [...this.wtPeers]) {
+        if (peer.connected) continue;
+        // Delete before destroy: destroy() fires the close handler, which
+        // deletes too, and this keeps the redial below from racing it.
+        this.wtPeers.delete(key);
+        this.wtNextTry.delete(key);
+        this.wtBackoff.delete(key);
+        peer.destroy();
+      }
+      this.reconcileWtPeers();
+    });
   }
 
   /**
@@ -483,6 +508,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   }
 
   destroy(): void {
+    this.iceUnsubscribe?.();
+    this.iceUnsubscribe = null;
     this.resetTransfers();
     this.connectedPeers.clear();
     this.clientP?.then((client) => client.destroy(() => {}));

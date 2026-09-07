@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as iceServerList from "../ice-server-list";
 
 const HASH = "a".repeat(40);
 const addedPeers: Array<{ id?: string }> = [];
@@ -66,7 +67,22 @@ vi.mock("webtorrent", () => {
   return { default: FakeClient };
 });
 
-vi.mock("../ice-server-list", () => ({ getIceServers: () => [] }));
+vi.mock("../ice-server-list", () => {
+  // The real module notifies subscribers when TURN credentials land; the
+  // transport rebuilds unconnected file links on that event. Capture the
+  // subscriber so a test can fire it.
+  let onChange: (() => void) | null = null;
+  return {
+    getIceServers: () => [],
+    onIceServersChanged: (cb: () => void) => {
+      onChange = cb;
+      return () => {
+        if (onChange === cb) onChange = null;
+      };
+    },
+    __fireIceServersChanged: () => onChange?.(),
+  };
+});
 
 const { WebTorrentFileTransport } = await import("./webtorrent");
 
@@ -170,6 +186,44 @@ describe("WebTorrentFileTransport", () => {
 
     expect(torrents.has(HASH)).toBe(true);
     expect(addedPeers.map((p) => p.id)).toEqual(["alice"]);
+  });
+
+  it("redials an unconnected file link with TURN once the credentials land", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    const desc = { infoHash: HASH, filename: "cat.png", mimeType: "image/png", size: 10 };
+    t.onPeerConnect("alice");
+    t.registerSeeder(desc as never, "alice");
+    // A dial that raced the credential fetch: built STUN-only, never connects.
+    t.ensureDownload(desc as never);
+    await tick();
+    const peers = (t as never as { wtPeers: Map<string, EventEmitter & { destroyed: boolean; connected?: boolean }> }).wtPeers;
+    expect(peers.size).toBe(1);
+    const stunOnly = [...peers.values()][0];
+    const dialsBefore = livePeers.length;
+
+    (iceServerList as never as { __fireIceServersChanged: () => void }).__fireIceServersChanged();
+    await tick();
+
+    // The stale link is gone and a fresh one was dialled in its place.
+    expect(stunOnly.destroyed).toBe(true);
+    expect(livePeers.length).toBe(dialsBefore + 1);
+    expect(peers.size).toBe(1);
+    expect([...peers.values()][0]).not.toBe(stunOnly);
+  });
+
+  it("leaves an established file link alone when the credentials land", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.onPeerConnect("alice");
+    t.handleSignal("alice", { kind: "file-wt-signal", infoHash: HASH, signal: {} } as never);
+    const peers = (t as never as { wtPeers: Map<string, EventEmitter & { destroyed: boolean; connected?: boolean }> }).wtPeers;
+    const live = [...peers.values()][0];
+    live.connected = true;
+
+    (iceServerList as never as { __fireIceServersChanged: () => void }).__fireIceServersChanged();
+    await tick();
+
+    expect(live.destroyed).toBe(false);
+    expect([...peers.values()][0]).toBe(live);
   });
 
   it("caps the distinct infoHashes a single peer may register", async () => {
