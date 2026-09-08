@@ -1,7 +1,11 @@
 import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
-import { loadRuntimeConfig } from "$lib/runtime-config";
+import { loadRuntimeConfig, useQc } from "$lib/runtime-config";
+import {
+  sweepOrphanQuickStorage,
+  useQuickStorage,
+} from "$lib/quick/quick-storage";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
@@ -41,6 +45,15 @@ window.addEventListener("vite:preloadError", (event) => {
 // them capture the build-time fallback instead of what the instance
 // actually serves. A missing config.json resolves immediately.
 await loadRuntimeConfig();
+
+// BEFORE the app mounts, and before anything opens IndexedDB: /qc runs the
+// whole stack against a throwaway database and identity init opens the real
+// one on the first frame. Doing this in the component would be too late.
+// The sweep clears databases a crashed quick page left behind.
+if (window.location.pathname.replace(/\/$/, "") === "/qc" && useQc()) {
+  useQuickStorage();
+}
+void sweepOrphanQuickStorage();
 
 const app = mount(App, {
   target: document.getElementById("app")!,

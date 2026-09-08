@@ -152,6 +152,7 @@ export class Peer {
         if (document.querySelector('input[placeholder="Room code, short code or link"]')) return 'ready';
         if (document.querySelector('textarea')) return 'ready';
         if (/Create new identity/i.test(t)) return 'ready';
+        if (/Quick (send|call)/i.test(t)) return 'ready'; // /qs and /qc have no identity at all
         return false;
       })()`),
       { timeout: 30_000 }

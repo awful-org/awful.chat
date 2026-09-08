@@ -27,6 +27,11 @@ api_url=${APP_API_URL:-${VITE_API_URL:-}}
 relay=${APP_RELAY_MULTIADDR:-${VITE_RELAY_MULTIADDR:-}}
 sfu=${APP_SFU_URLS:-${VITE_SFU_URLS:-${APP_SFU_URL:-${VITE_SFU_URL:-}}}}
 
+# Feature flags. Bare USE_QS/USE_QC are accepted too - they name nothing else
+# in this container, and they are the spelling the flags were asked for.
+use_qs=${APP_USE_QS:-${USE_QS:-${VITE_USE_QS:-}}}
+use_qc=${APP_USE_QC:-${USE_QC:-${VITE_USE_QC:-}}}
+
 # JSON forbids a raw control character inside a string, so a value carrying a
 # stray CR - a .env saved with CRLF line endings, a paste through a web UI -
 # would produce a file the app cannot parse. It is dropped rather than
@@ -35,6 +40,15 @@ sfu=${APP_SFU_URLS:-${VITE_SFU_URLS:-${APP_SFU_URL:-${VITE_SFU_URL:-}}}}
 # are escaped for the same reason.
 esc() {
   printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# A JSON boolean, defaulting to false: an unset or unrecognised flag leaves
+# the route off, so a typo hides the feature rather than exposing one.
+flag() {
+  case $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' \t') in
+    1 | true | yes | on) printf 'true' ;;
+    *) printf 'false' ;;
+  esac
 }
 
 # Comma separated list -> JSON array, empty entries dropped.
@@ -51,11 +65,14 @@ cat > "$OUT" <<JSON
 {
   "apiUrl": "$(esc "$api_url")",
   "relayMultiaddr": "$(esc "$relay")",
-  "sfuUrls": [$sfu_json]
+  "sfuUrls": [$sfu_json],
+  "useQs": $(flag "$use_qs"),
+  "useQc": $(flag "$use_qc")
 }
 JSON
 
-echo "[awful] wrote $OUT (api=${api_url:-unset} relay=${relay:-unset} sfu=${sfu:-unset})"
+echo "[awful] wrote $OUT (api=${api_url:-unset} relay=${relay:-unset}" \
+     "sfu=${sfu:-unset} qs=$(flag "$use_qs") qc=$(flag "$use_qc"))"
 
 # Nothing configured means nothing works: no relay to dial, no API. It is
 # worth being noisy about, because the container is otherwise healthy and the

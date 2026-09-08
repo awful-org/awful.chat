@@ -240,18 +240,6 @@ async function _adoptInline(
   });
 }
 
-export function isFileSignalWireMessage(
-  value: unknown
-): value is FileSignalWireMessage {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { type?: unknown }).type === "__file_signal" &&
-    typeof (value as { payload?: unknown }).payload === "object" &&
-    (value as { payload?: unknown }).payload !== null
-  );
-}
-
 export function maybePeerIdFromSenderId(senderId: string): string | null {
   const connectedPeers = _transport.peers();
   if (connectedPeers.includes(senderId)) return senderId;

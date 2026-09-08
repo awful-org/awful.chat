@@ -1,5 +1,7 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
 
+import { dbName } from "./quick/quick-storage";
+
 import {
   sealRow,
   openRow,
@@ -266,7 +268,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB("awful-chat", 6, {
+  db = (await openDB(dbName(), 6, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -2256,7 +2258,7 @@ export async function wipeLocalDatabase(): Promise<void> {
     db = null;
   }
   invalidatePeerProfilesCache();
-  await deleteDB("awful-chat");
+  await deleteDB(dbName());
 }
 
 /** Close the cached connection without deleting anything - a

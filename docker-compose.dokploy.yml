@@ -377,6 +377,10 @@ services:
       # Empty = this origin's own /sfu.
       - APP_SFU_URL=${VITE_SFU_URL:-}
       - APP_SFU_URLS=${VITE_SFU_URLS:-}
+      # Optional pages, off unless set: /qs sends a file to one person with
+      # no account, /qc is a call with no room.
+      - APP_USE_QS=${USE_QS:-}
+      - APP_USE_QC=${USE_QC:-}
     restart: unless-stopped
     # Drops every capability except what the stock nginx image needs: the
     # master starts as root and setuid/setgids its workers to the nginx user

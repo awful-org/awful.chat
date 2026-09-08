@@ -12,7 +12,10 @@ SCENARIOS="dm-extras sync-recovers dm-removal title-and-sound dtln-gain clock-sk
 room-removal reconnect-churn audio-prefs peer-volume background-sync rapid-switch
 drag-drop room-clock backfill-below-window call-status call-roster-ttl
 call-late-join call-join-speed call-without-sfu relay-upgrade history-pull mobile-shell
-device-sync"
+device-sync quick-send quick-send-alongside-app quick-call
+quick-call-alongside-app"
+# The quick-* scenarios need their routes turned on: start the dev server with
+# VITE_USE_QS=true VITE_USE_QC=true, or they fail saying so.
 fail=0
 failed=""
 for sc in $SCENARIOS; do

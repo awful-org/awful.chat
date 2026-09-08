@@ -36,6 +36,28 @@ describe("loadRuntimeConfig", () => {
     expect(m.sfuUrls()).toEqual(["wss://a.example/sfu", "wss://b.example/sfu"]);
   });
 
+  it("keeps an optional page off unless the flag plainly says yes", async () => {
+    // The entrypoint writes a JSON boolean, but a hand-edited config.json (or
+    // a VITE_ variable, which is always a string) writes "true". Both count;
+    // anything else leaves the route off rather than half-on.
+    for (const [raw, expected] of [
+      [true, true],
+      ["true", true],
+      ["YES", true],
+      ["1", true],
+      [false, false],
+      ["false", false],
+      ["", false],
+      ["maybe", false],
+      [undefined, false],
+    ] as const) {
+      const m = await load(respond(JSON.stringify({ useQs: raw })));
+      await m.loadRuntimeConfig();
+      expect(m.useQs(), `useQs for ${JSON.stringify(raw)}`).toBe(expected);
+      expect(m.useQc()).toBe(false); // absent stays off
+    }
+  });
+
   it("accepts the single-url form", async () => {
     const m = await load(respond(JSON.stringify({ sfuUrl: "wss://one/sfu" })));
     await m.loadRuntimeConfig();
