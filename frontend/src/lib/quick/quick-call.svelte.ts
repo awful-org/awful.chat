@@ -11,24 +11,31 @@
  *   - the identity: a keypair held only in memory (createEphemeralIdentity)
  *   - the database: a throwaway scope, deleted on the way out (quick-storage)
  *
- * What survives on purpose is the name and picture you call under, in
- * localStorage, because being asked who you are before every call is the
- * thing people hate about this kind of page.
+ * Who you are in the call is a choice: a throwaway identity under a name this
+ * page remembers in localStorage (being asked who you are before every call
+ * is the thing people hate about this kind of page), or the account this
+ * device already has - same DID, same profile, still a disposable database.
  *
  * The libp2p node is ephemeral too (session-key.ts) so a quick call can run
  * beside a tab already signed into the account, without taking its node seat.
  */
 
-import { createEphemeral } from "$lib/identity/identity.svelte";
-import { saveAvatar, saveName } from "$lib/profile.svelte";
-import { newRoomCode, normalizeRoomCode } from "$lib/room-code";
+import { createEphemeral, identityStore } from "$lib/identity/identity.svelte";
+import { loadProfile, saveAvatar, saveName } from "$lib/profile.svelte";
+import {
+  clearAtRestFlagForCurrentOwner,
+  closeDatabase,
+  getOwnProfile,
+  putOwnProfile,
+} from "$lib/storage";
+import { newQuickCode, normalizeQuickCode } from "$lib/room-code";
 import {
   joinRoom,
   leaveRoom,
   useEphemeralSession,
 } from "$lib/transport/transport.svelte";
 import { joinCall, leaveCall } from "$lib/transport/call.svelte";
-import { dbName, dropQuickStorage, isQuickStorage } from "./quick-storage";
+import { dbName, dropQuickStorage, useQuickStorage } from "./quick-storage";
 
 const PROFILE_KEY = "awful_qc_profile";
 /**
@@ -42,7 +49,11 @@ export interface QuickProfile {
 }
 
 export type QuickCallStage =
-  | "preparing"
+  /** Deciding who to be: only reached when this device HAS an account. */
+  | "choosing"
+  /** The account's own unlock screen is up. */
+  | "unlocking"
+  /** Name and picture, then Join. */
   | "setup"
   | "joining"
   | "in-call"
@@ -50,6 +61,8 @@ export type QuickCallStage =
 
 interface QuickCallState {
   stage: QuickCallStage;
+  /** Which identity is in the call: a throwaway one, or the real account. */
+  identity: "guest" | "account";
   code: string;
   error: string | null;
   /** What the setup screen starts filled in with. */
@@ -105,7 +118,8 @@ export function rememberQuickProfile(profile: QuickProfile | null): void {
 const remembered = readRememberedProfile();
 
 export const quickCall = $state<QuickCallState>({
-  stage: "preparing",
+  stage: "choosing",
+  identity: "guest",
   code: "",
   error: null,
   profile: remembered ?? { name: anonymousName() },
@@ -113,37 +127,48 @@ export const quickCall = $state<QuickCallState>({
 });
 
 /**
- * Mint a code, or take one from a link. The same 65-bit Crockford code rooms
- * use: it IS the membership secret, and a call is no less worth guessing than
- * a room - room-code.ts explains why it is not shorter.
+ * Mint a code, or take one from a link. A quick code, not a room code: ten
+ * characters for a call that lives hours, see room-code.ts for the numbers.
+ * A link carrying something else falls back to a fresh code rather than
+ * joining whatever the string happened to name.
  */
 export function setQuickCallCode(fromLink?: string): string {
-  quickCall.code = fromLink ? normalizeRoomCode(fromLink) : newRoomCode();
+  quickCall.code =
+    (fromLink ? normalizeQuickCode(fromLink) : "") || newQuickCode();
   return quickCall.code;
 }
 
 /**
- * Mint the identity and seed the profile, BEFORE the setup screen is usable.
+ * Switch this page onto its throwaway database.
  *
- * The identity has to exist first because every profile row is sealed with
- * its key - the avatar picker writes straight through to storage, and with no
- * session it would fail on the first click. Nothing here touches the network.
+ * Everything before this ran against the REAL one, because that is where the
+ * account's keypair and profile live and "use my account" has to be able to
+ * read them. The handle is closed first: the module caches an open
+ * connection, and leaving it open would keep writing to the wrong database.
+ *
+ * From here on the page is disposable. The libp2p node goes ephemeral in the
+ * same breath - whichever identity is in the call, the node must not take the
+ * seat belonging to a tab running the account (node-lock.ts).
  */
-/** Set once the ephemeral identity is live. Nothing may join before it is. */
+function switchToThrowawayStorage(): void {
+  closeDatabase();
+  useQuickStorage();
+  useEphemeralSession();
+}
+
+/** Set once an identity is live and the storage scope has moved. */
 let prepared = false;
 
-export async function prepareQuickCall(): Promise<void> {
-  if (quickCall.stage !== "preparing") return;
-  if (!isQuickStorage()) {
-    // main.ts switches the scope before the app mounts. Without it this page
-    // would write a room and a stranger's profile into the user's real
-    // database - refuse rather than quietly do that.
-    quickCall.stage = "failed";
-    quickCall.error = "Quick call storage was not set up - reload the page.";
-    return;
-  }
+/**
+ * Call as a stranger: a keypair that exists only in memory, under whatever
+ * name was remembered from last time.
+ */
+export async function prepareAsGuest(): Promise<void> {
+  if (prepared) return;
+  quickCall.identity = "guest";
+  quickCall.error = null;
   try {
-    useEphemeralSession();
+    switchToThrowawayStorage();
     await createEphemeral();
     await saveName(quickCall.profile.name);
     if (quickCall.profile.avatarUrl) {
@@ -157,18 +182,55 @@ export async function prepareQuickCall(): Promise<void> {
   }
 }
 
+/** Show the account's own unlock screen. */
+export function chooseAccount(): void {
+  quickCall.identity = "account";
+  quickCall.error = null;
+  quickCall.stage = "unlocking";
+}
+
+/**
+ * Carry the unlocked account into the call: same DID, same profile, same
+ * name colour and tag the room would show - but still a disposable database
+ * and a disposable node, so the call itself is no more permanent than a
+ * guest's. Called once identityStore reports the unlock landed.
+ *
+ * The whole profile ROW is copied rather than the display store: an uploaded
+ * avatar lives in the store as a blob: URL, which means nothing to anyone
+ * else, and copying the row keeps the bytes (and the colour, tag and bio)
+ * that _sendProfile actually puts on the wire.
+ */
+export async function adoptAccount(): Promise<void> {
+  if (prepared) return;
+  quickCall.error = null;
+  try {
+    const mine = await getOwnProfile(identityStore.did ?? undefined);
+    switchToThrowawayStorage();
+    if (mine) await putOwnProfile({ ...mine, isMe: true });
+    await loadProfile();
+    quickCall.profile = {
+      name: mine?.nickname?.trim() || quickCall.profile.name,
+      avatarUrl: mine?.pfpURL ?? quickCall.profile.avatarUrl,
+    };
+    prepared = true;
+    quickCall.stage = "setup";
+  } catch (err) {
+    quickCall.stage = "failed";
+    quickCall.error = err instanceof Error ? err.message : String(err);
+  }
+}
+
 /** Everything between "Join" and being in the call. */
 export async function startQuickCall(profile: QuickProfile): Promise<void> {
-  if (quickCall.stage !== "setup" && quickCall.stage !== "failed") return;
-  // "failed" is a retryable state - but not when what failed was the setup
-  // itself. Without this, a page whose storage scope never got switched let
-  // the second click join, which is the one outcome that writes a call into
-  // the user's real database.
+  // Checked FIRST, and loudly. "failed" is a retryable state - but not when
+  // what failed was the setup itself, and a join before any identity exists
+  // is the one path that would write a call into the user's real database.
   if (!prepared) {
     quickCall.stage = "failed";
     quickCall.error ??= "Quick call is not set up - reload the page.";
     return;
   }
+  if (quickCall.stage !== "setup" && quickCall.stage !== "failed") return;
   quickCall.stage = "joining";
   quickCall.error = null;
   quickCall.profile = profile;
@@ -195,10 +257,27 @@ export function endQuickCall(): void {
   quickCall.stage = "setup";
 }
 
+/** Whether this device has an account that could be brought into the call. */
+export function hasAccount(): boolean {
+  return identityStore.keypair !== null;
+}
+
 /** The page is going away: hang up and take the database with it. */
 export function teardownQuickCall(): void {
   leaveCall();
+  // An ephemeral identity's "database swept" marker is localStorage that
+  // would outlive everything else about the call. The account path leaves the
+  // real account's own marker alone - it earned it on the real database.
+  if (quickCall.identity === "guest") clearAtRestFlagForCurrentOwner();
   void dropQuickStorage();
+}
+
+/** Test seam: the module keeps one page's worth of state. */
+export function _resetQuickCallForTest(): void {
+  prepared = false;
+  quickCall.stage = "choosing";
+  quickCall.identity = "guest";
+  quickCall.error = null;
 }
 
 if (import.meta.env.DEV && typeof window !== "undefined") {
@@ -208,6 +287,7 @@ if (import.meta.env.DEV && typeof window !== "undefined") {
     state: quickCall,
     dbName,
     startQuickCall,
+    did: () => identityStore.did,
   };
 }
 

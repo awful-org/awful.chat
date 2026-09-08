@@ -33,10 +33,18 @@ try {
   const quick = alice.tab(qcContext);
   await quick.go("/qc");
 
-  await quick.waitFor("the quick tab is ready", async () =>
-    quick.eval(`window.__qc?.state.stage === 'setup'`)
+  // This profile HAS an account, so /qc asks who to be first. Guest, here:
+  // the account path has its own scenario.
+  await quick.waitFor("the choice appears", () =>
+    quick.eval(`window.__qc?.state.stage === 'choosing'`)
   );
-  await quick.fill("Your name", "Guest");
+  await quick.clickText("Join as a guest");
+  await quick.waitFor("the quick tab is ready", async () =>
+    quick.eval(`window.__qc.state.stage === 'setup'`)
+  );
+  if (!(await quick.fill("Your display name", "Guest"))) {
+    throw new Error("no name field on the quick setup screen");
+  }
   await quick.clickText("Join call");
   const code = await quick.waitFor("the quick tab joins its call", async () => {
     const stage = await quick.eval(`window.__qc.state.stage`);
@@ -65,7 +73,9 @@ try {
   await bob.waitFor("bob reaches the setup screen", () =>
     bob.eval(`window.__qc?.state.stage === 'setup'`)
   );
-  await bob.fill("Your name", "Bob");
+  if (!(await bob.fill("Your display name", "Bob"))) {
+    throw new Error("no name field on bob's setup screen");
+  }
   await bob.clickText("Join call");
   await bob.waitFor("bob is in the call", () =>
     bob.eval(`window.__qc.state.stage === 'in-call'`), { timeout: 60_000 });

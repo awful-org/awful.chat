@@ -37,7 +37,7 @@ try {
     const s = await alice.json(qsState);
     return s.status === "ready" && s.code ? s : null;
   });
-  check.ok(/^[0-9A-HJKMNP-TV-Z]{13}$/.test(host.code), "code is a room code", host.code);
+  check.ok(/^[0-9A-HJKMNP-TV-Z]{10}$/.test(host.code), "code is a 10-character quick code", host.code);
 
   // The code rides in the fragment, never the path - the whole point of the
   // /r/#<code> form the app already uses for invites.

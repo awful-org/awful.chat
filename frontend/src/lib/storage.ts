@@ -2363,6 +2363,20 @@ function removeAtRestFlags(match: (key: string) => boolean): void {
   }
 }
 
+/**
+ * Drop the sweep flag belonging to the identity that is active right now.
+ *
+ * For the quick pages: their database goes with the tab, so the localStorage
+ * marker saying it was swept must go too, or every ephemeral identity leaves
+ * one behind forever. Deliberately scoped to the current owner - the whole-
+ * family clear would take the real account's flag with it and cost the user a
+ * full re-sweep on their next unlock.
+ */
+export function clearAtRestFlagForCurrentOwner(): void {
+  const key = atRestFlagKey();
+  removeAtRestFlags((candidate) => candidate === key);
+}
+
 /** Call after any write that may have landed plaintext (a locked import):
  *  the next unlock's sweep re-scans and seals it. */
 export function markAtRestSweepNeeded(): void {

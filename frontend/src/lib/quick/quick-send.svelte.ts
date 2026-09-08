@@ -25,7 +25,7 @@ import { LibP2PTransport } from "$lib/transport/libp2p/transport";
 import { WebTorrentFileTransport } from "$lib/transport/file/webtorrent";
 import { refreshTurnCredentials } from "$lib/transport/ice-server-list";
 import { isConfigured } from "$lib/runtime-config";
-import { newRoomCode, normalizeRoomCode } from "$lib/room-code";
+import { newQuickCode, normalizeQuickCode } from "$lib/room-code";
 import { quickSessionSeed } from "./session-key";
 import { decode, encode } from "$lib/utils";
 import {
@@ -135,7 +135,12 @@ function noteIncoming(file: FileDescriptor): void {
  * revisit does not build a second node.
  */
 export async function startQuickSend(joinCode?: string): Promise<void> {
-  const code = joinCode ? normalizeRoomCode(joinCode) : newRoomCode();
+  const code = joinCode ? normalizeQuickCode(joinCode) : newQuickCode();
+  if (!code) {
+    quickSend.status = "failed";
+    quickSend.error = "That does not look like a quick send code.";
+    return;
+  }
   if (transport && quickSend.code === code) return;
   if (transport) stopQuickSend();
 

@@ -1,11 +1,8 @@
 import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
-import { loadRuntimeConfig, useQc } from "$lib/runtime-config";
-import {
-  sweepOrphanQuickStorage,
-  useQuickStorage,
-} from "$lib/quick/quick-storage";
+import { loadRuntimeConfig } from "$lib/runtime-config";
+import { sweepOrphanQuickStorage } from "$lib/quick/quick-storage";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
@@ -46,13 +43,9 @@ window.addEventListener("vite:preloadError", (event) => {
 // actually serves. A missing config.json resolves immediately.
 await loadRuntimeConfig();
 
-// BEFORE the app mounts, and before anything opens IndexedDB: /qc runs the
-// whole stack against a throwaway database and identity init opens the real
-// one on the first frame. Doing this in the component would be too late.
-// The sweep clears databases a crashed quick page left behind.
-if (window.location.pathname.replace(/\/$/, "") === "/qc" && useQc()) {
-  useQuickStorage();
-}
+// Databases a crashed quick page left behind. /qc does its OWN switch, once
+// the person has said whether they are a guest or their account - it has to
+// read the real database first to know an account is even there.
 void sweepOrphanQuickStorage();
 
 const app = mount(App, {

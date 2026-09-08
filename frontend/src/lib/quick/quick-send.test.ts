@@ -142,21 +142,30 @@ describe("quick send", () => {
 
   it("joins the code it is given, normalized", async () => {
     const qs = await load();
-    await qs.startQuickSend("abcd-efgh-jkmn-p");
-    expect(transport.joined).toEqual(["ABCDEFGHJKMNP"]);
+    await qs.startQuickSend("7qk3-m9ab-2c");
+    expect(transport.joined).toEqual(["7QK3M9AB2C"]);
     expect(qs.quickSend.status).toBe("ready");
+  });
+
+  it("refuses a link that is not a quick code", async () => {
+    const qs = await load();
+    // A room code is 13 characters and means something else entirely; a page
+    // that "helpfully" joined it would put a stranger in a real room.
+    await qs.startQuickSend("6BMB3GST2JRJZ");
+    expect(qs.quickSend.status).toBe("failed");
+    expect(transport.joined).toEqual([]);
   });
 
   it("mints a code when there is none to join", async () => {
     const qs = await load();
     await qs.startQuickSend();
-    expect(qs.quickSend.code).toMatch(/^[0-9A-HJKMNP-TV-Z]{13}$/);
+    expect(qs.quickSend.code).toMatch(/^[0-9A-HJKMNP-TV-Z]{10}$/);
     expect(qs.quickSend.isHost).toBe(true);
   });
 
   it("ignores a peer the relay has not placed in the code", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
 
     transport.emit("connect", "stranger");
     transport.emit("message", "stranger", frame(OFFER));
@@ -169,10 +178,10 @@ describe("quick send", () => {
 
   it("wires a room peer and surfaces what it offers", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
 
     transport.roomPeers.add("friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
     transport.emit("message", "friend", frame(OFFER));
 
     expect(files.connected).toEqual(["friend"]);
@@ -185,12 +194,12 @@ describe("quick send", () => {
 
   it("wires a room peer only once, however often the relay lists it", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
 
     transport.roomPeers.add("friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
     transport.emit("connect", "friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
 
     expect(files.connected).toEqual(["friend"]);
     expect(qs.quickSend.peers).toBe(1);
@@ -198,12 +207,12 @@ describe("quick send", () => {
 
   it("does not offer us back our own file", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
     await qs.offerFiles([new File(["x"], "mine.txt", { type: "text/plain" })]);
     expect(qs.quickSend.offered.map((f) => f.filename)).toEqual(["mine.txt"]);
 
     transport.roomPeers.add("friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
     transport.emit(
       "message",
       "friend",
@@ -221,9 +230,9 @@ describe("quick send", () => {
 
   it("downloads only on request, and only what was offered", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
     transport.roomPeers.add("friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
     transport.emit("message", "friend", frame(OFFER));
 
     expect(files.downloads).toEqual([]);
@@ -235,9 +244,9 @@ describe("quick send", () => {
 
   it("survives a frame that is not ours", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
     transport.roomPeers.add("friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
 
     expect(() => {
       transport.emit("message", "friend", new TextEncoder().encode("{oops"));
@@ -248,9 +257,9 @@ describe("quick send", () => {
 
   it("leaves nothing behind when the page goes away", async () => {
     const qs = await load();
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
     transport.roomPeers.add("friend");
-    transport.emit("roomPeers", "ABCDEFGHJKMNP", ["friend"]);
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
     await qs.offerFiles([new File(["x"], "mine.txt")]);
 
     qs.stopQuickSend();
@@ -269,7 +278,7 @@ describe("quick send", () => {
     files = new FakeFiles();
     const qs = await import("./quick-send.svelte");
 
-    await qs.startQuickSend("ABCDEFGHJKMNP");
+    await qs.startQuickSend("7QK3M9AB2C");
     expect(qs.quickSend.status).toBe("failed");
     expect(transport.joined).toEqual([]);
     vi.doUnmock("$lib/runtime-config");

@@ -19,14 +19,23 @@ const fakeLocalStorage = {
   removeItem: (k: string) => void store.delete(k),
 };
 
-let quickStorageOn = true;
+const identityStore = { keypair: null as unknown, did: "did:key:zSelf" };
+let ownProfile: Record<string, unknown> | undefined;
 
 vi.mock("$lib/identity/identity.svelte", () => ({
   createEphemeral: vi.fn(async () => {}),
+  identityStore,
 }));
 vi.mock("$lib/profile.svelte", () => ({
   saveName: vi.fn(async () => {}),
   saveAvatar: vi.fn(async () => {}),
+  loadProfile: vi.fn(async () => {}),
+}));
+vi.mock("$lib/storage", () => ({
+  closeDatabase: vi.fn(),
+  clearAtRestFlagForCurrentOwner: vi.fn(),
+  getOwnProfile: vi.fn(async () => ownProfile),
+  putOwnProfile: vi.fn(async () => {}),
 }));
 vi.mock("$lib/transport/transport.svelte", () => ({
   joinRoom: vi.fn(async () => true),
@@ -38,8 +47,9 @@ vi.mock("$lib/transport/call.svelte", () => ({
   leaveCall: vi.fn(),
 }));
 vi.mock("./quick-storage", () => ({
-  isQuickStorage: () => quickStorageOn,
-  dropQuickStorage: async () => {},
+  useQuickStorage: vi.fn(() => "awful-quick-test"),
+  dropQuickStorage: vi.fn(async () => {}),
+  dbName: () => "awful-quick-test",
 }));
 
 async function load() {
@@ -50,9 +60,11 @@ async function load() {
 
 describe("quick call profile", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     store.clear();
     quota = Infinity;
-    quickStorageOn = true;
+    identityStore.keypair = null;
+    ownProfile = undefined;
     vi.unstubAllGlobals();
   });
 
@@ -97,45 +109,98 @@ describe("quick call profile", () => {
     }
   });
 
-  it("refuses to join when the throwaway scope was not set up", async () => {
-    quickStorageOn = false;
+  it("refuses to join before an identity exists", async () => {
     const m = await load();
-    await m.prepareQuickCall();
-    expect(m.quickCall.stage).toBe("failed");
-
-    const transport = await import("$lib/transport/transport.svelte");
+    const { joinRoom } = await import("$lib/transport/transport.svelte");
+    // Straight to Join without choosing who to be: nothing may reach the
+    // network, and nothing may be written anywhere.
     await m.startQuickCall({ name: "Ada" });
-    // Nothing may reach the real database, so nothing joins either.
-    expect(transport.joinRoom).not.toHaveBeenCalled();
+    expect(m.quickCall.stage).toBe("failed");
+    expect(joinRoom).not.toHaveBeenCalled();
   });
 
-  it("puts the profile in before joining, so the room sees it", async () => {
+  it("moves off the real database before a guest writes anything", async () => {
     const m = await load();
+    const { closeDatabase } = await import("$lib/storage");
+    const { useQuickStorage } = await import("./quick-storage");
+    const { createEphemeral } = await import("$lib/identity/identity.svelte");
     const { saveName } = await import("$lib/profile.svelte");
-    const { joinRoom } = await import("$lib/transport/transport.svelte");
-    const { joinCall } = await import("$lib/transport/call.svelte");
     const order: string[] = [];
-    vi.mocked(saveName).mockImplementation(async () => void order.push("name"));
-    vi.mocked(joinRoom).mockImplementation(async () => {
-      order.push("room");
-      return true;
+    vi.mocked(closeDatabase).mockImplementation(() => void order.push("close"));
+    vi.mocked(useQuickStorage).mockImplementation(() => {
+      order.push("switch");
+      return "awful-quick-test";
     });
-    vi.mocked(joinCall).mockImplementation(async () => void order.push("call"));
+    vi.mocked(createEphemeral).mockImplementation(
+      async () => void order.push("identity")
+    );
+    vi.mocked(saveName).mockImplementation(async () => void order.push("name"));
 
-    await m.prepareQuickCall();
-    m.setQuickCallCode("ABCDEFGHJKMNP");
-    await m.startQuickCall({ name: "Ada" });
+    await m.prepareAsGuest();
 
-    expect(m.quickCall.stage).toBe("in-call");
-    expect(order).toEqual(["name", "name", "room", "call"]);
-    expect(joinRoom).toHaveBeenCalledWith("ABCDEFGHJKMNP");
+    expect(order).toEqual(["close", "switch", "identity", "name"]);
+    expect(m.quickCall.stage).toBe("setup");
+    expect(m.quickCall.identity).toBe("guest");
+  });
+
+  it("carries the account's whole profile row into the call", async () => {
+    identityStore.keypair = { did: "did:key:zSelf" };
+    ownProfile = {
+      did: "did:key:zSelf",
+      isMe: true,
+      nickname: "Ada",
+      pfpData: new ArrayBuffer(8),
+      color: "#ff0000",
+    };
+    const m = await load();
+    const { putOwnProfile, closeDatabase } = await import("$lib/storage");
+    const { useQuickStorage } = await import("./quick-storage");
+    const { createEphemeral } = await import("$lib/identity/identity.svelte");
+
+    expect(m.hasAccount()).toBe(true);
+    m.chooseAccount();
+    expect(m.quickCall.stage).toBe("unlocking");
+    await m.adoptAccount();
+
+    // The ROW, not the display store: an uploaded avatar is bytes, and a
+    // blob: URL would mean nothing to the other side.
+    expect(putOwnProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ nickname: "Ada", color: "#ff0000" })
+    );
+    // Read the real database first, then move off it.
+    expect(closeDatabase).toHaveBeenCalled();
+    expect(useQuickStorage).toHaveBeenCalled();
+    // The account's session is already live: no second, ephemeral identity.
+    expect(createEphemeral).not.toHaveBeenCalled();
+    expect(m.quickCall.stage).toBe("setup");
+    expect(m.quickCall.profile.name).toBe("Ada");
+  });
+
+  it("keeps an account's own at-rest marker on teardown", async () => {
+    identityStore.keypair = { did: "did:key:zSelf" };
+    ownProfile = { did: "did:key:zSelf", isMe: true, nickname: "Ada" };
+    const m = await load();
+    const { clearAtRestFlagForCurrentOwner } = await import("$lib/storage");
+    m.chooseAccount();
+    await m.adoptAccount();
+    m.teardownQuickCall();
+    // It belongs to the real database, which this page only read.
+    expect(clearAtRestFlagForCurrentOwner).not.toHaveBeenCalled();
+  });
+
+  it("takes a guest's at-rest marker with it", async () => {
+    const m = await load();
+    const { clearAtRestFlagForCurrentOwner } = await import("$lib/storage");
+    await m.prepareAsGuest();
+    m.teardownQuickCall();
+    expect(clearAtRestFlagForCurrentOwner).toHaveBeenCalled();
   });
 
   it("does not sit in 'joining' when the join fails", async () => {
     const m = await load();
     const { joinRoom } = await import("$lib/transport/transport.svelte");
     vi.mocked(joinRoom).mockRejectedValueOnce(new Error("relay is down"));
-    await m.prepareQuickCall();
+    await m.prepareAsGuest();
     await m.startQuickCall({ name: "Ada" });
     expect(m.quickCall.stage).toBe("failed");
     expect(m.quickCall.error).toBe("relay is down");

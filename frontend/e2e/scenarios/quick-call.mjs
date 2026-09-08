@@ -27,7 +27,9 @@ async function joinAs(peer, name) {
     const s = await peer.json(qcState);
     return s.stage === "setup";
   });
-  await peer.fill("Your name", name);
+  if (!(await peer.fill("Your display name", name))) {
+    throw new Error(`${name}: no name field on the setup screen`);
+  }
   await peer.clickText("Join call");
   return peer.waitFor(`${name} is in the call`, async () => {
     const s = await peer.json(qcState);
@@ -48,7 +50,7 @@ try {
   const code = await alice.waitFor("alice gets a code", () =>
     alice.eval(`window.__qc?.state.code || null`)
   );
-  check.ok(/^[0-9A-HJKMNP-TV-Z]{13}$/.test(code), "code is a room code", code);
+  check.ok(/^[0-9A-HJKMNP-TV-Z]{10}$/.test(code), "code is a 10-character quick code", code);
   check.equal(
     await alice.eval(`window.location.pathname + '|' + window.location.hash`),
     `/qc|#${code}`,
@@ -93,6 +95,24 @@ try {
     alice.eval(`[...window.__awful.state.peerNames.values()].includes('Bob')`)
   );
   check.ok(named, "the profile reached the other side");
+
+  // A quick call is a room nobody keeps, so it has the room's chat.
+  await alice.waitFor("alice can type", () =>
+    alice.eval(`!!document.querySelector('textarea')`)
+  );
+  await alice.eval(`(() => {
+    const el = document.querySelector('textarea');
+    const set = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    set.call(el, 'hello from alice');
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    return true;
+  })()`);
+  const heard = await bob.waitFor("bob reads it", () =>
+    bob.eval(`document.body.innerText.includes('hello from alice')`),
+    { timeout: 60_000 }
+  );
+  check.ok(heard, "the chat works in a quick call");
 
   // Nothing about this call may be in the database a real account uses.
   // start() visits /app first, so awful-chat exists on this profile - what

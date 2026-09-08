@@ -9,7 +9,6 @@
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
   import { useQc, useQs } from "$lib/runtime-config";
-  import { isQuickStorage } from "$lib/quick/quick-storage";
   import QuickSend from "$lib/components/QuickSend.svelte";
   import QuickCall from "$lib/components/QuickCall.svelte";
 
@@ -81,10 +80,12 @@
   // this device without a reload.
   $effect(() => {
     if (!identityStore.isUnlocked) return;
-    // Never for a quick page: its identity dies with the tab, and a push
-    // subscription would leave a device mailbox on the relay for an identity
-    // that no longer exists anywhere.
-    if (isQuickStorage()) return;
+    // Never on a quick page. A guest's identity dies with the tab and would
+    // leave a device mailbox on the relay for an identity that no longer
+    // exists; and an account unlocked to take a quick call did not ask to
+    // re-register push from here. The ROUTE decides, not the storage scope,
+    // which on /qc only moves once the person has chosen who to be.
+    if (currentRoute === "qs" || currentRoute === "qc") return;
     void notifyState.permission;
     void ensurePushSubscription();
   });

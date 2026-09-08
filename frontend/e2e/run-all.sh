@@ -13,7 +13,7 @@ room-removal reconnect-churn audio-prefs peer-volume background-sync rapid-switc
 drag-drop room-clock backfill-below-window call-status call-roster-ttl
 call-late-join call-join-speed call-without-sfu relay-upgrade history-pull mobile-shell
 device-sync quick-send quick-send-alongside-app quick-call
-quick-call-alongside-app"
+quick-call-alongside-app quick-call-account"
 # The quick-* scenarios need their routes turned on: start the dev server with
 # VITE_USE_QS=true VITE_USE_QC=true, or they fail saying so.
 fail=0
