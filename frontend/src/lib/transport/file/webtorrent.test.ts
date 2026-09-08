@@ -170,6 +170,57 @@ describe("WebTorrentFileTransport", () => {
     }
   });
 
+  it("gives up on a link that neither connects nor fails", async () => {
+    // The STUN-only-between-two-NATs case: ICE finds no path and the peer
+    // just sits there. Nothing destroys it, so without a deadline the pair
+    // is never redialled, the transfer never fails, and the file shows a
+    // skeleton for the rest of the session.
+    vi.useFakeTimers();
+    try {
+      const t = new WebTorrentFileTransport(() => "me");
+      const reconcile = () =>
+        (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      expect(livePeers.length).toBe(1);
+
+      // Reconciling changes nothing while the dead link is still held.
+      vi.advanceTimersByTime(20_000);
+      reconcile();
+      expect(livePeers.length).toBe(1);
+      expect(t.getTransfer(HASH)?.status).toBe("downloading");
+
+      // Past the deadline the link is dropped and dialling resumes, so the
+      // pair can finally run out of attempts.
+      for (let i = 0; i < 12; i++) {
+        vi.advanceTimersByTime(60_000);
+        reconcile();
+      }
+      expect(livePeers.length).toBe(6);
+      expect(t.getTransfer(HASH)?.status).toBe("failed");
+      expect(t.getTransfer(HASH)?.error).toBe("Could not reach the sender");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a connected link alone when the deadline passes", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = new WebTorrentFileTransport(() => "me");
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      const peer = livePeers[0] as EventEmitter & { destroyed: boolean };
+      peer.emit("connect");
+      vi.advanceTimersByTime(120_000);
+      expect(peer.destroyed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a seeded file stays seeding whatever the torrent's done flag says", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     await t.seedFiles([new File([new Uint8Array(10)], "cat.png", { type: "image/png" })]);
