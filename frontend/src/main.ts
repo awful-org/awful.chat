@@ -2,6 +2,7 @@ import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
 import { loadRuntimeConfig } from "$lib/runtime-config";
+import { sweepOrphanQuickStorage } from "$lib/quick/quick-storage";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
@@ -41,6 +42,11 @@ window.addEventListener("vite:preloadError", (event) => {
 // them capture the build-time fallback instead of what the instance
 // actually serves. A missing config.json resolves immediately.
 await loadRuntimeConfig();
+
+// Databases a crashed quick page left behind. /qc does its OWN switch, once
+// the person has said whether they are a guest or their account - it has to
+// read the real database first to know an account is even there.
+void sweepOrphanQuickStorage();
 
 const app = mount(App, {
   target: document.getElementById("app")!,

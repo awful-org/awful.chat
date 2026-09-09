@@ -309,6 +309,23 @@ export interface FileSignalWireMessage {
   payload: FileSignalEnvelope;
 }
 
+/**
+ * Lives with the wire type rather than in files.svelte.ts: /qs routes the same
+ * envelope with none of the app around it, and importing that module for a
+ * six-line shape check would pull the whole attachment store in with it.
+ */
+export function isFileSignalWireMessage(
+  value: unknown
+): value is FileSignalWireMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { type?: unknown }).type === "__file_signal" &&
+    typeof (value as { payload?: unknown }).payload === "object" &&
+    (value as { payload?: unknown }).payload !== null
+  );
+}
+
 // ── Union ─────────────────────────────────────────────────────────────────────
 
 export type AnyWireMessage =

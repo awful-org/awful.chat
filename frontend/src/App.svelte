@@ -8,8 +8,23 @@
   import { notifyState } from "$lib/notify.svelte";
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
+  import { useQc, useQs } from "$lib/runtime-config";
+  import QuickSend from "$lib/components/QuickSend.svelte";
+  import QuickCall from "$lib/components/QuickCall.svelte";
 
-  let currentRoute = $state<"landing" | "app">("landing");
+  let currentRoute = $state<"landing" | "app" | "qs" | "qc">("landing");
+
+  /**
+   * The routes an instance can turn off. A disabled one falls through to the
+   * landing page rather than 404ing: the flag is an operator's choice, not a
+   * broken link, and the page it would have shown does not exist here.
+   */
+  function optionalRoute(pathname: string): "qs" | "qc" | null {
+    const path = pathname.replace(/\/$/, "");
+    if (path === "/qs") return useQs() ? "qs" : null;
+    if (path === "/qc") return useQc() ? "qc" : null;
+    return null;
+  }
 
   /** A percent-encoded URL piece, or the piece itself when it is malformed. */
   function decode(part: string): string {
@@ -65,6 +80,12 @@
   // this device without a reload.
   $effect(() => {
     if (!identityStore.isUnlocked) return;
+    // Never on a quick page. A guest's identity dies with the tab and would
+    // leave a device mailbox on the relay for an identity that no longer
+    // exists; and an account unlocked to take a quick call did not ask to
+    // re-register push from here. The ROUTE decides, not the storage scope,
+    // which on /qc only moves once the person has chosen who to be.
+    if (currentRoute === "qs" || currentRoute === "qc") return;
     void notifyState.permission;
     void ensurePushSubscription();
   });
@@ -75,9 +96,12 @@
     upgradeLegacyPath();
     const pathname = window.location.pathname;
     const roomCode = urlRoomCode();
+    const optional = optionalRoute(pathname);
 
     if (roomCode) {
       currentRoute = "app";
+    } else if (optional) {
+      currentRoute = optional;
     } else if (pathname === "/app" || pathname === "/share-target") {
       // /share-target is normally a POST the service worker answers; a GET
       // reaches nginx only when no worker controls the page yet, and the
@@ -93,7 +117,14 @@
 
     const pathname = window.location.pathname;
 
-    if (urlRoomCode() || pathname === "/app" || pathname === "/share-target") {
+    const optional = optionalRoute(pathname);
+    if (optional) {
+      currentRoute = optional;
+    } else if (
+      urlRoomCode() ||
+      pathname === "/app" ||
+      pathname === "/share-target"
+    ) {
       currentRoute = "app";
     } else {
       currentRoute = "landing";
@@ -119,6 +150,10 @@
   <div class="min-h-screen bg-background flex items-center justify-center">
     <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
   </div>
+{:else if currentRoute === "qs"}
+  <QuickSend />
+{:else if currentRoute === "qc"}
+  <QuickCall />
 {:else if currentRoute === "landing"}
   <Landing />
 {:else}

@@ -58,6 +58,33 @@ const WT_MAX_ATTEMPTS = 6;
  * over the cap are not dropped, just deferred - the reconcile tick dials them
  * as transfers finish and slots come free.
  */
+/**
+ * How long a file link may sit unconnected before it is given up on.
+ *
+ * A SimplePeer whose ICE finds no path does not necessarily fail. With a
+ * STUN-only list between two NATs it can stay in `checking` and never emit
+ * `error` or `close` at all - and nothing else here has a clock. The link
+ * then lived for the rest of the session, which was worse than useless:
+ * dial() skips a pair that already has a peer, and allExhausted() refuses to
+ * give up while one exists, so the transfer sat at "downloading" with no
+ * error and no retry button, holding one of MAX_WT_PEERS the whole time.
+ *
+ * That is what a file over the inline limit looked like on an instance whose
+ * relay hands out no TURN (an unset TURN_SECRET answers /turn-credentials
+ * with 204): everything else worked - chat, voice, video, and any file small
+ * enough to ride inline - while anything bigger never loaded and never said
+ * why. Smaller files were fine because they never build one of these links
+ * at all; they travel inside the message, over libp2p, which has the relay
+ * circuit to fall back on. WebTorrent's own link has only TURN.
+ *
+ * Deliberately past the browser's own ICE failure detection (~15-30s), so a
+ * link the browser would have failed by itself is never cut short by this.
+ * On expiry the peer is destroyed, its close handler frees the slot, and the
+ * reconcile tick dials again - which is what lets the attempt count climb to
+ * WT_MAX_ATTEMPTS and the transfer finally say "Could not reach the sender".
+ */
+const WT_CONNECT_TIMEOUT_MS = 30_000;
+
 const MAX_WT_PEERS = 32;
 /**
  * One peer's share of that table.
@@ -733,16 +760,27 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     // pair per file was the most that could ever work.
     (peer as unknown as { id: string }).id = peerId;
 
+    // Cleared by whichever of connect/error/close arrives first; the whole
+    // point is the case where none of them ever does.
+    const connectDeadline = setTimeout(() => {
+      if (this.wtPeers.get(key) !== peer) return;
+      this.wtPeers.delete(key);
+      peer.destroy();
+    }, WT_CONNECT_TIMEOUT_MS);
+
     peer.on("connect", () => {
+      clearTimeout(connectDeadline);
       this.forgetRetryState(key);
       void this.attachToTorrent(infoHash, peer);
     });
 
     peer.on("error", () => {
+      clearTimeout(connectDeadline);
       this.wtPeers.delete(key);
     });
 
     peer.on("close", () => {
+      clearTimeout(connectDeadline);
       this.wtPeers.delete(key);
     });
     return true;

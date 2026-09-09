@@ -17,6 +17,7 @@
 
 import type { KeypairRecord, WebAuthnCapabilities } from "./identity";
 import {
+  createEphemeralIdentity,
   createIdentity,
   getIdentity,
   lockIdentity,
@@ -138,6 +139,24 @@ export async function create(password: string): Promise<string> {
   } finally {
     identityStore.loading = false;
   }
+}
+
+/**
+ * Unlock the session under a keypair that exists only in memory.
+ *
+ * Deliberately NOT setUnlocked: that asks the browser to persist storage,
+ * and a page whose whole point is leaving nothing behind should not be
+ * pinning a throwaway database against eviction. `keypair` stays null too -
+ * there is no record to load, and nothing should offer to lock or back up
+ * an identity that cannot be recovered.
+ */
+export async function createEphemeral(): Promise<void> {
+  const keypair = await createEphemeralIdentity();
+  identityStore.isUnlocked = true;
+  identityStore.did = keypair.did;
+  identityStore.publicKey = keypair.publicKey;
+  identityStore.error = null;
+  identityStore.initializing = false;
 }
 
 /**

@@ -1,5 +1,7 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
 
+import { dbName } from "./quick/quick-storage";
+
 import {
   sealRow,
   openRow,
@@ -266,7 +268,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB("awful-chat", 6, {
+  db = (await openDB(dbName(), 6, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -2256,7 +2258,7 @@ export async function wipeLocalDatabase(): Promise<void> {
     db = null;
   }
   invalidatePeerProfilesCache();
-  await deleteDB("awful-chat");
+  await deleteDB(dbName());
 }
 
 /** Close the cached connection without deleting anything - a
@@ -2359,6 +2361,20 @@ function removeAtRestFlags(match: (key: string) => boolean): void {
   } catch {
     // Without localStorage the sweep always runs anyway.
   }
+}
+
+/**
+ * Drop the sweep flag belonging to the identity that is active right now.
+ *
+ * For the quick pages: their database goes with the tab, so the localStorage
+ * marker saying it was swept must go too, or every ephemeral identity leaves
+ * one behind forever. Deliberately scoped to the current owner - the whole-
+ * family clear would take the real account's flag with it and cost the user a
+ * full re-sweep on their next unlock.
+ */
+export function clearAtRestFlagForCurrentOwner(): void {
+  const key = atRestFlagKey();
+  removeAtRestFlags((candidate) => candidate === key);
 }
 
 /** Call after any write that may have landed plaintext (a locked import):

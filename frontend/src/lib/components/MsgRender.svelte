@@ -38,6 +38,7 @@
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
   import { linkify } from "$lib/mentions";
+  import { formatSize } from "$lib/utils";
   import { mediaBoxStyle } from "$lib/image-size";
   import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
 
@@ -562,14 +563,6 @@
       }
     })();
   });
-
-  function formatSize(size: number): string {
-    if (size < 1024) return `${size} B`;
-    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-    if (size < 1024 * 1024 * 1024)
-      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
 
   function isGifUrl(text: string): boolean {
     // The whole message must be the URL - a gif link inside a sentence stays

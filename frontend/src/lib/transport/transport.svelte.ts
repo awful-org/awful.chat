@@ -48,6 +48,7 @@ import {
 import { normalizeWireName } from "../wire-name";
 import {
   MessageType,
+  isFileSignalWireMessage,
   boundReactionEmoji,
   boundReplyTo,
   wireToMessage,
@@ -84,6 +85,7 @@ import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession } from "../identity/identity";
 import { deviceKeySeed } from "./device-key";
 import { acquireNodeLock, releaseNodeLock } from "./node-lock";
+import { quickSessionSeed } from "$lib/quick/session-key";
 import { looksLikeDid, looksLikePeerId } from "../identity/identity-utils";
 import {
   canonicalContentV3,
@@ -154,7 +156,6 @@ import {
   stripAndAdoptInlineFiles,
   fileFingerprint,
   initFiles,
-  isFileSignalWireMessage,
   maybePeerIdFromSenderId,
   shouldAutoDownload,
   withFileTransfer,
@@ -3630,6 +3631,18 @@ function _stepDown(): void {
   connect().catch(() => {});
 }
 
+/**
+ * A quick page (/qc) runs this whole stack beside a tab that may already be
+ * running it for the user's real account. It must therefore NOT take the one
+ * node seat, and must not connect under the device key - see session-key.ts.
+ * Set before the first connect(); there is no way back within a page.
+ */
+let _ephemeralSession = false;
+
+export function useEphemeralSession(): void {
+  _ephemeralSession = true;
+}
+
 export async function connect() {
   // The flag is not proof. A page restored from the back-forward cache, or a
   // tab the browser froze, keeps relayConnected === true over a node that is
@@ -3651,10 +3664,14 @@ export async function connect() {
       // One node per browser profile: a second tab of the same profile would
       // share this peerId and the two would starve each other (node-lock.ts).
       // Waits here, for as long as it takes, when another tab has the seat.
-      await acquireNodeLock(_nodeLockEvents);
+      // An ephemeral session has a peerId of its own, so it neither needs the
+      // seat nor may take it from the tab running the user's account.
+      if (!_ephemeralSession) await acquireNodeLock(_nodeLockEvents);
       // This device's own libp2p key, NOT the identity key: two devices on the
       // same account would otherwise share a peerId and never connect.
-      await _transport.connect(deviceKeySeed());
+      await _transport.connect(
+        _ephemeralSession ? quickSessionSeed() : deviceKeySeed()
+      );
       transportState.relayConnected = true;
       transportState.error = null;
       _connectRetryDelay = CONNECT_RETRY_BASE_MS;
@@ -3734,6 +3751,9 @@ export function beginConversationOpen(): () => boolean {
 
 export async function joinRoom(roomCode: string): Promise<boolean> {
   const stillCurrent = beginConversationOpen();
+  // Before the relay wait too: the chat view's overlay reads this, and a
+  // room opened while the relay was still dialling showed no sign of it.
+  transportState.connecting = true;
   if (!transportState.relayConnected) {
     await connect();
   }
@@ -3745,7 +3765,6 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
   }
 
   transportState.error = null;
-  transportState.connecting = true;
   try {
     // Claim the room before the awaits, not after. Everything that routes an
     // incoming message compares against transportState.roomCode, so during the

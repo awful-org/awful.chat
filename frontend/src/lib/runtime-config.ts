@@ -25,6 +25,25 @@ export interface RuntimeConfig {
   relayMultiaddr: string;
   /** One SFU, or several. Empty means this origin's own /sfu. */
   sfuUrls: string[];
+  /** The /qs quick-send page. Off unless the instance turns it on. */
+  useQs: boolean;
+  /** The /qc quick-call page. Off unless the instance turns it on. */
+  useQc: boolean;
+}
+
+/**
+ * Anything but a plain yes is off. The value arrives as a JSON boolean from
+ * the entrypoint, but an operator hand-editing config.json (or setting a
+ * VITE_ variable, which is always a string) writes "true" - a flag that
+ * silently stayed off because it was quoted is not worth the debugging.
+ */
+function flag(raw: unknown, fallback: boolean): boolean {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "string") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off", ""].includes(v)) return false;
+  return fallback;
 }
 
 function splitList(raw: unknown): string[] {
@@ -35,7 +54,13 @@ function splitList(raw: unknown): string[] {
     .filter(Boolean);
 }
 
-const EMPTY: RuntimeConfig = { apiUrl: "", relayMultiaddr: "", sfuUrls: [] };
+const EMPTY: RuntimeConfig = {
+  apiUrl: "",
+  relayMultiaddr: "",
+  sfuUrls: [],
+  useQs: false,
+  useQc: false,
+};
 
 /**
  * The repo-root .env, for `pnpm dev` only.
@@ -55,6 +80,8 @@ function fromBuild(): RuntimeConfig {
     apiUrl: env.VITE_API_URL ?? "",
     relayMultiaddr: env.VITE_RELAY_MULTIADDR ?? "",
     sfuUrls: splitList(env.VITE_SFU_URLS || env.VITE_SFU_URL),
+    useQs: flag(env.VITE_USE_QS, false),
+    useQc: flag(env.VITE_USE_QC, false),
   };
 }
 
@@ -70,6 +97,8 @@ function coerce(raw: unknown, fallback: RuntimeConfig): RuntimeConfig {
     apiUrl: str(r.apiUrl, fallback.apiUrl),
     relayMultiaddr: str(r.relayMultiaddr, fallback.relayMultiaddr),
     sfuUrls: sfu.length ? sfu.map((u) => u.trim()) : fallback.sfuUrls,
+    useQs: flag(r.useQs, fallback.useQs),
+    useQc: flag(r.useQc, fallback.useQc),
   };
 }
 
@@ -183,4 +212,12 @@ export function relayMultiaddr(): string {
 
 export function sfuUrls(): string[] {
   return current.sfuUrls;
+}
+
+export function useQs(): boolean {
+  return current.useQs;
+}
+
+export function useQc(): boolean {
+  return current.useQc;
 }

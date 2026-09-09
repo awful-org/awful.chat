@@ -51,6 +51,61 @@ export function normalizeRoomCode(input: string): string {
   return ROOM_CODE_RE.test(folded) ? folded : trimmed;
 }
 
+/**
+ * Quick codes: /qs and /qc.
+ *
+ * 10 characters, 50 bits, shown as XXX-XXXX-XXX - the shape of a Google Meet
+ * code, and for the same reason. A room is permanent and its code is worth
+ * grinding for; a quick call or a file hand-off is alive for hours at the
+ * outside, and after that the code names nothing at all.
+ *
+ * The arithmetic, at a wildly generous 10,000 guesses per second sustained
+ * against the relay's rendezvous (there is no offline oracle - a guess has to
+ * be registered with the relay to test it), over a four-hour session:
+ *
+ *	one session:            1.4e8 tries / 2^50 = 0.00000013
+ *	1,000 live sessions:    1.4e8 * 1000 / 2^50 = 0.00013
+ *
+ * So one chance in eight thousand that a sustained four-hour attack lands on
+ * ANY live session across a busy instance. Eight characters (40 bits) is
+ * where that stops holding - it puts the same figure at 13%, which is why
+ * this is not shorter still.
+ *
+ * Deliberately a different LENGTH from a room code rather than a different
+ * alphabet, so one look tells them apart and neither parser can be fed the
+ * other's input by accident.
+ */
+const QUICK_CODE_LEN = 10;
+const QUICK_CODE_RE = new RegExp(`^[${ALPHABET}]{${QUICK_CODE_LEN}}$`);
+
+export function newQuickCode(): string {
+  return Array.from(
+    crypto.getRandomValues(new Uint8Array(QUICK_CODE_LEN)),
+    (b) => ALPHABET[b & 31]
+  ).join("");
+}
+
+/** Fold what a person typed or pasted into the wire form, or "" if it cannot be one. */
+export function normalizeQuickCode(input: string): string {
+  const folded = input
+    .trim()
+    .replace(/[-\s]/g, "")
+    .toUpperCase()
+    .replace(/O/g, "0")
+    .replace(/[IL]/g, "1");
+  return QUICK_CODE_RE.test(folded) ? folded : "";
+}
+
+export function isQuickCode(input: string): boolean {
+  return normalizeQuickCode(input) !== "";
+}
+
+/** For display: `7QK3M9AB2C` -> `7QK-3M9A-B2C`. */
+export function formatQuickCode(code: string): string {
+  if (!QUICK_CODE_RE.test(code)) return code;
+  return `${code.slice(0, 3)}-${code.slice(3, 7)}-${code.slice(7)}`;
+}
+
 /** For display: `6BMB3GST2JRJZ` -> `6BMB-3GST-2JRJ-Z`; other codes as is. */
 export function formatRoomCode(code: string): string {
   if (!ROOM_CODE_RE.test(code)) return code;

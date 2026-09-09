@@ -43,6 +43,11 @@ services:
       # 9000. QmRelay is still a placeholder - replace it with the peer id the
       # relay prints on boot.
       VITE_RELAY_MULTIADDR: ${VITE_RELAY_MULTIADDR:-/ip4/127.0.0.1/tcp/8080/ws/p2p/QmRelay}
+      # Optional pages, off unless set: /qs sends a file to one person with no
+      # account, /qc is a call with no room. The dev server reads the VITE_
+      # spelling; a built image reads APP_USE_QS / APP_USE_QC instead.
+      VITE_USE_QS: ${USE_QS:-}
+      VITE_USE_QC: ${USE_QC:-}
     depends_on:
       - relay
     networks:

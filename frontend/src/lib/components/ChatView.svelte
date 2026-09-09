@@ -109,7 +109,7 @@
   import { getRegistry, getPlugin } from "$lib/plugins/registry";
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
-  import { seededRandom } from "$lib/utils";
+  import { formatSize, seededRandom } from "$lib/utils";
   import { getQuotableText } from "$lib/quote-helper";
   import { createInvite, formatShortCode } from "$lib/invite";
   import {
@@ -945,14 +945,6 @@
   function getStagedPreviewURL(file: File): string | null {
     if (!isPreviewable(file)) return null;
     return stagedPreviewUrls.get(fileKey(file)) ?? null;
-  }
-
-  function formatSize(size: number): string {
-    if (size < 1024) return `${size} B`;
-    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-    if (size < 1024 * 1024 * 1024)
-      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   }
 
   function hasFilesInDataTransfer(dt: DataTransfer | null): boolean {

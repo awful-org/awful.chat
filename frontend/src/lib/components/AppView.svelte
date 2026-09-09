@@ -360,17 +360,45 @@
     history.replaceState({}, "", "/app");
   }
 
+  /** Bumped per join so a failed one only backs out if nothing newer ran. */
+  let joinSeq = 0;
+
   async function handleJoin(
     roomCode: string,
     _displayName: string,
     roomName?: string
   ) {
     joinError = null;
+    const known =
+      roomName || roomsStore.rooms.find((r) => r.roomCode === roomCode)?.name;
+    const label = known || roomCode;
+    // Switch the view on the click, not after the join: from /app nothing on
+    // screen changed until history was decrypted, the roster read and the
+    // profile broadcast, and the chat view's own "Connecting..." overlay
+    // could not show because the chat view was not mounted yet. Now the
+    // sidebar highlights, the pane mounts, and the overlay covers it until
+    // the room is open. A join that fails backs the view out again.
+    const seq = ++joinSeq;
+    const prev = {
+      roomCode: activeRoomCode,
+      roomName: activeRoomName,
+      dmPeerId: activeDmPeerId,
+    };
+    activeRoomCode = roomCode;
+    activeRoomName = label;
+    activeDmPeerId = null;
+    sidebarTab = "rooms";
+    const backOut = () => {
+      if (seq !== joinSeq) return;
+      activeRoomCode = prev.roomCode;
+      activeRoomName = prev.roomName;
+      activeDmPeerId = prev.dmPeerId;
+    };
     try {
-      if (!(await joinRoom(roomCode))) return;
-      const known =
-        roomName || roomsStore.rooms.find((r) => r.roomCode === roomCode)?.name;
-      const label = known || roomCode;
+      if (!(await joinRoom(roomCode))) {
+        backOut();
+        return;
+      }
       activeRoomCode = roomCode;
       activeRoomName = label;
       activeDmPeerId = null;
@@ -386,6 +414,7 @@
       await saveRoom(roomCode, label);
       history.pushState({ roomCode }, "", `/r/#${roomCode}`);
     } catch (err) {
+      backOut();
       joinError = err instanceof Error ? err.message : String(err);
     }
   }
@@ -494,10 +523,11 @@
     // on screen: the fast paths skipped the claim, so a second quick click
     // during an in-flight switch either no-opped or wrote view state that
     // the losing join later contradicted. Last click wins, by construction.
+    // The drawer closes on the tap, not once the room is open.
+    sidebarOpen = false;
     await handleJoin(code, "", room?.name);
     activeDmPeerId = null;
     sidebarTab = "rooms";
-    sidebarOpen = false;
   }
 
   /**

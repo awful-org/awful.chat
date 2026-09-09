@@ -300,6 +300,28 @@ export async function createIdentity(
 }
 
 /**
+ * A keypair for one page, held only in memory.
+ *
+ * Nothing is written: no mnemonic record, no keypair record, no wipe of what
+ * was there before. The session and the at-rest key are activated exactly as
+ * a real unlock does, so everything downstream (signing, sealed rows, the
+ * DID peers see) behaves normally - it simply ceases to exist when the page
+ * does. For /qc, where there is no account and there is not meant to be one.
+ *
+ * Deliberately paired with a quick storage scope (quick-storage.ts): these
+ * rows are sealed with a key that dies with the page, so writing them into
+ * the real database would leave undecryptable junk in it.
+ */
+export async function createEphemeralIdentity(): Promise<KeypairRecord> {
+  const { privateKey, publicKey } = deriveKeypairFromMnemonic(
+    generateMnemonic()
+  );
+  const did = publicKeyToDid(publicKey);
+  await _activateSession(privateKey, publicKey, did);
+  return { id: "keypair", did, publicKey };
+}
+
+/**
  * Restore an existing identity from a BIP39 mnemonic (account recovery).
  * Re-derives the keypair, re-encrypts the mnemonic with the given password,
  * and overwrites any existing identity in IndexedDB.
