@@ -1,7 +1,9 @@
 <script lang="ts">
   /**
    * /qs - the whole page. No sidebar, no chat, no identity: what the code
-   * names is a two-person room that exists for as long as this tab does.
+   * names is a swarm that exists for as long as somebody in it holds the
+   * file. Everyone who finishes one serves it on, so "the sender" stops
+   * being a role after the first delivery.
    */
   import { onDestroy, onMount } from "svelte";
   import { Check, Copy, Download, Upload, Users } from "@lucide/svelte";
@@ -14,6 +16,7 @@
     offerFiles,
     quickSend,
     quickSendLink,
+    setQuickSendMode,
     startQuickSend,
     stopQuickSend,
   } from "$lib/quick/quick-send.svelte";
@@ -96,7 +99,8 @@
         </Card.Title>
       </div>
       <Card.Description class="text-muted-foreground text-xs font-mono">
-        Send a file to one person · no account · the bytes go straight to them
+        Hand a file to one person or several · no account · multi-peer, so the
+        bytes go straight between you
       </Card.Description>
     </Card.Header>
 
@@ -117,6 +121,16 @@
         >
           Try again
         </Button>
+      </Card.Content>
+    {:else if quickSend.status === "closed"}
+      <Card.Content class="space-y-2">
+        <p class="text-sm font-mono">Delivered · this link is closed.</p>
+        <p class="text-xs text-muted-foreground font-mono leading-relaxed">
+          Somebody has the whole file, so nothing more is served from here and
+          the link no longer reaches anything. Whoever received it still has
+          it - a one-time link limits who can fetch it from you, not what they
+          do with it afterwards.
+        </p>
       </Card.Content>
     {:else if quickSend.status === "ready"}
       <Card.Content class="space-y-4">
@@ -146,11 +160,38 @@
               Waiting for the other side · send them the link
             {:else if quickSend.peers === 1}
               One person is here
+            {:else if quickSend.heardMode === "once"}
+              {quickSend.peers} people are here · only the first to finish
+              gets it
             {:else}
-              {quickSend.peers} people are here · anyone with the link can join
+              {quickSend.peers} people are here · they share with each other
             {/if}
           </p>
         </div>
+
+        {#if quickSend.isHost}
+          <label class="flex items-start gap-2.5 cursor-pointer group">
+            <input
+              type="checkbox"
+              checked={quickSend.mode === "once"}
+              onchange={(e) =>
+                setQuickSendMode(e.currentTarget.checked ? "once" : "multi")}
+              class="mt-0.5 w-4 h-4 rounded border-input bg-background accent-primary cursor-pointer"
+            />
+            <span
+              class="text-xs text-muted-foreground group-hover:text-foreground transition-colors font-mono leading-relaxed"
+            >
+              One-time link · closes as soon as one person has the file, and
+              they do not share it on. Use it when the link might outlive the
+              handover.
+            </span>
+          </label>
+        {:else if quickSend.heardMode === "once"}
+          <p class="text-xs text-muted-foreground font-mono leading-relaxed">
+            One-time link · you are the only recipient, and this page will not
+            share the file on to anyone else.
+          </p>
+        {/if}
 
         <div
           class="rounded-lg border border-dashed p-6 text-center transition-colors {dragging
@@ -200,8 +241,10 @@
                   <p class="text-sm font-mono truncate">{file.filename}</p>
                   <p class="text-xs text-muted-foreground font-mono">
                     {formatSize(file.size)} · {transfer?.peers
-                      ? `${transfer.peers} downloading`
-                      : "ready"}
+                      ? `${transfer.peers} connected`
+                      : "ready"}{(transfer?.seeders ?? 0) > 0
+                      ? ` · ${transfer?.seeders} also sharing`
+                      : ""}
                   </p>
                 </div>
               </div>
@@ -221,7 +264,9 @@
                   <div class="min-w-0">
                     <p class="text-sm font-mono truncate">{file.filename}</p>
                     <p class="text-xs text-muted-foreground font-mono">
-                      {formatSize(file.size)}
+                      {formatSize(file.size)}{transfer?.seeding
+                        ? " · sharing it on"
+                        : ""}
                     </p>
                   </div>
                   {#if transfer?.blobURL}
@@ -283,10 +328,12 @@
 
     <Card.Footer>
       <p class="text-xs text-muted-foreground font-mono leading-relaxed">
-        The relay introduces the two of you and TURN may carry the connection
-        when neither side is directly reachable · the file itself never
-        touches a server. Anyone with the link can join, so send it to one
-        person.
+        The relay introduces you and TURN may carry the connection when two
+        sides cannot reach each other directly · the file itself never touches
+        a server. Everyone holding the link is in one swarm and serves what
+        they have finished, so the sender can leave once somebody has it -
+        which also means anyone with the link can join. Send it to the people
+        you mean to.
       </p>
     </Card.Footer>
   </Card.Root>
