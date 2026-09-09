@@ -1,9 +1,25 @@
 <script lang="ts">
+  import { useQc, useQs } from "$lib/runtime-config";
+
   let currentSection = $state("");
+
+  // Both are optional pages an operator turns on, so everything about them on
+  // this page - the nav entry, the section, the FAQ answers - is conditional.
+  // An instance that does not serve them must not advertise them.
+  const quickAny = useQs() || useQc();
+
+  /**
+   * The sections are numbered in sequence and 04 only exists when the optional
+   * pages do, so everything after it shifts up by one when they are off.
+   * Takes the number the section has WITH them, which is the order on screen.
+   */
+  const sectionNo = (withQuick: number) =>
+    String(quickAny ? withQuick : withQuick - 1).padStart(2, "0");
 
   const navLinks = [
     { href: "#hero", label: "Awful.chat", accent: true },
     { href: "#features", label: "Features" },
+    ...(useQs() || useQc() ? [{ href: "#quick", label: "No account" }] : []),
     { href: "#stack", label: "Stack" },
     { href: "#deploy", label: "Deploy" },
     { href: "#faq", label: "FAQ" },
@@ -45,6 +61,22 @@
       q: "What if I lose my seed phrase?",
       a: "It is gone, and so is the identity - there is no reset email because there is no account. Back up the 12 words; syncing a second device via QR code also works as a backup.",
     },
+    ...(useQs()
+      ? [
+          {
+            q: "Can I send someone a file without either of us having an account?",
+            a: "Yes. Open /qs, drop the file in and send the short link it gives you. The file goes straight to whoever opens it over an encrypted peer-to-peer connection, so it is never uploaded to a server and nothing caps its size but your own machine. Everyone holding the link shares what they have already finished, so sending something large to a group does not mean uploading it once per person, and you can close the tab once somebody has it. There is also a one-time switch that closes the link the moment it has delivered, for when the link might outlive the handover.",
+          },
+        ]
+      : []),
+    ...(useQc()
+      ? [
+          {
+            q: "Can I start a video call without signing up?",
+            a: "Yes. Open /qc and send the link. Whoever opens it picks a name, or takes the one it remembers from last time, and joins: camera, screen share, text chat and the same apps that run in any other room here. Voice is peer-to-peer. Nothing about the call is kept - close the tab and the call, its chat and the throwaway identity it ran under are all gone, and it never appears in anybody's saved rooms. If you already have an identity on the device you can call as yourself instead, and the call is still disposable.",
+          },
+        ]
+      : []),
     {
       q: "Is it really free and open source?",
       a: "Yes. Apache-2.0, source on GitHub, no premium tier, no data harvesting to pay for it.",
@@ -440,9 +472,66 @@
   </section>
 
   <!-- Stack Section -->
+  <!-- Optional pages, so the whole section is conditional. -->
+  {#if quickAny}
+    <section id="quick" class="section-center">
+      <div class="container">
+        <div class="section-num">04 - NO ACCOUNT</div>
+        <h2 class="display-large section-title">
+          Nothing to sign<br /><span class="text-accent">up for.</span>
+        </h2>
+        <p class="section-desc">
+          Two pages that skip the app entirely. Open one, send the link, done.
+          Neither asks for an account, an email or a name you do not feel like
+          giving, and neither leaves anything behind on this device once the
+          tab is closed.
+        </p>
+        <div class="grid-2col" style="margin-top: 3rem; text-align: left;">
+          {#if useQs()}
+            <div>
+              <div class="bento-category font-mono">/qs</div>
+              <div class="bento-title">Send a file</div>
+              <p class="bento-desc text-muted">
+                Drop a file in and send one short link. The bytes go straight
+                to whoever opens it over an encrypted peer-to-peer connection:
+                nothing is uploaded to a server, nothing is scanned, and there
+                is no size limit anyone else decided. Everyone holding the link
+                shares what they have finished, so a big file reaches a group
+                without you uploading it once per person, and you can close the
+                tab as soon as somebody has it. Or make it a one-time link that
+                closes itself the moment it has delivered.
+              </p>
+              <a href="/qs" class="btn btn-outline" style="margin-top: 1.5rem;">
+                Send a file &rarr;
+              </a>
+            </div>
+          {/if}
+          {#if useQc()}
+            <div>
+              <div class="bento-category font-mono">/qc</div>
+              <div class="bento-title">Start a call</div>
+              <p class="bento-desc text-muted">
+                A link, a name if you want one, and you are in a call: camera,
+                screen share, text chat and the same apps that run in any other
+                room here. Voice goes peer-to-peer. Nothing about it is kept,
+                so when the tab closes the call and its chat are gone, and it
+                never appears in anybody's saved rooms. Already have an
+                identity on this device? You can call as yourself instead, and
+                the call stays just as disposable.
+              </p>
+              <a href="/qc" class="btn btn-outline" style="margin-top: 1.5rem;">
+                Start a call &rarr;
+              </a>
+            </div>
+          {/if}
+        </div>
+      </div>
+    </section>
+  {/if}
+
   <section id="stack" class="section-padded">
     <div class="container">
-      <div class="section-num">04 - STACK</div>
+      <div class="section-num">{sectionNo(5)} - STACK</div>
       <h2 class="display-large section-title">
         Built for the<br /><span class="text-accent">privacy concerned.</span>
       </h2>
@@ -466,7 +555,7 @@
   <!-- Self-host Section -->
   <section id="deploy" class="section-center">
     <div class="container">
-      <div class="section-num">05 - DEPLOY</div>
+      <div class="section-num">{sectionNo(6)} - DEPLOY</div>
       <div class="grid-2col">
         <div>
           <h2 class="display-large">
@@ -524,7 +613,7 @@
   <!-- FAQ Section -->
   <section id="faq" class="section-center">
     <div class="container">
-      <div class="section-num">06 - FAQ</div>
+      <div class="section-num">{sectionNo(7)} - FAQ</div>
       <h2 class="display-large section-title">
         Common<br /><span class="text-accent">questions.</span>
       </h2>

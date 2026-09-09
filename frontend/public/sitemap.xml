@@ -5,4 +5,22 @@
     <changefreq>monthly</changefreq>
     <priority>1.0</priority>
   </url>
+  <!--
+    The two pages that need no account. Listed because awful.chat serves
+    them; an instance that leaves USE_QS / USE_QC unset answers these paths
+    with the landing page instead, so drop these two entries when self-hosting
+    without them. Everything else here is already awful.chat-specific (the
+    canonical link and og:url in index.html name it outright), so this is no
+    less portable than the rest.
+  -->
+  <url>
+    <loc>https://awful.chat/qs</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://awful.chat/qc</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.6</priority>
+  </url>
 </urlset>

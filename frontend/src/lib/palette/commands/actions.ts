@@ -15,6 +15,8 @@ import {
   RefreshCw,
   Search,
   Trash2,
+  Upload,
+  Video,
 } from "@lucide/svelte";
 import { openSearch } from "$lib/search/ui.svelte";
 import { transportState, connect } from "$lib/transport/transport.svelte";
@@ -30,6 +32,7 @@ import {
 import { lock } from "$lib/identity/identity.svelte";
 import { requestPersistentStorage, wipeLocalDatabase } from "$lib/storage";
 import { openSettings } from "$lib/ui-state.svelte";
+import { useQc, useQs } from "$lib/runtime-config";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
 
@@ -56,6 +59,40 @@ export const actionCommands: CmdSource = () => {
       perform: () => openSearch(null),
     },
   });
+
+  // The pages that need no account, when this instance serves them. A real
+  // navigation rather than a router push: they run their own transport and
+  // their own storage scope, and both of those are decided before the app
+  // mounts. Opened in a new tab so whatever is going on here survives.
+  if (useQs()) {
+    cmds.push({
+      id: "actions.quickSend",
+      title: "Quick send a file",
+      subtitle: "No account, straight to them, nothing kept",
+      keywords: ["qs", "share", "transfer", "upload", "guest"],
+      group: "Actions",
+      icon: Upload,
+      action: {
+        kind: "act",
+        perform: () => window.open("/qs", "_blank", "noopener"),
+      },
+    });
+  }
+
+  if (useQc()) {
+    cmds.push({
+      id: "actions.quickCall",
+      title: "Quick call",
+      subtitle: "A call with no room, nothing kept",
+      keywords: ["qc", "meet", "guest", "video", "link"],
+      group: "Actions",
+      icon: Video,
+      action: {
+        kind: "act",
+        perform: () => window.open("/qc", "_blank", "noopener"),
+      },
+    });
+  }
 
   cmds.push({
     id: "actions.call.toggle",

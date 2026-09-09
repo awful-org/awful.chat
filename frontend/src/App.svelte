@@ -9,6 +9,7 @@
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
   import { useQc, useQs } from "$lib/runtime-config";
+  import { applyRouteMeta } from "$lib/page-meta";
   import QuickSend from "$lib/components/QuickSend.svelte";
   import QuickCall from "$lib/components/QuickCall.svelte";
 
@@ -110,6 +111,9 @@
     } else {
       currentRoute = "landing";
     }
+    // /qs and /qc are the only routes worth finding from a search, so they
+    // say who they are instead of canonicalising to the root - see page-meta.
+    applyRouteMeta(currentRoute);
   });
 
   function handlePopState() {
@@ -129,6 +133,7 @@
     } else {
       currentRoute = "landing";
     }
+    applyRouteMeta(currentRoute);
   }
 </script>
 
