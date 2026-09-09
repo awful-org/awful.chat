@@ -68,7 +68,10 @@
   import FloatingDmPanel from "$lib/components/FloatingDmPanel.svelte";
   import CallPipPanel from "$lib/components/CallPipPanel.svelte";
   import { normalizeRoomCode } from "$lib/room-code";
-  import { updateSpeakerTracks, stopAllSpeakers, resumeAudioContextOnVisibilityChange } from "$lib/speakers.svelte";
+  import {
+    syncSpeakersFromCall,
+    watchVisibilityForCall,
+  } from "$lib/call-speakers";
   import { callFocus } from "$lib/call-focus.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import { spotlight } from "$lib/spotlight";
@@ -220,45 +223,15 @@
     consumeSharedIfPresent().catch(() => {});
   });
 
-  // Speaker detection must run while in call, not just while the stage is mounted.
-  // The stage unmounts when the user navigates away from the call room, but speaker
-  // detection must continue for the floating panel to show who is speaking.
+  // Speaker detection follows the CALL, not the stage: the tiles unmount when
+  // the user navigates away from the call room and the floating panel still
+  // has to show who is talking. Shared with /qc, which mounts no AppView -
+  // see call-speakers.ts.
   $effect(() => {
-    if (!transportState.inCall) {
-      stopAllSpeakers();
-      return;
-    }
-    // Update speaker tracks whenever call state changes.
-    // Convert null to undefined for type compatibility.
-    const participants = new Map(
-      Array.from(transportState.participants).map(([peerId, p]) => [
-        peerId,
-        {
-          audioTrack: p.audioTrack ?? undefined,
-          videoTrack: p.videoTrack ?? undefined,
-          screenTrack: p.screenTrack ?? undefined,
-          screenAudioTrack: p.screenAudioTrack ?? undefined,
-        },
-      ])
-    );
-    updateSpeakerTracks(
-      participants,
-      transportState.muted,
-      transportState.localMicStream,
-      selfId()
-    );
+    syncSpeakersFromCall();
   });
 
-  // Resume audio context when visibility changes (tab becomes active), and
-  // close the PiP window the tab switch opened: the call is on screen again.
-  if (typeof document !== "undefined") {
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden && transportState.inCall) {
-        resumeAudioContextOnVisibilityChange();
-        if (callPipPanel.browserPip) void exitBrowserPip();
-      }
-    });
-  }
+  watchVisibilityForCall();
 
   let activeRoomCode = $state<string | null>(null);
   let activeRoomName = $state<string>("");

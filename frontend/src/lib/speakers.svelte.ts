@@ -315,6 +315,19 @@ export function updateSpeakerTracks(
  *
  * Wave 2 will call this in the cleanup of an effect that watches `inCall`.
  */
+/**
+ * Which peers currently have an analyser attached.
+ *
+ * A test seam, and the only observable proof that something is FEEDING this
+ * module: whether a ring visibly lights up needs an audible microphone and an
+ * AudioContext the browser has allowed to run, neither of which a headless
+ * run has. An empty list while a call is up means nobody is calling
+ * updateSpeakerTracks, which is exactly the bug /qc had.
+ */
+export function _trackedSpeakers(): string[] {
+  return [...analysers.keys()];
+}
+
 export function stopAllSpeakers(): void {
   if (rafId) {
     cancelAnimationFrame(rafId);

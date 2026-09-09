@@ -21,6 +21,7 @@
  */
 
 import { createEphemeral, identityStore } from "$lib/identity/identity.svelte";
+import { generateMnemonic } from "$lib/identity/identity";
 import { loadProfile, saveAvatar, saveName } from "$lib/profile.svelte";
 import {
   clearAtRestFlagForCurrentOwner,
@@ -115,6 +116,76 @@ export function rememberQuickProfile(profile: QuickProfile | null): void {
   }
 }
 
+/**
+ * What a page reload has to come back as.
+ *
+ * sessionStorage, not localStorage: it survives a refresh and dies with the
+ * tab, which is exactly the lifetime this page promises. Without it a refresh
+ * mid-call was a silent eviction - a new identity, a new database, back on the
+ * setup card being told you had been "invited" to the call you started, while
+ * the other side kept a ghost of you in its roster until the TTL swept it.
+ *
+ * Coming back under the SAME key is what avoids that ghost: the roster entry
+ * is reused rather than duplicated, and the room's history is pulled back off
+ * the other peers by the ordinary digest, so nothing has to be persisted for
+ * it. A guest's mnemonic goes in here to make that possible; an account's key
+ * never does, and a reload asks it to unlock again.
+ */
+const SESSION_KEY = "awful_qc_session";
+
+interface QuickSession {
+  code: string;
+  isHost: boolean;
+  identity: "guest" | "account";
+  /** Guest only. Re-derives the same DID, so peers see a reconnect. */
+  mnemonic?: string;
+  name: string;
+  avatarUrl?: string;
+  /** Whether to walk straight back into the call rather than the setup card. */
+  inCall: boolean;
+}
+
+let session: QuickSession | null = null;
+
+function readSession(): QuickSession | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as QuickSession;
+    return typeof p?.code === "string" && p.code ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(patch: Partial<QuickSession>): void {
+  session = { ...(session ?? ({} as QuickSession)), ...patch };
+  try {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Blocked: a refresh then behaves as it did before, which is survivable.
+  }
+}
+
+function clearSession(): void {
+  session = null;
+  try {
+    sessionStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* nothing to clear */
+  }
+}
+
+/**
+ * Whether this page load is a refresh of a call already in progress, for the
+ * code on screen. The caller uses it to skip the screens the person has
+ * already been through.
+ */
+export function resumableSession(code: string): QuickSession | null {
+  const found = readSession();
+  return found && found.code === code ? found : null;
+}
+
 const remembered = readRememberedProfile();
 
 export const quickCall = $state<QuickCallState>({
@@ -132,9 +203,13 @@ export const quickCall = $state<QuickCallState>({
  * A link carrying something else falls back to a fresh code rather than
  * joining whatever the string happened to name.
  */
-export function setQuickCallCode(fromLink?: string): string {
+export function setQuickCallCode(fromLink?: string, isHost?: boolean): string {
   quickCall.code =
     (fromLink ? normalizeQuickCode(fromLink) : "") || newQuickCode();
+  // Host-ness cannot be re-derived after a reload: the person who STARTED the
+  // call has the code in their address bar by then, and would be told they
+  // had been invited to it.
+  saveSession({ code: quickCall.code, isHost: isHost ?? !fromLink });
   return quickCall.code;
 }
 
@@ -163,13 +238,17 @@ let prepared = false;
  * Call as a stranger: a keypair that exists only in memory, under whatever
  * name was remembered from last time.
  */
-export async function prepareAsGuest(): Promise<void> {
+export async function prepareAsGuest(mnemonic?: string): Promise<void> {
   if (prepared) return;
   quickCall.identity = "guest";
   quickCall.error = null;
   try {
     switchToThrowawayStorage();
-    await createEphemeral();
+    // Minted here rather than inside createEphemeral so the same words can be
+    // put away for a reload. A resume passes back what it kept.
+    const words = mnemonic ?? generateMnemonic();
+    await createEphemeral(words);
+    saveSession({ identity: "guest", mnemonic: words });
     await saveName(quickCall.profile.name);
     if (quickCall.profile.avatarUrl) {
       await saveAvatar(quickCall.profile.avatarUrl);
@@ -206,6 +285,7 @@ export async function adoptAccount(): Promise<void> {
   try {
     const mine = await getOwnProfile(identityStore.did ?? undefined);
     switchToThrowawayStorage();
+    saveSession({ identity: "account" });
     if (mine) await putOwnProfile({ ...mine, isMe: true });
     await loadProfile();
     quickCall.profile = {
@@ -244,6 +324,11 @@ export async function startQuickCall(profile: QuickProfile): Promise<void> {
     if (!joined) throw new Error("Could not join the call.");
     await joinCall();
     quickCall.stage = "in-call";
+    saveSession({
+      inCall: true,
+      name: profile.name,
+      avatarUrl: profile.avatarUrl,
+    });
   } catch (err) {
     quickCall.stage = "failed";
     quickCall.error = err instanceof Error ? err.message : String(err);
@@ -255,6 +340,13 @@ export function endQuickCall(): void {
   leaveCall();
   leaveRoom();
   quickCall.stage = "setup";
+  // Hanging up is a decision. A reload after it should not walk back in.
+  saveSession({ inCall: false });
+}
+
+/** Leave for good: nothing here is resumed by a later page load. */
+export function forgetQuickCallSession(): void {
+  clearSession();
 }
 
 /** Whether this device has an account that could be brought into the call. */

@@ -18,6 +18,10 @@
   import ChatView from "$lib/components/ChatView.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
+  import {
+    syncSpeakersFromCall,
+    watchVisibilityForCall,
+  } from "$lib/call-speakers";
   import { profileStore } from "$lib/profile.svelte";
   import { formatQuickCode } from "$lib/room-code";
   import {
@@ -27,6 +31,7 @@
     hasAccount,
     prepareAsGuest,
     quickCall,
+    resumableSession,
     quickCallLink,
     rememberQuickProfile,
     setQuickCallCode,
@@ -58,15 +63,23 @@
 
   onMount(() => {
     const fromLink = window.location.hash.slice(1);
-    isHost = !fromLink;
-    setQuickCallCode(fromLink || undefined);
+    // A reload of a call in progress, rather than a fresh arrival. Everything
+    // this person already answered is answered again from the tab's own
+    // session, so a refresh is a reconnect and not a fresh sign-up.
+    const resume = resumableSession(fromLink || "");
+    isHost = resume ? resume.isHost : !fromLink;
+    setQuickCallCode(fromLink || undefined, isHost);
     // The code IS the secret, so it lives in the fragment and never in the
     // path - same reasoning as room invites, see App.svelte.
     if (isHost) {
       history.replaceState(history.state, "", `/qc#${quickCall.code}`);
     }
-    // With no account on this device there is nothing to choose between.
-    if (!hasAccount()) void prepareAsGuest();
+    if (resume) {
+      void resumeCall(resume);
+    } else if (!hasAccount()) {
+      // With no account on this device there is nothing to choose between.
+      void prepareAsGuest();
+    }
     // pagehide, not beforeunload: it is the one that fires on mobile when the
     // tab is discarded, and dropping the database is the whole promise here.
     const bye = () => teardownQuickCall();
@@ -76,12 +89,54 @@
 
   onDestroy(teardownQuickCall);
 
+  /**
+   * Walk a refresh back to where it was.
+   *
+   * A guest comes back under the same mnemonic, so the same DID: the other
+   * side sees a reconnect rather than a stranger with a familiar name, and
+   * the room's history is pulled back off them by the ordinary digest. An
+   * account has to unlock again - its key is never put in session storage -
+   * and the effect below carries on from there.
+   */
+  async function resumeCall(resume: {
+    identity: "guest" | "account";
+    mnemonic?: string;
+    name: string;
+    avatarUrl?: string;
+    inCall: boolean;
+  }) {
+    name = resume.name || name;
+    nameTouched = true;
+    if (resume.identity === "account") {
+      chooseAccount();
+      return;
+    }
+    await prepareAsGuest(resume.mnemonic);
+    if (resume.inCall && quickCall.stage === "setup") {
+      await startQuickCall({ name, avatarUrl: resume.avatarUrl ?? avatar });
+    }
+  }
+
+  // The app shell does this too, and /qc mounts no app shell: without it the
+  // analyser is never fed and nobody's speaking ring ever lights up.
+  $effect(() => {
+    syncSpeakersFromCall();
+  });
+  watchVisibilityForCall();
+
   // UnlockIdentity runs the whole unlock itself, remembered password and all,
   // so the only thing left here is to notice that it landed.
   $effect(() => {
     if (quickCall.stage !== "unlocking") return;
     if (!identityStore.isUnlocked) return;
-    void adoptAccount();
+    void adoptAccount().then(() => {
+      // A refresh of a call this account was already in walks straight back
+      // in, rather than stopping to ask the questions it already answered.
+      const resume = resumableSession(quickCall.code);
+      if (resume?.inCall && quickCall.stage === "setup") {
+        void startQuickCall({ name, avatarUrl: avatar });
+      }
+    });
   });
 
   // Take the name the account (or the remembered profile) turned out to have,
