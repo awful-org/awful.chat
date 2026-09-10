@@ -195,11 +195,12 @@
           <div class="flex items-center gap-2 mb-1">
             <div class="w-2 h-2 rounded-full bg-muted-foreground"></div>
             <Card.Title class="text-lg font-mono font-semibold">
-              Call ended
+              You left the call
             </Card.Title>
           </div>
           <Card.Description class="text-muted-foreground text-xs font-mono">
-            The call, its chat and everything it wrote are gone
+            Everything it wrote here is gone · anyone still on it carries on
+            without you
           </Card.Description>
         </Card.Header>
         <Card.Footer class="flex-col gap-2">

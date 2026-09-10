@@ -338,7 +338,13 @@ export async function startQuickCall(profile: QuickProfile): Promise<void> {
 }
 
 /**
- * Hang up, and take the call with you.
+ * Hang up, and take YOUR side of the call with you.
+ *
+ * Local only, and it has to be: the code names a gossipsub topic with no
+ * owner, so "host" means nothing more than whoever minted it. Leaving tells
+ * the others you are gone and nothing else - they keep talking, and the link
+ * still reaches them. There is no seat here from which to end a call for
+ * everybody, and pretending otherwise in the wording was the bug.
  *
  * leaveRoom already does the wire half - it broadcasts the leave so the others
  * see you go, unsubscribes the topic, hangs up, and empties the messages on

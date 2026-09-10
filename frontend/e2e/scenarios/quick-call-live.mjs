@@ -128,8 +128,13 @@ try {
     alice.eval(`window.__qc.state.stage === 'ended'`)
   );
   check.ok(
-    await alice.eval(`document.body.innerText.includes('Call ended')`),
-    "and the page says the call ended"
+    await alice.eval(`document.body.innerText.includes('You left the call')`),
+    "and the page says SHE left, not that the call is over for everyone"
+  );
+  // Which it is not: bob is still in it.
+  check.ok(
+    await bob.eval(`window.__awful.state.inCall === true`),
+    "bob is still in the call the host walked out of"
   );
 
   // The bytes, gone. Not "gone when the tab closes" - gone now.
