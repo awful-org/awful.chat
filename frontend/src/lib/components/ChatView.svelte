@@ -144,6 +144,8 @@
     leaveConfirm?: boolean;
     /** Passed to the call view's hang-up. See VoiceVideoCallView. */
     onHangUp?: () => void;
+    /** Passed to the call view's tile menus. See VoiceVideoCallView. */
+    personActions?: boolean;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
@@ -158,6 +160,7 @@
     leaveLabel,
     leaveConfirm = true,
     onHangUp,
+    personActions = true,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
@@ -1925,7 +1928,7 @@
           ? 'min-w-0 flex-1'
           : 'shrink-0'}"
       >
-        <VoiceVideoCallView beside={callBeside} {onHangUp} />
+        <VoiceVideoCallView beside={callBeside} {onHangUp} {personActions} />
       </div>
     {/if}
     <div

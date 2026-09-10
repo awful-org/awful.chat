@@ -391,3 +391,32 @@ describe("tileMenuHeight", () => {
     expect(tileMenuHeight([])).toBeGreaterThan(0);
   });
 });
+
+describe("a call nobody keeps", () => {
+  it("offers the volume and the call controls, and no phonebook", () => {
+    // /qc: the identity on the other side lasts as long as their tab, so a
+    // saved contact for somebody who cannot be contacted again is not a
+    // feature - and opening a DM would persist a room for them.
+    const rows = buildTileMenu(
+      tileMenuState({
+        kind: "camera",
+        label: "Guest 4821",
+        canMessage: false,
+        inPhonebook: false,
+        hasVideo: true,
+        pipSupported: true,
+      })
+    );
+    const labels = rows
+      .filter((r) => r.type === "item")
+      .map((r) => (r as { label: string }).label);
+
+    expect(labels).not.toContain("Add to phonebook");
+    expect(labels).not.toContain("Remove from phonebook");
+    expect(labels).not.toContain("Message");
+    // What is about the call itself stays.
+    expect(labels.some((l) => /mute/i.test(l))).toBe(true);
+    expect(rows.some((r) => r.type === "volume")).toBe(true);
+    expect(labels.some((l) => /spotlight|focus/i.test(l))).toBe(true);
+  });
+});

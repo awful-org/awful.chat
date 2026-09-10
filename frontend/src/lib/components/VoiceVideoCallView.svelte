@@ -126,7 +126,21 @@ import {
      * it the way it does in every other call app.
      */
     onHangUp = leaveCall,
-  }: { beside?: boolean; onHangUp?: () => void } = $props();
+    /**
+     * Whether a tile menu offers the things that outlast the call: message
+     * this person, view their profile, keep them in the phonebook. Off for
+     * /qc, where the identity on the other side exists for as long as their
+     * tab does - a saved contact for somebody who cannot be contacted again
+     * is not a feature, and opening a DM would persist a room for them.
+     * What the menu keeps there is what is about the CALL: their volume,
+     * the spotlight, fullscreen, picture-in-picture.
+     */
+    personActions = true,
+  }: {
+    beside?: boolean;
+    onHangUp?: () => void;
+    personActions?: boolean;
+  } = $props();
 
   $effect(() => {
     loadProfile();
@@ -684,7 +698,7 @@ import {
       isFullscreen,
       pipSupported: browserPipSupported(),
       pipOpen: callPipPanel.browserPip,
-      canMessage: !tile.isLocal && !!tile.peerId,
+      canMessage: personActions && !tile.isLocal && !!tile.peerId,
       inPhonebook: !tile.isLocal && !!tile.peerId && isInPhonebook(tile.peerId),
       // Off the slider, which openTileMenu seeds from the live gain: it is
       // reactive, so dragging it to 0 flips the row to Unmute in place.
