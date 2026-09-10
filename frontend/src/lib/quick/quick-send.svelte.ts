@@ -1,5 +1,10 @@
 /**
- * /qs - send a file to one person, with no account and no room.
+ * /qs - hand a file to one person or several, with no account and no room.
+ *
+ * Multi-peer: everyone holding the link is in one swarm. A receiver that
+ * finishes a file starts serving it too, so the sender uploads once rather
+ * than once per person - and can close the tab as soon as somebody has it,
+ * because the others can now get it from each other.
  *
  * Deliberately built on the two storage-free layers and nothing else:
  * LibP2PTransport for introduction and signalling, WebTorrentFileTransport
@@ -37,7 +42,44 @@ import type {
   FileTransferSnapshot,
 } from "$lib/transport/types";
 
-export type QuickSendStatus = "idle" | "connecting" | "ready" | "failed";
+export type QuickSendStatus =
+  | "idle"
+  | "connecting"
+  | "ready"
+  | "failed"
+  /** A one-time link that has delivered. Nothing more is served from here. */
+  | "closed";
+
+/**
+ * What the link is for.
+ *
+ * `multi` - everyone holding it is in one swarm and serves what they have
+ * finished, so the sender can leave once somebody has the file. The link
+ * stays good for as long as anyone in it still holds the bytes.
+ *
+ * `once` - the link is for ONE delivery. Receivers do not serve it on, and
+ * the sender stops the moment a receiver says it has the whole file, so the
+ * link is dead from then on. This is about a link that LEAKS after you sent
+ * it - a group chat scrolled back through, a forwarded message, a shared
+ * laptop - not about the person you sent it to, who has the file and can do
+ * what they like with it.
+ */
+export type QuickSendMode = "multi" | "once";
+
+/**
+ * /qs speaks two small messages of its own on top of the file signals.
+ *
+ * Deliberately NOT extra kinds on FileSignalEnvelope: the main app shares
+ * that union and would have to grow a case for something only this page says.
+ */
+type QuickWire =
+  | { type: "__qs_mode"; mode: QuickSendMode }
+  | { type: "__qs_ack"; infoHash: string };
+
+function isQuickWire(value: unknown): value is QuickWire {
+  const t = (value as { type?: unknown } | null)?.type;
+  return t === "__qs_mode" || t === "__qs_ack";
+}
 
 interface QuickSendState {
   status: QuickSendStatus;
@@ -54,6 +96,18 @@ interface QuickSendState {
   incoming: FileDescriptor[];
   /** infoHash -> live progress, for both directions. */
   transfers: Map<string, FileTransferSnapshot>;
+  /** What this page offers under. Only the page that minted the code sets it. */
+  mode: QuickSendMode;
+  /**
+   * The strictest mode anyone in this room has announced.
+   *
+   * Strictest, not latest: everyone here already holds the link, so a peer
+   * could otherwise announce "multi" and talk the others into serving on a
+   * file whose sender asked for one delivery. Once heard, `once` sticks.
+   */
+  heardMode: QuickSendMode;
+  /** A one-time link that has already delivered. */
+  closed: boolean;
 }
 
 export const quickSend = $state<QuickSendState>({
@@ -65,6 +119,9 @@ export const quickSend = $state<QuickSendState>({
   offered: [],
   incoming: [],
   transfers: new Map(),
+  mode: "multi",
+  heardMode: "multi",
+  closed: false,
 });
 
 let transport: LibP2PTransport | null = null;
@@ -83,6 +140,26 @@ let files: WebTorrentFileTransport | null = null;
  * it when somebody actually hits the ceiling.
  */
 const localFiles = new Map<string, File>();
+
+/**
+ * Whether to serve a file this device received.
+ *
+ * On by default: it is what makes the link multi-peer rather than a queue at
+ * the sender, and the bytes are resident anyway - the received Blob is held
+ * for the Save link whether or not anyone else wants it, so sharing costs
+ * upload, not memory.
+ *
+ * Save-Data is the one honest exception. A receiver uploading is a cost they
+ * never agreed to, and someone whose browser is asking every site on the
+ * internet to use less data has agreed to it least of all. No setting for
+ * this: the browser already carries the answer.
+ */
+function shouldReshare(): boolean {
+  const conn = (
+    navigator as Navigator & { connection?: { saveData?: boolean } }
+  ).connection;
+  return conn?.saveData !== true;
+}
 
 /** Peers we have wired into the file transport, so teardown is exact. */
 const wired = new Set<string>();
@@ -103,7 +180,50 @@ function wirePeer(peerId: string): void {
   if (!files || wired.has(peerId) || !isRoomPeer(peerId)) return;
   wired.add(peerId);
   files.onPeerConnect(peerId);
+  // Before anything is served: a receiver has to know not to serve it on.
+  sendQuick(peerId, { type: "__qs_mode", mode: quickSend.mode });
   refreshPeerCount();
+}
+
+function sendQuick(peerId: string, msg: QuickWire): void {
+  void transport?.send(peerId, encode(msg));
+}
+
+/** Tell everyone here what this link is for. */
+function announceMode(): void {
+  for (const peerId of wired) {
+    sendQuick(peerId, { type: "__qs_mode", mode: quickSend.mode });
+  }
+}
+
+/**
+ * Set what the link is for. The page that minted the code owns this; a page
+ * that followed a link takes the sender's word for it (see heardMode).
+ */
+export function setQuickSendMode(mode: QuickSendMode): void {
+  if (quickSend.mode === mode) return;
+  quickSend.mode = mode;
+  if (mode === "once") quickSend.heardMode = "once";
+  announceMode();
+}
+
+/**
+ * A one-time link has done its job.
+ *
+ * Leaving the room is what closes it: a peer is only ever wired once the
+ * relay places it here (wirePeer), so nobody new can be told what we hold.
+ * Transfers already running are direct WebRTC links and finish on their own -
+ * cutting somebody off mid-file to enforce a promise about NEW arrivals
+ * would be pure spite. The seeded copy is deliberately left in place for
+ * exactly that reason.
+ */
+function closeLink(): void {
+  if (quickSend.closed) return;
+  quickSend.closed = true;
+  quickSend.status = "closed";
+  transport?.leaveRoom(quickSend.code);
+  wired.clear();
+  quickSend.peers = 0;
 }
 
 function unwirePeer(peerId: string): void {
@@ -128,6 +248,19 @@ function noteIncoming(file: FileDescriptor): void {
   if (localFiles.has(file.infoHash)) return; // our own, echoed back
   if (quickSend.incoming.some((f) => f.infoHash === file.infoHash)) return;
   quickSend.incoming = [...quickSend.incoming, file];
+}
+
+function handleQuickWire(msg: QuickWire): void {
+  if (msg.type === "__qs_mode") {
+    // Strictest wins and never relaxes - see heardMode.
+    if (msg.mode === "once") quickSend.heardMode = "once";
+    return;
+  }
+  // An ack for something WE offered, on a one-time link: delivered, so the
+  // link is done. An ack for anything else is somebody else's business.
+  if (quickSend.mode !== "once" || quickSend.closed) return;
+  if (!quickSend.offered.some((f) => f.infoHash === msg.infoHash)) return;
+  closeLink();
 }
 
 /**
@@ -177,6 +310,24 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
     );
   });
   f.on("transfer", (snapshot) => putTransfer(snapshot));
+  f.on("downloaded", (infoHash, blob) => {
+    const desc = quickSend.incoming.find((f) => f.infoHash === infoHash);
+    if (!desc) return;
+    // Say so first, and whatever the mode: it is what lets a one-time link
+    // know it is done, and it costs one small frame.
+    for (const peerId of wired) {
+      sendQuick(peerId, { type: "__qs_ack", infoHash });
+    }
+    // A one-time link is ONE delivery, so this copy goes no further. In
+    // multi-peer this is what makes the swarm a swarm: seedFiles announces to
+    // every peer we are wired to, so the next person to ask has two places to
+    // pull from - and localFiles is what serves it, exactly as it serves the
+    // sender's own.
+    if (quickSend.heardMode === "once" || !shouldReshare()) return;
+    const file = new File([blob], desc.filename, { type: desc.mimeType });
+    localFiles.set(infoHash, file);
+    void f.seedFiles([file]);
+  });
 
   t.on("connect", wirePeer);
   t.on("disconnect", unwirePeer);
@@ -194,7 +345,11 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
     try {
       decoded = decode(data);
     } catch {
-      return; // not ours; this page speaks one message type
+      return; // not ours; this page speaks three message types
+    }
+    if (isQuickWire(decoded)) {
+      handleQuickWire(decoded);
+      return;
     }
     if (!isFileSignalWireMessage(decoded)) return;
     if (decoded.payload.kind === "file-seeder") {
@@ -259,6 +414,10 @@ export function stopQuickSend(): void {
   quickSend.incoming = [];
   quickSend.transfers = new Map();
   quickSend.error = null;
+  // `mode` survives: it is this person's choice for the page, not state of a
+  // particular link. What the room told us does not.
+  quickSend.heardMode = quickSend.mode;
+  quickSend.closed = false;
 }
 
 if (import.meta.env.DEV && typeof window !== "undefined") {

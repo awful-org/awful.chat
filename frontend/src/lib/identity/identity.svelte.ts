@@ -150,8 +150,8 @@ export async function create(password: string): Promise<string> {
  * there is no record to load, and nothing should offer to lock or back up
  * an identity that cannot be recovered.
  */
-export async function createEphemeral(): Promise<void> {
-  const keypair = await createEphemeralIdentity();
+export async function createEphemeral(mnemonic?: string): Promise<void> {
+  const keypair = await createEphemeralIdentity(mnemonic);
   identityStore.isUnlocked = true;
   identityStore.did = keypair.did;
   identityStore.publicKey = keypair.publicKey;

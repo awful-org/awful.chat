@@ -23,8 +23,12 @@ class FakeTransport {
     for (const h of this.handlers.get(event) ?? []) h(...args);
   }
   async connect() {}
+  left: string[] = [];
   joinRoom(code: string) {
     this.joined.push(code);
+  }
+  leaveRoom(code: string) {
+    this.left.push(code);
   }
   isRoomPeer(_room: string, peerId: string) {
     return this.roomPeers.has(peerId);
@@ -63,7 +67,9 @@ class FakeFiles {
   setLocalFileLookup(fn: (infoHash: string) => Promise<File | null>) {
     this.lookup = fn;
   }
+  seeded: string[] = [];
   async seedFiles(files: File[]) {
+    for (const f of files) this.seeded.push(f.name);
     return files.map((f, i) => ({
       infoHash: `hash${i}`,
       filename: f.name,
@@ -240,6 +246,134 @@ describe("quick send", () => {
     expect(files.downloads).toEqual([]);
     qs.acceptFile("abc");
     expect(files.downloads).toEqual(["abc"]);
+  });
+
+  it("serves on a file it finished, so the swarm has two sources", async () => {
+    const qs = await load();
+    await qs.startQuickSend("7QK3M9AB2C");
+    transport.roomPeers.add("friend");
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
+    transport.emit("message", "friend", frame(OFFER));
+    qs.acceptFile("abc");
+
+    files.emit("downloaded", "abc", new Blob(["bytes"]));
+    await Promise.resolve();
+
+    // seedFiles announces to every wired peer, which is what makes the next
+    // person's download have somewhere else to come from.
+    expect(files.seeded).toEqual(["holiday.mp4"]);
+    // And it is served locally from here on, exactly like our own offer.
+    expect(await files.lookup?.("abc")).toBeInstanceOf(File);
+  });
+
+  it("does not serve on a file nobody offered us", async () => {
+    const qs = await load();
+    await qs.startQuickSend("7QK3M9AB2C");
+    // A "downloaded" for a hash that was never in `incoming` has no
+    // descriptor to name it, and re-announcing something unnamed would put a
+    // file with a wrong name in front of the next person.
+    files.emit("downloaded", "not-ours", new Blob(["bytes"]));
+    await Promise.resolve();
+    expect(files.seeded).toEqual([]);
+  });
+
+  it("does not upload for a browser asking sites to save data", async () => {
+    const qs = await load();
+    vi.stubGlobal("navigator", { connection: { saveData: true } });
+    try {
+      await qs.startQuickSend("7QK3M9AB2C");
+      transport.roomPeers.add("friend");
+      transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
+      transport.emit("message", "friend", frame(OFFER));
+      files.emit("downloaded", "abc", new Blob(["bytes"]));
+      await Promise.resolve();
+      expect(files.seeded).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a one-time link neither shares on nor stays open", async () => {
+    const qs = await load();
+    await qs.startQuickSend("7QK3M9AB2C");
+    qs.setQuickSendMode("once");
+    await qs.offerFiles([new File(["x"], "secret.pdf")]);
+    files.seeded.length = 0;
+
+    transport.roomPeers.add("friend");
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
+    // Every peer is told what the link is for as it is wired.
+    const told = transport.sent
+      .map((s) => JSON.parse(new TextDecoder().decode(s.data)))
+      .filter((m) => m.type === "__qs_mode");
+    expect(told.at(-1)).toEqual({ type: "__qs_mode", mode: "once" });
+
+    // The receiver says it has the whole file, and the link shuts.
+    transport.emit(
+      "message",
+      "friend",
+      frame({ type: "__qs_ack", infoHash: "hash0" })
+    );
+    expect(qs.quickSend.status).toBe("closed");
+    expect(qs.quickSend.closed).toBe(true);
+    expect(transport.left).toEqual(["7QK3M9AB2C"]);
+    expect(qs.quickSend.peers).toBe(0);
+  });
+
+  it("ignores an ack for a file it never offered", async () => {
+    const qs = await load();
+    await qs.startQuickSend("7QK3M9AB2C");
+    qs.setQuickSendMode("once");
+    transport.roomPeers.add("friend");
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
+    transport.emit(
+      "message",
+      "friend",
+      frame({ type: "__qs_ack", infoHash: "someone-elses" })
+    );
+    expect(qs.quickSend.status).toBe("ready");
+    expect(transport.left).toEqual([]);
+  });
+
+  it("a receiver on a one-time link does not share it on", async () => {
+    const qs = await load();
+    await qs.startQuickSend("7QK3M9AB2C");
+    transport.roomPeers.add("friend");
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
+    transport.emit("message", "friend", frame(OFFER));
+    transport.emit(
+      "message",
+      "friend",
+      frame({ type: "__qs_mode", mode: "once" })
+    );
+    qs.acceptFile("abc");
+
+    files.emit("downloaded", "abc", new Blob(["bytes"]));
+    await Promise.resolve();
+
+    expect(files.seeded).toEqual([]);
+    // It still tells the sender, which is what closes the link.
+    const acks = transport.sent
+      .map((s) => JSON.parse(new TextDecoder().decode(s.data)))
+      .filter((m) => m.type === "__qs_ack");
+    expect(acks).toEqual([{ type: "__qs_ack", infoHash: "abc" }]);
+  });
+
+  it("cannot be talked out of one-time by a later peer", async () => {
+    // Everyone in the room holds the link already, so a peer could otherwise
+    // announce "multi" and talk the others into serving on a file whose
+    // sender asked for one delivery.
+    const qs = await load();
+    await qs.startQuickSend("7QK3M9AB2C");
+    transport.roomPeers.add("friend");
+    transport.emit("roomPeers", "7QK3M9AB2C", ["friend"]);
+    transport.emit("message", "friend", frame(OFFER));
+    transport.emit("message", "friend", frame({ type: "__qs_mode", mode: "once" }));
+    transport.emit("message", "friend", frame({ type: "__qs_mode", mode: "multi" }));
+
+    files.emit("downloaded", "abc", new Blob(["bytes"]));
+    await Promise.resolve();
+    expect(files.seeded).toEqual([]);
   });
 
   it("survives a frame that is not ours", async () => {

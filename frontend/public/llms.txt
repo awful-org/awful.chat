@@ -12,6 +12,17 @@ of it. Voice calls are fully peer-to-peer. Group video and
 screen share are routed through a mediasoup SFU. Files transfer via
 WebTorrent between peers.
 
+Two pages skip the app and the identity entirely, when an instance enables
+them (USE_QS / USE_QC):
+- /qs - hand a file to one person or several. The bytes go peer-to-peer over
+  WebTorrent and are never uploaded to a server. Everyone holding the link
+  seeds what they have finished, so the sender can leave once somebody has it.
+  A one-time switch closes the link as soon as it has delivered.
+- /qc - a call with no room and no account: camera, screen share, text chat
+  and plugins, under a throwaway identity in a database deleted when the tab
+  closes. An existing identity on the device can be used instead, and the call
+  is still disposable.
+
 Key properties:
 - No sign-up: create an identity locally, back it up with 12 words
 - End-to-end encrypted messaging (noise protocol between peers)

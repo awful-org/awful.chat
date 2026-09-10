@@ -311,11 +311,16 @@ export async function createIdentity(
  * Deliberately paired with a quick storage scope (quick-storage.ts): these
  * rows are sealed with a key that dies with the page, so writing them into
  * the real database would leave undecryptable junk in it.
+ *
+ * `mnemonic` is for ONE case: /qc holding its identity across a page reload,
+ * so a refresh mid-call comes back as the same person rather than as a
+ * stranger with the same name. It is kept in sessionStorage, which the tab
+ * takes with it when it closes - see quick-call.svelte.ts.
  */
-export async function createEphemeralIdentity(): Promise<KeypairRecord> {
-  const { privateKey, publicKey } = deriveKeypairFromMnemonic(
-    generateMnemonic()
-  );
+export async function createEphemeralIdentity(
+  mnemonic = generateMnemonic()
+): Promise<KeypairRecord> {
+  const { privateKey, publicKey } = deriveKeypairFromMnemonic(mnemonic);
   const did = publicKeyToDid(publicKey);
   await _activateSession(privateKey, publicKey, did);
   return { id: "keypair", did, publicKey };

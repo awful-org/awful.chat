@@ -129,6 +129,21 @@
     roomName: string;
     selfId: string;
     onLeave: () => void;
+    /**
+     * What the leave control says. Defaults to the room/DM wording; /qc passes
+     * "Leave call", because a quick call is not a room anybody is deleting -
+     * there is nothing saved to delete.
+     */
+    leaveLabel?: string;
+    /**
+     * Whether the leave control needs a second click. On by default because
+     * in a room it deletes one. /qc turns it off: there is nothing to delete
+     * that hanging up does not already take, and a confirm nothing signposts
+     * reads as a button that does not work.
+     */
+    leaveConfirm?: boolean;
+    /** Passed to the call view's hang-up. See VoiceVideoCallView. */
+    onHangUp?: () => void;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
@@ -140,6 +155,9 @@
     roomCode,
     roomName,
     onLeave,
+    leaveLabel,
+    leaveConfirm = true,
+    onHangUp,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
@@ -1541,6 +1559,12 @@
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
 
+  /** What the leave control says. /qc overrides it: a quick call is not a
+   *  room anybody is deleting, because there is nothing saved to delete. */
+  const leaveText = $derived(
+    leaveLabel ?? (isDmChat ? "Delete conversation" : "Delete room")
+  );
+
   // Desktop only: below sm there is no room for two columns, and the call
   // stage would squeeze the messages to nothing.
   const callBeside = $derived(displayPrefs.callChatBeside && !isMobile);
@@ -1844,20 +1868,14 @@
             {/snippet}
           </Tip>
         {/if}
-        <Tip
-          text={confirmingDelete
-            ? "Click again to confirm"
-            : isDmChat
-              ? "Delete conversation"
-              : "Delete room"}
-        >
+        <Tip text={confirmingDelete ? "Click again to confirm" : leaveText}>
           {#snippet children(props)}
             <Button
               {...props}
               variant="ghost"
               size="icon"
               onclick={() => {
-                if (!confirmingDelete) {
+                if (leaveConfirm && !confirmingDelete) {
                   confirmingDelete = true;
                   setTimeout(() => (confirmingDelete = false), 3000);
                   return;
@@ -1865,7 +1883,7 @@
                 confirmingDelete = false;
                 onLeave();
               }}
-              aria-label={isDmChat ? "Delete conversation" : "Delete room"}
+              aria-label={leaveText}
               class="text-red-400 hover:bg-destructive/10! hover:text-destructive! {confirmingDelete
                 ? 'bg-destructive/20!'
                 : ''}"
@@ -1907,7 +1925,7 @@
           ? 'min-w-0 flex-1'
           : 'shrink-0'}"
       >
-        <VoiceVideoCallView beside={callBeside} />
+        <VoiceVideoCallView beside={callBeside} {onHangUp} />
       </div>
     {/if}
     <div

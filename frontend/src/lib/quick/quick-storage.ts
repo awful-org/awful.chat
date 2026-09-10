@@ -75,15 +75,31 @@ function deleteDatabase(name: string): Promise<void> {
 }
 
 /**
- * Drop this page's database. Called on pagehide, where there is no time to
- * wait for anything - the promise is best effort and the sweep is the net.
+ * Delete this page's database and open an empty scope in its place.
+ *
+ * ROTATES rather than clears, and that is the point: a page that has once
+ * been quick must never fall back to the real database. Setting `quick` to
+ * null would make dbName() answer "awful-chat" again, so anything written
+ * between a hang-up and the next switch - a participant removal still in
+ * flight, a profile write, a stray sync - would land in the user's actual
+ * data. Rotating makes that fallback unreachable: the answer is always some
+ * throwaway name.
+ *
+ * The new name costs nothing until something writes, because a name is not a
+ * database until it is opened. If nothing does, none is created and the sweep
+ * has nothing to find.
+ *
+ * The CALLER closes the cached connection first (storage.closeDatabase), or
+ * the delete blocks behind it and the bytes outlive the call they belong to.
+ * This module deliberately does not import the store to do that itself.
  */
 export async function dropQuickStorage(): Promise<void> {
   if (!quick) return;
   const name = quick;
-  quick = null;
   releaseLock?.();
   releaseLock = null;
+  quick = null;
+  useQuickStorage();
   await deleteDatabase(name);
 }
 
