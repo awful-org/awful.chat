@@ -182,10 +182,7 @@
           roomName="Quick call"
           selfId={identityStore.did ?? ""}
           onLeave={endQuickCall}
-          onHangUp={endQuickCall}
-          leaveLabel="Leave call"
-          leaveConfirm={false}
-          personActions={false}
+          ephemeral
         />
       </div>
     </div>

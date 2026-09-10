@@ -15,7 +15,7 @@
    * The stream is stopped on unmount and whenever the panel is closed. A
    * preview left running holds the camera light on behind a joined call.
    */
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { Mic, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
   import {
@@ -55,17 +55,47 @@
 
   onDestroy(teardown);
 
-  // Open and close, and every device change, rebuild the preview.
+  /**
+   * Attach the stream to the element, whichever arrives second.
+   *
+   * Assigning inside start() raced the element into existence: the panel is
+   * behind an {#if}, so on the first open the <video> may not be bound yet,
+   * and a single assignment that finds `video` null never happens again -
+   * a black box with a live stream behind it. And `autoplay` is not enough
+   * on its own for a srcObject set from script, so it is asked to play.
+   */
   $effect(() => {
-    if (!open) {
-      teardown();
-      return;
-    }
-    void start(camera, mic);
+    if (!video || !stream) return;
+    video.srcObject = stream;
+    void video.play().catch(() => {});
+  });
+
+  /**
+   * Open and close, and every device change, rebuild the preview.
+   *
+   * The body is untracked and the dependencies are read deliberately above
+   * it, because the obvious version ate itself: teardown() READS `stream` and
+   * start() WRITES it, so the effect depended on the very thing it set. Each
+   * run stopped the stream the previous run had just acquired and asked for
+   * another, forever - which is what a black preview and a level bar pinned
+   * at zero actually were. The tracks were live for a moment and then
+   * "ended", which is the tell.
+   *
+   * Teardown moves into the cleanup, where Svelte runs it before the next run
+   * and once more on destroy - so there is exactly one place that stops a
+   * stream, and it cannot race the place that starts one.
+   */
+  $effect(() => {
+    const wantOpen = open;
+    const wantCamera = camera;
+    const wantMic = mic;
+    untrack(() => {
+      if (wantOpen) void start(wantCamera, wantMic);
+    });
+    return () => untrack(teardown);
   });
 
   async function start(cameraId: string | null, micId: string | null) {
-    teardown();
     error = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -81,7 +111,6 @@
           : "Could not open the camera or microphone.";
       return;
     }
-    if (video) video.srcObject = stream;
     // Labels arrive with permission, so this is the moment the lists become
     // readable rather than a row of "Camera 1".
     void refreshCameras();
@@ -97,6 +126,11 @@
     const track = stream?.getAudioTracks()[0];
     if (!track) return;
     audioCtx = new AudioContext();
+    // A context created off the back of an awaited getUserMedia is not
+    // covered by the click that started it, so it begins suspended and every
+    // analyser read comes back as silence - a level bar that never moves.
+    // The call's own detector resumes for the same reason (speakers.svelte).
+    void audioCtx.resume().catch(() => {});
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
     audioCtx.createMediaStreamSource(new MediaStream([track])).connect(analyser);

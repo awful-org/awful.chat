@@ -134,18 +134,25 @@
      * "Leave call", because a quick call is not a room anybody is deleting -
      * there is nothing saved to delete.
      */
-    leaveLabel?: string;
     /**
-     * Whether the leave control needs a second click. On by default because
-     * in a room it deletes one. /qc turns it off: there is nothing to delete
-     * that hanging up does not already take, and a confirm nothing signposts
-     * reads as a button that does not work.
+     * This conversation is not kept: it is a quick call, and closing it
+     * destroys everything it held.
+     *
+     * One flag rather than the four settings it used to be, because they were
+     * four spellings of the same fact and could only ever be set together.
+     * What it decides:
+     *
+     *  - the leave control says "Leave call" rather than "Delete room", since
+     *    there is no saved room to delete;
+     *  - it needs no second click, because hanging up already takes
+     *    everything and a confirm nothing signposts reads as a broken button;
+     *  - hanging up in the call bar LEAVES rather than just ending the call,
+     *    the way it does in every other call app - here the two are the same
+     *    act, which is why onLeave can serve as both;
+     *  - the tile menus drop message, profile and phonebook, which are all
+     *    about a person who exists for as long as their tab does.
      */
-    leaveConfirm?: boolean;
-    /** Passed to the call view's hang-up. See VoiceVideoCallView. */
-    onHangUp?: () => void;
-    /** Passed to the call view's tile menus. See VoiceVideoCallView. */
-    personActions?: boolean;
+    ephemeral?: boolean;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
@@ -157,10 +164,7 @@
     roomCode,
     roomName,
     onLeave,
-    leaveLabel,
-    leaveConfirm = true,
-    onHangUp,
-    personActions = true,
+    ephemeral = false,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
@@ -1565,7 +1569,11 @@
   /** What the leave control says. /qc overrides it: a quick call is not a
    *  room anybody is deleting, because there is nothing saved to delete. */
   const leaveText = $derived(
-    leaveLabel ?? (isDmChat ? "Delete conversation" : "Delete room")
+    ephemeral
+      ? "Leave call"
+      : isDmChat
+        ? "Delete conversation"
+        : "Delete room"
   );
 
   // Desktop only: below sm there is no room for two columns, and the call
@@ -1878,7 +1886,7 @@
               variant="ghost"
               size="icon"
               onclick={() => {
-                if (leaveConfirm && !confirmingDelete) {
+                if (!ephemeral && !confirmingDelete) {
                   confirmingDelete = true;
                   setTimeout(() => (confirmingDelete = false), 3000);
                   return;
@@ -1928,7 +1936,12 @@
           ? 'min-w-0 flex-1'
           : 'shrink-0'}"
       >
-        <VoiceVideoCallView beside={callBeside} {onHangUp} {personActions} />
+        <!-- In a call nobody keeps, hanging up and leaving are one act. -->
+        <VoiceVideoCallView
+          beside={callBeside}
+          onHangUp={ephemeral ? onLeave : undefined}
+          personActions={!ephemeral}
+        />
       </div>
     {/if}
     <div
