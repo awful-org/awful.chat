@@ -74,7 +74,9 @@ export const actionCommands: CmdSource = () => {
       icon: Upload,
       action: {
         kind: "act",
-        perform: () => window.open("/qs", "_blank", "noopener"),
+        perform: () => {
+          window.open("/qs", "_blank", "noopener");
+        },
       },
     });
   }
@@ -89,7 +91,9 @@ export const actionCommands: CmdSource = () => {
       icon: Video,
       action: {
         kind: "act",
-        perform: () => window.open("/qc", "_blank", "noopener"),
+        perform: () => {
+          window.open("/qc", "_blank", "noopener");
+        },
       },
     });
   }

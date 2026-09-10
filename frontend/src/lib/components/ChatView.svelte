@@ -186,12 +186,6 @@
     [...callPeerIds].filter((peerId) => callPeerRooms.get(peerId) === roomCode)
   );
 
-  /** What the leave control says. /qc overrides it: a quick call is not a
-   *  room anybody is deleting, because there is nothing saved to delete. */
-  const leaveText = $derived(
-    leaveLabel ?? (isDmChat ? "Delete conversation" : "Delete room")
-  );
-
   const showCallView = $derived(
     (inCall && callRoomCode === roomCode) || peersInThisRoom.length > 0
   );
@@ -1552,6 +1546,12 @@
 
   const isDmChat = $derived(
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
+  );
+
+  /** What the leave control says. /qc overrides it: a quick call is not a
+   *  room anybody is deleting, because there is nothing saved to delete. */
+  const leaveText = $derived(
+    leaveLabel ?? (isDmChat ? "Delete conversation" : "Delete room")
   );
 
   // Desktop only: below sm there is no room for two columns, and the call
