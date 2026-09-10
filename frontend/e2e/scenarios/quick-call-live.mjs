@@ -109,7 +109,13 @@ try {
   }, { timeout: 60_000 });
   check.ok(heardAgain.tracked.length > 0, "detection survived the reload", heardAgain);
 
-  // Hanging up is a decision: a reload after it must not walk back in.
+  // Hanging up takes the call with it: the chat, and the database it lived in.
+  const dbs = `indexedDB.databases().then((d) => JSON.stringify(
+    d.map((x) => x.name).filter((n) => n && n.startsWith('awful-quick-'))))`;
+  const during = await alice.json(dbs);
+  check.equal(during.length, 1, "the call has a database while it runs", during);
+  const callDb = await alice.eval(`window.__qc.dbName()`);
+
   // ChatView puts leaving behind a two-click confirm, and a quick call is not
   // a room anybody is deleting, so it says so.
   check.ok(
@@ -118,10 +124,35 @@ try {
   );
   await sleep(300);
   await alice.clickLabel("Leave call");
-  await alice.waitFor("alice leaves", () =>
-    alice.eval(`window.__qc.state.stage !== 'in-call'`)
+  await alice.waitFor("the call ends", () =>
+    alice.eval(`window.__qc.state.stage === 'ended'`)
   );
-  await sleep(1500);
+  check.ok(
+    await alice.eval(`document.body.innerText.includes('Call ended')`),
+    "and the page says the call ended"
+  );
+
+  // The bytes, gone. Not "gone when the tab closes" - gone now.
+  //
+  // What may remain is the EMPTY scope the drop rotates to, because leaveRoom
+  // finishes asynchronously and its participant removal has to land somewhere
+  // disposable rather than in the user's real database. So the promise is
+  // about the database the call actually wrote to, by name.
+  const left = await alice.waitFor("the call's database goes with it", async () => {
+    const names = await alice.json(dbs);
+    return names.includes(callDb) ? null : names;
+  }, { timeout: 30_000 });
+  check.ok(!left.includes(callDb), "nothing the call wrote survived it", {
+    callDb,
+    left,
+  });
+  check.ok(
+    left.every((n) => n !== callDb),
+    "and whatever is left is a different, empty scope",
+    left
+  );
+
+  // And a reload lands on a fresh page rather than walking back in.
   await alice.bidi.send("browsingContext.reload", {
     context: alice.bidi.context,
     wait: "complete",

@@ -58,6 +58,8 @@ export type QuickCallStage =
   | "setup"
   | "joining"
   | "in-call"
+  /** Hung up. The call, the chat and the database it lived in are gone. */
+  | "ended"
   | "failed";
 
 interface QuickCallState {
@@ -335,13 +337,41 @@ export async function startQuickCall(profile: QuickProfile): Promise<void> {
   }
 }
 
-/** Hang up and go back to the setup screen, still on the same code. */
+/**
+ * Hang up, and take the call with you.
+ *
+ * leaveRoom already does the wire half - it broadcasts the leave so the others
+ * see you go, unsubscribes the topic, hangs up, and empties the messages on
+ * screen. What it does not do is get rid of what the call wrote, and for a
+ * quick call that is the whole promise: there is no history here, and anybody
+ * who wants some makes a room instead.
+ *
+ * So the database goes too. The cached connection is closed first or the
+ * delete queues behind it and the rows outlive the call; dropQuickStorage
+ * then rotates to a fresh empty scope, so the participant removal still in
+ * flight from leaveRoom lands somewhere disposable rather than in the user's
+ * real database.
+ */
 export function endQuickCall(): void {
   leaveCall();
   leaveRoom();
+  // Nothing resumes a call that was deliberately ended.
+  clearSession();
+  closeDatabase();
+  void dropQuickStorage();
+  quickCall.stage = "ended";
+}
+
+/**
+ * Start over on a new code, in the empty scope the hang-up left behind. The
+ * identity is the same one - it lives in memory and dies with the tab either
+ * way - so this is a new call, not a new person.
+ */
+export function startAnotherCall(): string {
+  quickCall.error = null;
+  const code = setQuickCallCode(undefined, true);
   quickCall.stage = "setup";
-  // Hanging up is a decision. A reload after it should not walk back in.
-  saveSession({ inCall: false });
+  return code;
 }
 
 /** Leave for good: nothing here is resumed by a later page load. */

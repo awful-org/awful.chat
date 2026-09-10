@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  */
 
 const store = new Map<string, string>();
+const tabStore = new Map<string, string>();
 let quota = Infinity;
 
 const fakeLocalStorage = {
@@ -42,19 +43,27 @@ vi.mock("$lib/transport/transport.svelte", () => ({
   leaveRoom: vi.fn(),
   useEphemeralSession: vi.fn(),
 }));
-vi.mock("$lib/transport/call.svelte", () => ({
-  joinCall: vi.fn(async () => {}),
-  leaveCall: vi.fn(),
-}));
 vi.mock("./quick-storage", () => ({
   useQuickStorage: vi.fn(() => "awful-quick-test"),
   dropQuickStorage: vi.fn(async () => {}),
   dbName: () => "awful-quick-test",
 }));
+vi.mock("$lib/transport/call.svelte", () => ({
+  joinCall: vi.fn(async () => {}),
+  leaveCall: vi.fn(),
+}));
+
+/** Per-tab, so a reload keeps it and a closed tab does not. */
+const fakeSessionStorage = {
+  getItem: (k: string) => tabStore.get(k) ?? null,
+  setItem: (k: string, v: string) => void tabStore.set(k, v),
+  removeItem: (k: string) => void tabStore.delete(k),
+};
 
 async function load() {
   vi.resetModules();
   vi.stubGlobal("localStorage", fakeLocalStorage);
+  vi.stubGlobal("sessionStorage", fakeSessionStorage);
   return import("./quick-call.svelte");
 }
 
@@ -62,6 +71,7 @@ describe("quick call profile", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     store.clear();
+    tabStore.clear();
     quota = Infinity;
     identityStore.keypair = null;
     ownProfile = undefined;
@@ -194,6 +204,54 @@ describe("quick call profile", () => {
     await m.prepareAsGuest();
     m.teardownQuickCall();
     expect(clearAtRestFlagForCurrentOwner).toHaveBeenCalled();
+  });
+
+  it("hanging up takes the call's database with it", async () => {
+    const m = await load();
+    const { closeDatabase } = await import("$lib/storage");
+    const { dropQuickStorage } = await import("./quick-storage");
+    const { leaveRoom } = await import("$lib/transport/transport.svelte");
+    const order: string[] = [];
+    vi.mocked(closeDatabase).mockImplementation(() => void order.push("close"));
+    vi.mocked(dropQuickStorage).mockImplementation(async () => {
+      order.push("drop");
+    });
+    vi.mocked(leaveRoom).mockImplementation(() => void order.push("leave"));
+
+    await m.prepareAsGuest();
+    m.setQuickCallCode("7QK3M9AB2C");
+    await m.startQuickCall({ name: "Ada" });
+    order.length = 0; // the guest setup closed the real database on its way in
+    m.endQuickCall();
+
+    // The wire first, then the bytes - and the connection has to be closed
+    // before the delete or it queues behind it.
+    expect(order).toEqual(["leave", "close", "drop"]);
+    expect(m.quickCall.stage).toBe("ended");
+  });
+
+  it("a call that was ended is never resumed", async () => {
+    const m = await load();
+    await m.prepareAsGuest();
+    m.setQuickCallCode("7QK3M9AB2C");
+    await m.startQuickCall({ name: "Ada" });
+    expect(m.resumableSession("7QK3M9AB2C")).not.toBeNull();
+
+    m.endQuickCall();
+    expect(m.resumableSession("7QK3M9AB2C")).toBeNull();
+  });
+
+  it("starting another call mints a new code and hosts it", async () => {
+    const m = await load();
+    await m.prepareAsGuest();
+    m.setQuickCallCode("7QK3M9AB2C");
+    await m.startQuickCall({ name: "Ada" });
+    m.endQuickCall();
+
+    const next = m.startAnotherCall();
+    expect(next).toMatch(/^[0-9A-HJKMNP-TV-Z]{10}$/);
+    expect(next).not.toBe("7QK3M9AB2C");
+    expect(m.quickCall.stage).toBe("setup");
   });
 
   it("does not sit in 'joining' when the join fails", async () => {

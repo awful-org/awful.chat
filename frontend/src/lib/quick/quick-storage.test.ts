@@ -79,15 +79,29 @@ describe("quick storage", () => {
     expect(m.useQuickStorage()).toBe(name); // idempotent
   });
 
-  it("deletes its own database on the way out", async () => {
+  it("deletes its own database and opens an empty one in its place", async () => {
     const m = await load();
     const name = m.useQuickStorage();
     await m.dropQuickStorage();
     expect(deleted).toEqual([name]);
-    // And stops claiming a scope it no longer has, so nothing writes into a
-    // database that is being deleted.
-    expect(m.isQuickStorage()).toBe(false);
-    expect(m.dbName()).toBe("awful-chat");
+    // NEVER back to the real database. A page that has been quick stays
+    // quick: anything still in flight after a hang-up - a participant
+    // removal, a stray sync - has to land somewhere disposable rather than in
+    // the user's own data.
+    expect(m.isQuickStorage()).toBe(true);
+    expect(m.dbName()).not.toBe("awful-chat");
+    expect(m.dbName()).toMatch(/^awful-quick-[0-9a-f]{16}$/);
+    expect(m.dbName()).not.toBe(name);
+  });
+
+  it("the scope it rotates to is not a database until something writes", async () => {
+    const m = await load();
+    m.useQuickStorage();
+    await m.dropQuickStorage();
+    // Nothing opened the new name, so there is nothing of it to find.
+    existing = [];
+    await m.sweepOrphanQuickStorage();
+    expect(deleted.length).toBe(1);
   });
 
   it("sweeps a database whose page is gone", async () => {

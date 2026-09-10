@@ -35,6 +35,7 @@
     quickCallLink,
     rememberQuickProfile,
     setQuickCallCode,
+    startAnotherCall,
     startQuickCall,
     teardownQuickCall,
   } from "$lib/quick/quick-call.svelte";
@@ -180,6 +181,53 @@
           leaveLabel="Leave call"
         />
       </div>
+    </div>
+  {:else if quickCall.stage === "ended"}
+    <div
+      class="min-h-dvh overflow-y-auto bg-background text-foreground flex items-center justify-center p-4 font-mono"
+    >
+      <Card.Root
+        class="w-full max-w-sm bg-card border-border text-card-foreground"
+      >
+        <Card.Header class="pb-4">
+          <div class="flex items-center gap-2 mb-1">
+            <div class="w-2 h-2 rounded-full bg-muted-foreground"></div>
+            <Card.Title class="text-lg font-mono font-semibold">
+              Call ended
+            </Card.Title>
+          </div>
+          <Card.Description class="text-muted-foreground text-xs font-mono">
+            The call, its chat and everything it wrote are gone
+          </Card.Description>
+        </Card.Header>
+        <Card.Content>
+          <p class="text-xs text-muted-foreground font-mono leading-relaxed">
+            A quick call keeps nothing: there is no history to go back to, and
+            the old link no longer reaches anything of yours. If you want a
+            conversation that stays, make a room instead.
+          </p>
+        </Card.Content>
+        <Card.Footer class="flex-col gap-2">
+          <Button
+            onclick={() => {
+              const code = startAnotherCall();
+              isHost = true;
+              nameTouched = true;
+              history.replaceState(history.state, "", `/qc#${code}`);
+            }}
+            class="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-mono"
+          >
+            Start a new call
+          </Button>
+          <Button
+            variant="ghost"
+            href="/app"
+            class="w-full font-mono text-xs text-muted-foreground"
+          >
+            Go to the app
+          </Button>
+        </Card.Footer>
+      </Card.Root>
     </div>
   {:else if quickCall.stage === "unlocking"}
     <UnlockIdentity />
