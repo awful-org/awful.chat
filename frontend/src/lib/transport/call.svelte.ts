@@ -401,14 +401,26 @@ export function toggleMute(): void {
   _sendCallState();
 }
 
+/** Set by cameras.svelte, which cannot be imported here without a cycle. */
+let _onCameraStarted: (() => void) | null = null;
+
+export function onCameraStarted(fn: () => void): void {
+  _onCameraStarted = fn;
+}
+
 export async function startCamera(): Promise<void> {
   // Clear any pending error timeout and reset the error state. Attempting
   // the operation again makes any stale error irrelevant.
   cancelErrorClear();
   transportState.error = null;
   try {
+    // `ideal`, not `exact`: a remembered camera that has since been unplugged
+    // (or an iPhone that stopped offering itself) must fall back to whatever
+    // is there rather than failing the whole call's video.
+    const preferred = loadAudioPrefs().cameraDevice;
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
+        ...(preferred ? { deviceId: { ideal: preferred } } : {}),
         width: { ideal: 1280 },
         height: { ideal: 720 },
         frameRate: { ideal: 30 },
@@ -417,6 +429,12 @@ export async function startCamera(): Promise<void> {
     });
     transportState.localCameraStream = stream;
     transportState.cameraOff = false;
+    // Permission has just been granted, if it had not been before, so the
+    // device labels the browser was withholding are now readable. Told
+    // rather than polled, and deliberately not imported: cameras.svelte
+    // imports THIS module to restart a camera, so a direct call would be a
+    // cycle.
+    _onCameraStarted?.();
     playCameraOnSound();
     try {
       await _video.startCamera(stream);
