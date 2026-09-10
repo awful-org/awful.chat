@@ -117,7 +117,16 @@ import {
     /** The call stage is a column beside the chat, not a band above it. */
     beside?: boolean;
   }
-  let { beside = false }: Props = $props();
+    let {
+    beside = false,
+    /**
+     * What the red hang-up does. Defaults to leaving the CALL and staying in
+     * the room, which is right for a room: the conversation outlives the call.
+     * /qc overrides it, because there the call IS the thing - hanging up ends
+     * it the way it does in every other call app.
+     */
+    onHangUp = leaveCall,
+  }: { beside?: boolean; onHangUp?: () => void } = $props();
 
   $effect(() => {
     loadProfile();
@@ -2104,7 +2113,7 @@ import {
             <button
               {...props}
               type="button"
-              onclick={leaveCall}
+              onclick={onHangUp}
               aria-label="Leave call"
               class="group relative flex h-11 w-16 items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500"
             >
@@ -2284,7 +2293,7 @@ import {
           <button
             {...props}
             type="button"
-            onclick={leaveCall}
+            onclick={onHangUp}
             aria-label="Leave call"
             class={cn(
               "group relative flex items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500 hover:scale-105 hover:shadow-red-500/50 shrink-0",

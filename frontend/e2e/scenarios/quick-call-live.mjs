@@ -116,15 +116,15 @@ try {
   check.equal(during.length, 1, "the call has a database while it runs", during);
   const callDb = await alice.eval(`window.__qc.dbName()`);
 
-  // ChatView puts leaving behind a two-click confirm, and a quick call is not
-  // a room anybody is deleting, so it says so.
+  // The red hang-up in the call bar, which is the button a person reaches
+  // for. In a room it leaves the CALL and keeps the conversation; here it has
+  // to end the whole thing, the way every other call app does - and on one
+  // click, because an unsignposted confirm reads as a button that is broken.
   check.ok(
     await alice.clickLabel("Leave call"),
-    "the leave control says what it does"
+    "the hang-up is where a person looks for it"
   );
-  await sleep(300);
-  await alice.clickLabel("Leave call");
-  await alice.waitFor("the call ends", () =>
+  await alice.waitFor("the call ends on one click", () =>
     alice.eval(`window.__qc.state.stage === 'ended'`)
   );
   check.ok(

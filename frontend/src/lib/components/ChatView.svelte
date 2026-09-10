@@ -135,6 +135,15 @@
      * there is nothing saved to delete.
      */
     leaveLabel?: string;
+    /**
+     * Whether the leave control needs a second click. On by default because
+     * in a room it deletes one. /qc turns it off: there is nothing to delete
+     * that hanging up does not already take, and a confirm nothing signposts
+     * reads as a button that does not work.
+     */
+    leaveConfirm?: boolean;
+    /** Passed to the call view's hang-up. See VoiceVideoCallView. */
+    onHangUp?: () => void;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
@@ -147,6 +156,8 @@
     roomName,
     onLeave,
     leaveLabel,
+    leaveConfirm = true,
+    onHangUp,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
@@ -1864,7 +1875,7 @@
               variant="ghost"
               size="icon"
               onclick={() => {
-                if (!confirmingDelete) {
+                if (leaveConfirm && !confirmingDelete) {
                   confirmingDelete = true;
                   setTimeout(() => (confirmingDelete = false), 3000);
                   return;
@@ -1914,7 +1925,7 @@
           ? 'min-w-0 flex-1'
           : 'shrink-0'}"
       >
-        <VoiceVideoCallView beside={callBeside} />
+        <VoiceVideoCallView beside={callBeside} {onHangUp} />
       </div>
     {/if}
     <div

@@ -178,7 +178,9 @@
           roomName="Quick call"
           selfId={identityStore.did ?? ""}
           onLeave={endQuickCall}
+          onHangUp={endQuickCall}
           leaveLabel="Leave call"
+          leaveConfirm={false}
         />
       </div>
     </div>
@@ -200,13 +202,6 @@
             The call, its chat and everything it wrote are gone
           </Card.Description>
         </Card.Header>
-        <Card.Content>
-          <p class="text-xs text-muted-foreground font-mono leading-relaxed">
-            A quick call keeps nothing: there is no history to go back to, and
-            the old link no longer reaches anything of yours. If you want a
-            conversation that stays, make a room instead.
-          </p>
-        </Card.Content>
         <Card.Footer class="flex-col gap-2">
           <Button
             onclick={() => {
