@@ -177,6 +177,7 @@
           roomName="Quick call"
           selfId={identityStore.did ?? ""}
           onLeave={endQuickCall}
+          leaveLabel="Leave call"
         />
       </div>
     </div>

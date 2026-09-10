@@ -110,10 +110,14 @@ try {
   check.ok(heardAgain.tracked.length > 0, "detection survived the reload", heardAgain);
 
   // Hanging up is a decision: a reload after it must not walk back in.
-  // ChatView puts leaving behind a two-click confirm.
-  check.ok(await alice.clickLabel("Delete room"), "the leave control is there");
+  // ChatView puts leaving behind a two-click confirm, and a quick call is not
+  // a room anybody is deleting, so it says so.
+  check.ok(
+    await alice.clickLabel("Leave call"),
+    "the leave control says what it does"
+  );
   await sleep(300);
-  await alice.clickLabel("Delete room");
+  await alice.clickLabel("Leave call");
   await alice.waitFor("alice leaves", () =>
     alice.eval(`window.__qc.state.stage !== 'in-call'`)
   );

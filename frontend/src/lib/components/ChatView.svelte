@@ -129,6 +129,12 @@
     roomName: string;
     selfId: string;
     onLeave: () => void;
+    /**
+     * What the leave control says. Defaults to the room/DM wording; /qc passes
+     * "Leave call", because a quick call is not a room anybody is deleting -
+     * there is nothing saved to delete.
+     */
+    leaveLabel?: string;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
@@ -140,6 +146,7 @@
     roomCode,
     roomName,
     onLeave,
+    leaveLabel,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
@@ -177,6 +184,12 @@
 
   const peersInThisRoom = $derived(
     [...callPeerIds].filter((peerId) => callPeerRooms.get(peerId) === roomCode)
+  );
+
+  /** What the leave control says. /qc overrides it: a quick call is not a
+   *  room anybody is deleting, because there is nothing saved to delete. */
+  const leaveText = $derived(
+    leaveLabel ?? (isDmChat ? "Delete conversation" : "Delete room")
   );
 
   const showCallView = $derived(
@@ -1844,13 +1857,7 @@
             {/snippet}
           </Tip>
         {/if}
-        <Tip
-          text={confirmingDelete
-            ? "Click again to confirm"
-            : isDmChat
-              ? "Delete conversation"
-              : "Delete room"}
-        >
+        <Tip text={confirmingDelete ? "Click again to confirm" : leaveText}>
           {#snippet children(props)}
             <Button
               {...props}
@@ -1865,7 +1872,7 @@
                 confirmingDelete = false;
                 onLeave();
               }}
-              aria-label={isDmChat ? "Delete conversation" : "Delete room"}
+              aria-label={leaveText}
               class="text-red-400 hover:bg-destructive/10! hover:text-destructive! {confirmingDelete
                 ? 'bg-destructive/20!'
                 : ''}"
