@@ -62,6 +62,12 @@ group video.
   with, not replaces, your OS's full-disk encryption.
 - **Installable PWA**: opens offline with your full history; sending waits
   for peers.
+- **Two pages that need no account**, optional and off unless an instance
+  turns them on (`USE_QS`, `USE_QC`): `/qs` hands a file to one person or
+  several over a peer-to-peer link that is never uploaded anywhere, with a
+  one-time switch that closes the link once it has delivered; `/qc` is a call
+  with no room and no account, under a throwaway identity in a database
+  deleted when the tab closes.
 
 ## How private is it, exactly
 
@@ -172,7 +178,10 @@ iptables DNAT instead, which costs nothing.
 `VITE_API_URL`, `VITE_RELAY_MULTIADDR` and the two SFU variables are the
 instance's own addresses. They are NOT compiled into the app: the frontend
 container writes them to `/config.json` when it starts and the app reads that
-before it mounts, so changing one takes a restart rather than a rebuild.
+before it mounts, so changing one takes a restart rather than a rebuild. The
+two optional pages, `USE_QS` and `USE_QC`, ride the same file and behave the
+same way: `docker compose up -d frontend` is enough, and `curl
+https://<domain>/config.json` says which of them an instance is serving.
 
 That is also what makes a build checkable. Two instances running the *same
 build* - same commit and the same `PLUGIN_SOURCES`, since plugins compile in -
@@ -222,6 +231,8 @@ whose context holds no repository declares no commit.
 | `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |
+| `USE_QS` | no | `1` serves `/qs`, which hands a file to one person or several with no account: the bytes go peer to peer and are never uploaded anywhere, everyone holding the link serves what they have finished, and a one-time switch closes the link as soon as it has delivered. Unset answers that path with the landing page, and the app never mentions the feature |
+| `USE_QC` | no | `1` serves `/qc`, a call with no room and no account: camera, screen share and text chat under a throwaway identity in a database deleted when the tab closes. An identity already on the device can be used instead, and the call stays just as disposable. Unset answers that path with the landing page |
 
 Firewall: open 80/443 (web), 3478 tcp+udp (TURN), 5349 tcp+udp (TURN TLS,
 when configured), the SFU media range **tcp and udp**
