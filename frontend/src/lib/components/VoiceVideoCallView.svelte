@@ -2719,7 +2719,9 @@ import {
         Camera and audio
       </DialogTitle>
     </DialogHeader>
-    <div class="flex-1 overflow-y-auto px-4 py-4">
+    <!-- pb only: DialogContent is a grid with gap-4, so a top padding here
+         doubles the space under the header. Same as SettingsDialog. -->
+    <div class="flex-1 overflow-y-auto px-4 pb-4">
       <AudioSettings />
     </div>
   </DialogContent>
