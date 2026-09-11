@@ -1,5 +1,12 @@
 <script lang="ts">
   import { Tip } from "$lib/components/ui/tooltip";
+  import {
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+  } from "$lib/components/ui/dialog";
+  import AudioSettings from "./settings/AudioSettings.svelte";
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
@@ -126,7 +133,32 @@ import {
      * it the way it does in every other call app.
      */
     onHangUp = leaveCall,
-  }: { beside?: boolean; onHangUp?: () => void } = $props();
+    /**
+     * Whether a tile menu offers the things that outlast the call: message
+     * this person, view their profile, keep them in the phonebook. Off for
+     * /qc, where the identity on the other side exists for as long as their
+     * tab does - a saved contact for somebody who cannot be contacted again
+     * is not a feature, and opening a DM would persist a room for them.
+     * What the menu keeps there is what is about the CALL: their volume,
+     * the spotlight, fullscreen, picture-in-picture.
+     */
+    personActions = true,
+  }: {
+    beside?: boolean;
+    onHangUp?: () => void;
+    personActions?: boolean;
+  } = $props();
+
+  /**
+   * The device picker, opened from the call bar.
+   *
+   * It has to live HERE rather than in the app's settings dialog, because
+   * /qc has no sidebar and therefore no settings at all: once a quick call
+   * started, there was no way to change camera, microphone or speaker.
+   * Putting it on the controls fixes that and saves the app several clicks
+   * for the thing people reach for mid-call anyway.
+   */
+  let deviceSettingsOpen = $state(false);
 
   $effect(() => {
     loadProfile();
@@ -684,7 +716,7 @@ import {
       isFullscreen,
       pipSupported: browserPipSupported(),
       pipOpen: callPipPanel.browserPip,
-      canMessage: !tile.isLocal && !!tile.peerId,
+      canMessage: personActions && !tile.isLocal && !!tile.peerId,
       inPhonebook: !tile.isLocal && !!tile.peerId && isInPhonebook(tile.peerId),
       // Off the slider, which openTileMenu seeds from the live gain: it is
       // reactive, so dragging it to 0 flips the row to Unmute in place.
@@ -2288,6 +2320,23 @@ import {
             {/if}
           </div>
 
+          <Tip text="Camera and audio">
+            {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={() => (deviceSettingsOpen = true)}
+            aria-label="Camera and audio settings"
+            class={cn(
+              "group relative flex items-center justify-center rounded-lg bg-white/10 text-zinc-100 transition-all duration-200 hover:bg-white/20 hover:scale-105 shrink-0",
+              coarsePointer ? "h-11 w-11" : "h-8 w-8 md:h-10 md:w-10"
+            )}
+          >
+            <SlidersHorizontal class="md:size-5 size-4" />
+          </button>
+            {/snippet}
+          </Tip>
+
           <Tip text="Leave call">
             {#snippet children(props)}
           <button
@@ -2660,6 +2709,23 @@ import {
     inPhonebook={isInPhonebook(profileCardFor.peerId)}
   />
 {/if}
+
+<Dialog bind:open={deviceSettingsOpen}>
+  <DialogContent
+    class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg flex flex-col p-0 max-h-[85dvh]"
+  >
+    <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
+      <DialogTitle class="font-mono text-base font-semibold">
+        Camera and audio
+      </DialogTitle>
+    </DialogHeader>
+    <!-- pb only: DialogContent is a grid with gap-4, so a top padding here
+         doubles the space under the header. Same as SettingsDialog. -->
+    <div class="flex-1 overflow-y-auto px-4 pb-4">
+      <AudioSettings />
+    </div>
+  </DialogContent>
+</Dialog>
 
 <svelte:window
   onclick={closeMenus}

@@ -1,7 +1,13 @@
 /**
- * Audio settings survive a reload. They live in localStorage rather than
- * IndexedDB because they belong to the device, not the identity: the mic you
- * picked on this machine should not follow you to another one through sync.
+ * Media-device settings survive a reload. They live in localStorage rather
+ * than IndexedDB because they belong to the device, not the identity: the mic
+ * you picked on this machine should not follow you to another one through
+ * sync.
+ *
+ * The camera lives here too, despite the file's name. It is the same kind of
+ * setting with the same lifetime, and a second store with identical mechanics
+ * would buy nothing; the localStorage key stays as it is so nobody's existing
+ * audio settings are lost to a rename.
  */
 
 const KEY = "awful_audio_prefs";
@@ -9,6 +15,12 @@ const KEY = "awful_audio_prefs";
 export interface AudioPrefs {
   inputDevice: string | null;
   outputDevice: string | null;
+  /**
+   * deviceId of the camera to ask for, or null for whatever the browser
+   * calls default. A device that has since gone away is not an error: the
+   * constraint is `ideal`, so getUserMedia falls back rather than failing.
+   */
+  cameraDevice: string | null;
   inputGain: number;
   outputVolume: number;
   dtlnEnabled: boolean;
@@ -31,6 +43,7 @@ export interface AudioPrefs {
 export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   inputDevice: null,
   outputDevice: null,
+  cameraDevice: null,
   inputGain: 1.0,
   outputVolume: 1.0,
   dtlnEnabled: true,
@@ -71,6 +84,7 @@ export function loadAudioPrefs(): AudioPrefs {
     return {
       inputDevice: typeof p.inputDevice === "string" ? p.inputDevice : null,
       outputDevice: typeof p.outputDevice === "string" ? p.outputDevice : null,
+      cameraDevice: typeof p.cameraDevice === "string" ? p.cameraDevice : null,
       inputGain: num(p.inputGain, AUDIO_PREF_DEFAULTS.inputGain, 0, 2.5),
       outputVolume: num(p.outputVolume, AUDIO_PREF_DEFAULTS.outputVolume, 0, 2),
       dtlnEnabled:

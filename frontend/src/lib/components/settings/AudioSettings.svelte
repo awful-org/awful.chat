@@ -12,6 +12,12 @@
   import { Button } from "$lib/components/ui/button";
   import { transportState, _dtln } from "$lib/transport/transport.svelte";
   import {
+    cameraLabel,
+    cameras,
+    setCamera,
+    watchCameras,
+  } from "$lib/cameras.svelte";
+  import {
     getVoiceActiveInputDevice,
     getVoiceActiveOutputDevice,
     getVoiceInputDevices,
@@ -106,6 +112,10 @@
   }
   let inputSlider = $state<number[]>([liveInputSlider()]);
   let outputSlider = $state<number[]>([liveOutputSlider()]);
+
+  // The list is live: a phone offering itself as a camera attaches and
+  // detaches while this dialog is open.
+  watchCameras();
 
   $effect(() => {
     activeInput = getVoiceActiveInputDevice();
@@ -301,6 +311,58 @@
 </script>
 
 <div class="flex flex-col gap-6">
+  <!-- Camera Section -->
+  <div
+    class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+  >
+    <div class="flex items-center gap-2">
+      <div class="w-1 h-4 bg-blue-500 rounded-full"></div>
+      <Label
+        class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >Camera</Label
+      >
+    </div>
+
+    {#if cameras.devices.length > 0}
+      <Select
+        type="single"
+        value={cameras.selected ?? ""}
+        onValueChange={(v) => void setCamera(v || null)}
+      >
+        <SelectTrigger
+          class="bg-background border-input font-mono text-sm focus:ring-ring"
+        >
+          <span class="block truncate">
+            {cameras.devices.find((d) => d.deviceId === cameras.selected)
+              ?.label || "System default"}
+          </span>
+        </SelectTrigger>
+        <SelectContent class="bg-popover border-border font-mono">
+          {#each cameras.devices as dev, i (dev.deviceId)}
+            <SelectItem value={dev.deviceId} class="font-mono text-sm">
+              <span class="block truncate">{cameraLabel(dev, i)}</span>
+            </SelectItem>
+          {/each}
+        </SelectContent>
+      </Select>
+      {#if cameras.unnamed}
+        <p class="text-xs text-muted-foreground font-mono">
+          Turn your camera on once and these get their real names - a browser
+          withholds them until it has been allowed a camera.
+        </p>
+      {:else}
+        <p class="text-xs text-muted-foreground font-mono">
+          Changes take effect at once if your camera is on. A phone offering
+          itself as a camera appears here as soon as it does.
+        </p>
+      {/if}
+    {:else}
+      <p class="text-xs text-muted-foreground font-mono">
+        No cameras found on this device.
+      </p>
+    {/if}
+  </div>
+
   <!-- Microphone Section -->
   <div
     class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"

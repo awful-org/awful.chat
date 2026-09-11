@@ -10,11 +10,12 @@
    */
   import { onDestroy, onMount } from "svelte";
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
-  import { Check, Copy, LogIn, UserRound } from "@lucide/svelte";
+  import { Check, Copy, LogIn, Settings2, UserRound } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import * as Card from "$lib/components/ui/card/index.js";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import DeviceCheck from "$lib/components/DeviceCheck.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -43,6 +44,9 @@
   let name = $state(quickCall.profile.name);
   let remember = $state(quickCall.remembered);
   let pickerOpen = $state(false);
+  /** The green room. Closed by default so the page does not grab a camera
+   *  from somebody who only wants to type a name and join. */
+  let checking = $state(false);
   let copied = $state(false);
   /** True when this page minted the code rather than following a link. */
   let isHost = $state(false);
@@ -178,9 +182,7 @@
           roomName="Quick call"
           selfId={identityStore.did ?? ""}
           onLeave={endQuickCall}
-          onHangUp={endQuickCall}
-          leaveLabel="Leave call"
-          leaveConfirm={false}
+          ephemeral
         />
       </div>
     </div>
@@ -232,7 +234,9 @@
       class="min-h-dvh overflow-y-auto bg-background text-foreground flex items-center justify-center p-4 font-mono"
     >
       <Card.Root
-        class="w-full max-w-sm bg-card border-border text-card-foreground"
+        class="w-full {checking
+          ? 'max-w-md'
+          : 'max-w-sm'} bg-card border-border text-card-foreground transition-[max-width]"
       >
         <Card.Header class="pb-4">
           <div class="flex items-center gap-2 mb-1">
@@ -299,6 +303,16 @@
               placeholder="Your display name"
               class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono text-center focus-visible:ring-ring"
             />
+
+            <button
+              type="button"
+              onclick={() => (checking = !checking)}
+              class="flex w-full items-center justify-center gap-1.5 text-xs font-mono text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              <Settings2 class="size-3.5" />
+              {checking ? "Hide camera and mic" : "Check camera and mic"}
+            </button>
+            <DeviceCheck open={checking} />
 
             {#if quickCall.identity === "account"}
               <p class="text-xs text-muted-foreground font-mono text-center">
