@@ -12,6 +12,7 @@ import {
   mediaPrefs,
   setGifAutoplay,
   setAutoDownloadMedia,
+  setExternalMedia,
 } from "$lib/media-prefs.svelte";
 import {
   displayPrefs,
@@ -145,6 +146,7 @@ async function loadLocalFonts(): Promise<void> {
         </span>
       </div>
       <Switch
+        aria-label="Notify me about new messages"
         checked={notifyState.enabled}
         onCheckedChange={(checked) => setNotificationsEnabled(checked)}
       />
@@ -173,6 +175,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Wake this device for new messages"
       checked={pushPrefs.enabled}
       onCheckedChange={(checked) => setPushEnabled(checked)}
     />
@@ -217,6 +220,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Hide message text on the lock screen"
       checked={notifyState.hidePreview}
       onCheckedChange={(checked) => setHidePreview(checked)}
     />
@@ -232,6 +236,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Message sounds"
       checked={notifyState.soundsEnabled}
       onCheckedChange={(checked) => setMessageSoundsEnabled(checked)}
     />
@@ -259,9 +264,19 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Auto-play GIFs in chat"
       checked={mediaPrefs.gifAutoplay}
       onCheckedChange={(checked) => setGifAutoplay(checked)}
     />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">External previews and media</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        On by default. Sends message links to the relay for previews and loads images, GIFs and avatars from their hosts, disclosing your IP address. Turn off to block these requests; local attachments still work.
+      </span>
+    </div>
+    <Switch aria-label="External previews and media" checked={mediaPrefs.externalMedia} onCheckedChange={setExternalMedia} />
   </div>
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">
@@ -272,6 +287,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Auto-download media"
       checked={mediaPrefs.autoDownloadMedia}
       onCheckedChange={(checked) => setAutoDownloadMedia(checked)}
     />
@@ -285,6 +301,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Italicize my name"
       checked={displayPrefs.italicOwnName}
       onCheckedChange={(checked) => setItalicOwnName(checked)}
     />
@@ -298,6 +315,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Show others' nickname colors"
       checked={displayPrefs.showPeerNicknameColors}
       onCheckedChange={(checked) => setShowPeerNicknameColors(checked)}
     />
@@ -311,6 +329,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Collapse the sidebar"
       checked={displayPrefs.sidebarCollapsed}
       onCheckedChange={(checked) => setSidebarCollapsed(checked)}
     />
@@ -324,6 +343,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Chat beside the call"
       checked={displayPrefs.callChatBeside}
       onCheckedChange={(checked) => setCallChatBeside(checked)}
     />
@@ -350,6 +370,7 @@ async function loadLocalFonts(): Promise<void> {
       >
     </div>
     <Slider
+      aria-label="Chat font size"
       type="single"
       value={displayPrefs.chatFontSize}
       min={MIN_CHAT_FONT_SIZE}
@@ -372,6 +393,7 @@ async function loadLocalFonts(): Promise<void> {
         <button
           type="button"
           onclick={() => setChatFontFamily(entry.id)}
+          aria-pressed={displayPrefs.chatFontFamily === entry.id}
           style="font-family: {entry.stack}"
           class="cursor-pointer rounded-full border px-2.5 py-1 text-xs transition-colors {displayPrefs.chatFontFamily ===
           entry.id
@@ -390,6 +412,7 @@ async function loadLocalFonts(): Promise<void> {
     >
     <div class="flex items-center gap-2">
       <Input
+        aria-label="Font installed on this device"
         value={customFamily}
         placeholder="Consolas, Inter, Comic Sans MS…"
         oninput={(e) => (customFamily = e.currentTarget.value)}
@@ -418,6 +441,7 @@ async function loadLocalFonts(): Promise<void> {
           <button
             type="button"
             onclick={() => setChatFontFamily(family)}
+            aria-pressed={displayPrefs.chatFontFamily === family}
             style="font-family: '{family}'"
             class="cursor-pointer rounded-full border px-2.5 py-1 text-xs transition-colors {displayPrefs.chatFontFamily ===
             family
@@ -496,6 +520,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Picture-in-picture"
       checked={displayPrefs.callPip}
       onCheckedChange={(checked) => setCallPip(checked)}
     />
@@ -509,6 +534,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Tint tiles from avatars"
       checked={displayPrefs.avatarTint}
       onCheckedChange={(checked) => setAvatarTint(checked)}
     />
@@ -535,6 +561,7 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch
+      aria-label="Connection and relay indicators"
       checked={displayPrefs.showConnectionInfo}
       onCheckedChange={(checked) => setShowConnectionInfo(checked)}
     />

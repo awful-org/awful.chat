@@ -196,7 +196,7 @@
         <button
           type="button"
           onclick={claimNodeLock}
-          class="ml-1 rounded border border-border px-2 py-0.5 font-medium text-foreground hover:bg-accent"
+          class="ml-1 rounded border border-border px-2 py-0.5 font-medium text-foreground hover:bg-accent hover:text-accent-foreground"
         >
           Use here
         </button>

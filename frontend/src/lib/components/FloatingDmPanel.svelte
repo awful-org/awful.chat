@@ -5,7 +5,7 @@
   import {
     BAR_HEIGHT,
     HEIGHT,
-    WIDTH,
+    panelWidth,
     dmPanel,
     defaultPanelPosition,
   } from "$lib/dm-panel.svelte";
@@ -27,6 +27,7 @@
   let { onExpand }: Props = $props();
 
   let draft = $state("");
+  let sendError = $state<string | null>(null);
   let sending = $state(false);
   let list = $state<HTMLDivElement | null>(null);
 
@@ -55,7 +56,9 @@
     });
   }
 
-  const height = $derived(dmPanel.minimized ? BAR_HEIGHT : HEIGHT);
+  let width = $state(panelWidth());
+  let viewportHeight = $state(typeof window === "undefined" ? HEIGHT + 16 : window.innerHeight);
+  const height = $derived(Math.min(dmPanel.minimized ? BAR_HEIGHT : HEIGHT, Math.max(BAR_HEIGHT, viewportHeight - 16)));
   const chatFontStack = $derived(
     resolveChatFontStack(displayPrefs.chatFontFamily),
   );
@@ -63,8 +66,10 @@
   // A viewport that shrank under a parked panel (rotation, a resized window)
   // would otherwise leave it half off screen with its drag handle out of reach.
   function clampToViewport(): void {
+    width = panelWidth();
+    viewportHeight = window.innerHeight;
     if (!dmPanel.peerId) return;
-    dmPanel.x = Math.max(8, Math.min(dmPanel.x, window.innerWidth - WIDTH - 8));
+    dmPanel.x = Math.max(8, Math.min(dmPanel.x, window.innerWidth - width - 8));
     dmPanel.y = Math.max(8, Math.min(dmPanel.y, window.innerHeight - height - 8));
   }
 
@@ -87,11 +92,15 @@
     const peerId = dmPanel.peerId;
     if (!body || !peerId || sending) return;
     sending = true;
-    draft = "";
+    const submittedDraft = draft;
+    sendError = null;
     try {
       // Explicit peer: the panel is not the conversation the view is on, which
       // is the entire point of it.
       await sendDirectMessage(body, { peerId });
+      if (dmPanel.peerId === peerId && draft === submittedDraft) draft = "";
+    } catch (err) {
+      sendError = err instanceof Error ? err.message : "Could not send; your draft has been kept.";
     } finally {
       sending = false;
     }
@@ -119,7 +128,7 @@
   -->
   <div
     class="fixed z-50 flex flex-col overflow-hidden rounded-lg border border-border bg-card font-(family-name:--chat-font-family) shadow-2xl"
-    style="left: {dmPanel.x}px; top: {dmPanel.y}px; width: {WIDTH}px; height: {height}px; --chat-font-family: {chatFontStack}"
+    style="left: {dmPanel.x}px; top: {dmPanel.y}px; width: {width}px; height: {height}px; --chat-font-family: {chatFontStack}"
   >
     <div
       use:draggable={{
@@ -128,9 +137,9 @@
           dmPanel.x = pos.x;
           dmPanel.y = pos.y;
         },
-        size: () => ({ width: WIDTH, height }),
+        size: () => ({ width, height }),
       }}
-      class="flex h-10 shrink-0 cursor-grab touch-none items-center gap-1 border-b border-border bg-muted/40 px-2 active:cursor-grabbing"
+      class="flex h-13 shrink-0 cursor-grab touch-none items-center gap-1 border-b border-border bg-muted/40 px-2 active:cursor-grabbing"
     >
       <span class="min-w-0 flex-1 truncate text-xs font-medium">
         {dmPanel.peerName || "Direct message"}
@@ -143,7 +152,7 @@
             type="button"
             onclick={() => dmPanel.peerId && onExpand(dmPanel.peerId)}
             aria-label="Expand conversation"
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <CornerUpLeft class="size-3.5 rotate-180" />
           </button>
@@ -156,7 +165,7 @@
             type="button"
             onclick={() => (dmPanel.minimized = !dmPanel.minimized)}
             aria-label={dmPanel.minimized ? "Restore panel" : "Minimize panel"}
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <Minus class="size-3.5" />
           </button>
@@ -169,7 +178,7 @@
             type="button"
             onclick={closeDmPanel}
             aria-label="Close conversation panel"
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <X class="size-3.5" />
           </button>
@@ -184,7 +193,7 @@
         class="flex-1 overflow-y-auto px-2 py-1.5 text-(length:--chat-font-size) leading-normal"
       >
         {#if dmPanel.loading}
-          <div class="flex h-full items-center justify-center">
+          <div role="status" aria-label="Loading messages" class="flex h-full items-center justify-center">
             <div class="size-2 animate-pulse rounded-full bg-muted-foreground"></div>
           </div>
         {:else if visible.length === 0}
@@ -220,6 +229,8 @@
         {/if}
       </div>
 
+      {#if sendError}<p role="alert" class="px-2 py-1 text-xs text-destructive">{sendError}</p>{/if}
+      {#if draft.length > 16384}<p role="status" class="px-2 text-xs text-muted-foreground">This long message will be sent as message.txt.</p>{/if}
       <div class="flex shrink-0 items-center gap-1.5 border-t border-border p-2">
         <input
           bind:value={draft}

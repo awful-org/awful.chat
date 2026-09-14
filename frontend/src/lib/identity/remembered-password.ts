@@ -49,6 +49,11 @@ export async function saveRememberedPassword(
   days: number
 ): Promise<void> {
   takeLegacyCookie();
+  const { getWebAuthnRecord } = await import("../storage");
+  if (await getWebAuthnRecord()) {
+    await clearRememberedPassword();
+    return;
+  }
   const key = await crypto.subtle.generateKey(
     { name: "AES-GCM", length: 256 },
     false, // non-extractable
@@ -76,6 +81,13 @@ export async function saveRememberedPassword(
 }
 
 export async function loadRememberedPassword(): Promise<string | null> {
+  // Enforce at the storage boundary, not just the unlock screen. Older builds
+  // may have saved both credentials; those must never bypass user verification.
+  const { getWebAuthnRecord } = await import("../storage");
+  if (await getWebAuthnRecord()) {
+    await clearRememberedPassword();
+    return null;
+  }
   // Migrate a pre-existing plaintext-cookie password into the encrypted
   // store so users who had "remember me" enabled keep their auto-unlock.
   const legacy = takeLegacyCookie();

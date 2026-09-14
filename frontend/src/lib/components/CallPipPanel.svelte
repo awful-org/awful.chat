@@ -67,6 +67,7 @@
 
   // Clamping on window resize
   function clampToViewport(): void {
+    width = panelWidth();
     clampPanelToViewport();
   }
 
@@ -87,7 +88,7 @@
   const height = $derived(
     callPipPanel.minimized || !hasVideo ? BAR_HEIGHT : HEIGHT + BAR_HEIGHT
   );
-  const width = $derived(panelWidth());
+  let width = $state(panelWidth());
 
 </script>
 
@@ -113,10 +114,11 @@
         },
         size: () => ({ width, height }),
       }}
-      class="flex h-9 shrink-0 cursor-grab touch-none items-center gap-1 border-b border-border bg-muted/40 px-2 active:cursor-grabbing"
+      class="flex shrink-0 flex-wrap content-center cursor-grab touch-none items-center gap-1 border-b border-border bg-muted/40 px-2 active:cursor-grabbing"
+      style="height: {BAR_HEIGHT}px"
     >
       <!-- Room name with speaking ring if minimized -->
-      <span class="min-w-0 flex-1 truncate text-xs font-medium">
+      <span class="w-full min-w-0 truncate text-xs font-medium">
         {panelRoomName}
         {#if (callPipPanel.minimized || !hasVideo) && isSpeaking}
           <span class="ml-1 inline-block size-2 animate-pulse rounded-full bg-primary"></span>
@@ -131,7 +133,7 @@
             type="button"
             onclick={() => void toggleMute()}
             aria-label={transportState.muted ? "Unmute" : "Mute"}
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             {#if transportState.muted}
               <MicOff class="size-3.5" />
@@ -149,8 +151,10 @@
             {...props}
             type="button"
             onclick={() => void toggleCamera()}
+            disabled={transportState.cameraPending}
+            aria-busy={transportState.cameraPending}
             aria-label={transportState.cameraOff ? "Start camera" : "Stop camera"}
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50 disabled:cursor-wait {transportState.cameraPending ? 'animate-pulse' : ''}"
           >
             {#if transportState.cameraOff}
               <VideoOff class="size-3.5" />
@@ -169,7 +173,7 @@
             type="button"
             onclick={togglePin}
             aria-label={callFocus.pinnedTileId === spotlightTileId ? "Unpin" : "Pin"}
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <Pin class="size-3.5" />
           </button>
@@ -190,7 +194,7 @@
               }
             }}
             aria-label={callPipPanel.browserPip ? "Exit PiP" : "Picture in Picture"}
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <Maximize2 class="size-3.5" />
           </button>
@@ -205,7 +209,7 @@
             type="button"
             onclick={() => (callPipPanel.minimized = !callPipPanel.minimized)}
             aria-label={callPipPanel.minimized ? "Restore panel" : "Minimize panel"}
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <Minus class="size-3.5" />
           </button>
@@ -220,7 +224,7 @@
             type="button"
             onclick={() => void requestReturnToCall()}
             aria-label="Back to call"
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             <Phone class="size-3.5" />
           </button>
@@ -235,7 +239,7 @@
             type="button"
             onclick={() => leaveCall()}
             aria-label="Leave call"
-            class="inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded bg-red-600 text-white hover:bg-red-700"
           >
             <PhoneOff class="size-3.5" />
           </button>

@@ -179,3 +179,10 @@ timers, pin clearing on disappearance. `speakers` loop stays untested
 (needs real audio); the store's add/remove bookkeeping gets one test.
 One e2e scenario: join call, open a DM, assert the panel shows the peer,
 start a share on the other browser, assert the panel switches to it.
+# UI sizing update (2026-09-14)
+
+The in-app panel now reserves viewport gutters instead of shrinking to 45vw.
+The title and wrapped 44px call controls occupy a 132px toolbar so return/leave
+remain reachable on phones. Width is shared with drag/clamp calculations and
+refreshed on resize. Camera acquisition uses the stage's pending state; leave
+uses destructive red. Floating DMs also use viewport-bounded widths.

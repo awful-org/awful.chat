@@ -1,4 +1,5 @@
 <script lang="ts">
+  import GifImage from "../GifImage.svelte";
   import { onDestroy, tick } from "svelte";
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
@@ -265,7 +266,7 @@
       class="group relative block h-40 w-full cursor-pointer overflow-hidden bg-linear-to-r from-primary/20 to-secondary/40 sm:h-48"
     >
       {#if profileStore.bannerUrl}
-        <img
+        <GifImage
           src={profileStore.bannerUrl}
           alt="Profile banner"
           class="h-full w-full object-cover"
@@ -303,7 +304,7 @@
         class="group relative -mt-13 flex size-20 items-center justify-center overflow-hidden rounded-full bg-primary/20 ring-4 ring-card cursor-pointer shrink-0"
       >
         {#if profileStore.avatarUrl}
-          <img
+          <GifImage
             src={profileStore.avatarUrl}
             alt="Avatar"
             class="size-full object-cover"

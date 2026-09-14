@@ -238,10 +238,10 @@ services:
       SFU_TELEMETRY: ${SFU_TELEMETRY:-}
       # Floor between one peer's ms:diag requests. Default 10000. Too low and
       # a client can make the mediasoup worker sample stats continuously.
-      SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-}
+      SFU_DIAG_MIN_INTERVAL_MS: ${SFU_DIAG_MIN_INTERVAL_MS:-10000}
       # Same omission SFU_MAX_ROOMS had: read by sfu/index.ts, documented in
       # .env.example, never passed in - so setting it did nothing at all.
-      SFU_REJOIN_PROBE_MS: ${SFU_REJOIN_PROBE_MS:-}
+      SFU_REJOIN_PROBE_MS: ${SFU_REJOIN_PROBE_MS:-3000}
     # NOT dokploy-network. Nothing routes to this service by hostname from
     # outside - it has no traefik labels, and its media ports are published
     # straight to the host - so the only thing the shared network bought was

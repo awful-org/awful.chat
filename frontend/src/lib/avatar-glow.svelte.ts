@@ -1,4 +1,5 @@
 import { SvelteMap } from "svelte/reactivity";
+import { canLoadMedia } from "./media-prefs.svelte";
 
 /**
  * The average colour of an avatar, so chrome around a picture can be lit by
@@ -119,6 +120,7 @@ const glows = new SvelteMap<string, Triplet | null>();
 
 /** Start resolving a URL's glow if it is not already known or in flight. */
 export function primeGlow(url: string): void {
+  if (!canLoadMedia(url)) return;
   if (glows.has(url)) return;
   if (glows.size >= MAX_CACHED) {
     const oldest = glows.keys().next().value;

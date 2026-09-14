@@ -249,6 +249,10 @@ export async function enroll(password: string): Promise<void> {
   identityStore.error = null;
   try {
     await enrollWebAuthn(password);
+    // Biometric protection and a browser-readable remembered password are
+    // mutually exclusive. Keeping the latter would turn enrollment into UI
+    // decoration because the next unlock could bypass the authenticator.
+    await clearRememberedPassword();
     identityStore.hasWebAuthn = true;
   } catch (err) {
     identityStore.error = err instanceof Error ? err.message : String(err);

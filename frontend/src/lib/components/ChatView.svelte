@@ -2,7 +2,7 @@
   import { onDestroy, tick, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
-  import { MAX_MESSAGE_FILES } from "$lib/transport/verify-incoming";
+  import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
   import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
@@ -213,6 +213,8 @@
   let commandPopupOpen = $state(false);
   let commandSelectedIndex = $state(0);
   let commandHint = $state<string | null>(null);
+  let submitting = $state(false);
+  let sendError = $state<string | null>(null);
   let commandHintTimer: ReturnType<typeof setTimeout> | undefined;
   let mentionPopupOpen = $state(false);
   let mentionPrefix = $state("");
@@ -714,8 +716,15 @@
   }
 
   async function submit() {
+    if (submitting) return;
     const text = draft.trim();
     if (!text && stagedFiles.length === 0) return;
+    const submittedDraft = draft;
+    const submittedRoom = roomCode;
+    const submittedFiles = [...stagedFiles];
+    submitting = true;
+    sendError = null;
+    try {
 
     // Check for slash commands
     const slashMatch = text.match(/^\/([a-z0-9-]+)\s?(.*)$/);
@@ -745,6 +754,7 @@
           });
         } catch (err) {
           console.error(`[chat] command /${commandName} failed:`, err);
+          sendError = err instanceof Error ? err.message : "Command failed; your draft has been kept.";
         }
         return;
       }
@@ -763,7 +773,7 @@
 
     if (stagedFiles.length > 0) {
       const sendToken = beginSendingPreview(stagedFiles, wireText);
-      sendFiles(stagedFiles, wireText, {
+      await sendFiles(submittedFiles, wireText, {
         replyTo: replyTarget
           ? {
               id: replyTarget.id,
@@ -774,13 +784,14 @@
       }).finally(() => {
         clearSendingPreview(sendToken);
       });
-      clearStagedFiles();
+      if (roomCode === submittedRoom && stagedFiles.length === submittedFiles.length && stagedFiles.every((f, i) => f === submittedFiles[i])) clearStagedFiles();
     } else if (replyTarget) {
-      sendReply(wireText, replyTarget);
+      await sendReply(wireText, replyTarget);
     } else {
-      sendMessage(wireText);
+      await sendMessage(wireText);
     }
 
+    if (roomCode !== submittedRoom || draft !== submittedDraft) return;
     draft = "";
     replyTargetId = null;
     draftMentionMap.clear();
@@ -792,6 +803,11 @@
       autoResize();
       textareaEl?.focus();
     });
+    } catch (err) {
+      sendError = err instanceof Error ? err.message : "Could not send. Your draft and files have been kept.";
+    } finally {
+      submitting = false;
+    }
   }
 
   function startReply(msg: Message) {
@@ -844,13 +860,15 @@
     }, 900);
   }
 
-  function sendOrReplyWithMessage(content: string): void {
+  async function sendOrReplyWithMessage(content: string): Promise<void> {
     // Send a message (text or URL) with reply context if set. Mirrors the
     // reply branching logic from submit() so GIF selections preserve reply targets.
-    if (replyTarget) {
-      sendReply(content, replyTarget);
-    } else {
-      sendMessage(content);
+    try {
+      if (replyTarget) await sendReply(content, replyTarget);
+      else await sendMessage(content);
+    } catch (err) {
+      sendError = err instanceof Error ? err.message : "Could not send this GIF; please try again.";
+      return;
     }
     // Clear reply state exactly as submit() does.
     replyTargetId = null;
@@ -874,7 +892,7 @@
           }
         : undefined,
     })
-      .catch(() => {})
+      .catch((err) => { sendError = err instanceof Error ? err.message : "Could not send this GIF; please try again."; })
       .finally(() => {
         clearSendingPreview(sendToken);
         // Clear reply state exactly as submit() does.
@@ -2099,7 +2117,7 @@
                           : ""}
                     >
                       {#if isOwn && profileStore.avatarUrl}
-                        <img
+                        <GifImage
                           src={profileStore.avatarUrl}
                           alt="You"
                           class="size-full object-cover"
@@ -2522,6 +2540,13 @@
             updateCommandState();
           }}
         />
+        {#if sendError}
+          <p role="alert" class="mb-1 rounded border border-destructive/30 bg-background px-2 py-1 text-xs text-destructive">{sendError}</p>
+        {:else if submitting}
+          <p role="status" class="px-2 py-1 text-xs text-muted-foreground">Saving and sending…</p>
+        {:else if serialize(draft, draftMentionMap).length > MAX_CHAT_CONTENT_LENGTH}
+          <p role="status" class="px-2 py-1 text-xs text-muted-foreground">This long message will be sent as message.txt.</p>
+        {/if}
         {#if commandHint}
           <p class="absolute bottom-full left-0 mb-1 rounded bg-popover border border-border px-2 py-1 font-mono text-xs text-muted-foreground">
             {commandHint}

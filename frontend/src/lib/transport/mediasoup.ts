@@ -330,6 +330,11 @@ export class MediasoupVideo implements VideoTransport {
 
   // SFU WebSocket - opened on join(), closed on leave()
   private sfuWs: WebSocket | null = null;
+  private joinSigner: ((nonce: string, room: string, peer: string) => string) | null = null;
+
+  setJoinSigner(signer: (nonce: string, room: string, peer: string) => string): void {
+    this.joinSigner = signer;
+  }
   private currentRoomCode: string | null = null;
   private currentPeerId: string | null = null;
   private joinGeneration = 0; // incremented on each join() to guard against stale attemptRejoin
@@ -622,36 +627,55 @@ export class MediasoupVideo implements VideoTransport {
 
       const ws = new WebSocket(sfuUrl);
       this.sfuWs = ws;
+      let proofSent = false;
+      let authenticated = false;
+      const authTimer = setTimeout(() => {
+        reject(new Error("Video server authentication timed out. Update the app and server together."));
+        ws.close();
+      }, 10_000);
 
       ws.onopen = () => {
         rec(ev("sfu.ws.open"));
-        // Identify ourselves to the SFU with a stable anonymous peer id.
-        // We reuse a per-page session id so the SFU can correlate transports.
-        ws.send(
-          JSON.stringify({
-            type: "join",
-            roomCode,
-            peerId,
-          })
-        );
-        resolve();
+        // Wait for a fresh challenge; never send an unauthenticated legacy join.
       };
 
       ws.onerror = () => {
+        clearTimeout(authTimer);
         rec(ev("sfu.ws.error"));
         reject(new Error(SFU_UNREACHABLE));
       };
 
       ws.onmessage = (e: MessageEvent<string>) => {
         try {
-          const msg = JSON.parse(e.data) as MSMessage;
+          if (this.sfuWs !== ws) return;
+          const msg = JSON.parse(e.data);
+          if (!authenticated) {
+            if (msg.type === "auth:challenge" && !proofSent && this.joinSigner) {
+              proofSent = true;
+              const signature = this.joinSigner(msg.nonce, roomCode, peerId);
+              ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature }));
+            } else if (msg.type === "auth:joined" && proofSent) {
+              authenticated = true;
+              clearTimeout(authTimer);
+              resolve();
+            } else {
+              throw new Error("Video server could not verify this device. Update the app and try again.");
+            }
+            return;
+          }
           this.handleSignal(msg);
-        } catch {
-          // ignore non-JSON
+        } catch (err) {
+          if (!authenticated) {
+            clearTimeout(authTimer);
+            reject(err instanceof Error ? err : new Error("Video authentication failed"));
+            ws.close();
+          }
         }
       };
 
       ws.onclose = (closeEvent: CloseEvent) => {
+        clearTimeout(authTimer);
+        if (!authenticated) reject(new Error("Video server closed before authenticating this device"));
         // Only the CURRENT socket's close means anything. A rebuild closes the
         // old socket and opens a new one, and the old close event lands after
         // that - rejecting the fresh socket's in-flight requests (they share
@@ -818,8 +842,12 @@ export class MediasoupVideo implements VideoTransport {
     }
 
     for (const [peer, cs] of this.consumers) {
-      cs.forEach((c) => c.consumer.close());
-      this.emit("peerLeft", peer);
+      // A local rebuild is not a remote departure. Keep the UI's watch intent
+      // so Stop watching remains available while media reconnects.
+      cs.forEach((c) => {
+        c.consumer.close();
+        this.emit("trackRemoved", peer, c.source, c.consumer.kind);
+      });
     }
     this.consumers.clear();
     this.consumerStats.clear();
@@ -1468,6 +1496,8 @@ export class MediasoupVideo implements VideoTransport {
     source: VideoSource
   ): Promise<void> {
     if (!this.device) return;
+    const generation = this.joinGeneration;
+    const watching = source === "screen" && this.watchingTransmissionPeers.has(peerId);
     // A retry (finding 8), a stats-triggered re-consume (finding 5), and two
     // ms:new-producer deliveries for the same id must not double-consume -
     // the server's own duplicate-consume path (sfu/index.ts) resends the
@@ -1510,6 +1540,13 @@ export class MediasoupVideo implements VideoTransport {
       this.recoverRecvTransport();
       throw err;
     }
+    // Stop watching / leave / another reconnect may win while consume awaits
+    // signalling or SDP. Never resurrect that cancelled watch with a late track.
+    if (generation !== this.joinGeneration || (watching && !this.watchingTransmissionPeers.has(peerId))) {
+      consumer.close();
+      if (generation === this.joinGeneration) this.signal({ type: "ms:close-consumer", producerId });
+      return;
+    }
     // The server creates every consumer paused (see handleConsume) so no RTP
     // is wasted - and no keyframe lost - while the recv transport's DTLS
     // handshake is still in flight. Resuming here is what actually starts
@@ -1539,6 +1576,9 @@ export class MediasoupVideo implements VideoTransport {
     }
 
     this.emit("trackAdded", peerId, consumer.track, source);
+    if (source === "screen" && consumer.kind === "video" && this.watchingTransmissionPeers.has(peerId)) {
+      this.emit("transmissionRestored", peerId, producerId);
+    }
 
     consumer.on("trackended", () => {
       this.consumerStats.delete(consumer.id);
@@ -1563,6 +1603,8 @@ export class MediasoupVideo implements VideoTransport {
     producerId: string,
     source: VideoSource
   ): Promise<void> {
+    const generation = this.joinGeneration;
+    const watching = source === "screen" && this.watchingTransmissionPeers.has(peerId);
     try {
       await this.consumeProducer(peerId, producerId, source);
     } catch (err) {
@@ -1573,6 +1615,7 @@ export class MediasoupVideo implements VideoTransport {
         })
       );
       await new Promise((resolve) => setTimeout(resolve, 3_000));
+      if (generation !== this.joinGeneration || (watching && !this.watchingTransmissionPeers.has(peerId))) return;
       try {
         await this.consumeProducer(peerId, producerId, source);
       } catch (err) {

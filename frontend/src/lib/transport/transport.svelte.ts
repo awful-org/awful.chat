@@ -84,6 +84,8 @@ import { DtlnProcessor } from "../audio/dtln-processor";
 import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession } from "../identity/identity";
 import { deviceKeySeed } from "./device-key";
+import { signSfuJoin } from "./sfu-auth";
+import { prepareOutgoingText } from "./outgoing-text";
 import { acquireNodeLock, releaseNodeLock } from "./node-lock";
 import { quickSessionSeed } from "$lib/quick/session-key";
 import { looksLikeDid, looksLikePeerId } from "../identity/identity-utils";
@@ -651,6 +653,9 @@ else setTimeout(warmWorkletCache, 3000);
 export const _transport = new LibP2PTransport();
 export const _voice = new LibP2PVoice(_transport, _dtln);
 export const _video = new MediasoupVideo();
+_video.setJoinSigner((nonce, room, peer) =>
+  signSfuJoin(_ephemeralSession ? quickSessionSeed() : deviceKeySeed(), nonce, room, peer)
+);
 export const _fileTransport = new WebTorrentFileTransport(() =>
   _transport.selfId()
 );
@@ -4062,14 +4067,14 @@ async function _sendDmBatch(
   roomCode: string,
   wire: WireChatMessage,
   batchOf: (w: WireChatMessage) => Uint8Array
-): Promise<void> {
+): Promise<"sent" | "sending"> {
   const peerDid = await dmPeerDidForRoom(roomCode);
-  if (!peerDid) return;
+  if (!peerDid) throw new Error("Cannot send yet: still verifying who this peer is.");
   const batch = batchOf(wire);
   const peerId = didToPeerId(peerDid);
   if (peerId && (await _transport.send(peerId, batch))) {
     applyMessageStatus(wire.id, "sent");
-    return;
+    return "sent";
   }
   // Queued, so the clock stays on the bubble until the flush (or the peer's
   // own digest) says otherwise.
@@ -4084,6 +4089,7 @@ async function _sendDmBatch(
     "batch"
   );
   noteMailboxDeposit(wire.id, result);
+  return result === "sent" ? "sent" : "sending";
 }
 
 export async function sendMessage(
@@ -4094,16 +4100,22 @@ export async function sendMessage(
     await sendDirectMessage(text, { replyTo: options.replyTo });
     return;
   }
-  if (!transportState.roomCode) return;
+  const roomCode = transportState.roomCode;
+  if (!roomCode) throw new Error("Open a conversation before sending");
+  const prepared = prepareOutgoingText(text);
+  if (prepared.files.length) {
+    await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo });
+    return;
+  }
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
-  const lamport = lamportSend(transportState.roomCode);
+  const lamport = lamportSend(roomCode);
 
   let msg: Message = {
     id: crypto.randomUUID(),
-    roomCode: transportState.roomCode,
+    roomCode,
     senderId: myId,
     senderName,
     timestamp: Date.now(),
@@ -4127,16 +4139,21 @@ export async function sendMessage(
   // says so; _handleDigest promotes it to "sent" once a member's watermark
   // proves they hold it. Set AFTER signing: status is not in the canonical
   // and never rides the wire.
-  msg.status = _broadcastChatWire(messageToWire(msg), transportState.roomCode)
+  // Persist before publishing: a storage failure must leave a retryable draft,
+  // not a sent message that the composer reports as failed.
+  msg.status = "sending";
+  await putMessage(msg);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
+  msg.status = _broadcastChatWire(messageToWire(msg), roomCode)
     ? "sent"
     : "sending";
 
   // Echo BEFORE the storage writes: seal + two IDB round-trips gated the
   // local echo, which read as send lag - the network send already left.
-  transportState.messages = appendSorted(transportState.messages, msg);
-
-  await putMessage(msg);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
+  if (transportState.roomCode === roomCode) {
+    transportState.messages = appendSorted(transportState.messages, msg);
+  }
+  applyMessageStatus(msg.id, msg.status);
 
   markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
@@ -4163,9 +4180,14 @@ export async function sendReply(text: string, target: Message): Promise<void> {
 export async function sendFiles(
   files: File[],
   text = "",
-  options: Pick<SendMessageOptions, "replyTo"> = {}
+  options: Pick<SendMessageOptions, "replyTo"> & { roomCode?: string } = {}
 ): Promise<void> {
-  if (!transportState.roomCode || !files.length) return;
+  const roomCode = options.roomCode ?? transportState.roomCode;
+  if (!roomCode) throw new Error("Open a conversation before sending");
+  const prepared = prepareOutgoingText(text, files);
+  files = prepared.files;
+  text = prepared.text;
+  if (!files.length) throw new Error("Choose a file to send");
 
   const seeded: FileDescriptor[] = [];
   const sourceByInfoHash = new Map<string, File>();
@@ -4211,7 +4233,7 @@ export async function sendFiles(
     }
     const attachment: Attachment = {
       id: crypto.randomUUID(),
-      roomCode: transportState.roomCode,
+      roomCode,
       messageId,
       filename: seededFile.filename,
       mimeType: seededFile.mimeType,
@@ -4243,13 +4265,13 @@ export async function sendFiles(
   const myId = identityStore.did ?? _transport.selfId();
   // DM rooms order by wall-clock ms; a room-counter lamport (~small int)
   // filed the file before the entire conversation and it vanished on reload.
-  const lamport = transportState.roomCode.startsWith("dm-")
-    ? await nextDmLamport(transportState.roomCode, createdAt)
-    : lamportSend(transportState.roomCode);
+  const lamport = roomCode.startsWith("dm-")
+    ? await nextDmLamport(roomCode, createdAt)
+    : lamportSend(roomCode);
 
   let msg: Message = {
     id: messageId,
-    roomCode: transportState.roomCode,
+    roomCode,
     senderId: myId,
     senderName,
     timestamp: createdAt,
@@ -4281,13 +4303,23 @@ export async function sendFiles(
     };
   }
   // Same clock as a text send; see sendMessage.
-  msg.status = _broadcastChatWire(wire, transportState.roomCode)
-    ? "sent"
-    : "sending";
+  msg.status = "sending";
   await putMessage(msg);
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
-
-  transportState.messages = appendSorted(transportState.messages, msg);
+  if (roomCode.startsWith("dm-")) {
+    msg.status = await _sendDmBatch(roomCode, wire, (w) => encode({
+      type: MessageType.SyncBatch, roomCode, messages: [w],
+      batchIndex: 0, totalBatches: 1, live: true,
+    }));
+    const { appendToDmPanel } = await import("$lib/dm-panel.svelte");
+    appendToDmPanel(msg);
+  } else {
+    msg.status = _broadcastChatWire(wire, roomCode) ? "sent" : "sending";
+    applyMessageStatus(msg.id, msg.status);
+  }
+  if (transportState.roomCode === roomCode) {
+    transportState.messages = appendSorted(transportState.messages, msg);
+  }
 
   markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);

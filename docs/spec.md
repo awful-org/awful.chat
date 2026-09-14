@@ -968,10 +968,50 @@ Protocol handler: web+awfl://<code> maps to /r/<encoded url>; the router
 
 ---
 
+## SFU Connection Authentication
+
+The video server issues `auth:challenge` with a fresh 256-bit hex nonce for
+each WebSocket. Within 10 seconds, the client sends `join` with `roomCode`,
+`peerId`, and a base64 Ed25519 `signature` over the UTF-8 JSON serialization
+of `["awful:sfu:join:v1", nonce, roomCode, peerId]`. The server extracts the
+public key from the application's canonical libp2p Ed25519 peer ID and consumes
+the nonce once, before allocating a room or probing an incumbent session.
+`auth:joined` acknowledges admission. Unsigned legacy joins are rejected.
+
+Deploy the frontend and SFU together; older clients must reload. This proves
+device-key ownership, not secret room membership, and does not encrypt media
+against the SFU operator. Quick calls sign with their ephemeral session key.
+Blank numeric SFU environment variables use defaults; malformed/out-of-range
+values fail startup. Rejoin probes default to 3000 ms and diagnostics to a
+10000 ms minimum interval.
+
+## Long Messages and Invite Entry
+
+Outgoing text exceeding 16,384 JavaScript string code units after mention
+serialization becomes a UTF-8 `message.txt` attachment, preserving the text.
+The same path serves rooms, replies, and DMs (including the floating panel).
+The file counts toward the receiver's attachment limit. Composers retain their
+draft on rejected sends and show the error; offline queued delivery still uses
+the existing sending status. Attachment availability follows ordinary file
+transfer rules.
+
+Join accepts supported room links through the shared room-code parser.
+Unknown or expired short aliases produce an error; ambiguous six-hex legacy
+codes require explicit legacy joining. Short-code displays track the returned
+TTL and regenerate on copying after expiry. Global alias lookup admission
+runs before lookup for both existing and missing codes.
+
 ## Open Graph (OG) Proxy
 
 ```txt
-Purpose: Prevent client IP leaks to third-party sites when fetching link previews
+Purpose: Fetch preview metadata through the relay. The relay sees the complete
+         requested URL; directly loaded preview images/video still expose the
+         client's IP to their hosts.
+Privacy: App Settings > External previews and media is on by default.
+         When disabled, message preview metadata requests and core remote
+         avatars/GIFs are blocked. Local/blob/data attachments remain available.
+         GIF search, explicitly opened links, and plugin network access are
+         separate user-initiated surfaces, not covered by this media switch.
 Endpoint: /og/preview?url=<encoded_url> on the Go relay's API port
          (/og is an alias; /klipy/* proxies GIF search the same way)
 Response: JSON { title, description, image, siteName, url, video, mediaType }
@@ -1004,6 +1044,10 @@ Storage: password AES-256-GCM encrypted under a NON-EXTRACTABLE CryptoKey,
          both stored in a dedicated IndexedDB ("awful-auth") - never in a
          cookie, never sent over the network, not readable via document.cookie
 Expiry: user-configurable duration (default 15 days), optional sliding reset
+Opt-in: new identity setup does not remember the password by default.
+Biometrics: enrollment clears remembered credentials. Remembered-password
+            reads/writes also refuse access while WebAuthn is enrolled, including
+            credentials left by older versions. Password fallback must be typed.
 Migration: a legacy plaintext "awful_password" cookie is read once,
            migrated into the encrypted store, then deleted
 Fallback: manual password entry (or WebAuthn/biometric unlock) when absent

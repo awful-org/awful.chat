@@ -330,6 +330,7 @@
         onValueChange={(v) => void setCamera(v || null)}
       >
         <SelectTrigger
+          aria-label="Camera"
           class="bg-background border-input font-mono text-sm focus:ring-ring"
         >
           <span class="block truncate">
@@ -384,6 +385,7 @@
         onValueChange={(v) => handleInputDeviceChange(v)}
       >
         <SelectTrigger
+          aria-label="Microphone"
           class="bg-background border-input font-mono text-sm focus:ring-ring"
         >
           <span class="block truncate">
@@ -416,6 +418,7 @@
         >
       </div>
       <Slider
+        aria-label="Input gain"
         type="multiple"
         bind:value={inputSlider}
         min={0}
@@ -448,6 +451,7 @@
           {dtlnEnabled ? "DTLN" : "Browser"}
         </span>
         <Switch
+          aria-label="DTLN noise suppression"
           bind:checked={dtlnEnabled}
           onCheckedChange={(checked) => setVoiceDtlnEnabled(checked)}
         />
@@ -465,6 +469,7 @@
           >
         </div>
         <Slider
+          aria-label="Gate threshold"
           type="single"
           value={noiseGateSlider[0]}
           min={0}
@@ -532,6 +537,7 @@
         onValueChange={(v) => handleOutputDeviceChange(v)}
       >
         <SelectTrigger
+          aria-label="Speakers"
           class="bg-background border-input font-mono text-sm focus:ring-ring"
         >
           <span class="block truncate">
@@ -566,6 +572,7 @@
         >
       </div>
       <Slider
+        aria-label="Output volume"
         type="multiple"
         bind:value={outputSlider}
         min={0}
@@ -590,6 +597,7 @@
         >
       </div>
       <Switch
+        aria-label="Send screen share audio even when echo prevention is unavailable"
         bind:checked={shareAudioDespiteEchoRisk}
         onCheckedChange={(checked) => setShareAudioDespiteEchoRisk(checked)}
       />

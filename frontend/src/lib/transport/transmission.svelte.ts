@@ -144,6 +144,15 @@ _video.on("trackRemoved", (peerId, source, kind) => {
     playTransmissionJoinSound();
   });
 
+  _video.on("transmissionRestored", (peerId, producerId) => {
+    transportState.watchingTransmissionPeerId = peerId;
+    transportState.watchingTransmissionProducerId = producerId;
+    const pending = new Map(transportState.pendingTransmissions);
+    pending.delete(peerId);
+    transportState.pendingTransmissions = pending;
+    _sendWatchPresence();
+  });
+
   _video.on("transmissionWatchEnded", () => {
     playTransmissionLeaveSound();
   });
@@ -232,9 +241,9 @@ export async function watchTransmission(
 export function stopWatchingTransmission(): void {
   const peerId = transportState.watchingTransmissionPeerId;
   const producerId = transportState.watchingTransmissionProducerId;
-  if (!peerId || !producerId) return;
+  if (!peerId) return;
   getVideo().stopWatchingTransmission(peerId);
-  transportState.pendingTransmissions = new Map(
+  if (producerId) transportState.pendingTransmissions = new Map(
     transportState.pendingTransmissions
   ).set(peerId, producerId);
   transportState.watchingTransmissionPeerId = null;

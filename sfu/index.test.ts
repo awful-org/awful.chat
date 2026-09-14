@@ -12,6 +12,10 @@ import assert from "node:assert/strict";
 import { spawn, ChildProcess } from "node:child_process";
 import path from "node:path";
 import { WebSocket } from "ws";
+import { generateKeyPairSync, sign } from "node:crypto";
+import bs58 from "bs58";
+import { joinPayload, verifyJoin } from "./auth";
+import { envInteger } from "./config";
 import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 
 // Picking a port off the pid keeps concurrent test runs on the same machine
@@ -154,17 +158,96 @@ function nextMessage(
 
 async function connectAndJoin(
   roomCode: string,
-  peerId: string,
+  label: string,
   port: number = PORT,
 ): Promise<WebSocket> {
   const ws = new WebSocket(wsUrl(port));
+  const challenge = nextMessage(ws, (m) => m.type === "auth:challenge");
   await new Promise<void>((resolve, reject) => {
     ws.once("open", () => resolve());
     ws.once("error", reject);
   });
-  ws.send(JSON.stringify({ type: "join", roomCode, peerId }));
+  const { nonce } = await challenge;
+  const peerId = testPeer(label).peerId;
+  const signature = sign(null, Buffer.from(joinPayload(nonce, roomCode, peerId)), testPeer(label).privateKey).toString("base64");
+  const joined = nextMessage(ws, (m) => m.type === "auth:joined");
+  ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature }));
+  await joined;
   return ws;
 }
+
+const identities = new Map<string, ReturnType<typeof makeTestPeer>>();
+function makeTestPeer() {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const raw = Buffer.from(publicKey.export({ format: "jwk" }).x!, "base64url");
+  return { privateKey, peerId: bs58.encode(Buffer.concat([Buffer.from([0, 36, 8, 1, 18, 32]), raw])) };
+}
+function testPeer(label: string) {
+  if (!identities.has(label)) identities.set(label, makeTestPeer());
+  return identities.get(label)!;
+}
+
+test("join signature binds nonce, room and peer identity", () => {
+  const a = testPeer("auth-a"), b = testPeer("auth-b");
+  const signature = sign(null, Buffer.from(joinPayload("nonce-a", "room-a", a.peerId)), a.privateKey).toString("base64");
+  assert.ok(verifyJoin("nonce-a", "room-a", a.peerId, signature));
+  assert.equal(verifyJoin("nonce-b", "room-a", a.peerId, signature), false);
+  assert.equal(verifyJoin("nonce-a", "room-b", a.peerId, signature), false);
+  assert.equal(verifyJoin("nonce-a", "room-a", b.peerId, signature), false);
+  assert.equal(verifyJoin("nonce-a", "room-a", a.peerId, null), false);
+});
+
+test("SFU rejects unsigned joins, forged identities and cross-socket replay", async () => {
+  const a = testPeer("auth-wire-a"), b = testPeer("auth-wire-b");
+  let captured = "";
+  for (const mode of ["unsigned", "forged", "capture", "replay"]) {
+    const ws = new WebSocket(wsUrl());
+    try {
+      const { nonce } = await nextMessage(ws, m => m.type === "auth:challenge");
+      const signature = mode === "replay" ? captured : sign(null, Buffer.from(joinPayload(nonce, "auth-room", a.peerId)), mode === "forged" ? b.privateKey : a.privateKey).toString("base64");
+      if (mode === "capture") captured = signature;
+      const reply = nextMessage(ws, m => m.type === "auth:joined" || m.type === "ms:error");
+      ws.send(JSON.stringify({ type: "join", roomCode: "auth-room", peerId: a.peerId, signature: mode === "unsigned" ? undefined : signature }));
+      assert.equal((await reply).type, mode === "capture" ? "auth:joined" : "ms:error");
+    } finally { ws.close(); }
+  }
+});
+
+test("authenticated identity reconnects after disconnect and cannot evict its live session", async () => {
+  const label = "auth-reconnect";
+  const first = await connectAndJoin("auth-reconnect-room", label);
+  const duplicate = new WebSocket(wsUrl());
+  try {
+    const { nonce } = await nextMessage(duplicate, m => m.type === "auth:challenge");
+    const { peerId, privateKey } = testPeer(label);
+    const reply = nextMessage(duplicate, m => m.type === "ms:error");
+    const signature = sign(null, Buffer.from(joinPayload(nonce, "auth-reconnect-room", peerId)), privateKey).toString("base64");
+    duplicate.send(JSON.stringify({ type: "join", roomCode: "auth-reconnect-room", peerId, signature }));
+    assert.equal((await reply).reason, "peer-id-in-use");
+    assert.equal(first.readyState, WebSocket.OPEN);
+  } finally {
+    duplicate.close();
+    await new Promise<void>(resolve => { first.once("close", () => resolve()); first.close(); });
+  }
+  const next = await connectAndJoin("auth-reconnect-room", label);
+  next.close();
+});
+
+test("blank numeric settings use defaults and malformed limits fail closed", () => {
+  const key = "AWFUL_TEST_INTEGER";
+  try {
+    for (const raw of ["", "  "]) {
+      process.env[key] = raw;
+      assert.equal(envInteger(key, 3000), 3000);
+    }
+    for (const raw of ["no", "0", "-1", "3ms", "1.5", "Infinity", "2147483648"]) {
+      process.env[key] = raw;
+      assert.throws(() => envInteger(key, 3000));
+    }
+    process.env[key] = "25";
+    assert.equal(envInteger(key, 3000), 25);
+  } finally { delete process.env[key]; }
+});
 
 test("reaps a send transport that never completes ms:connect-transport", async () => {
   const ws = await connectAndJoin("room-reap", "peer-reap");
@@ -267,7 +350,7 @@ test("reaps a peer whose socket goes silently dead, freeing its producer", async
       wsB,
       (m) => m.type === "ms:new-producer" && m.producerId === producerId,
     );
-    assert.equal(newProducer.peerId, "peer-dead-a");
+    assert.equal(newProducer.peerId, testPeer("peer-dead-a").peerId);
 
     // Simulate the wifi-to-cellular handover the heartbeat exists for: the
     // socket sends no FIN and answers no ping, but nothing here calls
@@ -280,10 +363,10 @@ test("reaps a peer whose socket goes silently dead, freeing its producer", async
     const start = Date.now();
     const peerLeft = await nextMessage(
       wsB,
-      (m) => m.type === "ms:peer-left" && m.peerId === "peer-dead-a",
+      (m) => m.type === "ms:peer-left" && m.peerId === testPeer("peer-dead-a").peerId,
       HEARTBEAT_INTERVAL_MS * 2 + 4000,
     );
-    assert.equal(peerLeft.peerId, "peer-dead-a");
+    assert.equal(peerLeft.peerId, testPeer("peer-dead-a").peerId);
     // Reaped within roughly two heartbeat ticks (isAlive goes false on the
     // first unanswered ping, terminated on the second), not the old 30s-tick
     // heartbeat's up-to-60s window.
@@ -469,7 +552,7 @@ test("ms:diag returns a snapshot naming this peer's own transport and producer",
       (m) => m.type === "ms:diag" && m.requestId === "diag-1",
     );
 
-    assert.equal(reply.snapshot.self.peerId, "peer-diag-a");
+    assert.equal(reply.snapshot.self.peerId, testPeer("peer-diag-a").peerId);
     const sendTransport = reply.snapshot.self.transports.find(
       (t: { dir: string }) => t.dir === "send",
     );

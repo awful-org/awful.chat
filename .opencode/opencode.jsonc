@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agents": {
+    "fullstack": { "model": "openai/gpt-6-astra" },
+    "coding": { "model": "openai/gpt-6-astra" },
+    "devops": { "model": "openai/gpt-6-astra" },
+    "review": { "model": "openai/gpt-6-astra" },
+    "sa": { "model": "openai/gpt-6-astra" },
+    "general": { "model": "openai/gpt-6-astra" },
+    "explore": { "model": "openai/gpt-6-astra" }
+  }
+}

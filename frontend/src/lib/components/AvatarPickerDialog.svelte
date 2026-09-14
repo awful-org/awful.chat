@@ -1,4 +1,5 @@
 <script lang="ts">
+  import GifImage from "./GifImage.svelte";
   import { createInfiniteQuery } from "@tanstack/svelte-query";
   import { X, Upload, Search, Link, Crop } from "@lucide/svelte";
   import { Dialog as DialogPrimitive } from "bits-ui";
@@ -313,7 +314,7 @@
           : 'size-28 rounded-full'} overflow-hidden bg-primary/20 flex items-center justify-center ring-2 ring-border"
       >
         {#if preview}
-          <img
+          <GifImage
             src={preview}
             alt={isBanner ? "Banner preview" : "Avatar preview"}
             class="size-full object-cover"
@@ -459,7 +460,7 @@
                     : ''}"
                   aria-label={gif.title}
                 >
-                  <img
+                  <GifImage
                     src={gif.urls.tinygif || gif.urls.mediumgif}
                     alt={gif.title}
                     class="w-full h-full object-cover"

@@ -38,7 +38,11 @@ export interface DmPanelState {
 
 export const WIDTH = 340;
 export const HEIGHT = 420;
-export const BAR_HEIGHT = 40;
+export const BAR_HEIGHT = 52;
+
+export function panelWidth(): number {
+  return typeof window === "undefined" ? WIDTH : Math.min(WIDTH, Math.max(0, window.innerWidth - 16));
+}
 
 export const dmPanel = $state<DmPanelState>({
   peerId: null,
@@ -55,7 +59,7 @@ export const dmPanel = $state<DmPanelState>({
 export function defaultPanelPosition(): { x: number; y: number } {
   if (typeof window === "undefined") return { x: 24, y: 24 };
   return {
-    x: Math.max(8, window.innerWidth - WIDTH - 24),
+    x: Math.max(8, window.innerWidth - panelWidth() - 24),
     y: Math.max(8, window.innerHeight - HEIGHT - 96),
   };
 }

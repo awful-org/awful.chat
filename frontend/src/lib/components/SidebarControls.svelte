@@ -1,4 +1,5 @@
 <script lang="ts">
+  import GifImage from "./GifImage.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import {
     Camera,
@@ -178,7 +179,7 @@
           class="relative flex size-9 items-center justify-center rounded-full overflow-hidden bg-primary/20 hover:ring-2 hover:ring-primary/50 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary"
         >
           {#if profileStore.avatarUrl}
-            <img
+            <GifImage
               src={profileStore.avatarUrl}
               alt="Avatar"
               class="size-full object-cover"

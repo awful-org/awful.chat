@@ -75,13 +75,16 @@
       !identityStore.loading &&
       !identityStore.error
     ) {
+      if (identityStore.hasWebAuthn) {
+        // Clean up credentials saved by older builds. Password fallback stays
+        // available, but must be typed explicitly when biometrics are enrolled.
+        clearRememberedPassword().catch(() => {});
+        return;
+      }
       loadRememberedPassword().then((stored) => {
         if (!stored || userEdited || password) return;
         password = stored;
         remember = true;
-        if (canUseBiometrics) {
-          return;
-        }
         startAutoLogin(
           unlock(stored)
             .then(() => {
@@ -93,6 +96,8 @@
             })
             .catch(() => {})
         );
+      }).catch(() => {
+        // Storage may be unavailable; manual password entry remains usable.
       });
     }
   });
@@ -101,7 +106,7 @@
     try {
       identityStore.justLoggedOut = false;
       await unlock(password);
-      if (remember) {
+      if (remember && !identityStore.hasWebAuthn) {
         // getRememberDuration() may be -1 ("until logout") - a valid choice
         // that saveRememberedPassword now handles, not a reason to clear.
         await saveRememberedPassword(password, getRememberDuration());
@@ -117,14 +122,7 @@
     try {
       identityStore.justLoggedOut = false;
       await unlockWithBiometrics();
-      const resetTimer =
-        localStorage.getItem("awful_remember_reset_timer") === "true";
-      if (resetTimer) {
-        const stored = await loadRememberedPassword();
-        if (stored) {
-          await saveRememberedPassword(stored, getRememberDuration());
-        }
-      }
+      await clearRememberedPassword();
     } catch {
       // error already in identityStore.error
     }
@@ -181,12 +179,17 @@
         </div>
       {/if}
 
+      <label for="unlock-password" class="text-xs font-medium">Password</label>
       <Input
+        id="unlock-password"
         type="password"
         bind:value={password}
         oninput={() => (userEdited = true)}
         onkeydown={onKeydown}
-        placeholder="password"
+        placeholder="Password"
+        autocomplete="current-password"
+        aria-invalid={identityStore.error ? "true" : undefined}
+        aria-describedby={identityStore.error ? "unlock-error" : undefined}
         autofocus={!canUseBiometrics}
         class="bg-background border-input font-mono focus-visible:ring-ring
           {identityStore.error
@@ -195,14 +198,14 @@
       />
 
       {#if identityStore.error}
-        <p class="text-xs text-destructive font-mono">{identityStore.error}</p>
+        <p id="unlock-error" role="alert" class="text-xs text-destructive font-mono">{identityStore.error}</p>
       {/if}
 
       <label
         class="flex items-center gap-2 text-xs text-muted-foreground font-mono cursor-pointer"
       >
-        <input type="checkbox" bind:checked={remember} class="mt-0.5 w-4 h-4 rounded border-input bg-background accent-primary cursor-pointer" />
-        Remember my password
+        <input type="checkbox" bind:checked={remember} disabled={identityStore.hasWebAuthn} class="mt-0.5 w-4 h-4 rounded border-input bg-background accent-primary cursor-pointer" />
+        {identityStore.hasWebAuthn ? "Remembering is unavailable while biometric unlock is enabled" : "Remember my password"}
       </label>
     </CardContent>
 

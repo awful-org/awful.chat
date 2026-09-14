@@ -12,6 +12,14 @@
     Wifi,
     Video,
   } from "@lucide/svelte";
+  let { compact = false }: { compact?: boolean } = $props();
+  let expanded = $state(false);
+  const essentials = [
+    "Use an instance you trust: its operator supplies the app code and a modified app can read your messages and recovery phrase.",
+    "Camera and screen sharing pass through a media server whose operator can access them. Voice uses peer-to-peer connections, with TURN fallback when needed.",
+    "Your history lives on your devices and peers. Back it up before clearing site data. Offline DMs wait encrypted at the relay for up to 48 hours.",
+    "Write down your 12 recovery words outside this device. There is no password reset. The words restore your identity, not a guaranteed copy of your history.",
+  ];
 
   // Single source of truth for the "how this app behaves" copy. Rendered both
   // in the first-run dialog (IdentitySetup) and the Quirks settings tab.
@@ -78,7 +86,7 @@
 </script>
 
 <div class="flex flex-col gap-2">
-  {#each quirks as quirk (quirk.title)}
+  {#each compact && !expanded ? quirks.slice(0, 4) : quirks as quirk, i (quirk.title)}
     <div
       class="flex gap-3 p-3 rounded-lg border {quirk.warn
         ? 'bg-amber-500/5 border-amber-500/40'
@@ -94,9 +102,14 @@
           {quirk.title}
         </p>
         <p class="text-xs font-mono text-muted-foreground leading-relaxed">
-          {quirk.body}
+          {compact && !expanded ? essentials[i] : quirk.body}
         </p>
       </div>
     </div>
   {/each}
+  {#if compact}
+    <button type="button" aria-expanded={expanded} onclick={() => expanded = !expanded} class="rounded-md px-3 py-2 text-left text-sm text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring">
+      {expanded ? "Show the essentials" : "More about delivery, room codes, files and devices"}
+    </button>
+  {/if}
 </div>
