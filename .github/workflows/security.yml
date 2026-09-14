@@ -1,6 +1,5 @@
-# Weekly dependency sweep. Only govulncheck can fail the run: npm audit on
-# the frontend is dominated by react-native tooling that never ships in the
-# browser bundle, so it is reported, not enforced.
+# Weekly dependency sweep. Go reachable-code checks and both production
+# dependency audits are enforced. Frontend excludes unused native-only trees.
 name: security
 
 on:
@@ -29,7 +28,7 @@ jobs:
       - name: sfu (production deps)
         working-directory: sfu
         run: npm ci --ignore-scripts && npm audit --omit=dev
-      - name: frontend (production deps, informational)
+      - name: frontend (production deps)
         if: always()
         working-directory: frontend
-        run: pnpm install --frozen-lockfile --ignore-scripts && pnpm audit --prod || true
+        run: pnpm install --frozen-lockfile --ignore-scripts && pnpm audit --prod
