@@ -12,7 +12,26 @@
     DrawerHeader,
     DrawerTitle,
   } from "$lib/components/ui/drawer";
-  import { viewportHeight } from "$lib/actions/viewport-height";
+  let visibleHeight = $state(typeof window === "undefined" ? 800 : window.innerHeight);
+  let viewportTop = $state(0);
+  let viewportBottom = $state(0);
+  $effect(() => {
+    const viewport = window.visualViewport;
+    const update = () => {
+      visibleHeight = viewport?.height ?? window.innerHeight;
+      viewportTop = viewport?.offsetTop ?? 0;
+      viewportBottom = Math.max(0, window.innerHeight - visibleHeight - viewportTop);
+    };
+    update();
+    window.addEventListener("resize", update);
+    viewport?.addEventListener("resize", update);
+    viewport?.addEventListener("scroll", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      viewport?.removeEventListener("resize", update);
+      viewport?.removeEventListener("scroll", update);
+    };
+  });
 
   // Filled in with the host the page is actually served from, so the command
   // is runnable as printed rather than a template to edit.
@@ -145,6 +164,7 @@
       <button
         type="button"
         onclick={() => (activeTab = tab.id)}
+        aria-pressed={activeTab === tab.id}
         class="flex shrink-0 items-center gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {activeTab ===
         tab.id
           ? isMobile
@@ -262,10 +282,10 @@
 
 {#snippet DesktopSidebar()}
   <div class="flex flex-col h-full">
-    <div class="flex-1">
+    <div class="min-h-0 flex-1 overflow-y-auto">
       {@render TabBar()}
     </div>
-    <div class="pt-2 border-t border-border mt-2">
+    <div class="shrink-0 pt-2 border-t border-border mt-2">
       <Button
         variant="ghost"
         class="w-full font-mono text-xs text-muted-foreground justify-start
@@ -284,7 +304,7 @@
     <div class="hidden sm:flex w-36 h-full">
       {@render DesktopSidebar()}
     </div>
-    <div class="flex-1 overflow-y-auto pr-2 pt-4">
+    <div class="min-w-0 min-h-0 flex-1 overflow-y-auto pr-2 pt-4">
       {#if activeTab === "profile"}
         <ProfileSettings
           {isMobile}
@@ -314,14 +334,14 @@
 
 {#if isMobile}
   <Drawer bind:open onOpenChange={closeHandler} direction="bottom">
-    <DrawerContent class="bg-card text-card-foreground border-border">
-      <DrawerHeader class="px-4 py-2 bg-card sticky">
+    <DrawerContent class="bg-card text-card-foreground border-border overflow-hidden" style="height: {visibleHeight * 0.9}px; max-height: {visibleHeight * 0.9}px; bottom: {viewportBottom}px;">
+      <DrawerHeader class="shrink-0 px-4 py-2 bg-card">
         <DrawerTitle class="font-mono text-base font-semibold mx-auto"
           >Settings</DrawerTitle
         >
         {@render TabBar()}
       </DrawerHeader>
-      <div use:viewportHeight class="flex flex-col w-full overflow-hidden">
+      <div class="flex min-h-0 flex-1 flex-col w-full overflow-hidden">
         <div class="px-4 py-2 space-y-4 overflow-y-auto min-h-0">
           {#if activeTab === "profile"}
             <ProfileSettings
@@ -353,14 +373,15 @@
 {:else}
   <Dialog bind:open onOpenChange={closeHandler}>
     <DialogContent
-      class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-200 sm:h-137.5 lg:h-150 flex flex-col p-0"
+      class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-0 sm:h-137.5 lg:h-150 flex flex-col overflow-hidden p-0"
+      style="max-height: {Math.max(0, visibleHeight - 32)}px; top: {viewportTop + visibleHeight / 2}px;"
     >
       <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
         <DialogTitle class="font-mono text-base font-semibold"
           >Settings</DialogTitle
         >
       </DialogHeader>
-      <div class="flex-1 overflow-hidden px-4 pb-4">
+      <div class="min-h-0 flex-1 overflow-hidden px-4 pb-4">
         {@render DesktopContent()}
       </div>
     </DialogContent>

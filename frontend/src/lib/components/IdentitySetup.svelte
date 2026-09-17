@@ -1,4 +1,5 @@
 <script lang="ts">
+  import GifImage from "./GifImage.svelte";
   import { restore, identityStore } from "$lib/identity/identity.svelte";
   import { createIdentity } from "$lib/identity/identity";
   import { viewportHeight } from "$lib/actions/viewport-height";
@@ -228,7 +229,7 @@
   let createdPassword = $state(""); // hold password through steps for enrollment
   let biometricLoading = $state(false);
   let biometricError = $state<string | null>(null);
-  let remember = $state(true);
+  let remember = $state(false);
 
   const DURATION_KEY = "awful_remember_duration";
 
@@ -305,18 +306,18 @@
     identityStore.publicKey = pendingKeypair.publicKey;
     identityStore.keypair = pendingKeypair;
     identityStore.error = null;
-    if (remember) {
-      saveRememberedPassword(createdPassword, getRememberDuration());
+    if (remember && !identityStore.hasWebAuthn) {
+      await saveRememberedPassword(createdPassword, getRememberDuration());
     }
     createdPassword = "";
     mnemonic = null;
   }
 
   async function handleRestore() {
-    await restore(restoreMnemonic.trim(), restorePassword);
-    if (remember) {
-      saveRememberedPassword(restorePassword, getRememberDuration());
-    }
+    try {
+      await restore(restoreMnemonic.trim(), restorePassword);
+      if (remember && !identityStore.hasWebAuthn) await saveRememberedPassword(restorePassword, getRememberDuration());
+    } catch { /* restore exposes the error beside the preserved fields */ }
   }
 
   function copyMnemonic() {
@@ -432,7 +433,9 @@
         </CardDescription>
       </CardHeader>
       <CardContent class="flex flex-col gap-3">
+        <label for="create-password" class="text-xs font-medium">Password</label>
         <Input
+          id="create-password" autocomplete="new-password" aria-describedby="create-password-help"
           type="password"
           bind:value={password}
           placeholder="password"
@@ -442,7 +445,9 @@
           class="bg-background border-input font-mono focus-visible:ring-ring"
         />
         <div class="flex flex-col gap-1">
+          <label for="create-password-confirm" class="text-xs font-medium">Confirm password</label>
           <Input
+            id="create-password-confirm" autocomplete="new-password" aria-invalid={passwordMismatch} aria-describedby={passwordMismatch ? "create-password-mismatch" : undefined}
             type="password"
             bind:value={passwordConfirm}
             placeholder="confirm password"
@@ -453,13 +458,14 @@
 						{passwordMismatch ? 'border-destructive focus-visible:ring-destructive' : ''}"
           />
           {#if passwordMismatch}
-            <p class="text-xs text-destructive font-mono">
+            <p id="create-password-mismatch" role="alert" class="text-xs text-destructive font-mono">
               Passwords do not match
             </p>
           {/if}
         </div>
+        <p id="create-password-help" class="text-xs text-muted-foreground">At least 8 characters. This password protects data on this device.</p>
         {#if error}
-          <p class="text-xs text-destructive font-mono">{error}</p>
+          <p role="alert" class="text-xs text-destructive font-mono">{error}</p>
         {/if}
 
         <label
@@ -470,7 +476,7 @@
             bind:checked={remember}
             class="mt-0.5 w-4 h-4 rounded border-input bg-background accent-primary cursor-pointer"
           />
-          Remember my password
+          Keep this browser signed in for {getRememberDuration() < 0 ? "until logout" : `${getRememberDuration()} days`}
         </label>
       </CardContent>
       <CardFooter>
@@ -561,7 +567,7 @@
           class="relative group flex size-24 items-center justify-center rounded-full overflow-hidden bg-primary/20 ring-2 ring-border hover:ring-primary/60 transition-all cursor-pointer focus:outline-none focus:ring-primary"
         >
           {#if profileStore.avatarUrl}
-            <img
+            <GifImage
               src={profileStore.avatarUrl}
               alt="Avatar preview"
               class="size-full object-cover"
@@ -581,7 +587,9 @@
         <p class="text-xs text-muted-foreground font-mono text-center">
           Click to upload, pick a GIF, or enter an image URL
         </p>
+        <label for="setup-display-name" class="text-xs font-medium">Display name</label>
         <Input
+          id="setup-display-name" autocomplete="nickname"
           value={profileStore.nickname}
           oninput={(e) => {
             profileStore.nickname = (e.target as HTMLInputElement).value;
@@ -619,6 +627,7 @@
         <CardDescription class="text-muted-foreground text-xs font-mono">
           Use your device fingerprint, face, or PIN to unlock without typing
           your password. You can enable this later in Settings.
+          Enabling it turns off remembered-password access; password fallback must be typed.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -689,6 +698,7 @@
             was exported.
           </p>
           <Input
+            id="backup-passphrase" aria-label="Backup file passphrase" autocomplete="current-password"
             type="password"
             bind:value={backupPassphrase}
             placeholder="Backup file passphrase"
@@ -734,6 +744,7 @@
             This device is empty, so nothing here is overwritten.
           </p>
           <Input
+            id="backup-account-password" aria-label="Account password from backup" autocomplete="current-password"
             type="password"
             bind:value={backupPassword}
             placeholder="Account password from this backup"
@@ -807,13 +818,17 @@
         </p>
       </CardHeader>
       <CardContent class="flex flex-col gap-3">
+        <label for="recovery-phrase" class="text-xs font-medium">Recovery phrase</label>
         <textarea
+          id="recovery-phrase" autocomplete="off" autocapitalize="none" spellcheck={false}
           bind:value={restoreMnemonic}
           placeholder="word1 word2 word3 ..."
           rows={3}
           class="w-full bg-background border border-input rounded-md px-3 py-2 text-foreground placeholder:text-muted-foreground font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent"
         ></textarea>
+        <label for="restore-password" class="text-xs font-medium">New password</label>
         <Input
+          id="restore-password" autocomplete="new-password"
           type="password"
           bind:value={restorePassword}
           placeholder="new password"
@@ -823,7 +838,9 @@
           class="bg-background border-input font-mono focus-visible:ring-ring"
         />
         <div class="flex flex-col gap-1">
+          <label for="restore-password-confirm" class="text-xs font-medium">Confirm new password</label>
           <Input
+            id="restore-password-confirm" autocomplete="new-password" aria-invalid={restorePasswordMismatch}
             type="password"
             bind:value={restorePasswordConfirm}
             placeholder="confirm password"
@@ -893,7 +910,7 @@
         </DialogDescription>
       </DialogHeader>
       <div class="overflow-y-auto px-5 py-4 min-h-0">
-        <QuirksNotice />
+        <QuirksNotice compact />
       </div>
       <DialogFooter class="px-5 pb-5 pt-3 border-t border-border shrink-0">
         <Button

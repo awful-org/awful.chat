@@ -7,6 +7,7 @@
  */
 import { canonicalContentV3, verifySignature } from "../messaging";
 import type { WireChatMessage } from "../types/message";
+import { remoteLamportAllowed } from "./logical-clock";
 
 /**
  * ChatView has no client-side max on the composer body, so this is a floor
@@ -39,6 +40,7 @@ export interface VerifyOpts {
 }
 
 export type VerifyReason =
+  | "invalid-lamport"
   | "content-type"
   | "content-oversize"
   | "too-many-files"
@@ -55,6 +57,7 @@ export async function verifyIncoming(
   wire: WireChatMessage,
   opts: VerifyOpts = {}
 ): Promise<VerifyVerdict> {
+  if (!remoteLamportAllowed(opts.room ?? "", wire.lamport)) return { ok: false, reason: "invalid-lamport" };
   // Ahead of everything else, signed or not: a valid signature (or an
   // allowUnsigned sync batch from a trusted counterparty) only proves who
   // sent it, never that it is a reasonable size to store and render.

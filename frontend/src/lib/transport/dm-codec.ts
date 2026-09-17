@@ -138,9 +138,12 @@ export function parseDmEnvelope(
       }
       if (
         parsed.lamport !== undefined &&
-        (typeof parsed.lamport !== "number" || !Number.isFinite(parsed.lamport))
+        (typeof parsed.lamport !== "number" ||
+          !Number.isSafeInteger(parsed.lamport) ||
+          parsed.lamport < 0 ||
+          parsed.lamport >= Number.MAX_SAFE_INTEGER)
       ) {
-        delete parsed.lamport;
+        return null;
       }
       // Optional fields are stripped when malformed rather than rejecting
       // the whole message - the text still stands on its own.

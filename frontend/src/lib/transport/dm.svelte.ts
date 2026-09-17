@@ -27,6 +27,7 @@ import {
 } from "$lib/dm-panel.svelte";
 import { MessageType, type Message } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
+import { prepareOutgoingText } from "./outgoing-text";
 import { base64ToBytes, bytesToBase64 } from "$lib/utils";
 import { leaveCall } from "./call.svelte";
 import {
@@ -455,7 +456,7 @@ export async function sendDirectMessage(
   options: DirectMessageOptions = {}
 ): Promise<void> {
   const peerId = options.peerId ?? transportState.activeDmPeerId;
-  if (!peerId) return;
+  if (!peerId) throw new Error("Open a direct conversation before sending");
   const body = text.trim();
   // Reactions travel as empty-bodied envelopes; everything else needs text.
   if (!body && !options.reaction) return;
@@ -465,9 +466,16 @@ export async function sendDirectMessage(
     // Sending into a peerId-derived room would file the message in a thread
     // the other side never reads.
     transportState.error = "Cannot send yet: still verifying who this peer is.";
-    return;
+    throw new Error(transportState.error);
   }
   _transport.joinRoom(roomCode);
+
+  const prepared = prepareOutgoingText(body);
+  if (prepared.files.length && !options.reaction) {
+    const { sendFiles } = await import("./transport.svelte");
+    await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo });
+    return;
+  }
 
   const id = crypto.randomUUID();
   const ts = Date.now();

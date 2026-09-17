@@ -1,4 +1,5 @@
 import { isConfigured, relayMultiaddr } from "$lib/runtime-config";
+import { reservationClockWarning } from "$lib/clock-health";
 import { createLibp2p, type Libp2p } from "libp2p";
 import { webRTC } from "@libp2p/webrtc";
 import { webSockets } from "@libp2p/websockets";
@@ -1631,6 +1632,10 @@ export class LibP2PTransport implements PeerTransport {
       await transportManager.listen([circuitListenAddr]);
     } catch (err) {
       console.warn("[Transport] reservation request failed:", err);
+      const clockWarning = reservationClockWarning(err);
+      if (clockWarning) {
+        this.emit("status", { type: "app-warning", message: clockWarning });
+      }
       rec(ev("relay.reservation.timeout", { d: { err: errText(err) } }));
     }
   }

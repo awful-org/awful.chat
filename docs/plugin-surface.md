@@ -40,6 +40,28 @@ this file and the README disagree, the README wins. What has grown since:
   app-level access, can degrade performance).
 - Reference plugins: wheel took an optional question (`/wheel Question? a, b`),
   and poll shipped as planned.
+- A shared LIBRARY, not only shared components: `$lib/plugins/watch` keeps a
+  media element in step across peers so a watch-together plugin does not have
+  to re-derive the hard parts. It is pure and testable on its own
+  (`frontend/src/lib/plugins/watch/README.md`); anime-party and waffle-party both sit
+  on top of it.
+- The host API grew well past section 4. Beyond `cards()`,
+  `sendUpdateImmediately` and `setNowPlaying` already listed above:
+  `confirm` (a modal the HOST draws, so a consent question cannot be faked by
+  the plugin asking it), `showLocalCard` / `closeLocalCard` (a session-only
+  surface that is never a Message - no signing, storage, sync, unread or
+  notification), `roomContext` (recent messages, for a plugin that answers
+  questions about the room), `resolveRoomImage`, `openMessage` (jump the view
+  to one), `pictureInPicture`, `callAudio` (play a clip into this user's
+  outgoing call track, scoped to the calling plugin so one cannot stop
+  another's), `callCapture` (the call streams a recorder or transcriber may
+  tap), a per-plugin device-local `storage`, `seededRandom` (so a shared
+  outcome is reproducible on every client), and the measurement trio `ping` /
+  `clockSample` / `isRelayed`.
+- Call tiles carry their own state and menus, and plugins can be pinned as
+  widgets - `callTile`, `callTileActive`, `callTileViewers`, `callTileMenu`
+  and `widget` are all definition surfaces now, alongside `card`,
+  `localCard` and `settings`.
 
 ## Goals
 
@@ -225,7 +247,12 @@ covered by the manifest's `apiVersion`.
 Keep the list to components that are genuinely self-contained - no host
 state, no assumptions about where they are mounted - and prefer growing the
 `HostApi` over growing this list: data is a smaller promise to keep than
-layout.
+layout. That is why the list is still one entry: `Tip` remains the only
+export, and everything asked for since arrived as a `HostApi` method instead.
+
+Shared LOGIC is a different thing and does exist: `$lib/plugins/watch` is a
+library rather than a component, documented in
+`frontend/plugins/README.md` and in `frontend/src/lib/plugins/watch/README.md`.
 
 ## 5. Slash commands
 

@@ -48,15 +48,20 @@ describe("width", () => {
     expect(panelWidth()).toBe(WIDTH);
   });
 
-  // The spec narrows the panel on a small screen. The clamp has to use the
-  // same number the component renders, or the panel gets a strip of screen it
-  // can never be dragged into.
-  it("narrows on a phone, and the clamp agrees with it", () => {
+  it("keeps room for touch controls on a phone, and the clamp agrees", () => {
     setViewport(400, 800);
-    expect(panelWidth()).toBeLessThan(WIDTH);
+    expect(panelWidth()).toBe(WIDTH);
     callPipPanel.x = 9999;
     clampPanelToViewport();
     expect(callPipPanel.x + panelWidth()).toBeLessThanOrEqual(400);
+  });
+
+  it("reserves gutters even on a viewport narrower than the panel", () => {
+    setViewport(280, 600);
+    expect(panelWidth()).toBe(264);
+    callPipPanel.x = 9999;
+    clampPanelToViewport();
+    expect(callPipPanel.x + panelWidth()).toBeLessThanOrEqual(272);
   });
 });
 

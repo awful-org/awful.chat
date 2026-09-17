@@ -1,4 +1,5 @@
 <script lang="ts">
+  import GifImage from "./GifImage.svelte";
   import { transportState } from "$lib/transport/transport.svelte";
   import { profileStore } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -110,7 +111,7 @@
         class="absolute inset-0 bg-linear-to-r from-primary/20 to-secondary/40"
       ></div>
       {#if bannerUrl}
-        <img
+        <GifImage
           src={bannerUrl}
           alt="Profile banner"
           class="absolute inset-0 size-full object-cover"
@@ -147,7 +148,7 @@
         class="-mt-10 ml-3 flex size-20 items-center justify-center rounded-full overflow-hidden bg-primary/20 ring-4 ring-background shrink-0"
       >
         {#if avatarUrl}
-          <img
+          <GifImage
             src={avatarUrl}
             alt={name}
             class="size-full object-cover"

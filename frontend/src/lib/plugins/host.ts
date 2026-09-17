@@ -91,7 +91,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
         Math.max(1, options?.limit ?? 50)
       );
       const collected: Message[] = [];
-      let before: number | undefined = undefined;
+      let before: Pick<Message, "lamport" | "id"> | undefined = undefined;
       for (;;) {
         const page = { capped: false };
         const msgs: Message[] = await getMessages(roomCode, before, page);
@@ -100,7 +100,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
         // Overshoot a little: the filter drops rows, so a page of raw
         // messages does not guarantee a page of context.
         if (collected.length >= wanted * 2 || !page.capped) break;
-        before = msgs[0].lamport;
+        before = msgs[0];
       }
       return buildRoomContext(collected, { limit: wanted });
     },

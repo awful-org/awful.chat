@@ -23,7 +23,7 @@ import (
 // lifetime is nothing, and a hit only hands over what the inviter was about
 // to say out loud anyway.
 //
-// Per-IP alone is not enough against many addresses, so misses also draw on
+// Per-IP alone is not enough against many addresses, so all attempts draw on
 // one relay-wide budget. That makes the total guess rate against the whole
 // store a constant, and the store is small (inviteMaxLive), so the chance a
 // guess lands on ANY live code stays negligible: 1024/2^30 per try at 300
@@ -41,11 +41,11 @@ const inviteCodeLen = 6
 
 // Package vars, not consts, so tests can shrink them.
 var (
-	inviteTTL        = 5 * time.Minute
-	inviteMaxLive    = 1024
-	inviteRateLimit  = 10  // per client IP per minute, create and lookup alike
-	inviteMissLimit  = 300 // relay-wide misses per minute
-	inviteMaxBodyLen = int64(4096)
+	inviteTTL         = 5 * time.Minute
+	inviteMaxLive     = 1024
+	inviteRateLimit   = 10  // per client IP per minute, create and lookup alike
+	inviteLookupLimit = 300 // relay-wide resolution attempts per minute
+	inviteMaxBodyLen  = int64(4096)
 )
 
 type inviteEntry struct {
@@ -196,6 +196,13 @@ func handleInviteResolve(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
+	// Charge every admitted resolution before parsing or store lookup. A global
+	// misses-only budget leaves known/live candidates outside the distributed
+	// guessing ceiling and therefore leaks a cheaper hit oracle.
+	if !rateAllow("invite-lookup", inviteLookupLimit) {
+		apiError(w, r, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	code := normalizeInviteCode(strings.TrimPrefix(r.URL.Path, "/invite/"))
 	if !validInviteCode(code) {
 		apiError(w, r, "bad code", http.StatusBadRequest)
@@ -203,13 +210,6 @@ func handleInviteResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	roomCode, ok := resolveInvite(code, time.Now())
 	if !ok {
-		// Counted after the miss so a hit never draws on it; a 429 here is
-		// indistinguishable from a miss to a guesser and costs a real user
-		// nothing but a retry.
-		if !rateAllow("invite-miss", inviteMissLimit) {
-			apiError(w, r, "rate limited", http.StatusTooManyRequests)
-			return
-		}
 		inviteJSON(w, r, http.StatusNotFound, map[string]any{})
 		return
 	}

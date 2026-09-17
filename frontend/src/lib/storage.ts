@@ -32,6 +32,8 @@ import type {
   PendingMessage,
 } from "./types/message";
 import { MessageType } from "./types/message";
+import { compareMessages, type MessageCursor } from "./transport/message-order";
+import { issueLamport, observeLamport } from "./transport/logical-clock";
 import type {
   KeypairRecord,
   MnemonicRecord,
@@ -423,7 +425,7 @@ async function _openAll<T>(store: EncryptedStoreName, rows: T[]): Promise<T[]> {
  */
 export async function getMessages(
   roomCode: string,
-  beforeLamport?: number,
+  beforeLamport?: number | MessageCursor,
   /**
    * Set to whether this read hit the page cap.
    *
@@ -448,7 +450,8 @@ export async function getMessages(
   // and reading just one of them silently drops half the conversation.
   const ranges: Array<[string, number][]> = [];
   const blindRoomCode = await blindValue(roomCode);
-  const top = beforeLamport ?? Number.MAX_SAFE_INTEGER;
+  const before = typeof beforeLamport === "object" ? beforeLamport : undefined;
+  const top = before?.lamport ?? (typeof beforeLamport === "number" ? beforeLamport : Number.MAX_SAFE_INTEGER);
   ranges.push([
     [blindRoomCode, 0],
     [blindRoomCode, top],
@@ -460,7 +463,7 @@ export async function getMessages(
     ]);
   }
 
-  const exclusive = beforeLamport !== undefined;
+  const exclusive = typeof beforeLamport === "number";
   const tx = database.transaction("messages");
   const index = tx.store.index("byRoomLamport");
   const cursors = await Promise.all(
@@ -470,6 +473,16 @@ export async function getMessages(
   );
 
   const results: Message[] = [];
+  if (before) {
+    for (let i = 0; i < cursors.length; i++) {
+      let c = cursors[i];
+      if (c && c.value.lamport === before.lamport && c.value.id > before.id) {
+        c = await c.continuePrimaryKey(c.key, before.id);
+      }
+      if (c && c.value.lamport === before.lamport && c.value.id === before.id) c = await c.continue();
+      cursors[i] = c;
+    }
+  }
   const seen = new Set<string>();
   for (;;) {
     // Whichever cursor is sitting on the newer row goes next, so the merged
@@ -478,7 +491,7 @@ export async function getMessages(
     for (let i = 0; i < cursors.length; i++) {
       const c = cursors[i];
       if (!c) continue;
-      if (pick === -1 || c.value.lamport > cursors[pick]!.value.lamport) {
+      if (pick === -1 || compareMessages(c.value, cursors[pick]!.value) > 0) {
         pick = i;
       }
     }
@@ -532,7 +545,7 @@ export async function getLastMessage(
       .store.index("byRoomLamport")
       .openCursor(plaintextRange, "prev");
     // Return whichever is newer
-    if (plaintextNewest && (!newest || plaintextNewest.value.lamport > newest.value.lamport)) {
+    if (plaintextNewest && (!newest || compareMessages(plaintextNewest.value, newest.value) > 0)) {
       return _open("messages", plaintextNewest.value);
     }
   }
@@ -541,26 +554,33 @@ export async function getLastMessage(
 }
 
 /**
- * Next lamport for a DM room: wall-clock ms with a monotonic floor. A peer
- * whose clock runs behind must still land AFTER everything already in the
- * room, or their messages fall below the seen watermark and never show as
- * unread. Allocations are serialized per room so two quick sends cannot
- * take the same value.
+ * Logical allocation for ALL conversations, including legacy epoch-sized DM
+ * counters. Stored rows and durable sync watermarks establish a floor even
+ * after reload or history pruning. No wall-clock reading participates.
  */
-const _dmLamportChain = new Map<string, Promise<number>>();
+const _messageLamportChain = new Map<string, Promise<number>>();
 
-export function nextDmLamport(roomCode: string, ts: number): Promise<number> {
-  const prev = _dmLamportChain.get(roomCode) ?? Promise.resolve(0);
-  const next = prev.then(async (lastIssued) => {
-    const stored = (await getLastMessage(roomCode))?.lamport ?? 0;
-    const floor = Math.max(stored, lastIssued);
-    return ts > floor ? ts : floor + 1;
+export function nextMessageLamport(roomCode: string): Promise<number> {
+  const prev = _messageLamportChain.get(roomCode) ?? Promise.resolve(0);
+  const next = prev.then(async () => {
+    const [stored, watermarks, room] = await Promise.all([
+      getLastMessage(roomCode), getWatermarksForRoom(roomCode), getRoom(roomCode),
+    ]);
+    observeLamport(roomCode, stored?.lamport ?? 0);
+    observeLamport(roomCode, room?.lastSeenLamport ?? 0);
+    for (const value of Object.values(watermarks)) observeLamport(roomCode, value);
+    return issueLamport(roomCode);
   });
-  _dmLamportChain.set(
+  _messageLamportChain.set(
     roomCode,
     next.catch(() => 0)
   );
   return next;
+}
+
+/** Compatibility for callers using the old API; timestamp is display-only. */
+export function nextDmLamport(roomCode: string, _ts?: number): Promise<number> {
+  return nextMessageLamport(roomCode);
 }
 
 /**

@@ -21,10 +21,10 @@ export interface CallPipPanelState {
   browserPip: boolean;
 }
 
-// Panel dimensions (280x158 is 16:9, plus 36px title bar).
+// 280x158 video plus a title and two rows of 44px touch controls.
 export const WIDTH = 280;
 export const HEIGHT = 158;
-export const BAR_HEIGHT = 36;
+export const BAR_HEIGHT = 132;
 
 export const callPipPanel = $state<CallPipPanelState>({
   x: 0,
@@ -49,7 +49,7 @@ export const callPipPanel = $state<CallPipPanelState>({
  */
 export function panelWidth(): number {
   if (typeof window === "undefined") return WIDTH;
-  return Math.min(WIDTH, window.innerWidth * 0.45);
+  return Math.min(WIDTH, Math.max(0, window.innerWidth - 16));
 }
 
 export function defaultPanelPosition(): { x: number; y: number } {
@@ -59,7 +59,7 @@ export function defaultPanelPosition(): { x: number; y: number } {
   // sat entirely inside the DM panel's rectangle, which is exactly what
   // defaulting to the other corner is for.
   return {
-    x: 24,
+    x: Math.min(24, Math.max(8, window.innerWidth - panelWidth() - 8)),
     y: Math.max(8, window.innerHeight - panelHeight() - 96),
   };
 }

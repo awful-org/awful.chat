@@ -11,6 +11,7 @@
     "test": "tsx --test index.test.ts telemetry.test.ts"
   },
   "dependencies": {
+    "bs58": "6.0.0",
     "mediasoup": "^3.14.18",
     "ws": "^8.21.3"
   },

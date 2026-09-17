@@ -208,6 +208,8 @@ export interface VideoEvents {
   trackStalled: (peerId: string, source: VideoSource) => void;
   /** Fired when a remote peer starts a screen-share transmission (opt-in: not auto-consumed). */
   transmissionAvailable: (peerId: string, producerId: string) => void;
+  /** A watched screen video landed, including after automatic recovery. */
+  transmissionRestored: (peerId: string, producerId: string) => void;
   /** Fired when a remote peer's transmission ends (they stopped sharing or left). */
   transmissionEnded: (peerId: string) => void;
   /** Fired when output volume changes (0.0 to 1.0). */

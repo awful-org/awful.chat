@@ -32,7 +32,7 @@
   import type { FileTransferSnapshot } from "$lib/transport/types";
   import AudioPlayer from "./AudioPlayer.svelte";
   import GifImage from "./GifImage.svelte";
-  import { mediaPrefs } from "$lib/media-prefs.svelte";
+  import { mediaPrefs, canLoadMedia } from "$lib/media-prefs.svelte";
   // The queued tooltip must not promise the relay is holding a copy when the
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
@@ -694,7 +694,7 @@
 
   $effect(() => {
     ogPreview = null;
-    if (!shouldShowOg || !linkedUrl) return;
+    if (!mediaPrefs.externalMedia || !shouldShowOg || !linkedUrl) return;
     const ctrl = new AbortController();
     fetch(
       // No hardcoded origin: an unset apiUrl means this instance never said
@@ -706,7 +706,7 @@
     )
       .then((r) => r.json())
       .then((json: OgPreview) => {
-        ogPreview = json;
+        if (!ctrl.signal.aborted && mediaPrefs.externalMedia) ogPreview = json;
       })
       .catch(() => {});
     return () => ctrl.abort();
@@ -1244,7 +1244,7 @@
   {:else}
     <p class="whitespace-pre-wrap">{@html linkifyText(content)}</p>
 
-    {#if linkedUrl && ogPreview}
+    {#if mediaPrefs.externalMedia && linkedUrl && ogPreview}
       <div
         class="mt-2 max-w-sm overflow-hidden rounded-lg border border-border/70 bg-card"
       >
@@ -1417,7 +1417,7 @@
   {/if}
 </div>
 
-{#if lightbox}
+{#if lightbox && canLoadMedia(lightbox.url)}
   <div
     class="fixed inset-0 z-50 grid place-items-center p-4"
     role="dialog"

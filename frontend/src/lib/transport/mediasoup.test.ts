@@ -218,6 +218,34 @@ describe("getStats consumer stall detector (finding 5)", () => {
 });
 
 describe("a rejoin does not demote a watched transmission (movie-night drop)", () => {
+  it.each([false, true])("publishes restored watch state unless stopped during consume (stop=%s)", async (stop) => {
+    const video = new MediasoupVideo();
+    const internal = internalsOf(video);
+    internal.device = { recvRtpCapabilities: {} };
+    (internal.watchingTransmissionPeers as Set<string>).add("sharer");
+    internal.ensureRecvTransport = async () => {};
+    internal.request = async () => ({ type: "ms:consumer-options", options: {} });
+    internal.signal = vi.fn();
+    const consumer = { id: "c1", kind: "video", producerId: "new", track: {}, close: vi.fn(), on: vi.fn() };
+    internal.recvTransport = { consume: async () => {
+      if (stop) video.stopWatchingTransmission("sharer");
+      return consumer;
+    } };
+    const restored = vi.fn();
+    const added = vi.fn();
+    video.on("transmissionRestored", restored);
+    video.on("trackAdded", added);
+    await (internal.consumeProducerInner as (peer: string, producer: string, source: string) => Promise<void>)("sharer", "new", "screen");
+    if (stop) {
+      expect(consumer.close).toHaveBeenCalled();
+      expect(restored).not.toHaveBeenCalled();
+      expect(added).not.toHaveBeenCalled();
+    } else {
+      expect(restored).toHaveBeenCalledWith("sharer", "new");
+      expect(added).toHaveBeenCalled();
+    }
+  });
+
   it("preserves watchingTransmissionPeers through attemptRejoin's state wipe", async () => {
     const video = new MediasoupVideo();
     const internals = internalsOf(video);
@@ -226,6 +254,11 @@ describe("a rejoin does not demote a watched transmission (movie-night drop)", (
     (internals.watchingTransmissionPeers as Set<string>).add("sharer");
     (internals.pendingTransmissions as Map<string, string>).set("other", "p9");
     internals.sessionIsLive = () => false;
+    const removed = vi.fn();
+    const left = vi.fn();
+    video.on("trackRemoved", removed);
+    video.on("peerLeft", left);
+    internals.consumers = new Map([["sharer", [{ source: "screen", consumer: { close: vi.fn(), kind: "video" } }]]]);
     const join = vi.fn(async () => {});
     internals.join = join;
 
@@ -234,6 +267,8 @@ describe("a rejoin does not demote a watched transmission (movie-night drop)", (
     );
 
     expect(join).toHaveBeenCalledWith("room", "me");
+    expect(left).not.toHaveBeenCalled();
+    expect(removed).toHaveBeenCalledWith("sharer", "screen", "video");
     // Session state is rebuilt from scratch…
     expect((internals.pendingTransmissions as Map<string, string>).size).toBe(0);
     // …but the user's watch INTENT survives, so the join replay's

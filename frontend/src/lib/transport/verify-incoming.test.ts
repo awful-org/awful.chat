@@ -45,6 +45,22 @@ describe("verifyIncoming", () => {
   const alice = identity(1);
   const mallory = identity(2);
 
+  it("rejects a signed exhaustion claim before it can enter storage or watermarks", async () => {
+    const w = signV3(wire({ senderId: alice.did, senderDid: alice.did,
+      lamport: Number.MAX_SAFE_INTEGER - 1 }), alice.priv);
+    expect(await verifyIncoming(w, { room: ROOM })).toEqual({ ok: false, reason: "invalid-lamport" });
+    expect(await verifyIncoming({ ...w, sig: undefined }, { room: ROOM, allowUnsigned: true }))
+      .toEqual({ ok: false, reason: "invalid-lamport" });
+  });
+
+  it("accepts signed legacy future-clock counters without changing signed history", async () => {
+    const w = signV3(wire({ senderId: alice.did, senderDid: alice.did,
+      lamport: Date.UTC(2036, 0, 1), timestamp: 1 }), alice.priv);
+    const before = structuredClone(w);
+    expect(await verifyIncoming(w, { room: ROOM })).toEqual({ ok: true });
+    expect(w).toEqual(before);
+  });
+
   it("accepts a message properly signed by its claimed sender", async () => {
     const w = signV3(
       wire({ senderId: alice.did, senderDid: alice.did }),

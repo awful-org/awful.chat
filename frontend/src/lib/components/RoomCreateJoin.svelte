@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { formatRoomCode, newRoomCode, normalizeRoomCode } from "$lib/room-code";
+  import GifImage from "./GifImage.svelte";
+  import { formatRoomCode, newRoomCode } from "$lib/room-code";
   import {
     createInvite,
     formatShortCode,
-    looksLikeShortCode,
+    parseJoinInput,
     resolveInvite,
   } from "$lib/invite";
   import { Check, Clipboard, Copy, LogIn, Menu, Plus, Share2 } from "@lucide/svelte";
@@ -23,7 +24,7 @@
   import { displayPrefs } from "$lib/display-prefs.svelte";
 
   interface Props {
-    onJoin: (roomCode: string, displayName: string, roomName?: string) => void;
+    onJoin: (roomCode: string, displayName: string, roomName?: string) => void | Promise<void>;
     error?: string | null;
     toggleSidebar?: () => void;
   }
@@ -36,10 +37,20 @@
   let copied = $state(false);
   // The 5-minute alias of createdCode, once asked for. See $lib/invite.
   let shortCode = $state<string | null>(null);
+  let shortCodeExpiresAt = $state(0);
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!shortCode) return;
+    now = Date.now();
+    const timer = setInterval(() => now = Date.now(), 1000);
+    return () => clearInterval(timer);
+  });
   let shortCodeError = $state<string | null>(null);
   let shortCopied = $state(false);
   let copyMenuOpen = $state(false);
   let joinError = $state<string | null>(null);
+  let legacyFallback = $state<string | null>(null);
+  $effect(() => { joinCode; legacyFallback = null; joinError = null; });
   let avatarDialogOpen = $state(false);
 
   let { relayConnected } = $derived(transportState);
@@ -60,7 +71,10 @@
       createdCode = code;
       copied = false;
       shortCode = null;
+      shortCodeExpiresAt = 0;
       shortCodeError = null;
+    } catch (err) {
+      joinError = err instanceof Error ? err.message : "Could not create the room";
     } finally {
       creating = false;
     }
@@ -71,12 +85,14 @@
     joining = true;
     try {
       await saveName(profileStore.nickname);
-      onJoin(
+      await onJoin(
         createdCode,
         profileStore.nickname || "Anonymous",
         roomName.trim() || undefined
       );
       createdCode = null;
+    } catch (err) {
+      shortCodeError = err instanceof Error ? err.message : "Could not open the room";
     } finally {
       joining = false;
     }
@@ -86,23 +102,45 @@
     if (!joinCode.trim() || joining) return;
     joining = true;
     joinError = null;
+    legacyFallback = null;
     try {
       await saveName(profileStore.nickname);
-      let code = normalizeRoomCode(joinCode);
-      // Six characters is a short invite - or a legacy hex room code, which
-      // is why a miss falls through to joining the input as typed.
-      if (looksLikeShortCode(code)) {
+      const parsed = parseJoinInput(joinCode);
+      if (parsed.kind === "invalid") {
+        joinError = "Enter a valid room link or code";
+        return;
+      }
+      let code = parsed.code;
+      if (parsed.kind === "short") {
         try {
-          code = (await resolveInvite(code)) ?? code;
-        } catch {
-          joinError = "Could not reach the relay to look up that code";
+          const resolved = await resolveInvite(code);
+          if (!resolved) {
+            if (parsed.legacySixHex) legacyFallback = code.toLowerCase();
+            joinError = parsed.legacySixHex
+              ? "That short invite is unknown or expired. If this is an old six-character room code, confirm below."
+              : "That short invite is unknown or expired. Ask for a new code.";
+            return;
+          }
+          code = resolved;
+        } catch (err) {
+          joinError = err instanceof Error ? err.message : "Could not reach the relay to look up that code";
           return;
         }
       }
-      onJoin(code, profileStore.nickname || "Anonymous");
+      await onJoin(code, profileStore.nickname || "Anonymous");
+    } catch (err) {
+      joinError = err instanceof Error ? err.message : "Could not join the room";
     } finally {
       joining = false;
     }
+  }
+
+  async function joinLegacy() {
+    if (!legacyFallback || joining) return;
+    joining = true;
+    try { await onJoin(legacyFallback, profileStore.nickname || "Anonymous"); }
+    catch (err) { joinError = err instanceof Error ? err.message : "Could not join the legacy room"; }
+    finally { joining = false; }
   }
 
   async function handleCopyLink() {
@@ -116,13 +154,17 @@
     copyMenuOpen = false;
     shortCodeError = null;
     try {
-      shortCode ??= (await createInvite(createdCode!)).code;
+      if (!shortCode || Date.now() >= shortCodeExpiresAt) {
+        const made = await createInvite(createdCode!);
+        shortCode = made.code;
+        shortCodeExpiresAt = made.expiresAt;
+      }
     } catch {
       shortCodeError = "The relay is not reachable right now";
       return;
     }
-    await navigator.clipboard.writeText(formatShortCode(shortCode));
-    shortCopied = true;
+    try { await navigator.clipboard.writeText(formatShortCode(shortCode)); shortCopied = true; }
+    catch { shortCodeError = "Clipboard unavailable. Select and copy the code below."; }
     setTimeout(() => (shortCopied = false), 2000);
   }
 
@@ -160,12 +202,6 @@
     try {
       const text = await navigator.clipboard.readText();
       joinCode = text.trim();
-      if (joinCode.includes("/r/")) {
-        const parts = joinCode.split("/r/");
-        // Both link shapes: `#` is the fragment form's separator, not part
-        // of the code.
-        joinCode = parts[parts.length - 1].replace(/^#/, "");
-      }
     } catch {
       // clipboard denied
     }
@@ -231,6 +267,7 @@
       <CardContent class="grid gap-6">
         {#if error || joinError}
           <div
+            id="room-join-error" role="alert"
             class="rounded-lg bg-destructive/10 border border-destructive/30 px-3 py-2 text-sm text-destructive"
           >
             {error ?? joinError}
@@ -247,7 +284,7 @@
             class="relative group flex size-30 items-center justify-center rounded-full overflow-hidden bg-primary/20 hover:ring-2 hover:ring-primary/50 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary"
           >
             {#if profileStore.avatarUrl}
-              <img
+              <GifImage
                 src={profileStore.avatarUrl}
                 alt="Avatar"
                 class="size-full object-cover"
@@ -264,7 +301,9 @@
               <span class="text-white text-xs font-mono">Change</span>
             </div>
           </button>
+          <label for="display-name" class="text-xs font-medium">Display name</label>
           <Input
+            id="display-name" aria-label="Display name" autocomplete="nickname"
             value={profileStore.nickname}
             oninput={(e) => {
               profileStore.nickname = (e.target as HTMLInputElement).value;
@@ -275,7 +314,9 @@
         </div>
 
         <div class="grid gap-2">
+          <label for="room-name" class="text-sm font-medium">Room name <span class="text-muted-foreground">(optional)</span></label>
           <Input
+            id="room-name" autocomplete="off"
             bind:value={roomName}
             placeholder="Room name (optional)"
             class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono focus-visible:ring-ring"
@@ -300,8 +341,10 @@
         </div>
 
         <div class="grid gap-2">
+          <label for="join-code" class="text-sm font-medium">Room link or code</label>
           <div class="relative">
             <Input
+              id="join-code" autocomplete="off" aria-describedby={joinError ? "room-join-error" : undefined} aria-invalid={joinError ? "true" : undefined}
               bind:value={joinCode}
               placeholder="Room code, short code or link"
               class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-10 focus-visible:ring-ring"
@@ -324,6 +367,9 @@
             <LogIn class="size-4 mr-1" />
             {joining ? "Joining..." : "Join room"}
           </Button>
+          {#if legacyFallback}
+            <Button variant="ghost" disabled={joining} onclick={joinLegacy}>Join legacy room {legacyFallback}</Button>
+          {/if}
         </div>
       </CardContent>
     </Card>
@@ -406,7 +452,7 @@
               {formatShortCode(shortCode)}
             </div>
             <div class="mt-1 text-center text-xs text-muted-foreground">
-              Short code, works for 5 minutes
+              {now >= shortCodeExpiresAt ? "Expired — copy a short code again to refresh" : `Expires in ${Math.ceil((shortCodeExpiresAt - now) / 1000)} seconds`}
             </div>
           </div>
         {/if}

@@ -145,28 +145,32 @@ func TestInviteRateLimitCountsHitsAndMisses(t *testing.T) {
 	}
 }
 
-func TestInviteGlobalMissBudget(t *testing.T) {
+func TestInviteGlobalLookupBudget(t *testing.T) {
 	resetInvites(t)
-	orig := inviteMissLimit
-	inviteMissLimit = 5
-	defer func() { inviteMissLimit = orig }()
+	orig := inviteLookupLimit
+	inviteLookupLimit = 5
+	defer func() { inviteLookupLimit = orig }()
 	rateMu.Lock()
-	delete(rateBy, "invite-miss")
+	delete(rateBy, "invite-lookup")
 	rateMu.Unlock()
 	code, _ := createInvite("room", time.Now())
-	// Five misses from five different addresses use the relay-wide budget up.
+	// Hits, misses and malformed values from different addresses all spend the
+	// same pre-lookup relay-wide budget.
 	for i := 0; i < 5; i++ {
 		ip := "10.7.0." + string(rune('1'+i))
-		if rec := getInvite(t, ip, "ZZZZZZ"); rec.Code != http.StatusNotFound {
-			t.Fatalf("miss %d: want 404, got %d", i, rec.Code)
+		candidate := "ZZZZZZ"
+		if i == 1 || i == 3 {
+			candidate = code
+		}
+		if i == 4 {
+			candidate = "bad"
+		}
+		if rec := getInvite(t, ip, candidate); rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("attempt %d limited early", i)
 		}
 	}
-	if rec := getInvite(t, "10.7.0.9", "ZZZZZZ"); rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("6th miss: want 429, got %d", rec.Code)
-	}
-	// Hits never draw on it.
-	if rec := getInvite(t, "10.7.0.10", code); rec.Code != http.StatusOK {
-		t.Fatalf("hit after budget spent: want 200, got %d", rec.Code)
+	if rec := getInvite(t, "10.7.0.9", code); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("6th hit: want 429, got %d", rec.Code)
 	}
 }
 

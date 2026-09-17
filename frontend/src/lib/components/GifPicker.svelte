@@ -1,4 +1,5 @@
 <script lang="ts">
+  import GifImage from "./GifImage.svelte";
   import { onDestroy } from "svelte";
   import { Bookmark, Search, X, Loader } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
@@ -418,7 +419,7 @@
                 {isLarge ? 'col-span-2 row-span-2' : 'col-span-1 row-span-1'}
                 {!gifUrl && !gif.file ? 'opacity-50 cursor-not-allowed' : ''}"
             >
-              <img
+              <GifImage
                 src={previewUrl}
                 alt={gif.title}
                 loading="lazy"

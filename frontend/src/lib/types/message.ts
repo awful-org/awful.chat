@@ -386,8 +386,8 @@ export function boundReactionEmoji(e: unknown): string | undefined {
  *
  * `timestamp` is NOT in the v3 canonical (see canonicalContentV3), so any
  * peer relaying a message can rewrite it and the signature still verifies -
- * and compareMessages sorts by timestamp FIRST, so an unclamped one pins a
- * forwarded message to the top or the bottom of everyone's timeline forever.
+ * so bound misleading display dates even though timestamps cannot change
+ * logical conversation order.
  * A few minutes covers honest clock skew; anything past that is a claim, not
  * a clock.
  */

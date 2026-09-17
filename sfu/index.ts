@@ -1,6 +1,8 @@
 import * as mediasoup from "mediasoup";
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
+import { envInteger } from "./config";
+import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin } from "./auth";
 import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 import {
   SFU_DIAG_SCHEMA_VERSION,
@@ -170,7 +172,7 @@ interface MSDiagUnavailable {
 
 // Envelope sent by the client over this WebSocket connection.
 // All messages from client arrive as: { type: "join" } or { type: "ms:*", ... }
-type ClientJoin = { type: "join"; roomCode: string; peerId: string };
+type ClientJoin = { type: "join"; roomCode: string; peerId: string; signature: string };
 type ClientMsg =
   | ClientJoin
   | MSGetCapabilities
@@ -275,7 +277,7 @@ interface PeerState {
 // participant in a call holds two of them (send and recv). The default
 // 500-port range is therefore about 250 concurrent participants, and it runs
 // out before this ceiling does. Raise both together or neither.
-const MAX_ROOMS = parseInt(process.env.SFU_MAX_ROOMS ?? "250", 10);
+const MAX_ROOMS = envInteger("SFU_MAX_ROOMS", 250);
 const MAX_PEERS_PER_ROOM = 32;
 // A peer publishes at most camera video, screen video and screen audio. The
 // headroom absorbs a client that republishes before its close frame lands.
@@ -298,10 +300,7 @@ const MAX_CONSUMERS_PER_PEER = 256;
 // connect handshake. An earlier client created both at join, and since voice
 // is peer-to-peer they sat unconnected for every voice-only call; this reap
 // threw those calls out of the video server 20s in. 0 disables it.
-const TRANSPORT_CONNECT_TIMEOUT_MS = parseInt(
-  process.env.SFU_TRANSPORT_CONNECT_TIMEOUT_MS ?? "20000",
-  10,
-);
+const TRANSPORT_CONNECT_TIMEOUT_MS = envInteger("SFU_TRANSPORT_CONNECT_TIMEOUT_MS", 20000, 0);
 // roomCode and peerId become Map keys and are echoed into the logs. Real ones
 // are a 16-char hex room code (8 bytes, or "dm-" + 40 hex for DMs) and a
 // base58 libp2p peer id; anything long, non-string or carrying control
@@ -317,28 +316,19 @@ const DIAG_ENABLED = process.env.SFU_TELEMETRY === "1";
 // every retained transport/producer/consumer - a worker round-trip apiece -
 // so a peer with no floor could poll fast enough to compete with the room's
 // real media traffic for the same worker thread.
-const DIAG_MIN_INTERVAL_MS = parseInt(
-  process.env.SFU_DIAG_MIN_INTERVAL_MS ?? "10000",
-  10,
-);
+const DIAG_MIN_INTERVAL_MS = envInteger("SFU_DIAG_MIN_INTERVAL_MS", 10000);
 // Worker round-trips one socket may spend per WORKER_OP_WINDOW_MS. Every op
 // counted below reaches the ONE mediasoup worker that every room on this
 // instance shares, so a socket looping any of them stalls transport creation
 // in OTHER rooms - measured at seconds. The honest worst case is a peer
 // joining a full room and consuming every producer in it (a consume plus a
 // resume each), which stays well under this; a loop crosses it in a second.
-const MAX_WORKER_OPS_PER_WINDOW = parseInt(
-  process.env.SFU_MAX_WORKER_OPS ?? "600",
-  10,
-);
+const MAX_WORKER_OPS_PER_WINDOW = envInteger("SFU_MAX_WORKER_OPS", 600);
 const WORKER_OP_WINDOW_MS = 10_000;
 // How long a socket that spends its budget stops being read. Brief, and it
 // must stay well inside HEARTBEAT_INTERVAL_MS: a paused socket answers no
 // ping either, and two unanswered sweeps terminate it.
-const WORKER_OP_PAUSE_MS = parseInt(
-  process.env.SFU_WORKER_OP_PAUSE_MS ?? "1000",
-  10,
-);
+const WORKER_OP_PAUSE_MS = envInteger("SFU_WORKER_OP_PAUSE_MS", 1000);
 // The frame types that cost a worker round-trip. join, ms:get-capabilities
 // and ms:diag are answered from this process or carry their own floor.
 const WORKER_OP_TYPES = new Set<string>([
@@ -378,7 +368,7 @@ function getOrCreateRoom(roomCode: string): Map<string, PeerState> {
 // working connection always answers - it replies to a ping inside its
 // WebSocket stack, without waking the page - and short enough that a real
 // reconnect is not left staring at dead video.
-const REJOIN_PROBE_MS = parseInt(process.env.SFU_REJOIN_PROBE_MS ?? "3000", 10);
+const REJOIN_PROBE_MS = envInteger("SFU_REJOIN_PROBE_MS", 3000);
 
 // Whether an existing session is still there. readyState answers this only for
 // a socket that closed politely; the reconnect that actually matters - walking
@@ -448,14 +438,9 @@ const ANNOUNCED_IP = process.env.ANNOUNCED_IP ?? "127.0.0.1";
 // are accepted here: a bare `npm start` with the documented variables must
 // not silently fall back to the default range and announce ports nothing
 // published.
-const RTC_MIN_PORT = parseInt(
-  process.env.SFU_RTC_MIN_PORT ?? process.env.RTC_MIN_PORT ?? "40000",
-  10,
-);
-const RTC_MAX_PORT = parseInt(
-  process.env.SFU_RTC_MAX_PORT ?? process.env.RTC_MAX_PORT ?? "40499",
-  10,
-);
+const RTC_MIN_PORT = envInteger("SFU_RTC_MIN_PORT", envInteger("RTC_MIN_PORT", 40000, 1, 65535), 1, 65535);
+const RTC_MAX_PORT = envInteger("SFU_RTC_MAX_PORT", envInteger("RTC_MAX_PORT", 40499, 1, 65535), 1, 65535);
+if (RTC_MIN_PORT > RTC_MAX_PORT) throw new Error("SFU RTC minimum port exceeds maximum");
 
 const mediaCodecs: mediasoup.types.RouterOptions["mediaCodecs"] = [
   {
@@ -1480,7 +1465,7 @@ function emitSfuTelemetrySweep(): void {
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
 
-const PORT = parseInt(process.env.SFU_PORT ?? "3000", 10);
+const PORT = envInteger("SFU_PORT", 3000, 1, 65535);
 // Signalling frames are small JSON objects; the biggest carries SDP-ish
 // rtpParameters. 256 KiB is orders of magnitude of headroom and still stops
 // an anonymous client from making us buffer and parse megabytes per frame.
@@ -1494,18 +1479,12 @@ const MAX_FRAME_BYTES = 256 * 1024;
 // TCP receive window, which is where backpressure belongs. Generous against
 // legitimate use: the largest honest burst is a peer joining a busy room and
 // consuming every existing producer at once, a few dozen frames of ~1 KB.
-const MAX_QUEUED_FRAME_BYTES = parseInt(
-  process.env.SFU_MAX_QUEUED_FRAME_BYTES ?? String(4 * 1024 * 1024),
-  10,
-);
+const MAX_QUEUED_FRAME_BYTES = envInteger("SFU_MAX_QUEUED_FRAME_BYTES", 4 * 1024 * 1024);
 // How often the heartbeat sweeps every connection. Was 30s; halved so an
 // ordinary silent loss (no FIN - wifi to cellular, a killed tab) is reaped in
 // two ticks - 20s - instead of up to 60s, during which a fresh joiner was
 // still handed the dead peer's producers (finding 6).
-const HEARTBEAT_INTERVAL_MS = parseInt(
-  process.env.SFU_HEARTBEAT_INTERVAL_MS ?? "10000",
-  10,
-);
+const HEARTBEAT_INTERVAL_MS = envInteger("SFU_HEARTBEAT_INTERVAL_MS", 10000);
 // A socket flagged `backpressured` answers no ping and sends no close, so the
 // heartbeat used to skip it forever - correct for a peer that is merely slow,
 // wrong for one that is ALSO gone: nothing else in this file ever revisits a
@@ -1579,6 +1558,12 @@ async function main(): Promise<void> {
   });
 
   wss.on("connection", (ws: WebSocket, _req: IncomingMessage) => {
+    let joinNonce: string | null = newJoinNonce();
+    const joinDeadline = Date.now() + JOIN_TIMEOUT_MS;
+    const joinTimer = setTimeout(() => ws.terminate(), JOIN_TIMEOUT_MS);
+    joinTimer.unref();
+    ws.once("close", () => clearTimeout(joinTimer));
+    send(ws, { type: "auth:challenge", nonce: joinNonce });
     (ws as any).isAlive = true;
     ws.on("pong", () => {
       (ws as any).isAlive = true;
@@ -1649,6 +1634,17 @@ async function main(): Promise<void> {
           return;
         }
 
+        // Consume the challenge before any await or room allocation. Ownership
+        // proof is mandatory even when the slot is currently vacant.
+        const nonce = joinNonce;
+        joinNonce = null;
+        if (!nonce || Date.now() >= joinDeadline || !verifyJoin(nonce, joinMsg.roomCode, joinMsg.peerId, joinMsg.signature)) {
+          send(ws, { type: "ms:error", reason: "authentication-failed" });
+          ws.close(1008, "Video identity proof required; update the app");
+          return;
+        }
+        clearTimeout(joinTimer);
+
         const existingRoom = rooms.get(joinMsg.roomCode);
         if (!existingRoom && routers.size >= MAX_ROOMS) {
           console.error(
@@ -1673,10 +1669,8 @@ async function main(): Promise<void> {
 
         let oldPeer = existingRoom?.get(joinMsg.peerId);
         if (oldPeer) {
-          // Nothing proves this socket owns the peerId it claims, and the SFU
-          // itself discloses every producing peerId to any joiner, so a
-          // duplicate join is as likely to be an impostor as a reconnect and
-          // an incumbent that is really there keeps its slot. What it does not
+          // Both sockets proved ownership of the same device key. A live
+          // incumbent keeps its slot to avoid duplicate-tab churn. It does not
           // get is the benefit of the doubt: deciding that on readyState alone
           // refused every rejoin on the commonest reconnect path there is -
           // wifi to cellular sends no FIN, so the corpse still reads OPEN -
@@ -1772,6 +1766,7 @@ async function main(): Promise<void> {
           oldPeer.ws.terminate();
         }
         room.set(peer.peerId, peer);
+        send(ws, { type: "auth:joined" });
 
         // Send existing producers to the newly joined peer so it can consume them
         for (const [existingPeerId, existingPeer] of room) {

@@ -23,15 +23,12 @@ describe("DM envelopes", () => {
     expect(parsed).toEqual({ type: "chat", payload });
   });
 
-  it("strips a malformed lamport but keeps the message", () => {
-    const raw = JSON.stringify({ id: "m", text: "hi", ts: 1, lamport: "x" });
+  it.each(["x", -1, 1.5, Number.MAX_SAFE_INTEGER, null])("rejects malformed sequence %s instead of assigning a different order", (lamport) => {
+    const raw = JSON.stringify({ id: "m", text: "hi", ts: 1, lamport });
     const bytes = new Uint8Array(1 + raw.length);
     bytes[0] = 0x01;
     bytes.set(new TextEncoder().encode(raw), 1);
-    expect(parseDmEnvelope(bytes)).toEqual({
-      type: "chat",
-      payload: { id: "m", text: "hi", ts: 1 },
-    });
+    expect(parseDmEnvelope(bytes)).toBeNull();
   });
 
   it("round-trips a chat envelope with a reply quote", () => {

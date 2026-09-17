@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { canLoadMedia } from "$lib/media-prefs.svelte";
   /**
    * An image that can hold an animated GIF still. Browsers cannot pause a
    * GIF, so a canvas keeps the first frame and the animated img only exists
@@ -45,6 +46,7 @@
   }
 
   const isAnimated = $derived(animated ?? urlLooksAnimated(src));
+  const allowed = $derived(canLoadMedia(src));
   const playing = $derived(
     isAnimated && (animate === true || (animate === "hover" && hovered))
   );
@@ -55,7 +57,7 @@
   });
 
   $effect(() => {
-    if (!isAnimated || !canvasEl) return;
+    if (!allowed || !isAnimated || !canvasEl) return;
     const canvas = canvasEl;
     const img = new Image();
     img.src = src;
@@ -75,7 +77,9 @@
   });
 </script>
 
-{#if !isAnimated}
+{#if !allowed}
+  <span class={cls} role="img" aria-label={alt ? `${alt}: external image blocked` : "External image blocked"} title="External media is off. Enable it in App Settings.">◻</span>
+{:else if !isAnimated}
   <img {src} {alt} class={cls} {loading} />
 {:else}
   <span
