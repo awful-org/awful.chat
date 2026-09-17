@@ -90,8 +90,20 @@ describe("generateShortCode / parseShortCode round trip", () => {
     expect(parsed).toEqual({
       roomCode: ROOM_CODE,
       token: TOKEN.slice(0, 8),
-      peerPrefix: peerIdShortPrefix(PEER_ID),
+      peerPrefix: peerIdShortPrefix(PEER_ID).toLowerCase(),
     });
+  });
+
+  // A phone keyboard capitalised the code as it was typed, and the input
+  // showed it in caps regardless, so the person could not even see the
+  // difference. The peer segment is base58, which is case-sensitive, so an
+  // exact compare rejected every code typed on a phone.
+  it("accepts the code however a keyboard cased it", () => {
+    const code = generateShortCode(ROOM_CODE, TOKEN, PEER_ID);
+    const parsed = parseShortCode(code.toUpperCase());
+    expect(parsed).toEqual(parseShortCode(code));
+    expect(parsed?.roomCode).toBe(ROOM_CODE);
+    expect(matchesSourcePeer(parsed as never, PEER_ID)).toBe(true);
   });
 
   it("rejects a 2-part (pre-peerId-pinning) short code", () => {
@@ -110,7 +122,7 @@ describe("parsePlaintextToken", () => {
     expect(payload).not.toBeNull();
     expect(payload!.roomCode).toBe(ROOM_CODE);
     expect(payload!.token).toBe(TOKEN.slice(0, 8));
-    expect(payload!.peerPrefix).toBe(peerIdShortPrefix(PEER_ID));
+    expect(payload!.peerPrefix).toBe(peerIdShortPrefix(PEER_ID).toLowerCase());
     expect(payload!.peerId).toBeUndefined();
   });
 

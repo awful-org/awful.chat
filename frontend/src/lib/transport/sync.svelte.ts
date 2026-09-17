@@ -216,7 +216,8 @@ export function tokenAccepted(
  */
 export function matchesSourcePeer(payload: SyncPayload, peerId: string): boolean {
   if (payload.peerId) return peerId === payload.peerId;
-  if (payload.peerPrefix) return peerId.slice(8, 16) === payload.peerPrefix;
+  if (payload.peerPrefix)
+    return peerId.slice(8, 16).toLowerCase() === payload.peerPrefix.toLowerCase();
   return false;
 }
 
@@ -403,7 +404,10 @@ export function generateShortCode(
 export function parseShortCode(
   shortCode: string
 ): { roomCode: string; token: string; peerPrefix: string } | null {
-  const parts = shortCode.split("-");
+  // Case-insensitive: the room and token halves are hex, and the peer half
+  // is compared folded (matchesSourcePeer). A phone keyboard capitalises
+  // what it likes, and a typed code has to survive that.
+  const parts = shortCode.trim().toLowerCase().split("-");
   if (parts.length !== 3) return null;
 
   const [roomPart, tokenPart, peerPart] = parts;
