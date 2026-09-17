@@ -1779,13 +1779,14 @@ import {
 {#if nobodyInCall}
   <!-- render nothing -->
 {:else if othersInCallNotUs}
+  <!-- Sized by its content, not by the viewport: a dvh height that fit a
+       laptop put the join button on top of the avatars on a phone, with the
+       microphone hint spilling over both. -->
   <div
-    class="flex flex-col relative pb-14 bg-background
-      {beside
-      ? 'min-h-0 flex-1'
-      : 'h-[12dvh] sm:h-[16dvh] shrink-0 border-b border-border'}"
+    class="flex flex-col bg-background
+      {beside ? 'min-h-0 flex-1' : 'shrink-0 border-b border-border'}"
   >
-    <div class="flex-1 flex items-center justify-center">
+    <div class="flex-1 flex items-center justify-center py-3">
       <div class="flex flex-wrap items-center justify-center gap-1">
         {#each [...callPeerIds] as peerId (peerId)}
           {@const label = getPeerLabel(peerId)}
@@ -1848,7 +1849,7 @@ import {
         {/each}
       </div>
     </div>
-    <div class="absolute bottom-3 left-1/2 -translate-x-1/2">
+    <div class="flex flex-col items-center pb-3">
       <button
         type="button"
         onclick={joinCall}
@@ -1865,7 +1866,7 @@ import {
             : "Join call"}
       </button>
       {#if micPermission !== "granted"}
-        <p class="mt-1.5 text-center text-[11px] text-muted-foreground">
+        <p class="mt-1.5 px-4 text-center text-[11px] text-muted-foreground">
           Joining turns on your microphone. Your browser will ask first.
         </p>
       {/if}
