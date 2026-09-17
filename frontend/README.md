@@ -6,11 +6,18 @@ for the data model and wire protocols.
 
 ```sh
 pnpm install
+npm ci --prefix ../sfu --ignore-scripts # dependencies for the auth interoperability test
 pnpm dev      # needs the relay running (see root README)
 pnpm test     # vitest
 pnpm check    # svelte-check + tsc
 pnpm build
 ```
+
+`pnpm check` and `pnpm test` include the browser/SFU authentication
+interoperability test, which imports the actual verifier from `../sfu/auth.ts`.
+Install the SFU's locked dependencies as shown above even when working only on
+the frontend. This test does not need the mediasoup worker; running the SFU's own
+tests requires its normal `npm ci` install with scripts enabled.
 
 Env (`../.env`): `VITE_RELAY_MULTIADDR` (libp2p relay), `VITE_API_URL`
 (og/klipy proxies), `VITE_SFU_URL` (mediasoup signaling). These are read by

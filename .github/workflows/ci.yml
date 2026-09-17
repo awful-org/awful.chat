@@ -30,6 +30,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 24, cache: pnpm, cache-dependency-path: frontend/pnpm-lock.yaml }
       - run: pnpm install --frozen-lockfile
+      # The browser/SFU auth interoperability test imports the real server
+      # verifier. Install its locked dependencies without downloading/building
+      # mediasoup's worker; the separate SFU job tests the worker itself.
+      - name: install SFU dependencies for auth interoperability checks
+        run: npm ci --ignore-scripts
+        working-directory: sfu
       - run: pnpm check
       - run: pnpm test
       # The real build, plugin fetch included, so a broken Dockerfile input
