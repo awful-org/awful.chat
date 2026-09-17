@@ -417,13 +417,31 @@ function resolveMessage(msg: Message, channelDoc: Y.Doc): ResolvedMessage {
 
 ```typescript
 // send:    clock++
-// receive: clock = max(local, received) + 1
+// observe: clock = max(local, received); the next send increments it
 
 function sortMessages(a: Message, b: Message): number {
   if (a.lamport !== b.lamport) return a.lamport - b.lamport
-  return a.senderId.localeCompare(b.senderId)  // deterministic tiebreaker
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0 // binary, matching IndexedDB
 }
 ```
+
+Rooms and DMs allocate from per-conversation logical counters, seeded from stored
+messages and sync/read watermarks. Device wall clocks do not participate in new
+sequence allocation. Legacy epoch-sized DM counters remain valid floors; signed
+history and watermarks are not rewritten. History pagination uses `(lamport, id)`
+so concurrent messages sharing a counter cannot be skipped at a page boundary.
+
+Sender dates are reported metadata, not chronological guarantees. Offline
+concurrent messages sort deterministically once peers have the same set of
+messages; their actual real-world order cannot be inferred. Older clients still
+use timestamp-first display until upgraded. A newly paired device must sync
+before it can continue the other device's counter: disconnected devices using
+the same identity can still collide in the existing per-sender sync watermarks.
+This change does not replace that sync protocol with a per-device event log.
+
+Local wall-clock jumps and invalid relay reservation TTLs produce actionable
+clock notices. Relay expiry validation remains in force; logical conversation
+ordering does not make relay reservations independent of UTC.
 
 ---
 

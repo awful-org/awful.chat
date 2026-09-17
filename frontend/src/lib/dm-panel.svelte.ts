@@ -1,4 +1,5 @@
 import type { Message } from "./types/message";
+import { compareMessages } from "./transport/message-order";
 
 /**
  * A DM conversation floating over whatever is on screen.
@@ -74,11 +75,7 @@ export function defaultPanelPosition(): { x: number; y: number } {
 export function appendToDmPanel(msg: Message): void {
   if (!dmPanel.roomCode || msg.roomCode !== dmPanel.roomCode) return;
   if (dmPanel.messages.some((m) => m.id === msg.id)) return;
-  dmPanel.messages = [...dmPanel.messages, msg].sort((a, b) =>
-    a.lamport !== b.lamport
-      ? a.lamport - b.lamport
-      : a.senderId.localeCompare(b.senderId)
-  );
+  dmPanel.messages = [...dmPanel.messages, msg].sort(compareMessages);
 }
 
 /** True when the panel is showing this conversation, so it counts as read. */

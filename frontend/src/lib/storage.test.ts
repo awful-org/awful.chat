@@ -159,6 +159,25 @@ describe("unread counts and seen tracking", () => {
 });
 
 describe("message pagination", () => {
+  it("loads every equal-counter message exactly once across page boundaries", async () => {
+    const rows = Array.from({ length: 123 }, (_, i) => msg({
+      id: `tied-${String(i).padStart(3, "0")}`, lamport: 7,
+      timestamp: i % 2 ? 1 : Date.UTC(2036, 0, 1),
+    }));
+    await bulkPutMessages(rows);
+    const found: Message[] = [];
+    let before: Pick<Message, "lamport" | "id"> | undefined;
+    for (;;) {
+      const page = await getMessages("room-a", before);
+      if (!page.length) break;
+      found.unshift(...page);
+      before = page[0];
+    }
+    expect(found.map(m => m.id)).toEqual(rows.map(m => m.id));
+    // The cursor may outlive deletion of the boundary row.
+    expect((await getMessages("room-a", { lamport: 7, id: "tied-073a" }))[49].id).toBe("tied-073");
+  });
+
   it("pages by lamport descending window, returned ascending", async () => {
     await bulkPutMessages(
       Array.from({ length: 60 }, () => msg())
@@ -175,15 +194,15 @@ describe("message pagination", () => {
 });
 
 describe("nextDmLamport", () => {
-  it("uses the wall clock when it is ahead of the room", async () => {
-    expect(await nextDmLamport("dm-clock-a", 5_000)).toBe(5_000);
+  it("ignores the wall clock for a new conversation", async () => {
+    expect(await nextDmLamport("dm-clock-a", 5_000)).toBe(1);
   });
 
   it("floors to last-issued + 1 when the clock runs behind", async () => {
     const first = await nextDmLamport("dm-clock-b", 9_000);
     const second = await nextDmLamport("dm-clock-b", 1_000);
-    expect(first).toBe(9_000);
-    expect(second).toBe(9_001);
+    expect(first).toBe(1);
+    expect(second).toBe(2);
   });
 
   it("floors to the stored room maximum", async () => {
@@ -191,6 +210,24 @@ describe("nextDmLamport", () => {
       msg({ id: "dm-m1", roomCode: "dm-clock-c", lamport: 7_777 }),
     ]);
     expect(await nextDmLamport("dm-clock-c", 100)).toBe(7_778);
+  });
+
+  it("continues above a legacy future-dated DM counter after the PC clock is corrected", async () => {
+    const legacy = Date.UTC(2036, 0, 1);
+    await putMessage(msg({ id: "legacy-future", roomCode: "dm-legacy-future", lamport: legacy }));
+    const issued = await Promise.all(Array.from({ length: 4 }, () => nextDmLamport("dm-legacy-future", 1)));
+    expect(issued).toEqual([legacy + 1, legacy + 2, legacy + 3, legacy + 4]);
+    await putRoom({ roomCode: "dm-legacy-future", type: "text", name: "Legacy", createdAt: 1, participants: [], lastSeenLamport: legacy });
+    await putMessage(msg({ id: "corrected-clock", roomCode: "dm-legacy-future", lamport: issued[0], timestamp: 1, senderId: "peer" }));
+    expect(await getUnreadCount("dm-legacy-future", legacy, "self")).toBe(1);
+    await markRoomSeen("dm-legacy-future", issued[0]);
+    expect((await getRoom("dm-legacy-future"))?.lastSeenLamport).toBe(issued[0]);
+  });
+
+  it("respects durable sync/read watermarks after history is pruned", async () => {
+    await putRoom({ roomCode: "dm-pruned", type: "text", name: "Pruned", createdAt: 1, participants: [], lastSeenLamport: 500 });
+    await setWatermark("dm-pruned", "did:peer", 600);
+    expect(await nextDmLamport("dm-pruned", 1)).toBe(601);
   });
 });
 

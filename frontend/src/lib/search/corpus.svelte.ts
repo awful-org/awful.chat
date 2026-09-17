@@ -191,7 +191,7 @@ export async function ensureRoomCorpus(roomCode: string): Promise<void> {
     }
 
     // Full sweep, newest-first, through the same paged read the chat uses.
-    let before: number | undefined = undefined;
+    let before: Pick<Message, "lamport" | "id"> | undefined = undefined;
     let lastLamport = 0;
     for (;;) {
       const page = { capped: false };
@@ -206,7 +206,7 @@ export async function ensureRoomCorpus(roomCode: string): Promise<void> {
       }
       bump();
       if (!page.capped) break;
-      before = msgs[0].lamport;
+      before = msgs[0];
     }
     c.done = true;
     bump();

@@ -88,8 +88,7 @@ describe("wireToMessage: fields the signature does not cover", () => {
       wire({ timestamp: 8_640_000_000_000_000 }),
       ROOM
     ).timestamp;
-    // compareMessages sorts by timestamp first, so an unclamped value pins
-    // the message to the bottom of everyone's timeline forever.
+    // Timestamp bounds protect reported dates independently of logical order.
     expect(got).toBeGreaterThanOrEqual(before);
     expect(got).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
   });

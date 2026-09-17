@@ -28,8 +28,7 @@ import {
   setWatermark,
   markRoomSeen,
   markOwnMessagesReadUpTo,
-  PAGE_SIZE,
-  nextDmLamport,
+  nextMessageLamport,
   getPeerProfile,
   putPeerProfile,
   getAllPeerProfiles,
@@ -163,6 +162,8 @@ import {
   withFileTransfer,
 } from "./files.svelte";
 import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
+import type { MessageCursor } from "./message-order";
+import { issueLamport, observeLamport, remoteLamportAllowed } from "./logical-clock";
 import { ProfileEcho, frameHash } from "./profile-echo";
 import { initVoice } from "./voice.svelte";
 import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
@@ -511,20 +512,6 @@ export const transportState = $state<TransportState>({
   dmQueuedP2POnly: new Set(),
 });
 
-/**
- * Lamport clock PER ROOM.
- *
- * It used to be a single counter shared by every non-DM room and absorbed from
- * all of them, so somebody active in a busy room carried a large counter into a
- * quiet one: their next message there outranked messages that were genuinely
- * older, and two people posting at the same moment could be ordered by which
- * of them had been busier elsewhere rather than by what happened first.
- * Ordering is a per-room question, so the clock is per room.
- *
- * Seeded from stored history in _loadHistory, so a room continues above its own
- * past rather than restarting under it.
- */
-const _lamports = new Map<string, number>();
 let _connectPromise: Promise<void> | null = null;
 
 // Ephemeral message flood cap: ~4 per second per plugin per sender.
@@ -869,43 +856,14 @@ async function _cascadeReadAcks(
 }
 
 function lamportSend(roomCode: string): number {
-  const next = (_lamports.get(roomCode) ?? 0) + 1;
-  _lamports.set(roomCode, next);
-  return next;
+  return issueLamport(roomCode);
 }
 
-/**
- * A room's clock may only be dragged forward by a bounded step.
- *
- * `remote` is whatever the wire said. One message claiming
- * Number.MAX_SAFE_INTEGER used to saturate the counter outright: float64
- * cannot represent max+1 distinctly, so every later local message got the
- * SAME lamport. Ordering then collapsed to the senderId tiebreak in
- * MSG_ORDER, getMessagesAboveWatermarks' strict `>` stopped offering our own
- * messages to any peer, and the unread badge never moved again - permanently,
- * because the clock is also persisted through the watermarks it writes.
- *
- * DM rooms carry wall-clock milliseconds by design (nextDmLamport), so a
- * relative step is meaningless there and they get a wall-clock ceiling
- * instead. The room bound is deliberately generous: it exists to stop
- * saturation, not to police a busy room we have been away from.
- */
-const MAX_LAMPORT_JUMP = 1_000_000;
+/** Display timestamp bound only; logical sequence validation is clock-independent. */
 const MAX_DM_LAMPORT_SKEW = 86_400_000;
 
-function lamportCeiling(roomCode: string, at: number): number {
-  return roomCode.startsWith("dm-")
-    ? Math.max(at, Date.now() + MAX_DM_LAMPORT_SKEW)
-    : at + MAX_LAMPORT_JUMP;
-}
-
 function lamportReceive(roomCode: string, remote: number): void {
-  const at = _lamports.get(roomCode) ?? 0;
-  const sane =
-    typeof remote === "number" && Number.isSafeInteger(remote) && remote >= 0
-      ? Math.min(remote, lamportCeiling(roomCode, at))
-      : 0;
-  _lamports.set(roomCode, Math.max(at, sane) + 1);
+  observeLamport(roomCode, remote);
 }
 
 if (typeof window !== "undefined") {
@@ -1388,19 +1346,15 @@ export async function _loadHistory(
     getAllPeerProfiles(),
   ]);
   if (!stillCurrent()) return;
-  // Storage pages on the lamport index, which is not the order this is read
-  // in - see compareMessages. Every other path into transportState.messages
-  // sorts; this one assigned the page raw, so opening a room showed causal
-  // order and only a later sync or a scroll-up put it right.
+  // Storage and the live view share the same logical sequence/ID ordering.
   transportState.messages = [...msgs].sort(MSG_ORDER);
   // Whether a first read filled a page is the only honest answer to "is
   // there more?", and it is known here and nowhere else.
   transportState.historyCapped = page.capped;
-  // DM rooms use wall-clock ms as their lamport - absorbing those here would
-  // catapult the shared room clock to ~1.7e12 and skew every room after.
+  // Counters are per conversation, including legacy epoch-sized DM counters.
   if (msgs.length > 0) {
     const seen = Math.max(...msgs.map((m) => m.lamport));
-    _lamports.set(roomCode, Math.max(_lamports.get(roomCode) ?? 0, seen));
+    observeLamport(roomCode, seen);
   }
   if (profiles.length > 0) {
     const names = new Map(transportState.peerNames);
@@ -1933,8 +1887,7 @@ async function _handleSyncBatch(
   // file's dimensions. So a room member could take a row it holds (yours
   // included), rewrite those, re-push it under the ORIGINAL signature, and
   // have bulkPutMessages replace your copy on every peer that accepted the
-  // batch - message-order sorts by timestamp first, so that alone relocates
-  // or hides a message for everyone. Signed content cannot legitimately
+  // batch, altering reported dates and attribution. Signed content cannot legitimately
   // change, so the row we hold is authoritative and re-delivery is a no-op.
   const duplicates = usable.filter((w) => known.has(w.id));
   usable = usable.filter((w) => !known.has(w.id));
@@ -2009,8 +1962,7 @@ async function _handleSyncBatch(
   }
 
   for (const m of fullMessages) {
-    // DM lamports are wall-clock ms; absorbing one would catapult the shared
-    // room counter to ~1.7e12 and poison every room message sent after.
+    // Observe only this conversation's counter.
     lamportReceive(m.roomCode, m.lamport);
     // A watermark of NaN (or a lamport that arrived as a string) sticks:
     // setWatermark advances on `existing.maxLamport < maxLamport`, and every
@@ -2037,7 +1989,7 @@ async function _handleSyncBatch(
   // and only inside the loaded window - a backfilled message below it would
   // become messages[0] and break the load-older cursor.
   if (transportState.roomCode !== roomCode) return;
-  const windowFloor = transportState.messages[0]?.lamport ?? 0;
+  const windowFloor = transportState.messages[0];
   const existingIds = new Set(transportState.messages.map((m) => m.id));
   const fresh = fullMessages.filter((m) => !existingIds.has(m.id));
   if (!fresh.length) return;
@@ -2049,7 +2001,7 @@ async function _handleSyncBatch(
   // re-read from storage by _loadHistory and loadMoreMessages, so nothing
   // brought it back short of a reload. That is the "history does not sync
   // until I ctrl+shift+R" report. Re-read the page instead.
-  if (fresh.some((m) => m.lamport < windowFloor)) {
+  if (windowFloor && fresh.some((m) => MSG_ORDER(m, windowFloor) < 0)) {
     const page = await getMessages(roomCode);
     if (transportState.roomCode !== roomCode) return;
     // Identity-preserving: a row already on screen keeps its OBJECT, not
@@ -3154,13 +3106,8 @@ function _handleDmChatAsync(
     _transport.joinRoom(roomCode);
 
     const reaction = envelope.payload.reaction;
-    // DM lamports are wall-clock milliseconds, and this one is whatever the
-    // envelope said. It is written to a watermark below, and setWatermark
-    // never regresses - so a single message claiming a lamport far in the
-    // future would tell every later digest that we already hold the rest of
-    // this conversation, and the sender's real messages would never be
-    // offered again. Anything outside a day's skew is not a clock, it is a
-    // claim: fall back to the timestamp, and to now if that is junk too.
+    // Timestamp sanitization affects display only, never the sequence stored
+    // in sync/read watermarks. Old envelopes may carry epoch-sized counters.
     const wireTs = envelope.payload.ts;
     const ts =
       Number.isSafeInteger(wireTs) &&
@@ -3169,13 +3116,11 @@ function _handleDmChatAsync(
         ? wireTs
         : Date.now();
     const wireLamport = envelope.payload.lamport;
-    const lamport =
-      wireLamport !== undefined &&
-      Number.isSafeInteger(wireLamport) &&
-      wireLamport >= 0 &&
-      wireLamport <= Date.now() + MAX_DM_LAMPORT_SKEW
-        ? wireLamport
-        : ts;
+    // Preserve assigned logical values on every device, irrespective of its
+    // clock. Legacy envelopes without a counter use their original timestamp
+    // deterministically, never this receiver's arrival time.
+    const lamport = wireLamport ?? wireTs;
+    if (!remoteLamportAllowed(roomCode, lamport)) return;
     const msg: Message = {
       id: envelope.payload.id,
       roomCode,
@@ -3207,6 +3152,7 @@ function _handleDmChatAsync(
       status: "delivered",
     };
 
+    observeLamport(roomCode, lamport);
     // Against storage, not the on-screen list: that list holds whichever
     // conversation is open, so a redelivered message was only recognised
     // as a duplicate when you happened to be looking at that DM.
@@ -4111,7 +4057,7 @@ export async function sendMessage(
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
-  const lamport = lamportSend(roomCode);
+  const lamport = await nextMessageLamport(roomCode);
 
   let msg: Message = {
     id: crypto.randomUUID(),
@@ -4263,11 +4209,8 @@ export async function sendFiles(
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
-  // DM rooms order by wall-clock ms; a room-counter lamport (~small int)
-  // filed the file before the entire conversation and it vanished on reload.
-  const lamport = roomCode.startsWith("dm-")
-    ? await nextDmLamport(roomCode, createdAt)
-    : lamportSend(roomCode);
+  // Files share the conversation's logical counter with text and cards.
+  const lamport = await nextMessageLamport(roomCode);
 
   let msg: Message = {
     id: messageId,
@@ -4333,7 +4276,8 @@ export async function sendCard(
   pluginId: string,
   payload: unknown
 ): Promise<string> {
-  if (!transportState.roomCode) {
+  const roomCode = transportState.roomCode;
+  if (!roomCode) {
     throw new Error("Not in a room");
   }
 
@@ -4352,18 +4296,14 @@ export async function sendCard(
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
   const ts = Date.now();
-  // Same rule as files: DM rooms order by wall-clock ms, a room-counter
-  // lamport would file the card before the whole conversation.
-  const lamport = transportState.roomCode.startsWith("dm-")
-    ? await nextDmLamport(transportState.roomCode, ts)
-    : lamportSend(transportState.roomCode);
+  const lamport = await nextMessageLamport(roomCode);
 
   const cardId = crypto.randomUUID();
   const content = JSON.stringify({ pluginId, data: payload });
 
   let msg: Message = {
     id: cardId,
-    roomCode: transportState.roomCode,
+    roomCode,
     senderId: myId,
     senderName,
     timestamp: ts,
@@ -4376,14 +4316,15 @@ export async function sendCard(
   // Sign the message
   msg = signMessage(msg);
 
-  _broadcastChatWire(messageToWire(msg), transportState.roomCode);
+  _broadcastChatWire(messageToWire(msg), roomCode);
 
   await putMessage(msg);
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
 
-  transportState.messages = appendSorted(transportState.messages, msg);
-
-  markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  if (transportState.roomCode === roomCode) {
+    transportState.messages = appendSorted(transportState.messages, msg);
+    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  }
   noteRoomActivity(msg.roomCode, msg.timestamp);
 
   return cardId;
@@ -4455,10 +4396,8 @@ export async function sendUpdate(
 
   // Persisted updates
   const updateTs = Date.now();
-  // DM rooms order by wall-clock ms, same as files and cards.
-  const lamport = roomCode.startsWith("dm-")
-    ? await nextDmLamport(roomCode, updateTs)
-    : lamportSend(roomCode);
+  // Updates share the conversation's logical counter.
+  const lamport = await nextMessageLamport(roomCode);
   const content = JSON.stringify({ pluginId, cardId, data: payload });
 
   let msg: Message = {
@@ -4603,11 +4542,12 @@ export async function toggleReaction(
 }
 
 export async function loadMoreMessages(
-  beforeLamport: number
+  beforeLamport: number | MessageCursor
 ): Promise<boolean> {
   const roomCode = transportState.roomCode;
   if (!roomCode) return false;
-  const older = await getMessages(roomCode, beforeLamport);
+  const page = { capped: false };
+  const older = await getMessages(roomCode, beforeLamport, page);
   // The user can switch rooms while the page loads; prepending the old
   // room's backlog into the new room's view crosses histories.
   if (transportState.roomCode !== roomCode) return false;
@@ -4619,7 +4559,7 @@ export async function loadMoreMessages(
   );
   // "more exists" comes from the raw page size: dedup can shrink newOnes on
   // a full page, which used to hide the load-older button early.
-  return older.length === PAGE_SIZE;
+  return page.capped;
 }
 
 /**

@@ -904,7 +904,7 @@
   async function handleLoadMore() {
     if (loadingMore || !canLoadOlder || messages.length === 0) return;
     loadingMore = true;
-    const oldest = messages[0].lamport;
+    const oldest = messages[0];
     const more = await loadMoreMessages(oldest);
     hasMoreHistory = more;
     loadingMore = false;
@@ -1344,7 +1344,7 @@
     const a = senderDid(current.senderId) || current.senderId;
     const b = senderDid(previous.senderId) || previous.senderId;
     if (a !== b) return true;
-    return current.timestamp - previous.timestamp > 2 * 60 * 1000;
+    return Math.abs(current.timestamp - previous.timestamp) > 2 * 60 * 1000;
   }
 
   function shouldShowDateSep(current: number, previous?: number): boolean {
@@ -2028,7 +2028,8 @@
                 <div class="flex items-center gap-3 py-3">
                   <Separator class="flex-1 bg-border" />
                   <span class="text-xs text-muted-foreground"
-                    >{formatDate(msg.timestamp)}</span
+                    title="Reported message dates; conversation order uses logical sequence, not device clocks."
+                    >Reported date: {formatDate(msg.timestamp)}</span
                   >
                   <Separator class="flex-1 bg-border" />
                 </div>

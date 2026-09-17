@@ -5,6 +5,7 @@
   import { isConfigured } from "$lib/runtime-config";
   import { AppWindow, CircleAlert, ServerOff, WifiOff, X } from "@lucide/svelte";
   import { onDestroy, onMount } from "svelte";
+  import { clockJumped } from "$lib/clock-health";
 
   /**
    * The things the app has to say to everybody, whatever their settings.
@@ -47,6 +48,7 @@
     /storage is not protected/i,
     /damaged \d+ stored records/i,
     /backup file received/i,
+    /clock|automatic date and time/i,
   ];
 
   /** At most this many on screen; the oldest is dropped for a newer one. */
@@ -98,6 +100,21 @@
   }
 
   onMount(() => {
+    const sample = () => ({ wall: Date.now(), monotonic: performance.now() });
+    let baseline = sample();
+    const resetClockSample = () => { baseline = sample(); };
+    const clockTimer = setInterval(() => {
+      const now = sample();
+      if (document.visibilityState === "visible" && clockJumped(baseline, now)) {
+        push("Your device clock changed or resumed out of sync. Check automatic date and time. Conversation order is preserved, but displayed times and relay reservations may be affected.");
+      }
+      baseline = now;
+    }, 30_000);
+    document.addEventListener("visibilitychange", resetClockSample);
+    cleanups.push(() => {
+      clearInterval(clockTimer);
+      document.removeEventListener("visibilitychange", resetClockSample);
+    });
     online = navigator.onLine;
     // isConfigured() is a plain function, not reactive: it flips once the
     // /config.json load settles, and the load retries itself on `online`.
