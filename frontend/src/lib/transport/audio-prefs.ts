@@ -12,6 +12,11 @@
 
 const KEY = "awful_audio_prefs";
 
+export const SHARE_HEIGHTS = [0, 720, 1080] as const;
+export const SHARE_FPS = [15, 30, 60] as const;
+export type ShareHeight = (typeof SHARE_HEIGHTS)[number];
+export type ShareFps = (typeof SHARE_FPS)[number];
+
 export interface AudioPrefs {
   inputDevice: string | null;
   outputDevice: string | null;
@@ -33,6 +38,13 @@ export interface AudioPrefs {
    */
   shareAudioDespiteEchoRisk: boolean;
   /**
+   * Screen-share quality, Discord-style: the tallest frame to capture (0 =
+   * whatever the source is) and the frame rate to ask for. Device-local:
+   * it is about this uplink, not the room.
+   */
+  shareHeight: ShareHeight;
+  shareFps: ShareFps;
+  /**
    * How loud each person is for us, keyed by their did:key - the durable
    * identity, so the setting survives them reinstalling or changing devices,
    * where a peerId would not.
@@ -49,6 +61,8 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   dtlnEnabled: true,
   noiseGate: 0.002,
   shareAudioDespiteEchoRisk: false,
+  shareHeight: 0,
+  shareFps: 30,
   peerVolumes: {},
 };
 
@@ -75,6 +89,16 @@ function num(value: unknown, fallback: number, min: number, max: number) {
     : fallback;
 }
 
+function oneOf<T extends number>(
+  allowed: readonly T[],
+  value: unknown,
+  fallback: T
+): T {
+  return (allowed as readonly unknown[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
 export function loadAudioPrefs(): AudioPrefs {
   if (typeof localStorage === "undefined") return { ...AUDIO_PREF_DEFAULTS };
   try {
@@ -96,6 +120,12 @@ export function loadAudioPrefs(): AudioPrefs {
         typeof p.shareAudioDespiteEchoRisk === "boolean"
           ? p.shareAudioDespiteEchoRisk
           : AUDIO_PREF_DEFAULTS.shareAudioDespiteEchoRisk,
+      shareHeight: oneOf(
+        SHARE_HEIGHTS,
+        p.shareHeight,
+        AUDIO_PREF_DEFAULTS.shareHeight
+      ),
+      shareFps: oneOf(SHARE_FPS, p.shareFps, AUDIO_PREF_DEFAULTS.shareFps),
       peerVolumes: sanitizePeerVolumes(p.peerVolumes),
     };
   } catch {

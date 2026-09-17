@@ -241,8 +241,15 @@ export interface VideoTransport {
   /** If `stream` is provided, publish it directly (avoids a second getUserMedia call). */
   startCamera(stream?: MediaStream): Promise<void>;
   stopCamera(): void;
-  /** If `stream` is provided, publish it directly (avoids a second getDisplayMedia call). */
-  startScreenShare(stream?: MediaStream): Promise<void>;
+  /**
+   * Publish an already-captured share. Capture lives in call.svelte, which
+   * owns the picker options and the audio echo verdict; `encoding` caps the
+   * video sender to match the quality the capture was made with.
+   */
+  startScreenShare(
+    stream: MediaStream,
+    encoding?: RTCRtpEncodingParameters
+  ): Promise<void>;
   stopScreenShare(): void;
 
   /** Start consuming a pending transmission from a remote peer. */

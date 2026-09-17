@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildShareOptions, classifyShareAudio } from "./share-audio";
+import {
+  buildShareOptions,
+  classifyShareAudio,
+  shareVideoEncoding,
+} from "./share-audio";
 
 /**
  * Minimal MediaTrackSettings builders. Only the fields classifyShareAudio
@@ -11,6 +15,17 @@ function video(displaySurface?: string): MediaTrackSettings {
 function audio(restrictOwnAudio?: boolean): MediaTrackSettings {
   return { restrictOwnAudio };
 }
+
+describe("shareVideoEncoding", () => {
+  it("orders the tiers so more pixels or more frames never get less bitrate", () => {
+    const low = shareVideoEncoding({ shareHeight: 720, shareFps: 15 });
+    const mid = shareVideoEncoding({ shareHeight: 1080, shareFps: 30 });
+    const high = shareVideoEncoding({ shareHeight: 0, shareFps: 60 });
+    expect(low.maxFramerate).toBe(15);
+    expect(low.maxBitrate!).toBeLessThan(mid.maxBitrate!);
+    expect(mid.maxBitrate!).toBeLessThan(high.maxBitrate!);
+  });
+});
 
 describe("buildShareOptions", () => {
   // Every member the research's recommended object requires, regardless of
@@ -42,6 +57,25 @@ describe("buildShareOptions", () => {
       displaySurface: "window",
       frameRate: { ideal: 30 },
     });
+  });
+
+  it("caps height and frame rate from the chosen quality, and leaves source untouched", () => {
+    expect(
+      buildShareOptions(
+        { restrictOwnAudio: true },
+        { shareHeight: 720, shareFps: 15 }
+      ).video
+    ).toEqual({
+      displaySurface: "window",
+      frameRate: { ideal: 15 },
+      height: { max: 720 },
+    });
+    expect(
+      buildShareOptions(
+        { restrictOwnAudio: true },
+        { shareHeight: 0, shareFps: 60 }
+      ).video
+    ).toEqual({ displaySurface: "window", frameRate: { ideal: 60 } });
   });
 
   it("never omits a member the research requires, without restrictOwnAudio support", () => {

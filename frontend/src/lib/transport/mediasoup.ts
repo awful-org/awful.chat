@@ -233,6 +233,8 @@ interface Producer {
   producer: mediasoupClient.types.Producer;
   source: VideoSource;
   stream: MediaStream;
+  /** Kept so a rebuild republishes with the same caps. */
+  encoding?: RTCRtpEncodingParameters;
 }
 
 interface Consumer {
@@ -458,14 +460,11 @@ export class MediasoupVideo implements VideoTransport {
     this.stopSource("camera");
   }
 
-  async startScreenShare(stream?: MediaStream): Promise<void> {
-    const s =
-      stream ??
-      (await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 15 } }, // lower framerate for screen share
-        audio: true,
-      }));
-    await this.publish(s, "screen");
+  async startScreenShare(
+    stream: MediaStream,
+    encoding?: RTCRtpEncodingParameters
+  ): Promise<void> {
+    await this.publish(stream, "screen", encoding);
     // Track lifecycle (including the browser's own "Stop sharing" button,
     // which ends the video track) is owned by the app layer - call.svelte
     // already installs its own onended that calls stopScreenShare() and
@@ -809,11 +808,11 @@ export class MediasoupVideo implements VideoTransport {
     // rest of the call.
     if (this.sessionIsLive()) return;
 
-    const republish: { source: VideoSource; stream: MediaStream }[] = [];
+    const republish: Omit<Producer, "producer">[] = [];
     for (const [source, ps] of this.producers) {
       const stream = ps[0]?.stream;
       if (stream?.getTracks().some((t) => t.readyState === "live")) {
-        republish.push({ source, stream });
+        republish.push({ source, stream, encoding: ps[0].encoding });
       }
     }
 
@@ -858,8 +857,8 @@ export class MediasoupVideo implements VideoTransport {
     this.sfuWs = null;
 
     await this.join(roomCode, peerId);
-    for (const { source, stream } of republish) {
-      await this.publish(stream, source);
+    for (const { source, stream, encoding } of republish) {
+      await this.publish(stream, source, encoding);
     }
   }
 
@@ -900,17 +899,17 @@ export class MediasoupVideo implements VideoTransport {
     if (!this.sendTransport) return;
     this.sendTransport.close();
     this.sendTransport = null;
-    const republish: { source: VideoSource; stream: MediaStream }[] = [];
+    const republish: Omit<Producer, "producer">[] = [];
     for (const [source, ps] of this.producers) {
       const stream = ps[0]?.stream;
       if (stream?.getTracks().some((t) => t.readyState === "live")) {
-        republish.push({ source, stream });
+        republish.push({ source, stream, encoding: ps[0].encoding });
       }
     }
     this.producers.forEach((ps) => ps.forEach((p) => p.producer.close()));
     this.producers.clear();
-    for (const { source, stream } of republish) {
-      this.publish(stream, source).catch((err) => {
+    for (const { source, stream, encoding } of republish) {
+      this.publish(stream, source, encoding).catch((err) => {
         this.emit(
           "error",
           err instanceof Error ? err : new Error(String(err))
@@ -970,7 +969,8 @@ export class MediasoupVideo implements VideoTransport {
 
   private async publish(
     stream: MediaStream,
-    source: VideoSource
+    source: VideoSource,
+    encoding?: RTCRtpEncodingParameters
   ): Promise<void> {
     // Reached whenever the SFU was unavailable at join time (the call itself
     // survives that now), so name the actual cause rather than "Not joined".
@@ -1014,11 +1014,13 @@ export class MediasoupVideo implements VideoTransport {
                   opusMaxAverageBitrate: 128_000,
                 },
               }
-            : {}),
+            : encoding
+              ? { encodings: [encoding] }
+              : {}),
         });
         rec(ev("sfu.produce", { d: { source, kind: track.kind } }));
 
-        const entry: Producer = { producer, source, stream };
+        const entry: Producer = { producer, source, stream, encoding };
         produced.push(entry);
         // Record incrementally, not once after the whole loop: a screen
         // share produces video then audio, and if audio throws, this.producers

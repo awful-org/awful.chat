@@ -45,7 +45,7 @@
   import {
     joinCall,
     leaveCall,
-    toggleScreenShare,
+    shareScreenPressed,
     stopScreenShare,
     toggleCamera,
     toggleMute,
@@ -2116,7 +2116,7 @@ import {
                 <button
                   {...props}
                   type="button"
-                  onclick={toggleScreenShare}
+                  onclick={shareScreenPressed}
                   disabled={transportState.screenSharePending}
                   aria-busy={transportState.screenSharePending}
                   class:animate-pulse={transportState.screenSharePending}
@@ -2298,7 +2298,7 @@ import {
               <button
                 {...props}
                 type="button"
-                onclick={toggleScreenShare}
+                onclick={shareScreenPressed}
                 disabled={transportState.screenSharePending}
                 aria-busy={transportState.screenSharePending}
                 class:animate-pulse={transportState.screenSharePending}

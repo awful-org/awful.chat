@@ -16,7 +16,7 @@
   import {
     toggleMute,
     toggleCamera,
-    toggleScreenShare,
+    shareScreenPressed,
     leaveCall,
   } from "$lib/transport/call.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
@@ -24,6 +24,7 @@
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import SettingsDialog from "$lib/components/SettingsDialog.svelte";
+  import ShareScreenDialog from "$lib/components/ShareScreenDialog.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import { toggleDeafen } from "$lib/transport/call.svelte";
@@ -125,7 +126,7 @@
       <button
         {...props}
         type="button"
-        onclick={toggleScreenShare}
+        onclick={shareScreenPressed}
         disabled={transportState.screenSharePending}
         aria-busy={transportState.screenSharePending}
         class:animate-pulse={transportState.screenSharePending}
@@ -301,6 +302,8 @@
     avatarDialogOpen = false;
   }}
 />
+
+<ShareScreenDialog />
 
 <SettingsDialog
   bind:open={audioSettingsOpen}
