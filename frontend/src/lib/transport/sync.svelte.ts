@@ -439,11 +439,10 @@ export async function generateSyncCode(): Promise<void> {
     // A fresh code starts QR-only: the short code's truncated token is not
     // honoured until the user asks to see it.
     _shortCodeRevealed = false;
-    const expires = Date.now() + SYNC_TIMEOUT;
 
-    // Enforce expiry on the SOURCE: the QR/short code's own `expires` field
-    // is attacker-controlled (and re-synthesized for manual codes), so the
-    // only reliable expiry is tearing the server down ourselves.
+    // Enforce expiry on the SOURCE: the target synthesizes its own `expires`
+    // from whatever it scanned or typed, so the only reliable expiry is
+    // tearing the server down ourselves.
     if (_syncExpiryTimer) clearTimeout(_syncExpiryTimer);
     _syncExpiryTimer = setTimeout(() => {
       if (!syncState.isSyncing && !syncState.isComplete) {
@@ -474,17 +473,15 @@ export async function generateSyncCode(): Promise<void> {
       throw new Error("Could not determine this device's peer ID");
     }
 
-    const payload: SyncPayload = {
-      roomCode: _syncRoomCode,
-      token,
-      expires,
-      peerId: selfId,
-    };
+    // The QR carries room:token:peerId, the same "full format" the manual
+    // parser already reads. It used to carry the payload as JSON, which is
+    // sixty bytes of keys and quotes for nothing (expires is re-derived on
+    // the target and enforced here) and pushed the code from 41 to 49
+    // modules a side. A phone camera has to resolve every one of those
+    // squares off another phone's screen; fewer is what makes it scan.
+    const qrText = `${_syncRoomCode}:${token}:${selfId}`;
 
-    const payloadJson = JSON.stringify(payload);
-
-    // Generate QR code
-    const qrDataUrl = await QRCode.toDataURL(payloadJson, {
+    const qrDataUrl = await QRCode.toDataURL(qrText, {
       width: 256,
       margin: 2,
       color: {
@@ -1395,6 +1392,12 @@ export const scannerState = $state({
 });
 
 const BACK_CAMERA = /\b(back|rear|environment)\b/i;
+/**
+ * iPhones list every lens as its own camera. The ultra wide cannot focus on
+ * a phone held a hand's width away and the telephoto focuses no closer than
+ * arm's length, so either one "opens" and then never reads a thing.
+ */
+const CLOSE_FOCUS_UNFRIENDLY = /ultra|tele|zoom/i;
 
 /**
  * The camera to open first.
@@ -1405,9 +1408,11 @@ const BACK_CAMERA = /\b(back|rear|environment)\b/i;
  * up to the back of the device. Naming a device id makes the choice explicit,
  * and it gives the UI something to offer a switch between.
  */
-function preferBackCamera(cameras: ScanCamera[]): string | null {
+export function preferBackCamera(cameras: ScanCamera[]): string | null {
   if (cameras.length === 0) return null;
-  const back = cameras.find((c) => BACK_CAMERA.test(c.label));
+  const backs = cameras.filter((c) => BACK_CAMERA.test(c.label));
+  const back =
+    backs.find((c) => !CLOSE_FOCUS_UNFRIENDLY.test(c.label)) ?? backs[0];
   // Nothing labelled: the last entry is the back camera on most Androids, and
   // on a single-camera device it is the only one there is.
   return (back ?? cameras[cameras.length - 1]).id;
@@ -1464,35 +1469,45 @@ export async function startScanning(
     _html5QrCode = new Html5Qrcode(elementId);
 
     await _html5QrCode.start(
-      // A device id when the enumeration gave one; the old facingMode
-      // constraint stays as the fallback for a browser that listed nothing.
+      // Ignored once videoConstraints is set, but the API wants it.
       target ?? { facingMode: "environment" },
       {
         fps: 10,
         qrbox: { width: 250, height: 250 },
+        // Without a size the browser picks, and iOS Safari picks small: a
+        // 41-module code a third of the way across a 480-line frame is
+        // three pixels a square, under what the decoder can read. `ideal`
+        // is a preference, so a camera that cannot do 720p still opens.
+        videoConstraints: {
+          // A device id when the enumeration gave one; the old facingMode
+          // constraint stays as the fallback for a browser that listed nothing.
+          ...(target ? { deviceId: { exact: target } } : { facingMode: "environment" }),
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
       },
       (decodedText) => {
+        let payload: SyncPayload | null;
         try {
-          const payload = JSON.parse(decodedText) as SyncPayload;
-          // peerId is required: without it the target has nothing to pin
-          // the source connection to, and would trust whichever peer joins
-          // the ephemeral sync room first (see connectAsTarget).
-          if (
-            payload.roomCode &&
-            payload.token &&
-            payload.expires &&
-            payload.peerId
-          ) {
-            stopScanning();
-            onScan(payload);
-          } else if (payload.roomCode && payload.token && payload.expires) {
-            onError(
-              "This QR code is from an older version of the app - update both devices and generate a new code"
-            );
-          } else {
-            onError("Invalid QR code format");
-          }
-        } catch {
+          // The same parser as the typed code; a full-form code carries the
+          // whole peerId, which is what the target pins the connection to
+          // (see connectAsTarget). parsePlaintextToken throws its own
+          // message for a code from before pinning existed.
+          payload = parsePlaintextToken(decodedText);
+        } catch (err) {
+          onError(err instanceof Error ? err.message : "Invalid QR code");
+          return;
+        }
+        if (payload?.peerId) {
+          stopScanning();
+          onScan(payload);
+        } else if (decodedText.startsWith("{")) {
+          // The JSON payload the QR carried before this build. A PWA can
+          // hold an old build for a while after a deploy.
+          onError(
+            "This QR code is from an older version of the app - refresh the other device and generate a new code"
+          );
+        } else {
           onError("Invalid QR code");
         }
       },
