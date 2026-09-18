@@ -24,7 +24,7 @@ import {
   joinCall,
   leaveCall,
   stopScreenShare,
-  toggleCamera,
+  cameraOnPressed,
   toggleDeafen,
   toggleMute,
 } from "$lib/transport/call.svelte";
@@ -140,11 +140,7 @@ export const actionCommands: CmdSource = () => {
       action: {
         kind: "act",
         keepOpen: true,
-        perform: () => {
-          toggleCamera().catch((err) =>
-            console.warn("toggle camera failed", err)
-          );
-        },
+        perform: () => cameraOnPressed(),
       },
     });
 

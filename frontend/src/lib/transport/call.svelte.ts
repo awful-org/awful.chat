@@ -30,7 +30,7 @@ import {
   shareVideoEncoding,
 } from "./share-audio";
 import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
-import { openSharePicker } from "$lib/ui-state.svelte";
+import { openCameraPicker, openSharePicker } from "$lib/ui-state.svelte";
 import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
   cancelErrorClear,
@@ -450,6 +450,16 @@ export function toggleCamera(): Promise<void> {
       transportState.cameraPending = false;
     });
   return _cameraPromise;
+}
+
+/**
+ * What every "Turn on camera" button does: stop if already on, otherwise
+ * open the device picker, which starts the camera itself once one is
+ * chosen. Mirrors shareScreenPressed below.
+ */
+export function cameraOnPressed(): void {
+  if (!transportState.cameraOff) void toggleCamera();
+  else openCameraPicker();
 }
 
 /**

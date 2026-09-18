@@ -45,9 +45,9 @@
   import {
     joinCall,
     leaveCall,
+    cameraOnPressed,
     shareScreenPressed,
     stopScreenShare,
-    toggleCamera,
     toggleMute,
     toggleDeafen,
   } from "$lib/transport/call.svelte";
@@ -903,7 +903,7 @@ import {
         await stopScreenShare();
         break;
       case "toggle-camera":
-        await toggleCamera();
+        cameraOnPressed();
         break;
       case "toggle-mic":
         await toggleMute();
@@ -2100,7 +2100,7 @@ import {
               <button
                 {...props}
                 type="button"
-                onclick={toggleCamera}
+                onclick={cameraOnPressed}
                 disabled={transportState.cameraPending}
                 aria-busy={transportState.cameraPending}
                 class:animate-pulse={transportState.cameraPending}
@@ -2281,7 +2281,7 @@ import {
             <button
               {...props}
               type="button"
-              onclick={toggleCamera}
+              onclick={cameraOnPressed}
               disabled={transportState.cameraPending}
               aria-busy={transportState.cameraPending}
               class:animate-pulse={transportState.cameraPending}
