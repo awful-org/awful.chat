@@ -88,6 +88,7 @@ import { prepareOutgoingText } from "./outgoing-text";
 import { acquireNodeLock, releaseNodeLock } from "./node-lock";
 import { quickSessionSeed } from "$lib/quick/session-key";
 import { looksLikeDid, looksLikePeerId } from "../identity/identity-utils";
+import { reconcileRoomUsers } from "./room-roster";
 import {
   canonicalContentV3,
   canonicalFor,
@@ -2094,6 +2095,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   noteIdentity(peerId, did);
   const isNewMapping = _peerIdToDid.get(peerId) !== did;
   _setPeerDid(peerId, did);
+  _reconcileRoomUserBinding(peerId, did);
 
   // Queued DMs are keyed by DID, and the "connect" event fires before we
   // know the peer's DID - so the real flush happens here, once the profile
@@ -2397,6 +2399,22 @@ function _isSelfAnnouncement(fromPeerId: string, claimedDid: string): boolean {
   if (!claimedDid) return false;
   const senderDid = _peerIdToDid.get(fromPeerId);
   return !!senderDid && senderDid === claimedDid;
+}
+
+/**
+ * Call once a peerId->DID binding is proven, so a raw-peerId placeholder
+ * this peer's own earlier join may have left in the roster (see
+ * reconcileRoomUsers) becomes the real thing.
+ */
+function _reconcileRoomUserBinding(peerId: string, did: string): void {
+  const next = reconcileRoomUsers(transportState.roomUsers, peerId, did);
+  if (next === transportState.roomUsers) return;
+  transportState.roomUsers = next;
+  // The placeholder was never actually persisted (addRoomParticipant drops
+  // anything that isn't a DID), so this is the first real write for them.
+  if (transportState.roomCode) {
+    addRoomParticipant(transportState.roomCode, did).catch(() => {});
+  }
 }
 
 function _admitRoomMember(room: string, did: string): void {
