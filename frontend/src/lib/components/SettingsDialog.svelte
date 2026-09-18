@@ -69,6 +69,7 @@
     Github,
     Check,
     Copy,
+    ExternalLink,
   } from "@lucide/svelte";
 
   import ProfileSettings from "./settings/ProfileSettings.svelte";
@@ -266,9 +267,10 @@
         href="https://github.com/awful-org/awful-verify"
         target="_blank"
         rel="noopener noreferrer"
-        class="font-mono text-[11px] text-muted-foreground hover:text-primary hover:underline"
+        class="inline-flex items-center gap-1 font-mono text-[11px] text-muted-foreground hover:text-primary hover:underline"
       >
         what this checks, and what it cannot
+        <ExternalLink class="size-3" />
       </a>
     </div>
     <p class="text-xs font-mono text-muted-foreground leading-relaxed">
@@ -373,7 +375,7 @@
 {:else}
   <Dialog bind:open onOpenChange={closeHandler}>
     <DialogContent
-      class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-0 sm:h-137.5 lg:h-150 flex flex-col overflow-hidden p-0"
+      class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-0 sm:h-178.75 lg:h-195 flex flex-col overflow-hidden p-0"
       style="max-height: {Math.max(0, visibleHeight - 32)}px; top: {viewportTop + visibleHeight / 2}px;"
     >
       <DialogHeader class="px-6 py-4 border-b border-border shrink-0">

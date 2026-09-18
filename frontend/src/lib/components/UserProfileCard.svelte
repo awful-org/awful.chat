@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { transportState } from "$lib/transport/transport.svelte";
   import { profileStore } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -115,6 +116,7 @@
           src={bannerUrl}
           alt="Profile banner"
           class="absolute inset-0 size-full object-cover"
+          animate={mediaPrefs.gifAutoplay ? true : "hover"}
         />
       {/if}
       <!-- The dissolve. Tall enough that the avatar sits inside it, so the
@@ -152,6 +154,7 @@
             src={avatarUrl}
             alt={name}
             class="size-full object-cover"
+            animate={mediaPrefs.gifAutoplay ? true : "hover"}
           />
         {:else}
           <span

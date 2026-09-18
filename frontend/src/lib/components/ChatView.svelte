@@ -1959,6 +1959,7 @@
           beside={callBeside}
           onHangUp={ephemeral ? onLeave : undefined}
           personActions={!ephemeral}
+          showDeviceSettings={ephemeral}
         />
       </div>
     {/if}

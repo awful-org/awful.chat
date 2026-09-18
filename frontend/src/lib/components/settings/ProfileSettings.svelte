@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "../GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { onDestroy, tick } from "svelte";
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
@@ -270,6 +271,7 @@
           src={profileStore.bannerUrl}
           alt="Profile banner"
           class="h-full w-full object-cover"
+          animate={mediaPrefs.gifAutoplay ? true : "hover"}
         />
       {/if}
       <div
@@ -308,6 +310,7 @@
             src={profileStore.avatarUrl}
             alt="Avatar"
             class="size-full object-cover"
+            animate={mediaPrefs.gifAutoplay ? true : "hover"}
           />
         {:else}
           <span class="font-mono text-lg font-semibold text-primary select-none"

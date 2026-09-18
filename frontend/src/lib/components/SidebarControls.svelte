@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import {
     Camera,
@@ -184,6 +185,7 @@
               src={profileStore.avatarUrl}
               alt="Avatar"
               class="size-full object-cover"
+              animate={mediaPrefs.gifAutoplay ? true : "hover"}
             />
           {:else}
             <span
