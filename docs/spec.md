@@ -849,6 +849,13 @@ THREE VANTAGES ON ONE SESSION
   solved from peer.clock samples by least squares.
   dashboard/src/lib/analysis/merge.ts
 
+FILE TRANSFER SLOTS
+  Files above 512 KiB travel over WebTorrent rather than inline message bytes,
+  regardless of MIME type. Completed downloads release their WebRTC links so
+  queued files can use the bounded connection slots. The torrent and bytes
+  remain available to serve new inbound requests. Late close/error callbacks
+  from retired links must not remove replacement connections.
+
 SCREEN-SHARE RECOVERY
   During publisher session replacement, ms:producer-closed carries
   replacing: true. Viewers remove the old tracks but preserve watch intent,

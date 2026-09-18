@@ -289,6 +289,68 @@ describe("WebTorrentFileTransport", () => {
     expect(addCalls).toEqual([HASH]);
   });
 
+  it.each(["image/png", "application/octet-stream"])("completed %s downloads free slots for queued large files", async (mimeType) => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.onPeerConnect("alice");
+    const files = Array.from({ length: 9 }, (_, i) => ({
+      ...file, infoHash: (i + 1).toString(16).padStart(40, "0"),
+      filename: `large-${i}`, mimeType, size: 1024 * 1024,
+    }));
+    for (const desc of files) {
+      t.registerSeeder(desc, "alice");
+      t.ensureDownload(desc);
+    }
+    await tick();
+    await tick();
+    const peers = (t as never as { wtPeers: Map<string, EventEmitter & { destroyed: boolean }> }).wtPeers;
+    expect(peers.size).toBe(8);
+    const firstKey = `${files[0].infoHash}:alice`;
+    const first = peers.get(firstKey)!;
+    const queuedKey = `${files[8].infoHash}:alice`;
+    expect(peers.has(queuedKey)).toBe(false);
+    const torrent = torrents.get(files[0].infoHash)!;
+    const blob = new Blob([new Uint8Array(files[0].size)], { type: mimeType });
+    torrent.files = [{ getBlob: (cb: (err: null, blob: Blob) => void) => cb(null, blob) }];
+    const downloaded = vi.fn();
+    t.on("downloaded", downloaded);
+    torrent.done = true;
+    torrent.progress = 1;
+    torrent.emit("done");
+    expect(first.destroyed).toBe(true);
+    expect(peers.has(firstKey)).toBe(false);
+    expect(peers.has(queuedKey)).toBe(true);
+    expect(peers.size).toBe(8);
+    expect(downloaded).toHaveBeenCalledWith(files[0].infoHash, blob);
+    expect(t.getTransfer(files[0].infoHash)?.blobURL).toBeTruthy();
+    // Releasing a wire must not remove the torrent or the downloaded bytes.
+    expect(torrents.get(files[0].infoHash)).toBe(torrent);
+    t.handleSignal("bob", {
+      kind: "file-wt-signal", infoHash: files[0].infoHash, signal: {},
+    } as never);
+    peers.get(`${files[0].infoHash}:bob`)!.emit("connect");
+    await tick();
+    expect(addedPeers.some((peer) => peer.id === "bob")).toBe(true);
+    t.destroy();
+  });
+
+  it("late close and error events cannot remove a replacement file link", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.onPeerConnect("alice");
+    t.registerSeeder(file, "alice");
+    t.ensureDownload(file);
+    await tick();
+    const peers = (t as never as { wtPeers: Map<string, EventEmitter> }).wtPeers;
+    const key = `${HASH}:alice`;
+    const old = peers.get(key)!;
+    (iceServerList as never as { __fireIceServersChanged: () => void }).__fireIceServersChanged();
+    const replacement = peers.get(key)!;
+    expect(replacement).not.toBe(old);
+    old.emit("close");
+    old.emit("error", new Error("late ICE failure"));
+    expect(peers.get(key)).toBe(replacement);
+    t.destroy();
+  });
+
   it("gives every wire a distinct id so webtorrent can hold more than one", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     t.onPeerConnect("alice");
