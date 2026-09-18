@@ -66,10 +66,16 @@
           {#each list as f, i (`${f.id}-${i}`)}
             {@const rule = RULES[f.id]}
             <article
-              class="panel border-l-2 p-2.5"
+              class="panel border-l-4 p-2.5"
               style="border-left-color: {severityColor(f.severity)}"
             >
               <header class="flex flex-wrap items-baseline gap-x-2">
+                <span
+                  class="chip font-mono text-[10px] font-bold tracking-wider uppercase"
+                  style="color: {severityColor(f.severity)}; border-color: {severityColor(f.severity)}"
+                >
+                  {f.severity}
+                </span>
                 <h3 class="font-mono text-[12px]" style="color: {severityColor(f.severity)}">
                   {rule?.title ?? f.id}
                 </h3>
@@ -93,25 +99,30 @@
               {/if}
 
               {#if f.evidence.length > 0}
-                <div class="mt-1.5 flex flex-wrap items-center gap-1">
-                  <span class="font-mono text-[10px] tracking-wider text-faint uppercase">
-                    evidence
-                  </span>
-                  {#each f.evidence.slice(0, 24) as idx (idx)}
-                    {@const e = app.capture?.timeline[idx]}
-                    <button
-                      class="btn"
-                      title={e ? `${e.kind} ${fmtDetail(e.d)}` : `timeline index ${idx}`}
-                      onclick={() => focusTimelineIndex(idx)}
-                    >
-                      {e ? `${fmtClock(e.at)} ${e.kind}` : `#${idx}`}
-                    </button>
-                  {/each}
-                  {#if f.evidence.length > 24}
-                    <span class="text-[11px] text-faint">
-                      +{f.evidence.length - 24} more
+                <div class="mt-1.5 flex flex-col gap-1">
+                  <div class="flex flex-wrap items-center gap-1">
+                    <span class="font-mono text-[10px] tracking-wider text-faint uppercase">
+                      evidence · {f.evidence.length} event{f.evidence.length !== 1 ? "s" : ""}
                     </span>
-                  {/if}
+                    <span class="font-mono text-[9px] text-faint italic">(click or press f to jump)</span>
+                  </div>
+                  <div class="flex flex-wrap gap-1">
+                    {#each f.evidence.slice(0, 24) as idx (idx)}
+                      {@const e = app.capture?.timeline[idx]}
+                      <button
+                        class="btn hover:border-key hover:text-key transition-colors"
+                        title={e ? `${e.kind} ${fmtDetail(e.d)}` : `timeline index ${idx}`}
+                        onclick={() => focusTimelineIndex(idx)}
+                      >
+                        {e ? `${fmtClock(e.at)} ${e.kind}` : `#${idx}`}
+                      </button>
+                    {/each}
+                    {#if f.evidence.length > 24}
+                      <span class="text-[11px] text-faint">
+                        +{f.evidence.length - 24} more
+                      </span>
+                    {/if}
+                  </div>
                 </div>
               {/if}
             </article>

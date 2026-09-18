@@ -23,6 +23,9 @@
   } from "$lib/sources.svelte";
 
   let selected = $state<string | null>(null);
+  let rawSearch = $state("");
+  let parsedSearch = $state("");
+
   const current = $derived(
     app.logFiles.find((f) => f.id === selected) ?? app.logFiles[0] ?? null
   );
@@ -30,7 +33,12 @@
 
   /** Enough to read, and small enough that the browser stays responsive. */
   const MAX_LINES = 4000;
-  const lines = $derived(payload ? payload.text.split("\n").slice(0, MAX_LINES) : []);
+  const allLines = $derived(payload ? payload.text.split("\n").slice(0, MAX_LINES) : []);
+  const lines = $derived(
+    rawSearch.trim() === ""
+      ? allLines
+      : allLines.filter((line) => line.toLowerCase().includes(rawSearch.toLowerCase()))
+  );
 </script>
 
 {#if app.logFiles.length === 0}
@@ -92,16 +100,38 @@
 
       <div class="grid min-h-0 gap-3 xl:grid-cols-2">
         <section class="panel flex min-h-0 flex-col">
-          <h2 class="panel-head">raw</h2>
+          <div class="panel-head flex-col gap-1">
+            <div class="flex items-center justify-between">
+              <h2>raw</h2>
+              <span class="font-mono text-[10px] text-faint">{lines.length} / {allLines.length} lines</span>
+            </div>
+          </div>
+          <input
+            class="field m-2 mb-0"
+            type="text"
+            placeholder="search raw text..."
+            bind:value={rawSearch}
+            title="Filter log lines by text (case-insensitive)"
+          />
           <pre
-            class="max-h-[32rem] overflow-auto p-2 text-[11px] leading-snug whitespace-pre">{#each lines as line, n (n)}<span
+            class="max-h-[28rem] overflow-auto p-2 text-[11px] leading-snug whitespace-pre">{#each lines as line, n (n)}<span
                 class="text-faint">{String(n + 1).padStart(5)} </span>{line}
 {/each}</pre>
         </section>
 
         <section class="panel flex min-h-0 flex-col">
-          <h2 class="panel-head">parsed</h2>
-          <div class="max-h-[32rem] overflow-auto">
+          <h2 class="panel-head flex items-center justify-between">
+            <span>parsed</span>
+            <span class="font-mono text-[10px] text-faint">{payload?.parsed.events.filter((e) => parsedSearch === "" || e.kind.toLowerCase().includes(parsedSearch.toLowerCase()) || e.peer?.toLowerCase().includes(parsedSearch.toLowerCase())).length ?? 0} event{payload ? "s" : ""}</span>
+          </h2>
+          <input
+            class="field m-2 mb-0"
+            type="text"
+            placeholder="search kind or peer..."
+            bind:value={parsedSearch}
+            title="Filter parsed events by kind or peer (case-insensitive)"
+          />
+          <div class="max-h-[28rem] overflow-auto">
             <table class="tbl">
               <thead>
                 <tr><th>time</th><th>kind</th><th>peer</th><th>detail</th></tr>
@@ -109,36 +139,39 @@
               <tbody>
                 {#each payload.parsed.events as e, n (n)}
                   {@const raw = e.d?.raw !== undefined}
-                  <tr
-                    class="cursor-pointer"
-                    onclick={() => {
-                      const i = timelineIndexOf(e.source, e.seq, e.at);
-                      if (i >= 0) focusTimelineIndex(i);
-                    }}
-                    title={raw ? "This line matched no template. It survives as a raw event." : ""}
-                  >
-                    <td class="whitespace-nowrap">{fmtClock(e.at)}</td>
-                    <td style="color: {raw ? 'var(--color-sev-warn)' : sevColor(e.sev)}">
-                      {raw ? "unmatched" : e.kind}
-                    </td>
-                    <!--
-                      This pane shows the PARSER's own output, before the merge
-                      resolves a suffix to a full peerId, because a mis-parse is
-                      what the operator came here to check.
-                    -->
-                    <td
-                      class="text-dim"
-                      title={e.peer ??
-                        "The parser saw only a suffix. The merge resolves it against the loaded bundles."}
+                  {@const matchesSearch = parsedSearch === "" || e.kind.toLowerCase().includes(parsedSearch.toLowerCase()) || e.peer?.toLowerCase().includes(parsedSearch.toLowerCase())}
+                  {#if matchesSearch}
+                    <tr
+                      class="cursor-pointer hover:bg-raise transition-colors"
+                      onclick={() => {
+                        const i = timelineIndexOf(e.source, e.seq, e.at);
+                        if (i >= 0) focusTimelineIndex(i);
+                      }}
+                      title={raw ? "This line matched no template. It survives as a raw event." : "Click to jump to timeline"}
                     >
-                      {e.peer
-                        ? shortPeer(e.peer)
-                        : typeof e.d?.peerSuffix === "string"
-                          ? `…${e.d.peerSuffix}?`
-                          : ""}
-                    </td>
-                    <td class="max-w-[26rem] break-all text-dim">{fmtDetail(e.d)}</td>
-                  </tr>
+                      <td class="whitespace-nowrap">{fmtClock(e.at)}</td>
+                      <td style="color: {raw ? 'var(--color-sev-warn)' : sevColor(e.sev)}">
+                        {raw ? "unmatched" : e.kind}
+                      </td>
+                      <!--
+                        This pane shows the PARSER's own output, before the merge
+                        resolves a suffix to a full peerId, because a mis-parse is
+                        what the operator came here to check.
+                      -->
+                      <td
+                        class="text-dim"
+                        title={e.peer ??
+                          "The parser saw only a suffix. The merge resolves it against the loaded bundles."}
+                      >
+                        {e.peer
+                          ? shortPeer(e.peer)
+                          : typeof e.d?.peerSuffix === "string"
+                            ? `…${e.d.peerSuffix}?`
+                            : ""}
+                      </td>
+                      <td class="max-w-[26rem] break-all text-dim">{fmtDetail(e.d)}</td>
+                    </tr>
+                  {/if}
                 {/each}
               </tbody>
             </table>

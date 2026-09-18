@@ -241,8 +241,13 @@
     </section>
 
     <!-- Events -->
-    <section class="panel min-h-0 flex-1 overflow-auto">
-      <table class="tbl">
+    <section class="panel min-h-0 flex-1 overflow-auto flex flex-col">
+      {#if app.rows.length > MAX_ROWS}
+        <div class="p-2 text-[11px] border-b border-line shrink-0" style="color: var(--color-sev-warn)">
+          Table shows {MAX_ROWS} of {app.rows.length} rows. Narrow the filter or set a time range to see the rest.
+        </div>
+      {/if}
+      <table class="tbl flex-1">
         <thead>
           <tr>
             <th>time</th>
@@ -258,11 +263,23 @@
         <tbody bind:this={body}>
           {#each visible as row, n (row.i)}
             <tr
-              class="cursor-pointer {app.cursor === n ? 'bg-raise' : ''}"
+              class="cursor-pointer transition-colors"
+              class:bg-raise={app.cursor === n}
+              style="
+                background-color: {app.cursor === n ? 'var(--color-raise)' : 'inherit'};
+                border-left: 2px solid {evidence.has(row.i) ? 'var(--color-sev-error)' : 'transparent'};
+                padding-left: 0;
+              "
+              onmouseenter={(e) => {
+                if (app.cursor !== n) e.currentTarget.style.backgroundColor = 'var(--color-ink)';
+              }}
+              onmouseleave={(e) => {
+                if (app.cursor !== n) e.currentTarget.style.backgroundColor = 'inherit';
+              }}
               onclick={() => setCursor(n)}
             >
-              <td class="whitespace-nowrap" style="color: {app.cursor === n ? 'var(--color-key)' : ''}">
-                {#if evidence.has(row.i)}<span style="color: var(--color-sev-error)">●</span>{:else}<span
+              <td class="whitespace-nowrap pl-1" style="color: {app.cursor === n ? 'var(--color-key)' : ''}">
+                {#if evidence.has(row.i)}<span style="color: var(--color-sev-error); font-weight: bold">●</span>{:else}<span
                     class="text-faint">·</span
                   >{/if}
                 {fmtClock(row.e.at)}
@@ -280,13 +297,6 @@
           {/each}
         </tbody>
       </table>
-
-      {#if app.rows.length > MAX_ROWS}
-        <p class="p-2 text-[11px]" style="color: var(--color-sev-warn)">
-          The table shows the first {MAX_ROWS} of {app.rows.length} rows. Narrow
-          the filter or set a time range to see the rest.
-        </p>
-      {/if}
     </section>
   </div>
 {/if}

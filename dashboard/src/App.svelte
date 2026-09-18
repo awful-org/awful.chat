@@ -88,10 +88,10 @@
         id="tab-{t.id}"
         aria-selected={app.tab === t.id}
         aria-controls="view"
-        class="border-b-2 px-3 py-1.5 font-mono text-[11px] tracking-wide
+        class="border-b-2 px-3 py-1.5 font-mono text-[11px] tracking-wide transition-colors
                {app.tab === t.id
           ? 'border-key text-key'
-          : 'border-transparent text-dim hover:text-text'}"
+          : 'border-transparent text-dim hover:text-text focus-visible:text-text'}"
         onclick={() => goTo(t.id)}
       >
         {t.label}
