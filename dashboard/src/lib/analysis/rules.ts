@@ -175,7 +175,7 @@ export const RULES: Readonly<Record<FindingId, Rule>> = {
     id: "voice-never-connected",
     title: "Voice never connected",
     severity: "block",
-    meaning: "A voice peer connection never reached ICE connected in time. The call never started for this peer.",
+    meaning: "A voice connection attempt did not reach connected within 30 seconds. A later retry may have recovered.",
     remedy: "Check ICE candidates, TURN, and the signaling path for this peer.",
     aiHint: "Look at voice.ice.state and voice.signal.invalid events for this peer.",
   },

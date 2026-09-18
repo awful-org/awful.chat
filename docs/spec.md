@@ -849,6 +849,24 @@ THREE VANTAGES ON ONE SESSION
   solved from peer.clock samples by least squares.
   dashboard/src/lib/analysis/merge.ts
 
+SCREEN-SHARE RECOVERY
+  During publisher session replacement, ms:producer-closed carries
+  replacing: true. Viewers remove the old tracks but preserve watch intent,
+  automatically consuming replacement screen producers. Ordinary producer
+  closure still ends the watch once no screen consumers remain. Ending only
+  screen audio does not end a surviving video stream; callbacks from retired
+  consumers cannot remove replacement tracks.
+
+VOICE TIMING
+  Retry backoff, redial rate limits, handshake age and media watchdogs use
+  monotonic elapsed time. Correcting the OS clock must neither postpone
+  recovery nor expire an otherwise healthy voice connection.
+  The voice-setup finding recognizes ICE state connected/completed and PC
+  state connected (plus legacy voice.ice.connected). Attempts canceled or
+  replaced before the deadline are not failures. A timeout requires elapsed
+  evidence from the same captured source; a capture ending during setup is
+  inconclusive. A later successful retry does not erase a real earlier timeout.
+
 REDACTION (enforced by tests, not by convention)
   room code:      NEVER. A client bundle uses an ordinal ("r1"); a relay
                   bundle uses "h:"+HMAC(bootSecret, code)[0..12], and the

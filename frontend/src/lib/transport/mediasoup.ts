@@ -106,6 +106,8 @@ interface MSPeerLeft {
 }
 interface MSProducerClosed {
   type: "ms:producer-closed";
+  /** Publisher session replacement: keep the viewer's watch intent. */
+  replacing?: boolean;
   peerId: string;
   producerId: string;
   source: VideoSource;
@@ -1410,7 +1412,7 @@ export class MediasoupVideo implements VideoTransport {
               this.pendingScreenProducerIds.delete(msg.peerId);
               if (this.pendingTransmissions.has(msg.peerId)) {
                 this.pendingTransmissions.delete(msg.peerId);
-                this.emit("transmissionEnded", msg.peerId);
+                if (!msg.replacing) this.emit("transmissionEnded", msg.peerId);
               }
             }
           }
@@ -1423,6 +1425,7 @@ export class MediasoupVideo implements VideoTransport {
             ?.some((c) => c.source === "screen");
           if (
             this.watchingTransmissionPeers.has(msg.peerId) &&
+            !msg.replacing &&
             !stillHasScreenConsumer
           ) {
             this.watchingTransmissionPeers.delete(msg.peerId);
@@ -1583,9 +1586,24 @@ export class MediasoupVideo implements VideoTransport {
     }
 
     consumer.on("trackended", () => {
+      const current = this.consumers.get(peerId);
+      // A callback from an already replaced consumer cannot remove new media.
+      if (!current?.some((entry) => entry.consumer === consumer)) return;
+      const remaining = current.filter((entry) => entry.consumer !== consumer);
+      if (remaining.length) this.consumers.set(peerId, remaining);
+      else this.consumers.delete(peerId);
       this.consumerStats.delete(consumer.id);
-      this.emit("trackRemoved", peerId, source, consumer.kind);
-      if (source === "screen") {
+      consumer.close();
+      if (!remaining.some((entry) =>
+        entry.source === source && entry.consumer.kind === consumer.kind
+      )) {
+        this.emit("trackRemoved", peerId, source, consumer.kind);
+      }
+      if (
+        source === "screen" &&
+        !remaining.some((entry) => entry.source === "screen")
+      ) {
+        this.watchingTransmissionPeers.delete(peerId);
         this.emit("transmissionEnded", peerId);
       }
     });

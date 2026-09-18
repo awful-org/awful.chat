@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LibP2PVoice } from "./voice";
 
 // handleRedialRequest touches only the link bookkeeping, so the peer
@@ -19,11 +19,11 @@ function fakeRemote(
     sourceNode: null,
     gainNode: null,
     pendingCandidates: [],
-    createdAt: Date.now() - ageMs,
+    createdAt: performance.now() - ageMs,
     everConnected,
-    okAt: Date.now() - okAgoMs,
+    okAt: performance.now() - okAgoMs,
     lastBytesReceived,
-    lastBytesReceivedAt: Date.now() - bytesReceivedAgoMs,
+    lastBytesReceivedAt: performance.now() - bytesReceivedAgoMs,
   };
 }
 
@@ -56,6 +56,7 @@ function makeVoice(
 
 describe("handleRedialRequest", () => {
   let dialed: string[];
+  afterEach(() => vi.restoreAllMocks());
   beforeEach(() => {
     dialed = [];
   });
@@ -118,6 +119,32 @@ describe("handleRedialRequest", () => {
     expect(dialed).toEqual(["aaa"]);
   });
 
+  it.each([-3_600_000, 3_600_000])("keeps retry limits working across a %i ms clock correction", (jump) => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    const wall = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const { voice, internals } = makeVoice(null);
+    spyDial(internals);
+    voice.handleRedialRequest("aaa");
+    expect(dialed).toEqual(["aaa"]); // first retry allowed even at time zero
+    wall.mockReturnValue(1_800_000_000_000 + jump);
+    clock.mockReturnValue(1_000);
+    voice.handleRedialRequest("aaa");
+    expect(dialed).toEqual(["aaa"]);
+    clock.mockReturnValue(60_000);
+    voice.handleRedialRequest("aaa");
+    expect(dialed).toEqual(["aaa", "aaa"]);
+  });
+
+  it("does not expire a fresh handshake when the system clock jumps forward", () => {
+    vi.spyOn(performance, "now").mockReturnValue(100);
+    const wall = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const { voice, internals } = makeVoice("connecting");
+    spyDial(internals);
+    wall.mockReturnValue(1_800_003_600_000);
+    voice.handleRedialRequest("aaa");
+    expect(dialed).toEqual([]);
+  });
+
   it("refuses an ask during a fresh blip on an established link", () => {
     // "disconnected" seconds after being connected may recover by itself
     // (ICE restart); the ask must not flap a link mid-recovery.
@@ -142,7 +169,7 @@ describe("handleRedialRequest", () => {
     spyDial(internals);
     (internals.nextDialAt as Map<string, number>).set(
       "aaa",
-      Date.now() + 8_000
+      performance.now() + 8_000
     );
     (internals.dialBackoff as Map<string, number>).set("aaa", 8_000);
     voice.handleRedialRequest("aaa");
@@ -211,7 +238,7 @@ describe("linkIsHealthy: inbound-media watchdog (finding 3)", () => {
     const remote = (internals.remotePeers as Map<string, TestRemote>).get(
       "aaa"
     )!;
-    const now = Date.now();
+    const now = performance.now();
     remote.lastBytesReceived = 50_000;
     remote.lastBytesReceivedAt = now - 6_000; // inside the 8s stall window
     remote.okAt = now - 6_000;
@@ -233,7 +260,7 @@ describe("linkIsHealthy: inbound-media watchdog (finding 3)", () => {
     const remote = (internals.remotePeers as Map<string, TestRemote>).get(
       "aaa"
     )!;
-    const now = Date.now();
+    const now = performance.now();
     remote.lastBytesReceived = 50_000;
     remote.lastBytesReceivedAt = now - 25_000;
     remote.okAt = now - 25_000;
@@ -245,7 +272,7 @@ describe("linkIsHealthy: inbound-media watchdog (finding 3)", () => {
     const remote = (internals.remotePeers as Map<string, TestRemote>).get(
       "aaa"
     )!;
-    const now = Date.now();
+    const now = performance.now();
     remote.lastBytesReceived = 12_000;
     remote.lastBytesReceivedAt = now - 500; // increased half a second ago
     remote.okAt = now - 10_000; // stale from before this sample
@@ -265,7 +292,7 @@ describe("linkIsHealthy: inbound-media watchdog (finding 3)", () => {
     const statuses: Array<{ type: string; peerId?: string; relayed?: boolean }> =
       [];
     voice.on("status", (s) => statuses.push(s as (typeof statuses)[number]));
-    const now = Date.now();
+    const now = performance.now();
     // A stall was already announced (tile is amber), the pair went via TURN.
     remote.stallSignaled = true;
     remote.relayed = true;
@@ -301,7 +328,7 @@ describe("linkIsHealthy: inbound-media watchdog (finding 3)", () => {
     internals.node = {} as unknown;
     internals.callPeers = new Set(["zzz"]);
     internals.rosterSeen = true;
-    const now = Date.now();
+    const now = performance.now();
     const remote = {
       ...fakeRemote("connected", 60_000, true, 25_000, 50_000, 25_000),
       peerId: "zzz",
