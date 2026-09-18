@@ -776,12 +776,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
     peer.on("error", () => {
       clearTimeout(connectDeadline);
-      this.wtPeers.delete(key);
+      if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
     });
 
     peer.on("close", () => {
       clearTimeout(connectDeadline);
-      this.wtPeers.delete(key);
+      if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
     });
     return true;
   }
@@ -898,6 +898,16 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     torrent.on("done", () => {
       pushUpdate();
       if (this.seedingByHash.get(infoHash)) return;
+      // Manual WebRTC peers have no tracker to rotate idle connections for
+      // us. Finished downloads otherwise occupy the per-peer cap forever,
+      // starving every subsequent image above the inline limit. Keep the
+      // torrent (and its bytes) available for new inbound seeding requests.
+      for (const [key, peer] of this.wtPeers) {
+        if (!key.startsWith(`${infoHash}:`)) continue;
+        this.wtPeers.delete(key);
+        peer.destroy();
+      }
+      this.reconcileWtPeers();
       const file = torrent.files?.[0];
       if (!file) return;
       file.getBlob((_err, blob) => {

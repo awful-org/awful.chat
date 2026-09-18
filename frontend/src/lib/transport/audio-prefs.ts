@@ -14,6 +14,8 @@ const KEY = "awful_audio_prefs";
 
 export const SHARE_HEIGHTS = [0, 720, 1080] as const;
 export const SHARE_FPS = [15, 30, 60] as const;
+export const SHARE_CONTENT_HINTS = ["", "motion", "detail"] as const;
+export type ShareContentHint = (typeof SHARE_CONTENT_HINTS)[number];
 export type ShareHeight = (typeof SHARE_HEIGHTS)[number];
 export type ShareFps = (typeof SHARE_FPS)[number];
 
@@ -44,6 +46,7 @@ export interface AudioPrefs {
    */
   shareHeight: ShareHeight;
   shareFps: ShareFps;
+  shareContentHint: ShareContentHint;
   /**
    * How loud each person is for us, keyed by their did:key - the durable
    * identity, so the setting survives them reinstalling or changing devices,
@@ -63,6 +66,7 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   shareAudioDespiteEchoRisk: false,
   shareHeight: 0,
   shareFps: 30,
+  shareContentHint: "",
   peerVolumes: {},
 };
 
@@ -89,7 +93,7 @@ function num(value: unknown, fallback: number, min: number, max: number) {
     : fallback;
 }
 
-function oneOf<T extends number>(
+function oneOf<T extends number | string>(
   allowed: readonly T[],
   value: unknown,
   fallback: T
@@ -126,6 +130,9 @@ export function loadAudioPrefs(): AudioPrefs {
         AUDIO_PREF_DEFAULTS.shareHeight
       ),
       shareFps: oneOf(SHARE_FPS, p.shareFps, AUDIO_PREF_DEFAULTS.shareFps),
+      shareContentHint: oneOf(
+        SHARE_CONTENT_HINTS, p.shareContentHint, AUDIO_PREF_DEFAULTS.shareContentHint
+      ),
       peerVolumes: sanitizePeerVolumes(p.peerVolumes),
     };
   } catch {

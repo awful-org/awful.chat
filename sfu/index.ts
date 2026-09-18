@@ -108,6 +108,7 @@ interface MSNewProducer {
 }
 interface MSProducerClosed {
   type: "ms:producer-closed";
+  replacing?: boolean;
   peerId: string;
   producerId: string;
   source: "camera" | "screen";
@@ -1747,6 +1748,7 @@ async function main(): Promise<void> {
               send(otherPeer.ws, {
                 type: "ms:producer-closed",
                 peerId: joinMsg.peerId,
+                replacing: true,
                 producerId,
                 source,
                 kind: producer.kind,

@@ -350,7 +350,9 @@ export class LibP2PVoice implements VoiceTransport {
   setCallPeers(peerIds: Iterable<string>): void {
     this.callPeers = new Set(peerIds);
     this.rosterSeen = true;
-    const now = Date.now();
+    // All voice deadlines use monotonic time: fixing the OS clock must not
+    // strand retry backoffs or prematurely expire a healthy handshake.
+    const now = performance.now();
     for (const [peerId, entry] of this.pendingRosterSignals) {
       if (now - entry.at > 20_000) {
         this.pendingRosterSignals.delete(peerId);
@@ -416,7 +418,7 @@ export class LibP2PVoice implements VoiceTransport {
       if (
         existing &&
         existing.everConnected &&
-        Date.now() - (this.lastRedialAsk.get(peerId) ?? 0) < VOICE_REDIAL_ASK_MS
+        performance.now() - (this.lastRedialAsk.get(peerId) ?? -Infinity) < VOICE_REDIAL_ASK_MS
       ) {
         this.teardownRemotePeer(peerId);
         this.emit("peerLeft", peerId);
@@ -430,7 +432,7 @@ export class LibP2PVoice implements VoiceTransport {
       // session descriptions do not. Both branches are rate-limited.
       if (signal.type === "ice") return;
       if (peerId > this.transport.selfId()) {
-        this.askForRedial(peerId, Date.now());
+        this.askForRedial(peerId, performance.now());
       } else {
         this.handleRedialRequest(peerId);
       }
@@ -446,7 +448,7 @@ export class LibP2PVoice implements VoiceTransport {
   private bufferRosterSignal(peerId: string, signal: unknown): void {
     const entry = this.pendingRosterSignals.get(peerId);
     if (!entry && this.pendingRosterSignals.size >= 8) return;
-    const target = entry ?? { at: Date.now(), signals: [] };
+    const target = entry ?? { at: performance.now(), signals: [] };
     if (target.signals.length >= 32) return;
     target.signals.push(signal);
     this.pendingRosterSignals.set(peerId, target);
@@ -480,7 +482,7 @@ export class LibP2PVoice implements VoiceTransport {
     if (!this.node || !this.rosterSeen) return;
     const self = this.transport.selfId();
     const connected = new Set(this.transport.peers());
-    const now = Date.now();
+    const now = performance.now();
 
     // A browser or OS audio interruption suspends this context, and
     // nothing else resumes it - the visibility handler only resumes the
@@ -554,7 +556,7 @@ export class LibP2PVoice implements VoiceTransport {
   }
 
   private askForRedial(peerId: string, now: number): void {
-    if (now - (this.lastRedialAsk.get(peerId) ?? 0) < VOICE_REDIAL_ASK_MS) return;
+    if (now - (this.lastRedialAsk.get(peerId) ?? -Infinity) < VOICE_REDIAL_ASK_MS) return;
     this.lastRedialAsk.set(peerId, now);
     this.debugStats.redialsAsked++;
     rec(ev("voice.redial.ask", { peer: peerId }));
@@ -579,8 +581,8 @@ export class LibP2PVoice implements VoiceTransport {
     // at all: a peer stuck in a redial loop (or one that simply means us harm)
     // would otherwise tear our link down on every message, and since only the
     // rebuild was rate limited, a healthy call could be flapped from outside.
-    const now = Date.now();
-    if (now - (this.lastRedialServed.get(peerId) ?? 0) < VOICE_REDIAL_ASK_MS) {
+    const now = performance.now();
+    if (now - (this.lastRedialServed.get(peerId) ?? -Infinity) < VOICE_REDIAL_ASK_MS) {
       rec(ev("voice.redial.serve", { peer: peerId, d: { refused: "rate-limited" } }));
       return;
     }
@@ -652,7 +654,7 @@ export class LibP2PVoice implements VoiceTransport {
   /** Note progress on a link so the wedge check does not fire mid-handshake. */
   private touchLink(peerId: string): void {
     const remote = this.remotePeers.get(peerId);
-    if (remote) remote.okAt = Date.now();
+    if (remote) remote.okAt = performance.now();
   }
 
   private linkIsHealthy(remote: RemotePeer, now: number): boolean {
@@ -1167,7 +1169,7 @@ export class LibP2PVoice implements VoiceTransport {
     // way: an RTCPeerConnection that fails immediately (no working ICE) tore
     // itself down, which triggered an instant redial, which failed again, at
     // ~20 dials a second on both sides at once.
-    const now = Date.now();
+    const now = performance.now();
     if (now < (this.nextDialAt.get(peerId) ?? 0)) return;
     const wait = Math.min(
       (this.dialBackoff.get(peerId) ?? 0) + VOICE_DIAL_STEP_MS,
@@ -1363,7 +1365,7 @@ export class LibP2PVoice implements VoiceTransport {
               // unrecoverable until the 5s blip ask - unlike the initial
               // offer and the answer, this send's result used to be
               // discarded via `void` (finding 10).
-              if (!sent) this.askForRedial(peerId, Date.now());
+              if (!sent) this.askForRedial(peerId, performance.now());
             })
             .catch((err) => {
               console.warn(
@@ -1394,11 +1396,11 @@ export class LibP2PVoice implements VoiceTransport {
       sourceNode: null,
       gainNode: null,
       pendingCandidates: [],
-      createdAt: Date.now(),
+      createdAt: performance.now(),
       everConnected: false,
-      okAt: Date.now(),
+      okAt: performance.now(),
       lastBytesReceived: null,
-      lastBytesReceivedAt: Date.now(),
+      lastBytesReceivedAt: performance.now(),
       stallSignaled: false,
       relayed: false,
     };
@@ -1498,7 +1500,7 @@ export class LibP2PVoice implements VoiceTransport {
           console.warn(
             `[Voice] unexpected signaling state ${state} on offer from ${peerId}`
           );
-          this.askForRedial(peerId, Date.now());
+          this.askForRedial(peerId, performance.now());
           return;
         }
 
@@ -1520,7 +1522,7 @@ export class LibP2PVoice implements VoiceTransport {
           // fresh dial (rate-limited) instead of letting both ends wait.
           this.teardownRemotePeer(peerId);
           this.emit("peerLeft", peerId);
-          this.askForRedial(peerId, Date.now());
+          this.askForRedial(peerId, performance.now());
         }
         break;
       }

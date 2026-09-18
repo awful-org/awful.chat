@@ -555,7 +555,10 @@ describe("sync-stalled", () => {
 
 describe("voice-never-connected", () => {
   it("fires when ICE never connects within the deadline", () => {
-    const c = makeCapture([ev({ kind: "voice.pc.new", at: 0, peer: "p1" })]);
+    const c = makeCapture([
+      ev({ kind: "voice.pc.new", at: 0, peer: "p1" }),
+      ev({ kind: "counters", at: VOICE_SETUP_DEADLINE_MS + 1 }),
+    ]);
     const findings = runFindings(c);
     expect(idsOf(findings)).toContain("voice-never-connected");
     expectEvidenceValid(c, findings);
@@ -567,6 +570,46 @@ describe("voice-never-connected", () => {
       ev({ kind: "voice.ice.connected", at: VOICE_SETUP_DEADLINE_MS - 1000, peer: "p1" }),
     ]);
     expect(idsOf(runFindings(c))).not.toContain("voice-never-connected");
+  });
+
+  it.each(["connected", "completed"])("recognizes the client's actual ICE state event: %s", (state) => {
+    const c = makeCapture([
+      ev({ kind: "voice.pc.new", at: 0, peer: "p1" }),
+      ev({ kind: "voice.ice.state", at: 300, peer: "p1", d: { state } }),
+      ev({ kind: "counters", at: 60_000 }),
+    ]);
+    expect(idsOf(runFindings(c))).not.toContain("voice-never-connected");
+  });
+
+  it("ignores canceled attempts and a successful replacement", () => {
+    const c = makeCapture([
+      ev({ kind: "voice.pc.new", at: 0, peer: "p1" }),
+      ev({ kind: "voice.teardown", at: 30, peer: "p1" }),
+      ev({ kind: "voice.pc.new", at: 31, peer: "p1" }),
+      ev({ kind: "voice.ice.state", at: 400, peer: "p1", d: { state: "connected" } }),
+      ev({ kind: "counters", at: 60_000 }),
+    ]);
+    expect(idsOf(runFindings(c))).not.toContain("voice-never-connected");
+  });
+
+  it("waits for the deadline and does not borrow elapsed time from another session", () => {
+    const c = makeCapture([
+      ev({ kind: "voice.pc.new", at: 0, peer: "p1" }),
+      ev({ kind: "counters", at: 60_000, source: "other-session" }),
+    ]);
+    expect(idsOf(runFindings(c))).not.toContain("voice-never-connected");
+  });
+
+  it("reports a real timeout even if a later attempt connects", () => {
+    const c = makeCapture([
+      ev({ kind: "voice.pc.new", at: 0, peer: "p1" }),
+      ev({ kind: "voice.teardown", at: 31_000, peer: "p1" }),
+      ev({ kind: "voice.pc.new", at: 31_001, peer: "p1" }),
+      ev({ kind: "voice.ice.state", at: 31_400, peer: "p1", d: { state: "connected" } }),
+    ]);
+    const findings = runFindings(c).filter(f => f.id === "voice-never-connected");
+    expect(findings).toHaveLength(1);
+    expect(findings[0].evidence).toEqual([0]);
   });
 });
 

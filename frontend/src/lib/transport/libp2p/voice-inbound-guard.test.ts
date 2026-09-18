@@ -152,9 +152,9 @@ describe("dialAndOfferInner offer delivery", () => {
       sourceNode: null,
       gainNode: null,
       pendingCandidates: [],
-      createdAt: Date.now(),
+      createdAt: performance.now(),
       everConnected: false,
-      okAt: Date.now(),
+      okAt: performance.now(),
     };
     internals.ensureRemotePeer = () => remote;
     (internals.remotePeers as Map<string, unknown>).set("aaa", remote);

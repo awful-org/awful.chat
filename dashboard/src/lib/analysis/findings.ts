@@ -931,6 +931,35 @@ function captureIncomplete(c: Capture): Finding[] {
   return [make("capture-incomplete", {}, evidence, { droppedTotal, suppressedKinds })];
 }
 
+function voiceNeverConnected(timeline: MergedEvent[]): Finding[] {
+  const out: Finding[] = [];
+  timeline.forEach((start, index) => {
+    if (start.kind !== "voice.pc.new" || !start.peer) return;
+    let elapsed = 0;
+    for (let i = index + 1; i < timeline.length; i++) {
+      const e = timeline[i];
+      // A retry in another captured session must not settle this attempt.
+      if (e.source !== start.source || e.observer !== start.observer) continue;
+      elapsed = e.t - start.t;
+      if (elapsed > VOICE_SETUP_DEADLINE_MS) break;
+      if (e.peer !== start.peer) continue;
+      const connected = e.kind === "voice.ice.connected" ||
+        ((e.kind === "voice.ice.state" || e.kind === "voice.pc.state") &&
+          (str(e.d, "state") === "connected" ||
+            (e.kind === "voice.ice.state" && str(e.d, "state") === "completed")));
+      // Short-lived PCs superseded by redial are canceled, not timed out.
+      if (connected || e.kind === "voice.teardown" || e.kind === "voice.leave" ||
+          e.kind === "voice.pc.new") return;
+    }
+    // A capture ending mid-handshake does not prove a timeout.
+    if (elapsed < VOICE_SETUP_DEADLINE_MS) return;
+    out.push(make("voice-never-connected", {
+      peer: start.peer, vantage: start.observer,
+    }, [index], { deadlineMs: VOICE_SETUP_DEADLINE_MS }));
+  });
+  return out;
+}
+
 function relayCloseUnclean(timeline: MergedEvent[]): Finding[] {
   const out: Finding[] = [];
   timeline.forEach((e, i) => {
@@ -1007,14 +1036,7 @@ export function runFindings(c: Capture): Finding[] {
     ...roomViewSplit(timeline),
     ...messageRejected(timeline),
     ...syncStalled(timeline),
-    ...unmatchedDeadlineFindings(
-      timeline,
-      "voice.pc.new",
-      ["voice.ice.connected"],
-      VOICE_SETUP_DEADLINE_MS,
-      "observer+peer",
-      "voice-never-connected"
-    ),
+    ...voiceNeverConnected(timeline),
     ...unmatchedDeadlineFindings(
       timeline,
       "voice.media.stall",
@@ -1050,8 +1072,8 @@ export function runFindings(c: Capture): Finding[] {
     ...peerConnectionLeak(timeline),
     ...producerNeverConsumed(c, timeline),
     ...turnUnreachable(timeline),
-    // One event, one finding: the client only emits it when the disagreement
-    // is unambiguous, so there is nothing left to threshold here.
+    // Retain older clients' count-only diagnosis as informational evidence.
+    // Presence can precede SFU join even when there is only one server.
     ...thresholdByObserver(timeline, "sfu.misplaced", 1, "sfu-misplaced"),
     ...thresholdByObserver(timeline, "runtime.error", 1, "uncaught-error"),
   ];

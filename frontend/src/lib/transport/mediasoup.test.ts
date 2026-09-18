@@ -246,6 +246,66 @@ describe("a rejoin does not demote a watched transmission (movie-night drop)", (
     }
   });
 
+  it.each([true, false])("publisher replacement=%s preserves watch intent only for recovery", (replacing) => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    internals.device = {};
+    const watching = internals.watchingTransmissionPeers as Set<string>;
+    watching.add("sharer");
+    const entries = ["video", "audio"].map((kind) => ({
+      source: "screen", consumer: { producerId: kind, kind, close: vi.fn() },
+    }));
+    internals.consumers = new Map([["sharer", entries]]);
+    internals.pendingScreenProducerIds = new Map([["sharer", new Set(["video", "audio"])]]);
+    const ended = vi.fn();
+    video.on("transmissionEnded", ended);
+    const signal = internals.handleSignal as (msg: unknown) => void;
+    for (const kind of ["video", "audio"]) signal.call(video, {
+      type: "ms:producer-closed", peerId: "sharer", producerId: kind,
+      source: "screen", kind, replacing,
+    });
+    expect(watching.has("sharer")).toBe(replacing);
+    expect(ended).toHaveBeenCalledTimes(replacing ? 0 : 1);
+    const retry = vi.fn(async () => {});
+    internals.consumeProducerWithRetry = retry;
+    signal.call(video, {
+      type: "ms:new-producer", peerId: "sharer", producerId: "replacement", source: "screen",
+    });
+    expect(retry).toHaveBeenCalledTimes(replacing ? 1 : 0);
+  });
+
+  it("an ended audio track leaves video playing, and stale callbacks cannot end its replacement", async () => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    const callbacks = new Map<string, () => void>();
+    internals.device = { recvRtpCapabilities: {} };
+    internals.ensureRecvTransport = async () => {};
+    internals.request = async () => ({ type: "ms:consumer-options", options: {} });
+    internals.signal = () => {};
+    let kind = "video";
+    internals.recvTransport = { consume: async () => {
+      const trackKind = kind;
+      return { id: trackKind, producerId: trackKind, kind: trackKind, track: {}, close: vi.fn(),
+        on: (_event: string, cb: () => void) => callbacks.set(trackKind, cb) };
+    } };
+    const consume = internals.consumeProducer as (p: string, id: string, source: string) => Promise<void>;
+    await consume.call(video, "sharer", "video", "screen");
+    kind = "audio";
+    await consume.call(video, "sharer", "audio", "screen");
+    const ended = vi.fn();
+    const removed = vi.fn();
+    video.on("transmissionEnded", ended);
+    video.on("trackRemoved", removed);
+    callbacks.get("audio")!();
+    expect(ended).not.toHaveBeenCalled();
+    expect(removed).toHaveBeenCalledWith("sharer", "screen", "audio");
+    removed.mockClear();
+    internals.consumers = new Map([["sharer", [{ source: "screen", consumer: { kind: "video" } }]]]);
+    callbacks.get("video")!();
+    expect(ended).not.toHaveBeenCalled();
+    expect(removed).not.toHaveBeenCalled();
+  });
+
   it("preserves watchingTransmissionPeers through attemptRejoin's state wipe", async () => {
     const video = new MediasoupVideo();
     const internals = internalsOf(video);
