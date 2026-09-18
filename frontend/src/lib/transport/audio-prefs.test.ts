@@ -12,6 +12,7 @@ import {
   loadAudioPrefs,
   loadPeerVolume,
   savePeerVolume,
+  saveAudioPrefs,
 } from "./audio-prefs";
 
 describe("per-peer volume persistence", () => {
@@ -51,5 +52,20 @@ describe("per-peer volume persistence", () => {
     expect(loaded["did:key:zBad"]).toBeUndefined();
     expect(loaded["12D3KooWNotADid"]).toBeUndefined();
     expect(Object.keys(loaded).length).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("screen-share priority", () => {
+  beforeEach(() => localStorage.clear());
+
+  it.each(["", "motion", "detail"] as const)("persists %s independently of FPS", (hint) => {
+    saveAudioPrefs({ shareContentHint: hint, shareFps: 15 });
+    expect(loadAudioPrefs().shareContentHint).toBe(hint);
+    expect(loadAudioPrefs().shareFps).toBe(15);
+  });
+
+  it.each([{}, { shareContentHint: "invalid" }])("defaults old or invalid settings to Auto", (prefs) => {
+    localStorage.setItem("awful_audio_prefs", JSON.stringify(prefs));
+    expect(loadAudioPrefs().shareContentHint).toBe("");
   });
 });

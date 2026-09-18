@@ -25,6 +25,8 @@
     saveAudioPrefs,
     SHARE_FPS,
     SHARE_HEIGHTS,
+    SHARE_CONTENT_HINTS,
+    type ShareContentHint,
     type ShareFps,
     type ShareHeight,
   } from "$lib/transport/audio-prefs";
@@ -34,6 +36,7 @@
 
   let height = $state<ShareHeight>(0);
   let fps = $state<ShareFps>(30);
+  let contentHint = $state<ShareContentHint>("");
 
   // Fresh from storage each time it opens: a pick abandoned with Escape
   // must not show up as the saved one next time.
@@ -42,6 +45,7 @@
       const p = loadAudioPrefs();
       height = p.shareHeight;
       fps = p.shareFps;
+      contentHint = p.shareContentHint;
     }
   });
 
@@ -56,7 +60,7 @@
     }`;
 
   function share() {
-    saveAudioPrefs({ shareHeight: height, shareFps: fps });
+    saveAudioPrefs({ shareHeight: height, shareFps: fps, shareContentHint: contentHint });
     uiState.sharePickerOpen = false;
     // A share that started elsewhere while this sat open must not be toggled
     // off by the button that promises to start one.
@@ -120,6 +124,28 @@
           {/each}
         </div>
 
+        <div class="flex items-center gap-2">
+          <div class="w-1 h-4 bg-purple-500 rounded-full"></div>
+          <Label class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+            >Prioritize</Label>
+        </div>
+        <div class="flex flex-wrap gap-2" role="radiogroup" aria-label="Screen-share priority">
+          {#each SHARE_CONTENT_HINTS as hint (hint)}
+            <button
+              type="button"
+              role="radio"
+              aria-checked={contentHint === hint}
+              class={chip(contentHint === hint)}
+              onclick={() => (contentHint = hint)}
+              >{hint === "motion" ? "Smoothness" : hint === "detail" ? "Detail" : "Auto"}</button
+            >
+          {/each}
+        </div>
+        <p class="text-xs font-mono text-muted-foreground leading-relaxed">
+          Smoothness favors motion for games and video; Detail favors sharp
+          text and images when bandwidth or CPU is limited. Auto lets the
+          browser choose. This is a browser hint, not a quality guarantee.
+        </p>
         <p class="text-xs font-mono text-muted-foreground leading-relaxed">
           60 fps is for games and video, 15 fps is plenty for a document.
           Lower both on a weak upload. Remembered for next time.

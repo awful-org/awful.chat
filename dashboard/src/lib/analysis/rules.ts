@@ -295,14 +295,14 @@ export const RULES: Readonly<Record<FindingId, Rule>> = {
   },
   "sfu-misplaced": {
     id: "sfu-misplaced",
-    title: "Call split across SFU nodes",
-    severity: "block",
+    title: "SFU roster snapshot mismatch (legacy)",
+    severity: "info",
     meaning:
-      "This peer joined an SFU room the server says is empty, while presence placed other people in it. The call is spread over two nodes, which keep separate rooms, so no camera or screen share can cross between them.",
+      "An older client saw other call participants in presence but none in its SFU snapshot. Joining or reconnecting peers can cause this even on one server; it does not prove a node split.",
     remedy:
-      "Put one SFU behind each hostname. Rooms live in one process and do not cascade, so several instances behind one name cannot serve one room - list each instance in VITE_SFU_URLS and let the room code choose.",
+      "Check subsequent SFU joins and media flow before treating this as a failure.",
     aiHint:
-      "Compare expectedOthers against reportedByServer on the sfu.misplaced event, then check sfu.pick host across the vantages - a split behind ONE hostname is a load balancer, not a misconfigured pool.",
+      "Presence is announced before SFU join. A zero-peer snapshot alone cannot establish node placement or loss of media.",
   },
   "turn-unreachable": {
     id: "turn-unreachable",

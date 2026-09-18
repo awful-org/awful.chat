@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as audioPrefs from "./audio-prefs";
 
 // call.svelte.ts pulls in the real transport singletons (transport.svelte.ts
 // builds a libp2p node at import time - see the comment in call-error.ts),
@@ -74,6 +75,9 @@ const videoMock = {
   ensureLive: vi.fn(),
   stopCamera: vi.fn(),
   stopScreenShare: vi.fn(),
+  startScreenShare: vi.fn(async (_stream: MediaStream, _encoding: RTCRtpEncodingParameters) => {}),
+  roomPeerCount: () => 0,
+  isConnected: () => true,
 };
 
 const transportMock = {
@@ -104,7 +108,7 @@ vi.mock("./transport.svelte", () => ({
 // vi.mock calls above must resolve before call.svelte.ts's own top-level
 // `import { ... } from "./transport.svelte"` runs, and only a module loaded
 // after those mocks land observes the mocked version.
-const { joinCall, leaveCall, setDeafened } = await import("./call.svelte");
+const { joinCall, leaveCall, setDeafened, startScreenShare } = await import("./call.svelte");
 
 beforeEach(() => {
   transportState.roomCode = "room1";
@@ -125,9 +129,29 @@ afterEach(() => {
   // Every test that joins leaves a presence heartbeat interval running;
   // leaveCall() is the only thing that clears it.
   leaveCall();
+  vi.restoreAllMocks();
 });
 
 describe("_joinCall roster sequencing (finding 6)", () => {
+  it("does not infer a node split from a zero-peer SFU snapshot", async () => {
+    transportState.callPeerRooms = new Map([["alice", "room1"]]);
+    await joinCall();
+    expect(transportState.inCall).toBe(true);
+    expect(transportState.error).toBeNull();
+    expect(videoMock.ensureLive).not.toHaveBeenCalled();
+  });
+
+  it("keeps voice and video in the original room while microphone permission is pending", async () => {
+    let finish: () => void = () => {};
+    voiceMock.join.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const joined = joinCall();
+    transportState.roomCode = "room2";
+    finish();
+    await joined;
+    expect(voiceMock.join).toHaveBeenLastCalledWith("room1");
+    expect(transportState.callRoomCode).toBe("room1");
+    expect(videoMock.join).toHaveBeenLastCalledWith("room1", "self-id");
+  });
   it("sets inCall/callRoomCode before the FIRST roster sync, not after _video.join()", async () => {
     const snapshots: Array<{ inCall: unknown; callRoomCode: unknown }> = [];
     syncVoiceRoster.mockImplementation(() => {
@@ -163,6 +187,23 @@ describe("_joinCall roster sequencing (finding 6)", () => {
     // empty roster (default-deny, nobody admitted) for the whole
     // _video.join() round trip (finding 6).
     expect(snapshots[0]).toEqual({ inCall: true, callRoomCode: "room1" });
+  });
+});
+
+describe("screen-share content hint", () => {
+  it.each(["", "motion", "detail"] as const)("applies %s before publishing while retaining the FPS cap", async (hint) => {
+    vi.spyOn(audioPrefs, "loadAudioPrefs").mockReturnValue({
+      ...audioPrefs.AUDIO_PREF_DEFAULTS, shareContentHint: hint, shareFps: 15,
+    });
+    const track = { kind: "video", contentHint: "", getSettings: () => ({}), stop: vi.fn() };
+    const stream = {
+      getVideoTracks: () => [track], getAudioTracks: () => [], getTracks: () => [track],
+    } as unknown as MediaStream;
+    videoMock.startScreenShare.mockImplementationOnce(async () => {
+      expect(track.contentHint).toBe(hint);
+    });
+    await startScreenShare(stream);
+    expect(videoMock.startScreenShare).toHaveBeenLastCalledWith(stream, expect.objectContaining({ maxFramerate: 15 }));
   });
 });
 
