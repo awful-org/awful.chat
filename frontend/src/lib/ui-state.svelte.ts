@@ -23,7 +23,17 @@ export const uiState = $state({
    * ChatView scrolls to the row once the history is on screen and clears it.
    */
   jumpToMessage: null as { roomCode: string; messageId: string } | null,
+  /**
+   * The screen-share quality picker (ShareScreenDialog, owned by
+   * SidebarControls). Three buttons open it - sidebar, call view, palette -
+   * so it is a plain shared flag rather than a request each owner clears.
+   */
+  sharePickerOpen: false,
 });
+
+export function openSharePicker(): void {
+  uiState.sharePickerOpen = true;
+}
 
 export function openSettings(tab: string | null = null): void {
   uiState.settingsTab = tab;

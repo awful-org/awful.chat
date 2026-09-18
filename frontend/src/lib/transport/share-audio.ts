@@ -36,6 +36,8 @@
  * no signal that distinguishes "genuinely captured only that application"
  * from "captured the whole system, then filtered our own output back out".
  */
+import { AUDIO_PREF_DEFAULTS, type AudioPrefs } from "./audio-prefs";
+
 export type ShareAudioVerdictKind =
   | "application-scoped"
   | "system-audio-own-audio-stripped"
@@ -48,6 +50,27 @@ export interface ShareAudioVerdict {
   reason: string;
   /** One sentence for the sharer, matching this verdict. */
   message: string;
+}
+
+/** The two screen-share quality prefs; a whole AudioPrefs satisfies it. */
+export type ShareQuality = Pick<AudioPrefs, "shareHeight" | "shareFps">;
+
+/**
+ * Sender-side encoder caps for the share's video producer. Without these
+ * libwebrtc picks its own ceiling from the frame size, which is what let a
+ * 4K "source" share flood a weak uplink while a 720p15 one was still sent
+ * at the same ceiling. Tiers roughly follow what Discord and Meet hand a
+ * screen track of that size and rate.
+ */
+export function shareVideoEncoding(q: ShareQuality): RTCRtpEncodingParameters {
+  // ponytail: two-axis table, replace with a per-pixel formula if tiers grow
+  const base =
+    q.shareHeight === 0 || q.shareHeight > 720 ? 4_000_000 : 2_500_000;
+  const fpsFactor = q.shareFps >= 60 ? 1.5 : q.shareFps <= 15 ? 0.6 : 1;
+  return {
+    maxBitrate: Math.round(base * fpsFactor),
+    maxFramerate: q.shareFps,
+  };
 }
 
 /**
@@ -70,7 +93,8 @@ export interface ShareAudioVerdict {
  * (Chrome's own workaround before restrictOwnAudio existed) when it can't.
  */
 export function buildShareOptions(
-  supported: MediaTrackSupportedConstraints
+  supported: MediaTrackSupportedConstraints,
+  quality: ShareQuality = AUDIO_PREF_DEFAULTS
 ): DisplayMediaStreamOptions {
   const audio: MediaTrackConstraints = supported.restrictOwnAudio
     ? {
@@ -105,7 +129,12 @@ export function buildShareOptions(
       // can never cause OverconstrainedError - so this can only nudge the
       // user toward a window, never break the capture.
       displaySurface: "window",
-      frameRate: { ideal: 30 },
+      frameRate: { ideal: quality.shareFps },
+      // A `max` height makes the browser downscale a bigger source to fit;
+      // a smaller one is left alone rather than upscaled.
+      ...(quality.shareHeight > 0
+        ? { height: { max: quality.shareHeight } }
+        : {}),
     },
     audio,
     // Ask for real per-application audio where the platform can give it

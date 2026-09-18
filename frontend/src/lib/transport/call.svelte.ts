@@ -24,8 +24,13 @@ import {
   _sendWatchPresence,
   setTransmissionOutputVolume,
 } from "./transmission.svelte";
-import { buildShareOptions, classifyShareAudio } from "./share-audio";
+import {
+  buildShareOptions,
+  classifyShareAudio,
+  shareVideoEncoding,
+} from "./share-audio";
 import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
+import { openSharePicker } from "$lib/ui-state.svelte";
 import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
   cancelErrorClear,
@@ -493,6 +498,15 @@ export function toggleCamera(): Promise<void> {
   return _cameraPromise;
 }
 
+/**
+ * What every "Share screen" button does: stop if sharing, otherwise open
+ * the quality picker, which starts the share itself.
+ */
+export function shareScreenPressed(): void {
+  if (transportState.screenSharing) void toggleScreenShare();
+  else openSharePicker();
+}
+
 export function toggleScreenShare(): Promise<void> {
   if (_screenPromise) return _screenPromise;
   transportState.screenSharePending = true;
@@ -530,10 +544,11 @@ export async function startScreenShare(stream?: MediaStream): Promise<void> {
     throw new Error("Screen sharing is not supported on this device");
   }
   try {
+    const prefs = loadAudioPrefs();
     const captured =
       stream ??
       (await navigator.mediaDevices.getDisplayMedia(
-        buildShareOptions(navigator.mediaDevices.getSupportedConstraints())
+        buildShareOptions(navigator.mediaDevices.getSupportedConstraints(), prefs)
       ));
 
     // "music" keeps the browser's encoder from treating loopback audio as
@@ -555,7 +570,7 @@ export async function startScreenShare(stream?: MediaStream): Promise<void> {
     );
 
     if (verdict.kind === "echo-risk" && audioTrack) {
-      if (loadAudioPrefs().shareAudioDespiteEchoRisk) {
+      if (prefs.shareAudioDespiteEchoRisk) {
         _transport.announce({
           type: "app-warning",
           message: `${verdict.message} Sending it anyway - "Send screen-share audio despite echo risk" is on in Settings > Audio.`,
@@ -599,7 +614,7 @@ export async function startScreenShare(stream?: MediaStream): Promise<void> {
     playScreenShareStartSound();
     videoTrack.onended = () => stopScreenShare();
     try {
-      await _video.startScreenShare(captured);
+      await _video.startScreenShare(captured, shareVideoEncoding(prefs));
     } catch (err) {
       // As with the camera: otherwise we advertise a transmission that does
       // not exist and the browser keeps the capture indicator up.

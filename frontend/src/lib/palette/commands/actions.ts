@@ -23,7 +23,6 @@ import { transportState, connect } from "$lib/transport/transport.svelte";
 import {
   joinCall,
   leaveCall,
-  startScreenShare,
   stopScreenShare,
   toggleCamera,
   toggleDeafen,
@@ -31,7 +30,7 @@ import {
 } from "$lib/transport/call.svelte";
 import { lock } from "$lib/identity/identity.svelte";
 import { requestPersistentStorage, wipeLocalDatabase } from "$lib/storage";
-import { openSettings } from "$lib/ui-state.svelte";
+import { openSettings, openSharePicker } from "$lib/ui-state.svelte";
 import { useQc, useQs } from "$lib/runtime-config";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
@@ -162,11 +161,7 @@ export const actionCommands: CmdSource = () => {
         keepOpen: true,
         perform: transportState.screenSharing
           ? () => stopScreenShare()
-          : () => {
-              startScreenShare().catch((err) =>
-                console.warn("start screen share failed", err)
-              );
-            },
+          : () => openSharePicker(),
       },
     });
   }

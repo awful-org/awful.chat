@@ -549,7 +549,10 @@ async function handleStartScanning() {
           <Input
             bind:value={manualToken}
             placeholder="abcd1234-abcd1234-abcd1234"
-            class="font-mono text-center uppercase"
+            class="font-mono text-center"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck={false}
             onkeydown={(e) => {
               if (e.key === "Enter" && manualToken.trim()) {
                 // preventDefault: otherwise the keypress bubbles into the
