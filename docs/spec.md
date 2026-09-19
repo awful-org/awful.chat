@@ -355,16 +355,26 @@ on connect (both peers):
 
 on receive SyncDigest:
   → compare their watermarks against mine
-  → push everything they're missing as SyncBatch[] + SyncComplete
+  → push everything they're missing as SyncBatch[] + SyncComplete,
+    NEWEST FIRST: the receiver keeps one page on screen (the newest) and
+    parks the rest in storage, so batch 0 is the page they will render
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
   → bulkPut to IDB (idempotent - put by id)
   → update watermarks (max semantics)
-  → merge into in-memory message list
+  → live batch (one send's direct copy): merge into the view now
+  → repair batch: park rows for the view (sync-view.ts), flushed ONCE per
+    burst - 250ms quiet, 1s at most, or on SyncComplete. At the flush, rows
+    at/above the loaded window's floor are appended; anything below it (or
+    everything, for an empty view) triggers ONE re-read of the newest page,
+    identity-preserving, and stays in storage behind "load older"
+  → count the frame for the room's syncing pill (sync-progress.svelte.ts):
+    batchIndex/totalBatches across every pusher, cleared on SyncComplete or
+    after 20s without a frame
 
 on receive SyncComplete:
-  → re-sort in-memory list
+  → flush the room's parked rows; re-sort in-memory list if out of order
   → send SyncDigest to all OTHER connected peers (gossip propagation)
     so data spreads through partial meshes without requiring direct connections
 

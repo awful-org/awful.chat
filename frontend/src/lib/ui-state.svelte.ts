@@ -36,7 +36,17 @@ export const uiState = $state({
    * "whatever was last saved" is not a choice.
    */
   cameraPickerOpen: false,
+  /**
+   * The room's member list (UserListSidebar, drawn by ChatView). Shared so
+   * the palette can toggle it: it used to be ChatView's own $state, which
+   * left Ctrl+K with no way to show it.
+   */
+  userListOpen: false,
 });
+
+export function toggleUserList(): void {
+  uiState.userListOpen = !uiState.userListOpen;
+}
 
 export function openSharePicker(): void {
   uiState.sharePickerOpen = true;

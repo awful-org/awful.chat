@@ -70,6 +70,8 @@
     isOnline: boolean;
     isConnecting: boolean;
     isSelf: boolean;
+    /** A nickname resolved; false means the row shows a truncated DID. */
+    named: boolean;
     isRelayed: boolean;
     inCall: boolean;
     sharing: boolean;
@@ -166,6 +168,7 @@
         !!relayedPeerId && isOnline && isRelayed(relayedPeerId);
 
       let name: string;
+      let named = true;
       let avatarUrl: string | null = null;
       let color: string | null = null;
       let nameEffect: string | null = null;
@@ -192,7 +195,9 @@
       } else {
         // roomUsers can carry a raw peerId while these maps are DID-keyed.
         const nameKey = peerIdToDid(did) || did;
-        name = peerNames.get(nameKey) || peerNames.get(did) || did.slice(0, 12);
+        const known = peerNames.get(nameKey) || peerNames.get(did);
+        named = !!known;
+        name = known || did.slice(0, 12);
         avatarUrl = peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
         color =
           displayPrefs.showPeerNicknameColors
@@ -247,6 +252,7 @@
         isOnline,
         isConnecting,
         isSelf,
+        named,
         isRelayed: userIsRelayed,
         inCall,
         sharing: inCall && sharing,
@@ -265,6 +271,11 @@
       if (!a.isOnline && b.isOnline) return 1;
       if (a.isConnecting && !b.isConnecting) return -1;
       if (!a.isConnecting && b.isConnecting) return 1;
+      // Rows without a nickname yet read as "did:key:z6Mk", and "d" sorted
+      // them above most real names - strangers at the top of every list.
+      // They belong under the people you can actually tell apart.
+      if (a.named && !b.named) return -1;
+      if (!a.named && b.named) return 1;
       return a.name.localeCompare(b.name);
     });
   });

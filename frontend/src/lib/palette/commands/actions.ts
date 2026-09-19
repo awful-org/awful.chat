@@ -16,6 +16,7 @@ import {
   Search,
   Trash2,
   Upload,
+  Users,
   Video,
 } from "@lucide/svelte";
 import { openSearch } from "$lib/search/ui.svelte";
@@ -30,7 +31,12 @@ import {
 } from "$lib/transport/call.svelte";
 import { lock } from "$lib/identity/identity.svelte";
 import { requestPersistentStorage, wipeLocalDatabase } from "$lib/storage";
-import { openSettings, openSharePicker } from "$lib/ui-state.svelte";
+import {
+  openSettings,
+  openSharePicker,
+  toggleUserList,
+  uiState,
+} from "$lib/ui-state.svelte";
 import { useQc, useQs } from "$lib/runtime-config";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
@@ -58,6 +64,21 @@ export const actionCommands: CmdSource = () => {
       perform: () => openSearch(null),
     },
   });
+
+  // Only where the list exists: a DM has two people and no roster, and the
+  // landing screen has no room. Omitted rather than disabled, like the
+  // in-call rows.
+  if (transportState.roomCode && transportState.chatMode === "room") {
+    cmds.push({
+      id: "actions.userList.toggle",
+      title: uiState.userListOpen ? "Hide users" : "Show users",
+      keywords: ["members", "user list", "sidebar", "people", "roster", "who"],
+      group: "Actions",
+      icon: Users,
+      badge: uiState.userListOpen ? "On" : "Off",
+      action: { kind: "act", perform: () => toggleUserList() },
+    });
+  }
 
   // The pages that need no account, when this instance serves them. A real
   // navigation rather than a router push: they run their own transport and

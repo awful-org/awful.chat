@@ -164,6 +164,12 @@ import {
 } from "./files.svelte";
 import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
 import type { MessageCursor } from "./message-order";
+import { createSyncViewBuffer } from "./sync-view";
+import {
+  noteSyncBatch,
+  noteSyncComplete,
+  syncProgress,
+} from "./sync-progress.svelte";
 import { issueLamport, observeLamport, remoteLamportAllowed } from "./logical-clock";
 import { ProfileEcho, frameHash } from "./profile-echo";
 import { initVoice } from "./voice.svelte";
@@ -571,6 +577,7 @@ if (import.meta.env.DEV && typeof window !== "undefined") {
     state: transportState,
     peerIdToDid: _peerIdToDid,
     stats: _stats,
+    syncProgress,
     transportStats: () => _transport.debugStats,
     voice: () => _voice.debugVoice(),
     video: () => ({ connected: _video.isConnected() }),
@@ -1543,6 +1550,13 @@ async function _pushMissingTo(
 
   if (!missing.length) return;
 
+  // Newest first. The receiver renders one page - the newest - and parks
+  // everything older in storage behind "load older" (_mergeSyncedIntoView),
+  // so the first frame on the wire should be the one their screen is going
+  // to keep. Oldest first meant that page was the LAST to arrive, with every
+  // earlier frame painted and then pushed out of view by the next.
+  missing.sort((a, b) => MSG_ORDER(b, a));
+
   // Re-attach inline bytes for small files we still hold: this is what lets
   // a peer who was offline at send time get the image at all - attachment
   // bytes have no other path through history sync.
@@ -1614,7 +1628,9 @@ async function _handleSyncBatch(
    * repair. Only a live batch may announce: a repair would beep once per
    * recovered message.
    */
-  live = false
+  live = false,
+  /** Where this frame sits in its push - for the syncing pill, nothing else. */
+  progress?: { batchIndex: number; totalBatches: number }
 ): Promise<void> {
   // Bind incoming history to the room named in the (signed-message-bearing)
   // batch, and only if we actually joined it - a peer cannot inject history
@@ -1668,6 +1684,18 @@ async function _handleSyncBatch(
   const allowUnsignedFor = (m: WireChatMessage) =>
     unsignedFrom !== null &&
     (unsignedFrom === "*" || m.senderId === unsignedFrom);
+  // Past the membership checks, so a frame we would refuse whole draws
+  // nothing; before verification, because the pill is about the push being
+  // in flight, and a frame this size takes real time to verify.
+  if (!live && progress && fromPeerId) {
+    noteSyncBatch(
+      roomCode,
+      fromPeerId,
+      progress.batchIndex,
+      progress.totalBatches,
+      messages.length
+    );
+  }
   const verdicts = await Promise.all(
     messages.map((m) =>
       _verifyIncoming(m, { room: roomCode, allowUnsigned: allowUnsignedFor(m) })
@@ -1986,46 +2014,83 @@ async function _handleSyncBatch(
   });
 
   // Storage got everything; the view only takes messages for the room that is
-  // actually open (the user may have switched while the batch was in flight),
-  // and only inside the loaded window - a backfilled message below it would
-  // become messages[0] and break the load-older cursor.
+  // actually open (the user may have switched while the batch was in flight).
+  // A live batch - one send's direct copy - takes them now. Repair rows wait
+  // in the sync view buffer and land in ONE flush per burst: taking every
+  // frame as it arrived replaced the array, re-ran the derived chain and
+  // autoscrolled tens of times a second while a backlog poured in, which is
+  // the flicker that survived keeping row identity across re-reads.
   if (transportState.roomCode !== roomCode) return;
-  const windowFloor = transportState.messages[0];
-  const existingIds = new Set(transportState.messages.map((m) => m.id));
-  const fresh = fullMessages.filter((m) => !existingIds.has(m.id));
-  if (!fresh.length) return;
+  if (live) {
+    await _mergeSyncedIntoView(roomCode, fullMessages);
+    return;
+  }
+  _syncView.add(roomCode, fullMessages);
+}
 
-  // Anything below the loaded window is backfill: history that arrived late
-  // and belongs BEFORE what is on screen. Splicing it in would make it
-  // messages[0] and break the load-older cursor - but dropping it, which is
-  // what used to happen, left it stored and invisible. The view is only ever
-  // re-read from storage by _loadHistory and loadMoreMessages, so nothing
-  // brought it back short of a reload. That is the "history does not sync
-  // until I ctrl+shift+R" report. Re-read the page instead.
-  if (windowFloor && fresh.some((m) => MSG_ORDER(m, windowFloor) < 0)) {
-    const page = await getMessages(roomCode);
-    if (transportState.roomCode !== roomCode) return;
-    // Identity-preserving: a row already on screen keeps its OBJECT, not
-    // just its key. The re-read built brand-new objects for every id, so
-    // every mounted row saw all its props change and re-rendered - a sync
-    // burst repainted the entire visible chat once per batch, which is the
-    // flicker. Message rows are immutable once stored (re-delivery writes
-    // an identical row), so reuse by id is safe.
-    const held = new Map(transportState.messages.map((m) => [m.id, m]));
-    const merged = page.map((m) => held.get(m.id) ?? m);
-    const seen = new Set(page.map((m) => m.id));
-    // Keep anything already on screen that the newest page does not cover
-    // (the user may have paged back), so a refill never loses scrollback.
-    const kept = transportState.messages.filter(
-      (m) => m.roomCode === roomCode && !seen.has(m.id)
-    );
-    transportState.messages = [...kept, ...merged].sort(MSG_ORDER);
+const _syncView = createSyncViewBuffer((roomCode, rows) => {
+  _mergeSyncedIntoView(roomCode, rows).catch(() => {});
+});
+
+/**
+ * Put synced rows on screen - the ones that belong there.
+ *
+ * Rows at or above the loaded window's floor are simply appended: they are
+ * newer than something already showing, so leaving them out would open a
+ * gap the load-older cursor (which walks DOWN from messages[0]) could never
+ * reach. Anything below the floor is backfill - history that arrived late
+ * and belongs BEFORE what is on screen. Splicing it in would make it
+ * messages[0] and break that cursor, but dropping it (what used to happen)
+ * left it stored and invisible until a reload: the "history does not sync
+ * until I ctrl+shift+R" report. So the newest page is re-read instead, and
+ * whatever the page does not cover stays in storage behind "load older".
+ *
+ * An empty view is the same case with no floor: a joiner takes the newest
+ * page and pages back for the rest, rather than watching the whole backlog
+ * stack up on screen (the pusher sends newest first for exactly this).
+ */
+async function _mergeSyncedIntoView(
+  roomCode: string,
+  rows: Message[]
+): Promise<void> {
+  if (transportState.roomCode !== roomCode) return;
+  const onScreen = transportState.messages;
+  const windowFloor = onScreen[0];
+  const existingIds = new Set(onScreen.map((m) => m.id));
+  const fresh = rows.filter((m) => !existingIds.has(m.id));
+  if (!fresh.length) return;
+  const above = windowFloor
+    ? fresh.filter((m) => MSG_ORDER(m, windowFloor) >= 0)
+    : [];
+  if (windowFloor && above.length === fresh.length) {
+    transportState.messages = [...onScreen, ...fresh].sort(MSG_ORDER);
     return;
   }
 
-  transportState.messages = [...transportState.messages, ...fresh].sort(
-    MSG_ORDER
+  const page = { capped: false };
+  const newest = await getMessages(roomCode, undefined, page);
+  if (transportState.roomCode !== roomCode) return;
+  // Identity-preserving: a row already on screen keeps its OBJECT, not
+  // just its key. A re-read that built brand-new objects for every id made
+  // every mounted row see all its props change and re-render. Message rows
+  // are immutable once stored (re-delivery writes an identical row), so
+  // reuse by id is safe. Read again after the await: a live append may
+  // have landed meanwhile.
+  const held = new Map(transportState.messages.map((m) => [m.id, m]));
+  const merged = newest.map((m) => held.get(m.id) ?? m);
+  const seen = new Set(newest.map((m) => m.id));
+  // Keep anything already on screen that the newest page does not cover
+  // (the user may have paged back), so a refill never loses scrollback -
+  // and every fresh row above the old floor, so the view stays gap-free
+  // from its floor up even when the burst outran a page.
+  const kept = transportState.messages.filter(
+    (m) => m.roomCode === roomCode && !seen.has(m.id)
   );
+  const extra = above.filter((m) => !seen.has(m.id) && !held.has(m.id));
+  transportState.messages = [...kept, ...merged, ...extra].sort(MSG_ORDER);
+  // A full page below the view is more to page back to. Only ever raised
+  // here: the first read's answer stands otherwise, and a room cannot shrink.
+  if (page.capped) transportState.historyCapped = true;
 }
 
 function _handleSyncComplete(peerId: string, roomCode?: string): void {
@@ -2034,6 +2099,12 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
   // a background room that had just synced never told anybody else about it -
   // it healed only via the slow one-room-per-tick rotation.
   const room = roomCode ?? transportState.roomCode;
+  if (room) {
+    // Whatever this push parked for the view goes on screen now, and the
+    // pill for it comes down.
+    _syncView.settle(room);
+    noteSyncComplete(room, peerId);
+  }
   if (room && transportState.roomCode === room) {
     // Only when actually out of order: the unconditional sort replaced the
     // array identity on EVERY inbound SyncComplete, re-running the view's
@@ -3507,7 +3578,8 @@ _transport.on("message", (peerId, data, room) => {
           msg.roomCode,
           msg.messages,
           peerId,
-          msg.live === true
+          msg.live === true,
+          { batchIndex: msg.batchIndex, totalBatches: msg.totalBatches }
         ).catch(() => {});
         break;
       case MessageType.SyncComplete:
@@ -3741,6 +3813,7 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
     // worse - a message for the room being LEFT still matched and was appended
     // into the freshly loaded list. Clear the outgoing room's messages with it
     // so nothing from the old conversation is on screen under the new name.
+    if (transportState.roomCode) _syncView.drop(transportState.roomCode);
     transportState.roomCode = roomCode;
     transportState.messages = [];
     // The roster too: the union below keeps whoever announces themselves
