@@ -46,6 +46,7 @@
     BellOff,
     AtSign,
     Share2,
+    RefreshCw,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -81,6 +82,7 @@
     requestFileDownload,
     resolveMentionDisplayName,
   } from "$lib/transport/transport.svelte";
+  import { syncProgress } from "$lib/transport/sync-progress.svelte";
   import { humanizeMentions } from "$lib/mentions";
   import { refreshPhonebook } from "$lib/rooms.svelte";
   import { formatReactorNames } from "$lib/reaction-names";
@@ -103,6 +105,7 @@
   import {
     openSettings,
     requestReturnToCall,
+    toggleUserList,
     uiState,
   } from "$lib/ui-state.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -207,7 +210,7 @@
   const showCallView = $derived(
     (inCall && callRoomCode === roomCode) || peersInThisRoom.length > 0
   );
-  let showUserList = $state(false);
+  const showUserList = $derived(uiState.userListOpen);
 
   let draft = $state("");
   let commandPopupOpen = $state(false);
@@ -275,6 +278,18 @@
   const canLoadOlder = $derived(
     hasMoreHistory && transportState.historyCapped
   );
+  /**
+   * A history push in flight for THIS conversation. Repair frames land in
+   * storage first and reach the screen in bursts (see sync-view.ts), so
+   * without this the room read as "that is all there is" while it was still
+   * catching up. Single-frame pushes are not shown: they are over before
+   * the pill could mean anything.
+   */
+  const syncing = $derived.by(() => {
+    const p = syncProgress.get(roomCode);
+    if (!p || p.total < 2) return null;
+    return Math.min(99, Math.floor((p.batches / p.total) * 100));
+  });
   let activeMessageId = $state<string | null>(null);
   let stagedFiles = $state<File[]>([]);
   // Names of files between "Enter pressed" and "message echoed" - hashing
@@ -1858,7 +1873,7 @@
                 {...props}
                 variant="ghost"
                 size="icon"
-                onclick={() => (showUserList = !showUserList)}
+                onclick={toggleUserList}
                 aria-label="Toggle user list"
                 class="flex text-muted-foreground hover:text-foreground cursor-pointer {showUserList
                   ? 'text-primary'
@@ -1959,6 +1974,7 @@
           beside={callBeside}
           onHangUp={ephemeral ? onLeave : undefined}
           personActions={!ephemeral}
+          showDeviceSettings={ephemeral}
         />
       </div>
     {/if}
@@ -1984,6 +2000,22 @@
             <LocalPluginCard {entry} />
           </div>
         {/each}
+      </div>
+    {/if}
+    {#if syncing !== null}
+      <!-- Over the list, not in it: a row in the flow would scroll away
+           with the history it is announcing. -->
+      <div
+        class="pointer-events-none absolute inset-x-0 top-2 z-30 flex justify-center"
+      >
+        <div
+          role="status"
+          aria-live="polite"
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/95 px-2.5 py-1 text-xs text-muted-foreground shadow-md backdrop-blur"
+        >
+          <RefreshCw class="size-3 animate-spin" />
+          <span>Syncing history · {syncing}%</span>
+        </div>
       </div>
     {/if}
     <div
@@ -2359,7 +2391,7 @@
     {#if !isDmChat}
       <UserListSidebar
         open={showUserList}
-        onToggle={() => (showUserList = !showUserList)}
+        onToggle={toggleUserList}
         {onOpenDm}
       />
     {/if}

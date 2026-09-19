@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   /**
    * /qc - the whole page.
    *
@@ -283,7 +284,12 @@
               class="relative group flex size-24 items-center justify-center rounded-full overflow-hidden bg-primary/20 ring-2 ring-border hover:ring-primary/60 transition-all cursor-pointer focus:outline-none focus:ring-primary"
             >
               {#if avatar}
-                <GifImage src={avatar} alt="" class="size-full object-cover" />
+                <GifImage
+                  src={avatar}
+                  alt=""
+                  class="size-full object-cover"
+                  animate={mediaPrefs.gifAutoplay ? true : "hover"}
+                />
               {:else}
                 <span
                   class="text-3xl font-semibold text-primary font-mono select-none"

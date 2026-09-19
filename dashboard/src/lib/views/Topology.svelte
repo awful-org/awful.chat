@@ -230,28 +230,32 @@
 
 {#if !topo}
   <p class="text-dim">
-    No capture selected. Pick one in
-    <button class="text-key underline" onclick={() => goTo("sessions")}>Sessions</button>.
+    No capture loaded. Go to
+    <button class="text-key underline hover:text-key" onclick={() => goTo("sources")}>Sources</button>
+    to load a bundle or log, then pick a capture in
+    <button class="text-key underline hover:text-key" onclick={() => goTo("sessions")}>Sessions</button>
+    to see the peer graph.
   </p>
 {:else}
   <div class="flex flex-col gap-2">
     <div class="flex flex-wrap items-center gap-2">
-      <span class="font-mono text-[11px]" style="color: var(--color-key)">
+      <span class="font-mono text-sm font-semibold" style="color: var(--color-key); min-width: 100px">
         {fmtClock(topo.at)}
       </span>
-      <button class="btn" onclick={() => nudge(-1)}>◂ keyframe</button>
-      <button class="btn" onclick={() => nudge(1)}>keyframe ▸</button>
+      <button class="btn" title="Jump to previous keyframe" onclick={() => nudge(-1)}>◂ keyframe</button>
+      <button class="btn" title="Jump to next keyframe" onclick={() => nudge(1)}>keyframe ▸</button>
       <input
         type="range"
         class="min-w-48 flex-1 accent-key"
         aria-label="scrub time"
+        title="Drag to scrub through topology events"
         min={app.capture?.window.from ?? 0}
         max={app.capture?.window.to ?? 1}
         step="1"
         value={app.at}
         oninput={(e) => scrubTo(Number((e.currentTarget as HTMLInputElement).value))}
       />
-      <button class="btn" onclick={() => goTo("timeline")}>Open timeline</button>
+      <button class="btn" title="Open Timeline for event-by-event navigation" onclick={() => goTo("timeline")}>Open timeline</button>
     </div>
 
     <div class="panel overflow-hidden">
@@ -439,32 +443,37 @@
     </div>
 
     <!-- Legend -->
-    <div class="panel flex flex-wrap items-center gap-x-4 gap-y-1 p-2">
-      {#each LINK_STATES as s (s)}
-        <span class="flex items-center gap-1 font-mono text-[10px] text-dim">
-          <svg width="22" height="6" aria-hidden="true"
-            ><line x1="0" y1="3" x2="22" y2="3" stroke={linkColor(s)} stroke-width="2" /></svg
+    <div class="panel flex flex-wrap items-start gap-x-4 gap-y-2 p-2">
+      <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span class="font-mono text-[10px] text-faint uppercase tracking-wide">link states:</span>
+        {#each LINK_STATES as s (s)}
+          <span class="flex items-center gap-1 font-mono text-[10px] text-dim">
+            <svg width="18" height="5" aria-hidden="true"
+              ><line x1="0" y1="2.5" x2="18" y2="2.5" stroke={linkColor(s)} stroke-width="1.5" /></svg
+            >
+            {s}
+          </span>
+        {/each}
+      </div>
+      <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span class="flex items-center gap-1 font-mono text-[10px]" style="color: var(--color-sev-error)">
+          <svg width="18" height="5" aria-hidden="true"
+            ><line
+              x1="0"
+              y1="2.5"
+              x2="18"
+              y2="2.5"
+              stroke="var(--color-sev-error)"
+              stroke-width="1.5"
+              stroke-dasharray="4 3"
+            /></svg
           >
-          {s}
+          one-way (dashed + hollow + ✕)
         </span>
-      {/each}
-      <span class="flex items-center gap-1 font-mono text-[10px]" style="color: var(--color-sev-error)">
-        <svg width="22" height="6" aria-hidden="true"
-          ><line
-            x1="0"
-            y1="3"
-            x2="22"
-            y2="3"
-            stroke="var(--color-sev-error)"
-            stroke-width="2"
-            stroke-dasharray="6 4"
-          /></svg
-        >
-        dashed + hollow head + ✕ = one way
-      </span>
-      <span class="font-mono text-[10px] text-faint">
-        thin dotted = voice · square = media
-      </span>
+        <span class="font-mono text-[10px] text-faint">
+          voice = dotted · media = square
+        </span>
+      </div>
     </div>
   </div>
 {/if}

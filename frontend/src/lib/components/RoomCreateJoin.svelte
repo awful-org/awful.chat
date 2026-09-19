@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { formatRoomCode, newRoomCode } from "$lib/room-code";
   import {
     createInvite,
@@ -288,6 +289,7 @@
                 src={profileStore.avatarUrl}
                 alt="Avatar"
                 class="size-full object-cover"
+                animate={mediaPrefs.gifAutoplay ? true : "hover"}
               />
             {:else}
               <span

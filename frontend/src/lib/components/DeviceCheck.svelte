@@ -27,7 +27,17 @@
   import { cameraLabel, cameras, refreshCameras, watchCameras } from "$lib/cameras.svelte";
   import { loadAudioPrefs, saveAudioPrefs } from "$lib/transport/audio-prefs";
 
-  let { open = false }: { open?: boolean } = $props();
+  let {
+    open = false,
+    /**
+     * Hide the mic device picker: the level bar still shows the mic is
+     * alive, but there is nowhere to change it from. Off for the in-call
+     * camera picker, which already has its own mic control elsewhere - a
+     * second way to change mics there is one that doesn't belong to this
+     * dialog's job.
+     */
+    showMic = true,
+  }: { open?: boolean; showMic?: boolean } = $props();
 
   let video = $state<HTMLVideoElement | null>(null);
   // $state: the template reads it to show the "no picture" placeholder.
@@ -220,28 +230,30 @@
       </Select>
     </div>
 
-    <div class="flex flex-col gap-1.5">
-      <Label
-        class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
-      >
-        <Mic class="mr-1 inline size-3" /> Microphone
-      </Label>
-      <Select type="single" value={mic ?? ""} onValueChange={pickMic}>
-        <SelectTrigger class="bg-background border-input font-mono text-sm">
-          <span class="block truncate">
-            {mics.find((d) => d.deviceId === mic)?.label || "System default"}
-          </span>
-        </SelectTrigger>
-        <SelectContent class="bg-popover border-border font-mono">
-          {#each mics as dev, i (dev.deviceId)}
-            <SelectItem value={dev.deviceId} class="font-mono text-sm">
-              <span class="block truncate"
-                >{dev.label || `Microphone ${i + 1}`}</span
-              >
-            </SelectItem>
-          {/each}
-        </SelectContent>
-      </Select>
-    </div>
+    {#if showMic}
+      <div class="flex flex-col gap-1.5">
+        <Label
+          class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >
+          <Mic class="mr-1 inline size-3" /> Microphone
+        </Label>
+        <Select type="single" value={mic ?? ""} onValueChange={pickMic}>
+          <SelectTrigger class="bg-background border-input font-mono text-sm">
+            <span class="block truncate">
+              {mics.find((d) => d.deviceId === mic)?.label || "System default"}
+            </span>
+          </SelectTrigger>
+          <SelectContent class="bg-popover border-border font-mono">
+            {#each mics as dev, i (dev.deviceId)}
+              <SelectItem value={dev.deviceId} class="font-mono text-sm">
+                <span class="block truncate"
+                  >{dev.label || `Microphone ${i + 1}`}</span
+                >
+              </SelectItem>
+            {/each}
+          </SelectContent>
+        </Select>
+      </div>
+    {/if}
   </div>
 {/if}

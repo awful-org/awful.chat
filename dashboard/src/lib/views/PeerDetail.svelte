@@ -97,28 +97,31 @@
 
 {#if !app.capture}
   <p class="text-dim">
-    No capture selected. Pick one in
-    <button class="text-key underline" onclick={() => goTo("sessions")}>Sessions</button>.
+    No capture loaded. Go to
+    <button class="text-key underline hover:text-key" onclick={() => goTo("sources")}>Sources</button>
+    to load data.
   </p>
 {:else}
   <div class="grid gap-3 lg:grid-cols-[13rem_1fr]">
     <!-- Picker -->
     <nav class="panel h-fit">
       <h2 class="panel-head">peers {app.peers.length}</h2>
-      <ul>
-        {#each app.peers as p (p.peerId)}
-          <li>
+      <ul role="listbox">
+        {#each app.peers as p, i (p.peerId)}
+          <li role="option" aria-selected={peer?.peerId === p.peerId}>
             <button
-              class="flex w-full items-baseline gap-1.5 px-2 py-0.5 text-left font-mono text-[11px]
-                     {peer?.peerId === p.peerId ? 'bg-raise' : 'hover:bg-raise'}"
+              class="flex w-full items-baseline gap-1.5 px-2 py-0.5 text-left font-mono text-[11px] border-l-2 transition-colors
+                     {peer?.peerId === p.peerId
+                       ? 'border-key bg-raise text-key'
+                       : 'border-transparent hover:bg-raise'}"
               onclick={() => selectPeer(p.peerId)}
-              title={p.peerId}
+              title={`${p.peerId} (${i + 1}/${app.peers.length})`}
             >
-              <span style="color: {peer?.peerId === p.peerId ? 'var(--color-key)' : ''}">
+              <span>
                 {shortPeer(p.peerId)}
               </span>
               {#if p.hasVantage}
-                <span class="text-[9px] text-faint">vantage</span>
+                <span class="text-[9px] text-faint">v</span>
               {/if}
             </button>
           </li>
@@ -127,7 +130,7 @@
     </nav>
 
     {#if !peer}
-      <p class="text-dim">This capture names no peer.</p>
+      <p class="text-dim">This capture names no peer. Pick a capture with peers in Sessions.</p>
     {:else}
       <div class="flex min-w-0 flex-col gap-3">
         <!-- Identity -->
@@ -164,8 +167,8 @@
         </section>
 
         <!-- What each witness believes right now -->
-        <section class="panel">
-          <h2 class="panel-head">
+        <section class="panel border-l-4" style="border-left-color: var(--color-key)">
+          <h2 class="panel-head" style="color: var(--color-key)">
             link state at {fmtClock(app.at)}
           </h2>
           <table class="tbl">
@@ -205,7 +208,7 @@
                     </tr>
                   {/each}
                   {#if transitions.length === 0}
-                    <tr><td class="text-faint">No transport transition recorded.</td></tr>
+                    <tr><td class="text-faint">Peer did not transition states (no dial, connect, disconnect, etc).</td></tr>
                   {/if}
                 </tbody>
               </table>
@@ -222,14 +225,20 @@
             </h2>
             {#if rttPath.path === ""}
               <p class="p-2.5 text-faint">
-                Fewer than two measured probes. `peer.rtt` is budgeted at two per
-                second, so a short capture can hold none.
+                Fewer than two probes recorded. `peer.rtt` samples at ~2 per second.
               </p>
             {:else}
-              <svg viewBox="0 0 300 44" class="w-full p-2" role="img" aria-label="round trip series">
-                <line x1="0" y1="40" x2="300" y2="40" stroke="var(--color-line)" />
-                <path d={rttPath.path} fill="none" stroke="var(--color-ls-direct)" stroke-width="1.5" />
-              </svg>
+              <div class="flex items-stretch gap-1 p-2">
+                <div class="flex flex-col items-end justify-between font-mono text-[9px] text-faint pr-1">
+                  <span>{Math.round(rttPath.max)}</span>
+                  <span>{Math.round(rttPath.max / 2)}</span>
+                  <span>0</span>
+                </div>
+                <svg viewBox="0 0 300 44" class="w-full flex-1" role="img" aria-label="round trip series (ms)">
+                  <line x1="0" y1="40" x2="300" y2="40" stroke="var(--color-line)" />
+                  <path d={rttPath.path} fill="none" stroke="var(--color-ls-direct)" stroke-width="1.5" />
+                </svg>
+              </div>
             {/if}
           </section>
 
@@ -243,11 +252,11 @@
                   style="color: {sevColor(r.e.sev)}"
                   title="{fmtClock(r.e.at)} {r.e.kind} from {shortPeer(r.e.observer)}"
                 >
-                  {r.e.d?.state ?? r.e.kind}
+                  {r.e.d?.state ?? r.e.kind.split(".").pop()}
                 </span>
               {/each}
               {#if voiceHistory.length === 0}
-                <span class="text-faint">No voice peer connection for this peer.</span>
+                <span class="text-faint">No voice session for this peer.</span>
               {/if}
             </div>
           </section>
@@ -268,9 +277,7 @@
                   {#if iceEvents.length === 0}
                     <tr>
                       <td class="text-faint">
-                        No ICE or TURN event names this peer. A candidate TYPE is
-                        only recorded where the transport reports one, so this
-                        panel can be empty on a healthy direct link.
+                        No ICE or TURN event. A direct link produces no ICE candidates, so this is normal.
                       </td>
                     </tr>
                   {/if}
@@ -284,11 +291,11 @@
         <section class="panel">
           <h2 class="panel-head">
             counter series {counters.length}
-            <span class="text-faint">changed fields only, sampled every 5s</span>
+            <span class="text-faint">changed fields, sampled every 5s</span>
           </h2>
           {#if counters.length === 0}
             <p class="p-2.5 text-faint">
-              This peer uploaded no vantage, so it has no counter bag of its own.
+              This peer has no vantage or did not emit counters.
             </p>
           {:else}
             <div class="max-h-56 overflow-auto">
@@ -393,15 +400,12 @@
                 {/each}
               </tbody>
             </table>
-            <p class="border-t border-line/50 px-2 py-1 text-[11px] text-faint">
-              This is the sibling view another peer's snapshot carried. It has no
-              transport or consumer detail, because the SFU only reports those to
-              the peer they belong to.
+            <p class="border-t border-line/50 px-2 py-1 text-[10px] text-faint">
+              Sibling data only (from another peer's snapshot). Full transport and consumer details are only reported to the producing peer.
             </p>
           {:else}
             <p class="p-2.5 text-faint">
-              No SFU snapshot names this peer. A snapshot needs SFU_TELEMETRY=1 on
-              the SFU and a video or screen call in progress.
+              No snapshot from the SFU. This peer either never produced/consumed media, or SFU telemetry is not enabled.
             </p>
           {/if}
         </section>

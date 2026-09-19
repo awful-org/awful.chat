@@ -29,10 +29,31 @@ export const uiState = $state({
    * so it is a plain shared flag rather than a request each owner clears.
    */
   sharePickerOpen: false,
+  /**
+   * The camera picker (CameraPickerDialog, owned by SidebarControls), the
+   * same live-preview device check /qc's green room uses. Turning the
+   * camera OFF stays one click; turning it ON opens this first, since
+   * "whatever was last saved" is not a choice.
+   */
+  cameraPickerOpen: false,
+  /**
+   * The room's member list (UserListSidebar, drawn by ChatView). Shared so
+   * the palette can toggle it: it used to be ChatView's own $state, which
+   * left Ctrl+K with no way to show it.
+   */
+  userListOpen: false,
 });
+
+export function toggleUserList(): void {
+  uiState.userListOpen = !uiState.userListOpen;
+}
 
 export function openSharePicker(): void {
   uiState.sharePickerOpen = true;
+}
+
+export function openCameraPicker(): void {
+  uiState.cameraPickerOpen = true;
 }
 
 export function openSettings(tab: string | null = null): void {

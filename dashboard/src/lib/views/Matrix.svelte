@@ -96,6 +96,21 @@
       </span>
     </div>
 
+    <div class="panel p-2">
+      <div class="mb-2 pb-2 border-b border-line flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span class="font-mono text-[10px] text-faint">link states:</span>
+        {#each ["none", "dialing", "dial-failed", "relayed", "direct", "proven", "lost", "dropped"] as LinkState[] as s (s)}
+          <span class="flex items-center gap-1 font-mono text-[10px] text-dim">
+            <span class="inline-block h-2.5 w-2.5" style="background-color: {linkColor(s)}"></span>
+            {s}
+          </span>
+        {/each}
+      </div>
+      <p class="text-[10px] text-faint mb-2">
+        Upper-left = row→column. Lower-right = column→row. Flat = agree. Seam = disagree. ? = no vantage.
+      </p>
+    </div>
+
     <div class="panel overflow-auto p-2">
       <table style="border-collapse: separate; border-spacing: 2px">
         <thead>
@@ -103,11 +118,11 @@
             <th></th>
             {#each peers as p, j (p.peerId)}
               <th
-                class="font-mono text-[10px] font-normal"
+                class="font-mono text-[10px] font-normal hover:text-key transition-colors p-0.5"
                 style="width: {CELL}px; color: {witnesses.has(p.peerId)
                   ? 'var(--color-dim)'
-                  : 'var(--color-faint)'}"
-                title={p.peerId}>{j + 1}</th
+                  : 'var(--color-faint)'}; cursor: default"
+                title="{p.peerId}{witnesses.has(p.peerId) ? '' : ' (no vantage)'}">{j + 1}</th
               >
             {/each}
           </tr>
@@ -117,10 +132,10 @@
             <tr>
               <th class="pr-2 text-right font-mono text-[10px] font-normal whitespace-nowrap">
                 <button
-                  class="hover:text-key"
+                  class="hover:text-key hover:underline transition-colors p-0.5"
                   style="color: {witnesses.has(row.peerId)
                     ? 'var(--color-text)'
-                    : 'var(--color-faint)'}"
+                    : 'var(--color-faint)'}; cursor: pointer"
                   title="{row.peerId}{witnesses.has(row.peerId)
                     ? ''
                     : ' — no vantage, so this row is unknown, not broken'}"
@@ -144,8 +159,8 @@
                   {@const differs = ab.known && ba.known && ab.state !== ba.state}
                   <td style="width: {CELL}px; height: {CELL}px; padding: 0">
                     <button
-                      class="block"
-                      style="width: {CELL}px; height: {CELL}px"
+                      class="block w-full h-full hover:outline hover:outline-2 hover:outline-key transition-all"
+                      style="width: {CELL}px; height: {CELL}px; cursor: pointer"
                       title="{shortPeer(row.peerId)} → {shortPeer(col.peerId)}: {ab.known
                         ? ab.state
                         : 'no vantage'} | {shortPeer(col.peerId)} → {shortPeer(
@@ -175,7 +190,8 @@
                             y="13"
                             text-anchor="middle"
                             class="text-[10px]"
-                            fill="var(--color-faint)">?</text
+                            fill="var(--color-faint)"
+                            font-weight="bold">?</text
                           >
                         {/if}
                         {#if !ba.known}
@@ -184,7 +200,8 @@
                             y="26"
                             text-anchor="middle"
                             class="text-[10px]"
-                            fill="var(--color-faint)">?</text
+                            fill="var(--color-faint)"
+                            font-weight="bold">?</text
                           >
                         {/if}
                       </svg>
@@ -197,11 +214,6 @@
         </tbody>
       </table>
 
-      <p class="mt-2 text-[11px] text-faint">
-        A flat square means both peers agree. A seam means they do not. Click a
-        square to filter the Timeline to that peer; click a row label to open it
-        in Peers.
-      </p>
     </div>
 
     {#if splits.length > 0}
@@ -233,14 +245,5 @@
         </table>
       </section>
     {/if}
-
-    <div class="panel flex flex-wrap items-center gap-x-4 gap-y-1 p-2">
-      {#each ["none", "dialing", "dial-failed", "relayed", "direct", "proven", "lost", "dropped"] as LinkState[] as s (s)}
-        <span class="flex items-center gap-1 font-mono text-[10px] text-dim">
-          <span class="inline-block h-3 w-3" style="background-color: {linkColor(s)}"></span>
-          {s}
-        </span>
-      {/each}
-    </div>
   </div>
 {/if}

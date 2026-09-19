@@ -60,11 +60,10 @@ function permissionPath(): string {
   return "Look for notification permissions in this site's settings.";
 }
 
-/** Three short lines: the desktop dialog is a fixed height, mobile is a drawer. */
+/** Two lines: the desktop dialog is a fixed height, mobile is a drawer. */
 const PREVIEW_LINES = [
-  { name: "ana", text: "did the relay come back up?" },
-  { name: "you", text: "yes — mailbox drained, nothing lost" },
-  { name: "kai", text: "0x1f4a9 renders fine at this size 💩" },
+  { name: "ana", text: "did the relay come back up? mailbox drained, nothing lost this time" },
+  { name: "you", text: "yes - reconnected clean, 0x1f4a9 renders fine at this size 💩" },
 ] as const;
 
 const previewStack = $derived(resolveChatFontStack(displayPrefs.chatFontFamily));
@@ -476,23 +475,34 @@ async function loadLocalFonts(): Promise<void> {
   <!--
     The preview declares the SAME two custom properties the real chat container
     does, so it is structurally identical to production rather than an
-    approximation of it. Kept to three short lines: the desktop dialog has a
-    fixed height and the mobile path is a bottom drawer.
+    approximation of it. The name-above-message, avatar-indented shape matches
+    ChatView/MsgRender's own layout (finding: a single inline "name: text" row
+    let a size look fine here and cramped in real chat, since real messages
+    wrap under an indent this preview never showed). Kept to two lines: the
+    desktop dialog has a fixed height and the mobile path is a bottom drawer.
   -->
   <div
     style="--chat-font-size: {displayPrefs.chatFontSize}px; --chat-font-family: {previewStack}"
     class="rounded-md border border-border bg-background p-3 font-(family-name:--chat-font-family)"
   >
-    <div class="flex flex-col gap-1.5">
+    <div class="flex flex-col gap-3">
       {#each PREVIEW_LINES as line (line.name)}
-        <div class="flex gap-2">
-          <span class="shrink-0 text-xs font-semibold text-primary"
-            >{line.name}</span
+        <div class="flex gap-2.5">
+          <div
+            class="size-8 shrink-0 rounded-full bg-muted flex items-center justify-center text-[10px] font-semibold text-muted-foreground"
           >
-          <span
-            class="text-(length:--chat-font-size) leading-normal text-foreground"
-            >{line.text}</span
-          >
+            {line.name.slice(0, 2).toUpperCase()}
+          </div>
+          <div class="min-w-0 flex flex-col">
+            <span
+              class="text-(length:--chat-font-size) font-medium text-primary"
+              >{line.name}</span
+            >
+            <span
+              class="text-(length:--chat-font-size) leading-normal text-foreground wrap-break-word"
+              >{line.text}</span
+            >
+          </div>
         </div>
       {/each}
     </div>

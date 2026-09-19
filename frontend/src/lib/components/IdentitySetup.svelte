@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { restore, identityStore } from "$lib/identity/identity.svelte";
   import { createIdentity } from "$lib/identity/identity";
   import { viewportHeight } from "$lib/actions/viewport-height";
@@ -571,6 +572,7 @@
               src={profileStore.avatarUrl}
               alt="Avatar preview"
               class="size-full object-cover"
+              animate={mediaPrefs.gifAutoplay ? true : "hover"}
             />
           {:else}
             <span

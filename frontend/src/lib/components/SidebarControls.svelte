@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import {
     Camera,
@@ -16,7 +17,7 @@
   import { transportState } from "$lib/transport/transport.svelte";
   import {
     toggleMute,
-    toggleCamera,
+    cameraOnPressed,
     shareScreenPressed,
     leaveCall,
   } from "$lib/transport/call.svelte";
@@ -26,6 +27,7 @@
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import SettingsDialog from "$lib/components/SettingsDialog.svelte";
   import ShareScreenDialog from "$lib/components/ShareScreenDialog.svelte";
+  import CameraPickerDialog from "$lib/components/CameraPickerDialog.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import { toggleDeafen } from "$lib/transport/call.svelte";
@@ -97,7 +99,7 @@
       <button
         {...props}
         type="button"
-        onclick={toggleCamera}
+        onclick={cameraOnPressed}
         disabled={transportState.cameraPending}
         aria-busy={transportState.cameraPending}
         class:animate-pulse={transportState.cameraPending}
@@ -184,6 +186,7 @@
               src={profileStore.avatarUrl}
               alt="Avatar"
               class="size-full object-cover"
+              animate={mediaPrefs.gifAutoplay ? true : "hover"}
             />
           {:else}
             <span
@@ -305,6 +308,7 @@
 />
 
 <ShareScreenDialog />
+<CameraPickerDialog />
 
 <SettingsDialog
   bind:open={audioSettingsOpen}

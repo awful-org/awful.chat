@@ -45,9 +45,9 @@
   import {
     joinCall,
     leaveCall,
+    cameraOnPressed,
     shareScreenPressed,
     stopScreenShare,
-    toggleCamera,
     toggleMute,
     toggleDeafen,
   } from "$lib/transport/call.svelte";
@@ -143,10 +143,18 @@ import {
      * the spotlight, fullscreen, picture-in-picture.
      */
     personActions = true,
+    /**
+     * The camera/mic/screen-share-quality gear on the call bar. /qc has no
+     * sidebar to reach Settings from mid-call, so it needs this control;
+     * the app does, and showing a second way to the same dialog there is
+     * just clutter on the bar people are trying to hang up from.
+     */
+    showDeviceSettings = false,
   }: {
     beside?: boolean;
     onHangUp?: () => void;
     personActions?: boolean;
+    showDeviceSettings?: boolean;
   } = $props();
 
   /**
@@ -895,7 +903,7 @@ import {
         await stopScreenShare();
         break;
       case "toggle-camera":
-        await toggleCamera();
+        cameraOnPressed();
         break;
       case "toggle-mic":
         await toggleMute();
@@ -2092,7 +2100,7 @@ import {
               <button
                 {...props}
                 type="button"
-                onclick={toggleCamera}
+                onclick={cameraOnPressed}
                 disabled={transportState.cameraPending}
                 aria-busy={transportState.cameraPending}
                 class:animate-pulse={transportState.cameraPending}
@@ -2273,7 +2281,7 @@ import {
             <button
               {...props}
               type="button"
-              onclick={toggleCamera}
+              onclick={cameraOnPressed}
               disabled={transportState.cameraPending}
               aria-busy={transportState.cameraPending}
               class:animate-pulse={transportState.cameraPending}
@@ -2321,6 +2329,7 @@ import {
             {/if}
           </div>
 
+          {#if showDeviceSettings}
           <Tip text="Camera and audio">
             {#snippet children(props)}
           <button
@@ -2337,6 +2346,7 @@ import {
           </button>
             {/snippet}
           </Tip>
+          {/if}
 
           <Tip text="Leave call">
             {#snippet children(props)}

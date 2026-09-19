@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { createInfiniteQuery } from "@tanstack/svelte-query";
   import { X, Upload, Search, Link, Crop } from "@lucide/svelte";
   import { Dialog as DialogPrimitive } from "bits-ui";
@@ -318,6 +319,7 @@
             src={preview}
             alt={isBanner ? "Banner preview" : "Avatar preview"}
             class="size-full object-cover"
+            animate={mediaPrefs.gifAutoplay ? true : "hover"}
           />
         {:else}
           <span

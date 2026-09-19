@@ -10,7 +10,7 @@
     defaultPanelPosition,
     clampPanelToViewport,
   } from "$lib/call-pip.svelte";
-  import { toggleMute, toggleCamera, leaveCall } from "$lib/transport/call.svelte";
+  import { toggleMute, cameraOnPressed, leaveCall } from "$lib/transport/call.svelte";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
   import { roomsStore } from "$lib/rooms.svelte";
@@ -150,7 +150,7 @@
           <button
             {...props}
             type="button"
-            onclick={() => void toggleCamera()}
+            onclick={cameraOnPressed}
             disabled={transportState.cameraPending}
             aria-busy={transportState.cameraPending}
             aria-label={transportState.cameraOff ? "Start camera" : "Stop camera"}
