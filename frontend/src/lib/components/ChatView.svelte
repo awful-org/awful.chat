@@ -361,9 +361,9 @@
   let swipeMessageId = $state<string | null>(null);
   let isSwiping = $state(false);
   let swipeDirection: SwipeDirection = $state("undecided");
-  const SWIPE_THRESHOLD = 25;
-  const SWIPE_DEADZONE = 15;
-  const SWIPE_DIRECTION_RATIO = 1.25;
+  const SWIPE_THRESHOLD = 60;
+  const SWIPE_DEADZONE = 20;
+  const SWIPE_DIRECTION_RATIO = 1.75;
 
   let isMobile = $state(false);
   let messagesEl = $state<HTMLDivElement | null>(null);

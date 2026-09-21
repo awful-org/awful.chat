@@ -57,6 +57,11 @@ export const manifest: PluginManifest = {
   repository: "https://github.com/you/your-plugin",
   apiVersion: 1,           // must be 1; the registry skips (and logs) anything else
   commands: [{ name: "wheel", usage: "/wheel Question? option1, option2" }],
+  // Optional. Actions this plugin offers in the Ctrl+K palette. Eager, like
+  // `commands` above, so the palette never loads plugin code just to list a
+  // row; the handler lives on the definition's `paletteCommands` and is
+  // fetched only once the user picks it.
+  paletteCommands: [{ name: "spin", title: "Spin the wheel" }],
   hasSettings: true,      // optional: draws the gear for your `settings` surface
   // Optional. Host features you cannot run without: an older app refuses to
   // LOAD the plugin and says so, instead of mounting code that crashes.
@@ -93,6 +98,13 @@ export default definePlugin({
     wheel: async (args, host) => {
       const options = args.split(",").map((s) => s.trim()).filter(Boolean);
       if (options.length >= 2) await host.sendCard({ options });
+    },
+  },
+  // Keyed by the `name` in manifest.paletteCommands. `host` is bound to the
+  // room open when the palette was accepted, or "" with none open.
+  paletteCommands: {
+    spin: async (host) => {
+      await host.sendCard({ options: [] });
     },
   },
 });
@@ -233,7 +245,7 @@ in the host's room (cheap - it reads only card rows), and
 of sendUpdate for `host.onBeforeDisconnect` departure beacons - no async
 work, same room binding as sendUpdate.
 
-### Identity, determinism, size caps, slash commands, disabling
+### Identity, determinism, size caps, slash and palette commands, disabling
 
 **Identity**: `ctx.senderDid` and `ctx.senderName` are verified by the
 host. Anything inside `update.data` is peer-supplied and untrusted;
@@ -255,6 +267,15 @@ file layer, not through card payloads.
 **Slash commands** register from the `commands` map; `/wheel a, b, c`
 calls your handler with the raw argument string. Commands of disabled
 plugins do not autocomplete and do not fire.
+
+**Palette commands** add rows to the Ctrl+K palette. List them eagerly in
+`manifest.paletteCommands` (`name`, `title`, optional `subtitle`) so the
+palette can draw the row without loading your plugin code; the handler
+that actually runs lives on `paletteCommands` in your definition, keyed by
+that same `name`, and is fetched only when the user accepts the row. Rows
+appear under a "Plugins" group and are filtered the same as any other
+palette entry. Like slash commands, a disabled plugin's rows disappear
+from the palette.
 
 **Disabling**: users can toggle any plugin off in settings. Your cards
 then render as a neutral fallback naming the plugin; nothing else breaks,
@@ -388,7 +409,8 @@ to load the plugin with a clear "needs a newer awful.chat" line instead
 of mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
 `call-audio`, `call-capture`, `clock-sample`, `local-card`,
-`now-playing`, `plugin-stream`, `picture-in-picture`, `call-tile-menu`.
+`now-playing`, `plugin-stream`, `picture-in-picture`, `call-tile-menu`,
+`palette-commands`.
 Declare only what you truly cannot function without. A feature that only adds a button is
 better guarded at the call site (`typeof host.pictureInPicture ===
 "function"`) so the plugin still loads on an older app and just hides the
