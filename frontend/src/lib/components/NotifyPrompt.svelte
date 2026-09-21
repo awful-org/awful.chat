@@ -92,7 +92,7 @@
 
 {#if show}
   <div
-    class="fixed top-2 inset-x-2 z-50 mx-auto flex max-w-md items-center gap-3 rounded-lg border bg-background/95 px-3 py-2 font-mono text-xs shadow-lg backdrop-blur"
+    class="fixed top-[calc(0.5rem+env(safe-area-inset-top))] left-[max(0.5rem,env(safe-area-inset-left))] right-[max(0.5rem,env(safe-area-inset-right))] z-50 mx-auto flex max-w-md flex-wrap items-center gap-3 rounded-lg border bg-background/95 px-3 py-2 font-mono text-xs shadow-lg backdrop-blur"
     role="status"
   >
     <Bell class="size-4 shrink-0 text-primary" />

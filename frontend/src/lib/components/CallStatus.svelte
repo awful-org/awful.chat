@@ -14,15 +14,9 @@
   } from "@lucide/svelte";
   import { roomsStore } from "$lib/rooms.svelte";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
-  import { onMount, onDestroy } from "svelte";
   import { cn } from "$lib/utils";
-  import type { TransportStatus } from "$lib/transport/types";
-  import {
-    applyCallQualityStatus,
-    noteTrackAdded,
-    worstQuality,
-    type PeerVoiceQuality,
-  } from "$lib/call-quality";
+  import { worstQuality } from "$lib/call-quality";
+  import { peerQualityState } from "$lib/call-peer-quality.svelte";
 
   interface Props {
     /** Icon-rail layout: one icon, the whole status in a tooltip. */
@@ -32,14 +26,12 @@
 
   type CallQuality = "connecting" | "p2p" | "relayed" | "degraded" | "failed";
 
-  // Per-peer voice link quality, keyed by peerId. A single shared value let
-  // one peer's "degraded" paint the whole call, and let any OTHER peer's
-  // trackAdded erase it moments later (voice-audit finding 8) - keying by
-  // peerId makes that impossible. transportQuality is a separate axis: the
-  // relay itself can fail while every peer's own verdict is still the
-  // healthy one from before the drop.
-  let peerQuality = $state<Map<string, PeerVoiceQuality>>(new Map());
-  let transportQuality = $state<"ok" | "degraded" | "failed">("ok");
+  // Use the same durable state as the tiles, including when this component
+  // mounts mid-call or is recreated by a responsive layout change.
+  const peerQuality = $derived(peerQualityState.peers);
+  const transportQuality = $derived(
+    transportState.relayConnected ? "ok" : "failed"
+  );
 
   const QUALITY_RANK: Record<CallQuality, number> = {
     connecting: 0,
@@ -48,9 +40,6 @@
     degraded: 2,
     failed: 3,
   };
-
-  let handlers: (() => void)[] = [];
-
   function getStatusConfig(q: CallQuality) {
     switch (q) {
       case "p2p":
@@ -96,50 +85,6 @@
         };
     }
   }
-
-  onMount(() => {
-    if (!_transport) return;
-
-    const handleStatus = (status: TransportStatus) => {
-      switch (status.type) {
-        case "relay-connected":
-          transportQuality = "ok";
-          break;
-        case "relay-disconnected":
-          transportQuality = "failed";
-          break;
-        case "relay-reconnecting":
-          transportQuality = "degraded";
-          break;
-        case "relay-reconnect-failed":
-          transportQuality = "failed";
-          break;
-        case "voice-ice-connected":
-        case "voice-connection-failed":
-        case "voice-degraded":
-        case "voice-peer-left":
-          peerQuality = new Map(applyCallQualityStatus(peerQuality, status));
-          break;
-      }
-    };
-
-    const handleTrackAdded = (peerId: string) => {
-      // A track is proof of connection but says nothing about the path -
-      // never overwrite an existing verdict, ours or another peer's, with
-      // the mere fact that a track arrived.
-      peerQuality = new Map(noteTrackAdded(peerQuality, peerId));
-    };
-
-    _transport.on("status", handleStatus);
-    _voice?.on("trackAdded", handleTrackAdded);
-
-    handlers = [
-      () => _transport?.off("status", handleStatus),
-      () => _voice?.off("trackAdded", handleTrackAdded),
-    ];
-  });
-
-  onDestroy(() => handlers.forEach((h) => h()));
 
   // The one summary badge: the worse of "is the relay itself in trouble"
   // and "is any peer's own voice link in trouble" - never a value some
@@ -289,7 +234,7 @@
 
       <div class="flex items-center gap-1 shrink-0">
         {#if quality === "relayed"}
-          <Tip text="Connected via TURN relay">
+          <Tip text="Voice is using a TURN relay. A direct path may not be available on these networks; relay use alone does not mean poor quality.">
             {#snippet children(props)}
               <div
                 {...props}

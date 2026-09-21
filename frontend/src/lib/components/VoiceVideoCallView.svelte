@@ -19,6 +19,7 @@
   } from "$lib/transport/dm.svelte";
   import { refreshPhonebook } from "$lib/rooms.svelte";
   import UserProfileCard from "./UserProfileCard.svelte";
+  import PeerConnectionDetails from "./PeerConnectionDetails.svelte";
   import {
     getVoicePeerVolume,
     setVoicePeerVolume,
@@ -672,6 +673,7 @@ import {
    * disappears with its tile instead of acting on something gone.
    */
   let tileMenu = $state<{ tileId: string; x: number; y: number } | null>(null);
+  let connectionDetails = $state<{ peerId: string; name: string } | null>(null);
   /** Right-click on the call background: picks what the grid shows. */
   let viewMenu = $state<{ x: number; y: number } | null>(null);
   let peerVolumeSlider = $state(UNITY_STOP);
@@ -836,6 +838,10 @@ import {
       action.kind === "plugin" ? pluginMenuItems[action.index] : undefined;
     closeMenus();
     switch (action.kind) {
+      case "connection-details":
+        if (document.fullscreenElement) await document.exitFullscreen().catch(() => {});
+        connectionDetails = { peerId: tile.peerId, name: tile.label };
+        break;
       case "focus":
         callFocus.pinnedTileId = tile.id;
         break;
@@ -958,6 +964,7 @@ import {
 
   /** Which lucide glyph a menu row's icon key names. */
   const TILE_MENU_ICONS: Record<TileMenuIcon, typeof Pin> = {
+    connection: Workflow,
     pin: Pin,
     "pin-off": PinOff,
     pip: PictureInPicture2,
@@ -2718,6 +2725,14 @@ import {
     }}
     onTogglePhonebook={() => void togglePhonebook(profileCardFor!.peerId)}
     inPhonebook={isInPhonebook(profileCardFor.peerId)}
+  />
+{/if}
+
+{#if connectionDetails}
+  <PeerConnectionDetails
+    peerId={connectionDetails.peerId}
+    name={connectionDetails.name}
+    onClose={() => (connectionDetails = null)}
   />
 {/if}
 

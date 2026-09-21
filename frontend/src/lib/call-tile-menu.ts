@@ -17,6 +17,7 @@ export type TileMenuKind = "camera" | "screen" | "transmission" | "plugin";
 
 /** Icon keys the stage maps to lucide components. */
 export type TileMenuIcon =
+  | "connection"
   | "pin"
   | "pin-off"
   | "pip"
@@ -40,6 +41,7 @@ export type TileMenuIcon =
   | "plugin";
 
 export type TileMenuAction =
+  | { kind: "connection-details" }
   /** Spotlight this tile / release the pin. */
   | { kind: "focus" }
   | { kind: "unfocus" }
@@ -344,6 +346,10 @@ export function buildTileMenu(s: TileMenuState): TileMenuRow[] {
 
   const tail: TileMenuRow[] = [];
   if (s.kind === "camera") {
+    tail.push({
+      type: "item", label: "Connection details", icon: "connection",
+      action: { kind: "connection-details" },
+    });
     if (s.canMessage) {
       tail.push(
         {

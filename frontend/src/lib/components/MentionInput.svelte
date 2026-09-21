@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { DraftSegment } from "$lib/mentions";
+  import { tick } from "svelte";
+  import { commonEmoji, emojiToken, insertEmoji, searchEmoji, type EmojiSuggestion } from "$lib/emoji-autocomplete";
 
   interface Props {
     /** The raw draft text. */
@@ -69,6 +71,81 @@
   );
 
   let scrollTop = $state(0);
+  const inputId = $props.id();
+  let caret = $state(0);
+  let selectionEnd = $state(0);
+  let focused = $state(false);
+  let composing = $state(false);
+  let dismissedAt = $state<number | null>(null);
+  let suggestions = $state<EmojiSuggestion[]>([]);
+  let selected = $state(0);
+  let searching = $state(false);
+  const token = $derived(focused && !composing ? emojiToken(value, caret, selectionEnd) : null);
+  const emojiOpen = $derived(!!token && dismissedAt !== token.start && !token.closed);
+
+  function syncCaret() {
+    caret = el?.selectionStart ?? 0;
+    selectionEnd = el?.selectionEnd ?? caret;
+  }
+
+  $effect(() => {
+    const current = token;
+    if (!current) { dismissedAt = null; return; }
+    if (dismissedAt === current.start) return;
+    const draft = value;
+    suggestions = commonEmoji(current.query);
+    selected = 0;
+    searching = true;
+    let cancelled = false;
+    void searchEmoji(current.query).then((results) => {
+      if (cancelled || value !== draft) return;
+      searching = false;
+      suggestions = results;
+      // A fully typed :shortcode: resolves too, but unknown names stay literal.
+      const exact = results.find((emoji) => emoji.shortcode === current.query);
+      if (current.closed && exact) void chooseEmoji(exact);
+    });
+    return () => { cancelled = true; };
+  });
+
+  async function chooseEmoji(emoji: EmojiSuggestion) {
+    if (!token) return;
+    const next = insertEmoji(value, token, emoji.unicode);
+    value = next.value;
+    suggestions = [];
+    await tick();
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(next.caret, next.caret);
+    syncCaret();
+    oninput?.();
+  }
+
+  function handleKeydown(event: KeyboardEvent) {
+    // IME Enter commits composition, not an emoji or a message.
+    if (event.isComposing || composing || event.keyCode === 229) return;
+    if (emojiOpen) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        dismissedAt = token!.start;
+        return;
+      }
+      if (["ArrowDown", "ArrowUp", "Enter", "Tab"].includes(event.key) && !event.shiftKey) {
+        if (suggestions.length) {
+          event.preventDefault();
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            selected = (selected + (event.key === "ArrowDown" ? 1 : -1) + suggestions.length) % suggestions.length;
+            void tick().then(() => document.getElementById(`${inputId}-emoji-${selected}`)?.scrollIntoView({ block: "nearest" }));
+          } else void chooseEmoji(suggestions[selected]);
+          return;
+        }
+        // Do not send the draft while an emoji query is still loading.
+        if (searching && event.key === "Enter") { event.preventDefault(); return; }
+      }
+    }
+    onkeydown?.(event);
+  }
   /**
    * Content-box width of the textarea. A classic (space-taking) scrollbar
    * narrows the real text once the draft overflows; copying the measured
@@ -99,6 +176,24 @@
 <!-- The wrapper carries the background: the textarea itself has to be
      transparent for the mirror underneath it to show through. -->
 <div class="relative w-full rounded-md bg-background">
+  {#if emojiOpen}
+    <div class="absolute bottom-full left-0 z-50 mb-1 w-full max-w-sm overflow-hidden rounded-md border border-border bg-popover shadow-lg">
+      <div class="px-3 py-2 text-[10px] font-mono text-muted-foreground">Emojis · ↑↓ navigate · Enter select · Esc cancel</div>
+      <div id={`${inputId}-emojis`} role="listbox" aria-label="Emoji suggestions" class="max-h-48 overflow-y-auto">
+        {#each suggestions as emoji, index (emoji.unicode)}
+          <button type="button" role="option" aria-selected={selected === index}
+            id={`${inputId}-emoji-${index}`}
+            class="flex w-full items-center gap-3 px-3 py-1.5 text-left text-sm hover:bg-muted {selected === index ? 'bg-muted' : ''}"
+            onpointerdown={(event) => event.preventDefault()}
+            onclick={() => void chooseEmoji(emoji)}>
+            <span class="text-xl">{emoji.unicode}</span><span class="truncate font-mono">:{emoji.shortcode}:</span>
+          </button>
+        {:else}
+          <div role="status" class="px-3 py-2 text-xs text-muted-foreground">{searching ? "Searching emojis..." : "No matching emojis"}</div>
+        {/each}
+      </div>
+    </div>
+  {/if}
   <div
     aria-hidden="true"
     class="pointer-events-none absolute left-px top-px overflow-hidden whitespace-pre-wrap break-words border-transparent text-foreground {BOX}"
@@ -123,9 +218,20 @@
     bind:this={el}
     bind:value
     {placeholder}
-    {onkeydown}
+    onkeydown={handleKeydown}
+    onkeyup={syncCaret}
+    onclick={syncCaret}
+    onselect={syncCaret}
+    onfocus={() => { focused = true; syncCaret(); }}
+    onblur={() => (focused = false)}
+    oncompositionstart={() => (composing = true)}
+    oncompositionend={() => { composing = false; syncCaret(); }}
+    aria-label={placeholder ?? "Message"}
+    aria-autocomplete="list"
+    aria-controls={emojiOpen ? `${inputId}-emojis` : undefined}
+    aria-activedescendant={emojiOpen && suggestions.length ? `${inputId}-emoji-${selected}` : undefined}
     rows={1}
-    oninput={() => oninput?.()}
+    oninput={(event) => { value = event.currentTarget.value; syncCaret(); oninput?.(); }}
     onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)}
     class="relative block max-h-30 min-h-10 w-full resize-none overflow-y-auto rounded-md border-input bg-transparent text-transparent caret-foreground placeholder:text-muted-foreground selection:bg-primary/30 focus:outline-none focus:ring-1 focus:ring-ring {BOX}"
   ></textarea>

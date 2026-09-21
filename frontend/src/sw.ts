@@ -1,10 +1,9 @@
 /// <reference lib="webworker" />
 
-import { cacheNames, clientsClaim } from "workbox-core";
+import { clientsClaim } from "workbox-core";
 import {
   precacheAndRoute,
   matchPrecache,
-  getCacheKeyForURL,
 } from "workbox-precaching";
 import { storeSharedPayload } from "$lib/share-target";
 import { storeNotifyIntent } from "$lib/notify-intents";
@@ -200,38 +199,6 @@ async function handleNavigation(request: Request): Promise<Response> {
   return fetch(request);
 }
 
-/** One refresh per worker lifetime: a burst of navigations must not turn into
- *  a burst of shell fetches. */
-let shellRefreshed = false;
-
-/**
- * Stale-while-revalidate for the shell.
- *
- * The precached index.html only changes when a NEW worker installs, and a
- * "prompt" registration waits for the user to accept that. Somebody who never
- * accepts - which on a phone is most people, the popup is at the bottom of a
- * screen they are not looking at - kept being served the shell from whenever
- * they installed. Serving the cached copy stays the fast path; this quietly
- * puts the current one in its place for the NEXT launch.
- */
-async function refreshShell(): Promise<void> {
-  if (shellRefreshed || !navigator.onLine) return;
-  shellRefreshed = true;
-  try {
-    // The precache is keyed by URL + revision, so the entry has to be
-    // replaced under the key workbox filed it under, not under "/index.html".
-    const key = getCacheKeyForURL("index.html");
-    if (!key) return;
-    const res = await fetch(key, { cache: "no-store" });
-    if (!res.ok) return;
-    const cache = await caches.open(cacheNames.precache);
-    await cache.put(key, res);
-  } catch {
-    // Offline, or a captive portal answering with its own page. The cached
-    // shell is still perfectly good; that is the point of serving it first.
-  }
-}
-
 self.addEventListener("fetch", (event) => {
   const request = event.request;
 
@@ -283,9 +250,9 @@ self.addEventListener("fetch", (event) => {
   if (request.mode === "navigate") {
     if (!/\.[a-z0-9]+$/i.test(new URL(request.url).pathname)) {
       event.respondWith(handleNavigation(request));
-      // After the response, not in front of it: the revalidate half of
-      // stale-while-revalidate must never be something the user waits on.
-      event.waitUntil(refreshShell());
+      // HTML and hashed assets belong to the same precache revision. Only a
+      // fully installed update may replace them; refreshing HTML alone can
+      // leave the next offline launch referring to uncached chunks.
     }
     return;
   }

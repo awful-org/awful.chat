@@ -15,9 +15,9 @@ export type PeerVoiceQuality = "p2p" | "relayed" | "degraded" | "failed";
 
 const QUALITY_RANK: Record<PeerVoiceQuality, number> = {
   p2p: 0,
-  relayed: 0,
-  degraded: 1,
-  failed: 2,
+  relayed: 1,
+  degraded: 2,
+  failed: 3,
 };
 
 export type CallQualityStatusEvent =

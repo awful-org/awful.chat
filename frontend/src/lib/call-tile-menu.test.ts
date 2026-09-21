@@ -37,6 +37,7 @@ describe("buildTileMenu", () => {
       "focus",
       "pip",
       "fullscreen",
+      "connection-details",
       "message",
       "profile",
       "add-phonebook",
@@ -50,7 +51,7 @@ describe("buildTileMenu", () => {
     const rows = buildTileMenu(
       tileMenuState({ kind: "camera", label: "Ada", canMessage: false })
     );
-    expect(actions(rows)).toEqual(["focus", "fullscreen", "mute-peer"]);
+    expect(actions(rows)).toEqual(["focus", "fullscreen", "connection-details", "mute-peer"]);
     expect(rows).toContainEqual({ type: "volume", target: "peer" });
   });
 

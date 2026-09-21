@@ -18,6 +18,7 @@
   import { onDestroy, untrack } from "svelte";
   import { Mic, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
+  import { Button } from "$lib/components/ui/button";
   import {
     Select,
     SelectContent,
@@ -30,14 +31,12 @@
   let {
     open = false,
     /**
-     * Hide the mic device picker: the level bar still shows the mic is
-     * alive, but there is nowhere to change it from. Off for the in-call
-     * camera picker, which already has its own mic control elsewhere - a
-     * second way to change mics there is one that doesn't belong to this
-     * dialog's job.
+     * Include microphone permission, device selection, and a level meter.
+     * Off for the in-call camera picker, which only needs camera access.
      */
     showMic = true,
-  }: { open?: boolean; showMic?: boolean } = $props();
+    ready = $bindable(false),
+  }: { open?: boolean; showMic?: boolean; ready?: boolean } = $props();
 
   let video = $state<HTMLVideoElement | null>(null);
   // $state: the template reads it to show the "no picture" placeholder.
@@ -48,12 +47,18 @@
   /** 0..1, smoothed. Drives the bar that tells you the mic is alive. */
   let level = $state(0);
   let error = $state<string | null>(null);
+  let permissionDenied = $state(false);
+  let pending = $state(false);
+  let requestId = 0;
   let audioCtx: AudioContext | null = null;
   let raf = 0;
 
   watchCameras();
 
   function teardown() {
+    requestId++;
+    pending = false;
+    ready = false;
     cancelAnimationFrame(raf);
     raf = 0;
     stream?.getTracks().forEach((t) => t.stop());
@@ -106,20 +111,34 @@
   });
 
   async function start(cameraId: string | null, micId: string | null) {
+    teardown();
+    const request = ++requestId;
     error = null;
+    permissionDenied = false;
+    pending = true;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
+      const acquired = await navigator.mediaDevices.getUserMedia({
         video: cameraId ? { deviceId: { ideal: cameraId } } : true,
-        audio: micId ? { deviceId: { ideal: micId } } : true,
+        audio: showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false,
       });
+      if (request !== requestId || !open) {
+        acquired.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      stream = acquired;
+      ready = acquired.getVideoTracks().some((track) => track.readyState === "live");
     } catch (err) {
+      if (request !== requestId) return;
       // A refused permission or a camera another app is holding. The mic and
       // camera pickers are still worth showing; joining is still allowed.
-      error =
-        err instanceof Error && err.name === "NotAllowedError"
-          ? "Your browser is not letting this page use the camera or microphone."
-          : "Could not open the camera or microphone.";
+      permissionDenied = err instanceof Error && err.name === "NotAllowedError";
+      const devices = showMic ? "camera or microphone" : "camera";
+      error = permissionDenied
+        ? `Your browser is not letting this page use the ${devices}.`
+        : `Could not open the ${devices}. Check whether another app is using it.`;
       return;
+    } finally {
+      if (request === requestId) pending = false;
     }
     // Labels arrive with permission, so this is the moment the lists become
     // readable rather than a row of "Camera 1".
@@ -194,9 +213,19 @@
     </div>
 
     {#if error}
-      <p class="text-xs text-destructive font-mono leading-relaxed">{error}</p>
+      <p role="status" class="text-xs text-destructive font-mono leading-relaxed">{error}</p>
+      {#if permissionDenied}
+        <p class="text-xs text-muted-foreground leading-relaxed">If no permission prompt appears, open your browser's site settings, allow camera{showMic ? " and microphone" : ""} access, then try again.</p>
+      {/if}
+      <Button variant="outline" class="text-xs font-mono" disabled={pending}
+        onclick={() => void start(camera, mic)}>
+        {permissionDenied ? "Ask again for permission" : "Try camera again"}
+      </Button>
+    {:else if pending}
+      <p role="status" class="text-xs text-muted-foreground">Waiting for camera access...</p>
     {/if}
 
+    {#if showMic}
     <div class="flex items-center gap-2">
       <Mic class="size-3.5 shrink-0 text-muted-foreground" />
       <div class="h-1.5 flex-1 overflow-hidden rounded bg-muted">
@@ -206,6 +235,7 @@
         ></div>
       </div>
     </div>
+    {/if}
 
     <div class="flex flex-col gap-1.5">
       <Label

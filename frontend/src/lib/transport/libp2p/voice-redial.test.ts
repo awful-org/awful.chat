@@ -54,6 +54,92 @@ function makeVoice(
   return { voice, internals };
 }
 
+describe("live voice status from stats", () => {
+  function setup() {
+    const { voice, internals } = makeVoice("connected");
+    const remote = (internals.remotePeers as Map<string, ReturnType<typeof fakeRemote> & {
+      relayed?: boolean; reportedRelayed?: boolean; recoveryPending?: boolean;
+      stallSignaled?: boolean;
+    }>).get("aaa")!;
+    const statuses: unknown[] = [];
+    voice.on("status", (status) => statuses.push(status));
+    const poll = () => (internals.pollInboundMedia as (r: unknown, n: number) => Promise<void>)
+      .call(internals, remote, performance.now());
+    const stats = (relayed: boolean, bytes = 100) => new Map([
+      ["pair", { type: "candidate-pair", state: "succeeded", nominated: true,
+        localCandidateType: relayed ? "relay" : "host", remoteCandidateType: "host" }],
+      ["audio", { type: "inbound-rtp", kind: "audio", bytesReceived: bytes }],
+    ]);
+    return { voice, internals, remote, statuses, poll, stats };
+  }
+
+  it("exposes measured diagnostics without refreshing their age when stats fail", async () => {
+    const { voice, remote, poll, stats } = setup();
+    expect(voice.getPeerDiagnostics("aaa")).toBeNull();
+    remote.pc.getStats = async () => stats(true, 100);
+    await poll();
+    const first = voice.getPeerDiagnostics("aaa")!;
+    expect(first).toMatchObject({ route: "relay", connectionState: "connected", rttMs: null });
+    expect(first.lastAudioAt).toBe(first.sampledAt);
+
+    // A successful sample with unchanged bytes does not fake audio progress.
+    await poll();
+    expect(voice.getPeerDiagnostics("aaa")!.lastAudioAt).toBe(first.lastAudioAt);
+    const sampledAt = voice.getPeerDiagnostics("aaa")!.sampledAt;
+    remote.pc.connectionState = "disconnected";
+    remote.pc.getStats = async () => { throw new Error("stats unavailable"); };
+    await poll();
+    expect(voice.getPeerDiagnostics("aaa")).toMatchObject({ sampledAt, connectionState: "disconnected" });
+    expect(voice.getPeerDiagnostics("unknown")).toBeNull();
+  });
+
+  it("reports TURN-to-direct changes without a connection-state event, once per change", async () => {
+    const { remote, statuses, poll, stats } = setup();
+    remote.pc.getStats = async () => stats(true);
+    await poll();
+    remote.pc.getStats = async () => stats(false, 200);
+    await poll();
+    await poll();
+    expect(statuses).toEqual([
+      expect.objectContaining({ type: "voice-ice-connected", relayed: true }),
+      expect.objectContaining({ type: "voice-ice-connected", relayed: false }),
+    ]);
+  });
+
+  it("retries missing initial stats and clears a recovered disconnect on the same route", async () => {
+    const { remote, statuses, poll, stats } = setup();
+    await poll();
+    expect(statuses).toHaveLength(0);
+    remote.pc.getStats = async () => stats(true);
+    await poll();
+    remote.recoveryPending = true;
+    await poll();
+    expect(statuses).toHaveLength(2);
+    expect(remote.recoveryPending).toBe(false);
+  });
+
+  it("does not clear degraded media just because the ICE route changed", async () => {
+    const { remote, statuses, poll, stats } = setup();
+    remote.stallSignaled = true;
+    remote.lastBytesReceived = 100;
+    remote.lastBytesReceivedAt = performance.now() - 20_000;
+    remote.pc.getStats = async () => stats(false);
+    await poll();
+    expect(statuses).toHaveLength(0);
+  });
+
+  it("ignores a pending stats result after the peer is replaced", async () => {
+    const { internals, remote, statuses, poll, stats } = setup();
+    let resolve!: (value: Map<string, unknown>) => void;
+    remote.pc.getStats = () => new Promise((r) => { resolve = r; });
+    const pending = poll();
+    (internals.remotePeers as Map<string, unknown>).set("aaa", fakeRemote("connected"));
+    resolve(stats(false));
+    await pending;
+    expect(statuses).toHaveLength(0);
+  });
+});
+
 describe("handleRedialRequest", () => {
   let dialed: string[];
   afterEach(() => vi.restoreAllMocks());

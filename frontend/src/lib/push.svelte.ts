@@ -79,8 +79,7 @@ interface PushConfig {
 
 let configCache: Promise<PushConfig | null> | null = null;
 
-/** What the relay says about its own push support. Cached for the session:
- *  it is instance configuration, not state. */
+/** Cache successful configuration, not a transient offline/startup failure. */
 function pushConfig(): Promise<PushConfig | null> {
   return (configCache ??= (async () => {
     if (!API()) return null;
@@ -99,7 +98,10 @@ function pushConfig(): Promise<PushConfig | null> {
       // error worth a stack trace: the app just stays local-only.
       return null;
     }
-  })());
+  })().then((config) => {
+    if (!config) configCache = null;
+    return config;
+  }));
 }
 
 /** Our libp2p peer id, the way the DM and mailbox paths get it. */
@@ -135,6 +137,7 @@ async function post(path: string, body: object): Promise<boolean> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(8000),
   });
   return res.ok;
 }
@@ -232,7 +235,11 @@ async function subscribe(): Promise<boolean> {
 
     const dev = await device();
     const marker = `${config.publicKey}|${json.endpoint}|${dev}`;
-    if (marker === lastPosted) return true;
+    if (marker === lastPosted) {
+      pushState.status = "subscribed";
+      pushState.reason = null;
+      return true;
+    }
 
     const ok = await post("/push/subscribe", {
       ...authFields(),
