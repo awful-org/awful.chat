@@ -2587,48 +2587,54 @@
         {/if}
         {#if commandPopupOpen && filteredCommands.length > 0}
           <div
-            class="absolute bottom-full left-0 z-50 mb-1 max-h-48 min-w-64 overflow-y-auto rounded-md border border-border bg-popover py-1 shadow-lg"
+            class="absolute bottom-full left-0 z-50 mb-1 min-w-64 overflow-hidden rounded-md border border-border bg-popover shadow-lg"
           >
-            {#each filteredCommands as cmd, index (cmd.name)}
-              <button
-                type="button"
-                class="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-sm hover:bg-muted {commandSelectedIndex ===
-                index
-                  ? 'bg-muted'
-                  : ''}"
-                onclick={() => selectCommand(cmd)}
-              >
-                <PluginIcon icon={cmd.icon} class="size-4" />
-                <span class="text-foreground">/{cmd.name}</span>
-                <span class="truncate text-xs text-muted-foreground">{cmd.usage}</span>
-              </button>
-            {/each}
+            <div class="px-3 py-2 text-[10px] font-mono text-muted-foreground">Commands · ↑↓ navigate · Enter select · Esc cancel</div>
+            <div class="max-h-48 overflow-y-auto py-1">
+              {#each filteredCommands as cmd, index (cmd.name)}
+                <button
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-sm hover:bg-muted {commandSelectedIndex ===
+                  index
+                    ? 'bg-muted'
+                    : ''}"
+                  onclick={() => selectCommand(cmd)}
+                >
+                  <PluginIcon icon={cmd.icon} class="size-4" />
+                  <span class="text-foreground">/{cmd.name}</span>
+                  <span class="truncate text-xs text-muted-foreground">{cmd.usage}</span>
+                </button>
+              {/each}
+            </div>
           </div>
         {/if}
         {#if mentionPopupOpen && filteredMembersForMention.length > 0}
           <div
-            class="absolute bottom-full left-0 z-50 mb-1 max-h-48 min-w-48 overflow-y-auto rounded-md border border-border bg-popover py-1 shadow-lg"
+            class="absolute bottom-full left-0 z-50 mb-1 min-w-48 overflow-hidden rounded-md border border-border bg-popover shadow-lg"
           >
-            {#each filteredMembersForMention as member, index (member.did)}
-              <button
-                type="button"
-                class="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-sm hover:bg-muted {mentionSelectedIndex ===
-                index
-                  ? 'bg-muted'
-                  : ''}"
-                onclick={() => selectMentionMember(member)}
-              >
-                <span class="text-muted-foreground">@</span>
-                <span class="truncate">{member.name}</span>
-                {#if !member.online}
-                  <!-- Say so rather than hiding them: mentioning an away member
-                       is the point, and a silent list looks like a bug. -->
-                  <span class="ml-auto shrink-0 text-[10px] text-muted-foreground">
-                    away
-                  </span>
-                {/if}
-              </button>
-            {/each}
+            <div class="px-3 py-2 text-[10px] font-mono text-muted-foreground">Mentions · ↑↓ navigate · Enter select · Esc cancel</div>
+            <div class="max-h-48 overflow-y-auto py-1">
+              {#each filteredMembersForMention as member, index (member.did)}
+                <button
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-sm hover:bg-muted {mentionSelectedIndex ===
+                  index
+                    ? 'bg-muted'
+                    : ''}"
+                  onclick={() => selectMentionMember(member)}
+                >
+                  <span class="text-muted-foreground">@</span>
+                  <span class="truncate">{member.name}</span>
+                  {#if !member.online}
+                    <!-- Say so rather than hiding them: mentioning an away member
+                         is the point, and a silent list looks like a bug. -->
+                    <span class="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                      away
+                    </span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
           </div>
         {/if}
         <div
