@@ -1237,6 +1237,7 @@ export class LibP2PTransport implements PeerTransport {
         clearTimeout(timer);
         this.rttProbes.delete(nonce);
         rec(ev("peer.rtt", { peer: peerId, d: { ms: rtt } }));
+        resolve(rtt);
       };
       const timer = setTimeout(() => settle(null), timeoutMs);
       // sentAt is recorded as late as possible - after the frame is built,
@@ -1281,6 +1282,7 @@ export class LibP2PTransport implements PeerTransport {
             })
           );
         }
+        resolve(sample);
       };
       const timer = setTimeout(() => finish(null), timeoutMs);
       const sentWallAt = Date.now();
