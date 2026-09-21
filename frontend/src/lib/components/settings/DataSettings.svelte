@@ -50,13 +50,9 @@
   function enhanceMetricsWithDmNames(m: StorageMetrics): StorageMetrics {
     return {
       ...m,
-      rooms: m.rooms.map((room) => {
-        // Only process if the room name looks like a DM room code.
-        if (!room.name.startsWith("dm-")) {
-          return room;
-        }
+      dms: m.dms.map((room) => {
         const displayName = resolveDmRoomDisplayName(
-          room.name,
+          room.roomCode,
           roomsStore.dmRooms,
           roomsStore.phonebook,
           transportState.peerNames
@@ -293,6 +289,13 @@
           </div>
           <div class="bg-muted/50 rounded-lg p-3">
             <div class="flex items-center gap-2 mb-1">
+              <MessageSquare class="w-3.5 h-3.5 text-muted-foreground" />
+              <span class="text-[10px] text-muted-foreground font-mono uppercase">DMs</span>
+            </div>
+            <p class="text-lg font-semibold font-mono">{metrics.totalDMs.toLocaleString()}</p>
+          </div>
+          <div class="bg-muted/50 rounded-lg p-3">
+            <div class="flex items-center gap-2 mb-1">
               <Users class="w-3.5 h-3.5 text-muted-foreground" />
               <span
                 class="text-[10px] text-muted-foreground font-mono uppercase"
@@ -404,17 +407,17 @@
         </div>
 
         <!-- Top Rooms Bar Chart -->
-        {#if metrics.rooms.length > 0}
+        {#each [{ title: "Top Rooms", items: metrics.rooms, empty: "No rooms stored" }, { title: "Top DMs", items: metrics.dms, empty: "No DMs stored" }] as group (group.title)}
           <div class="bg-muted/50 rounded-lg p-4">
             <div class="flex items-center gap-2 mb-3">
               <Database class="w-4 h-4 text-muted-foreground" />
               <span class="text-xs text-muted-foreground font-mono uppercase"
-                >Top Rooms</span
+                >{group.title}</span
               >
             </div>
             <div class="flex flex-col gap-2">
-              {#each metrics.rooms as room, i}
-                {@const maxMessages = metrics.rooms[0]?.messageCount || 1}
+              {#each group.items as room, i (room.roomCode)}
+                {@const maxMessages = group.items[0]?.messageCount || 1}
                 <div class="flex items-center gap-2 text-xs">
                   <span class="font-mono w-4 text-muted-foreground"
                     >{i + 1}.</span
@@ -432,10 +435,12 @@
                     >{room.messageCount}</span
                   >
                 </div>
+              {:else}
+                <p class="text-xs text-muted-foreground font-mono">{group.empty}</p>
               {/each}
             </div>
           </div>
-        {/if}
+        {/each}
       </div>
     {:else if metricsError}
       <div class="flex flex-col items-center gap-2 py-8">
@@ -457,7 +462,7 @@
       <div class="flex flex-col gap-4 animate-pulse">
         <!-- Stats Grid Skeleton -->
         <div class="grid grid-cols-2 gap-3">
-          {#each [1, 2, 3, 4] as _}
+          {#each [1, 2, 3, 4, 5] as _}
             <div class="bg-muted/50 rounded-lg p-3">
               <div class="flex items-center gap-2 mb-1">
                 <div class="w-3.5 h-3.5 rounded bg-muted/60"></div>

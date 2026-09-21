@@ -25,7 +25,9 @@
           // PWA never does - without this poll an update went unseen until the
           // next full reload, days later.
           if (registration) {
-            setInterval(() => void registration.update(), 60 * 60 * 1000);
+            setInterval(() => {
+              if (navigator.onLine) void registration.update().catch(() => {});
+            }, 60 * 60 * 1000);
             // A worker already waiting at launch is an update the user was
             // offered and dismissed, and dismissing it only ever meant "not
             // this second". Left unasked it waits forever, because a PWA
@@ -47,18 +49,25 @@
   // location.reload(), and on a slow connection that chain takes seconds
   // with zero visible effect - which reads as a dead button.
   let updating = $state(false);
-  function update() {
+  let updateError = $state(false);
+  async function update() {
     updating = true;
-    void updateServiceWorker();
+    updateError = false;
+    try {
+      await updateServiceWorker();
+    } catch {
+      updating = false;
+      updateError = true;
+    }
   }
 </script>
 
 {#if $needRefresh}
   <div
-    class="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))] z-50 flex items-center gap-3 rounded-lg border bg-background/95 backdrop-blur px-4 py-3 text-sm font-mono text-foreground shadow-lg"
+    class="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))] max-w-[calc(100vw-2rem)] z-50 flex flex-wrap items-center gap-3 rounded-lg border bg-background/95 backdrop-blur px-4 py-3 text-sm font-mono text-foreground shadow-lg"
     role="alert"
   >
-    <span>New version available</span>
+    <span>{updateError ? "Update failed. Try again." : "New version available"}</span>
     <button
       class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 cursor-pointer disabled:cursor-default disabled:opacity-70"
       onclick={update}

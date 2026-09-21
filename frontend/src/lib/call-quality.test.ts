@@ -105,4 +105,9 @@ describe("worstQuality", () => {
       )
     ).not.toBe("degraded");
   });
+
+  it("shows relay use in a mixed call regardless of peer insertion order", () => {
+    expect(worstQuality(m([["a", "p2p"], ["b", "relayed"]]))).toBe("relayed");
+    expect(worstQuality(m([["b", "relayed"], ["a", "p2p"]]))).toBe("relayed");
+  });
 });

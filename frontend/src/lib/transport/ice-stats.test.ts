@@ -65,6 +65,20 @@ describe("succeededPair", () => {
     expect(succeededPair(rows)).toBeNull();
   });
 
+  it("uses the transport-selected pair even when an old nominated TURN pair remains", () => {
+    const direct = { ...firefox[0], id: "direct" };
+    const transport = { type: "transport", selectedCandidatePairId: "direct" };
+    for (const pairs of [[direct, ...chrome], [...chrome, direct]]) {
+      expect(succeededPair([transport, ...pairs])?.relayed).toBe(false);
+    }
+  });
+
+  it("honors the legacy selected flag over an old nominated pair", () => {
+    expect(succeededPair([
+      { ...firefox[0], selected: true }, ...chrome,
+    ])?.relayed).toBe(false);
+  });
+
   it("accepts a real RTCStatsReport, which is a Map", () => {
     const report = new Map(chrome.map((r) => [r.id, r]));
     expect(succeededPair(report)?.relayed).toBe(true);

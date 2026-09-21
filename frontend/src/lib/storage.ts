@@ -2631,11 +2631,13 @@ export interface StorageMetrics {
   quota: number | null;
   totalMessages: number;
   totalRooms: number;
+  totalDMs: number;
   totalProfiles: number;
   seedingAttachments: number;
   totalAttachments: number;
   storedDataSize: number;
-  rooms: { name: string; messageCount: number }[];
+  rooms: import("./storage-metrics").ConversationMetric[];
+  dms: import("./storage-metrics").ConversationMetric[];
 }
 
 export async function getStorageMetrics(): Promise<StorageMetrics> {
@@ -2683,16 +2685,7 @@ export async function getStorageMetrics(): Promise<StorageMetrics> {
     roomCounts.set(room.roomCode, count);
   }
 
-  const roomMetrics = Array.from(roomCounts.entries())
-    .map(([roomCode, messageCount]) => {
-      const room = rooms.find((r) => r.roomCode === roomCode);
-      return {
-        name: room?.name || roomCode,
-        messageCount,
-      };
-    })
-    .sort((a, b) => b.messageCount - a.messageCount)
-    .slice(0, 5);
+  const { conversationMetrics } = await import("./storage-metrics");
 
   let quota: number | null = null;
   try {
@@ -2705,11 +2698,10 @@ export async function getStorageMetrics(): Promise<StorageMetrics> {
     persisted: await isStoragePersisted(),
     quota,
     totalMessages,
-    totalRooms: rooms.length,
+    ...conversationMetrics(rooms, roomCounts),
     totalProfiles,
     seedingAttachments: seedingCount,
     totalAttachments,
     storedDataSize: storedSize,
-    rooms: roomMetrics,
   };
 }

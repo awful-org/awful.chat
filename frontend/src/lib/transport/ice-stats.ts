@@ -25,7 +25,8 @@ export interface SucceededPair {
 type Row = Record<string, unknown> & { type?: string };
 
 /**
- * The nominated succeeded pair, or the first succeeded one. Returns null when
+ * The transport's selected pair, then a nominated/selected succeeded pair,
+ * or the first succeeded one for older browsers. Returns null when
  * no pair has succeeded yet, which is itself the answer to "why is there no
  * audio" and must not be confused with a pair whose types are unknown.
  */
@@ -42,7 +43,14 @@ export function succeededPair(
   }
 
   const candidates = new Map<string, Row>();
+  const selectedIds = new Set(
+    rows
+      .filter((row) => row.type === "transport")
+      .map((row) => row.selectedCandidatePairId)
+      .filter((id): id is string => typeof id === "string")
+  );
   let best: Row | null = null;
+  let bestRank = -1;
   for (const row of rows) {
     if (row.type === "local-candidate" || row.type === "remote-candidate") {
       const id = row.id;
@@ -50,8 +58,14 @@ export function succeededPair(
       continue;
     }
     if (row.type !== "candidate-pair" || row.state !== "succeeded") continue;
-    // A nominated pair beats a merely succeeded one; ICE can hold several.
-    if (!best || row.nominated === true) best = row;
+    // Old nominated pairs can remain in stats after a route change.
+    const rank = typeof row.id === "string" && selectedIds.has(row.id)
+      ? 3
+      : row.selected === true ? 2 : row.nominated === true ? 1 : 0;
+    if (rank > bestRank) {
+      best = row;
+      bestRank = rank;
+    }
   }
   if (!best) return null;
 
