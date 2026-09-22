@@ -170,7 +170,12 @@ export interface VoiceTransport {
   off<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void;
 
   // introspection
+  /** Peers whose audio track has arrived. That happens at offer/answer,
+   *  BEFORE ICE connects, so it is proof of presence, not of a working link. */
   activePeers(): string[];
+  /** Peers whose link has actually reached "connected" - what a status
+   *  line may call connected. */
+  connectedPeers(): string[];
 }
 
 export type VideoSource = "camera" | "screen";
