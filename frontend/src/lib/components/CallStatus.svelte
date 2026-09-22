@@ -108,7 +108,10 @@
   $effect(() => {
     const tick = setInterval(() => {
       if (!transportState.inCall) return;
-      activeCount = _voice?.activePeers().length ?? 0;
+      // connectedPeers, not activePeers: a peer's track arrives at the SDP
+      // handshake, seconds before ICE connects, so counting tracks flipped
+      // this to "Connected" while nobody could hear anybody yet.
+      activeCount = _voice?.connectedPeers().length ?? 0;
       let expected = 0;
       const self = _transport?.selfId();
       for (const [pid, room] of transportState.callPeerRooms) {
@@ -135,8 +138,8 @@
         label: `Connecting ${activeCount}/${expectedCount}...`,
       };
     }
-    // Everyone announced is connected; if the ICE event was missed, the
-    // active peers are still proof enough.
+    // Everyone announced has a connected link; if the ICE event was missed,
+    // that is still proof enough.
     return quality === "connecting" ? getStatusConfig("p2p") : base;
   });
   const StatusIcon = $derived(config.icon);

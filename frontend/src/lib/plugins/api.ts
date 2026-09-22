@@ -38,6 +38,13 @@ export interface PluginManifest {
    * plugin code. Names must match the keys of the definition's `commands`.
    */
   commands?: Array<{ name: string; usage: string }>;
+  /**
+   * Actions this plugin offers in the Ctrl+K palette. Lives in the manifest
+   * for the same reason `commands` does: the palette catalog rebuilds on
+   * app state changes and must not load plugin code just to list a row.
+   * `name` must match a key of the definition's `paletteCommands`.
+   */
+  paletteCommands?: Array<{ name: string; title: string; subtitle?: string }>;
   /** This plugin ships a `settings` component; draws the gear in the
    *  plugins tab without loading plugin code. */
   hasSettings?: boolean;
@@ -69,6 +76,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "plugin-stream",
   "picture-in-picture",
   "call-tile-menu",
+  "palette-commands",
 ]);
 
 export interface UpdateCtx {
@@ -518,6 +526,13 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
     string,
     (args: string, host: HostApi) => void | Promise<void>
   >;
+  /**
+   * Handlers for this plugin's palette actions, keyed by the `name` in
+   * `manifest.paletteCommands`. `host` is bound to the room open when the
+   * palette was accepted, or "" with none open - the same binding the
+   * `settings` surface gets, since the palette itself is not room-scoped.
+   */
+  paletteCommands?: Record<string, (host: HostApi) => void | Promise<void>>;
 }
 
 // Internal message format: JSON stringified into content field

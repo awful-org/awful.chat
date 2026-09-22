@@ -45,8 +45,8 @@ group video.
 - **Profiles**: avatar, banner (image or GIF), a colored tag chip, bio, and
   name effects (gradient, shimmer, glow, rainbow).
 - **Plugins**: instance-level, Minecraft-mods style. Drop a folder or point
-  `PLUGIN_SOURCES` at GitHub repos and redeploy; ships with `/wheel` and
-  `/poll`, with more at
+  `PLUGIN_SOURCES` at GitHub repos and redeploy; ships with `/wheel`,
+  `/poll` and `/ping`, with more at
   [awful-org/awfully-awesome](https://github.com/awful-org/awfully-awesome).
   See [frontend/plugins/README.md](frontend/plugins/README.md).
 - **Multi-device**: several devices on one identity, QR device sync,

@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Room } from "$lib/storage";
   import {
+    GripVertical,
     Hash,
     MessageSquare,
     PanelLeftClose,
@@ -60,6 +61,8 @@
     onRemoveDmConversation: (peerId: string) => void;
     dmContextActions?: DmContextAction[];
     onRemoveRoom: (code: string) => void;
+    /** Drag `fromCode`'s row to sit just before `toCode`'s. */
+    onReorderRoom: (fromCode: string, toCode: string) => void;
     onOpenCreateJoin?: () => void;
     onOpenPhonebook?: () => void;
   }
@@ -87,11 +90,45 @@
     onRemoveDmConversation,
     dmContextActions,
     onRemoveRoom,
+    onReorderRoom,
     onOpenCreateJoin,
     onOpenPhonebook,
   }: Props = $props();
 
   let contextMenu = $state<{ code: string; x: number; y: number } | null>(null);
+
+  // Drag-to-reorder, expanded room list only. Pointer capture on the grip
+  // handle means the row it belongs to keeps receiving move/up events no
+  // matter where the pointer physically is; the keyed {#each} below means
+  // that handle is the SAME element even as onReorderRoom relocates its row
+  // mid-drag, so the capture survives the reorder.
+  let draggingRoomCode = $state<string | null>(null);
+  let lastDragOverCode: string | null = null;
+
+  function startRoomDrag(e: PointerEvent, roomCode: string): void {
+    if (e.button !== 0) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    draggingRoomCode = roomCode;
+    lastDragOverCode = null;
+    e.preventDefault();
+  }
+
+  function onRoomDragMove(e: PointerEvent): void {
+    if (!draggingRoomCode) return;
+    const overCode = document
+      .elementFromPoint(e.clientX, e.clientY)
+      ?.closest<HTMLElement>("[data-room-code]")?.dataset.roomCode;
+    if (!overCode || overCode === draggingRoomCode || overCode === lastDragOverCode) return;
+    lastDragOverCode = overCode;
+    onReorderRoom(draggingRoomCode, overCode);
+  }
+
+  function endRoomDrag(e: PointerEvent): void {
+    const handle = e.currentTarget as HTMLElement;
+    if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+    draggingRoomCode = null;
+    lastDragOverCode = null;
+  }
   let dmContextMenu = $state<{
     peerId: string;
     inPhonebook: boolean;
@@ -526,12 +563,25 @@
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
           role="none"
+          data-room-code={room.roomCode}
+          class="flex items-center gap-0.5 rounded-md {draggingRoomCode === room.roomCode ? 'opacity-60' : ''}"
           oncontextmenu={(e) => openContextMenu(e, room.roomCode)}
         >
           <button
             type="button"
+            aria-label="Drag to reorder {room.name || room.roomCode}"
+            onpointerdown={(e) => startRoomDrag(e, room.roomCode)}
+            onpointermove={onRoomDragMove}
+            onpointerup={endRoomDrag}
+            onpointercancel={endRoomDrag}
+            class="shrink-0 touch-none cursor-grab rounded p-1 text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing"
+          >
+            <GripVertical class="size-3.5" />
+          </button>
+          <button
+            type="button"
             onclick={() => onSelectRoom(room.roomCode)}
-            class="flex w-full items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors cursor-pointer hover:bg-accent/50
+            class="flex min-w-0 flex-1 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors cursor-pointer hover:bg-accent/50
               {activeRoomCode === room.roomCode
               ? 'bg-accent text-accent-foreground'
               : 'text-muted-foreground'}"

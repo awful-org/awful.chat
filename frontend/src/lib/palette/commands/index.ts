@@ -3,11 +3,13 @@ import type { CmdSource, PaletteHost } from "../host";
 import { roomCommands } from "./rooms";
 import { settingsCommands } from "./settings";
 import { actionCommands } from "./actions";
+import { pluginCommands } from "./plugins";
 
 export const allSources: CmdSource[] = [
   roomCommands,
   settingsCommands,
   actionCommands,
+  pluginCommands,
 ];
 
 /** Concatenate every command source into the full catalog for one host. */
