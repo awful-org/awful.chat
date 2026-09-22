@@ -62,6 +62,12 @@ this file and the README disagree, the README wins. What has grown since:
   widgets - `callTile`, `callTileActive`, `callTileViewers`, `callTileMenu`
   and `widget` are all definition surfaces now, alongside `card`,
   `localCard` and `settings`.
+- Plugins can add rows to the Ctrl+K command palette: `manifest.paletteCommands`
+  (eager `{name, title, subtitle?}`, so the catalog lists them without loading
+  plugin code) plus `PluginDefinition.paletteCommands` (the lazy handlers,
+  keyed by that same `name`) - the same eager-manifest / lazy-handler split
+  slash commands already use. Gated behind the `palette-commands` host
+  feature.
 
 ## Goals
 

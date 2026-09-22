@@ -1065,6 +1065,14 @@ export class LibP2PVoice implements VoiceTransport {
     return Array.from(this.active);
   }
 
+  connectedPeers(): string[] {
+    const ids: string[] = [];
+    for (const [peerId, remote] of this.remotePeers) {
+      if (remote.pc.connectionState === "connected") ids.push(peerId);
+    }
+    return ids;
+  }
+
   // ─── internals ────────────────────────────────────────────────────────────
 
   private async startMic(deviceId?: string): Promise<void> {

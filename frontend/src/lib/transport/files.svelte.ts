@@ -105,7 +105,12 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
   });
 
   _fileTransport.on("transfer", (snapshot) => {
-    withFileTransfer(snapshot);
+    // Never adopt the file transport's own blobURL: it keeps that URL in its
+    // own map and re-sends it on every wire/upload/seed event, so once this
+    // map had swapped it for a URL of ours (and revoked it), the next event
+    // swapped the dead one back in - and the room, already marked hydrated,
+    // never rebuilt it. The picture for a download is minted below instead.
+    withFileTransfer({ ...snapshot, blobURL: undefined });
 
     if (
       snapshot.status === "seeding" ||
@@ -120,6 +125,10 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
   });
 
   _fileTransport.on("downloaded", (infoHash, blob) => {
+    const current = transportState.fileTransfers.get(infoHash);
+    if (current && !current.blobURL) {
+      withFileTransfer({ ...current, blobURL: URL.createObjectURL(blob) });
+    }
     _persistDownloadedBlob(infoHash, blob).catch(() => {});
 
     getAttachmentsByInfoHash(infoHash)
@@ -290,20 +299,13 @@ export async function fileFingerprint(file: File): Promise<string> {
 export function withFileTransfer(snapshot: FileTransferSnapshot): void {
   const prev = transportState.fileTransfers.get(snapshot.infoHash);
 
-  // Determine which blobURL to use: defensively prefer existing one unless
-  // snapshot provides a new one with a status indicating completion
-  let blobURLToUse = prev?.blobURL;
-  if (snapshot.blobURL) {
-    // Only accept snapshot's blobURL if we don't have one yet, or if status
-    // indicates a fresh transfer (complete or seeding)
-    if (!prev?.blobURL || snapshot.status === "complete" || snapshot.status === "seeding") {
-      blobURLToUse = snapshot.blobURL;
-    }
-  }
-
-  // Revoke previous blobURL if we're replacing it with a different one
-  if (prev?.blobURL && blobURLToUse && prev.blobURL !== blobURLToUse) {
-    URL.revokeObjectURL(prev.blobURL);
+  // Every blobURL offered here was minted for this map alone, and an infoHash
+  // names exactly one set of bytes - so the URL already on screen is as good
+  // as any newer one. Keep it and drop the duplicate; swapping revoked a URL
+  // that something still rendering (or re-sending) could hand back.
+  const blobURLToUse = prev?.blobURL ?? snapshot.blobURL;
+  if (snapshot.blobURL && snapshot.blobURL !== blobURLToUse) {
+    URL.revokeObjectURL(snapshot.blobURL);
   }
 
   const nextSnapshot: FileTransferSnapshot = {
