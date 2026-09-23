@@ -29,7 +29,27 @@ export function notePeerQualityTrack(peerId: string): void {
   if (next !== peerQualityState.peers) peerQualityState.peers = next;
 }
 
+/**
+ * Peers whose voice RTCPeerConnection currently reads "connected". The ONE
+ * answer to "is this person connected yet" for every surface - the call
+ * tile's pulse and the sidebar badge each used their own proxy (an audio
+ * track, which lands at the SDP handshake; a status event a component had
+ * to be mounted to hear) and disagreed for seconds on every join.
+ */
+export const voiceLinkState = $state({
+  connected: new Set<string>() as ReadonlySet<string>,
+});
+
+export function setVoiceLink(peerId: string, up: boolean): void {
+  if (voiceLinkState.connected.has(peerId) === up) return;
+  const next = new Set(voiceLinkState.connected);
+  if (up) next.add(peerId);
+  else next.delete(peerId);
+  voiceLinkState.connected = next;
+}
+
 /** Call teardown: verdicts are about links that no longer exist. */
 export function resetPeerQuality(): void {
   if (peerQualityState.peers.size > 0) peerQualityState.peers = new Map();
+  if (voiceLinkState.connected.size > 0) voiceLinkState.connected = new Set();
 }

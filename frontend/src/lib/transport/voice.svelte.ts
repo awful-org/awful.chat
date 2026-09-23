@@ -12,6 +12,7 @@ import type { DtlnProcessor } from "../audio/dtln-processor";
 import {
   applyPeerQualityEvent,
   notePeerQualityTrack,
+  setVoiceLink,
 } from "$lib/call-peer-quality.svelte";
 import type { CallQualityStatusEvent } from "$lib/call-quality";
 
@@ -94,6 +95,8 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
   _voice.on("error", (err) => {
     transportState.error = err.message;
   });
+
+  _voice.on("linkState", setVoiceLink);
 
   // voice.ts's own status statuses (voice-peer-left, voice-connection-
   // failed, voice-degraded, voice-dial-failed, voice-ice-connected) reach
