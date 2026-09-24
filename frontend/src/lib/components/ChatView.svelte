@@ -1407,10 +1407,50 @@
     if (document.visibilityState === "visible") markSeen().catch(() => {});
   }
 
+  /**
+   * Put the caret in the composer when a conversation opens or the window
+   * comes back, so typing just works. Only where there is a real keyboard -
+   * on a touch screen this would throw up the on-screen one over the chat -
+   * and never over something the user is already in: another field, an open
+   * dialog, or text they have selected to copy.
+   */
+  function focusComposer(): void {
+    if (!textareaEl || isMobile) return;
+    if (!window.matchMedia("(pointer: fine)").matches) return;
+    const active = document.activeElement;
+    if (
+      active &&
+      active !== document.body &&
+      active !== textareaEl &&
+      active.closest(
+        "input, textarea, select, [contenteditable='true'], [role='dialog'], [role='alertdialog']"
+      )
+    ) {
+      return;
+    }
+    if (window.getSelection()?.isCollapsed === false) return;
+    textareaEl.focus({ preventScroll: true });
+  }
+
   $effect(() => {
     void roomCode;
     pinnedOpen = false;
   });
+
+  $effect(() => {
+    void roomCode;
+    // After the frame that swaps the conversation in, and after the sidebar
+    // button or palette row that was pressed has had its own focus handling.
+    const frame = requestAnimationFrame(focusComposer);
+    return () => cancelAnimationFrame(frame);
+  });
+
+  // Coming back to the window restores whatever was focused before, so only
+  // step in when that was nothing at all.
+  function focusComposerOnReturn(): void {
+    if (document.activeElement && document.activeElement !== document.body) return;
+    focusComposer();
+  }
 
   function shouldShowHeader(current: Message, previous?: Message): boolean {
     if (!previous) return true;
@@ -1721,6 +1761,7 @@
       activeMessageId = null;
     }
   }}
+  onfocus={focusComposerOnReturn}
 />
 
 <svelte:document onvisibilitychange={markSeenOnReturn} />
