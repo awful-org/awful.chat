@@ -21,10 +21,13 @@ export interface CallPipPanelState {
   browserPip: boolean;
 }
 
-// 280x158 video plus a title and two rows of 44px touch controls.
-export const WIDTH = 280;
-export const HEIGHT = 158;
-export const BAR_HEIGHT = 132;
+// A 16:9 video under ONE row: the room, then the controls. Seven 44px
+// buttons in 280px wrapped onto a second row and made the bar 132px tall.
+export const WIDTH = 320;
+export const HEIGHT = 180;
+export const BAR_HEIGHT = 48;
+/** Minimized: a pill holding the room, mute and expand. */
+export const MINIMIZED_WIDTH = 220;
 
 export const callPipPanel = $state<CallPipPanelState>({
   x: 0,
@@ -48,8 +51,9 @@ export const callPipPanel = $state<CallPipPanelState>({
  * pushing it left of where it actually ends.
  */
 export function panelWidth(): number {
-  if (typeof window === "undefined") return WIDTH;
-  return Math.min(WIDTH, Math.max(0, window.innerWidth - 16));
+  const width = callPipPanel.minimized ? MINIMIZED_WIDTH : WIDTH;
+  if (typeof window === "undefined") return width;
+  return Math.min(width, Math.max(0, window.innerWidth - 16));
 }
 
 export function defaultPanelPosition(): { x: number; y: number } {
@@ -64,9 +68,25 @@ export function defaultPanelPosition(): { x: number; y: number } {
   };
 }
 
-/** The panel's real height, which depends on whether it is collapsed. */
-function panelHeight(): number {
-  return callPipPanel.minimized ? BAR_HEIGHT : HEIGHT + BAR_HEIGHT;
+/**
+ * The panel's real height. A voice-only call has no video body, so it is the
+ * bar whether or not it is minimized.
+ */
+export function panelHeight(hasVideo = true): number {
+  return callPipPanel.minimized || !hasVideo ? BAR_HEIGHT : HEIGHT + BAR_HEIGHT;
+}
+
+/**
+ * Collapse to the pill or expand back, keeping the BOTTOM edge where it was:
+ * the panel lives in a bottom corner, and resizing from the top left it
+ * floating mid-screen or hanging off the bottom.
+ */
+export function setMinimized(minimized: boolean, hasVideo: boolean): void {
+  if (callPipPanel.minimized === minimized) return;
+  const before = panelHeight(hasVideo);
+  callPipPanel.minimized = minimized;
+  callPipPanel.y += before - panelHeight(hasVideo);
+  clampPanelToViewport(hasVideo);
 }
 
 /**
@@ -76,7 +96,7 @@ function panelHeight(): number {
  * function slides it back into view without changing its size. It follows
  * the same logic as the DM panel.
  */
-export function clampPanelToViewport(): void {
+export function clampPanelToViewport(hasVideo = true): void {
   if (typeof window === "undefined") return;
   const minX = 8;
   const maxX = Math.max(minX, window.innerWidth - panelWidth() - 8);
@@ -85,7 +105,7 @@ export function clampPanelToViewport(): void {
   // another 158px - hanging below the viewport whenever the panel was not
   // minimized, so the clamp failed to do the one thing it exists for in the
   // common case.
-  const maxY = Math.max(minY, window.innerHeight - panelHeight() - 8);
+  const maxY = Math.max(minY, window.innerHeight - panelHeight(hasVideo) - 8);
 
   callPipPanel.x = Math.max(minX, Math.min(callPipPanel.x, maxX));
   callPipPanel.y = Math.max(minY, Math.min(callPipPanel.y, maxY));

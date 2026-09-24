@@ -1,14 +1,25 @@
 <script lang="ts">
-  import { Maximize2, Minus, Phone, PhoneOff, Mic, MicOff, Video, VideoOff, Pin } from "@lucide/svelte";
+  import {
+    ChevronDown,
+    ChevronUp,
+    CornerUpLeft,
+    Mic,
+    MicOff,
+    PhoneOff,
+    PictureInPicture2,
+    Video,
+    VideoOff,
+  } from "@lucide/svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { draggable } from "$lib/actions/draggable";
   import {
     BAR_HEIGHT,
-    HEIGHT,
+    panelHeight,
     panelWidth,
     callPipPanel,
     defaultPanelPosition,
     clampPanelToViewport,
+    setMinimized,
   } from "$lib/call-pip.svelte";
   import { toggleMute, cameraOnPressed, leaveCall } from "$lib/transport/call.svelte";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
@@ -16,18 +27,15 @@
   import { roomsStore } from "$lib/rooms.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import { speakers } from "$lib/speakers.svelte";
-  import { callFocus } from "$lib/call-focus.svelte";
   import {
     spotlightStore,
     getSpeakingLabel,
+    browserPipSupported,
     enterBrowserPip,
     exitBrowserPip,
   } from "$lib/call-spotlight.svelte";
-  import type { SpotlightTile } from "$lib/spotlight";
 
   // Read the shared spotlight from AppView.
-  const tiles = $derived(spotlightStore.tiles);
-  const spotlightTileId = $derived(spotlightStore.spotlightTileId);
   const spotlightTile = $derived(spotlightStore.spotlightTile);
 
   function handlePipVideoClick(): void {
@@ -49,26 +57,17 @@
     return roomsStore.rooms.find((r) => r.roomCode === code)?.name || code.slice(0, 12);
   });
 
-  // Handle pin cycling: pin current -> unpin
-  function togglePin(): void {
-    if (callFocus.pinnedTileId === spotlightTileId) {
-      callFocus.pinnedTileId = null;
-    } else if (spotlightTileId) {
-      callFocus.pinnedTileId = spotlightTileId;
-    }
+  function togglePip(): void {
+    if (callPipPanel.browserPip) void exitBrowserPip();
+    else void enterBrowserPip(() => void requestReturnToCall());
   }
 
-  async function enterPip(): Promise<void> {
-    await enterBrowserPip(() => void requestReturnToCall());
-  }
-  async function exitPip(): Promise<void> {
-    await exitBrowserPip();
-  }
-
-  // Clamping on window resize
+  // panelWidth reads window.innerWidth, which is not reactive; bump this on
+  // resize so the derived width recomputes.
+  let viewportTick = $state(0);
   function clampToViewport(): void {
-    width = panelWidth();
-    clampPanelToViewport();
+    viewportTick++;
+    clampPanelToViewport(hasVideo);
   }
 
   // Initialize position on first mount
@@ -85,11 +84,14 @@
 
   // Voice-only call: nothing worth a video body, so the panel is its bar.
   const hasVideo = $derived(!!spotlightTile?.videoTrack);
-  const height = $derived(
-    callPipPanel.minimized || !hasVideo ? BAR_HEIGHT : HEIGHT + BAR_HEIGHT
-  );
-  let width = $state(panelWidth());
+  const height = $derived(panelHeight(hasVideo));
+  const width = $derived.by(() => {
+    void viewportTick;
+    return panelWidth();
+  });
 
+  const btn =
+    "inline-flex size-8 [@media(pointer:coarse)]:size-10 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground";
 </script>
 
 <svelte:window onresize={clampToViewport} />
@@ -114,18 +116,20 @@
         },
         size: () => ({ width, height }),
       }}
-      class="flex shrink-0 flex-wrap content-center cursor-grab touch-none items-center gap-1 border-b border-border bg-muted/40 px-2 active:cursor-grabbing"
+      class="flex shrink-0 cursor-grab touch-none items-center gap-0.5 border-b border-border bg-muted/40 pl-2.5 pr-1 active:cursor-grabbing"
       style="height: {BAR_HEIGHT}px"
     >
-      <!-- Room name with speaking ring if minimized -->
-      <span class="w-full min-w-0 truncate text-xs font-medium">
-        {panelRoomName}
-        {#if (callPipPanel.minimized || !hasVideo) && isSpeaking}
-          <span class="ml-1 inline-block size-2 animate-pulse rounded-full bg-primary"></span>
-        {/if}
+      <!-- One row: the room (the drag handle), then the controls. Minimized
+           keeps only the room, mute and expand. -->
+      <span class="flex min-w-0 flex-1 items-center gap-1.5 text-xs font-medium">
+        <span
+          class="size-2 shrink-0 rounded-full {isSpeaking
+            ? 'animate-pulse bg-primary'
+            : 'bg-green-500'}"
+        ></span>
+        <span class="truncate">{panelRoomName}</span>
       </span>
 
-      <!-- Mute button -->
       <Tip text={transportState.muted ? "Unmute" : "Mute"}>
         {#snippet children(props)}
           <button
@@ -133,115 +137,100 @@
             type="button"
             onclick={() => void toggleMute()}
             aria-label={transportState.muted ? "Unmute" : "Mute"}
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            class="{btn} {transportState.muted ? 'text-red-400' : ''}"
           >
             {#if transportState.muted}
-              <MicOff class="size-3.5" />
+              <MicOff class="size-4" />
             {:else}
-              <Mic class="size-3.5" />
+              <Mic class="size-4" />
             {/if}
           </button>
         {/snippet}
       </Tip>
 
-      <!-- Camera button -->
-      <Tip text={transportState.cameraOff ? "Start camera" : "Stop camera"}>
+      {#if !callPipPanel.minimized}
+        <Tip text={transportState.cameraOff ? "Start camera" : "Stop camera"}>
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={cameraOnPressed}
+              disabled={transportState.cameraPending}
+              aria-busy={transportState.cameraPending}
+              aria-label={transportState.cameraOff ? "Start camera" : "Stop camera"}
+              class="{btn} disabled:cursor-wait disabled:opacity-50 {transportState.cameraPending ? 'animate-pulse' : ''}"
+            >
+              {#if transportState.cameraOff}
+                <VideoOff class="size-4" />
+              {:else}
+                <Video class="size-4" />
+              {/if}
+            </button>
+          {/snippet}
+        </Tip>
+
+        <!-- Only with a picture to float: a voice-only call has nothing to put
+             in a browser picture-in-picture window. -->
+        {#if hasVideo && browserPipSupported()}
+          <Tip text={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}>
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={togglePip}
+                aria-label={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}
+                class="{btn} {callPipPanel.browserPip ? 'text-primary' : ''}"
+              >
+                <PictureInPicture2 class="size-4" />
+              </button>
+            {/snippet}
+          </Tip>
+        {/if}
+
+        <Tip text="Back to call">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={() => void requestReturnToCall()}
+              aria-label="Back to call"
+              class={btn}
+            >
+              <CornerUpLeft class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
+
+        <Tip text="Leave call">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={() => leaveCall()}
+              aria-label="Leave call"
+              class="{btn} bg-red-600 text-white hover:bg-red-700 hover:text-white"
+            >
+              <PhoneOff class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
+
+      <Tip text={callPipPanel.minimized ? "Expand" : "Minimize"}>
         {#snippet children(props)}
           <button
             {...props}
             type="button"
-            onclick={cameraOnPressed}
-            disabled={transportState.cameraPending}
-            aria-busy={transportState.cameraPending}
-            aria-label={transportState.cameraOff ? "Start camera" : "Stop camera"}
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50 disabled:cursor-wait {transportState.cameraPending ? 'animate-pulse' : ''}"
+            onclick={() => setMinimized(!callPipPanel.minimized, hasVideo)}
+            aria-label={callPipPanel.minimized ? "Expand call panel" : "Minimize call panel"}
+            aria-expanded={!callPipPanel.minimized}
+            class={btn}
           >
-            {#if transportState.cameraOff}
-              <VideoOff class="size-3.5" />
+            {#if callPipPanel.minimized}
+              <ChevronUp class="size-4" />
             {:else}
-              <Video class="size-3.5" />
+              <ChevronDown class="size-4" />
             {/if}
-          </button>
-        {/snippet}
-      </Tip>
-
-      <!-- Pin button -->
-      <Tip text={callFocus.pinnedTileId === spotlightTileId ? "Unpin" : "Pin"}>
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={togglePin}
-            aria-label={callFocus.pinnedTileId === spotlightTileId ? "Unpin" : "Pin"}
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            <Pin class="size-3.5" />
-          </button>
-        {/snippet}
-      </Tip>
-
-      <!-- Browser PiP button -->
-      <Tip text={callPipPanel.browserPip ? "Exit PiP" : "Picture in Picture"}>
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={() => {
-              if (callPipPanel.browserPip) {
-                void exitPip();
-              } else {
-                void enterPip();
-              }
-            }}
-            aria-label={callPipPanel.browserPip ? "Exit PiP" : "Picture in Picture"}
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            <Maximize2 class="size-3.5" />
-          </button>
-        {/snippet}
-      </Tip>
-
-      <!-- Minimize button -->
-      <Tip text={callPipPanel.minimized ? "Expand panel" : "Collapse to the bar"}>
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={() => (callPipPanel.minimized = !callPipPanel.minimized)}
-            aria-label={callPipPanel.minimized ? "Restore panel" : "Minimize panel"}
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            <Minus class="size-3.5" />
-          </button>
-        {/snippet}
-      </Tip>
-
-      <!-- Back to call button -->
-      <Tip text="Back to call">
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={() => void requestReturnToCall()}
-            aria-label="Back to call"
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            <Phone class="size-3.5" />
-          </button>
-        {/snippet}
-      </Tip>
-
-      <!-- Leave call button -->
-      <Tip text="Leave call">
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={() => leaveCall()}
-            aria-label="Leave call"
-            class="inline-flex size-11 shrink-0 cursor-pointer items-center justify-center rounded bg-red-600 text-white hover:bg-red-700"
-          >
-            <PhoneOff class="size-3.5" />
           </button>
         {/snippet}
       </Tip>

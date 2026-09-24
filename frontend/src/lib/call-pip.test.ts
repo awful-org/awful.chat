@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BAR_HEIGHT,
   HEIGHT,
+  MINIMIZED_WIDTH,
   WIDTH,
   callPipPanel,
   clampPanelToViewport,
   defaultPanelPosition,
+  panelHeight,
   panelWidth,
+  setMinimized,
 } from "./call-pip.svelte";
 
 // This suite runs in node (vitest.config.ts sets environment: "node") and the
@@ -90,5 +93,26 @@ describe("clamping on resize", () => {
     clampPanelToViewport();
     expect(callPipPanel.x).toBeGreaterThanOrEqual(0);
     expect(callPipPanel.y).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("minimize", () => {
+  it("keeps the bottom edge where it was, both ways", () => {
+    callPipPanel.x = 24;
+    callPipPanel.y = 600;
+    const bottom = 600 + HEIGHT + BAR_HEIGHT;
+    setMinimized(true, true);
+    expect(callPipPanel.y + BAR_HEIGHT).toBe(bottom);
+    setMinimized(false, true);
+    expect(callPipPanel.y + HEIGHT + BAR_HEIGHT).toBe(bottom);
+  });
+
+  it("changes something even in a voice-only call: the pill is narrower", () => {
+    // With no video the panel was already just the bar, so minimizing was
+    // invisible - the "minimize does nothing" report.
+    expect(panelHeight(false)).toBe(BAR_HEIGHT);
+    setMinimized(true, false);
+    expect(panelWidth()).toBe(MINIMIZED_WIDTH);
+    expect(MINIMIZED_WIDTH).toBeLessThan(WIDTH);
   });
 });

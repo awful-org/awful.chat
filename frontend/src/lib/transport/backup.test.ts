@@ -173,6 +173,27 @@ describe("mergeImportedRoom", () => {
     expect(merged.lastSeenLamport).toBe(900);
     expect(merged.name).toBe("Real Name");
   });
+
+  it("keeps this device's pin and position, filling in only what it lacks", () => {
+    const kept = mergeImportedRoom(
+      { ...local, pinnedAt: 1, position: 2 },
+      { ...local, pinnedAt: 99, position: 7 }
+    );
+    expect(kept.pinnedAt).toBe(1);
+    expect(kept.position).toBe(2);
+
+    const filled = mergeImportedRoom(local, { ...local, pinnedAt: 99, position: 7 });
+    expect(filled.pinnedAt).toBe(99);
+    expect(filled.position).toBe(7);
+  });
+
+  it("unions pinned messages from both devices", () => {
+    const merged = mergeImportedRoom(
+      { ...local, pinnedMessages: ["m1", "m2"] },
+      { ...local, pinnedMessages: ["m2", "m3"] }
+    );
+    expect(merged.pinnedMessages).toEqual(["m1", "m2", "m3"]);
+  });
 });
 
 function validMessage(overrides: Record<string, unknown> = {}) {

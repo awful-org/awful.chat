@@ -37,6 +37,10 @@ import {
   removeRoomParticipant,
   cleanupInactiveParticipants,
   getRoomParticipants,
+  setRoomPinned,
+  setRoomPositions,
+  setMessagePinned,
+  deleteRoom,
 } from "./storage";
 import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { STORE_SPECS, inspectRow, isCurrentAad, sealRow } from "./storage-crypto";
@@ -155,6 +159,80 @@ describe("unread counts and seen tracking", () => {
     await markRoomSeen("room-a", 42);
     await markRoomSeen("room-a", 7);
     expect((await getRoom("room-a"))?.lastSeenLamport).toBe(42);
+  });
+});
+
+describe("sidebar pin and position live on the room record", () => {
+  const room = (roomCode: string): Room => ({
+    roomCode,
+    type: "text",
+    name: roomCode,
+    lastSeenLamport: 0,
+    createdAt: 0,
+    participants: [],
+  });
+
+  it("pins and unpins, leaving the rest of the record alone", async () => {
+    await putRoom(room("room-a"));
+    await markRoomSeen("room-a", 5);
+    await setRoomPinned("room-a", 123);
+    expect((await getRoom("room-a"))?.pinnedAt).toBe(123);
+    expect((await getRoom("room-a"))?.lastSeenLamport).toBe(5);
+    await setRoomPinned("room-a", null);
+    expect(await getRoom("room-a")).not.toHaveProperty("pinnedAt");
+  });
+
+  it("numbers rooms by the order given", async () => {
+    await putRoom(room("room-a"));
+    await putRoom(room("room-b"));
+    await setRoomPositions(["room-b", "room-a"]);
+    expect((await getRoom("room-b"))?.position).toBe(0);
+    expect((await getRoom("room-a"))?.position).toBe(1);
+  });
+
+  it("pins messages in pin order and unpins them, idempotently", async () => {
+    await putRoom(room("room-a"));
+    await setMessagePinned("room-a", "m1", true);
+    await setMessagePinned("room-a", "m2", true);
+    await setMessagePinned("room-a", "m1", true);
+    expect((await getRoom("room-a"))?.pinnedMessages).toEqual(["m1", "m2"]);
+    await setMessagePinned("room-a", "m1", false);
+    expect((await getRoom("room-a"))?.pinnedMessages).toEqual(["m2"]);
+  });
+
+  it("seals pins and positions with the rest of the record", async () => {
+    await putRoom(room("room-a"));
+    await setRoomPinned("room-a", 123);
+    await setMessagePinned("room-a", "m1", true);
+    const raw = await (await getDB()).getAll("rooms");
+    const onDisk = JSON.stringify(raw);
+    // Only the store's clear fields may be readable on disk.
+    expect(onDisk).not.toContain("m1");
+    expect(onDisk).not.toContain("pinnedMessages");
+    expect(onDisk).not.toContain("pinnedAt");
+  });
+
+  it("keeps a pin written at the same moment as a seen watermark", async () => {
+    await putRoom(room("room-a"));
+    // Both read-modify-write the same record; interleaved, the second write
+    // put back what the first had not seen yet and the pin was gone.
+    await Promise.all([
+      markRoomSeen("room-a", 9),
+      setRoomPinned("room-a", 123),
+      setMessagePinned("room-a", "m1", true),
+      markRoomSeen("room-a", 10),
+    ]);
+    const stored = await getRoom("room-a");
+    expect(stored?.pinnedAt).toBe(123);
+    expect(stored?.pinnedMessages).toEqual(["m1"]);
+    expect(stored?.lastSeenLamport).toBe(10);
+  });
+
+  it("goes with the room when it is removed", async () => {
+    await putRoom(room("room-a"));
+    await setRoomPinned("room-a", 1);
+    await deleteRoom("room-a");
+    expect(await getRoom("room-a")).toBeUndefined();
   });
 });
 
