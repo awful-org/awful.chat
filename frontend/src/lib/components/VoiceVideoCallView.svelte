@@ -10,7 +10,6 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
-  import { applyVoiceLinkStatus } from "$lib/voice-link-status";
   import {
     addToPhonebook,
     isInPhonebook,
@@ -111,7 +110,7 @@ import {
 } from "$lib/call-tile-menu";
 import PluginCallTileView from "./PluginCallTileView.svelte";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
-import { peerQualityState } from "$lib/call-peer-quality.svelte";
+import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
 import type { PeerVoiceQuality } from "$lib/call-quality";
 import {
   ambientStyle,
@@ -278,20 +277,6 @@ import {
     );
   }
 
-  // Peers whose voice ICE actually completed - a roster tile without a
-  // track AND without this is still connecting, and must not render as
-  // present. Insert and delete key are the SAME reducer, so they can never
-  // drift apart the way an insert-by-full-id/delete-by-short-id split once
-  // did (voice-audit finding 8) - a torn-down peer always leaves this set.
-  let iceConnectedPeers = $state(new Set<string>());
-  $effect(() => {
-    const onStatus = (st: { type: string; peerId?: string }) => {
-      iceConnectedPeers = new Set(applyVoiceLinkStatus(iceConnectedPeers, st));
-    };
-    _transport?.on("status", onStatus);
-    return () => _transport?.off("status", onStatus);
-  });
-
   // Speaker detection is driven from AppView, NOT here. A $effect in this
   // component dies with it, and this component unmounts the moment the user
   // navigates away from the call room - which is exactly when the floating
@@ -394,8 +379,9 @@ import {
         peerId,
         muted: remoteCallState?.muted,
         deafened: remoteCallState?.deafened,
-        connecting:
-          !p.audioTrack && !p.videoTrack && !iceConnectedPeers.has(peerId),
+        // Not "has a track": the audio track lands at the SDP handshake,
+        // seconds before any sound can cross. Same set as the sidebar badge.
+        connecting: !voiceLinkState.connected.has(peerId),
         stalled: p.videoStalled,
         quality: peerQualityState.peers.get(peerId),
       });
@@ -1397,8 +1383,22 @@ import {
     }
   });
 
-  const nobodyInCall = $derived(callPeerIds.size === 0 && !inCall);
-  const othersInCallNotUs = $derived(callPeerIds.size > 0 && !inCall);
+  // inCall is global. In a call in room A while looking at room B, where a
+  // friend has started one, B used to render the full stage - your own tile,
+  // theirs pulsing "connecting" to a call you were never part of.
+  const inThisCall = $derived(
+    inCall && transportState.callRoomCode === transportState.roomCode
+  );
+  const inOtherCall = $derived(inCall && !inThisCall);
+  const nobodyInCall = $derived(callPeerIds.size === 0 && !inThisCall);
+  const othersInCallNotUs = $derived(callPeerIds.size > 0 && !inThisCall);
+
+  // joinCall is a no-op while any call is up, so moving to this room's call
+  // means leaving the other one first.
+  function joinThisCall(): void {
+    if (inOtherCall) leaveCall();
+    void joinCall();
+  }
 </script>
 
 <!-- Error banner (always visible if present) -->
@@ -1867,7 +1867,7 @@ import {
     <div class="flex flex-col items-center pb-3">
       <button
         type="button"
-        onclick={joinCall}
+        onclick={joinThisCall}
         disabled={transportState.connecting || transportState.joiningCall}
         aria-busy={transportState.joiningCall}
         class:animate-pulse={transportState.joiningCall}
@@ -1878,8 +1878,15 @@ import {
           ? "Joining..."
           : transportState.connecting
             ? "Connecting..."
-            : "Join call"}
+            : inOtherCall
+              ? "Switch to this call"
+              : "Join call"}
       </button>
+      {#if inOtherCall && !transportState.joiningCall}
+        <p class="mt-1.5 px-4 text-center text-[11px] text-muted-foreground">
+          You're in a call in another room. Switching leaves it.
+        </p>
+      {/if}
       {#if micPermission !== "granted"}
         <p class="mt-1.5 px-4 text-center text-[11px] text-muted-foreground">
           Joining turns on your microphone. Your browser will ask first.
@@ -1887,7 +1894,7 @@ import {
       {/if}
     </div>
   </div>
-{:else if inCall}
+{:else if inThisCall}
   <!-- The left/right insets matter in landscape, which is how a phone is held
        for a video call: the notch and the rounded corners eat the edges of the
        stage otherwise. -->

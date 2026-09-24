@@ -3,7 +3,6 @@
   import {
     transportState,
     _transport,
-    _voice,
   } from "$lib/transport/transport.svelte";
   import {
     CornerUpLeft,
@@ -16,7 +15,7 @@
   import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { cn } from "$lib/utils";
   import { worstQuality } from "$lib/call-quality";
-  import { peerQualityState } from "$lib/call-peer-quality.svelte";
+  import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
 
   interface Props {
     /** Icon-rail layout: one icon, the whole status in a tooltip. */
@@ -102,25 +101,18 @@
   // "Connected" used to flip on the FIRST peer while the rest were still
   // handshaking - true for one friend, false for the call. Compare who is
   // actually connected against who announced they are in this call.
-  let activeCount = $state(0);
-  let expectedCount = $state(0);
-
-  $effect(() => {
-    const tick = setInterval(() => {
-      if (!transportState.inCall) return;
-      // connectedPeers, not activePeers: a peer's track arrives at the SDP
-      // handshake, seconds before ICE connects, so counting tracks flipped
-      // this to "Connected" while nobody could hear anybody yet.
-      activeCount = _voice?.connectedPeers().length ?? 0;
-      let expected = 0;
-      const self = _transport?.selfId();
-      for (const [pid, room] of transportState.callPeerRooms) {
-        if (room === transportState.callRoomCode && pid !== self) expected++;
-      }
-      expectedCount = expected;
-    }, 1000);
-    return () => clearInterval(tick);
+  // voiceLinkState is the same set the call tiles pulse from, so the two
+  // can never disagree about who is connected.
+  const expectedPeers = $derived.by(() => {
+    const self = _transport?.selfId();
+    return [...transportState.callPeerRooms]
+      .filter(([pid, room]) => room === transportState.callRoomCode && pid !== self)
+      .map(([pid]) => pid);
   });
+  const expectedCount = $derived(expectedPeers.length);
+  const activeCount = $derived(
+    expectedPeers.filter((pid) => voiceLinkState.connected.has(pid)).length
+  );
 
   const deafened = $derived(transportState.deafened ?? false);
   const config = $derived.by(() => {

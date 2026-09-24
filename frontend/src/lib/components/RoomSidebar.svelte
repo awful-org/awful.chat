@@ -1,5 +1,8 @@
 <script lang="ts">
   import type { Room } from "$lib/storage";
+  import { flip } from "svelte/animate";
+  import { cubicOut } from "svelte/easing";
+  import { dropIndex, moveItem, slotTop, type RowBox } from "$lib/room-order";
   import {
     GripVertical,
     Hash,
@@ -61,8 +64,8 @@
     onRemoveDmConversation: (peerId: string) => void;
     dmContextActions?: DmContextAction[];
     onRemoveRoom: (code: string) => void;
-    /** Drag `fromCode`'s row to sit just before `toCode`'s. */
-    onReorderRoom: (fromCode: string, toCode: string) => void;
+    /** The full room order after a drag or keyboard move, as roomCodes. */
+    onReorderRooms: (order: string[]) => void;
     onOpenCreateJoin?: () => void;
     onOpenPhonebook?: () => void;
   }
@@ -90,45 +93,186 @@
     onRemoveDmConversation,
     dmContextActions,
     onRemoveRoom,
-    onReorderRoom,
+    onReorderRooms,
     onOpenCreateJoin,
     onOpenPhonebook,
   }: Props = $props();
 
   let contextMenu = $state<{ code: string; x: number; y: number } | null>(null);
 
-  // Drag-to-reorder, expanded room list only. Pointer capture on the grip
-  // handle means the row it belongs to keeps receiving move/up events no
-  // matter where the pointer physically is; the keyed {#each} below means
-  // that handle is the SAME element even as onReorderRoom relocates its row
-  // mid-drag, so the capture survives the reorder.
-  let draggingRoomCode = $state<string | null>(null);
-  let lastDragOverCode: string | null = null;
+  // Drag-to-reorder, expanded room list only. The lifted row follows the
+  // pointer while the others slide aside (animate:flip on a PREVIEW order);
+  // the order is committed once, on drop. Pointer capture on the grip keeps
+  // move/up events coming wherever the pointer goes, and the keyed {#each}
+  // keeps that grip the same element as its row moves, so capture survives.
+  const SETTLE_MS = 180;
+  const EDGE_PX = 40;
+  const FLIP_MS = 180;
+
+  let listEl = $state<HTMLDivElement | null>(null);
+  let drag = $state<{
+    code: string;
+    /** The order when the drag began; `from`/`to` index into it. */
+    base: string[];
+    from: number;
+    to: number;
+    /** Pixels from the row's current slot to where it is drawn. */
+    dy: number;
+    order: string[];
+    /** Released: the pointer no longer moves it. */
+    dropping: boolean;
+    /** Animating dy to 0, into its slot. */
+    gliding: boolean;
+  } | null>(null);
+  // Pre-drag geometry, in the list's scroll coordinates so auto-scroll does
+  // not invalidate it. Not state: nothing renders from it directly.
+  let rowBoxes: RowBox[] = [];
+  let startContentY = 0;
+  let lastClientY = 0;
+  let scrollFrame = 0;
+  let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const roomsByCode = $derived(new Map(rooms.map((r) => [r.roomCode, r])));
+  const displayRooms = $derived(
+    drag
+      ? drag.order.flatMap((code) => roomsByCode.get(code) ?? [])
+      : rooms
+  );
+
+  function contentY(clientY: number): number {
+    const rect = listEl!.getBoundingClientRect();
+    return clientY - rect.top + listEl!.scrollTop;
+  }
 
   function startRoomDrag(e: PointerEvent, roomCode: string): void {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || !listEl || drag) return;
+    const from = rooms.findIndex((r) => r.roomCode === roomCode);
+    if (from === -1) return;
+    const listTop = listEl.getBoundingClientRect().top - listEl.scrollTop;
+    rowBoxes = [...listEl.querySelectorAll<HTMLElement>("[data-room-code]")].map((el) => {
+      const r = el.getBoundingClientRect();
+      return { top: r.top - listTop, height: r.height };
+    });
+    if (rowBoxes.length !== rooms.length) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    draggingRoomCode = roomCode;
-    lastDragOverCode = null;
     e.preventDefault();
+    lastClientY = e.clientY;
+    startContentY = contentY(e.clientY);
+    const base = rooms.map((r) => r.roomCode);
+    drag = {
+      code: roomCode,
+      base,
+      from,
+      to: from,
+      dy: 0,
+      order: base,
+      dropping: false,
+      gliding: false,
+    };
+    navigator.vibrate?.(8);
+    scrollFrame = requestAnimationFrame(autoScroll);
+  }
+
+  function updateDrag(): void {
+    if (!drag || drag.dropping) return;
+    const delta = contentY(lastClientY) - startContentY;
+    const { from } = drag;
+    const center = rowBoxes[from].top + rowBoxes[from].height / 2 + delta;
+    const to = dropIndex(rowBoxes, from, center);
+    if (to !== drag.to) {
+      drag.to = to;
+      drag.order = moveItem(drag.base, from, to);
+    }
+    drag.dy = rowBoxes[from].top + delta - slotTop(rowBoxes, from, to);
   }
 
   function onRoomDragMove(e: PointerEvent): void {
-    if (!draggingRoomCode) return;
-    const overCode = document
-      .elementFromPoint(e.clientX, e.clientY)
-      ?.closest<HTMLElement>("[data-room-code]")?.dataset.roomCode;
-    if (!overCode || overCode === draggingRoomCode || overCode === lastDragOverCode) return;
-    lastDragOverCode = overCode;
-    onReorderRoom(draggingRoomCode, overCode);
+    if (!drag) return;
+    lastClientY = e.clientY;
+    updateDrag();
+  }
+
+  // Dragging near the list's edge scrolls it, so a room can travel further
+  // than the part of the list on screen.
+  function autoScroll(): void {
+    if (!drag || drag.dropping || !listEl) return;
+    const rect = listEl.getBoundingClientRect();
+    const speed =
+      lastClientY < rect.top + EDGE_PX
+        ? -Math.ceil((rect.top + EDGE_PX - lastClientY) / 4)
+        : lastClientY > rect.bottom - EDGE_PX
+          ? Math.ceil((lastClientY - (rect.bottom - EDGE_PX)) / 4)
+          : 0;
+    if (speed !== 0) {
+      listEl.scrollTop += speed;
+      updateDrag();
+    }
+    scrollFrame = requestAnimationFrame(autoScroll);
+  }
+
+  function finishDrag(commit: boolean): void {
+    if (!drag || drag.dropping) return;
+    cancelAnimationFrame(scrollFrame);
+    const d = drag;
+    const heldTop = slotTop(rowBoxes, d.from, d.to) + d.dy;
+    if (commit && d.to !== d.from) {
+      onReorderRooms(d.order);
+    } else {
+      d.to = d.from;
+      d.order = d.base;
+    }
+    d.dropping = true;
+    // A cancel moves the row's slot back under it; keep it drawn where it is
+    // held for this frame, then glide it into the slot instead of snapping.
+    d.dy = heldTop - slotTop(rowBoxes, d.from, d.to);
+    requestAnimationFrame(() => {
+      if (drag !== d) return;
+      d.gliding = true;
+      d.dy = 0;
+    });
+    settleTimer = setTimeout(() => {
+      drag = null;
+      settleTimer = null;
+    }, SETTLE_MS + 20);
   }
 
   function endRoomDrag(e: PointerEvent): void {
     const handle = e.currentTarget as HTMLElement;
     if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
-    draggingRoomCode = null;
-    lastDragOverCode = null;
+    finishDrag(e.type === "pointerup");
   }
+
+  function onDragKeydown(e: KeyboardEvent): void {
+    if (e.key === "Escape" && drag && !drag.dropping) {
+      e.preventDefault();
+      finishDrag(false);
+    }
+  }
+
+  // Keyboard reorder on the focused grip: the same move without a pointer.
+  function onGripKeydown(e: KeyboardEvent, roomCode: string): void {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    if (drag) return;
+    const from = rooms.findIndex((r) => r.roomCode === roomCode);
+    const to = from + (e.key === "ArrowUp" ? -1 : 1);
+    if (from === -1 || to < 0 || to >= rooms.length) return;
+    e.preventDefault();
+    onReorderRooms(moveItem(rooms.map((r) => r.roomCode), from, to));
+  }
+
+  function rowStyle(roomCode: string): string {
+    if (drag?.code !== roomCode) return "";
+    const lift = drag.dropping ? "" : " scale(1.02)";
+    const glide = drag.gliding
+      ? `transition: transform ${SETTLE_MS}ms cubic-bezier(0.2, 0, 0, 1);`
+      : "";
+    return `transform: translateY(${drag.dy}px)${lift}; ${glide}`;
+  }
+
+  $effect(() => () => {
+    cancelAnimationFrame(scrollFrame);
+    if (settleTimer) clearTimeout(settleTimer);
+  });
   let dmContextMenu = $state<{
     peerId: string;
     inPhonebook: boolean;
@@ -236,6 +380,7 @@
 <svelte:window
   onclick={closeContextMenu}
   onkeydown={(e) => {
+    onDragKeydown(e);
     if (e.key === "Escape") closeContextMenu();
   }}
 />
@@ -455,7 +600,7 @@
   {/if}
 
   <!-- Room list -->
-  <div class="flex-1 overflow-y-auto p-1.5">
+  <div bind:this={listEl} class="flex-1 overflow-y-auto p-1.5">
     {#if collapsed}
       {#if activeTab === "rooms"}
         {#each rooms as room (room.roomCode)}
@@ -559,22 +704,31 @@
     {/if}
 
     {#if activeTab === "rooms"}
-      {#each rooms as room (room.roomCode)}
+      {#each displayRooms as room (room.roomCode)}
+        {@const lifted = drag?.code === room.roomCode}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
           role="none"
           data-room-code={room.roomCode}
-          class="flex items-center gap-0.5 rounded-md {draggingRoomCode === room.roomCode ? 'opacity-60' : ''}"
+          animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
+          style={rowStyle(room.roomCode)}
+          class="group relative flex items-center gap-0.5 rounded-md transition-shadow duration-150 {lifted
+            ? 'z-10 bg-sidebar ring-1 ring-border'
+            : ''} {lifted && !drag?.dropping ? 'shadow-lg' : ''}"
           oncontextmenu={(e) => openContextMenu(e, room.roomCode)}
         >
           <button
             type="button"
-            aria-label="Drag to reorder {room.name || room.roomCode}"
+            aria-label="Reorder {room.name || room.roomCode}"
+            title="Drag, or press ↑/↓, to reorder"
             onpointerdown={(e) => startRoomDrag(e, room.roomCode)}
             onpointermove={onRoomDragMove}
             onpointerup={endRoomDrag}
             onpointercancel={endRoomDrag}
-            class="shrink-0 touch-none cursor-grab rounded p-1 text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing"
+            onkeydown={(e) => onGripKeydown(e, room.roomCode)}
+            class="shrink-0 touch-none rounded p-1 transition-opacity focus-visible:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100 {lifted
+              ? 'cursor-grabbing text-foreground opacity-100'
+              : 'cursor-grab text-muted-foreground/60 opacity-0 hover:text-muted-foreground'}"
           >
             <GripVertical class="size-3.5" />
           </button>

@@ -30,7 +30,7 @@
   } from "$lib/rooms.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import { applyRoomOrder } from "$lib/room-order";
-  import { roomOrderStore, reorderRoom } from "$lib/room-order.svelte";
+  import { roomOrderStore, setRoomOrder } from "$lib/room-order.svelte";
   import {
     getMessages,
     getLastMessage,
@@ -1208,8 +1208,7 @@
     <div class="min-h-dvh bg-background text-foreground font-mono flex">
       <RoomSidebar
         rooms={orderedRooms}
-        onReorderRoom={(fromCode, toCode) =>
-          reorderRoom(roomsStore.rooms, fromCode, toCode)}
+        onReorderRooms={setRoomOrder}
         phonebook={dmEntries}
         {dmPreviews}
         dmUnreadCounts={dmUnreadByPeer}
