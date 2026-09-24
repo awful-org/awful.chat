@@ -15,8 +15,12 @@ export interface CallPipPanelState {
   x: number;
   /** Y coordinate relative to viewport top (pixels). */
   y: number;
-  /** Collapsed to title bar only. */
-  minimized: boolean;
+  /**
+   * Closed with its X for the current call. Cleared on returning to the
+   * call's room or when the call ends, so it never silently stays gone for
+   * the next one; the sidebar's call chip still leads back meanwhile.
+   */
+  dismissed: boolean;
   /** Browser Element PiP window is open (via requestPictureInPicture). */
   browserPip: boolean;
 }
@@ -26,13 +30,11 @@ export interface CallPipPanelState {
 export const WIDTH = 320;
 export const HEIGHT = 180;
 export const BAR_HEIGHT = 48;
-/** Minimized: a pill holding the room, mute and expand. */
-export const MINIMIZED_WIDTH = 220;
 
 export const callPipPanel = $state<CallPipPanelState>({
   x: 0,
   y: 0,
-  minimized: false,
+  dismissed: false,
   browserPip: false,
 });
 
@@ -51,9 +53,8 @@ export const callPipPanel = $state<CallPipPanelState>({
  * pushing it left of where it actually ends.
  */
 export function panelWidth(): number {
-  const width = callPipPanel.minimized ? MINIMIZED_WIDTH : WIDTH;
-  if (typeof window === "undefined") return width;
-  return Math.min(width, Math.max(0, window.innerWidth - 16));
+  if (typeof window === "undefined") return WIDTH;
+  return Math.min(WIDTH, Math.max(0, window.innerWidth - 16));
 }
 
 export function defaultPanelPosition(): { x: number; y: number } {
@@ -68,25 +69,9 @@ export function defaultPanelPosition(): { x: number; y: number } {
   };
 }
 
-/**
- * The panel's real height. A voice-only call has no video body, so it is the
- * bar whether or not it is minimized.
- */
+/** The panel's real height: a voice-only call has no video body, just the bar. */
 export function panelHeight(hasVideo = true): number {
-  return callPipPanel.minimized || !hasVideo ? BAR_HEIGHT : HEIGHT + BAR_HEIGHT;
-}
-
-/**
- * Collapse to the pill or expand back, keeping the BOTTOM edge where it was:
- * the panel lives in a bottom corner, and resizing from the top left it
- * floating mid-screen or hanging off the bottom.
- */
-export function setMinimized(minimized: boolean, hasVideo: boolean): void {
-  if (callPipPanel.minimized === minimized) return;
-  const before = panelHeight(hasVideo);
-  callPipPanel.minimized = minimized;
-  callPipPanel.y += before - panelHeight(hasVideo);
-  clampPanelToViewport(hasVideo);
+  return hasVideo ? HEIGHT + BAR_HEIGHT : BAR_HEIGHT;
 }
 
 /**
@@ -101,10 +86,9 @@ export function clampPanelToViewport(hasVideo = true): void {
   const minX = 8;
   const maxX = Math.max(minX, window.innerWidth - panelWidth() - 8);
   const minY = 8;
-  // Against the panel's ACTUAL height. Reserving only the bar left the body -
-  // another 158px - hanging below the viewport whenever the panel was not
-  // minimized, so the clamp failed to do the one thing it exists for in the
-  // common case.
+  // Against the panel's ACTUAL height. Reserving only the bar left the video
+  // body hanging below the viewport, so the clamp failed to do the one thing
+  // it exists for in the common case.
   const maxY = Math.max(minY, window.innerHeight - panelHeight(hasVideo) - 8);
 
   callPipPanel.x = Math.max(minX, Math.min(callPipPanel.x, maxX));
