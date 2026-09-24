@@ -182,10 +182,20 @@ function clearSession(): void {
  * Whether this page load is a refresh of a call already in progress, for the
  * code on screen. The caller uses it to skip the screens the person has
  * already been through.
+ *
+ * Only once an identity was chosen: setQuickCallCode saves a session the
+ * moment the page opens, and treating that as resumable made a refresh on
+ * the guest-or-account screen quietly pick "guest" for the person.
  */
 export function resumableSession(code: string): QuickSession | null {
   const found = readSession();
-  return found && found.code === code ? found : null;
+  return found && found.code === code && found.identity ? found : null;
+}
+
+/** Whether this tab minted `code`, or null if it has no record of it. */
+export function hostedHere(code: string): boolean | null {
+  const found = readSession();
+  return found && found.code === code ? found.isHost : null;
 }
 
 const remembered = readRememberedProfile();
@@ -268,6 +278,13 @@ export function chooseAccount(): void {
   quickCall.identity = "account";
   quickCall.error = null;
   quickCall.stage = "unlocking";
+}
+
+/** Leave the unlock screen without unlocking: back to guest-or-account. */
+export function backToChoosing(): void {
+  if (quickCall.stage !== "unlocking") return;
+  quickCall.identity = "guest";
+  quickCall.stage = "choosing";
 }
 
 /**

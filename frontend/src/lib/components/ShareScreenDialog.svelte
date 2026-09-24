@@ -9,7 +9,9 @@
    *
    * Opened through uiState.sharePickerOpen (see shareScreenPressed in
    * call.svelte): the sidebar, the call view and the palette all share one
-   * instance, mounted by SidebarControls.
+   * instance, mounted by SidebarControls in the app and by QuickCall on /qc,
+   * which has no sidebar. A page with a share button and neither of those
+   * needs its own, or the button does nothing.
    */
   import {
     Dialog,

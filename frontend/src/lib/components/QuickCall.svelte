@@ -17,6 +17,8 @@
   import { Input } from "$lib/components/ui/input/index.js";
   import * as Card from "$lib/components/ui/card/index.js";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import CameraPickerDialog from "$lib/components/CameraPickerDialog.svelte";
+  import ShareScreenDialog from "$lib/components/ShareScreenDialog.svelte";
   import DeviceCheck from "$lib/components/DeviceCheck.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
@@ -29,9 +31,11 @@
   import { formatQuickCode } from "$lib/room-code";
   import {
     adoptAccount,
+    backToChoosing,
     chooseAccount,
     endQuickCall,
     hasAccount,
+    hostedHere,
     prepareAsGuest,
     quickCall,
     resumableSession,
@@ -74,7 +78,7 @@
     // this person already answered is answered again from the tab's own
     // session, so a refresh is a reconnect and not a fresh sign-up.
     const resume = resumableSession(fromLink || "");
-    isHost = resume ? resume.isHost : !fromLink;
+    isHost = hostedHere(fromLink || "") ?? !fromLink;
     setQuickCallCode(fromLink || undefined, isHost);
     // The code IS the secret, so it lives in the fragment and never in the
     // path - same reasoning as room invites, see App.svelte.
@@ -230,7 +234,7 @@
       </Card.Root>
     </div>
   {:else if quickCall.stage === "unlocking"}
-    <UnlockIdentity />
+    <UnlockIdentity onBack={backToChoosing} />
   {:else}
     <div
       class="min-h-dvh overflow-y-auto bg-background text-foreground flex items-center justify-center p-4 font-mono"
@@ -388,4 +392,9 @@
   {/if}
 
   <AvatarPickerDialog open={pickerOpen} onClose={() => (pickerOpen = false)} />
+  <!-- The call's camera and share buttons only OPEN these (uiState flags);
+       the app mounts them in SidebarControls, which /qc has none of, so
+       both buttons did nothing here. -->
+  <CameraPickerDialog />
+  <ShareScreenDialog />
 </QueryClientProvider>
