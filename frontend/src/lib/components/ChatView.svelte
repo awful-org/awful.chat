@@ -95,6 +95,7 @@
   import { getMessage } from "$lib/storage";
   import { openSearch } from "$lib/search/ui.svelte";
   import { revealMessage } from "$lib/reveal-message";
+  import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
@@ -916,11 +917,38 @@
     }))
   );
 
+  /**
+   * Pictures a pinned message carries, as thumbnails: image attachments
+   * (drawn once this device holds the bytes) and a message that is just a
+   * gif link, the way the chat itself renders one inline.
+   */
+  function pinnedImages(msg: Message): { key: string; url: string | null; alt: string; gif: boolean }[] {
+    if (msg.type === MessageType.File) {
+      return (msg.meta?.files ?? [])
+        .filter((f) => f.mimeType?.startsWith("image/"))
+        .slice(0, 4)
+        .map((f) => ({
+          key: f.infoHash,
+          url: fileTransfers.get(f.infoHash)?.blobURL ?? null,
+          alt: f.filename,
+          gif: f.mimeType === "image/gif",
+        }));
+    }
+    const text = (msg.content ?? "").trim();
+    return isGifUrl(text) ? [{ key: text, url: text, alt: "GIF", gif: true }] : [];
+  }
+
+  /** The words beside the pictures: the caption and any non-image files. */
   function pinnedPreview(msg: Message): string {
     if (msg.type === MessageType.File) {
-      return msg.meta?.files?.map((f) => f.filename).join(", ") || "Attachment";
+      const caption = humanizeMentions(msg.content ?? "", resolveMentionDisplayName);
+      const others = (msg.meta?.files ?? [])
+        .filter((f) => !f.mimeType?.startsWith("image/"))
+        .map((f) => f.filename);
+      return [caption, ...others].filter(Boolean).join(" · ");
     }
-    return humanizeMentions(msg.content ?? "", resolveMentionDisplayName) || "Message";
+    if (isGifUrl(msg.content ?? "")) return "";
+    return humanizeMentions(msg.content ?? "", resolveMentionDisplayName);
   }
 
   function openPinned(msg: Message): void {
@@ -1749,7 +1777,15 @@
     closeUserMenu();
     if (copyMenuOpen && !(e.target as HTMLElement).closest("[data-copy-menu]"))
       copyMenuOpen = false;
-    if (pinnedOpen && !(e.target as HTMLElement).closest("[data-pinned-menu]"))
+    // composedPath, not target.closest: unpinning removes the row that was
+    // clicked before this runs, and a detached target is inside nothing -
+    // which read as a click outside and closed the list on every unpin.
+    if (
+      pinnedOpen &&
+      !e
+        .composedPath()
+        .some((n) => n instanceof Element && n.hasAttribute("data-pinned-menu"))
+    )
       pinnedOpen = false;
   }}
   onkeydown={(e) => {
@@ -1924,50 +1960,6 @@
             </Button>
           {/snippet}
         </Tip>
-        {#if !inCall}
-          <Tip text="Join call">
-            {#snippet children(props)}
-              <Button
-                {...props}
-                variant="ghost"
-                size="icon"
-                onclick={joinCall}
-                disabled={transportState.connecting || transportState.joiningCall}
-                aria-busy={transportState.joiningCall}
-                aria-label="Join call"
-                class="text-muted-foreground hover:text-foreground cursor-pointer {transportState.joiningCall
-                  ? 'animate-pulse'
-                  : ''}"
-              >
-                <Phone class="size-4" />
-              </Button>
-            {/snippet}
-          </Tip>
-        {:else if callRoomCode && callRoomCode !== roomCode}
-          <!--
-            The call is live in another conversation and its stage is not on
-            screen. The sidebar chip also leads back, but below sm the sidebar
-            is off-canvas - so the way back has to exist here too, and this slot
-            is empty in exactly this state.
-          -->
-          <Tip text="Back to the call you are in">
-            {#snippet children(props)}
-              <button
-                {...props}
-                type="button"
-                onclick={requestReturnToCall}
-                aria-label="Back to call"
-                class="flex items-center gap-1.5 rounded-full border border-green-500/20 bg-green-500/10 px-2 py-1 text-xs font-mono text-green-400 hover:brightness-125 cursor-pointer"
-              >
-                <span
-                  class="size-1.5 rounded-full bg-green-400 animate-pulse"
-                ></span>
-                <CornerUpLeft class="size-3.5" />
-                <span class="hidden sm:inline">Back to call</span>
-              </button>
-            {/snippet}
-          </Tip>
-        {/if}
         {#if !ephemeral}
           <Tip text="Search messages">
             {#snippet children(props)}
@@ -1994,18 +1986,11 @@
                   aria-label="Pinned messages"
                   aria-haspopup="menu"
                   aria-expanded={pinnedOpen}
-                  class="relative flex text-muted-foreground hover:text-foreground cursor-pointer {pinnedOpen
+                  class="flex text-muted-foreground hover:text-foreground cursor-pointer {pinnedOpen
                     ? 'text-primary'
                     : ''}"
                 >
                   <Pin class="size-4" />
-                  {#if pinnedIds.length > 0}
-                    <span
-                      class="absolute right-0.5 top-0.5 min-w-3.5 rounded-full bg-primary px-0.5 text-[9px] font-bold leading-3.5 text-primary-foreground tabular-nums"
-                    >
-                      {Math.min(pinnedIds.length, 99)}
-                    </span>
-                  {/if}
                 </Button>
               {/snippet}
             </Tip>
@@ -2015,14 +2000,17 @@
                 aria-label="Pinned messages"
                 class="absolute right-0 top-full z-50 mt-1 flex max-h-96 w-80 max-w-[calc(100vw-1rem)] flex-col overflow-hidden rounded-md border border-border bg-popover shadow-lg"
               >
-                <div class="px-3 py-2 text-[10px] font-mono text-muted-foreground">
-                  Pinned · only you see these
+                <div class="flex items-center justify-between gap-2 px-3 py-2 text-[10px] font-mono text-muted-foreground">
+                  <span>Pinned · only you see these</span>
+                  <span class="tabular-nums" aria-label="{pinnedIds.length} pinned">{pinnedIds.length}</span>
                 </div>
                 <div class="overflow-y-auto">
                   {#each pinnedEntries as entry (entry.id)}
                     <div class="group/pin flex items-start gap-1 border-t border-border/60 px-1 py-1">
                       {#if entry.msg}
                         {@const msg = entry.msg}
+                        {@const images = pinnedImages(msg)}
+                        {@const preview = pinnedPreview(msg)}
                         <button
                           type="button"
                           role="menuitem"
@@ -2033,9 +2021,34 @@
                             <span class="truncate font-medium text-foreground">{displayName(msg)}</span>
                             <span class="shrink-0 text-[10px] text-muted-foreground">{formatDate(msg.timestamp)}</span>
                           </div>
-                          <p class="line-clamp-2 break-words text-xs text-muted-foreground">
-                            {pinnedPreview(msg)}
-                          </p>
+                          {#if images.length > 0}
+                            <div class="mt-1 flex flex-wrap gap-1">
+                              {#each images as img (img.key)}
+                                {#if img.url}
+                                  <GifImage
+                                    src={img.url}
+                                    alt={img.alt}
+                                    class="size-16 rounded object-cover"
+                                    animated={img.gif}
+                                    animate="hover"
+                                  />
+                                {:else}
+                                  <!-- Not on this device yet; the chat
+                                       fetches it, the list only shows it. -->
+                                  <span class="flex size-16 items-center justify-center rounded bg-muted text-[10px] text-muted-foreground">
+                                    image
+                                  </span>
+                                {/if}
+                              {/each}
+                            </div>
+                          {/if}
+                          {#if preview}
+                            <p class="line-clamp-2 break-words text-xs text-muted-foreground">
+                              {preview}
+                            </p>
+                          {:else if images.length === 0}
+                            <p class="text-xs italic text-muted-foreground">Attachment</p>
+                          {/if}
                         </button>
                       {:else}
                         <p class="min-w-0 flex-1 px-2 py-1 text-xs italic text-muted-foreground">
@@ -2065,6 +2078,52 @@
               </div>
             {/if}
           </div>
+        {/if}
+        <!-- Right beside the user list, outlined green so it reads as the
+             way into the call. -->
+        {#if !inCall}
+          <Tip text="Join call">
+            {#snippet children(props)}
+              <Button
+                {...props}
+                variant="ghost"
+                size="icon"
+                onclick={joinCall}
+                disabled={transportState.connecting || transportState.joiningCall}
+                aria-busy={transportState.joiningCall}
+                aria-label="Join call"
+                class="border border-green-500/60 text-green-400 hover:bg-green-500/10 hover:text-green-300 cursor-pointer {transportState.joiningCall
+                  ? 'animate-pulse'
+                  : ''}"
+              >
+                <Phone class="size-4" />
+              </Button>
+            {/snippet}
+          </Tip>
+        {:else if callRoomCode && callRoomCode !== roomCode}
+          <!--
+            The call is live in another conversation and its stage is not on
+            screen. The sidebar chip also leads back, but below sm the sidebar
+            is off-canvas - so the way back has to exist here too, and this slot
+            is empty in exactly this state.
+          -->
+          <Tip text="Back to the call you are in">
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={requestReturnToCall}
+                aria-label="Back to call"
+                class="flex items-center gap-1.5 rounded-full border border-green-500/60 bg-green-500/10 px-2 py-1 text-xs font-mono text-green-400 hover:brightness-125 cursor-pointer"
+              >
+                <span
+                  class="size-1.5 rounded-full bg-green-400 animate-pulse"
+                ></span>
+                <CornerUpLeft class="size-3.5" />
+                <span class="hidden sm:inline">Back to call</span>
+              </button>
+            {/snippet}
+          </Tip>
         {/if}
         {#if !isDmChat}
           <Tip text={showUserList ? "Hide users" : "Show users"}>

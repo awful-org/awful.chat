@@ -2,8 +2,8 @@
  * Message search engine: corpus entries, filter matching, ranking.
  *
  * Pure module - no storage, no UI, no $state - so the whole pipeline is
- * unit-testable. The fuzzy scorer is the palette's fzf port; this module
- * only decides WHAT to match it against and how to rank what comes back.
+ * unit-testable. Terms match at word starts (matchWordPrefix), quoted
+ * phrases anywhere; only the short sender name in from: stays fuzzy.
  */
 import { MessageType, type ChatMessageType } from "$lib/types/message";
 import {
@@ -128,6 +128,34 @@ export interface SearchHit {
   ranges: MatchRange[];
 }
 
+const WORD_CHAR = /[\p{L}\p{N}_]/u;
+/** Scripts written without spaces: there is no word start to anchor on. */
+const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u;
+
+/**
+ * An unquoted term matches where a WORD begins with it: "dep" finds
+ * "deploy", "ploy" does not, and neither do letters that merely occur in
+ * order somewhere. This used the palette's fuzzy scorer, which is right for
+ * a few dozen short titles and wrong for message text - a paragraph contains
+ * almost any handful of letters in order, so most of a room matched.
+ * Scored like matchExact, plus a bonus for matching the whole word.
+ */
+export function matchWordPrefix(lowText: string, lowTerm: string) {
+  if (lowTerm.length === 0) return null;
+  if (UNSPACED.test(lowTerm[0])) return matchExact(lowText, lowTerm);
+  for (let at = lowText.indexOf(lowTerm); at >= 0; at = lowText.indexOf(lowTerm, at + 1)) {
+    if (at > 0 && WORD_CHAR.test(lowText[at - 1])) continue;
+    const hit = matchExact(lowText.slice(at), lowTerm)!;
+    const end = at + lowTerm.length;
+    const wholeWord = end === lowText.length || !WORD_CHAR.test(lowText[end]);
+    return {
+      score: hit.score + (wholeWord ? lowTerm.length * 8 : 0),
+      positions: hit.positions.map((p) => p + at),
+    };
+  }
+  return null;
+}
+
 /** Recency half-life: a hit ages to half its score every 30 days. */
 const HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -155,7 +183,7 @@ export function matchEntry(
   for (const term of q.terms) {
     const hit = term.exact
       ? matchExact(entry.low, term.text)
-      : match(entry.low, term.text);
+      : matchWordPrefix(entry.low, term.text);
     if (!hit) return null;
     termScore += hit.score;
     for (const p of hit.positions)

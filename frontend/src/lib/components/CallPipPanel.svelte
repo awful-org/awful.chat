@@ -1,7 +1,5 @@
 <script lang="ts">
   import {
-    ChevronDown,
-    ChevronUp,
     CornerUpLeft,
     Mic,
     MicOff,
@@ -9,6 +7,7 @@
     PictureInPicture2,
     Video,
     VideoOff,
+    X,
   } from "@lucide/svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { draggable } from "$lib/actions/draggable";
@@ -19,7 +18,6 @@
     callPipPanel,
     defaultPanelPosition,
     clampPanelToViewport,
-    setMinimized,
   } from "$lib/call-pip.svelte";
   import { toggleMute, cameraOnPressed, leaveCall } from "$lib/transport/call.svelte";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
@@ -77,7 +75,17 @@
     }
   });
 
-  // Get the speaking ring display for the minimized state
+  // A close lasts for this visit away from the call: going back to the call's
+  // room, or the call ending, brings the panel back next time.
+  $effect(() => {
+    if (
+      !transportState.inCall ||
+      transportState.uiRoomCode === transportState.callRoomCode
+    ) {
+      callPipPanel.dismissed = false;
+    }
+  });
+
   const isSpeaking = $derived(
     spotlightTile && speakers.speaking.has(spotlightTile.peerId)
   );
@@ -97,7 +105,7 @@
 <svelte:window onresize={clampToViewport} />
 
 
-{#if displayPrefs.callPip && transportState.inCall && transportState.uiRoomCode !== transportState.callRoomCode}
+{#if displayPrefs.callPip && transportState.inCall && transportState.uiRoomCode !== transportState.callRoomCode && !callPipPanel.dismissed}
   <!--
     z-50 is the app's chrome layer, shared with context menus and dialogs.
     The panel floats over the call without stealing focus the way a modal would.
@@ -116,11 +124,10 @@
         },
         size: () => ({ width, height }),
       }}
-      class="flex shrink-0 cursor-grab touch-none items-center gap-0.5 border-b border-border bg-muted/40 pl-2.5 pr-1 active:cursor-grabbing"
+      class="flex shrink-0 cursor-grab touch-none items-center gap-1.5 border-b border-border bg-muted/40 pl-2.5 pr-1.5 active:cursor-grabbing"
       style="height: {BAR_HEIGHT}px"
     >
-      <!-- One row: the room (the drag handle), then the controls. Minimized
-           keeps only the room, mute and expand. -->
+      <!-- One row: the room (the drag handle), then the controls. -->
       <span class="flex min-w-0 flex-1 items-center gap-1.5 text-xs font-medium">
         <span
           class="size-2 shrink-0 rounded-full {isSpeaking
@@ -148,8 +155,7 @@
         {/snippet}
       </Tip>
 
-      {#if !callPipPanel.minimized}
-        <Tip text={transportState.cameraOff ? "Start camera" : "Stop camera"}>
+      <Tip text={transportState.cameraOff ? "Start camera" : "Stop camera"}>
           {#snippet children(props)}
             <button
               {...props}
@@ -214,30 +220,25 @@
             </button>
           {/snippet}
         </Tip>
-      {/if}
 
-      <Tip text={callPipPanel.minimized ? "Expand" : "Minimize"}>
+      <!-- Hides the panel for this call; the call itself carries on. -->
+      <Tip text="Close">
         {#snippet children(props)}
           <button
             {...props}
             type="button"
-            onclick={() => setMinimized(!callPipPanel.minimized, hasVideo)}
-            aria-label={callPipPanel.minimized ? "Expand call panel" : "Minimize call panel"}
-            aria-expanded={!callPipPanel.minimized}
+            onclick={() => (callPipPanel.dismissed = true)}
+            aria-label="Close call panel"
             class={btn}
           >
-            {#if callPipPanel.minimized}
-              <ChevronUp class="size-4" />
-            {:else}
-              <ChevronDown class="size-4" />
-            {/if}
+            <X class="size-4" />
           </button>
         {/snippet}
       </Tip>
     </div>
 
     <!-- Panel body: shows the spotlight tile video -->
-    {#if !callPipPanel.minimized && hasVideo && spotlightTile}
+    {#if hasVideo && spotlightTile}
       <button
         type="button"
         class="relative flex-1 overflow-hidden bg-black cursor-pointer"
