@@ -2,14 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BAR_HEIGHT,
   HEIGHT,
-  MINIMIZED_WIDTH,
   WIDTH,
   callPipPanel,
   clampPanelToViewport,
   defaultPanelPosition,
   panelHeight,
   panelWidth,
-  setMinimized,
 } from "./call-pip.svelte";
 
 // This suite runs in node (vitest.config.ts sets environment: "node") and the
@@ -24,10 +22,8 @@ const setViewport = (w: number, h: number) => {
 
 beforeEach(() => {
   setViewport(1920, 1080);
-  callPipPanel.minimized = false;
 });
 afterEach(() => {
-  callPipPanel.minimized = false;
   delete (globalThis as { window?: unknown }).window;
 });
 
@@ -77,12 +73,12 @@ describe("clamping on resize", () => {
     expect(callPipPanel.y + HEIGHT + BAR_HEIGHT).toBeLessThanOrEqual(700);
   });
 
-  it("only reserves the bar when minimized", () => {
-    callPipPanel.minimized = true;
+  it("only reserves the bar in a voice-only call", () => {
+    expect(panelHeight(false)).toBe(BAR_HEIGHT);
     callPipPanel.x = 100;
     callPipPanel.y = 900;
     setViewport(1920, 700);
-    clampPanelToViewport();
+    clampPanelToViewport(false);
     expect(callPipPanel.y + BAR_HEIGHT).toBeLessThanOrEqual(700);
     expect(callPipPanel.y).toBeGreaterThan(700 - BAR_HEIGHT - 40);
   });
@@ -93,26 +89,5 @@ describe("clamping on resize", () => {
     clampPanelToViewport();
     expect(callPipPanel.x).toBeGreaterThanOrEqual(0);
     expect(callPipPanel.y).toBeGreaterThanOrEqual(0);
-  });
-});
-
-describe("minimize", () => {
-  it("keeps the bottom edge where it was, both ways", () => {
-    callPipPanel.x = 24;
-    callPipPanel.y = 600;
-    const bottom = 600 + HEIGHT + BAR_HEIGHT;
-    setMinimized(true, true);
-    expect(callPipPanel.y + BAR_HEIGHT).toBe(bottom);
-    setMinimized(false, true);
-    expect(callPipPanel.y + HEIGHT + BAR_HEIGHT).toBe(bottom);
-  });
-
-  it("changes something even in a voice-only call: the pill is narrower", () => {
-    // With no video the panel was already just the bar, so minimizing was
-    // invisible - the "minimize does nothing" report.
-    expect(panelHeight(false)).toBe(BAR_HEIGHT);
-    setMinimized(true, false);
-    expect(panelWidth()).toBe(MINIMIZED_WIDTH);
-    expect(MINIMIZED_WIDTH).toBeLessThan(WIDTH);
   });
 });
