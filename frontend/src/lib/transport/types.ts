@@ -116,6 +116,8 @@ export interface VoiceEvents {
   deviceChanged: (kind: "input" | "output", deviceId: string) => void;
   error: (err: Error) => void;
   status: (status: TransportStatus) => void;
+  /** A peer's voice link entered (true) or left (false) "connected". */
+  linkState: (peerId: string, connected: boolean) => void;
 }
 
 /**
@@ -173,9 +175,6 @@ export interface VoiceTransport {
   /** Peers whose audio track has arrived. That happens at offer/answer,
    *  BEFORE ICE connects, so it is proof of presence, not of a working link. */
   activePeers(): string[];
-  /** Peers whose link has actually reached "connected" - what a status
-   *  line may call connected. */
-  connectedPeers(): string[];
 }
 
 export type VideoSource = "camera" | "screen";

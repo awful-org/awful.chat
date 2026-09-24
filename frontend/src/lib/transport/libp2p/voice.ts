@@ -1065,14 +1065,6 @@ export class LibP2PVoice implements VoiceTransport {
     return Array.from(this.active);
   }
 
-  connectedPeers(): string[] {
-    const ids: string[] = [];
-    for (const [peerId, remote] of this.remotePeers) {
-      if (remote.pc.connectionState === "connected") ids.push(peerId);
-    }
-    return ids;
-  }
-
   // ─── internals ────────────────────────────────────────────────────────────
 
   private async startMic(deviceId?: string): Promise<void> {
@@ -1363,6 +1355,10 @@ export class LibP2PVoice implements VoiceTransport {
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
       rec(ev("voice.pc.state", { peer: peerId, d: { state } }));
+      // A replaced link's late events must not speak for its successor.
+      if (this.remotePeers.get(peerId) === remote) {
+        this.emit("linkState", peerId, state === "connected");
+      }
       if (state === "connected") {
         // Reconcile also polls: routes can change without a state transition,
         // and the first connected event can precede candidate-pair stats.
@@ -1507,6 +1503,8 @@ export class LibP2PVoice implements VoiceTransport {
     this.remotePeers.delete(peerId);
     this.active.delete(peerId);
 
+    // pc.close() fires no connectionstatechange, so say it here.
+    this.emit("linkState", peerId, false);
     this.emit("trackRemoved", peerId);
 
     // The single choke point every teardown path passes through (finding
