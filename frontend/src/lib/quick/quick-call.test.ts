@@ -241,6 +241,29 @@ describe("quick call profile", () => {
     expect(m.resumableSession("7QK3M9AB2C")).toBeNull();
   });
 
+  it("a refresh before anyone was chosen is not a call to resume", async () => {
+    const m = await load();
+    // Opening the page saves the code and who minted it, nothing more.
+    m.setQuickCallCode(undefined, true);
+    const code = m.quickCall.code;
+    // Resuming this used to pick "guest" for someone still deciding.
+    expect(m.resumableSession(code)).toBeNull();
+    expect(m.hostedHere(code)).toBe(true);
+    expect(m.hostedHere("7QK3M9AB2C")).toBeNull();
+
+    await m.prepareAsGuest();
+    expect(m.resumableSession(code)?.identity).toBe("guest");
+  });
+
+  it("backs out of the account unlock to the choice", async () => {
+    const m = await load();
+    m.chooseAccount();
+    expect(m.quickCall.stage).toBe("unlocking");
+    m.backToChoosing();
+    expect(m.quickCall.stage).toBe("choosing");
+    expect(m.quickCall.identity).toBe("guest");
+  });
+
   it("starting another call mints a new code and hosts it", async () => {
     const m = await load();
     await m.prepareAsGuest();

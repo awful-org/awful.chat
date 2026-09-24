@@ -29,9 +29,11 @@
   import { formatQuickCode } from "$lib/room-code";
   import {
     adoptAccount,
+    backToChoosing,
     chooseAccount,
     endQuickCall,
     hasAccount,
+    hostedHere,
     prepareAsGuest,
     quickCall,
     resumableSession,
@@ -74,7 +76,7 @@
     // this person already answered is answered again from the tab's own
     // session, so a refresh is a reconnect and not a fresh sign-up.
     const resume = resumableSession(fromLink || "");
-    isHost = resume ? resume.isHost : !fromLink;
+    isHost = hostedHere(fromLink || "") ?? !fromLink;
     setQuickCallCode(fromLink || undefined, isHost);
     // The code IS the secret, so it lives in the fragment and never in the
     // path - same reasoning as room invites, see App.svelte.
@@ -230,7 +232,7 @@
       </Card.Root>
     </div>
   {:else if quickCall.stage === "unlocking"}
-    <UnlockIdentity />
+    <UnlockIdentity onBack={backToChoosing} />
   {:else}
     <div
       class="min-h-dvh overflow-y-auto bg-background text-foreground flex items-center justify-center p-4 font-mono"

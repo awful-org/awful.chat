@@ -59,8 +59,15 @@
 
   interface Props {
     onRecover?: () => void;
+    /**
+     * Set when unlocking is one option among others (/qc's guest-or-account
+     * choice): offers a way back, and drops "use a different account", whose
+     * erase of this device's account has no place on a page promising to
+     * leave nothing behind.
+     */
+    onBack?: () => void;
   }
-  let { onRecover }: Props = $props();
+  let { onRecover, onBack }: Props = $props();
 
   const canUnlock = $derived(password.length > 0 && !identityStore.loading);
   const canUseBiometrics = $derived(
@@ -217,11 +224,17 @@
       >
         {identityStore.loading ? "Unlocking..." : "Unlock"}
       </Button>
-      <Button variant="outline" class="w-full font-mono" onclick={onRecover}>
-        Restore from phrase
-      </Button>
+      {#if onRecover}
+        <Button variant="outline" class="w-full font-mono" onclick={onRecover}>
+          Restore from phrase
+        </Button>
+      {/if}
 
-      {#if !confirmSwitch}
+      {#if onBack}
+        <Button variant="ghost" class="w-full font-mono text-xs" onclick={onBack}>
+          Back
+        </Button>
+      {:else if !confirmSwitch}
         <button
           type="button"
           onclick={() => (confirmSwitch = true)}

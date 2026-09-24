@@ -151,14 +151,21 @@
 <InstallPrompt />
 <NotifyPrompt />
 
-{#if identityStore.initializing}
+<!--
+  /qc before the spinner: its "use my account" unlock can auto-login with a
+  remembered password, and that raises `initializing` too. Swapping the page
+  for the spinner destroyed it mid-unlock; the remount then read the tab's
+  session as a guest's and called under a throwaway identity instead. The
+  route is only ever "qc" once boot has finished, so this skips nothing.
+-->
+{#if currentRoute === "qc"}
+  <QuickCall />
+{:else if identityStore.initializing}
   <div class="min-h-screen bg-background flex items-center justify-center">
     <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
   </div>
 {:else if currentRoute === "qs"}
   <QuickSend />
-{:else if currentRoute === "qc"}
-  <QuickCall />
 {:else if currentRoute === "landing"}
   <Landing />
 {:else}
