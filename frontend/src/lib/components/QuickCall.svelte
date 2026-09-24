@@ -17,6 +17,8 @@
   import { Input } from "$lib/components/ui/input/index.js";
   import * as Card from "$lib/components/ui/card/index.js";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
+  import CameraPickerDialog from "$lib/components/CameraPickerDialog.svelte";
+  import ShareScreenDialog from "$lib/components/ShareScreenDialog.svelte";
   import DeviceCheck from "$lib/components/DeviceCheck.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
@@ -390,4 +392,9 @@
   {/if}
 
   <AvatarPickerDialog open={pickerOpen} onClose={() => (pickerOpen = false)} />
+  <!-- The call's camera and share buttons only OPEN these (uiState flags);
+       the app mounts them in SidebarControls, which /qc has none of, so
+       both buttons did nothing here. -->
+  <CameraPickerDialog />
+  <ShareScreenDialog />
 </QueryClientProvider>
