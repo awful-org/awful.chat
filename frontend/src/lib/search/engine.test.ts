@@ -94,11 +94,37 @@ describe("matchEntry", () => {
     msg({ content: "Deploy went fine, ship the release" })
   )!;
 
-  it("fuzzy matches terms with highlight ranges", () => {
+  it("matches terms at word starts, with highlight ranges", () => {
     const hit = matchEntry(entry, parseSearchQuery("deploy"), NOW)!;
     expect(hit).not.toBeNull();
     expect(hit.ranges[0].start).toBe(0);
     expect(hit.score).toBeGreaterThan(0);
+    const prefix = matchEntry(entry, parseSearchQuery("rel"), NOW)!;
+    expect(prefix.ranges).toEqual([{ start: 27, end: 30 }]);
+  });
+
+  it("does not match letters scattered in order, or mid-word", () => {
+    // The fuzzy scorer took both: d..e..p..l in order, "ploy" inside Deploy.
+    expect(matchEntry(entry, parseSearchQuery("dpl"), NOW)).toBeNull();
+    expect(matchEntry(entry, parseSearchQuery("ploy"), NOW)).toBeNull();
+    expect(matchEntry(entry, parseSearchQuery("dwf"), NOW)).toBeNull();
+  });
+
+  it("finds a word after punctuation, and prefers a whole-word match", () => {
+    const url = entryFromMessage(msg({ content: "see https://github.com/x" }))!;
+    expect(matchEntry(url, parseSearchQuery("github"), NOW)).not.toBeNull();
+    const whole = matchEntry(
+      entryFromMessage(msg({ content: "ship it" }))!, parseSearchQuery("ship"), NOW
+    )!;
+    const part = matchEntry(
+      entryFromMessage(msg({ content: "shipping" }))!, parseSearchQuery("ship"), NOW
+    )!;
+    expect(whole.score).toBeGreaterThan(part.score);
+  });
+
+  it("matches inside text written without spaces", () => {
+    const ja = entryFromMessage(msg({ content: "明日のデプロイ" }))!;
+    expect(matchEntry(ja, parseSearchQuery("デプロイ"), NOW)).not.toBeNull();
   });
 
   it("ANDs multiple terms and rejects a missing one", () => {
