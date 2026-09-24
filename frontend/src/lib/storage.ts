@@ -54,6 +54,12 @@ export interface Room {
   pfpURL?: string; // external URL (tenor, giphy, etc) - stored as-is
   participants: string[]; // DIDs of users in the room (stable identity)
   participantLastSeen?: Record<string, number>; // DID -> timestamp of last seen
+  /** Pinned to the top of the sidebar; the timestamp orders the pins. */
+  pinnedAt?: number;
+  /** Place among the unpinned rooms, from a sidebar drag. Absent = unplaced. */
+  position?: number;
+  /** Messages this user pinned here, oldest pin first. Private: never sent. */
+  pinnedMessages?: string[];
 }
 
 const PARTICIPANT_INACTIVE_DAYS = 30;
@@ -1726,8 +1732,30 @@ export async function putRoom(room: Room | DMRoom): Promise<void> {
  *  single-transaction versions cannot survive at-rest crypto (an IDB tx
  *  auto-commits on any non-IDB await), so the patch runs between a read and
  *  a write; every patch below is idempotent or monotonic, which keeps the
- *  slightly wider race window harmless. */
-async function _patchRoom(
+ *  slightly wider race window harmless.
+ *
+ *  Not so the sidebar pin, position and pinned messages: a markRoomSeen that
+ *  read the record before them and wrote after would silently drop them, and
+ *  nothing re-asserts a lost pin. So patches to one room run one at a time -
+ *  each reads what the previous one wrote. */
+const _roomPatchQueue = new Map<string, Promise<void>>();
+
+function _patchRoom(
+  roomCode: string,
+  patch: (room: Room | DMRoom) => Room | DMRoom | null
+): Promise<void> {
+  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(() =>
+    _patchRoomNow(roomCode, patch)
+  );
+  const settled = run.catch(() => {});
+  _roomPatchQueue.set(roomCode, settled);
+  void settled.then(() => {
+    if (_roomPatchQueue.get(roomCode) === settled) _roomPatchQueue.delete(roomCode);
+  });
+  return run;
+}
+
+async function _patchRoomNow(
   roomCode: string,
   patch: (room: Room | DMRoom) => Room | DMRoom | null
 ): Promise<void> {
@@ -1754,6 +1782,47 @@ async function _patchRoom(
   await tx.store.delete(roomCode as Blinded);
   await tx.store.put(sealed);
   await tx.done;
+}
+
+/** Pin a room to the top of the sidebar, or unpin it (null). */
+export async function setRoomPinned(
+  roomCode: string,
+  pinnedAt: number | null
+): Promise<void> {
+  await _patchRoom(roomCode, (room) => {
+    if ((room.pinnedAt ?? null) === pinnedAt) return null;
+    const { pinnedAt: _old, ...rest } = room;
+    return pinnedAt === null ? rest : { ...rest, pinnedAt };
+  });
+}
+
+/** Pin a message in its room for this user, or unpin it. */
+export async function setMessagePinned(
+  roomCode: string,
+  messageId: string,
+  pinned: boolean
+): Promise<void> {
+  await _patchRoom(roomCode, (room) => {
+    const current = room.pinnedMessages ?? [];
+    if (current.includes(messageId) === pinned) return null;
+    return {
+      ...room,
+      pinnedMessages: pinned
+        ? [...current, messageId]
+        : current.filter((id) => id !== messageId),
+    };
+  });
+}
+
+/** Number the given rooms 0..n-1 in the sidebar, skipping unchanged ones. */
+export async function setRoomPositions(order: string[]): Promise<void> {
+  await Promise.all(
+    order.map((roomCode, position) =>
+      _patchRoom(roomCode, (room) =>
+        room.position === position ? null : { ...room, position }
+      )
+    )
+  );
 }
 
 export async function getRoomParticipants(roomCode: string): Promise<string[]> {
