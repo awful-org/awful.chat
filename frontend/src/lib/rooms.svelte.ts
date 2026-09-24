@@ -10,6 +10,9 @@ import {
   getMessages,
   getPhonebookEntries,
   dedupePhonebook,
+  setRoomPinned,
+  setRoomPositions,
+  setMessagePinned,
   type DMRoom,
   type PhonebookEntry,
   type Room,
@@ -80,6 +83,7 @@ export async function loadRooms(): Promise<void> {
       merged.set(r.roomCode, r);
     }
     roomsStore.rooms = Array.from(merged.values());
+    await migrateLegacyRoomOrder();
     roomsStore.dmRooms = await getDMRooms();
     roomsStore.phonebook = await getPhonebookEntries();
     await _refreshAllUnread();
@@ -222,6 +226,86 @@ export async function renameRoom(
   const updated = { ...stored, name: trimmed };
   roomsStore.rooms[idx] = updated;
   await putRoom(updated);
+}
+
+/** Pin a room to the top of the sidebar, or unpin it back into its place. */
+export async function toggleRoomPin(roomCode: string): Promise<void> {
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  if (!room) return;
+  const pinnedAt = room.pinnedAt == null ? Date.now() : null;
+  // The mirror first, so the sidebar moves on the click, not on the write.
+  roomsStore.rooms = roomsStore.rooms.map((r) => {
+    if (r.roomCode !== roomCode) return r;
+    const { pinnedAt: _old, ...rest } = r;
+    return pinnedAt === null ? rest : { ...rest, pinnedAt };
+  });
+  await setRoomPinned(roomCode, pinnedAt);
+}
+
+/** This user's pinned messages in a room or DM, oldest pin first. */
+export function pinnedMessagesOf(roomCode: string): string[] {
+  return (
+    roomsStore.rooms.find((r) => r.roomCode === roomCode)?.pinnedMessages ??
+    roomsStore.dmRooms.find((r) => r.roomCode === roomCode)?.pinnedMessages ??
+    []
+  );
+}
+
+/** Pin a message for yourself in its room or DM, or unpin it. */
+export async function toggleMessagePin(
+  roomCode: string,
+  messageId: string
+): Promise<void> {
+  const pinned = !pinnedMessagesOf(roomCode).includes(messageId);
+  const apply = <T extends Room>(r: T): T => {
+    if (r.roomCode !== roomCode) return r;
+    const current = r.pinnedMessages ?? [];
+    return {
+      ...r,
+      pinnedMessages: pinned
+        ? [...current, messageId]
+        : current.filter((id) => id !== messageId),
+    };
+  };
+  roomsStore.rooms = roomsStore.rooms.map(apply);
+  roomsStore.dmRooms = roomsStore.dmRooms.map(apply);
+  await setMessagePinned(roomCode, messageId, pinned);
+}
+
+/** The unpinned rooms' order after a sidebar drag or keyboard move. */
+export async function setRoomOrder(order: string[]): Promise<void> {
+  const position = new Map(order.map((code, i) => [code, i]));
+  roomsStore.rooms = roomsStore.rooms.map((r) =>
+    position.has(r.roomCode) ? { ...r, position: position.get(r.roomCode) } : r
+  );
+  await setRoomPositions(order);
+}
+
+/**
+ * The order used to live in localStorage (#63), outside the account: it
+ * survived an account switch with the old account's room codes in it, and
+ * sync and backups never saw it. Moved onto the records once, then dropped.
+ * A device whose rooms already carry positions (synced in) keeps those.
+ */
+const LEGACY_ORDER_KEY = "awful:room-order:v1";
+
+async function migrateLegacyRoomOrder(): Promise<void> {
+  let order: string[];
+  try {
+    const raw = localStorage.getItem(LEGACY_ORDER_KEY);
+    if (raw === null) return;
+    localStorage.removeItem(LEGACY_ORDER_KEY);
+    const parsed = JSON.parse(raw);
+    order = Array.isArray(parsed)
+      ? parsed.filter((code): code is string => typeof code === "string")
+      : [];
+  } catch {
+    return;
+  }
+  if (roomsStore.rooms.some((r) => r.position != null)) return;
+  const known = new Set(roomsStore.rooms.map((r) => r.roomCode));
+  const mine = order.filter((code) => known.has(code));
+  if (mine.length > 0) await setRoomOrder(mine);
 }
 
 /**

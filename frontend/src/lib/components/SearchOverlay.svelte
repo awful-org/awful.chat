@@ -10,11 +10,8 @@
   import { snippetFor, type SearchHit } from "$lib/search/engine";
   import { match } from "$lib/palette/scorer";
   import { roomsStore } from "$lib/rooms.svelte";
-  import {
-    loadMoreMessages,
-    transportState,
-  } from "$lib/transport/transport.svelte";
-  import { requestJumpToMessage } from "$lib/ui-state.svelte";
+  import { transportState } from "$lib/transport/transport.svelte";
+  import { revealMessage } from "$lib/reveal-message";
 
   let {
     openRoom,
@@ -136,17 +133,7 @@
       const { roomCode, id, lamport } = hit.entry;
       closeSearch();
       if (transportState.roomCode !== roomCode) await openRoom(roomCode);
-      // Page history until the target is loaded. The entry's lamport bounds
-      // the walk: once the oldest loaded row is at or past it, either the
-      // message is present or it is not coming.
-      for (let i = 0; i < 40; i++) {
-        if (transportState.roomCode !== roomCode) return;
-        if (transportState.messages.some((m) => m.id === id)) break;
-        const oldest = transportState.messages[0];
-        if (!oldest || oldest.lamport < lamport || (oldest.lamport === lamport && oldest.id <= id)) break;
-        if (!(await loadMoreMessages(oldest))) break;
-      }
-      requestJumpToMessage(roomCode, id);
+      await revealMessage(roomCode, id, lamport);
     } finally {
       jumping = false;
     }

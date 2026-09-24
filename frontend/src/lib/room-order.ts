@@ -1,33 +1,25 @@
 /**
- * Custom room order for the sidebar. Device-local, like the rest of
- * display-prefs: it says nothing about a room and rides on no wire format,
- * so it never needs to sync or survive a room's own record changing shape.
+ * The sidebar's room order. It lives ON the room records (pinnedAt,
+ * position), so it is wiped with the account, deleted with the room, and
+ * carried by device sync and backups like everything else about the room.
  */
 
 import type { Room } from "./storage";
 
 /**
- * Lay `rooms` out by `order` (a list of roomCodes). A code the room list no
- * longer has (a removed room) is skipped rather than erroring, and a room
- * `order` has never seen (freshly joined, or ordering never touched) keeps
- * its relative position from `rooms`, appended after every ordered one - so
- * an empty `order` is the identity and a partial one only moves what it
- * names.
+ * Pinned rooms first, oldest pin on top; then rooms a drag has placed, by
+ * position; then rooms never placed (freshly joined, or never dragged) in
+ * the order they came in. Array.sort is stable, so ties keep that order too.
  */
-export function applyRoomOrder(rooms: Room[], order: string[]): Room[] {
-  if (order.length === 0) return rooms;
-  const remaining = new Map(rooms.map((room) => [room.roomCode, room] as const));
-  const ordered: Room[] = [];
-  for (const code of order) {
-    const room = remaining.get(code);
-    if (!room) continue;
-    ordered.push(room);
-    remaining.delete(code);
-  }
-  for (const room of rooms) {
-    if (remaining.has(room.roomCode)) ordered.push(room);
-  }
-  return ordered;
+export function sortRooms(rooms: Room[]): Room[] {
+  const pinned = rooms
+    .filter((r) => r.pinnedAt != null)
+    .sort((a, b) => a.pinnedAt! - b.pinnedAt!);
+  const placed = rooms
+    .filter((r) => r.pinnedAt == null && r.position != null)
+    .sort((a, b) => a.position! - b.position!);
+  const unplaced = rooms.filter((r) => r.pinnedAt == null && r.position == null);
+  return [...pinned, ...placed, ...unplaced];
 }
 
 export function moveItem<T>(list: readonly T[], from: number, to: number): T[] {

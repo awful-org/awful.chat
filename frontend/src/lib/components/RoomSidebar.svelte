@@ -6,6 +6,8 @@
   import {
     GripVertical,
     Hash,
+    Pin,
+    PinOff,
     MessageSquare,
     PanelLeftClose,
     PanelLeftOpen,
@@ -64,6 +66,8 @@
     onRemoveDmConversation: (peerId: string) => void;
     dmContextActions?: DmContextAction[];
     onRemoveRoom: (code: string) => void;
+    /** Pin or unpin. `rooms` already lists the pinned (pinnedAt) first. */
+    onTogglePin: (code: string) => void;
     /** The full room order after a drag or keyboard move, as roomCodes. */
     onReorderRooms: (order: string[]) => void;
     onOpenCreateJoin?: () => void;
@@ -93,6 +97,7 @@
     onRemoveDmConversation,
     dmContextActions,
     onRemoveRoom,
+    onTogglePin,
     onReorderRooms,
     onOpenCreateJoin,
     onOpenPhonebook,
@@ -132,11 +137,16 @@
   let scrollFrame = 0;
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Pinned rooms sit above the rest and do not drag; every index the drag
+  // code uses is into `movable`, so nothing can be dropped above a pin.
+  const pinnedList = $derived(rooms.filter((r) => r.pinnedAt != null));
+  const pinnedSet = $derived(new Set(pinnedList.map((r) => r.roomCode)));
+  const movable = $derived(rooms.filter((r) => r.pinnedAt == null));
   const roomsByCode = $derived(new Map(rooms.map((r) => [r.roomCode, r])));
   const displayRooms = $derived(
     drag
       ? drag.order.flatMap((code) => roomsByCode.get(code) ?? [])
-      : rooms
+      : movable
   );
 
   function contentY(clientY: number): number {
@@ -146,19 +156,19 @@
 
   function startRoomDrag(e: PointerEvent, roomCode: string): void {
     if (e.button !== 0 || !listEl || drag) return;
-    const from = rooms.findIndex((r) => r.roomCode === roomCode);
+    const from = movable.findIndex((r) => r.roomCode === roomCode);
     if (from === -1) return;
     const listTop = listEl.getBoundingClientRect().top - listEl.scrollTop;
-    rowBoxes = [...listEl.querySelectorAll<HTMLElement>("[data-room-code]")].map((el) => {
+    rowBoxes = [...listEl.querySelectorAll<HTMLElement>("[data-drag-row]")].map((el) => {
       const r = el.getBoundingClientRect();
       return { top: r.top - listTop, height: r.height };
     });
-    if (rowBoxes.length !== rooms.length) return;
+    if (rowBoxes.length !== movable.length) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     e.preventDefault();
     lastClientY = e.clientY;
     startContentY = contentY(e.clientY);
-    const base = rooms.map((r) => r.roomCode);
+    const base = movable.map((r) => r.roomCode);
     drag = {
       code: roomCode,
       base,
@@ -253,11 +263,11 @@
   function onGripKeydown(e: KeyboardEvent, roomCode: string): void {
     if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
     if (drag) return;
-    const from = rooms.findIndex((r) => r.roomCode === roomCode);
+    const from = movable.findIndex((r) => r.roomCode === roomCode);
     const to = from + (e.key === "ArrowUp" ? -1 : 1);
-    if (from === -1 || to < 0 || to >= rooms.length) return;
+    if (from === -1 || to < 0 || to >= movable.length) return;
     e.preventDefault();
-    onReorderRooms(moveItem(rooms.map((r) => r.roomCode), from, to));
+    onReorderRooms(moveItem(movable.map((r) => r.roomCode), from, to));
   }
 
   function rowStyle(roomCode: string): string {
@@ -703,13 +713,62 @@
       </div>
     {/if}
 
+    {#snippet roomButton(room: Room)}
+      <button
+        type="button"
+        onclick={() => onSelectRoom(room.roomCode)}
+        class="flex min-w-0 flex-1 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors cursor-pointer hover:bg-accent/50
+          {activeRoomCode === room.roomCode
+          ? 'bg-accent text-accent-foreground'
+          : 'text-muted-foreground'}"
+      >
+        <Hash class="mt-0.5 size-3.5 shrink-0 opacity-50" />
+        <div class="min-w-0 flex-1">
+          <div class="select-text truncate text-sm font-medium font-mono">
+            {room.name || room.roomCode}
+          </div>
+          <div class="truncate text-xs opacity-60 font-mono">
+            {timeAgo(roomActivity.get(room.roomCode) ?? room.createdAt)}
+          </div>
+        </div>
+        {#if (unreadCounts.get(room.roomCode) ?? 0) > 0 && activeRoomCode !== room.roomCode}
+          <span
+            class="ml-auto shrink-0 min-w-4.5 h-4.5 rounded-full bg-primary text-primary-foreground text-[10px] font-bold flex items-center justify-center px-1 tabular-nums"
+          >
+            {Math.min(unreadCounts.get(room.roomCode) ?? 0, 99)}
+          </span>
+        {/if}
+      </button>
+    {/snippet}
+
     {#if activeTab === "rooms"}
+      <!-- Pinned: on top, in pin order, and not draggable. The pin sits in
+           the grip's slot so the names line up with the rows below. -->
+      {#each pinnedList as room (room.roomCode)}
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <div
+          role="none"
+          data-room-code={room.roomCode}
+          animate:flip={{ duration: FLIP_MS, easing: cubicOut }}
+          class="flex items-center gap-0.5 rounded-md"
+          oncontextmenu={(e) => openContextMenu(e, room.roomCode)}
+        >
+          <span class="shrink-0 p-1 text-muted-foreground/60" title="Pinned">
+            <Pin class="size-3.5" />
+          </span>
+          {@render roomButton(room)}
+        </div>
+      {/each}
+      {#if pinnedList.length > 0 && displayRooms.length > 0}
+        <div class="mx-2.5 my-1 h-px bg-sidebar-border" role="separator"></div>
+      {/if}
       {#each displayRooms as room (room.roomCode)}
         {@const lifted = drag?.code === room.roomCode}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
           role="none"
           data-room-code={room.roomCode}
+          data-drag-row
           animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
           style={rowStyle(room.roomCode)}
           class="group relative flex items-center gap-0.5 rounded-md transition-shadow duration-150 {lifted
@@ -732,31 +791,7 @@
           >
             <GripVertical class="size-3.5" />
           </button>
-          <button
-            type="button"
-            onclick={() => onSelectRoom(room.roomCode)}
-            class="flex min-w-0 flex-1 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors cursor-pointer hover:bg-accent/50
-              {activeRoomCode === room.roomCode
-              ? 'bg-accent text-accent-foreground'
-              : 'text-muted-foreground'}"
-          >
-            <Hash class="mt-0.5 size-3.5 shrink-0 opacity-50" />
-            <div class="min-w-0 flex-1">
-              <div class="select-text truncate text-sm font-medium font-mono">
-                {room.name || room.roomCode}
-              </div>
-              <div class="truncate text-xs opacity-60 font-mono">
-                {timeAgo(roomActivity.get(room.roomCode) ?? room.createdAt)}
-              </div>
-            </div>
-            {#if (unreadCounts.get(room.roomCode) ?? 0) > 0 && activeRoomCode !== room.roomCode}
-              <span
-                class="ml-auto shrink-0 min-w-4.5 h-4.5 rounded-full bg-primary text-primary-foreground text-[10px] font-bold flex items-center justify-center px-1 tabular-nums"
-              >
-                {Math.min(unreadCounts.get(room.roomCode) ?? 0, 99)}
-              </span>
-            {/if}
-          </button>
+          {@render roomButton(room)}
         </div>
       {/each}
     {:else}
@@ -842,6 +877,22 @@
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
   >
+    <button
+      type="button"
+      onclick={() => {
+        onTogglePin(contextMenu!.code);
+        closeContextMenu();
+      }}
+      class="flex w-full items-center gap-2 px-3 py-1.5 text-sm text-foreground hover:bg-muted cursor-pointer font-mono"
+    >
+      {#if pinnedSet.has(contextMenu.code)}
+        <PinOff class="size-4" />
+        Unpin
+      {:else}
+        <Pin class="size-4" />
+        Pin to top
+      {/if}
+    </button>
     <button
       type="button"
       onclick={() => {

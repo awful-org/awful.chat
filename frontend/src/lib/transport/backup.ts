@@ -171,6 +171,17 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
     participantLastSeen,
     name:
       !local.name || local.name === local.roomCode ? imported.name : local.name,
+    // This device's sidebar layout wins, the same way its room name does;
+    // the import only fills in rooms this device never arranged.
+    pinnedAt: local.pinnedAt ?? imported.pinnedAt,
+    position: local.position ?? imported.position,
+    // A union, like membership: a message pinned on either device stays so.
+    pinnedMessages: [
+      ...new Set([
+        ...(local.pinnedMessages ?? []),
+        ...(imported.pinnedMessages ?? []),
+      ]),
+    ],
   };
 }
 

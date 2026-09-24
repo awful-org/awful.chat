@@ -19,6 +19,9 @@
     Smile,
     Reply,
     X,
+    Pin,
+    PinOff,
+    Search,
     Paperclip,
     FileText,
     ArrowDown,
@@ -84,7 +87,14 @@
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
   import { humanizeMentions } from "$lib/mentions";
-  import { refreshPhonebook } from "$lib/rooms.svelte";
+  import {
+    pinnedMessagesOf,
+    refreshPhonebook,
+    toggleMessagePin,
+  } from "$lib/rooms.svelte";
+  import { getMessage } from "$lib/storage";
+  import { openSearch } from "$lib/search/ui.svelte";
+  import { revealMessage } from "$lib/reveal-message";
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
@@ -875,6 +885,49 @@
     }, 900);
   }
 
+  // Pinned messages: private to this user, stored on the room record.
+  const pinnedIds = $derived(pinnedMessagesOf(roomCode));
+  const pinnedSet = $derived(new Set(pinnedIds));
+  let pinnedOpen = $state(false);
+  /** Pinned messages older than the loaded page, read from storage. */
+  let pinnedFromStore = $state(new Map<string, Message | null>());
+
+  $effect(() => {
+    if (!pinnedOpen) return;
+    const loaded = new Set(messages.map((m) => m.id));
+    const missing = pinnedIds.filter(
+      (id) => !loaded.has(id) && !pinnedFromStore.has(id)
+    );
+    if (missing.length === 0) return;
+    void Promise.all(missing.map((id) => getMessage(id).catch(() => undefined))).then(
+      (rows) => {
+        const next = new Map(pinnedFromStore);
+        missing.forEach((id, i) => next.set(id, rows[i] ?? null));
+        pinnedFromStore = next;
+      }
+    );
+  });
+
+  /** Newest pin first; a pin whose message is gone shows as unavailable. */
+  const pinnedEntries = $derived(
+    [...pinnedIds].reverse().map((id) => ({
+      id,
+      msg: messages.find((m) => m.id === id) ?? pinnedFromStore.get(id) ?? null,
+    }))
+  );
+
+  function pinnedPreview(msg: Message): string {
+    if (msg.type === MessageType.File) {
+      return msg.meta?.files?.map((f) => f.filename).join(", ") || "Attachment";
+    }
+    return humanizeMentions(msg.content ?? "", resolveMentionDisplayName) || "Message";
+  }
+
+  function openPinned(msg: Message): void {
+    pinnedOpen = false;
+    void revealMessage(roomCode, msg.id, msg.lamport);
+  }
+
   async function sendOrReplyWithMessage(content: string): Promise<void> {
     // Send a message (text or URL) with reply context if set. Mirrors the
     // reply branching logic from submit() so GIF selections preserve reply targets.
@@ -1354,6 +1407,51 @@
     if (document.visibilityState === "visible") markSeen().catch(() => {});
   }
 
+  /**
+   * Put the caret in the composer when a conversation opens or the window
+   * comes back, so typing just works. Only where there is a real keyboard -
+   * on a touch screen this would throw up the on-screen one over the chat -
+   * and never over something the user is already in: another field, an open
+   * dialog, or text they have selected to copy.
+   */
+  function focusComposer(): void {
+    if (!textareaEl || isMobile) return;
+    if (!window.matchMedia("(pointer: fine)").matches) return;
+    const active = document.activeElement;
+    if (
+      active &&
+      active !== document.body &&
+      active !== textareaEl &&
+      active.closest(
+        "input, textarea, select, [contenteditable='true'], [role='dialog'], [role='alertdialog']"
+      )
+    ) {
+      return;
+    }
+    if (window.getSelection()?.isCollapsed === false) return;
+    textareaEl.focus({ preventScroll: true });
+  }
+
+  $effect(() => {
+    void roomCode;
+    pinnedOpen = false;
+  });
+
+  $effect(() => {
+    void roomCode;
+    // After the frame that swaps the conversation in, and after the sidebar
+    // button or palette row that was pressed has had its own focus handling.
+    const frame = requestAnimationFrame(focusComposer);
+    return () => cancelAnimationFrame(frame);
+  });
+
+  // Coming back to the window restores whatever was focused before, so only
+  // step in when that was nothing at all.
+  function focusComposerOnReturn(): void {
+    if (document.activeElement && document.activeElement !== document.body) return;
+    focusComposer();
+  }
+
   function shouldShowHeader(current: Message, previous?: Message): boolean {
     if (!previous) return true;
     const a = senderDid(current.senderId) || current.senderId;
@@ -1651,15 +1749,19 @@
     closeUserMenu();
     if (copyMenuOpen && !(e.target as HTMLElement).closest("[data-copy-menu]"))
       copyMenuOpen = false;
+    if (pinnedOpen && !(e.target as HTMLElement).closest("[data-pinned-menu]"))
+      pinnedOpen = false;
   }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
       closeUserMenu();
       copyMenuOpen = false;
+      pinnedOpen = false;
       reactionPickerFor = null;
       activeMessageId = null;
     }
   }}
+  onfocus={focusComposerOnReturn}
 />
 
 <svelte:document onvisibilitychange={markSeenOnReturn} />
@@ -1865,6 +1967,104 @@
               </button>
             {/snippet}
           </Tip>
+        {/if}
+        {#if !ephemeral}
+          <Tip text="Search messages">
+            {#snippet children(props)}
+              <Button
+                {...props}
+                variant="ghost"
+                size="icon"
+                onclick={() => openSearch(roomCode)}
+                aria-label="Search messages"
+                class="flex text-muted-foreground hover:text-foreground cursor-pointer"
+              >
+                <Search class="size-4" />
+              </Button>
+            {/snippet}
+          </Tip>
+          <div class="relative" data-pinned-menu>
+            <Tip text="Pinned messages">
+              {#snippet children(props)}
+                <Button
+                  {...props}
+                  variant="ghost"
+                  size="icon"
+                  onclick={() => (pinnedOpen = !pinnedOpen)}
+                  aria-label="Pinned messages"
+                  aria-haspopup="menu"
+                  aria-expanded={pinnedOpen}
+                  class="relative flex text-muted-foreground hover:text-foreground cursor-pointer {pinnedOpen
+                    ? 'text-primary'
+                    : ''}"
+                >
+                  <Pin class="size-4" />
+                  {#if pinnedIds.length > 0}
+                    <span
+                      class="absolute right-0.5 top-0.5 min-w-3.5 rounded-full bg-primary px-0.5 text-[9px] font-bold leading-3.5 text-primary-foreground tabular-nums"
+                    >
+                      {Math.min(pinnedIds.length, 99)}
+                    </span>
+                  {/if}
+                </Button>
+              {/snippet}
+            </Tip>
+            {#if pinnedOpen}
+              <div
+                role="menu"
+                aria-label="Pinned messages"
+                class="absolute right-0 top-full z-50 mt-1 flex max-h-96 w-80 max-w-[calc(100vw-1rem)] flex-col overflow-hidden rounded-md border border-border bg-popover shadow-lg"
+              >
+                <div class="px-3 py-2 text-[10px] font-mono text-muted-foreground">
+                  Pinned · only you see these
+                </div>
+                <div class="overflow-y-auto">
+                  {#each pinnedEntries as entry (entry.id)}
+                    <div class="group/pin flex items-start gap-1 border-t border-border/60 px-1 py-1">
+                      {#if entry.msg}
+                        {@const msg = entry.msg}
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onclick={() => openPinned(msg)}
+                          class="min-w-0 flex-1 rounded px-2 py-1 text-left hover:bg-muted cursor-pointer"
+                        >
+                          <div class="flex items-baseline gap-2 text-xs">
+                            <span class="truncate font-medium text-foreground">{displayName(msg)}</span>
+                            <span class="shrink-0 text-[10px] text-muted-foreground">{formatDate(msg.timestamp)}</span>
+                          </div>
+                          <p class="line-clamp-2 break-words text-xs text-muted-foreground">
+                            {pinnedPreview(msg)}
+                          </p>
+                        </button>
+                      {:else}
+                        <p class="min-w-0 flex-1 px-2 py-1 text-xs italic text-muted-foreground">
+                          {pinnedFromStore.has(entry.id) ? "Message no longer on this device" : "Loading..."}
+                        </p>
+                      {/if}
+                      <Tip text="Unpin">
+                        {#snippet children(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            aria-label="Unpin message"
+                            onclick={() => void toggleMessagePin(roomCode, entry.id)}
+                            class="mt-1 inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
+                          >
+                            <PinOff class="size-3.5" />
+                          </button>
+                        {/snippet}
+                      </Tip>
+                    </div>
+                  {:else}
+                    <p class="border-t border-border/60 px-3 py-4 text-center text-xs text-muted-foreground">
+                      No pinned messages. Hover a message and press the pin to keep it here.
+                    </p>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+          </div>
         {/if}
         {#if !isDmChat}
           <Tip text={showUserList ? "Hide users" : "Show users"}>
@@ -2072,7 +2272,7 @@
                   ? 'mt-3 pt-1'
                   : ''} {messageIsMentioningMe(msg)
                   ? 'bg-primary/5 border-l-2 border-l-primary pl-1.5'
-                  : ''}"
+                  : ''} {pinnedSet.has(msg.id) ? 'pr-6' : ''}"
                 role="button"
                 tabindex={isMobile ? 0 : -1}
                 onclick={() => isMobile && handleMessageClick(msg.id)}
@@ -2324,7 +2524,41 @@
                   </button>
                     {/snippet}
                   </Tip>
+                  {#if !ephemeral}
+                    <Tip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                      {#snippet children(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 hover:text-foreground cursor-pointer {pinnedSet.has(msg.id)
+                        ? 'text-primary'
+                        : 'text-muted-foreground'}"
+                      aria-label={pinnedSet.has(msg.id) ? "Unpin message" : "Pin message"}
+                      aria-pressed={pinnedSet.has(msg.id)}
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        void toggleMessagePin(roomCode, msg.id);
+                        activeMessageId = null;
+                      }}
+                    >
+                      {#if pinnedSet.has(msg.id)}
+                        <PinOff class="size-3.5" />
+                      {:else}
+                        <Pin class="size-3.5" />
+                      {/if}
+                    </button>
+                      {/snippet}
+                    </Tip>
+                  {/if}
                 </div>
+                {#if pinnedSet.has(msg.id)}
+                  <!-- Marks a pinned message at rest; the toolbar above
+                       covers it on hover, where the same pin unpins. -->
+                  <Pin
+                    class="pointer-events-none absolute right-2 top-1.5 size-3 rotate-45 text-primary/70 transition-opacity group-hover:opacity-0"
+                    aria-label="Pinned"
+                  />
+                {/if}
               </div>
             </div>
           {/each}

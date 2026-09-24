@@ -1,37 +1,36 @@
 import { describe, expect, it } from "vitest";
-import { applyRoomOrder, dropIndex, moveItem, slotTop } from "./room-order";
+import { dropIndex, moveItem, slotTop, sortRooms } from "./room-order";
 import type { Room } from "./storage";
 
-const room = (roomCode: string): Room => ({
+const room = (roomCode: string, extra: Partial<Room> = {}): Room => ({
   roomCode,
   type: "text",
   name: roomCode,
   lastSeenLamport: 0,
   createdAt: 0,
   participants: [],
+  ...extra,
 });
 
-const rooms = [room("a"), room("b"), room("c")];
+const codes = (list: Room[]) => list.map((r) => r.roomCode);
 
-describe("applyRoomOrder", () => {
-  it("is the identity with no stored order", () => {
-    expect(applyRoomOrder(rooms, []).map((r) => r.roomCode)).toEqual(["a", "b", "c"]);
+describe("sortRooms", () => {
+  it("keeps the incoming order when nothing is pinned or placed", () => {
+    expect(codes(sortRooms([room("a"), room("b"), room("c")]))).toEqual(["a", "b", "c"]);
   });
 
-  it("lays rooms out by the stored order", () => {
-    expect(applyRoomOrder(rooms, ["c", "a", "b"]).map((r) => r.roomCode)).toEqual([
-      "c", "a", "b",
-    ]);
+  it("lays placed rooms out by position, unplaced ones after in incoming order", () => {
+    const list = [room("a"), room("b", { position: 1 }), room("c"), room("d", { position: 0 })];
+    expect(codes(sortRooms(list))).toEqual(["d", "b", "a", "c"]);
   });
 
-  it("appends a room the order has never named, in its original relative position", () => {
-    expect(applyRoomOrder(rooms, ["b"]).map((r) => r.roomCode)).toEqual(["b", "a", "c"]);
-  });
-
-  it("skips a roomCode the order names that no longer exists", () => {
-    expect(applyRoomOrder(rooms, ["z", "c", "a", "b"]).map((r) => r.roomCode)).toEqual([
-      "c", "a", "b",
-    ]);
+  it("puts pinned rooms first, oldest pin on top, whatever their position", () => {
+    const list = [
+      room("a", { position: 0 }),
+      room("b", { pinnedAt: 200, position: 5 }),
+      room("c", { pinnedAt: 100 }),
+    ];
+    expect(codes(sortRooms(list))).toEqual(["c", "b", "a"]);
   });
 });
 

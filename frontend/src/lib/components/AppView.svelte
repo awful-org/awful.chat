@@ -27,10 +27,11 @@
     saveRoom,
     refreshPhonebook,
     refreshDmRooms,
+    setRoomOrder,
+    toggleRoomPin,
   } from "$lib/rooms.svelte";
   import { uiState } from "$lib/ui-state.svelte";
-  import { applyRoomOrder } from "$lib/room-order";
-  import { roomOrderStore, setRoomOrder } from "$lib/room-order.svelte";
+  import { sortRooms } from "$lib/room-order";
   import {
     getMessages,
     getLastMessage,
@@ -258,9 +259,9 @@
   const dmUnreadTotal = $derived(
     [...dmUnread.values()].reduce((sum, n) => sum + n, 0)
   );
-  /** roomsStore.rooms laid out by the sidebar's saved drag order. */
+  /** roomsStore.rooms laid out by the sidebar's pins, then its drag order. */
   const orderedRooms = $derived(
-    applyRoomOrder(roomsStore.rooms, roomOrderStore.order)
+    sortRooms(roomsStore.rooms)
   );
 
   // Tell the transport what is actually on screen; see uiRoomCode.
@@ -1208,7 +1209,8 @@
     <div class="min-h-dvh bg-background text-foreground font-mono flex">
       <RoomSidebar
         rooms={orderedRooms}
-        onReorderRooms={setRoomOrder}
+        onReorderRooms={(order) => void setRoomOrder(order)}
+        onTogglePin={(code) => void toggleRoomPin(code)}
         phonebook={dmEntries}
         {dmPreviews}
         dmUnreadCounts={dmUnreadByPeer}
