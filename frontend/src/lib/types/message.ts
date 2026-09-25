@@ -233,8 +233,10 @@ export interface WireVoiceSignal {
 
 export interface WireWatchPresence {
   type: MessageType.WatchPresence;
-  /** Sharer peerId being watched, or null when the viewer stopped. */
+  /** The latest share being watched, or null for none. What older clients read. */
   watching: string | null;
+  /** Every share being watched, oldest first. Absent from older senders. */
+  watchingAll?: string[];
 }
 
 export interface WirePluginEphemeral {
