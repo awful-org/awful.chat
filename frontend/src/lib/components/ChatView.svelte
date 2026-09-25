@@ -50,6 +50,7 @@
     AtSign,
     Share2,
     RefreshCw,
+    MailX,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -99,10 +100,12 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
+    dmInboxNoticeFor,
     openDmPanel,
     removeFromPhonebook,
     isInPhonebook,
   } from "$lib/transport/dm.svelte";
+  import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
   import {
     buildMentionCandidates,
@@ -889,12 +892,11 @@
   // Pinned messages: private to this user, stored on the room record.
   const pinnedIds = $derived(pinnedMessagesOf(roomCode));
   const pinnedSet = $derived(new Set(pinnedIds));
-  let pinnedOpen = $state(false);
   /** Pinned messages older than the loaded page, read from storage. */
   let pinnedFromStore = $state(new Map<string, Message | null>());
 
   $effect(() => {
-    if (!pinnedOpen) return;
+    if (!uiState.pinnedOpen) return;
     const loaded = new Set(messages.map((m) => m.id));
     const missing = pinnedIds.filter(
       (id) => !loaded.has(id) && !pinnedFromStore.has(id)
@@ -952,7 +954,7 @@
   }
 
   function openPinned(msg: Message): void {
-    pinnedOpen = false;
+    uiState.pinnedOpen = false;
     void revealMessage(roomCode, msg.id, msg.lamport);
   }
 
@@ -1462,7 +1464,7 @@
 
   $effect(() => {
     void roomCode;
-    pinnedOpen = false;
+    uiState.pinnedOpen = false;
   });
 
   $effect(() => {
@@ -1645,6 +1647,15 @@
     return null;
   }
 
+  /**
+   * Who a DM from a profile card goes to: their live peerId when connected,
+   * else their DID - a DM works offline too (the queue, and the mailbox when
+   * both inboxes are on), so being offline is no reason to hide Message.
+   */
+  function dmTargetFor(senderId: string): string | null {
+    return peerIdForSender(senderId) ?? (senderId.startsWith("did:") ? senderId : null);
+  }
+
   let profileCardFor = $state<{
     did: string;
     name: string;
@@ -1755,6 +1766,13 @@
       : "flex-1"
   );
 
+  /** Offline and either inbox off: this DM only lands while you both are online. */
+  const dmInboxWarning = $derived(
+    isDmChat && !ephemeral && transportState.activeDmPeerId
+      ? dmInboxNoticeFor(transportState.activeDmPeerId, !mailboxPrefs.enabled)
+      : null
+  );
+
   const dmPeerInPhonebook = $derived.by(() => {
     const peerId = transportState.activeDmPeerId;
     if (!peerId) return false;
@@ -1780,19 +1798,26 @@
     // composedPath, not target.closest: unpinning removes the row that was
     // clicked before this runs, and a detached target is inside nothing -
     // which read as a click outside and closed the list on every unpin.
+    // A click inside a dialog is not a click on the page either: picking
+    // "Show pinned messages" in Ctrl+K opened the list and that same click,
+    // reaching here, shut it again.
     if (
-      pinnedOpen &&
+      uiState.pinnedOpen &&
       !e
         .composedPath()
-        .some((n) => n instanceof Element && n.hasAttribute("data-pinned-menu"))
+        .some(
+          (n) =>
+            n instanceof Element &&
+            (n.hasAttribute("data-pinned-menu") || n.getAttribute("role") === "dialog")
+        )
     )
-      pinnedOpen = false;
+      uiState.pinnedOpen = false;
   }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
       closeUserMenu();
       copyMenuOpen = false;
-      pinnedOpen = false;
+      uiState.pinnedOpen = false;
       reactionPickerFor = null;
       activeMessageId = null;
     }
@@ -1982,11 +2007,11 @@
                   {...props}
                   variant="ghost"
                   size="icon"
-                  onclick={() => (pinnedOpen = !pinnedOpen)}
+                  onclick={() => (uiState.pinnedOpen = !uiState.pinnedOpen)}
                   aria-label="Pinned messages"
                   aria-haspopup="menu"
-                  aria-expanded={pinnedOpen}
-                  class="flex text-muted-foreground hover:text-foreground cursor-pointer {pinnedOpen
+                  aria-expanded={uiState.pinnedOpen}
+                  class="flex text-muted-foreground hover:text-foreground cursor-pointer {uiState.pinnedOpen
                     ? 'text-primary'
                     : ''}"
                 >
@@ -1994,7 +2019,7 @@
                 </Button>
               {/snippet}
             </Tip>
-            {#if pinnedOpen}
+            {#if uiState.pinnedOpen}
               <div
                 role="menu"
                 aria-label="Pinned messages"
@@ -2708,6 +2733,17 @@
     </div>
   {/if}
 
+  {#if dmInboxWarning}
+    <!-- Sending still works; this says when it will land. -->
+    <p
+      role="status"
+      class="flex items-center gap-2 border-t border-border bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground"
+    >
+      <MailX class="size-3.5 shrink-0" />
+      {dmInboxWarning}
+    </p>
+  {/if}
+
   {#if replyTarget}
     <div
       class="px-4 p-2 text-muted-foreground bg-muted/50 border-t border-border text-sm"
@@ -3014,11 +3050,11 @@
     avatarUrl={profileCardFor.avatarUrl}
     color={profileCardFor.color}
     onEdit={() => openSettings("profile")}
-    onMessage={peerIdForSender(profileCardFor.did)
+    onMessage={dmTargetFor(profileCardFor.did)
       ? () => {
-          const pid = peerIdForSender(profileCardFor!.did)!;
+          const target = dmTargetFor(profileCardFor!.did)!;
           profileCardFor = null;
-          startDmFromMenu(pid);
+          startDmFromMenu(target);
         }
       : undefined}
     onTogglePhonebook={peerIdForSender(profileCardFor.did)

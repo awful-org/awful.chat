@@ -191,6 +191,12 @@ export interface WireProfile {
    */
   nameShimmer?: boolean;
   nameGlow?: boolean;
+  /**
+   * Set only when the sender's offline inbox (relay mailbox) is off: a DM
+   * then reaches them only while both sides are online. Absent means on -
+   * the default - and is also what an older build sends.
+   */
+  inboxOff?: true;
   gradient2?: string | null;
   gradient3?: string | null;
 }
@@ -233,8 +239,10 @@ export interface WireVoiceSignal {
 
 export interface WireWatchPresence {
   type: MessageType.WatchPresence;
-  /** Sharer peerId being watched, or null when the viewer stopped. */
+  /** The latest share being watched, or null for none. What older clients read. */
   watching: string | null;
+  /** Every share being watched, oldest first. Absent from older senders. */
+  watchingAll?: string[];
 }
 
 export interface WirePluginEphemeral {

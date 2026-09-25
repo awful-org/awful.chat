@@ -256,7 +256,8 @@ let { isMobile = false, onClose, onOpenSync }: Props = $props();
       the relay for up to 48 hours - they collect it next time they open the
       app, no need to be online together. The relay only ever sees
       ciphertext and delivery times, never content or who sent it. On by
-      default; turned off, DMs queue until you are both online together.
+      default; turned off, DMs queue until you are both online together -
+      and the people you talk to are told, so their DMs to you can say so.
     </p>
     <Switch
       checked={mailboxPrefs.enabled}

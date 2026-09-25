@@ -28,6 +28,7 @@ import {
 import { MessageType, type Message } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
 import { prepareOutgoingText } from "./outgoing-text";
+import { dmInboxNotice } from "$lib/dm-inbox-notice";
 import { base64ToBytes, bytesToBase64 } from "$lib/utils";
 import { leaveCall } from "./call.svelte";
 import {
@@ -748,6 +749,30 @@ export function resolveDmDisplayName(peerId: string): string {
   );
   if (entry?.nickname) return entry.nickname;
   return peerId.slice(0, 12);
+}
+
+/**
+ * The composer warning for a DM with this person, or null (see
+ * dm-inbox-notice.ts). `myInboxOff` comes from the caller, which already
+ * reads the mailbox prefs reactively - importing them here would close the
+ * mailbox -> transport -> dm cycle.
+ */
+export function dmInboxNoticeFor(
+  peerIdOrDid: string,
+  myInboxOff: boolean
+): string | null {
+  const did = dmPeerDid(peerIdOrDid);
+  if (!did) return null;
+  void transportState.peerDidVersion;
+  const peerId = looksLikeDid(peerIdOrDid)
+    ? didToPeerId(did, _peerIdToDid)
+    : peerIdOrDid;
+  return dmInboxNotice({
+    peerName: resolveDmDisplayName(peerId ?? peerIdOrDid),
+    peerOnline: !!peerId && transportState.peers.includes(peerId),
+    theirInboxOff: transportState.peerInboxOff.has(did),
+    myInboxOff,
+  });
 }
 
 export async function joinPhonebookDmRooms(): Promise<void> {

@@ -10,7 +10,12 @@
     dmPanel,
     defaultPanelPosition,
   } from "$lib/dm-panel.svelte";
-  import { closeDmPanel, sendDirectMessage } from "$lib/transport/dm.svelte";
+  import {
+    closeDmPanel,
+    dmInboxNoticeFor,
+    sendDirectMessage,
+  } from "$lib/transport/dm.svelte";
+  import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import { resolveChatFontStack } from "$lib/chat-font";
   import {
@@ -37,6 +42,10 @@
   let draft = $state("");
   let sendError = $state<string | null>(null);
   let sending = $state(false);
+  /** Same warning as the DMs tab: offline, and either inbox off. */
+  const inboxWarning = $derived(
+    dmPanel.peerId ? dmInboxNoticeFor(dmPanel.peerId, !mailboxPrefs.enabled) : null
+  );
   let list = $state<HTMLDivElement | null>(null);
 
   // Emoji shortcode autocomplete (":wave" -> popup -> unicode). Same pure
@@ -313,6 +322,7 @@
         {/if}
       </div>
 
+      {#if inboxWarning}<p role="status" class="border-t border-border bg-muted/40 px-2 py-1 text-[11px] text-muted-foreground">{inboxWarning}</p>{/if}
       {#if sendError}<p role="alert" class="px-2 py-1 text-xs text-destructive">{sendError}</p>{/if}
       {#if draft.length > 16384}<p role="status" class="px-2 text-xs text-muted-foreground">This long message will be sent as message.txt.</p>{/if}
       <div class="flex shrink-0 items-center gap-1.5 border-t border-border p-2">

@@ -129,6 +129,7 @@ import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
 import { _sendWatchPresence } from "./transmission.svelte";
+import { watchedFromWire } from "$lib/watch-presence";
 import {
   type DmPayload,
   encodeDmAckEnvelope,
@@ -425,6 +426,9 @@ interface TransportState {
    * only place that distinction reaches the UI.
    */
   provenPeers: Set<string>;
+  /** DIDs whose offline inbox is off, from their profiles (live or stored):
+   *  a DM reaches them only while both sides are online. */
+  peerInboxOff: Set<string>;
   /** Profile metadata: banners, tags, bios, name effects; keyed by DID. */
   peerProfileMeta: Map<
     string,
@@ -446,8 +450,13 @@ interface TransportState {
   callPeerRooms: Map<string, string>; // peerId -> roomCode they're calling in
   transmissionViewers: Map<string, Set<string>>; // sharer peerId -> viewer peerIds
   pendingTransmissions: Map<string, string>;
-  watchingTransmissionPeerId: string | null;
-  watchingTransmissionProducerId: string | null;
+  /**
+   * Shares being watched: sharer peerId -> producerId, oldest first (a
+   * re-watch moves to the end). Several at once is real - the SFU layer
+   * consumes each separately - and this used to be a single peerId, so the
+   * second share started made the first unstoppable.
+   */
+  watchingTransmissions: Map<string, string>;
   transmissionOutputVolume: number;
   fileTransfers: Map<string, FileTransferSnapshot>;
   callPeerStates: Map<string, { muted: boolean; deafened: boolean }>;
@@ -500,14 +509,14 @@ export const transportState = $state<TransportState>({
   historyCapped: false,
   relayedPeers: new Set(),
   provenPeers: new Set(),
+  peerInboxOff: new Set(),
   peerProfileMeta: new Map(),
   error: null,
   callPeerIds: new Set(),
   callPeerRooms: new Map(),
   transmissionViewers: new Map(),
   pendingTransmissions: new Map(),
-  watchingTransmissionPeerId: null,
-  watchingTransmissionProducerId: null,
+  watchingTransmissions: new Map(),
   transmissionOutputVolume: 1,
   fileTransfers: new Map(),
   callPeerStates: new Map(),
@@ -721,6 +730,9 @@ installTelemetryTaps({
   requestSfuDiag: () => _video.requestDiag(),
 });
 
+/** DIDs whose profile arrived live this session: storage must not overrule. */
+const _inboxHeardLive = new Set<string>();
+
 // Stored peer profile metadata is invisible until the peer re-broadcasts:
 // the reactive map only ever filled from live messages, so a reload emptied
 // every card and name effect for anyone not currently online. Hydrate from
@@ -732,6 +744,11 @@ installTelemetryTaps({
 function _hydratePeerProfileMeta(): void {
   void getAllPeerProfiles()
   .then((profiles) => {
+    const inboxOff = new Set(transportState.peerInboxOff);
+    for (const p of profiles) {
+      if (p.inboxOff && !_inboxHeardLive.has(p.did)) inboxOff.add(p.did);
+    }
+    transportState.peerInboxOff = inboxOff;
     const meta = new Map(transportState.peerProfileMeta);
     for (const p of profiles) {
       if (meta.has(p.did)) continue;
@@ -1001,6 +1018,11 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     nameEffect: profile?.nameEffect ?? undefined,
     nameShimmer: profile?.nameShimmer ?? undefined,
     nameGlow: profile?.nameGlow ?? undefined,
+    // Only when off, so a DM to us can warn it needs both of us online.
+    // Imported lazily like dm.svelte does: the mailbox imports this module.
+    inboxOff: (await import("./mailbox.svelte")).mailboxPrefs.enabled
+      ? undefined
+      : true,
   });
 
   const hash = frameHash(payload);
@@ -2213,6 +2235,16 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
     transportState.peerColors = colors;
   }
 
+  // Absent = on: the default, and what a build predating the field sends.
+  const inboxOff = msg.inboxOff === true;
+  _inboxHeardLive.add(did);
+  if (transportState.peerInboxOff.has(did) !== inboxOff) {
+    const next = new Set(transportState.peerInboxOff);
+    if (inboxOff) next.add(did);
+    else next.delete(did);
+    transportState.peerInboxOff = next;
+  }
+
   // Validate and store profile metadata
   const validated = validateProfileMeta({
     bannerUrl: msg.bannerUrl,
@@ -2267,6 +2299,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
         nameEffect: validated.nameEffect,
         nameShimmer: validated.nameShimmer,
         nameGlow: validated.nameGlow,
+        ...(inboxOff ? { inboxOff: true } : {}),
         ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
       }).catch(() => {})
     )
@@ -2290,10 +2323,18 @@ function _peerCallSound(
   else if (chime === "leave") playPeerLeaveSound();
 }
 
-/** One viewer watches at most one share; a new announcement replaces it. */
+/** Drop one share from what we are watching, if it is there. */
+export function _forgetWatched(peerId: string): void {
+  if (!transportState.watchingTransmissions.has(peerId)) return;
+  const next = new Map(transportState.watchingTransmissions);
+  next.delete(peerId);
+  transportState.watchingTransmissions = next;
+}
+
+/** A viewer's announcement replaces everything it said it watched before. */
 export function _handleWatchPresence(
   viewerPeerId: string,
-  watching: string | null
+  watching: readonly string[]
 ): void {
   const next = new Map<string, Set<string>>();
   for (const [sharer, viewers] of transportState.transmissionViewers) {
@@ -2311,10 +2352,13 @@ export function _handleWatchPresence(
   const theirRoom = transportState.callPeerRooms.get(viewerPeerId);
   const admitted =
     !!theirRoom && _transport.isRoomPeer(theirRoom, viewerPeerId);
-  if (watching && admitted && looksLikePeerId(watching)) {
-    const set = new Set(next.get(watching) ?? []);
-    set.add(viewerPeerId);
-    next.set(watching, set);
+  if (admitted) {
+    for (const sharer of watching) {
+      if (!looksLikePeerId(sharer)) continue;
+      const set = new Set(next.get(sharer) ?? []);
+      set.add(viewerPeerId);
+      next.set(sharer, set);
+    }
   }
   transportState.transmissionViewers = next;
 }
@@ -2374,10 +2418,7 @@ function _handleCallPresence(
     txNext.delete(peerId);
     transportState.pendingTransmissions = txNext;
 
-    if (transportState.watchingTransmissionPeerId === peerId) {
-      transportState.watchingTransmissionPeerId = null;
-      transportState.watchingTransmissionProducerId = null;
-    }
+    _forgetWatched(peerId);
 
     const callStateNext = new Map(transportState.callPeerStates);
     callStateNext.delete(peerId);
@@ -3042,7 +3083,7 @@ _transport.on("disconnect", (peerId) => {
   transportState.participants = parts;
 
   // Gone peers neither watch nor share.
-  _handleWatchPresence(peerId, null);
+  _handleWatchPresence(peerId, []);
   if (transportState.transmissionViewers.has(peerId)) {
     const viewers = new Map(transportState.transmissionViewers);
     viewers.delete(peerId);
@@ -3074,10 +3115,7 @@ _transport.on("disconnect", (peerId) => {
   txNext.delete(peerId);
   transportState.pendingTransmissions = txNext;
 
-  if (transportState.watchingTransmissionPeerId === peerId) {
-    transportState.watchingTransmissionPeerId = null;
-    transportState.watchingTransmissionProducerId = null;
-  }
+  _forgetWatched(peerId);
 });
 
 /**
@@ -3493,7 +3531,7 @@ _transport.on("message", (peerId, data, room) => {
         _voice.handleWireSignal(peerId, msg.signal);
         break;
       case MessageType.WatchPresence:
-        _handleWatchPresence(peerId, msg.watching);
+        _handleWatchPresence(peerId, watchedFromWire(msg));
         break;
       case MessageType.RoomName:
         _handleRoomName(msg, room);
@@ -3999,11 +4037,12 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerNames = new Map();
   transportState.peerAvatars = new Map();
   transportState.peerColors = new Map();
+  transportState.peerInboxOff = new Set();
+  _inboxHeardLive.clear();
   transportState.error = null;
   transportState.callPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
-  transportState.watchingTransmissionPeerId = null;
-  transportState.watchingTransmissionProducerId = null;
+  transportState.watchingTransmissions = new Map();
   transportState.fileTransfers = new Map();
   // The per-session "already hydrated this room" guard rides on the transfer
   // map staying populated across switches; when the map is wiped, the guard

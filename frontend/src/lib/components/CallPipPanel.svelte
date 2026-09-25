@@ -221,7 +221,9 @@
           {/snippet}
         </Tip>
 
-      <!-- Hides the panel for this call; the call itself carries on. -->
+      <!-- Hides the panel for this call; the call itself carries on. A
+           neutral hover, not red: red is the leave-call button beside it,
+           and two red buttons read as two ways to hang up. -->
       <Tip text="Close">
         {#snippet children(props)}
           <button
@@ -229,7 +231,7 @@
             type="button"
             onclick={() => (callPipPanel.dismissed = true)}
             aria-label="Close call panel"
-            class={btn}
+            class="inline-flex size-8 [@media(pointer:coarse)]:size-10 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <X class="size-4" />
           </button>

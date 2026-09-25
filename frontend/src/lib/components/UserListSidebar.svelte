@@ -230,14 +230,14 @@
           transportState.callPeerRooms.get(did) === transportState.roomCode;
 
       // A pending entry means they are sharing and we are not watching;
-      // watching moves them out of pending and into watchingTransmissionPeerId.
+      // watching moves them out of pending and into watchingTransmissions.
       const sharing = isSelf
         ? transportState.screenSharing
         : [mappedPeerId, did].some(
             (k) =>
               !!k &&
               (transportState.pendingTransmissions.has(k) ||
-                transportState.watchingTransmissionPeerId === k)
+                transportState.watchingTransmissions.has(k))
           );
 
       allUsers.push({
@@ -572,15 +572,16 @@
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
   >
+    <!-- Never "unavailable": an offline member is reached by DID, and the
+         DM itself warns when it will only land while both are online. -->
     <button
       type="button"
-      disabled={!userMenu.user.peerId}
       class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
       onclick={() =>
-        userMenu?.user.peerId && handleOpenDm(userMenu.user.peerId)}
+        userMenu && handleOpenDm(userMenu.user.peerId ?? userMenu.user.did)}
     >
       <Users class="size-4" />
-      {userMenu.user.peerId ? "Send DM" : "DM unavailable"}
+      Send DM
     </button>
     {#if userMenu.user.peerId && !isInPhonebook(userMenu.user.peerId)}
       <button
@@ -618,13 +619,13 @@
     avatarUrl={selectedUserForProfile.avatarUrl ?? undefined}
     color={selectedUserForProfile.color ?? undefined}
     onEdit={() => openSettings("profile")}
-    onMessage={selectedUserForProfile.peerId
-      ? () => {
-          const pid = selectedUserForProfile!.peerId!;
-          selectedUserForProfile = null;
-          handleOpenDm(pid);
-        }
-      : undefined}
+    onMessage={() => {
+      // Offline members too: their DID opens the conversation, and the DM
+      // itself says if it will only land while you are both online.
+      const target = selectedUserForProfile!.peerId ?? selectedUserForProfile!.did;
+      selectedUserForProfile = null;
+      handleOpenDm(target);
+    }}
     onTogglePhonebook={selectedUserForProfile.peerId
       ? () => {
           const pid = selectedUserForProfile!.peerId!;

@@ -42,10 +42,17 @@ export const uiState = $state({
    * left Ctrl+K with no way to show it.
    */
   userListOpen: false,
+  /** The open room's pinned-messages list (ChatView's header dropdown). Shared
+   *  for the same reason as userListOpen: Ctrl+K opens and closes it too. */
+  pinnedOpen: false,
 });
 
 export function toggleUserList(): void {
   uiState.userListOpen = !uiState.userListOpen;
+}
+
+export function togglePinnedMessages(): void {
+  uiState.pinnedOpen = !uiState.pinnedOpen;
 }
 
 export function openSharePicker(): void {

@@ -10,8 +10,7 @@ describe("buildCallTiles", () => {
       localCameraStream: null,
       localScreenStream: null,
       cameraOff: false,
-      watchingTransmissionPeerId: null,
-      watchingTransmissionProducerId: null,
+      watchingTransmissions: new Map(),
       selfId: "self",
       trackStartTimes: new Map(),
     };
@@ -126,8 +125,7 @@ describe("buildCallTiles", () => {
 
   it("a watched share with its track is a remote-screen tile, like the stage", () => {
     const transmissionTrack = { kind: "video" } as MediaStreamTrack;
-    state.watchingTransmissionPeerId = "sharer1";
-    state.watchingTransmissionProducerId = "prod-123";
+    state.watchingTransmissions = new Map([["sharer1", "prod-123"]]);
     state.participants.set("sharer1", {
       videoTrack: null,
       screenTrack: transmissionTrack,
@@ -142,8 +140,7 @@ describe("buildCallTiles", () => {
   });
 
   it("includes transmission tile while joining (producerId set, no track yet)", () => {
-    state.watchingTransmissionPeerId = "sharer1";
-    state.watchingTransmissionProducerId = "prod-123";
+    state.watchingTransmissions = new Map([["sharer1", "prod-123"]]);
     state.participants.set("sharer1", {
       videoTrack: null,
       screenTrack: null,
@@ -156,8 +153,20 @@ describe("buildCallTiles", () => {
     expect(txTile?.videoTrack).toBeNull();
   });
 
+  it("a waiting tile for EVERY share being watched, not just the latest", () => {
+    state.watchingTransmissions = new Map([
+      ["sharer1", "prod-1"],
+      ["sharer2", "prod-2"],
+    ]);
+    const tiles = buildCallTiles(state);
+    expect(tiles.filter((t) => t.id.startsWith("pending-tx-")).map((t) => t.id)).toEqual([
+      "pending-tx-sharer1",
+      "pending-tx-sharer2",
+    ]);
+  });
+
   it("does not include transmission tile when not watching", () => {
-    state.watchingTransmissionPeerId = null;
+    state.watchingTransmissions = new Map();
     state.participants.set("sharer1", {
       videoTrack: null,
       screenTrack: { kind: "video" } as MediaStreamTrack,
@@ -171,8 +180,7 @@ describe("buildCallTiles", () => {
 
   it("one tile per source: no duplicates for watched peer", () => {
     const screenTrack = { kind: "video" } as MediaStreamTrack;
-    state.watchingTransmissionPeerId = "sharer1";
-    state.watchingTransmissionProducerId = "prod-123";
+    state.watchingTransmissions = new Map([["sharer1", "prod-123"]]);
     state.participants.set("sharer1", {
       videoTrack: null,
       screenTrack,
@@ -205,8 +213,7 @@ describe("buildCallTiles", () => {
       videoTrack: remoteCamTrack,
       screenTrack: remoteScreenTrack,
     });
-    state.watchingTransmissionPeerId = "peer2";
-    state.watchingTransmissionProducerId = "prod-123";
+    state.watchingTransmissions = new Map([["peer2", "prod-123"]]);
     state.participants.set("peer2", {
       videoTrack: null,
       screenTrack: null,
