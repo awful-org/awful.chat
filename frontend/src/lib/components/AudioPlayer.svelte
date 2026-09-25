@@ -32,16 +32,38 @@
   let el = $state<HTMLAudioElement | null>(null);
   let playing = $state(false);
   let muted = $state(false);
-  let volume = $state(loadVolume());
+  const initialVolume = loadVolume();
+  let volume = $state(initialVolume);
+  /** The level to come back to when unmuting from zero. */
+  let lastAudible = initialVolume > 0 ? initialVolume : 1;
   $effect(() => {
-    if (el) el.volume = volume;
+    if (!el) return;
+    el.volume = volume;
+    el.muted = muted;
   });
+
+  // Mute and the slider are one control: the slider reads 0 while muted,
+  // moving it up unmutes, and dragging it to 0 is muting. They used to be
+  // separate, so a muted clip stayed silent however far the slider moved.
   function setVolume(value: number) {
     volume = value;
+    if (value > 0) {
+      lastAudible = value;
+      muted = false;
+    }
     try {
       localStorage.setItem(VOLUME_KEY, String(value));
     } catch {
       // Storage blocked: the level just does not survive a reload.
+    }
+  }
+
+  function toggleMute(): void {
+    if (muted || volume === 0) {
+      muted = false;
+      if (volume === 0) setVolume(lastAudible);
+    } else {
+      muted = true;
     }
   }
   let currentTime = $state(0);
@@ -142,11 +164,8 @@
   <div class="group/vol relative shrink-0">
     <button
       type="button"
-      onclick={() => {
-        muted = !muted;
-        if (el) el.muted = muted;
-      }}
-      aria-label={muted ? `Unmute ${label}` : `Mute ${label}`}
+      onclick={toggleMute}
+      aria-label={muted || volume === 0 ? `Unmute ${label}` : `Mute ${label}`}
       class="inline-flex size-6 cursor-pointer items-center justify-center rounded text-muted-foreground hover:text-foreground"
     >
       {#if muted || volume === 0}
@@ -166,7 +185,7 @@
           min="0"
           max="1"
           step="0.05"
-          value={volume}
+          value={muted ? 0 : volume}
           aria-label={`Volume for ${label}`}
           oninput={(e) => setVolume(Number(e.currentTarget.value))}
           class="h-1 w-20 cursor-pointer accent-primary"
