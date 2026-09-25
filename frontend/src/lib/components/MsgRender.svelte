@@ -1388,15 +1388,27 @@
   {/if}
 </div>
 
+<!--
+  On the window, not the dialog: opening the viewer leaves focus on the
+  thumbnail that was clicked, which is outside it, so a handler on the dialog
+  itself never heard Escape. One of these per message, each closing only its
+  own open viewer.
+-->
+<svelte:window
+  onkeydown={(e) => {
+    if (lightbox && e.key === "Escape") {
+      e.preventDefault();
+      closeLightbox();
+    }
+  }}
+/>
+
 {#if lightbox && canLoadMedia(lightbox.url)}
   <div
     class="fixed inset-0 z-50 grid place-items-center p-4"
     role="dialog"
     aria-modal="true"
     tabindex="0"
-    onkeydown={(e) => {
-      if (e.key === "Escape") closeLightbox();
-    }}
   >
     <button
       type="button"
