@@ -1233,7 +1233,11 @@
         onOpenPhonebook={() => (phonebookOpen = true)}
         collapsed={!isMobile && displayPrefs.sidebarCollapsed}
         onToggleCollapsed={() =>
-          setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
+          // A phone has no rail to collapse to (`collapsed` is forced off
+          // there), so the button closes the slide-over instead.
+          isMobile
+            ? (sidebarOpen = false)
+            : setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
       />
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}
