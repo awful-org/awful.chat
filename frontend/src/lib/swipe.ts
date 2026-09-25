@@ -1,5 +1,7 @@
 /**
- * Mobile swipes on a message row: left to reply, right to open the sidebar.
+ * Mobile swipes in the chat: left on a message row to reply (the row
+ * follows the finger), right anywhere in the message area to open the rooms
+ * sidebar (nothing moves).
  *
  * Decisions use the RAW finger travel; only the drawing is damped. The old
  * code compared the damped offset against the threshold, and its curve

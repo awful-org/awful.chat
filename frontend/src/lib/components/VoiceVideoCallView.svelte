@@ -2084,7 +2084,12 @@ import {
       }}
     >
       {#if isSmallScreen}
-        <div class="grid grid-cols-3 items-center gap-2">
+        <!-- 1fr auto 1fr, not three equal thirds: the mic/camera/screen card
+             is wider than a third of a phone, and an equal column let it
+             run under the hang-up button. An fr track never goes below its
+             content, so the card takes what it needs and hang-up stays
+             centred whenever there is room to. -->
+        <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
           <div class="flex justify-start">
             <div
               class="flex gap-2 rounded-xl border border-white/10 bg-zinc-900/95 px-2.5 py-2"
