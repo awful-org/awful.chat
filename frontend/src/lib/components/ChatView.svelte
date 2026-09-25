@@ -50,6 +50,7 @@
     AtSign,
     Share2,
     RefreshCw,
+    MailX,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -99,10 +100,12 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
+    dmInboxNoticeFor,
     openDmPanel,
     removeFromPhonebook,
     isInPhonebook,
   } from "$lib/transport/dm.svelte";
+  import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
   import {
     buildMentionCandidates,
@@ -1645,6 +1648,15 @@
     return null;
   }
 
+  /**
+   * Who a DM from a profile card goes to: their live peerId when connected,
+   * else their DID - a DM works offline too (the queue, and the mailbox when
+   * both inboxes are on), so being offline is no reason to hide Message.
+   */
+  function dmTargetFor(senderId: string): string | null {
+    return peerIdForSender(senderId) ?? (senderId.startsWith("did:") ? senderId : null);
+  }
+
   let profileCardFor = $state<{
     did: string;
     name: string;
@@ -1753,6 +1765,13 @@
           showUserList && !isDmChat ? "w-156" : "w-96"
         }`
       : "flex-1"
+  );
+
+  /** Offline and either inbox off: this DM only lands while you both are online. */
+  const dmInboxWarning = $derived(
+    isDmChat && !ephemeral && transportState.activeDmPeerId
+      ? dmInboxNoticeFor(transportState.activeDmPeerId, !mailboxPrefs.enabled)
+      : null
   );
 
   const dmPeerInPhonebook = $derived.by(() => {
@@ -2708,6 +2727,17 @@
     </div>
   {/if}
 
+  {#if dmInboxWarning}
+    <!-- Sending still works; this says when it will land. -->
+    <p
+      role="status"
+      class="flex items-center gap-2 border-t border-border bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground"
+    >
+      <MailX class="size-3.5 shrink-0" />
+      {dmInboxWarning}
+    </p>
+  {/if}
+
   {#if replyTarget}
     <div
       class="px-4 p-2 text-muted-foreground bg-muted/50 border-t border-border text-sm"
@@ -3014,11 +3044,11 @@
     avatarUrl={profileCardFor.avatarUrl}
     color={profileCardFor.color}
     onEdit={() => openSettings("profile")}
-    onMessage={peerIdForSender(profileCardFor.did)
+    onMessage={dmTargetFor(profileCardFor.did)
       ? () => {
-          const pid = peerIdForSender(profileCardFor!.did)!;
+          const target = dmTargetFor(profileCardFor!.did)!;
           profileCardFor = null;
-          startDmFromMenu(pid);
+          startDmFromMenu(target);
         }
       : undefined}
     onTogglePhonebook={peerIdForSender(profileCardFor.did)

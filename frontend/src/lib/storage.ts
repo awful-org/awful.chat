@@ -117,6 +117,9 @@ export interface PeerProfile {
   /** Extra gradient stops for the "gradient" name effect. */
   gradient2?: string;
   gradient3?: string;
+  /** Their offline inbox is off (from their profile). Kept so it is known
+   *  while they are offline, which is exactly when it matters. */
+  inboxOff?: boolean;
   updatedAt: number;
 }
 

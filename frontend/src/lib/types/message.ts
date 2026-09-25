@@ -191,6 +191,12 @@ export interface WireProfile {
    */
   nameShimmer?: boolean;
   nameGlow?: boolean;
+  /**
+   * Set only when the sender's offline inbox (relay mailbox) is off: a DM
+   * then reaches them only while both sides are online. Absent means on -
+   * the default - and is also what an older build sends.
+   */
+  inboxOff?: true;
   gradient2?: string | null;
   gradient3?: string | null;
 }

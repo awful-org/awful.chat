@@ -21,7 +21,7 @@
     name: string;
     avatarUrl?: string;
     color?: string;
-    /** Absent = the action is unavailable (self, or peer not connected). */
+    /** Absent = no Message action (yourself, or nobody to address). */
     onMessage?: () => void;
     onTogglePhonebook?: () => void;
     inPhonebook?: boolean;
