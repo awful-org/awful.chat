@@ -384,7 +384,7 @@
   let swipeMessageId = $state<string | null>(null);
   let isSwiping = $state(false);
   let swipeDirection: SwipeDirection = $state("undecided");
-  /** Replies start from the right half, so a left-half touch can only open the sidebar. */
+  /** Replies start from the right half of the row, clear of the thumb's scroll path. */
   let swipeCanReply = false;
   /** Set once the swipe has replied, so holding past the threshold does not reply again. */
   let swipeFired = false;
@@ -1306,19 +1306,16 @@
 
     if (swipeDirection !== "horizontal") return;
 
-    // Leftward is reply, which only a right-half touch may start; a swipe
-    // that turns back past its start is drawn at rest rather than dropped.
-    const raw = deltaX < 0 && !swipeCanReply ? 0 : deltaX;
+    // Only leftward moves the row, and only from a right-half touch; a
+    // rightward swipe is the message area's (regionTouchMove), and the row
+    // stays put for it.
+    const raw = deltaX < 0 && swipeCanReply ? deltaX : 0;
     isSwiping = true;
     swipeDelta = raw;
 
     // Act the moment the threshold is crossed rather than on touchend: the
     // browser can cancel the touch mid-gesture, and then no touchend comes.
-    const action = swipeAction(raw);
-    if (action === "sidebar") {
-      resetSwipe();
-      onOpenSidebar?.();
-    } else if (action === "reply" && !swipeFired) {
+    if (swipeAction(raw) === "reply" && !swipeFired) {
       swipeFired = true;
       const msg = visibleMessages.find((m) => m.id === msgId);
       if (msg) {
@@ -1332,6 +1329,40 @@
   function handleTouchEnd(msgId: string) {
     if (swipeMessageId !== msgId) return;
     resetSwipe();
+  }
+
+  /**
+   * Swiping right anywhere in the message area opens the rooms sidebar.
+   * On the area rather than the rows so it works with no messages, and the
+   * rows do not move for it: it is navigation, not something done to a
+   * message.
+   */
+  let regionSwipe: { x: number; y: number; dir: SwipeDirection } | null = null;
+
+  function regionTouchStart(e: TouchEvent) {
+    const t = e.touches.length === 1 ? e.touches[0] : null;
+    regionSwipe = t ? { x: t.clientX, y: t.clientY, dir: "undecided" } : null;
+  }
+
+  function regionTouchMove(e: TouchEvent) {
+    if (!regionSwipe || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dx = t.clientX - regionSwipe.x;
+    const absX = Math.abs(dx);
+    const absY = Math.abs(t.clientY - regionSwipe.y);
+    if (absX < SWIPE_DEADZONE && absY < SWIPE_DEADZONE) return;
+    if (regionSwipe.dir === "undecided") {
+      if (absX > absY * SWIPE_DIRECTION_RATIO) regionSwipe.dir = "horizontal";
+      else if (absY > absX) {
+        regionSwipe = null;
+        return;
+      }
+    }
+    if (regionSwipe.dir === "horizontal" && swipeAction(dx) === "sidebar") {
+      regionSwipe = null;
+      resetSwipe();
+      onOpenSidebar?.();
+    }
   }
 
   $effect(() => {
@@ -1955,8 +1986,10 @@
             </Tip>
           </div>
         {:else}
-          <p class="border-t border-border/60 px-3 py-4 text-center text-xs text-muted-foreground">
-            No pinned messages. Hover a message and press the pin to keep it here.
+          <!-- Taller in the phone drawer: at py-4 the empty sheet was barely
+               taller than its own drag handle. -->
+          <p class="border-t border-border/60 px-3 {isMobile ? 'py-10' : 'py-4'} text-center text-xs text-muted-foreground">
+            No pinned messages. {isMobile ? "Tap" : "Hover"} a message and press the pin to keep it here.
           </p>
         {/each}
       </div>
@@ -2468,10 +2501,19 @@
         </div>
       </div>
     {/if}
+    <!-- The touch handlers are the swipe-right-for-sidebar gesture; the
+         header button is its accessible equivalent. -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       bind:this={messagesEl}
       onscroll={handleScroll}
-      style="--chat-font-size: {displayPrefs.chatFontSize}px"
+      ontouchstart={isMobile && onOpenSidebar ? regionTouchStart : undefined}
+      ontouchmove={isMobile && onOpenSidebar ? regionTouchMove : undefined}
+      ontouchend={isMobile ? () => (regionSwipe = null) : undefined}
+      ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
+      style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
+        ? ' touch-action: pan-y;'
+        : ''}"
       class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
     >
       {#if canLoadOlder && visibleMessages.length > 0}

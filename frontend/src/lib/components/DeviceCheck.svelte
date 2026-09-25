@@ -106,6 +106,10 @@
     const wantMic = mic;
     untrack(() => {
       if (wantOpen) void start(wantCamera, wantMic);
+      else {
+        error = null;
+        permissionDenied = false;
+      }
     });
     return () => untrack(teardown);
   });
@@ -113,8 +117,11 @@
   async function start(cameraId: string | null, micId: string | null) {
     teardown();
     const request = ++requestId;
-    error = null;
-    permissionDenied = false;
+    // The error stays up until this attempt settles. Clearing it first made
+    // a retry after a refusal flicker: a browser that has been told no
+    // rejects at once without asking, so the panel blinked to "waiting" and
+    // straight back to the same error.
+    const wasDenied = permissionDenied;
     pending = true;
     try {
       const acquired = await navigator.mediaDevices.getUserMedia({
@@ -126,6 +133,8 @@
         return;
       }
       stream = acquired;
+      error = null;
+      permissionDenied = false;
       ready = acquired.getVideoTracks().some((track) => track.readyState === "live");
     } catch (err) {
       if (request !== requestId) return;
@@ -134,7 +143,9 @@
       permissionDenied = err instanceof Error && err.name === "NotAllowedError";
       const devices = showMic ? "camera or microphone" : "camera";
       error = permissionDenied
-        ? `Your browser is not letting this page use the ${devices}.`
+        ? wasDenied
+          ? `Still blocked. The browser will not ask again after a refusal; it has to be allowed in its site settings.`
+          : `Your browser is not letting this page use the ${devices}.`
         : `Could not open the ${devices}. Check whether another app is using it.`;
       return;
     } finally {
@@ -177,6 +188,36 @@
     tick();
   }
 
+  /**
+   * Once refused, the browser answers getUserMedia with a refusal and never
+   * shows the prompt again, so "ask again" cannot ask. Watch the permission
+   * instead, where the browser exposes it, and retry the moment it is
+   * allowed in site settings.
+   */
+  $effect(() => {
+    if (!open || !permissionDenied || !navigator.permissions) return;
+    const names = (showMic ? ["camera", "microphone"] : ["camera"]) as PermissionName[];
+    let statuses: PermissionStatus[] = [];
+    let cancelled = false;
+    void Promise.all(
+      // Firefox has no "camera" permission name and throws; that browser
+      // keeps the manual retry.
+      names.map((name) => navigator.permissions.query({ name }).catch(() => null))
+    ).then((found) => {
+      if (cancelled) return;
+      statuses = found.filter((s): s is PermissionStatus => s !== null);
+      for (const status of statuses) {
+        status.onchange = () => {
+          if (status.state !== "denied") void start(camera, mic);
+        };
+      }
+    });
+    return () => {
+      cancelled = true;
+      for (const status of statuses) status.onchange = null;
+    };
+  });
+
   function pickCamera(id: string) {
     camera = id || null;
     saveAudioPrefs({ cameraDevice: camera });
@@ -215,11 +256,11 @@
     {#if error}
       <p role="status" class="text-xs text-destructive font-mono leading-relaxed">{error}</p>
       {#if permissionDenied}
-        <p class="text-xs text-muted-foreground leading-relaxed">If no permission prompt appears, open your browser's site settings, allow camera{showMic ? " and microphone" : ""} access, then try again.</p>
+        <p class="text-xs text-muted-foreground leading-relaxed">Open the site settings (the icon beside the address bar), allow camera{showMic ? " and microphone" : ""} access, then try again.</p>
       {/if}
       <Button variant="outline" class="text-xs font-mono" disabled={pending}
         onclick={() => void start(camera, mic)}>
-        {permissionDenied ? "Ask again for permission" : "Try camera again"}
+        {pending ? "Trying..." : permissionDenied ? "Try again" : "Try camera again"}
       </Button>
     {:else if pending}
       <p role="status" class="text-xs text-muted-foreground">Waiting for camera access...</p>
