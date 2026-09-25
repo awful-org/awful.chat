@@ -302,6 +302,14 @@
   }
 
   let userMenu = $state<{ user: User; x: number; y: number } | null>(null);
+  /**
+   * Who the member menu adds or removes. Offline members too: the phonebook
+   * stores them by DID until they are next seen, and merges the rows then
+   * (addToPhonebook).
+   */
+  const userMenuContact = $derived(
+    userMenu ? (userMenu.user.peerId ?? userMenu.user.did) : ""
+  );
   let selectedUserForProfile = $state<User | null>(null);
 
   function openUserMenu(e: MouseEvent, user: User): void {
@@ -583,23 +591,20 @@
       <Users class="size-4" />
       Send DM
     </button>
-    {#if userMenu.user.peerId && !isInPhonebook(userMenu.user.peerId)}
+    {#if !isInPhonebook(userMenuContact)}
       <button
         type="button"
         class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
-        onclick={() =>
-          userMenu?.user.peerId && handleAddToPhonebook(userMenu.user.peerId)}
+        onclick={() => handleAddToPhonebook(userMenuContact)}
       >
         <UserPlus class="size-4" />
         Add to phonebook
       </button>
-    {:else if userMenu.user.peerId}
+    {:else}
       <button
         type="button"
         class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono text-destructive hover:bg-muted cursor-pointer"
-        onclick={() =>
-          userMenu?.user.peerId &&
-          handleRemoveFromPhonebook(userMenu.user.peerId)}
+        onclick={() => handleRemoveFromPhonebook(userMenuContact)}
       >
         <UserRoundMinus class="size-4" />
         Remove from phonebook
@@ -626,15 +631,13 @@
       selectedUserForProfile = null;
       handleOpenDm(target);
     }}
-    onTogglePhonebook={selectedUserForProfile.peerId
-      ? () => {
-          const pid = selectedUserForProfile!.peerId!;
-          if (isInPhonebook(pid)) handleRemoveFromPhonebook(pid);
-          else handleAddToPhonebook(pid);
-        }
-      : undefined}
-    inPhonebook={selectedUserForProfile.peerId
-      ? isInPhonebook(selectedUserForProfile.peerId)
-      : false}
+    onTogglePhonebook={() => {
+      const contact = selectedUserForProfile!.peerId ?? selectedUserForProfile!.did;
+      if (isInPhonebook(contact)) handleRemoveFromPhonebook(contact);
+      else handleAddToPhonebook(contact);
+    }}
+    inPhonebook={isInPhonebook(
+      selectedUserForProfile.peerId ?? selectedUserForProfile.did
+    )}
   />
 {/if}

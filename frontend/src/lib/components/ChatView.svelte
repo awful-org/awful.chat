@@ -51,11 +51,18 @@
     Share2,
     RefreshCw,
     MailX,
+    EllipsisVertical,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
   import { Tip } from "$lib/components/ui/tooltip";
   import { Separator } from "$lib/components/ui/separator";
+  import {
+    Drawer,
+    DrawerContent,
+    DrawerHeader,
+    DrawerTitle,
+  } from "$lib/components/ui/drawer";
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import MsgRender from "./MsgRender.svelte";
   import LocalPluginCard from "./LocalPluginCard.svelte";
@@ -96,6 +103,7 @@
   import { getMessage } from "$lib/storage";
   import { openSearch } from "$lib/search/ui.svelte";
   import { revealMessage } from "$lib/reveal-message";
+  import { REPLY_THRESHOLD, dragOffset, swipeAction } from "$lib/swipe";
   import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
   import {
@@ -371,11 +379,15 @@
   type SwipeDirection = "undecided" | "horizontal" | "vertical";
   let swipeStartX = $state(0);
   let swipeStartY = $state(0);
-  let swipeCurrentX = $state(0);
+  /** Raw horizontal finger travel; the row is drawn at dragOffset() of it. */
+  let swipeDelta = $state(0);
   let swipeMessageId = $state<string | null>(null);
   let isSwiping = $state(false);
   let swipeDirection: SwipeDirection = $state("undecided");
-  const SWIPE_THRESHOLD = 60;
+  /** Replies start from the right half, so a left-half touch can only open the sidebar. */
+  let swipeCanReply = false;
+  /** Set once the swipe has replied, so holding past the threshold does not reply again. */
+  let swipeFired = false;
   const SWIPE_DEADZONE = 20;
   const SWIPE_DIRECTION_RATIO = 1.75;
 
@@ -392,6 +404,10 @@
     x: number;
     y: number;
   } | null>(null);
+  /** Who the author menu acts on; offline authors too, by DID. */
+  const userMenuContact = $derived(
+    userMenu ? (userMenu.peerId ?? dmTargetFor(userMenu.senderId)) : null
+  );
 
   $effect(() => {
     if (typeof window === "undefined") return;
@@ -1126,6 +1142,20 @@
   }
 
   let copyMenuOpen = $state(false);
+  /** The phone header's overflow sheet: what the header has no room for. */
+  let moreOpen = $state(false);
+
+  /** Leave/delete asks twice unless it is an ephemeral call. */
+  function leaveOrConfirm() {
+    if (!ephemeral && !confirmingDelete) {
+      confirmingDelete = true;
+      setTimeout(() => (confirmingDelete = false), 3000);
+      return;
+    }
+    confirmingDelete = false;
+    moreOpen = false;
+    onLeave();
+  }
   // Header short code: minted for THIS room on first use and dropped on a
   // room switch, since it aliases one room code.
   let shortCode = $state<string | null>(null);
@@ -1225,29 +1255,29 @@
     textareaEl.style.height = textareaEl.scrollHeight + "px";
   }
 
+  function resetSwipe() {
+    swipeMessageId = null;
+    swipeDirection = "undecided";
+    isSwiping = false;
+    swipeDelta = 0;
+    swipeFired = false;
+  }
+
   function handleTouchStart(msgId: string, e: TouchEvent) {
     if (e.touches.length !== 1) {
-      swipeMessageId = null;
-      isSwiping = false;
+      resetSwipe();
       return;
     }
 
-    const rowEl = e.currentTarget as HTMLElement | null;
-    if (rowEl) {
-      const rect = rowEl.getBoundingClientRect();
-      const touchX = e.touches[0].clientX;
-      if (touchX < rect.left + rect.width * 0.5) {
-        swipeMessageId = null;
-        isSwiping = false;
-        return;
-      }
-    }
-
     const touch = e.touches[0];
+    const rowEl = e.currentTarget as HTMLElement | null;
+    const rect = rowEl?.getBoundingClientRect();
+    swipeCanReply = !rect || touch.clientX >= rect.left + rect.width * 0.5;
+
     swipeStartX = touch.clientX;
     swipeStartY = touch.clientY;
-    swipeCurrentX = touch.clientX;
-
+    swipeDelta = 0;
+    swipeFired = false;
     swipeMessageId = msgId;
     swipeDirection = "undecided";
     isSwiping = false;
@@ -1274,43 +1304,34 @@
       }
     }
 
-    if (swipeDirection === "horizontal") {
-      if (deltaX >= 0) {
-        isSwiping = false;
-        return;
-      }
+    if (swipeDirection !== "horizontal") return;
 
-      const resistance = 1 - Math.pow(Math.min(absX / 180, 1), 1.2);
-      const adjustedX = deltaX * resistance;
+    // Leftward is reply, which only a right-half touch may start; a swipe
+    // that turns back past its start is drawn at rest rather than dropped.
+    const raw = deltaX < 0 && !swipeCanReply ? 0 : deltaX;
+    isSwiping = true;
+    swipeDelta = raw;
 
-      isSwiping = true;
-      swipeCurrentX = swipeStartX + adjustedX;
-
-      if (adjustedX < -SWIPE_THRESHOLD) {
-        const msg = visibleMessages.find((m) => m.id === msgId);
-        if (msg) {
-          startReply(msg);
-          activeMessageId = null;
-        }
-      }
-    }
-  }
-
-  function handleTouchEnd(msgId: string, _: TouchEvent) {
-    if (swipeMessageId !== msgId) return;
-
-    if (isSwiping && swipeCurrentX - swipeStartX < -SWIPE_THRESHOLD) {
+    // Act the moment the threshold is crossed rather than on touchend: the
+    // browser can cancel the touch mid-gesture, and then no touchend comes.
+    const action = swipeAction(raw);
+    if (action === "sidebar") {
+      resetSwipe();
+      onOpenSidebar?.();
+    } else if (action === "reply" && !swipeFired) {
+      swipeFired = true;
       const msg = visibleMessages.find((m) => m.id === msgId);
       if (msg) {
+        navigator.vibrate?.(10);
         startReply(msg);
         activeMessageId = null;
       }
     }
+  }
 
-    swipeMessageId = null;
-    swipeDirection = "undecided";
-    isSwiping = false;
-    swipeCurrentX = 0;
+  function handleTouchEnd(msgId: string) {
+    if (swipeMessageId !== msgId) return;
+    resetSwipe();
   }
 
   $effect(() => {
@@ -1860,6 +1881,87 @@
        than eaten out of it - the app paints under a translucent status bar
        (viewport-fit=cover), so without this the room name sat under the
        clock on a phone. -->
+  <!-- One list, two frames: a dropdown under the pin on a desktop, a
+       bottom drawer on a phone, where a 20rem popover off the header's edge
+       is cramped and hard to dismiss. -->
+  {#snippet pinnedList()}
+    <div class="flex items-center justify-between gap-2 px-3 py-2 text-[10px] font-mono text-muted-foreground">
+      <span>Pinned · only you see these</span>
+      <span class="tabular-nums" aria-label="{pinnedIds.length} pinned">{pinnedIds.length}</span>
+    </div>
+    <div class="overflow-y-auto">
+      {#each pinnedEntries as entry (entry.id)}
+        <div class="group/pin flex items-start gap-1 border-t border-border/60 px-1 py-1">
+          {#if entry.msg}
+            {@const msg = entry.msg}
+            {@const images = pinnedImages(msg)}
+            {@const preview = pinnedPreview(msg)}
+            <button
+              type="button"
+              role="menuitem"
+              onclick={() => openPinned(msg)}
+              class="min-w-0 flex-1 rounded px-2 py-1 text-left hover:bg-muted cursor-pointer"
+            >
+              <div class="flex items-baseline gap-2 text-xs">
+                <span class="truncate font-medium text-foreground">{displayName(msg)}</span>
+                <span class="shrink-0 text-[10px] text-muted-foreground">{formatDate(msg.timestamp)}</span>
+              </div>
+              {#if images.length > 0}
+                <div class="mt-1 flex flex-wrap gap-1">
+                  {#each images as img (img.key)}
+                    {#if img.url}
+                      <GifImage
+                        src={img.url}
+                        alt={img.alt}
+                        class="size-16 rounded object-cover"
+                        animated={img.gif}
+                        animate="hover"
+                      />
+                    {:else}
+                      <!-- Not on this device yet; the chat
+                           fetches it, the list only shows it. -->
+                      <span class="flex size-16 items-center justify-center rounded bg-muted text-[10px] text-muted-foreground">
+                        image
+                      </span>
+                    {/if}
+                  {/each}
+                </div>
+              {/if}
+              {#if preview}
+                <p class="line-clamp-2 break-words text-xs text-muted-foreground">
+                  {preview}
+                </p>
+              {:else if images.length === 0}
+                <p class="text-xs italic text-muted-foreground">Attachment</p>
+              {/if}
+            </button>
+          {:else}
+            <p class="min-w-0 flex-1 px-2 py-1 text-xs italic text-muted-foreground">
+              {pinnedFromStore.has(entry.id) ? "Message no longer on this device" : "Loading..."}
+            </p>
+          {/if}
+          <Tip text="Unpin">
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                aria-label="Unpin message"
+                onclick={() => void toggleMessagePin(roomCode, entry.id)}
+                class="mt-1 inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
+              >
+                <PinOff class="size-3.5" />
+              </button>
+            {/snippet}
+            </Tip>
+          </div>
+        {:else}
+          <p class="border-t border-border/60 px-3 py-4 text-center text-xs text-muted-foreground">
+            No pinned messages. Hover a message and press the pin to keep it here.
+          </p>
+        {/each}
+      </div>
+  {/snippet}
+
   <header
     class="flex h-[calc(3.25rem+env(safe-area-inset-top))] items-center border-b border-border px-4 pt-[env(safe-area-inset-top)] shrink-0"
   >
@@ -1994,7 +2096,7 @@
                 size="icon"
                 onclick={() => openSearch(roomCode)}
                 aria-label="Search messages"
-                class="flex text-muted-foreground hover:text-foreground cursor-pointer"
+                class="hidden sm:flex text-muted-foreground hover:text-foreground cursor-pointer"
               >
                 <Search class="size-4" />
               </Button>
@@ -2019,87 +2121,13 @@
                 </Button>
               {/snippet}
             </Tip>
-            {#if uiState.pinnedOpen}
+            {#if uiState.pinnedOpen && !isMobile}
               <div
                 role="menu"
                 aria-label="Pinned messages"
                 class="absolute right-0 top-full z-50 mt-1 flex max-h-96 w-80 max-w-[calc(100vw-1rem)] flex-col overflow-hidden rounded-md border border-border bg-popover shadow-lg"
               >
-                <div class="flex items-center justify-between gap-2 px-3 py-2 text-[10px] font-mono text-muted-foreground">
-                  <span>Pinned · only you see these</span>
-                  <span class="tabular-nums" aria-label="{pinnedIds.length} pinned">{pinnedIds.length}</span>
-                </div>
-                <div class="overflow-y-auto">
-                  {#each pinnedEntries as entry (entry.id)}
-                    <div class="group/pin flex items-start gap-1 border-t border-border/60 px-1 py-1">
-                      {#if entry.msg}
-                        {@const msg = entry.msg}
-                        {@const images = pinnedImages(msg)}
-                        {@const preview = pinnedPreview(msg)}
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onclick={() => openPinned(msg)}
-                          class="min-w-0 flex-1 rounded px-2 py-1 text-left hover:bg-muted cursor-pointer"
-                        >
-                          <div class="flex items-baseline gap-2 text-xs">
-                            <span class="truncate font-medium text-foreground">{displayName(msg)}</span>
-                            <span class="shrink-0 text-[10px] text-muted-foreground">{formatDate(msg.timestamp)}</span>
-                          </div>
-                          {#if images.length > 0}
-                            <div class="mt-1 flex flex-wrap gap-1">
-                              {#each images as img (img.key)}
-                                {#if img.url}
-                                  <GifImage
-                                    src={img.url}
-                                    alt={img.alt}
-                                    class="size-16 rounded object-cover"
-                                    animated={img.gif}
-                                    animate="hover"
-                                  />
-                                {:else}
-                                  <!-- Not on this device yet; the chat
-                                       fetches it, the list only shows it. -->
-                                  <span class="flex size-16 items-center justify-center rounded bg-muted text-[10px] text-muted-foreground">
-                                    image
-                                  </span>
-                                {/if}
-                              {/each}
-                            </div>
-                          {/if}
-                          {#if preview}
-                            <p class="line-clamp-2 break-words text-xs text-muted-foreground">
-                              {preview}
-                            </p>
-                          {:else if images.length === 0}
-                            <p class="text-xs italic text-muted-foreground">Attachment</p>
-                          {/if}
-                        </button>
-                      {:else}
-                        <p class="min-w-0 flex-1 px-2 py-1 text-xs italic text-muted-foreground">
-                          {pinnedFromStore.has(entry.id) ? "Message no longer on this device" : "Loading..."}
-                        </p>
-                      {/if}
-                      <Tip text="Unpin">
-                        {#snippet children(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            aria-label="Unpin message"
-                            onclick={() => void toggleMessagePin(roomCode, entry.id)}
-                            class="mt-1 inline-flex size-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground cursor-pointer"
-                          >
-                            <PinOff class="size-3.5" />
-                          </button>
-                        {/snippet}
-                      </Tip>
-                    </div>
-                  {:else}
-                    <p class="border-t border-border/60 px-3 py-4 text-center text-xs text-muted-foreground">
-                      No pinned messages. Hover a message and press the pin to keep it here.
-                    </p>
-                  {/each}
-                </div>
+                {@render pinnedList()}
               </div>
             {/if}
           </div>
@@ -2159,7 +2187,7 @@
                 size="icon"
                 onclick={toggleUserList}
                 aria-label="Toggle user list"
-                class="flex text-muted-foreground hover:text-foreground cursor-pointer {showUserList
+                class="hidden sm:flex text-muted-foreground hover:text-foreground cursor-pointer {showUserList
                   ? 'text-primary'
                   : ''}"
               >
@@ -2183,9 +2211,9 @@
             aria-label={dmPeerInPhonebook
               ? "Remove from phonebook"
               : "Add to phonebook"}
-            class={dmPeerInPhonebook
-              ? "text-red-400 hover:text-destructive! hover:bg-destructive/10!"
-              : "text-green-400 hover:text-green-500! hover:bg-green-500/10!"}
+            class="hidden sm:inline-flex {dmPeerInPhonebook
+              ? 'text-red-400 hover:text-destructive! hover:bg-destructive/10!'
+              : 'text-green-400 hover:text-green-500! hover:bg-green-500/10!'}"
           >
             {#if dmPeerInPhonebook}
               <UserRoundMinus class="size-4" />
@@ -2202,17 +2230,9 @@
               {...props}
               variant="ghost"
               size="icon"
-              onclick={() => {
-                if (!ephemeral && !confirmingDelete) {
-                  confirmingDelete = true;
-                  setTimeout(() => (confirmingDelete = false), 3000);
-                  return;
-                }
-                confirmingDelete = false;
-                onLeave();
-              }}
+              onclick={leaveOrConfirm}
               aria-label={leaveText}
-              class="text-red-400 hover:bg-destructive/10! hover:text-destructive! {confirmingDelete
+              class="hidden sm:inline-flex text-red-400 hover:bg-destructive/10! hover:text-destructive! {confirmingDelete
                 ? 'bg-destructive/20!'
                 : ''}"
             >
@@ -2220,9 +2240,155 @@
             </Button>
           {/snippet}
         </Tip>
+        <!-- Phone: the header keeps notify, pinned and call; the rest sits
+             behind this, rightmost. -->
+        <Button
+          variant="ghost"
+          size="icon"
+          onclick={() => (moreOpen = true)}
+          aria-label="More"
+          aria-haspopup="dialog"
+          aria-expanded={moreOpen}
+          class="sm:hidden text-muted-foreground hover:text-foreground cursor-pointer"
+        >
+          <EllipsisVertical class="size-4" />
+        </Button>
       </div>
     </div>
   </header>
+
+  {#if isMobile}
+    <Drawer
+      open={uiState.pinnedOpen}
+      onOpenChange={(o) => (uiState.pinnedOpen = o)}
+      direction="bottom"
+    >
+      <!-- data-pinned-menu: the window click handler closes the list on a
+           click outside it, and the drawer is portalled out of the header. -->
+      <DrawerContent
+        data-pinned-menu
+        class="bg-card text-card-foreground overflow-hidden max-h-[75dvh] pb-[env(safe-area-inset-bottom)]"
+      >
+        <DrawerTitle class="sr-only">Pinned messages</DrawerTitle>
+        <div class="flex min-h-0 flex-col pt-2">
+          {@render pinnedList()}
+        </div>
+      </DrawerContent>
+    </Drawer>
+
+    <Drawer open={moreOpen} onOpenChange={(o) => (moreOpen = o)} direction="bottom">
+      <DrawerContent
+        class="bg-card text-card-foreground overflow-hidden pb-[env(safe-area-inset-bottom)]"
+      >
+        <DrawerHeader class="px-4 py-3 border-b border-border shrink-0">
+          <DrawerTitle class="m-auto font-semibold truncate">
+            {roomName || roomCode}
+          </DrawerTitle>
+        </DrawerHeader>
+        <div class="flex flex-col p-2">
+          {#if !ephemeral}
+            <button
+              type="button"
+              onclick={() => {
+                moreOpen = false;
+                openSearch(roomCode);
+              }}
+              class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+            >
+              <Search class="size-4 text-muted-foreground" />
+              Search messages
+            </button>
+          {/if}
+          {#if !isDmChat}
+            <button
+              type="button"
+              onclick={() => {
+                moreOpen = false;
+                toggleUserList();
+              }}
+              class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+            >
+              <Users class="size-4 text-muted-foreground" />
+              {showUserList ? "Hide users" : "Show users"}
+            </button>
+            <button
+              type="button"
+              onclick={() => {
+                moreOpen = false;
+                void copyCode();
+              }}
+              class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+            >
+              <Copy class="size-4 text-muted-foreground" />
+              Copy invite link
+            </button>
+            {#if canShare}
+              <button
+                type="button"
+                onclick={() => {
+                  moreOpen = false;
+                  void shareLink();
+                }}
+                class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+              >
+                <Share2 class="size-4 text-muted-foreground" />
+                Share invite link
+              </button>
+            {/if}
+            <!-- Stays open: the code it mints is shown here to read out. -->
+            <button
+              type="button"
+              onclick={() => void copyShortCode()}
+              class="flex items-start gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+            >
+              <Copy class="size-4 mt-0.5 text-muted-foreground" />
+              <span>
+                Copy short code
+                <span class="block text-xs text-muted-foreground">
+                  {#if shortCode && shortCodeFor === roomCode}
+                    {formatShortCode(shortCode)} - works for 5 minutes
+                  {:else if shortCodeError}
+                    {shortCodeError}
+                  {:else}
+                    Works for 5 minutes
+                  {/if}
+                </span>
+              </span>
+            </button>
+          {:else}
+            <button
+              type="button"
+              onclick={() => {
+                moreOpen = false;
+                void toggleActiveDmPhonebook();
+              }}
+              class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer {dmPeerInPhonebook
+                ? 'text-red-400'
+                : 'text-green-400'}"
+            >
+              {#if dmPeerInPhonebook}
+                <UserRoundMinus class="size-4" />
+                Remove from phonebook
+              {:else}
+                <UserPlus class="size-4" />
+                Add to phonebook
+              {/if}
+            </button>
+          {/if}
+          <button
+            type="button"
+            onclick={leaveOrConfirm}
+            class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm text-red-400 hover:bg-destructive/10 cursor-pointer {confirmingDelete
+              ? 'bg-destructive/20'
+              : ''}"
+          >
+            <LogOut class="size-4" />
+            {confirmingDelete ? "Tap again to confirm" : leaveText}
+          </button>
+        </div>
+      </DrawerContent>
+    </Drawer>
+  {/if}
 
   {#if connecting}
     <div
@@ -2345,7 +2511,7 @@
                   <Separator class="flex-1 bg-border" />
                   <span class="text-xs text-muted-foreground"
                     title="Reported message dates; conversation order uses logical sequence, not device clocks."
-                    >Reported date: {formatDate(msg.timestamp)}</span
+                    >{formatDate(msg.timestamp)}</span
                   >
                   <Separator class="flex-1 bg-border" />
                 </div>
@@ -2375,10 +2541,13 @@
                   ? (e) => handleTouchMove(msg.id, e)
                   : undefined}
                 ontouchend={isMobile
-                  ? (e) => handleTouchEnd(msg.id, e)
+                  ? () => handleTouchEnd(msg.id)
                   : undefined}
-                style={isMobile && swipeMessageId === msg.id
-                  ? `transform: translateX(${Math.min(0, swipeCurrentX - swipeStartX)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}`
+                ontouchcancel={isMobile
+                  ? () => handleTouchEnd(msg.id)
+                  : undefined}
+                style={isMobile
+                  ? `touch-action: pan-y;${swipeMessageId === msg.id ? ` transform: translateX(${dragOffset(swipeDelta)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}` : ""}`
                   : ""}
               >
                 {#if msg.replyTo}
@@ -2551,11 +2720,8 @@
                   </div>
                 {/if}
 
-                {#if isMobile && swipeMessageId === msg.id}
-                  {@const progress = Math.min(
-                    1,
-                    Math.abs((swipeCurrentX - swipeStartX) / SWIPE_THRESHOLD)
-                  )}
+                {#if isMobile && swipeMessageId === msg.id && swipeDelta < 0}
+                  {@const progress = Math.min(1, -swipeDelta / REPLY_THRESHOLD)}
                   <div
                     class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
                     style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
@@ -3057,15 +3223,15 @@
           startDmFromMenu(target);
         }
       : undefined}
-    onTogglePhonebook={peerIdForSender(profileCardFor.did)
+    onTogglePhonebook={dmTargetFor(profileCardFor.did)
       ? () => {
-          const pid = peerIdForSender(profileCardFor!.did)!;
-          if (isInPhonebook(pid)) removeFromMenu(pid);
-          else addFromMenu(pid);
+          const contact = dmTargetFor(profileCardFor!.did)!;
+          if (isInPhonebook(contact)) removeFromMenu(contact);
+          else addFromMenu(contact);
         }
       : undefined}
-    inPhonebook={peerIdForSender(profileCardFor.did)
-      ? isInPhonebook(peerIdForSender(profileCardFor.did)!)
+    inPhonebook={dmTargetFor(profileCardFor.did)
+      ? isInPhonebook(dmTargetFor(profileCardFor.did)!)
       : false}
   />
 {/if}
@@ -3110,37 +3276,36 @@
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
   >
-    <button
-      type="button"
-      disabled={!userMenu.peerId}
-      class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
-      onclick={() => userMenu?.peerId && startDmFromMenu(userMenu.peerId)}
-    >
-      <Users class="size-4" />
-      {userMenu.peerId ? "Send DM" : "DM unavailable"}
-    </button>
-    {#if userMenu.peerId && !isInPhonebook(userMenu.peerId)}
+    <!-- Offline authors too: their DID opens the DM and keys the contact. -->
+    {#if userMenuContact}
+      {@const contact = userMenuContact}
       <button
         type="button"
         class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
-        onclick={() => userMenu?.peerId && addFromMenu(userMenu.peerId)}
+        onclick={() => startDmFromMenu(contact)}
       >
-        <UserPlus class="size-4" />
-        Add to phonebook
+        <Users class="size-4" />
+        Send DM
       </button>
-    {:else if userMenu.peerId}
-      <button
-        type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono text-destructive hover:bg-muted cursor-pointer"
-        onclick={() => userMenu?.peerId && removeFromMenu(userMenu.peerId)}
-      >
-        <UserRoundMinus class="size-4" />
-        Remove from phonebook
-      </button>
-    {:else}
-      <div class="px-3 py-1.5 text-xs text-muted-foreground">
-        DM unavailable
-      </div>
+      {#if !isInPhonebook(contact)}
+        <button
+          type="button"
+          class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
+          onclick={() => addFromMenu(contact)}
+        >
+          <UserPlus class="size-4" />
+          Add to phonebook
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono text-destructive hover:bg-muted cursor-pointer"
+          onclick={() => removeFromMenu(contact)}
+        >
+          <UserRoundMinus class="size-4" />
+          Remove from phonebook
+        </button>
+      {/if}
     {/if}
   </div>
 {/if}
