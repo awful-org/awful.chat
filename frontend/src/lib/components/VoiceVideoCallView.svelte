@@ -57,6 +57,7 @@
   } from "$lib/transport/voice.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
+  import { latestWatched } from "$lib/watch-presence";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { callPipPanel } from "$lib/call-pip.svelte";
   import { browserPipSupported, enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
@@ -218,7 +219,7 @@ import {
     cameraOff,
     screenSharing,
     pendingTransmissions = new Map<string, string>(),
-    watchingTransmissionPeerId = null,
+    watchingTransmissions = new Map<string, string>(),
     callPeerStates = new Map<string, { muted: boolean; deafened: boolean }>(),
     error = null,
   } = $derived(transportState);
@@ -251,8 +252,7 @@ import {
     const remote = [
       ...(transportState.transmissionViewers.get(key) ?? []),
     ];
-    const self =
-      transportState.watchingTransmissionPeerId === sharerPeerId;
+    const self = transportState.watchingTransmissions.has(sharerPeerId);
     return {
       count: remote.length + (self ? 1 : 0),
       label: formatReactorNames(remote.map(getPeerLabel), self),
@@ -625,7 +625,37 @@ import {
   let cardStateTickForPlugins = $state(0);
   $effect(() => onCardStateChange(() => (cardStateTickForPlugins += 1)));
 
-  const isWatchingTransmission = $derived(watchingTransmissionPeerId !== null);
+  const isWatchingTransmission = $derived(watchingTransmissions.size > 0);
+
+  /** Someone else's share that we are watching - loading or live. A watched
+   *  share is a "transmission" tile until its track lands, then a "screen"
+   *  one; checking only the first hid its stop controls once it played. */
+  function isWatchedShare(tile: TileData): boolean {
+    return (
+      !tile.isLocal &&
+      (tile.kind === "transmission" || tile.kind === "screen") &&
+      watchingTransmissions.has(tile.peerId)
+    );
+  }
+
+  /**
+   * The share the call-wide Stop watching acts on: the focused tile's when it
+   * is one being watched, else the one started most recently - so with two
+   * open, the button stops the one you are looking at, not an arbitrary one.
+   */
+  const currentWatched = $derived.by(() => {
+    const focused = tiles.find((t) => t.id === callFocus.pinnedTileId);
+    if (focused && isWatchedShare(focused)) return focused.peerId;
+    return latestWatched(watchingTransmissions);
+  });
+  const stopWatchingLabel = $derived(
+    currentWatched && watchingTransmissions.size > 1
+      ? `Stop watching ${getPeerLabel(currentWatched)}`
+      : "Stop watching"
+  );
+  function stopCurrentWatch(): void {
+    stopWatchingTransmission(currentWatched ?? undefined);
+  }
 
   const remoteAudio = $derived.by(() => {
     const tracks: Array<{ id: string; track: MediaStreamTrack }> = [];
@@ -705,9 +735,7 @@ import {
       isLocal: tile.isLocal,
       hasVideo: tile.videoTrack !== null,
       isPending: !!tile.isPending,
-      isWatched:
-        tile.kind === "transmission" &&
-        watchingTransmissionPeerId === tile.peerId,
+      isWatched: isWatchedShare(tile),
       isFocused: callFocus.pinnedTileId === tile.id,
       isFullscreen,
       pipSupported: browserPipSupported(),
@@ -889,7 +917,7 @@ import {
         if (tile.producerId) watchTransmission(tile.peerId, tile.producerId);
         break;
       case "stop-watching":
-        stopWatchingTransmission();
+        stopWatchingTransmission(tile.peerId);
         break;
       case "stop-sharing":
         await stopScreenShare();
@@ -1420,8 +1448,7 @@ import {
 )}
   {@const hasVideo = tile.videoTrack !== null}
   {@const isPendingTx = tile.kind === "transmission" && tile.isPending}
-  {@const isWatchedTx =
-    tile.kind === "transmission" && watchingTransmissionPeerId === tile.peerId}
+  {@const isWatchedTx = isWatchedShare(tile)}
   {@const tileColor = getPeerColor(tile.peerId)}
   {#if tile.kind === "plugin" && joinedPluginTiles.has(tile.id)}
     <!-- A DIV, not the button every other tile is: the plugin renders its
@@ -1780,8 +1807,8 @@ import {
            the tile stop being a button in the first place. -->
       <button
         type="button"
-        onclick={stopWatchingTransmission}
-        aria-label="Stop watching"
+        onclick={() => stopWatchingTransmission(tile.peerId)}
+        aria-label="Stop watching {tile.label}"
         class="absolute top-1.5 left-1.5 z-20 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 hover:bg-red-500/45"
       >
         <Radio class="size-4" />
@@ -2184,13 +2211,13 @@ import {
                 data-transmission-volume
                 class="relative flex items-center gap-2 rounded-xl border border-white/10 bg-zinc-900/95 px-2 py-2"
               >
-                <Tip text="Stop watching">
+                <Tip text={stopWatchingLabel}>
                   {#snippet children(props)}
                 <button
                   {...props}
                   type="button"
-                  onclick={stopWatchingTransmission}
-                  aria-label="Stop watching"
+                  onclick={stopCurrentWatch}
+                  aria-label={stopWatchingLabel}
                   class="flex h-8 w-8 items-center justify-center rounded-lg bg-red-500/20 text-red-400 transition-all duration-200 hover:bg-red-500/30 ring-1 ring-red-500/50"
                 >
                   <Radio class="size-4" />
@@ -2390,13 +2417,13 @@ import {
                   "rounded-xl bg-zinc-900/95 border border-white/10 p-3 py-2"
               )}
             >
-              <Tip text="Stop watching">
+              <Tip text={stopWatchingLabel}>
                 {#snippet children(props)}
               <button
                 {...props}
                 type="button"
-                onclick={stopWatchingTransmission}
-                aria-label="Stop watching"
+                onclick={stopCurrentWatch}
+                aria-label={stopWatchingLabel}
                 class="flex h-8 w-8 md:h-10 md:w-10 items-center justify-center rounded-lg bg-red-500/20 text-red-400 transition-all duration-200 hover:bg-red-500/30 ring-1 ring-red-500/50"
               >
                 <Radio class="size-4" />

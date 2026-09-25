@@ -1,9 +1,11 @@
 import {
   Camera,
   CameraOff,
+  CornerUpLeft,
   Download,
   HardDrive,
   Headphones,
+  Keyboard,
   HeadphoneOff,
   Lock,
   Mic,
@@ -12,6 +14,8 @@ import {
   MonitorOff,
   Phone,
   PhoneOff,
+  PictureInPicture2,
+  Pin,
   RefreshCw,
   Search,
   Trash2,
@@ -20,7 +24,22 @@ import {
   Video,
 } from "@lucide/svelte";
 import { openSearch } from "$lib/search/ui.svelte";
-import { transportState, connect } from "$lib/transport/transport.svelte";
+import {
+  transportState,
+  connect,
+  peerIdToDid,
+} from "$lib/transport/transport.svelte";
+import {
+  stopWatchingTransmission,
+  watchTransmission,
+} from "$lib/transport/transmission.svelte";
+import { callPipPanel } from "$lib/call-pip.svelte";
+import {
+  browserPipSupported,
+  enterBrowserPip,
+  exitBrowserPip,
+  spotlightStore,
+} from "$lib/call-spotlight.svelte";
 import {
   joinCall,
   leaveCall,
@@ -34,12 +53,25 @@ import { requestPersistentStorage, wipeLocalDatabase } from "$lib/storage";
 import {
   openSettings,
   openSharePicker,
+  requestReturnToCall,
+  togglePinnedMessages,
   toggleUserList,
   uiState,
 } from "$lib/ui-state.svelte";
+import { pinnedMessagesOf } from "$lib/rooms.svelte";
 import { useQc, useQs } from "$lib/runtime-config";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
+import { shortcutRows } from "../shortcuts";
+
+function peerName(peerId: string): string {
+  const did = peerIdToDid(peerId);
+  return (
+    (did && transportState.peerNames.get(did)) ||
+    transportState.peerNames.get(peerId) ||
+    peerId.slice(0, 8)
+  );
+}
 
 /**
  * Call controls plus app-wide actions (reconnect, lock, storage, backup,
@@ -52,17 +84,28 @@ import type { CmdSource } from "../host";
 export const actionCommands: CmdSource = () => {
   const cmds: Cmd[] = [];
 
+  // Split to match the shortcuts: this listed Ctrl+F, which searches the open
+  // room, while it searched every room - which is Ctrl+Shift+F.
+  if (transportState.roomCode) {
+    const here = transportState.roomCode;
+    cmds.push({
+      id: "action.searchRoom",
+      title: "Search this room",
+      keywords: ["find", "history", "grep", "messages"],
+      group: "Actions",
+      icon: Search,
+      shortcut: ["Ctrl", "F"],
+      action: { kind: "act", perform: () => openSearch(here) },
+    });
+  }
   cmds.push({
     id: "action.searchMessages",
-    title: "Search messages",
-    keywords: ["find", "history", "grep"],
+    title: "Search all rooms",
+    keywords: ["find", "history", "grep", "messages", "everywhere"],
     group: "Actions",
     icon: Search,
-    shortcut: ["Ctrl", "F"],
-    action: {
-      kind: "act",
-      perform: () => openSearch(null),
-    },
+    shortcut: ["Ctrl", "Shift", "F"],
+    action: { kind: "act", perform: () => openSearch(null) },
   });
 
   // Only where the list exists: a DM has two people and no roster, and the
@@ -77,6 +120,20 @@ export const actionCommands: CmdSource = () => {
       icon: Users,
       badge: uiState.userListOpen ? "On" : "Off",
       action: { kind: "act", perform: () => toggleUserList() },
+    });
+  }
+
+  // Rooms and DMs both keep pins; the landing screen has none to show.
+  if (transportState.roomCode) {
+    const count = pinnedMessagesOf(transportState.roomCode).length;
+    cmds.push({
+      id: "actions.pinned.toggle",
+      title: uiState.pinnedOpen ? "Hide pinned messages" : "Show pinned messages",
+      keywords: ["pins", "pinned", "saved", "bookmarks"],
+      group: "Actions",
+      icon: Pin,
+      badge: count > 0 ? String(count) : undefined,
+      action: { kind: "act", perform: () => togglePinnedMessages() },
     });
   }
 
@@ -181,7 +238,114 @@ export const actionCommands: CmdSource = () => {
           : () => openSharePicker(),
       },
     });
+
+    const callRoom = transportState.callRoomCode;
+    if (callRoom && transportState.uiRoomCode !== callRoom) {
+      cmds.push({
+        id: "actions.call.return",
+        title: "Back to call",
+        keywords: ["return", "go to call"],
+        group: "Call",
+        icon: CornerUpLeft,
+        action: { kind: "act", perform: () => requestReturnToCall() },
+      });
+    }
+
+    // Only with a picture to float - a voice-only call has none.
+    if (browserPipSupported() && spotlightStore.spotlightTile?.videoTrack) {
+      cmds.push({
+        id: "actions.call.pip",
+        title: callPipPanel.browserPip
+          ? "Exit picture-in-picture"
+          : "Picture-in-picture",
+        keywords: ["pip", "float", "popout", "window"],
+        group: "Call",
+        icon: PictureInPicture2,
+        action: {
+          kind: "act",
+          perform: () =>
+            void (callPipPanel.browserPip
+              ? exitBrowserPip()
+              : enterBrowserPip(() => requestReturnToCall())),
+        },
+      });
+    }
+
+    // Every share on offer in this call, and every one being watched - each
+    // its own row, so the one you mean is the one that starts or stops.
+    const inThisCall = (pid: string) =>
+      transportState.callPeerRooms.get(pid) === callRoom;
+    for (const [pid, producerId] of transportState.pendingTransmissions) {
+      if (!inThisCall(pid)) continue;
+      cmds.push({
+        id: `actions.watch:${pid}`,
+        title: `Watch ${peerName(pid)}'s screen`,
+        keywords: ["screen share", "stream", "watch"],
+        group: "Call",
+        icon: Monitor,
+        action: {
+          kind: "act",
+          perform: () =>
+            void watchTransmission(pid, producerId).catch((err) =>
+              console.warn("watch failed", err)
+            ),
+        },
+      });
+    }
+    for (const pid of transportState.watchingTransmissions.keys()) {
+      cmds.push({
+        id: `actions.stopWatching:${pid}`,
+        title: `Stop watching ${peerName(pid)}`,
+        keywords: ["screen share", "stream", "watch"],
+        group: "Call",
+        icon: MonitorOff,
+        action: { kind: "act", perform: () => stopWatchingTransmission(pid) },
+      });
+    }
   }
+
+  // In a call elsewhere, and this room has one going: move to it.
+  const here = transportState.roomCode;
+  if (
+    transportState.inCall &&
+    here &&
+    transportState.callRoomCode !== here &&
+    [...transportState.callPeerRooms.values()].includes(here)
+  ) {
+    cmds.push({
+      id: "actions.call.switch",
+      title: "Switch to this room's call",
+      subtitle: "Leaves the call you are in",
+      keywords: ["join", "move", "call"],
+      group: "Call",
+      icon: Phone,
+      action: {
+        kind: "act",
+        perform: () => {
+          leaveCall();
+          joinCall().catch((err) => console.warn("switch call failed", err));
+        },
+      },
+    });
+  }
+
+  cmds.push({
+    id: "actions.help.shortcuts",
+    title: "Keyboard shortcuts",
+    subtitle: "Also under ? in this palette",
+    keywords: ["keys", "hotkeys", "help", "keybindings"],
+    group: "App",
+    icon: Keyboard,
+    action: {
+      kind: "page",
+      open: () => ({
+        kind: "list",
+        id: "help.shortcuts",
+        title: "Keyboard shortcuts",
+        items: shortcutRows,
+      }),
+    },
+  });
 
   cmds.push({
     id: "actions.app.reconnect",

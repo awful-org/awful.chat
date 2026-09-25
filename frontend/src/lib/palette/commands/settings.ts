@@ -21,6 +21,7 @@ import {
 } from "$lib/display-prefs.svelte";
 import {
   mediaPrefs,
+  setExternalMedia,
   setGifAutoplay,
   setAutoDownloadMedia,
 } from "$lib/media-prefs.svelte";
@@ -168,6 +169,20 @@ export const settingsCommands: CmdSource = () => {
       kind: "act",
       keepOpen: true,
       perform: () => setAvatarTint(!displayPrefs.avatarTint),
+    },
+  });
+
+  cmds.push({
+    id: "settings.toggle:externalMedia",
+    title: "External media",
+    subtitle: "Load images and GIFs from other sites (reveals your IP to them)",
+    keywords: ["toggle", "enable", "disable", "privacy", "images", "gifs", "links"],
+    group: "Settings",
+    badge: mediaPrefs.externalMedia ? "On" : "Off",
+    action: {
+      kind: "act",
+      keepOpen: true,
+      perform: () => setExternalMedia(!mediaPrefs.externalMedia),
     },
   });
 

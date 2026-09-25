@@ -230,14 +230,14 @@
           transportState.callPeerRooms.get(did) === transportState.roomCode;
 
       // A pending entry means they are sharing and we are not watching;
-      // watching moves them out of pending and into watchingTransmissionPeerId.
+      // watching moves them out of pending and into watchingTransmissions.
       const sharing = isSelf
         ? transportState.screenSharing
         : [mappedPeerId, did].some(
             (k) =>
               !!k &&
               (transportState.pendingTransmissions.has(k) ||
-                transportState.watchingTransmissionPeerId === k)
+                transportState.watchingTransmissions.has(k))
           );
 
       allUsers.push({

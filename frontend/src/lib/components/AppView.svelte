@@ -32,6 +32,7 @@
   } from "$lib/rooms.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import { sortRooms } from "$lib/room-order";
+  import { latestWatched } from "$lib/watch-presence";
   import {
     getMessages,
     getLastMessage,
@@ -718,8 +719,7 @@
       localCameraStream: transportState.localCameraStream,
       localScreenStream: transportState.localScreenStream,
       cameraOff: transportState.cameraOff,
-      watchingTransmissionPeerId: transportState.watchingTransmissionPeerId,
-      watchingTransmissionProducerId: transportState.watchingTransmissionProducerId,
+      watchingTransmissions: transportState.watchingTransmissions,
       selfId: id,
       trackStartTimes,
     };
@@ -731,7 +731,7 @@
     spotlight(
       tiles,
       callFocus.pinnedTileId,
-      transportState.watchingTransmissionPeerId,
+      latestWatched(transportState.watchingTransmissions),
       speakers,
       spotlightPrevious,
       tickingNow

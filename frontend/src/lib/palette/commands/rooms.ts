@@ -1,10 +1,38 @@
-import { DoorOpen, LogIn, LogOut, Link, Pencil, Plus, Trash2, Users } from "@lucide/svelte";
-import { roomsStore, renameRoom } from "$lib/rooms.svelte";
+import {
+  AtSign,
+  Bell,
+  BellOff,
+  DoorOpen,
+  KeyRound,
+  LogIn,
+  LogOut,
+  Link,
+  Pencil,
+  Pin,
+  PinOff,
+  Plus,
+  Share2,
+  Trash2,
+  Users,
+} from "@lucide/svelte";
+import { roomsStore, renameRoom, toggleRoomPin } from "$lib/rooms.svelte";
+import { createInvite, formatShortCode } from "$lib/invite";
+import {
+  getRoomNotifyMode,
+  setRoomNotifyMode,
+  type RoomNotifyMode,
+} from "$lib/notify-prefs.svelte";
 import { hashRef } from "$lib/storage-crypto";
 import { setRoomName } from "$lib/transport/transport.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
 import { parseRoomCode } from "../query";
+
+const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
+  all: "All messages",
+  mentions: "Mentions only",
+  muted: "Off",
+};
 
 /**
  * Room navigation, joining, and the destructive room-management actions.
@@ -137,6 +165,85 @@ export const roomCommands: CmdSource = (host) => {
             }
           },
           submitLabel: "Rename",
+        }),
+      },
+    });
+
+    // The header's invite menu, minus nothing: the 5-minute short code for
+    // typing on a phone, and the OS share sheet where the browser has one.
+    cmds.push({
+      id: "room.copyShortCode",
+      title: "Copy short invite code",
+      subtitle: "Works for 5 minutes",
+      keywords: ["invite", "code", "share"],
+      group: "Rooms",
+      icon: KeyRound,
+      action: {
+        kind: "act",
+        perform: async () => {
+          try {
+            const { code } = await createInvite(activeCode);
+            await navigator.clipboard.writeText(formatShortCode(code));
+          } catch (err) {
+            console.warn("copy short invite code failed", err);
+          }
+        },
+      },
+    });
+    if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
+      cmds.push({
+        id: "room.shareLink",
+        title: "Share room link",
+        keywords: ["invite", "send"],
+        group: "Rooms",
+        icon: Share2,
+        action: {
+          kind: "act",
+          perform: () => {
+            navigator
+              .share({ url: `${window.location.origin}/r/#${activeCode}` })
+              .catch(() => {});
+          },
+        },
+      });
+    }
+
+    const pinned = current?.pinnedAt != null;
+    cmds.push({
+      id: "room.pin",
+      title: pinned ? "Unpin room" : "Pin room to top",
+      keywords: ["pin", "favorite", "top", "sidebar"],
+      group: "Rooms",
+      icon: pinned ? PinOff : Pin,
+      action: { kind: "act", perform: () => void toggleRoomPin(activeCode) },
+    });
+
+    const mode = getRoomNotifyMode(activeCode);
+    cmds.push({
+      id: "room.notify",
+      title: "Room notifications",
+      keywords: ["mute", "mentions", "notify", "bell", "quiet"],
+      group: "Rooms",
+      icon: mode === "muted" ? BellOff : mode === "mentions" ? AtSign : Bell,
+      badge: NOTIFY_LABEL[mode],
+      action: {
+        kind: "page",
+        open: () => ({
+          kind: "list",
+          id: "room.notify",
+          title: "Room notifications",
+          items: () =>
+            (["all", "mentions", "muted"] as const).map((m) => ({
+              id: `room.notify:${m}`,
+              title: NOTIFY_LABEL[m],
+              group: "Notify me about",
+              icon: m === "muted" ? BellOff : m === "mentions" ? AtSign : Bell,
+              badge: m === mode ? "Current" : undefined,
+              action: {
+                kind: "act" as const,
+                perform: () => setRoomNotifyMode(activeCode, m),
+              },
+            })),
         }),
       },
     });

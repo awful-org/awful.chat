@@ -24,10 +24,8 @@ export interface CallState {
   localScreenStream: MediaStream | null;
   /** Whether camera is off (user turned it off, not just no track) */
   cameraOff: boolean;
-  /** Watching this peer's transmission (SFU share) */
-  watchingTransmissionPeerId: string | null;
-  /** SFU producer ID for the watched transmission */
-  watchingTransmissionProducerId: string | null;
+  /** Shares being watched (SFU): sharer peerId -> producerId */
+  watchingTransmissions: ReadonlyMap<string, string>;
   /** Self's peer ID */
   selfId: string;
   /** Track start times, to preserve startedAt across rebuilds */
@@ -113,8 +111,7 @@ export function buildCallTiles(state: CallState): SpotlightTile[] {
   // A share we asked to watch but whose track has not arrived yet: the
   // stage's pending-tx tile. Once the track lands it is a remote-screen tile
   // above, never both.
-  if (state.watchingTransmissionPeerId && state.watchingTransmissionProducerId) {
-    const watchedPeerId = state.watchingTransmissionPeerId;
+  for (const watchedPeerId of state.watchingTransmissions.keys()) {
     if (!state.participants.get(watchedPeerId)?.screenTrack) {
       const trackId = `pending-tx-${watchedPeerId}`;
       const startedAt =

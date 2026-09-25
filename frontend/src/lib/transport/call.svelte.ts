@@ -337,8 +337,7 @@ export function leaveCall(): void {
   transportState.screenSharing = false;
   transportState.pendingTransmissions = new Map();
   transportState.transmissionViewers = new Map();
-  transportState.watchingTransmissionPeerId = null;
-  transportState.watchingTransmissionProducerId = null;
+  transportState.watchingTransmissions = new Map();
 }
 
 export function toggleMute(): void {

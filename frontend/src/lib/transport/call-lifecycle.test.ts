@@ -44,8 +44,7 @@ const transportState: Record<string, unknown> = {
   participants: new Map(),
   pendingTransmissions: new Map(),
   transmissionViewers: new Map(),
-  watchingTransmissionPeerId: null,
-  watchingTransmissionProducerId: null,
+  watchingTransmissions: new Map(),
   error: null,
 };
 

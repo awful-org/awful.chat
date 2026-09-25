@@ -4,7 +4,8 @@ import {
   playTransmissionJoinSound,
   playTransmissionLeaveSound,
 } from "$lib/sounds";
-import { transportState, _transport } from "./transport.svelte";
+import { transportState, _transport, _forgetWatched } from "./transport.svelte";
+import { latestWatched } from "$lib/watch-presence";
 import { encode } from "../utils";
 import { MessageType } from "../types/message";
 import type { MediasoupVideo } from "./mediasoup";
@@ -99,10 +100,7 @@ _video.on("trackRemoved", (peerId, source, kind) => {
     tx.delete(peerId);
     transportState.pendingTransmissions = tx;
 
-    if (transportState.watchingTransmissionPeerId === peerId) {
-      transportState.watchingTransmissionPeerId = null;
-      transportState.watchingTransmissionProducerId = null;
-    }
+    _forgetWatched(peerId);
   });
 
   _video.on("transmissionAvailable", (peerId, producerId) => {
@@ -129,9 +127,8 @@ _video.on("trackRemoved", (peerId, source, kind) => {
       viewers.delete(peerId);
       transportState.transmissionViewers = viewers;
     }
-    if (transportState.watchingTransmissionPeerId === peerId) {
-      transportState.watchingTransmissionPeerId = null;
-      transportState.watchingTransmissionProducerId = null;
+    if (transportState.watchingTransmissions.has(peerId)) {
+      _forgetWatched(peerId);
       playTransmissionEndedSound();
       // Retract our watch for everyone now - peers who missed the share's
       // end (their producer-closed lost, or they were reconnecting) would
@@ -145,8 +142,7 @@ _video.on("trackRemoved", (peerId, source, kind) => {
   });
 
   _video.on("transmissionRestored", (peerId, producerId) => {
-    transportState.watchingTransmissionPeerId = peerId;
-    transportState.watchingTransmissionProducerId = producerId;
+    _markWatched(peerId, producerId);
     const pending = new Map(transportState.pendingTransmissions);
     pending.delete(peerId);
     transportState.pendingTransmissions = pending;
@@ -193,11 +189,22 @@ export function setTransmissionOutputVolume(volume: number): void {
     });
 }
 
-/** Tell the call who we are watching (or that we stopped: watching null). */
+/** A share is being watched (again): moved to the end, the most recent. */
+function _markWatched(peerId: string, producerId: string): void {
+  const next = new Map(transportState.watchingTransmissions);
+  next.delete(peerId);
+  next.set(peerId, producerId);
+  transportState.watchingTransmissions = next;
+}
+
+/** Tell the call every share we are watching (none: an empty list). */
 export function _sendWatchPresence(peerId?: string): void {
+  const all = [...transportState.watchingTransmissions.keys()];
   const payload = encode({
     type: MessageType.WatchPresence,
-    watching: transportState.watchingTransmissionPeerId,
+    // Older clients read only this one: give them the latest.
+    watching: latestWatched(transportState.watchingTransmissions),
+    watchingAll: all,
   });
   if (peerId) {
     _transport.send(peerId, payload);
@@ -226,8 +233,7 @@ export async function watchTransmission(
   transportState.error = null;
   try {
     await getVideo().watchTransmission(peerId, producerId);
-    transportState.watchingTransmissionPeerId = peerId;
-    transportState.watchingTransmissionProducerId = producerId;
+    _markWatched(peerId, producerId);
     _sendWatchPresence();
     const next = new Map(transportState.pendingTransmissions);
     next.delete(peerId);
@@ -238,15 +244,20 @@ export async function watchTransmission(
   }
 }
 
-export function stopWatchingTransmission(): void {
-  const peerId = transportState.watchingTransmissionPeerId;
-  const producerId = transportState.watchingTransmissionProducerId;
-  if (!peerId) return;
-  getVideo().stopWatchingTransmission(peerId);
-  if (producerId) transportState.pendingTransmissions = new Map(
+/**
+ * Stop watching one share: the one named, else the most recently started.
+ * Taking no argument used to mean "the only one" - with two open, every
+ * stop button (a tile's own included) closed whichever started last.
+ */
+export function stopWatchingTransmission(peerId?: string): void {
+  const target = peerId ?? latestWatched(transportState.watchingTransmissions);
+  if (!target) return;
+  const producerId = transportState.watchingTransmissions.get(target);
+  if (!producerId) return;
+  getVideo().stopWatchingTransmission(target);
+  transportState.pendingTransmissions = new Map(
     transportState.pendingTransmissions
-  ).set(peerId, producerId);
-  transportState.watchingTransmissionPeerId = null;
-  transportState.watchingTransmissionProducerId = null;
+  ).set(target, producerId);
+  _forgetWatched(target);
   _sendWatchPresence();
 }
