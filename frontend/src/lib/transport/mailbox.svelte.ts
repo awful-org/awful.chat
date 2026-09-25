@@ -18,6 +18,7 @@ import {
 import { parseDmEnvelope } from "./dm-codec";
 import {
   _transport,
+  broadcastProfile,
   deliverMailboxBatch,
   deliverMailboxDm,
   deliverMailboxReceipt,
@@ -56,6 +57,9 @@ export function setMailboxEnabled(on: boolean): void {
     // Choice just does not survive a reload.
   }
   if (on) void collectMailbox();
+  // The profile carries it, so the people who DM us can say when a message
+  // will only arrive while we are both online.
+  broadcastProfile();
 }
 
 const b64 = (u: Uint8Array): string => btoa(String.fromCharCode(...u));

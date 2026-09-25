@@ -426,6 +426,9 @@ interface TransportState {
    * only place that distinction reaches the UI.
    */
   provenPeers: Set<string>;
+  /** DIDs whose offline inbox is off, from their profiles (live or stored):
+   *  a DM reaches them only while both sides are online. */
+  peerInboxOff: Set<string>;
   /** Profile metadata: banners, tags, bios, name effects; keyed by DID. */
   peerProfileMeta: Map<
     string,
@@ -506,6 +509,7 @@ export const transportState = $state<TransportState>({
   historyCapped: false,
   relayedPeers: new Set(),
   provenPeers: new Set(),
+  peerInboxOff: new Set(),
   peerProfileMeta: new Map(),
   error: null,
   callPeerIds: new Set(),
@@ -726,6 +730,9 @@ installTelemetryTaps({
   requestSfuDiag: () => _video.requestDiag(),
 });
 
+/** DIDs whose profile arrived live this session: storage must not overrule. */
+const _inboxHeardLive = new Set<string>();
+
 // Stored peer profile metadata is invisible until the peer re-broadcasts:
 // the reactive map only ever filled from live messages, so a reload emptied
 // every card and name effect for anyone not currently online. Hydrate from
@@ -737,6 +744,11 @@ installTelemetryTaps({
 function _hydratePeerProfileMeta(): void {
   void getAllPeerProfiles()
   .then((profiles) => {
+    const inboxOff = new Set(transportState.peerInboxOff);
+    for (const p of profiles) {
+      if (p.inboxOff && !_inboxHeardLive.has(p.did)) inboxOff.add(p.did);
+    }
+    transportState.peerInboxOff = inboxOff;
     const meta = new Map(transportState.peerProfileMeta);
     for (const p of profiles) {
       if (meta.has(p.did)) continue;
@@ -1006,6 +1018,11 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     nameEffect: profile?.nameEffect ?? undefined,
     nameShimmer: profile?.nameShimmer ?? undefined,
     nameGlow: profile?.nameGlow ?? undefined,
+    // Only when off, so a DM to us can warn it needs both of us online.
+    // Imported lazily like dm.svelte does: the mailbox imports this module.
+    inboxOff: (await import("./mailbox.svelte")).mailboxPrefs.enabled
+      ? undefined
+      : true,
   });
 
   const hash = frameHash(payload);
@@ -2218,6 +2235,16 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
     transportState.peerColors = colors;
   }
 
+  // Absent = on: the default, and what a build predating the field sends.
+  const inboxOff = msg.inboxOff === true;
+  _inboxHeardLive.add(did);
+  if (transportState.peerInboxOff.has(did) !== inboxOff) {
+    const next = new Set(transportState.peerInboxOff);
+    if (inboxOff) next.add(did);
+    else next.delete(did);
+    transportState.peerInboxOff = next;
+  }
+
   // Validate and store profile metadata
   const validated = validateProfileMeta({
     bannerUrl: msg.bannerUrl,
@@ -2272,6 +2299,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
         nameEffect: validated.nameEffect,
         nameShimmer: validated.nameShimmer,
         nameGlow: validated.nameGlow,
+        ...(inboxOff ? { inboxOff: true } : {}),
         ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
       }).catch(() => {})
     )
@@ -4009,6 +4037,8 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerNames = new Map();
   transportState.peerAvatars = new Map();
   transportState.peerColors = new Map();
+  transportState.peerInboxOff = new Set();
+  _inboxHeardLive.clear();
   transportState.error = null;
   transportState.callPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
