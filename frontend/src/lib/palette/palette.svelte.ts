@@ -2,6 +2,7 @@ import { loadMru, saveMru, type Mru } from "./mru";
 import { parseQuery } from "./query";
 import { RECENT_GROUP, flatten, rank } from "./rank";
 import { SIGILS, type Cmd, type Page, type RankedCmd, type Sigil } from "./types";
+import { shortcutRows } from "./shortcuts";
 
 /**
  * Which command groups each scope prefix admits.
@@ -408,14 +409,18 @@ function confirmRows(
   ];
 }
 
-/** Rows for the `?` scope, so the prefixes are discoverable rather than folklore. */
+/**
+ * Rows for the `?` scope, so the prefixes and the keyboard shortcuts are
+ * discoverable rather than folklore.
+ */
 function helpRows(apply: (sigil: Sigil) => void): Cmd[] {
-  return (Object.keys(SIGILS) as Sigil[]).map((sigil) => ({
+  const prefixes = (Object.keys(SIGILS) as Sigil[]).map((sigil) => ({
     id: `help:${sigil}`,
     title: `${sigil}  ${SIGILS[sigil]}`,
     subtitle: `Search only ${SIGILS[sigil].toLowerCase()}`,
     group: "Prefixes",
     // Accepting a help row types the prefix, so the user learns it by using it.
-    action: { kind: "act", perform: () => apply(sigil), keepOpen: true },
+    action: { kind: "act" as const, perform: () => apply(sigil), keepOpen: true },
   }));
+  return [...prefixes, ...shortcutRows()];
 }

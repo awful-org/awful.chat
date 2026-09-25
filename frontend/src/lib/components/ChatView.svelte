@@ -889,12 +889,11 @@
   // Pinned messages: private to this user, stored on the room record.
   const pinnedIds = $derived(pinnedMessagesOf(roomCode));
   const pinnedSet = $derived(new Set(pinnedIds));
-  let pinnedOpen = $state(false);
   /** Pinned messages older than the loaded page, read from storage. */
   let pinnedFromStore = $state(new Map<string, Message | null>());
 
   $effect(() => {
-    if (!pinnedOpen) return;
+    if (!uiState.pinnedOpen) return;
     const loaded = new Set(messages.map((m) => m.id));
     const missing = pinnedIds.filter(
       (id) => !loaded.has(id) && !pinnedFromStore.has(id)
@@ -952,7 +951,7 @@
   }
 
   function openPinned(msg: Message): void {
-    pinnedOpen = false;
+    uiState.pinnedOpen = false;
     void revealMessage(roomCode, msg.id, msg.lamport);
   }
 
@@ -1462,7 +1461,7 @@
 
   $effect(() => {
     void roomCode;
-    pinnedOpen = false;
+    uiState.pinnedOpen = false;
   });
 
   $effect(() => {
@@ -1780,19 +1779,26 @@
     // composedPath, not target.closest: unpinning removes the row that was
     // clicked before this runs, and a detached target is inside nothing -
     // which read as a click outside and closed the list on every unpin.
+    // A click inside a dialog is not a click on the page either: picking
+    // "Show pinned messages" in Ctrl+K opened the list and that same click,
+    // reaching here, shut it again.
     if (
-      pinnedOpen &&
+      uiState.pinnedOpen &&
       !e
         .composedPath()
-        .some((n) => n instanceof Element && n.hasAttribute("data-pinned-menu"))
+        .some(
+          (n) =>
+            n instanceof Element &&
+            (n.hasAttribute("data-pinned-menu") || n.getAttribute("role") === "dialog")
+        )
     )
-      pinnedOpen = false;
+      uiState.pinnedOpen = false;
   }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
       closeUserMenu();
       copyMenuOpen = false;
-      pinnedOpen = false;
+      uiState.pinnedOpen = false;
       reactionPickerFor = null;
       activeMessageId = null;
     }
@@ -1982,11 +1988,11 @@
                   {...props}
                   variant="ghost"
                   size="icon"
-                  onclick={() => (pinnedOpen = !pinnedOpen)}
+                  onclick={() => (uiState.pinnedOpen = !uiState.pinnedOpen)}
                   aria-label="Pinned messages"
                   aria-haspopup="menu"
-                  aria-expanded={pinnedOpen}
-                  class="flex text-muted-foreground hover:text-foreground cursor-pointer {pinnedOpen
+                  aria-expanded={uiState.pinnedOpen}
+                  class="flex text-muted-foreground hover:text-foreground cursor-pointer {uiState.pinnedOpen
                     ? 'text-primary'
                     : ''}"
                 >
@@ -1994,7 +2000,7 @@
                 </Button>
               {/snippet}
             </Tip>
-            {#if pinnedOpen}
+            {#if uiState.pinnedOpen}
               <div
                 role="menu"
                 aria-label="Pinned messages"
