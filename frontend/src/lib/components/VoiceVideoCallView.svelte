@@ -62,6 +62,13 @@
   import { callPipPanel } from "$lib/call-pip.svelte";
   import { browserPipSupported, enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
   import { spotlightStore } from "$lib/call-spotlight.svelte";
+  import {
+    closePopout,
+    focusPopout,
+    openPopout,
+    poppedOut,
+    popoutSupported,
+  } from "$lib/call-popout.svelte";
 
   import {
     Eye,
@@ -89,6 +96,8 @@
     Pin,
     PinOff,
     LogIn,
+    SquareArrowOutUpRight,
+    SquareArrowDownLeft,
   } from "@lucide/svelte";
   import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
@@ -627,6 +636,24 @@ import {
 
   const isWatchingTransmission = $derived(watchingTransmissions.size > 0);
 
+  /** Read once: desktop vs phone does not change under a running call. */
+  const canPopout = popoutSupported();
+
+  /** Camera and screen tiles with a picture; plugin tiles come later. */
+  function canPopoutTile(tile: TileData): boolean {
+    return (
+      canPopout &&
+      (tile.kind === "camera" || tile.kind === "screen") &&
+      tile.videoTrack !== null
+    );
+  }
+
+  function popOut(tile: TileData): void {
+    if (!openPopout(tile, tile.label)) {
+      console.warn("[popout] the browser blocked the window");
+    }
+  }
+
   /** Someone else's share that we are watching - loading or live. A watched
    *  share is a "transmission" tile until its track lands, then a "screen"
    *  one; checking only the first hid its stop controls once it played. */
@@ -740,6 +767,8 @@ import {
       isFullscreen,
       pipSupported: browserPipSupported(),
       pipOpen: callPipPanel.browserPip,
+      popoutSupported: canPopout,
+      poppedOut: poppedOut.has(tile.id),
       canMessage: personActions && !tile.isLocal && !!tile.peerId,
       inPhonebook: !tile.isLocal && !!tile.peerId && isInPhonebook(tile.peerId),
       // Off the slider, which openTileMenu seeds from the live gain: it is
@@ -871,6 +900,13 @@ import {
       case "exit-pip":
         await exitBrowserPip();
         break;
+      case "popout":
+        // Before any await: the popup needs this click's gesture.
+        popOut(tile);
+        break;
+      case "popin":
+        closePopout(tile.id);
+        break;
       case "fullscreen":
       case "exit-fullscreen":
         toggleFullscreen();
@@ -982,6 +1018,8 @@ import {
     pin: Pin,
     "pin-off": PinOff,
     pip: PictureInPicture2,
+    popout: SquareArrowOutUpRight,
+    popin: SquareArrowDownLeft,
     fullscreen: Maximize,
     "fullscreen-exit": Minimize,
     message: MessageSquare,
@@ -1448,7 +1486,8 @@ import {
 )}
   {@const hasVideo = tile.videoTrack !== null}
   {@const isPendingTx = tile.kind === "transmission" && tile.isPending}
-  {@const isWatchedTx = isWatchedShare(tile)}
+  {@const isPoppedOut = poppedOut.has(tile.id)}
+  {@const showPopButton = !isPendingTx && (isPoppedOut || canPopoutTile(tile))}
   {@const tileColor = getPeerColor(tile.peerId)}
   {#if tile.kind === "plugin" && joinedPluginTiles.has(tile.id)}
     <!-- A DIV, not the button every other tile is: the plugin renders its
@@ -1577,17 +1616,14 @@ import {
       </div>
     </div>
   {:else}
-  <!-- A wrapper so the "stop watching" control can sit BESIDE the tile rather
-       than inside it. A button nested in a button is invalid HTML, which is
-       what pushed this element to div role="button" - but that trades away
-       focus handling, keyboard activation and assistive-technology semantics
-       that a real button gives for free, on every tile in the call, to serve
-       one overlay. The layout classes live on the wrapper; the button fills
-       it. -->
+  <!-- A wrapper so controls can sit BESIDE the tile rather than inside it
+       (the pop-out button): a button nested in a button is invalid HTML.
+       The layout classes live on the wrapper; the button fills it.
+       group/tile: the tile's hover reveals the sibling controls too. -->
   <div
     role="none"
     oncontextmenu={(e) => openTileMenu(e, tile)}
-    class="relative {isFocused ? 'w-full h-full' : ''} {compact
+    class="group/tile relative {isFocused ? 'w-full h-full' : ''} {compact
       ? 'aspect-video'
       : ''}"
   >
@@ -1611,17 +1647,32 @@ import {
         }
         return;
       }
+      if (isPoppedOut) {
+        focusPopout(tile.id);
+        return;
+      }
       if (isOnlyOne) return;
       if (isFocused) onUnfocus();
       else onFocus();
     }}
     aria-label={isPendingTx
       ? `Watch ${tile.label}'s screen`
+      : isPoppedOut
+        ? `${tile.label} is in its own window. Bring it forward`
       : isFocused
         ? "Minimize tile"
         : `Focus ${tile.label}`}
   >
-    {#if hasVideo}
+    {#if isPoppedOut}
+      <!-- The picture is in its own window; the slot says where it went
+           rather than playing the same stream twice. -->
+      <div class="flex flex-col items-center gap-1.5 text-muted-foreground">
+        <SquareArrowOutUpRight class={compact ? "size-4" : "size-6"} />
+        {#if !compact}
+          <span class="text-xs font-mono">In its own window</span>
+        {/if}
+      </div>
+    {:else if hasVideo}
       <video
         autoplay
         playsinline
@@ -1725,7 +1776,7 @@ import {
     <!-- Stalled overlay: getStats saw the consumer stop advancing. A track
          object is proof a consumer exists, not that RTP still arrives
          (sfu-audit finding 14) - this is the honest signal instead. -->
-    {#if tile.stalled && hasVideo}
+    {#if tile.stalled && hasVideo && !isPoppedOut}
       <div
         class="pointer-events-none absolute inset-0 grid place-items-center bg-background/50"
       >
@@ -1758,8 +1809,12 @@ import {
 
     <!-- Name badge -->
     {#if !isPendingTx}
+      <!-- Capped short of the bottom-right corner, which the pop-out
+           button owns: a long name was free to run under it. -->
       <div
-        class="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none"
+        class="absolute bottom-1.5 left-1.5 flex min-w-0 items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none {showPopButton
+          ? 'max-w-[calc(100%-2.75rem)]'
+          : 'max-w-[calc(100%-0.75rem)]'}"
       >
         {#if tile.kind === "screen" || tile.kind === "transmission"}
           <MonitorIcon class="size-3 text-white" />
@@ -1771,7 +1826,7 @@ import {
           <HeadphoneOff class="size-3 text-red-400" />
         {/if}
         <span
-          class="text-xs mt-0.75 leading-none text-white font-mono"
+          class="min-w-0 truncate text-xs mt-0.75 leading-none text-white font-mono"
           style={tileColor ? `color: ${tileColor}` : ""}
         >
           {tile.kind === "transmission"
@@ -1802,17 +1857,33 @@ import {
       </div>
     {/if}
   </button>
-    {#if isWatchedTx}
-      <!-- A SIBLING of the tile button, not a child: nesting it was what made
-           the tile stop being a button in the first place. -->
-      <button
-        type="button"
-        onclick={() => stopWatchingTransmission(tile.peerId)}
-        aria-label="Stop watching {tile.label}"
-        class="absolute top-1.5 left-1.5 z-20 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 hover:bg-red-500/45"
-      >
-        <Radio class="size-4" />
-      </button>
+    {#if showPopButton}
+      <!-- A sibling of the tile button, not a child (a button cannot nest
+           in one). Bottom-right: the one corner nothing else uses - PiP
+           top-left, audience and link quality top-right, the name
+           bottom-left. -->
+      <Tip text={isPoppedOut ? "Bring back into the call" : "Pop out"}>
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            class="absolute bottom-1.5 right-1.5 z-20 flex size-6 items-center justify-center rounded bg-black/60 text-white hover:bg-black/80 cursor-pointer transition-opacity focus-visible:opacity-100 {isPoppedOut
+              ? ''
+              : 'opacity-0 group-hover/tile:opacity-100'}"
+            aria-label={isPoppedOut ? "Bring back into the call" : `Pop out ${tile.label}`}
+            onclick={() => {
+              if (isPoppedOut) closePopout(tile.id);
+              else popOut(tile);
+            }}
+          >
+            {#if isPoppedOut}
+              <SquareArrowDownLeft class="size-3.5" />
+            {:else}
+              <SquareArrowOutUpRight class="size-3.5" />
+            {/if}
+          </button>
+        {/snippet}
+      </Tip>
     {/if}
   </div>
   {/if}

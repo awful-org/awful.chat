@@ -239,6 +239,12 @@
   let commandSelectedIndex = $state(0);
   let commandHint = $state<string | null>(null);
   let submitting = $state(false);
+  /**
+   * The "Saving and sending" line is for attachments only. A text message
+   * settles in a blink, and the line flashed (and nudged the composer) on
+   * every one; images and files take long enough to be worth saying so.
+   */
+  let submittingFiles = $state(false);
   let sendError = $state<string | null>(null);
   let commandHintTimer: ReturnType<typeof setTimeout> | undefined;
   let mentionPopupOpen = $state(false);
@@ -768,6 +774,7 @@
     const submittedRoom = roomCode;
     const submittedFiles = [...stagedFiles];
     submitting = true;
+    submittingFiles = submittedFiles.length > 0;
     sendError = null;
     try {
 
@@ -852,6 +859,7 @@
       sendError = err instanceof Error ? err.message : "Could not send. Your draft and files have been kept.";
     } finally {
       submitting = false;
+      submittingFiles = false;
     }
   }
 
@@ -3112,7 +3120,7 @@
         />
         {#if sendError}
           <p role="alert" class="mb-1 rounded border border-destructive/30 bg-background px-2 py-1 text-xs text-destructive">{sendError}</p>
-        {:else if submitting}
+        {:else if submittingFiles}
           <p role="status" class="px-2 py-1 text-xs text-muted-foreground">Saving and sending…</p>
         {:else if serialize(draft, draftMentionMap).length > MAX_CHAT_CONTENT_LENGTH}
           <p role="status" class="px-2 py-1 text-xs text-muted-foreground">This long message will be sent as message.txt.</p>
