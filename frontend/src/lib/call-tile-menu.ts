@@ -21,6 +21,8 @@ export type TileMenuIcon =
   | "pin"
   | "pin-off"
   | "pip"
+  | "popout"
+  | "popin"
   | "fullscreen"
   | "fullscreen-exit"
   | "message"
@@ -48,6 +50,9 @@ export type TileMenuAction =
   /** The browser's own floating window, following the pinned tile. */
   | { kind: "pip" }
   | { kind: "exit-pip" }
+  /** A window of its own (call-popout), and back into the grid. */
+  | { kind: "popout" }
+  | { kind: "popin" }
   | { kind: "fullscreen" }
   | { kind: "exit-fullscreen" }
   | { kind: "message" }
@@ -123,6 +128,10 @@ export interface TileMenuState {
   pipSupported: boolean;
   /** The browser's PiP window is open. */
   pipOpen: boolean;
+  /** Desktop: a tile can move to a window of its own. */
+  popoutSupported: boolean;
+  /** This tile is in its own window right now. */
+  poppedOut: boolean;
   /** A remote peer with a real peer id, so a DM can be opened. */
   canMessage: boolean;
   /** That person is in the phonebook already. */
@@ -154,6 +163,8 @@ export function tileMenuState(
     isFullscreen: false,
     pipSupported: false,
     pipOpen: false,
+    popoutSupported: false,
+    poppedOut: false,
     canMessage: false,
     inPhonebook: false,
     peerMuted: false,
@@ -199,6 +210,29 @@ function pipRows(s: TileMenuState): TileMenuRow[] {
           action: { kind: "pip" },
         },
       ];
+}
+
+function popoutRows(s: TileMenuState): TileMenuRow[] {
+  if (s.poppedOut) {
+    return [
+      {
+        type: "item",
+        label: "Bring back into the call",
+        icon: "popin",
+        action: { kind: "popin" },
+      },
+    ];
+  }
+  // Like PiP, only a real track can move: an avatar tile has nothing to show.
+  if (!s.popoutSupported || !s.hasVideo) return [];
+  return [
+    {
+      type: "item",
+      label: "Pop out",
+      icon: "popout",
+      action: { kind: "popout" },
+    },
+  ];
 }
 
 function fullscreenRow(s: TileMenuState): TileMenuRow {
@@ -297,7 +331,7 @@ export function buildTileMenu(s: TileMenuState): TileMenuRow[] {
     return rows;
   }
 
-  rows.push(focusRow(s), ...pipRows(s), fullscreenRow(s));
+  rows.push(focusRow(s), ...pipRows(s), ...popoutRows(s), fullscreenRow(s));
 
   if (s.kind === "camera" && s.isLocal) {
     rows.push(

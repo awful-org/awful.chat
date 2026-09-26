@@ -91,6 +91,8 @@
     exitBrowserPip,
   } from "$lib/call-spotlight.svelte";
   import type { CallState } from "$lib/call-tiles";
+  import { closeAllPopouts, syncPopouts } from "$lib/call-popout.svelte";
+  import { profileStore } from "$lib/profile.svelte";
   import { setOnPictureInPictureEnter } from "$lib/plugins/media-session";
 
   const queryClient = new QueryClient();
@@ -805,6 +807,24 @@
         tile.peerId.slice(0, 8))
       : "";
     setPipSource(spotlightStream, label, spotlightFit);
+  });
+
+  // Popped-out tiles follow the call from here rather than from the stage:
+  // this tile list is live whichever room the view is on, so a share in its
+  // own window keeps its track while the stage is not mounted. Leaving the
+  // call closes them all - the local camera tile outlives the call in
+  // `tiles`, and its window must not.
+  $effect(() => {
+    if (!transportState.inCall) {
+      closeAllPopouts();
+      return;
+    }
+    syncPopouts(tiles, (tile) =>
+      tile.isLocal
+        ? profileStore.nickname || "You"
+        : (transportState.peerNames.get(peerIdToDid(tile.peerId) || tile.peerId) ??
+          tile.peerId.slice(0, 8))
+    );
   });
 
   // Wire up browser PiP event handlers on the video element.
