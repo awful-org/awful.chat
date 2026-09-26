@@ -875,7 +875,6 @@
     openRoom: (code) => void handleSelectRoom(code),
     joinRoomByCode: (code) => void handleJoin(code, ""),
     openDm: (peerId) => void handleSelectDm(peerId),
-    leaveRoom: handleLeave,
     removeRoom: (code) => void handleRemoveRoom(code),
     openCreateJoin,
   };

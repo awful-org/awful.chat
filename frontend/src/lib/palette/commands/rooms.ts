@@ -5,7 +5,6 @@ import {
   DoorOpen,
   KeyRound,
   LogIn,
-  LogOut,
   Link,
   Pencil,
   Pin,
@@ -246,14 +245,6 @@ export const roomCommands: CmdSource = (host) => {
             })),
         }),
       },
-    });
-
-    cmds.push({
-      id: "room.leave",
-      title: "Leave room",
-      group: "Rooms",
-      icon: LogOut,
-      action: { kind: "act", perform: () => host.leaveRoom() },
     });
 
     cmds.push({
