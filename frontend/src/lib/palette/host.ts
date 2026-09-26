@@ -26,9 +26,6 @@ export interface PaletteHost {
   /** Open a direct-message conversation with a phonebook peer. */
   openDm(peerId: string): void;
 
-  /** Close the room on screen. Keeps it in the room list. */
-  leaveRoom(): void;
-
   /** Remove a room and its history. Destructive. */
   removeRoom(roomCode: string): void;
 
