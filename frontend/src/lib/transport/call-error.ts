@@ -26,6 +26,30 @@ export function describeMediaError(err: unknown): string {
   return String(err);
 }
 
+/**
+ * What to say when a screen share fails to start - or nothing, when the
+ * person simply closed the browser's picker.
+ *
+ * Every engine reports a cancelled picker as NotAllowedError, the same name
+ * a refused camera gets, so the camera copy above ("Microphone or camera
+ * permission denied") greeted everyone who changed their mind. Chrome
+ * separates the one refusal that is not a choice by its message: the OS
+ * withholding screen capture ("Permission denied by system", macOS Screen
+ * Recording). That one gets copy that says where to fix it.
+ */
+export function describeShareError(err: unknown): string | null {
+  if (err instanceof Error) {
+    if (err.name === "AbortError") return null;
+    if (err.name === "NotAllowedError") {
+      return /by system/i.test(err.message)
+        ? "Your system is blocking screen capture. Allow this browser under Screen Recording in your system's privacy settings, then try again."
+        : null;
+    }
+    return err.message;
+  }
+  return String(err);
+}
+
 /** Structural, so this module never has to import the transport state. */
 export interface ErrorSlot {
   error: string | null;
