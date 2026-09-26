@@ -21,6 +21,7 @@
   import ShareScreenDialog from "$lib/components/ShareScreenDialog.svelte";
   import DeviceCheck from "$lib/components/DeviceCheck.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
+  import AppNotices from "$lib/components/AppNotices.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import {
@@ -192,6 +193,9 @@
         />
       </div>
     </div>
+    <!-- The call's errors and the no-microphone row live here now, not
+         above the stage - so a quick call needs it as much as the app. -->
+    <AppNotices />
   {:else if quickCall.stage === "ended"}
     <div
       class="min-h-dvh overflow-y-auto bg-background text-foreground flex items-center justify-center p-4 font-mono"

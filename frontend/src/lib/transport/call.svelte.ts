@@ -35,6 +35,7 @@ import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
   cancelErrorClear,
   describeMediaError,
+  describeShareError,
   setErrorWithAutoClear,
 } from "./call-error";
 
@@ -593,8 +594,9 @@ export async function startScreenShare(stream?: MediaStream): Promise<void> {
     // Set error with auto-clear: permission errors should not persist
     // indefinitely on screen. The user is still in the call after screen share
     // startup fails, so the error clears when they retry or when the timer
-    // expires.
-    setErrorWithAutoClear(transportState, describeMediaError(err));
+    // expires. A closed picker is no error at all (describeShareError).
+    const message = describeShareError(err);
+    if (message) setErrorWithAutoClear(transportState, message);
     throw err;
   }
 }

@@ -91,6 +91,8 @@
     exitBrowserPip,
   } from "$lib/call-spotlight.svelte";
   import type { CallState } from "$lib/call-tiles";
+  import { closeAllPopouts, syncPopouts } from "$lib/call-popout.svelte";
+  import { profileStore } from "$lib/profile.svelte";
   import { setOnPictureInPictureEnter } from "$lib/plugins/media-session";
 
   const queryClient = new QueryClient();
@@ -807,6 +809,24 @@
     setPipSource(spotlightStream, label, spotlightFit);
   });
 
+  // Popped-out tiles follow the call from here rather than from the stage:
+  // this tile list is live whichever room the view is on, so a share in its
+  // own window keeps its track while the stage is not mounted. Leaving the
+  // call closes them all - the local camera tile outlives the call in
+  // `tiles`, and its window must not.
+  $effect(() => {
+    if (!transportState.inCall) {
+      closeAllPopouts();
+      return;
+    }
+    syncPopouts(tiles, (tile) =>
+      tile.isLocal
+        ? profileStore.nickname || "You"
+        : (transportState.peerNames.get(peerIdToDid(tile.peerId) || tile.peerId) ??
+          tile.peerId.slice(0, 8))
+    );
+  });
+
   // Wire up browser PiP event handlers on the video element.
   $effect(() => {
     if (!pipVideoElement) return;
@@ -855,7 +875,6 @@
     openRoom: (code) => void handleSelectRoom(code),
     joinRoomByCode: (code) => void handleJoin(code, ""),
     openDm: (peerId) => void handleSelectDm(peerId),
-    leaveRoom: handleLeave,
     removeRoom: (code) => void handleRemoveRoom(code),
     openCreateJoin,
   };
@@ -1233,7 +1252,11 @@
         onOpenPhonebook={() => (phonebookOpen = true)}
         collapsed={!isMobile && displayPrefs.sidebarCollapsed}
         onToggleCollapsed={() =>
-          setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
+          // A phone has no rail to collapse to (`collapsed` is forced off
+          // there), so the button closes the slide-over instead.
+          isMobile
+            ? (sidebarOpen = false)
+            : setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
       />
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}

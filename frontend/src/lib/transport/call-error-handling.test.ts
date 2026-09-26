@@ -3,6 +3,7 @@ import {
   ERROR_CLEAR_MS,
   cancelErrorClear,
   describeMediaError,
+  describeShareError,
   setErrorWithAutoClear,
   type ErrorSlot,
 } from "./call-error";
@@ -39,6 +40,32 @@ describe("describeMediaError", () => {
 
   it("survives a thrown non-Error", () => {
     expect(describeMediaError("something odd")).toBe("something odd");
+  });
+});
+
+describe("describeShareError", () => {
+  it("says nothing when the picker was closed, in any engine's words", () => {
+    for (const raw of [
+      "Permission denied",
+      "Permission denied by user",
+      "The request is not allowed by the user agent or the platform in the current context.",
+    ]) {
+      expect(describeShareError(new DOMException(raw, "NotAllowedError"))).toBeNull();
+    }
+    expect(describeShareError(new DOMException("aborted", "AbortError"))).toBeNull();
+  });
+
+  it("never blames the microphone or camera", () => {
+    const out = describeShareError(
+      new DOMException("Permission denied by system", "NotAllowedError")
+    );
+    expect(out).not.toBeNull();
+    expect(out!.toLowerCase()).not.toContain("microphone");
+    expect(out!.toLowerCase()).toContain("screen recording");
+  });
+
+  it("passes a real failure through", () => {
+    expect(describeShareError(new Error("SFU unreachable"))).toBe("SFU unreachable");
   });
 });
 

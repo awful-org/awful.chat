@@ -51,10 +51,6 @@
     toggleMute,
     toggleDeafen,
   } from "$lib/transport/call.svelte";
-  import {
-    getVoiceActiveInputDevice,
-    setVoiceInputDevice,
-  } from "$lib/transport/voice.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
   import { latestWatched } from "$lib/watch-presence";
@@ -62,6 +58,13 @@
   import { callPipPanel } from "$lib/call-pip.svelte";
   import { browserPipSupported, enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
   import { spotlightStore } from "$lib/call-spotlight.svelte";
+  import {
+    closePopout,
+    focusPopout,
+    openPopout,
+    poppedOut,
+    popoutSupported,
+  } from "$lib/call-popout.svelte";
 
   import {
     Eye,
@@ -85,10 +88,11 @@
     Workflow,
     Puzzle,
     X as XIcon,
-    Tv2,
     Pin,
     PinOff,
     LogIn,
+    SquareArrowOutUpRight,
+    SquareArrowDownLeft,
   } from "@lucide/svelte";
   import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
@@ -221,7 +225,6 @@ import {
     pendingTransmissions = new Map<string, string>(),
     watchingTransmissions = new Map<string, string>(),
     callPeerStates = new Map<string, { muted: boolean; deafened: boolean }>(),
-    error = null,
   } = $derived(transportState);
 
   // Only the call in the room on screen. Peers of another room's call are
@@ -627,6 +630,24 @@ import {
 
   const isWatchingTransmission = $derived(watchingTransmissions.size > 0);
 
+  /** Read once: desktop vs phone does not change under a running call. */
+  const canPopout = popoutSupported();
+
+  /** Camera and screen tiles with a picture; plugin tiles come later. */
+  function canPopoutTile(tile: TileData): boolean {
+    return (
+      canPopout &&
+      (tile.kind === "camera" || tile.kind === "screen") &&
+      tile.videoTrack !== null
+    );
+  }
+
+  function popOut(tile: TileData): void {
+    if (!openPopout(tile, tile.label)) {
+      console.warn("[popout] the browser blocked the window");
+    }
+  }
+
   /** Someone else's share that we are watching - loading or live. A watched
    *  share is a "transmission" tile until its track lands, then a "screen"
    *  one; checking only the first hid its stop controls once it played. */
@@ -740,6 +761,8 @@ import {
       isFullscreen,
       pipSupported: browserPipSupported(),
       pipOpen: callPipPanel.browserPip,
+      popoutSupported: canPopout,
+      poppedOut: poppedOut.has(tile.id),
       canMessage: personActions && !tile.isLocal && !!tile.peerId,
       inPhonebook: !tile.isLocal && !!tile.peerId && isInPhonebook(tile.peerId),
       // Off the slider, which openTileMenu seeds from the live gain: it is
@@ -871,6 +894,13 @@ import {
       case "exit-pip":
         await exitBrowserPip();
         break;
+      case "popout":
+        // Before any await: the popup needs this click's gesture.
+        popOut(tile);
+        break;
+      case "popin":
+        closePopout(tile.id);
+        break;
       case "fullscreen":
       case "exit-fullscreen":
         toggleFullscreen();
@@ -982,6 +1012,8 @@ import {
     pin: Pin,
     "pin-off": PinOff,
     pip: PictureInPicture2,
+    popout: SquareArrowOutUpRight,
+    popin: SquareArrowDownLeft,
     fullscreen: Maximize,
     "fullscreen-exit": Minimize,
     message: MessageSquare,
@@ -1209,33 +1241,6 @@ import {
     typeof navigator.mediaDevices?.getDisplayMedia === "function";
 
   /**
-   * In the call, but with no microphone.
-   *
-   * Denied permission, a device already held by another app, hardware that
-   * is not there. Being in a call you cannot speak in and not being told is
-   * the worst version of this, so it gets a badge that does not time out.
-   *
-   * The transport withdraws the flag as soon as a later mic start succeeds,
-   * so this is safe to render as a badge that never times out.
-   */
-  const micUnavailable = $derived(transportState.micUnavailable);
-  let micRetrying = $state(false);
-
-  async function retryMic(): Promise<void> {
-    micRetrying = true;
-    try {
-      // The existing start path: setInputDevice re-runs the same
-      // getUserMedia the join does, with the remembered device (or the
-      // system default when there is none). Nothing here reimplements it.
-      await setVoiceInputDevice(getVoiceActiveInputDevice() ?? "");
-    } catch {
-      // Still no microphone. The badge stays, which is the honest answer.
-    } finally {
-      micRetrying = false;
-    }
-  }
-
-  /**
    * Say what the tap is about to do BEFORE the browser asks.
    *
    * The permission prompt has to hang off a user gesture, and the join
@@ -1390,6 +1395,30 @@ import {
     else panelEl.requestFullscreen().catch(() => {});
   }
 
+  const headerBtn =
+    "flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 transition-all duration-200 hover:scale-105 cursor-pointer";
+
+  /**
+   * The tile the header's pop out acts on: the spotlight, the same one
+   * picture in picture floats - the focused tile when there is one.
+   */
+  const spotlightStageTile = $derived(
+    tiles.find((t) => t.id === spotlightStore.spotlightTileId) ?? null
+  );
+  const spotlightPopped = $derived(
+    !!spotlightStageTile && poppedOut.has(spotlightStageTile.id)
+  );
+  const spotlightPoppable = $derived(
+    !!spotlightStageTile && canPopoutTile(spotlightStageTile)
+  );
+
+  function toggleSpotlightPopout(): void {
+    const tile = spotlightStageTile;
+    if (!tile) return;
+    if (poppedOut.has(tile.id)) closePopout(tile.id);
+    else popOut(tile);
+  }
+
   async function toggleBrowserPiP(): Promise<void> {
     if (callPipPanel.browserPip) await exitBrowserPip();
     else await enterBrowserPip(() => {});
@@ -1429,12 +1458,6 @@ import {
   }
 </script>
 
-<!-- Error banner (always visible if present) -->
-{#if error}
-  <div class="flex flex-col border-b border-border shrink-0 bg-background">
-    <p class="text-sm text-destructive px-3 pt-1.5">{error}</p>
-  </div>
-{/if}
 
 <!-- ── CallTile snippet ── -->
 {#snippet callTile(
@@ -1448,7 +1471,7 @@ import {
 )}
   {@const hasVideo = tile.videoTrack !== null}
   {@const isPendingTx = tile.kind === "transmission" && tile.isPending}
-  {@const isWatchedTx = isWatchedShare(tile)}
+  {@const isPoppedOut = poppedOut.has(tile.id)}
   {@const tileColor = getPeerColor(tile.peerId)}
   {#if tile.kind === "plugin" && joinedPluginTiles.has(tile.id)}
     <!-- A DIV, not the button every other tile is: the plugin renders its
@@ -1577,13 +1600,9 @@ import {
       </div>
     </div>
   {:else}
-  <!-- A wrapper so the "stop watching" control can sit BESIDE the tile rather
-       than inside it. A button nested in a button is invalid HTML, which is
-       what pushed this element to div role="button" - but that trades away
-       focus handling, keyboard activation and assistive-technology semantics
-       that a real button gives for free, on every tile in the call, to serve
-       one overlay. The layout classes live on the wrapper; the button fills
-       it. -->
+  <!-- A wrapper so controls can sit BESIDE the tile rather than inside it
+       (a button nested in a button is invalid HTML). The layout classes
+       live on the wrapper; the button fills it. -->
   <div
     role="none"
     oncontextmenu={(e) => openTileMenu(e, tile)}
@@ -1611,17 +1630,32 @@ import {
         }
         return;
       }
+      if (isPoppedOut) {
+        focusPopout(tile.id);
+        return;
+      }
       if (isOnlyOne) return;
       if (isFocused) onUnfocus();
       else onFocus();
     }}
     aria-label={isPendingTx
       ? `Watch ${tile.label}'s screen`
+      : isPoppedOut
+        ? `${tile.label} is in its own window. Bring it forward`
       : isFocused
         ? "Minimize tile"
         : `Focus ${tile.label}`}
   >
-    {#if hasVideo}
+    {#if isPoppedOut}
+      <!-- The picture is in its own window; the slot says where it went
+           rather than playing the same stream twice. -->
+      <div class="flex flex-col items-center gap-1.5 text-muted-foreground">
+        <SquareArrowOutUpRight class={compact ? "size-4" : "size-6"} />
+        {#if !compact}
+          <span class="text-xs font-mono">In its own window</span>
+        {/if}
+      </div>
+    {:else if hasVideo}
       <video
         autoplay
         playsinline
@@ -1670,28 +1704,6 @@ import {
 
     {#if tile.kind === "screen" || tile.kind === "transmission" || isPendingTx}
       {@const audience = transmissionAudience(tile.peerId)}
-      {#if hasVideo && !isPendingTx && browserPipSupported()}
-        <!-- The browser's own floating window for this share, not the in-app
-             panel: pin the share so the spotlight follows it, then open the
-             surface AppView already keeps in sync with the spotlight. -->
-        <Tip text="Picture in picture">
-          {#snippet children(props)}
-            <button
-              {...props}
-              type="button"
-              class="absolute top-1.5 left-1.5 z-20 flex size-6 items-center justify-center rounded bg-black/60 text-white hover:bg-black/80 cursor-pointer"
-              aria-label="Picture in picture"
-              onclick={(e: MouseEvent) => {
-                e.stopPropagation();
-                callFocus.pinnedTileId = tile.id;
-                void enterBrowserPip(() => void requestReturnToCall());
-              }}
-            >
-              <PictureInPicture2 class="size-3.5" />
-            </button>
-          {/snippet}
-        </Tip>
-      {/if}
       {#if audience.count > 0}
         <Tip text={audience.label}>
           {#snippet children(props)}
@@ -1725,7 +1737,7 @@ import {
     <!-- Stalled overlay: getStats saw the consumer stop advancing. A track
          object is proof a consumer exists, not that RTP still arrives
          (sfu-audit finding 14) - this is the honest signal instead. -->
-    {#if tile.stalled && hasVideo}
+    {#if tile.stalled && hasVideo && !isPoppedOut}
       <div
         class="pointer-events-none absolute inset-0 grid place-items-center bg-background/50"
       >
@@ -1758,8 +1770,10 @@ import {
 
     <!-- Name badge -->
     {#if !isPendingTx}
+      <!-- Capped to the tile, so a long name ends in an ellipsis rather
+           than running off the edge. -->
       <div
-        class="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none"
+        class="absolute bottom-1.5 left-1.5 flex min-w-0 max-w-[calc(100%-0.75rem)] items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none"
       >
         {#if tile.kind === "screen" || tile.kind === "transmission"}
           <MonitorIcon class="size-3 text-white" />
@@ -1771,7 +1785,7 @@ import {
           <HeadphoneOff class="size-3 text-red-400" />
         {/if}
         <span
-          class="text-xs mt-0.75 leading-none text-white font-mono"
+          class="min-w-0 truncate text-xs mt-0.75 leading-none text-white font-mono"
           style={tileColor ? `color: ${tileColor}` : ""}
         >
           {tile.kind === "transmission"
@@ -1802,18 +1816,6 @@ import {
       </div>
     {/if}
   </button>
-    {#if isWatchedTx}
-      <!-- A SIBLING of the tile button, not a child: nesting it was what made
-           the tile stop being a button in the first place. -->
-      <button
-        type="button"
-        onclick={() => stopWatchingTransmission(tile.peerId)}
-        aria-label="Stop watching {tile.label}"
-        class="absolute top-1.5 left-1.5 z-20 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 hover:bg-red-500/45"
-      >
-        <Radio class="size-4" />
-      </button>
-    {/if}
   </div>
   {/if}
 {/snippet}
@@ -1934,23 +1936,6 @@ import {
     class="flex flex-col relative bg-background pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] {panelSizeClass}"
     class:cursor-hidden={isFullscreen && !controlsVisible}
   >
-    {#if micUnavailable}
-      <div
-        role="status"
-        class="absolute left-1/2 top-2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-amber-500/40 bg-background/95 px-2.5 py-1.5 text-xs shadow-lg backdrop-blur"
-      >
-        <MicOff class="size-3.5 shrink-0 text-amber-500" />
-        <span class="text-foreground">Listen only, no microphone</span>
-        <button
-          type="button"
-          onclick={retryMic}
-          disabled={micRetrying}
-          class="inline-flex h-8 items-center rounded px-2 font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
-        >
-          {micRetrying ? "Trying..." : "Retry"}
-        </button>
-      </div>
-    {/if}
 
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
@@ -2084,7 +2069,12 @@ import {
       }}
     >
       {#if isSmallScreen}
-        <div class="grid grid-cols-3 items-center gap-2">
+        <!-- 1fr auto 1fr, not three equal thirds: the mic/camera/screen card
+             is wider than a third of a phone, and an equal column let it
+             run under the hang-up button. An fr track never goes below its
+             content, so the card takes what it needs and hang-up stays
+             centred whenever there is room to. -->
+        <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
           <div class="flex justify-start">
             <div
               class="flex gap-2 rounded-xl border border-white/10 bg-zinc-900/95 px-2.5 py-2"
@@ -2484,9 +2474,6 @@ import {
           "opacity-0 pointer-events-none"
       )}
     >
-    <!-- PiP and fullscreen buttons in the top corners -->
-    <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-      {#snippet children(props)}
     <!-- Worth showing only when it changes anything: some tile with
          video AND some tile without. It also stays up whenever a filter is
          active, so a filter picked from the menu always has a way out even
@@ -2518,38 +2505,65 @@ import {
       </Tip>
     {/if}
 
-    <!-- Browser PiP button. Clicking requests picture-in-picture on the panel's video element. -->
-    <Tip text={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}>
-      {#snippet children(props)}
-        <button
-          {...props}
-          type="button"
-          onclick={toggleBrowserPiP}
-          aria-label={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}
-          class="absolute top-3 right-12 sm:top-4 sm:right-12 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 text-zinc-300 transition-all duration-200 hover:bg-zinc-900 hover:scale-105 z-20 {callPipPanel.browserPip
-            ? 'text-primary'
-            : ''}"
-        >
-          <Tv2 class="size-4" />
-        </button>
-      {/snippet}
-    </Tip>
-
-    <button
-      {...props}
-      type="button"
-      onclick={toggleFullscreen}
-      aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-      class="absolute top-3 right-3 sm:top-4 sm:right-4 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 text-zinc-300 transition-all duration-200 hover:bg-zinc-900 hover:scale-105 z-20"
-    >
-      {#if isFullscreen}
-        <Minimize class="size-4" />
-      {:else}
-        <Maximize class="size-4" />
+    <!-- What the stage does with the spotlight, in one row top-right:
+         from the right, fullscreen, pop out, picture in picture. Per-tile
+         copies of the last two used to sit on the tiles themselves (two PiP
+         buttons for one window); a tile's own are in its right-click menu. -->
+    <div class="absolute top-3 right-3 sm:top-4 sm:right-4 z-20 flex items-center gap-2">
+      {#if browserPipSupported()}
+        <Tip text={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}>
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={toggleBrowserPiP}
+              aria-label={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}
+              class="{headerBtn} {callPipPanel.browserPip ? 'text-primary' : 'text-zinc-300'}"
+            >
+              <PictureInPicture2 class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
       {/if}
-    </button>
-      {/snippet}
-    </Tip>
+      {#if spotlightPopped || spotlightPoppable}
+        <Tip text={spotlightPopped ? "Bring back into the call" : "Pop out"}>
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={toggleSpotlightPopout}
+              aria-label={spotlightPopped
+                ? "Bring back into the call"
+                : `Pop out ${spotlightStageTile?.label ?? ""}`.trim()}
+              class="{headerBtn} {spotlightPopped ? 'text-primary' : 'text-zinc-300'}"
+            >
+              {#if spotlightPopped}
+                <SquareArrowDownLeft class="size-4" />
+              {:else}
+                <SquareArrowOutUpRight class="size-4" />
+              {/if}
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
+      <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={toggleFullscreen}
+            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            class="{headerBtn} text-zinc-300"
+          >
+            {#if isFullscreen}
+              <Minimize class="size-4" />
+            {:else}
+              <Maximize class="size-4" />
+            {/if}
+          </button>
+        {/snippet}
+      </Tip>
+    </div>
     </div>
 
     <!-- Both menus live inside the panel on purpose. The panel is the element
@@ -2622,7 +2636,7 @@ import {
           class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
           onclick={() => setCallPip(!displayPrefs.callPip)}
         >
-          <Tv2 class="size-4 shrink-0" />
+          <PictureInPicture2 class="size-4 shrink-0" />
           <span class="flex-1 truncate text-left">Picture-in-picture</span>
           {#if displayPrefs.callPip}
             <Check class="size-3.5 shrink-0 text-primary" />

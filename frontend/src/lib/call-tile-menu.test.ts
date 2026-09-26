@@ -233,6 +233,36 @@ describe("buildTileMenu", () => {
     expect(actions(other)).not.toContain("exit-pip");
   });
 
+  it("pops out only a tile with a track, where the platform can", () => {
+    const share = { kind: "screen" as const, label: "Ada", hasVideo: true };
+    expect(
+      actions(buildTileMenu(tileMenuState({ ...share, popoutSupported: true })))
+    ).toContain("popout");
+    // A phone: no window to move it to.
+    expect(actions(buildTileMenu(tileMenuState(share)))).not.toContain("popout");
+    // An avatar tile has nothing to show in a window.
+    expect(
+      actions(
+        buildTileMenu(
+          tileMenuState({ kind: "camera", label: "Ada", popoutSupported: true })
+        )
+      )
+    ).not.toContain("popout");
+  });
+
+  it("offers to bring a popped tile back, even while its track is gone", () => {
+    const rows = buildTileMenu(
+      tileMenuState({
+        kind: "camera",
+        label: "Ada",
+        popoutSupported: true,
+        poppedOut: true,
+      })
+    );
+    expect(actions(rows)).toContain("popin");
+    expect(actions(rows)).not.toContain("popout");
+  });
+
   it("mirrors focus and fullscreen state in the labels", () => {
     const rows = buildTileMenu(
       tileMenuState({
