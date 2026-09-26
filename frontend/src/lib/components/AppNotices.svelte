@@ -3,8 +3,12 @@
   import type { TransportStatus } from "$lib/transport/types";
   import { claimNodeLock } from "$lib/transport/node-lock";
   import { isConfigured } from "$lib/runtime-config";
-  import { AppWindow, CircleAlert, ServerOff, WifiOff, X } from "@lucide/svelte";
-  import { onDestroy, onMount } from "svelte";
+  import { AppWindow, CircleAlert, MicOff, ServerOff, WifiOff, X } from "@lucide/svelte";
+  import {
+    getVoiceActiveInputDevice,
+    setVoiceInputDevice,
+  } from "$lib/transport/voice.svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import { clockJumped } from "$lib/clock-health";
 
   /**
@@ -29,6 +33,10 @@
     message: string;
     /** Stays until dismissed. See STICKY. */
     sticky: boolean;
+    /** Red for something that failed, amber for something to know. */
+    tone: "warning" | "error";
+    /** The transport's error slot, mirrored rather than timed (see below). */
+    fromErrorSlot?: boolean;
   }
 
   /**
@@ -69,20 +77,32 @@
   const timers = new Map<number, ReturnType<typeof setTimeout>>();
 
   function dismiss(id: number): void {
+    // Closing the mirrored error closes the error: left in the slot, it
+    // would come straight back the next time anything re-read it.
+    if (notices.some((n) => n.id === id && n.fromErrorSlot)) {
+      transportState.error = null;
+    }
     notices = notices.filter((n) => n.id !== id);
     const t = timers.get(id);
     if (t) clearTimeout(t);
     timers.delete(id);
   }
 
-  function push(message: string): void {
+  function push(
+    message: string,
+    opts: { tone?: Notice["tone"]; fromErrorSlot?: boolean } = {}
+  ): void {
     // The same warning announced twice (a retry, a second tab's storage
     // event) should not stack two identical toasts on top of each other.
     if (notices.some((n) => n.message === message)) return;
     const notice: Notice = {
       id: ++nextId,
       message,
-      sticky: STICKY.some((re) => re.test(message)),
+      // The error slot times itself out (setErrorWithAutoClear); its toast
+      // follows the slot, so no second timer here.
+      sticky: !!opts.fromErrorSlot || STICKY.some((re) => re.test(message)),
+      tone: opts.tone ?? "warning",
+      fromErrorSlot: opts.fromErrorSlot,
     };
     // Drop the OLDEST when full: the newest thing to go wrong is the one the
     // user is looking at the screen for.
@@ -151,6 +171,47 @@
     cleanups.push(() => _transport.off("status", onStatus));
   });
 
+  /**
+   * The call's errors: a camera that would not open, a share that failed, a
+   * DM that could not go out. They used to be a red line above the call,
+   * pushing the whole stage down and seen only while the call was on
+   * screen. The toast follows the slot exactly - shown while it holds a
+   * message, gone when it is cleared (a retry, or its own timeout).
+   */
+  const slotError = $derived(transportState.error);
+  $effect(() => {
+    const message = slotError;
+    const current = untrack(() => notices.find((n) => n.fromErrorSlot));
+    if (current?.message === message) return;
+    if (current) {
+      untrack(() => {
+        notices = notices.filter((n) => n.id !== current.id);
+      });
+    }
+    if (message) untrack(() => push(message, { tone: "error", fromErrorSlot: true }));
+  });
+
+  /**
+   * In a call with no microphone: denied, held by another app, not there.
+   * Stays until a mic start succeeds - the transport withdraws the flag -
+   * because a call you cannot speak in, untold, is the worst version.
+   */
+  const micUnavailable = $derived(transportState.inCall && transportState.micUnavailable);
+  let micRetrying = $state(false);
+
+  async function retryMic(): Promise<void> {
+    micRetrying = true;
+    try {
+      // The join's own start path, with the remembered device (or the
+      // system default when there is none).
+      await setVoiceInputDevice(getVoiceActiveInputDevice() ?? "");
+    } catch {
+      // Still no microphone. The row stays, which is the honest answer.
+    } finally {
+      micRetrying = false;
+    }
+  }
+
   // A relay that connects proves the configuration was read, and a failed
   // load that later succeeds shows up here first.
   $effect(() => {
@@ -181,9 +242,16 @@
   {#each notices as notice (notice.id)}
     <div
       role="alert"
-      class="pointer-events-auto flex w-full max-w-md items-start gap-2 rounded-lg border border-amber-500/40 bg-background/95 px-3 py-2 text-xs shadow-lg backdrop-blur"
+      class="pointer-events-auto flex w-full max-w-md items-start gap-2 rounded-lg border bg-background/95 px-3 py-2 text-xs shadow-lg backdrop-blur {notice.tone ===
+      'error'
+        ? 'border-destructive/50'
+        : 'border-amber-500/40'}"
     >
-      <CircleAlert class="mt-0.5 size-4 shrink-0 text-amber-500" />
+      <CircleAlert
+        class="mt-0.5 size-4 shrink-0 {notice.tone === 'error'
+          ? 'text-destructive'
+          : 'text-amber-500'}"
+      />
       <span class="min-w-0 flex-1 text-foreground">{notice.message}</span>
       <button
         type="button"
@@ -195,6 +263,24 @@
       </button>
     </div>
   {/each}
+
+  {#if micUnavailable}
+    <div
+      role="status"
+      class="pointer-events-auto flex w-full max-w-md items-center justify-center gap-2 rounded-lg border border-amber-500/40 bg-background/95 px-3 py-1.5 text-xs shadow-lg backdrop-blur"
+    >
+      <MicOff class="size-3.5 shrink-0 text-amber-500" />
+      <span class="text-foreground">Listen only, no microphone</span>
+      <button
+        type="button"
+        onclick={retryMic}
+        disabled={micRetrying}
+        class="ml-1 rounded border border-border px-2 py-0.5 font-medium text-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+      >
+        {micRetrying ? "Trying..." : "Retry"}
+      </button>
+    </div>
+  {/if}
 
   {#if barText}
     <div

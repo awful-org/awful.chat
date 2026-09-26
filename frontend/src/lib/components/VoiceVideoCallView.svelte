@@ -51,10 +51,6 @@
     toggleMute,
     toggleDeafen,
   } from "$lib/transport/call.svelte";
-  import {
-    getVoiceActiveInputDevice,
-    setVoiceInputDevice,
-  } from "$lib/transport/voice.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
   import { latestWatched } from "$lib/watch-presence";
@@ -229,7 +225,6 @@ import {
     pendingTransmissions = new Map<string, string>(),
     watchingTransmissions = new Map<string, string>(),
     callPeerStates = new Map<string, { muted: boolean; deafened: boolean }>(),
-    error = null,
   } = $derived(transportState);
 
   // Only the call in the room on screen. Peers of another room's call are
@@ -1246,33 +1241,6 @@ import {
     typeof navigator.mediaDevices?.getDisplayMedia === "function";
 
   /**
-   * In the call, but with no microphone.
-   *
-   * Denied permission, a device already held by another app, hardware that
-   * is not there. Being in a call you cannot speak in and not being told is
-   * the worst version of this, so it gets a badge that does not time out.
-   *
-   * The transport withdraws the flag as soon as a later mic start succeeds,
-   * so this is safe to render as a badge that never times out.
-   */
-  const micUnavailable = $derived(transportState.micUnavailable);
-  let micRetrying = $state(false);
-
-  async function retryMic(): Promise<void> {
-    micRetrying = true;
-    try {
-      // The existing start path: setInputDevice re-runs the same
-      // getUserMedia the join does, with the remembered device (or the
-      // system default when there is none). Nothing here reimplements it.
-      await setVoiceInputDevice(getVoiceActiveInputDevice() ?? "");
-    } catch {
-      // Still no microphone. The badge stays, which is the honest answer.
-    } finally {
-      micRetrying = false;
-    }
-  }
-
-  /**
    * Say what the tap is about to do BEFORE the browser asks.
    *
    * The permission prompt has to hang off a user gesture, and the join
@@ -1490,12 +1458,6 @@ import {
   }
 </script>
 
-<!-- Error banner (always visible if present) -->
-{#if error}
-  <div class="flex flex-col border-b border-border shrink-0 bg-background">
-    <p class="text-sm text-destructive px-3 pt-1.5">{error}</p>
-  </div>
-{/if}
 
 <!-- ── CallTile snippet ── -->
 {#snippet callTile(
@@ -1974,23 +1936,6 @@ import {
     class="flex flex-col relative bg-background pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] {panelSizeClass}"
     class:cursor-hidden={isFullscreen && !controlsVisible}
   >
-    {#if micUnavailable}
-      <div
-        role="status"
-        class="absolute left-1/2 top-2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-amber-500/40 bg-background/95 px-2.5 py-1.5 text-xs shadow-lg backdrop-blur"
-      >
-        <MicOff class="size-3.5 shrink-0 text-amber-500" />
-        <span class="text-foreground">Listen only, no microphone</span>
-        <button
-          type="button"
-          onclick={retryMic}
-          disabled={micRetrying}
-          class="inline-flex h-8 items-center rounded px-2 font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
-        >
-          {micRetrying ? "Trying..." : "Retry"}
-        </button>
-      </div>
-    {/if}
 
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
