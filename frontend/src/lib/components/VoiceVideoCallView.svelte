@@ -92,7 +92,6 @@
     Workflow,
     Puzzle,
     X as XIcon,
-    Tv2,
     Pin,
     PinOff,
     LogIn,
@@ -1428,6 +1427,30 @@ import {
     else panelEl.requestFullscreen().catch(() => {});
   }
 
+  const headerBtn =
+    "flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 transition-all duration-200 hover:scale-105 cursor-pointer";
+
+  /**
+   * The tile the header's pop out acts on: the spotlight, the same one
+   * picture in picture floats - the focused tile when there is one.
+   */
+  const spotlightStageTile = $derived(
+    tiles.find((t) => t.id === spotlightStore.spotlightTileId) ?? null
+  );
+  const spotlightPopped = $derived(
+    !!spotlightStageTile && poppedOut.has(spotlightStageTile.id)
+  );
+  const spotlightPoppable = $derived(
+    !!spotlightStageTile && canPopoutTile(spotlightStageTile)
+  );
+
+  function toggleSpotlightPopout(): void {
+    const tile = spotlightStageTile;
+    if (!tile) return;
+    if (poppedOut.has(tile.id)) closePopout(tile.id);
+    else popOut(tile);
+  }
+
   async function toggleBrowserPiP(): Promise<void> {
     if (callPipPanel.browserPip) await exitBrowserPip();
     else await enterBrowserPip(() => {});
@@ -1487,7 +1510,6 @@ import {
   {@const hasVideo = tile.videoTrack !== null}
   {@const isPendingTx = tile.kind === "transmission" && tile.isPending}
   {@const isPoppedOut = poppedOut.has(tile.id)}
-  {@const showPopButton = !isPendingTx && (isPoppedOut || canPopoutTile(tile))}
   {@const tileColor = getPeerColor(tile.peerId)}
   {#if tile.kind === "plugin" && joinedPluginTiles.has(tile.id)}
     <!-- A DIV, not the button every other tile is: the plugin renders its
@@ -1617,13 +1639,12 @@ import {
     </div>
   {:else}
   <!-- A wrapper so controls can sit BESIDE the tile rather than inside it
-       (the pop-out button): a button nested in a button is invalid HTML.
-       The layout classes live on the wrapper; the button fills it.
-       group/tile: the tile's hover reveals the sibling controls too. -->
+       (a button nested in a button is invalid HTML). The layout classes
+       live on the wrapper; the button fills it. -->
   <div
     role="none"
     oncontextmenu={(e) => openTileMenu(e, tile)}
-    class="group/tile relative {isFocused ? 'w-full h-full' : ''} {compact
+    class="relative {isFocused ? 'w-full h-full' : ''} {compact
       ? 'aspect-video'
       : ''}"
   >
@@ -1721,28 +1742,6 @@ import {
 
     {#if tile.kind === "screen" || tile.kind === "transmission" || isPendingTx}
       {@const audience = transmissionAudience(tile.peerId)}
-      {#if hasVideo && !isPendingTx && browserPipSupported()}
-        <!-- The browser's own floating window for this share, not the in-app
-             panel: pin the share so the spotlight follows it, then open the
-             surface AppView already keeps in sync with the spotlight. -->
-        <Tip text="Picture in picture">
-          {#snippet children(props)}
-            <button
-              {...props}
-              type="button"
-              class="absolute top-1.5 left-1.5 z-20 flex size-6 items-center justify-center rounded bg-black/60 text-white hover:bg-black/80 cursor-pointer"
-              aria-label="Picture in picture"
-              onclick={(e: MouseEvent) => {
-                e.stopPropagation();
-                callFocus.pinnedTileId = tile.id;
-                void enterBrowserPip(() => void requestReturnToCall());
-              }}
-            >
-              <PictureInPicture2 class="size-3.5" />
-            </button>
-          {/snippet}
-        </Tip>
-      {/if}
       {#if audience.count > 0}
         <Tip text={audience.label}>
           {#snippet children(props)}
@@ -1809,12 +1808,10 @@ import {
 
     <!-- Name badge -->
     {#if !isPendingTx}
-      <!-- Capped short of the bottom-right corner, which the pop-out
-           button owns: a long name was free to run under it. -->
+      <!-- Capped to the tile, so a long name ends in an ellipsis rather
+           than running off the edge. -->
       <div
-        class="absolute bottom-1.5 left-1.5 flex min-w-0 items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none {showPopButton
-          ? 'max-w-[calc(100%-2.75rem)]'
-          : 'max-w-[calc(100%-0.75rem)]'}"
+        class="absolute bottom-1.5 left-1.5 flex min-w-0 max-w-[calc(100%-0.75rem)] items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none"
       >
         {#if tile.kind === "screen" || tile.kind === "transmission"}
           <MonitorIcon class="size-3 text-white" />
@@ -1857,34 +1854,6 @@ import {
       </div>
     {/if}
   </button>
-    {#if showPopButton}
-      <!-- A sibling of the tile button, not a child (a button cannot nest
-           in one). Bottom-right: the one corner nothing else uses - PiP
-           top-left, audience and link quality top-right, the name
-           bottom-left. -->
-      <Tip text={isPoppedOut ? "Bring back into the call" : "Pop out"}>
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            class="absolute bottom-1.5 right-1.5 z-20 flex size-6 items-center justify-center rounded bg-black/60 text-white hover:bg-black/80 cursor-pointer transition-opacity focus-visible:opacity-100 {isPoppedOut
-              ? ''
-              : 'opacity-0 group-hover/tile:opacity-100'}"
-            aria-label={isPoppedOut ? "Bring back into the call" : `Pop out ${tile.label}`}
-            onclick={() => {
-              if (isPoppedOut) closePopout(tile.id);
-              else popOut(tile);
-            }}
-          >
-            {#if isPoppedOut}
-              <SquareArrowDownLeft class="size-3.5" />
-            {:else}
-              <SquareArrowOutUpRight class="size-3.5" />
-            {/if}
-          </button>
-        {/snippet}
-      </Tip>
-    {/if}
   </div>
   {/if}
 {/snippet}
@@ -2560,9 +2529,6 @@ import {
           "opacity-0 pointer-events-none"
       )}
     >
-    <!-- PiP and fullscreen buttons in the top corners -->
-    <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-      {#snippet children(props)}
     <!-- Worth showing only when it changes anything: some tile with
          video AND some tile without. It also stays up whenever a filter is
          active, so a filter picked from the menu always has a way out even
@@ -2594,38 +2560,65 @@ import {
       </Tip>
     {/if}
 
-    <!-- Browser PiP button. Clicking requests picture-in-picture on the panel's video element. -->
-    <Tip text={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}>
-      {#snippet children(props)}
-        <button
-          {...props}
-          type="button"
-          onclick={toggleBrowserPiP}
-          aria-label={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}
-          class="absolute top-3 right-12 sm:top-4 sm:right-12 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 text-zinc-300 transition-all duration-200 hover:bg-zinc-900 hover:scale-105 z-20 {callPipPanel.browserPip
-            ? 'text-primary'
-            : ''}"
-        >
-          <Tv2 class="size-4" />
-        </button>
-      {/snippet}
-    </Tip>
-
-    <button
-      {...props}
-      type="button"
-      onclick={toggleFullscreen}
-      aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-      class="absolute top-3 right-3 sm:top-4 sm:right-4 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 text-zinc-300 transition-all duration-200 hover:bg-zinc-900 hover:scale-105 z-20"
-    >
-      {#if isFullscreen}
-        <Minimize class="size-4" />
-      {:else}
-        <Maximize class="size-4" />
+    <!-- What the stage does with the spotlight, in one row top-right:
+         from the right, fullscreen, pop out, picture in picture. Per-tile
+         copies of the last two used to sit on the tiles themselves (two PiP
+         buttons for one window); a tile's own are in its right-click menu. -->
+    <div class="absolute top-3 right-3 sm:top-4 sm:right-4 z-20 flex items-center gap-2">
+      {#if browserPipSupported()}
+        <Tip text={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}>
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={toggleBrowserPiP}
+              aria-label={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}
+              class="{headerBtn} {callPipPanel.browserPip ? 'text-primary' : 'text-zinc-300'}"
+            >
+              <PictureInPicture2 class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
       {/if}
-    </button>
-      {/snippet}
-    </Tip>
+      {#if spotlightPopped || spotlightPoppable}
+        <Tip text={spotlightPopped ? "Bring back into the call" : "Pop out"}>
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={toggleSpotlightPopout}
+              aria-label={spotlightPopped
+                ? "Bring back into the call"
+                : `Pop out ${spotlightStageTile?.label ?? ""}`.trim()}
+              class="{headerBtn} {spotlightPopped ? 'text-primary' : 'text-zinc-300'}"
+            >
+              {#if spotlightPopped}
+                <SquareArrowDownLeft class="size-4" />
+              {:else}
+                <SquareArrowOutUpRight class="size-4" />
+              {/if}
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
+      <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={toggleFullscreen}
+            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            class="{headerBtn} text-zinc-300"
+          >
+            {#if isFullscreen}
+              <Minimize class="size-4" />
+            {:else}
+              <Maximize class="size-4" />
+            {/if}
+          </button>
+        {/snippet}
+      </Tip>
+    </div>
     </div>
 
     <!-- Both menus live inside the panel on purpose. The panel is the element
@@ -2698,7 +2691,7 @@ import {
           class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
           onclick={() => setCallPip(!displayPrefs.callPip)}
         >
-          <Tv2 class="size-4 shrink-0" />
+          <PictureInPicture2 class="size-4 shrink-0" />
           <span class="flex-1 truncate text-left">Picture-in-picture</span>
           {#if displayPrefs.callPip}
             <Check class="size-3.5 shrink-0 text-primary" />
