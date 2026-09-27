@@ -11,6 +11,7 @@ import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, ChildProcess } from "node:child_process";
 import path from "node:path";
+import { createServer } from "node:net";
 import { WebSocket } from "ws";
 import { generateKeyPairSync, sign } from "node:crypto";
 import bs58 from "bs58";
@@ -18,9 +19,36 @@ import { joinPayload, verifyJoin } from "./auth";
 import { envInteger } from "./config";
 import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 
-// Picking a port off the pid keeps concurrent test runs on the same machine
-// from colliding on a fixed number.
-const PORT = 34000 + (process.pid % 1000);
+// The SFU's port for this file, chosen in test.before by freePort().
+let PORT = 0;
+
+/**
+ * A port nothing is listening on, below the kernel's ephemeral range.
+ *
+ * The old 34000 + pid % 1000 sat INSIDE that range (32768-60999 on Linux),
+ * where the OS hands ports to outgoing connections: on a busy CI runner some
+ * other process's socket already held the number, the SFU died on
+ * EADDRINUSE, and every test in the file failed as "never started
+ * listening". Below 32768 only a listener can take a port, so a successful
+ * probe bind is a promise that holds until the SFU binds it. The pid still
+ * picks the starting point, so concurrent runs on one machine walk
+ * different ranges.
+ */
+async function freePort(avoid: readonly number[] = []): Promise<number> {
+  const start = 20_000 + ((process.pid * 7) % 10_000);
+  for (let i = 0; i < 2_000; i++) {
+    const port = 20_000 + ((start - 20_000 + i) % 12_000);
+    if (avoid.includes(port)) continue;
+    const free = await new Promise<boolean>((resolve) => {
+      const probe = createServer();
+      probe.once("error", () => resolve(false));
+      // No host: the SFU listens on every interface, so the probe must too.
+      probe.listen(port, () => probe.close(() => resolve(true)));
+    });
+    if (free) return port;
+  }
+  throw new Error("no free port for the test SFU");
+}
 // Short enough that the "never connects" test doesn't sit around, long
 // enough that the assertions below (which each take a real websocket round
 // trip) aren't racing the reaper.
@@ -125,6 +153,7 @@ function spawnSfu(port: number, extraEnv: Record<string, string>): SpawnedSfu {
 let sfu: SpawnedSfu;
 
 test.before(async () => {
+  PORT = await freePort();
   sfu = spawnSfu(PORT, { SFU_TELEMETRY: "1" });
   child = sfu.proc;
   await waitForServer(PORT);
@@ -598,10 +627,12 @@ test("a second immediate ms:diag is refused as rate-limited, not answered again"
 // the "disabled" behaviour needs a SEPARATE process from the one above,
 // which runs with SFU_TELEMETRY=1 for the whole file.
 describe("ms:diag with SFU_TELEMETRY unset", () => {
-  const DISABLED_PORT = PORT + 500;
+  let DISABLED_PORT = 0;
   let disabledSfu: SpawnedSfu;
 
   before(async () => {
+    // Not the main SFU's port, which is still bound while this block runs.
+    DISABLED_PORT = await freePort([PORT]);
     disabledSfu = spawnSfu(DISABLED_PORT, {});
     await waitForServer(DISABLED_PORT);
   });
