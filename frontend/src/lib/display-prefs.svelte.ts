@@ -10,6 +10,7 @@ import {
   clampChatFontSize,
   sanitizeFontFamily,
 } from "./chat-font";
+import { parseFraction } from "./call-split";
 
 const ITALIC_KEY = "awful:italic-own-name:v1";
 const PEER_COLORS_KEY = "awful:show-peer-colors:v1";
@@ -20,6 +21,13 @@ const CALL_PIP_KEY = "awful:call-pip:v1";
 const AVATAR_TINT_KEY = "awful:avatar-tint:v1";
 const CHAT_FONT_SIZE_KEY = "awful:chat-font-size:v1";
 const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
+const CALL_STAGE_HEIGHT_KEY = "awful:call-stage-height:v1";
+const CALL_CHAT_WIDTH_KEY = "awful:call-chat-width:v1";
+
+function readFraction(key: string): number | null {
+  if (typeof localStorage === "undefined") return null;
+  return parseFraction(localStorage.getItem(key));
+}
 
 function readStored(key: string, defaultValue: boolean): boolean {
   if (typeof localStorage === "undefined") return defaultValue;
@@ -72,6 +80,16 @@ export const displayPrefs = $state({
    * distinct picture.
    */
   avatarTint: readStored(AVATAR_TINT_KEY, true),
+  /**
+   * The call's height above the chat, as a share of the window, once dragged
+   * (call-split.ts). Null is automatic: the stage sizes itself by its tiles.
+   */
+  callStageHeight: readFraction(CALL_STAGE_HEIGHT_KEY),
+  /**
+   * The chat column's width beside the call, as a share of the row, not
+   * counting the user list. Null is the default width.
+   */
+  callChatWidth: readFraction(CALL_CHAT_WIDTH_KEY),
   /** Chat message text size, in pixels. */
   chatFontSize: readChatFontSize(),
   /** Chat message font: a FontStackId, or a sanitized custom family name. */
@@ -145,6 +163,27 @@ export function setShowConnectionInfo(on: boolean): void {
   }
 }
 
+function storeFraction(key: string, value: number | null): void {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, String(value));
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
+/** Null hands the height back to the stage's own sizing. */
+export function setCallStageHeight(fraction: number | null): void {
+  displayPrefs.callStageHeight = fraction;
+  storeFraction(CALL_STAGE_HEIGHT_KEY, fraction);
+}
+
+/** Null goes back to the default chat width. */
+export function setCallChatWidth(fraction: number | null): void {
+  displayPrefs.callChatWidth = fraction;
+  storeFraction(CALL_CHAT_WIDTH_KEY, fraction);
+}
+
 export function setChatFontSize(px: number): void {
   displayPrefs.chatFontSize = clampChatFontSize(px);
   try {
@@ -188,5 +227,9 @@ if (typeof window !== "undefined") {
           : clampChatFontSize(e.newValue);
     if (e.key === CHAT_FONT_FAMILY_KEY)
       displayPrefs.chatFontFamily = normalizeChatFontFamily(e.newValue);
+    if (e.key === CALL_STAGE_HEIGHT_KEY)
+      displayPrefs.callStageHeight = parseFraction(e.newValue);
+    if (e.key === CALL_CHAT_WIDTH_KEY)
+      displayPrefs.callChatWidth = parseFraction(e.newValue);
   });
 }
