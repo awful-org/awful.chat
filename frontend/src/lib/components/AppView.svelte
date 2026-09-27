@@ -292,7 +292,14 @@
     const total = rooms + dmUnreadTotal;
     setBadge(total);
     if (typeof document !== "undefined") {
-      document.title = total > 0 ? `(${total}) Awful.chat` : "Awful.chat";
+      // A tab another tab took over holds no live counts - its "(3)" would
+      // be stale - so it says why it is quiet instead, beside its favicon
+      // (tab-icon.ts), for tab strips too narrow to show the icon clearly.
+      document.title = transportState.nodeHeldElsewhere
+        ? "(!) Awful.chat"
+        : total > 0
+          ? `(${total}) Awful.chat`
+          : "Awful.chat";
     }
   });
   const dmLatestByPeer = $derived.by(() => {
