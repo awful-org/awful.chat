@@ -60,6 +60,9 @@ export default defineConfig(({ mode }) => ({
       // PWA exists for. They total a few KB.
       includeAssets: [
         "favicon.ico",
+        // The waiting tab's icon (tab-icon.ts): it swaps in while another tab
+        // holds the node, which is no time to find it missing.
+        "favicon-held.png",
         "apple-touch-icon-180x180.png",
         "sounds/*",
         "logo.svg",
