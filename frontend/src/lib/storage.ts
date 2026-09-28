@@ -428,6 +428,104 @@ async function _openAll<T>(store: EncryptedStoreName, rows: T[]): Promise<T[]> {
   return openRows<T>(rows, STORE_SPECS[store]);
 }
 
+// ── Unreadable rows that repair themselves ────────────────────────────────────
+//
+// A row that will not decrypt is dropped from the read, which keeps one bad
+// row from blanking a query - but for these two stores dropping it was not
+// enough, because the row stayed and did damage on every read after:
+//
+// - watermarks: a sender whose row will not open is simply missing from
+//   getWatermarksForRoom, so the digest tells every peer we hold nothing of
+//   theirs and they re-send that sender's whole history. setWatermark then
+//   refuses to replace the row - its regression guard trusts the CLEAR
+//   maxLamport of the dead row, already high - so the loop never ended: a
+//   room that had lived through older storage formats re-synced thousands of
+//   messages every session, on every digest.
+// - attachments: the status and data updates open the row first and gave up
+//   when it would not, so a finished download was never stored and the file
+//   was fetched again every session.
+//
+// Both hold nothing that cannot come back - a watermark is rebuilt by the
+// sync it restarts, an attachment row by the next copy of its message
+// (_ensureAttachmentRows) and its bytes by the swarm - so an unreadable row
+// is deleted where a read finds it, and the next write lands clean.
+
+type SelfHealingStore = "watermarks" | "attachments";
+
+/** Which sealed write a row is: its random IV, or "plain" for an unsealed row. */
+function _sealFingerprint(row: unknown): string {
+  const iv = (row as { _enc?: { iv?: ArrayBuffer | ArrayBufferView } } | null)?._enc?.iv;
+  if (!iv) return "plain";
+  const bytes =
+    iv instanceof ArrayBuffer
+      ? new Uint8Array(iv)
+      : new Uint8Array(iv.buffer, iv.byteOffset, iv.byteLength);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Delete rows that failed to open - but only if each is still the very row
+ * that failed. The read and this delete are separate transactions, and a good
+ * row written in between (setWatermark, a finished download) must survive.
+ */
+async function _purgeUnreadable(
+  store: SelfHealingStore,
+  rows: Array<{ id: string }>
+): Promise<void> {
+  if (!rows.length) return;
+  try {
+    const database = await getDB();
+    const tx = database.transaction(store, "readwrite");
+    let removed = 0;
+    for (const row of rows) {
+      const key = row.id as never;
+      const current = await tx.store.get(key);
+      if (current && _sealFingerprint(current) === _sealFingerprint(row)) {
+        await tx.store.delete(key);
+        removed += 1;
+      }
+    }
+    await tx.done;
+    if (removed) console.warn(`[storage] removed ${removed} unreadable ${store} row(s)`);
+  } catch (err) {
+    // Best effort: the row is still skipped, it just gets another chance to
+    // be removed on the next read.
+    console.warn(`[storage] could not remove unreadable ${store} rows:`, err);
+  }
+}
+
+async function _openHealing<T extends { id: string }>(
+  store: SelfHealingStore,
+  row: T | undefined,
+  opts?: { skipBytes?: boolean }
+): Promise<T | undefined> {
+  const opened = await _open<T>(store, row, opts);
+  if (row !== undefined && opened === undefined) await _purgeUnreadable(store, [row]);
+  return opened;
+}
+
+async function _openAllHealing<T extends { id: string }>(
+  store: SelfHealingStore,
+  rows: T[],
+  opts?: { skipBytes?: boolean }
+): Promise<T[]> {
+  const settled = await Promise.allSettled(
+    rows.map((r) => openRow<T>(r, STORE_SPECS[store], opts))
+  );
+  const out: T[] = [];
+  const dead: T[] = [];
+  settled.forEach((s, i) => {
+    if (s.status === "fulfilled") out.push(s.value);
+    else if (isStorageLockedError(s.reason)) throw s.reason;
+    else dead.push(rows[i]);
+  });
+  if (dead.length) {
+    rec(ev("storage.drop", { d: { store, count: dead.length } }));
+    await _purgeUnreadable(store, dead);
+  }
+  return out;
+}
+
 /**
  * Load a page of messages for a room, sorted by lamport ascending.
  * Pass beforeLamport for cursor-based pagination (scroll up to load older).
@@ -1422,7 +1520,7 @@ export async function getAttachment(
   id: string
 ): Promise<Attachment | undefined> {
   const database = await getDB();
-  return _open("attachments", await database.get("attachments", id));
+  return _openHealing("attachments", await database.get("attachments", id));
 }
 
 export async function getAttachmentsByMessage(
@@ -1449,7 +1547,7 @@ export async function getAttachmentsByMessage(
     for (const a of plaintextAttachments) byId.set(a.id, a);
     attachments = Array.from(byId.values());
   }
-  return _openAll("attachments", attachments);
+  return _openAllHealing("attachments", attachments);
 }
 
 export async function getAttachmentsByInfoHash(
@@ -1457,7 +1555,7 @@ export async function getAttachmentsByInfoHash(
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedInfoHash = await blindValue(infoHash);
-  return _openAll(
+  return _openAllHealing(
     "attachments",
     await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash)
   );
@@ -1498,7 +1596,7 @@ export async function getAttachmentsWithData(
     }
     cursor = await cursor.continue();
   }
-  return _openAll("attachments", matches);
+  return _openAllHealing("attachments", matches);
 }
 
 /**
@@ -1543,10 +1641,13 @@ export async function getSeedableFiles(): Promise<
   }
   const out: Array<{ roomCode: string; file: FileEntry }> = [];
   const seen = new Set<string>();
-  for (const row of rows) {
-    const a = await openRow<Attachment>(row, STORE_SPECS.attachments, {
-      skipBytes: true,
-    });
+  // One unreadable row used to throw here and take the whole inventory with
+  // it: _announceStoredFilesTo told peers about none of our files, the good
+  // ones included, so nothing this device held could be fetched from it.
+  const opened = await _openAllHealing<Attachment>("attachments", rows, {
+    skipBytes: true,
+  });
+  for (const a of opened) {
     if (!seen.has(a.infoHash)) {
       seen.add(a.infoHash);
       out.push({
@@ -1593,7 +1694,7 @@ export async function updateAttachmentStatus(
   status: AttachmentStatus
 ): Promise<void> {
   const database = await getDB();
-  const attachment = await _open<Attachment>(
+  const attachment = await _openHealing<Attachment>(
     "attachments",
     await database.get("attachments", id)
   );
@@ -1630,7 +1731,7 @@ export async function updateAttachmentData(
   data: ArrayBuffer
 ): Promise<void> {
   const database = await getDB();
-  const attachment = await _open<Attachment>(
+  const attachment = await _openHealing<Attachment>(
     "attachments",
     await database.get("attachments", id)
   );
@@ -2169,9 +2270,27 @@ export async function setWatermark(
   // Never regress - only advance the watermark
   if (!existing || existing.maxLamport < maxLamport) {
     await tx.store.put(sealed);
+    await tx.done;
+    _readableWatermarks.add(blindedId);
+    return;
   }
   await tx.done;
+  // Held back as "not newer" - which is only right if the row we kept can be
+  // read. An unreadable one advertised a high maxLamport in the clear while
+  // the digest could not use it, so it blocked every repair forever. Checked
+  // once per row: this runs for every message a sync delivers.
+  if (_readableWatermarks.has(blindedId)) return;
+  if (await _openHealing<WatermarkRecord>("watermarks", existing)) {
+    _readableWatermarks.add(blindedId);
+    return;
+  }
+  // The dead row is gone (_openHealing); this write is the first readable one.
+  await database.put("watermarks", sealed);
+  _readableWatermarks.add(blindedId);
 }
+
+/** Watermark rows known to decrypt, so setWatermark checks each only once. */
+const _readableWatermarks = new Set<string>();
 
 export async function getWatermarksForRoom(
   roomCode: string
@@ -2217,7 +2336,7 @@ export async function getWatermarksForRoom(
   }
   const result: Record<string, number> = {};
   for (const record of byBlinded.values()) {
-    const decrypted = await _open<WatermarkRecord>("watermarks", record);
+    const decrypted = await _openHealing<WatermarkRecord>("watermarks", record);
     if (decrypted?.senderId) {
       result[decrypted.senderId] = decrypted.maxLamport;
     }
@@ -2350,6 +2469,7 @@ export async function wipeLocalDatabase(): Promise<void> {
     db = null;
   }
   invalidatePeerProfilesCache();
+  _readableWatermarks.clear();
   await deleteDB(dbName());
 }
 
