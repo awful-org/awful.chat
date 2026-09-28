@@ -89,10 +89,17 @@ const VOICE_MEDIA_STALL_MS = 8_000;
 // echo whenever anyone talked, which read as "DTLN is processing inbound
 // audio too" (it never touches the inbound path). AEC runs at capture,
 // before the track reaches the worklet, so the two compose.
+//
+// AGC ON here too. With it off, speech reached the worklet at whatever level
+// the hardware produced, and its noise gate has a fixed threshold: a quiet
+// mic (a HyperX Cloud III sat right on it) had its gate closing inside
+// words, which everyone heard as a spotty voice that only a threshold of 0
+// fixed. AGC brings every mic to roughly the same level, well clear of the
+// gate - the same leveling the non-DTLN path has always had.
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: false,
-  autoGainControl: false,
+  autoGainControl: true,
 };
 
 const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {
