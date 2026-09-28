@@ -50,7 +50,8 @@
   const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
     echoCancellation: true,
     noiseSuppression: false,
-    autoGainControl: false,
+    // Mirrors the call path: AGC keeps a quiet mic clear of DTLN's gate.
+    autoGainControl: true,
   };
 
   const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {

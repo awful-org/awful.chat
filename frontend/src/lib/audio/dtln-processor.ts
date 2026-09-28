@@ -25,10 +25,13 @@ export class DtlnProcessor {
   private fatalHandler: (() => void) | null = null;
 
   /**
-   * The one compensation for the model's attenuation. The worklet itself is
-   * unity gain, so this constant is the only boost in the chain.
+   * Gain after the model. The worklet is unity gain, and the model barely
+   * attenuates clean speech (~0.4 dB), so with AGC leveling the mic this is
+   * 1: the same loudness as the non-DTLN path. It was 3 while AGC was off on
+   * this path, making up for quiet mics by hand - on an AGC-leveled signal
+   * that would clip. Kept as a named knob so there is one place to change.
    */
-  static readonly OUTPUT_COMPENSATION = 3.0;
+  static readonly OUTPUT_COMPENSATION = 1.0;
 
   // Two independent graphs share the single DTLN worklet node:
   //
@@ -125,6 +128,9 @@ export class DtlnProcessor {
       this.resolveReady();
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
+      // A retry must not reuse this context: its worklet scope may hold a
+      // WASM instance that has spent its denoiser budget (see discardContext).
+      this.discardContext();
       this.initializing = false;
       this.rejectReady(e);
       // Re-arm so a later voice start can retry instead of seeing the same
@@ -144,10 +150,25 @@ export class DtlnProcessor {
     this.releaseTransport();
     this.releaseMonitor();
     this.workletNode = null;
+    this.discardContext();
     this.ready = false;
     this.initializing = false;
     this.armReadyPromise();
     this.fatalHandler?.();
+  }
+
+  /**
+   * Close the context so the next init() builds a new one. Every worklet node
+   * in a context shares one WASM instance, and that instance can create only
+   * two denoisers in its lifetime (a fixed 16 MB heap that destroy does not
+   * give back) - rebuilding in the same context after a crash got a
+   * denoiser that trapped on its first block, or a create that never
+   * returned and hung the audio thread. A new context is a new instance.
+   */
+  private discardContext(): void {
+    const ctx = this.audioCtx;
+    this.audioCtx = null;
+    void ctx?.close().catch(() => {});
   }
 
   /** Set (or clear with null) the fatal callback. One slot: one caller owns it. */
