@@ -3374,6 +3374,9 @@ function _handleDmChatAsync(
  * attachment row from a message we hold. Used to refuse file signals for
  * hashes we never asked about.
  */
+/** The tail of each peer's file-signal chain; see the __file_signal branch. */
+const _fileSignalQueue = new Map<string, Promise<void>>();
+
 async function _haveFileFor(infoHash: string): Promise<boolean> {
   if (transportState.fileTransfers.has(infoHash)) return true;
   const rows = await getAttachmentsByInfoHash(infoHash).catch(() => []);
@@ -3497,11 +3500,21 @@ _transport.on("message", (peerId, data, room) => {
         // meaningful for a transfer or an attachment we actually hold, so an
         // infoHash we have never heard of buys nothing.
         const signal = decoded.payload;
-        void (async () => {
-          if (!(await _peerSharesRoomWithUs(peerId))) return;
-          if (!(await _haveFileFor(signal.infoHash))) return;
-          _fileTransport.handleSignal(peerId, signal);
-        })().catch(() => {});
+        // In arrival order, per peer. Each signal awaits its own gate, and
+        // the gates do not take equal time (a transfer we track answers from
+        // memory, an attachment from IndexedDB) - so an offer could reach
+        // the link after the candidates, or after the next attempt's.
+        const next = (_fileSignalQueue.get(peerId) ?? Promise.resolve())
+          .then(async () => {
+            if (!(await _peerSharesRoomWithUs(peerId))) return;
+            if (!(await _haveFileFor(signal.infoHash))) return;
+            _fileTransport.handleSignal(peerId, signal);
+          })
+          .catch(() => {});
+        _fileSignalQueue.set(peerId, next);
+        void next.then(() => {
+          if (_fileSignalQueue.get(peerId) === next) _fileSignalQueue.delete(peerId);
+        });
       }
       return;
     }

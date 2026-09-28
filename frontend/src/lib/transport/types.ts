@@ -315,6 +315,12 @@ export type FileSignalEnvelope =
       kind: "file-wt-signal";
       infoHash: string;
       signal: unknown;
+      /**
+       * Which dial this signal belongs to, chosen by the side that dialled
+       * (webtorrent.ts). Optional: older clients send none, and are handled
+       * the way they always were.
+       */
+      session?: string;
     };
 
 export interface FileTransferEvents {
