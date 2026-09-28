@@ -96,7 +96,12 @@
   } from "@lucide/svelte";
   import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
-import { displayPrefs, setCallChatBeside, setCallPip } from "$lib/display-prefs.svelte";
+import {
+  displayPrefs,
+  setCallChatBeside,
+  setCallPip,
+  setCallStageHeight,
+} from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
 import { callTilesState, refreshCallTiles } from "$lib/plugins/call-tiles.svelte";
 import { getManifest, getPlugin } from "$lib/plugins/registry";
@@ -114,6 +119,8 @@ import {
   type TileMenuState,
 } from "$lib/call-tile-menu";
 import PluginCallTileView from "./PluginCallTileView.svelte";
+import SplitHandle from "./SplitHandle.svelte";
+import { resolveSplit } from "$lib/call-split";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
 import type { PeerVoiceQuality } from "$lib/call-quality";
@@ -1135,18 +1142,85 @@ import {
         : "h-[45dvh]"
   );
 
+  // ── Dragged height (stacked) ──────────────────────────────────────────────
+  //
+  // The line under the stage can be dragged (SplitHandle). Once it has been,
+  // the stage keeps that share of the window whatever its tiles do; until
+  // then, or after a reset, rowFraction above sizes it. The defaults are
+  // magnetic (call-split.ts), and letting go on the automatic one hands the
+  // sizing back rather than freezing today's number.
+
+  /** One tile row plus the docked controls. */
+  const STAGE_MIN_PX = 200;
+  /** The chat header, the composer and a few messages. */
+  const CHAT_MIN_PX = 260;
+  const STAGE_DEFAULTS = [0.35, 0.45, 0.54];
+
+  let stageDragPx = $state<number | null>(null);
+  let stageSnap = $state<number | null>(null);
+  let stageDragFrom = 0;
+
+  const stageAutoPx = $derived(Math.round(viewportPx * rowFraction));
+  const stageBounds = $derived({
+    min: STAGE_MIN_PX,
+    max: viewportPx - CHAT_MIN_PX,
+    snaps: STAGE_DEFAULTS.map((f) => Math.round(viewportPx * f)),
+  });
+  const stagePx = $derived.by(() => {
+    if (stageDragPx !== null) return stageDragPx;
+    const chosen = displayPrefs.callStageHeight;
+    if (chosen === null) return stageAutoPx;
+    // Re-clamped against today's window: a share picked on a tall monitor
+    // must still leave the chat its composer on a laptop.
+    return resolveSplit(chosen * viewportPx, { ...stageBounds, snaps: [] }).px;
+  });
+
+  function stageDragStart(): void {
+    stageDragFrom = stagePx;
+    stageDragPx = stagePx;
+  }
+
+  function stageDragMove(delta: number): void {
+    const at = resolveSplit(stageDragFrom + delta, stageBounds);
+    stageDragPx = at.px;
+    stageSnap = at.snap;
+  }
+
+  function stageDragEnd(): void {
+    if (stageDragPx === null) return;
+    setCallStageHeight(
+      stageSnap !== null && stageSnap === stageAutoPx ? null : stageDragPx / viewportPx
+    );
+    stageDragPx = null;
+    stageSnap = null;
+  }
+
+  function stageStep(direction: -1 | 1): void {
+    const at = resolveSplit(stagePx + direction * viewportPx * 0.05, {
+      ...stageBounds,
+      snaps: [],
+    });
+    setCallStageHeight(at.px / viewportPx);
+  }
+
+  const showStageHandle = $derived.by(() => !beside && !isFullscreen && viewportPx > 0);
+
   // rowClass is window-height based and only means anything stacked. Beside
-  // the chat the panel just fills its row.
+  // the chat the panel just fills its row. The height eases between sizes -
+  // a fresh tile row, a reset, a snap - and follows the pointer almost
+  // directly while dragged.
   const panelSizeClass = $derived.by(() => {
     if (isFullscreen) return "h-dvh";
     if (beside) return "min-h-0 flex-1";
-    return `shrink-0 border-b border-border ${rowClass}`;
+    return `shrink-0 border-b border-border ${rowClass} transition-[height] ease-out motion-reduce:transition-none ${
+      stageDragPx !== null ? "duration-75" : "duration-200"
+    }`;
   });
 
   const panelSizeStyle = $derived.by(() => {
     if (beside || !viewportPx) return "";
     if (isFullscreen) return `height:${viewportPx}px`;
-    return `height:${Math.round(viewportPx * rowFraction)}px`;
+    return `height:${stagePx}px`;
   });
 
   // ── Focus ─────────────────────────────────────────────────────────────────
@@ -2565,6 +2639,22 @@ import {
       </Tip>
     </div>
     </div>
+
+    <!-- The line under the stage, straddling the panel's bottom edge. -->
+    {#if showStageHandle}
+      <SplitHandle
+        orientation="row"
+        label="Resize the call"
+        valueNow={(stagePx / viewportPx) * 100}
+        snapped={stageSnap !== null}
+        class="bottom-0 translate-y-1/2"
+        onstart={stageDragStart}
+        onmove={stageDragMove}
+        onend={stageDragEnd}
+        onreset={() => setCallStageHeight(null)}
+        onstep={stageStep}
+      />
+    {/if}
 
     <!-- Both menus live inside the panel on purpose. The panel is the element
          handed to requestFullscreen, and only the fullscreen element's own

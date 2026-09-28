@@ -73,7 +73,9 @@
   import MentionInput from "./MentionInput.svelte";
   import UserListSidebar from "./UserListSidebar.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
-  import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { displayPrefs, setCallChatWidth } from "$lib/display-prefs.svelte";
+  import { resolveSplit } from "$lib/call-split";
+  import SplitHandle from "./SplitHandle.svelte";
   import { resolveChatFontStack } from "$lib/chat-font";
   import { nameEffectStyle } from "$lib/name-effect";
   import { viewportHeight } from "$lib/actions/viewport-height";
@@ -1818,12 +1820,80 @@
   );
   // Opening the user list widens the chat column instead of crushing the
   // message text into what the w-60 aside leaves behind.
+  // ── Chat width beside the call ────────────────────────────────────────────
+  //
+  // The line between the call and the chat can be dragged (SplitHandle), the
+  // same way as the one under a stacked stage. The width is the chat's own,
+  // the user list's 240px added on top when it is open, so opening the list
+  // does not squeeze the conversation. Defaults are magnetic (call-split.ts):
+  // the standard 384px and an even split; letting go on 384 returns to it.
+  const CHAT_DEFAULT_PX = 384;
+  const CHAT_MIN_PX = 320;
+  const USER_LIST_PX = 240;
+  /** One tile column plus the controls. */
+  const STAGE_MIN_WIDTH_PX = 360;
+
+  let splitRowWidth = $state(0);
+  let chatDragPx = $state<number | null>(null);
+  let chatSnap = $state<number | null>(null);
+  let chatDragFrom = 0;
+
+  const chatExtraPx = $derived(showUserList && !isDmChat ? USER_LIST_PX : 0);
+  const chatBounds = $derived({
+    min: CHAT_MIN_PX,
+    max: splitRowWidth - chatExtraPx - STAGE_MIN_WIDTH_PX,
+    snaps: [CHAT_DEFAULT_PX, Math.round(splitRowWidth / 2 - chatExtraPx)],
+  });
+  const chatPx = $derived.by(() => {
+    if (chatDragPx !== null) return chatDragPx;
+    const chosen = displayPrefs.callChatWidth;
+    if (chosen === null || splitRowWidth === 0) return CHAT_DEFAULT_PX;
+    return resolveSplit(chosen * splitRowWidth, { ...chatBounds, snaps: [] }).px;
+  });
+
+  function chatDragStart(): void {
+    chatDragFrom = chatPx;
+    chatDragPx = chatPx;
+  }
+
+  function chatDragMove(delta: number): void {
+    // The handle is the chat's LEFT edge: dragging left widens it.
+    const at = resolveSplit(chatDragFrom - delta, chatBounds);
+    chatDragPx = at.px;
+    chatSnap = at.snap;
+  }
+
+  function chatDragEnd(): void {
+    if (chatDragPx === null) return;
+    setCallChatWidth(
+      chatSnap === CHAT_DEFAULT_PX || splitRowWidth === 0
+        ? null
+        : chatDragPx / splitRowWidth
+    );
+    chatDragPx = null;
+    chatSnap = null;
+  }
+
+  function chatStep(direction: -1 | 1): void {
+    if (splitRowWidth === 0) return;
+    // +1 moves the line right: the call wider, the chat narrower.
+    const at = resolveSplit(chatPx - direction * splitRowWidth * 0.05, {
+      ...chatBounds,
+      snaps: [],
+    });
+    setCallChatWidth(at.px / splitRowWidth);
+  }
+
+  const chatBesideCall = $derived(callBeside && showCallView);
   const chatColClass = $derived(
-    callBeside && showCallView
-      ? `shrink-0 border-l border-border ${
-          showUserList && !isDmChat ? "w-156" : "w-96"
+    chatBesideCall
+      ? `shrink-0 border-l border-border transition-[width] ease-out motion-reduce:transition-none ${
+          chatDragPx !== null ? "duration-75" : "duration-200"
         }`
       : "flex-1"
+  );
+  const chatColStyle = $derived(
+    chatBesideCall ? `width:${chatPx + chatExtraPx}px` : ""
   );
 
   /** Offline and either inbox off: this DM only lands while you both are online. */
@@ -2448,6 +2518,7 @@
        wrapper is always mounted: a remount would rebind messagesEl and drop
        the scroll position on every switch. -->
   <div
+    bind:clientWidth={splitRowWidth}
     class="flex flex-1 min-h-0 overflow-hidden {callBeside
       ? 'flex-row'
       : 'flex-col'}"
@@ -2469,7 +2540,26 @@
         />
       </div>
     {/if}
+    {#if chatBesideCall && splitRowWidth > 0}
+      <!-- Zero-width, between the columns: inside the chat column its
+           overflow-hidden would clip half the grab strip away. -->
+      <div class="relative w-0 shrink-0">
+        <SplitHandle
+          orientation="column"
+          label="Resize the chat"
+          valueNow={((chatPx + chatExtraPx) / splitRowWidth) * 100}
+          snapped={chatSnap !== null}
+          class="left-0 -translate-x-1/2"
+          onstart={chatDragStart}
+          onmove={chatDragMove}
+          onend={chatDragEnd}
+          onreset={() => setCallChatWidth(null)}
+          onstep={chatStep}
+        />
+      </div>
+    {/if}
     <div
+      style={chatColStyle}
       class="flex min-h-0 min-w-0 flex-col overflow-hidden {chatColClass}"
     >
 

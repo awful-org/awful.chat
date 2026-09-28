@@ -24,11 +24,16 @@ const torrents = new Map<string, FakeTorrent>();
 vi.mock("simple-peer", () => {
   class FakePeer extends EventEmitter {
     destroyed = false;
+    connected = false;
+    /** What was handed to signal(), in order. */
+    signals: unknown[] = [];
     constructor() {
       super();
       livePeers.push(this as never);
     }
-    signal(): void {}
+    signal(s: unknown): void {
+      this.signals.push(s);
+    }
     destroy(): void {
       this.destroyed = true;
       this.emit("close");
@@ -325,7 +330,7 @@ describe("WebTorrentFileTransport", () => {
     // Releasing a wire must not remove the torrent or the downloaded bytes.
     expect(torrents.get(files[0].infoHash)).toBe(torrent);
     t.handleSignal("bob", {
-      kind: "file-wt-signal", infoHash: files[0].infoHash, signal: {},
+      kind: "file-wt-signal", infoHash: files[0].infoHash, signal: { type: "offer" },
     } as never);
     peers.get(`${files[0].infoHash}:bob`)!.emit("connect");
     await tick();
@@ -400,7 +405,7 @@ describe("WebTorrentFileTransport", () => {
     t.handleSignal("alice", {
       kind: "file-wt-signal",
       infoHash: HASH,
-      signal: {},
+      signal: { type: "offer" },
     } as never);
 
     const peers = (t as never as { wtPeers: Map<string, EventEmitter> }).wtPeers;
@@ -438,7 +443,7 @@ describe("WebTorrentFileTransport", () => {
   it("leaves an established file link alone when the credentials land", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     t.onPeerConnect("alice");
-    t.handleSignal("alice", { kind: "file-wt-signal", infoHash: HASH, signal: {} } as never);
+    t.handleSignal("alice", { kind: "file-wt-signal", infoHash: HASH, signal: { type: "offer" } } as never);
     const peers = (t as never as { wtPeers: Map<string, EventEmitter & { destroyed: boolean; connected?: boolean }> }).wtPeers;
     const live = [...peers.values()][0];
     live.connected = true;
@@ -488,5 +493,110 @@ describe("WebTorrentFileTransport", () => {
     ).peerSeeded;
     // The active transfer survives even though the cap was hit repeatedly.
     expect(peerSeeded.get("alice")?.has(activeHash)).toBe(true);
+  });
+
+  describe("dial sessions", () => {
+    type Peer = EventEmitter & {
+      destroyed: boolean;
+      connected: boolean;
+      signals: unknown[];
+      destroy(): void;
+    };
+    const linksOf = (t: unknown) =>
+      (t as { wtPeers: Map<string, Peer> }).wtPeers;
+    const key = `${HASH}:alice`;
+    const sig = (signal: unknown, session?: string) =>
+      ({ kind: "file-wt-signal", infoHash: HASH, signal, session }) as never;
+
+    it("a retry's offer replaces what the sender has left of the last one", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      t.onPeerConnect("alice");
+      t.handleSignal("alice", sig({ type: "offer" }, "one"));
+      const first = linksOf(t).get(key)!;
+
+      t.handleSignal("alice", sig({ type: "offer" }, "two"));
+      const second = linksOf(t).get(key)!;
+      expect(first.destroyed).toBe(true);
+      expect(second).not.toBe(first);
+      // The new offer went to the new link, not into the dead one.
+      expect(second.signals).toEqual([{ type: "offer" }]);
+      t.destroy();
+    });
+
+    it("ignores the tail of an attempt that was replaced", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      t.onPeerConnect("alice");
+      t.handleSignal("alice", sig({ type: "offer" }, "one"));
+      t.handleSignal("alice", sig({ type: "offer" }, "two"));
+      const current = linksOf(t).get(key)!;
+
+      t.handleSignal("alice", sig({ type: "candidate" }, "one"));
+      t.handleSignal("alice", sig({ type: "offer" }, "one"));
+      expect(linksOf(t).get(key)).toBe(current);
+      expect(current.signals).toEqual([{ type: "offer" }]);
+      t.destroy();
+    });
+
+    it("builds nothing for an answer or candidate with no link to land on", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      t.onPeerConnect("alice");
+      t.handleSignal("alice", sig({ type: "answer" }, "gone"));
+      t.handleSignal("alice", sig({ type: "candidate" }));
+      expect(linksOf(t).size).toBe(0);
+      t.destroy();
+    });
+
+    it("stamps the dialler's session on its signals and keeps other sessions off its link", async () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      const sent: Array<{ session?: string }> = [];
+      t.on("signal", (_peer, envelope) => sent.push(envelope as never));
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      await tick();
+      const link = linksOf(t).get(key)!;
+      link.emit("signal", { type: "offer" });
+      const session = sent.at(-1)?.session;
+      expect(session).toMatch(/^[0-9a-f]{12}$/);
+
+      t.handleSignal("alice", sig({ type: "answer" }, "someone-else"));
+      expect(link.signals).toEqual([]);
+      t.handleSignal("alice", sig({ type: "answer" }, session));
+      expect(link.signals).toEqual([{ type: "answer" }]);
+      t.destroy();
+    });
+
+    it("drops a late answer for its own dial once that dial is over", async () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      const sent: Array<{ session?: string }> = [];
+      t.on("signal", (_peer, envelope) => sent.push(envelope as never));
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      await tick();
+      const link = linksOf(t).get(key)!;
+      link.emit("signal", { type: "offer" });
+      const session = sent.at(-1)?.session;
+      link.destroy();
+
+      t.handleSignal("alice", sig({ type: "answer" }, session));
+      expect(linksOf(t).size).toBe(0);
+      t.destroy();
+    });
+
+    it("still talks to a client that sends no session", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      t.onPeerConnect("alice");
+      t.handleSignal("alice", sig({ type: "offer" }));
+      const first = linksOf(t).get(key)!;
+      t.handleSignal("alice", sig({ type: "candidate" }));
+      expect(first.signals).toEqual([{ type: "offer" }, { type: "candidate" }]);
+
+      // A fresh offer while the old link never connected: a new attempt.
+      t.handleSignal("alice", sig({ type: "offer" }));
+      expect(first.destroyed).toBe(true);
+      expect(linksOf(t).get(key)).not.toBe(first);
+      t.destroy();
+    });
   });
 });

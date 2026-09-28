@@ -629,6 +629,71 @@ describe("updateAttachmentStatus", () => {
   });
 });
 
+describe("unreadable rows repair themselves", () => {
+  // Breaks a sealed row the way older builds did: a clear field rewritten
+  // around the seal fails the AAD check, so the row no longer decrypts.
+  async function breakOnlyRow(store: "watermarks" | "attachments", patch: object) {
+    const db = await getDB();
+    const rows = await db.getAll(store);
+    expect(rows).toHaveLength(1);
+    await db.put(store, { ...rows[0], ...patch } as never);
+  }
+
+  it("a watermark that will not open is removed, and the sync can rebuild it", async () => {
+    await setWatermark("room-a", "alice", 10);
+    await breakOnlyRow("watermarks", { maxLamport: 50 });
+    await setWatermark("room-a", "bob", 5);
+
+    // Alice is missing, as before - but her dead row is gone now instead of
+    // advertising lamport 50 in the clear forever.
+    expect(await getWatermarksForRoom("room-a")).toEqual({ bob: 5 });
+    expect(await (await getDB()).count("watermarks")).toBe(1);
+
+    await setWatermark("room-a", "alice", 7);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 7, bob: 5 });
+  });
+
+  it("setWatermark replaces an unreadable row even when it claims to be newer", async () => {
+    // Written the way an older build left it, not by this session's
+    // setWatermark: the trap is a dead row whose clear maxLamport beat
+    // every write after it.
+    const sealed = await sealRow(
+      { id: "room-a:alice", roomCode: "room-a", senderId: "alice", maxLamport: 10 },
+      STORE_SPECS.watermarks
+    );
+    await (await getDB()).put("watermarks", sealed as never);
+    await breakOnlyRow("watermarks", { maxLamport: 50 });
+
+    await setWatermark("room-a", "alice", 20);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 20 });
+    // And the regression guard still holds once the row is a good one.
+    await setWatermark("room-a", "alice", 3);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 20 });
+  });
+
+  it("one unreadable attachment neither hides the rest from seeding nor stays", async () => {
+    const base = {
+      roomCode: "room-a",
+      messageId: "m1",
+      filename: "cat.png",
+      mimeType: "image/png",
+      size: 4,
+      status: "seeding" as const,
+      createdAt: 1,
+      data: new ArrayBuffer(4),
+    };
+    await putAttachment({ ...base, id: "dead", infoHash: "h-dead" });
+    await breakOnlyRow("attachments", { status: "complete" });
+    await putAttachment({ ...base, id: "good", infoHash: "h-good" });
+
+    // This threw on the dead row and announced nothing at all.
+    const seedable = await getSeedableFiles();
+    expect(seedable.map((s) => s.file.infoHash)).toEqual(["h-good"]);
+    expect(await (await getDB()).get("attachments", "dead")).toBeUndefined();
+    expect(await (await getDB()).get("attachments", "good")).toBeDefined();
+  });
+});
+
 describe("room participants and persistence", () => {
   const baseRoom: Room = {
     roomCode: "room-persist",

@@ -2,6 +2,7 @@
   import { _transport, transportState } from "$lib/transport/transport.svelte";
   import type { TransportStatus } from "$lib/transport/types";
   import { claimNodeLock } from "$lib/transport/node-lock";
+  import { showHeldElsewhereIcon } from "$lib/tab-icon";
   import { isConfigured } from "$lib/runtime-config";
   import { AppWindow, CircleAlert, MicOff, ServerOff, WifiOff, X } from "@lucide/svelte";
   import {
@@ -72,6 +73,9 @@
   // Another tab of this profile has the node; this one waits for it and can
   // ask for it (node-lock.ts). Nothing else in this tab works until then.
   const heldElsewhere = $derived(transportState.nodeHeldElsewhere);
+  // The bar only speaks to someone looking at this tab; the favicon says it
+  // in the tab strip. Here rather than in AppView so /qc gets it too.
+  $effect(() => showHeldElsewhereIcon(heldElsewhere));
 
   let cleanups: (() => void)[] = [];
   const timers = new Map<number, ReturnType<typeof setTimeout>>();

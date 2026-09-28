@@ -109,6 +109,51 @@ function isValidInfoHash(h: string): boolean {
   return /^[a-f0-9]{40}$/i.test(h) || /^[a-z2-7]{32}$/i.test(h);
 }
 
+/**
+ * Which dial a file link belongs to.
+ *
+ * Links are keyed by (file, peer), and nothing said which ATTEMPT a signal
+ * was for - so a retry collided with what was left of the attempt before
+ * it. The sender still held its half of the dead link (its own deadline
+ * runs later, and a torn-down initiator tells it nothing), fed the retry's
+ * offer into it, and that link died on the mismatched DTLS fingerprint. The
+ * retry's trickled candidates then built an orphan with no offer, which sat
+ * for 30s and caught the NEXT retry's offer the same way. Late answers from
+ * a dead attempt landed on the downloader's new link too. Files over the
+ * inline limit went through this whenever a first dial failed - and the
+ * first dials of a session fail by design while the TURN credentials are
+ * still on their way - so a transfer either worked first time or burned
+ * through WT_MAX_ATTEMPTS to "Could not reach the sender".
+ *
+ * The side that dials picks a session; both sides stamp it on every signal.
+ * A new session replaces the sender's leftover link, and a session that has
+ * ended is ignored wherever it turns up. Optional on the wire: an older
+ * client sends none and is handled as before.
+ */
+const MAX_RETIRED_SESSIONS = 8;
+
+function newSession(): string {
+  // getRandomValues, not randomUUID: the latter only exists on a secure
+  // page, and the app is also opened over plain http on a LAN address.
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function readSession(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 64
+    ? raw
+    : undefined;
+}
+
+/** Only an offer starts a link; see handleSignal. */
+function isOffer(signal: unknown): boolean {
+  return (
+    typeof signal === "object" &&
+    signal !== null &&
+    (signal as { type?: unknown }).type === "offer"
+  );
+}
+
 export class WebTorrentFileTransport implements FileTransferTransport {
   /**
    * Created on first use: the library is large and a session that never
@@ -140,6 +185,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   /** infoHashes registered by each peer, oldest-first (Set preserves insertion order) - bounds registerSeeder against a flooding peer. */
   private peerSeeded = new Map<string, Set<string>>();
   private wtPeers = new Map<string, SimplePeerInstance>();
+  /** Which dial each live link belongs to, and whether we made it. */
+  private wtLinkMeta = new WeakMap<
+    SimplePeerInstance,
+    { session: string | undefined; initiator: boolean }
+  >();
+  /** Sessions of links that have ended, per pair: their signals are stale. */
+  private wtRetired = new Map<string, Set<string>>();
   /**
    * Per-pair retry state for the WebRTC links that carry file data.
    *
@@ -494,10 +546,57 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     }
 
     const key = wtKey(envelope.infoHash, fromPeerId);
-    if (!this.wtPeers.has(key)) {
-      this.createWTPeer(envelope.infoHash, fromPeerId, false);
+    const session = readSession(envelope.session);
+    // The tail of a link that is already over: an answer or candidates from
+    // an attempt we replaced or gave up on.
+    if (session !== undefined && this.wtRetired.get(key)?.has(session)) return;
+
+    let peer = this.wtPeers.get(key);
+    const meta = peer && this.wtLinkMeta.get(peer);
+    if (peer && meta) {
+      if (meta.initiator) {
+        // Our own dial: only its own session belongs on it.
+        if (session !== undefined && meta.session !== undefined && session !== meta.session) {
+          return;
+        }
+      } else if (
+        session !== undefined
+          ? session !== meta.session
+          : isOffer(envelope.signal) && !peer.connected
+      ) {
+        // They dialled again. Whatever is left of the last attempt goes; the
+        // new offer gets a link of its own instead of dying on the old one.
+        this.retireSession(key, meta.session);
+        this.wtPeers.delete(key);
+        peer.destroy();
+        peer = undefined;
+      }
     }
-    this.wtPeers.get(key)?.signal(envelope.signal as never);
+
+    if (!peer) {
+      // Only an offer starts a link. An answer or a candidate with nothing to
+      // land on belongs to an attempt that is over, and a link built for it
+      // sat on the pair for WT_CONNECT_TIMEOUT_MS - blocking the next dial,
+      // which skips a pair that already has one.
+      if (!isOffer(envelope.signal)) return;
+      if (!this.createWTPeer(envelope.infoHash, fromPeerId, false, session)) return;
+      peer = this.wtPeers.get(key);
+    }
+    peer?.signal(envelope.signal as never);
+  }
+
+  private retireSession(key: string, session: string | undefined): void {
+    if (session === undefined) return;
+    let retired = this.wtRetired.get(key);
+    if (!retired) {
+      retired = new Set();
+      this.wtRetired.set(key, retired);
+    }
+    retired.add(session);
+    // Oldest first out: a pair only ever needs its last few attempts.
+    while (retired.size > MAX_RETIRED_SESSIONS) {
+      retired.delete(retired.values().next().value as string);
+    }
   }
 
   onPeerConnect(peerId: string): void {
@@ -519,6 +618,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     // straight away rather than inheriting a wait from before it dropped.
     for (const key of new Set([...this.wtNextTry.keys(), ...this.wtAttempts.keys()])) {
       if (key.endsWith(`:${peerId}`)) this.forgetRetryState(key);
+    }
+    for (const key of [...this.wtRetired.keys()]) {
+      if (key.endsWith(`:${peerId}`)) this.wtRetired.delete(key);
     }
 
     for (const [infoHash, seeders] of this.seedersByHash) {
@@ -581,6 +683,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       peer.destroy();
     }
     this.wtPeers.clear();
+    this.wtRetired.clear();
 
     const blobUrls = new Set(
       [...this.transfers.values()]
@@ -716,7 +819,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private createWTPeer(
     infoHash: string,
     peerId: string,
-    initiator: boolean
+    initiator: boolean,
+    /** The dialler's session, for a link we answer. */
+    answering?: string
   ): boolean {
     const key = wtKey(infoHash, peerId);
     if (this.wtPeers.has(key)) return false;
@@ -744,12 +849,15 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     });
 
     this.wtPeers.set(key, peer);
+    const session = initiator ? newSession() : answering;
+    this.wtLinkMeta.set(peer, { session, initiator });
 
     peer.on("signal", (signal: unknown) => {
       this.emit("signal", peerId, {
         kind: "file-wt-signal",
         infoHash,
         signal,
+        ...(session !== undefined ? { session } : {}),
       });
     });
 
@@ -764,6 +872,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     // point is the case where none of them ever does.
     const connectDeadline = setTimeout(() => {
       if (this.wtPeers.get(key) !== peer) return;
+      this.retireSession(key, session);
       this.wtPeers.delete(key);
       peer.destroy();
     }, WT_CONNECT_TIMEOUT_MS);
@@ -774,13 +883,17 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       void this.attachToTorrent(infoHash, peer);
     });
 
+    // Whichever way a link ends, its session is over: a late answer or
+    // candidate for it must not start a link of its own.
     peer.on("error", () => {
       clearTimeout(connectDeadline);
+      this.retireSession(key, session);
       if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
     });
 
     peer.on("close", () => {
       clearTimeout(connectDeadline);
+      this.retireSession(key, session);
       if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
     });
     return true;

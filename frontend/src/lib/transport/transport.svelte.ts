@@ -2866,7 +2866,16 @@ async function _handleChatMessage(
   const seederPeerId =
     receivedFromPeerId ?? maybePeerIdFromSenderId(msg.senderId) ?? null;
 
-  if (isNewMessage) {
+  // Not only for a new message: a message we already hold can have lost its
+  // attachment rows - storage deletes a row it cannot decrypt (storage.ts,
+  // _purgeUnreadable) - and the next copy of the message, a sync re-send
+  // included, is the one chance to put them back. Without a row a finished
+  // download has nowhere to be stored and is fetched again every session.
+  // The in-flight guard stands in for the isNewMessage gate this used to
+  // have: the same message arriving from two peers at once must not get two
+  // sets of rows.
+  if (!_ensuringAttachmentRows.has(msg.id)) {
+    _ensuringAttachmentRows.add(msg.id);
     getAttachmentsByMessage(msg.id)
       .then((existing) => {
         if (existing.length > 0) return;
@@ -2889,7 +2898,8 @@ async function _handleChatMessage(
           )
         );
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => _ensuringAttachmentRows.delete(msg.id));
   }
 
   for (const file of msg.meta.files) {
@@ -3374,6 +3384,12 @@ function _handleDmChatAsync(
  * attachment row from a message we hold. Used to refuse file signals for
  * hashes we never asked about.
  */
+/** Messages whose attachment rows are being checked or written right now. */
+const _ensuringAttachmentRows = new Set<string>();
+
+/** The tail of each peer's file-signal chain; see the __file_signal branch. */
+const _fileSignalQueue = new Map<string, Promise<void>>();
+
 async function _haveFileFor(infoHash: string): Promise<boolean> {
   if (transportState.fileTransfers.has(infoHash)) return true;
   const rows = await getAttachmentsByInfoHash(infoHash).catch(() => []);
@@ -3497,11 +3513,21 @@ _transport.on("message", (peerId, data, room) => {
         // meaningful for a transfer or an attachment we actually hold, so an
         // infoHash we have never heard of buys nothing.
         const signal = decoded.payload;
-        void (async () => {
-          if (!(await _peerSharesRoomWithUs(peerId))) return;
-          if (!(await _haveFileFor(signal.infoHash))) return;
-          _fileTransport.handleSignal(peerId, signal);
-        })().catch(() => {});
+        // In arrival order, per peer. Each signal awaits its own gate, and
+        // the gates do not take equal time (a transfer we track answers from
+        // memory, an attachment from IndexedDB) - so an offer could reach
+        // the link after the candidates, or after the next attempt's.
+        const next = (_fileSignalQueue.get(peerId) ?? Promise.resolve())
+          .then(async () => {
+            if (!(await _peerSharesRoomWithUs(peerId))) return;
+            if (!(await _haveFileFor(signal.infoHash))) return;
+            _fileTransport.handleSignal(peerId, signal);
+          })
+          .catch(() => {});
+        _fileSignalQueue.set(peerId, next);
+        void next.then(() => {
+          if (_fileSignalQueue.get(peerId) === next) _fileSignalQueue.delete(peerId);
+        });
       }
       return;
     }
