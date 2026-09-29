@@ -4,11 +4,13 @@
   import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { newRoomCode } from "$lib/room-code";
   import { parseJoinInput } from "$lib/invite";
-  import { hostInvitationPairing, joinInvitationPairing } from "$lib/invite-pairing";
+  import { joinInvitationPairing } from "$lib/invite-pairing";
+  import { cancelShortCode, hostShortCode, liveShortCode, shortCodeLink, shortCodeOutcome } from "$lib/short-codes.svelte";
   import { parseSecureInvitation } from "$lib/room-security/invitations";
   import { onDestroy, tick } from "svelte";
   import QRCode from "qrcode";
-  import { Check, Clipboard, Copy, LogIn, Menu, Plus, Share2 } from "@lucide/svelte";
+  import { Check, Clipboard, Copy, Keyboard, LogIn, Menu, Plus, QrCode, ScanLine, Share2 } from "@lucide/svelte";
+  import QrScanner from "./QrScanner.svelte";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -45,16 +47,24 @@
   );
   let copied = $state(false);
   let qr = $state("");
+  // The room's QR is one tap away, not on screen by default: it took most of
+  // the modal for something a link or short code usually does.
+  let showQr = $state(false);
+  let scanning = $state(false);
+  let scanHint = $state<string | null>(null);
   const qrSize = $derived(inDialog ? "size-50" : "size-60");
-  let cancelPairing: (() => void) | undefined;
-  let hostController: AbortController | undefined;
   let joinController: AbortController | undefined;
   let alive = true;
   let pairingBusy = $state(false);
-  onDestroy(() => { alive = false; hostController?.abort(); cancelPairing?.(); joinController?.abort(); });
-  // Online OPAQUE pairing is single-use and only works while this view is open.
-  let shortCode = $state<string | null>(null);
-  let shortCodeExpiresAt = $state(0);
+  // The short code outlives this view (short-codes.svelte.ts): it keeps
+  // working after "Join room" or closing the modal, while the tab is open.
+  onDestroy(() => { alive = false; joinController?.abort(); });
+  const createdSecret = $derived(createdCode ? parseSecureInvitation(createdCode) : null);
+  const live = $derived(createdSecret ? liveShortCode(createdSecret) : null);
+  const shortCode = $derived(live?.code ?? null);
+  const shortCodeExpiresAt = $derived(live?.expiresAt ?? 0);
+  // Outcomes reported by the pairing ("delivered", "expired"): not errors.
+  const pairingStatus = $derived(createdSecret && !live ? shortCodeOutcome(createdSecret) : null);
   let now = $state(Date.now());
   $effect(() => {
     if (!shortCode) return;
@@ -67,10 +77,7 @@
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   });
   let shortCodeError = $state<string | null>(null);
-  // Outcomes reported by the pairing ("delivered", "expired"): not errors.
-  let pairingStatus = $state<string | null>(null);
   let shortCopied = $state(false);
-  let copyMenuOpen = $state(false);
   let joinError = $state<string | null>(null);
   // Only a short-code join waits on the inviter, so only it can be cancelled.
   let pairingJoin = $state(false);
@@ -96,10 +103,9 @@
       const code = newRoomCode();
       createdCode = code;
       copied = false;
-      shortCode = null;
-      shortCodeExpiresAt = 0;
+      showQr = false;
+      scanning = false;
       shortCodeError = null;
-      pairingStatus = null;
       // The focused Create button is gone; joining is the next step.
       void tick().then(() => joinCreatedButton?.focus());
       qr = await QRCode.toDataURL(`${window.location.origin}/r/#${code}`, { width: 280, margin: 2 });
@@ -120,7 +126,6 @@
         profileStore.nickname || "Anonymous",
         roomName.trim() || undefined
       );
-      hostController?.abort(); cancelPairing?.();
       createdCode = null;
     } catch (err) {
       shortCodeError = err instanceof Error ? err.message : "Could not open the room";
@@ -165,47 +170,47 @@
   }
 
   async function handleCopyLink() {
-    copyMenuOpen = false;
     await handleCopy(createdCode!);
   }
 
-  // Mint on first use, then copy. The code stays on screen afterwards so it
-  // can be read aloud, which is the point of it.
-  async function handleCopyShort() {
-    if (pairingBusy || !createdCode) return;
+  // Like the invite dialog: getting a code shows it, to read aloud or type
+  // in; "Copy link" beside it copies its short link.
+  async function handleGetShort() {
+    if (pairingBusy || !createdSecret) return;
     pairingBusy = true;
-    copyMenuOpen = false;
     shortCodeError = null;
-    pairingStatus = null;
     try {
-      if (!shortCode || Date.now() >= shortCodeExpiresAt) {
-        cancelPairing?.();
-        hostController?.abort();
-        hostController = new AbortController();
-        const made = await hostInvitationPairing(parseSecureInvitation(createdCode), value => { if (alive) { pairingStatus = value; shortCode = null; } }, hostController.signal);
-        if (!alive) { made.cancel(); return; }
-        cancelPairing = made.cancel;
-        shortCode = made.code;
-        shortCodeExpiresAt = made.expiresAt;
-      }
+      await hostShortCode(createdSecret);
     } catch {
-      shortCodeError = "Couldn't get a short code right now. Share the link instead.";
+      if (alive) shortCodeError = "Couldn't get a short code right now. Share the full link instead.";
+    } finally { pairingBusy = false; }
+  }
+
+  async function handleCopyShort() {
+    if (pairingBusy || !createdSecret) return;
+    pairingBusy = true;
+    shortCodeError = null;
+    let code: string;
+    try {
+      code = (await hostShortCode(createdSecret)).code;
+    } catch {
+      if (alive) shortCodeError = "Couldn't get a short code right now. Share the full link instead.";
       return;
     } finally { pairingBusy = false; }
-    try { await navigator.clipboard.writeText(shortCode!); shortCopied = true; }
+    if (!alive) return;
+    try { await navigator.clipboard.writeText(shortCodeLink(code)); shortCopied = true; }
     catch { shortCodeError = "Couldn't copy. Select the code below and copy it."; }
     setTimeout(() => (shortCopied = false), 2000);
   }
 
   // The OS share sheet, where there is one. Only offered when the browser
-  // actually has it, or the menu would carry two entries that do the same
+  // actually has it, or there would be two buttons that do the same
   // thing; the catch still falls back to the clipboard.
   const canShare = $derived(
     typeof navigator !== "undefined" && typeof navigator.share === "function"
   );
 
   async function handleShareLink() {
-    copyMenuOpen = false;
     try {
       await navigator.share({ url: createdLink });
     } catch (err) {
@@ -222,6 +227,22 @@
     catch { shortCodeError = "Couldn't copy. Select the link above and copy it."; return; }
     copied = true;
     setTimeout(() => (copied = false), 2000);
+  }
+
+  // A room's QR carries its invite link (or a short link); any other QR is
+  // not ours and the camera keeps looking.
+  function handleScannedText(text: string): boolean {
+    if (parseJoinInput(text).kind === "invalid") {
+      scanHint = "That QR code isn't a room invite.";
+      return false;
+    }
+    scanning = false;
+    scanHint = null;
+    joinCode = text.trim();
+    // After the field's effect: it aborts the join in flight whenever the
+    // text changes, which would be this one if it started first.
+    void tick().then(handleJoin);
+    return true;
   }
 
   async function handlePaste() {
@@ -360,18 +381,42 @@
             <Input
               id="join-code" autocomplete="off" aria-describedby={joinError ? "room-join-error" : undefined} aria-invalid={joinError ? "true" : undefined}
               bind:value={joinCode}
-              placeholder="Invite link or short code"
-              class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-10 focus-visible:ring-ring"
+              placeholder="Link or short code"
+              class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-16 focus-visible:ring-ring"
             />
-            <button
-              type="button"
-              onclick={handlePaste}
-              class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
-              aria-label="Paste room code"
-            >
-              <Clipboard class="size-4" />
-            </button>
+            <div class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-2">
+              <button
+                type="button"
+                onclick={() => { scanHint = null; scanning = !scanning; }}
+                class="text-muted-foreground hover:text-foreground cursor-pointer"
+                aria-label={scanning ? "Stop scanning" : "Scan a QR code"}
+                aria-pressed={scanning}
+                title="Scan a QR code"
+              >
+                <ScanLine class="size-4" />
+              </button>
+              <button
+                type="button"
+                onclick={handlePaste}
+                class="text-muted-foreground hover:text-foreground cursor-pointer"
+                aria-label="Paste room code"
+              >
+                <Clipboard class="size-4" />
+              </button>
+            </div>
           </div>
+          {#if scanning}
+            <QrScanner
+              onText={handleScannedText}
+              onUnavailable={() => {
+                scanning = false;
+                joinError = "Couldn't open the camera. Allow camera access, or paste the link instead.";
+              }}
+            />
+            <p role={scanHint ? "alert" : undefined} class="text-center text-xs {scanHint ? 'text-destructive' : 'text-muted-foreground'}">
+              {scanHint ?? "Point the camera at a room's QR code."}
+            </p>
+          {/if}
           <Button
             variant="outline"
             onclick={handleJoin}
@@ -398,84 +443,44 @@
       <CardHeader>
         <CardTitle class="font-mono text-foreground">Room created</CardTitle>
         <CardDescription class="text-muted-foreground">
-          Anyone with this link or QR code can join.
+          Anyone with this link can join.
         </CardDescription>
       </CardHeader>
       <!-- grid-cols-1 (minmax(0, 1fr)) so the long link cannot widen the card. -->
       <CardContent class="grid grid-cols-1 gap-4">
-        {#if qr}
-          <img
-            src={qr}
-            alt="Room invitation QR code"
-            class="mx-auto rounded-lg [image-rendering:pixelated] {qrSize}"
-          />
-        {:else}
-          <div class="mx-auto rounded-lg bg-muted {qrSize}" aria-hidden="true"></div>
-        {/if}
-        <div class="relative">
+        <!-- Buttons, laid out like the room's invite dialog, not a menu: a
+             menu under the field ran past the modal and scrolled it, and
+             one above it had nothing to open over once the QR was folded. -->
+        <div class="flex gap-2">
           <!-- A field, so the link can be selected when the clipboard is refused. -->
           <Input
             aria-label="Invitation link"
             readonly
             value={createdLink}
             onclick={(e) => e.currentTarget.select()}
-            class="bg-muted border-transparent font-mono text-xs md:text-xs text-muted-foreground pr-10 focus-visible:ring-ring"
+            class="bg-muted border-transparent font-mono text-xs md:text-xs text-muted-foreground focus-visible:ring-ring"
           />
-          <div class="absolute right-2 top-1/2 -translate-y-1/2" data-copy-menu>
-            <button
-              type="button"
-              onclick={() => (copyMenuOpen = !copyMenuOpen)}
-              class="flex rounded-sm text-muted-foreground hover:text-foreground cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              aria-label="Copy"
-              aria-haspopup="menu"
-              aria-expanded={copyMenuOpen}
-            >
-              {#if copied || shortCopied}
-                <Check class="size-4 text-primary" />
-              {:else}
-                <Copy class="size-4" />
-              {/if}
-            </button>
-            {#if copyMenuOpen}
-              <div
-                role="menu"
-                class="absolute right-0 top-full mt-2 z-10 w-56 rounded-lg border border-border bg-popover text-popover-foreground shadow-md p-1"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={handleCopyLink}
-                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
-                >
-                  Copy link
-                </button>
-                {#if canShare}
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onclick={handleShareLink}
-                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted cursor-pointer"
-                  >
-                    <Share2 class="size-3.5" />
-                    Share link
-                  </button>
-                {/if}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={handleCopyShort}
-                  disabled={pairingBusy}
-                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer disabled:cursor-wait disabled:opacity-60"
-                >
-                  {pairingBusy ? "Getting a short code..." : "Copy short code"}
-                  <span class="block text-xs text-muted-foreground">
-                    Works once, for 5 minutes
-                  </span>
-                </button>
-              </div>
+          <Button
+            variant="outline"
+            size="icon"
+            class="shrink-0 cursor-pointer"
+            aria-label="Copy invitation link"
+            title={copied ? "Copied" : "Copy link"}
+            onclick={handleCopyLink}
+          >
+            {#if copied}
+              <Check class="size-4 text-primary" />
+            {:else}
+              <Copy class="size-4" />
             {/if}
-          </div>
+          </Button>
         </div>
+        {#if canShare}
+          <Button variant="outline" class="w-full font-mono cursor-pointer" onclick={handleShareLink}>
+            <Share2 class="size-4" />
+            Share invite link
+          </Button>
+        {/if}
 
         {#if shortCode}
           <div class="rounded-lg bg-muted px-3 py-2 text-center">
@@ -483,18 +488,69 @@
               {shortCode}
             </div>
             <div class="mt-1 text-xs text-muted-foreground">
-              {now >= shortCodeExpiresAt
-                ? "Expired. Copy a new short code from the menu."
-                : `Works once · ${shortCodeLeft} left · keep this open`}
+              {#if now >= shortCodeExpiresAt}
+                Expired. Get a new one below.
+              {:else}
+                Works once · {shortCodeLeft} left
+                <span class="block">Keep Awful.chat open until it's used</span>
+              {/if}
             </div>
-            <button
-              type="button"
-              onclick={() => { cancelPairing?.(); shortCode = null; }}
-              class="mt-1 rounded-sm text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              Cancel short code
-            </button>
+            <div class="mt-2 flex justify-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                class="font-mono text-xs cursor-pointer"
+                aria-label="Copy short link"
+                onclick={handleCopyShort}
+              >
+                {#if shortCopied}
+                  <Check class="size-3.5 text-primary" /> Copied
+                {:else}
+                  <Copy class="size-3.5" /> Copy link
+                {/if}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                class="font-mono text-xs text-muted-foreground cursor-pointer"
+                aria-label="Cancel short code"
+                onclick={() => createdSecret && cancelShortCode(createdSecret)}
+              >
+                Cancel
+              </Button>
+            </div>
           </div>
+        {:else}
+          <Button
+            variant="ghost"
+            disabled={pairingBusy}
+            class="w-full font-mono text-xs text-muted-foreground cursor-pointer"
+            onclick={handleGetShort}
+          >
+            <Keyboard class="size-3.5" />
+            {pairingBusy ? "Getting a short code..." : "Get a short code"}
+          </Button>
+        {/if}
+
+        <button
+          type="button"
+          onclick={() => (showQr = !showQr)}
+          aria-expanded={showQr}
+          class="mx-auto flex items-center gap-1.5 rounded-sm font-mono text-xs text-muted-foreground hover:text-foreground cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <QrCode class="size-3.5" />
+          {showQr ? "Hide QR code" : "Show QR code"}
+        </button>
+        {#if showQr}
+          {#if qr}
+            <img
+              src={qr}
+              alt="Room invitation QR code"
+              class="mx-auto rounded-lg [image-rendering:pixelated] {qrSize}"
+            />
+          {:else}
+            <div class="mx-auto rounded-lg bg-muted {qrSize}" aria-hidden="true"></div>
+          {/if}
         {/if}
         {#if pairingBusy && !shortCode}
           <p role="status" class="text-center text-xs text-muted-foreground">Getting a short code...</p>
@@ -546,16 +602,6 @@
     {@render card()}
   </div>
 {/if}
-
-<svelte:window
-  onclick={(e) => {
-    if (copyMenuOpen && !(e.target as HTMLElement).closest("[data-copy-menu]"))
-      copyMenuOpen = false;
-  }}
-  onkeydown={(e) => {
-    if (e.key === "Escape") copyMenuOpen = false;
-  }}
-/>
 
 <AvatarPickerDialog
   open={avatarDialogOpen}

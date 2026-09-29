@@ -6,10 +6,18 @@ export type JoinInput =
   | { kind: "room"; code: string }
   | { kind: "invalid" };
 
+/**
+ * A short link, `https://awful.chat/r/#k5t-8r5`, with or without the scheme.
+ * Fragment only, like a full invitation: a live code has no business in a path
+ * that reaches server logs.
+ */
+const SHORT_LINK_RE = /^(?:(?:[a-z][a-z0-9+.-]*:\/\/)?[^/?#\s]+)?\/r\/#([^/?#]+)$/i;
+
 /** All invitation entry points reject public IDs and retired plaintext aliases. */
 export function parseJoinInput(input: string): JoinInput {
   try { return { kind: "room", code: parseSecureInvitation(input) }; } catch { /* Try online pairing. */ }
-  const pair = parsePairingCode(input);
+  const link = SHORT_LINK_RE.exec(input.trim());
+  const pair = parsePairingCode(link ? link[1] : input);
   return pair ? { kind: "pairing", code: formatPairingCode(pair.locator, pair.password) } : { kind: "invalid" };
 }
 

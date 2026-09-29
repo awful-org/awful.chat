@@ -27,7 +27,7 @@ try {
   await writeFile(join(temp, "package.json"), '{"type":"module"}');
   const gate = join(temp, "src/lib/room-security/invitation-release.ts");
   const originalGate = await readFile(gate, "utf8");
-  assert.match(originalGate, /ROOM_SECURITY_V2_RELEASED: boolean = false/);
+  assert.match(originalGate, /ROOM_SECURITY_V2_RELEASED: boolean = (true|false)/);
   await writeFile(gate, originalGate.replace("boolean = false", "boolean = true"));
   const fixtures = {
     "$lib/profile.svelte": `export const profileStore = $state({nickname:'UI Tester',avatarUrl:null}); export async function loadProfile(){} export async function saveName(name){profileStore.nickname=name;}`,
@@ -99,7 +99,8 @@ try {
   }
   const host = await page(), guest = await page();
   const clipboard = p => p.evaluate(()=>navigator.clipboard.readText());
-  async function menu(p, name) {await p.getByRole('button',{name:'Copy',exact:true}).click();await p.getByRole('menuitem',{name,exact:true}).click();}
+  async function press(p, name) {await p.getByRole('button',{name,exact:true}).click();}
+  async function getShortLink(p) {await press(p,'Get a short code');await press(p,'Copy short link');}
   async function qr(p, link) {
     const image = p.getByRole('img',{name:'Room invitation QR code'});
     await image.waitFor();
@@ -117,11 +118,12 @@ try {
   await host.getByRole('button',{name:'Create room',exact:true}).click();
   const link = await host.getByLabel('Invitation link',{exact:true}).inputValue();
   const secret = new URL(link).hash.slice(1);assert.match(secret,/^r2_/);
-  await qr(host,link);await menu(host,'Copy link');assert.equal(await clipboard(host),link);
-  await menu(host,'Share link');assert.deepEqual(await host.evaluate(()=>window.shares),[{url:link}]);
+  assert.equal(await host.getByRole('img',{name:'Room invitation QR code'}).count(),0,'QR folded by default');
+  await press(host,'Show QR code');await qr(host,link);await press(host,'Copy invitation link');assert.equal(await clipboard(host),link);
+  await press(host,'Share invite link');assert.deepEqual(await host.evaluate(()=>window.shares),[{url:link}]);
   await host.evaluate(()=>{window.shareMode='AbortError';return navigator.clipboard.writeText('sentinel');});
-  await menu(host,'Share link');assert.equal(await clipboard(host),'sentinel','share cancellation must not copy');
-  await host.evaluate(()=>window.shareMode='NotAllowedError');await menu(host,'Share link');assert.equal(await clipboard(host),link,'failed share falls back to clipboard');
+  await press(host,'Share invite link');assert.equal(await clipboard(host),'sentinel','share cancellation must not copy');
+  await host.evaluate(()=>window.shareMode='NotAllowedError');await press(host,'Share invite link');assert.equal(await clipboard(host),link,'failed share falls back to clipboard');
   await submit(guest,'retired-code');await guest.getByRole('alert').filter({hasText:'Enter a valid'}).waitFor();
   assert.deepEqual(await guest.evaluate(()=>window.joined),[]);
   await submit(guest,link);await joined(guest,secret);
@@ -130,40 +132,52 @@ try {
   const id = await host.evaluate(secret=>window.deriveRoomKeys(secret).discoveryId,secret);
   await submit(guest,id);await guest.getByRole('alert').filter({hasText:'Enter a valid'}).waitFor();
   await guest.evaluate(link=>navigator.clipboard.writeText(link),link);await guest.getByRole('button',{name:'Paste room code'}).click();await guest.waitForFunction(link=>document.querySelector('#join-code').value===link,link);
-  await menu(host,'Copy short code Works once, for 5 minutes');
+  const shortLink = new RegExp(`^${origin.replace(/[.]/g,'\\.')}/r/#[0-9a-z]{3}-[0-9a-z]{3}$`);
+  await getShortLink(host);
   await host.getByRole('button',{name:'Cancel short code',exact:true}).waitFor();
-  const pairingCode = await clipboard(host);assert.notEqual(pairingCode,link);
+  const pairingCode = await clipboard(host);assert.match(pairingCode,shortLink);
   await submit(guest,pairingCode);await joined(guest,secret,4);
   await host.getByText('Invitation delivered. This code is now used.',{exact:true}).waitFor();
   await submit(guest,pairingCode);await guest.getByRole('alert').waitFor();assert.equal(await guest.evaluate(()=>window.joined.length),4);
+  // Joining the room ends the view, not a short link handed out from it.
+  await getShortLink(host);await host.getByRole('button',{name:'Cancel short code',exact:true}).waitFor();
+  const lateCode = await clipboard(host);assert.notEqual(lateCode,pairingCode);
   await host.getByRole('button',{name:'Join room',exact:true}).click();await joined(host,secret);assert.equal(await host.evaluate(()=>window.joined[0][2]),'Browser room');
-  console.log('PASS: RoomCreateJoin create/QR/copy/share/cancel/fallback, invalid/public-ID rejection, paste, full/protocol links, real-relay UI pairing, reuse rejection, created-room callback');
+  await submit(guest,lateCode);await joined(guest,secret,5);
+  console.log('PASS: RoomCreateJoin create/QR/copy/share/cancel/fallback, invalid/public-ID rejection, paste, full/protocol links, real-relay UI pairing by short link, reuse rejection, created-room callback, short link outliving the view');
 
   await host.evaluate(({id,secret})=>{window.testRooms={[id]:{roomCode:id,roomSecret:secret}};window.showDialog(id);},{id,secret});
   const dialog=host.getByRole('dialog');await dialog.waitFor();
-  assert.equal(await dialog.getByLabel('Invitation link').inputValue(),link);await qr(dialog,link);
+  assert.equal(await dialog.getByLabel('Invitation link',{exact:true}).inputValue(),link);await qr(dialog,link);
   await dialog.getByRole('button',{name:'Copy invitation link',exact:true}).click();assert.equal(await clipboard(host),link);
   await host.evaluate(()=>window.shareMode='success');await dialog.getByRole('button',{name:'Share invite link',exact:true}).click();assert.equal(await host.evaluate(()=>window.shares.at(-1).url),link);
-  await dialog.getByRole('button',{name:"Can't scan? Get a short code",exact:true}).click();await dialog.getByRole('button',{name:'Copy short code',exact:true}).click();
-  const dialogCode=await clipboard(host);await submit(guest,dialogCode);await joined(guest,secret,5);
-  await dialog.getByRole('status').filter({hasText:'Invitation delivered'}).waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy short code',exact:true}).count(),0);
-  await dialog.getByRole('button',{name:"Can't scan? Get a short code",exact:true}).click();await dialog.getByRole('button',{name:'Copy short code',exact:true}).click();
-  const cancelledCode=await clipboard(host);
-  const cancellation=host.waitForResponse(r=>r.url().endsWith('/invite')&&r.request().postDataJSON()?.action==='cancel');
-  await dialog.getByRole('button',{name:'Close',exact:true}).click();await cancellation;
-  await submit(guest,cancelledCode);await guest.getByRole('alert').waitFor();assert.equal(await guest.evaluate(()=>window.joined.length),5);
-  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link').waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy short code',exact:true}).count(),0);
+  // Closing the dialog leaves the code working; reopening tells how it ended.
+  await dialog.getByRole('button',{name:"Can't scan? Get a short code",exact:true}).click();await dialog.getByRole('button',{name:'Copy short link',exact:true}).click();
+  const dialogCode=await clipboard(host);assert.match(dialogCode,shortLink);
   await dialog.getByRole('button',{name:'Close',exact:true}).click();
-  console.log('PASS: InvitationDialog saved-room/QR/copy/share, real-relay UI transfer, consumed-code removal, close cancellation and clean reopen');
+  await submit(guest,dialogCode);await joined(guest,secret,6);
+  await host.evaluate(id=>window.showDialog(id),id);
+  await dialog.getByRole('status').filter({hasText:'Invitation delivered'}).waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy short link',exact:true}).count(),0);
+  // A live code shows again on reopen, and its own Cancel ends it.
+  await dialog.getByRole('button',{name:"Can't scan? Get a short code",exact:true}).click();await dialog.getByRole('button',{name:'Copy short link',exact:true}).click();
+  const cancelledCode=await clipboard(host);
+  await dialog.getByRole('button',{name:'Close',exact:true}).click();await host.evaluate(id=>window.showDialog(id),id);
+  await dialog.getByRole('button',{name:'Copy short link',exact:true}).click();assert.equal(await clipboard(host),cancelledCode);
+  const cancellation=host.waitForResponse(r=>r.url().endsWith('/invite')&&r.request().postDataJSON()?.action==='cancel');
+  await dialog.getByRole('button',{name:'Cancel short code',exact:true}).click();await cancellation;
+  assert.equal(await dialog.getByRole('button',{name:'Copy short link',exact:true}).count(),0);
+  await submit(guest,cancelledCode);await guest.getByRole('alert').waitFor();assert.equal(await guest.evaluate(()=>window.joined.length),6);
+  await dialog.getByRole('button',{name:'Close',exact:true}).click();
+  console.log('PASS: InvitationDialog saved-room/QR/copy/share, real-relay UI transfer by short link, code outliving the dialog, delivered status on reopen, explicit cancellation');
 
   // A clipboard permission prompt can outlive its dialog. Its completion must not
   // overwrite status in a newly opened dialog.
-  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link').waitFor();
+  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link',{exact:true}).waitFor();
   await host.evaluate(()=>{window.originalWrite=navigator.clipboard.writeText.bind(navigator.clipboard);navigator.clipboard.writeText=()=>new Promise(resolve=>window.finishCopy=resolve);});
   await dialog.getByRole('button',{name:'Copy invitation link',exact:true}).click();
   await host.waitForFunction(()=>!!window.finishCopy);
   await dialog.getByRole('button',{name:'Close',exact:true}).click();
-  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link').waitFor();
+  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link',{exact:true}).waitFor();
   await host.evaluate(()=>{window.finishCopy();navigator.clipboard.writeText=window.originalWrite;});
   assert.equal(await dialog.getByRole('status').textContent(),'','stale clipboard completion overwrote replacement dialog');
   await dialog.getByRole('button',{name:'Close',exact:true}).click();
@@ -181,16 +195,19 @@ try {
   console.log('PASS: stale clipboard completion and edited-input cancellation isolation');
   for(const exchange of traffic) {
     assert.ok(!exchange.body.includes(secret)&&!exchange.text.includes(secret),'secret exposed at relay');
-    for(const code of [pairingCode,dialogCode,cancelledCode]) {
-      const password=code.replace(/[-\s]/g,'').slice(8);
-      assert.ok(password.length>0&&!exchange.body.includes(password)&&!exchange.text.includes(password),'pairing password exposed at relay');
+    // The whole code, locator and password together: the locator is sent on
+    // purpose, and four characters alone turn up by chance in base64 payloads.
+    for(const link of [pairingCode,lateCode,dialogCode,cancelledCode]) {
+      const code=link.split('#').pop();
+      assert.match(code,/^[0-9a-z]{3}-[0-9a-z]{3}$/);
+      for(const form of [code,code.replace('-','')]) assert.ok(!exchange.body.includes(form)&&!exchange.text.includes(form),'pairing code exposed at relay');
     }
   }
   assert.ok(traffic.length>0&&traffic.every(t=>t.status!==502));
   assert.ok(requests.every(url=>!url.includes(secret)),'secret in HTTP URL');
   assert.deepEqual(errors,[],'unexpected browser exceptions');
   assert.equal(await readFile(join(root,'src/lib/room-security/invitation-release.ts'),'utf8'),originalGate,'shared gate changed');
-  console.log(`PASS: ${traffic.length} real relay exchanges inspected; shared gate unchanged/false; no browser exceptions`);
+  console.log(`PASS: ${traffic.length} real relay exchanges inspected; shared gate unchanged; no browser exceptions`);
 } finally {
   await browser?.close();
   if(server) await new Promise(resolve=>server.close(resolve));

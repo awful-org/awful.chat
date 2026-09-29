@@ -25,6 +25,14 @@ it("accepts six-character online pairing codes, lowercase, folding human lookali
     expect(parseJoinInput(wrong)).toEqual({ kind: "invalid" });
   }
 });
+it("accepts a short link, in the fragment only", () => {
+  for (const input of ["https://awful.chat/r/#k5t-8r5", "awful.chat/r/#K5T8R5", "/r/#k5t-8r5", " http://127.0.0.1:5173/r/#k5t-8r5 "]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  }
+  for (const input of ["https://awful.chat/r/k5t-8r5", "https://awful.chat/r/#k5t-8r5/x", "https://awful.chat/r/?c=k5t-8r5", "https://awful.chat/#k5t-8r5"]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "invalid" });
+  }
+});
 it("rejects public IDs, old room codes and malformed or path/query capabilities", () => {
   const secret = newRoomSecret();
   // Six-character inputs are pairing-code shaped now; a retired short alias
