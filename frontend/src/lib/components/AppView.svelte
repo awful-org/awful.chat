@@ -6,7 +6,11 @@
   import { captureSessionGuard } from "$lib/identity/session-guard";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import { parseSecureInvitation } from "$lib/room-security/invitation-format";
-  import { DISCOVERY_ID_RE } from "$lib/room-security/keys";
+  import { DISCOVERY_ID_RE, deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
+  import { secureInvitationLink } from "$lib/room-security/invitation-format";
+  import { legacyMoveInviteText, linkLegacyMove } from "$lib/room-security/legacy-move";
+  import MoveLegacyRoomDialog from "./MoveLegacyRoomDialog.svelte";
+  import { sendDirectMessage } from "$lib/transport/dm.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
@@ -299,8 +303,92 @@
   );
   /** roomsStore.rooms laid out by the sidebar's pins, then its drag order. */
   const orderedRooms = $derived(
-    sortRooms(roomsStore.rooms)
+    sortRooms(roomsStore.rooms.filter((r) => !r.movedTo))
   );
+
+  // ── Moving an old room to a secure one (room-security/legacy-move.ts) ─────
+  const activeLegacyRoom = $derived(
+    activeRoomCode && isLegacyArchive(activeRoomCode)
+      ? (roomsStore.rooms.find((r) => r.roomCode === activeRoomCode) ?? null)
+      : null
+  );
+  let moveDialogOpen = $state(false);
+  let moveBusy = $state(false);
+  let moveError = $state<string | null>(null);
+  /** Old rooms the popup already opened for this session, on its own. */
+  const moveOffered = new Set<string>();
+
+  // Offered once per session when an old room is opened; after that it is
+  // the archive banner's button - "check your DMs first" sends the person
+  // away, and they must be able to come back to it.
+  $effect(() => {
+    const room = activeLegacyRoom;
+    if (!room || room.movedTo || moveOffered.has(room.roomCode)) return;
+    moveOffered.add(room.roomCode);
+    moveError = null;
+    moveDialogOpen = true;
+  });
+
+  const legacyMembers = $derived(
+    activeLegacyRoom?.participants.filter((did) => did !== identityStore.did) ?? []
+  );
+
+  async function moveLegacyRoom(inviteOthers: boolean): Promise<void> {
+    const old = activeLegacyRoom;
+    if (!old || moveBusy) return;
+    moveBusy = true;
+    moveError = null;
+    try {
+      const secret = newRoomSecret();
+      const newCode = deriveRoomKeys(secret).discoveryId;
+      // The ordinary join path creates, stores and opens the new room.
+      await handleJoin(secret, "", old.name);
+      if (activeRoomCode !== newCode) {
+        moveError = joinError ?? "Could not create the new room. Try again.";
+        return;
+      }
+      await linkLegacyMove(old.roomCode, newCode);
+      await loadRooms();
+      // Announce again now the link exists: the name frame carries
+      // movedFrom, which is how the other members link their own history.
+      setRoomName(old.name);
+      moveDialogOpen = false;
+      if (inviteOthers) {
+        const text = legacyMoveInviteText(old.name, secureInvitationLink(window.location.origin, secret));
+        for (const did of old.participants) {
+          if (did === identityStore.did) continue;
+          // One at a time, and a failure is one missed invite, not a failed
+          // move: the room exists, and the link can still be shared by hand.
+          await sendDirectMessage(text, { peerId: did }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      moveError = err instanceof Error ? err.message : "Could not move the room.";
+    } finally {
+      moveBusy = false;
+    }
+  }
+
+  // An invitation link clicked inside a message joins here, in this tab.
+  // Message links open in a new tab, and a second tab of the app only waits
+  // behind "open in another tab" - the move DM's link is the case that
+  // matters, but any invitation a person pastes into a chat is the same.
+  $effect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      const anchor = (e.target as Element | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!anchor) return;
+      let url: URL;
+      try { url = new URL(anchor.href); } catch { return; }
+      if (url.origin !== window.location.origin || url.pathname !== "/r/") return;
+      let secret: string;
+      try { secret = parseSecureInvitation(url.href); } catch { return; }
+      e.preventDefault();
+      void handleJoin(secret, "");
+    };
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  });
 
   // Tell the transport what is actually on screen; see uiRoomCode.
   $effect(() => {
@@ -1362,12 +1450,38 @@
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}
           {#if isLegacyArchive(activeRoomCode)}
-            <LegacyArchive
-              roomCode={activeRoomCode}
-              roomName={activeRoomName}
-              onLeave={handleLeave}
-              onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
-            />
+            <div class="flex h-full min-h-0 flex-col">
+              <!-- The way back to the move popup, for after "check your DMs
+                   first" - or, once moved, the way to where the room went. -->
+              <div
+                role="status"
+                class="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/30 px-4 py-2 font-mono text-xs text-muted-foreground"
+              >
+                {#if activeLegacyRoom?.movedTo}
+                  <span>This room moved to a secure room.</span>
+                  <button
+                    type="button"
+                    class="rounded border border-border px-2 py-1 text-foreground hover:bg-muted cursor-pointer"
+                    onclick={() => void handleJoin(activeLegacyRoom!.movedTo!, "")}
+                  >Open the new room</button>
+                {:else}
+                  <span>This room can't send messages anymore.</span>
+                  <button
+                    type="button"
+                    class="rounded border border-border px-2 py-1 text-foreground hover:bg-muted cursor-pointer"
+                    onclick={() => { moveError = null; moveDialogOpen = true; }}
+                  >Move to a secure room</button>
+                {/if}
+              </div>
+              <div class="min-h-0 flex-1">
+                <LegacyArchive
+                  roomCode={activeRoomCode}
+                  roomName={activeRoomName}
+                  onLeave={handleLeave}
+                  onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
+                />
+              </div>
+            </div>
           {:else}
           <ChatView
             roomCode={activeRoomCode}
@@ -1454,6 +1568,23 @@
           />
         {/if}
       </div>
+
+      {#if activeLegacyRoom && !activeLegacyRoom.movedTo}
+        <MoveLegacyRoomDialog
+          bind:open={moveDialogOpen}
+          roomName={activeLegacyRoom.name}
+          memberCount={legacyMembers.length}
+          busy={moveBusy}
+          error={moveError}
+          onMove={(invite) => void moveLegacyRoom(invite)}
+          onCheckDms={() => {
+            moveDialogOpen = false;
+            sidebarTab = "users";
+            sidebarOpen = true;
+          }}
+          onClose={() => (moveDialogOpen = false)}
+        />
+      {/if}
 
       <Dialog.Root bind:open={createJoinOpen}>
         <Dialog.Portal>

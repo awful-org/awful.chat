@@ -77,7 +77,9 @@ import {
   renameRoom,
   noteRoomActivity,
   roomsStore,
+  loadRooms,
 } from "../rooms.svelte";
+import { adoptLegacyPredecessor } from "../room-security/legacy-move";
 import { WebTorrentFileTransport } from "./file/webtorrent";
 import type { FileDescriptor, FileTransferSnapshot } from "./types";
 import { LibP2PTransport } from "./libp2p/transport";
@@ -997,7 +999,15 @@ function _sendRoomName(peerId?: string): void {
   if (!name || !roomCode) return;
   // roomCode travels with it: a direct send has no topic to infer it from, so
   // the receiver used to apply the name to whatever room they had open.
-  const payload = encode({ type: MessageType.RoomName, name, roomCode });
+  // A moved room says where it came from, so the other members of the old
+  // room can put their own copy of its history on top (legacy-move.ts).
+  const movedFrom = roomsStore.rooms.find((r) => r.roomCode === roomCode)?.archiveOf;
+  const payload = encode({
+    type: MessageType.RoomName,
+    name,
+    roomCode,
+    ...(movedFrom && roomCode.startsWith("rd2_") ? { movedFrom } : {}),
+  });
   if (peerId) {
     // Same gate as _sendDigestForRoom, and for the same reason: this frame
     // NAMES the room code, and a room code is the room's entire membership
@@ -2539,7 +2549,7 @@ function _handleCallState(peerId: string, msg: WireCallState): void {
   transportState.callPeerStates = next;
 }
 
-function _handleRoomName(msg: WireRoomName, room: string | null): void {
+function _handleRoomName(msg: WireRoomName, room: string | null, peerId: string): void {
   // The AUTHENTICATED pubsub topic wins over anything in the message body.
   // A direct send (legit: _sendRoomName welcomes a fresh joiner) may only
   // name a room we have actually joined - same rule as _handleDigest, or a
@@ -2555,6 +2565,13 @@ function _handleRoomName(msg: WireRoomName, room: string | null): void {
   if (trimmed === target) return;
   renameRoom(target, trimmed).catch(() => {});
   if (target === transportState.roomCode) transportState.roomName = trimmed;
+  // Only over the secure room's own channel (room !== null) and only for a
+  // secure room: the claim is about THIS room, from one of its members.
+  if (msg.movedFrom !== undefined && room !== null && target.startsWith("rd2_")) {
+    adoptLegacyPredecessor(target, msg.movedFrom, _peerIdToDid.get(peerId))
+      .then((changed) => (changed ? loadRooms() : undefined))
+      .catch(() => {});
+  }
 }
 
 /**
@@ -3634,7 +3651,7 @@ _transport.on("message", (peerId, data, room) => {
         _handleWatchPresence(peerId, watchedFromWire(msg));
         break;
       case MessageType.RoomName:
-        _handleRoomName(msg, room);
+        _handleRoomName(msg, room, peerId);
         break;
       case MessageType.PluginEphemeral: {
         // Wire-only ephemeral messages: verify, fold to card state, but never persist.

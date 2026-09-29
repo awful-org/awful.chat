@@ -96,6 +96,14 @@ export interface Room {
   position?: number;
   /** Messages this user pinned here, oldest pin first. Private: never sent. */
   pinnedMessages?: string[];
+  /**
+   * Secure room only: the legacy room whose history this one continues
+   * (room-security/legacy-move.ts). Its messages stay under their own code
+   * and are shown on top of this room, on this device only.
+   */
+  archiveOf?: string;
+  /** Legacy room only: the secure room it moved to. Hidden from the sidebar. */
+  movedTo?: string;
 }
 
 const PARTICIPANT_INACTIVE_DAYS = 30;

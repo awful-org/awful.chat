@@ -140,6 +140,8 @@
   import { formatSize, seededRandom } from "$lib/utils";
   import { getQuotableText } from "$lib/quote-helper";
   import InvitationDialog from "./InvitationDialog.svelte";
+  import ArchivedHistory from "./ArchivedHistory.svelte";
+  import { roomsStore } from "$lib/rooms.svelte";
   import {
     getRoomNotifyMode,
     setRoomNotifyMode,
@@ -1151,6 +1153,12 @@
     if (!e.dataTransfer?.files?.length) return;
     void addFilesToStage(e.dataTransfer.files);
   }
+
+  /** The old room this one was moved from, if any (legacy-move.ts). */
+  const movedFromRoom = $derived.by(() => {
+    const code = roomsStore.rooms.find((r) => r.roomCode === roomCode)?.archiveOf;
+    return code ? (roomsStore.rooms.find((r) => r.roomCode === code) ?? null) : null;
+  });
 
   let copyMenuOpen = $state(false);
   /** The phone header's overflow sheet: what the header has no room for. */
@@ -2613,6 +2621,11 @@
         : ''}"
       class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
     >
+      <!-- A room moved from an old one carries that room's history on top,
+           once the new room's own history has run out above. -->
+      {#if movedFromRoom && !canLoadOlder}
+        <ArchivedHistory roomCode={movedFromRoom.roomCode} roomName={movedFromRoom.name} />
+      {/if}
       {#if canLoadOlder && visibleMessages.length > 0}
         <div class="flex justify-center py-2">
           <Button
