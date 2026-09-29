@@ -13,6 +13,8 @@
   import { sendDirectMessage } from "$lib/transport/dm.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { cancelAllShortCodes } from "$lib/short-codes.svelte";
+  import { isChosenName } from "$lib/room-name";
+  import { claimNodeLock } from "$lib/transport/node-lock";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
@@ -32,7 +34,7 @@
     joinRoom,
     leaveRoom,
     selfId,
-    setRoomName,
+    announceRoomName,
     removeRoomCompletely,
     connect,
     peerIdToDid, resolveMentionDisplayName} from "$lib/transport/transport.svelte";
@@ -168,7 +170,26 @@
     return code;
   }
 
-  let pendingRoomCode = $state<string | null>(consumeRoomLocation());
+  /** What the address bar held when this tab opened. */
+  const openedWith = consumeRoomLocation();
+  let pendingRoomCode = $state<string | null>(openedWith);
+  /**
+   * This tab was opened with an invitation - a link tapped in WhatsApp, say.
+   * With Awful.chat already open elsewhere (another tab, the installed app)
+   * that one holds the node, and this tab only queued behind it: the join
+   * waited on a relay connection that never came, behind a pulsing dot. An
+   * invitation opened on purpose is a clear "use this one", so it takes the
+   * node the way "Use here" does. A saved room's own address (a reload, a
+   * restored session) is no such request and still queues.
+   */
+  let claimForInvite = $state(
+    openedWith !== null && parseJoinInput(openedWith).kind !== "invalid"
+  );
+  $effect(() => {
+    if (!claimForInvite || !transportState.nodeHeldElsewhere) return;
+    claimForInvite = false;
+    claimNodeLock();
+  });
 
   let joiningRoom = $state(false);
   // A short link waits on the inviter's tab, for up to a minute: say so.
@@ -363,7 +384,7 @@
       await loadRooms();
       // Announce again now the link exists: the name frame carries
       // movedFrom, which is how the other members link their own history.
-      setRoomName(old.name);
+      announceRoomName(newCode);
       moveDialogOpen = false;
       if (inviteOthers) {
         const text = legacyMoveInviteText(old.name, secureInvitationLink(window.location.origin, secret));
@@ -532,7 +553,7 @@
     if (roomCode.startsWith("r2_")) {
       try {
         requireRoomSecurityRelease();
-        const imported = await storeSecureInvitation(roomCode, roomName ?? "Room");
+        const imported = await storeSecureInvitation(roomCode, roomName);
         if (!current()) return;
         if (seq !== joinSeq) return;
         roomCode = imported.roomCode;
@@ -581,16 +602,19 @@
         history.pushState({ roomCode }, "", `/r/#${roomCode}`);
         return;
       }
-      if (known) {
-        // Only announce a name we actually have. Joining from a bare invite
-        // link used to broadcast the room code as the name and overwrite it
-        // for everyone already in the room.
-        setRoomName(known);
-      } else {
-        transportState.roomName = label;
-      }
+      transportState.roomName = label;
       await saveRoom(roomCode, label, guard);
       if (!current()) return;
+      // The stored name, which a member's announcement may have updated
+      // while the room was opening. Then ours goes out with when it was
+      // chosen: anyone on an older name takes it, anyone on a newer one
+      // answers with theirs, and a placeholder is never sent (room-name.ts).
+      const saved = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+      if (saved && isChosenName(saved)) {
+        activeRoomName = saved.name;
+        transportState.roomName = saved.name;
+      }
+      announceRoomName(roomCode);
       history.pushState({ roomCode }, "", `/r/#${roomCode}`);
     } catch (err) {
       if (!current()) return;
@@ -1422,7 +1446,9 @@
   {#if joiningRoom}
     <div class="min-h-dvh bg-background flex flex-col items-center justify-center gap-3">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
-      {#if joiningWithCode}
+      {#if transportState.nodeHeldElsewhere}
+        <p class="font-mono text-xs text-muted-foreground">Moving Awful.chat over from your other tab...</p>
+      {:else if joiningWithCode}
         <p class="font-mono text-xs text-muted-foreground">Getting the invitation from whoever shared it...</p>
       {/if}
     </div>

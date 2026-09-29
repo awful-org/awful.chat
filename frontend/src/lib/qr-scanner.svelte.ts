@@ -1,4 +1,4 @@
-import { Html5Qrcode } from "html5-qrcode";
+import jsQR from "jsqr";
 
 /**
  * The camera QR scanner: device sync and joining a room both use it.
@@ -38,10 +38,6 @@ export const scannerState = $state({
   torchAvailable: false,
   torchOn: false,
 });
-
-let _scanner: Html5Qrcode | null = null;
-/** The element the running camera draws into: its viewfinder's own id. */
-let _scannerElement: string | null = null;
 
 const BACK_CAMERA = /\b(back|rear|environment)\b/i;
 const FRONT_CAMERA = /\b(front|user|facetime)\b/i;
@@ -103,25 +99,72 @@ export function otherSideCameraId(
   return cameras[(at + 1) % cameras.length].id;
 }
 
-/** Read the running camera's torch support; never throws. */
-function readTorchSupport(): void {
-  if (!_scanner) return;
+/**
+ * The platform's QR detector, where there is one (Chrome on Android, macOS,
+ * ChromeOS). Not in TypeScript's DOM types yet.
+ */
+interface QrDetector {
+  detect(source: CanvasImageSource): Promise<{ rawValue: string }[]>;
+}
+interface QrDetectorClass {
+  new (options: { formats: string[] }): QrDetector;
+  getSupportedFormats(): Promise<string[]>;
+}
+
+async function nativeDetector(): Promise<QrDetector | null> {
+  const Detector = (globalThis as { BarcodeDetector?: QrDetectorClass }).BarcodeDetector;
+  if (!Detector) return null;
   try {
-    // The same MediaTrackCapabilities.torch the platform reports, read
-    // through the wrapper that also knows how to apply it.
-    const torch = _scanner.getRunningTrackCameraCapabilities().torchFeature();
-    scannerState.torchAvailable = torch.isSupported();
-    scannerState.torchOn = torch.value() === true;
+    if (!(await Detector.getSupportedFormats()).includes("qr_code")) return null;
+    return new Detector({ formats: ["qr_code"] });
   } catch {
-    // No running camera, or a browser that reports no capabilities.
-    scannerState.torchAvailable = false;
-    scannerState.torchOn = false;
+    return null;
   }
 }
 
+/** The running scan: one at a time, there is one camera to hold. */
+interface Session {
+  element: string;
+  stream: MediaStream;
+  video: HTMLVideoElement;
+  timer: ReturnType<typeof setTimeout> | null;
+  stopped: boolean;
+}
+let _session: Session | null = null;
+
+/** How often a frame is read. A decode is 10-40ms; more often only heats the phone. */
+const SCAN_INTERVAL_MS = 150;
 /**
- * Start the camera in the element with this id. Resolves once it runs, or
- * rejects when there is no camera to run (refused, missing, busy).
+ * The frame is decoded at the camera's own resolution, only capped. The old
+ * scanner (html5-qrcode) shrank it to the scan box's size ON SCREEN first: a
+ * 1080p camera in a phone-width viewfinder came down to ~300px, and a code
+ * held at a normal distance to under two pixels a square - unreadable, which
+ * is why scanning "did nothing" on real cameras.
+ */
+const MAX_DECODE_SIDE = 960;
+
+function videoConstraints(cameraId: string | null): MediaTrackConstraints {
+  return {
+    // A device id when the enumeration gave one; facingMode for the first
+    // open, before there is a list to choose from.
+    ...(cameraId ? { deviceId: { exact: cameraId } } : { facingMode: { ideal: "environment" } }),
+    // Without a size the browser picks, and iOS Safari picks small. `ideal`,
+    // so a camera that cannot do it still opens.
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+  };
+}
+
+async function listCameras(): Promise<ScanCamera[]> {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((d) => d.kind === "videoinput")
+    .map((d, i) => ({ id: d.deviceId, label: d.label || `Camera ${i + 1}` }));
+}
+
+/**
+ * Start the camera inside the element with this id. Resolves once it runs,
+ * or rejects when there is no camera to run (refused, missing, busy).
  */
 export async function startQrScan(
   elementId: string,
@@ -130,79 +173,113 @@ export async function startQrScan(
   /** A camera picked by the user (the front/back switch); else the back one. */
   cameraId?: string
 ): Promise<void> {
+  // Browsers only hand out a camera to a secure page. Over plain http - the
+  // dev server opened by a phone at its LAN address - getUserMedia does not
+  // even exist, and the scan failed with nothing that said why.
+  if (typeof window !== "undefined" && !window.isSecureContext) {
+    throw new Error("The camera only works over HTTPS. Open Awful.chat at an https:// address to scan.");
+  }
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser has no camera access.");
   await stopQrScan();
-  scannerState.torchAvailable = false;
-  scannerState.torchOn = false;
-  // getCameras() is what raises the permission prompt, and it does not
-  // resolve until the user has answered it - so this, and only this, is the
-  // window in which the view should say it is waiting for them.
+  const host = document.getElementById(elementId);
+  if (!host) throw new Error("Scanner view is gone");
+
+  let stream: MediaStream;
   if (scannerState.cameras.length === 0) {
+    // The first getUserMedia is what raises the permission prompt, and it
+    // does not resolve until the user has answered it - so this, and only
+    // this, is the window in which the view should say it is waiting.
     scannerState.awaitingPermission = true;
     try {
-      scannerState.cameras = (await Html5Qrcode.getCameras()).map((c) => ({
-        id: c.id,
-        label: c.label,
-      }));
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(cameraId ?? null) });
     } finally {
       scannerState.awaitingPermission = false;
     }
-  }
-  const target = cameraId ?? preferBackCamera(scannerState.cameras);
-  scannerState.activeCameraId = target;
-
-  const scanner = new Html5Qrcode(elementId);
-  _scanner = scanner;
-  _scannerElement = elementId;
-  try {
-    await startCamera(scanner, target, onText);
-  } catch (err) {
-    if (_scanner === scanner) {
-      _scanner = null;
-      _scannerElement = null;
+    // Labels, and so the front/back choice, only exist once permission is in.
+    scannerState.cameras = await listCameras();
+    const best = cameraId ?? preferBackCamera(scannerState.cameras);
+    const opened = stream.getVideoTracks()[0]?.getSettings().deviceId;
+    if (best && opened && best !== opened) {
+      // facingMode is a hint the browser may ignore - on several Androids it
+      // opened the front camera. Now there is a list, open the one chosen.
+      for (const t of stream.getTracks()) t.stop();
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints(best) });
     }
+  } else {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: videoConstraints(cameraId ?? preferBackCamera(scannerState.cameras)),
+    });
+  }
+  const track = stream.getVideoTracks()[0];
+  scannerState.activeCameraId = track?.getSettings().deviceId ?? cameraId ?? null;
+
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
+  video.srcObject = stream;
+  // The front camera shown as a mirror, like every camera app does.
+  const front = cameraFacing(scannerState.cameras.find((c) => c.id === scannerState.activeCameraId)) === "front";
+  video.className = `block w-full ${front ? "-scale-x-100" : ""}`;
+  host.replaceChildren(video);
+
+  const session: Session = { element: elementId, stream, video, timer: null, stopped: false };
+  _session = session;
+  try {
+    await video.play();
+  } catch (err) {
+    if (_session === session) await stopQrScan();
     throw err;
   }
-  readTorchSupport();
-}
 
-function startCamera(
-  scanner: Html5Qrcode,
-  target: string | null,
-  onText: (text: string) => boolean
-): Promise<null> {
-  return scanner.start(
-    // Ignored once videoConstraints is set, but the API wants it.
-    target ?? { facingMode: "environment" },
-    {
-      fps: 10,
-      qrbox: { width: 250, height: 250 },
-      // Without a size the browser picks, and iOS Safari picks small: a
-      // 41-module code a third of the way across a 480-line frame is
-      // three pixels a square, under what the decoder can read. `ideal`
-      // is a preference, so a camera that cannot do 720p still opens.
-      videoConstraints: {
-        // A device id when the enumeration gave one; the old facingMode
-        // constraint stays as the fallback for a browser that listed nothing.
-        ...(target ? { deviceId: { exact: target } } : { facingMode: "environment" }),
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-    },
-    (decodedText) => {
-      if (_scanner === scanner && onText(decodedText)) void stopQrScan();
-    },
-    () => {
-      // Scan error - usually just means no QR code in frame, ignore
+  try {
+    const caps = (track?.getCapabilities?.() ?? {}) as { torch?: boolean };
+    scannerState.torchAvailable = caps.torch === true;
+  } catch {
+    scannerState.torchAvailable = false;
+  }
+  scannerState.torchOn = false;
+
+  const detector = await nativeDetector();
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+
+  const scan = async () => {
+    if (session.stopped) return;
+    let text: string | null = null;
+    try {
+      if (video.readyState >= 2 && video.videoWidth > 0) {
+        if (detector) {
+          text = (await detector.detect(video))[0]?.rawValue ?? null;
+        } else if (context) {
+          const scale = Math.min(1, MAX_DECODE_SIDE / Math.max(video.videoWidth, video.videoHeight));
+          canvas.width = Math.round(video.videoWidth * scale);
+          canvas.height = Math.round(video.videoHeight * scale);
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const image = context.getImageData(0, 0, canvas.width, canvas.height);
+          text = jsQR(image.data, image.width, image.height, { inversionAttempts: "attemptBoth" })?.data ?? null;
+        }
+      }
+    } catch {
+      // A frame that could not be read; the next one will be.
     }
-  );
+    if (session.stopped) return;
+    if (text && onText(text)) {
+      if (_session === session) await stopQrScan();
+      return;
+    }
+    session.timer = setTimeout(() => void scan(), SCAN_INTERVAL_MS);
+  };
+  void scan();
 }
 
 /** Switch the running camera's torch. Silently does nothing without one. */
 export async function toggleScanTorch(): Promise<void> {
-  if (!_scanner || !scannerState.torchAvailable) return;
+  const track = _session?.stream.getVideoTracks()[0];
+  if (!track || !scannerState.torchAvailable) return;
   const next = !scannerState.torchOn;
   try {
-    await _scanner.getRunningTrackCameraCapabilities().torchFeature().apply(next);
+    await track.applyConstraints({ advanced: [{ torch: next } as MediaTrackConstraintSet] });
     scannerState.torchOn = next;
   } catch {
     // Some devices advertise a torch and then refuse to switch it while the
@@ -218,30 +295,30 @@ export async function toggleScanTorch(): Promise<void> {
  * replaced it.
  */
 export async function stopQrScan(elementId?: string): Promise<void> {
-  if (elementId !== undefined && elementId !== _scannerElement) return;
-  const scanner = _scanner;
-  const torchOn = scannerState.torchOn;
-  _scanner = null;
-  _scannerElement = null;
+  const session = _session;
+  if (!session || (elementId !== undefined && elementId !== session.element)) {
+    if (!session) scannerState.awaitingPermission = false;
+    return;
+  }
+  _session = null;
+  session.stopped = true;
+  if (session.timer) clearTimeout(session.timer);
+  const track = session.stream.getVideoTracks()[0];
+  // Off before the stop: some Androids leave the torch burning after the
+  // camera is released, and nothing in the app can reach it again.
+  if (scannerState.torchOn && track) {
+    try {
+      await track.applyConstraints({ advanced: [{ torch: false } as MediaTrackConstraintSet] });
+    } catch {
+      // Nothing more to try; stopping the track releases the device anyway.
+    }
+  }
+  for (const t of session.stream.getTracks()) t.stop();
+  session.video.srcObject = null;
+  session.video.remove();
   scannerState.awaitingPermission = false;
   scannerState.torchAvailable = false;
   scannerState.torchOn = false;
-  if (scanner) {
-    // Off before the stop: some Androids leave the torch burning after the
-    // camera is released, and nothing in the app can reach it again.
-    if (torchOn) {
-      try {
-        await scanner.getRunningTrackCameraCapabilities().torchFeature().apply(false);
-      } catch {
-        // Nothing more to try; the stop below releases the device anyway.
-      }
-    }
-    try {
-      await scanner.stop();
-    } catch {
-      // Ignore stop errors
-    }
-  }
   // cameras and activeCameraId deliberately survive: a camera switch stops
   // and restarts, and re-enumerating would re-prompt on some browsers.
 }

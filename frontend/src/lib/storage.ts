@@ -104,6 +104,11 @@ export interface Room {
   archiveOf?: string;
   /** Legacy room only: the secure room it moved to. Hidden from the sidebar. */
   movedTo?: string;
+  /**
+   * When the name was chosen (ms): the newest name wins between members
+   * (room-name.ts). 0 for the placeholder a bare invite link stores.
+   */
+  nameAt?: number;
 }
 
 const PARTICIPANT_INACTIVE_DAYS = 30;

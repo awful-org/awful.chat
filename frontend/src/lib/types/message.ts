@@ -273,6 +273,8 @@ export interface WireRoomName {
    * own channel; receivers adopt it under the rules in adoptLegacyPredecessor.
    */
   movedFrom?: string;
+  /** When this name was chosen (ms); the newest wins (room-name.ts). */
+  nameAt?: number;
 }
 
 export interface WireJoinRoom {
