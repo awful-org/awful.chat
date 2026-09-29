@@ -72,6 +72,8 @@ export interface Message {
 }
 
 export interface Attachment {
+  /** Private descriptor; data, when present, contains ciphertext for v2. */
+  encryption?: import("../room-security/file-crypto").EncryptedFileDescriptor;
   id: string; // UUIDv7
   roomCode: string;
   messageId: string;
@@ -115,6 +117,7 @@ export interface FileMeta {
 }
 
 export interface FileEntry {
+  encryption?: import("../room-security/file-crypto").EncryptedFileDescriptor;
   filename: string;
   mimeType: string;
   size: number;

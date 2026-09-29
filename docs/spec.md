@@ -458,7 +458,7 @@ ordering does not make relay reservations independent of UTC.
 ## Sync Flow
 
 ```txt
-peer joins room → rendezvous on the Go relay (/awful/rendezvous/1.0.0,
+peer joins room → rendezvous on the Go relay (/awful/rendezvous/2.0.0,
 length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT)
 → dials peers via libp2p (WebRTC direct, circuit-relay fallback, 3 dial
 attempts with backoff) → gossipsub topic app:room:{roomCode} per room

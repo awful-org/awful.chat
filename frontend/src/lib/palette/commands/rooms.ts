@@ -15,7 +15,8 @@ import {
   Users,
 } from "@lucide/svelte";
 import { roomsStore, renameRoom, toggleRoomPin } from "$lib/rooms.svelte";
-import { createInvite, formatShortCode } from "$lib/invite";
+import { uiState } from "$lib/ui-state.svelte";
+import { savedRoomInvitationLink } from "$lib/room-security/invitations";
 import {
   getRoomNotifyMode,
   setRoomNotifyMode,
@@ -25,7 +26,7 @@ import { hashRef } from "$lib/storage-crypto";
 import { setRoomName } from "$lib/transport/transport.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
-import { parseRoomCode } from "../query";
+import { parseJoinInput } from "$lib/invite";
 
 const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
   all: "All messages",
@@ -97,14 +98,14 @@ export const roomCommands: CmdSource = (host) => {
         kind: "prompt",
         id: "room.join",
         title: "Join room by code",
-        placeholder: "Room code or invite link…",
+        placeholder: "Invitation link or online pairing code…",
         validate: (value) =>
-          parseRoomCode(value) === null
-            ? "Not a room code, invite link, or web+awfl:// link"
+          parseJoinInput(value).kind === "invalid"
+            ? "Enter a complete invitation link or online pairing code"
             : null,
         submit: (value) => {
-          const code = parseRoomCode(value);
-          if (code) host.joinRoomByCode(code);
+          const parsed = parseJoinInput(value);
+          if (parsed.kind !== "invalid") host.joinRoomByCode(parsed.code);
         },
         submitLabel: "Join",
       }),
@@ -129,9 +130,8 @@ export const roomCommands: CmdSource = (host) => {
         kind: "act",
         perform: () => {
           // Fragment form - see RoomCreateJoin's handleCopy.
-          const url = `${window.location.origin}/r/#${activeCode}`;
-          navigator.clipboard
-            .writeText(url)
+          savedRoomInvitationLink(window.location.origin, activeCode)
+            .then((url) => navigator.clipboard.writeText(url))
             .catch((err) => console.warn("copy room link failed", err));
         },
       },
@@ -172,21 +172,14 @@ export const roomCommands: CmdSource = (host) => {
     // typing on a phone, and the OS share sheet where the browser has one.
     cmds.push({
       id: "room.copyShortCode",
-      title: "Copy short invite code",
-      subtitle: "Works for 5 minutes",
+      title: "Create short invite code",
+      subtitle: "Online pairing · works for 5 minutes",
       keywords: ["invite", "code", "share"],
       group: "Rooms",
       icon: KeyRound,
       action: {
         kind: "act",
-        perform: async () => {
-          try {
-            const { code } = await createInvite(activeCode);
-            await navigator.clipboard.writeText(formatShortCode(code));
-          } catch (err) {
-            console.warn("copy short invite code failed", err);
-          }
-        },
+        perform: () => { uiState.invitationRoomRequested = activeCode; },
       },
     });
     if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
@@ -198,10 +191,11 @@ export const roomCommands: CmdSource = (host) => {
         icon: Share2,
         action: {
           kind: "act",
-          perform: () => {
-            navigator
-              .share({ url: `${window.location.origin}/r/#${activeCode}` })
-              .catch(() => {});
+          perform: async () => {
+            try {
+              const url = await savedRoomInvitationLink(window.location.origin, activeCode);
+              await navigator.share({ url });
+            } catch { /* Cancelled or capability unavailable. */ }
           },
         },
       });

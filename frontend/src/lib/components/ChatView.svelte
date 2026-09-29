@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { savedRoomInvitationLink } from "$lib/room-security/invitations";
   import { onDestroy, tick, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
@@ -138,7 +139,7 @@
   import type { HostApi } from "$lib/plugins/api";
   import { formatSize, seededRandom } from "$lib/utils";
   import { getQuotableText } from "$lib/quote-helper";
-  import { createInvite, formatShortCode } from "$lib/invite";
+  import InvitationDialog from "./InvitationDialog.svelte";
   import {
     getRoomNotifyMode,
     setRoomNotifyMode,
@@ -1166,15 +1167,24 @@
     moreOpen = false;
     onLeave();
   }
-  // Header short code: minted for THIS room on first use and dropped on a
-  // room switch, since it aliases one room code.
-  let shortCode = $state<string | null>(null);
-  let shortCodeFor = $state<string | null>(null);
+  let invitationOpen = $state(false);
+  $effect(() => {
+    if (uiState.invitationRoomRequested === roomCode) {
+      uiState.invitationRoomRequested = null;
+      invitationOpen = true;
+    }
+  });
   let shortCodeError = $state<string | null>(null);
 
   async function copyCode() {
     copyMenuOpen = false;
-    await navigator.clipboard.writeText(window.location.href);
+    try {
+      const url = await savedRoomInvitationLink(window.location.origin, roomCode);
+      await navigator.clipboard.writeText(url);
+    } catch (err) {
+      shortCodeError = err instanceof Error ? err.message : "Could not copy invitation";
+      return;
+    }
     copied = true;
     setTimeout(() => (copied = false), 2000);
   }
@@ -1190,7 +1200,8 @@
   async function shareLink() {
     copyMenuOpen = false;
     try {
-      await navigator.share({ url: window.location.href });
+      const url = await savedRoomInvitationLink(window.location.origin, roomCode);
+      await navigator.share({ url });
     } catch (err) {
       // Dismissing the sheet is not a failure and must not silently copy
       // something the user decided not to send.
@@ -1201,18 +1212,7 @@
 
   async function copyShortCode() {
     copyMenuOpen = false;
-    shortCodeError = null;
-    if (shortCodeFor !== roomCode) shortCode = null;
-    try {
-      shortCode ??= (await createInvite(roomCode)).code;
-      shortCodeFor = roomCode;
-    } catch {
-      shortCodeError = "Relay not reachable";
-      return;
-    }
-    await navigator.clipboard.writeText(formatShortCode(shortCode));
-    copied = true;
-    setTimeout(() => (copied = false), 2000);
+    invitationOpen = true;
   }
 
   /**
@@ -1920,6 +1920,10 @@
   }
 </script>
 
+{#key roomCode}
+  <InvitationDialog {roomCode} bind:open={invitationOpen} />
+{/key}
+
 <svelte:window
   onclick={(e) => {
     closeUserMenu();
@@ -2106,7 +2110,7 @@
       </div>
       <div class="flex items-center gap-2 shrink-0">
         {#if !isDmChat}
-          <div class="relative hidden sm:block" data-copy-menu>
+          <div class="relative" data-copy-menu>
             <Tip text={copied ? "Copied" : "Copy invite"}>
               {#snippet children(props)}
             <button
@@ -2118,7 +2122,7 @@
               aria-expanded={copyMenuOpen}
               class="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
             >
-              <code>{formatRoomCode(roomCode)}</code>
+              <span>Invite</span>
               {#if copied}
                 <Check class="size-3 text-primary" />
               {:else}
@@ -2157,14 +2161,12 @@
                   onclick={copyShortCode}
                   class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
                 >
-                  Copy short code
+                  QR / online pairing code
                   <span class="block text-xs text-muted-foreground">
-                    {#if shortCode && shortCodeFor === roomCode}
-                      {formatShortCode(shortCode)} - works for 5 minutes
-                    {:else if shortCodeError}
+                    {#if shortCodeError}
                       {shortCodeError}
                     {:else}
-                      Works for 5 minutes
+                      Single-use pairing, expires in 5 minutes
                     {/if}
                   </span>
                 </button>
@@ -2446,19 +2448,16 @@
                 Share invite link
               </button>
             {/if}
-            <!-- Stays open: the code it mints is shown here to read out. -->
             <button
               type="button"
-              onclick={() => void copyShortCode()}
+              onclick={() => { moreOpen = false; void copyShortCode(); }}
               class="flex items-start gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
             >
               <Copy class="size-4 mt-0.5 text-muted-foreground" />
               <span>
                 Copy short code
                 <span class="block text-xs text-muted-foreground">
-                  {#if shortCode && shortCodeFor === roomCode}
-                    {formatShortCode(shortCode)} - works for 5 minutes
-                  {:else if shortCodeError}
+                  {#if shortCodeError}
                     {shortCodeError}
                   {:else}
                     Works for 5 minutes

@@ -14,7 +14,8 @@ import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { hex, unhex, utf8 } from "./utils";
 import { didToPublicKey, requireSession } from "./identity/identity";
-import type { Message } from "./types/message";
+import { MessageType, type Message } from "./types/message";
+import { fileSignatureBinding } from "./room-security/file-descriptor";
 
 /**
  * Legacy (v1) canonical form: only id/senderId/lamport/content are signed.
@@ -37,7 +38,7 @@ type Signable = Pick<
   | "reactionOp"
   | "replyTo"
   | "meta"
-> & { sigV?: number; type?: Message["type"]; roomCode?: string };
+> & { sigV?: number; type?: MessageType; roomCode?: string; timestamp?: number };
 
 /**
  * v2 canonical form - additionally covers reaction fields, the replied-to
@@ -57,7 +58,7 @@ export function canonicalContentV2(msg: Signable): string {
     msg.reactionOp ?? null,
     msg.replyTo?.id ?? null,
     msg.meta?.files?.map(
-      (f) => `${f.infoHash}:${f.size}:${f.mimeType}:${f.filename}`
+      fileSignatureBinding
     ) ?? null,
   ]);
 }
@@ -84,8 +85,11 @@ export function canonicalContentV3(msg: Signable): string {
     msg.reactionOp ?? null,
     msg.replyTo?.id ?? null,
     msg.meta?.files?.map(
-      (f) => `${f.infoHash}:${f.size}:${f.mimeType}:${f.filename}`
+      fileSignatureBinding
     ) ?? null,
+    // Ephemerals are live-only, never stored history. Sign freshness so a
+    // captured update cannot be refreshed by changing its wall-clock value.
+    ...(msg.type === MessageType.PluginEphemeral ? [msg.timestamp ?? null] : []),
   ]);
 }
 
@@ -185,7 +189,12 @@ export async function verifySignature(
  */
 export async function verifyMessage(message: Message): Promise<boolean> {
   if (!message.senderDid || !message.sig) return false;
-  return verifySignature(message.senderDid, message.sig, canonicalFor(message));
+  try {
+    return await verifySignature(message.senderDid, message.sig, canonicalFor(message));
+  } catch {
+    // Invalid encryption descriptors are untrusted input, not verifier failures.
+    return false;
+  }
 }
 
 // ── X25519 key agreement ──────────────────────────────────────────────────────

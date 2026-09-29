@@ -12,6 +12,7 @@ import { base64ToBytes, bytesToBase64, utf8 } from "../utils";
 import { AESFromPassword, PBKDF2_ITERATIONS } from "../identity/identity";
 import { MessageType } from "../types/message";
 import type { Message, Attachment, PendingMessage } from "../types/message";
+import { encryptedFileSize } from "../room-security/file-descriptor";
 import type {
   Room,
   DMRoom,
@@ -22,6 +23,7 @@ import type {
 } from "../storage";
 
 export interface AttachmentExport {
+  encryption?: Attachment["encryption"];
   id: string;
   roomCode: string;
   messageId: string;
@@ -145,6 +147,9 @@ export function pfpToJson<T extends { pfpData?: unknown; bannerData?: unknown }>
  * a union, and a real local name is not overwritten by the import.
  */
 export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
+  if (local.roomSecret && imported.roomSecret && local.roomSecret !== imported.roomSecret) {
+    throw new Error("Imported room capability conflicts with the local room");
+  }
   const participantLastSeen: Record<string, number> = {};
   for (const [did, ts] of Object.entries(local.participantLastSeen ?? {})) {
     participantLastSeen[did] = ts ?? 0;
@@ -154,6 +159,9 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   }
   return {
     ...imported,
+    ...(local.roomSecret || imported.roomSecret
+      ? { roomSecret: local.roomSecret ?? imported.roomSecret }
+      : {}),
     lastSeenLamport: Math.max(
       local.lastSeenLamport ?? 0,
       imported.lastSeenLamport ?? 0
@@ -477,6 +485,16 @@ export function isValidMessageRecord(m: unknown): m is Message {
 export function isValidAttachmentRecord(a: unknown): a is AttachmentExport {
   if (!a || typeof a !== "object") return false;
   const r = a as Record<string, unknown>;
+  if (r.encryption !== undefined) {
+    try {
+      const expected = encryptedFileSize(a as Attachment);
+      if (!/^[a-f0-9]{40}$/i.test(String(r.infoHash))) return false;
+      if (r.data !== undefined) {
+        const bytes = typeof r.data === "string" ? base64ToBytes(r.data) : Array.isArray(r.data) ? r.data : null;
+        if (!bytes || bytes.length !== expected) return false;
+      }
+    } catch { return false; }
+  }
   return (
     isNonEmptyString(r.id) &&
     isNonEmptyString(r.roomCode) &&

@@ -1,4 +1,7 @@
 import { identityStore } from "$lib/identity/identity.svelte";
+import { captureDmOwnership } from "./dm-ownership";
+import { requireSession, didToPublicKey } from "$lib/identity/identity";
+import { pairwiseRoomSecret } from "$lib/room-security/pairwise";
 import { refreshDmRooms } from "$lib/rooms.svelte";
 import { dropRoomCorpus } from "$lib/search/corpus.svelte";
 import {
@@ -150,7 +153,9 @@ async function saveQueuedDmMessages(queue: QueuedMessage[]): Promise<void> {
     return;
   }
   try {
+    const session = requireSession();
     const sealed = await sealRow({ q: queue }, DM_QUEUE_SPEC);
+    if (requireSession() !== session) return;
     localStorage.setItem(
       DM_QUEUE_KEY,
       JSON.stringify({
@@ -203,9 +208,14 @@ let _queueChain: Promise<void> = Promise.resolve();
 function mutateDmQueue(
   mutate: (queue: QueuedMessage[]) => QueuedMessage[]
 ): Promise<void> {
+  const session = requireSession();
   const run = _queueChain.then(async () => {
-    const apply = async () =>
-      saveQueuedDmMessages(mutate(await loadQueuedDmMessages()));
+    const apply = async () => {
+      if (requireSession() !== session) return;
+      const queue = await loadQueuedDmMessages();
+      if (requireSession() !== session) return;
+      await saveQueuedDmMessages(mutate(queue));
+    };
     // The chain above only serializes THIS context. The queue lives in
     // localStorage, which a second tab (or the installed PWA alongside the
     // browser) shares: both read the same blob, both write blob+1, and the
@@ -330,7 +340,11 @@ export async function openDmConversation(
   if (!_transport.selfId()) return false;
   // A faster second switch supersedes this one: view state and read acks
   // belong to the conversation the user asked for LAST.
-  const stillCurrent = beginConversationOpen();
+  const session = requireSession();
+  const currentView = beginConversationOpen();
+  const stillCurrent = () => {
+    try { return currentView() && requireSession() === session; } catch { return false; }
+  };
   // Use the input as-is if we can't resolve to a peer ID
   // This supports opening DMs with DIDs directly
   const resolvedPeerId = resolveDmPeerId(peerIdOrDid) ?? peerIdOrDid;
@@ -342,7 +356,6 @@ export async function openDmConversation(
     return false;
   }
   if (!stillCurrent()) return false;
-  _transport.joinRoom(roomCode);
   // Claim the conversation BEFORE the awaits, exactly like joinRoom does:
   // while _loadHistory and the hydrations were in flight, roomCode still
   // named the room being LEFT, so a live message or sync batch for that room
@@ -375,6 +388,7 @@ export async function openDmConversation(
     const lastTheirs = await getLastMessageFrom(roomCode, selfDid);
     if (lastTheirs) theirMessageIds.push(lastTheirs.id);
   }
+  if (!stillCurrent()) return false;
   sendDmReadAcks(resolvedPeerId, theirMessageIds);
   return true;
 }
@@ -387,11 +401,15 @@ export async function openDmConversation(
  * doing - from a call tile, most obviously, where taking over the pane also
  * unmounts the call stage.
  */
+let panelOpenEpoch = 0;
 export async function openDmPanel(peerIdOrDid: string): Promise<boolean> {
   if (!_transport.selfId()) return false;
+  const epoch = ++panelOpenEpoch;
+  const session = requireSession();
   const resolvedPeerId = resolveDmPeerId(peerIdOrDid) ?? peerIdOrDid;
   if (!resolvedPeerId) return false;
   const roomCode = await ensureDmRoomForPeer(resolvedPeerId);
+  if (epoch !== panelOpenEpoch || requireSession() !== session) return false;
   if (!roomCode) {
     transportState.error =
       "Cannot open this conversation yet: waiting to verify who this peer is.";
@@ -400,7 +418,6 @@ export async function openDmPanel(peerIdOrDid: string): Promise<boolean> {
   // Files and plugin cards in a DM ride the room topic, so the panel has to be
   // subscribed for the same reasons the pane is. Text arrives over a direct
   // stream either way.
-  _transport.joinRoom(roomCode);
 
   if (dmPanel.peerId !== resolvedPeerId) {
     Object.assign(dmPanel, defaultPanelPosition());
@@ -415,7 +432,7 @@ export async function openDmPanel(peerIdOrDid: string): Promise<boolean> {
   const page = await getMessages(roomCode);
   // The user can close the panel, or open another conversation in it, while
   // the page is in flight.
-  if (dmPanel.roomCode !== roomCode) return false;
+  if (epoch !== panelOpenEpoch || requireSession() !== session || dmPanel.roomCode !== roomCode) return false;
   dmPanel.messages = page;
   dmPanel.loading = false;
 
@@ -433,6 +450,7 @@ export async function openDmPanel(peerIdOrDid: string): Promise<boolean> {
 }
 
 export function closeDmPanel(): void {
+  panelOpenEpoch++;
   dmPanel.peerId = null;
   dmPanel.roomCode = null;
   dmPanel.peerName = "";
@@ -456,6 +474,8 @@ export async function sendDirectMessage(
   text: string,
   options: DirectMessageOptions = {}
 ): Promise<void> {
+  const guard = captureDmOwnership();
+  const session = requireSession();
   const peerId = options.peerId ?? transportState.activeDmPeerId;
   if (!peerId) throw new Error("Open a direct conversation before sending");
   const body = text.trim();
@@ -463,17 +483,18 @@ export async function sendDirectMessage(
   if (!body && !options.reaction) return;
 
   const roomCode = await ensureDmRoomForPeer(peerId);
+  if (requireSession() !== session) throw new Error("Identity changed");
   if (!roomCode) {
     // Sending into a peerId-derived room would file the message in a thread
     // the other side never reads.
     transportState.error = "Cannot send yet: still verifying who this peer is.";
     throw new Error(transportState.error);
   }
-  _transport.joinRoom(roomCode);
 
   const prepared = prepareOutgoingText(body);
   if (prepared.files.length && !options.reaction) {
     const { sendFiles } = await import("./transport.svelte");
+    guard();
     await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo });
     return;
   }
@@ -484,6 +505,7 @@ export async function sendDirectMessage(
   // below the peer's seen watermark. Shipped in the envelope so both sides
   // store the same value and watermarks stay comparable.
   const lamport = await nextDmLamport(roomCode, ts);
+  if (requireSession() !== session) throw new Error("Identity changed");
   const envelope = encodeDmChatEnvelope({
     id,
     // A reaction's emoji doubles as the text so an older client renders it
@@ -516,9 +538,10 @@ export async function sendDirectMessage(
 
   let delivered = false;
   if (isOnline) {
-    delivered = await _transport.send(resolvedPeerId!, envelope);
+    delivered = await sendDmFrame(resolvedPeerId!, envelope);
     rec(ev("dm.send", { peer: resolvedPeerId, d: { delivered } }));
   }
+  if (requireSession() !== session) throw new Error("Identity changed");
   // STARTED here, awaited after the local echo. The queue write is now a
   // sealed read-modify-write of the whole queue (AES-GCM both ways), and
   // awaiting it here put all of that in front of the user's own bubble - the
@@ -540,14 +563,16 @@ export async function sendDirectMessage(
     // the queue keeps retrying P2P either way.
     if (peerDid.startsWith("did:")) {
       const { depositDmToMailbox } = await import("./mailbox.svelte");
+      guard();
       void depositDmToMailbox(peerDid, envelope).then((result) => {
+        guard();
         noteMailboxDeposit(id, result);
         // One tick: the relay holds a sealed copy, so the message is out of
         // this device's hands even though nobody has it yet. It sat on the
         // clock until their ack came back, which for an offline peer could
         // be days, and read as "never left".
         if (result === "sent") applyMessageStatus(id, "sent");
-      });
+      }).catch(() => {});
     }
   }
 
@@ -597,12 +622,14 @@ export async function sendDirectMessage(
   // actually landed - it is what retries this message after a reload.
   if (queued) await queued;
 
-  await putMessage(msg);
-  await setWatermark(roomCode, mySenderId, msg.lamport);
+  if (requireSession() !== session) throw new Error("Identity changed");
+  await putMessage(msg, guard);
+  await setWatermark(roomCode, mySenderId, msg.lamport, guard);
   // Sending is reading: your own message must not count as unread, and the
   // watermark - not a sender-id comparison - is what the badge trusts.
-  await markRoomSeen(roomCode, msg.lamport);
+  await markRoomSeen(roomCode, msg.lamport, guard);
   await refreshDmRooms();
+  guard();
   transportState.dmVersion += 1;
 }
 
@@ -620,7 +647,9 @@ export function sendDmReadAcks(peerId: string, messageIds: string[]): void {
     resolved = didToPeerId(resolved, _peerIdToDid) ?? resolved;
   }
   if (resolved && !looksLikeDid(resolved) && _transport.peers().includes(resolved)) {
-    _transport.send(resolved, envelope).catch(() => {});
+    void sendDmFrame(resolved, envelope).then((sent) => {
+      if (!sent) return depositDmReceipt(peerId, envelope);
+    }).catch(() => {});
     return;
   }
   // Offline: leave the receipt in their mailbox instead of dropping it. The
@@ -634,9 +663,11 @@ export async function depositDmReceipt(
   peerIdOrDid: string,
   envelope: Uint8Array
 ): Promise<void> {
+  const session = requireSession();
   const did = dmPeerDid(peerIdOrDid);
   if (!did) return;
   const { depositDmToMailbox } = await import("./mailbox.svelte");
+  if (requireSession() !== session) return;
   await depositDmToMailbox(did, envelope, "receipt").catch(() => "failed");
 }
 
@@ -645,8 +676,18 @@ export async function depositDmReceipt(
 // peer) while the awaited sends were in flight.
 let _flushChain: Promise<void> = Promise.resolve();
 
+/** All live DM envelopes and batches use the pairwise channel, never raw send. */
+export async function sendDmFrame(peerId: string, data: Uint8Array): Promise<boolean> {
+  try {
+    const session = requireSession();
+    const room = await ensureDmRoomForPeer(peerId);
+    if (!room || requireSession() !== session) return false;
+    return await _transport.sendRoom(peerId, room, data);
+  } catch { return false; }
+}
+
 export function flushQueuedDmForPeer(peerId: string): Promise<void> {
-  _flushChain = _flushChain.then(() => _flushQueuedDmForPeer(peerId));
+  _flushChain = _flushChain.catch(() => {}).then(() => _flushQueuedDmForPeer(peerId));
   return _flushChain;
 }
 
@@ -660,11 +701,12 @@ export function flushQueuedDmForPeer(peerId: string): Promise<void> {
  * pass costs a decrypt of the whole sealed blob.
  */
 export function flushQueuedDmForConnectedPeers(): Promise<void> {
-  _flushChain = _flushChain.then(() => _flushAllQueuedDm());
+  _flushChain = _flushChain.catch(() => {}).then(() => _flushAllQueuedDm());
   return _flushChain;
 }
 
 async function _flushAllQueuedDm(): Promise<void> {
+  const session = requireSession();
   const peerIds = _transport.peers();
   if (peerIds.length === 0) return;
   const byDid = new Map<string, string>();
@@ -675,11 +717,13 @@ async function _flushAllQueuedDm(): Promise<void> {
   const connected = new Set(peerIds);
   const sent = new Set<string>();
   for (const entry of await loadQueuedDmMessages()) {
+    if (requireSession() !== session) return;
     // Entries are keyed by DID, except the older ones queued before the
     // binding arrived, which are keyed by the raw peerId.
     const pid = byDid.get(entry.to) ?? (connected.has(entry.to) ? entry.to : null);
     if (!pid) continue;
-    const ok = await _transport.send(pid, new Uint8Array(entry.data));
+    const ok = await sendDmFrame(pid, new Uint8Array(entry.data));
+    if (requireSession() !== session) return;
     if (!ok) continue;
     sent.add(queueEntryKey(entry));
     if (entry.messageId) {
@@ -699,16 +743,19 @@ function queueEntryKey(e: QueuedMessage): string {
 }
 
 async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
+  const session = requireSession();
   const peerDid =
     _peerIdToDid.get(peerId) ?? resolveToDid(peerId, _peerIdToDid);
   if (!peerDid) return; // Can't flush if we don't know their DID yet
 
   const sent = new Set<string>();
   for (const entry of await loadQueuedDmMessages()) {
+    if (requireSession() !== session) return;
     // Match entries keyed by the DID *or* by the raw peerId - older entries
     // queued before the DID was known were stored under the peerId.
     if (entry.to !== peerDid && entry.to !== peerId) continue;
-    const ok = await _transport.send(peerId, new Uint8Array(entry.data));
+    const ok = await sendDmFrame(peerId, new Uint8Array(entry.data));
+    if (requireSession() !== session) return;
     if (ok) {
       sent.add(queueEntryKey(entry));
       if (entry.messageId) {
@@ -785,18 +832,32 @@ export async function joinPhonebookDmRooms(): Promise<void> {
     // from a peerId and quietly miss every DM sent to the real one.
     const peerDid = dmPeerDid(entry.did ?? entry.peerId);
     if (!peerDid) continue;
-    const roomCode = await hashDmRoomCode(selfDid, peerDid);
-    _transport.joinRoom(roomCode);
+    await ensureDmRoomForPeer(peerDid);
   }
 }
 
 export async function ensureDmRoomForPeer(
   peerIdOrDid: string
 ): Promise<string | null> {
-  const peerDid = dmPeerDid(peerIdOrDid);
+  const guard = captureDmOwnership();
+  const session = requireSession();
+  let peerDid = dmPeerDid(peerIdOrDid);
+  if (!peerDid && looksLikePeerId(peerIdOrDid)) {
+    await _transport.introduceDm(peerIdOrDid);
+    peerDid = dmPeerDid(peerIdOrDid);
+  }
   const roomCode = peerDid ? await dmConversationCodeAsync(peerIdOrDid) : null;
   if (!roomCode || !peerDid) return null;
   const existing = await getRoom(roomCode);
+  if (requireSession() !== session) throw new Error("Identity changed");
+  _transport.joinSecureConversation(roomCode, pairwiseRoomSecret(session.privateKey, didToPublicKey(peerDid)));
+  const device = looksLikePeerId(peerIdOrDid) ? peerIdOrDid : didToPeerId(peerDid, _peerIdToDid);
+  // A known profile is not proof the other device has opened this DM yet.
+  // Explicit device inputs initiate first contact; DID-only restore is passive.
+  if (device === peerIdOrDid && !_transport.isRoomPeer(roomCode, device)) {
+    await _transport.introduceDm(device, peerDid);
+    if (requireSession() !== session) throw new Error("Identity changed");
+  }
   if (existing) return roomCode;
   const room: DMRoom = {
     roomCode,
@@ -808,7 +869,8 @@ export async function ensureDmRoomForPeer(
     participantLastSeen: {},
     participantDid: peerDid,
   };
-  await putRoom(room);
+  await putRoom(room, guard);
+  if (requireSession() !== session) throw new Error("Identity changed");
   return roomCode;
 }
 
@@ -849,7 +911,7 @@ export async function addToPhonebook(peerIdOrDid: string): Promise<void> {
     addedAt: keeper?.addedAt ?? Date.now(),
     favorite: keeper?.favorite,
   });
-  _transport.joinRoom(roomCode);
+  await ensureDmRoomForPeer(did);
 }
 
 /** Whether that person is in the phonebook, under any key an entry may carry. */

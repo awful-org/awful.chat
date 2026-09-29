@@ -20,13 +20,18 @@ const { FakeTransport, instances } = vi.hoisted(() => {
       this.handlers.set(event, arr);
     }
     emit(event: string, ...args: any[]) {
+      if (event === "message" && args.length === 2) args.push((this as any).pairingRoom);
       for (const fn of this.handlers.get(event) ?? []) fn(...args);
     }
     async connect() {}
     joinRoom() {}
+    joinSecureRoom() {}
+    async sendSecureRoom(peer: string, _room: string, data: Uint8Array) {
+      return FakeTransport.prototype.send.call(this, peer, data);
+    }
     async disconnect() {}
     selfId() {
-      return "";
+      return "12D3KooW" + "A".repeat(44);
     }
     async send(_peerId: string, data: Uint8Array) {
       this.sent.push(JSON.parse(new TextDecoder().decode(data)));
@@ -39,13 +44,16 @@ vi.mock("./libp2p/transport", () => ({ LibP2PTransport: FakeTransport }));
 
 // The import half is exercised in backup-restore.test.ts against a real
 // database; here only WHAT the target hands it matters.
-const { importCalls } = vi.hoisted(() => ({
-  importCalls: [] as { data: any; mode: string }[],
+const { importCalls, importControl } = vi.hoisted(() => ({
+  importCalls: [] as { data: any; mode: string; options: any }[],
+  importControl: { run: null as null | ((options: any) => Promise<void>) },
 }));
 vi.mock("./backup-restore", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./backup-restore")>()),
-  importDatabase: async (data: any, mode: any) => {
-    importCalls.push({ data, mode });
+  importDatabase: async (data: any, mode: any, options: any) => {
+    importCalls.push({ data, mode, options });
+    if (importControl.run) await importControl.run(options);
+    else options.beforeCommit?.();
     return { droppedRecords: 0 };
   },
 }));
@@ -54,6 +62,8 @@ import {
   cancelSync,
   connectAsTarget,
   generateShortCode,
+  generateSyncCode,
+  revealShortCode,
   matchesSourcePeer,
   parsePlaintextToken,
   parseShortCode,
@@ -63,12 +73,150 @@ import {
   tokenAccepted,
   utf8Length,
 } from "./sync.svelte";
+import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
+import * as storage from "$lib/storage";
+import QRCode from "qrcode";
+const SECURE_SECRET = newRoomSecret();
+const SECURE_ROOM = deriveRoomKeys(SECURE_SECRET).discoveryId;
 
 // A realistic-shaped Ed25519 libp2p peerId: the constant "12D3KooW" multihash
 // prefix followed by base58 key material.
 const PEER_ID = "12D3KooWBmoLnSw8ChzC2K1LZjb1XkUJDihMAcqBRfsTGjfCgHz";
 const ROOM_CODE = "__sync_deadbeef";
 const TOKEN = "0123456789abcdef0123456789abcdef";
+
+describe("secure sync invitation and source authorization", () => {
+  afterEach(async () => { await cancelSync(); });
+
+  it("exports opened watermarks so backup and device restore cannot double-seal them", async () => {
+    const { createIdentity, lockIdentity } = await import("$lib/identity/identity");
+    await createIdentity("watermark-export-test-password");
+    try {
+      await storage.setWatermark(SECURE_ROOM, "watermark-export-sender", 73);
+      const raw = await (await storage.getDB()).getAll("watermarks");
+      expect(raw.some((row: any) => row._enc)).toBe(true);
+      await generateSyncCode();
+      const source = instances.at(-1);
+      const payload = parsePlaintextToken(syncState.plaintextToken!)!;
+      source.emit("message", "target", new TextEncoder().encode(JSON.stringify({
+        type: "sync_export_request", payload: { token: payload.token, mode: "add" },
+      })), payload.roomCode);
+      await vi.waitFor(() => expect(source.sent.some((m: any) =>
+        m.type === "sync_export_data" && JSON.stringify(m).includes("watermark-export-sender"),
+      )).toBe(true));
+      const frame = source.sent.find((m: any) =>
+        m.type === "sync_export_data" && JSON.stringify(m).includes("watermark-export-sender"),
+      );
+      expect(JSON.stringify(frame)).not.toContain('"_enc"');
+      expect(JSON.stringify(frame)).toContain('"maxLamport":73');
+    } finally {
+      await cancelSync();
+      lockIdentity();
+    }
+  });
+
+  it("discards a pending QR result after a replacement session starts", async () => {
+    let release!: (url: string) => void;
+    const pending = new Promise<string>((resolve) => { release = resolve; });
+    const spy = vi.spyOn(QRCode, "toDataURL").mockImplementationOnce(() => pending);
+    try {
+      const old = generateSyncCode();
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+      await cancelSync();
+      await generateSyncCode();
+      const replacementCode = syncState.plaintextToken;
+      const replacementQr = syncState.qrDataUrl;
+      release("old-secret-qr");
+      await old;
+      expect(syncState.plaintextToken).toBe(replacementCode);
+      expect(syncState.qrDataUrl).toBe(replacementQr);
+      expect(syncState.syncError).toBeNull();
+    } finally {
+      release("discarded");
+      spy.mockRestore();
+    }
+  });
+
+  it("does not send a pending old export through a replacement sync session", async () => {
+    await generateSyncCode();
+    const old = instances.at(-1);
+    const payload = parsePlaintextToken(syncState.plaintextToken!)!;
+    const db = await storage.getDB();
+    let release!: (value: typeof db) => void;
+    const pending = new Promise<typeof db>((resolve) => { release = resolve; });
+    const spy = vi.spyOn(storage, "getDB").mockImplementationOnce(() => pending);
+    try {
+      old.emit("message", "target", new TextEncoder().encode(JSON.stringify({
+        type: "sync_export_request", payload: { token: payload.token, mode: "add" },
+      })), payload.roomCode);
+      await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+      await cancelSync();
+      await generateSyncCode();
+      const replacement = instances.at(-1);
+      const replacementCode = syncState.plaintextToken;
+      release(db);
+      // Give the actual IndexedDB export time to drain its transactions.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(replacement.sent).toHaveLength(0);
+      expect(old.sent).toHaveLength(0);
+      expect(syncState.plaintextToken).toBe(replacementCode);
+      expect(syncState.syncError).toBeNull();
+    } finally { release(db); spy.mockRestore(); }
+  });
+
+  it("old disconnect completion cannot reset replacement state", async () => {
+    await generateSyncCode();
+    const old = instances.at(-1);
+    let release!: () => void;
+    old.disconnect = () => new Promise<void>((resolve) => { release = resolve; });
+    const cancelling = cancelSync();
+    await generateSyncCode();
+    const replacementCode = syncState.plaintextToken;
+    expect(replacementCode).toBeTruthy();
+    release();
+    await cancelling;
+    expect(syncState.plaintextToken).toBe(replacementCode);
+  });
+
+  it("rejects incomplete tokens and invalid expiry before constructing a transport", async () => {
+    const before = instances.length;
+    const payload = { roomSecret: SECURE_SECRET, roomCode: SECURE_ROOM, token: TOKEN,
+      peerId: PEER_ID, expires: Date.now() + 60_000 };
+    await expect(connectAsTarget({ ...payload, token: TOKEN.slice(0, 8) }))
+      .rejects.toThrow("complete secure sync code");
+    await expect(connectAsTarget({ ...payload, expires: NaN }))
+      .rejects.toThrow("expiry");
+    expect(instances).toHaveLength(before);
+  });
+
+  it("generates a copyable full-capability code and parses it without publishing the secret as the room ID", async () => {
+    await generateSyncCode();
+    expect(syncState.syncError).toBeNull();
+    const payload = parsePlaintextToken(syncState.plaintextToken!);
+    expect(payload?.roomSecret).toMatch(/^r2_/);
+    expect(payload?.roomCode).toBe(instances.at(-1).pairingRoom);
+    expect(payload?.roomCode).not.toContain(payload!.roomSecret!.slice(3));
+    expect(payload?.token).toHaveLength(32);
+    expect(payload?.peerId).toBe(instances.at(-1).selfId());
+  });
+
+  it("ignores raw export requests and refuses truncated tokens even when manual code is shown", async () => {
+    await generateSyncCode();
+    revealShortCode();
+    const t = instances.at(-1);
+    const payload = parsePlaintextToken(syncState.plaintextToken!)!;
+    const frame = (token: string) => new TextEncoder().encode(JSON.stringify({
+      type: "sync_export_request", payload: { token, mode: "replace" },
+    }));
+    t.emit("message", "intruder", frame(payload.token), null);
+    await Promise.resolve();
+    expect(t.sent).toHaveLength(0);
+    t.emit("message", "intruder", frame(payload.token.slice(0, 8)), payload.roomCode);
+    await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+    expect(t.sent[0].type).toBe("sync_error");
+    expect(syncState.isSyncing).toBe(false);
+  });
+});
 
 describe("peerIdShortPrefix", () => {
   it("takes the 8 chars right after the Ed25519 prefix", () => {
@@ -270,7 +418,8 @@ describe("target ExportRequest delivery", () => {
   });
 
   const payload = () => ({
-    roomCode: ROOM_CODE,
+    roomCode: SECURE_ROOM,
+    roomSecret: SECURE_SECRET,
     token: TOKEN,
     expires: Date.now() + 60_000,
     peerId: PEER_ID,
@@ -310,6 +459,22 @@ describe("target ExportRequest delivery", () => {
     await Promise.resolve();
     expect(requests(t)).toHaveLength(1);
   });
+
+  it("ignores completion outside the authenticated pairing room", async () => {
+    await connectAsTarget(payload());
+    const t = instances.at(-1);
+    t.emit("connect", PEER_ID);
+    t.emit("message", PEER_ID, new TextEncoder().encode(JSON.stringify({ type: "sync_export_complete" })), "wrong-room");
+    await Promise.resolve();
+    expect(syncState.isComplete).toBe(false);
+    expect(importCalls).toHaveLength(0);
+  });
+
+  it("rejects a pairing secret attached to another room before connecting", async () => {
+    const count = instances.length;
+    await expect(connectAsTarget({ ...payload(), roomCode: ROOM_CODE })).rejects.toThrow("capability mismatch");
+    expect(instances).toHaveLength(count);
+  });
 });
 
 // The 8-char short code carries 32 bits of the 128-bit token, which is
@@ -348,6 +513,7 @@ describe("tokenAccepted", () => {
 // straight over the target's identity - a takeover, not a merge.
 describe("target-side identity handling", () => {
   afterEach(async () => {
+    importControl.run = null;
     importCalls.length = 0;
     await cancelSync();
   });
@@ -362,7 +528,8 @@ describe("target-side identity handling", () => {
 
   async function runTarget(mode: "add" | "replace") {
     await connectAsTarget({
-      roomCode: ROOM_CODE,
+      roomCode: SECURE_ROOM,
+      roomSecret: SECURE_SECRET,
       token: TOKEN,
       expires: Date.now() + 60_000,
       peerId: PEER_ID,
@@ -390,32 +557,63 @@ describe("target-side identity handling", () => {
     expect(call.data.identity).toBeUndefined();
   });
 
-  it("keeps the short-code target accepting the source's full-token frames", async () => {
-    await connectAsTarget({
+  it("rejects an old target's commit after cancellation while its password was pending", async () => {
+    let resume!: () => void;
+    let rejected = false;
+    const pending = new Promise<void>((resolve) => { resume = resolve; });
+    importControl.run = async (options) => {
+      await pending;
+      try { options.beforeCommit(); }
+      catch (error) { rejected = true; throw error; }
+    };
+    try {
+      await runTarget("replace");
+      await cancelSync();
+      await generateSyncCode();
+      const replacementCode = syncState.plaintextToken;
+      resume();
+      await vi.waitFor(() => expect(rejected).toBe(true));
+      expect(syncState.plaintextToken).toBe(replacementCode);
+      expect(syncState.syncError).toBeNull();
+    } finally { resume(); }
+  });
+
+  it("waits for committed import writes before starting a replacement session", async () => {
+    let finish!: () => void;
+    const writes = new Promise<void>((resolve) => { finish = resolve; });
+    importControl.run = async (options) => {
+      options.beforeCommit();
+      await writes;
+    };
+    try {
+      await runTarget("replace");
+      await cancelSync();
+      const count = instances.length;
+      const replacement = generateSyncCode();
+      // Drain startup microtasks; the import write lease must still block it.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(instances).toHaveLength(count);
+      expect(syncState.plaintextToken).toBeNull();
+      finish();
+      await replacement;
+      expect(instances).toHaveLength(count + 1);
+      expect(syncState.plaintextToken).not.toBeNull();
+      expect(syncState.syncError).toBeNull();
+    } finally { finish(); }
+  });
+
+  it("rejects obsolete short codes before creating a network session", async () => {
+    const count = instances.length;
+    await expect(connectAsTarget({
       roomCode: ROOM_CODE,
       // What parseShortCode produces: 8 chars of token, 8 of peerId.
       token: TOKEN.slice(0, 8),
       peerPrefix: PEER_ID.slice(8, 16),
       expires: Date.now() + 60_000,
       mode: "replace",
-    });
-    const t = instances.at(-1);
-    t.emit("connect", PEER_ID);
-    t.emit(
-      "message",
-      PEER_ID,
-      frame({
-        type: "sync_export_data",
-        // The source always echoes the FULL token, never its short form.
-        payload: { section: "identity", data: identitySection, token: TOKEN },
-      })
-    );
-    await vi.waitFor(() => expect(t.sent.length).toBeGreaterThan(1));
-    t.emit("message", PEER_ID, frame({ type: "sync_export_complete" }));
-    await vi.waitFor(() => expect(importCalls).toHaveLength(1));
-    expect(importCalls[0].data.identity.keypair.did).toBe(
-      "did:key:zSomebodyElse"
-    );
+    })).rejects.toThrow("Update both devices");
+    expect(instances).toHaveLength(count);
+    expect(importCalls).toHaveLength(0);
   });
 
   it("still adopts it in replace mode, which is what replace means", async () => {

@@ -13,6 +13,11 @@ import type {
 import { getIceServers, onIceServersChanged } from "../ice-server-list";
 import { ev, errText } from "../../telemetry/event";
 import { rec, refs } from "../../telemetry/recorder";
+import type { FileEntry } from "../../types/message";
+import { encryptedFileSize, opaqueFileName } from "../../room-security/file-descriptor";
+import { stageEncryptedFile, stageDecryptedFile, type StagedFile } from "../../room-security/file-staging";
+import { readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-store";
+import { OPFSChunkStore } from "./opfs-store";
 
 type TorrentLike = {
   infoHash: string;
@@ -22,6 +27,8 @@ type TorrentLike = {
   done: boolean;
   numPeers?: number;
   files?: Array<{
+    name?: string;
+    createReadStream?: () => AsyncIterable<Uint8Array>;
     getBlob: (cb: (err: unknown, blob?: Blob) => void) => void;
   }>;
   on: (event: string, cb: (...args: unknown[]) => void) => void;
@@ -273,6 +280,60 @@ export class WebTorrentFileTransport implements FileTransferTransport {
    */
   private addingTorrents = new Set<string>();
   private seedingByHash = new Map<string, boolean>();
+  private lifecycle = new AbortController();
+  private plaintext = new Map<string, StagedFile>();
+  private publishing = new Set<string>();
+
+  /** New protected sends only. The returned descriptor contains a secret and
+   * must travel inside an authenticated room message, never public discovery. */
+  async seedEncryptedFiles(files: File[]): Promise<FileEntry[]> {
+    const signal = this.lifecycle.signal;
+    const descriptors: FileEntry[] = [];
+    for (const source of files) {
+      const staged = await stageEncryptedFile(source, signal);
+      try {
+        signal.throwIfAborted();
+        const descriptor = await this.seedSingle(staged.file, {
+          infoHash: "", filename: source.name, mimeType: source.type || "application/octet-stream",
+          size: source.size, encryption: staged.encryption,
+        });
+        await writeCiphertext(descriptor.infoHash, staged.file, signal);
+        descriptors.push(descriptor);
+      } finally { await staged.dispose(); }
+    }
+    return descriptors;
+  }
+
+  async persistableCiphertext(infoHash: string, maxBytes: number): Promise<ArrayBuffer | undefined> {
+    const file = await readCiphertext(infoHash);
+    return file && file.size <= maxBytes ? file.arrayBuffer() : undefined;
+  }
+
+  /** Resume using the original ciphertext, opaque name and fixed piece size.
+   * Never re-encrypt: doing so changes the signed infoHash. */
+  async restoreEncryptedFile(descriptor: FileEntry, data?: ArrayBuffer): Promise<boolean> {
+    if (!descriptor.encryption) throw new Error("Encrypted descriptor required");
+    const signal = this.lifecycle.signal;
+    const ciphertext = data ? new Blob([data]) : await readCiphertext(descriptor.infoHash);
+    if (!ciphertext) return false;
+    const plain = await stageDecryptedFile(ciphertext, descriptor.encryption, descriptor.filename, descriptor.mimeType, signal);
+    try {
+      signal.throwIfAborted();
+      await this.seedSingle(new File([ciphertext], opaqueFileName(descriptor), { type: "application/octet-stream" }), descriptor);
+      if (data) await writeCiphertext(descriptor.infoHash, ciphertext, signal);
+      signal.throwIfAborted();
+      await this.plaintext.get(descriptor.infoHash)?.dispose();
+      signal.throwIfAborted();
+      this.plaintext.set(descriptor.infoHash, plain);
+      const snapshot = this.transfers.get(descriptor.infoHash)!;
+      this.upsertTransfer({ ...snapshot, blobURL: URL.createObjectURL(plain.file) });
+      // The application deliberately does not adopt transport-owned blob URLs.
+      // Recovery must deliver the authenticated file through the same publication
+      // event as a network download so hydration can mint its own usable URL.
+      this.emit("downloaded", descriptor.infoHash, plain.file);
+      return true;
+    } catch (e) { await plain.dispose(); throw e; }
+  }
 
   private localFileLookup: ((infoHash: string) => Promise<File | null>) | null =
     null;
@@ -434,6 +495,10 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   }
 
   registerSeeder(file: FileDescriptor, seederPeerId: string): void {
+    try { encryptedFileSize(file); } catch { return; }
+    const held = this.knownFiles.get(file.infoHash) as FileEntry | undefined;
+    // Seeder announcements must not replace the authenticated message's key.
+    if (held?.encryption && JSON.stringify(held.encryption) !== JSON.stringify((file as FileEntry).encryption)) return;
     if (!isValidInfoHash(file.infoHash)) {
       console.warn(`Rejecting seeder registration with invalid infoHash: ${file.infoHash}`);
       return;
@@ -536,6 +601,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   }
 
   ensureDownload(file: FileDescriptor, opts?: { retry?: boolean }): void {
+    try { encryptedFileSize(file); } catch { return; }
+    const signal = this.lifecycle.signal;
     if (!isValidInfoHash(file.infoHash)) {
       console.warn(`Rejecting download with invalid infoHash: ${file.infoHash}`);
       return;
@@ -563,6 +630,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       this.addingTorrents.add(file.infoHash);
       void this.client()
         .then((client) => {
+          if (signal.aborted) return;
           const torrent = client.get(
             file.infoHash
           ) as unknown as TorrentLike | null;
@@ -572,6 +640,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           }
           const added = client.add(file.infoHash, {
             announce: [],
+            ...((file as FileEntry).encryption ? { store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeCacheSlots: 2 } : {}),
           }) as TorrentLike;
           this.attachTorrent(added, false, file);
         })
@@ -776,6 +845,15 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   }
 
   resetTransfers(): void {
+    this.lifecycle.abort();
+    this.lifecycle = new AbortController();
+    for (const staged of this.plaintext.values()) void staged.dispose();
+    this.plaintext.clear();
+    this.publishing.clear();
+    // A lock/reset must also stop torrents serving ciphertext and free stores.
+    const client = this.clientP;
+    this.clientP = null;
+    void client?.then(c => c.destroy(() => {}));
     for (const peer of this.wtPeers.values()) {
       peer.destroy();
     }
@@ -808,18 +886,26 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.clientP = null;
   }
 
-  private async seedSingle(file: File): Promise<FileDescriptor> {
+  private async seedSingle(file: File, protectedDescriptor?: FileEntry): Promise<FileEntry> {
+    const signal = this.lifecycle.signal;
     const client = await this.client();
-    return new Promise<FileDescriptor>((resolve, reject) => {
+    signal.throwIfAborted();
+    return new Promise<FileEntry>((resolve, reject) => {
       const torrent = client.seed(
         file,
-        { announce: [] },
+        { announce: [], ...(protectedDescriptor ? { name: file.name, pieceLength: 256 * 1024, private: true, store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeCacheSlots: 2 } : {}) },
         (created: any) => {
-          const descriptor: FileDescriptor = {
+          if (signal.aborted || (protectedDescriptor?.infoHash && protectedDescriptor.infoHash !== created.infoHash)) {
+            created.destroy();
+            reject(new Error("Encrypted torrent identity mismatch or cancelled"));
+            return;
+          }
+          const descriptor: FileEntry = {
+            ...protectedDescriptor,
             infoHash: created.infoHash,
-            filename: file.name,
-            mimeType: file.type || "application/octet-stream",
-            size: file.size,
+            filename: protectedDescriptor?.filename ?? file.name,
+            mimeType: protectedDescriptor?.mimeType ?? (file.type || "application/octet-stream"),
+            size: protectedDescriptor?.size ?? file.size,
           };
 
           this.knownFiles.set(descriptor.infoHash, descriptor);
@@ -853,11 +939,16 @@ export class WebTorrentFileTransport implements FileTransferTransport {
             (torrent as any).infoHash
           ) as unknown as TorrentLike | null;
           if (existing?.infoHash) {
-            const descriptor: FileDescriptor = {
+            if (signal.aborted || (protectedDescriptor?.infoHash && protectedDescriptor.infoHash !== existing.infoHash)) {
+              reject(new Error("Encrypted torrent identity mismatch or cancelled"));
+              return;
+            }
+            const descriptor: FileEntry = {
+              ...protectedDescriptor,
               infoHash: existing.infoHash,
-              filename: file.name,
-              mimeType: file.type || "application/octet-stream",
-              size: file.size,
+              filename: protectedDescriptor?.filename ?? file.name,
+              mimeType: protectedDescriptor?.mimeType ?? (file.type || "application/octet-stream"),
+              size: protectedDescriptor?.size ?? file.size,
             };
             this.knownFiles.set(descriptor.infoHash, descriptor);
             this.localSeedHashes.add(descriptor.infoHash);
@@ -899,9 +990,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     if (!torrent && this.localFileLookup) {
       const file = await this.localFileLookup(infoHash).catch(() => null);
       if (file) {
-        await this.seedFiles([file]).catch(() => {});
+        const descriptor = this.knownFiles.get(infoHash) as FileEntry | undefined;
+        if (descriptor?.encryption) await this.restoreEncryptedFile(descriptor, await file.arrayBuffer()).catch(() => {});
+        else await this.seedFiles([file]).catch(() => {});
         torrent = client.get(infoHash) as unknown as TorrentLike | null;
       }
+      torrent = client.get(infoHash) as unknown as TorrentLike | null;
     }
     // The wire can die during the seed above, and a torrent we neither hold
     // nor can rebuild means dropping the link so the reconcile tick dials
@@ -1014,7 +1108,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       this.seedingByHash.set(infoHash, false);
     }
 
-    const descriptor = this.knownFiles.get(infoHash) ?? fallback;
+    const descriptor: FileEntry = this.knownFiles.get(infoHash) ?? fallback;
+    const encrypted = !!descriptor.encryption;
+    const signal = this.lifecycle.signal;
 
     /**
      * The torrent's REAL length against the size the sender signed.
@@ -1030,7 +1126,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const enforceSignedLength = (): boolean => {
       if (seeding) return false;
       const actual = torrent.length;
-      if (typeof actual !== "number" || actual <= descriptor.size) return false;
+      if (typeof actual !== "number") return false;
+      const expected = encryptedFileSize(descriptor);
+      if (encrypted ? actual === expected && (!torrent.files || (torrent.files.length === 1 && torrent.files[0].name === opaqueFileName(descriptor))) : actual <= expected) return false;
       this.attachedTorrents.delete(infoHash);
       try {
         torrent.destroy?.();
@@ -1065,9 +1163,11 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     };
 
     const pushUpdate = () => {
+      if (signal.aborted) return;
       const isSeeding = this.seedingByHash.get(infoHash) ?? seeding;
       const existing = this.transfers.get(infoHash);
       this.upsertTransfer({
+        ...descriptor,
         infoHash,
         filename: descriptor.filename,
         mimeType: descriptor.mimeType,
@@ -1078,11 +1178,11 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         // then had the reconcile tick dialling peers for a file we hold.
         status: isSeeding
           ? "seeding"
-          : torrent.done
+          : torrent.done && (!encrypted || this.plaintext.has(infoHash))
             ? "complete"
             : "downloading",
         progress: torrent.progress ?? existing?.progress ?? 0,
-        done: isSeeding || torrent.done,
+        done: isSeeding || (torrent.done && (!encrypted || this.plaintext.has(infoHash))),
         seeding: isSeeding,
         peers: torrent.numPeers ?? existing?.peers ?? 0,
         seeders:
@@ -1109,6 +1209,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     torrent.on("wire", pushUpdate);
 
     torrent.on("done", () => {
+      if (signal.aborted || enforceSignedLength()) return;
       pushUpdate();
       if (this.seedingByHash.get(infoHash)) return;
       // Manual WebRTC peers have no tracker to rotate idle connections for
@@ -1123,6 +1224,30 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       this.reconcileWtPeers();
       const file = torrent.files?.[0];
       if (!file) return;
+      if (encrypted) {
+        if (this.publishing.has(infoHash)) return;
+        this.publishing.add(infoHash);
+        void (async () => {
+          if (!file.createReadStream) throw new Error("Streaming torrent support required");
+          const ciphertext = await writeCiphertext(infoHash, file.createReadStream(), signal);
+          const plain = await stageDecryptedFile(ciphertext, descriptor.encryption!, descriptor.filename, descriptor.mimeType, signal);
+          if (signal.aborted) { await plain.dispose(); return; }
+          this.plaintext.set(infoHash, plain);
+          this.localSeedHashes.add(infoHash);
+          this.seedingByHash.set(infoHash, true);
+          this.upsertTransfer({ ...descriptor, status: "seeding", done: true, seeding: true,
+            progress: 1, peers: torrent.numPeers ?? 0, seeders: 1, blobURL: URL.createObjectURL(plain.file) });
+          this.emit("downloaded", infoHash, plain.file);
+        })().catch(async () => {
+          await removeCiphertext(infoHash).catch(() => {});
+          torrent.destroy?.();
+          this.attachedTorrents.delete(infoHash);
+          if (!signal.aborted) this.upsertTransfer({ ...descriptor, status: "failed", done: false,
+            seeding: false, progress: 0, peers: 0, seeders: 0, blobURL: undefined,
+            error: "Encrypted file authentication failed" });
+        }).finally(() => this.publishing.delete(infoHash));
+        return;
+      }
       file.getBlob((_err, blob) => {
         if (!blob) return;
         const prev = this.transfers.get(infoHash);

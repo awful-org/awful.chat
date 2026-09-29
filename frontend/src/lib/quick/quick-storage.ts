@@ -23,7 +23,7 @@ const QUICK_PREFIX = "awful-quick-";
 
 let quick: string | null = null;
 /** Resolving this releases the lock that marks our database as live. */
-let releaseLock: (() => void) | null = null;
+let lease: { active: boolean; release?: () => void } | null = null;
 
 export function isQuickStorage(): boolean {
   return quick !== null;
@@ -46,11 +46,13 @@ export function useQuickStorage(): string {
     b.toString(16).padStart(2, "0")
   ).join("");
   quick = QUICK_PREFIX + id;
+  const owner = { active: true } as NonNullable<typeof lease>;
+  lease = owner;
   try {
     void navigator.locks?.request(
       quick,
-      () => new Promise<void>((resolve) => (releaseLock = resolve))
-    );
+      () => owner.active ? new Promise<void>((resolve) => (owner.release = resolve)) : undefined
+    ).catch(() => {});
   } catch {
     // No Lock Manager: the delete below still runs, only the orphan sweep
     // has nothing to go on.
@@ -96,8 +98,8 @@ function deleteDatabase(name: string): Promise<void> {
 export async function dropQuickStorage(): Promise<void> {
   if (!quick) return;
   const name = quick;
-  releaseLock?.();
-  releaseLock = null;
+  if (lease) { lease.active = false; lease.release?.(); }
+  lease = null;
   quick = null;
   useQuickStorage();
   await deleteDatabase(name);

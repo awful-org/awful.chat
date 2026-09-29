@@ -25,3 +25,18 @@ export function verifyJoin(nonce: string, roomCode: string, peerId: string, sign
     return false;
   }
 }
+
+/** The authenticated peer also proves room access. Never accept root secrets or
+ * discovery IDs as an alternative legacy SFU room identifier. */
+export function verifyRoomAdmission(nonce: string, room: string, peer: string, capability: unknown): boolean {
+  if (!room.startsWith("rs2_")) return false;
+  try {
+    if (!/^rs2_[A-Za-z0-9_-]{43}$/.test(room) || typeof capability !== "string" ||
+        !/^[A-Za-z0-9_-]{86}$/.test(capability) || !/^[0-9a-f]{64}$/.test(nonce)) return false;
+    const publicBytes = Buffer.from(room.slice(4), "base64url");
+    const signature = Buffer.from(capability, "base64url");
+    if (publicBytes.toString("base64url") !== room.slice(4) || signature.toString("base64url") !== capability) return false;
+    const key = createPublicKey({ format: "jwk", key: { kty: "OKP", crv: "Ed25519", x: room.slice(4) } });
+    return verify(null, Buffer.from(JSON.stringify(["awful:sfu:room:v2", nonce, room, peer])), key, signature);
+  } catch { return false; }
+}

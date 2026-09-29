@@ -29,11 +29,13 @@ import {
   getOwnProfile,
   putOwnProfile,
 } from "$lib/storage";
-import { newQuickCode, normalizeQuickCode } from "$lib/room-code";
+import { newRoomSecret, parseRoomSecret, deriveRoomKeys } from "$lib/room-security/keys";
+import { storeSecureInvitation } from "$lib/room-security/invitations";
 import {
   joinRoom,
   leaveRoom,
   useEphemeralSession,
+  transportState,
 } from "$lib/transport/transport.svelte";
 import { joinCall, leaveCall } from "$lib/transport/call.svelte";
 import { dbName, dropQuickStorage, useQuickStorage } from "./quick-storage";
@@ -67,6 +69,7 @@ interface QuickCallState {
   /** Which identity is in the call: a throwaway one, or the real account. */
   identity: "guest" | "account";
   code: string;
+  roomCode: string;
   error: string | null;
   /** What the setup screen starts filled in with. */
   profile: QuickProfile;
@@ -154,7 +157,11 @@ function readSession(): QuickSession | null {
     const raw = sessionStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const p = JSON.parse(raw) as QuickSession;
-    return typeof p?.code === "string" && p.code ? p : null;
+    parseRoomSecret(p?.code);
+    if ((p.identity !== "guest" && p.identity !== "account") ||
+      typeof p.isHost !== "boolean" || typeof p.inCall !== "boolean" ||
+      typeof p.name !== "string" || (p.identity === "guest" && typeof p.mnemonic !== "string")) return null;
+    return p;
   } catch {
     return null;
   }
@@ -194,8 +201,17 @@ export function resumableSession(code: string): QuickSession | null {
 
 /** Whether this tab minted `code`, or null if it has no record of it. */
 export function hostedHere(code: string): boolean | null {
-  const found = readSession();
-  return found && found.code === code ? found.isHost : null;
+  // Host provenance is saved before identity selection; it does not authorize
+  // resuming a call. Keep readSession's complete-identity validation intact.
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const found = JSON.parse(raw);
+    parseRoomSecret(found?.code);
+    return found.code === code && typeof found.isHost === "boolean" ? found.isHost : null;
+  } catch {
+    return null;
+  }
 }
 
 const remembered = readRememberedProfile();
@@ -204,24 +220,33 @@ export const quickCall = $state<QuickCallState>({
   stage: "choosing",
   identity: "guest",
   code: "",
+  roomCode: "",
   error: null,
   profile: remembered ?? { name: anonymousName() },
   remembered: remembered !== null,
 });
 
 /**
- * Mint a code, or take one from a link. A quick code, not a room code: ten
- * characters for a call that lives hours, see room-code.ts for the numbers.
- * A link carrying something else falls back to a fresh code rather than
- * joining whatever the string happened to name.
+ * Mint a v2 capability or validate the exact case-sensitive fragment. Invalid
+ * and legacy invitations fail closed, never silently create another call.
  */
 export function setQuickCallCode(fromLink?: string, isHost?: boolean): string {
-  quickCall.code =
-    (fromLink ? normalizeQuickCode(fromLink) : "") || newQuickCode();
+  if (quickCall.stage === "joining" || quickCall.stage === "in-call") return quickCall.code;
+  ++generation;
+  try {
+    quickCall.code = fromLink === undefined ? newRoomSecret() : parseRoomSecret(fromLink);
+  } catch {
+    quickCall.code = "";
+    quickCall.stage = "failed";
+    quickCall.error = "Invalid quick call invitation. Ask for a new link.";
+    clearSession();
+    return "";
+  }
+  if (session?.code !== quickCall.code) clearSession();
   // Host-ness cannot be re-derived after a reload: the person who STARTED the
   // call has the code in their address bar by then, and would be told they
   // had been invited to it.
-  saveSession({ code: quickCall.code, isHost: isHost ?? !fromLink });
+  saveSession({ code: quickCall.code, isHost: isHost ?? !fromLink, inCall: session?.inCall ?? false });
   return quickCall.code;
 }
 
@@ -245,32 +270,53 @@ function switchToThrowawayStorage(): void {
 
 /** Set once an identity is live and the storage scope has moved. */
 let prepared = false;
+let guestMnemonic: string | undefined;
+let generation = 0;
+// Storage and the shared call stack have page-wide state. Serialize operations
+// through teardown so a cancelled write/join cannot race a replacement call.
+let work: Promise<void> = Promise.resolve();
+function serial(operation: () => Promise<void>): Promise<void> {
+  const result = work.then(operation);
+  work = result.catch(() => {});
+  return result;
+}
 
 /**
  * Call as a stranger: a keypair that exists only in memory, under whatever
  * name was remembered from last time.
  */
 export async function prepareAsGuest(mnemonic?: string): Promise<void> {
+  const attempt = generation;
+  return serial(async () => {
+  if (attempt !== generation) return;
   if (prepared) return;
   quickCall.identity = "guest";
+  quickCall.stage = "joining";
   quickCall.error = null;
   try {
+    parseRoomSecret(quickCall.code);
     switchToThrowawayStorage();
     // Minted here rather than inside createEphemeral so the same words can be
     // put away for a reload. A resume passes back what it kept.
     const words = mnemonic ?? generateMnemonic();
     await createEphemeral(words);
-    saveSession({ identity: "guest", mnemonic: words });
+    if (attempt !== generation) return;
+    guestMnemonic = words;
+    saveSession({ identity: "guest", mnemonic: words, name: quickCall.profile.name });
     await saveName(quickCall.profile.name);
+    if (attempt !== generation) return;
     if (quickCall.profile.avatarUrl) {
       await saveAvatar(quickCall.profile.avatarUrl);
+      if (attempt !== generation) return;
     }
     prepared = true;
     quickCall.stage = "setup";
   } catch (err) {
+    if (attempt !== generation) return;
     quickCall.stage = "failed";
     quickCall.error = err instanceof Error ? err.message : String(err);
   }
+  });
 }
 
 /** Show the account's own unlock screen. */
@@ -299,14 +345,23 @@ export function backToChoosing(): void {
  * that _sendProfile actually puts on the wire.
  */
 export async function adoptAccount(): Promise<void> {
+  const attempt = generation;
+  return serial(async () => {
+  if (attempt !== generation) return;
   if (prepared) return;
+  quickCall.stage = "joining";
   quickCall.error = null;
   try {
+    parseRoomSecret(quickCall.code);
     const mine = await getOwnProfile(identityStore.did ?? undefined);
+    if (attempt !== generation) return;
     switchToThrowawayStorage();
-    saveSession({ identity: "account" });
+    saveSession({ identity: "account", name: quickCall.profile.name });
+    guestMnemonic = undefined;
     if (mine) await putOwnProfile({ ...mine, isMe: true });
+    if (attempt !== generation) return;
     await loadProfile();
+    if (attempt !== generation) return;
     quickCall.profile = {
       name: mine?.nickname?.trim() || quickCall.profile.name,
       avatarUrl: mine?.pfpURL ?? quickCall.profile.avatarUrl,
@@ -314,13 +369,19 @@ export async function adoptAccount(): Promise<void> {
     prepared = true;
     quickCall.stage = "setup";
   } catch (err) {
+    if (attempt !== generation) return;
     quickCall.stage = "failed";
     quickCall.error = err instanceof Error ? err.message : String(err);
   }
+  });
 }
 
 /** Everything between "Join" and being in the call. */
 export async function startQuickCall(profile: QuickProfile): Promise<void> {
+  const attempt = generation;
+  const code = quickCall.code;
+  return serial(async () => {
+  if (attempt !== generation) return;
   // Checked FIRST, and loudly. "failed" is a retryable state - but not when
   // what failed was the setup itself, and a join before any identity exists
   // is the one path that would write a call into the user's real database.
@@ -335,23 +396,43 @@ export async function startQuickCall(profile: QuickProfile): Promise<void> {
   quickCall.profile = profile;
 
   try {
+    const secret = parseRoomSecret(code);
     // The profile goes in before joinRoom, which broadcasts it to everyone
     // already in the call.
     await saveName(profile.name.trim() || anonymousName());
+    if (attempt !== generation) return;
     if (profile.avatarUrl) await saveAvatar(profile.avatarUrl);
-    const joined = await joinRoom(quickCall.code);
+    if (attempt !== generation) return;
+    const room = await storeSecureInvitation(secret, "Quick call");
+    if (attempt !== generation) return;
+    if (room.roomCode !== deriveRoomKeys(secret).discoveryId || room.roomSecret !== secret) {
+      throw new Error("Quick call capability mismatch.");
+    }
+    quickCall.roomCode = room.roomCode;
+    const joined = await joinRoom(room.roomCode);
+    if (attempt !== generation) return;
     if (!joined) throw new Error("Could not join the call.");
     await joinCall();
+    if (attempt !== generation) return;
+    if (!transportState.inCall || transportState.callRoomCode !== room.roomCode) {
+      throw new Error(transportState.error || "Could not join the protected call.");
+    }
     quickCall.stage = "in-call";
     saveSession({
+      identity: quickCall.identity,
+      mnemonic: quickCall.identity === "guest" ? guestMnemonic : undefined,
       inCall: true,
       name: profile.name,
       avatarUrl: profile.avatarUrl,
     });
   } catch (err) {
+    if (attempt !== generation) return;
+    leaveCall();
+    leaveRoom();
     quickCall.stage = "failed";
     quickCall.error = err instanceof Error ? err.message : String(err);
   }
+  });
 }
 
 /**
@@ -376,12 +457,18 @@ export async function startQuickCall(profile: QuickProfile): Promise<void> {
  * real database.
  */
 export function endQuickCall(): void {
+  ++generation;
   leaveCall();
   leaveRoom();
   // Nothing resumes a call that was deliberately ended.
   clearSession();
-  closeDatabase();
-  void dropQuickStorage();
+  void serial(async () => {
+    leaveCall();
+    leaveRoom();
+    closeDatabase();
+    await dropQuickStorage();
+  });
+  quickCall.roomCode = "";
   quickCall.stage = "ended";
 }
 
@@ -391,6 +478,7 @@ export function endQuickCall(): void {
  * way - so this is a new call, not a new person.
  */
 export function startAnotherCall(): string {
+  if (quickCall.stage !== "ended") return quickCall.code;
   quickCall.error = null;
   const code = setQuickCallCode(undefined, true);
   quickCall.stage = "setup";
@@ -409,17 +497,25 @@ export function hasAccount(): boolean {
 
 /** The page is going away: hang up and take the database with it. */
 export function teardownQuickCall(): void {
+  ++generation;
   leaveCall();
   // An ephemeral identity's "database swept" marker is localStorage that
   // would outlive everything else about the call. The account path leaves the
   // real account's own marker alone - it earned it on the real database.
-  if (quickCall.identity === "guest") clearAtRestFlagForCurrentOwner();
-  void dropQuickStorage();
+  void serial(async () => {
+    leaveCall();
+    leaveRoom();
+    if (quickCall.identity === "guest") clearAtRestFlagForCurrentOwner();
+    closeDatabase();
+    await dropQuickStorage();
+  });
 }
 
 /** Test seam: the module keeps one page's worth of state. */
 export function _resetQuickCallForTest(): void {
+  ++generation;
   prepared = false;
+  guestMnemonic = undefined;
   quickCall.stage = "choosing";
   quickCall.identity = "guest";
   quickCall.error = null;

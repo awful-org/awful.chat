@@ -29,7 +29,9 @@ import (
 	"github.com/libp2p/go-libp2p/x/rate"
 )
 
-const RendezvousProtocol = "/awful/rendezvous/1.0.0"
+// Coordinated v2 cutover: no v1 handler or protocol fallback. Legacy clients
+// must update before they can register room discovery on this relay.
+const RendezvousProtocol = "/awful/rendezvous/2.0.0"
 
 type clientMsg struct {
 	Type string `json:"type"` // REGISTER | UNREGISTER | PING
@@ -1462,8 +1464,7 @@ func main() {
 		mux.HandleFunc("/klipy/search", getOnly(handleKlipySearch))
 		mux.HandleFunc("/klipy/trending", getOnly(handleKlipyTrending))
 		mux.HandleFunc("/turn-credentials", getOnly(handleTurnCredentials))
-		mux.HandleFunc("/invite", postOnly(handleInviteCreate))
-		mux.HandleFunc("/invite/", getOnly(handleInviteResolve))
+		registerInviteEndpoints(mux)
 		mux.HandleFunc("/plugin-proxy", getOnly(handlePluginProxy))
 		mux.HandleFunc("/plugin-stream", getOnly(handlePluginStream))
 		mux.HandleFunc("/mailbox/deposit", handleMailboxDeposit)

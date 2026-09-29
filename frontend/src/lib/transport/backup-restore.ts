@@ -61,6 +61,11 @@ export interface ImportResult {
 }
 
 export interface ImportOptions {
+  /** Synchronous cancellation check immediately before irreversible identity
+   * activation/database mutation. Throw to abort with no import writes. Once
+   * accepted, callers must serialize replacement operations until settlement;
+   * the multi-transaction import cannot be rolled back after this boundary. */
+  beforeCommit?: () => void;
   /**
    * Asked for the imported identity's password BEFORE anything is wiped or
    * written, so the at-rest key is armed and sealRow seals every imported row
@@ -167,6 +172,12 @@ export async function importDatabase(
   // plaintext originals recoverable, which is exactly what the at-rest design
   // and the duress wipe assume never happens.
   let armed = false;
+  let committed = false;
+  const beforeCommit = () => {
+    if (committed) return;
+    options.beforeCommit?.();
+    committed = true;
+  };
   if (identity && options.requestPassword) {
     const record = mnemonicRecordFromExport(identity);
     for (let retry = false; ; retry = true) {
@@ -176,7 +187,7 @@ export async function importDatabase(
         throw new Error("Import cancelled - nothing on this device changed");
       }
       try {
-        await unlockWithImportedMnemonic(record, password);
+        await unlockWithImportedMnemonic(record, password, beforeCommit);
         armed = true;
         break;
       } catch (err) {
@@ -189,6 +200,7 @@ export async function importDatabase(
     }
   }
 
+  beforeCommit();
   if (mode === "replace") {
     // Clear existing data first
     console.log("[Sync] Wiping local database (replace mode)");

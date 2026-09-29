@@ -184,7 +184,9 @@ export default defineConfig(({ mode }) => ({
         protocol_handlers: [
           {
             protocol: "web+awfl",
-            url: "/r/%s",
+            // Protocol payloads can contain room capabilities. Keep them out
+            // of HTTP request paths, server logs and Referer headers.
+            url: "/r/#%s",
           },
         ],
       },

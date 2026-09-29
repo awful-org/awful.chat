@@ -10,9 +10,9 @@ import {
 } from "./room-code";
 
 describe("room codes", () => {
-  it("is 13 Crockford base32 characters (65 bits)", () => {
+  it("is a canonical 256-bit v2 capability", () => {
     for (let i = 0; i < 50; i++) {
-      expect(newRoomCode()).toMatch(/^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{13}$/);
+      expect(newRoomCode()).toMatch(/^r2_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/);
     }
   });
 

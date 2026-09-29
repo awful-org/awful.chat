@@ -176,11 +176,12 @@ async function _refreshAllUnread(): Promise<void> {
   roomsStore.unreadCounts = merged;
 }
 
-export async function saveRoom(roomCode: string, name: string): Promise<void> {
+export async function saveRoom(roomCode: string, name: string, guard?: () => void): Promise<void> {
   // Check the DATABASE, not the in-memory mirror: on a deep-link join the
   // mirror can still be empty while loadRooms() is in flight, and recreating
   // the record here wiped its name, watermark and member list.
   const stored = await getRoom(roomCode);
+  guard?.();
   if (stored) {
     if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
       roomsStore.rooms = [...roomsStore.rooms, stored];
@@ -198,7 +199,8 @@ export async function saveRoom(roomCode: string, name: string): Promise<void> {
     participantLastSeen: {},
   };
 
-  await putRoom(room);
+  await putRoom(room, guard);
+  guard?.();
   if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
     roomsStore.rooms = [...roomsStore.rooms, room];
   }

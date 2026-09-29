@@ -1,4 +1,38 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
+import { validateStoredCapability } from "./room-security/keys";
+import { onIdentityLock } from "./identity/lock-events";
+
+type WriteGuard = () => void;
+let writeEpoch = 0;
+onIdentityLock(() => { writeEpoch++; });
+function captureWriteGuard(): WriteGuard {
+  const epoch = writeEpoch;
+  return () => {
+    if (epoch !== writeEpoch) throw new Error("Identity changed during storage write");
+  };
+}
+
+/** Abort pending IDB requests on lock; check ownership at the commit boundary. */
+async function guardedCommit(
+  database: AppDB, store: "messages" | "rooms" | "watermarks" | "attachments",
+  guard: WriteGuard, write: (tx: any) => Promise<void>,
+): Promise<void> {
+  guard();
+  const tx = database.transaction(store, "readwrite");
+  const done = tx.done;
+  // Observe rejection immediately, including when lock aborts during a request.
+  void done.catch(() => {});
+  const release = onIdentityLock(() => { try { tx.abort(); } catch {} });
+  try {
+    await write(tx);
+    guard();
+    await done;
+    guard();
+  } catch (error) {
+    try { tx.abort(); } catch {}
+    throw error;
+  } finally { release(); }
+}
 
 import { dbName } from "./quick/quick-storage";
 
@@ -46,6 +80,8 @@ export type RoomType = "text" | "dm";
 
 export interface Room {
   roomCode: string;
+  /** Local encrypted capability. Never serialize into room rosters or plugin APIs. */
+  roomSecret?: string;
   type: RoomType;
   name: string;
   lastSeenLamport: number; // unread count = messages with lamport > this
@@ -1019,17 +1055,19 @@ function _notifyMessageStored(msg: Message): void {
   }
 }
 
-export async function putMessage(message: Message): Promise<void> {
+export async function putMessage(message: Message, guard: WriteGuard = captureWriteGuard()): Promise<void> {
   const database = await getDB();
-  await database.put("messages", await _seal("messages", message));
+  guard();
+  const sealed = await _seal("messages", message);
+  await guardedCommit(database, "messages", guard, async tx => { await tx.store.put(sealed); });
   _notifyMessageStored(message);
 }
 
-export async function bulkPutMessages(messages: Message[]): Promise<void> {
+export async function bulkPutMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<void> {
   const database = await getDB();
+  guard();
   const sealed = await Promise.all(messages.map((m) => _seal("messages", m)));
-  const tx = database.transaction("messages", "readwrite");
-  await Promise.all([...sealed.map((m) => tx.store.put(m)), tx.done]);
+  await guardedCommit(database, "messages", guard, async tx => { await Promise.all(sealed.map(m => tx.store.put(m))); });
   for (const m of messages) _notifyMessageStored(m);
 }
 
@@ -1589,14 +1627,19 @@ export async function getAttachmentsWithData(
   while (cursor) {
     const a = cursor.value;
     if (
-      rowHasBytes(a, "data") &&
       (a.roomCode === blindedRoomCode || a.roomCode === roomCode)
     ) {
       matches.push(a);
     }
     cursor = await cursor.continue();
   }
-  return _openAllHealing("attachments", matches);
+  const opened = await _openAllHealing<Attachment>("attachments", matches);
+  const { readCiphertext } = await import("./transport/file/ciphertext-store");
+  const available: Attachment[] = [];
+  for (const a of opened) {
+    if (a.data || (a.encryption && await readCiphertext(a.infoHash).catch(() => null))) available.push(a);
+  }
+  return available;
 }
 
 /**
@@ -1627,10 +1670,12 @@ export async function getSeedableFiles(): Promise<
   // infoHash is blinded for migrated rows and plaintext for legacy rows, so
   // the same file could appear twice without plaintext-based deduplication.
   const rows: Attachment[] = [];
+  const rowsWithBytes = new Set<string>();
   let cursor = await database.transaction("attachments").store.openCursor();
   while (cursor) {
     const row = cursor.value;
-    if (rowHasBytes(row, "data")) {
+    if (rowHasBytes(row, "data")) rowsWithBytes.add(row.id);
+    {
       const { data: _d, ...meta } = row as Attachment & {
         _encBytes?: unknown;
       };
@@ -1648,6 +1693,11 @@ export async function getSeedableFiles(): Promise<
     skipBytes: true,
   });
   for (const a of opened) {
+    if (!rowsWithBytes.has(a.id) && !a.encryption) continue;
+    if (a.encryption && !rowsWithBytes.has(a.id)) {
+      const { readCiphertext } = await import("./transport/file/ciphertext-store");
+      if (!await readCiphertext(a.infoHash).catch(() => null)) continue;
+    }
     if (!seen.has(a.infoHash)) {
       seen.add(a.infoHash);
       out.push({
@@ -1657,6 +1707,7 @@ export async function getSeedableFiles(): Promise<
           filename: a.filename,
           mimeType: a.mimeType,
           size: a.size,
+          encryption: a.encryption,
         },
       });
     }
@@ -1664,10 +1715,18 @@ export async function getSeedableFiles(): Promise<
   return out;
 }
 
-export async function putAttachment(attachment: Attachment): Promise<void> {
+export async function putAttachment(attachment: Attachment, guard: WriteGuard = captureWriteGuard()): Promise<void> {
+  guard();
+  if (attachment.encryption) {
+    const { encryptedFileSize } = await import("./room-security/file-descriptor");
+    const expected = encryptedFileSize(attachment);
+    if (attachment.data && attachment.data.byteLength !== expected) throw new Error("Encrypted attachment data must be ciphertext");
+  }
   const database = await getDB();
+  guard();
   const { blobURL: _, ...record } = attachment;
-  await database.put("attachments", await _seal("attachments", record));
+  const sealed = await _seal("attachments", record);
+  await guardedCommit(database, "attachments", guard, async tx => { await tx.store.put(sealed); });
   _attachmentEpoch += 1;
 }
 
@@ -1691,13 +1750,16 @@ const ATTACHMENT_STATUS_RANK: Record<AttachmentStatus, number> = {
  */
 export async function updateAttachmentStatus(
   id: string,
-  status: AttachmentStatus
+  status: AttachmentStatus,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
+  guard();
   const database = await getDB();
   const attachment = await _openHealing<Attachment>(
     "attachments",
     await database.get("attachments", id)
   );
+  guard();
   if (!attachment) return;
   if (
     ATTACHMENT_STATUS_RANK[attachment.status] >= ATTACHMENT_STATUS_RANK[status]
@@ -1707,17 +1769,14 @@ export async function updateAttachmentStatus(
   const sealed = await _seal("attachments", { ...attachment, status });
   // The seal ran outside any transaction: re-check against the freshest row
   // so a later status is never regressed and a deleted row never returns.
-  const tx = database.transaction("attachments", "readwrite");
-  const fresh = await tx.store.get(id);
-  if (
-    !fresh ||
-    ATTACHMENT_STATUS_RANK[fresh.status] >= ATTACHMENT_STATUS_RANK[status]
-  ) {
-    await tx.done;
-    return;
-  }
-  await tx.store.put(sealed);
-  await tx.done;
+  await guardedCommit(database, "attachments", guard, async tx => {
+    const fresh = await tx.store.get(id) as { status: AttachmentStatus } | undefined;
+    if (
+      !fresh ||
+      ATTACHMENT_STATUS_RANK[fresh.status] >= ATTACHMENT_STATUS_RANK[status]
+    ) return;
+    await tx.store.put(sealed);
+  });
   _attachmentEpoch += 1;
 }
 
@@ -1728,13 +1787,16 @@ export async function updateAttachmentStatus(
  */
 export async function updateAttachmentData(
   id: string,
-  data: ArrayBuffer
+  data: ArrayBuffer,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
+  guard();
   const database = await getDB();
   const attachment = await _openHealing<Attachment>(
     "attachments",
     await database.get("attachments", id)
   );
+  guard();
   if (!attachment) return;
   const status =
     ATTACHMENT_STATUS_RANK[attachment.status] >=
@@ -1745,21 +1807,22 @@ export async function updateAttachmentData(
   // The seal ran outside any transaction; status is a CLEAR field, so the
   // regression guard re-checks against the freshest row at write time - the
   // seeding path may have advanced it while we were encrypting the blob.
-  const tx = database.transaction("attachments", "readwrite");
-  const fresh = await tx.store.get(id);
-  if (!fresh) {
-    // Deleted (room wipe) while the blob was encrypting: re-inserting it
-    // would leave an undeletable orphan.
-    await tx.done;
-    return;
-  }
-  if (
-    ATTACHMENT_STATUS_RANK[fresh.status] > ATTACHMENT_STATUS_RANK[sealed.status]
-  ) {
-    sealed.status = fresh.status;
-  }
-  await tx.store.put(sealed);
-  await tx.done;
+  let retry = false;
+  await guardedCommit(database, "attachments", guard, async tx => {
+    const fresh = await tx.store.get(id) as { status: AttachmentStatus } | undefined;
+    if (!fresh) {
+      // Deleted (room wipe) while encrypting: do not resurrect the row.
+      return;
+    }
+    if (ATTACHMENT_STATUS_RANK[fresh.status] > ATTACHMENT_STATUS_RANK[sealed.status]) {
+      // Status is authenticated metadata. Re-seal the newer row rather than
+      // mutating authenticated fields on an already encrypted record.
+      retry = true;
+      return;
+    }
+    await tx.store.put(sealed);
+  });
+  if (retry) return updateAttachmentData(id, data, guard);
   _attachmentEpoch += 1;
 }
 
@@ -1813,23 +1876,26 @@ export async function getDMRooms(): Promise<DMRoom[]> {
   );
 }
 
-export async function putRoom(room: Room | DMRoom): Promise<void> {
+export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWriteGuard()): Promise<void> {
+  validateStoredCapability(room);
   const database = await getDB();
   const roomWithParticipants = {
     ...room,
     participants: room.participants ?? [],
   };
+  guard();
   const sealed = await _seal("rooms", roomWithParticipants);
   const blindedRoomCode = await blindValue(room.roomCode);
   // The primary key changed (roomCode is now blinded), so we must delete the
   // old plaintext key if it exists, then put the new blinded one. Otherwise
   // we end up with both versions in the store.
-  const tx = database.transaction("rooms", "readwrite");
+  await guardedCommit(database, "rooms", guard, async tx => {
   // Cast to Blinded: during migration, legacy plaintext keys exist and must
   // be deleted. This is intentional and safe.
   await tx.store.delete(room.roomCode as Blinded);
+  guard();
   await tx.store.put(sealed);
-  await tx.done;
+  });
 }
 
 /** Shared read-decrypt-modify-seal-write cycle for room records. The old
@@ -1846,10 +1912,11 @@ const _roomPatchQueue = new Map<string, Promise<void>>();
 
 function _patchRoom(
   roomCode: string,
-  patch: (room: Room | DMRoom) => Room | DMRoom | null
+  patch: (room: Room | DMRoom) => Room | DMRoom | null,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(() =>
-    _patchRoomNow(roomCode, patch)
+    _patchRoomNow(roomCode, patch, guard)
   );
   const settled = run.catch(() => {});
   _roomPatchQueue.set(roomCode, settled);
@@ -1861,7 +1928,8 @@ function _patchRoom(
 
 async function _patchRoomNow(
   roomCode: string,
-  patch: (room: Room | DMRoom) => Room | DMRoom | null
+  patch: (room: Room | DMRoom) => Room | DMRoom | null,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   const database = await getDB();
   const blindedRoomCode = await blindValue(roomCode);
@@ -1877,15 +1945,17 @@ async function _patchRoomNow(
   if (!room) return;
   const updated = patch(room);
   if (!updated) return;
+  guard();
   const sealed = await _seal("rooms", updated);
   // The primary key is blinded, so delete the old plaintext key before
   // putting the updated version under the blinded key. For new rooms this
   // is a no-op; for migrated ones it cleans up the plaintext record.
-  const tx = database.transaction("rooms", "readwrite");
+  await guardedCommit(database, "rooms", guard, async tx => {
   // Cast to Blinded: we are intentionally deleting the legacy plaintext key.
   await tx.store.delete(roomCode as Blinded);
+  guard();
   await tx.store.put(sealed);
-  await tx.done;
+  });
 }
 
 /** Pin a room to the top of the sidebar, or unpin it (null). */
@@ -2018,12 +2088,13 @@ export async function cleanupInactiveParticipants(
  */
 export async function markRoomSeen(
   roomCode: string,
-  lamport: number
+  lamport: number,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   await _patchRoom(roomCode, (room) => ({
     ...room,
     lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, lamport),
-  }));
+  }), guard);
 }
 
 export async function deleteRoom(roomCode: string): Promise<void> {
@@ -2250,11 +2321,13 @@ export async function getWatermark(
 export async function setWatermark(
   roomCode: string,
   senderId: string,
-  maxLamport: number
+  maxLamport: number,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   const database = await getDB();
   const id = watermarkId(roomCode, senderId);
   const blindedId = await blindValue(id);
+  guard();
   // Seal OUTSIDE the transaction to avoid timeout issues with async ops.
   const sealed = await _seal("watermarks", {
     id,
@@ -2265,8 +2338,9 @@ export async function setWatermark(
   // Read+write in ONE transaction so concurrent fire-and-forget callers can't
   // interleave and regress the watermark (a late lower value clobbering a
   // higher one written between our get and put).
-  const tx = database.transaction("watermarks", "readwrite");
+  await guardedCommit(database, "watermarks", guard, async tx => {
   const existing = await tx.store.get(blindedId);
+  guard();
   // Never regress - only advance the watermark
   if (!existing || existing.maxLamport < maxLamport) {
     await tx.store.put(sealed);
@@ -2285,8 +2359,14 @@ export async function setWatermark(
     return;
   }
   // The dead row is gone (_openHealing); this write is the first readable one.
-  await database.put("watermarks", sealed);
+  guard();
+  await guardedCommit(database, "watermarks", guard, async repair => {
+    const current = await repair.store.get(blindedId);
+    guard();
+    if (!current || current.maxLamport < maxLamport) await repair.store.put(sealed);
+  });
   _readableWatermarks.add(blindedId);
+  });
 }
 
 /** Watermark rows known to decrypt, so setWatermark checks each only once. */
@@ -2471,6 +2551,7 @@ export async function wipeLocalDatabase(): Promise<void> {
   invalidatePeerProfilesCache();
   _readableWatermarks.clear();
   await deleteDB(dbName());
+  await (await import("./transport/file/ciphertext-store")).wipeCiphertext();
 }
 
 /** Close the cached connection without deleting anything - a

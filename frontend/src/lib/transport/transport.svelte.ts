@@ -1,4 +1,8 @@
 import { MediasoupVideo } from "./mediasoup";
+import { acceptsRoomScope } from "$lib/room-security/scope";
+import { captureDmOwnership, allowsUnsignedDmHistory } from "./dm-ownership";
+import { acceptsFileDescriptors } from "$lib/room-security/file-descriptor";
+import { profileDeliveryRoom } from "$lib/room-security/profile-route";
 import {
   cachePluginSenderName,
   immediatePluginSenderName,
@@ -38,6 +42,7 @@ import {
   updateMessageStatus,
   getMessage,
   getAllRooms,
+  getRoom,
   getRoomParticipants,
   addRoomParticipant,
   removeRoomParticipant,
@@ -79,9 +84,16 @@ import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
 import { verifyIncoming } from "./verify-incoming";
+import { LiveUpdateAdmission } from "../room-security/live-updates";
+
+const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
 import { WORKLET_URL } from "../audio/worklet-url";
-import { requireSession } from "../identity/identity";
+import { requireSession, onIdentityLock } from "../identity/identity";
+import { captureSessionGuard } from "../identity/session-guard";
+import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
+import { isLegacyArchive, requireWritableRoom } from "$lib/room-security/legacy-archive";
+import { hydrateLegacyAttachments } from "./files.svelte";
 import { deviceKeySeed } from "./device-key";
 import { signSfuJoin } from "./sfu-auth";
 import { prepareOutgoingText } from "./outgoing-text";
@@ -143,6 +155,7 @@ import {
   dmPeerDid,
   dmPeerDidForRoom,
   ensureDmRoomForPeer,
+  sendDmFrame,
   flushQueuedDmForConnectedPeers,
   flushQueuedDmForPeer,
   joinPhonebookDmRooms,
@@ -157,10 +170,10 @@ import {
   _resetAttachmentHydration,
   INLINE_FILE_MAX_BYTES,
   stripAndAdoptInlineFiles,
-  fileFingerprint,
   initFiles,
   maybePeerIdFromSenderId,
   shouldAutoDownload,
+  fileRoomForPeer,
   withFileTransfer,
 } from "./files.svelte";
 import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
@@ -607,7 +620,7 @@ if (import.meta.env.DEV && typeof window !== "undefined") {
  * binding lands. Bounded: an unbound peer must not be able to make us buffer
  * without limit.
  */
-type PendingDm = { payload: DmPayload };
+type PendingDm = { payload: DmPayload; room: string };
 const _pendingDmByPeer = new Map<string, PendingDm[]>();
 const MAX_PENDING_DM_PER_PEER = 32;
 
@@ -615,7 +628,7 @@ function _replayPendingDm(peerId: string, senderDid: string): void {
   const pending = _pendingDmByPeer.get(peerId);
   if (!pending?.length) return;
   _pendingDmByPeer.delete(peerId);
-  for (const envelope of pending) _handleDmChat(peerId, senderDid, envelope);
+  for (const envelope of pending) _handleDmChat(peerId, senderDid, envelope, envelope.room);
 }
 
 /**
@@ -645,18 +658,34 @@ function _setPeerDid(peerId: string, did: string): void {
   // first connection that only lands here, once the profile has arrived.
   _announceStoredFilesTo(peerId).catch(() => {});
 }
-const _seededByFingerprint = new Map<string, FileDescriptor>();
 
 export const _dtln = new DtlnProcessor();
 // The 8 MB worklet is loaded lazily on first voice use (waitUntilReady kicks
 // init); at startup we only warm the service-worker cache for it, off the
 // critical path, so the first call doesn't also pay the download.
-const warmWorkletCache = () => void fetch(WORKLET_URL).catch(() => {});
+// Consume the body too: an unread worker-served stream keeps Chromium's old
+// worker busy and can delay even skipWaiting() activation for five minutes.
+const warmWorkletCache = () => void fetch(WORKLET_URL)
+  .then((response) => response.arrayBuffer())
+  .catch(() => {});
 if (typeof requestIdleCallback === "function") requestIdleCallback(warmWorkletCache);
 else setTimeout(warmWorkletCache, 3000);
 export const _transport = new LibP2PTransport();
+function currentIdentitySession() {
+  try { return requireSession(); } catch { return null; }
+}
+_transport.setDmIntroduction(() => {
+  try { return requireSession(); } catch { return null; }
+}, async (peer, did) => {
+  const previous = _peerIdToDid.get(peer);
+  if (previous && previous !== did) throw new Error("Conflicting device identity");
+  _setPeerDid(peer, did);
+  await ensureDmRoomForPeer(did);
+  _replayPendingDm(peer, did);
+});
 export const _voice = new LibP2PVoice(_transport, _dtln);
 export const _video = new MediasoupVideo();
+_video.setRoomAdmission((room, nonce, peer) => _transport.sfuAdmission(room, nonce, peer));
 _video.setJoinSigner((nonce, room, peer) =>
   signSfuJoin(_ephemeralSession ? quickSessionSeed() : deviceKeySeed(), nonce, room, peer)
 );
@@ -810,9 +839,11 @@ export function applyMessageStatus(
  */
 async function _acceptableReceipts(
   peerId: string,
-  messageIds: string[]
+  messageIds: string[],
+  channelRoom: string,
 ): Promise<string[]> {
   if (!_peerIdToDid.get(peerId)) return [];
+  if (await dmConversationCodeAsync(peerId) !== channelRoom || !_transport.isRoomPeer(channelRoom, peerId)) return [];
   return _receiptsForDmWith(peerId, messageIds);
 }
 
@@ -826,6 +857,8 @@ async function _receiptsForDmWith(
   who: string,
   messageIds: string[]
 ): Promise<string[]> {
+  const session = currentIdentitySession();
+  if (!session) return [];
   const roomCode = await dmConversationCodeAsync(who).catch(() => null);
   if (!roomCode) return [];
   // One transaction, no decryption: roomCode is a clear field. Reading these
@@ -840,6 +873,7 @@ async function _receiptsForDmWith(
   // sender currently had on screen, which is exactly when they are watching
   // the ticks.
   const blindedRoomCode = await blindValue(roomCode);
+  if (currentIdentitySession() !== session) return [];
   return ids.filter((id) => {
     const local = transportState.messages.find((m) => m.id === id);
     if (local) return local.roomCode === roomCode;
@@ -971,7 +1005,7 @@ function _sendRoomName(peerId?: string): void {
     // who knows our permanent peerId can - so an ungated welcome handed the
     // join secret for the room on screen to whoever turned up.
     if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
-    _transport.send(peerId, payload);
+    _transport.sendRoom(peerId, roomCode, payload);
   } else _transport.broadcast(payload, roomCode);
 }
 
@@ -1035,8 +1069,17 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     return true;
   };
 
+  const sendProfileTo = async (pid: string): Promise<void> => {
+    const room = profileDeliveryRoom(_transport.rooms(), pid, (r) => _transport.peersInRoom(r));
+    if (room === null || !sendTo(pid)) return;
+    const delivered = await (room === undefined
+      ? _transport.send(pid, payload)
+      : _transport.sendRoom(pid, room, payload)).catch(() => false);
+    if (!delivered) _profileEcho.forget(pid);
+  };
+
   if (peerId) {
-    if (sendTo(peerId)) _transport.send(peerId, payload);
+    await sendProfileTo(peerId);
     return;
   }
 
@@ -1046,10 +1089,11 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   // when the gossipsub mesh had not formed yet - which is why a changed
   // nickname or avatar often never showed up for anyone.
   for (const room of _transport.rooms()) {
+    if (_transport.rooms().some((r) => _transport.isSecureRoom(r)) && !_transport.isSecureRoom(room)) continue;
     _transport.broadcast(payload, room);
   }
   for (const pid of _transport.peers()) {
-    if (sendTo(pid)) _transport.send(pid, payload).catch(() => {});
+    void sendProfileTo(pid);
   }
 }
 
@@ -1358,8 +1402,8 @@ async function _sendDigestForRoom(
       d: { watermarks: Object.keys(watermarks).length },
     })
   );
-  await _transport.send(
-    peerId,
+  await _transport.sendRoom(
+    peerId, roomCode,
     encode({ type: MessageType.SyncDigest, roomCode, watermarks })
   );
 }
@@ -1587,7 +1631,7 @@ async function _pushMissingTo(
       if (m.type !== MessageType.File || !m.meta?.files?.length) return m;
       const files = await Promise.all(
         m.meta.files.map(async (f) => {
-          if (f.size > INLINE_FILE_MAX_BYTES) return f;
+          if (f.encryption || roomCode.startsWith("rd2_") || roomCode.startsWith("dm-") || f.size > INLINE_FILE_MAX_BYTES) return f;
           const stored = (await getAttachmentsByInfoHash(f.infoHash)).find(
             (a) => a.data
           );
@@ -1626,8 +1670,8 @@ async function _pushMissingTo(
   if (cur.length) batches.push(cur);
 
   for (let i = 0; i < batches.length; i++) {
-    _transport.send(
-      peerId,
+    _transport.sendRoom(
+      peerId, roomCode,
       encode({
         type: MessageType.SyncBatch,
         roomCode,
@@ -1638,7 +1682,7 @@ async function _pushMissingTo(
     );
   }
 
-  _transport.send(peerId, encode({ type: MessageType.SyncComplete, roomCode }));
+  _transport.sendRoom(peerId, roomCode, encode({ type: MessageType.SyncComplete, roomCode }));
 }
 
 async function _handleSyncBatch(
@@ -1654,6 +1698,7 @@ async function _handleSyncBatch(
   /** Where this frame sits in its push - for the syncing pill, nothing else. */
   progress?: { batchIndex: number; totalBatches: number }
 ): Promise<void> {
+  const guard = captureDmOwnership();
   // Bind incoming history to the room named in the (signed-message-bearing)
   // batch, and only if we actually joined it - a peer cannot inject history
   // into whatever room the receiver currently has open.
@@ -1698,14 +1743,14 @@ async function _handleSyncBatch(
       const expected = await dmConversationCodeAsync(fromPeerId).catch(
         () => null
       );
+      guard();
       if (expected !== roomCode) return;
       // expected === roomCode already proves fromDid resolved; be explicit.
       unsignedFrom = fromDid;
     }
   }
   const allowUnsignedFor = (m: WireChatMessage) =>
-    unsignedFrom !== null &&
-    (unsignedFrom === "*" || m.senderId === unsignedFrom);
+    allowsUnsignedDmHistory(m, unsignedFrom, live);
   // Past the membership checks, so a frame we would refuse whole draws
   // nothing; before verification, because the pill is about the push being
   // in flight, and a frame this size takes real time to verify.
@@ -1724,6 +1769,7 @@ async function _handleSyncBatch(
     )
   );
   const verified = messages.filter((_, i) => verdicts[i].ok);
+  guard();
   if (verified.length < messages.length) {
     const reasons: Record<string, number> = {};
     for (const v of verdicts) {
@@ -1894,9 +1940,11 @@ async function _handleSyncBatch(
   // Re-delivery of the same message by the same sender still overwrites,
   // which is what makes sync idempotent.
   const known = await messageClearFieldsByIds(usable.map((w) => w.id));
+  guard();
   // messageClearFieldsByIds returns blinded roomCode and senderId, so we need
   // to blind the wire values before comparing.
   const blindedRoomCode = await blindValue(roomCode);
+  guard();
   // Blind all wire sender IDs for the comparison; usable may be large.
   const blindedSenderIds = new Map<string, Promise<string>>();
   for (const w of usable) {
@@ -1907,6 +1955,7 @@ async function _handleSyncBatch(
   const resolved = new Map<string, string>();
   for (const [did, promise] of blindedSenderIds) {
     resolved.set(did, await promise);
+    guard();
   }
   const hijacks = usable.filter((w) => {
     const held = known.get(w.id);
@@ -1947,7 +1996,8 @@ async function _handleSyncBatch(
   // those before dropping the duplicate - the descriptor they are checked
   // against (infoHash, size) is inside the signature that just verified.
   for (const w of duplicates) {
-    stripAndAdoptInlineFiles(wireToMessage(w, roomCode));
+    await ensureMessageAttachmentOwnership(w.id, guard);
+    guard();
   }
   if (!usable.length) return;
 
@@ -1978,7 +2028,13 @@ async function _handleSyncBatch(
     )
   );
 
-  await bulkPutMessages(fullMessages);
+  guard();
+  await bulkPutMessages(fullMessages, guard);
+  guard();
+  for (const message of fullMessages) {
+    await ensureMessageAttachmentOwnership(message.id, guard);
+    guard();
+  }
 
   // Backfilled plugin updates cannot be folded onto a cached state (the fold
   // order is global, they may sort BEFORE updates already applied) - evict
@@ -2022,7 +2078,8 @@ async function _handleSyncBatch(
     if (!Number.isSafeInteger(m.lamport) || m.lamport < 0) continue;
     const floor = rejectedFloor.get(m.senderId);
     if (floor === undefined || m.lamport < floor) {
-      await setWatermark(m.roomCode, m.senderId, m.lamport);
+      await setWatermark(m.roomCode, m.senderId, m.lamport, guard);
+      guard();
     }
   }
 
@@ -2689,7 +2746,12 @@ function _broadcastLeaveRoom(): Promise<void> {
  * relays; local copies are untouched, and the rejectedFloor machinery in
  * _handleSyncBatch keeps watermarks honest about what was refused.
  */
-const _verifyIncoming = verifyIncoming;
+const _verifyIncoming: typeof verifyIncoming = async (wire, opts = {}) => {
+  if (wire.type === MessageType.File && !acceptsFileDescriptors(opts.room, wire.meta?.files)) {
+    return { ok: false, reason: "bad-signature" };
+  }
+  return verifyIncoming(wire, opts);
+};
 
 /** Every id that means "me". Shared so the announce and mention checks agree. */
 function _selfIds(): string[] {
@@ -2721,12 +2783,15 @@ async function _handleChatMessage(
   roomCodeOverride?: string,
   receivedFromPeerId?: string
 ): Promise<void> {
+  const guard = captureDmOwnership();
   // Never guess the room from what is on screen: an echoed or replayed
   // frame arriving without attribution would be filed - and PERSISTED -
   // into whichever room the user happens to be viewing.
   const roomCode = roomCodeOverride;
   if (!roomCode) return;
-  if (!roomCode) return;
+  if ((roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) &&
+      wire.type === MessageType.File &&
+      (!wire.meta?.files?.length || wire.meta.files.some(file => !file.encryption))) return;
 
   // DM rooms now start with "dm-" (hash-based)
   // We don't need to ensure room here - it should already exist from sender context
@@ -2794,6 +2859,7 @@ async function _handleChatMessage(
   const isNewMessage =
     !transportState.messages.some((m) => m.id === msg.id) &&
     !(await getMessage(msg.id));
+  guard();
 
   // Only a genuinely new message is written: re-putting a replayed one
   // would overwrite the stored row with this handler's view of it.
@@ -2803,7 +2869,7 @@ async function _handleChatMessage(
   // would ever send it again.
   if (isNewMessage) {
     try {
-      await putMessage(msg);
+      await putMessage(msg, guard);
     } catch (err) {
       console.warn("[chat] store failed, not claiming the message:", err);
       return;
@@ -2820,7 +2886,9 @@ async function _handleChatMessage(
       const payload = pluginPayload;
       if (payload?.pluginId && payload.cardId) {
         const { getPlugin } = await import("../plugins/registry");
+        guard();
         const plugin = await getPlugin(payload.pluginId);
+        guard();
         if (plugin) {
           foldUpdate(payload.cardId, plugin, {
             id: msg.id,
@@ -2842,8 +2910,9 @@ async function _handleChatMessage(
   // Same rule as the sync path: a NaN watermark can never be advanced past
   // (every comparison against it is false), so it would silently retire that
   // sender's history in this room.
+  guard();
   if (Number.isSafeInteger(msg.lamport) && msg.lamport >= 0) {
-    setWatermark(msg.roomCode, msg.senderId, msg.lamport).catch(() => {});
+    setWatermark(msg.roomCode, msg.senderId, msg.lamport, guard).catch(() => {});
   }
   refreshUnreadCount(msg.roomCode).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
@@ -2876,28 +2945,7 @@ async function _handleChatMessage(
   // sets of rows.
   if (!_ensuringAttachmentRows.has(msg.id)) {
     _ensuringAttachmentRows.add(msg.id);
-    getAttachmentsByMessage(msg.id)
-      .then((existing) => {
-        if (existing.length > 0) return;
-        const now = Date.now();
-        return Promise.all(
-          msg.meta!.files.map((file) =>
-            putAttachment({
-              id: crypto.randomUUID(),
-              roomCode: msg.roomCode,
-              messageId: msg.id,
-              filename: file.filename,
-              mimeType: file.mimeType,
-              size: file.size,
-              infoHash: file.infoHash,
-              width: file.width,
-              height: file.height,
-              status: "pending",
-              createdAt: now,
-            })
-          )
-        );
-      })
+    ensureMessageAttachmentOwnership(msg.id, guard)
       .catch(() => {})
       .finally(() => _ensuringAttachmentRows.delete(msg.id));
   }
@@ -2968,6 +3016,8 @@ _transport.on("status", (status) => {
 _transport.on("roomPeers", (room, peerIds) => {
   if (!_transport.rooms().includes(room)) return;
   for (const pid of peerIds) {
+    _sendProfile(pid);
+    flushQueuedDmForPeer(pid).catch(() => {});
     // The other half of the connect handler's gate. Everything there that
     // names a room code is refused for a peer the relay had not yet placed
     // in the room, and "connect" never fires again for a peer we are already
@@ -3055,8 +3105,8 @@ async function _sendRoomUsers(
       ? transportState.roomUsers
       : await getRoomParticipants(roomCode);
   const participants = [...new Set([...known, selfDid])];
-  _transport.send(
-    peerId,
+  _transport.sendRoom(
+    peerId, roomCode,
     encode({ type: MessageType.RoomUsersSync, participants, roomCode })
   );
 }
@@ -3166,6 +3216,7 @@ export async function deliverMailboxBatch(
   senderDid: string,
   data: Uint8Array
 ): Promise<void> {
+  const guard = captureDmOwnership();
   const decoded = decode(data) as {
     type?: string;
     roomCode?: string;
@@ -3175,11 +3226,12 @@ export async function deliverMailboxBatch(
   if (decoded?.type !== MessageType.SyncBatch) return;
   if (!Array.isArray(decoded.messages)) return;
   const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
+  guard();
   if (!roomCode || roomCode !== decoded.roomCode) return;
   // The batch handler refuses a room we have not joined, and a conversation
   // whose first contact arrives through the mailbox has never been joined.
   await ensureDmRoomForPeer(senderDid);
-  _transport.joinRoom(roomCode);
+  guard();
   await _handleSyncBatch(
     roomCode,
     decoded.messages,
@@ -3220,9 +3272,15 @@ function _depositDmReceipt(senderDid: string, envelope: Uint8Array): void {
 function _handleDmChat(
   peerId: string,
   senderDid: string,
-  envelope: { payload: DmPayload }
+  envelope: { payload: DmPayload },
+  channelRoom: string,
 ): void {
-  void _handleDmChatAsync(peerId, senderDid, envelope).catch(console.error);
+  const guard = captureDmOwnership();
+  void dmConversationCodeAsync(senderDid).then((expected) => {
+    guard();
+    if (expected !== channelRoom || !_transport.isRoomPeer(channelRoom, peerId)) return;
+    return _handleDmChatAsync(peerId, senderDid, envelope);
+  }).catch(console.error);
 }
 
 function _handleDmChatAsync(
@@ -3237,10 +3295,11 @@ function _handleDmChatAsync(
    */
   viaMailbox = false
 ): Promise<void> {
+  const guard = captureDmOwnership();
   return (async () => {
     const roomCode = await ensureDmRoomForPeer(peerId);
+    guard();
     if (!roomCode) return;
-    _transport.joinRoom(roomCode);
 
     const reaction = envelope.payload.reaction;
     // Timestamp sanitization affects display only, never the sequence stored
@@ -3295,12 +3354,14 @@ function _handleDmChatAsync(
     // as a duplicate when you happened to be looking at that DM.
     let readSent = false;
     if (!(await getMessage(msg.id))) {
-      await putMessage(msg);
+      guard();
+      await putMessage(msg, guard);
       // Without a watermark row a DM digest carries an empty map on both
       // sides and _handleDigest concludes nothing is missing - DM history
       // had no sync-repair at all.
-      await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
+      await setWatermark(msg.roomCode, msg.senderId, msg.lamport, guard);
       await refreshDmRooms();
+      guard();
       transportState.dmVersion += 1;
       const activeDid = peerIdToDid(transportState.activeDmPeerId ?? "");
       const isViewingThisDm =
@@ -3331,7 +3392,8 @@ function _handleDmChatAsync(
         document.visibilityState === "visible";
       if (onScreen && !isViewingThisDm && dmPanelIsShowing(roomCode)) {
         readSent = true;
-        await markRoomSeen(roomCode, msg.lamport);
+        await markRoomSeen(roomCode, msg.lamport, guard);
+        guard();
         const roomIndex = roomsStore.dmRooms.findIndex(
           (r) => r.roomCode === roomCode
         );
@@ -3345,6 +3407,7 @@ function _handleDmChatAsync(
           };
         }
         await refreshDmRooms();
+        guard();
         transportState.dmVersion += 1;
         // No stream to reply on when the DM came out of the mailbox. Calling
         // send() with a DID makes peerIdFromString throw inside libp2p, and
@@ -3360,7 +3423,7 @@ function _handleDmChatAsync(
           );
         } else {
           _transport
-            .send(peerId, encodeDmReadEnvelope([envelope.payload.id]))
+            .sendRoom(peerId, roomCode, encodeDmReadEnvelope([envelope.payload.id]))
             .catch(() => {});
         }
       }
@@ -3368,12 +3431,13 @@ function _handleDmChatAsync(
 
     // A read outranks an ack on the sender's side, so when one just went
     // out the ack would only cost a second mailbox deposit.
+    guard();
     if (readSent) return;
     if (viaMailbox) {
       _depositDmReceipt(senderDid, encodeDmAckEnvelope(envelope.payload.id));
     } else {
       _transport
-        .send(peerId, encodeDmAckEnvelope(envelope.payload.id))
+        .sendRoom(peerId, roomCode, encodeDmAckEnvelope(envelope.payload.id))
         .catch(() => {});
     }
   })();
@@ -3429,17 +3493,20 @@ async function _peerSharesRoomWithUs(peerId: string): Promise<boolean> {
 }
 
 _transport.on("message", (peerId, data, room) => {
+  let guard: () => void;
+  try { guard = captureDmOwnership(); } catch { return; }
   // Before ANY branch: the DM and file-signal paths return early, and a peer
   // we only ever DM with would otherwise read as permanently app-silent -
   // making the repair tick send it a digest every 15s for the lifetime of the
   // connection, the exact busywork the tick promises not to do.
   _lastAppInbound.set(peerId, Date.now());
-  if (room === null) {
+  if (room?.startsWith("dm-") && _transport.isRoomPeer(room, peerId)) {
     const envelope = parseDmEnvelope(data);
     if (envelope) {
       if (envelope.type === "ack") {
-        void _acceptableReceipts(peerId, [envelope.messageId])
+        void _acceptableReceipts(peerId, [envelope.messageId], room)
           .then((ids) => {
+            guard();
             for (const id of ids) applyMessageStatus(id, "delivered");
           })
           .catch(() => {});
@@ -3447,8 +3514,9 @@ _transport.on("message", (peerId, data, room) => {
       }
 
       if (envelope.type === "read") {
-        void _acceptableReceipts(peerId, envelope.messageIds)
+        void _acceptableReceipts(peerId, envelope.messageIds, room)
           .then((ids) => {
+            guard();
             if (!ids.length) return;
             for (const id of ids) applyMessageStatus(id, "read");
             // The reader only acks the page they had loaded; a read at lamport
@@ -3468,18 +3536,19 @@ _transport.on("message", (peerId, data, room) => {
       if (!senderDid) {
         const pending = _pendingDmByPeer.get(peerId) ?? [];
         if (pending.length < MAX_PENDING_DM_PER_PEER) {
-          pending.push(envelope);
+          pending.push({ ...envelope, room });
           _pendingDmByPeer.set(peerId, pending);
         }
         return;
       }
-      _handleDmChat(peerId, senderDid, envelope);
+      _handleDmChat(peerId, senderDid, envelope, room);
       return;
     }
   }
 
   try {
     const decoded = decode(data);
+    if (!acceptsRoomScope(decoded, room)) return;
     if (isFileSignalWireMessage(decoded)) {
       if (decoded.payload.kind === "file-seeder") {
         // Unsolicited: a file-seeder is a direct send, not tied to a room or
@@ -3492,15 +3561,19 @@ _transport.on("message", (peerId, data, room) => {
         // for unknown hashes because peers announce their inventory on
         // connect, before we have opened the room the file belongs to.
         const file = decoded.payload.file;
-        _peerSharesRoomWithUs(peerId)
-          .then((shared) => {
+        fileRoomForPeer(peerId, file.infoHash, room)
+          .then(async (shared) => {
             if (!shared) return;
-            _fileTransport.registerSeeder(file, peerId);
+            const stored = (await getAttachmentsByInfoHash(file.infoHash)).find(a => a.roomCode === shared);
+            if (!stored || !acceptsFileDescriptors(shared, [stored])) return;
+            // The signed stored message owns the descriptor, not a seeder's
+            // unsigned inventory announcement (which may substitute its key).
+            _fileTransport.registerSeeder(stored, peerId);
             if (
-              shouldAutoDownload(file.mimeType, file.size) &&
+              shouldAutoDownload(stored.mimeType, stored.size) &&
               transportState.fileTransfers.has(file.infoHash)
             ) {
-              _fileTransport.ensureDownload(file);
+              _fileTransport.ensureDownload(stored);
             }
           })
           .catch(() => {});
@@ -3519,8 +3592,7 @@ _transport.on("message", (peerId, data, room) => {
         // the link after the candidates, or after the next attempt's.
         const next = (_fileSignalQueue.get(peerId) ?? Promise.resolve())
           .then(async () => {
-            if (!(await _peerSharesRoomWithUs(peerId))) return;
-            if (!(await _haveFileFor(signal.infoHash))) return;
+            if (!(await fileRoomForPeer(peerId, signal.infoHash, room ?? null))) return;
             _fileTransport.handleSignal(peerId, signal);
           })
           .catch(() => {});
@@ -3551,9 +3623,11 @@ _transport.on("message", (peerId, data, room) => {
         _handleCallState(peerId, msg);
         break;
       case MessageType.VoiceRedial:
+        if (transportState.callRoomCode && _transport.isSecureRoom(transportState.callRoomCode) && room !== transportState.callRoomCode) break;
         _voice.handleRedialRequest(peerId);
         break;
       case MessageType.VoiceSignal:
+        if (transportState.callRoomCode && _transport.isSecureRoom(transportState.callRoomCode) && room !== transportState.callRoomCode) break;
         _voice.handleWireSignal(peerId, msg.signal);
         break;
       case MessageType.WatchPresence:
@@ -3568,6 +3642,7 @@ _transport.on("message", (peerId, data, room) => {
         const ephemeralMsg = msg as WirePluginEphemeral;
         _verifyIncoming(ephemeralMsg as unknown as WireChatMessage, { room })
           .then((v) => {
+            guard();
             if (!v.ok) {
               console.warn(
                 "[app] dropped ephemeral plugin message with invalid signature from",
@@ -3604,8 +3679,11 @@ _transport.on("message", (peerId, data, room) => {
               );
               const cardId = payload?.cardId;
               if (!payload || !cardId) return;
+              if (!liveUpdateAdmission.accept(room, ephemeralMsg.senderDid ?? "",
+                peerIdToDid(peerId), ephemeralMsg.id, ephemeralMsg.timestamp)) return;
               if (!_checkEphemeralFloodCap(payload.pluginId, peerId)) return;
               void getPlugin(payload.pluginId).then((plugin) => {
+                guard();
                 if (!plugin) return;
                 foldUpdate(cardId, plugin, {
                   id: ephemeralMsg.id,
@@ -3617,7 +3695,7 @@ _transport.on("message", (peerId, data, room) => {
                   ephemeral: true,
                   roomCode: room,
                 });
-              });
+              }).catch(() => {});
             } catch (err) {
               console.warn("[app] failed to fold ephemeral update:", err);
             }
@@ -3669,6 +3747,7 @@ _transport.on("message", (peerId, data, room) => {
         }
         _verifyIncoming(msg, { room })
           .then((v) => {
+            guard();
             if (v.ok) {
               _handleChatMessage(msg, room, peerId).catch(() => {});
               return;
@@ -3815,8 +3894,14 @@ async function _joinSavedRooms(): Promise<void> {
   for (const room of rooms) {
     // DMs are handled by joinPhonebookDmRooms, which derives the room code
     // from the DID rather than trusting a stored one.
-    if (room.roomCode.startsWith("dm-")) continue;
-    _transport.joinRoom(room.roomCode);
+    if (isLegacyArchive(room.roomCode)) continue;
+    try {
+      joinStoredRoom(_transport, room.roomCode, room);
+    } catch {
+      // One damaged invitation must not prevent other rooms reconnecting.
+      // Never include the record or secret in diagnostics.
+      console.warn("[room] skipped a saved room with an invalid invitation");
+    }
   }
   // Not awaited in the join order any more: housekeeping, once per session.
   void _sweepInactiveParticipants(rooms);
@@ -3830,6 +3915,7 @@ async function _sweepInactiveParticipants(
   rooms: { roomCode: string }[]
 ): Promise<void> {
   for (const room of rooms) {
+    if (isLegacyArchive(room.roomCode)) continue;
     const removed = await cleanupInactiveParticipants(room.roomCode).catch(
       () => []
     );
@@ -3855,7 +3941,29 @@ export function beginConversationOpen(): () => boolean {
 }
 
 export async function joinRoom(roomCode: string): Promise<boolean> {
+  if (roomCode.startsWith("r2_")) {
+    throw new Error("Import the invitation before opening the room.");
+  }
   const stillCurrent = beginConversationOpen();
+  if (isLegacyArchive(roomCode)) {
+    const saved = await getRoom(roomCode);
+    if (!stillCurrent()) return false;
+    if (!saved || saved.roomSecret) throw new Error("Legacy archive unavailable");
+    if (transportState.roomCode) _syncView.drop(transportState.roomCode);
+    transportState.roomCode = roomCode;
+    transportState.roomName = saved.name;
+    transportState.messages = [];
+    transportState.roomUsers = [];
+    transportState.connected = false;
+    transportState.connecting = false;
+    transportState.error = null;
+    transportState.chatMode = "room";
+    transportState.activeDmPeerId = null;
+    await _loadHistory(roomCode, stillCurrent);
+    if (!stillCurrent()) return false;
+    await hydrateLegacyAttachments(roomCode, stillCurrent);
+    return stillCurrent();
+  }
   // Before the relay wait too: the chat view's overlay reads this, and a
   // room opened while the relay was still dialling showed no sign of it.
   transportState.connecting = true;
@@ -3863,6 +3971,7 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
     await connect();
   }
 
+  if (!stillCurrent()) return false;
   if (!transportState.relayConnected) {
     transportState.error = "Transport not connected to relay";
     transportState.connecting = false;
@@ -3895,7 +4004,9 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
       console.warn("[room] attachment hydrate/seed failed:", err)
     );
     if (!stillCurrent()) return false;
-    _transport.joinRoom(roomCode);
+    const savedRoom = await getRoom(roomCode);
+    if (!stillCurrent()) return false;
+    joinStoredRoom(_transport, roomCode, savedRoom);
     transportState.connected = true;
     transportState.chatMode = "room";
     transportState.activeDmPeerId = null;
@@ -3999,6 +4110,14 @@ async function _leaveCurrentRoom(): Promise<void> {
   beginConversationOpen();
   const roomCode = transportState.roomCode;
   if (!roomCode) return;
+  if (isLegacyArchive(roomCode)) {
+    transportState.roomCode = null;
+    transportState.roomName = "";
+    transportState.messages = [];
+    transportState.roomUsers = [];
+    transportState.connected = false;
+    return;
+  }
   const selfDid = identityStore.did ?? _transport.selfId();
   if (selfDid) {
     // Await the publish: unsubscribing right after would drop the message and
@@ -4025,6 +4144,8 @@ export function disconnectTransport(): void {
 }
 
 function _disconnectWithoutBroadcasting(): void {
+  beginConversationOpen();
+  _syncView.clear();
   rec(ev("session.end"));
   for (const transfer of transportState.fileTransfers.values()) {
     if (transfer.blobURL) URL.revokeObjectURL(transfer.blobURL);
@@ -4083,6 +4204,17 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.dmQueuedP2POnly = new Set();
 }
 
+onIdentityLock(_disconnectWithoutBroadcasting);
+
+/** Restore ciphertext locally before asking peers, using the authenticated
+ * transfer publication path shared by attachment hydration. */
+export async function restoreFileAttachment(attachment: Attachment): Promise<boolean> {
+  const guard = captureSessionGuard();
+  const restored = await _fileTransport.restoreEncryptedFile(attachment, attachment.data);
+  guard();
+  return restored;
+}
+
 /**
  * Chat used to ride gossipsub alone, and a publish into a dead or still-forming
  * mesh is silently dropped (allowPublishToZeroTopicPeers) - only the slow
@@ -4131,7 +4263,7 @@ function _broadcastChatWire(wire: WireChatMessage, roomCode: string): boolean {
   for (const pid of _transport.peers()) {
     const did = _peerIdToDid.get(pid);
     if (!did || !members.has(did)) continue;
-    _transport.send(pid, batch).catch(() => {});
+    _transport.sendRoom(pid, roomCode, batch).catch(() => {});
   }
   // "Handed to the network", not "delivered": a node with at least one peer
   // the relay places in this room. With neither, the publish went into a
@@ -4170,26 +4302,33 @@ async function _sendDmBatch(
   wire: WireChatMessage,
   batchOf: (w: WireChatMessage) => Uint8Array
 ): Promise<"sent" | "sending"> {
+  const guard = captureSessionGuard();
   const peerDid = await dmPeerDidForRoom(roomCode);
+  guard();
   if (!peerDid) throw new Error("Cannot send yet: still verifying who this peer is.");
   const batch = batchOf(wire);
   const peerId = didToPeerId(peerDid);
-  if (peerId && (await _transport.send(peerId, batch))) {
+  if (peerId && (await sendDmFrame(peerId, batch))) {
+    guard();
     applyMessageStatus(wire.id, "sent");
     return "sent";
   }
   // Queued, so the clock stays on the bubble until the flush (or the peer's
   // own digest) says otherwise.
+  guard();
   await queueDmMessage(peerDid, batch, wire.id);
+  guard();
   // The mailbox copy drops the inline bytes: they exist to save a round trip
   // for a peer who is online, and they are what pushes an ordinary photo
   // past the largest bucket the mailbox will hold.
   const { depositDmToMailbox } = await import("./mailbox.svelte");
+  guard();
   const result = await depositDmToMailbox(
     peerDid,
     batchOf(_stripInlineFiles(wire)),
     "batch"
   );
+  guard();
   noteMailboxDeposit(wire.id, result);
   return result === "sent" ? "sent" : "sending";
 }
@@ -4198,6 +4337,8 @@ export async function sendMessage(
   text: string,
   options: SendMessageOptions = {}
 ): Promise<void> {
+  requireWritableRoom(transportState.roomCode);
+  const assertCurrent = captureSessionGuard();
   if (transportState.chatMode === "dm") {
     await sendDirectMessage(text, { replyTo: options.replyTo });
     return;
@@ -4211,9 +4352,11 @@ export async function sendMessage(
   }
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
+  assertCurrent();
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
   const lamport = await nextMessageLamport(roomCode);
+  assertCurrent();
 
   let msg: Message = {
     id: crypto.randomUUID(),
@@ -4244,8 +4387,9 @@ export async function sendMessage(
   // Persist before publishing: a storage failure must leave a retryable draft,
   // not a sent message that the composer reports as failed.
   msg.status = "sending";
-  await putMessage(msg);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
+  await putMessage(msg, assertCurrent);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
+  assertCurrent();
   msg.status = _broadcastChatWire(messageToWire(msg), roomCode)
     ? "sent"
     : "sending";
@@ -4285,7 +4429,18 @@ export async function sendFiles(
   options: Pick<SendMessageOptions, "replyTo"> & { roomCode?: string } = {}
 ): Promise<void> {
   const roomCode = options.roomCode ?? transportState.roomCode;
+  requireWritableRoom(roomCode);
   if (!roomCode) throw new Error("Open a conversation before sending");
+  const session = requireSession();
+  const assertCurrent = () => {
+    if (requireSession() !== session) throw new Error("Identity changed");
+  };
+  if (roomCode.startsWith("dm-")) {
+    const did = await dmPeerDidForRoom(roomCode);
+    if (!did || await ensureDmRoomForPeer(did) !== roomCode) throw new Error("DM identity unavailable");
+  }
+  if (!_transport.rooms().includes(roomCode)) throw new Error("Not in a room");
+  assertCurrent();
   const prepared = prepareOutgoingText(text, files);
   files = prepared.files;
   text = prepared.text;
@@ -4293,21 +4448,10 @@ export async function sendFiles(
 
   const seeded: FileDescriptor[] = [];
   const sourceByInfoHash = new Map<string, File>();
-  // Small files also travel inside the message (wire copy only, never the
-  // stored one): they render for everyone like a CDN gif, seeders or not.
-  const _inlineByHash = new Map<string, string>();
-
   for (const file of files) {
-    const fingerprint = await fileFingerprint(file);
-    const existing = _seededByFingerprint.get(fingerprint);
-    if (existing) {
-      seeded.push(existing);
-      sourceByInfoHash.set(existing.infoHash, file);
-      continue;
-    }
-
-    const [newSeed] = await _fileTransport.seedFiles([file]);
-    _seededByFingerprint.set(fingerprint, newSeed);
+    assertCurrent();
+    const [newSeed] = await _fileTransport.seedEncryptedFiles([file]);
+    assertCurrent();
     seeded.push(newSeed);
     sourceByInfoHash.set(newSeed.infoHash, file);
   }
@@ -4326,13 +4470,8 @@ export async function sendFiles(
     if (!source) continue;
     const dims = await measureMedia(source);
     if (dims) dimsByHash.set(seededFile.infoHash, dims);
-    const canPersistData = source.size <= MAX_PERSISTED_ATTACHMENT_BYTES;
-    if (source.size <= INLINE_FILE_MAX_BYTES) {
-      _inlineByHash.set(
-        seededFile.infoHash,
-        bytesToBase64(new Uint8Array(await source.arrayBuffer()))
-      );
-    }
+    const data = await _fileTransport.persistableCiphertext(seededFile.infoHash, MAX_PERSISTED_ATTACHMENT_BYTES);
+    assertCurrent();
     const attachment: Attachment = {
       id: crypto.randomUUID(),
       roomCode,
@@ -4345,10 +4484,12 @@ export async function sendFiles(
       createdAt,
       width: dims?.width,
       height: dims?.height,
-      data: canPersistData ? await source.arrayBuffer() : undefined,
+      encryption: seededFile.encryption,
+      data: data ?? undefined,
     };
     attachmentIds.push(attachment.id);
-    await putAttachment(attachment);
+    await putAttachment(attachment, assertCurrent);
+    assertCurrent();
 
     withFileTransfer({
       ...seededFile,
@@ -4363,10 +4504,12 @@ export async function sendFiles(
   }
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
+  assertCurrent();
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
   // Files share the conversation's logical counter with text and cards.
   const lamport = await nextMessageLamport(roomCode);
+  assertCurrent();
 
   let msg: Message = {
     id: messageId,
@@ -4387,30 +4530,19 @@ export async function sendFiles(
   msg = signMessage(msg);
 
   const wire = messageToWire(msg);
-  if (_inlineByHash.size) {
-    wire.meta = {
-      // From the SAME dim-enriched entries the stored message carries.
-      // Rebuilding from `seeded` dropped width/height from the wire for
-      // every inline-sized file - which is every ordinary chat image - so
-      // receivers never got the dimensions and the loading skeleton only
-      // ever worked on the sender's own echo.
-      files: seeded.map((f) => {
-        const withDims = { ...f, ...dimsByHash.get(f.infoHash) };
-        const b64 = _inlineByHash.get(f.infoHash);
-        return b64 ? { ...withDims, inline: b64 } : withDims;
-      }),
-    };
-  }
+  assertCurrent();
   // Same clock as a text send; see sendMessage.
   msg.status = "sending";
-  await putMessage(msg);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
+  await putMessage(msg, assertCurrent);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
+  assertCurrent();
   if (roomCode.startsWith("dm-")) {
     msg.status = await _sendDmBatch(roomCode, wire, (w) => encode({
       type: MessageType.SyncBatch, roomCode, messages: [w],
       batchIndex: 0, totalBatches: 1, live: true,
     }));
     const { appendToDmPanel } = await import("$lib/dm-panel.svelte");
+    assertCurrent();
     appendToDmPanel(msg);
   } else {
     msg.status = _broadcastChatWire(wire, roomCode) ? "sent" : "sending";
@@ -4430,10 +4562,13 @@ export async function sendFiles(
 // path.
 export async function sendCard(
   pluginId: string,
-  payload: unknown
+  payload: unknown,
+  targetRoom?: string,
 ): Promise<string> {
-  const roomCode = transportState.roomCode;
-  if (!roomCode) {
+  const assertCurrent = captureSessionGuard();
+  const roomCode = targetRoom ?? transportState.roomCode;
+  requireWritableRoom(roomCode);
+  if (!roomCode || !_transport.rooms().includes(roomCode)) {
     throw new Error("Not in a room");
   }
 
@@ -4449,10 +4584,12 @@ export async function sendCard(
   }
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
+  assertCurrent();
   const senderName = profile?.nickname?.trim() || "Anonymous";
   const myId = identityStore.did ?? _transport.selfId();
   const ts = Date.now();
   const lamport = await nextMessageLamport(roomCode);
+  assertCurrent();
 
   const cardId = crypto.randomUUID();
   const content = JSON.stringify({ pluginId, data: payload });
@@ -4472,10 +4609,10 @@ export async function sendCard(
   // Sign the message
   msg = signMessage(msg);
 
+  await putMessage(msg, assertCurrent);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
+  assertCurrent();
   _broadcastChatWire(messageToWire(msg), roomCode);
-
-  await putMessage(msg);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
 
   if (transportState.roomCode === roomCode) {
     transportState.messages = appendSorted(transportState.messages, msg);
@@ -4498,6 +4635,8 @@ export async function sendUpdate(
   targetRoom?: string
 ): Promise<void> {
   const roomCode = targetRoom ?? transportState.roomCode;
+  const assertCurrent = captureSessionGuard();
+  requireWritableRoom(roomCode);
   if (!roomCode) {
     throw new Error("Not in a room");
   }
@@ -4514,11 +4653,13 @@ export async function sendUpdate(
   }
 
   const profile = await getOwnProfile(undefined, { skipBytes: true });
+  assertCurrent();
   const senderName = profile?.nickname?.trim() || "Anonymous";
   cachedPluginSenderName = cachePluginSenderName(
     cachedPluginSenderName,
     profile?.nickname
   );
+  assertCurrent();
   const myId = identityStore.did ?? _transport.selfId();
 
   // Ephemeral messages: check flood cap, wire-only (lamport:0), PluginEphemeral type
@@ -4554,6 +4695,7 @@ export async function sendUpdate(
   const updateTs = Date.now();
   // Updates share the conversation's logical counter.
   const lamport = await nextMessageLamport(roomCode);
+  assertCurrent();
   const content = JSON.stringify({ pluginId, cardId, data: payload });
 
   let msg: Message = {
@@ -4571,11 +4713,11 @@ export async function sendUpdate(
   // Sign the message
   msg = signMessage(msg);
 
-  _broadcastChatWire(messageToWire(msg), roomCode);
-
   // Persist non-ephemeral updates
-  await putMessage(msg);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport);
+  await putMessage(msg, assertCurrent);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
+  assertCurrent();
+  _broadcastChatWire(messageToWire(msg), roomCode);
   // View and seen-watermark belong to the OPEN room only: a widget update
   // for a background room must not paint here or mark that room read.
   if (transportState.roomCode === msg.roomCode) {
@@ -4590,6 +4732,7 @@ export async function sendUpdate(
     const { getPlugin } = await import("../plugins/registry");
     const plugin = await getPlugin(pluginId);
     if (plugin) {
+      assertCurrent();
       foldUpdate(cardId, plugin, {
         id: msg.id,
         senderId: msg.senderId,
@@ -4605,6 +4748,7 @@ export async function sendUpdate(
     console.warn("[plugins] failed to fold own update:", err);
   }
 
+  assertCurrent();
   noteRoomActivity(msg.roomCode, msg.timestamp);
 }
 
@@ -4622,9 +4766,11 @@ export function sendUpdateImmediately(
   // the user reads ANOTHER room (or a DM) must still land in the card's own
   // room - hardcoding the open room misrouted or dropped it.
   const roomCode = targetRoom ?? transportState.roomCode;
+  if (isLegacyArchive(roomCode)) return;
   if (!roomCode || (!targetRoom && transportState.chatMode === "dm")) return;
   if (!validatePluginId(pluginId).ok || !validateUpdatePayload(payload).ok)
     return;
+  const guard = captureSessionGuard();
   const msg = signMessage({
     id: crypto.randomUUID(),
     roomCode,
@@ -4644,9 +4790,9 @@ export function sendUpdateImmediately(
   // The broadcast gets the departure to connected peers immediately. Keep a
   // best-effort local copy too: after a refresh the sender must rebuild the
   // same closed/left state without waiting for another peer's next digest.
-  void putMessage(msg)
-    .then(() => setWatermark(roomCode, msg.senderId, msg.lamport))
-    .then(() => markRoomSeen(roomCode, msg.lamport))
+  void putMessage(msg, guard)
+    .then(() => { guard(); return setWatermark(roomCode, msg.senderId, msg.lamport, guard); })
+    .then(() => { guard(); return markRoomSeen(roomCode, msg.lamport, guard); })
     .catch(() => {});
 }
 
@@ -4654,6 +4800,7 @@ export function requestFileDownload(
   file: FileEntry,
   senderId?: string | null
 ): void {
+  if (isLegacyArchive(transportState.roomCode)) return;
   const peerId = senderId ? maybePeerIdFromSenderId(senderId) : null;
   if (peerId) {
     _fileTransport.registerSeeder(file, peerId);
@@ -4666,6 +4813,7 @@ export async function toggleReaction(
   emoji: string
 ): Promise<void> {
   const roomCode = transportState.roomCode;
+  requireWritableRoom(roomCode);
   if (!roomCode) return;
   // The loaded page cannot see reactions on older messages, which made
   // un-reacting there impossible: the prior comes from storage. Reaction
@@ -4728,6 +4876,7 @@ export async function loadMoreMessages(
  * page comes back.
  */
 export async function markSeen(): Promise<void> {
+  if (isLegacyArchive(transportState.roomCode)) return;
   if (typeof document !== "undefined" && document.visibilityState !== "visible")
     return;
   const roomCode = transportState.roomCode;
@@ -4854,3 +5003,4 @@ export async function measureClockSample(
 export function isRelayed(peerId: string): boolean {
   return transportState.relayedPeers.has(peerId);
 }
+import { joinStoredRoom } from "$lib/room-security/room-lifecycle";
