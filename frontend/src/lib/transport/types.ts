@@ -281,6 +281,7 @@ export type FileTransferStatus =
   | "failed";
 
 export interface FileDescriptor {
+  encryption?: import('../room-security/file-crypto').EncryptedFileDescriptor;
   infoHash: string;
   filename: string;
   mimeType: string;

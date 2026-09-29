@@ -116,8 +116,17 @@ describe("validateProfileMeta", () => {
       expect(validateProfileMeta({ bannerUrl: url }).bannerUrl).toBe(url);
     });
 
-    it("drops non-data:image URLs", () => {
-      expect(validateProfileMeta({ bannerUrl: "http://example.com/banner.jpg" }).bannerUrl).toBeUndefined();
+    it("preserves linked banners and GIFs through a serialized profile", () => {
+      for (const url of ["http://example.com/banner.jpg", "https://example.com/banner.gif?size=medium"]) {
+        const received = JSON.parse(JSON.stringify({ bannerUrl: url, bio: "Hello" }));
+        expect(validateProfileMeta(received)).toEqual({ bannerUrl: url, bio: "Hello" });
+      }
+    });
+
+    it("drops invalid URLs and non-image data", () => {
+      for (const url of ["javascript:alert(1)", "blob:https://example.com/local-only", "file:///banner.png", "not a url"]) {
+        expect(validateProfileMeta({ bannerUrl: url }).bannerUrl).toBeUndefined();
+      }
       expect(validateProfileMeta({ bannerUrl: "data:text/plain;base64,..." }).bannerUrl).toBeUndefined();
     });
 

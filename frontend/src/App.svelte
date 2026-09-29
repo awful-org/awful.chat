@@ -46,10 +46,9 @@
    *
    * The palette's parser rather than a local one: it is the only parser that
    * knows every shape a code has ever had AND strips the `web+awfl://` scheme.
-   * The manifest registers that protocol as `/r/%s`, so a tapped `web+awfl://`
-   * link arrives as an ENCODED url inside the path - which the local parser
-   * handed to normalizeRoomCode whole, and every such link opened the landing
-   * page instead of the room.
+   * The manifest registers that protocol as `/r/#%s`, keeping its encoded
+   * payload out of HTTP requests. The shared parser understands this fragment
+   * handoff as well as the older legacy-code path form.
    */
   function urlRoomCode(): string | null {
     const { pathname, hash } = window.location;
@@ -99,7 +98,7 @@
     const roomCode = urlRoomCode();
     const optional = optionalRoute(pathname);
 
-    if (roomCode) {
+    if (roomCode || pathname.startsWith("/r/")) {
       currentRoute = "app";
     } else if (optional) {
       currentRoute = optional;
@@ -126,6 +125,7 @@
       currentRoute = optional;
     } else if (
       urlRoomCode() ||
+      pathname.startsWith("/r/") ||
       pathname === "/app" ||
       pathname === "/share-target"
     ) {

@@ -1,13 +1,13 @@
 <script lang="ts">
+  import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import GifImage from "./GifImage.svelte";
   import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { formatRoomCode, newRoomCode } from "$lib/room-code";
-  import {
-    createInvite,
-    formatShortCode,
-    parseJoinInput,
-    resolveInvite,
-  } from "$lib/invite";
+  import { parseJoinInput } from "$lib/invite";
+  import { hostInvitationPairing, joinInvitationPairing } from "$lib/invite-pairing";
+  import { parseSecureInvitation } from "$lib/room-security/invitations";
+  import { onDestroy } from "svelte";
+  import QRCode from "qrcode";
   import { Check, Clipboard, Copy, LogIn, Menu, Plus, Share2 } from "@lucide/svelte";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import { Button } from "$lib/components/ui/button";
@@ -36,7 +36,14 @@
   let joinCode = $state("");
   let createdCode = $state<string | null>(null);
   let copied = $state(false);
-  // The 5-minute alias of createdCode, once asked for. See $lib/invite.
+  let qr = $state("");
+  let cancelPairing: (() => void) | undefined;
+  let hostController: AbortController | undefined;
+  let joinController: AbortController | undefined;
+  let alive = true;
+  let pairingBusy = $state(false);
+  onDestroy(() => { alive = false; hostController?.abort(); cancelPairing?.(); joinController?.abort(); });
+  // Online OPAQUE pairing is single-use and only works while this view is open.
   let shortCode = $state<string | null>(null);
   let shortCodeExpiresAt = $state(0);
   let now = $state(Date.now());
@@ -50,8 +57,7 @@
   let shortCopied = $state(false);
   let copyMenuOpen = $state(false);
   let joinError = $state<string | null>(null);
-  let legacyFallback = $state<string | null>(null);
-  $effect(() => { joinCode; legacyFallback = null; joinError = null; });
+  $effect(() => { joinCode; joinController?.abort(); joinError = null; });
   let avatarDialogOpen = $state(false);
 
   let { relayConnected } = $derived(transportState);
@@ -68,12 +74,14 @@
     creating = true;
     try {
       await saveName(profileStore.nickname);
+      requireRoomSecurityRelease();
       const code = newRoomCode();
       createdCode = code;
       copied = false;
       shortCode = null;
       shortCodeExpiresAt = 0;
       shortCodeError = null;
+      qr = await QRCode.toDataURL(`${window.location.origin}/r/#${code}`, { width: 280, margin: 2 });
     } catch (err) {
       joinError = err instanceof Error ? err.message : "Could not create the room";
     } finally {
@@ -91,6 +99,7 @@
         profileStore.nickname || "Anonymous",
         roomName.trim() || undefined
       );
+      hostController?.abort(); cancelPairing?.();
       createdCode = null;
     } catch (err) {
       shortCodeError = err instanceof Error ? err.message : "Could not open the room";
@@ -103,45 +112,29 @@
     if (!joinCode.trim() || joining) return;
     joining = true;
     joinError = null;
-    legacyFallback = null;
+    const controller = new AbortController();
+    joinController = controller;
+    const input = joinCode;
     try {
+      requireRoomSecurityRelease();
       await saveName(profileStore.nickname);
-      const parsed = parseJoinInput(joinCode);
+      if (!alive || controller.signal.aborted) return;
+      const parsed = parseJoinInput(input);
       if (parsed.kind === "invalid") {
         joinError = "Enter a valid room link or code";
         return;
       }
       let code = parsed.code;
-      if (parsed.kind === "short") {
-        try {
-          const resolved = await resolveInvite(code);
-          if (!resolved) {
-            if (parsed.legacySixHex) legacyFallback = code.toLowerCase();
-            joinError = parsed.legacySixHex
-              ? "That short invite is unknown or expired. If this is an old six-character room code, confirm below."
-              : "That short invite is unknown or expired. Ask for a new code.";
-            return;
-          }
-          code = resolved;
-        } catch (err) {
-          joinError = err instanceof Error ? err.message : "Could not reach the relay to look up that code";
-          return;
-        }
-      }
+      if (parsed.kind === "pairing") code = await joinInvitationPairing(code, controller.signal);
+      if (!alive || controller.signal.aborted) return;
       await onJoin(code, profileStore.nickname || "Anonymous");
     } catch (err) {
-      joinError = err instanceof Error ? err.message : "Could not join the room";
+      if (alive && !controller.signal.aborted && joinController === controller) {
+        joinError = err instanceof Error ? err.message : "Could not join the room";
+      }
     } finally {
-      joining = false;
+      if (joinController === controller) joining = false;
     }
-  }
-
-  async function joinLegacy() {
-    if (!legacyFallback || joining) return;
-    joining = true;
-    try { await onJoin(legacyFallback, profileStore.nickname || "Anonymous"); }
-    catch (err) { joinError = err instanceof Error ? err.message : "Could not join the legacy room"; }
-    finally { joining = false; }
   }
 
   async function handleCopyLink() {
@@ -152,19 +145,26 @@
   // Mint on first use, then copy. The code stays on screen afterwards so it
   // can be read aloud, which is the point of it.
   async function handleCopyShort() {
+    if (pairingBusy || !createdCode) return;
+    pairingBusy = true;
     copyMenuOpen = false;
     shortCodeError = null;
     try {
       if (!shortCode || Date.now() >= shortCodeExpiresAt) {
-        const made = await createInvite(createdCode!);
+        cancelPairing?.();
+        hostController?.abort();
+        hostController = new AbortController();
+        const made = await hostInvitationPairing(parseSecureInvitation(createdCode), value => { if (alive) { shortCodeError = value; shortCode = null; } }, hostController.signal);
+        if (!alive) { made.cancel(); return; }
+        cancelPairing = made.cancel;
         shortCode = made.code;
         shortCodeExpiresAt = made.expiresAt;
       }
     } catch {
-      shortCodeError = "The relay is not reachable right now";
+      shortCodeError = "Pairing unavailable. Use the full invitation link.";
       return;
-    }
-    try { await navigator.clipboard.writeText(formatShortCode(shortCode)); shortCopied = true; }
+    } finally { pairingBusy = false; }
+    try { await navigator.clipboard.writeText(shortCode!); shortCopied = true; }
     catch { shortCodeError = "Clipboard unavailable. Select and copy the code below."; }
     setTimeout(() => (shortCopied = false), 2000);
   }
@@ -194,7 +194,8 @@
     // `/r/#<code>`, not `/r/<code>`: a fragment never reaches the server, so
     // the membership secret stays out of access logs and out of the Referer
     // of every link the room page later opens.
-    await navigator.clipboard.writeText(`${window.location.origin}/r/#${code}`);
+    try { await navigator.clipboard.writeText(`${window.location.origin}/r/#${code}`); }
+    catch { shortCodeError = "Clipboard unavailable. Select and copy the invitation."; return; }
     copied = true;
     setTimeout(() => (copied = false), 2000);
   }
@@ -310,6 +311,11 @@
             oninput={(e) => {
               profileStore.nickname = (e.target as HTMLInputElement).value;
             }}
+            onchange={(e) => {
+              void saveName((e.target as HTMLInputElement).value).catch((err) => {
+                joinError = err instanceof Error ? err.message : "Could not save your display name";
+              });
+            }}
             placeholder="Your display name"
             class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono text-center focus-visible:ring-ring"
           />
@@ -348,7 +354,7 @@
             <Input
               id="join-code" autocomplete="off" aria-describedby={joinError ? "room-join-error" : undefined} aria-invalid={joinError ? "true" : undefined}
               bind:value={joinCode}
-              placeholder="Room code, short code or link"
+              placeholder="Invitation link or online pairing code"
               class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-10 focus-visible:ring-ring"
             />
             <button
@@ -369,9 +375,7 @@
             <LogIn class="size-4 mr-1" />
             {joining ? "Joining..." : "Join room"}
           </Button>
-          {#if legacyFallback}
-            <Button variant="ghost" disabled={joining} onclick={joinLegacy}>Join legacy room {legacyFallback}</Button>
-          {/if}
+          {#if joining}<Button variant="ghost" onclick={() => joinController?.abort()}>Cancel pairing</Button>{/if}
         </div>
       </CardContent>
     </Card>
@@ -385,10 +389,12 @@
       <CardHeader>
         <CardTitle class="font-mono text-foreground">Room created</CardTitle>
         <CardDescription class="text-muted-foreground">
-          Share this code with others so they can join.
+          Anyone with this invitation can join. Its QR carries the same complete secret.
         </CardDescription>
       </CardHeader>
       <CardContent class="grid gap-4">
+        {#if qr}<img src={qr} alt="Room invitation QR code" class="mx-auto" />{/if}
+        <input aria-label="Invitation link" readonly value={`${window.location.origin}/r/#${createdCode}`} class="w-full font-mono text-xs" />
         <div class="relative rounded-lg bg-muted px-3 py-2">
           <div
             class="text-center font-mono text-sm tracking-widest text-muted-foreground truncate overflow-hidden pr-8"
@@ -440,8 +446,8 @@
                   onclick={handleCopyShort}
                   class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
                 >
-                  Copy short code
-                  <span class="block text-xs text-muted-foreground">Works for 5 minutes</span>
+                  {pairingBusy ? "Preparing pairing…" : "Copy online pairing code"}
+                  <span class="block text-xs text-muted-foreground">Single use; keep this screen open</span>
                 </button>
               </div>
             {/if}
@@ -451,12 +457,13 @@
         {#if shortCode}
           <div class="rounded-lg bg-muted px-3 py-2">
             <div class="text-center font-mono text-lg tracking-widest text-foreground">
-              {formatShortCode(shortCode)}
+              {shortCode}
             </div>
             <div class="mt-1 text-center text-xs text-muted-foreground">
-              {now >= shortCodeExpiresAt ? "Expired — copy a short code again to refresh" : `Expires in ${Math.ceil((shortCodeExpiresAt - now) / 1000)} seconds`}
+              {now >= shortCodeExpiresAt ? "Expired — generate a new pairing code" : `Expires in ${Math.ceil((shortCodeExpiresAt - now) / 1000)} seconds; at most 5 attempts`}
             </div>
           </div>
+          <Button variant="ghost" onclick={() => { cancelPairing?.(); shortCode = null; }}>Cancel pairing</Button>
         {/if}
         {#if shortCodeError}
           <div class="text-center text-xs text-destructive">{shortCodeError}</div>

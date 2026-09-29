@@ -2,7 +2,16 @@ import { afterEach, expect, it, vi } from "vitest";
 
 const { matchPrecache } = vi.hoisted(() => ({ matchPrecache: vi.fn() }));
 vi.mock("workbox-core", () => ({ clientsClaim: vi.fn() }));
-vi.mock("workbox-precaching", () => ({ precacheAndRoute: vi.fn(), matchPrecache }));
+vi.mock("workbox-precaching", () => ({
+  PrecacheController: class {
+    matchPrecache = matchPrecache;
+    addToCacheList = vi.fn();
+    install = vi.fn();
+    activate = vi.fn();
+  },
+  PrecacheRoute: class {},
+}));
+vi.mock("workbox-routing", () => ({ registerRoute: vi.fn() }));
 vi.mock("$lib/share-target", () => ({ storeSharedPayload: vi.fn() }));
 vi.mock("$lib/notify-intents", () => ({ storeNotifyIntent: vi.fn() }));
 

@@ -206,6 +206,12 @@ export function _sendWatchPresence(peerId?: string): void {
     watching: latestWatched(transportState.watchingTransmissions),
     watchingAll: all,
   });
+  const secureCallRoom = transportState.callRoomCode ?? transportState.roomCode;
+  if (secureCallRoom && _transport.isSecureRoom(secureCallRoom)) {
+    if (peerId) void _transport.sendRoom(peerId, secureCallRoom, payload);
+    else _transport.broadcast(payload, secureCallRoom);
+    return;
+  }
   if (peerId) {
     _transport.send(peerId, payload);
     return;

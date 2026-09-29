@@ -1,4 +1,13 @@
 <script lang="ts">
+  import { untrack } from "svelte";
+  import { isLegacyArchive } from "$lib/room-security/legacy-archive";
+  import LegacyArchive from "./LegacyArchive.svelte";
+  import { storeSecureInvitation } from "$lib/room-security/invitations";
+  import { captureSessionGuard } from "$lib/identity/session-guard";
+  import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
+  import { parseSecureInvitation } from "$lib/room-security/invitation-format";
+  import { parseJoinInput } from "$lib/invite";
+  import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -111,6 +120,7 @@
       hash.length > 1 ? hash.slice(1) : pathname.slice(3).split("/")[0];
     if (!raw) return null;
     try {
+      try { return parseSecureInvitation(pathname + hash); } catch { /* Stored room navigation. */ }
       return normalizeRoomCode(decodeURIComponent(raw));
     } catch {
       return normalizeRoomCode(raw);
@@ -138,12 +148,39 @@
 
 
 
-  let pendingRoomCode = $state<string | null>(
-    parseRoomCode(window.location.pathname, window.location.hash)
-  );
+  function consumeRoomLocation(): string | null {
+    const code = parseRoomCode(window.location.pathname, window.location.hash);
+    // Keep incoming capabilities only in memory, even while identity is locked.
+    // Public saved-room IDs are safe to retain for reload/navigation. Strip
+    // malformed inputs too: they can contain a truncated or wrapped secret.
+    if (code && !/^rd2_[A-Za-z0-9_-]{43}$/.test(code)) {
+      history.replaceState(history.state, "", "/r/");
+    }
+    return code;
+  }
+
+  let pendingRoomCode = $state<string | null>(consumeRoomLocation());
 
   let joiningRoom = $state(false);
   let bootstrapped = $state(false);
+
+  // Lock now tears down the application transport. Re-arm each unlocked
+  // session, including unlocks that keep this AppView mounted.
+  $effect(() => {
+    if (!identityStore.isUnlocked) return;
+    untrack(() => {
+      const guard = captureSessionGuard();
+      void connect();
+      void loadRooms();
+      void loadProfile();
+      import("$lib/transport/mailbox.svelte")
+        .then(({ startMailboxCollector }) => {
+          guard();
+          startMailboxCollector();
+        })
+        .catch(() => {});
+    });
+  });
 
   // Not folded into the bootstrap effect below: that one is once-per-page,
   // while an intent stored DURING a lock must drain on the re-unlock too
@@ -170,11 +207,6 @@
       },
       { once: true }
     );
-    connect();
-    // Offline DMs deposited at the relay while we were away (opt-in).
-    import("$lib/transport/mailbox.svelte")
-      .then(({ startMailboxCollector }) => startMailboxCollector())
-      .catch(() => {});
     // Persistence IS requested at every unlock, but a denial was silent -
     // and eviction on a denied origin is exactly how a phone loses its
     // identity. Say it out loud, once per page load. ($lib/storage is
@@ -207,15 +239,17 @@
         })
       )
       .catch(() => {});
-    const roomsReady = loadRooms();
-    loadProfile();
+  });
+
+  $effect(() => {
+    if (!identityStore.isUnlocked) return;
     if (pendingRoomCode) {
       const code = pendingRoomCode;
       pendingRoomCode = null;
       joiningRoom = true;
       // Join only after the stored rooms are loaded: the join saves the room,
       // and racing loadRooms() could drop it from the sidebar mirror.
-      roomsReady
+      loadRooms()
         .catch(() => {})
         .then(() => handleJoin(code, ""))
         .finally(() => {
@@ -352,6 +386,8 @@
 
   /** Bumped per join so a failed one only backs out if nothing newer ran. */
   let joinSeq = 0;
+  let pairingController: AbortController | undefined;
+  $effect(() => () => pairingController?.abort());
 
   async function handleJoin(
     roomCode: string,
@@ -359,6 +395,39 @@
     roomName?: string
   ) {
     joinError = null;
+    const guard = captureSessionGuard();
+    const current = () => {
+      try { guard(); return seq === joinSeq; } catch { return false; }
+    };
+    const seq = ++joinSeq;
+    pairingController?.abort();
+    const parsed = parseJoinInput(roomCode);
+    if (parsed.kind === "pairing") {
+      const controller = new AbortController();
+      pairingController = controller;
+      try {
+        requireRoomSecurityRelease();
+        roomCode = await joinInvitationPairing(parsed.code, controller.signal);
+        if (!current()) return;
+        if (seq !== joinSeq || controller.signal.aborted) return;
+      } catch (err) {
+        if (current()) joinError = err instanceof Error ? err.message : "Pairing failed";
+        return;
+      }
+    } else if (parsed.kind === "room") roomCode = parsed.code;
+    if (roomCode.startsWith("r2_")) {
+      try {
+        requireRoomSecurityRelease();
+        const imported = await storeSecureInvitation(roomCode, roomName ?? "Room");
+        if (!current()) return;
+        if (seq !== joinSeq) return;
+        roomCode = imported.roomCode;
+        history.replaceState({}, "", "/app");
+      } catch (err) {
+        if (current()) joinError = err instanceof Error ? err.message : "Invalid room invitation";
+        return;
+      }
+    }
     const known =
       roomName || roomsStore.rooms.find((r) => r.roomCode === roomCode)?.name;
     const label = known || roomCode;
@@ -368,7 +437,6 @@
     // could not show because the chat view was not mounted yet. Now the
     // sidebar highlights, the pane mounts, and the overlay covers it until
     // the room is open. A join that fails backs the view out again.
-    const seq = ++joinSeq;
     const prev = {
       roomCode: activeRoomCode,
       roomName: activeRoomName,
@@ -379,7 +447,7 @@
     activeDmPeerId = null;
     sidebarTab = "rooms";
     const backOut = () => {
-      if (seq !== joinSeq) return;
+      if (!current()) return;
       activeRoomCode = prev.roomCode;
       activeRoomName = prev.roomName;
       activeDmPeerId = prev.dmPeerId;
@@ -389,10 +457,15 @@
         backOut();
         return;
       }
+      if (!current()) return;
       activeRoomCode = roomCode;
       activeRoomName = label;
       activeDmPeerId = null;
       sidebarTab = "rooms";
+      if (isLegacyArchive(roomCode)) {
+        history.pushState({ roomCode }, "", `/r/#${roomCode}`);
+        return;
+      }
       if (known) {
         // Only announce a name we actually have. Joining from a bare invite
         // link used to broadcast the room code as the name and overwrite it
@@ -401,15 +474,19 @@
       } else {
         transportState.roomName = label;
       }
-      await saveRoom(roomCode, label);
+      await saveRoom(roomCode, label, guard);
+      if (!current()) return;
       history.pushState({ roomCode }, "", `/r/#${roomCode}`);
     } catch (err) {
+      if (!current()) return;
       backOut();
       joinError = err instanceof Error ? err.message : String(err);
     }
   }
 
   function handleLeave() {
+    ++joinSeq;
+    pairingController?.abort();
     leaveRoom();
     activeRoomCode = null;
     activeRoomName = "";
@@ -921,8 +998,18 @@
     incomingSharedText = "";
   }
 
+  function handleHashChange(event: HashChangeEvent) {
+    // Fragment navigation can emit popstate before hashchange. If popstate
+    // already consumed/replaced this URL, don't clear its pending invitation.
+    if (event.newURL === window.location.href) handlePopState();
+  }
+
   function handlePopState() {
-    const code = parseRoomCode(window.location.pathname, window.location.hash);
+    const code = consumeRoomLocation();
+    if (!identityStore.isUnlocked) {
+      pendingRoomCode = code;
+      return;
+    }
     // The URL is the truth: even if the view already names this room, the
     // transport can be elsewhere (a DM opened underneath) - re-join then.
     if (code && (code !== activeRoomCode || transportState.roomCode !== code)) {
@@ -1160,6 +1247,7 @@
 
 <svelte:window
   onpopstate={handlePopState}
+  onhashchange={handleHashChange}
   onkeydown={(e) => {
     if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
 
@@ -1267,6 +1355,14 @@
       />
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}
+          {#if isLegacyArchive(activeRoomCode)}
+            <LegacyArchive
+              roomCode={activeRoomCode}
+              roomName={activeRoomName}
+              onLeave={handleLeave}
+              onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
+            />
+          {:else}
           <ChatView
             roomCode={activeRoomCode}
             roomName={transportState.roomName || activeRoomName}
@@ -1281,6 +1377,7 @@
             {incomingSharedText}
             onConsumeIncomingShared={clearIncomingShared}
           />
+          {/if}
         {:else}
           {#if incomingSharedFiles.length > 0 || incomingSharedText}
             <Dialog.Root
@@ -1773,8 +1870,10 @@
        every command needs an identity, and because openSettings' consumer only
        exists in the unlocked tree. -->
   {#if identityStore.isUnlocked}
+    {#if !isLegacyArchive(activeRoomCode)}
     <CommandPalette bind:open={paletteOpen} host={paletteHost} />
-    <SearchOverlay openRoom={(code) => handleSelectRoom(code)} />
     <PluginConfirmModal />
+    {/if}
+    <SearchOverlay openRoom={(code) => handleSelectRoom(code)} />
   {/if}
 </QueryClientProvider>

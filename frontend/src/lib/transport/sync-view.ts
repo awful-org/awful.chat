@@ -31,6 +31,7 @@ interface Pending {
 }
 
 export interface SyncViewBuffer {
+  clear(): void;
   /** Park rows for the room; a row already parked is not parked twice. */
   add(roomCode: string, rows: Message[]): void;
   /** Flush the room now - the pusher sent SyncComplete. */
@@ -58,6 +59,10 @@ export function createSyncViewBuffer(flush: SyncViewFlush): SyncViewBuffer {
   }
 
   return {
+    clear() {
+      for (const p of pending.values()) clear(p);
+      pending.clear();
+    },
     add(roomCode, rows) {
       if (!rows.length) return;
       let p = pending.get(roomCode);

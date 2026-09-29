@@ -86,6 +86,23 @@ describe("restoring a backup onto a device with no identity", () => {
     expect(restored?.did).toBe(backup.identity?.keypair.did);
   });
 
+  it("checks cancellation after password derivation before activating or writing an identity", async () => {
+    let checked = false;
+    await expect(applyBackup(backup, "replace", {
+      requestPassword: async () => PASSWORD,
+      beforeCommit: () => {
+        checked = true;
+        expect(isUnlocked()).toBe(false);
+        throw new Error("Cancelled session");
+      },
+    })).rejects.toThrow("Cancelled session");
+    expect(checked).toBe(true);
+    expect(isUnlocked()).toBe(false);
+    expect(await getKeypairRecord()).toBeUndefined();
+    expect(await getMnemonicRecord()).toBeUndefined();
+    expect(await getAllRooms()).toEqual([]);
+  });
+
   it("restores the data, which a recovery phrase alone cannot", async () => {
     await applyBackup(backup, "replace");
     // Import runs with storage locked, so rows land plaintext and the first

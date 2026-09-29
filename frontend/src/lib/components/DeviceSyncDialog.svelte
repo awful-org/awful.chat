@@ -76,9 +76,8 @@ import {
     }
   });
 
-  // The typed short code carries only the first 8 chars of the sync token, so
-  // the source stops honouring the full 128-bit one the moment it is shown -
-  // keep it behind a deliberate tap instead of printing it next to every QR.
+  // Manual pairing copies the complete capability and full token, just like
+  // scanning the QR. Showing it never weakens source authentication.
   let shortCodeShown = $state(false);
 
   function handleShowShortCode() {
@@ -412,7 +411,7 @@ async function handleStartScanning() {
           {#if shortCodeShown}
             <div class="w-full space-y-2">
               <p class="text-xs text-muted-foreground text-center">
-                Or enter this code manually:
+                Or copy this secure pairing code to your other device:
               </p>
               <div class="flex gap-2">
                 <Input
@@ -436,7 +435,7 @@ async function handleStartScanning() {
               </div>
               {#if copyFailed}
                 <p class="text-xs text-muted-foreground">
-                  Could not reach the clipboard. Type the code instead.
+                  Could not reach the clipboard. Select and copy the complete code.
                 </p>
               {/if}
             </div>
@@ -447,7 +446,7 @@ async function handleStartScanning() {
               class="w-full font-mono text-xs text-muted-foreground"
             >
               <Keyboard class="w-3.5 h-3.5 mr-2" />
-              Can't scan? Show a code to type
+              Can't scan? Copy a pairing code
             </Button>
           {/if}
 
@@ -548,7 +547,7 @@ async function handleStartScanning() {
           </p>
           <Input
             bind:value={manualToken}
-            placeholder="abcd1234-abcd1234-abcd1234"
+            placeholder="Paste the complete secure pairing code"
             class="font-mono text-center"
             autocapitalize="off"
             autocorrect="off"

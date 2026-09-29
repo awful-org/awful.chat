@@ -8,6 +8,7 @@
 <script lang="ts">
   import { apiUrl } from "$lib/runtime-config";
   import { isGifUrl } from "$lib/media-url";
+  import { remotePreviewUrl } from "$lib/preview-url";
   import { Tip } from "$lib/components/ui/tooltip";
   import {
     ChevronDown,
@@ -666,13 +667,15 @@
   $effect(() => {
     ogPreview = null;
     if (!mediaPrefs.externalMedia || !shouldShowOg || !linkedUrl) return;
+    const previewUrl = remotePreviewUrl(linkedUrl);
+    if (!previewUrl) return;
     const ctrl = new AbortController();
     fetch(
       // No hardcoded origin: an unset apiUrl means this instance never said
       // where its relay is, and defaulting to awful.frav.in would hand every
       // link its users open to a stranger's server. Empty resolves
       // same-origin and 404s, so previews are simply off.
-      `${apiUrl()}/og/preview?url=${encodeURIComponent(linkedUrl)}`,
+      `${apiUrl()}/og/preview?url=${encodeURIComponent(previewUrl)}`,
       { signal: ctrl.signal }
     )
       .then((r) => r.json())

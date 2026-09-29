@@ -22,6 +22,7 @@ import {
 } from "./identity/identity";
 import { MessageType, type Message } from "./types/message";
 import { hex, unhex, utf8 } from "./utils";
+import { encryptFileTo } from "./room-security/file-crypto";
 
 function makeMessage(overrides: Partial<Message> = {}): Message {
   return {
@@ -44,6 +45,34 @@ beforeAll(async () => {
 });
 
 describe("sign / verify", () => {
+  it("signs freshness for live plugin updates without changing historical message canonical forms", async () => {
+    // The wire-only send path uses the shared signer without storing this as a
+    // chat row; Message's persisted type union intentionally excludes it.
+    const signed = signMessage(makeMessage({ type: MessageType.PluginEphemeral as unknown as Message["type"] }));
+    expect(await verifyMessage(signed)).toBe(true);
+    expect(await verifyMessage({ ...signed, timestamp: signed.timestamp + 1 })).toBe(false);
+    const chat = signMessage(makeMessage());
+    expect(await verifyMessage({ ...chat, timestamp: chat.timestamp + 1 })).toBe(true);
+  });
+  it("binds encrypted file metadata and rejects descriptor removal or tampering", async () => {
+    const encryption = await encryptFileTo(new Blob(["private"]), new WritableStream({ write() {} }));
+    const file = { infoHash: "a".repeat(40), size: 7, mimeType: "text/plain", filename: "private.txt", encryption };
+    const signed = signMessage(makeMessage({ type: MessageType.File, meta: { files: [file] } }));
+    expect(await verifyMessage(signed)).toBe(true);
+    const altered = [
+      undefined,
+      { ...encryption, key: "A".repeat(43) },
+      { ...encryption, id: "A".repeat(22) },
+      { ...encryption, size: 8 },
+      { ...encryption, chunkSize: 1 },
+      { ...encryption, version: 1 },
+    ];
+    for (const descriptor of altered) {
+      const tampered = { ...signed, meta: { files: [{ ...file, encryption: descriptor }] } } as Message;
+      expect(await verifyMessage(tampered)).toBe(false);
+    }
+  });
+
   it("signs and verifies a message round-trip", async () => {
     const signed = signMessage(makeMessage());
     expect(signed.sig).toBeTruthy();

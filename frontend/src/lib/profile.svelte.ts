@@ -7,6 +7,7 @@ import {
   pfpBlobURL,
 } from "$lib/storage";
 import { broadcastProfile } from "$lib/transport/transport.svelte";
+import { bytesToBase64, sniffImageMime } from "$lib/utils";
 
 interface ProfileStore {
   nickname: string;
@@ -53,7 +54,16 @@ export async function loadProfile(): Promise<void> {
   }
   profileStore.nickname = p.nickname || "Anonymous";
   profileStore.color = p.color;
-  profileStore.bannerUrl = p.bannerURL;
+  if (p.bannerURL) {
+    profileStore.bannerUrl = p.bannerURL;
+  } else if (p.bannerData) {
+    // A data URL also survives saving the picker without editing the image;
+    // a temporary blob URL would become an unusable banner on other devices.
+    const bytes = new Uint8Array(p.bannerData);
+    profileStore.bannerUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
+  } else {
+    profileStore.bannerUrl = undefined;
+  }
   profileStore.tagText = p.tagText;
   profileStore.tagTextColor = p.tagTextColor;
   profileStore.tagChipColor = p.tagChipColor;

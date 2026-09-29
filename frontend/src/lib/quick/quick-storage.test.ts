@@ -134,4 +134,20 @@ describe("quick storage", () => {
     await expect(m.sweepOrphanQuickStorage()).resolves.toBeUndefined();
     expect(deleted).toEqual([]);
   });
+
+  it("does not retain a retired database lock when its callback arrives after rotation", async () => {
+    const m = await load();
+    const callbacks: Array<() => unknown> = [];
+    vi.stubGlobal("navigator", { locks: { request: (_name: string, cb: () => unknown) => {
+      callbacks.push(cb); return Promise.resolve();
+    } } });
+    const old = m.useQuickStorage();
+    await m.dropQuickStorage();
+    expect(deleted).toEqual([old]);
+    expect(callbacks[0]()).toBeUndefined();
+    const active = callbacks[1]();
+    expect(active).toBeInstanceOf(Promise);
+    await m.dropQuickStorage();
+    await expect(active).resolves.toBeUndefined();
+  });
 });

@@ -43,6 +43,13 @@ let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
 let _mutedBeforeDeafen = false;
 export function _sendCallState(peerId?: string): void {
+  const secureCallRoom = transportState.callRoomCode ?? transportState.roomCode;
+  if (secureCallRoom && _transport.isSecureRoom(secureCallRoom)) {
+    const payload = encode({ type: MessageType.CallState, muted: transportState.muted, deafened: transportState.deafened });
+    if (peerId) void _transport.sendRoom(peerId, secureCallRoom, payload);
+    else _transport.broadcast(payload, secureCallRoom);
+    return;
+  }
   const payload = encode({
     type: MessageType.CallState,
     muted: transportState.muted,
@@ -102,6 +109,12 @@ export function _sendCallPresence(peerId?: string): void {
     inCall: transportState.inCall,
     roomCode: callRoom,
   });
+  const secureCallRoom = transportState.callRoomCode ?? transportState.roomCode;
+  if (secureCallRoom && _transport.isSecureRoom(secureCallRoom)) {
+    if (peerId) void _transport.sendRoom(peerId, secureCallRoom, payload);
+    else _transport.broadcast(payload, secureCallRoom);
+    return;
+  }
   if (peerId) {
     _transport.send(peerId, payload);
     return;

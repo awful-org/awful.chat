@@ -7,6 +7,7 @@
 import type { HostApi } from "./api";
 import { seededRandom } from "$lib/utils";
 import { identityStore } from "$lib/identity/identity.svelte";
+import { captureSessionGuard } from "$lib/identity/session-guard";
 import {
   onBeforeDisconnect,
   didToPeerId,
@@ -74,7 +75,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
     pictureInPicture: (video) => requestElementPip(video),
     async sendCard(payload) {
       const { sendCard } = await import("$lib/transport/transport.svelte");
-      return sendCard(pluginId, payload);
+      return sendCard(pluginId, payload, roomCode);
     },
     async sendUpdate(cardId, payload, opts) {
       const { sendUpdate } = await import("$lib/transport/transport.svelte");
@@ -106,34 +107,50 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
     },
     async resolveRoomImage(infoHash, options) {
       if (typeof infoHash !== "string" || !infoHash) return null;
+      const guard = captureSessionGuard();
       // The reference must be an IMAGE attachment of THIS room - a plugin
       // must not use this to pull arbitrary hashes from other rooms.
       const rows = await getAttachmentsByInfoHash(infoHash);
+      guard();
       const row = rows.find(
         (a) => a.roomCode === roomCode && a.mimeType.startsWith("image/")
       );
       if (!row) return null;
-      if (row.data) return new Blob([row.data], { type: row.mimeType });
+      if (row.data && !row.encryption) return new Blob([row.data], { type: row.mimeType });
 
-      const { requestFileDownload } = await import(
+      const { requestFileDownload, restoreFileAttachment } = await import(
         "$lib/transport/transport.svelte"
       );
+      guard();
       const fromTransfer = async (): Promise<Blob | null> => {
+        guard();
         const url = transportState.fileTransfers.get(infoHash)?.blobURL;
         if (!url) return null;
         try {
-          return await (await fetch(url)).blob();
+          const blob = await (await fetch(url)).blob();
+          guard();
+          return blob;
         } catch {
           return null;
         }
       };
       const local = await fromTransfer();
       if (local) return local;
+      if (row.encryption) {
+        await restoreFileAttachment(row);
+        guard();
+        const restored = await fromTransfer();
+        if (restored) return restored;
+      }
+      guard();
       requestFileDownload({
         infoHash,
         filename: row.filename,
         mimeType: row.mimeType,
         size: row.size,
+        encryption: row.encryption,
+        width: row.width,
+        height: row.height,
       });
       const deadline =
         Date.now() + Math.min(30_000, Math.max(0, options?.timeoutMs ?? 15_000));

@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
+const SECRET = newRoomSecret();
+const ROOM = deriveRoomKeys(SECRET).discoveryId;
+const callState = { inCall: false, callRoomCode: null as string | null, roomCode: null as string | null, error: null as string | null };
 
 /**
  * The remembered profile is the one thing /qc keeps on purpose, so it is the
@@ -21,6 +25,10 @@ const fakeLocalStorage = {
 };
 
 const identityStore = { keypair: null as unknown, did: "did:key:zSelf" };
+vi.mock("$lib/identity/identity", async (importOriginal) => ({
+  ...await importOriginal<typeof import("$lib/identity/identity")>(),
+  requireSession: () => identityStore,
+}));
 let ownProfile: Record<string, unknown> | undefined;
 
 vi.mock("$lib/identity/identity.svelte", () => ({
@@ -33,13 +41,16 @@ vi.mock("$lib/profile.svelte", () => ({
   loadProfile: vi.fn(async () => {}),
 }));
 vi.mock("$lib/storage", () => ({
+  getRoom: vi.fn(async () => undefined),
+  putRoom: vi.fn(async () => {}),
   closeDatabase: vi.fn(),
   clearAtRestFlagForCurrentOwner: vi.fn(),
   getOwnProfile: vi.fn(async () => ownProfile),
   putOwnProfile: vi.fn(async () => {}),
 }));
 vi.mock("$lib/transport/transport.svelte", () => ({
-  joinRoom: vi.fn(async () => true),
+  joinRoom: vi.fn(async (room: string) => { callState.roomCode = room; return true; }),
+  transportState: callState,
   leaveRoom: vi.fn(),
   useEphemeralSession: vi.fn(),
 }));
@@ -49,7 +60,7 @@ vi.mock("./quick-storage", () => ({
   dbName: () => "awful-quick-test",
 }));
 vi.mock("$lib/transport/call.svelte", () => ({
-  joinCall: vi.fn(async () => {}),
+  joinCall: vi.fn(async () => { callState.inCall = true; callState.callRoomCode = callState.roomCode; }),
   leaveCall: vi.fn(),
 }));
 
@@ -64,7 +75,9 @@ async function load() {
   vi.resetModules();
   vi.stubGlobal("localStorage", fakeLocalStorage);
   vi.stubGlobal("sessionStorage", fakeSessionStorage);
-  return import("./quick-call.svelte");
+  const m = await import("./quick-call.svelte");
+  m.setQuickCallCode(SECRET);
+  return m;
 }
 
 describe("quick call profile", () => {
@@ -75,6 +88,7 @@ describe("quick call profile", () => {
     quota = Infinity;
     identityStore.keypair = null;
     ownProfile = undefined;
+    Object.assign(callState, { inCall: false, callRoomCode: null, roomCode: null, error: null });
     vi.unstubAllGlobals();
   });
 
@@ -203,7 +217,7 @@ describe("quick call profile", () => {
     const { clearAtRestFlagForCurrentOwner } = await import("$lib/storage");
     await m.prepareAsGuest();
     m.teardownQuickCall();
-    expect(clearAtRestFlagForCurrentOwner).toHaveBeenCalled();
+    await vi.waitFor(() => expect(clearAtRestFlagForCurrentOwner).toHaveBeenCalled());
   });
 
   it("hanging up takes the call's database with it", async () => {
@@ -219,26 +233,26 @@ describe("quick call profile", () => {
     vi.mocked(leaveRoom).mockImplementation(() => void order.push("leave"));
 
     await m.prepareAsGuest();
-    m.setQuickCallCode("7QK3M9AB2C");
+    m.setQuickCallCode(SECRET);
     await m.startQuickCall({ name: "Ada" });
     order.length = 0; // the guest setup closed the real database on its way in
     m.endQuickCall();
 
     // The wire first, then the bytes - and the connection has to be closed
     // before the delete or it queues behind it.
-    expect(order).toEqual(["leave", "close", "drop"]);
+    await vi.waitFor(() => expect(order).toEqual(["leave", "leave", "close", "drop"]));
     expect(m.quickCall.stage).toBe("ended");
   });
 
   it("a call that was ended is never resumed", async () => {
     const m = await load();
     await m.prepareAsGuest();
-    m.setQuickCallCode("7QK3M9AB2C");
+    m.setQuickCallCode(SECRET);
     await m.startQuickCall({ name: "Ada" });
-    expect(m.resumableSession("7QK3M9AB2C")).not.toBeNull();
+    expect(m.resumableSession(SECRET)).not.toBeNull();
 
     m.endQuickCall();
-    expect(m.resumableSession("7QK3M9AB2C")).toBeNull();
+    expect(m.resumableSession(SECRET)).toBeNull();
   });
 
   it("a refresh before anyone was chosen is not a call to resume", async () => {
@@ -267,14 +281,16 @@ describe("quick call profile", () => {
   it("starting another call mints a new code and hosts it", async () => {
     const m = await load();
     await m.prepareAsGuest();
-    m.setQuickCallCode("7QK3M9AB2C");
+    m.setQuickCallCode(SECRET);
     await m.startQuickCall({ name: "Ada" });
     m.endQuickCall();
 
     const next = m.startAnotherCall();
-    expect(next).toMatch(/^[0-9A-HJKMNP-TV-Z]{10}$/);
-    expect(next).not.toBe("7QK3M9AB2C");
+    expect(next).toMatch(/^r2_[A-Za-z0-9_-]{43}$/);
+    expect(next).not.toBe(SECRET);
     expect(m.quickCall.stage).toBe("setup");
+    await m.startQuickCall({ name: "Ada" });
+    expect(m.resumableSession(next)).toMatchObject({ identity: "guest", inCall: true, code: next });
   });
 
   it("does not sit in 'joining' when the join fails", async () => {
@@ -285,5 +301,58 @@ describe("quick call profile", () => {
     await m.startQuickCall({ name: "Ada" });
     expect(m.quickCall.stage).toBe("failed");
     expect(m.quickCall.error).toBe("relay is down");
+  });
+
+  it("stores the capability only in disposable storage and joins by public ID", async () => {
+    const m = await load(); await m.prepareAsGuest(); await m.startQuickCall({ name: "Ada" });
+    const { putRoom } = await import("$lib/storage");
+    const { joinRoom } = await import("$lib/transport/transport.svelte");
+    expect(putRoom).toHaveBeenCalledWith(expect.objectContaining({ roomCode: ROOM, roomSecret: SECRET }), expect.any(Function));
+    expect(joinRoom).toHaveBeenCalledWith(ROOM); expect(m.quickCall.roomCode).toBe(ROOM);
+    expect(m.quickCall.stage).toBe("in-call");
+  });
+
+  it.each(["7QK3M9AB2C", ROOM, "bad"])("rejects invalid launch %s before storage/identity preparation", async code => {
+    const m = await load(); expect(m.setQuickCallCode(code)).toBe("");
+    await m.prepareAsGuest(); await m.adoptAccount();
+    const { useQuickStorage } = await import("./quick-storage");
+    expect(useQuickStorage).not.toHaveBeenCalled(); expect(m.quickCall.stage).toBe("failed");
+  });
+
+  it("does not report success when core call join fails or lands in another room", async () => {
+    const m = await load(); await m.prepareAsGuest();
+    const { joinCall } = await import("$lib/transport/call.svelte");
+    vi.mocked(joinCall).mockImplementationOnce(async () => { callState.inCall = true; callState.callRoomCode = "wrong"; });
+    await m.startQuickCall({ name: "Ada" }); expect(m.quickCall.stage).toBe("failed");
+    expect(m.resumableSession(SECRET)?.inCall).not.toBe(true);
+  });
+
+  it("rejects a stored capability substituted under this room ID", async () => {
+    const m = await load(); await m.prepareAsGuest();
+    const { getRoom } = await import("$lib/storage");
+    vi.mocked(getRoom).mockResolvedValueOnce({ roomCode: ROOM, roomSecret: newRoomSecret() } as never);
+    await m.startQuickCall({ name: "Ada" }); expect(m.quickCall.stage).toBe("failed");
+    const { joinRoom } = await import("$lib/transport/transport.svelte"); expect(joinRoom).not.toHaveBeenCalled();
+  });
+
+  it("hangup during a pending room join prevents late media entry and resume", async () => {
+    const m = await load(); await m.prepareAsGuest();
+    const { joinRoom } = await import("$lib/transport/transport.svelte");
+    const { joinCall } = await import("$lib/transport/call.svelte");
+    let finish!: (v: boolean) => void;
+    vi.mocked(joinRoom).mockImplementationOnce(() => new Promise(r => { finish = r; }));
+    const pending = m.startQuickCall({ name: "Ada" }); await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    m.endQuickCall(); finish(true); await pending;
+    expect(joinCall).not.toHaveBeenCalled(); expect(m.quickCall.stage).toBe("ended"); expect(m.resumableSession(SECRET)).toBeNull();
+  });
+
+  it("serializes replacement behind cancelled identity preparation and cleanup", async () => {
+    const m = await load(); const { createEphemeral } = await import("$lib/identity/identity.svelte");
+    let finish!: () => void;
+    vi.mocked(createEphemeral).mockImplementationOnce(() => new Promise(r => { finish = r; }));
+    const pending = m.prepareAsGuest(); await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    m.endQuickCall(); m.startAnotherCall(); const replacement = m.prepareAsGuest(); finish(); await pending; await replacement;
+    expect(m.quickCall.stage).toBe("setup"); expect(createEphemeral).toHaveBeenCalledTimes(2);
+    expect(m.resumableSession(SECRET)).toBeNull();
   });
 });

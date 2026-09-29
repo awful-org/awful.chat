@@ -424,7 +424,8 @@ export async function unlockIdentity(password: string): Promise<void> {
  */
 async function _unlockFromMnemonicRecord(
   record: MnemonicRecord,
-  password: string
+  password: string,
+  beforeActivate?: () => void
 ): Promise<string> {
   // Records written before per-record iteration counts existed used 100k.
   const aesKey = await AESFromPassword(
@@ -449,6 +450,12 @@ async function _unlockFromMnemonicRecord(
   const { privateKey, publicKey } = deriveKeypairFromMnemonic(mnemonic);
   const did = publicKeyToDid(publicKey);
 
+  try {
+    beforeActivate?.();
+  } catch (error) {
+    privateKey.fill(0);
+    throw error;
+  }
   await _activateSession(privateKey, publicKey, did);
   return mnemonic;
 }
@@ -467,9 +474,10 @@ async function _unlockFromMnemonicRecord(
  */
 export async function unlockWithImportedMnemonic(
   record: MnemonicRecord,
-  password: string
+  password: string,
+  beforeActivate?: () => void
 ): Promise<void> {
-  await _unlockFromMnemonicRecord(record, password);
+  await _unlockFromMnemonicRecord(record, password, beforeActivate);
 }
 
 /**
@@ -477,6 +485,9 @@ export async function unlockWithImportedMnemonic(
  * Prevents lingering key material in the GC heap.
  * Call this on logout or when the app moves to the background.
  */
+export { onIdentityLock } from "./lock-events";
+import { notifyIdentityLock } from "./lock-events";
+
 export function lockIdentity(): void {
   if (session) {
     session.privateKey.fill(0);
@@ -484,6 +495,7 @@ export function lockIdentity(): void {
   }
   // Sealed rows become unreadable until the next unlock re-derives the key.
   clearStorageCrypto();
+  notifyIdentityLock();
 }
 
 /**

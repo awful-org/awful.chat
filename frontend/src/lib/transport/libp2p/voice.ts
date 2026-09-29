@@ -290,7 +290,10 @@ export class LibP2PVoice implements VoiceTransport {
     });
   }
 
+  private securityRoom: string | null = null;
+
   async join(_roomCode: string): Promise<void> {
+    this.securityRoom = _roomCode;
     this.node = this.transport.p2pNode;
     if (!this.node) throw new Error("Transport not connected");
 
@@ -565,8 +568,7 @@ export class LibP2PVoice implements VoiceTransport {
     this.lastRedialAsk.set(peerId, now);
     this.debugStats.redialsAsked++;
     rec(ev("voice.redial.ask", { peer: peerId }));
-    void this.transport
-      .send(peerId, encode({ type: MessageType.VoiceRedial }))
+    void this.sendVoiceFrame(peerId, encode({ type: MessageType.VoiceRedial }))
       .catch(() => {});
   }
 
@@ -1281,9 +1283,14 @@ export class LibP2PVoice implements VoiceTransport {
    * handleWireSignal for why this replaced the dedicated /voice/ stream.
    */
   private sendSignal(peerId: string, signal: VoiceSignal): Promise<boolean> {
-    return this.transport
-      .send(peerId, encode({ type: MessageType.VoiceSignal, signal }))
+    return this.sendVoiceFrame(peerId, encode({ type: MessageType.VoiceSignal, signal }))
       .catch(() => false);
+  }
+
+  private sendVoiceFrame(peerId: string, data: Uint8Array): Promise<boolean> {
+    return this.securityRoom && (this.securityRoom.startsWith("rd2_") || this.securityRoom.startsWith("dm-"))
+      ? this.transport.sendRoom(peerId, this.securityRoom, data)
+      : this.transport.send(peerId, data);
   }
 
   private ensureRemotePeer(peerId: string): RemotePeer {

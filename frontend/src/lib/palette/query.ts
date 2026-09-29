@@ -85,6 +85,11 @@ const BASE32_ROOM_CODE = /^[0-9A-HJKMNP-TV-Z]{13}$/;
 export function parseRoomCode(text: string): string | null {
   const trimmed = text.trim();
   if (trimmed.length === 0) return null;
+  try {
+    return parseSecureInvitation(trimmed);
+  } catch {
+    // Try legacy formats below.
+  }
 
   const candidates = [trimmed];
   const afterPath = trimmed.split("/r/")[1];
@@ -104,3 +109,4 @@ export function parseRoomCode(text: string): string | null {
   }
   return null;
 }
+import { parseSecureInvitation } from "$lib/room-security/invitation-format";

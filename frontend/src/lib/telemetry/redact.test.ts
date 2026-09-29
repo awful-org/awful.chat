@@ -20,6 +20,16 @@ describe("roomKind", () => {
 });
 
 describe("RefTable", () => {
+  it("scrubs unregistered capabilities, truncated keys and full sync bundles", () => {
+    const refs = new RefTable(() => 0);
+    const secret = `r2_${"A".repeat(43)}`;
+    expect(refs.scrub(`failed: ${secret}`)).toBe("failed: <capability>");
+    expect(refs.scrub("failed: r2_partial")).toBe("failed: <capability>");
+    expect(refs.scrub(`failed: ${secret}:private-token:source-peer`)).toBe("failed: <capability>");
+    expect(refs.scrub(`failed: web+awfl:${secret}`)).toBe("failed: <invitation>");
+    expect(refs.scrub("discovery rd2_public")).toBe("discovery rd2_public");
+  });
+
   it("assigns ordinals in first-seen order and is stable", () => {
     const refs = new RefTable(() => 1000);
     expect(refs.roomRef("aaaaaaaaaaaaaaaa")).toBe("r1");

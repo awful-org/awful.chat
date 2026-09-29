@@ -41,6 +41,7 @@
     "vitest": "^4.1.10",
     "workbox-core": "^7.4.0",
     "workbox-precaching": "^7.4.0",
+    "workbox-routing": "7.4.0",
     "workbox-window": "^7.4.0"
   },
   "pnpm": {
@@ -69,6 +70,7 @@
     "@noble/hashes": "^2.0.1",
     "@scure/base": "^2.0.0",
     "@scure/bip39": "^2.0.1",
+    "@serenity-kit/opaque": "1.1.0",
     "@tanstack/svelte-query": "^6.1.12",
     "dompurify": "^3.4.14",
     "emoji-picker-element": "^1.29.1",

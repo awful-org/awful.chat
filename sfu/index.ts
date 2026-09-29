@@ -2,7 +2,7 @@ import * as mediasoup from "mediasoup";
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
 import { envInteger } from "./config";
-import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin } from "./auth";
+import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin, verifyRoomAdmission } from "./auth";
 import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 import {
   SFU_DIAG_SCHEMA_VERSION,
@@ -173,7 +173,7 @@ interface MSDiagUnavailable {
 
 // Envelope sent by the client over this WebSocket connection.
 // All messages from client arrive as: { type: "join" } or { type: "ms:*", ... }
-type ClientJoin = { type: "join"; roomCode: string; peerId: string; signature: string };
+type ClientJoin = { type: "join"; roomCode: string; peerId: string; signature: string; capability?: string };
 type ClientMsg =
   | ClientJoin
   | MSGetCapabilities
@@ -1639,7 +1639,8 @@ async function main(): Promise<void> {
         // proof is mandatory even when the slot is currently vacant.
         const nonce = joinNonce;
         joinNonce = null;
-        if (!nonce || Date.now() >= joinDeadline || !verifyJoin(nonce, joinMsg.roomCode, joinMsg.peerId, joinMsg.signature)) {
+        if (!nonce || Date.now() >= joinDeadline || !verifyJoin(nonce, joinMsg.roomCode, joinMsg.peerId, joinMsg.signature) ||
+            !verifyRoomAdmission(nonce, joinMsg.roomCode, joinMsg.peerId, joinMsg.capability)) {
           send(ws, { type: "ms:error", reason: "authentication-failed" });
           ws.close(1008, "Video identity proof required; update the app");
           return;

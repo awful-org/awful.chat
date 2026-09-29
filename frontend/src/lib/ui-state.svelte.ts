@@ -17,6 +17,8 @@ export const uiState = $state({
    * Cmd/Ctrl+K, so anything outside that tree travels through here too.
    */
   paletteOpenRequested: false,
+  /** Open the active room's capability/PAKE invitation dialog. */
+  invitationRoomRequested: null as string | null,
   /**
    * Somebody asked to navigate to one message - a pinned widget jumping to
    * its card. Two owners consume it in sequence: AppView opens the room,

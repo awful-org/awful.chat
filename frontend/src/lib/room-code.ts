@@ -28,12 +28,7 @@ const ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const ROOM_CODE_LEN = 13;
 const ROOM_CODE_RE = new RegExp(`^[${ALPHABET}]{${ROOM_CODE_LEN}}$`);
 
-export function newRoomCode(): string {
-  return Array.from(
-    crypto.getRandomValues(new Uint8Array(ROOM_CODE_LEN)),
-    (b) => ALPHABET[b & 31]
-  ).join("");
-}
+export { newRoomSecret as newRoomCode } from "./room-security/keys";
 
 /**
  * What a person typed or pasted, as the wire form. Only a base32 code is

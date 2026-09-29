@@ -10,6 +10,13 @@ import { identify, type Identify } from "@libp2p/identify";
 import { gossipsub, type GossipSub } from "@libp2p/gossipsub";
 import { keys } from "@libp2p/crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { deriveRoomKeys, type DiscoveryId, type RoomKeys, type RoomSecret } from "$lib/room-security/keys";
+import { attachRoomStream, ROOM_PROTOCOL } from "$lib/room-security/stream";
+import type { SecureRoomChannel } from "$lib/room-security/channel";
+import { attachDmIntroduction, DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
+import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
+import { onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
+import { roomSfuAdmission } from "$lib/room-security/sfu";
 import { multiaddr, type Multiaddr } from "@multiformats/multiaddr";
 import type { Connection, Stream } from "@libp2p/interface";
 import type { StreamMessageEvent, StreamCloseEvent } from "@libp2p/interface";
@@ -50,7 +57,7 @@ const RELAY_RESERVATION_TIMEOUT_MS = 20_000;
 /** Reservation attempts per relay reconnect before the node is rebuilt. */
 const RELAY_RESERVATION_ATTEMPTS = 3;
 const DIRECT_MSG_PROTOCOL = "/app/direct/1.0.0";
-const RENDEZVOUS_PROTOCOL = "/awful/rendezvous/1.0.0";
+const RENDEZVOUS_PROTOCOL = "/awful/rendezvous/2.0.0";
 // Upper bound on a single length-prefixed frame. A peer declares the length
 // up front, so without a cap a malicious 4-byte length forces us to buffer
 // gigabytes waiting for bytes that never come. Direct-stream frames carry app
@@ -211,6 +218,234 @@ export interface AppServices {
 }
 
 export class LibP2PTransport implements PeerTransport {
+  private dmIdentity: () => UnlockedSession | null = () => null;
+  private dmIdentityManaged = false;
+  private dmSessions = new Map<string, UnlockedSession>();
+  private dmCurrent(room: string): boolean {
+    const local = this.localRoom(room);
+    return !local.startsWith("dm-") || !this.dmIdentityManaged ||
+      (!!this.dmIdentity() && this.dmSessions.get(local) === this.dmIdentity());
+  }
+  private dmVerified: (peer: string, did: string, secret: RoomSecret) => Promise<void> = async () => {};
+  private dmIntroductions = new Map<Connection, { close: () => void; ready: Promise<boolean>; outgoing: boolean }>();
+  private dmOpening = new Map<string, Promise<boolean>>();
+
+  setDmIntroduction(identity: () => UnlockedSession | null,
+    verified: (peer: string, did: string, secret: RoomSecret) => Promise<void>): void {
+    this.dmIdentity = identity; this.dmVerified = verified; this.dmIdentityManaged = true;
+  }
+
+  private attachIntroduction(stream: Stream, connection: Connection, initiate?: { expectedDid?: string }) {
+    for (const [conn, handle] of this.dmIntroductions) if (conn.status !== "open") handle.close();
+    const existing = this.dmIntroductions.get(connection);
+    if (existing) {
+      // Simultaneous first contact converges on the smaller device's stream.
+      if (!initiate && existing.outgoing && this.selfId() > connection.remotePeer.toString()) existing.close();
+      else { stream.abort(new Error("Introduction already pending")); return initiate ? existing : null; }
+    }
+    if (this.dmIntroductions.size >= 32 || !this.dmIdentity()) {
+      stream.abort(new Error("Introduction unavailable")); return null;
+    }
+    const handle = attachDmIntroduction({ stream, connection, local: this.selfId(),
+      identity: this.dmIdentity, initiate,
+      verified: (did, secret) => this.dmVerified(connection.remotePeer.toString(), did, secret),
+      onClose: () => { this.dmIntroductions.delete(connection); },
+    });
+    this.dmIntroductions.set(connection, { ...handle, outgoing: !!initiate });
+    return handle;
+  }
+
+  /** Synchronous revocation hook for lock/logout, before asynchronous teardown. */
+  clearRoomSecurity(): void {
+    for (const handle of this.dmIntroductions.values()) handle.close();
+    for (const room of [...this.secureRooms.keys()]) this.leaveRoom(room);
+    this.dmSessions.clear();
+    this.secureOpening.clear();
+  }
+
+  introduceDm(peer: string, expectedDid?: string): Promise<boolean> {
+    const existing = this.dmOpening.get(peer);
+    if (existing) return existing;
+    const node = this.node, identity = this.dmIdentity();
+    if (!node || !identity || this.dmOpening.size >= 32 || this.isRelayPeer(peer)) return Promise.resolve(false);
+    const job = (async () => {
+      const signal = AbortSignal.timeout(10_000);
+      await this.dialPeer(peer);
+      if (node !== this.node || identity !== this.dmIdentity()) return false;
+      const connection = await node.dial(peerIdFromString(peer), { signal });
+      const stream = await connection.newStream(DM_INTRODUCTION_PROTOCOL, { signal, runOnLimitedConnection: true });
+      if (node !== this.node || identity !== this.dmIdentity()) { stream.abort(new Error("Session ended")); return false; }
+      return await (this.attachIntroduction(stream, connection, { expectedDid })?.ready ?? false);
+    })().catch(() => false).finally(() => { if (this.dmOpening.get(peer) === job) this.dmOpening.delete(peer); });
+    this.dmOpening.set(peer, job); return job;
+  }
+  private secureRooms = new Map<DiscoveryId, RoomKeys>();
+  private unobserveLock: (() => void) | null = null;
+  private lifecycleGeneration = 0;
+  // Local conversation references never become network discovery identifiers.
+  // Retain bindings after leave/disconnect: stale sends must fail closed rather
+  // than interpreting a previously protected reference as a legacy room.
+  private secureAliases = new Map<string, DiscoveryId>();
+  private secureLocalIds = new Map<DiscoveryId, string>();
+
+  private wireRoom(room: string): string {
+    return this.secureAliases.get(room) ?? room;
+  }
+
+  private localRoom(room: string): string {
+    return this.secureLocalIds.get(room as DiscoveryId) ?? room;
+  }
+
+  isSecureRoom(room: string): boolean {
+    return room.startsWith("dm-") || this.wireRoom(room).startsWith("rd2_");
+  }
+
+  /** Keep an existing DM storage ID while using a private capability on wire. */
+  joinSecureConversation(localId: string, secret: RoomSecret): DiscoveryId {
+    if (!/^dm-[a-f0-9]{40}$/.test(localId)) throw new Error("Invalid local DM reference");
+    const session = this.dmIdentity();
+    if (this.dmIdentityManaged && !session) throw new Error("Identity locked");
+    if (this.dmSessions.has(localId) && this.dmSessions.get(localId) !== session) this.leaveRoom(localId);
+    const { discoveryId } = deriveRoomKeys(secret);
+    const previous = this.secureAliases.get(localId);
+    const owner = this.secureLocalIds.get(discoveryId);
+    if ((previous && previous !== discoveryId) || (owner && owner !== localId)) {
+      throw new Error("Conflicting conversation capability");
+    }
+    if (!previous && this.secureAliases.size >= 512) throw new Error("Conversation binding limit");
+    if (!previous && this.joinedRooms.has(localId)) {
+      throw new Error("Leave legacy discovery before binding a protected conversation");
+    }
+    this.secureAliases.set(localId, discoveryId);
+    this.secureLocalIds.set(discoveryId, localId);
+    if (session) this.dmSessions.set(localId, session);
+    return this.joinSecureRoom(secret);
+  }
+  private secureOpening = new Map<string, Promise<SecureRoomChannel | null>>();
+  private secureStreams = new Set<{
+    connection: Connection;
+    room: DiscoveryId | null;
+    channel: SecureRoomChannel | null;
+    close: () => void;
+  }>();
+
+  /** Explicit v2 API: only the derived public ID reaches rendezvous. */
+  joinSecureRoom(secret: RoomSecret): DiscoveryId {
+    this.unobserveLock ??= onIdentityLock(() => { void this.disconnect(); });
+    const keys = deriveRoomKeys(secret);
+    if (this.secureRooms.has(keys.discoveryId)) return keys.discoveryId;
+    this.secureRooms.set(keys.discoveryId, keys);
+    this.joinRoom(keys.discoveryId);
+    return keys.discoveryId;
+  }
+
+  private attachSecureStream(stream: Stream, connection: Connection, initiate?: RoomKeys) {
+    for (const old of this.secureStreams) if (old.connection.status !== "open") old.close();
+    if (this.secureStreams.size >= 256 ||
+        [...this.secureStreams].filter((e) => e.connection === connection).length >= 32) {
+      stream.abort(new Error("Room connection limit"));
+      return null;
+    }
+    const entry = { connection, room: null as DiscoveryId | null,
+      channel: null as SecureRoomChannel | null, close: () => {} };
+    this.secureStreams.add(entry);
+    const handle = attachRoomStream({
+      stream, connection, local: this.selfId(), rooms: this.secureRooms, initiate,
+      onReady: (room, channel) => {
+        if (!this.secureRooms.has(room) || !this.dmCurrent(room)) { entry.close(); return; }
+        entry.room = room; entry.channel = channel;
+        this.emit("roomPeers", this.localRoom(room), this.peersInRoom(room));
+      },
+      onData: (room, data) => {
+        if (this.secureRooms.has(room) && this.dmCurrent(room) && connection.status === "open") {
+          this.emit("message", connection.remotePeer.toString(), data, this.localRoom(room));
+        }
+      },
+      onClose: () => { this.secureStreams.delete(entry); },
+    });
+    entry.close = handle.close;
+    return handle;
+  }
+
+  async sendSecureRoom(peerId: string, room: DiscoveryId, data: Uint8Array): Promise<boolean> {
+    const channel = await this.ensureSecureRoom(peerId, room);
+    return channel && this.dmCurrent(room) ? channel.send(data) : false;
+  }
+
+  /** Room-scoped application traffic must use this instead of raw send().
+   * A v2 capability failure must never fall back to the plaintext protocol.
+   */
+  sendRoom(peerId: string, room: string, data: Uint8Array): Promise<boolean> {
+    if (!this.dmCurrent(room)) return Promise.resolve(false);
+    room = this.wireRoom(room);
+    if (room.startsWith("r2_")) return Promise.resolve(false);
+    if (room.startsWith("dm-")) return Promise.resolve(false);
+    if (room.startsWith("rd2_")) return this.sendSecureRoom(peerId, room as DiscoveryId, data);
+    if (ROOM_SECURITY_V2_RELEASED) return Promise.resolve(false);
+    return this.send(peerId, data);
+  }
+
+  sfuAdmission(room: string, nonce: string, peer: string): { roomCode: string; capability: string } | undefined {
+    if (!this.dmCurrent(room)) throw new Error("Identity session ended");
+    room = this.wireRoom(room);
+    if (room.startsWith("dm-")) throw new Error("DM capability unavailable");
+    if (room.startsWith("r2_")) throw new Error("Room secret cannot be an SFU identifier");
+    if (!room.startsWith("rd2_")) {
+      if (ROOM_SECURITY_V2_RELEASED) throw new Error("Legacy rooms are read-only");
+      return undefined;
+    }
+    const keys = this.secureRooms.get(room as DiscoveryId);
+    if (!keys) throw new Error("Room capability unavailable");
+    return roomSfuAdmission(keys, nonce, peer);
+  }
+
+  private ensureSecureRoom(peerId: string, room: DiscoveryId): Promise<SecureRoomChannel | null> {
+    if (!this.dmCurrent(room)) return Promise.resolve(null);
+    const keys = this.secureRooms.get(room);
+    const node = this.node;
+    if (!keys || !node || peerId === this.selfId() || this.isRelayPeer(peerId)) return Promise.resolve(null);
+      for (const entry of this.secureStreams) {
+        if (entry.room === room && entry.connection.status === "open" &&
+            entry.connection.remotePeer.toString() === peerId && entry.channel?.verified) {
+          return Promise.resolve(entry.channel);
+        }
+      }
+    const openingKey = `${room}:${peerId}`;
+    const existing = this.secureOpening.get(openingKey);
+    if (existing) return existing;
+    if (this.secureOpening.size >= 64) return Promise.resolve(null);
+    const job = (async () => {
+      const signal = AbortSignal.timeout(30_000);
+      const connection = await node.dial(peerIdFromString(peerId), { signal });
+      if (this.node !== node || this.secureRooms.get(room) !== keys) return null;
+      const stream = await connection.newStream(ROOM_PROTOCOL, { runOnLimitedConnection: true, signal });
+      if (this.node !== node || this.secureRooms.get(room) !== keys) {
+        stream.abort(new Error("Room session ended")); return null;
+      }
+      const handle = this.attachSecureStream(stream, connection, keys);
+      const channel = handle?.getChannel();
+      if (!channel) return null;
+      await channel.ready;
+      if (this.node !== node || this.secureRooms.get(room) !== keys || !this.dmCurrent(room)) { channel.close(); return null; }
+      return channel;
+    })().catch(() => null).finally(() => {
+      if (this.secureOpening.get(openingKey) === job) this.secureOpening.delete(openingKey);
+    });
+    this.secureOpening.set(openingKey, job);
+    return job;
+  }
+
+  private verifyDiscoveredRoomPeer(room: string, peer: string): void {
+    const keys = this.secureRooms.get(room as DiscoveryId);
+    if (!keys) return;
+    // dialPeer knows the relay's circuit addresses; ordinary node.dial does not
+    // necessarily have an address for a freshly discovered peer yet.
+    void this.dialPeer(peer).then(() => {
+      if (this.secureRooms.get(room as DiscoveryId) === keys) {
+        return this.ensureSecureRoom(peer, room as DiscoveryId);
+      }
+    }).catch(() => {});
+  }
   private node: Libp2p<AppServices> | null = null;
   private handlers = new Map<keyof TransportEvents, Set<Function>>();
   private relayedPeers = new Set<string>();
@@ -518,6 +753,15 @@ export class LibP2PTransport implements PeerTransport {
   private noiseFilterInstalled = false;
 
   async connect(privateKeyBytes?: Uint8Array | null): Promise<void> {
+    const generation = ++this.lifecycleGeneration;
+    let startingNode: Libp2p<AppServices> | null = null;
+    const assertCurrent = () => {
+      if (generation === this.lifecycleGeneration) return;
+      try { void Promise.resolve(startingNode?.stop()).catch(() => {}); } catch {}
+      throw new Error("Transport connection cancelled");
+    };
+    for (const entry of this.secureStreams) entry.close();
+    this.secureOpening.clear();
     this.installStreamNoiseFilter();
     this.intentionalDisconnect = false;
 
@@ -551,6 +795,7 @@ export class LibP2PTransport implements PeerTransport {
       try {
         await this.node.stop();
       } catch {}
+      assertCurrent();
       this.node = null;
     }
     // Stopping the old node fires its own relay peer:disconnect, which
@@ -612,8 +857,10 @@ export class LibP2PTransport implements PeerTransport {
     const privateKey = this.privateKeyBytes
       ? await this.privateKeyFromRawKey(this.privateKeyBytes)
       : undefined;
+    assertCurrent();
 
-    this.node = await createLibp2p({
+    startingNode = await createLibp2p({
+      start: false,
       privateKey,
       addresses: { listen: ["/webrtc"] },
       transports: [
@@ -639,6 +886,8 @@ export class LibP2PTransport implements PeerTransport {
         }),
       },
     });
+    assertCurrent();
+    this.node = startingNode;
 
     await this.node.handle(
       DIRECT_MSG_PROTOCOL,
@@ -657,8 +906,20 @@ export class LibP2PTransport implements PeerTransport {
       // would make every relayed peer connect and carry nothing.
       { force: true, runOnLimitedConnection: true }
     );
+    assertCurrent();
+
+    await this.node.handle(ROOM_PROTOCOL, (stream: Stream, connection: Connection) => {
+      this.attachSecureStream(stream, connection);
+    }, { force: true, runOnLimitedConnection: true });
+    assertCurrent();
+
+    await this.node.handle(DM_INTRODUCTION_PROTOCOL, (stream: Stream, connection: Connection) => {
+      this.attachIntroduction(stream, connection);
+    }, { force: true, runOnLimitedConnection: true, maxInboundStreams: 1 });
+    assertCurrent();
 
     await this.node.start();
+    assertCurrent();
 
     const relayMa = relayMultiaddr();
     this.relayPeerId = relayMa.split("/p2p/").pop() ?? null;
@@ -694,7 +955,7 @@ export class LibP2PTransport implements PeerTransport {
       // true for frames that never arrive, which makes the DM layer delete
       // them from its persisted queue. The message itself is the presence
       // signal, so there is nothing further to record here.
-      if (room && this.joinedRooms.has(room)) {
+      if (!ROOM_SECURITY_V2_RELEASED && room && !room.startsWith("rd2_") && this.joinedRooms.has(room)) {
         this.emit("message", from, evt.detail.data, room);
       }
     });
@@ -720,16 +981,21 @@ export class LibP2PTransport implements PeerTransport {
 
     try {
       await this.dialRelay();
+      assertCurrent();
     } catch (err) {
       // Don't leave a running node behind on a failed connect
       try {
-        await this.node.stop();
+        await startingNode.stop();
       } catch {}
+      assertCurrent();
       this.node = null;
       throw err;
     }
     await this.requestRelayReservation();
-    if (!(await this.waitForRelayReservation())) {
+    assertCurrent();
+    const reserved = await this.waitForRelayReservation();
+    assertCurrent();
+    if (!reserved) {
       // No reservation means nobody can reach US: a browser cannot listen, so
       // every inbound path runs through the relay circuit. One more attempt
       // covers the common case of the first request racing the relay dial.
@@ -739,7 +1005,9 @@ export class LibP2PTransport implements PeerTransport {
       // builds a FRESH node, is the real recovery.)
       console.warn("[Transport] no relay reservation, retrying once");
       await this.requestRelayReservation();
+      assertCurrent();
       await this.waitForRelayReservation();
+      assertCurrent();
     }
 
     // Anything that connected before the listeners existed (or whose event we
@@ -766,6 +1034,9 @@ export class LibP2PTransport implements PeerTransport {
     this.node.addEventListener(
       "connection:close",
       (evt: CustomEvent<Connection>) => {
+        for (const entry of this.secureStreams) {
+          if (entry.connection === evt.detail) entry.close();
+        }
         const id = evt.detail.remotePeer.toString();
         if (!this.connectedPeers.has(id)) return;
         this.updateRelayedStatus(id);
@@ -816,20 +1087,38 @@ export class LibP2PTransport implements PeerTransport {
     // with no subscriptions, and joinRoom() early-returns for known rooms.
     // (startRendezvous re-REGISTERs them with the relay itself.)
     for (const room of this.joinedRooms) {
-      this.node.services.pubsub.subscribe(roomTopic(room));
+      if (!room.startsWith("rd2_")) this.node.services.pubsub.subscribe(roomTopic(room));
     }
 
     this.startRendezvous();
   }
 
   joinRoom(roomCode: string): void {
+    if (ROOM_SECURITY_V2_RELEASED && !roomCode.startsWith("rd2_")) throw new Error("Legacy rooms are read-only");
+    roomCode = this.wireRoom(roomCode);
+    if (roomCode.startsWith("dm-")) throw new Error("Missing room capability");
+    if (roomCode.startsWith("r2_")) throw new Error("Room secrets require joinSecureRoom");
+    if (roomCode.startsWith("rd2_") && !this.secureRooms.has(roomCode as DiscoveryId)) {
+      throw new Error("Missing room capability");
+    }
     if (this.joinedRooms.has(roomCode)) return;
     this.joinedRooms.add(roomCode);
-    this.node?.services.pubsub.subscribe(roomTopic(roomCode));
+    if (!roomCode.startsWith("rd2_")) this.node?.services.pubsub.subscribe(roomTopic(roomCode));
     this.rendezvousSend({ type: "REGISTER", room: roomCode });
   }
 
   leaveRoom(roomCode: string): void {
+    roomCode = this.wireRoom(roomCode);
+    for (const entry of this.secureStreams) {
+      // Pending inbound handshakes do not yet have an admitted room. Closing
+      // them on leave prevents completion against a removed capability.
+      if (entry.room === roomCode || entry.room === null) entry.close();
+    }
+    const keys = this.secureRooms.get(roomCode as DiscoveryId);
+    if (keys) {
+      keys.membershipKey.fill(0); keys.encryptionKey.fill(0); keys.sfuSigningSeed.fill(0);
+      this.secureRooms.delete(roomCode as DiscoveryId);
+    }
     if (!this.joinedRooms.has(roomCode)) return;
     this.joinedRooms.delete(roomCode);
     // Otherwise the set grows for the whole session; retryMissingRoomPeers
@@ -837,11 +1126,21 @@ export class LibP2PTransport implements PeerTransport {
     this.roomPeers.delete(roomCode);
     this.rendezvousSend({ type: "UNREGISTER", room: roomCode });
     try {
-      this.node?.services.pubsub.unsubscribe(roomTopic(roomCode));
+      if (!roomCode.startsWith("rd2_")) this.node?.services.pubsub.unsubscribe(roomTopic(roomCode));
     } catch {}
   }
 
   async disconnect(): Promise<void> {
+    const generation = ++this.lifecycleGeneration;
+    this.unobserveLock?.();
+    this.unobserveLock = null;
+    this.clearRoomSecurity();
+    for (const handle of this.dmIntroductions.values()) handle.close();
+    this.dmOpening.clear();
+    this.dmSessions.clear();
+    for (const entry of this.secureStreams) entry.close();
+    this.secureOpening.clear();
+    this.secureRooms.clear();
     // mark intentional so no reconnect timers fire
     this.intentionalDisconnect = true;
 
@@ -865,6 +1164,7 @@ export class LibP2PTransport implements PeerTransport {
     try {
       await this.node.stop();
     } catch {}
+    if (generation !== this.lifecycleGeneration) return;
     this.node = null;
     this.relayPeerId = null;
     this.stopRendezvousPing();
@@ -979,7 +1279,15 @@ export class LibP2PTransport implements PeerTransport {
    * be flushed before the node is stopped or it never leaves the machine.
    */
   async broadcast(data: Uint8Array, roomCode: string): Promise<void> {
-    if (!this.node || !this.joinedRooms.has(roomCode)) return;
+    if (!this.dmCurrent(roomCode)) return;
+    roomCode = this.wireRoom(roomCode);
+    if (roomCode.startsWith("dm-")) throw new Error("DM capability unavailable");
+    if (roomCode.startsWith("r2_")) throw new Error("Cannot broadcast a room secret");
+    if (roomCode.startsWith("rd2_")) {
+      await Promise.all(this.peersInRoom(roomCode).map((peer) => this.sendSecureRoom(peer, roomCode as DiscoveryId, data)));
+      return;
+    }
+    if (ROOM_SECURITY_V2_RELEASED || !this.node || !this.joinedRooms.has(roomCode)) return;
     if (shouldDropFrame(data)) return;
     try {
       await this.node.services.pubsub.publish(roomTopic(roomCode), data);
@@ -1013,6 +1321,12 @@ export class LibP2PTransport implements PeerTransport {
    * key to it.
    */
   peersInRoom(room: string): string[] {
+    if (!this.dmCurrent(room)) return [];
+    room = this.wireRoom(room);
+    if (room.startsWith("dm-")) return [];
+    if (room.startsWith("rd2_")) return [...new Set([...this.secureStreams]
+      .filter((e) => e.room === room && e.connection.status === "open" && e.channel?.verified)
+      .map((e) => e.connection.remotePeer.toString()))];
     const known = this.roomPeers.get(room);
     if (!known) return [];
     return [...known].filter((p) => this.connectedPeers.has(p));
@@ -1029,6 +1343,10 @@ export class LibP2PTransport implements PeerTransport {
    * connection of its own, and that is precisely the peer worth dialling.
    */
   isRoomPeer(room: string, peerId: string): boolean {
+    if (!this.dmCurrent(room)) return false;
+    room = this.wireRoom(room);
+    if (room.startsWith("dm-")) return false;
+    if (room.startsWith("rd2_")) return this.peersInRoom(room).includes(peerId);
     return this.roomPeers.get(room)?.has(peerId) === true;
   }
 
@@ -1071,7 +1389,7 @@ export class LibP2PTransport implements PeerTransport {
   }
 
   rooms(): string[] {
-    return Array.from(this.joinedRooms);
+    return Array.from(this.joinedRooms, (room) => this.localRoom(room));
   }
 
   /**
@@ -2372,6 +2690,10 @@ export class LibP2PTransport implements PeerTransport {
         for (const peerId of msg.peers ?? []) {
           if (peerId === selfId) continue;
           this.rememberRoomPeer(msg.room, peerId);
+          if (msg.room.startsWith("rd2_")) {
+            this.verifyDiscoveredRoomPeer(msg.room, peerId);
+            continue;
+          }
           if (this.connectedPeers.has(peerId)) continue;
           this.dialPeer(peerId).catch(() => {});
         }
@@ -2379,15 +2701,19 @@ export class LibP2PTransport implements PeerTransport {
         // without this nothing would reconcile history with them until the
         // repair tick came round - digests are gated on membership, and this
         // reply is where membership becomes known.
-        this.emit("roomPeers", msg.room, this.peersInRoom(msg.room));
+        this.emit("roomPeers", this.localRoom(msg.room), this.peersInRoom(msg.room));
         break;
       }
       case "PEER_JOINED": {
         const peerId = msg.peer;
         if (peerId === selfId) break;
         this.rememberRoomPeer(msg.room, peerId);
+        if (msg.room.startsWith("rd2_")) {
+          this.verifyDiscoveredRoomPeer(msg.room, peerId);
+          break;
+        }
         if (this.connectedPeers.has(peerId)) {
-          this.emit("roomPeers", msg.room, [peerId]);
+          if (!msg.room.startsWith("rd2_")) this.emit("roomPeers", msg.room, [peerId]);
         }
         if (this.connectedPeers.has(peerId)) break;
         this.dialPeer(peerId).catch(() => {});

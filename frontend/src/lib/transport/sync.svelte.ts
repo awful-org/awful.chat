@@ -8,7 +8,8 @@
 import QRCode from "qrcode";
 import { Html5Qrcode } from "html5-qrcode";
 import type { PeerTransport } from "./types";
-import { LibP2PTransport } from "./libp2p/transport";
+import { SecureSyncTransport } from "$lib/room-security/sync-transport";
+import { deriveRoomKeys, newRoomSecret, parseRoomSecret, type RoomSecret } from "$lib/room-security/keys";
 import {
   getDB,
   wipeLocalDatabase,
@@ -76,6 +77,7 @@ export type {
 } from "./backup";
 
 export interface SyncPayload {
+  roomSecret?: string;
   roomCode: string;
   token: string;
   expires: number;
@@ -146,9 +148,15 @@ export const syncState = $state<SyncState>({
 });
 
 let _transport: PeerTransport | null = null;
+// A committed multi-transaction import cannot be rolled back. Keep its write
+// lease through cleanup so a replacement sync cannot overlap identity/storage.
+let _importCommitDone: Promise<void> | null = null;
 let _html5QrCode: Html5Qrcode | null = null;
 let _syncRoomCode: string | null = null;
+let _syncRoomSecret: RoomSecret | null = null;
 let _syncToken: string | null = null;
+/** Only the first peer proving the pairing token may control this export. */
+let _authorizedExportPeer: string | null = null;
 let _syncExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 let _isSourceDevice = false;
 /**
@@ -363,15 +371,6 @@ function decode(data: Uint8Array): unknown {
   return JSON.parse(new TextDecoder().decode(data));
 }
 
-function generateSyncRoomCode(): string {
-  // Generate 8 random hex chars = 4.3 billion combinations, plenty for ephemeral sync
-  const randomBytes = crypto.getRandomValues(new Uint8Array(4));
-  const random = Array.from(randomBytes, (b) =>
-    b.toString(16).padStart(2, "0")
-  ).join("");
-  return `${SYNC_ROOM_PREFIX}${random}`;
-}
-
 function generateToken(): string {
   const array = new Uint8Array(16);
   crypto.getRandomValues(array);
@@ -427,15 +426,23 @@ export function parseShortCode(
  * Call this when you want to sync FROM this device TO another.
  */
 export async function generateSyncCode(): Promise<void> {
+  // Invalidate the previous session synchronously. Its disconnect may finish
+  // later, but must never publish a QR or clear this attempt's state.
+  const previousCleanup = cleanup();
+  const token = generateToken();
+  _syncToken = token;
+  const current = () => _syncToken === token;
   syncState.isGenerating = true;
   syncState.qrDataUrl = null;
   syncState.plaintextToken = null;
   syncState.syncError = null;
 
   try {
-    _syncRoomCode = generateSyncRoomCode();
-    const token = generateToken();
-    _syncToken = token;
+    await previousCleanup;
+    await _importCommitDone;
+    if (!current()) return;
+    _syncRoomSecret = newRoomSecret();
+    _syncRoomCode = deriveRoomKeys(_syncRoomSecret).discoveryId;
     // A fresh code starts QR-only: the short code's truncated token is not
     // honoured until the user asks to see it.
     _shortCodeRevealed = false;
@@ -445,7 +452,7 @@ export async function generateSyncCode(): Promise<void> {
     // tearing the server down ourselves.
     if (_syncExpiryTimer) clearTimeout(_syncExpiryTimer);
     _syncExpiryTimer = setTimeout(() => {
-      if (!syncState.isSyncing && !syncState.isComplete) {
+      if (current() && !syncState.isSyncing && !syncState.isComplete) {
         syncState.syncError = "Sync code expired";
         cleanup().catch(() => {});
       }
@@ -458,28 +465,19 @@ export async function generateSyncCode(): Promise<void> {
     // trusting whichever peer joins the room first), and that peerId only
     // exists once the transport is connected. The UI stays on its spinner
     // (isGenerating) for this whole span.
-    try {
-      await startSyncServer();
-    } catch (err) {
-      await cleanup();
-      throw err;
-    }
+    await startSyncServer();
+    if (!current()) return;
 
     const selfId = _transport?.selfId() ?? "";
     if (!selfId) {
       // The code is USELESS without a peerId to pin to - the other device
       // would scan it and have nothing to authenticate the source against.
-      await cleanup();
       throw new Error("Could not determine this device's peer ID");
     }
 
-    // The QR carries room:token:peerId, the same "full format" the manual
-    // parser already reads. It used to carry the payload as JSON, which is
-    // sixty bytes of keys and quotes for nothing (expires is re-derived on
-    // the target and enforced here) and pushed the code from 41 to 49
-    // modules a side. A phone camera has to resolve every one of those
-    // squares off another phone's screen; fewer is what makes it scan.
-    const qrText = `${_syncRoomCode}:${token}:${selfId}`;
+    // QR and copy/paste both carry the full capability and pin the source's
+    // Noise-authenticated identity. No token truncation for the manual path.
+    const qrText = `${_syncRoomSecret}:${token}:${selfId}`;
 
     const qrDataUrl = await QRCode.toDataURL(qrText, {
       width: 256,
@@ -489,16 +487,20 @@ export async function generateSyncCode(): Promise<void> {
         light: "#ffffff",
       },
     });
+    if (!current()) return;
 
-    // Create short plaintext token
-    const plaintextToken = generateShortCode(_syncRoomCode, token, selfId);
+    // The copy/paste fallback preserves the same authentication as the QR.
+    const plaintextToken = qrText;
 
     syncState.qrDataUrl = qrDataUrl;
     syncState.plaintextToken = plaintextToken;
   } catch (err) {
+    if (!current()) return;
     syncState.syncError = err instanceof Error ? err.message : String(err);
-  } finally {
     syncState.isGenerating = false;
+    await cleanup();
+  } finally {
+    if (current()) syncState.isGenerating = false;
   }
 }
 
@@ -514,6 +516,13 @@ export async function generateSyncCode(): Promise<void> {
  * without source authentication.
  */
 export function parsePlaintextToken(plaintext: string): SyncPayload | null {
+  if (plaintext.trim().startsWith("r2_")) {
+    const parts = plaintext.trim().split(":");
+    if (parts.length !== 3 || !/^[0-9a-f]{32}$/.test(parts[1]) || !/^12D3KooW[1-9A-HJ-NP-Za-km-z]{44}$/.test(parts[2])) return null;
+    const roomSecret = parseRoomSecret(parts[0]);
+    return { roomSecret, roomCode: deriveRoomKeys(roomSecret).discoveryId,
+      token: parts[1], peerId: parts[2], expires: Date.now() + SYNC_TIMEOUT };
+  }
   // Try short format first (contains hyphen but no __sync_ prefix)
   if (plaintext.includes("-") && !plaintext.includes(SYNC_ROOM_PREFIX)) {
     const legacyParts = plaintext.split("-");
@@ -559,22 +568,22 @@ export function parsePlaintextToken(plaintext: string): SyncPayload | null {
  * and source responds with data.
  */
 async function startSyncServer(): Promise<void> {
-  if (!_syncRoomCode) return;
+  if (!_syncRoomCode || !_syncRoomSecret) return;
 
   // The room code is the ephemeral sync room's membership secret; anything
   // that can read the console can join it, so it never gets printed.
   console.log("[Sync][Source] Starting sync server");
 
-  _transport = new LibP2PTransport({ diagBus: "sync" });
+  _transport = new SecureSyncTransport(_syncRoomSecret);
+  const sourceTransport = _transport;
 
   // Set up handlers
   _transport.on("connect", (peerId: string) => {
     console.log("[Sync][Source] Peer connected:", peerId.slice(0, 8));
-    syncState.isConnecting = false;
-    syncState.isSyncing = true;
   });
 
-  _transport.on("disconnect", () => {
+  _transport.on("disconnect", (peerId) => {
+    if (peerId !== _authorizedExportPeer) return;
     console.log("[Sync][Source] Peer disconnected");
     if (!syncState.isComplete) {
       syncState.syncError = "Connection lost";
@@ -582,23 +591,24 @@ async function startSyncServer(): Promise<void> {
   });
 
   // Source handles requests from target
-  _transport.on("message", async (peerId: string, data: Uint8Array) => {
+  _transport.on("message", async (peerId: string, data: Uint8Array, room: string | null) => {
+    if (_transport !== sourceTransport || room !== _syncRoomCode) return;
     console.log("[Sync][Source] Received message from:", peerId.slice(0, 8));
     try {
       const msg = decode(data) as SyncMessage;
+      if (msg.type !== SyncMessageType.ExportRequest && peerId !== _authorizedExportPeer) return;
       console.log("[Sync][Source] Message type:", msg.type);
 
       if (msg.type === SyncMessageType.ExportRequest) {
+        if (_authorizedExportPeer !== null) return;
         const { mode, token } = (msg.payload ?? {}) as {
           mode?: "add" | "replace";
           token?: string;
         };
 
-        // The room code alone is only 32 bits of entropy - the token from
-        // the QR/short code is the actual proof the requester scanned it.
-        // The truncated short-code prefix only counts once this device has
-        // actually shown the short code (see revealShortCode).
-        const tokenOk = tokenAccepted(token, _syncToken, _shortCodeRevealed);
+        // The room handshake proves the fresh 256-bit capability; require the
+        // complete pairing token as well, regardless of the UI entry method.
+        const tokenOk = tokenAccepted(token, _syncToken, false);
         if (!tokenOk) {
           console.warn("[Sync][Source] Rejected ExportRequest: bad token");
           _transport?.send(
@@ -614,6 +624,9 @@ async function startSyncServer(): Promise<void> {
           return;
         }
 
+        _authorizedExportPeer = peerId;
+        syncState.isConnecting = false;
+        syncState.isSyncing = true;
         const requestMode = mode ?? "replace";
         console.log(
           `[Sync][Source] Received ExportRequest, mode: ${requestMode}, sending data...`
@@ -652,8 +665,9 @@ async function startSyncServer(): Promise<void> {
 
   syncState.isConnecting = true;
   console.log("[Sync][Source] Connecting to room...");
-  await _transport.connect();
-  _transport.joinRoom(_syncRoomCode);
+  await sourceTransport.connect();
+  if (_transport !== sourceTransport || !_syncRoomCode) return;
+  sourceTransport.joinRoom(_syncRoomCode);
   console.log("[Sync][Source] Connected to room");
 }
 
@@ -665,27 +679,33 @@ async function sendExportData(
   mode: "add" | "replace" = "replace"
 ): Promise<void> {
   if (!_transport) return;
+  const transport = _transport;
+  const token = _syncToken ?? undefined;
+  const room = _syncRoomCode;
+  const current = () => _transport === transport && _syncRoomCode === room &&
+    (_syncToken ?? undefined) === token;
 
   console.log(`[Sync][Source] Exporting data in ${mode} mode`);
 
   try {
     // In "add" mode, we skip identity export since target keeps its own
     const exportData = await exportDatabase(mode === "add");
+    if (!current()) return;
 
     // Echo the proof-of-scan token in every data frame so the target can
     // reject data from a peer that never proved it holds the shared secret.
-    const token = _syncToken ?? undefined;
 
     // Send identity first. Checked like every other send: this is the one
     // frame whose loss leaves the target sitting at exactly 0%, and it was
     // also the only one whose result was thrown away.
-    const identityOk = await _transport.send(
+    const identityOk = await transport.send(
       peerId,
       encode({
         type: SyncMessageType.ExportData,
         payload: { section: "identity", data: exportData.identity, token },
       })
     );
+    if (!current()) return;
     if (!identityOk) {
       throw new Error("Connection lost before sending identity - try again");
     }
@@ -734,13 +754,14 @@ async function sendExportData(
       );
 
       for (let i = 0; i < batches.length; i++) {
+        if (!current()) return;
         // send() resolving false means the stream is gone; silently pouring
         // the rest of the export into it is how the source reached 90% with
         // a target that had stopped hearing anything at 20%. It resolves in
         // bounded time: the transport gives a frame a drain budget scaled to
         // its size, so a far end that stopped reading (a phone that went to
         // sleep mid transfer) fails the send instead of parking this loop.
-        const ok = await _transport.send(
+        const ok = await transport.send(
           peerId,
           encode({
             type: SyncMessageType.ExportData,
@@ -753,6 +774,7 @@ async function sendExportData(
             },
           })
         );
+        if (!current()) return;
         if (!ok) {
           throw new Error(
             `Connection lost while sending ${section.name} - try again`
@@ -762,6 +784,7 @@ async function sendExportData(
         // Small delay between batches to prevent overwhelming the target
         if (i < batches.length - 1) {
           await new Promise((resolve) => setTimeout(resolve, 10));
+          if (!current()) return;
         }
       }
       processed++;
@@ -774,10 +797,12 @@ async function sendExportData(
 
     console.log("[Sync][Source] Sending ExportComplete");
     // Send completion
-    const okComplete = await _transport.send(
+    if (!current()) return;
+    const okComplete = await transport.send(
       peerId,
       encode({ type: SyncMessageType.ExportComplete })
     );
+    if (!current()) return;
     if (!okComplete) {
       throw new Error("Connection lost before the export finished - try again");
     }
@@ -791,6 +816,7 @@ async function sendExportData(
     armAckTimer();
     console.log("[Sync][Source] Waiting for target to finish importing...");
   } catch (err) {
+    if (!current()) return;
     console.error("[Sync] Error sending export data:", err);
     // Into syncState, not only the console. Every throw in this function
     // landed here and stopped: no error was set, isSyncing stayed true, and
@@ -801,7 +827,7 @@ async function sendExportData(
     // this function was reporting into a black hole.
     syncState.syncError = err instanceof Error ? err.message : String(err);
     syncState.isSyncing = false;
-    void _transport
+    void transport
       ?.send(
         peerId,
         encode({
@@ -822,6 +848,12 @@ export async function connectAsTarget(
   payload: SyncPayload,
   importOptions: ImportOptions = {}
 ): Promise<void> {
+  if (!payload.roomSecret || !payload.peerId || !/^[a-f0-9]{32}$/i.test(payload.token ?? "")) {
+    throw new Error("Update both devices and generate a new complete secure sync code.");
+  }
+  if (!Number.isFinite(payload.expires)) throw new Error("Invalid sync invitation expiry.");
+  const pairingSecret = parseRoomSecret(payload.roomSecret);
+  if (deriveRoomKeys(pairingSecret).discoveryId !== payload.roomCode) throw new Error("Sync capability mismatch");
   if (payload.expires < Date.now()) {
     throw new Error("Sync code has expired");
   }
@@ -834,6 +866,9 @@ export async function connectAsTarget(
   }
 
   const mode = payload.mode ?? "replace";
+  const previousCleanup = cleanup();
+  const attemptToken = generateToken();
+  _syncToken = attemptToken;
   // Room code redacted for the same reason as on the source side.
   console.log(`[Sync][Target] Starting sync client, mode: ${mode}`);
 
@@ -841,10 +876,15 @@ export async function connectAsTarget(
   syncState.syncError = null;
 
   try {
+    await previousCleanup;
+    await _importCommitDone;
+    if (_syncToken !== attemptToken) return;
     _syncRoomCode = payload.roomCode;
+    _syncRoomSecret = pairingSecret;
     _isSourceDevice = false;
 
-    _transport = new LibP2PTransport({ diagBus: "sync" });
+    _transport = new SecureSyncTransport(pairingSecret);
+    const targetTransport = _transport;
 
     let receivedIdentity: DatabaseExport["identity"] | null = null;
     const receivedData: Partial<DatabaseExport> = {};
@@ -879,7 +919,7 @@ export async function connectAsTarget(
       // ponytail: 3 tries, 2s apart; each send already spends the
       // transport's ~5.6s confirm budget before resolving false.
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (!_transport || !syncState.isSyncing || syncState.isComplete) return;
+        if (_transport !== targetTransport || !syncState.isSyncing || syncState.isComplete) return;
         if (await _transport.send(peerId, frame)) return;
         await new Promise((r) => setTimeout(r, 2000));
       }
@@ -941,7 +981,8 @@ export async function connectAsTarget(
       }
     });
 
-    _transport.on("message", async (peerId: string, data: Uint8Array) => {
+    _transport.on("message", async (peerId: string, data: Uint8Array, room: string | null) => {
+      if (_transport !== targetTransport || room !== _syncRoomCode) return;
       // Only accept sync traffic from the authenticated source peer - both
       // the identity check (peerId matches the QR/short code) and the pin
       // (peerId matches the one "connect" already accepted). The identity
@@ -1073,6 +1114,7 @@ export async function connectAsTarget(
           syncState.syncProgress = Math.max(syncState.syncProgress, 90);
           let lastReport = 0;
           const onProgress = (done: number, total: number): void => {
+            if (_transport !== targetTransport) return;
             const percent =
               total > 0 ? 90 + Math.floor((done / total) * 9) : 99;
             if (percent > syncState.syncProgress) {
@@ -1084,7 +1126,7 @@ export async function connectAsTarget(
             const now = Date.now();
             if (now - lastReport < 2000) return;
             lastReport = now;
-            void _transport
+            void targetTransport
               ?.send(
                 peerId,
                 encode({
@@ -1096,6 +1138,8 @@ export async function connectAsTarget(
           };
           // Import all received data
           if (receivedIdentity || mode === "add") {
+            let releaseCommit: (() => void) | undefined;
+            let commitDone: Promise<void> | undefined;
             try {
               const { droppedRecords } = await importDatabase(
                 {
@@ -1122,8 +1166,25 @@ export async function connectAsTarget(
                 // the at-rest key is armed before the first row is written,
                 // so nothing lands in plaintext on a device that has never
                 // unlocked (see importDatabase).
-                { ...importOptions, onProgress }
-              );
+                { ...importOptions, onProgress,
+                  requestPassword: importOptions.requestPassword ? async (retry) => {
+                    if (_transport !== targetTransport) return null;
+                    const password = await importOptions.requestPassword!(retry);
+                    return _transport === targetTransport ? password : null;
+                  } : undefined,
+                  beforeCommit: () => {
+                  if (_transport !== targetTransport) throw new Error("Sync import cancelled before commit");
+                  importOptions.beforeCommit?.();
+                  if (_transport !== targetTransport) throw new Error("Sync import cancelled before commit");
+                  if (_importCommitDone) throw new Error("Another import is committing");
+                  commitDone = new Promise<void>((resolve) => { releaseCommit = resolve; });
+                  _importCommitDone = commitDone;
+                } }
+              ).finally(() => {
+                if (_importCommitDone === commitDone) _importCommitDone = null;
+                releaseCommit?.();
+              });
+              if (_transport !== targetTransport) return;
               if (droppedRecords > 0) {
                 // The sync itself succeeded - this is a partial-data note,
                 // not a failure, so it doesn't route through syncError/the
@@ -1145,9 +1206,10 @@ export async function connectAsTarget(
               // cleanup() disconnected the transport meant the source often
               // never saw the completion. The transport bounds the wait, so a
               // source that already gave up cannot hold this side at 99.
-              await _transport
+              await targetTransport
                 ?.send(peerId, encode({ type: SyncMessageType.ExportComplete }))
                 .catch(() => false);
+              if (_transport !== targetTransport) return;
 
               syncState.isSyncing = false;
               syncState.isComplete = true;
@@ -1155,10 +1217,11 @@ export async function connectAsTarget(
               clearStallTimer();
               await cleanup();
             } catch (err) {
+              if (_transport !== targetTransport) return;
               console.error("[Sync][Target] Import failed:", err);
               syncState.syncError =
                 err instanceof Error ? err.message : "Import failed";
-              await _transport
+              await targetTransport
                 ?.send(
                   peerId,
                   encode({
@@ -1176,13 +1239,15 @@ export async function connectAsTarget(
           await cleanup();
         }
       } catch (err) {
+        if (_transport !== targetTransport) return;
         console.error("[Sync] Error handling message:", err);
         syncState.syncError = err instanceof Error ? err.message : String(err);
       }
     });
 
-    await _transport.connect();
-    _transport.joinRoom(payload.roomCode);
+    await targetTransport.connect();
+    if (_transport !== targetTransport) return;
+    targetTransport.joinRoom(payload.roomCode);
 
     // Joining the room is not the same as finding the other device: the
     // source may have expired its code, closed the dialog, or never gotten
@@ -1264,7 +1329,9 @@ async function exportDatabase(skipIdentity = false): Promise<DatabaseExport> {
     db
       .getAll("pending")
       .then((r) => openRows<PendingMessage>(r, STORE_SPECS.pending)),
-    db.getAll("watermarks"),
+    db.getAll("watermarks").then((r) =>
+      openRows<DatabaseExport["watermarks"][number]>(r, STORE_SPECS.watermarks),
+    ),
     db
       .getAll("yjsDocs")
       .then((r) => openRows(r, STORE_SPECS.yjsDocs))
@@ -1567,12 +1634,19 @@ export async function toggleScanTorch(): Promise<void> {
  * Stop camera scanning.
  */
 export async function stopScanning(): Promise<void> {
-  if (_html5QrCode) {
+  const scanner = _html5QrCode;
+  const torchOn = scannerState.torchOn;
+  _html5QrCode = null;
+  syncState.isScanning = false;
+  scannerState.awaitingPermission = false;
+  scannerState.torchAvailable = false;
+  scannerState.torchOn = false;
+  if (scanner) {
     // Off before the stop: some Androids leave the torch burning after the
     // camera is released, and nothing in the app can reach it again.
-    if (scannerState.torchOn) {
+    if (torchOn) {
       try {
-        await _html5QrCode
+        await scanner
           .getRunningTrackCameraCapabilities()
           .torchFeature()
           .apply(false);
@@ -1581,16 +1655,11 @@ export async function stopScanning(): Promise<void> {
       }
     }
     try {
-      await _html5QrCode.stop();
+      await scanner.stop();
     } catch {
       // Ignore stop errors
     }
-    _html5QrCode = null;
   }
-  syncState.isScanning = false;
-  scannerState.awaitingPermission = false;
-  scannerState.torchAvailable = false;
-  scannerState.torchOn = false;
   // cameras and activeCameraId deliberately survive: switchScanCamera stops
   // and restarts, and re-enumerating would re-prompt on some browsers.
 }
@@ -1616,19 +1685,30 @@ export function resetSyncState(): void {
  * Clean up resources.
  */
 async function cleanup(): Promise<void> {
+  const dying = _transport;
+  _transport = null;
+  const stoppingScanner = stopScanning();
+  if (_syncExpiryTimer) clearTimeout(_syncExpiryTimer);
+  _syncExpiryTimer = null;
+  _syncRoomCode = null;
+  _syncRoomSecret = null;
+  _syncToken = null;
+  _authorizedExportPeer = null;
+  _shortCodeRevealed = false;
+  _isSourceDevice = false;
+  _targetSourcePeerId = null;
+  _exportRequested = false;
   if (_ackTimeoutTimer) clearTimeout(_ackTimeoutTimer);
   _ackTimeoutTimer = null;
   if (_peerWaitTimer) clearTimeout(_peerWaitTimer);
   _peerWaitTimer = null;
   clearStallTimer();
-  if (_transport) {
+  if (dying) {
     // AWAIT it. disconnect() stops the libp2p node asynchronously, and
     // dropping the promise let the next attempt start a second node while
     // the first was still tearing its relay socket down - two nodes racing
     // the same dial is exactly what made a retry fail more often than the
     // first try.
-    const dying = _transport;
-    _transport = null;
     try {
       await dying.disconnect();
     } catch {
@@ -1636,23 +1716,13 @@ async function cleanup(): Promise<void> {
       // is dropped either way.
     }
   }
-  await stopScanning();
-  if (_syncExpiryTimer) {
-    clearTimeout(_syncExpiryTimer);
-    _syncExpiryTimer = null;
-  }
-  _syncRoomCode = null;
-  _syncToken = null;
-  _shortCodeRevealed = false;
-  _isSourceDevice = false;
-  _targetSourcePeerId = null;
-  _exportRequested = false;
+  await stoppingScanner;
 }
 
 /**
  * Cancel/abort current sync operation.
  */
 export async function cancelSync(): Promise<void> {
-  await cleanup();
   resetSyncState();
+  await cleanup();
 }

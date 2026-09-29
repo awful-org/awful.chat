@@ -335,6 +335,11 @@ export class MediasoupVideo implements VideoTransport {
   // SFU WebSocket - opened on join(), closed on leave()
   private sfuWs: WebSocket | null = null;
   private joinSigner: ((nonce: string, room: string, peer: string) => string) | null = null;
+  private roomAdmission: ((room: string, nonce: string, peer: string) => { roomCode: string; capability: string } | undefined) | null = null;
+
+  setRoomAdmission(provider: NonNullable<typeof this.roomAdmission>): void {
+    this.roomAdmission = provider;
+  }
 
   setJoinSigner(signer: (nonce: string, room: string, peer: string) => string): void {
     this.joinSigner = signer;
@@ -653,8 +658,11 @@ export class MediasoupVideo implements VideoTransport {
           if (!authenticated) {
             if (msg.type === "auth:challenge" && !proofSent && this.joinSigner) {
               proofSent = true;
-              const signature = this.joinSigner(msg.nonce, roomCode, peerId);
-              ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature }));
+              const admission = this.roomAdmission?.(roomCode, msg.nonce, peerId);
+              if (roomCode.startsWith("rd2_") && !admission) throw new Error("Room capability unavailable");
+              const wireRoom = admission?.roomCode ?? roomCode;
+              const signature = this.joinSigner(msg.nonce, wireRoom, peerId);
+              ws.send(JSON.stringify({ type: "join", roomCode: wireRoom, peerId, signature, capability: admission?.capability }));
             } else if (msg.type === "auth:joined" && proofSent) {
               authenticated = true;
               clearTimeout(authTimer);
