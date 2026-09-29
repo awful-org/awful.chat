@@ -13,6 +13,7 @@
   import { sendDirectMessage } from "$lib/transport/dm.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { cancelAllShortCodes } from "$lib/short-codes.svelte";
+  import { claimNodeLock } from "$lib/transport/node-lock";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
@@ -168,7 +169,26 @@
     return code;
   }
 
-  let pendingRoomCode = $state<string | null>(consumeRoomLocation());
+  /** What the address bar held when this tab opened. */
+  const openedWith = consumeRoomLocation();
+  let pendingRoomCode = $state<string | null>(openedWith);
+  /**
+   * This tab was opened with an invitation - a link tapped in WhatsApp, say.
+   * With Awful.chat already open elsewhere (another tab, the installed app)
+   * that one holds the node, and this tab only queued behind it: the join
+   * waited on a relay connection that never came, behind a pulsing dot. An
+   * invitation opened on purpose is a clear "use this one", so it takes the
+   * node the way "Use here" does. A saved room's own address (a reload, a
+   * restored session) is no such request and still queues.
+   */
+  let claimForInvite = $state(
+    openedWith !== null && parseJoinInput(openedWith).kind !== "invalid"
+  );
+  $effect(() => {
+    if (!claimForInvite || !transportState.nodeHeldElsewhere) return;
+    claimForInvite = false;
+    claimNodeLock();
+  });
 
   let joiningRoom = $state(false);
   // A short link waits on the inviter's tab, for up to a minute: say so.
@@ -1422,7 +1442,9 @@
   {#if joiningRoom}
     <div class="min-h-dvh bg-background flex flex-col items-center justify-center gap-3">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
-      {#if joiningWithCode}
+      {#if transportState.nodeHeldElsewhere}
+        <p class="font-mono text-xs text-muted-foreground">Moving Awful.chat over from your other tab...</p>
+      {:else if joiningWithCode}
         <p class="font-mono text-xs text-muted-foreground">Getting the invitation from whoever shared it...</p>
       {/if}
     </div>
