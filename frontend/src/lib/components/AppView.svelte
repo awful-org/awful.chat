@@ -1365,6 +1365,7 @@
               roomCode={activeRoomCode}
               roomName={activeRoomName}
               onLeave={handleLeave}
+              onCreateRoom={openCreateJoin}
               onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
             />
           {:else}
