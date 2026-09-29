@@ -1,3 +1,15 @@
+<script module lang="ts">
+  /**
+   * The room this tab was opened for, once read out of the address bar and
+   * until its join has run. Module-level, not component state: a remembered
+   * password unlocks by raising identityStore.initializing, which swaps this
+   * view for the spinner and back - a fresh instance - and the address bar
+   * was already cleared, so the invitation was simply gone: the tab showed
+   * the room list, "Connecting...", and never joined or took the node.
+   */
+  let parkedRoomCode: string | null = null;
+</script>
+
 <script lang="ts">
   import { untrack } from "svelte";
   import { isLegacyArchive } from "$lib/room-security/legacy-archive";
@@ -171,8 +183,13 @@
   }
 
   /** What the address bar held when this tab opened. */
-  const openedWith = consumeRoomLocation();
+  const openedWith = consumeRoomLocation() ?? parkedRoomCode;
+  parkedRoomCode = openedWith;
   let pendingRoomCode = $state<string | null>(openedWith);
+  let alive = true;
+  $effect(() => () => {
+    alive = false;
+  });
   /**
    * This tab was opened with an invitation - a link tapped in WhatsApp, say.
    * With Awful.chat already open elsewhere (another tab, the installed app)
@@ -301,6 +318,9 @@
         .then(() => handleJoin(code, ""))
         .finally(() => {
           joiningRoom = false;
+          // Done with it - unless this instance was replaced mid-join, and
+          // the one that replaced it still has to open the room on screen.
+          if (alive && parkedRoomCode === code) parkedRoomCode = null;
         });
     }
   });
@@ -1162,6 +1182,7 @@
     const code = consumeRoomLocation();
     if (!identityStore.isUnlocked) {
       pendingRoomCode = code;
+      parkedRoomCode = code;
       return;
     }
     // The URL is the truth: even if the view already names this room, the
