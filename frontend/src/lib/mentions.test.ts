@@ -408,4 +408,32 @@ describe("linkify", () => {
   it("treats a non-string body as empty", () => {
     expect(linkify(42 as unknown as string, resolve)).toBe("");
   });
+
+  describe("emoji", () => {
+    const spans = (out: string) =>
+      [...out.matchAll(/<span class="emoji">(.*?)<\/span>/gu)].map((m) => m[1]);
+
+    it("wraps each emoji, and leaves the words around it alone", () => {
+      const out = linkify("nice 😀 work 🎉", resolve);
+      expect(spans(out)).toEqual(["😀", "🎉"]);
+      expect(out).toContain("nice ");
+      expect(out).toContain(" work ");
+    });
+
+    it("keeps a joined emoji as one glyph", () => {
+      for (const e of ["👨‍👩‍👧‍👦", "👍🏽", "🏃‍♀️", "🇧🇷", "❤️", "1️⃣", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"]) {
+        expect(spans(linkify(e, resolve))).toEqual([e]);
+      }
+    });
+
+    it("leaves text symbols and digits text-sized", () => {
+      expect(linkify("© 2026 ™ 5 #1", resolve)).not.toContain("emoji");
+    });
+
+    it("leaves an emoji inside a url as part of the link", () => {
+      const out = linkify("https://example.com/🎉 🎉", resolve);
+      expect(out).toContain('href="https://example.com/🎉"');
+      expect(spans(out)).toEqual(["🎉"]);
+    });
+  });
 });

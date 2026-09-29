@@ -151,6 +151,16 @@ body {
   overscroll-behavior-y: none;
 }
 
+/* Emoji a size above the text they sit in. They are drawn by the system emoji
+   font at the surrounding font-size, which reads small next to a word; the
+   message body wraps each one (mentions.ts linkify), and the reaction chips
+   use the same class. line-height 1 so a line holding one is not taller than
+   the lines around it. */
+.emoji {
+  font-size: 1.3em;
+  line-height: 1;
+}
+
 .chat-messages {
   overscroll-behavior: contain;
 }
