@@ -91,7 +91,7 @@
     exitBrowserPip,
   } from "$lib/call-spotlight.svelte";
   import type { CallState } from "$lib/call-tiles";
-  import { closeAllPopouts, syncPopouts } from "$lib/call-popout.svelte";
+  import { closeAllPopouts, poppedOut, syncPopouts } from "$lib/call-popout.svelte";
   import { profileStore } from "$lib/profile.svelte";
   import { setOnPictureInPictureEnter } from "$lib/plugins/media-session";
 
@@ -863,6 +863,11 @@
       // Nothing to see in a voice-only call: an avatar floating over another
       // tab is noise, not a call. The user can still open it by hand.
       if (!spotlightTrack) return;
+      // A stream already in a window of its own stays in view whatever tab
+      // is on top - that is what the window is for - so a floating copy of
+      // the call on a tab switch is a second picture of the same thing. The
+      // PiP button still opens one on purpose.
+      if (poppedOut.size > 0) return;
       await enterBrowserPip(() => void returnToCall());
     };
 
