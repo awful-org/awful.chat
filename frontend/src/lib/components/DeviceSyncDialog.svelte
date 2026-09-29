@@ -411,7 +411,7 @@ async function handleStartScanning() {
           {#if shortCodeShown}
             <div class="w-full space-y-2">
               <p class="text-xs text-muted-foreground text-center">
-                Or copy this secure pairing code to your other device:
+                Or copy this sync code to your other device:
               </p>
               <div class="flex gap-2">
                 <Input
@@ -446,7 +446,7 @@ async function handleStartScanning() {
               class="w-full font-mono text-xs text-muted-foreground"
             >
               <Keyboard class="w-3.5 h-3.5 mr-2" />
-              Can't scan? Copy a pairing code
+              Can't scan? Copy a sync code
             </Button>
           {/if}
 
@@ -542,12 +542,11 @@ async function handleStartScanning() {
       {:else if view === "manual-input"}
         <div class="space-y-4">
           <p class="text-sm text-muted-foreground">
-            Enter the sync code shown on your other device (three groups of
-            eight characters, separated by dashes).
+            Paste the sync code copied from your other device.
           </p>
           <Input
             bind:value={manualToken}
-            placeholder="Paste the complete secure pairing code"
+            placeholder="Sync code"
             class="font-mono text-center"
             autocapitalize="off"
             autocorrect="off"
