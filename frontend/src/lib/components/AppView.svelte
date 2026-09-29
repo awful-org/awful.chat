@@ -186,7 +186,16 @@
     openedWith !== null && parseJoinInput(openedWith).kind !== "invalid"
   );
   $effect(() => {
-    if (!claimForInvite || !transportState.nodeHeldElsewhere) return;
+    if (!claimForInvite) return;
+    // Once this tab has run the node, the claim is spent. Kept, it came back
+    // the moment ANOTHER invitation tab took the node over: this one grabbed
+    // it straight back, and the two passed it to and fro, the new tab ending
+    // up with neither the node nor the room.
+    if (transportState.relayConnected) {
+      claimForInvite = false;
+      return;
+    }
+    if (!transportState.nodeHeldElsewhere) return;
     claimForInvite = false;
     claimNodeLock();
   });
