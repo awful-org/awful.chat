@@ -62,7 +62,14 @@ docker run --rm -v /home/flaggzz/repos/awful.chat/sfu:/src \
 
 ## Publication checkpoint
 
-Validation complete; push and PR creation are the next authorized actions.
+- Branch pushed with upstream tracking: `origin/feat/room-security-v2`.
+- PR created targeting `dev`: https://github.com/awful-org/awful.chat/pull/94
+- Commits: `37aca8f` feature, `697cdc8` dev merge, `dcdcba9` validation docs;
+  this final documentation-only checkpoint records publication.
+- Remote `dev` was not modified or pushed. No deployment performed.
+- Tracked working tree is clean after the publication checkpoint commit; only
+  unrelated untracked `.claude/` and `.pnpm-store/` remain. Both recovery stashes
+  are retained.
 
 ## Release and coverage boundaries
 
