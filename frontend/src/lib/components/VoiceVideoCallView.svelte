@@ -60,7 +60,6 @@
   import { spotlightStore } from "$lib/call-spotlight.svelte";
   import {
     closePopout,
-    focusPopout,
     openPopout,
     poppedOut,
     popoutSupported,
@@ -1704,18 +1703,15 @@ import {
         }
         return;
       }
-      if (isPoppedOut) {
-        focusPopout(tile.id);
-        return;
-      }
+      // A popped-out tile clicks like any other: focus and unfocus. It used
+      // to bring its window forward instead, which left no way to unfocus it
+      // but the right-click menu.
       if (isOnlyOne) return;
       if (isFocused) onUnfocus();
       else onFocus();
     }}
     aria-label={isPendingTx
       ? `Watch ${tile.label}'s screen`
-      : isPoppedOut
-        ? `${tile.label} is in its own window. Bring it forward`
       : isFocused
         ? "Minimize tile"
         : `Focus ${tile.label}`}

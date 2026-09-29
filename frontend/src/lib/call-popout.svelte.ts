@@ -181,10 +181,6 @@ function showWaiting(entry: Popout): void {
   entry.empty.textContent = "Waiting for the picture...";
 }
 
-export function focusPopout(id: string): void {
-  windows.get(id)?.win.focus();
-}
-
 /** Close one window, bringing the tile back into the call. */
 export function closePopout(id: string): void {
   const entry = windows.get(id);
