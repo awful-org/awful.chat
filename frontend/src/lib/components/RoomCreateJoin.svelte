@@ -11,6 +11,13 @@
   import QRCode from "qrcode";
   import { Check, Clipboard, Copy, Keyboard, LogIn, Menu, Plus, QrCode, ScanLine, Share2 } from "@lucide/svelte";
   import QrScanner from "./QrScanner.svelte";
+  import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogHeader,
+    DialogTitle,
+  } from "$lib/components/ui/dialog";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -50,8 +57,10 @@
   // The room's QR is one tap away, not on screen by default: it took most of
   // the modal for something a link or short code usually does.
   let showQr = $state(false);
+  // The camera opens in a dialog of its own, over this card.
   let scanning = $state(false);
   let scanHint = $state<string | null>(null);
+  let scanError = $state<string | null>(null);
   const qrSize = $derived(inDialog ? "size-50" : "size-60");
   let joinController: AbortController | undefined;
   let alive = true;
@@ -387,10 +396,9 @@
             <div class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-2">
               <button
                 type="button"
-                onclick={() => { scanHint = null; scanning = !scanning; }}
+                onclick={() => { scanHint = null; scanError = null; scanning = true; }}
                 class="text-muted-foreground hover:text-foreground cursor-pointer"
-                aria-label={scanning ? "Stop scanning" : "Scan a QR code"}
-                aria-pressed={scanning}
+                aria-label="Scan a QR code"
                 title="Scan a QR code"
               >
                 <ScanLine class="size-4" />
@@ -405,18 +413,38 @@
               </button>
             </div>
           </div>
-          {#if scanning}
-            <QrScanner
-              onText={handleScannedText}
-              onUnavailable={() => {
-                scanning = false;
-                joinError = "Couldn't open the camera. Allow camera access, or paste the link instead.";
-              }}
-            />
-            <p role={scanHint ? "alert" : undefined} class="text-center text-xs {scanHint ? 'text-destructive' : 'text-muted-foreground'}">
-              {scanHint ?? "Point the camera at a room's QR code."}
-            </p>
-          {/if}
+          <!-- Content only while open, so the camera stops when it closes. -->
+          <Dialog bind:open={scanning}>
+            <DialogContent
+              class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-sm flex flex-col gap-0 p-0 max-h-[calc(100dvh-2rem)] overflow-hidden"
+            >
+              <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
+                <DialogTitle class="font-mono text-base font-semibold">Scan a QR code</DialogTitle>
+                <DialogDescription class="text-xs">
+                  Point the camera at a room's QR code.
+                </DialogDescription>
+              </DialogHeader>
+              <div class="flex min-h-0 flex-col gap-3 overflow-y-auto p-4">
+                {#if scanError}
+                  <p role="alert" class="rounded-lg bg-destructive/10 border border-destructive/30 px-3 py-2 text-sm text-destructive">
+                    {scanError}
+                  </p>
+                {:else}
+                  <QrScanner
+                    onText={handleScannedText}
+                    onUnavailable={(message) => {
+                      scanError = /https/i.test(message)
+                        ? message
+                        : "Couldn't open the camera. Allow camera access in your browser, or paste the link instead.";
+                    }}
+                  />
+                  {#if scanHint}
+                    <p role="alert" class="text-center text-xs text-destructive">{scanHint}</p>
+                  {/if}
+                {/if}
+              </div>
+            </DialogContent>
+          </Dialog>
           <Button
             variant="outline"
             onclick={handleJoin}

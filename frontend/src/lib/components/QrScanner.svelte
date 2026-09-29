@@ -49,14 +49,31 @@
     if (!starting) void stopQrScan(elementId);
   });
 
+  let viewWidth = $state(0);
+  let viewHeight = $state(0);
+  /** A square guide, whether the picture is wide or tall. */
+  const guide = $derived(Math.round(Math.min(viewWidth, viewHeight) * 0.65));
+
   const other = $derived(otherSideCameraId(scannerState.cameras, scannerState.activeCameraId));
   const onFront = $derived(
     cameraFacing(scannerState.cameras.find((c) => c.id === scannerState.activeCameraId)) === "front"
   );
 </script>
 
-<div class="relative w-full">
-  <div id={elementId} class="w-full aspect-square bg-black rounded-lg overflow-hidden"></div>
+<!-- The whole picture, never cropped: the full frame is decoded, so a code
+     anywhere in view reads. min-h holds the space until the picture comes. -->
+<div
+  bind:clientWidth={viewWidth}
+  bind:clientHeight={viewHeight}
+  class="relative w-full min-h-48 bg-black rounded-lg overflow-hidden"
+>
+  <div id={elementId} class="w-full"></div>
+  <!-- Where to aim. Only a guide: the code is read anywhere in the frame. -->
+  <div
+    aria-hidden="true"
+    style="width: {guide}px; height: {guide}px"
+    class="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-xl border-2 border-white/70"
+  ></div>
   <!-- Over the viewfinder, because that is where the user is looking while
        they hold a phone up to a code. -->
   <div class="absolute right-2 top-2 flex flex-col gap-2">

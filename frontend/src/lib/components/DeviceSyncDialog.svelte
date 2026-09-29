@@ -56,6 +56,7 @@ import {
   // A code the camera read that is not a sync code. Not a camera problem:
   // it used to flip the view to "camera access denied".
   let scanHint = $state<string | null>(null);
+  let scanUnavailable = $state<string | null>(null);
   let syncMode = $state<"add" | "replace">("add");
 
   // Auto-set initial view based on flowMode
@@ -440,8 +441,8 @@ import {
             <div class="text-center space-y-2">
               <CircleAlert class="w-12 h-12 text-destructive mx-auto" />
               <p class="text-sm text-muted-foreground">
-                Camera access denied. Please allow camera access or use manual
-                entry.
+                {scanUnavailable ??
+                  "Camera access denied. Please allow camera access or use manual entry."}
               </p>
             </div>
             <Button onclick={handleManualInput} class="w-full font-mono">
@@ -453,6 +454,9 @@ import {
               onText={handleScannedText}
               onUnavailable={(message) => {
                 console.error("Scan error:", message);
+                // Plain http has no camera at all; saying "denied" sent people
+                // looking for a permission that was never asked.
+                scanUnavailable = /https/i.test(message) ? message : null;
                 scanPermission = false;
               }}
             />
