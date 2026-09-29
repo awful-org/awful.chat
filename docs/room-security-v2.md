@@ -4,8 +4,9 @@
 
 **Security v2 is enabled in the shared source.** The implementation, final source
 review fixes, enabled regression suite, and available real-browser integration
-checks are complete. This is local release readiness; nothing was committed,
-pushed or deployed. The frontend, relay and SFU must be shipped together.
+checks are complete. Subsequent authorized commits, dev synchronization and PR
+status are tracked in `security-v2-pr-handoff.md`. No deployment was performed.
+The frontend, relay and SFU must be shipped together.
 `security-v2-release-validation.md` records the release decision and exact checks.
 
 ### Implemented application behavior
