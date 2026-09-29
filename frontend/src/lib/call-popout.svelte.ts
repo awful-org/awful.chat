@@ -33,7 +33,15 @@ interface Popout {
   trackId: string | null;
   /** When the tile left the call's list, if it has; see MISSING_GRACE_MS. */
   missingSince: number | null;
+  /** Hides the pointer and the name once the mouse rests; see IDLE_MS. */
+  idleTimer: ReturnType<typeof setTimeout> | undefined;
 }
+
+/**
+ * How long the mouse may rest before the pointer and the name label go, the
+ * way a video player clears the picture. Any movement brings both back.
+ */
+const IDLE_MS = 2000;
 
 /**
  * How long a tile may be missing before its window closes. A watched share's
@@ -99,7 +107,8 @@ export function openPopout(tile: SpotlightTile, name: string): boolean {
   // Sound stays in the app tab, where the call's own volume controls are.
   video.muted = true;
   video.playsInline = true;
-  video.title = "Double-click for fullscreen";
+  // No title tooltip: the browser shows it exactly when the mouse comes to
+  // rest, which is the moment the pointer is meant to disappear.
   video.style.cssText =
     "position:absolute;inset:0;width:100%;height:100%;object-fit:contain" +
     (tile.isLocal && tile.kind === "camera" ? ";transform:scaleX(-1)" : "");
@@ -116,11 +125,31 @@ export function openPopout(tile: SpotlightTile, name: string): boolean {
 
   const label = d.createElement("div");
   label.style.cssText =
-    "position:absolute;left:8px;bottom:8px;padding:2px 8px;border-radius:4px;background:rgba(0,0,0,.6)";
+    "position:absolute;left:8px;bottom:8px;padding:2px 8px;border-radius:4px;background:rgba(0,0,0,.6);transition:opacity .3s";
 
   d.body.append(video, empty, label);
 
-  const entry: Popout = { win, video, label, empty, trackId: null, missingSince: null };
+  const entry: Popout = {
+    win,
+    video,
+    label,
+    empty,
+    trackId: null,
+    missingSince: null,
+    idleTimer: undefined,
+  };
+  const wake = () => {
+    d.body.style.cursor = "";
+    label.style.opacity = "1";
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = setTimeout(() => {
+      d.body.style.cursor = "none";
+      label.style.opacity = "0";
+    }, IDLE_MS);
+  };
+  d.addEventListener("mousemove", wake);
+  d.addEventListener("pointerdown", wake);
+  wake();
   windows.set(tile.id, entry);
   poppedOut.add(tile.id);
   render(entry, tile, name);
@@ -194,7 +223,10 @@ export function closeAllPopouts(): void {
 
 function forget(id: string): void {
   const entry = windows.get(id);
-  if (entry) entry.video.srcObject = null;
+  if (entry) {
+    entry.video.srcObject = null;
+    clearTimeout(entry.idleTimer);
+  }
   windows.delete(id);
   poppedOut.delete(id);
   if (windows.size === 0 && closedPoll) {
