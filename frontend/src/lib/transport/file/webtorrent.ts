@@ -67,7 +67,7 @@ const WT_MAX_ATTEMPTS = 6;
  * then lived for the rest of the session, which was worse than useless:
  * dial() skips a pair that already has a peer, and allExhausted() refuses to
  * give up while one exists, so the transfer sat at "downloading" with no
- * error and no retry button, holding one of MAX_WT_PEERS the whole time.
+ * error and no retry button, holding one of the link slots the whole time.
  *
  * That is what a file over the inline limit looked like on an instance whose
  * relay hands out no TURN (an unset TURN_SECRET answers /turn-credentials
@@ -85,7 +85,35 @@ const WT_MAX_ATTEMPTS = 6;
  */
 const WT_CONNECT_TIMEOUT_MS = 30_000;
 
-const MAX_WT_PEERS = 32;
+/**
+ * The table is split by direction: links we dialled to FETCH a file, and
+ * links other people dialled to fetch one from US.
+ *
+ * It used to be one table of 32 for both, which is what made big rooms
+ * spotty while a room of two always worked. A person catching up on a busy
+ * room's history filled all 32 with their own downloads - and then could
+ * not serve anything, including the image they had just sent. Their side
+ * dropped the request without a word, the downloader waited out the 30s
+ * deadline, and a few rounds of that ended in "Could not reach the sender".
+ * With a budget of its own, serving never waits on our own downloads.
+ */
+const MAX_WT_DIALS = 24;
+const MAX_WT_SERVES = 24;
+/**
+ * Holders of one file dialled at the same time.
+ *
+ * A download dialled every holder at once, so with four people holding an
+ * image it took four links, and a room's worth of images asked for many
+ * times the table. Two keep a spare when one does not answer; the next
+ * holder is dialled as a link fails, in the order they were learned - the
+ * author first, since the message and its own announce come from them.
+ */
+const WT_HOLDERS_PER_FILE = 2;
+/**
+ * How long a downloader waits after a holder answered "busy" (its serving
+ * budget was full). A busy answer is not a failed dial: it costs no attempt.
+ */
+const WT_BUSY_RETRY_MS = 10_000;
 /**
  * One peer's share of that table.
  *
@@ -143,6 +171,22 @@ function readSession(raw: unknown): string | undefined {
   return typeof raw === "string" && raw.length > 0 && raw.length <= 64
     ? raw
     : undefined;
+}
+
+/**
+ * The answer a holder sends when its serving budget is full, instead of
+ * dropping the offer. Optional on the wire: an older client handed one gets
+ * a signal SimplePeer rejects, which fails its link at once - still sooner
+ * than the 30s it would otherwise have waited.
+ */
+const BUSY_SIGNAL = { type: "busy" } as const;
+
+function isBusy(signal: unknown): boolean {
+  return (
+    typeof signal === "object" &&
+    signal !== null &&
+    (signal as { type?: unknown }).type === "busy"
+  );
 }
 
 /** Only an offer starts a link; see handleSignal. */
@@ -209,6 +253,14 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   /** Consecutive dials that never connected, per pair. See WT_MAX_ATTEMPTS. */
   private wtAttempts = new Map<string, number>();
   private wtReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * When each download was asked for, as a sequence number. Free slots go
+   * to the NEWEST first: the image just sent in the chat before the backlog
+   * of history a join started fetching. Transfers are otherwise walked in
+   * the order they were first seen, which is oldest first.
+   */
+  private wtRequested = new Map<string, number>();
+  private wtRequestSeq = 0;
   private iceUnsubscribe: (() => void) | null = null;
   private attachedTorrents = new Set<string>();
   /**
@@ -275,12 +327,16 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private reconcileWtPeers(): void {
     if (typeof document !== "undefined" && document.hidden) return;
     const now = Date.now();
-    for (const [infoHash, snapshot] of this.transfers) {
-      // Only what we are still trying to fetch. "pending" is a file nobody
-      // asked for yet; dialling those built links that attachToTorrent then
-      // dropped for having no torrent, over and over, for every file in the
-      // room.
-      if (snapshot.status !== "downloading") continue;
+    // Only what we are still trying to fetch. "pending" is a file nobody
+    // asked for yet; dialling those built links that attachToTorrent then
+    // dropped for having no torrent, over and over, for every file in the
+    // room.
+    const wanted = [...this.transfers]
+      .filter(([, snapshot]) => snapshot.status === "downloading")
+      .sort(
+        ([a], [b]) => (this.wtRequested.get(b) ?? 0) - (this.wtRequested.get(a) ?? 0)
+      );
+    for (const [infoHash, snapshot] of wanted) {
       const seeders = this.seedersByHash.get(infoHash);
       if (!seeders?.size) continue;
       for (const peerId of seeders) this.dial(infoHash, peerId, now);
@@ -310,6 +366,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     if (now < (this.wtNextTry.get(key) ?? 0)) return false;
     const attempts = this.wtAttempts.get(key) ?? 0;
     if (attempts >= WT_MAX_ATTEMPTS) return false;
+    if (this.dialledHolders(infoHash) >= WT_HOLDERS_PER_FILE) return false;
     // Backoff is for a peer that will not answer. A pair held back by the
     // cap has not been tried at all, so it keeps its place at the front of
     // the queue instead of being pushed out to the next retry window.
@@ -322,6 +379,24 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.wtNextTry.set(key, now + wait);
     this.wtAttempts.set(key, attempts + 1);
     return true;
+  }
+
+  /** Links we dialled for this file, whatever state they are in. */
+  private dialledHolders(infoHash: string): number {
+    let n = 0;
+    for (const [key, peer] of this.wtPeers) {
+      if (key.startsWith(`${infoHash}:`) && this.wtLinkMeta.get(peer)?.initiator) n += 1;
+    }
+    return n;
+  }
+
+  /** Links in one direction: ours to fetch (true) or theirs to fetch from us. */
+  private linkCount(initiator: boolean): number {
+    let n = 0;
+    for (const peer of this.wtPeers.values()) {
+      if (!!this.wtLinkMeta.get(peer)?.initiator === initiator) n += 1;
+    }
+    return n;
   }
 
   /** Every reachable seeder of the file is capped and none has a link. */
@@ -519,6 +594,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     // One request per download, not one per announce: this is called again
     // for every file every time its sender reconnects.
     if (existing?.status !== "downloading") {
+      this.wtRequested.set(file.infoHash, ++this.wtRequestSeq);
       rec(
         ev("file.request", {
           d: {
@@ -559,6 +635,18 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         if (session !== undefined && meta.session !== undefined && session !== meta.session) {
           return;
         }
+        if (isBusy(envelope.signal)) {
+          // They are serving all they can. Not a failed dial: the attempt is
+          // handed back, and the pair waits a while before trying again.
+          const attempts = this.wtAttempts.get(key) ?? 0;
+          if (attempts > 0) this.wtAttempts.set(key, attempts - 1);
+          this.wtNextTry.set(key, Date.now() + WT_BUSY_RETRY_MS);
+          this.wtPeers.delete(key);
+          peer.destroy();
+          // Another holder may have room; the tick dials it.
+          this.reconcileWtPeers();
+          return;
+        }
       } else if (
         session !== undefined
           ? session !== meta.session
@@ -579,7 +667,16 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       // sat on the pair for WT_CONNECT_TIMEOUT_MS - blocking the next dial,
       // which skips a pair that already has one.
       if (!isOffer(envelope.signal)) return;
-      if (!this.createWTPeer(envelope.infoHash, fromPeerId, false, session)) return;
+      if (!this.createWTPeer(envelope.infoHash, fromPeerId, false, session)) {
+        // Full. Say so, rather than leave them waiting out their deadline.
+        this.emit("signal", fromPeerId, {
+          kind: "file-wt-signal",
+          infoHash: envelope.infoHash,
+          signal: BUSY_SIGNAL,
+          ...(session !== undefined ? { session } : {}),
+        });
+        return;
+      }
       peer = this.wtPeers.get(key);
     }
     peer?.signal(envelope.signal as never);
@@ -684,6 +781,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     }
     this.wtPeers.clear();
     this.wtRetired.clear();
+    this.wtRequested.clear();
 
     const blobUrls = new Set(
       [...this.transfers.values()]
@@ -825,7 +923,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   ): boolean {
     const key = wtKey(infoHash, peerId);
     if (this.wtPeers.has(key)) return false;
-    if (this.wtPeers.size >= MAX_WT_PEERS) return false;
+    if (this.linkCount(initiator) >= (initiator ? MAX_WT_DIALS : MAX_WT_SERVES)) {
+      return false;
+    }
     let mine = 0;
     for (const existing of this.wtPeers.keys()) {
       if (existing.endsWith(`:${peerId}`)) mine += 1;
