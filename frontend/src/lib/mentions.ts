@@ -140,15 +140,36 @@ export function linkify(
   if (typeof content !== "string") return "";
   const escaped = escapeHtml(content);
   // A url wins at any position it starts, so a token inside one stays part of
-  // the link rather than being rewritten inside an href.
+  // the link rather than being rewritten inside an href. Same for an emoji:
+  // one inside a url stays in the link text, untouched.
   return escaped.replace(
-    /(https?:\/\/[^\s<]+)|(@\[[^[\]]+\])/gi,
-    (_m, url: string | undefined, mention: string | undefined) =>
+    LINKIFY_RE,
+    (m, url: string | undefined, mention: string | undefined) =>
       url
         ? `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-primary hover:underline">${url}</a>`
-        : humanize(mention!, resolveName)
+        : mention
+          ? humanize(mention, resolveName)
+          : `<span class="emoji">${m}</span>`
   );
 }
+
+/**
+ * One emoji as the eye sees it: a flag, a keycap, or a pictograph with its
+ * skin tone, variation selector, tag sequence and ZWJ joins - so a family or a
+ * profession stays ONE span and scales as one glyph.
+ *
+ * Only what draws as an emoji: Emoji_Presentation, or a text-default symbol
+ * explicitly asked for with U+FE0F. A bare (c), (R) or TM stays text-sized, as
+ * does a digit.
+ */
+const EMOJI_PART = String.raw`(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}️)(?:\p{Emoji_Modifier}|️)?[\u{E0020}-\u{E007F}]*`;
+const EMOJI = String.raw`\p{Regional_Indicator}{2}|[#*0-9]️?⃣|${EMOJI_PART}(?:‍(?:\p{Emoji_Presentation}|\p{Extended_Pictographic})(?:\p{Emoji_Modifier}|️)?)*`;
+
+/** Urls, then mention tokens, then emoji - wrapped for a size of their own. */
+const LINKIFY_RE = new RegExp(
+  String.raw`(https?:\/\/[^\s<]+)|(@\[[^[\]]+\])|(?:${EMOJI})`,
+  "giu"
+);
 
 /**
  * Convert @[did] tokens in content to human-readable @Name mentions as plain text.
