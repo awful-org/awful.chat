@@ -53,6 +53,7 @@
     RefreshCw,
     MailX,
     EllipsisVertical,
+    QrCode,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -183,6 +184,11 @@
      *    about a person who exists for as long as their tab does.
      */
     ephemeral?: boolean;
+    /**
+     * The link the invite menu hands out, when it is not the saved room's
+     * `/r/#` link. A quick call's guests arrive through `/qc#`.
+     */
+    inviteLink?: string;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
@@ -195,6 +201,7 @@
     roomName,
     onLeave,
     ephemeral = false,
+    inviteLink,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
@@ -1182,15 +1189,19 @@
       invitationOpen = true;
     }
   });
-  let shortCodeError = $state<string | null>(null);
+  function invitationUrl(): Promise<string> {
+    return inviteLink
+      ? Promise.resolve(inviteLink)
+      : savedRoomInvitationLink(window.location.origin, roomCode);
+  }
 
   async function copyCode() {
     copyMenuOpen = false;
     try {
-      const url = await savedRoomInvitationLink(window.location.origin, roomCode);
-      await navigator.clipboard.writeText(url);
-    } catch (err) {
-      shortCodeError = err instanceof Error ? err.message : "Could not copy invitation";
+      await navigator.clipboard.writeText(await invitationUrl());
+    } catch {
+      // The dialog shows the link to copy by hand, or why there is none.
+      if (!inviteLink) invitationOpen = true;
       return;
     }
     copied = true;
@@ -1208,8 +1219,7 @@
   async function shareLink() {
     copyMenuOpen = false;
     try {
-      const url = await savedRoomInvitationLink(window.location.origin, roomCode);
-      await navigator.share({ url });
+      await navigator.share({ url: await invitationUrl() });
     } catch (err) {
       // Dismissing the sheet is not a failure and must not silently copy
       // something the user decided not to send.
@@ -2118,7 +2128,9 @@
       </div>
       <div class="flex items-center gap-2 shrink-0">
         {#if !isDmChat}
-          <div class="relative" data-copy-menu>
+          <!-- Desktop only: the phone header has no room for it next to the
+               room name; its overflow sheet carries the same actions. -->
+          <div class="relative hidden sm:block" data-copy-menu>
             <Tip text={copied ? "Copied" : "Copy invite"}>
               {#snippet children(props)}
             <button
@@ -2163,21 +2175,17 @@
                     Share link
                   </button>
                 {/if}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={copyShortCode}
-                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
-                >
-                  QR / online pairing code
-                  <span class="block text-xs text-muted-foreground">
-                    {#if shortCodeError}
-                      {shortCodeError}
-                    {:else}
-                      Single-use pairing, expires in 5 minutes
-                    {/if}
-                  </span>
-                </button>
+                {#if !inviteLink}
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onclick={copyShortCode}
+                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted cursor-pointer"
+                  >
+                    <QrCode class="size-3.5" />
+                    QR or short code
+                  </button>
+                {/if}
               </div>
             {/if}
           </div>
@@ -2456,23 +2464,16 @@
                 Share invite link
               </button>
             {/if}
-            <button
-              type="button"
-              onclick={() => { moreOpen = false; void copyShortCode(); }}
-              class="flex items-start gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
-            >
-              <Copy class="size-4 mt-0.5 text-muted-foreground" />
-              <span>
-                Copy short code
-                <span class="block text-xs text-muted-foreground">
-                  {#if shortCodeError}
-                    {shortCodeError}
-                  {:else}
-                    Works for 5 minutes
-                  {/if}
-                </span>
-              </span>
-            </button>
+            {#if !inviteLink}
+              <button
+                type="button"
+                onclick={() => { moreOpen = false; void copyShortCode(); }}
+                class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+              >
+                <QrCode class="size-4 text-muted-foreground" />
+                QR or short code
+              </button>
+            {/if}
           {:else}
             <button
               type="button"

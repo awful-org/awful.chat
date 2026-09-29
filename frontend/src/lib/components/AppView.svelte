@@ -1450,38 +1450,15 @@
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}
           {#if isLegacyArchive(activeRoomCode)}
-            <div class="flex h-full min-h-0 flex-col">
-              <!-- The way back to the move popup, for after "check your DMs
-                   first" - or, once moved, the way to where the room went. -->
-              <div
-                role="status"
-                class="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/30 px-4 py-2 font-mono text-xs text-muted-foreground"
-              >
-                {#if activeLegacyRoom?.movedTo}
-                  <span>This room moved to a secure room.</span>
-                  <button
-                    type="button"
-                    class="rounded border border-border px-2 py-1 text-foreground hover:bg-muted cursor-pointer"
-                    onclick={() => void handleJoin(activeLegacyRoom!.movedTo!, "")}
-                  >Open the new room</button>
-                {:else}
-                  <span>This room can't send messages anymore.</span>
-                  <button
-                    type="button"
-                    class="rounded border border-border px-2 py-1 text-foreground hover:bg-muted cursor-pointer"
-                    onclick={() => { moveError = null; moveDialogOpen = true; }}
-                  >Move to a secure room</button>
-                {/if}
-              </div>
-              <div class="min-h-0 flex-1">
-                <LegacyArchive
-                  roomCode={activeRoomCode}
-                  roomName={activeRoomName}
-                  onLeave={handleLeave}
-                  onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
-                />
-              </div>
-            </div>
+            <LegacyArchive
+              roomCode={activeRoomCode}
+              roomName={activeRoomName}
+              moved={!!activeLegacyRoom?.movedTo}
+              onMove={() => { moveError = null; moveDialogOpen = true; }}
+              onOpenMoved={() => void handleJoin(activeLegacyRoom!.movedTo!, "")}
+              onLeave={handleLeave}
+              onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
+            />
           {:else}
           <ChatView
             roomCode={activeRoomCode}
@@ -1591,10 +1568,13 @@
           <Dialog.Overlay
             class="fixed inset-0 z-40 bg-black/50 "
           />
+          <!-- Capped to the screen and scrolling: a translate-centred box
+               taller than the viewport cannot be scrolled back to its top. -->
           <Dialog.Content
-            class="fixed w-sm top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 p-0 border-0 [&>div]:bg-transparent [&>div]:min-h-0 [&>div]:p-0"
+            aria-label="Create or join a room"
+            class="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100%-2rem)] max-w-sm max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain rounded-xl"
           >
-            <RoomCreateJoin onJoin={handleJoinFromModal} error={joinError} />
+            <RoomCreateJoin inDialog onJoin={handleJoinFromModal} error={joinError} />
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>

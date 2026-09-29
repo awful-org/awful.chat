@@ -130,8 +130,8 @@ try {
   const id = await host.evaluate(secret=>window.deriveRoomKeys(secret).discoveryId,secret);
   await submit(guest,id);await guest.getByRole('alert').filter({hasText:'Enter a valid'}).waitFor();
   await guest.evaluate(link=>navigator.clipboard.writeText(link),link);await guest.getByRole('button',{name:'Paste room code'}).click();await guest.waitForFunction(link=>document.querySelector('#join-code').value===link,link);
-  await menu(host,'Copy online pairing code Single use; keep this screen open');
-  await host.getByRole('button',{name:'Cancel pairing',exact:true}).waitFor();
+  await menu(host,'Copy short code Works once, for 5 minutes');
+  await host.getByRole('button',{name:'Cancel short code',exact:true}).waitFor();
   const pairingCode = await clipboard(host);assert.notEqual(pairingCode,link);
   await submit(guest,pairingCode);await joined(guest,secret,4);
   await host.getByText('Invitation delivered. This code is now used.',{exact:true}).waitFor();
@@ -143,16 +143,16 @@ try {
   const dialog=host.getByRole('dialog');await dialog.waitFor();
   assert.equal(await dialog.getByLabel('Invitation link').inputValue(),link);await qr(dialog,link);
   await dialog.getByRole('button',{name:'Copy invitation link',exact:true}).click();assert.equal(await clipboard(host),link);
-  await host.evaluate(()=>window.shareMode='success');await dialog.getByRole('button',{name:'Share invitation',exact:true}).click();assert.equal(await host.evaluate(()=>window.shares.at(-1).url),link);
-  await dialog.getByRole('button',{name:'Generate online pairing code',exact:true}).click();await dialog.getByRole('button',{name:'Copy pairing code',exact:true}).click();
+  await host.evaluate(()=>window.shareMode='success');await dialog.getByRole('button',{name:'Share invite link',exact:true}).click();assert.equal(await host.evaluate(()=>window.shares.at(-1).url),link);
+  await dialog.getByRole('button',{name:"Can't scan? Get a short code",exact:true}).click();await dialog.getByRole('button',{name:'Copy short code',exact:true}).click();
   const dialogCode=await clipboard(host);await submit(guest,dialogCode);await joined(guest,secret,5);
-  await dialog.getByRole('status').filter({hasText:'Invitation delivered'}).waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy pairing code',exact:true}).count(),0);
-  await dialog.getByRole('button',{name:'Generate online pairing code',exact:true}).click();await dialog.getByRole('button',{name:'Copy pairing code',exact:true}).click();
+  await dialog.getByRole('status').filter({hasText:'Invitation delivered'}).waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy short code',exact:true}).count(),0);
+  await dialog.getByRole('button',{name:"Can't scan? Get a short code",exact:true}).click();await dialog.getByRole('button',{name:'Copy short code',exact:true}).click();
   const cancelledCode=await clipboard(host);
   const cancellation=host.waitForResponse(r=>r.url().endsWith('/invite')&&r.request().postDataJSON()?.action==='cancel');
   await dialog.getByRole('button',{name:'Close',exact:true}).click();await cancellation;
   await submit(guest,cancelledCode);await guest.getByRole('alert').waitFor();assert.equal(await guest.evaluate(()=>window.joined.length),5);
-  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link').waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy pairing code',exact:true}).count(),0);
+  await host.evaluate(id=>window.showDialog(id),id);await dialog.getByLabel('Invitation link').waitFor();assert.equal(await dialog.getByRole('button',{name:'Copy short code',exact:true}).count(),0);
   await dialog.getByRole('button',{name:'Close',exact:true}).click();
   console.log('PASS: InvitationDialog saved-room/QR/copy/share, real-relay UI transfer, consumed-code removal, close cancellation and clean reopen');
 

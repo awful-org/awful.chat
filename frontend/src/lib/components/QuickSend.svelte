@@ -143,9 +143,9 @@
         {/if}
         <div class="space-y-1.5">
           <div class="flex items-center justify-between gap-2">
-            <code class="text-base font-mono tracking-wide text-foreground">
-              Protected file link
-            </code>
+            <span class="text-sm font-mono text-foreground">
+              File link
+            </span>
             <Button
               variant="ghost"
               size="sm"

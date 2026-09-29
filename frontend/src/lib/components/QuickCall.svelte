@@ -189,6 +189,7 @@
           selfId={identityStore.did ?? ""}
           onLeave={endQuickCall}
           ephemeral
+          inviteLink={link}
         />
       </div>
     </div>
@@ -367,9 +368,9 @@
 
             <div class="w-full space-y-1.5">
               <div class="flex items-center justify-between gap-2">
-                <code class="text-sm font-mono tracking-wide text-foreground">
-                  Protected call link
-                </code>
+                <span class="text-sm font-mono text-foreground">
+                  Call link
+                </span>
                 <Button
                   variant="ghost"
                   size="sm"

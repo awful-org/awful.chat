@@ -40,7 +40,7 @@
     {
       icon: HardDrive,
       title: "Every device is a server, yours included",
-      body: "Messages, files and your identity live in this browser's storage, not on a server (the one exception: offline DMs wait encrypted at the relay for up to 48 hours). Clearing site data, private browsing or uninstalling the app erases your copy. That is not always fatal: everyone in a room keeps their own copy, so with your 12 words you can restore your identity, rejoin with the room code and pull history back from peers who are online and still have it. Expect gaps in what comes back, and if everyone in a room wipes their data the conversation is gone for good. Settings > Data can ask the browser to protect this storage from being cleared automatically when space runs low.",
+      body: "Messages, files and your identity live in this browser's storage, not on a server (the one exception: offline DMs wait encrypted at the relay for up to 48 hours). Clearing site data, private browsing or uninstalling the app erases your copy. That is not always fatal: everyone in a room keeps their own copy, so with your 12 words you can restore your identity, rejoin with the room's invite link and pull history back from peers who are online and still have it. Expect gaps in what comes back, and if everyone in a room wipes their data the conversation is gone for good. Settings > Data can ask the browser to protect this storage from being cleared automatically when space runs low.",
     },
     {
       icon: KeyRound,
@@ -59,8 +59,8 @@
     },
     {
       icon: Hash,
-      title: "The room code is the invite and the lock",
-      body: "Anyone holding a room code can join it. There are no roles, bans or moderation tools yet, so share codes only with people you want in the room.",
+      title: "The invite link is the key to the room",
+      body: "Anyone holding a room's invite link can join it. There are no roles, bans or moderation tools yet, so share it only with people you want in the room.",
     },
     {
       icon: FileDown,
@@ -109,7 +109,7 @@
   {/each}
   {#if compact}
     <button type="button" aria-expanded={expanded} onclick={() => expanded = !expanded} class="rounded-md px-3 py-2 text-left text-sm text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring">
-      {expanded ? "Show the essentials" : "More about delivery, room codes, files and devices"}
+      {expanded ? "Show the essentials" : "More about delivery, invites, files and devices"}
     </button>
   {/if}
 </div>
