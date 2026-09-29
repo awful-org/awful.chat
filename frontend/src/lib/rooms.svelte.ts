@@ -207,26 +207,30 @@ export async function saveRoom(roomCode: string, name: string, guard?: () => voi
 }
 
 /**
- * Persist a room name learned from a peer (or set locally).
- * Without this a name broadcast only lived in transportState, so the sidebar
- * and the next join still showed the raw room code.
+ * Persist a room name learned from a peer (or set locally), with when it
+ * was chosen (room-name.ts). Without this a name broadcast only lived in
+ * transportState, so the sidebar and the next join still showed the raw
+ * room code.
  */
 export async function renameRoom(
   roomCode: string,
-  name: string
+  name: string,
+  nameAt: number
 ): Promise<void> {
   const trimmed = name.trim().slice(0, 64);
   if (!trimmed || trimmed === roomCode) return;
-  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
-  if (idx === -1) return;
-  if (roomsStore.rooms[idx].name === trimmed) return;
+  // Not in the mirror yet (a room still being opened): the stored record
+  // still takes it, and the mirror picks it up from there.
+  const current = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  if (current && current.name === trimmed && current.nameAt === nameAt) return;
   // Patch the STORED record: the mirror is refreshed rarely, and writing a
   // whole room from it rolled back participants and the seen watermark that
   // other writers had advanced since page load (evicting members days early).
   const stored = await getRoom(roomCode);
   if (!stored) return;
-  const updated = { ...stored, name: trimmed };
-  roomsStore.rooms[idx] = updated;
+  const updated = { ...stored, name: trimmed, nameAt };
+  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
+  if (idx !== -1) roomsStore.rooms[idx] = updated;
   await putRoom(updated);
 }
 

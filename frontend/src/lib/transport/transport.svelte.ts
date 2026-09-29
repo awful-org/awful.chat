@@ -79,6 +79,7 @@ import {
   roomsStore,
   loadRooms,
 } from "../rooms.svelte";
+import { LEGACY_NAME_AT, isChosenName, judgeRoomName, nameStamp, nextNameStamp } from "../room-name";
 import { adoptLegacyPredecessor } from "../room-security/legacy-move";
 import { WebTorrentFileTransport } from "./file/webtorrent";
 import type { FileDescriptor, FileTransferSnapshot } from "./types";
@@ -1020,19 +1021,28 @@ async function _resumeFromFrozen(why: string): Promise<void> {
 
 // ── Senders ───────────────────────────────────────────────────────────────────
 
-function _sendRoomName(peerId?: string): void {
-  const roomCode = transportState.roomCode;
-  const name = transportState.roomName.trim().slice(0, 64);
-  if (!name || !roomCode) return;
+/**
+ * Announce a room's stored name, with when it was chosen: to the room, or to
+ * one peer (a welcome, or the answer to an older name). Only a chosen name -
+ * the "Room" placeholder of a bare invite link is nobody's choice, and
+ * sending it renamed the room for everyone (room-name.ts).
+ */
+function _sendRoomName(peerId?: string, roomCode: string | null = transportState.roomCode): void {
+  if (!roomCode) return;
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  if (!room || !isChosenName(room)) return;
+  const name = room.name.trim().slice(0, 64);
+  if (!name) return;
   // roomCode travels with it: a direct send has no topic to infer it from, so
   // the receiver used to apply the name to whatever room they had open.
   // A moved room says where it came from, so the other members of the old
   // room can put their own copy of its history on top (legacy-move.ts).
-  const movedFrom = roomsStore.rooms.find((r) => r.roomCode === roomCode)?.archiveOf;
+  const movedFrom = room.archiveOf;
   const payload = encode({
     type: MessageType.RoomName,
     name,
     roomCode,
+    nameAt: nameStamp(room),
     ...(movedFrom && roomCode.startsWith("rd2_") ? { movedFrom } : {}),
   });
   if (peerId) {
@@ -2576,6 +2586,25 @@ function _handleCallState(peerId: string, msg: WireCallState): void {
   transportState.callPeerStates = next;
 }
 
+/**
+ * The newest name wins; one older than ours is answered with ours, so a
+ * member who missed a rename catches up (room-name.ts).
+ */
+async function _applyRoomName(peerId: string, target: string, name: string, nameAt: number | undefined): Promise<void> {
+  // The stored record when the sidebar's mirror does not have the room yet:
+  // a welcome lands while a room joined from a link is still being opened,
+  // and dropping it left the member with "Room" until somebody renamed it.
+  const stored = roomsStore.rooms.find((r) => r.roomCode === target) ?? (await getRoom(target));
+  if (!stored) return;
+  const verdict = judgeRoomName(stored, name, nameAt);
+  if (verdict === "take") {
+    await renameRoom(target, name, nameAt ?? LEGACY_NAME_AT);
+    if (target === transportState.roomCode) transportState.roomName = name;
+  } else if (verdict === "answer") {
+    _sendRoomName(peerId, target);
+  }
+}
+
 function _handleRoomName(msg: WireRoomName, room: string | null, peerId: string): void {
   // The AUTHENTICATED pubsub topic wins over anything in the message body.
   // A direct send (legit: _sendRoomName welcomes a fresh joiner) may only
@@ -2590,8 +2619,8 @@ function _handleRoomName(msg: WireRoomName, room: string | null, peerId: string)
   // room code as a placeholder. Accepting it would overwrite the real name for
   // everyone in the room.
   if (trimmed === target) return;
-  renameRoom(target, trimmed).catch(() => {});
-  if (target === transportState.roomCode) transportState.roomName = trimmed;
+  _applyRoomName(peerId, target, trimmed, typeof msg.nameAt === "number" ? msg.nameAt : undefined)
+    .catch(() => {});
   // Only over the secure room's own channel (room !== null) and only for a
   // secure room: the claim is about THIS room, from one of its members.
   if (msg.movedFrom !== undefined && room !== null && target.startsWith("rd2_")) {
@@ -3067,7 +3096,7 @@ _transport.on("roomPeers", (room, peerIds) => {
     // PEERS reply never learned the room's name, never saw its roster, and
     // never heard about a call in it. All three handlers are idempotent, so
     // repeating them when the relay re-lists a peer costs a few small frames.
-    _sendRoomName(pid);
+    _sendRoomName(pid, room);
     _sendCallFramesTo(pid);
     _sendRoomUsers(pid, room).catch(() => {});
     if (!_peerIdToDid.has(pid)) continue;
@@ -3119,7 +3148,9 @@ _transport.on("connect", (peerId) => {
   // the room's only join secret and this event fires for any peer that dials
   // us). A peer that connects BEFORE the relay lists them in the room gets
   // nothing here; the "roomPeers" handler is what catches them up.
-  _sendRoomName(peerId);
+  // Every room we share, not just the one on screen: a rename made while this
+  // peer was away otherwise reached them only if they happened to open it.
+  for (const room of _transport.rooms()) _sendRoomName(peerId, room);
   _sendCallFramesTo(peerId);
   _sendDigest(peerId);
   if (transportState.roomCode) {
@@ -4982,9 +5013,19 @@ export function broadcastProfile(): void {
   _broadcastProfile().catch(() => {});
 }
 
-export function setRoomName(name: string): void {
-  transportState.roomName = name.trim().slice(0, 64);
-  _sendRoomName();
+/** Tell the room its name as this device has it; see _sendRoomName. */
+export function announceRoomName(roomCode: string): void {
+  _sendRoomName(undefined, roomCode);
+}
+
+/** Rename a room for everyone: stamped now, so it wins (room-name.ts). */
+export async function renameRoomEverywhere(roomCode: string, name: string): Promise<void> {
+  const trimmed = name.trim().slice(0, 64);
+  if (!trimmed) return;
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  await renameRoom(roomCode, trimmed, nextNameStamp(room));
+  if (roomCode === transportState.roomCode) transportState.roomName = trimmed;
+  _sendRoomName(undefined, roomCode);
 }
 
 export function selfId(): string {

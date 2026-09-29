@@ -14,7 +14,7 @@ import {
   Trash2,
   Users,
 } from "@lucide/svelte";
-import { roomsStore, renameRoom, toggleRoomPin } from "$lib/rooms.svelte";
+import { roomsStore, toggleRoomPin } from "$lib/rooms.svelte";
 import { uiState } from "$lib/ui-state.svelte";
 import { savedRoomInvitationLink } from "$lib/room-security/invitations";
 import {
@@ -23,7 +23,7 @@ import {
   type RoomNotifyMode,
 } from "$lib/notify-prefs.svelte";
 import { hashRef } from "$lib/storage-crypto";
-import { setRoomName } from "$lib/transport/transport.svelte";
+import { renameRoomEverywhere } from "$lib/transport/transport.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
 import { parseJoinInput } from "$lib/invite";
@@ -153,13 +153,12 @@ export const roomCommands: CmdSource = (host) => {
           title: "Rename room",
           initial: currentTitle,
           // Without this an empty submit would blank the room name for every
-          // participant, since `setRoomName` broadcasts whatever it is given.
+          // participant, since the rename is broadcast to the room.
           validate: (value) =>
             value.trim().length === 0 ? "Room name cannot be empty" : null,
           submit: async (value) => {
             try {
-              await renameRoom(activeCode, value);
-              setRoomName(value);
+              await renameRoomEverywhere(activeCode, value);
             } catch (err) {
               console.warn("rename room failed", err);
             }

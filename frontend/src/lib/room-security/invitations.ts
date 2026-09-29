@@ -1,5 +1,6 @@
 import { deriveRoomKeys, parseRoomSecret, type RoomSecret } from "./keys";
 import { getRoom, putRoom, type Room } from "$lib/storage";
+import { PLACEHOLDER_NAME_AT } from "$lib/room-name";
 import { captureSessionGuard } from "$lib/identity/session-guard";
 import { parseSecureInvitation, secureInvitationLink } from "./invitation-format";
 export { parseSecureInvitation, secureInvitationLink } from "./invitation-format";
@@ -17,7 +18,12 @@ export async function savedRoomInvitationLink(origin: string, roomCode: string):
 
 /** The database's existing sealed rooms store protects this extra field and
  * carries it through encrypted exports. The public ID remains the record key. */
-export async function storeSecureInvitation(input: string, name: string): Promise<Room> {
+/**
+ * Store the room an invitation opens. `name` is a name somebody chose (a
+ * room being created); without one the room gets the "Room" placeholder,
+ * which is never announced and gives way to the members' real name.
+ */
+export async function storeSecureInvitation(input: string, name?: string): Promise<Room> {
   const guard = captureSessionGuard();
   const roomSecret = parseSecureInvitation(input);
   const roomCode = deriveRoomKeys(roomSecret).discoveryId;
@@ -26,7 +32,12 @@ export async function storeSecureInvitation(input: string, name: string): Promis
   if (stored?.roomSecret && stored.roomSecret !== roomSecret) throw new Error("Room capability mismatch");
   const room: Room = stored
     ? { ...stored, roomSecret }
-    : { roomCode, roomSecret, name: name.trim() || "Room", type: "text", createdAt: Date.now(), lastSeenLamport: 0, participants: [] };
+    : {
+        roomCode, roomSecret, type: "text", createdAt: Date.now(), lastSeenLamport: 0, participants: [],
+        ...(name?.trim()
+          ? { name: name.trim(), nameAt: Date.now() }
+          : { name: "Room", nameAt: PLACEHOLDER_NAME_AT }),
+      };
   await putRoom(room, guard);
   guard();
   return room;

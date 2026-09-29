@@ -13,6 +13,7 @@
   import { sendDirectMessage } from "$lib/transport/dm.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { cancelAllShortCodes } from "$lib/short-codes.svelte";
+  import { isChosenName } from "$lib/room-name";
   import { claimNodeLock } from "$lib/transport/node-lock";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
@@ -33,7 +34,7 @@
     joinRoom,
     leaveRoom,
     selfId,
-    setRoomName,
+    announceRoomName,
     removeRoomCompletely,
     connect,
     peerIdToDid, resolveMentionDisplayName} from "$lib/transport/transport.svelte";
@@ -383,7 +384,7 @@
       await loadRooms();
       // Announce again now the link exists: the name frame carries
       // movedFrom, which is how the other members link their own history.
-      setRoomName(old.name);
+      announceRoomName(newCode);
       moveDialogOpen = false;
       if (inviteOthers) {
         const text = legacyMoveInviteText(old.name, secureInvitationLink(window.location.origin, secret));
@@ -552,7 +553,7 @@
     if (roomCode.startsWith("r2_")) {
       try {
         requireRoomSecurityRelease();
-        const imported = await storeSecureInvitation(roomCode, roomName ?? "Room");
+        const imported = await storeSecureInvitation(roomCode, roomName);
         if (!current()) return;
         if (seq !== joinSeq) return;
         roomCode = imported.roomCode;
@@ -601,16 +602,19 @@
         history.pushState({ roomCode }, "", `/r/#${roomCode}`);
         return;
       }
-      if (known) {
-        // Only announce a name we actually have. Joining from a bare invite
-        // link used to broadcast the room code as the name and overwrite it
-        // for everyone already in the room.
-        setRoomName(known);
-      } else {
-        transportState.roomName = label;
-      }
+      transportState.roomName = label;
       await saveRoom(roomCode, label, guard);
       if (!current()) return;
+      // The stored name, which a member's announcement may have updated
+      // while the room was opening. Then ours goes out with when it was
+      // chosen: anyone on an older name takes it, anyone on a newer one
+      // answers with theirs, and a placeholder is never sent (room-name.ts).
+      const saved = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+      if (saved && isChosenName(saved)) {
+        activeRoomName = saved.name;
+        transportState.roomName = saved.name;
+      }
+      announceRoomName(roomCode);
       history.pushState({ roomCode }, "", `/r/#${roomCode}`);
     } catch (err) {
       if (!current()) return;
