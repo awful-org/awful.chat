@@ -9,13 +9,28 @@ it("accepts complete capabilities and fragment/protocol handoffs without case fo
     expect(parseJoinInput(input)).toEqual({ kind: "room", code: secret });
   }
 });
-it("accepts complete online pairing codes and folds human lookalikes", () => {
-  expect(parseJoinInput("abcd-efgh jkmn-pqrs")).toEqual({ kind: "pairing", code: "ABCD-EFGH JKMN-PQRS" });
-  expect(parseJoinInput("oooo-llll 2345-6789")).toEqual({ kind: "pairing", code: "0000-1111 2345-6789" });
-});
-it("rejects retired aliases, public IDs and malformed or path/query capabilities", () => {
+it("accepts a capability in any case and hands back the lowercase form", () => {
   const secret = newRoomSecret();
-  for (const input of ["", "7QK3M9", "a1b2c3", "6BMB3GST2JRJZ", deriveRoomKeys(secret).discoveryId, `/r/${secret}`, `/r/?secret=${secret}`, "https://example.org/", `${secret}/junk`]) {
+  expect(secret).toBe(secret.toLowerCase());
+  for (const input of [secret.toUpperCase(), `https://chat.example/r/#${secret.toUpperCase()}`]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "room", code: secret });
+  }
+});
+it("accepts six-character online pairing codes, lowercase, folding human lookalikes", () => {
+  expect(parseJoinInput("k5t-8r5")).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  expect(parseJoinInput(" K5T 8R5 ")).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  expect(parseJoinInput("k5t8r5")).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  expect(parseJoinInput("ooo-lll")).toEqual({ kind: "pairing", code: "000-111" });
+  for (const wrong of ["k5t-8r", "k5t-8r5a", "k5u-8r5"]) {
+    expect(parseJoinInput(wrong)).toEqual({ kind: "invalid" });
+  }
+});
+it("rejects public IDs, old room codes and malformed or path/query capabilities", () => {
+  const secret = newRoomSecret();
+  // Six-character inputs are pairing-code shaped now; a retired short alias
+  // such as "7QK3M9" is tried as a pairing and fails at the relay - never
+  // looked up as a plaintext alias, which is what this guards.
+  for (const input of ["", "6BMB3GST2JRJZ", deriveRoomKeys(secret).discoveryId, `/r/${secret}`, `/r/?secret=${secret}`, "https://example.org/", `${secret}/junk`]) {
     expect(parseJoinInput(input)).toEqual({ kind: "invalid" });
   }
 });

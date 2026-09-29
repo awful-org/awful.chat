@@ -49,6 +49,38 @@ it("runs real OPAQUE through the UI network adapters without exposing the capabi
   } finally { pair.cancel(); }
 }, 15000);
 
+it("draws a new locator when the relay says the first is in use", async () => {
+  const relay = mailbox();
+  const creates: string[] = [];
+  const real = relay.fetchSpy.getMockImplementation()!;
+  relay.fetchSpy.mockImplementation(async (url, options) => {
+    const b = JSON.parse(options!.body as string);
+    if (b.action === "create") {
+      creates.push(b.locator);
+      if (creates.length === 1) return new Response("{}", { status: 409 });
+    }
+    return real(url, options);
+  });
+  const secret = newRoomSecret();
+  const pair = await hostInvitationPairing(secret, vi.fn());
+  try {
+    expect(creates).toHaveLength(2);
+    expect(parsePairingCode(pair.code)!.locator).toBe(creates[1]);
+    expect(await joinInvitationPairing(pair.code, new AbortController().signal)).toBe(secret);
+  } finally { pair.cancel(); }
+}, 15000);
+
+it("gives up on a relay that refuses for any other reason", async () => {
+  const relay = mailbox();
+  let creates = 0;
+  relay.fetchSpy.mockImplementation(async () => {
+    creates++;
+    return new Response("{}", { status: 429 });
+  });
+  await expect(hostInvitationPairing(newRoomSecret(), vi.fn())).rejects.toThrow("Pairing unavailable");
+  expect(creates).toBe(1);
+});
+
 it("aborts preparation before publishing a code and does not start polling", async () => {
   const controller = new AbortController();
   const calls: string[] = [];

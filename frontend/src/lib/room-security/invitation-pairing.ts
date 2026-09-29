@@ -6,18 +6,36 @@ import { parseRoomSecret, type RoomSecret } from "./keys";
 
 export const PAIRING_TTL = 300_000;
 export const PAIRING_ATTEMPTS = 5;
-const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/**
+ * The code is SHORT on purpose - six characters a person reads out or types
+ * - because OPAQUE lets its password be: nothing about it can be tested
+ * offline, only by a live attempt against the inviter, at most
+ * PAIRING_ATTEMPTS per code and only for PAIRING_TTL. Four characters of
+ * password is 2^20 possibilities, so a guesser's odds per code are 5 in
+ * ~1M. The two-character locator only finds the pairing at the relay; it
+ * is not secret, and a collision there is answered 409 and retried with a
+ * fresh one (invite-pairing.ts).
+ *
+ * Lowercase Crockford base32: no i, l, o or u to confuse, and typed input
+ * folds those to 1 and 0, in any case.
+ */
+export const PAIRING_LOCATOR_LENGTH = 2;
+export const PAIRING_PASSWORD_LENGTH = 4;
+const alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
 const enc = new TextEncoder();
 export function pairingRandom(length: number): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(length)), b => alphabet[b & 31]).join("");
 }
 export function parsePairingCode(input: string): { locator: string; password: string } | null {
-  const raw = input.trim().toUpperCase().replace(/[-\s]/g, "").replace(/O/g, "0").replace(/[IL]/g, "1");
-  if (!/^[0-9A-HJKMNP-TV-Z]{16}$/.test(raw)) return null;
-  return { locator: raw.slice(0, 8), password: raw.slice(8) };
+  const raw = input.trim().toLowerCase().replace(/[-\s]/g, "").replace(/o/g, "0").replace(/[il]/g, "1");
+  const length = PAIRING_LOCATOR_LENGTH + PAIRING_PASSWORD_LENGTH;
+  if (raw.length !== length || !/^[0-9a-hjkmnp-tv-z]+$/.test(raw)) return null;
+  return { locator: raw.slice(0, PAIRING_LOCATOR_LENGTH), password: raw.slice(PAIRING_LOCATOR_LENGTH) };
 }
+/** Shown as two groups of three - "k5t-8r5" - whatever the split. */
 export function formatPairingCode(locator: string, password: string): string {
-  return `${locator.slice(0, 4)}-${locator.slice(4)} ${password.slice(0, 4)}-${password.slice(4)}`;
+  const code = locator + password;
+  return `${code.slice(0, 3)}-${code.slice(3)}`;
 }
 const identifiers = (locator: string) => ({ client: `awful/pairing/v2/joiner/${locator}`, server: `awful/pairing/v2/inviter/${locator}` });
 function message(value: string): string {
@@ -35,8 +53,8 @@ function aad(locator: string, attempt: string): Uint8Array<ArrayBuffer> {
 
 /** OPAQUE's server is the inviter, never the relay. Registration stays local. */
 export class InvitationPairingHost {
-  readonly locator = pairingRandom(8);
-  readonly password = pairingRandom(8);
+  readonly locator = pairingRandom(PAIRING_LOCATOR_LENGTH);
+  readonly password = pairingRandom(PAIRING_PASSWORD_LENGTH);
   readonly expiresAt: number;
   private setup = "";
   private record = "";

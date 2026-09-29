@@ -1,4 +1,5 @@
 import { base64urlnopad } from "@scure/base";
+import { DISCOVERY_ID_RE } from "./keys";
 import { openRoomEnvelope, sealRoomEnvelope, MAX_ROOM_PLAINTEXT } from "./envelope";
 import { MembershipSession, type MembershipFrame } from "./session";
 import type { RoomKeys } from "./keys";
@@ -164,5 +165,5 @@ export function isMembershipHello(input: unknown): input is Extract<MembershipFr
   if (!input || typeof input !== "object") return false;
   const f = input as MembershipFrame;
   return f.version === 2 && f.type === "hello" && typeof f.room === "string" &&
-    /^rd2_[A-Za-z0-9_-]{43}$/.test(f.room) && typeof f.challenge === "string" && /^[A-Za-z0-9_-]{43}$/.test(f.challenge);
+    DISCOVERY_ID_RE.test(f.room) && typeof f.challenge === "string" && /^[A-Za-z0-9_-]{43}$/.test(f.challenge);
 }

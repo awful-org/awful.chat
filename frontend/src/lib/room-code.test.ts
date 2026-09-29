@@ -12,7 +12,9 @@ import {
 describe("room codes", () => {
   it("is a canonical 256-bit v2 capability", () => {
     for (let i = 0; i < 50; i++) {
-      expect(newRoomCode()).toMatch(/^r2_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/);
+      // 256 bits in 52 base32 characters: the last one carries a single
+      // bit and four zero bits, so it is only ever "a" or "q".
+      expect(newRoomCode()).toMatch(/^r2_[a-z2-7]{51}[aq]$/);
     }
   });
 

@@ -2,7 +2,7 @@ import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base64urlnopad as b64 } from "@scure/base";
-import { parseRoomSecret, type RoomSecret } from "./keys";
+import { b32, parseRoomSecret, type RoomSecret } from "./keys";
 
 /** Existing local database reference; never a network discovery capability. */
 export function pairwiseLocalId(selfDid: string, peerDid: string): string {
@@ -22,7 +22,7 @@ export function pairwiseRoomSecret(identitySeed: Uint8Array, remoteIdentityKey: 
   try {
     const root = hkdf(sha256, shared, new TextEncoder().encode("awful/dm/v2"),
       new TextEncoder().encode(JSON.stringify(identities)), 32);
-    try { return parseRoomSecret(`r2_${b64.encode(root)}`); }
+    try { return parseRoomSecret(`r2_${b32.encode(root)}`); }
     finally { root.fill(0); }
   } finally { privateKey.fill(0); shared.fill(0); }
 }

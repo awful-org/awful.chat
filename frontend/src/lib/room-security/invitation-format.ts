@@ -3,7 +3,8 @@ import { parseRoomSecret, type RoomSecret } from "./keys";
 /** Capability links must never put their secret in a URL path or query. */
 export function parseSecureInvitation(input: string): RoomSecret {
   const raw = input.trim();
-  if (raw.startsWith("r2_")) return parseRoomSecret(raw);
+  // Any case: parseRoomSecret folds a capitalised secret to its lowercase form.
+  if (/^r2_/i.test(raw)) return parseRoomSecret(raw);
   if (raw.startsWith("web+awfl://")) return parseProtocolInvitation(raw);
   const url = new URL(raw, "https://room.invalid");
   if (!/^https?:$/.test(url.protocol) || url.pathname !== "/r/" || url.search) {
@@ -16,7 +17,8 @@ export function parseSecureInvitation(input: string): RoomSecret {
 }
 
 function parseProtocolInvitation(input: string): RoomSecret {
-  // Do not parse the secret as an HTTPS hostname or normalize its case.
+  // Not parsed as a URL: the secret is not a hostname. Its case no longer
+  // matters (lowercase base32, see keys.ts), so a browser folding it is fine.
   const value = input.slice("web+awfl://".length);
   return parseRoomSecret(value.startsWith("r/#") ? value.slice(3) : value);
 }

@@ -6,6 +6,7 @@
   import { captureSessionGuard } from "$lib/identity/session-guard";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import { parseSecureInvitation } from "$lib/room-security/invitation-format";
+  import { DISCOVERY_ID_RE } from "$lib/room-security/keys";
   import { parseJoinInput } from "$lib/invite";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
@@ -153,7 +154,7 @@
     // Keep incoming capabilities only in memory, even while identity is locked.
     // Public saved-room IDs are safe to retain for reload/navigation. Strip
     // malformed inputs too: they can contain a truncated or wrapped secret.
-    if (code && !/^rd2_[A-Za-z0-9_-]{43}$/.test(code)) {
+    if (code && !DISCOVERY_ID_RE.test(code)) {
       history.replaceState(history.state, "", "/r/");
     }
     return code;

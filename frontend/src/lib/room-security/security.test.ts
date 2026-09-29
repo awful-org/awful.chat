@@ -15,7 +15,11 @@ describe("v2 room security core", () => {
   });
   it("rejects old codes and preserves canonical high-entropy invitations", () => {
     const secret = newRoomSecret();
-    expect(secret).toHaveLength(46);
+    expect(secret).toHaveLength(55);
+    expect(secret).toBe(secret.toLowerCase());
+    expect(deriveRoomKeys(secret).discoveryId).toMatch(/^rd2_[a-z2-7]{52}$/);
+    // Any case in, the one lowercase form out: same room.
+    expect(parseRoomSecret(secret.toUpperCase())).toBe(secret);
     expect(parseRoomSecret(secret)).toBe(secret);
     for (const invalid of ["ABCDEF", "7QK3M9AB2C", secret + "=", secret.slice(3), " " + secret]) {
       expect(() => parseRoomSecret(invalid)).toThrow();
