@@ -11,22 +11,26 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import { Check, CircleAlert, Copy, Keyboard, RefreshCw, Share2 } from "@lucide/svelte";
   import { savedRoomInvitationLink, parseSecureInvitation } from "$lib/room-security/invitations";
-  import { hostInvitationPairing } from "$lib/invite-pairing";
+  import { cancelShortCode, hostShortCode, liveShortCode, shortCodeLink, shortCodeOutcome } from "$lib/short-codes.svelte";
+  import type { RoomSecret } from "$lib/room-security/keys";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import QRCode from "qrcode";
   let { roomCode, open = $bindable(false) }: { roomCode: string; open?: boolean } = $props();
   let link = $state("");
   let qr = $state("");
-  let code = $state("");
-  let codeExpiresAt = $state(0);
+  // The room's short code lives in short-codes.svelte.ts, not here: closing
+  // this dialog leaves it working, and reopening it shows it again.
+  const secret = $derived(link ? parseSecureInvitation(link) as RoomSecret : null);
+  const live = $derived(secret ? liveShortCode(secret) : null);
+  const code = $derived(live?.code ?? "");
+  const codeExpiresAt = $derived(live?.expiresAt ?? 0);
+  const outcome = $derived(secret && !live ? shortCodeOutcome(secret) : null);
   let status = $state("");
   let statusIsError = $state(false);
   let unavailable = $state(false);
   let copiedWhat = $state<"link" | "code" | null>(null);
   let busy = $state(false);
   let now = $state(Date.now());
-  let cancel: (() => void) | undefined;
-  let controller: AbortController | undefined;
   let generation = 0;
   const canShare =
     typeof navigator !== "undefined" && typeof navigator.share === "function";
@@ -38,7 +42,7 @@
     const room = roomCode;
     if (!open) return;
     const current = ++generation;
-    link = qr = code = status = "";
+    link = qr = status = "";
     statusIsError = unavailable = false;
     void savedRoomInvitationLink(window.location.origin, room).then(async value => {
       const image = await QRCode.toDataURL(value, { width: 280, margin: 2 });
@@ -48,7 +52,7 @@
       unavailable = true;
       say(err instanceof Error ? err.message : "This room's invite link is not available.", true);
     });
-    return () => { generation++; controller?.abort(); cancel?.(); cancel = undefined; link = qr = code = ""; busy = false; copiedWhat = null; };
+    return () => { generation++; link = qr = ""; busy = false; copiedWhat = null; };
   });
   $effect(() => {
     if (!code) return;
@@ -61,24 +65,18 @@
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   });
   async function pairing() {
-    if (busy || !link) return;
+    if (busy || !secret) return;
     const current = generation;
     busy = true;
-    controller?.abort(); cancel?.(); code = "";
     say("");
-    controller = new AbortController();
     try {
       requireRoomSecurityRelease();
-      const pair = await hostInvitationPairing(parseSecureInvitation(link), value => { if (current === generation) { say(value); code = ""; } }, controller.signal);
-      if (current !== generation) { pair.cancel(); return; }
-      cancel = pair.cancel; code = pair.code; codeExpiresAt = pair.expiresAt;
-    } catch { if (current === generation) say("Couldn't get a short code right now. Share the link instead.", true); }
+      await hostShortCode(secret);
+    } catch { if (current === generation) say("Couldn't get a short code right now. Share the full link instead.", true); }
     finally { if (current === generation) busy = false; }
   }
   function cancelCode() {
-    cancel?.();
-    cancel = undefined;
-    code = "";
+    if (secret) cancelShortCode(secret);
     say("");
   }
   async function copy(value: string, what: "link" | "code") {
@@ -90,7 +88,7 @@
       say("");
       setTimeout(() => { if (current === generation && copiedWhat === what) copiedWhat = null; }, 2000);
     }
-    catch { if (current === generation) say(what === "link" ? "Couldn't copy. Select the link and copy it." : "Couldn't copy. Select the code and copy it.", true); }
+    catch { if (current === generation) say(what === "link" ? "Couldn't copy. Select the link and copy it." : "Couldn't copy. Type the code in instead.", true); }
   }
   async function share() {
     const current = generation;
@@ -168,20 +166,25 @@
           <div class="rounded-lg bg-muted px-3 py-2 text-center">
             <div class="select-all font-mono text-lg tracking-widest text-foreground">{code}</div>
             <div class="mt-1 text-xs text-muted-foreground">
-              Works once · {codeLeft} left · keep this open
+              {#if now >= codeExpiresAt}
+                Expired. Get a new one below.
+              {:else}
+                Works once · {codeLeft} left
+                <span class="block">Keep Awful.chat open until it's used</span>
+              {/if}
             </div>
             <div class="mt-2 flex justify-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
                 class="font-mono text-xs cursor-pointer"
-                aria-label="Copy short code"
-                onclick={() => copy(code, "code")}
+                aria-label="Copy short link"
+                onclick={() => copy(shortCodeLink(code), "code")}
               >
                 {#if copiedWhat === "code"}
                   <Check class="size-3.5 text-primary" /> Copied
                 {:else}
-                  <Copy class="size-3.5" /> Copy
+                  <Copy class="size-3.5" /> Copy link
                 {/if}
               </Button>
               <Button
@@ -210,8 +213,8 @@
           role="status"
           class={status
             ? `text-center text-xs ${statusIsError ? "text-destructive" : "text-muted-foreground"}`
-            : "sr-only"}
-        >{status}</p>
+            : outcome ? "text-center text-xs text-muted-foreground" : "sr-only"}
+        >{status || outcome || ""}</p>
       </div>
     </div>
   </DialogContent>

@@ -609,8 +609,9 @@
   </div>
   {/if}
 
-  <!-- Room list -->
-  <div bind:this={listEl} class="flex-1 overflow-y-auto p-1.5">
+  <!-- Room list. Not selectable, and no iOS callout: a long press is the
+       touch way to open a row's menu, and it also selected the row's text. -->
+  <div bind:this={listEl} class="flex-1 overflow-y-auto p-1.5 select-none [-webkit-touch-callout:none]">
     {#if collapsed}
       {#if activeTab === "rooms"}
         {#each rooms as room (room.roomCode)}
@@ -872,7 +873,7 @@
   <div
     role="menu"
     tabindex="-1"
-    class="fixed z-50 min-w-35 rounded-md border border-border bg-popover py-1 shadow-xl"
+    class="fixed z-50 min-w-35 select-none rounded-md border border-border bg-popover py-1 shadow-xl"
     style="top: {contextMenu.y}px; left: {contextMenu.x}px"
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
@@ -918,7 +919,7 @@
   <div
     role="menu"
     tabindex="-1"
-    class="fixed z-50 min-w-35 rounded-md border border-border bg-popover py-1 shadow-xl"
+    class="fixed z-50 min-w-35 select-none rounded-md border border-border bg-popover py-1 shadow-xl"
     style="top: {dmContextMenu.y}px; left: {dmContextMenu.x}px"
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}

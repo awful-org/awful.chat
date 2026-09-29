@@ -6,7 +6,7 @@
  */
 
 import QRCode from "qrcode";
-import { Html5Qrcode } from "html5-qrcode";
+import { stopQrScan } from "../qr-scanner.svelte";
 import type { PeerTransport } from "./types";
 import { SecureSyncTransport } from "$lib/room-security/sync-transport";
 import { deriveRoomKeys, newRoomSecret, parseRoomSecret, type RoomSecret } from "$lib/room-security/keys";
@@ -118,8 +118,6 @@ export interface SyncState {
   isGenerating: boolean;
   qrDataUrl: string | null;
   plaintextToken: string | null;
-  isScanning: boolean;
-  scanError: string | null;
   isConnecting: boolean;
   isSyncing: boolean;
   syncProgress: number;
@@ -137,8 +135,6 @@ export const syncState = $state<SyncState>({
   isGenerating: false,
   qrDataUrl: null,
   plaintextToken: null,
-  isScanning: false,
-  scanError: null,
   isConnecting: false,
   isSyncing: false,
   syncProgress: 0,
@@ -151,7 +147,6 @@ let _transport: PeerTransport | null = null;
 // A committed multi-transaction import cannot be rolled back. Keep its write
 // lease through cleanup so a replacement sync cannot overlap identity/storage.
 let _importCommitDone: Promise<void> | null = null;
-let _html5QrCode: Html5Qrcode | null = null;
 let _syncRoomCode: string | null = null;
 let _syncRoomSecret: RoomSecret | null = null;
 let _syncToken: string | null = null;
@@ -1427,243 +1422,6 @@ export async function downloadBackup(passphrase?: string): Promise<void> {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-/** A camera the QR scanner can run on. */
-export interface ScanCamera {
-  id: string;
-  label: string;
-}
-
-/**
- * Camera state for the QR scanner.
- *
- * Its own store rather than more fields on syncState: this is about the
- * hardware in front of the user, it means nothing outside the scan view, and
- * it changes several times while a camera is starting.
- */
-export const scannerState = $state({
-  /**
-   * The camera has been asked for and the user has not answered yet.
-   *
-   * Distinct from scanning and distinct from an error. On a phone the prompt
-   * sits there for as long as it takes somebody to read it, and for that whole
-   * time the view was a black square saying nothing at all - which reads as a
-   * broken scanner, not as a question waiting for an answer.
-   */
-  awaitingPermission: false,
-  /** Every camera on the device, once permission has been granted. */
-  cameras: [] as ScanCamera[],
-  activeCameraId: null as string | null,
-  /** The running camera has a torch, and it can be switched. */
-  torchAvailable: false,
-  torchOn: false,
-});
-
-const BACK_CAMERA = /\b(back|rear|environment)\b/i;
-/**
- * iPhones list every lens as its own camera. The ultra wide cannot focus on
- * a phone held a hand's width away and the telephoto focuses no closer than
- * arm's length, so either one "opens" and then never reads a thing.
- */
-const CLOSE_FOCUS_UNFRIENDLY = /ultra|tele|zoom/i;
-
-/**
- * The camera to open first.
- *
- * `{ facingMode: "environment" }` was a constraint, not a choice, and a
- * browser that cannot honour it gets to pick - which on several Androids is
- * the front camera, pointed at the face of somebody holding their other phone
- * up to the back of the device. Naming a device id makes the choice explicit,
- * and it gives the UI something to offer a switch between.
- */
-export function preferBackCamera(cameras: ScanCamera[]): string | null {
-  if (cameras.length === 0) return null;
-  const backs = cameras.filter((c) => BACK_CAMERA.test(c.label));
-  const back =
-    backs.find((c) => !CLOSE_FOCUS_UNFRIENDLY.test(c.label)) ?? backs[0];
-  // Nothing labelled: the last entry is the back camera on most Androids, and
-  // on a single-camera device it is the only one there is.
-  return (back ?? cameras[cameras.length - 1]).id;
-}
-
-/** Read the running camera's torch support; never throws. */
-function readTorchSupport(): void {
-  if (!_html5QrCode) return;
-  try {
-    // The same MediaTrackCapabilities.torch the platform reports, read
-    // through the wrapper that also knows how to apply it.
-    const torch = _html5QrCode
-      .getRunningTrackCameraCapabilities()
-      .torchFeature();
-    scannerState.torchAvailable = torch.isSupported();
-    scannerState.torchOn = torch.value() === true;
-  } catch {
-    // No running camera, or a browser that reports no capabilities.
-    scannerState.torchAvailable = false;
-    scannerState.torchOn = false;
-  }
-}
-
-export async function startScanning(
-  elementId: string,
-  onScan: (payload: SyncPayload) => void,
-  onError: (error: string) => void,
-  /** Skip the automatic choice - see switchScanCamera. */
-  cameraId?: string
-): Promise<void> {
-  syncState.isScanning = true;
-  syncState.scanError = null;
-  scannerState.torchAvailable = false;
-  scannerState.torchOn = false;
-
-  try {
-    // getCameras() is what raises the permission prompt, and it does not
-    // resolve until the user has answered it - so this, and only this, is the
-    // window in which the view should say it is waiting for them.
-    if (scannerState.cameras.length === 0) {
-      scannerState.awaitingPermission = true;
-      try {
-        scannerState.cameras = (await Html5Qrcode.getCameras()).map((c) => ({
-          id: c.id,
-          label: c.label,
-        }));
-      } finally {
-        scannerState.awaitingPermission = false;
-      }
-    }
-    const target = cameraId ?? preferBackCamera(scannerState.cameras);
-    scannerState.activeCameraId = target;
-
-    _html5QrCode = new Html5Qrcode(elementId);
-
-    await _html5QrCode.start(
-      // Ignored once videoConstraints is set, but the API wants it.
-      target ?? { facingMode: "environment" },
-      {
-        fps: 10,
-        qrbox: { width: 250, height: 250 },
-        // Without a size the browser picks, and iOS Safari picks small: a
-        // 41-module code a third of the way across a 480-line frame is
-        // three pixels a square, under what the decoder can read. `ideal`
-        // is a preference, so a camera that cannot do 720p still opens.
-        videoConstraints: {
-          // A device id when the enumeration gave one; the old facingMode
-          // constraint stays as the fallback for a browser that listed nothing.
-          ...(target ? { deviceId: { exact: target } } : { facingMode: "environment" }),
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-      },
-      (decodedText) => {
-        let payload: SyncPayload | null;
-        try {
-          // The same parser as the typed code; a full-form code carries the
-          // whole peerId, which is what the target pins the connection to
-          // (see connectAsTarget). parsePlaintextToken throws its own
-          // message for a code from before pinning existed.
-          payload = parsePlaintextToken(decodedText);
-        } catch (err) {
-          onError(err instanceof Error ? err.message : "Invalid QR code");
-          return;
-        }
-        if (payload?.peerId) {
-          stopScanning();
-          onScan(payload);
-        } else if (decodedText.startsWith("{")) {
-          // The JSON payload the QR carried before this build. A PWA can
-          // hold an old build for a while after a deploy.
-          onError(
-            "This QR code is from an older version of the app - refresh the other device and generate a new code"
-          );
-        } else {
-          onError("Invalid QR code");
-        }
-      },
-      () => {
-        // Scan error - usually just means no QR code in frame, ignore
-      }
-    );
-    readTorchSupport();
-  } catch (err) {
-    syncState.scanError = err instanceof Error ? err.message : String(err);
-    onError(syncState.scanError);
-  }
-}
-
-/**
- * Move the scan to another camera without leaving the scan view.
- *
- * The camera list survives stopScanning, so this never re-prompts.
- */
-export async function switchScanCamera(
-  cameraId: string,
-  elementId: string,
-  onScan: (payload: SyncPayload) => void,
-  onError: (error: string) => void
-): Promise<void> {
-  await stopScanning();
-  await startScanning(elementId, onScan, onError, cameraId);
-}
-
-/** The next camera in the list, or null when there is only the one. */
-export function nextScanCameraId(): string | null {
-  const { cameras, activeCameraId } = scannerState;
-  if (cameras.length < 2) return null;
-  const at = cameras.findIndex((c) => c.id === activeCameraId);
-  return cameras[(at + 1) % cameras.length].id;
-}
-
-/** Switch the running camera's torch. Silently does nothing without one. */
-export async function toggleScanTorch(): Promise<void> {
-  if (!_html5QrCode || !scannerState.torchAvailable) return;
-  const next = !scannerState.torchOn;
-  try {
-    await _html5QrCode
-      .getRunningTrackCameraCapabilities()
-      .torchFeature()
-      .apply(next);
-    scannerState.torchOn = next;
-  } catch {
-    // Some devices advertise a torch and then refuse to switch it while the
-    // camera is running. Drop the control rather than leave a button that
-    // does nothing.
-    scannerState.torchAvailable = false;
-  }
-}
-
-/**
- * Stop camera scanning.
- */
-export async function stopScanning(): Promise<void> {
-  const scanner = _html5QrCode;
-  const torchOn = scannerState.torchOn;
-  _html5QrCode = null;
-  syncState.isScanning = false;
-  scannerState.awaitingPermission = false;
-  scannerState.torchAvailable = false;
-  scannerState.torchOn = false;
-  if (scanner) {
-    // Off before the stop: some Androids leave the torch burning after the
-    // camera is released, and nothing in the app can reach it again.
-    if (torchOn) {
-      try {
-        await scanner
-          .getRunningTrackCameraCapabilities()
-          .torchFeature()
-          .apply(false);
-      } catch {
-        // Nothing more to try; the stop below releases the device anyway.
-      }
-    }
-    try {
-      await scanner.stop();
-    } catch {
-      // Ignore stop errors
-    }
-  }
-  // cameras and activeCameraId deliberately survive: switchScanCamera stops
-  // and restarts, and re-enumerating would re-prompt on some browsers.
-}
-
 /**
  * Reset sync state.
  */
@@ -1671,8 +1429,6 @@ export function resetSyncState(): void {
   syncState.isGenerating = false;
   syncState.qrDataUrl = null;
   syncState.plaintextToken = null;
-  syncState.isScanning = false;
-  syncState.scanError = null;
   syncState.isConnecting = false;
   syncState.isSyncing = false;
   syncState.syncProgress = 0;
@@ -1687,7 +1443,7 @@ export function resetSyncState(): void {
 async function cleanup(): Promise<void> {
   const dying = _transport;
   _transport = null;
-  const stoppingScanner = stopScanning();
+  const stoppingScanner = stopQrScan();
   if (_syncExpiryTimer) clearTimeout(_syncExpiryTimer);
   _syncExpiryTimer = null;
   _syncRoomCode = null;

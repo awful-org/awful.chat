@@ -84,12 +84,18 @@
     class="flex w-full items-center justify-center gap-2 rounded-md py-2 font-mono text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground cursor-pointer"
   >
     <History class="size-3.5" />
-    <span>Earlier messages from "{roomName}", before the move · only on this device</span>
+    <span>Earlier messages from "{roomName}", before the move</span>
     {#if open}<ChevronUp class="size-3.5" />{:else}<ChevronDown class="size-3.5" />{/if}
   </button>
 
   {#if open}
     <div class="mt-2 flex flex-col gap-3 opacity-80">
+      <!-- Read from this device, never re-sent: each member of the old room
+           sees their own copy here, and people new to the room see none. -->
+      <p class="text-center font-mono text-xs text-muted-foreground">
+        Everyone who was in "{roomName}" sees their own copy of these.
+        People who join later don't.
+      </p>
       {#if more}
         <button
           type="button"

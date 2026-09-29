@@ -12,6 +12,7 @@
   import MoveLegacyRoomDialog from "./MoveLegacyRoomDialog.svelte";
   import { sendDirectMessage } from "$lib/transport/dm.svelte";
   import { parseJoinInput } from "$lib/invite";
+  import { cancelAllShortCodes } from "$lib/short-codes.svelte";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
   import { QueryClient, QueryClientProvider } from "@tanstack/svelte-query";
@@ -126,6 +127,9 @@
     if (!raw) return null;
     try {
       try { return parseSecureInvitation(pathname + hash); } catch { /* Stored room navigation. */ }
+      // A short link, `/r/#k5t-8r5`: handleJoin redeems it like a typed code.
+      const pairing = parseJoinInput(decodeURIComponent(raw));
+      if (pairing.kind === "pairing") return pairing.code;
       return normalizeRoomCode(decodeURIComponent(raw));
     } catch {
       return normalizeRoomCode(raw);
@@ -167,12 +171,19 @@
   let pendingRoomCode = $state<string | null>(consumeRoomLocation());
 
   let joiningRoom = $state(false);
+  // A short link waits on the inviter's tab, for up to a minute: say so.
+  let joiningWithCode = $state(false);
   let bootstrapped = $state(false);
 
   // Lock now tears down the application transport. Re-arm each unlocked
   // session, including unlocks that keep this AppView mounted.
   $effect(() => {
-    if (!identityStore.isUnlocked) return;
+    if (!identityStore.isUnlocked) {
+      // A lock ends the short codes this tab hosts, like everything else
+      // holding a room secret in memory (short-codes.svelte.ts).
+      cancelAllShortCodes();
+      return;
+    }
     untrack(() => {
       const guard = captureSessionGuard();
       void connect();
@@ -252,6 +263,7 @@
       const code = pendingRoomCode;
       pendingRoomCode = null;
       joiningRoom = true;
+      joiningWithCode = parseJoinInput(code).kind === "pairing";
       // Join only after the stored rooms are loaded: the join saves the room,
       // and racing loadRooms() could drop it from the sidebar mirror.
       loadRooms()
@@ -381,10 +393,11 @@
       let url: URL;
       try { url = new URL(anchor.href); } catch { return; }
       if (url.origin !== window.location.origin || url.pathname !== "/r/") return;
-      let secret: string;
-      try { secret = parseSecureInvitation(url.href); } catch { return; }
+      // A full invitation or a short link; a saved room's own address is not one.
+      const parsed = parseJoinInput(url.href);
+      if (parsed.kind === "invalid") return;
       e.preventDefault();
-      void handleJoin(secret, "");
+      void handleJoin(parsed.code, "");
     };
     document.addEventListener("click", onClick, true);
     return () => document.removeEventListener("click", onClick, true);
@@ -478,6 +491,17 @@
   let pairingController: AbortController | undefined;
   $effect(() => () => pairingController?.abort());
 
+  // A join that failed only because the relay was not up yet - a browser
+  // starting with the tab restored - is retried once it is. Before, the room
+  // was dropped and nothing brought it back when the relay came up.
+  let awaitingRelay = $state<{ roomCode: string; roomName?: string } | null>(null);
+  $effect(() => {
+    if (!transportState.relayConnected || !awaitingRelay) return;
+    const { roomCode, roomName } = awaitingRelay;
+    awaitingRelay = null;
+    untrack(() => void handleJoin(roomCode, "", roomName));
+  });
+
   async function handleJoin(
     roomCode: string,
     _displayName: string,
@@ -490,6 +514,7 @@
     };
     const seq = ++joinSeq;
     pairingController?.abort();
+    awaitingRelay = null;
     const parsed = parseJoinInput(roomCode);
     if (parsed.kind === "pairing") {
       const controller = new AbortController();
@@ -543,6 +568,7 @@
     };
     try {
       if (!(await joinRoom(roomCode))) {
+        if (current() && !transportState.relayConnected) awaitingRelay = { roomCode, roomName: known || undefined };
         backOut();
         return;
       }
@@ -576,6 +602,7 @@
   function handleLeave() {
     ++joinSeq;
     pairingController?.abort();
+    awaitingRelay = null;
     leaveRoom();
     activeRoomCode = null;
     activeRoomName = "";
@@ -1393,8 +1420,11 @@
        generated all gone. The genuine first-load spinner is App.svelte's,
        gated on identityStore.initializing, which is what that flag is for. -->
   {#if joiningRoom}
-    <div class="min-h-dvh bg-background flex items-center justify-center">
+    <div class="min-h-dvh bg-background flex flex-col items-center justify-center gap-3">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
+      {#if joiningWithCode}
+        <p class="font-mono text-xs text-muted-foreground">Getting the invitation from whoever shared it...</p>
+      {/if}
     </div>
   {:else if !identityStore.keypair}
     <IdentitySetup />

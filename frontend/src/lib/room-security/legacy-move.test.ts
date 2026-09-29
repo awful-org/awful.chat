@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getRoom, putRoom, wipeLocalDatabase, type Room } from "$lib/storage";
+import { getRoom, putMessage, putRoom, wipeLocalDatabase, type Room } from "$lib/storage";
 import { clearStorageCrypto, initStorageCrypto } from "$lib/storage-crypto";
 import { getRoomNotifyMode, setRoomNotifyMode } from "$lib/notify-prefs.svelte";
 import { deriveRoomKeys, newRoomSecret } from "./keys";
@@ -78,6 +78,14 @@ describe("adoptLegacyPredecessor", () => {
     expect(await adoptLegacyPredecessor(newCode, OLD, "did:key:z6MkMallory")).toBe(false);
     expect(await adoptLegacyPredecessor(newCode, OLD, undefined)).toBe(false);
     expect((await getRoom(newCode))?.archiveOf).toBeUndefined();
+  });
+
+  it("takes having written in the old room as membership, once the roster dropped them", async () => {
+    const CAROL = "did:key:z6MkCarol";
+    expect(await adoptLegacyPredecessor(newCode, OLD, CAROL)).toBe(false);
+    await putMessage({ id: "m1", roomCode: OLD, senderId: CAROL, senderName: "Carol", lamport: 1, timestamp: 1, type: "text", content: "hi", attachments: [] } as never);
+    expect(await adoptLegacyPredecessor(newCode, OLD, CAROL)).toBe(true);
+    expect((await getRoom(newCode))?.archiveOf).toBe(OLD);
   });
 
   it("ignores an old room we do not hold, and keeps the first link", async () => {

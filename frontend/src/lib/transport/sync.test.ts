@@ -68,7 +68,6 @@ import {
   parsePlaintextToken,
   parseShortCode,
   peerIdShortPrefix,
-  preferBackCamera,
   syncState,
   tokenAccepted,
   utf8Length,
@@ -314,34 +313,6 @@ describe("the QR text", () => {
       peerId: PEER_ID,
     });
     expect(matchesSourcePeer(payload!, PEER_ID)).toBe(true);
-  });
-});
-
-describe("preferBackCamera", () => {
-  const cam = (id: string, label: string) => ({ id, label });
-
-  // An iPhone lists each lens as a camera. The first "Back" match used to
-  // win, and when that was the ultra wide or the telephoto the camera
-  // opened and could not focus on a phone held up to it.
-  it("skips the lenses that cannot focus up close", () => {
-    expect(
-      preferBackCamera([
-        cam("f", "Front Camera"),
-        cam("uw", "Back Ultra Wide Camera"),
-        cam("t", "Back Telephoto Camera"),
-        cam("b", "Back Camera"),
-      ])
-    ).toBe("b");
-  });
-
-  it("still takes a back lens over nothing", () => {
-    expect(
-      preferBackCamera([cam("f", "Front Camera"), cam("uw", "Back Ultra Wide Camera")])
-    ).toBe("uw");
-  });
-
-  it("falls back to the last camera when nothing is labelled", () => {
-    expect(preferBackCamera([cam("a", ""), cam("b", "")])).toBe("b");
   });
 });
 

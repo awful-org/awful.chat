@@ -978,6 +978,13 @@ export async function getMessagesAboveWatermarks(
   );
 }
 
+/** Whether `did` wrote anything in the room: clear fields only, no decrypt. */
+export async function roomHasMessageFrom(roomCode: string, did: string): Promise<boolean> {
+  const rows = await _rawRoomMessages(roomCode);
+  const blinded = await blindValue(did);
+  return rows.some((r) => r.senderId === blinded || r.senderId === did);
+}
+
 export async function getMessage(id: string): Promise<Message | undefined> {
   const database = await getDB();
   return _open("messages", await database.get("messages", id));
