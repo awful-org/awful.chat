@@ -19,7 +19,7 @@
  * old room they hold and the announcer was a member of - see
  * adoptLegacyPredecessor.
  */
-import { getRoom, putRoom, type Room } from "$lib/storage";
+import { getRoom, putRoom, roomHasMessageFrom, type Room } from "$lib/storage";
 import { getRoomNotifyMode, setRoomNotifyMode } from "$lib/notify-prefs.svelte";
 import { isLegacyArchive } from "./legacy-archive";
 
@@ -74,8 +74,9 @@ function carrySettings(oldRoom: Room, newRoom: Room): Room {
  * - we hold that legacy room, and it has not been linked elsewhere already;
  * - the new room has no predecessor yet (the first answer wins; a later,
  *   different claim changes nothing);
- * - the announcer was a member of the old room. A member of the NEW room
- *   who never was in the old one cannot point it at someone else's history.
+ * - the announcer was a member of the old room: on its roster, or wrote in
+ *   it. A member of the NEW room who never was in the old one cannot point
+ *   it at someone else's history.
  * Returns whether anything changed.
  */
 export async function adoptLegacyPredecessor(
@@ -87,7 +88,11 @@ export async function adoptLegacyPredecessor(
   const [oldRoom, newRoom] = await Promise.all([getRoom(movedFrom), getRoom(newCode)]);
   if (!oldRoom || !newRoom || newRoom.archiveOf || oldRoom.movedTo) return false;
   if (!isLegacyArchive(movedFrom)) return false;
-  if (!oldRoom.participants.includes(announcerDid)) return false;
+  // The roster alone is not enough: it drops members after 30 days without
+  // being seen, and old rooms stopped seeing anyone at the cutover. Having
+  // written in the room is proof of membership just the same.
+  if (!oldRoom.participants.includes(announcerDid) &&
+      !(await roomHasMessageFrom(movedFrom, announcerDid))) return false;
   await linkLegacyMove(movedFrom, newCode);
   return true;
 }

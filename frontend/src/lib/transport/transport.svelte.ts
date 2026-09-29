@@ -650,6 +650,28 @@ export function resolveMentionDisplayName(did: string): string {
   );
 }
 
+/**
+ * A moved room's `movedFrom`, held until its sender's DID is known. Adopting
+ * it checks the sender was in the old room, which takes the DID - and the
+ * room name that carries the claim goes out right behind the profile that
+ * binds it, the profile being async: on a first connection the claim arrived
+ * first, and was dropped as coming from nobody.
+ */
+const _pendingMoveClaims = new Map<string, { room: string; movedFrom: string }>();
+
+function _claimLegacyPredecessor(peerId: string, room: string, movedFrom: string): void {
+  const did = _peerIdToDid.get(peerId);
+  if (!did) {
+    if (_pendingMoveClaims.size < 64 || _pendingMoveClaims.has(peerId)) {
+      _pendingMoveClaims.set(peerId, { room, movedFrom });
+    }
+    return;
+  }
+  adoptLegacyPredecessor(room, movedFrom, did)
+    .then((changed) => (changed ? loadRooms() : undefined))
+    .catch(() => {});
+}
+
 /** Mutate the peer->DID map through here so reactive readers are notified. */
 function _setPeerDid(peerId: string, did: string): void {
   if (_peerIdToDid.get(peerId) === did) return;
@@ -659,6 +681,11 @@ function _setPeerDid(peerId: string, did: string): void {
   // The announcement is scoped by room membership, so it needs the DID; on a
   // first connection that only lands here, once the profile has arrived.
   _announceStoredFilesTo(peerId).catch(() => {});
+  const claim = _pendingMoveClaims.get(peerId);
+  if (claim) {
+    _pendingMoveClaims.delete(peerId);
+    _claimLegacyPredecessor(peerId, claim.room, claim.movedFrom);
+  }
 }
 
 export const _dtln = new DtlnProcessor();
@@ -2568,9 +2595,7 @@ function _handleRoomName(msg: WireRoomName, room: string | null, peerId: string)
   // Only over the secure room's own channel (room !== null) and only for a
   // secure room: the claim is about THIS room, from one of its members.
   if (msg.movedFrom !== undefined && room !== null && target.startsWith("rd2_")) {
-    adoptLegacyPredecessor(target, msg.movedFrom, _peerIdToDid.get(peerId))
-      .then((changed) => (changed ? loadRooms() : undefined))
-      .catch(() => {});
+    _claimLegacyPredecessor(peerId, target, msg.movedFrom);
   }
 }
 
@@ -4176,6 +4201,7 @@ function _disconnectWithoutBroadcasting(): void {
   releaseNodeLock();
   stopTelemetryTaps();
   _peerIdToDid.clear();
+  _pendingMoveClaims.clear();
   clearCardStates();
   // The search corpus is decrypted message text; it dies with the session
   // for the same reason card states do.
