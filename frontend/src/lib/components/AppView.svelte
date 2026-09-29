@@ -1459,10 +1459,13 @@
           <Dialog.Overlay
             class="fixed inset-0 z-40 bg-black/50 "
           />
+          <!-- Capped to the screen and scrolling: a translate-centred box
+               taller than the viewport cannot be scrolled back to its top. -->
           <Dialog.Content
-            class="fixed w-sm top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 p-0 border-0 [&>div]:bg-transparent [&>div]:min-h-0 [&>div]:p-0"
+            aria-label="Create or join a room"
+            class="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100%-2rem)] max-w-sm max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain rounded-xl"
           >
-            <RoomCreateJoin onJoin={handleJoinFromModal} error={joinError} />
+            <RoomCreateJoin inDialog onJoin={handleJoinFromModal} error={joinError} />
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
