@@ -27,7 +27,7 @@ func pairingRequest(t *testing.T, ip string, body map[string]any) *httptest.Resp
 	t.Helper()
 	body["version"] = 2
 	if body["locator"] == nil {
-		body["locator"] = "12345678"
+		body["locator"] = "k5"
 	}
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -62,7 +62,7 @@ func createPairing(t *testing.T) string {
 func TestPairingMountedExchangeSingleUse(t *testing.T) {
 	resetPairing(t)
 	token := createPairing(t)
-	attempt := strings.Repeat("A", 32)
+	attempt := strings.Repeat("a", 32)
 	send := func(action, kind, payload, auth string, want int) *httptest.ResponseRecorder {
 		t.Helper()
 		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": action, "kind": kind, "payload": payload, "token": auth, "attempt": attempt})
@@ -106,7 +106,7 @@ func TestPairingLimitsAndExpiry(t *testing.T) {
 	resetPairing(t)
 	token := createPairing(t)
 	for i := 0; i < 6; i++ {
-		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": "start", "kind": "start", "payload": "opaque", "attempt": strings.Repeat(string(rune('A'+i)), 32)})
+		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": "start", "kind": "start", "payload": "opaque", "attempt": strings.Repeat(string(rune('a'+i)), 32)})
 		want := 200
 		if i == 5 {
 			want = 409
@@ -116,7 +116,7 @@ func TestPairingLimitsAndExpiry(t *testing.T) {
 		}
 	}
 	pairingMu.Lock()
-	pairingStore["12345678"].expires = time.Now().Add(-time.Second)
+	pairingStore["k5"].expires = time.Now().Add(-time.Second)
 	pairingMu.Unlock()
 	if rec := pairingRequest(t, "10.0.0.1", map[string]any{"action": "host-poll", "token": token}); rec.Code != 404 {
 		t.Fatal("expired session admitted")
@@ -160,10 +160,10 @@ func TestPairingRejectsMalformedAndOrigin(t *testing.T) {
 	strictOrigin, domain = true, "chat.example"
 	defer func() { strictOrigin, domain = oldStrict, oldDomain }()
 	for _, body := range []string{
-		`{"version":2,"action":"create","locator":"12345678","password":"secret"}`,
-		`{"version":2,"action":"create","locator":"12345678"} {}`,
-		`{"version":1,"action":"create","locator":"12345678"}`,
-		`{"version":2,"action":"create","locator":"12345678","payload":"` + strings.Repeat("A", 4096) + `"}`,
+		`{"version":2,"action":"create","locator":"k5","password":"secret"}`,
+		`{"version":2,"action":"create","locator":"k5"} {}`,
+		`{"version":1,"action":"create","locator":"k5"}`,
+		`{"version":2,"action":"create","locator":"k5","payload":"` + strings.Repeat("A", 4096) + `"}`,
 	} {
 		rec := httptest.NewRecorder()
 		postOnly(handleInviteCreate)(rec, httptest.NewRequest("POST", "/invite", strings.NewReader(body)))
@@ -177,5 +177,30 @@ func TestPairingRejectsMalformedAndOrigin(t *testing.T) {
 	postOnly(handleInviteCreate)(rec, req)
 	if rec.Code != 403 {
 		t.Fatalf("origin: %d", rec.Code)
+	}
+}
+
+// Two characters leave room for two live pairings to draw the same locator.
+// The second create gets 409 of its own - not the 429 of a full or throttled
+// relay - so the client knows a fresh draw will do.
+func TestPairingLocatorInUseIsConflict(t *testing.T) {
+	resetPairing(t)
+	createPairing(t)
+	if rec := pairingRequest(t, "10.0.0.3", map[string]any{"action": "create"}); rec.Code != http.StatusConflict {
+		t.Fatalf("live locator: %d", rec.Code)
+	}
+	if rec := pairingRequest(t, "10.0.0.3", map[string]any{"action": "create", "locator": "q7"}); rec.Code != 200 {
+		t.Fatalf("fresh locator: %d", rec.Code)
+	}
+}
+
+// Lowercase only, two characters, Crockford alphabet: the old eight-character
+// uppercase locator and confusable letters are refused before any lookup.
+func TestPairingLocatorFormat(t *testing.T) {
+	resetPairing(t)
+	for _, locator := range []string{"K5", "k", "k5t", "12345678", "ku", "ki"} {
+		if rec := pairingRequest(t, "10.0.0.4", map[string]any{"action": "create", "locator": locator}); rec.Code != 400 {
+			t.Fatalf("locator %q: %d", locator, rec.Code)
+		}
 	}
 }

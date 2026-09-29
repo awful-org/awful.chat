@@ -1,7 +1,7 @@
 /** V2 primitives. Never pass a RoomSecret to a network routing API. */
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { base64urlnopad as base64url } from "@scure/base";
+import { base32nopad } from "@scure/base";
 
 declare const secretBrand: unique symbol;
 declare const discoveryBrand: unique symbol;
@@ -10,25 +10,49 @@ export type DiscoveryId = string & { readonly [discoveryBrand]: true };
 const encoder = new TextEncoder();
 const salt = encoder.encode("awful/room/v2");
 
+/**
+ * Lowercase base32 (RFC 4648 alphabet, no padding) for the values a person
+ * sees: the secret in an invitation link and the room's public ID in the
+ * address bar. Always lowercase, so a link reads and types the same way
+ * everywhere, and survives anything that folds case - a browser lowercases
+ * the "host" of a web+awfl: link, which base64url could not survive.
+ *
+ * Wire-only values (challenges, envelopes, session IDs, the SFU's room ID)
+ * stay base64url: nobody reads them.
+ */
+export const b32 = {
+  encode: (bytes: Uint8Array): string => base32nopad.encode(bytes).toLowerCase(),
+  decode: (text: string): Uint8Array => base32nopad.decode(text.toUpperCase()),
+};
+
+/** A public room ID as it appears in a URL: rd2_ and 32 bytes of base32. */
+export const DISCOVERY_ID_RE = /^rd2_[a-z2-7]{52}$/;
+
 export function newRoomSecret(): RoomSecret {
-  return `r2_${base64url.encode(crypto.getRandomValues(new Uint8Array(32)))}` as RoomSecret;
+  return `r2_${b32.encode(crypto.getRandomValues(new Uint8Array(32)))}` as RoomSecret;
 }
 
+/**
+ * Accepts any case - a link retyped, or capitalised by a phone keyboard -
+ * and returns the lowercase form. Whitespace is still refused: callers trim
+ * what a person pasted, and a secret stored or sent must be canonical.
+ */
 export function parseRoomSecret(input: string): RoomSecret {
-  if (!/^r2_[A-Za-z0-9_-]{43}$/.test(input)) throw new Error("Invalid v2 invitation");
-  const bytes = base64url.decode(input.slice(3));
-  if (bytes.length !== 32 || base64url.encode(bytes) !== input.slice(3)) {
+  const value = typeof input === "string" ? input.toLowerCase() : "";
+  if (!/^r2_[a-z2-7]{52}$/.test(value)) throw new Error("Invalid v2 invitation");
+  const bytes = b32.decode(value.slice(3));
+  if (bytes.length !== 32 || b32.encode(bytes) !== value.slice(3)) {
     throw new Error("Invalid v2 invitation");
   }
-  return input as RoomSecret;
+  return value as RoomSecret;
 }
 
 export function deriveRoomKeys(secret: RoomSecret) {
-  parseRoomSecret(secret);
-  const root = base64url.decode(secret.slice(3));
+  const canonical = parseRoomSecret(secret);
+  const root = b32.decode(canonical.slice(3));
   const derive = (purpose: string) => hkdf(sha256, root, salt, encoder.encode(purpose), 32);
   const result = {
-    discoveryId: `rd2_${base64url.encode(derive("discovery"))}` as DiscoveryId,
+    discoveryId: `rd2_${b32.encode(derive("discovery"))}` as DiscoveryId,
     membershipKey: derive("membership"),
     encryptionKey: derive("encryption"),
     sfuSigningSeed: derive("sfu-signing"),

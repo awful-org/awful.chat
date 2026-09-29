@@ -6,6 +6,11 @@
   import { captureSessionGuard } from "$lib/identity/session-guard";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import { parseSecureInvitation } from "$lib/room-security/invitation-format";
+  import { DISCOVERY_ID_RE, deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
+  import { secureInvitationLink } from "$lib/room-security/invitation-format";
+  import { legacyMoveInviteText, linkLegacyMove } from "$lib/room-security/legacy-move";
+  import MoveLegacyRoomDialog from "./MoveLegacyRoomDialog.svelte";
+  import { sendDirectMessage } from "$lib/transport/dm.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import { Tip } from "$lib/components/ui/tooltip";
@@ -153,7 +158,7 @@
     // Keep incoming capabilities only in memory, even while identity is locked.
     // Public saved-room IDs are safe to retain for reload/navigation. Strip
     // malformed inputs too: they can contain a truncated or wrapped secret.
-    if (code && !/^rd2_[A-Za-z0-9_-]{43}$/.test(code)) {
+    if (code && !DISCOVERY_ID_RE.test(code)) {
       history.replaceState(history.state, "", "/r/");
     }
     return code;
@@ -298,8 +303,92 @@
   );
   /** roomsStore.rooms laid out by the sidebar's pins, then its drag order. */
   const orderedRooms = $derived(
-    sortRooms(roomsStore.rooms)
+    sortRooms(roomsStore.rooms.filter((r) => !r.movedTo))
   );
+
+  // ── Moving an old room to a secure one (room-security/legacy-move.ts) ─────
+  const activeLegacyRoom = $derived(
+    activeRoomCode && isLegacyArchive(activeRoomCode)
+      ? (roomsStore.rooms.find((r) => r.roomCode === activeRoomCode) ?? null)
+      : null
+  );
+  let moveDialogOpen = $state(false);
+  let moveBusy = $state(false);
+  let moveError = $state<string | null>(null);
+  /** Old rooms the popup already opened for this session, on its own. */
+  const moveOffered = new Set<string>();
+
+  // Offered once per session when an old room is opened; after that it is
+  // the archive banner's button - "check your DMs first" sends the person
+  // away, and they must be able to come back to it.
+  $effect(() => {
+    const room = activeLegacyRoom;
+    if (!room || room.movedTo || moveOffered.has(room.roomCode)) return;
+    moveOffered.add(room.roomCode);
+    moveError = null;
+    moveDialogOpen = true;
+  });
+
+  const legacyMembers = $derived(
+    activeLegacyRoom?.participants.filter((did) => did !== identityStore.did) ?? []
+  );
+
+  async function moveLegacyRoom(inviteOthers: boolean): Promise<void> {
+    const old = activeLegacyRoom;
+    if (!old || moveBusy) return;
+    moveBusy = true;
+    moveError = null;
+    try {
+      const secret = newRoomSecret();
+      const newCode = deriveRoomKeys(secret).discoveryId;
+      // The ordinary join path creates, stores and opens the new room.
+      await handleJoin(secret, "", old.name);
+      if (activeRoomCode !== newCode) {
+        moveError = joinError ?? "Could not create the new room. Try again.";
+        return;
+      }
+      await linkLegacyMove(old.roomCode, newCode);
+      await loadRooms();
+      // Announce again now the link exists: the name frame carries
+      // movedFrom, which is how the other members link their own history.
+      setRoomName(old.name);
+      moveDialogOpen = false;
+      if (inviteOthers) {
+        const text = legacyMoveInviteText(old.name, secureInvitationLink(window.location.origin, secret));
+        for (const did of old.participants) {
+          if (did === identityStore.did) continue;
+          // One at a time, and a failure is one missed invite, not a failed
+          // move: the room exists, and the link can still be shared by hand.
+          await sendDirectMessage(text, { peerId: did }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      moveError = err instanceof Error ? err.message : "Could not move the room.";
+    } finally {
+      moveBusy = false;
+    }
+  }
+
+  // An invitation link clicked inside a message joins here, in this tab.
+  // Message links open in a new tab, and a second tab of the app only waits
+  // behind "open in another tab" - the move DM's link is the case that
+  // matters, but any invitation a person pastes into a chat is the same.
+  $effect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      const anchor = (e.target as Element | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!anchor) return;
+      let url: URL;
+      try { url = new URL(anchor.href); } catch { return; }
+      if (url.origin !== window.location.origin || url.pathname !== "/r/") return;
+      let secret: string;
+      try { secret = parseSecureInvitation(url.href); } catch { return; }
+      e.preventDefault();
+      void handleJoin(secret, "");
+    };
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  });
 
   // Tell the transport what is actually on screen; see uiRoomCode.
   $effect(() => {
@@ -1364,6 +1453,9 @@
             <LegacyArchive
               roomCode={activeRoomCode}
               roomName={activeRoomName}
+              moved={!!activeLegacyRoom?.movedTo}
+              onMove={() => { moveError = null; moveDialogOpen = true; }}
+              onOpenMoved={() => void handleJoin(activeLegacyRoom!.movedTo!, "")}
               onLeave={handleLeave}
               onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
             />
@@ -1454,15 +1546,35 @@
         {/if}
       </div>
 
+      {#if activeLegacyRoom && !activeLegacyRoom.movedTo}
+        <MoveLegacyRoomDialog
+          bind:open={moveDialogOpen}
+          roomName={activeLegacyRoom.name}
+          memberCount={legacyMembers.length}
+          busy={moveBusy}
+          error={moveError}
+          onMove={(invite) => void moveLegacyRoom(invite)}
+          onCheckDms={() => {
+            moveDialogOpen = false;
+            sidebarTab = "users";
+            sidebarOpen = true;
+          }}
+          onClose={() => (moveDialogOpen = false)}
+        />
+      {/if}
+
       <Dialog.Root bind:open={createJoinOpen}>
         <Dialog.Portal>
           <Dialog.Overlay
             class="fixed inset-0 z-40 bg-black/50 "
           />
+          <!-- Capped to the screen and scrolling: a translate-centred box
+               taller than the viewport cannot be scrolled back to its top. -->
           <Dialog.Content
-            class="fixed w-sm top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 p-0 border-0 [&>div]:bg-transparent [&>div]:min-h-0 [&>div]:p-0"
+            aria-label="Create or join a room"
+            class="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[calc(100%-2rem)] max-w-sm max-h-[calc(100dvh-2rem)] overflow-y-auto overscroll-contain rounded-xl"
           >
-            <RoomCreateJoin onJoin={handleJoinFromModal} error={joinError} />
+            <RoomCreateJoin inDialog onJoin={handleJoinFromModal} error={joinError} />
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>

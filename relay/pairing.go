@@ -31,11 +31,18 @@ type pairingEntry struct {
 
 var pairingMu sync.Mutex
 var pairingStore = map[string]*pairingEntry{}
-var pairingLocator = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{8}$`)
-var pairingAttempt = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{32}$`)
+// Lowercase Crockford base32, as the client draws them. The locator is two
+// characters: the pairing code is six (locator + four-character password),
+// short because the password can only be guessed live, five times, within
+// five minutes - see frontend/src/lib/room-security/invitation-pairing.ts.
+var pairingLocator = regexp.MustCompile(`^[0-9a-hjkmnp-tv-z]{2}$`)
+var pairingAttempt = regexp.MustCompile(`^[0-9a-hjkmnp-tv-z]{32}$`)
 var pairingPayload = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
-const pairingMaxLive = 1024
+// A quarter of the 1024 two-character locators, so a new pairing rarely
+// draws one already live - and when it does, create answers 409 and the
+// client draws again.
+const pairingMaxLive = 256
 const pairingMaxAttempts = 5
 
 func handlePairing(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +85,14 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	e := pairingStore[b.Locator]
 	if b.Action == "create" {
-		if !rateAllow("pairing-create:"+clientIP(r), 10) || !rateAllow("pairing-create-global", 300) || len(pairingStore) >= pairingMaxLive || e != nil {
+		if !rateAllow("pairing-create:"+clientIP(r), 10) || !rateAllow("pairing-create-global", 300) || len(pairingStore) >= pairingMaxLive {
 			apiError(w, r, "pairing unavailable", http.StatusTooManyRequests)
+			return
+		}
+		// A live pairing already holds this locator. Its own status, so the
+		// client knows to draw another rather than give up.
+		if e != nil {
+			apiError(w, r, "locator in use", http.StatusConflict)
 			return
 		}
 		token := make([]byte, 32)

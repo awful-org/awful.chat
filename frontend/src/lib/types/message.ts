@@ -267,6 +267,12 @@ export interface WireRoomName {
   /** Which room this name is for. Required on a direct send, where there is
    *  no pubsub topic to infer it from. */
   roomCode?: string;
+  /**
+   * The legacy room this secure room continues, when it was moved from one
+   * (room-security/legacy-move.ts). Only ever sent inside the secure room's
+   * own channel; receivers adopt it under the rules in adoptLegacyPredecessor.
+   */
+  movedFrom?: string;
 }
 
 export interface WireJoinRoom {

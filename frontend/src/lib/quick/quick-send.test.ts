@@ -62,7 +62,7 @@ describe("protected quick send", () => {
     expect(await f.lookup?.(HASH)).toBeNull();
   });
   it("mints a high-entropy capability", async () => {
-    await qs.startQuickSend(); expect(qs.quickSend.code).toMatch(/^r2_[A-Za-z0-9_-]{43}$/);
+    await qs.startQuickSend(); expect(qs.quickSend.code).toMatch(/^r2_[a-z2-7]{52}$/);
     expect(qs.quickSend.isHost).toBe(true);
   });
   it.each(["7QK3M9AB2C", ROOM, "", `${SECRET}junk`])("rejects non-capability %s without fallback", async code => {

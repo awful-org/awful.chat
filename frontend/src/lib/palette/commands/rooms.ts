@@ -98,10 +98,10 @@ export const roomCommands: CmdSource = (host) => {
         kind: "prompt",
         id: "room.join",
         title: "Join room by code",
-        placeholder: "Invitation link or online pairing code…",
+        placeholder: "Invite link or short code…",
         validate: (value) =>
           parseJoinInput(value).kind === "invalid"
-            ? "Enter a complete invitation link or online pairing code"
+            ? "Not an invite link or short code"
             : null,
         submit: (value) => {
           const parsed = parseJoinInput(value);
@@ -130,9 +130,10 @@ export const roomCommands: CmdSource = (host) => {
         kind: "act",
         perform: () => {
           // Fragment form - see RoomCreateJoin's handleCopy.
+          // On failure the invite dialog shows the link, or why there is none.
           savedRoomInvitationLink(window.location.origin, activeCode)
             .then((url) => navigator.clipboard.writeText(url))
-            .catch((err) => console.warn("copy room link failed", err));
+            .catch(() => { uiState.invitationRoomRequested = activeCode; });
         },
       },
     });
@@ -168,13 +169,12 @@ export const roomCommands: CmdSource = (host) => {
       },
     });
 
-    // The header's invite menu, minus nothing: the 5-minute short code for
-    // typing on a phone, and the OS share sheet where the browser has one.
+    // The header's invite menu, minus nothing: the invite dialog (QR and
+    // short code), and the OS share sheet where the browser has one.
     cmds.push({
       id: "room.copyShortCode",
-      title: "Create short invite code",
-      subtitle: "Online pairing · works for 5 minutes",
-      keywords: ["invite", "code", "share"],
+      title: "Invite with QR code or short code",
+      keywords: ["invite", "qr", "short code", "share"],
       group: "Rooms",
       icon: KeyRound,
       action: {

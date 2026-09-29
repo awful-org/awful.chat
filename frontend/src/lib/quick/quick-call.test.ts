@@ -286,7 +286,7 @@ describe("quick call profile", () => {
     m.endQuickCall();
 
     const next = m.startAnotherCall();
-    expect(next).toMatch(/^r2_[A-Za-z0-9_-]{43}$/);
+    expect(next).toMatch(/^r2_[a-z2-7]{52}$/);
     expect(next).not.toBe(SECRET);
     expect(m.quickCall.stage).toBe("setup");
     await m.startQuickCall({ name: "Ada" });

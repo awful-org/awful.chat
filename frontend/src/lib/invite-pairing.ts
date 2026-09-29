@@ -3,13 +3,27 @@ import { InvitationPairingHost, formatPairingCode, startPairingJoin } from "./ro
 import type { RoomSecret } from "./room-security/keys";
 
 interface Message { attempt: string; kind: string; payload: string }
+
+/** A pairing request the relay refused, with its status for the caller. */
+class PairingRequestError extends Error {
+  constructor(readonly status: number) {
+    super("Pairing unavailable or expired. Request a new code.");
+  }
+}
+
+/**
+ * Fresh locators to try when the relay answers 409 "already in use". The
+ * locator is two characters (invitation-pairing.ts), so two live pairings
+ * can land on the same one; a new draw almost always clears it.
+ */
+const CREATE_TRIES = 6;
 async function request(body: Record<string, unknown>, signal?: AbortSignal): Promise<{ token?: string; messages: Message[] }> {
   const response = await fetch(`${apiUrl()}/invite`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ version: 2, ...body }), cache: "no-store",
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
   });
-  if (!response.ok) throw new Error("Pairing unavailable or expired. Request a new code.");
+  if (!response.ok) throw new PairingRequestError(response.status);
    const reader = response.body?.getReader();
    if (!reader) throw new Error("Invalid pairing response");
    const chunks: Uint8Array[] = [];
@@ -36,14 +50,23 @@ const pause = () => new Promise<void>(resolve => setTimeout(resolve, 1500));
 
 export async function hostInvitationPairing(secret: RoomSecret, onStatus: (status: string) => void, signal?: AbortSignal) {
   signal?.throwIfAborted();
-  const host = await InvitationPairingHost.create(secret);
   const controller = new AbortController();
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  let host!: InvitationPairingHost;
   let token: string | undefined;
-  try {
-    combined.throwIfAborted();
-    ({ token } = await request({ action: "create", locator: host.locator }, combined));
-  } catch (err) { host.cancel(); throw err; }
+  for (let tries = 1; ; tries++) {
+    // A new host per try: the locator is bound into its OPAQUE registration.
+    host = await InvitationPairingHost.create(secret);
+    try {
+      combined.throwIfAborted();
+      ({ token } = await request({ action: "create", locator: host.locator }, combined));
+      break;
+    } catch (err) {
+      host.cancel();
+      const taken = err instanceof PairingRequestError && err.status === 409;
+      if (!taken || tries >= CREATE_TRIES) throw err;
+    }
+  }
   if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) { host.cancel(); throw new Error("Invalid pairing response"); }
   let cancelled = false;
   const cancel = () => {
