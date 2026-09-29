@@ -2849,7 +2849,7 @@
                                 activeMessageId = null;
                               }}
                             >
-                              <span>{emoji}</span>
+                              <span class="emoji">{emoji}</span>
                               <span>{users.size}</span>
                             </button>
                           {/snippet}

@@ -38,10 +38,35 @@
   let viewportWidth = $state(0);
   let viewportHeight = $state(0);
 
+  let picker = $state<HTMLElement | null>(null);
+
   // The picker is a custom element, so it upgrades in place once the
   // definition loads - no need to carry the library before the first open.
+  //
+  // Opening it means looking for an emoji, so the search box takes the focus.
+  // It lives in the picker's shadow root and only exists once the element has
+  // upgraded AND rendered (it loads its emoji data first), so it is waited
+  // for a few frames rather than assumed. Not on a touch screen: there the
+  // focus pulls up the keyboard, which covers the grid the tap opened.
   $effect(() => {
-    if (open) void import("emoji-picker-element");
+    if (!open) return;
+    const el = picker;
+    let cancelled = false;
+    void import("emoji-picker-element").then(async () => {
+      if (!el || window.matchMedia("(pointer: coarse)").matches) return;
+      await customElements.whenDefined("emoji-picker");
+      for (let frame = 0; frame < 60 && !cancelled; frame++) {
+        const search = el.shadowRoot?.querySelector<HTMLInputElement>("input[type=search]");
+        if (search) {
+          search.focus({ preventScroll: true });
+          return;
+        }
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   });
 
   const position = $derived.by(() => {
@@ -105,6 +130,7 @@
          inline box ignores height, so without it the panel measures 0 tall on
          the first open and the flip decision is made on a bogus size. -->
     <emoji-picker
+      bind:this={picker}
       style="display:block;height:420px;"
       onemoji-click={(e: any) => {
         onSelect(e.detail.unicode);
