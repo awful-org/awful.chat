@@ -31,8 +31,15 @@ interface Popout {
   empty: HTMLElement;
   /** What the <video> carries, so an unchanged track is never reassigned. */
   trackId: string | null;
-  /** When the tile left the call's list, if it has; see MISSING_GRACE_MS. */
-  missingSince: number | null;
+  /** The tile as last drawn: what to say once it leaves the call's list. */
+  kind: SpotlightTile["kind"];
+  peerId: string;
+  isLocal: boolean;
+  name: string;
+  /** Why the tile is gone, if it is; see syncPopouts. */
+  missing: "reconnecting" | "ended" | null;
+  /** When a window whose tile is gone closes. */
+  closeAt: number | null;
   /** Hides the pointer and the name once the mouse rests; see IDLE_MS. */
   idleTimer: ReturnType<typeof setTimeout> | undefined;
 }
@@ -44,12 +51,18 @@ interface Popout {
 const IDLE_MS = 2000;
 
 /**
- * How long a tile may be missing before its window closes. A watched share's
- * tile drops out of the list whenever its track does - a media reconnect
- * included - and comes back under the same id; closing at once would throw
- * the window away over a hiccup.
+ * A tile that leaves the call's list is either coming back or gone for good,
+ * and the window says which instead of one "Waiting for the picture..." for
+ * both - which read as a stall when the stream had simply ended.
+ *
+ * A watched share whose track drops (a media reconnect) leaves the list but
+ * keeps its placeholder tile: we are still watching, just without a picture.
+ * That window waits, and says it is reconnecting. When the share ends, the
+ * watch goes with it (transmissionEnded), and so does the placeholder - the
+ * window says who stopped, long enough to read, and closes.
  */
-const MISSING_GRACE_MS = 5000;
+const RECONNECT_GRACE_MS = 20_000;
+const ENDED_CLOSE_MS = 2500;
 
 const windows = new Map<string, Popout>();
 let closedPoll: ReturnType<typeof setInterval> | null = null;
@@ -135,7 +148,12 @@ export function openPopout(tile: SpotlightTile, name: string): boolean {
     label,
     empty,
     trackId: null,
-    missingSince: null,
+    kind: tile.kind,
+    peerId: tile.peerId,
+    isLocal: tile.isLocal,
+    name,
+    missing: null,
+    closeAt: null,
     idleTimer: undefined,
   };
   const wake = () => {
@@ -161,6 +179,10 @@ export function openPopout(tile: SpotlightTile, name: string): boolean {
 }
 
 function render(entry: Popout, tile: SpotlightTile, name: string): void {
+  entry.kind = tile.kind;
+  entry.peerId = tile.peerId;
+  entry.isLocal = tile.isLocal;
+  entry.name = name;
   const track = tile.videoTrack;
   const trackId = track?.id ?? null;
   if (trackId !== entry.trackId) {
@@ -179,8 +201,8 @@ function render(entry: Popout, tile: SpotlightTile, name: string): void {
 
 /**
  * Follow the call: new tracks go to their window, and a tile that has left
- * the call (share ended, person hung up) closes its window - after
- * MISSING_GRACE_MS, waiting on "no picture" meanwhile.
+ * the call closes its window - at once with a word on why when the stream
+ * ended, after a wait when it is only reconnecting (see RECONNECT_GRACE_MS).
  */
 export function syncPopouts(
   tiles: readonly SpotlightTile[],
@@ -193,21 +215,36 @@ export function syncPopouts(
     }
     const tile = tiles.find((t) => t.id === id);
     if (tile) {
-      entry.missingSince = null;
+      entry.missing = null;
+      entry.closeAt = null;
       render(entry, tile, nameFor(tile));
-    } else if (entry.missingSince === null) {
-      entry.missingSince = Date.now();
-      showWaiting(entry);
+      continue;
     }
+    const reconnecting =
+      entry.kind === "screen" &&
+      !entry.isLocal &&
+      tiles.some((t) => t.id === `pending-tx-${entry.peerId}`);
+    const why = reconnecting ? "reconnecting" : "ended";
+    if (entry.missing === why) continue;
+    entry.missing = why;
+    entry.closeAt = Date.now() + (reconnecting ? RECONNECT_GRACE_MS : ENDED_CLOSE_MS);
+    showGone(entry, goneText(entry, reconnecting));
   }
 }
 
-function showWaiting(entry: Popout): void {
+/** What the window says once its tile is gone. */
+function goneText(entry: Popout, reconnecting: boolean): string {
+  if (reconnecting) return `Reconnecting to ${entry.name}'s screen...`;
+  if (entry.kind === "camera") return `${entry.name} left the call`;
+  return entry.isLocal ? "You stopped sharing" : `${entry.name} stopped sharing`;
+}
+
+function showGone(entry: Popout, text: string): void {
   entry.trackId = null;
   entry.video.srcObject = null;
   entry.video.style.display = "none";
   entry.empty.style.display = "flex";
-  entry.empty.textContent = "Waiting for the picture...";
+  entry.empty.textContent = text;
 }
 
 /** Close one window, bringing the tile back into the call. */
@@ -239,8 +276,8 @@ function forget(id: string): void {
  * pagehide from the popup is not guaranteed (a window closed while its
  * opener is busy, some window managers), and a tile left marked "popped
  * out" with no window would show a placeholder forever. A cheap check while
- * any is open - which is also what ends a missing tile's grace, since a tile
- * that stays gone never triggers another sync.
+ * any is open - which is also what closes a window whose tile is gone, since
+ * a tile that stays gone never triggers another sync.
  */
 function startClosedPoll(): void {
   if (closedPoll) return;
@@ -248,9 +285,7 @@ function startClosedPoll(): void {
     const now = Date.now();
     for (const [id, entry] of windows) {
       if (entry.win.closed) forget(id);
-      else if (entry.missingSince !== null && now - entry.missingSince > MISSING_GRACE_MS) {
-        closePopout(id);
-      }
+      else if (entry.closeAt !== null && now >= entry.closeAt) closePopout(id);
     }
   }, 1000);
 }
