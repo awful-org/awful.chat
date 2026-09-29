@@ -82,9 +82,13 @@
 {:else if !isAnimated}
   <img {src} {alt} class={cls} {loading} />
 {:else}
+  <!-- The one track is the span's own size. With auto tracks a size-full
+       canvas took its height from the image instead, so a tall GIF in a
+       round avatar drew a 24x72 bean. An unsized span (a GIF in a message)
+       still sizes to the image: a percentage of an auto size is auto. -->
   <span
     class={cls}
-    style="display:inline-grid"
+    style="display:inline-grid;grid-template:100% / 100%"
     role="img"
     aria-label={alt}
     onmouseenter={animate === "hover" ? () => (hovered = true) : undefined}
