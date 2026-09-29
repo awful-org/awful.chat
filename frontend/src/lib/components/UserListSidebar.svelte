@@ -387,7 +387,7 @@
         openProfileCard(user);
       }
     }}
-    class="flex items-center ml-2 gap-3 px-2 py-1.5 rounded-md transition-colors {user.isSelf
+    class="flex items-center ml-2 gap-3 px-2 py-1.5 rounded-md transition-colors select-none [-webkit-touch-callout:none] {user.isSelf
       ? user.isOnline
         ? ''
         : 'opacity-60'
@@ -575,7 +575,7 @@
   <div
     role="menu"
     tabindex="-1"
-    class="fixed z-50 min-w-40 rounded-md border border-border bg-popover py-1 shadow-xl"
+    class="fixed z-50 min-w-40 select-none rounded-md border border-border bg-popover py-1 shadow-xl"
     style="top: {userMenu.y}px; left: {userMenu.x}px"
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
