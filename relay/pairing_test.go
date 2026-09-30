@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+// ke1 is a start payload of the shape a real one has: an OPAQUE KE1, 128
+// characters of base64url. The tag keeps two of them apart.
+func ke1(tag string) string {
+	return tag + strings.Repeat("A", 128-len(tag))
+}
+
 func resetPairing(t *testing.T) {
 	t.Helper()
 	pairingMu.Lock()
@@ -71,12 +77,12 @@ func TestPairingMountedExchangeSingleUse(t *testing.T) {
 		}
 		return rec
 	}
-	send("start", "start", "opaque_request", "", 200)
-	send("start", "start", "opaque_request", "", 409)
+	send("start", "start", ke1("opaque_request"), "", 200)
+	send("start", "start", ke1("opaque_request"), "", 409)
 	send("reply", "response", "opaque_response", "", 409)
 	send("host-poll", "", "", "wrong", 403)
 	rec := send("host-poll", "", "", token, 200)
-	if !strings.Contains(rec.Body.String(), "opaque_request") {
+	if !strings.Contains(rec.Body.String(), ke1("opaque_request")) {
 		t.Fatal("host lost request")
 	}
 	if strings.Contains(send("host-poll", "", "", token, 200).Body.String(), "opaque_request") {
@@ -91,7 +97,7 @@ func TestPairingMountedExchangeSingleUse(t *testing.T) {
 	send("finish", "finish", "proof", "", 200)
 	send("finish", "finish", "proof", "", 409)
 	send("reply", "transfer", "nonce.ciphertext", token, 200)
-	send("start", "start", "another_request", "", 409)
+	send("start", "start", ke1("another_request"), "", 409)
 	rec = send("join-poll", "", "", "", 200)
 	if !strings.Contains(rec.Body.String(), "nonce.ciphertext") {
 		t.Fatal("missing encrypted transfer")
@@ -100,13 +106,14 @@ func TestPairingMountedExchangeSingleUse(t *testing.T) {
 		t.Fatal("transfer replay")
 	}
 	send("cancel", "", "", token, 200)
-	send("host-poll", "", "", token, 404)
+	// Gone now, and answered as a live pairing answers a wrong token.
+	send("host-poll", "", "", token, 403)
 }
 func TestPairingLimitsAndExpiry(t *testing.T) {
 	resetPairing(t)
 	token := createPairing(t)
 	for i := 0; i < 6; i++ {
-		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": "start", "kind": "start", "payload": "opaque", "attempt": strings.Repeat(string(rune('a'+i)), 32)})
+		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": "start", "kind": "start", "payload": ke1("opaque"), "attempt": strings.Repeat(string(rune('a'+i)), 32)})
 		want := 200
 		if i == 5 {
 			want = 409
@@ -118,7 +125,7 @@ func TestPairingLimitsAndExpiry(t *testing.T) {
 	pairingMu.Lock()
 	pairingStore["k5"].expires = time.Now().Add(-time.Second)
 	pairingMu.Unlock()
-	if rec := pairingRequest(t, "10.0.0.1", map[string]any{"action": "host-poll", "token": token}); rec.Code != 404 {
+	if rec := pairingRequest(t, "10.0.0.1", map[string]any{"action": "host-poll", "token": token}); rec.Code != 403 {
 		t.Fatal("expired session admitted")
 	}
 	pairingMu.Lock()
@@ -132,26 +139,117 @@ func TestPairingLimitsAndExpiry(t *testing.T) {
 }
 func TestPairingStartBudgetsIncludeMisses(t *testing.T) {
 	resetPairing(t)
-	for i := 0; i < 11; i++ {
-		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": "start"})
-		want := 404
-		if i == 10 {
-			want = 429
+	start := func(ip, locator string) int {
+		return pairingRequest(t, ip, map[string]any{"action": "start", "kind": "start", "locator": locator,
+			"payload": ke1("x"), "attempt": strings.Repeat("a", 32)}).Code
+	}
+	// Per client, misses included, spread over locators.
+	for i := 0; i < pairingStartsPerClient+1; i++ {
+		want := http.StatusConflict
+		if i == pairingStartsPerClient {
+			want = http.StatusTooManyRequests
 		}
-		if rec.Code != want {
-			t.Fatalf("per-IP %d: %d", i, rec.Code)
+		if code := start("10.0.0.2", fmt.Sprintf("%c%c", "0123456789"[i%10], 'a'+i/10)); code != want {
+			t.Fatalf("per-IP %d: %d", i, code)
 		}
 	}
+	// Per locator, from many clients.
 	resetPairing(t)
-	for i := 0; i < 301; i++ {
-		rec := pairingRequest(t, fmt.Sprintf("10.1.%d.%d", i/250, i%250+1), map[string]any{"action": "start"})
-		want := 404
-		if i == 300 {
-			want = 429
+	for i := 0; i < pairingStartsPerLocator+1; i++ {
+		want := http.StatusConflict
+		if i == pairingStartsPerLocator {
+			want = http.StatusTooManyRequests
 		}
-		if rec.Code != want {
-			t.Fatalf("global %d: %d", i, rec.Code)
+		if code := start(fmt.Sprintf("10.1.0.%d", i+1), "k5"); code != want {
+			t.Fatalf("per-locator %d: %d", i, code)
 		}
+	}
+}
+
+// There is no global start or create bucket for a few dozen clients to
+// empty: many clients, each well inside its own budget, never lock
+// everybody else out.
+func TestPairingHasNoGlobalBucketToStarve(t *testing.T) {
+	resetPairing(t)
+	locators := "0123456789abcdefghjkmnpqrstvwxyz"
+	for i := 0; i < 600; i++ {
+		loc := string(locators[i%32]) + string(locators[(i/32)%32])
+		code := pairingRequest(t, fmt.Sprintf("10.2.%d.%d", i/250, i%250+1), map[string]any{
+			"action": "start", "kind": "start", "locator": loc, "payload": ke1("x"), "attempt": strings.Repeat("b", 32),
+		}).Code
+		if code == http.StatusTooManyRequests {
+			t.Fatalf("start %d refused by a shared bucket", i)
+		}
+	}
+	// A real pairing still works after all that.
+	createPairing(t)
+}
+
+// Nothing tells a stranger which locators are live except a start, which
+// spends one of that pairing's attempts. Every other request gets the same
+// answer from a live pairing as from an empty locator.
+func TestPairingDoesNotRevealLiveness(t *testing.T) {
+	resetPairing(t)
+	createPairing(t) // live at k5
+	stranger := []map[string]any{
+		{"action": "host-poll"},
+		{"action": "host-poll", "token": strings.Repeat("t", 43)},
+		{"action": "cancel"},
+		{"action": "join-poll", "attempt": strings.Repeat("c", 32)},
+		{"action": "finish", "kind": "finish", "payload": "proof", "attempt": strings.Repeat("c", 32)},
+		{"action": "reply", "kind": "response", "payload": "resp", "attempt": strings.Repeat("c", 32)},
+		{"action": "start", "kind": "start", "payload": "short", "attempt": strings.Repeat("c", 32)},
+		{"action": "join-poll", "attempt": "bad"},
+	}
+	for _, body := range stranger {
+		live := map[string]any{"locator": "k5"}
+		empty := map[string]any{"locator": "q7"}
+		for k, v := range body {
+			live[k], empty[k] = v, v
+		}
+		a := pairingRequest(t, "10.0.0.9", live)
+		b := pairingRequest(t, "10.0.0.9", empty)
+		if a.Code != b.Code || a.Body.String() != b.Body.String() {
+			t.Errorf("%v: live answered %d %s, empty %d %s", body, a.Code, a.Body, b.Code, b.Body)
+		}
+	}
+}
+
+// A start that is not the shape of a real one is refused before it can
+// spend one of the pairing's attempts.
+func TestPairingMalformedStartSpendsNoAttempt(t *testing.T) {
+	resetPairing(t)
+	createPairing(t)
+	for i, payload := range []string{"x", ke1("x") + "A", strings.Repeat("A", 127), strings.Repeat("A", 126) + ".A"} {
+		rec := pairingRequest(t, "10.0.0.5", map[string]any{"action": "start", "kind": "start", "payload": payload, "attempt": strings.Repeat(string(rune('a'+i)), 32)})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("malformed start %d: %d", i, rec.Code)
+		}
+	}
+	pairingMu.Lock()
+	spent := len(pairingStore["k5"].attempts)
+	pairingMu.Unlock()
+	if spent != 0 {
+		t.Fatalf("malformed starts spent %d attempts", spent)
+	}
+}
+
+// One source holds at most pairingMaxLivePerSource pairings, so filling
+// the store takes many.
+func TestPairingLivePerSource(t *testing.T) {
+	resetPairing(t)
+	locators := "0123456789abcdefghjkmnpqrstvwxyz"
+	for i := 0; i < pairingMaxLivePerSource+1; i++ {
+		want := 200
+		if i == pairingMaxLivePerSource {
+			want = http.StatusTooManyRequests
+		}
+		if rec := pairingRequest(t, "10.0.7.7", map[string]any{"action": "create", "locator": "a" + string(locators[i])}); rec.Code != want {
+			t.Fatalf("create %d: %d", i, rec.Code)
+		}
+	}
+	if rec := pairingRequest(t, "10.0.7.8", map[string]any{"action": "create", "locator": "zz"}); rec.Code != 200 {
+		t.Fatalf("another source refused: %d", rec.Code)
 	}
 }
 func TestPairingRejectsMalformedAndOrigin(t *testing.T) {
