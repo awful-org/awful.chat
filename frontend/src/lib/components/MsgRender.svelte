@@ -39,7 +39,7 @@
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
-  import { codeBlocks } from "$lib/actions/code-blocks";
+  import { messageBody } from "$lib/actions/message-body";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
   import { formatSize } from "$lib/utils";
   import { mediaBoxStyle } from "$lib/image-size";
@@ -765,7 +765,7 @@
            showed mention tokens as @[did:key:...] instead of the name. A div,
            not a p: markdown can put a heading or a list in it. -->
       {@const body = renderBody(content)}
-      <div class="whitespace-pre-wrap mb-2" {@attach codeBlocks(body)}>{@html body}</div>
+      <div class="whitespace-pre-wrap mb-2" {@attach messageBody(body)}>{@html body}</div>
     {/if}
 
     <div class="space-y-2">
@@ -1108,7 +1108,7 @@
     {/if}
   {:else}
     {@const body = renderBody(content)}
-    <div class="whitespace-pre-wrap" {@attach codeBlocks(body)}>{@html body}</div>
+    <div class="whitespace-pre-wrap" {@attach messageBody(body)}>{@html body}</div>
 
     {#if mediaPrefs.externalMedia && linkedUrl && ogPreview}
       <div

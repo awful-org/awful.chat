@@ -27,7 +27,7 @@ const LINK_CLASS = "text-primary hover:underline";
 const CODE_CLASS = "rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]";
 /**
  * A fenced block: the box, a copy button, and a <pre data-lang> that
- * actions/code-blocks.ts highlights once the message is on screen and whose
+ * actions/message-body.ts highlights once the message is on screen and whose
  * button it answers. Every block gets both, not only a message's first.
  */
 const CODE_BLOCK_CLASS =
@@ -41,7 +41,17 @@ const ICON_ATTRS =
 const COPY_ICONS =
   `<svg ${ICON_ATTRS} class="group-data-[copied]/copy:hidden"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>` +
   `<svg ${ICON_ATTRS} class="hidden group-data-[copied]/copy:block"><path d="M20 6 9 17l-5-5"/></svg>`;
-const LIST_CLASS = "list-disc pl-5";
+/** Bullets by depth, so a nested list reads as nested. */
+const BULLET_CLASS = ["list-disc", "list-[circle]", "list-[square]", "list-[square]"];
+const QUOTE_CLASS = "my-0.5 border-l-4 border-muted-foreground/40 pl-3";
+const SUBTEXT_CLASS = "text-[0.8em] text-muted-foreground";
+/**
+ * Hidden until clicked (actions/message-body.ts sets data-revealed): the
+ * text goes transparent and anything inside - an emoji, a link, a mention -
+ * invisible, which also keeps a link from being followed before it is seen.
+ */
+const SPOILER_CLASS =
+  "cursor-pointer rounded-sm bg-muted-foreground/40 px-0.5 not-data-revealed:text-transparent not-data-revealed:[&_*]:invisible data-revealed:cursor-auto data-revealed:bg-muted/60";
 const HEADING_CLASS: Record<number, string> = {
   1: "text-[1.5em] font-bold leading-tight",
   2: "text-[1.25em] font-bold leading-tight",
@@ -61,7 +71,7 @@ const PARKED_RE = /<(\d+)>/g;
  */
 const SPAN_RE = new RegExp(
   [
-    String.raw`\\([\\\x60*~\[\]()#-])`,
+    String.raw`\\([\\\x60*~_|>\[\]()#-])`,
     String.raw`\x60\x60\x60([^\n]+?)\x60\x60\x60`,
     String.raw`\x60([^\x60\n]+)\x60`,
     String.raw`\[([^\]\n]+)\]\((https?:\/\/[^\s()<>"]+)\)`,
@@ -79,7 +89,7 @@ const SPAN_RE = new RegExp(
  * the dots that draw like one ("paypal․com").
  */
 const LOOKS_LIKE_URL_RE = /:\/\/|\bwww[.\u2024\u3002\uFF0E\uFF61]|\w[.\u2024\u3002\uFF0E\uFF61][a-z]{2,}(?![a-z0-9])/i;
-const looksLikeUrl = (label: string) => LOOKS_LIKE_URL_RE.test(label.replace(/[*~\x60\\]/g, ""));
+const looksLikeUrl = (label: string) => LOOKS_LIKE_URL_RE.test(label.replace(/[*~_|\x60\\]/g, ""));
 
 /**
  * A url found in running text, without the punctuation that ends the
@@ -90,7 +100,7 @@ export function trimUrl(url: string): { url: string; rest: string } {
   let end = url.length;
   for (;;) {
     const ch = url[end - 1];
-    if (/[.,!?;:'*~]/.test(ch)) {
+    if (/[.,!?;:'*~_|]/.test(ch)) {
       end--;
       continue;
     }
@@ -116,8 +126,10 @@ function code(src: string, resolveName: ResolveName): string {
   return escapeHtml(humanizeMentions(src, resolveName));
 }
 
+type Marker = "*" | "_" | "~" | "|";
+
 interface Delim {
-  ch: "*" | "~";
+  ch: Marker;
   /** Where the run sits among all runs, to tell which opened first. */
   seq: number;
   /** Markers not yet used by a match; they render as literal text. */
@@ -130,65 +142,106 @@ interface Delim {
   closes: string[];
 }
 
+const MARKERS: Marker[] = ["*", "_", "~", "|"];
+
 /**
- * Bold, italic and strike over escaped text, matched with a delimiter stack
- * (CommonMark's idea, much simplified) so tags always nest: "***both***" is
- * <em><strong>, never <strong><em>…</strong></em>.
+ * A letter or digit, in any script. Not \w: that counts "_" as a letter, so
+ * the * in "__*a*__" read as mid-word, and it knows only ASCII.
+ */
+const WORD_RE = /[\p{L}\p{N}]/u;
+
+/** What a matched pair of `n` markers becomes. */
+function tagFor(ch: Marker, n: number): string {
+  if (ch === "~") return "s";
+  if (ch === "|") return "spoiler";
+  if (ch === "_") return n === 2 ? "u" : "em";
+  return n === 2 ? "strong" : "em";
+}
+
+/**
+ * Bold, italic, underline, strike and spoilers over escaped text, matched
+ * with a delimiter stack (CommonMark's idea, much simplified) so tags always
+ * nest: "***both***" is <em><strong>, never <strong><em>…</strong></em>.
+ *
+ *   *a* _a_ italic   **a** bold   __a__ underline   ~a~ ~~a~~ strike
+ *   ||a|| spoiler
  *
  * A run opens when a non-space follows it and closes when a non-space comes
- * before it, so "2 * 3 * 4" stays arithmetic. A single * or ~ also needs a
- * non-word character outside it, so snake*case*word and file~1~ are left
- * alone.
- *
- * Strike takes one tilde or two, as GitHub's markdown does, and a closer
- * must match its opener's length: ~a~ and ~~a~~ strike, ~a~~ does not.
+ * before it, so "2 * 3 * 4" stays arithmetic. A single * or ~, and any run
+ * of _, also needs a non-word character outside it, so snake_case,
+ * snake*case*word and file~1~ are left alone. Strike takes one tilde or two
+ * and a spoiler exactly two bars, closed by the same count: ~a~~ does not
+ * strike, and a lone | is just a bar.
  *
  * One opener stack per marker, so a closer finds its opener on top instead
- * of walking past every opener of the other kind: linear, where one stack was
+ * of walking past every opener of another kind: linear, where one stack was
  * quadratic on a peer's "*a *a *a … a~~ a~~" - and this runs on every
  * notification and on the whole history when search rebuilds.
+ *
+ * With `tags` off (plain text) every tag is dropped except a spoiler's,
+ * which becomes "<|>…</|>" for the caller to replace: escaped text never
+ * holds "<", so the pair cannot be forged.
  */
 function emphasis(html: string, tags = true): string {
   const parts: (string | Delim)[] = [];
-  const stacks: Record<Delim["ch"], Delim[]> = { "*": [], "~": [] };
+  const stacks: Record<Marker, Delim[]> = { "*": [], "_": [], "~": [], "|": [] };
   let seq = 0;
-  // Every run of tildes is taken whole: only a run of one or two strikes,
-  // so "~~~~a~~~~" stays text instead of pairing into two empty <s></s>.
-  const RUN_RE = /\*+|~+/g;
+  // Every run is taken whole, so "~~~~a~~~~" or "|||" stays text instead of
+  // pairing into empty tags.
+  const RUN_RE = /\*+|_+|~+|\|+/g;
   let last = 0;
   for (let m = RUN_RE.exec(html); m; m = RUN_RE.exec(html)) {
     const run = m[0];
+    const ch = run[0] as Marker;
     const before = html[m.index - 1];
     const after = html[m.index + run.length];
-    const single = run === "*" || run === "~";
-    const inert = run[0] === "~" && run.length > 2;
+    const inert = (ch === "~" && run.length > 2) || (ch === "|" && run.length !== 2);
+    const wordy = ch === "_" || ((ch === "*" || ch === "~") && run.length === 1);
+    const spaced = ch !== "|";
     const d: Delim = {
-      ch: run[0] as "*" | "~",
+      ch,
       seq: seq++,
       count: run.length,
-      open: !inert && !!after && /\S/.test(after) && !(single && before !== undefined && /\w/.test(before)),
-      close: !inert && !!before && /\S/.test(before) && !(single && after !== undefined && /\w/.test(after)),
+      open:
+        !inert && !!after && (!spaced || /\S/.test(after)) &&
+        !(wordy && before !== undefined && WORD_RE.test(before)),
+      close:
+        !inert && !!before && (!spaced || /\S/.test(before)) &&
+        !(wordy && after !== undefined && WORD_RE.test(after)),
       opens: [],
       closes: [],
     };
     parts.push(html.slice(last, m.index), d);
     last = m.index + run.length;
 
-    const same = stacks[d.ch];
-    const other = stacks[d.ch === "*" ? "~" : "*"];
+    const same = stacks[ch];
     while (d.close && d.count > 0 && same.length > 0) {
       const o = same[same.length - 1];
-      if (d.ch === "~" && o.count !== d.count) break;
-      const n = d.ch === "~" ? d.count : o.count >= 2 && d.count >= 2 ? 2 : 1;
-      const tag = d.ch === "~" ? "s" : n === 2 ? "strong" : "em";
+      const exact = ch === "~" || ch === "|";
+      if (exact && o.count !== d.count) break;
+      const n = exact ? d.count : o.count >= 2 && d.count >= 2 ? 2 : 1;
+      const tag = tagFor(ch, n);
       o.count -= n;
       d.count -= n;
-      o.opens.unshift(tags ? `<${tag}>` : "");
-      d.closes.push(tags ? `</${tag}>` : "");
+      if (tag === "spoiler") {
+        o.opens.unshift(
+          tags
+            ? `<span class="${SPOILER_CLASS}" data-spoiler role="button" tabindex="0" aria-label="Spoiler, press to reveal">`
+            : "<|>",
+        );
+        d.closes.push(tags ? "</span>" : "</|>");
+      } else {
+        o.opens.unshift(tags ? `<${tag}>` : "");
+        d.closes.push(tags ? `</${tag}>` : "");
+      }
       if (o.count === 0) same.pop();
-      // Whatever of the other kind opened between the two stays literal: it
+      // Whatever of another kind opened between the two stays literal: it
       // can no longer close without crossing this pair.
-      while (other.length > 0 && other[other.length - 1].seq > o.seq) other.pop();
+      for (const k of MARKERS) {
+        if (k === ch) continue;
+        const other = stacks[k];
+        while (other.length > 0 && other[other.length - 1].seq > o.seq) other.pop();
+      }
     }
     if (d.open && d.count > 0) same.push(d);
   }
@@ -244,7 +297,11 @@ function inline(src: string, resolveName: ResolveName, links = true, plain = fal
   }
   text += escapeHtml(src.slice(last));
 
-  const marked = plain ? emphasis(text, false) : wrapEmoji(emphasis(text));
+  // Plain text shows a spoiler as what it is, never what it hides: a
+  // notification or a quote would otherwise give it away.
+  const marked = plain
+    ? emphasis(text, false).replace(/<\|>[^]*?<\/\|>/g, "[spoiler]")
+    : wrapEmoji(emphasis(text));
   return marked.replace(PARKED_RE, (_, i: string) => parked[Number(i)]);
 }
 
@@ -293,31 +350,28 @@ function fenceAt(lines: string[], i: number, closeAt: number[]): Fence | null {
   return { lead: open[1].trim(), tail: then?.[1] ?? "", lang: open[2], body: body.join("\n"), end };
 }
 
-/**
- * The first url the rendered message actually links to - a masked link's
- * target, or a bare url trimmed as it is rendered - for the link preview. A
- * url written as code is not a link, so it gets no preview either.
- */
-export function firstLinkedUrl(content: string): string | null {
-  if (typeof content !== "string") return null;
-  for (const line of classify(content)) {
-    if (line.kind === "fence") continue;
-    for (const [, , , , , href, bare] of line.text.matchAll(SPAN_RE)) {
-      if (href !== undefined) return href;
-      if (bare !== undefined) return trimUrl(bare).url;
-    }
-  }
-  return null;
-}
-
 type Line =
   | { kind: "fence"; lang: string; body: string }
-  | { kind: "item"; text: string }
+  | { kind: "quote"; body: string }
+  | { kind: "item"; ordered: false; depth: number; text: string }
+  | { kind: "item"; ordered: true; n: number; depth: number; text: string }
   | { kind: "heading"; level: number; text: string }
+  | { kind: "subtext"; text: string }
   | { kind: "text"; text: string };
 
-/** The message's lines, each read as the one block construct it is. */
-function classify(content: string): Line[] {
+type Item = Extract<Line, { kind: "item" }>;
+
+/** Two spaces, or a tab, per level of list nesting; three levels at most. */
+function depthOf(indent: string): number {
+  const width = indent.replace(/\t/g, "  ").length;
+  return Math.min(3, Math.floor(width / 2));
+}
+
+/**
+ * The message's lines, each read as the one block construct it is.
+ * `quotes` is off inside a quote: a quote does not nest.
+ */
+function classify(content: string, quotes = true): Line[] {
   // A peer's client may send CRLF: a stray \r would keep a heading or an
   // empty line from reading as one.
   const lines = content.split(/\r?\n/);
@@ -328,6 +382,7 @@ function classify(content: string): Line[] {
   }
   const out: Line[] = [];
   for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const fence = fenceAt(lines, i, closeAt);
     if (fence) {
       if (fence.lead) out.push({ kind: "text", text: fence.lead });
@@ -336,47 +391,128 @@ function classify(content: string): Line[] {
       i = fence.end;
       continue;
     }
-    const item = /^\s*[-*]\s+(\S.*)$/.exec(lines[i]);
-    if (item) {
-      out.push({ kind: "item", text: item[1] });
+    if (quotes) {
+      // ">>> " quotes everything after it, to the end of the message.
+      const rest = /^>>>(?: (.*))?$/.exec(line);
+      if (rest) {
+        out.push({ kind: "quote", body: [rest[1] ?? "", ...lines.slice(i + 1)].join("\n") });
+        break;
+      }
+      // "> " quotes its line; a run of them is one quote.
+      if (/^>(?: |$)/.test(line)) {
+        const body: string[] = [];
+        while (i < lines.length && /^>(?: |$)/.test(lines[i])) body.push(lines[i++].slice(2));
+        i--;
+        out.push({ kind: "quote", body: body.join("\n") });
+        continue;
+      }
+    }
+    const subtext = /^-# (\S.*)$/.exec(line);
+    if (subtext) {
+      out.push({ kind: "subtext", text: subtext[1] });
       continue;
     }
-    const heading = /^(#{1,3})\s+(\S.*)$/.exec(lines[i]);
+    const bullet = /^([ \t]*)[-*]\s+(\S.*)$/.exec(line);
+    if (bullet) {
+      out.push({ kind: "item", ordered: false, depth: depthOf(bullet[1]), text: bullet[2] });
+      continue;
+    }
+    const numbered = /^([ \t]*)(\d{1,9})[.)]\s+(\S.*)$/.exec(line);
+    if (numbered) {
+      const n = Number(numbered[2]);
+      out.push({ kind: "item", ordered: true, n, depth: depthOf(numbered[1]), text: numbered[3] });
+      continue;
+    }
+    const heading = /^(#{1,3})\s+(\S.*)$/.exec(line);
     if (heading) {
       out.push({ kind: "heading", level: heading[1].length, text: heading[2] });
       continue;
     }
-    out.push({ kind: "text", text: lines[i] });
+    out.push({ kind: "text", text: line });
   }
   return out;
+}
+
+/** A spoiler's reach in raw text: "||" to the next "||" on the line. */
+const SPOILED_RE = /(?<!\|)\|\|(?!\|)[^\n]*?(?<!\|)\|\|(?!\|)/g;
+
+/**
+ * Every stretch of inline text in the message, quotes included, fences not,
+ * and spoilers left out: a link preview or a search snippet naming the site a
+ * spoiler hides would give it away.
+ */
+function* inlineTexts(content: string, quotes = true): Generator<string> {
+  for (const line of classify(content, quotes)) {
+    if (line.kind === "fence") continue;
+    if (line.kind === "quote") yield* inlineTexts(line.body, false);
+    else yield line.text.replace(SPOILED_RE, " ");
+  }
+}
+
+/**
+ * The first url the rendered message actually links to - a masked link's
+ * target, or a bare url trimmed as it is rendered - for the link preview. A
+ * url written as code is not a link, so it gets no preview either.
+ */
+export function firstLinkedUrl(content: string): string | null {
+  if (typeof content !== "string") return null;
+  for (const text of inlineTexts(content)) {
+    for (const [, , , , , href, bare] of text.matchAll(SPAN_RE)) {
+      if (href !== undefined) return href;
+      if (bare !== undefined) return trimUrl(bare).url;
+    }
+  }
+  return null;
+}
+
+/**
+ * A run of list items as nested lists. An item may go one level deeper than
+ * the one before it, never more; a change between bullets and numbers at the
+ * same depth starts a new list. A numbered list starts where its first item
+ * says, as "3." does in the typed text.
+ */
+function renderList(items: Item[], resolveName: ResolveName): string {
+  let html = "";
+  const stack: boolean[] = [];
+  const close = () => {
+    html += stack.pop() ? "</li></ol>" : "</li></ul>";
+  };
+  for (const it of items) {
+    const depth = Math.min(it.depth, stack.length);
+    while (stack.length > depth + 1) close();
+    if (stack.length === depth + 1) {
+      if (stack[depth] === it.ordered) html += "</li>";
+      else close();
+    }
+    if (stack.length === depth) {
+      html += it.ordered
+        ? `<ol class="list-decimal pl-6"${it.n !== 1 ? ` start="${it.n}"` : ""}>`
+        : `<ul class="${BULLET_CLASS[depth]} pl-5">`;
+      stack.push(it.ordered);
+    }
+    html += `<li>${inline(it.text, resolveName)}`;
+  }
+  while (stack.length) close();
+  return html;
 }
 
 /** One empty line, as a block: what a blank line beside a block becomes. */
 const GAP = "<div><br></div>";
 
-/**
- * The whole message. The container keeps `white-space: pre-wrap`, so plain
- * lines keep their newlines; a heading, a list or a code block already breaks
- * the line, so the newline beside one is dropped. A blank line beside one
- * would go with it - a newline next to a block draws nothing - so every
- * blank line in a run that touches a block is drawn as a line of its own.
- */
-export function renderMessageMarkdown(content: string, resolveName: ResolveName): string {
-  // Content is a claim about a JSON.parse result: a peer can send a number.
-  if (typeof content !== "string") return "";
-  const lines = classify(content);
+function renderBlocks(content: string, resolveName: ResolveName, quotes: boolean): string {
+  const lines = classify(content, quotes);
   // `blank`: a line with nothing to draw, spaces included.
   const out: { block: boolean; blank?: boolean; html: string }[] = [];
-  let items: string[] = [];
+  let items: Item[] = [];
   const flushList = () => {
     if (!items.length) return;
-    out.push({ block: true, html: `<ul class="${LIST_CLASS}">${items.join("")}</ul>` });
+    out.push({ block: true, html: renderList(items, resolveName) });
     items = [];
   };
 
   for (const line of lines) {
     if (line.kind === "item") {
-      items.push(`<li>${inline(line.text, resolveName)}</li>`);
+      items.push(line);
       continue;
     }
     flushList();
@@ -389,9 +525,16 @@ export function renderMessageMarkdown(content: string, resolveName: ResolveName)
           `<pre class="${PRE_CLASS}" data-lang="${escapeHtml(line.lang || "text")}"><code>${code(line.body, resolveName)}</code></pre>` +
           `</div>`,
       });
+    } else if (line.kind === "quote") {
+      out.push({
+        block: true,
+        html: `<blockquote class="${QUOTE_CLASS}">${renderBlocks(line.body, resolveName, false)}</blockquote>`,
+      });
     } else if (line.kind === "heading") {
       const h = `h${line.level}`;
       out.push({ block: true, html: `<${h} class="${HEADING_CLASS[line.level]}">${inline(line.text, resolveName)}</${h}>` });
+    } else if (line.kind === "subtext") {
+      out.push({ block: true, html: `<div class="${SUBTEXT_CLASS}">${inline(line.text, resolveName)}</div>` });
     } else {
       out.push({ block: false, blank: !line.text.trim(), html: inline(line.text, resolveName) });
     }
@@ -420,13 +563,41 @@ export function renderMessageMarkdown(content: string, resolveName: ResolveName)
   return html;
 }
 
+/**
+ * The whole message. The container keeps `white-space: pre-wrap`, so plain
+ * lines keep their newlines; a heading, a list, a quote or a code block
+ * already breaks the line, so the newline beside one is dropped. A blank
+ * line beside one would go with it - a newline next to a block draws nothing
+ * - so every blank line in a run that touches a block is drawn as a line of
+ * its own.
+ */
+export function renderMessageMarkdown(content: string, resolveName: ResolveName): string {
+  // Content is a claim about a JSON.parse result: a peer can send a number.
+  if (typeof content !== "string") return "";
+  return renderBlocks(content, resolveName, true);
+}
+
 const ENTITIES: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'" };
+
+function stripBlocks(content: string, name: ResolveName, quotes: boolean): string {
+  return classify(content, quotes)
+    .map((line) => {
+      if (line.kind === "fence") return code(line.body, name);
+      if (line.kind === "quote") return stripBlocks(line.body, name, false);
+      const text = inline(line.text, name, true, true);
+      if (line.kind !== "item") return text;
+      const indent = "  ".repeat(line.depth);
+      return line.ordered ? `${indent}${line.n}. ${text}` : `${indent}• ${text}`;
+    })
+    .join("\n");
+}
 
 /**
  * The message as plain text, markup read and dropped: for a notification, a
  * reply quote, a pinned-list line or the search index, which all show text,
- * never HTML. Headings lose their #, list items read "• ", code keeps its
- * contents, a link its label.
+ * never HTML. Headings and subtext lose their markers, a quote its ">",
+ * bullets read "• " and numbers keep theirs, code keeps its contents, a link
+ * its label, and a spoiler reads "[spoiler]" - never what it hides.
  *
  * Mentions are named HERE, from the tokens the message really carries, and
  * the result is final text: running humanizeMentions over it afterwards would
@@ -437,14 +608,7 @@ export function stripMarkdown(content: string, resolveName?: ResolveName): strin
   if (typeof content !== "string") return "";
   // humanizeMentions writes "@" + name, so "[did]" as the name keeps the token.
   const name: ResolveName = resolveName ?? ((did) => `[${did}]`);
-  const html = classify(content)
-    .map((line) => {
-      if (line.kind === "fence") return code(line.body, name);
-      const text = inline(line.text, name, true, true);
-      return line.kind === "item" ? `• ${text}` : text;
-    })
-    .join("\n");
-  return html.replace(/&(?:amp|lt|gt|quot|#39);/g, (e) => ENTITIES[e]);
+  return stripBlocks(content, name, true).replace(/&(?:amp|lt|gt|quot|#39);/g, (e) => ENTITIES[e]);
 }
 
 /**
@@ -455,9 +619,8 @@ export function stripMarkdown(content: string, resolveName?: ResolveName): strin
 export function linkTargets(content: string): string[] {
   if (typeof content !== "string") return [];
   const out: string[] = [];
-  for (const line of classify(content)) {
-    if (line.kind === "fence") continue;
-    for (const [, , , , , href] of line.text.matchAll(SPAN_RE)) {
+  for (const text of inlineTexts(content)) {
+    for (const [, , , , , href] of text.matchAll(SPAN_RE)) {
       if (href !== undefined) out.push(href);
     }
   }
