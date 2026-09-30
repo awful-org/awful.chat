@@ -2340,6 +2340,12 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
     const joinedRoom = await getRoom(room);
     if (joinedRoom?.type !== "text") return;
     if (did === (identityStore.did ?? "")) return;
+    const isNewMapping = _peerIdToDid.get(peerId) !== did;
+    _setPeerDid(peerId, did);
+    if (isNewMapping) {
+      flushQueuedDmForPeer(peerId).catch(() => {});
+      _replayPendingDm(peerId, did);
+    }
     const validated = validateProfileMeta({
       bannerUrl: msg.bannerUrl, gradient2: msg.gradient2 ?? undefined,
       gradient3: msg.gradient3 ?? undefined, tagText: msg.tagText,
@@ -2358,7 +2364,14 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
       nameEffect: validated.nameEffect, nameShimmer: validated.nameShimmer,
       nameGlow: validated.nameGlow,
     };
-    await putPeerRoomProfile(room, joinedRoom.createdAt, peerProfile).catch(() => {});
+    try {
+      await putPeerRoomProfile(room, joinedRoom.createdAt, peerProfile);
+    } catch {
+      return;
+    }
+    const currentRoom = await getRoom(room);
+    if (currentRoom?.type !== "text" || currentRoom.createdAt !== joinedRoom.createdAt ||
+        !_transport.rooms().includes(room) || !_transport.isRoomPeer(room, peerId)) return;
     const scoped = new Map(transportState.peerRoomProfiles);
     const peers = new Map(scoped.get(room));
     peers.set(did, peerProfile);

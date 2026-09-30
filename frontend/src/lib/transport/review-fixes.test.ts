@@ -10,6 +10,7 @@ const s = vi.hoisted(() => ({
   roomSend: vi.fn(async (_peer: string, _room: string, _frame: Uint8Array) => true),
   roomPeer: "peer1",
   peerRoomRows: new Map<string, any[]>(), roomWrites: vi.fn(async (_room: string, _generation: number, _profile: any) => {}),
+  joined: true,
   lamport: vi.fn(async () => 1), put: vi.fn(async (_m: any, guard?: () => void) => { guard?.(); }),
   watermark: vi.fn(async (_r: string, _s: string, _l: number, guard?: () => void) => { guard?.(); }),
   sign: vi.fn((m: any) => m), broadcast: vi.fn(), reset: vi.fn(), disconnect: vi.fn(),
@@ -48,7 +49,7 @@ vi.mock("$lib/storage", () => ({
   getOwnRoomProfile: s.roomProfile,
   getAllPeerRoomProfiles: async (room: string) => s.peerRoomRows.get(room) ?? [],
   putPeerRoomProfile: s.roomWrites,
-  getRoom: async (room: string) => ({ roomCode: room, type: "text", createdAt: 1 }),
+  getRoom: async (room: string) => s.joined ? ({ roomCode: room, type: "text", createdAt: 1 }) : undefined,
   setWatermark: s.watermark, markRoomSeen: vi.fn(async () => {}),
   getAttachmentsWithData: () => s.read ?? Promise.resolve(s.attachments),
   getMessage: async (id: string) => s.rows.get(id),
@@ -69,7 +70,7 @@ vi.mock("./node-lock", () => ({ releaseNodeLock: vi.fn() }));
 vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
 
-import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch } from "./transport.svelte";
+import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch, peerIdToDid } from "./transport.svelte";
 import { encode, decode } from "$lib/utils";
 import { hydrateLegacyAttachments } from "./files.svelte";
 import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
@@ -77,10 +78,31 @@ import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
 beforeEach(() => {
   vi.clearAllMocks(); s.session = { did: "did:alice" }; s.rows.clear(); s.attachments = []; s.read = null;
   s.roomPeer = "peer1";
+  s.joined = true;
   s.peerRoomRows.clear(); transportState.peerRoomProfiles = new Map();
   s.profile.mockResolvedValue({ nickname: "Alice" }); s.lamport.mockResolvedValue(1);
   transportState.roomCode = "rd2_room"; transportState.chatMode = "room";
   transportState.messages = []; transportState.fileTransfers = new Map();
+});
+
+it("does not republish a scoped profile after a failed write or a concurrent leave", async () => {
+  const onMessage = s.handlers.get("message")!;
+  const frame = encode({ type: MessageType.Profile, roomScoped: true, name: "Room",
+    did: "did:peer", peerId: "peer1", bindingSig: "sig", avatarUrl: null });
+  s.roomWrites.mockRejectedValueOnce(new Error("left"));
+  onMessage("peer1", frame, "rd2_room");
+  await vi.waitFor(() => expect(s.roomWrites).toHaveBeenCalledTimes(1));
+  expect(peerIdToDid("peer1")).toBe("did:peer");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(transportState.peerRoomProfiles.get("rd2_room")?.has("did:peer")).not.toBe(true);
+  let finish!: () => void;
+  s.roomWrites.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+  onMessage("peer1", frame, "rd2_room");
+  await vi.waitFor(() => expect(s.roomWrites).toHaveBeenCalledTimes(2));
+  s.joined = false;
+  finish();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(transportState.peerRoomProfiles.get("rd2_room")?.has("did:peer")).not.toBe(true);
 });
 
 it("keeps marked profiles in their authenticated room and leaves the main profile intact", async () => {
