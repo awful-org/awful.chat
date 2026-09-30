@@ -2225,9 +2225,15 @@ export async function getAllOwnRoomProfiles(): Promise<OwnRoomProfileRecord[]> {
 export async function putOwnRoomProfile(
   record: OwnRoomProfileRecord, guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
-  const marker = await getRoomDeletionMarker(record.roomCode);
-  if (marker && record.generation <= marker.generation) throw new Error("room generation was deleted");
+  const room = await getRoom(record.roomCode);
+  if (room?.type !== "text" || room.createdAt !== record.generation) {
+    throw new Error("room generation is not joined");
+  }
   const database = await getDB();
+  const markerKey = await blindValue(roomProfileId("deletion", record.roomCode));
+  const markerBefore = await database.get("roomProfiles", markerKey);
+  const marker = await _open("roomProfiles", markerBefore);
+  if (marker && record.generation <= marker.generation) throw new Error("room generation was deleted");
   const fields = { ...record.fields };
   const pfpData = fields.pfpData instanceof ArrayBuffer ? fields.pfpData : undefined;
   const bannerData = fields.bannerData instanceof ArrayBuffer ? fields.bannerData : undefined;
@@ -2239,7 +2245,11 @@ export async function putOwnRoomProfile(
     generation: record.generation, fields, fieldEdits: record.fieldEdits,
     pfpData, bannerData,
   });
-  await guardedCommit(database, "roomProfiles", guard, async tx => { await tx.store.put(sealed); });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const current = await tx.store.get(markerKey);
+    if (_sealFingerprint(current) !== _sealFingerprint(markerBefore)) throw new Error("room generation was deleted");
+    await tx.store.put(sealed);
+  });
 }
 
 export async function getPeerRoomProfile(roomCode: string, did: string): Promise<PeerProfile | undefined> {
@@ -2253,16 +2263,26 @@ export async function putPeerRoomProfile(
   roomCode: string, generation: number, profile: PeerProfile,
   guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
-  const marker = await getRoomDeletionMarker(roomCode);
+  const room = await getRoom(roomCode);
+  if (room?.type !== "text" || room.createdAt !== generation) {
+    throw new Error("room generation is not joined");
+  }
+  const database = await getDB();
+  const markerKey = await blindValue(roomProfileId("deletion", roomCode));
+  const markerBefore = await database.get("roomProfiles", markerKey);
+  const marker = await _open("roomProfiles", markerBefore);
   if (marker && generation <= marker.generation) throw new Error("room generation was deleted");
   const { pfpData, bannerData, ...display } = profile;
-  const database = await getDB();
   const sealed = await _seal("roomProfiles", {
     id: roomProfileId("peer", roomCode, profile.did), roomCode,
     did: profile.did, kind: "peer" as const, generation,
     profile: display, pfpData, bannerData,
   });
-  await guardedCommit(database, "roomProfiles", guard, async tx => { await tx.store.put(sealed); });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const current = await tx.store.get(markerKey);
+    if (_sealFingerprint(current) !== _sealFingerprint(markerBefore)) throw new Error("room generation was deleted");
+    await tx.store.put(sealed);
+  });
 }
 
 /** Remove both profile kinds but keep the non-profile marker for later device sync. */
