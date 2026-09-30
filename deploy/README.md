@@ -252,3 +252,14 @@ effect needs the client's address carried to the relay's libp2p listener,
 which takes PROXY protocol on a Traefik TCP router plus PROXY protocol
 support in the relay's listener (it has none today), or the listener
 exposed directly without Traefik in front.
+
+**Plugin secrets are bound, one binding per name.** Each
+`PLUGIN_PROXY_SECRETS` entry is `NAME@host/path/prefix?param=value`: the
+relay substitutes `{{secret:NAME}}` only as the whole value of that query
+parameter, on that host, for a path under that prefix. A NAME holds a single
+binding - a later entry with the same NAME replaces the earlier one - so a
+plugin that calls several path prefixes on its host with the same key needs
+the prefix `/` (`STEAM@api.steampowered.com/?key=...`). The older
+`NAME@host=value` and `NAME=value` forms are no longer substituted; the relay
+names any it finds at boot, and the plugins using them report "not
+configured" until they are rewritten.
