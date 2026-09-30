@@ -98,13 +98,14 @@ describe("room profile backup records", () => {
       fieldEdits: { nickname: { at: 101, id: "device-a" } } };
     const result = sanitizeCollections({ ...base,
       roomProfiles: [record, { ...record, fields: { inboxOff: true } },
+        { ...record, fields: { did: "spoofed identity" } },
         { ...record, fieldEdits: { nickname: { at: -1, id: "bad" } } }],
       roomDeletions: [{ roomCode: "rd2_b", generation: 120, deletedAt: 121 },
         { roomCode: "rd2_b", generation: -1, deletedAt: 121 }],
     });
     expect(result.roomProfiles).toEqual([record]);
     expect(result.roomDeletions).toEqual([{ roomCode: "rd2_b", generation: 120, deletedAt: 121 }]);
-    expect(result.dropped).toBe(3);
+    expect(result.dropped).toBe(4);
   });
 
   it("loads old backups without room collections", () => {
