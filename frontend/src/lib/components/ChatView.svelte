@@ -90,6 +90,7 @@
     didToPeerId,
     peerIdToDid,
     sendReply,
+    sendRoomTyping,
     sendFiles,
     toggleReaction,
     loadMoreMessages,
@@ -116,7 +117,10 @@
     openDmPanel,
     removeFromPhonebook,
     isInPhonebook,
+    sendDmTyping,
   } from "$lib/transport/dm.svelte";
+  import { TypingAnnouncer, typingLine } from "$lib/typing";
+  import { typersIn, typingPrefs } from "$lib/typing.svelte";
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
   import {
@@ -816,6 +820,7 @@
 
         try {
           await handler(args, hostApi);
+          stopTyping();
           draft = "";
           replyTargetId = null;
           autoScroll = true;
@@ -863,6 +868,7 @@
     }
 
     if (roomCode !== submittedRoom || draft !== submittedDraft) return;
+    stopTyping();
     draft = "";
     replyTargetId = null;
     draftMentionMap.clear();
@@ -1708,6 +1714,37 @@
   function displayName(msg: Message): string {
     return displayNameFor(msg.senderId, msg.senderName);
   }
+
+  // ── Typing indicator ──────────────────────────────────────────────────
+  const typing = new TypingAnnouncer<{ roomCode: string; dmPeerId: string | null }>(
+    (to, on) => {
+      if (to.dmPeerId) sendDmTyping(to.dmPeerId, on);
+      else sendRoomTyping(to.roomCode, on);
+    }
+  );
+
+  /** On every keystroke. A message request stays silent until accepted. */
+  function noteDraftTyping() {
+    const hasText = typingPrefs.sendTyping && !dmRequest && draft.trim().length > 0;
+    typing.input(hasText, Date.now(), () => {
+      if (!roomCode.startsWith("dm-")) return { roomCode, dmPeerId: null };
+      const dmPeerId = transportState.activeDmPeerId;
+      return dmPeerId ? { roomCode, dmPeerId } : null;
+    });
+  }
+
+  function stopTyping() {
+    typing.stop();
+  }
+
+  $effect(() => {
+    void roomCode;
+    return () => untrack(stopTyping);
+  });
+
+  const typingText = $derived(
+    typingLine(typersIn(roomCode).map((did) => displayNameFor(did)))
+  );
 
   /** What a reply should QUOTE.
    *
@@ -3214,8 +3251,24 @@
   {/if}
 
   <div
-    class="border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))] min-h-18.75 bg-background"
+    class="relative border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))] min-h-18.75 bg-background"
   >
+    {#if typingText}
+      <!-- In the composer's top padding, so it never moves the chat. -->
+      <p
+        class="pointer-events-none absolute inset-x-4 top-0 flex h-4 items-center gap-1.5 font-mono text-[11px] text-muted-foreground"
+      >
+        <span class="inline-flex shrink-0 gap-0.5" aria-hidden="true">
+          {#each [0, 1, 2] as i (i)}
+            <span
+              class="size-1 rounded-full bg-current motion-safe:animate-pulse"
+              style="animation-delay: {i * 200}ms"
+            ></span>
+          {/each}
+        </span>
+        <span class="truncate">{typingText}</span>
+      </p>
+    {/if}
     <form
       onsubmit={(e) => {
         e.preventDefault();
@@ -3261,6 +3314,7 @@
             autoResize();
             updateMentionState();
             updateCommandState();
+            noteDraftTyping();
           }}
         />
         {#if sendError}

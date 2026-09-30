@@ -19,6 +19,7 @@ export enum MessageType {
   VoiceSignal = "voice_signal",
   RoomName = "room_name",
   PluginEphemeral = "plugin_ephemeral",
+  Typing = "typing",
   // room users - wire only, never persisted
   JoinRoom = "join_room",
   LeaveRoom = "leave_room",
@@ -271,6 +272,20 @@ export interface WireWatchPresence {
   watchingAll?: string[];
 }
 
+/**
+ * "I am typing in this conversation" (true), or "I stopped" (false).
+ *
+ * No name, no room, no signature: it only ever travels over a room's or a
+ * DM's authenticated channel, which already says who sent it and where, and
+ * the receiver names the typer from its own view of that peer. Senders repeat
+ * it while the draft keeps changing; receivers forget a typer that goes quiet
+ * (typing.ts has the timings).
+ */
+export interface WireTyping {
+  type: MessageType.Typing;
+  typing: boolean;
+}
+
 export interface WirePluginEphemeral {
   type: MessageType.PluginEphemeral;
   id: string;
@@ -379,6 +394,7 @@ export type AnyWireMessage =
   | WireWatchPresence
   | WireCallState
   | WirePluginEphemeral
+  | WireTyping
   | WireRoomName
   | WireJoinRoom
   | WireLeaveRoom

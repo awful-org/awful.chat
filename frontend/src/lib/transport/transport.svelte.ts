@@ -76,6 +76,7 @@ import {
   type WireRoomName,
   type WireRoomUsersSync,
   type WireCallState,
+  type WireTyping,
   type FileEntry,
   type FileMeta,
   type Attachment,
@@ -164,6 +165,7 @@ import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
 import { _sendWatchPresence } from "./transmission.svelte";
 import { watchedFromWire } from "$lib/watch-presence";
+import { clearTyping, noteTyping, typingPrefs } from "$lib/typing.svelte";
 import {
   type DmPayload,
   encodeDmAckEnvelope,
@@ -2800,6 +2802,36 @@ export function _syncVoiceRoster(): void {
   _video.retryDeferredProducers();
 }
 
+/**
+ * Someone started or stopped typing. Only over a room's or a DM's channel:
+ * that is what says who sent it and where, since the frame carries neither.
+ * Rooms never forward a frame, so the channel peer IS the typer. Our own
+ * other devices are not "someone".
+ */
+function _handleTyping(
+  peerId: string,
+  msg: WireTyping,
+  room: string | null,
+  guard: () => void
+): void {
+  if (!room || !_transport.isSecureRoom(room) || typeof msg.typing !== "boolean") return;
+  const did = _peerIdToDid.get(peerId);
+  if (!did || did === identityStore.did) return;
+  if (!room.startsWith("dm-")) {
+    noteTyping(room, did, msg.typing);
+    return;
+  }
+  // Same binding a DM message gets: the conversation must be the one
+  // between us and this sender, not merely one they hold a channel for.
+  if (!_transport.isRoomPeer(room, peerId)) return;
+  void dmConversationCodeAsync(did)
+    .then((expected) => {
+      guard();
+      if (expected === room) noteTyping(room, did, msg.typing);
+    })
+    .catch(() => {});
+}
+
 function _handleCallState(peerId: string, msg: WireCallState): void {
   // Same membership rule as _handleCallPresence, which is what fills
   // callPeerRooms in the first place: a mute/deafen badge belongs to somebody
@@ -3661,6 +3693,7 @@ function _handleDmChat(
   void dmConversationCodeAsync(senderDid).then((expected) => {
     guard();
     if (expected !== channelRoom || !_transport.isRoomPeer(channelRoom, peerId)) return;
+    if (!envelope.payload.reaction) clearTyping(channelRoom, senderDid);
     return _handleDmChatAsync(peerId, senderDid, envelope);
   }).catch(console.error);
 }
@@ -3989,6 +4022,13 @@ _transport.on("message", (peerId, data, room) => {
       return;
     }
 
+    // Before the last-seen write below: that is a read-modify-write of the
+    // room record, and typing repeats every few seconds per typer.
+    if ((decoded as AnyWireMessage).type === MessageType.Typing) {
+      _handleTyping(peerId, decoded as WireTyping, room, guard);
+      return;
+    }
+
     // Update last seen for this peer
     const did = _peerIdToDid.get(peerId);
     if (did && room) {
@@ -4132,6 +4172,15 @@ _transport.on("message", (peerId, data, room) => {
             msg.senderId
           );
           break;
+        }
+        // The message replaces its author's dots. Not a reaction or a plugin
+        // update: neither is what they were typing. On arrival, not after the
+        // async verify, which could otherwise wipe a burst they started
+        // since. The channel peer is the author (rooms never forward), and
+        // clearing their own dots is nothing a "stopped" frame could not do.
+        if (msg.type !== MessageType.Reaction && msg.type !== MessageType.PluginUpdate) {
+          const author = _peerIdToDid.get(peerId);
+          if (author) clearTyping(room, author);
         }
         _verifyIncoming(msg, { room })
           .then((v) => {
@@ -4801,6 +4850,18 @@ export async function sendMessage(
 
   markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
+}
+
+/**
+ * Tell a room we are typing, or that we stopped. Best effort and never
+ * queued: a "typing" that arrives late is wrong, not late. DMs go through
+ * sendDmTyping, which knows the peer.
+ */
+export function sendRoomTyping(roomCode: string, typing: boolean): void {
+  if (typing && !typingPrefs.sendTyping) return;
+  if (roomCode.startsWith("dm-") || !_transport.isSecureRoom(roomCode)) return;
+  const frame: WireTyping = { type: MessageType.Typing, typing };
+  void _transport.broadcast(encode(frame), roomCode).catch(() => {});
 }
 
 export async function sendReply(text: string, target: Message): Promise<void> {
