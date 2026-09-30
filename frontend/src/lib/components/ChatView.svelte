@@ -139,7 +139,7 @@
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
   import { formatSize, seededRandom } from "$lib/utils";
-  import { getQuotableText } from "$lib/quote-helper";
+  import { QUOTE_SHOWN_CHARS, getQuotableText } from "$lib/quote-helper";
   import InvitationDialog from "./InvitationDialog.svelte";
   import ArchivedHistory from "./ArchivedHistory.svelte";
   import { roomsStore } from "$lib/rooms.svelte";
@@ -1724,7 +1724,10 @@
     if (held) {
       // Use quotable text for held messages so image-only messages show
       // [image] instead of empty content. Held message is the source of truth.
-      return { name: displayName(held), content: getQuotableText(held) };
+      // Far more than the 160-character snapshot: it is stripped of markdown
+      // before it shows and the line truncates itself, so a cut through a
+      // link never reaches the screen.
+      return { name: displayName(held), content: getQuotableText(held, QUOTE_SHOWN_CHARS) };
     }
     // Snapshot from the wire is already built with quotable text
     return { name: r.senderName, content: r.content };
@@ -3115,7 +3118,7 @@
           >
           <span class="mx-1">•</span>
           <span class="truncate"
-            >{stripMarkdown(getQuotableText(replyTarget), resolveMentionDisplayName)}</span
+            >{stripMarkdown(getQuotableText(replyTarget, QUOTE_SHOWN_CHARS), resolveMentionDisplayName)}</span
           >
         </div>
         <Tip text="Cancel reply (Esc)">

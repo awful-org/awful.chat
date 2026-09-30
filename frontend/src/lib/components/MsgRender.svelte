@@ -39,8 +39,8 @@
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
+  import { codeBlocks } from "$lib/actions/code-blocks";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
-  import { escapeHtml } from "$lib/mentions";
   import { formatSize } from "$lib/utils";
   import { mediaBoxStyle } from "$lib/image-size";
   import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
@@ -181,7 +181,6 @@
   const content = $derived(typeof msg.content === "string" ? msg.content : "");
 
   let isMobile = $state(false);
-  let highlightedCode = $state<string | null>(null);
   let ogPreview = $state<OgPreview | null>(null);
   let gifSaved = $state(false);
   /**
@@ -462,7 +461,6 @@
       cancelled = true;
     };
   });
-  let copiedCode = $state(false);
   let videoPlaying = $state(false);
   let videoEl = $state<HTMLVideoElement | null>(null);
   let videoNaturalWidth = $state(0);
@@ -573,29 +571,6 @@
   }
 
   const isFileMessage = $derived(msg.type === MessageType.File);
-  const asCodeBlock = $derived.by(() => {
-    const match = content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
-    if (!match) return null;
-    return { lang: match[1] || "text", code: match[2] };
-  });
-  const codeSegments = $derived.by(() => {
-    const match = content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
-    if (!match) return null;
-    const fullMatch = match[0];
-    const startIdx = content.indexOf(fullMatch);
-    const endIdx = startIdx + fullMatch.length;
-
-    const before = content.slice(0, startIdx).trim();
-    const code = match[2];
-    const after = content.slice(endIdx).trim();
-
-    return {
-      before,
-      lang: match[1] || "text",
-      code,
-      after,
-    };
-  });
   // The first url the body renders as a link, trimmed the same way, so
   // "(see https://a.b)" or [label](https://a.b) previews https://a.b, and a
   // url written as code gets no preview.
@@ -640,26 +615,6 @@
     update();
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
-  });
-
-  $effect(() => {
-    highlightedCode = null;
-    if (!asCodeBlock) return;
-    // Loaded on demand: the highlighter engine plus its wasm is well over
-    // half a megabyte, and most sessions never see a code block.
-    import("shiki")
-      .then(({ codeToHtml }) =>
-        codeToHtml(asCodeBlock.code, {
-          lang: asCodeBlock.lang,
-          theme: "github-dark",
-        })
-      )
-      .then((html) => {
-        highlightedCode = html;
-      })
-      .catch(() => {
-        highlightedCode = `<pre><code>${escapeHtml(asCodeBlock.code)}</code></pre>`;
-      });
   });
 
   $effect(() => {
@@ -783,35 +738,10 @@
     }
   }
 
-  /**
-   * Drop the C0 controls, keeping only newline and tab (and DEL, which behaves
-   * like one).
-   *
-   * A fenced block is peer text on its way to a terminal, and the bytes that
-   * do not show on screen are the dangerous ones: a `\r` rewrites the line the
-   * reader thinks they pasted, and an escape byte can drive the terminal
-   * itself. What was copied has to be what was displayed.
-   */
-  function stripControlChars(text: string): string {
-    // eslint-disable-next-line no-control-regex
-    return text.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "");
-  }
-
-  async function copyCodeBlock() {
-    if (!asCodeBlock) return;
-    await navigator.clipboard.writeText(stripControlChars(asCodeBlock.code));
-    copiedCode = true;
-    setTimeout(() => {
-      copiedCode = false;
-    }, 1200);
-  }
-
   /** Every message body goes through here: markdown, links, mentions, emoji. */
   function renderBody(text: string): string {
     return renderMessageMarkdown(text, resolveMentionDisplayName);
   }
-
-
 
   function onVideoMeta() {
     if (!videoEl) return;
@@ -834,7 +764,8 @@
       <!-- Through renderBody like every other body: rendered raw, a caption
            showed mention tokens as @[did:key:...] instead of the name. A div,
            not a p: markdown can put a heading or a list in it. -->
-      <div class="whitespace-pre-wrap mb-2">{@html renderBody(content)}</div>
+      {@const body = renderBody(content)}
+      <div class="whitespace-pre-wrap mb-2" {@attach codeBlocks(body)}>{@html body}</div>
     {/if}
 
     <div class="space-y-2">
@@ -1051,31 +982,6 @@
         </div>
       {/each}
     </div>
-  {:else if codeSegments}
-    {#if codeSegments.before}
-      <div class="whitespace-pre-wrap mb-2">{@html renderBody(codeSegments.before)}</div>
-    {/if}
-    <div
-      class="relative overflow-x-auto rounded-md border border-border/70 bg-muted/30 p-2 [&_.shiki]:bg-transparent! {codeSegments.after ? 'mb-2' : ''}"
-    >
-      <button
-        type="button"
-        class="absolute right-2 top-2 z-10 inline-flex size-7 items-center justify-center rounded border border-border/70 bg-card text-muted-foreground hover:text-foreground"
-        onclick={copyCodeBlock}
-        aria-label={copiedCode ? "Copied" : "Copy code"}
-      >
-        {#if copiedCode}
-          <Check class="size-3.5" />
-        {:else}
-          <Copy class="size-3.5" />
-        {/if}
-      </button>
-      {@html highlightedCode ??
-        `<pre><code>${escapeHtml(codeSegments.code)}</code></pre>`}
-    </div>
-    {#if codeSegments.after}
-      <div class="whitespace-pre-wrap">{@html renderBody(codeSegments.after)}</div>
-    {/if}
   {:else if isGifMessage}
     <div class="group relative inline-block">
       <button
@@ -1201,7 +1107,8 @@
       </div>
     {/if}
   {:else}
-    <div class="whitespace-pre-wrap">{@html renderBody(content)}</div>
+    {@const body = renderBody(content)}
+    <div class="whitespace-pre-wrap" {@attach codeBlocks(body)}>{@html body}</div>
 
     {#if mediaPrefs.externalMedia && linkedUrl && ogPreview}
       <div

@@ -25,8 +25,22 @@ type ResolveName = (did: string) => string;
 
 const LINK_CLASS = "text-primary hover:underline";
 const CODE_CLASS = "rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]";
-const PRE_CLASS =
-  "my-1 overflow-x-auto whitespace-pre rounded-md border border-border/70 bg-muted/30 p-2 font-mono text-[0.85em]";
+/**
+ * A fenced block: the box, a copy button, and a <pre data-lang> that
+ * actions/code-blocks.ts highlights once the message is on screen and whose
+ * button it answers. Every block gets both, not only a message's first.
+ */
+const CODE_BLOCK_CLASS =
+  "relative my-1 overflow-x-auto rounded-md border border-border/70 bg-muted/30 p-2 [&_.shiki]:bg-transparent!";
+const PRE_CLASS = "whitespace-pre pr-9 font-mono text-[0.85em]";
+const COPY_CLASS =
+  "group/copy absolute right-2 top-2 z-10 inline-flex size-7 cursor-pointer items-center justify-center rounded border border-border/70 bg-card text-muted-foreground hover:text-foreground";
+const ICON_ATTRS =
+  'xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+/** Lucide's copy and check, swapped by the button's data-copied. */
+const COPY_ICONS =
+  `<svg ${ICON_ATTRS} class="group-data-[copied]/copy:hidden"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>` +
+  `<svg ${ICON_ATTRS} class="hidden group-data-[copied]/copy:block"><path d="M20 6 9 17l-5-5"/></svg>`;
 const LIST_CLASS = "list-disc pl-5";
 const HEADING_CLASS: Record<number, string> = {
   1: "text-[1.5em] font-bold leading-tight",
@@ -229,16 +243,49 @@ function inline(src: string, resolveName: ResolveName, links = true, plain = fal
   return marked.replace(PARKED_RE, (_, i: string) => parked[Number(i)]);
 }
 
+interface Fence {
+  /** Text on the opening line before the fence ("look: ```js"). */
+  lead: string;
+  /** Text on the closing line after the fence ("``` done"). */
+  tail: string;
+  lang: string;
+  body: string;
+  /** Index of the closing line. */
+  end: number;
+}
+
+const FENCE_OPEN_RE = /^(.*?)```([\w-]*)\s*$/;
+const FENCE_CLOSE_RE = /^(.*?)```\s*$/;
+/** "``` done": a close with words after it, which the words then follow. */
+const FENCE_CLOSE_THEN_RE = /^```\s+(\S.*)$/;
+const closesFence = (line: string) => {
+  const close = FENCE_CLOSE_RE.exec(line);
+  return (!!close && !close[1].includes("`")) || FENCE_CLOSE_THEN_RE.test(line);
+};
+
 /**
- * The line that closes a fence opened at `lines[i]`, or -1. A fence only
- * counts once it closes; an unclosed one is plain text.
+ * The fenced block opened at `lines[i]`, or null. A fence only counts once
+ * it closes; an unclosed one is plain text. Chat writes fences loosely, and
+ * both of these were code before markdown and stay code: an opening fence
+ * after some words ("look: ```js"), a closing one on the last line of code
+ * ("}```"), and a closing one followed by words ("``` done"). "```js" never
+ * closes a fence, so a fence written out inside code stays inside it.
+ *
+ * `closeAt[k]` is the first closing line at or after k (-1 for none), found
+ * once per message: scanning ahead from every opener was quadratic, and a
+ * peer's message of nothing but "```a" lines stalled every render of it for
+ * seconds.
  */
-function fenceEnd(lines: string[], i: number): number {
-  if (!/^```[\w-]*\s*$/.test(lines[i])) return -1;
-  for (let end = i + 1; end < lines.length; end++) {
-    if (/^```\s*$/.test(lines[end])) return end;
-  }
-  return -1;
+function fenceAt(lines: string[], i: number, closeAt: number[]): Fence | null {
+  const open = FENCE_OPEN_RE.exec(lines[i]);
+  if (!open || open[1].includes("`")) return null;
+  const end = closeAt[i + 1];
+  if (end === -1) return null;
+  const body = lines.slice(i + 1, end);
+  const then = FENCE_CLOSE_THEN_RE.exec(lines[end]);
+  const last = then ? "" : FENCE_CLOSE_RE.exec(lines[end])![1];
+  if (last.trim()) body.push(last);
+  return { lead: open[1].trim(), tail: then?.[1] ?? "", lang: open[2], body: body.join("\n"), end };
 }
 
 /**
@@ -259,7 +306,7 @@ export function firstLinkedUrl(content: string): string | null {
 }
 
 type Line =
-  | { kind: "fence"; body: string }
+  | { kind: "fence"; lang: string; body: string }
   | { kind: "item"; text: string }
   | { kind: "heading"; level: number; text: string }
   | { kind: "text"; text: string };
@@ -269,12 +316,19 @@ function classify(content: string): Line[] {
   // A peer's client may send CRLF: a stray \r would keep a heading or an
   // empty line from reading as one.
   const lines = content.split(/\r?\n/);
+  const closeAt: number[] = new Array(lines.length + 1);
+  closeAt[lines.length] = -1;
+  for (let k = lines.length - 1; k >= 0; k--) {
+    closeAt[k] = closesFence(lines[k]) ? k : closeAt[k + 1];
+  }
   const out: Line[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const end = fenceEnd(lines, i);
-    if (end !== -1) {
-      out.push({ kind: "fence", body: lines.slice(i + 1, end).join("\n") });
-      i = end;
+    const fence = fenceAt(lines, i, closeAt);
+    if (fence) {
+      if (fence.lead) out.push({ kind: "text", text: fence.lead });
+      out.push({ kind: "fence", lang: fence.lang, body: fence.body });
+      if (fence.tail) out.push({ kind: "text", text: fence.tail });
+      i = fence.end;
       continue;
     }
     const item = /^\s*[-*]\s+(\S.*)$/.exec(lines[i]);
@@ -322,7 +376,14 @@ export function renderMessageMarkdown(content: string, resolveName: ResolveName)
     }
     flushList();
     if (line.kind === "fence") {
-      out.push({ block: true, html: `<pre class="${PRE_CLASS}"><code>${code(line.body, resolveName)}</code></pre>` });
+      out.push({
+        block: true,
+        html:
+          `<div class="${CODE_BLOCK_CLASS}" data-code-block>` +
+          `<button type="button" class="${COPY_CLASS}" data-copy-code aria-label="Copy code">${COPY_ICONS}</button>` +
+          `<pre class="${PRE_CLASS}" data-lang="${escapeHtml(line.lang || "text")}"><code>${code(line.body, resolveName)}</code></pre>` +
+          `</div>`,
+      });
     } else if (line.kind === "heading") {
       const h = `h${line.level}`;
       out.push({ block: true, html: `<${h} class="${HEADING_CLASS[line.level]}">${inline(line.text, resolveName)}</${h}>` });

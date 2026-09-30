@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { MessageType, type Message } from "$lib/types/message";
-import { getQuotableText } from "./quote-helper";
+import { QUOTE_SHOWN_CHARS, getQuotableText, trimContent } from "./quote-helper";
+import { stripMarkdown } from "./markdown";
 
 function makeMessage(overrides: Partial<Message> = {}): Message {
   return {
@@ -194,5 +195,50 @@ describe("quote helper", () => {
     // Text that mentions https but doesn't start with it is preserved
     const textMsg = makeMessage({ content: "I posted https://example.com/image" });
     expect(getQuotableText(textMsg)).toBe("I posted https://example.com/image");
+  });
+});
+
+describe("trimContent", () => {
+  const pad = (n: number) => "x ".repeat(n);
+
+  it("backs off before a link it would cut in half", () => {
+    const cut = trimContent(pad(70) + "see [the full plan](https://example.com/a/very/long/path) now");
+    expect(cut).toBe(pad(70).trimEnd() + " see...");
+    expect(stripMarkdown(cut)).not.toContain("[");
+  });
+
+  it("backs off before a code span or a fence it would leave open", () => {
+    expect(trimContent(pad(75) + "`" + "c".repeat(40) + "`")).toBe(pad(75).trimEnd() + "...");
+    expect(trimContent(pad(70) + "```js\n" + "c".repeat(60) + "\n```")).toBe(pad(70).trimEnd() + "...");
+  });
+
+  it("closes a fence or code span the message opens with, rather than quote only \"...\"", () => {
+    const fenced = trimContent("```js\n" + "c".repeat(300) + "\n```");
+    expect(stripMarkdown(fenced)).toBe("c".repeat(151) + "...");
+    expect(trimContent("`" + "c".repeat(300) + "`")).toBe("`" + "c".repeat(156) + "...`");
+  });
+
+  it("does not back off to a backtick or bracket that never closes", () => {
+    expect(trimContent("don`t " + pad(100))).toBe(("don`t " + pad(100)).slice(0, 157).trimEnd() + "...");
+    expect(trimContent("ok :[ " + pad(100))).toBe(("ok :[ " + pad(100)).slice(0, 157).trimEnd() + "...");
+  });
+
+  it("does not count the backticks inside a closed fence", () => {
+    const text = "```\nit's `odd\n```\n" + pad(100);
+    expect(trimContent(text)).toBe(text.slice(0, 157).trimEnd() + "...");
+  });
+
+  it("keeps markup that closes inside the cut", () => {
+    const text = "[a](https://a.bc) `x` " + "y".repeat(200);
+    expect(trimContent(text).startsWith("[a](https://a.bc) `x` ")).toBe(true);
+  });
+
+  it("takes far more for a quote shown on screen, still cut safely", () => {
+    const long = "z".repeat(300);
+    expect(getQuotableText(makeMessage({ content: long }), QUOTE_SHOWN_CHARS)).toBe(long);
+    const huge = "hi\n```js\n" + "c".repeat(5000) + "\n```";
+    const shown = stripMarkdown(getQuotableText(makeMessage({ content: huge }), QUOTE_SHOWN_CHARS));
+    expect(shown.length).toBeLessThan(2100);
+    expect(shown).not.toContain("```");
   });
 });

@@ -4,7 +4,11 @@ import { firstLinkedUrl, renderMessageMarkdown, stripMarkdown, trimUrl } from ".
 const names: Record<string, string> = { "did:key:zAna": "Ana" };
 const md = (s: string) => renderMessageMarkdown(s, (did) => names[did] ?? did.slice(0, 8));
 /** The rendered markup without its classes, which are not what is under test. */
-const plain = (s: string) => md(s).replace(/ class="[^"]*"/g, "");
+const plain = (s: string) =>
+  md(s)
+    .replace(/ class="[^"]*"/g, "")
+    // A fenced block's box and copy button, down to its <pre>: tested on its own below.
+    .replace(/<div data-code-block><button[^]*?<\/button>(<pre)[^>]*(>[^]*?<\/pre>)<\/div>/g, "$1$2");
 
 describe("inline markdown", () => {
   it("renders bold, italic, strikethrough and code", () => {
@@ -273,5 +277,37 @@ describe("emphasis at scale", () => {
     stripMarkdown(hostile);
     renderMessageMarkdown(hostile, (d) => d);
     expect(performance.now() - started).toBeLessThan(500);
+  });
+});
+
+describe("fenced blocks", () => {
+  it("gives every block its language and a copy button, not only the first", () => {
+    const html = md("```js\nlet a = 1\n```\nand\n```py\nb = 2\n```");
+    expect(html.match(/data-copy-code/g)).toHaveLength(2);
+    expect(html).toContain('data-lang="js"><code>let a = 1</code>');
+    expect(html).toContain('data-lang="py"><code>b = 2</code>');
+    expect(md("```\nplain\n```")).toContain('data-lang="text"');
+  });
+
+  it("closes on \"``` done\", the words after it following the block", () => {
+    expect(plain("```\ncode\n``` done")).toBe("<pre><code>code</code></pre>done");
+    // A fence written out inside code does not close it.
+    expect(plain("```md\n```js\nx\n```")).toBe("<pre><code>```js\nx</code></pre>");
+  });
+
+  it("keeps the loose fences chat has always accepted", () => {
+    expect(plain("look: ```js\nx()\n```")).toBe("look:<pre><code>x()</code></pre>");
+    expect(plain("```\nif (a) {\n}```")).toBe("<pre><code>if (a) {\n}</code></pre>");
+  });
+
+  it("stays linear on a message of openers that never close", () => {
+    const started = performance.now();
+    md("```a\n".repeat(13000));
+    stripMarkdown("```a\n".repeat(13000));
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("escapes a language that is not one", () => {
+    expect(md('```"><img src=x onerror=alert(1)>\nx\n```')).not.toMatch(/<img/);
   });
 });
