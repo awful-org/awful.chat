@@ -4267,6 +4267,28 @@ export async function removeRoomCompletely(roomCode: string): Promise<void> {
   transportState.peerRoomProfiles = scoped;
 }
 
+/** Called after device sync has already removed the room from storage. */
+export function forgetSyncedRoom(roomCode: string): void {
+  if (!_transport.rooms().includes(roomCode) &&
+      !roomsStore.rooms.some(room => room.roomCode === roomCode) &&
+      transportState.roomCode !== roomCode &&
+      !transportState.peerRoomProfiles.has(roomCode)) return;
+  beginConversationOpen();
+  if (_transport.rooms().includes(roomCode)) _transport.leaveRoom(roomCode);
+  if (transportState.callRoomCode === roomCode) leaveCall();
+  if (transportState.roomCode === roomCode) {
+    transportState.roomCode = null;
+    transportState.roomName = "";
+    transportState.roomUsers = [];
+    transportState.messages = [];
+    transportState.connected = false;
+  }
+  roomsStore.rooms = roomsStore.rooms.filter(room => room.roomCode !== roomCode);
+  const scoped = new Map(transportState.peerRoomProfiles);
+  scoped.delete(roomCode);
+  transportState.peerRoomProfiles = scoped;
+}
+
 export function leaveRoom(): void {
   void _leaveCurrentRoom();
 }

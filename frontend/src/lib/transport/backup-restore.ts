@@ -64,7 +64,8 @@ import {
 } from "./backup";
 import type { RoomProfileField } from "../room-profile";
 
-export async function applyRoomDeletionMarkers(markers: unknown[]): Promise<void> {
+export async function applyRoomDeletionMarkers(markers: unknown[]): Promise<string[]> {
+  const removed: string[] = [];
   for (const value of markers) {
     if (!isValidRoomDeletionMarker(value)) continue;
     const marker = value as RoomDeletionMarker;
@@ -80,8 +81,10 @@ export async function applyRoomDeletionMarkers(markers: unknown[]): Promise<void
     if (room?.type === "text") {
       await deleteMessagesForRoom(marker.roomCode);
       await deleteRoom(marker.roomCode);
+      removed.push(marker.roomCode);
     }
   }
+  return removed;
 }
 
 function roomProfileFromExport(raw: RoomProfileExport): OwnRoomProfileRecord {

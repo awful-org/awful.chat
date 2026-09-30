@@ -7,6 +7,7 @@ const s = vi.hoisted(() => ({
   profile: vi.fn(async (): Promise<any> => ({ nickname: "Alice" })),
   roomProfile: vi.fn(async (room: string): Promise<any> => ({ fields: { nickname: room === "rd2_room" ? "A" : "B" } })),
   direct: vi.fn(async (_peer: string, _frame: Uint8Array) => true),
+  leaveRoom: vi.fn(),
   roomSend: vi.fn(async (_peer: string, _room: string, _frame: Uint8Array) => true),
   roomPeer: "peer1",
   peerRoomRows: new Map<string, any[]>(), roomWrites: vi.fn(async (_room: string, _generation: number, _profile: any) => {}),
@@ -28,6 +29,7 @@ vi.mock("./libp2p/transport", () => ({ LibP2PTransport: class {
   isRoomPeer(room: string, peer: string) { return room !== "dm-peer" && peer === s.roomPeer; }
   isSecureRoom(room: string) { return room.startsWith("rd2_") || room.startsWith("dm-"); }
   send = s.direct; sendRoom = s.roomSend;
+  leaveRoom = s.leaveRoom;
   broadcast = s.broadcast; disconnect = s.disconnect;
 } }));
 vi.mock("./libp2p/voice", () => ({ LibP2PVoice: class { setCallPeers() {} } }));
@@ -70,7 +72,8 @@ vi.mock("./node-lock", () => ({ releaseNodeLock: vi.fn() }));
 vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
 
-import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch, peerIdToDid } from "./transport.svelte";
+import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch, peerIdToDid, forgetSyncedRoom } from "./transport.svelte";
+import { roomsStore } from "$lib/rooms.svelte";
 import { encode, decode } from "$lib/utils";
 import { hydrateLegacyAttachments } from "./files.svelte";
 import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
@@ -103,6 +106,17 @@ it("does not republish a scoped profile after a failed write or a concurrent lea
   finish();
   await new Promise(resolve => setTimeout(resolve, 0));
   expect(transportState.peerRoomProfiles.get("rd2_room")?.has("did:peer")).not.toBe(true);
+});
+
+it("forgets a remotely deleted room from the live subscription and reactive profile cache", () => {
+  roomsStore.rooms = [{ roomCode: "rd2_room" } as any];
+  transportState.roomCode = "rd2_room";
+  transportState.peerRoomProfiles = new Map([["rd2_room", new Map([["did:peer", { nickname: "Room" } as any]])]]);
+  forgetSyncedRoom("rd2_room");
+  expect(s.leaveRoom).toHaveBeenCalledWith("rd2_room");
+  expect(roomsStore.rooms).toEqual([]);
+  expect(transportState.roomCode).toBeNull();
+  expect(transportState.peerRoomProfiles.has("rd2_room")).toBe(false);
 });
 
 it("keeps marked profiles in their authenticated room and leaves the main profile intact", async () => {

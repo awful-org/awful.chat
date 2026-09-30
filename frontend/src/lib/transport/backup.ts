@@ -29,6 +29,16 @@ export type RoomProfileExport = Omit<OwnRoomProfileRecord, "fields"> & {
   fields: Partial<Record<RoomProfileField, string | boolean | null>>;
 };
 
+/** JSON has no ArrayBuffer representation, including inside nested overrides. */
+export function roomProfileToExport(record: OwnRoomProfileRecord): RoomProfileExport {
+  const fields = { ...record.fields } as RoomProfileExport["fields"];
+  for (const key of ["pfpData", "bannerData"] as const) {
+    const bytes = record.fields[key];
+    if (bytes instanceof ArrayBuffer) fields[key] = bytesToBase64(new Uint8Array(bytes));
+  }
+  return { ...record, fields };
+}
+
 export interface AttachmentExport {
   encryption?: Attachment["encryption"];
   id: string;
@@ -102,7 +112,8 @@ export const BACKUP_FORMAT = "awful.chat/backup";
 // v2: attachment and saved-gif bytes are base64 strings, not number[]. An
 // old build restoring a v2 file would coerce the string to garbage bytes, so
 // it must refuse cleanly on the version instead.
-export const BACKUP_VERSION = 2;
+// v3 adds room overrides and leave markers. A v2 reader would discard them.
+export const BACKUP_VERSION = 3;
 
 export interface BackupFile extends DatabaseExport {
   format: typeof BACKUP_FORMAT;
