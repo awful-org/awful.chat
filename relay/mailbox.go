@@ -33,7 +33,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -271,8 +273,6 @@ func mailboxIDForDid(did string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// verifyMailboxAuth checks the collect/ack proof: an ed25519 signature by
-// the did's key over "awful-mailbox:{unix-seconds}", fresh within the skew.
 // The canonical and non-canonical encodings of the eight ed25519 points with
 // order dividing 8. Rejecting them is what libsodium does and what
 // RFC8032-strict verifiers do; Go's stdlib does neither.
@@ -301,7 +301,16 @@ func isSmallOrderPubKey(pub []byte) bool {
 	return new(edwards25519.Point).MultByCofactor(p).Equal(edwards25519.NewIdentityPoint()) == 1
 }
 
+// verifyMailboxAuth checks the LEGACY (v1) proof: a signature over
+// "awful-mailbox:{unix-seconds}" and nothing else. See authenticateMailbox
+// for the one place it is still accepted, and why.
 func verifyMailboxAuth(did string, ts int64, sigB64 string) (string, error) {
+	return verifyMailboxSignature(did, ts, sigB64, []byte("awful-mailbox:"+strconv.FormatInt(ts, 10)))
+}
+
+// verifyMailboxSignature checks that sigB64 is the did's signature over msg,
+// made within the freshness window around ts, and returns the did's box.
+func verifyMailboxSignature(did string, ts int64, sigB64 string, msg []byte) (string, error) {
 	if d := time.Since(time.Unix(ts, 0)); d > mailboxAuthSkew || d < -mailboxAuthFutureSkew {
 		return "", fmt.Errorf("stale timestamp")
 	}
@@ -321,11 +330,138 @@ func verifyMailboxAuth(did string, ts int64, sigB64 string) (string, error) {
 	if isSmallOrderPubKey(pub) {
 		return "", fmt.Errorf("small-order public key")
 	}
-	msg := []byte("awful-mailbox:" + strconv.FormatInt(ts, 10))
 	if !ed25519.Verify(pub, msg, sig) {
 		return "", fmt.Errorf("bad signature")
 	}
 	return mailboxIDForDid(did), nil
+}
+
+// ── Request auth, v2 ─────────────────────────────────────────────────────
+
+// The v1 proof was a signature over "awful-mailbox:<ts>" and nothing else,
+// so ONE captured proof was good for about two and a half minutes on all
+// four authenticated calls: collect, ack, push subscribe and push
+// unsubscribe. The device field that scopes an ack sat outside the
+// signature too. Anyone who saw one request - a proxy log, a shared
+// network, a browser extension - could replay it as an ack naming the
+// victim's device (hiding its offline mail from it), subscribe their OWN
+// push endpoint to the victim's box, or unsubscribe the victim's.
+//
+// A v2 proof signs what the request does:
+//
+//	awful-mailbox:v2:<action>:<host>:<device>:<ts>:<hex sha256 of the body>
+//
+// action is one of the four below, host is the relay's Host as the client
+// addressed it (so a proof for one relay is worthless at another), device is
+// the body's device field, and the body hash covers everything else in the
+// request - the ack's ids, the subscription's endpoint and keys. The proof
+// travels in the Authorization header, which the CORS preflight already
+// allows, since it cannot be inside the body it signs. The client puts a
+// random nonce in the body, so two otherwise identical requests in the same
+// second are still two different proofs, and each proof is accepted once
+// (mailboxAuthFirstUse).
+const (
+	mailboxActionCollect  = "collect"
+	mailboxActionAck      = "ack"
+	pushActionSubscribe   = "push-subscribe"
+	pushActionUnsubscribe = "push-unsubscribe"
+	mailboxAuthScheme     = "AwfulMailbox-v2"
+)
+
+func mailboxAuthMessage(action, host, device string, ts int64, bodySha256Hex string) []byte {
+	return []byte("awful-mailbox:v2:" + action + ":" + host + ":" + device + ":" +
+		strconv.FormatInt(ts, 10) + ":" + bodySha256Hex)
+}
+
+// readMailboxBody reads an authenticated call's body whole, bounded, since
+// the v2 proof is over its exact bytes.
+func readMailboxBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return nil, false
+	}
+	return body, true
+}
+
+// authenticateMailbox proves the request's did for one action and returns
+// its box. A v2 proof comes in the Authorization header. Without one, the
+// v1 fields from the body are accepted for COLLECT ONLY, during the
+// transition:
+//
+// A cached app from before v2 keeps working for the thing that matters most
+// - receiving offline DMs - until it reloads, and collect is the one call
+// whose replay changes nothing: the blobs it returns are sealed to the
+// recipient, and a captured proof reveals only what is waiting (count,
+// padded sizes, times), not what it says. Its acks and push calls fail
+// until the reload, which costs a duplicate delivery (deduplicated by id)
+// and a missed wake-up, not a message. Those three are the calls a replay
+// can do harm with, so none of them takes v1. A v1 collect is not put
+// through the replay cache: v1 signatures are deterministic per second, so
+// an old client collecting twice in one second would be refused its own
+// second collect, and a replay of a read gains nothing a replay cache would
+// stop. Remove the v1 branch once old clients have aged out.
+func authenticateMailbox(r *http.Request, action string, body []byte, device, legacyDid string, legacyTs int64, legacySig string) (string, error) {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, mailboxAuthScheme+" ") {
+		f := strings.Fields(h[len(mailboxAuthScheme)+1:])
+		if len(f) != 3 {
+			return "", errors.New("malformed authorization")
+		}
+		ts, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			return "", errors.New("malformed timestamp")
+		}
+		sum := sha256.Sum256(body)
+		msg := mailboxAuthMessage(action, strings.ToLower(r.Host), device, ts, hex.EncodeToString(sum[:]))
+		box, err := verifyMailboxSignature(f[0], ts, f[2], msg)
+		if err != nil {
+			return "", err
+		}
+		if !mailboxAuthFirstUse(f[2], ts) {
+			return "", errors.New("replayed proof")
+		}
+		return box, nil
+	}
+	if action != mailboxActionCollect {
+		return "", errors.New("this call needs a v2 proof")
+	}
+	return verifyMailboxAuth(legacyDid, legacyTs, legacySig)
+}
+
+// Proofs already accepted, so each one works once. An entry is needed only
+// while its timestamp is still inside the freshness window; after that the
+// timestamp check refuses the proof on its own. The cap bounds memory
+// against a flood of freshly signed proofs from free dids; past it the
+// oldest entries go first, which can only reopen a proof that has almost
+// certainly expired already - and a v2 replay repeats one request exactly,
+// so even that would do nothing new.
+const mailboxSeenMax = 1 << 16
+
+var (
+	mailboxSeenMu    sync.Mutex
+	mailboxSeen      = map[string]time.Time{}
+	mailboxSeenOrder []string
+)
+
+func mailboxAuthFirstUse(sig string, ts int64) bool {
+	now := time.Now()
+	expires := time.Unix(ts, 0).Add(mailboxAuthSkew + time.Second)
+	mailboxSeenMu.Lock()
+	defer mailboxSeenMu.Unlock()
+	for len(mailboxSeenOrder) > 0 {
+		oldest := mailboxSeenOrder[0]
+		if exp, ok := mailboxSeen[oldest]; ok && now.Before(exp) && len(mailboxSeenOrder) < mailboxSeenMax {
+			break
+		}
+		delete(mailboxSeen, oldest)
+		mailboxSeenOrder = mailboxSeenOrder[1:]
+	}
+	if exp, ok := mailboxSeen[sig]; ok && now.Before(exp) {
+		return false
+	}
+	mailboxSeen[sig] = expires
+	mailboxSeenOrder = append(mailboxSeenOrder, sig)
+	return true
 }
 
 func mailboxCORS(w http.ResponseWriter, r *http.Request) bool {
@@ -727,7 +863,11 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		Sig    string `json:"sig"`
 		Device string `json:"device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 4096)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -735,7 +875,7 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	box, err := authenticateMailbox(r, mailboxActionCollect, body, req.Device, req.Did, req.Ts, req.Sig)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -788,13 +928,14 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Did    string   `json:"did"`
-		Ts     int64    `json:"ts"`
-		Sig    string   `json:"sig"`
 		IDs    []string `json:"ids"`
 		Device string   `json:"device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 16*1024)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -802,7 +943,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	box, err := authenticateMailbox(r, mailboxActionAck, body, req.Device, "", 0, "")
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

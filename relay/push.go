@@ -679,9 +679,6 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Did          string `json:"did"`
-		Ts           int64  `json:"ts"`
-		Sig          string `json:"sig"`
 		Device       string `json:"device"`
 		Subscription struct {
 			Endpoint string `json:"endpoint"`
@@ -691,7 +688,11 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 			} `json:"keys"`
 		} `json:"subscription"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 8*1024)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -708,10 +709,12 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad keys", http.StatusBadRequest)
 		return
 	}
-	// The same auth the mailbox uses, verbatim: same signed string, same
-	// helper, same skew, and the same box derivation - so a subscription can
-	// only ever be filed under the box its holder can also collect from.
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	// The mailbox's auth, for this action: the same key, skew and box
+	// derivation - so a subscription can only ever be filed under the box
+	// its holder can also collect from - and a proof that signs this
+	// endpoint and this device, so a captured one cannot subscribe anybody
+	// else's.
+	box, err := authenticateMailbox(r, pushActionSubscribe, body, req.Device, "", 0, "")
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -764,12 +767,13 @@ func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Did    string `json:"did"`
-		Ts     int64  `json:"ts"`
-		Sig    string `json:"sig"`
 		Device string `json:"device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 4096)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -777,7 +781,7 @@ func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	box, err := authenticateMailbox(r, pushActionUnsubscribe, body, req.Device, "", 0, "")
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

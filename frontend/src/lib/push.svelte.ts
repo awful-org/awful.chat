@@ -1,4 +1,5 @@
 import { ed25519 } from "@noble/curves/ed25519.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { isUnlocked, requireSession } from "$lib/identity/identity";
 import { apiUrl } from "$lib/runtime-config";
 
@@ -44,22 +45,47 @@ export const pushPrefs = $state({
 
 const b64 = (u: Uint8Array): string => btoa(String.fromCharCode(...u));
 
+const hex = (u: Uint8Array): string =>
+  Array.from(u, (b) => b.toString(16).padStart(2, "0")).join("");
+
+type PushAction = "push-subscribe" | "push-unsubscribe";
+
 /**
- * The mailbox's auth fields, byte for byte: the relay checks ONE signature
- * string for every authenticated call, so subscribing proves the same thing
- * collecting does - that this client holds the key behind the DID.
+ * The mailbox's v2 proof (mailboxAuthMessage in mailbox.svelte.ts and
+ * relay/mailbox.go), for the two push calls. It signs the action, the
+ * relay's host, the device and the exact body - the endpoint and keys
+ * included - so a captured subscribe cannot be replayed to aim this box's
+ * wake-ups at somebody else's endpoint, and a captured collect cannot
+ * unsubscribe this device.
  *
- * Rebuilt here rather than imported because mailbox.svelte.ts keeps it
- * private; the string below must stay identical to the one it signs.
+ * Rebuilt here rather than imported: mailbox.svelte.ts pulls in the libp2p
+ * stack at load, which this module must not (see the note at the top). The
+ * string below must stay identical to the one that module signs.
  */
-function authFields(): { did: string; ts: number; sig: string } {
+function signedRequest(
+  action: PushAction,
+  payload: { device: string } & Record<string, unknown>
+): { headers: Record<string, string>; body: string } {
   const session = requireSession();
+  const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
+  const body = JSON.stringify({ ...payload, nonce });
   const ts = Math.floor(Date.now() / 1000);
+  const base = typeof location === "undefined" ? undefined : location.href;
+  const host = new URL(API(), base).host;
+  const digest = hex(sha256(new TextEncoder().encode(body)));
   const sig = ed25519.sign(
-    new TextEncoder().encode(`awful-mailbox:${ts}`),
+    new TextEncoder().encode(
+      `awful-mailbox:v2:${action}:${host}:${payload.device}:${ts}:${digest}`
+    ),
     session.privateKey
   );
-  return { did: session.did, ts, sig: b64(sig) };
+  return {
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `AwfulMailbox-v2 ${session.did} ${ts} ${b64(sig)}`,
+    },
+    body,
+  };
 }
 
 /** base64url (what VAPID keys are published as) to the raw bytes
@@ -132,11 +158,14 @@ function remember(key: string, value: string | null): void {
 let lastPosted = "";
 let inFlight: Promise<boolean> | null = null;
 
-async function post(path: string, body: object): Promise<boolean> {
+async function post(
+  path: string,
+  action: PushAction,
+  payload: { device: string } & Record<string, unknown>
+): Promise<boolean> {
   const res = await fetch(`${API()}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    ...signedRequest(action, payload),
     signal: AbortSignal.timeout(8000),
   });
   return res.ok;
@@ -241,8 +270,7 @@ async function subscribe(): Promise<boolean> {
       return true;
     }
 
-    const ok = await post("/push/subscribe", {
-      ...authFields(),
+    const ok = await post("/push/subscribe", "push-subscribe", {
       device: dev,
       subscription: {
         endpoint: json.endpoint,
@@ -288,7 +316,7 @@ export async function disablePush(): Promise<void> {
   }
   try {
     if (API() && isUnlocked()) {
-      await post("/push/unsubscribe", { ...authFields(), device: dev });
+      await post("/push/unsubscribe", "push-unsubscribe", { device: dev });
     }
   } catch (err) {
     // The relay drops an endpoint the push service rejects anyway, so a

@@ -612,9 +612,14 @@ Crypto (frontend/src/lib/mailbox-crypto.ts, "awful-mailbox-v1"):
 Relay side (relay/mailbox.go):
   blobs keyed by a hash of the recipient DID; 16 KiB blob cap; unclaimed
   blobs expire after 48 h; deposits rate-limited and a global byte quota
-  caps total mailbox disk. Collection authenticates with an ed25519
-  signature over "awful-mailbox:<unix-ts>" by the recipient DID (accepted
-  with or without the multibase z prefix).
+  caps total mailbox disk. Collect, ack and the two push calls
+  authenticate with an ed25519 signature by the recipient DID (accepted
+  with or without the multibase z prefix) over
+  "awful-mailbox:v2:<action>:<relay host>:<device>:<unix-ts>:<hex sha256
+  of the body>", sent as "Authorization: AwfulMailbox-v2 <did> <ts>
+  <sig>"; the body carries a random nonce and each proof is accepted
+  once. The old proof over "awful-mailbox:<unix-ts>" alone is still
+  accepted for collect only, while pre-v2 clients age out.
   Devices: collect and ack carry the device's libp2p peerId. An ack hides
   the blob from THAT device only; the blob leaves at TTL or quota
   eviction, so a phone and a desktop on one identity each collect it
