@@ -24,6 +24,7 @@
   import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
   import { roomsStore } from "$lib/rooms.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { getScopedProfile } from "$lib/profile.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import {
     spotlightStore,
@@ -54,6 +55,14 @@
     }
     return roomsStore.rooms.find((r) => r.roomCode === code)?.name || code.slice(0, 12);
   });
+
+  function participantName(tile: { peerId: string; isLocal?: boolean }): string {
+    const room = transportState.callRoomCode;
+    if (tile.isLocal) return getScopedProfile(room?.startsWith("rd2_") ? room : null).nickname || "You";
+    const did = peerIdToDid(tile.peerId) || tile.peerId;
+    const scoped = room?.startsWith("rd2_") ? transportState.peerRoomProfiles.get(room)?.get(did) : undefined;
+    return scoped?.nickname || transportState.peerNames.get(did) || transportState.peerNames.get(tile.peerId) || tile.peerId.slice(0, 8);
+  }
 
   function togglePip(): void {
     if (callPipPanel.browserPip) void exitBrowserPip();
@@ -263,9 +272,7 @@
         <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-2 py-2">
           <div class="flex items-center justify-between gap-2">
             <span class="text-xs font-medium text-white truncate">
-              {transportState.peerNames.get(peerIdToDid(spotlightTile.peerId) || spotlightTile.peerId) ||
-                transportState.peerNames.get(spotlightTile.peerId) ||
-                spotlightTile.peerId.slice(0, 8)}
+              {participantName(spotlightTile)}
             </span>
             {#if getSpeakingLabel(spotlightTile, speakers)}
               <span class="text-xs text-gray-300 shrink-0">

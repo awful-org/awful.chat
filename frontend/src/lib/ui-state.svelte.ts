@@ -6,6 +6,8 @@
 export const uiState = $state({
   settingsOpenRequested: false,
   settingsTab: null as string | null,
+  /** Room scope requested by an in-room profile card; null means Main. */
+  settingsProfileRoom: null as string | null,
   /**
    * Somebody asked to be taken back to the call they are in. Only AppView knows
    * how to get there - it owns the active conversation - and the button lives
@@ -65,8 +67,12 @@ export function openCameraPicker(): void {
   uiState.cameraPickerOpen = true;
 }
 
-export function openSettings(tab: string | null = null): void {
+export function openSettings(
+  tab: string | null = null,
+  profileRoom: string | null = null
+): void {
   uiState.settingsTab = tab;
+  uiState.settingsProfileRoom = profileRoom;
   uiState.settingsOpenRequested = true;
 }
 

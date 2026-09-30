@@ -5,16 +5,19 @@
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import {
-    profileStore,
-    saveName,
-    saveColor,
-    saveBanner,
-    saveTag,
-    saveTagColors,
-    saveBio,
-    saveNameEffectFields,
-    saveGradientColors,
+    getScopedProfile, hasScopedOverrides, loadRoomProfile, resetScopedProfile,
+    saveScopedFields,
+    saveName as mainSaveName,
+    saveColor as mainSaveColor,
+    saveBanner as mainSaveBanner,
+    saveTag as mainSaveTag,
+    saveTagColors as mainSaveTagColors,
+    saveBio as mainSaveBio,
+    saveNameEffectFields as mainSaveNameEffectFields,
+    saveGradientColors as mainSaveGradientColors,
   } from "$lib/profile.svelte";
+  import { roomsStore } from "$lib/rooms.svelte";
+  import { roomEditFields, shouldSaveEditedValue } from "./profile-editor";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
   import { identityStore, lock } from "$lib/identity/identity.svelte";
   import { nameEffectStyle, wireToModel, modelToWire, type NameEffectFill } from "$lib/name-effect";
@@ -26,15 +29,99 @@
     Pencil,
     Plus,
     Trash2,
+    Hash,
   } from "@lucide/svelte";
 
   interface Props {
     isMobile?: boolean;
     avatarDialogOpen?: boolean;
     onAvatarClick?: () => void;
+    roomCode?: string | null;
+    onRoomChange?: (roomCode: string | null) => void;
   }
 
-  let { isMobile = false, onAvatarClick }: Props = $props();
+  let { isMobile = false, avatarDialogOpen = false, onAvatarClick, roomCode = null, onRoomChange }: Props = $props();
+  const scopedProfile = $derived(getScopedProfile(roomCode));
+  const joinedRooms = $derived(roomsStore.rooms.filter(r => r.type === "text" && !r.movedTo));
+  let saveError = $state("");
+  let nameAtStart = "";
+  let tagAtStart = "";
+  let bioAtStart = "";
+  let tagTextColorAtStart: string | undefined;
+  let tagChipColorAtStart: string | undefined;
+  let switching = $state(false);
+  let bannerPickerRoom = $state<string | null>(null);
+  let scopeList = $state<HTMLDivElement | null>(null);
+
+  function roomNickname(code: string): string {
+    return getScopedProfile(code).nickname || "Anonymous";
+  }
+
+  async function saveRoomOrMain(scope: string | null, fields: Record<string, string | boolean | undefined>, mainSave: () => Promise<void>) {
+    try {
+      if (scope) await saveScopedFields(scope, roomEditFields(fields));
+      else await mainSave();
+      saveError = "";
+    } catch (error) {
+      saveError = "Could not save profile. Try again.";
+      editing = null;
+      throw error;
+    }
+  }
+  const saveName = (v: string, scope = roomCode) => saveRoomOrMain(scope, { nickname: v }, () => mainSaveName(v));
+  const saveColor = (v: string | undefined, scope = roomCode) => saveRoomOrMain(scope, { color: v }, () => mainSaveColor(v));
+  const saveBanner = (v: string | undefined, scope = roomCode) => saveRoomOrMain(scope, { bannerURL: v }, () => mainSaveBanner(v));
+  const saveTag = (v: string | undefined, scope = roomCode) => saveRoomOrMain(scope, { tagText: v?.toUpperCase() }, () => mainSaveTag(v));
+  const saveTagColors = (text: string | undefined, chip: string | undefined, scope = roomCode) => saveRoomOrMain(scope, { tagTextColor: text, tagChipColor: chip }, () => mainSaveTagColors(text, chip));
+  const saveBio = (v: string | undefined, scope = roomCode) => saveRoomOrMain(scope, { bio: v }, () => mainSaveBio(v));
+  const saveNameEffectFields = (effect: string | undefined, shimmer: boolean | undefined, glow: boolean | undefined, scope = roomCode) => saveRoomOrMain(scope, { nameEffect: effect, nameShimmer: shimmer, nameGlow: glow }, () => mainSaveNameEffectFields(effect, shimmer, glow));
+  const saveGradientColors = (second: string | undefined, third: string | undefined, scope = roomCode) => saveRoomOrMain(scope, { gradient2: second, gradient3: third }, () => mainSaveGradientColors(second, third));
+
+  async function selectRoom(next: string | null) {
+    if (switching || next === roomCode) return;
+    switching = true;
+    try {
+      if (editing === "name") await commitName();
+      else if (editing === "tag") await commitTag();
+      else if (editing === "bio") await commitBio();
+      if (next) await loadRoomProfile(next);
+      saveError = "";
+      onRoomChange?.(next);
+    } catch { /* keep the current scope and visible error */ }
+    finally { switching = false; }
+  }
+
+  $effect(() => {
+    if (roomCode && !joinedRooms.some(r => r.roomCode === roomCode)) onRoomChange?.(null);
+  });
+
+  // The dialog can open directly on the room that is currently visible. Load
+  // that scope before the editor reads its fields, just as a manual room
+  // selection does below.
+  $effect(() => {
+    if (roomCode && joinedRooms.some(r => r.roomCode === roomCode)) {
+      void loadRoomProfile(roomCode);
+    }
+  });
+
+  // Keep the selected scope visible when Profile opens on a room farther down
+  // the list, and when the user changes scope manually.
+  $effect(() => {
+    const selected = roomCode;
+    joinedRooms.length;
+    void tick().then(() => {
+      const list = scopeList;
+      if (!list) return;
+      const target = Array.from(
+        list.querySelectorAll<HTMLElement>("[data-profile-scope]")
+      ).find((element) =>
+        selected === null
+          ? element.dataset.mainProfile === "true"
+          : element.dataset.roomCode === selected
+      );
+      target?.scrollIntoView({ block: "nearest" });
+    });
+  });
 
   let nameValue = $state("");
   let colorValue = $state("#3b82f6");
@@ -51,25 +138,25 @@
     // the store mid-commit, which re-ran this sync and reset the color
     // locals to their OLD values before saveTagColors read them.
     if (editing) return;
-    nameValue = profileStore.nickname;
-    colorValue = profileStore.color ?? "#3b82f6";
-    tagText = profileStore.tagText ?? "";
-    tagTextColor = profileStore.tagTextColor ?? "#000000";
-    tagChipColor = profileStore.tagChipColor ?? "#e5e7eb";
-    bio = profileStore.bio ?? "";
+    nameValue = scopedProfile.nickname;
+    colorValue = scopedProfile.color ?? "#3b82f6";
+    tagText = scopedProfile.tagText ?? "";
+    tagTextColor = scopedProfile.tagTextColor ?? "#000000";
+    tagChipColor = scopedProfile.tagChipColor ?? "#e5e7eb";
+    bio = scopedProfile.bio ?? "";
 
     // Convert wire format to model
     const model = wireToModel(
-      profileStore.nameEffect,
-      profileStore.nameShimmer,
-      profileStore.nameGlow
+      scopedProfile.nameEffect,
+      scopedProfile.nameShimmer,
+      scopedProfile.nameGlow
     );
     nameFill = model.fill;
     nameShimmer = model.shimmer;
     nameGlow = model.glow;
 
-    gradient2Value = profileStore.gradient2 ?? "#a855f7";
-    gradient3Value = profileStore.gradient3 ?? null;
+    gradient2Value = scopedProfile.gradient2 ?? "#a855f7";
+    gradient3Value = scopedProfile.gradient3 ?? null;
   });
 
   const FILL_OPTIONS = ["none", "gradient", "rainbow"] as const;
@@ -142,7 +229,7 @@
   });
 
   const profileInitial = $derived(
-    (profileStore.nickname || nameValue || "?").charAt(0).toUpperCase()
+    (scopedProfile.nickname || nameValue || "?").charAt(0).toUpperCase()
   );
 
   const effectStyle = $derived.by(() => {
@@ -187,39 +274,44 @@
   }
 
   async function commitName() {
+    const scope = roomCode;
     const trimmed = nameValue.trim();
-    if (trimmed && trimmed !== profileStore.nickname) await saveName(trimmed);
+    if (trimmed && shouldSaveEditedValue(scope, trimmed, nameAtStart, scopedProfile.nickname)) await saveName(trimmed, scope);
     if (colorTouched) {
       const color = colorValue || undefined;
-      if (color !== (profileStore.color ?? undefined)) await saveColor(color);
+      if (color !== (scopedProfile.color ?? undefined)) await saveColor(color, scope);
     }
     if (gradientTouched) {
       const gradient2 = gradient2Value || undefined;
       const gradient3 = gradient3Value || undefined;
       if (
-        gradient2 !== (profileStore.gradient2 ?? undefined) ||
-        gradient3 !== (profileStore.gradient3 ?? undefined)
+        gradient2 !== (scopedProfile.gradient2 ?? undefined) ||
+        gradient3 !== (scopedProfile.gradient3 ?? undefined)
       ) {
-        await saveGradientColors(gradient2, gradient3);
+        await saveGradientColors(gradient2, gradient3, scope);
       }
     }
     editing = null;
   }
 
   async function commitTag() {
+    const scope = roomCode;
     // Snapshot before any await - belt to the effect-guard's suspenders.
     const trimmed = tagText.trim();
     const textColor = tagTextColor || undefined;
     const chipColor = tagChipColor || undefined;
-    if (trimmed !== (profileStore.tagText ?? "")) {
-      await saveTag(trimmed || undefined);
+    if (shouldSaveEditedValue(scope, trimmed, tagAtStart, scopedProfile.tagText ?? "")) {
+      await saveTag(trimmed || undefined, scope);
     }
-    await saveTagColors(textColor, chipColor);
+    if (textColor !== tagTextColorAtStart || chipColor !== tagChipColorAtStart) {
+      await saveTagColors(textColor, chipColor, scope);
+    }
     editing = null;
   }
 
   async function commitBio() {
-    if (bio !== (profileStore.bio ?? "")) await saveBio(bio || undefined);
+    const scope = roomCode;
+    if (shouldSaveEditedValue(scope, bio, bioAtStart, scopedProfile.bio ?? "")) await saveBio(bio || undefined, scope);
     editing = null;
   }
 
@@ -251,7 +343,9 @@
   <p class="text-xs font-mono text-muted-foreground -mt-2">
     This card is what others see. Click any part of it to change it.
   </p>
+  {#if saveError}<p role="alert" class="text-xs text-destructive">{saveError}</p>{/if}
 
+  <div class="flex flex-col items-stretch gap-4 lg:flex-row lg:items-start lg:justify-center">
   <!-- max-w-md, the real card's own width. "What others see" is only true
        if the preview is the same shape: object-cover crops to the box, so a
        preview twice as wide showed a thin band through the middle of a
@@ -262,13 +356,13 @@
     <!-- Banner: click to change -->
     <button
       type="button"
-      onclick={() => (bannerPickerOpen = true)}
+      onclick={() => { bannerPickerRoom = roomCode; bannerPickerOpen = true; }}
       aria-label="Change banner"
       class="group relative block h-40 w-full cursor-pointer overflow-hidden bg-linear-to-r from-primary/20 to-secondary/40 sm:h-48"
     >
-      {#if profileStore.bannerUrl}
+      {#if scopedProfile.bannerUrl}
         <GifImage
-          src={profileStore.bannerUrl}
+          src={scopedProfile.bannerUrl}
           alt="Profile banner"
           class="h-full w-full object-cover"
           animate={mediaPrefs.gifAutoplay ? true : "hover"}
@@ -281,10 +375,10 @@
         class="absolute inset-0 flex items-center justify-center gap-1.5 bg-black/50 font-mono text-xs text-white opacity-0 transition-opacity group-hover:opacity-100"
       >
         <Camera class="size-4" />
-        {profileStore.bannerUrl ? "Change banner" : "Add a banner"}
+        {scopedProfile.bannerUrl ? "Change banner" : "Add a banner"}
       </div>
     </button>
-    {#if profileStore.bannerUrl}
+    {#if scopedProfile.bannerUrl}
       <!-- Positioned against the card, not floated up out of the row below
            the banner on an offset that only worked at one banner height. -->
       <button
@@ -305,9 +399,9 @@
         aria-label="Change avatar"
         class="group relative -mt-13 flex size-20 items-center justify-center overflow-hidden rounded-full bg-primary/20 ring-4 ring-card cursor-pointer shrink-0"
       >
-        {#if profileStore.avatarUrl}
+        {#if scopedProfile.avatarUrl}
           <GifImage
-            src={profileStore.avatarUrl}
+            src={scopedProfile.avatarUrl}
             alt="Avatar"
             class="size-full object-cover"
             animate={mediaPrefs.gifAutoplay ? true : "hover"}
@@ -348,7 +442,7 @@
             onkeydown={(e) => {
               if (e.key === "Enter") void commitName();
               if (e.key === "Escape") {
-                nameValue = profileStore.nickname;
+                nameValue = scopedProfile.nickname;
                 editing = null;
               }
             }}
@@ -509,19 +603,20 @@
             onclick={() => {
               colorTouched = false;
               gradientTouched = false;
+              nameAtStart = scopedProfile.nickname;
               editing = "name";
             }}
             aria-label="Edit name, color and effect"
-            class="group flex min-w-0 cursor-pointer items-center gap-1.5 {profileStore.tagText
+            class="group flex min-w-0 cursor-pointer items-center gap-1.5 {scopedProfile.tagText
               ? 'max-w-[calc(100%-3.5rem)]'
               : 'max-w-full'}"
           >
             <span
               class="min-w-0 truncate text-left font-mono text-base font-semibold {effectStyle.class}"
               style={effectStyle.style ||
-                (profileStore.color ? `color: ${profileStore.color}` : "")}
+                (scopedProfile.color ? `color: ${scopedProfile.color}` : "")}
             >
-              {profileStore.nickname || "Anonymous"}
+              {scopedProfile.nickname || "Anonymous"}
             </span>
             <Pencil
               class="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100"
@@ -529,20 +624,20 @@
           </button>
 
           {#if editing !== "tag"}
-            {#if profileStore.tagText}
+            {#if scopedProfile.tagText}
               <button
                 type="button"
-                onclick={() => (editing = "tag")}
+                onclick={() => { tagAtStart = scopedProfile.tagText ?? ""; tagTextColorAtStart = scopedProfile.tagTextColor; tagChipColorAtStart = scopedProfile.tagChipColor; editing = "tag"; }}
                 aria-label="Edit tag"
                 class="shrink-0 cursor-pointer rounded px-2 py-0.5 font-mono text-xs font-semibold uppercase hover:opacity-80"
-                style={`background-color: ${profileStore.tagChipColor ?? "#e5e7eb"}; color: ${profileStore.tagTextColor ?? "#000000"}`}
+                style={`background-color: ${scopedProfile.tagChipColor ?? "#e5e7eb"}; color: ${scopedProfile.tagTextColor ?? "#000000"}`}
               >
-                {profileStore.tagText}
+                {scopedProfile.tagText}
               </button>
             {:else}
               <button
                 type="button"
-                onclick={() => (editing = "tag")}
+                onclick={() => { tagAtStart = scopedProfile.tagText ?? ""; tagTextColorAtStart = scopedProfile.tagTextColor; tagChipColorAtStart = scopedProfile.tagChipColor; editing = "tag"; }}
                 aria-label="Add a tag"
                 class="flex cursor-pointer items-center gap-0.5 rounded border border-dashed border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:border-primary/60 hover:text-foreground transition-colors"
               >
@@ -574,7 +669,7 @@
             onkeydown={(e) => {
               if (e.key === "Enter") commitTag();
               if (e.key === "Escape") {
-                tagText = profileStore.tagText ?? "";
+                tagText = scopedProfile.tagText ?? "";
                 editing = null;
               }
             }}
@@ -612,7 +707,7 @@
           >
             <Check class="size-4" />
           </button>
-          {#if profileStore.tagText}
+          {#if scopedProfile.tagText}
             <button
               type="button"
               onclick={async () => {
@@ -638,7 +733,7 @@
             onblur={commitBio}
             onkeydown={(e) => {
               if (e.key === "Escape") {
-                bio = profileStore.bio ?? "";
+                bio = scopedProfile.bio ?? "";
                 editing = null;
               }
             }}
@@ -653,14 +748,14 @@
       {:else}
         <button
           type="button"
-          onclick={() => (editing = "bio")}
+          onclick={() => { bioAtStart = scopedProfile.bio ?? ""; editing = "bio"; }}
           aria-label="Edit bio"
           class="group block min-h-20 w-full cursor-pointer rounded text-left"
         >
-          {#if profileStore.bio}
+          {#if scopedProfile.bio}
             <span
               class="whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground group-hover:text-foreground transition-colors"
-              >{profileStore.bio}</span
+              >{scopedProfile.bio}</span
             >
           {:else}
             <span
@@ -697,10 +792,72 @@
     </div>
   </div>
 
+  <aside class="w-full max-w-md rounded-lg border border-border/50 bg-card/70 p-2 lg:w-64 lg:max-w-none">
+    <div class="px-2 pb-2 pt-1">
+      <p class="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Profile scope</p>
+      <p class="mt-1 font-mono text-[11px] text-muted-foreground/70">Choose where this profile appears</p>
+    </div>
+    <div bind:this={scopeList} class="max-h-80 space-y-1 overflow-y-auto pr-1">
+      <button
+        type="button"
+        data-profile-scope
+        data-main-profile="true"
+        disabled={switching || bannerPickerOpen || avatarDialogOpen}
+        aria-current={roomCode === null ? "true" : undefined}
+        onclick={() => void selectRoom(null)}
+        class="flex w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-colors {roomCode === null ? 'border-primary/40 bg-primary/10 text-foreground shadow-sm' : 'border-transparent text-muted-foreground hover:bg-muted/70 hover:text-foreground'} disabled:cursor-default"
+      >
+        <span class="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground"><Hash class="size-4" /></span>
+        <span class="min-w-0 flex-1 truncate font-mono text-sm">Main Profile</span>
+        {#if roomCode === null}<span class="flex size-5 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">✓</span>{/if}
+      </button>
+      {#each joinedRooms as room (room.roomCode)}
+        {@const nickname = roomNickname(room.roomCode)}
+        {@const differs = nickname !== getScopedProfile(null).nickname}
+        {@const modified = hasScopedOverrides(room.roomCode)}
+        <button
+          type="button"
+          data-profile-scope
+          data-room-code={room.roomCode}
+          disabled={switching || bannerPickerOpen || avatarDialogOpen}
+          aria-current={roomCode === room.roomCode ? "true" : undefined}
+          onclick={() => void selectRoom(room.roomCode)}
+          class="flex w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-colors {roomCode === room.roomCode ? 'border-primary/40 bg-primary/10 text-foreground shadow-sm' : 'border-transparent text-muted-foreground hover:bg-muted/70 hover:text-foreground'} disabled:cursor-default"
+        >
+          {#if room.pfpURL}
+            <GifImage src={room.pfpURL} alt="" class="size-8 shrink-0 rounded-md object-cover" />
+          {:else}
+            <span class="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/15 font-mono text-xs font-semibold text-primary">{(room.name || "#").charAt(0).toUpperCase()}</span>
+          {/if}
+          <span class="min-w-0 flex-1">
+            <span class="block truncate font-mono text-sm">{room.name || "Unnamed room"}</span>
+            {#if differs}<span class="block truncate font-mono text-[10px] {roomCode === room.roomCode ? 'text-primary/70' : 'text-muted-foreground/70'}">{nickname}</span>{/if}
+          </span>
+          <span class="mt-0.5 flex size-5 shrink-0 translate-y-1.5 items-center justify-center self-start">
+            {#if modified}<span class="font-mono text-sm font-bold text-red-400" title="Room profile has custom fields">*</span>{/if}
+          </span>
+          <span class="flex size-5 shrink-0 items-center justify-center">
+            {#if roomCode === room.roomCode}<span class="flex size-5 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">✓</span>{/if}
+          </span>
+        </button>
+      {/each}
+    </div>
+    {#if roomCode && hasScopedOverrides(roomCode)}
+      <Button variant="outline" class="mt-2 w-full border-primary/30 bg-primary/5 text-xs hover:bg-primary/10" onclick={async () => {
+        try { await resetScopedProfile(roomCode!); saveError = ""; }
+        catch { saveError = "Could not save profile. Try again."; }
+      }}>Reset to main profile</Button>
+    {/if}
+  </aside>
+  </div>
+
   <AvatarPickerDialog
     open={bannerPickerOpen}
     onClose={() => (bannerPickerOpen = false)}
     target="banner"
+    scopeKey={bannerPickerRoom}
+    value={getScopedProfile(bannerPickerRoom).bannerUrl}
+    onSave={(value) => saveBanner(value, bannerPickerRoom)}
   />
 
   {#if isMobile}

@@ -121,7 +121,7 @@
   } from "$lib/call-spotlight.svelte";
   import type { CallState } from "$lib/call-tiles";
   import { closeAllPopouts, poppedOut, syncPopouts } from "$lib/call-popout.svelte";
-  import { profileStore } from "$lib/profile.svelte";
+  import { getScopedProfile } from "$lib/profile.svelte";
   import { setOnPictureInPictureEnter } from "$lib/plugins/media-session";
 
   const queryClient = new QueryClient();
@@ -981,6 +981,14 @@
     return buildTilesWithTracking(callState);
   });
 
+  function callDisplayName(tile: SpotlightTile): string {
+    const room = transportState.callRoomCode;
+    if (tile.isLocal) return getScopedProfile(room?.startsWith("rd2_") ? room : null).nickname || "You";
+    const did = peerIdToDid(tile.peerId) || tile.peerId;
+    const scoped = room?.startsWith("rd2_") ? transportState.peerRoomProfiles.get(room)?.get(did) : undefined;
+    return scoped?.nickname || transportState.peerNames.get(did) || transportState.peerNames.get(tile.peerId) || tile.peerId.slice(0, 8);
+  }
+
   // Calculate spotlight.
   const spotlightTileId = $derived(
     spotlight(
@@ -1041,10 +1049,7 @@
         spotlightStream = new MediaStream([spotlightTrack]);
       } else if (tile) {
         // No video: a still of the avatar, drawn once per spotlight change.
-        const label =
-          transportState.peerNames.get(
-            peerIdToDid(tile.peerId) || tile.peerId
-          ) ?? tile.peerId.slice(0, 8);
+        const label = callDisplayName(tile);
         spotlightStream = createCanvasPlaceholder(label, label.charAt(0));
       } else {
         spotlightStream = null;
@@ -1056,8 +1061,7 @@
       el.style.objectFit = spotlightFit;
     }
     const label = tile
-      ? (transportState.peerNames.get(peerIdToDid(tile.peerId) || tile.peerId) ??
-        tile.peerId.slice(0, 8))
+      ? callDisplayName(tile)
       : "";
     setPipSource(spotlightStream, label, spotlightFit);
   });
@@ -1073,10 +1077,7 @@
       return;
     }
     syncPopouts(tiles, (tile) =>
-      tile.isLocal
-        ? profileStore.nickname || "You"
-        : (transportState.peerNames.get(peerIdToDid(tile.peerId) || tile.peerId) ??
-          tile.peerId.slice(0, 8))
+      callDisplayName(tile)
     );
   });
 
