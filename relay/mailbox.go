@@ -425,7 +425,17 @@ func authenticateMailbox(r *http.Request, action string, body []byte, device, le
 		if err != nil {
 			return "", err
 		}
-		if !mailboxAuthFirstUse(f[2], ts) {
+		// Keyed on the signature's BYTES, not its text. Lenient base64 lets
+		// the unused low bits of the last character vary, so one proof has
+		// sixteen spellings that all decode to the same signature, and a
+		// cache keyed on the string took each as a new proof. Strict
+		// decoding refuses the non-canonical spellings outright, and the
+		// byte key would catch any that slipped through.
+		sigBytes, err := base64.StdEncoding.Strict().DecodeString(f[2])
+		if err != nil {
+			return "", errors.New("malformed signature")
+		}
+		if !mailboxAuthFirstUse(string(sigBytes), ts) {
 			return "", errors.New("replayed proof")
 		}
 		return box, nil

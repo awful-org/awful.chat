@@ -215,3 +215,45 @@ func TestMailboxAuthMessageVector(t *testing.T) {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 }
+
+// Lenient base64 lets the unused low bits of a signature's last character
+// vary, so one proof had sixteen spellings, and a replay cache keyed on the
+// text took each for a new proof.
+func TestReplayedProofInAnotherSpellingIsRefused(t *testing.T) {
+	mailboxDir = t.TempDir()
+	did, priv := testDid(t)
+	req := v2Request(t, "/mailbox/collect", mailboxActionCollect, did, priv, map[string]any{"device": deviceID(24)})
+	body := bodyOf(t, req)
+	auth := req.Header.Get("Authorization")
+	f := strings.Fields(auth)
+	sig := f[3]
+	// 64 bytes is 86 significant characters; the 86th carries two bits of
+	// the signature and four that decoding ignores.
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	i := strings.IndexByte(alphabet, sig[85])
+	respelled := sig[:85] + string(alphabet[i^1]) + sig[86:]
+	a, _ := base64.StdEncoding.DecodeString(sig)
+	b, err := base64.StdEncoding.DecodeString(respelled)
+	if err != nil || !bytes.Equal(a, b) || respelled == sig {
+		t.Fatalf("test bug: the respelling does not decode to the same signature")
+	}
+
+	if code := replayAs(req, body, "/mailbox/collect", handleMailboxCollect); code != 200 {
+		t.Fatalf("genuine collect: %d", code)
+	}
+	again := httptest.NewRequest("POST", "/mailbox/collect", bytes.NewReader(body))
+	again.Header.Set("Authorization", strings.Join([]string{f[0], f[1], f[2], respelled}, " "))
+	w := httptest.NewRecorder()
+	handleMailboxCollect(w, again)
+	if w.Code != 401 {
+		t.Fatalf("the same proof respelled was accepted again: %d", w.Code)
+	}
+
+	// Keyed on the bytes, the cache refuses it too, whatever the decoder.
+	mailboxSeenMu.Lock()
+	_, seen := mailboxSeen[string(a)]
+	mailboxSeenMu.Unlock()
+	if !seen {
+		t.Fatal("the replay cache is not keyed on the signature bytes")
+	}
+}
