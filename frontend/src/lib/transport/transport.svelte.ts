@@ -93,6 +93,13 @@ const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
 import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession, onIdentityLock } from "../identity/identity";
+import {
+  pickPqKeyCertificate,
+  pqKeyCertificate,
+  verifyPqKeyCertificate,
+  type PqKeyCertificate,
+} from "../identity/pq-identity";
+import { rememberPeerPqKey } from "../identity/pq-peers";
 import { captureSessionGuard } from "../identity/session-guard";
 import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
 import { isLegacyArchive, requireWritableRoom } from "$lib/room-security/legacy-archive";
@@ -791,6 +798,12 @@ installTelemetryTaps({
 
 /** DIDs whose profile arrived live this session: storage must not overrule. */
 const _inboxHeardLive = new Set<string>();
+/**
+ * Whether a DEVICE's last profile carried a valid PQ key certificate. Per
+ * peerId, not per DID: one person can run a new build on one device and an
+ * old one on another, and only the device itself says which it is.
+ */
+const _peerPqCapable = new Map<string, boolean>();
 
 // Stored peer profile metadata is invisible until the peer re-broadcasts:
 // the reactive map only ever filled from live messages, so a reload emptied
@@ -1074,10 +1087,15 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
 
   // Prove this DID owns our peerId; the receiver cannot derive it any more.
   let binding: { did: string; bindingSig: string } | null = null;
+  let pq: PqKeyCertificate | undefined;
   try {
     binding = signPeerBinding(_transport.selfId());
+    // Our ML-KEM key, so peers can seal for us post-quantum (mailbox, DM
+    // upgrade). Signed by the same identity the binding proves.
+    pq = pqKeyCertificate(requireSession());
   } catch {
     binding = null; // identity locked: the peer just will not bind us yet
+    pq = undefined;
   }
 
   const payload = encode({
@@ -1104,6 +1122,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     inboxOff: (await import("./mailbox.svelte")).mailboxPrefs.enabled
       ? undefined
       : true,
+    pq,
   });
 
   const hash = frameHash(payload);
@@ -2339,6 +2358,18 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
     transportState.peerColors = colors;
   }
 
+  // A PQ key only counts once it verifies against the DID this connection
+  // just proved: the certificate is the DID's own signature, so a profile
+  // cannot attach someone else's key, or its own key to someone else. A
+  // missing or bad one is ignored, never a reason to drop a key we hold -
+  // the same person's other device may simply be on an older build.
+  const pqKey =
+    msg.pq !== undefined && verifyPqKeyCertificate(did, msg.pq)
+      ? pickPqKeyCertificate(msg.pq)
+      : undefined;
+  if (pqKey) rememberPeerPqKey(did, pqKey);
+  _peerPqCapable.set(peerId, !!pqKey);
+
   // Absent = on: the default, and what a build predating the field sends.
   const inboxOff = msg.inboxOff === true;
   _inboxHeardLive.add(did);
@@ -2405,6 +2436,7 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
         nameGlow: validated.nameGlow,
         ...(inboxOff ? { inboxOff: true } : {}),
         ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
+        ...(pqKey ?? existing?.pqKey ? { pqKey: pqKey ?? existing?.pqKey } : {}),
       }).catch(() => {})
     )
     .catch(() => {});
@@ -3202,6 +3234,7 @@ _transport.on("disconnect", (peerId) => {
   // until the sender's DID binds, so dropping them on a disconnect would throw
   // away messages that a reconnect would otherwise replay.
   _lastDigestAt.delete(peerId);
+  _peerPqCapable.delete(peerId);
   transportState.peers = _transport.peers();
   for (const listener of _peerDisconnectListeners) listener({ did });
   _fileTransport.onPeerDisconnect(peerId);
@@ -4260,6 +4293,7 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerColors = new Map();
   transportState.peerInboxOff = new Set();
   _inboxHeardLive.clear();
+  _peerPqCapable.clear();
   transportState.error = null;
   transportState.callPeerIds = new Set();
   transportState.pendingTransmissions = new Map();

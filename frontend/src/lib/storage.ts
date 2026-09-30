@@ -1,6 +1,7 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { validateStoredCapability } from "./room-security/keys";
 import { onIdentityLock } from "./identity/lock-events";
+import type { PqKeyCertificate } from "./identity/pq-identity";
 
 type WriteGuard = () => void;
 let writeEpoch = 0;
@@ -169,6 +170,12 @@ export interface PeerProfile {
   /** Their offline inbox is off (from their profile). Kept so it is known
    *  while they are offline, which is exactly when it matters. */
   inboxOff?: boolean;
+  /**
+   * Their ML-KEM-768 key certificate, from a profile they sent. Kept so a
+   * message sealed for them while they are offline can still be sealed
+   * post-quantum; re-verified against the DID on every use.
+   */
+  pqKey?: PqKeyCertificate;
   updatedAt: number;
 }
 

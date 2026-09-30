@@ -7,8 +7,10 @@ import {
   getDB,
   getKeypairRecord,
   getMnemonicRecord,
+  getPeerProfile,
   getWatermark,
   migrateAtRest,
+  putPeerProfile,
   setAtRestOwner,
   wipeLocalDatabase,
 } from "../storage";
@@ -16,8 +18,11 @@ import {
   createIdentity,
   isUnlocked,
   lockIdentity,
+  publicKeyToDid,
   unlockIdentity,
 } from "../identity/identity";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { pqKeyCertificate } from "../identity/pq-identity";
 
 const PASSWORD = "the password that was in use at backup time";
 
@@ -297,6 +302,31 @@ describe("a merge never adopts the incoming identity", () => {
     expect((await getAllRooms()).map((r) => r.roomCode)).toContain(
       "restoredroom0001"
     );
+  });
+});
+
+// A peer's PQ key certificate is what lets this device seal for them
+// post-quantum while they are offline. A merged-in profile row from a device
+// that never heard it is usually NEWER (it saw their name change later), and
+// taking it wholesale quietly downgraded every message sealed to them.
+describe("a merge keeps a peer's post-quantum key", () => {
+  it("keeps the local certificate when a newer imported row has none", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    const peerSeed = crypto.getRandomValues(new Uint8Array(32));
+    const peerDid = publicKeyToDid(ed25519.getPublicKey(peerSeed));
+    const cert = pqKeyCertificate({ did: peerDid, privateKey: peerSeed });
+    await putPeerProfile({ did: peerDid, isMe: false, nickname: "old", updatedAt: 1, pqKey: cert });
+
+    await applyBackup({
+      ...incoming,
+      profiles: [{ did: peerDid, isMe: false, nickname: "new", updatedAt: 2 }],
+    } as unknown as BackupFile, "add");
+
+    const merged = await getPeerProfile(peerDid);
+    expect(merged?.nickname).toBe("new");
+    expect(merged?.pqKey).toEqual(cert);
   });
 });
 

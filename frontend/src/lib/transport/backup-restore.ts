@@ -318,7 +318,16 @@ async function importDatabaseInner(
             const importedUpdatedAt = (importedProfile as PeerProfile).updatedAt ?? 0;
             const localUpdatedAt = (localProfile as PeerProfile | undefined)?.updatedAt ?? 0;
             if (importedUpdatedAt >= localUpdatedAt) {
-              await putPeerProfile(importedProfile as PeerProfile);
+              // A newer row from a device that never heard their PQ key must
+              // not erase the one this device holds: losing it quietly drops
+              // sealing for them back to X25519 only. Every use re-verifies
+              // the certificate, so keeping either copy trusts nothing new.
+              const pqKey =
+                (importedProfile as PeerProfile).pqKey ?? localProfile?.pqKey;
+              await putPeerProfile({
+                ...(importedProfile as PeerProfile),
+                ...(pqKey ? { pqKey } : {}),
+              });
             }
           }
         })();
