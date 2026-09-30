@@ -1093,14 +1093,19 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
 
   // Prove this DID owns our peerId; the receiver cannot derive it any more.
   let binding: { did: string; bindingSig: string } | null = null;
-  let pq: PqKeyCertificate | undefined;
   try {
     binding = signPeerBinding(_transport.selfId());
-    // Our ML-KEM key, so peers can seal for us post-quantum (mailbox, DM
-    // upgrade). Signed by the same identity the binding proves.
-    pq = pqKeyCertificate(requireSession());
   } catch {
     binding = null; // identity locked: the peer just will not bind us yet
+  }
+  // Our ML-KEM key, so peers can seal for us post-quantum (mailbox, DM
+  // upgrade), signed by the same identity the binding proves. Separate from
+  // the binding: without it we are merely a peer on an older build, and
+  // that must never cost the binding itself.
+  let pq: PqKeyCertificate | undefined;
+  try {
+    pq = binding ? pqKeyCertificate(requireSession()) : undefined;
+  } catch {
     pq = undefined;
   }
 
