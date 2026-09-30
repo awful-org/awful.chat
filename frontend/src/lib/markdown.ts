@@ -136,8 +136,12 @@ interface Delim {
  * <em><strong>, never <strong><em>…</strong></em>.
  *
  * A run opens when a non-space follows it and closes when a non-space comes
- * before it, so "2 * 3 * 4" stays arithmetic. A single * also needs a
- * non-word character outside it, so snake*case*word is left alone.
+ * before it, so "2 * 3 * 4" stays arithmetic. A single * or ~ also needs a
+ * non-word character outside it, so snake*case*word and file~1~ are left
+ * alone.
+ *
+ * Strike takes one tilde or two, as GitHub's markdown does, and a closer
+ * must match its opener's length: ~a~ and ~~a~~ strike, ~a~~ does not.
  *
  * One opener stack per marker, so a closer finds its opener on top instead
  * of walking past every opener of the other kind: linear, where one stack was
@@ -148,7 +152,7 @@ function emphasis(html: string, tags = true): string {
   const parts: (string | Delim)[] = [];
   const stacks: Record<Delim["ch"], Delim[]> = { "*": [], "~": [] };
   let seq = 0;
-  // Every run of tildes is taken whole: only a run of exactly two strikes,
+  // Every run of tildes is taken whole: only a run of one or two strikes,
   // so "~~~~a~~~~" stays text instead of pairing into two empty <s></s>.
   const RUN_RE = /\*+|~+/g;
   let last = 0;
@@ -156,8 +160,8 @@ function emphasis(html: string, tags = true): string {
     const run = m[0];
     const before = html[m.index - 1];
     const after = html[m.index + run.length];
-    const single = run === "*";
-    const inert = run[0] === "~" && run.length !== 2;
+    const single = run === "*" || run === "~";
+    const inert = run[0] === "~" && run.length > 2;
     const d: Delim = {
       ch: run[0] as "*" | "~",
       seq: seq++,
@@ -174,7 +178,8 @@ function emphasis(html: string, tags = true): string {
     const other = stacks[d.ch === "*" ? "~" : "*"];
     while (d.close && d.count > 0 && same.length > 0) {
       const o = same[same.length - 1];
-      const n = d.ch === "~" || (o.count >= 2 && d.count >= 2) ? 2 : 1;
+      if (d.ch === "~" && o.count !== d.count) break;
+      const n = d.ch === "~" ? d.count : o.count >= 2 && d.count >= 2 ? 2 : 1;
       const tag = d.ch === "~" ? "s" : n === 2 ? "strong" : "em";
       o.count -= n;
       d.count -= n;
