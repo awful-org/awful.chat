@@ -1,6 +1,7 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { validateStoredCapability } from "./room-security/keys";
 import { onIdentityLock } from "./identity/lock-events";
+import type { RoomProfileFields, RoomProfileField } from "./room-profile";
 
 type WriteGuard = () => void;
 let writeEpoch = 0;
@@ -14,7 +15,7 @@ function captureWriteGuard(): WriteGuard {
 
 /** Abort pending IDB requests on lock; check ownership at the commit boundary. */
 async function guardedCommit(
-  database: AppDB, store: "messages" | "rooms" | "watermarks" | "attachments",
+  database: AppDB, store: "messages" | "rooms" | "watermarks" | "attachments" | "roomProfiles",
   guard: WriteGuard, write: (tx: any) => Promise<void>,
 ): Promise<void> {
   guard();
@@ -172,6 +173,41 @@ export interface PeerProfile {
   updatedAt: number;
 }
 
+export interface RoomProfileFieldEdit {
+  at: number;
+  id: string;
+  /** A reset inherits main and must win over older sync data. */
+  reset?: boolean;
+}
+
+export interface OwnRoomProfileRecord {
+  roomCode: string;
+  did: string;
+  generation: number;
+  fields: RoomProfileFields;
+  fieldEdits?: Partial<Record<RoomProfileField, RoomProfileFieldEdit>>;
+}
+
+export interface RoomDeletionMarker {
+  roomCode: string;
+  generation: number;
+  deletedAt: number;
+}
+
+interface RoomProfileRow {
+  id: string;
+  roomCode: string;
+  did: string;
+  kind: "own" | "peer" | "deletion";
+  generation: number;
+  fields?: RoomProfileFields;
+  fieldEdits?: OwnRoomProfileRecord["fieldEdits"];
+  profile?: PeerProfile;
+  pfpData?: ArrayBuffer;
+  bannerData?: ArrayBuffer;
+  deletedAt?: number;
+}
+
 export interface WatermarkRecord {
   id: string; // "roomCode:senderId"
   roomCode: string;
@@ -256,6 +292,11 @@ type AppDB = IDBPDatabase<{
     key: Blinded;
     value: OwnProfile | PeerProfile;
   };
+  roomProfiles: {
+    key: Blinded;
+    value: RoomProfileRow;
+    indexes: { byRoom: Blinded };
+  };
   savedGifs: {
     key: string;
     value: SavedGif;
@@ -328,7 +369,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 6, {
+  db = (await openDB(dbName(), 7, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -416,6 +457,10 @@ async function openDatabase(): Promise<AppDB> {
         // Diagnostic event chunks, sealed (see STORE_SPECS). Never synced.
         const s = database.createObjectStore("diagnostics", { keyPath: "id" });
         s.createIndex("bySession", "sessionId", { unique: false });
+      }
+      if (oldVersion < 7) {
+        const store = database.createObjectStore("roomProfiles", { keyPath: "id" });
+        store.createIndex("byRoom", "roomCode", { unique: false });
       }
     },
     blocking() {
@@ -2126,6 +2171,114 @@ export async function deleteRoom(roomCode: string): Promise<void> {
   // Cast to Blinded: during migration, both forms may exist and must be deleted.
   await tx.store.delete(roomCode as Blinded);
   await tx.store.delete(blindedRoomCode);
+  await tx.done;
+}
+
+function roomProfileId(kind: RoomProfileRow["kind"], roomCode: string, did = ""): string {
+  return `${kind}\0${roomCode}\0${did}`;
+}
+
+async function getRoomProfileRow(
+  kind: RoomProfileRow["kind"], roomCode: string, did = "",
+): Promise<RoomProfileRow | undefined> {
+  const database = await getDB();
+  const row = await database.get("roomProfiles", await blindValue(roomProfileId(kind, roomCode, did)));
+  return _open("roomProfiles", row);
+}
+
+export async function getRoomDeletionMarker(roomCode: string): Promise<RoomDeletionMarker | undefined> {
+  const row = await getRoomProfileRow("deletion", roomCode);
+  return row ? { roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt! } : undefined;
+}
+
+export async function getAllRoomDeletionMarkers(): Promise<RoomDeletionMarker[]> {
+  const database = await getDB();
+  const rows = await _openAll("roomProfiles", await database.getAll("roomProfiles"));
+  return rows.filter(row => row.kind === "deletion").map(row => ({
+    roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt!,
+  }));
+}
+
+function ownRoomRecord(row: RoomProfileRow): OwnRoomProfileRecord {
+  return {
+    roomCode: row.roomCode, did: row.did, generation: row.generation,
+    fields: {
+      ...row.fields,
+      ...(row.pfpData ? { pfpData: row.pfpData } : {}),
+      ...(row.bannerData ? { bannerData: row.bannerData } : {}),
+    },
+    fieldEdits: row.fieldEdits,
+  };
+}
+
+export async function getOwnRoomProfile(roomCode: string, did: string): Promise<OwnRoomProfileRecord | undefined> {
+  const row = await getRoomProfileRow("own", roomCode, did);
+  return row?.kind === "own" ? ownRoomRecord(row) : undefined;
+}
+
+export async function getAllOwnRoomProfiles(): Promise<OwnRoomProfileRecord[]> {
+  const database = await getDB();
+  const rows = await _openAll("roomProfiles", await database.getAll("roomProfiles"));
+  return rows.filter(row => row.kind === "own").map(ownRoomRecord);
+}
+
+export async function putOwnRoomProfile(
+  record: OwnRoomProfileRecord, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const marker = await getRoomDeletionMarker(record.roomCode);
+  if (marker && record.generation <= marker.generation) throw new Error("room generation was deleted");
+  const database = await getDB();
+  const fields = { ...record.fields };
+  const pfpData = fields.pfpData instanceof ArrayBuffer ? fields.pfpData : undefined;
+  const bannerData = fields.bannerData instanceof ArrayBuffer ? fields.bannerData : undefined;
+  if (pfpData) delete fields.pfpData;
+  if (bannerData) delete fields.bannerData;
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("own", record.roomCode, record.did),
+    roomCode: record.roomCode, did: record.did, kind: "own" as const,
+    generation: record.generation, fields, fieldEdits: record.fieldEdits,
+    pfpData, bannerData,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => { await tx.store.put(sealed); });
+}
+
+export async function getPeerRoomProfile(roomCode: string, did: string): Promise<PeerProfile | undefined> {
+  const row = await getRoomProfileRow("peer", roomCode, did);
+  return row?.kind === "peer" && row.profile
+    ? { ...row.profile, pfpData: row.pfpData, bannerData: row.bannerData }
+    : undefined;
+}
+
+export async function putPeerRoomProfile(
+  roomCode: string, generation: number, profile: PeerProfile,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const marker = await getRoomDeletionMarker(roomCode);
+  if (marker && generation <= marker.generation) throw new Error("room generation was deleted");
+  const { pfpData, bannerData, ...display } = profile;
+  const database = await getDB();
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("peer", roomCode, profile.did), roomCode,
+    did: profile.did, kind: "peer" as const, generation,
+    profile: display, pfpData, bannerData,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => { await tx.store.put(sealed); });
+}
+
+/** Remove both profile kinds but keep the non-profile marker for later device sync. */
+export async function deleteRoomProfilesForRoom(roomCode: string, generation: number): Promise<void> {
+  const existing = await getRoomDeletionMarker(roomCode);
+  const nextGeneration = Math.max(generation, existing?.generation ?? 0);
+  const database = await getDB();
+  const marker = await _seal("roomProfiles", {
+    id: roomProfileId("deletion", roomCode), roomCode, did: "",
+    kind: "deletion" as const, generation: nextGeneration,
+    deletedAt: Date.now(),
+  });
+  const tx = database.transaction("roomProfiles", "readwrite");
+  const keys = await tx.store.index("byRoom").getAllKeys(await blindValue(roomCode));
+  for (const key of keys) await tx.store.delete(key);
+  await tx.store.put(marker);
   await tx.done;
 }
 
