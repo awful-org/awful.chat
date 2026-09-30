@@ -134,3 +134,43 @@ func TestClientIPTrustsOnlyProxies(t *testing.T) {
 		}
 	}
 }
+
+func TestClientBuckets(t *testing.T) {
+	cases := []struct{ addr, own, agg string }{
+		{"203.0.113.9", "203.0.113.9", ""},
+		{"::ffff:203.0.113.9", "203.0.113.9", ""},
+		{"2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64", "2001:db8:1::/48"},
+		{"2001:db8:1:ff00::1", "2001:db8:1:ff00::/64", "2001:db8:1::/48"},
+		{"not-an-ip", "not-an-ip", ""},
+	}
+	for _, c := range cases {
+		own, agg := clientBuckets(c.addr)
+		if own != c.own || agg != c.agg {
+			t.Errorf("%s: got (%q, %q), want (%q, %q)", c.addr, own, agg, c.own, c.agg)
+		}
+	}
+	if sourceKey("2001:db8:1:2::1") != sourceKey("2001:db8:1:3::1") || sourceKey("203.0.113.9") != "203.0.113.9" {
+		t.Error("sourceKey is not the /48 for IPv6 and the address for IPv4")
+	}
+}
+
+// A request the /48 aggregate refuses must not also be charged to the
+// client's own window, or a neighbour's flood would lock this client out
+// for a minute after the aggregate recovered.
+func TestRateAllowAllChargesNothingOnRefusal(t *testing.T) {
+	resetRateLimiter(t)
+	if !rateAllowAll([]string{"t:own", "t:agg"}, []int{5, 1}) {
+		t.Fatal("first request refused")
+	}
+	for i := 0; i < 3; i++ {
+		if rateAllowAll([]string{"t:own", "t:agg"}, []int{5, 1}) {
+			t.Fatal("request past the aggregate allowed")
+		}
+	}
+	rateMu.Lock()
+	own := rateBy["t:own"].count
+	rateMu.Unlock()
+	if own != 1 {
+		t.Fatalf("refused requests were charged to the client's own bucket: %d", own)
+	}
+}

@@ -125,6 +125,16 @@ const pluginProxyRateWindow = time.Minute
 // rateAllow enforces a fixed window per key. Callers namespace the key
 // ("pp:"+ip, "mb:"+ip, ...) so hammering one feature cannot starve another.
 func rateAllow(key string, limit int) bool {
+	return rateAllowAll([]string{key}, []int{limit})
+}
+
+// rateAllowAll spends one request from every key at once, or from none of
+// them: each window is checked before any is charged, all under one lock.
+// Charging a client's own bucket for a request its /48 aggregate then
+// refused would make one party's flood eat into its own window for nothing,
+// and the reverse would let a refused request still count against the
+// neighbours it shares the aggregate with.
+func rateAllowAll(keys []string, limits []int) bool {
 	now := time.Now()
 	rateMu.Lock()
 	defer rateMu.Unlock()
@@ -138,21 +148,25 @@ func rateAllow(key string, limit int) bool {
 			}
 		}
 	}
-	e, ok := rateBy[key]
-	if !ok || now.After(e.resetAt) {
-		rateBy[key] = rateEntry{count: 1, resetAt: now.Add(pluginProxyRateWindow)}
-		return true
+	for i, key := range keys {
+		if e, ok := rateBy[key]; ok && !now.After(e.resetAt) && e.count >= limits[i] {
+			return false
+		}
 	}
-	if e.count >= limit {
-		return false
+	for _, key := range keys {
+		e, ok := rateBy[key]
+		if !ok || now.After(e.resetAt) {
+			rateBy[key] = rateEntry{count: 1, resetAt: now.Add(pluginProxyRateWindow)}
+			continue
+		}
+		e.count++
+		rateBy[key] = e
 	}
-	e.count++
-	rateBy[key] = e
 	return true
 }
 
-func pluginProxyAllow(ip string) bool {
-	return rateAllow("pp:"+ip, pluginProxyRateLimit)
+func pluginProxyAllow(r *http.Request) bool {
+	return rateAllowClient(r, "pp:", pluginProxyRateLimit)
 }
 
 var secretPlaceholderRe = regexp.MustCompile(`\{\{secret:([A-Za-z0-9_-]+)\}\}`)
@@ -332,7 +346,7 @@ func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 		withCors(w, r, func(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) })
 		return
 	}
-	if !pluginProxyAllow(clientIP(r)) {
+	if !pluginProxyAllow(r) {
 		apiError(w, r, "Slow down", http.StatusTooManyRequests)
 		return
 	}

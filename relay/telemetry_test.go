@@ -343,7 +343,7 @@ func TestTelemetryPerPeerEvictionAtNineUploads(t *testing.T) {
 	const peerId = "peer-evict-test-0000000000000000000000000"
 	var ids []string
 	for i := 0; i < telemetryMaxPerPeer+1; i++ {
-		id, status, err := storeTelemetryBundle(peerId, []byte(fmt.Sprintf(`{"n":%d}`, i)))
+		id, status, err := storeTelemetryBundle("", peerId, []byte(fmt.Sprintf(`{"n":%d}`, i)))
 		if err != nil {
 			t.Fatalf("upload %d: %v (status %d)", i, err, status)
 		}
@@ -372,7 +372,7 @@ func TestTelemetryGlobalRefusalAt507(t *testing.T) {
 	t.Cleanup(func() { telemetryUsedBytes, telemetryFiles = savedBytes, savedFiles })
 	telemetryUsedBytes, telemetryFiles = telemetryGlobalMaxBytes, 0
 
-	_, status, err := storeTelemetryBundle("peer-global-refusal-0000000000000000000000", []byte(`{"a":1}`))
+	_, status, err := storeTelemetryBundle("", "peer-global-refusal-0000000000000000000000", []byte(`{"a":1}`))
 	if err == nil || status != http.StatusInsufficientStorage {
 		t.Fatalf("over the global byte ceiling: got status %d err %v, want 507", status, err)
 	}
@@ -385,7 +385,7 @@ func TestTelemetrySweeperExpiresAgedBundlesAndDecrementsCounters(t *testing.T) {
 	telemetryUsedBytes, telemetryFiles = 0, 0
 
 	const peerId = "peer-sweep-test-00000000000000000000000000"
-	id, status, err := storeTelemetryBundle(peerId, []byte(`{"a":1}`))
+	id, status, err := storeTelemetryBundle("", peerId, []byte(`{"a":1}`))
 	if err != nil {
 		t.Fatalf("setup upload: %v (status %d)", err, status)
 	}
@@ -458,7 +458,7 @@ func TestTelemetryAdminListAndGetWithRightToken(t *testing.T) {
 	resetRateLimiter(t)
 
 	peerId, _ := testPeer(t)
-	id, status, err := storeTelemetryBundle(peerId.String(), []byte(`{"a":1}`))
+	id, status, err := storeTelemetryBundle("", peerId.String(), []byte(`{"a":1}`))
 	if err != nil {
 		t.Fatalf("setup upload: %v (status %d)", err, status)
 	}
@@ -682,4 +682,48 @@ func TestReadLoopRecordsLivenessTimeoutClose(t *testing.T) {
 		t.Fatalf("readLoop reason = %q, want %q", reason, relayCloseLivenessTimeout)
 	}
 	assertLastCloseReason(t, "peer-diag-liveness", relayCloseLivenessTimeout)
+}
+
+// peerIds are free, so the per-peer quota is not a ceiling on one party. A
+// source - one IPv4 address, or one IPv6 /48 - holds only its share of the
+// store, however many peers it uploads as.
+func TestTelemetrySourceShare(t *testing.T) {
+	telemetryDir = t.TempDir()
+	telemetryInitUsedBytes()
+	body := bytes.Repeat([]byte("x"), 1<<20)
+	source := sourceKey("2001:db8:5:6::1")
+	if other := sourceKey("2001:db8:5:ff::9"); other != source {
+		t.Fatalf("two /64s of one /48 are different sources: %q %q", source, other)
+	}
+	stored := 0
+	for i := 0; ; i++ {
+		peer := fmt.Sprintf("peer%040d", i)
+		_, status, err := storeTelemetryBundle(source, peer, body)
+		if err != nil {
+			if status != http.StatusTooManyRequests {
+				t.Fatalf("refusal %d: %v", status, err)
+			}
+			break
+		}
+		stored++
+		if stored > telemetryGlobalMaxFiles {
+			t.Fatal("one source filled the store")
+		}
+	}
+	if int64(stored)*int64(len(body)) > telemetryMaxBytesPerSource {
+		t.Fatalf("one source holds %d bundles of %d bytes, share is %d", stored, len(body), telemetryMaxBytesPerSource)
+	}
+	// Another source still gets in, and expiry gives the share back.
+	if _, _, err := storeTelemetryBundle(sourceKey("198.51.100.3"), "peer-other-0000000000000000000000000000000", body); err != nil {
+		t.Fatalf("another source refused: %v", err)
+	}
+	if removed := sweepTelemetryOnce(time.Now().Add(telemetryTTL + time.Hour)); removed == 0 {
+		t.Fatal("sweep removed nothing")
+	}
+	telemetryMu.Lock()
+	left := len(telemetryHeld)
+	telemetryMu.Unlock()
+	if left != 0 {
+		t.Fatalf("expired bundles still charged to %d sources", left)
+	}
 }

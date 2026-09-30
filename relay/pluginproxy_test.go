@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -77,16 +78,23 @@ func TestPluginProxyRateLimit(t *testing.T) {
 	resetRateLimiter(t)
 	ip := "203.0.113.9"
 	for i := 0; i < pluginProxyRateLimit; i++ {
-		if !pluginProxyAllow(ip) {
+		if !pluginProxyAllow(reqFrom(ip)) {
 			t.Fatalf("request %d refused inside the window", i)
 		}
 	}
-	if pluginProxyAllow(ip) {
+	if pluginProxyAllow(reqFrom(ip)) {
 		t.Error("request over the limit allowed")
 	}
-	if !pluginProxyAllow("203.0.113.10") {
+	if !pluginProxyAllow(reqFrom("203.0.113.10")) {
 		t.Error("another client caught by the first client's bucket")
 	}
+}
+
+// reqFrom is a request whose socket peer is addr, so it is its own client.
+func reqFrom(addr string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = net.JoinHostPort(addr, "1234")
+	return req
 }
 
 func TestPluginProxyEnvParsing(t *testing.T) {

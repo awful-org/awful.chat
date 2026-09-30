@@ -301,7 +301,40 @@ func TestPluginStreamRateLimitHasItsOwnBucket(t *testing.T) {
 		t.Error("request over the limit allowed")
 	}
 	// Draining the stream bucket must not spend the buffered proxy's.
-	if !pluginProxyAllow(ip) {
+	req := httptest.NewRequest("GET", "/plugin-proxy", nil)
+	req.RemoteAddr = ip + ":1234"
+	if !pluginProxyAllow(req) {
 		t.Error("the buffered proxy's budget was spent by the stream path")
 	}
+}
+
+// One IPv6 /56 is a single household's allocation and holds 256 /64s. Each
+// /64 is its own client, but the /48 they share has a ceiling of its own, so
+// one allocation can no longer hold every slot on the instance.
+func TestPluginStreamAggregateCapsAnIPv6Allocation(t *testing.T) {
+	held := []string{}
+	defer func() {
+		for _, a := range held {
+			pluginStreamRelease(a)
+		}
+	}()
+	for i := 0; ; i++ {
+		// A fresh /64 inside one /56 each time.
+		addr := fmt.Sprintf("2001:db8:1:%x::1", i)
+		if !pluginStreamAcquire(addr) {
+			if len(held) != pluginStreamPerAggregate {
+				t.Fatalf("the /48 held %d streams before being refused, want %d", len(held), pluginStreamPerAggregate)
+			}
+			break
+		}
+		held = append(held, addr)
+		if i > pluginStreamGlobal {
+			t.Fatal("one /48 reached the global ceiling")
+		}
+	}
+	// Another allocation is untouched by that one's ceiling.
+	if !pluginStreamAcquire("2001:db8:2::1") {
+		t.Fatal("a different /48 was refused")
+	}
+	pluginStreamRelease("2001:db8:2::1")
 }

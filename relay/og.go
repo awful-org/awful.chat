@@ -262,7 +262,7 @@ func handleOgPreview(w http.ResponseWriter, r *http.Request) {
 	// a DNS lookup plus up to 10s of held goroutine and a 5MB read - the
 	// cheapest-for-attacker, dearest-for-server call here. Same budget as
 	// its plugin-proxy sibling.
-	if !rateAllow("og:"+clientIP(r), pluginProxyRateLimit) {
+	if !rateAllowClient(r, "og:", pluginProxyRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}

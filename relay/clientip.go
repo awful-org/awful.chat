@@ -254,18 +254,67 @@ func clientAddr(r *http.Request) string {
 	return hops[len(hops)-1]
 }
 
-// rateKeyIP is the address a rate limit is keyed on. An IPv6 client is
-// keyed on its /64: a single host routinely holds a whole /64 (and often a
-// /56), so per-address buckets would let it rotate through 2^64 fresh
-// identities and every per-client limit in this file would gate nothing.
-func rateKeyIP(s string) string {
-	ip := net.ParseIP(s)
-	if ip == nil || ip.To4() != nil {
-		return s
+// ── Buckets ──────────────────────────────────────────────────────────────
+
+// An IPv6 client is keyed on its /64: a single host routinely holds a whole
+// /64, so per-address buckets would let it rotate through 2^64 fresh
+// identities. But a /64 is not the unit anybody is actually allocated
+// either. A residential line gets a /56 - 256 /64s - and a server a /48, so
+// a /64 bucket on its own still handed one household 256 budgets and one
+// rented box 65,536: every "per client" ceiling in this binary was that
+// many times looser than it read. Each IPv6 client therefore also spends
+// from an aggregate bucket for its /48, sized at ipv6AggregateFactor times
+// the per-client budget - enough for several real people on one site, far
+// short of what a single allocation used to mint.
+const ipv6AggregateFactor = 4
+
+// clientBuckets returns the keys one address is budgeted under: its own
+// bucket (an IPv4 address, or an IPv6 /64) and, for IPv6 only, the /48 it
+// sits in. IPv4 has no aggregate: the scarce unit there is the address.
+func clientBuckets(addr string) (own, agg string) {
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		return addr, ""
 	}
-	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	a = a.Unmap()
+	if a.Is4() {
+		return a.String(), ""
+	}
+	p64, _ := a.Prefix(64)
+	p48, _ := a.Prefix(48)
+	return p64.String(), p48.String()
+}
+
+// sourceKey is the single coarsest bucket for an address - the IPv4
+// address, or the IPv6 /48 - for the budgets that are a SHARE of something
+// global (stored bytes, open streams) rather than a rate.
+func sourceKey(addr string) string {
+	own, agg := clientBuckets(addr)
+	if agg != "" {
+		return agg
+	}
+	return own
+}
+
+// rateKeyIP is the per-client bucket alone. Kept for the callers that only
+// need a stable key for one client.
+func rateKeyIP(s string) string {
+	own, _ := clientBuckets(s)
+	return own
 }
 
 func clientIP(r *http.Request) string {
 	return rateKeyIP(clientAddr(r))
+}
+
+// rateAllowClient spends one request from the client's own bucket and, for
+// IPv6, from its /48's aggregate too. Both are checked before either is
+// charged, so a request the aggregate refuses does not also eat into the
+// client's own window.
+func rateAllowClient(r *http.Request, prefix string, limit int) bool {
+	own, agg := clientBuckets(clientAddr(r))
+	if agg == "" {
+		return rateAllow(prefix+own, limit)
+	}
+	return rateAllowAll([]string{prefix + own, prefix + agg}, []int{limit, limit * ipv6AggregateFactor})
 }

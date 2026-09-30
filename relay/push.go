@@ -401,7 +401,7 @@ func handlePushConfig(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
 		return
 	}
-	if !rateAllow("push:"+clientIP(r), pushRateLimit) {
+	if !rateAllowClient(r, "push:", pushRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -433,7 +433,7 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("push:"+clientIP(r), pushRateLimit) {
+	if !rateAllowClient(r, "push:", pushRateLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -518,7 +518,7 @@ func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("push:"+clientIP(r), pushRateLimit) {
+	if !rateAllowClient(r, "push:", pushRateLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}

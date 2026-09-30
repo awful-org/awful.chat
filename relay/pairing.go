@@ -51,7 +51,7 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
 		return
 	}
-	if !rateAllow("pairing:"+clientIP(r), 240) || !rateAllow("pairing-global", 12000) {
+	if !rateAllowClient(r, "pairing:", 240) || !rateAllow("pairing-global", 12000) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -71,7 +71,7 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Meter starts independently from polling, including misses, across all IPs.
-	if b.Action == "start" && (!rateAllow("pairing-start:"+clientIP(r), 10) || !rateAllow("pairing-start-global", 300)) {
+	if b.Action == "start" && (!rateAllowClient(r, "pairing-start:", 10) || !rateAllow("pairing-start-global", 300)) {
 		apiError(w, r, "rate limited", 429)
 		return
 	}
@@ -85,7 +85,7 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 	}
 	e := pairingStore[b.Locator]
 	if b.Action == "create" {
-		if !rateAllow("pairing-create:"+clientIP(r), 10) || !rateAllow("pairing-create-global", 300) || len(pairingStore) >= pairingMaxLive {
+		if !rateAllowClient(r, "pairing-create:", 10) || !rateAllow("pairing-create-global", 300) || len(pairingStore) >= pairingMaxLive {
 			apiError(w, r, "pairing unavailable", http.StatusTooManyRequests)
 			return
 		}

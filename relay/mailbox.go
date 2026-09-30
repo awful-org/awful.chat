@@ -27,6 +27,8 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -105,6 +107,16 @@ const (
 	// carrier's CGNAT, so the number has to cover several people at once.
 	mailboxDepositLimit = 120
 	mailboxAuthedLimit  = 240
+	// The share of the global budget one source may hold at once: an IPv4
+	// address, or an IPv6 /48 (sourceKey). The deposit rate limit alone was
+	// not a ceiling on this - it bounds deposits per minute, blobs live
+	// for mailboxTTL, and a /56 was 256 separate rate-limit buckets, about
+	// 30,000 deposits a minute, which filled all 65,536 files in two
+	// minutes and closed every box on the instance for two days. A
+	// sixteenth means at least sixteen separate allocations to do that
+	// now, and still leaves one busy carrier NAT thousands of pending DMs.
+	mailboxMaxHeldPerSource      = mailboxGlobalMaxFiles / 16
+	mailboxMaxHeldBytesPerSource = mailboxGlobalMaxBytes / 16
 	// Maximum IDs one ack request may carry. A real client acks what it just
 	// collected, which is a small number bounded by mailboxMaxMsgs. This limit
 	// leaves clear headroom and prevents the ack loop from doing unbounded
@@ -145,6 +157,77 @@ var mailboxIDRe = regexp.MustCompile(`^[0-9a-f]{1,32}$`)
 // mailboxMu serializes writes per process - deposit volume is tiny and a
 // single lock keeps the quota check race-free.
 var mailboxMu sync.Mutex
+
+// Which source deposited each blob, and how much of the global budget each
+// source holds - see mailboxMaxHeldPerSource. Memory only, guarded by
+// mailboxMu, and bounded by the blobs on disk. A restart forgets it, which
+// only means blobs from before the restart count against nobody's share.
+//
+// The relay already learns the depositor's address with every deposit
+// (docs/spec.md, "Server Privacy"); what is new is holding a link from a
+// stored blob back to it for the blob's lifetime. So the link is a keyed
+// hash of the coarse source bucket, not the address, under a key that
+// exists only in this process: it lets the relay tell "same source" from
+// "different source" and nothing else, and it is gone at the next restart.
+type mailboxOrigin struct {
+	source string
+	charge int64
+}
+
+type mailboxShare struct {
+	files int
+	bytes int64
+}
+
+var (
+	mailboxBlobOrigin = map[string]mailboxOrigin{} // "<box>/<id>" -> origin
+	mailboxHeld       = map[string]mailboxShare{}  // source -> what it holds
+)
+
+var mailboxSourceKey = func() []byte {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		panic("mailbox: no randomness for the source key: " + err.Error())
+	}
+	return k
+}()
+
+// mailboxSourceTag is the opaque per-process name of a request's source.
+func mailboxSourceTag(r *http.Request) string {
+	m := hmac.New(sha256.New, mailboxSourceKey)
+	m.Write([]byte(sourceKey(clientAddr(r))))
+	return hex.EncodeToString(m.Sum(nil)[:12])
+}
+
+// mailboxRecordBlob charges a stored blob to its source. Caller holds
+// mailboxMu.
+func mailboxRecordBlob(box, id, source string, charge int64) {
+	mailboxBlobOrigin[box+"/"+id] = mailboxOrigin{source: source, charge: charge}
+	h := mailboxHeld[source]
+	h.files++
+	h.bytes += charge
+	mailboxHeld[source] = h
+}
+
+// mailboxForgetBlob returns a removed blob's charge to its source. Every
+// site that removes a blob calls it, like the global counters. Caller holds
+// mailboxMu.
+func mailboxForgetBlob(box, id string) {
+	key := box + "/" + id
+	o, ok := mailboxBlobOrigin[key]
+	if !ok {
+		return
+	}
+	delete(mailboxBlobOrigin, key)
+	h := mailboxHeld[o.source]
+	h.files--
+	h.bytes -= o.charge
+	if h.files <= 0 {
+		delete(mailboxHeld, o.source)
+		return
+	}
+	mailboxHeld[o.source] = h
+}
 
 // didToPubKey decodes a did:key to the raw ed25519 public key. The app's
 // identity layer encodes WITHOUT the multibase 'z' (did:key:<base58> of
@@ -302,6 +385,8 @@ func mailboxInitUsedBytes() {
 	mailboxUsedBytes = 0
 	mailboxFiles = 0
 	mailboxBoxes = 0
+	mailboxBlobOrigin = map[string]mailboxOrigin{}
+	mailboxHeld = map[string]mailboxShare{}
 	boxes, _ := os.ReadDir(mailboxDir)
 	for _, b := range boxes {
 		if !b.IsDir() {
@@ -433,6 +518,7 @@ func evictOldestStaleBox() bool {
 			continue
 		}
 		if os.Remove(filepath.Join(dir, e.Name())) == nil {
+			mailboxForgetBlob(oldest, e.Name())
 			// Same non-negative guard as ack: a counter that can go negative
 			// silently disables the ceiling it enforces.
 			if charge := mailboxCharge(info.Size()); mailboxUsedBytes >= charge {
@@ -458,7 +544,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("mb:"+clientIP(r), mailboxDepositLimit) {
+	if !rateAllowClient(r, "mb:", mailboxDepositLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -479,6 +565,8 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad blob", http.StatusBadRequest)
 		return
 	}
+
+	source := mailboxSourceTag(r)
 
 	mailboxMu.Lock()
 	defer mailboxMu.Unlock()
@@ -537,6 +625,27 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "mailbox full", http.StatusInsufficientStorage)
 		return
 	}
+	// A full box sheds this source's OWN oldest blobs first, then everyone
+	// else's oldest. Anyone can still push a named user's pending mail out
+	// by depositing into their box - the box id is public and deposits are
+	// anonymous - but one source now only ever pushes out one blob that is
+	// not its own: after that the box is shedding its own junk. Clearing a
+	// hundred real messages takes a hundred separate sources rather than a
+	// hundred requests.
+	sort.SliceStable(stored, func(i, j int) bool {
+		oi := mailboxBlobOrigin[req.Box+"/"+stored[i].name].source == source
+		oj := mailboxBlobOrigin[req.Box+"/"+stored[j].name].source == source
+		return oi && !oj
+	})
+	boxFull := len(stored)+1 > mailboxMaxMsgs || total+int64(len(blob)) > mailboxMaxBytes
+	ownInBox := len(stored) > 0 && mailboxBlobOrigin[req.Box+"/"+stored[0].name].source == source
+	// Over its share, a source may still deposit where doing so evicts one
+	// of its own blobs, which does not grow what it holds.
+	if held := mailboxHeld[source]; (held.files >= mailboxMaxHeldPerSource ||
+		held.bytes+charge > mailboxMaxHeldBytesPerSource) && !(boxFull && ownInBox) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
@@ -558,6 +667,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	mailboxFiles++
 	mailboxUsedBytes += charge
+	mailboxRecordBlob(req.Box, id, source, charge)
 	total += int64(len(blob))
 
 	// A full box evicts its OLDEST blob rather than refusing the new one. The
@@ -574,6 +684,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		oldest := stored[0]
 		stored = stored[1:]
 		if os.Remove(filepath.Join(dir, oldest.name)) == nil {
+			mailboxForgetBlob(req.Box, oldest.name)
 			total -= oldest.size
 			mailboxUsedBytes -= mailboxCharge(oldest.size)
 			mailboxFiles--
@@ -606,7 +717,7 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 	// Unlimited, these endpoints were a free signature-verification and
 	// ReadDir sink for anyone with curl. 30/min covers the 5-minute collect
 	// loop plus its acks many times over.
-	if !rateAllow("mba:"+clientIP(r), mailboxAuthedLimit) {
+	if !rateAllowClient(r, "mba:", mailboxAuthedLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -672,7 +783,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("mba:"+clientIP(r), mailboxAuthedLimit) {
+	if !rateAllowClient(r, "mba:", mailboxAuthedLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -746,6 +857,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 	for _, id := range validIDs {
 		p := filepath.Join(boxPath(box), id)
 		if info, err := os.Stat(p); err == nil && os.Remove(p) == nil {
+			mailboxForgetBlob(box, id)
 			charge := mailboxCharge(info.Size())
 			// Prevent counters from going negative. A counter that can go
 			// negative silently disables the ceiling it exists to enforce -
@@ -802,6 +914,7 @@ func sweepMailboxOnce(now time.Time) int {
 			}
 			if info.ModTime().Before(cutoff) {
 				if os.Remove(filepath.Join(dir, e.Name())) == nil {
+					mailboxForgetBlob(b.Name(), e.Name())
 					mailboxUsedBytes -= mailboxCharge(info.Size())
 					mailboxFiles--
 				}
