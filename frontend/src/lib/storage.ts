@@ -1,5 +1,6 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { validateStoredCapability } from "./room-security/keys";
+import { sanitizePeerProfile } from "./profile-sanitize";
 import { onIdentityLock } from "./identity/lock-events";
 import type { PqKeyCertificate } from "./identity/pq-identity";
 import type { DmPqState } from "./room-security/pq-dm";
@@ -1096,6 +1097,28 @@ export async function putMessage(message: Message, guard: WriteGuard = captureWr
   const sealed = await _seal("messages", message);
   await guardedCommit(database, "messages", guard, async tx => { await tx.store.put(sealed); });
   _notifyMessageStored(message);
+}
+
+/**
+ * The messages a MERGE import brings in: never a row already held. A backup
+ * is a file, possibly someone else's, and reusing a real message's id was how
+ * one replaced a genuine signed row with forged content under any sender.
+ * Resolves the number actually added.
+ */
+export async function bulkAddNewMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<number> {
+  const database = await getDB();
+  guard();
+  const sealed = await Promise.all(messages.map((m) => _seal("messages", m)));
+  const added: Message[] = [];
+  await guardedCommit(database, "messages", guard, async tx => {
+    for (let i = 0; i < sealed.length; i++) {
+      if ((await tx.store.getKey(messages[i].id)) !== undefined) continue;
+      await tx.store.put(sealed[i]);
+      added.push(messages[i]);
+    }
+  });
+  for (const m of added) _notifyMessageStored(m);
+  return added.length;
 }
 
 export async function bulkPutMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<void> {
@@ -2313,7 +2336,10 @@ export async function getPeerProfile(
     record = await database.get("profiles", did as Blinded);
   }
   if (!record || record.isMe) return undefined;
-  return _open("profiles", record as PeerProfile);
+  // Checked on the way out, like a live profile: a stored row may have come
+  // from a backup or an older build (profile-sanitize.ts).
+  const opened = await _open("profiles", record as PeerProfile);
+  return opened && sanitizePeerProfile(opened);
 }
 
 export async function putPeerProfile(profile: PeerProfile): Promise<void> {
@@ -2350,10 +2376,10 @@ export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
   if (_peerProfilesCache) return _peerProfilesCache;
   const database = await getDB();
   const all = await database.getAll("profiles");
-  const opened = await _openAll(
+  const opened = (await _openAll(
     "profiles",
     all.filter((p): p is PeerProfile => p.isMe === false)
-  );
+  )).map(sanitizePeerProfile);
   _peerProfilesCache = opened;
   return opened;
 }

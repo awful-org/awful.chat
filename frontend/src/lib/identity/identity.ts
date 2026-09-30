@@ -36,6 +36,16 @@ const ED25519_MULTICODEC = new Uint8Array([0xed, 0x01]);
  */
 export const PBKDF2_ITERATIONS = 600_000;
 const LEGACY_PBKDF2_ITERATIONS = 100_000;
+/**
+ * The iteration counts a stored record may carry. The count travels in
+ * backups, and a file claiming billions made the unlock prompt spin forever;
+ * nothing this app ever wrote is outside this range.
+ */
+export const MAX_PBKDF2_ITERATIONS = 10_000_000;
+export function validPbkdf2Iterations(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) &&
+    value >= LEGACY_PBKDF2_ITERATIONS && value <= MAX_PBKDF2_ITERATIONS;
+}
 
 export interface MnemonicRecord {
   id: "mnemonic";
@@ -165,7 +175,15 @@ export function didToPublicKey(did: string): Uint8Array<ArrayBuffer> {
     throw new Error(`Invalid did:key: ${did}`);
   }
   const prefixed = base58.decode(did.slice("did:key:".length));
-  return prefixed.slice(ED25519_MULTICODEC.length) as Uint8Array<ArrayBuffer>;
+  const key = prefixed.slice(ED25519_MULTICODEC.length) as Uint8Array<ArrayBuffer>;
+  // Exactly one DID per key: the ed25519 multicodec prefix, 32 bytes, and
+  // the canonical encoding. Without this some 65,000 strings decoded to the
+  // same key. Every signature covers the DID string, so that was not
+  // exploitable - but a key is not supposed to have aliases at all.
+  if (key.length !== 32 || publicKeyToDid(key) !== did) {
+    throw new Error(`Invalid did:key: ${did}`);
+  }
+  return key;
 }
 
 // ── identity lifecycle ────────────────────────────────────────────────────────
@@ -425,8 +443,12 @@ export async function unlockIdentity(password: string): Promise<void> {
 async function _unlockFromMnemonicRecord(
   record: MnemonicRecord,
   password: string,
-  beforeActivate?: () => void
+  beforeActivate?: () => void,
+  expectedDid?: string
 ): Promise<string> {
+  if (record.iterations !== undefined && !validPbkdf2Iterations(record.iterations)) {
+    throw new Error("Invalid identity record");
+  }
   // Records written before per-record iteration counts existed used 100k.
   const aesKey = await AESFromPassword(
     password,
@@ -449,6 +471,13 @@ async function _unlockFromMnemonicRecord(
   new Uint8Array(decrypted).fill(0);
   const { privateKey, publicKey } = deriveKeypairFromMnemonic(mnemonic);
   const did = publicKeyToDid(publicKey);
+  // An imported record comes with the DID it claims to be. The phrase is the
+  // truth: a mismatch showed one account on the lock screen and unlocked
+  // another.
+  if (expectedDid !== undefined && did !== expectedDid) {
+    privateKey.fill(0);
+    throw new Error("The backup's identity does not match its recovery phrase");
+  }
 
   try {
     beforeActivate?.();
@@ -475,9 +504,11 @@ async function _unlockFromMnemonicRecord(
 export async function unlockWithImportedMnemonic(
   record: MnemonicRecord,
   password: string,
-  beforeActivate?: () => void
+  beforeActivate?: () => void,
+  /** The DID the import says this is; refused if the phrase says otherwise. */
+  expectedDid?: string
 ): Promise<void> {
-  await _unlockFromMnemonicRecord(record, password, beforeActivate);
+  await _unlockFromMnemonicRecord(record, password, beforeActivate, expectedDid);
 }
 
 /**

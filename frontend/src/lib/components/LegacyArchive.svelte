@@ -146,7 +146,7 @@
       <article id="msg-{msg.id}" class="py-1.5">
         <div class="flex min-w-0 items-baseline gap-2">
           <span class="truncate text-sm font-medium text-foreground">
-            {msg.senderName || msg.senderId}
+            {transportState.peerNames.get(msg.senderDid || msg.senderId) || msg.senderName || msg.senderId}
           </span>
           <span class="shrink-0 text-xs text-muted-foreground">{formatStamp(msg.timestamp)}</span>
         </div>

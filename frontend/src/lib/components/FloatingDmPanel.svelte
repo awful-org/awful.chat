@@ -305,7 +305,11 @@
                     ? 'text-primary'
                     : 'text-foreground'}"
                 >
-                  {own ? "You" : dmPanel.peerName || msg.senderName}
+                  {own
+                    ? "You"
+                    : dmPanel.peerName ||
+                      transportState.peerNames.get(msg.senderDid || msg.senderId) ||
+                      msg.senderName}
                 </span>
                 <span class="shrink-0 text-[10px] text-muted-foreground">
                   {formatTime(msg.timestamp)}

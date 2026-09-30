@@ -15,6 +15,7 @@ import { attachRoomStream, ROOM_PROTOCOL } from "$lib/room-security/stream";
 import type { SecureRoomChannel } from "$lib/room-security/channel";
 import { attachDmIntroduction, DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
 import { LobbyDialBudget } from "./dm-lobby-budget";
+import { FrameAssembler, FrameTooLargeError } from "./frame-assembler";
 import type { DmPqState } from "$lib/room-security/pq-dm";
 import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 import { onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
@@ -2439,34 +2440,29 @@ export class LibP2PTransport implements PeerTransport {
         this.resetOutboundStream(fromId);
       }
     }
-    let buf = new Uint8Array(0);
+    // Frames out of the stream's chunks, each byte copied once: see
+    // frame-assembler.ts for why merging per chunk had to go.
+    const assembler = new FrameAssembler(MAX_DIRECT_FRAME_BYTES);
 
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
         evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
 
-      const merged = new Uint8Array(buf.byteLength + chunk.byteLength);
-      merged.set(buf);
-      merged.set(chunk, buf.byteLength);
-      buf = merged;
-
-      while (buf.byteLength >= 4) {
-        const len = new DataView(buf.buffer, buf.byteOffset).getUint32(
-          0,
-          false
+      let frames: Uint8Array[];
+      try {
+        frames = assembler.push(chunk);
+      } catch (err) {
+        const len = err instanceof FrameTooLargeError ? err.bytes : -1;
+        console.warn(
+          `[LibP2PTransport] oversized direct frame (${len}b) from ${fromId.slice(-8)}, aborting stream`
         );
-        if (len > MAX_DIRECT_FRAME_BYTES) {
-          console.warn(
-            `[LibP2PTransport] oversized direct frame (${len}b) from ${fromId.slice(-8)}, aborting stream`
-          );
-          rec(ev("rv.frame.oversize", { peer: fromId, d: { bytes: len } }));
-          this.cleanupPeerStream(fromId);
-          stream.abort(new Error("frame too large"));
-          return;
-        }
-        if (buf.byteLength < 4 + len) break;
-        const payload = buf.slice(4, 4 + len);
-        buf = buf.slice(4 + len);
+        rec(ev("rv.frame.oversize", { peer: fromId, d: { bytes: len } }));
+        this.cleanupPeerStream(fromId);
+        stream.abort(new Error("frame too large"));
+        return;
+      }
+
+      for (const payload of frames) {
 
         // Anything at all from this peer proves it is alive.
         this.debugStats.framesIn++;

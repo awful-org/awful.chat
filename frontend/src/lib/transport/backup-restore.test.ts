@@ -6,6 +6,8 @@ import {
   getAllRooms,
   getDB,
   getKeypairRecord,
+  getMessage,
+  putMessage,
   getMnemonicRecord,
   getPeerProfile,
   getWatermark,
@@ -302,6 +304,54 @@ describe("a merge never adopts the incoming identity", () => {
     expect((await getAllRooms()).map((r) => r.roomCode)).toContain(
       "restoredroom0001"
     );
+  });
+});
+
+// The identity section is part of a file someone may have handed over
+// (security audit L3).
+describe("a backup's identity section is checked before it is trusted", () => {
+  it("refuses an iteration count no build ever wrote, which made unlocking spin", async () => {
+    const backup = await backupFromAnIdentity();
+    backup.identity!.mnemonic.iterations = 4_000_000_000;
+    await wipeLocalDatabase();
+    await expect(applyBackup(backup, "replace")).rejects.toThrow("Invalid backup");
+    expect(await getKeypairRecord()).toBeUndefined();
+  });
+
+  it("refuses a keypair whose public key is not its DID's", async () => {
+    const backup = await backupFromAnIdentity();
+    backup.identity!.keypair.did = publicKeyToDid(ed25519.getPublicKey(new Uint8Array(32).fill(7)));
+    await wipeLocalDatabase();
+    await expect(applyBackup(backup, "replace")).rejects.toThrow("does not match its DID");
+    expect(await getKeypairRecord()).toBeUndefined();
+  });
+});
+
+// A merged-in file could reuse a real message's id to replace it with forged
+// content under anyone's name (security audit M4).
+describe("a merge never overwrites or forges messages", () => {
+  it("keeps a message already held, drops a bad signature, adds genuinely new rows", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    const row = (id: string, content: string, extra: Record<string, unknown> = {}) => ({
+      id, roomCode: "restoredroom0001", senderId: "did:key:zBob", senderName: "Bob",
+      timestamp: 1, lamport: 1, type: "text", content, attachments: [], ...extra,
+    });
+    await putMessage(row("m-1", "the real message") as never);
+
+    await applyBackup({
+      ...incoming,
+      messages: [
+        row("m-1", "forged"),
+        row("m-2", "new and unsigned"),
+        row("m-3", "forged with a bad signature", { senderDid: "did:key:zBob", sig: "00".repeat(64), sigV: 3 }),
+      ],
+    } as unknown as BackupFile, "add");
+
+    expect((await getMessage("m-1"))?.content).toBe("the real message");
+    expect((await getMessage("m-2"))?.content).toBe("new and unsigned");
+    expect(await getMessage("m-3")).toBeUndefined();
   });
 });
 
