@@ -76,27 +76,38 @@ var (
 
 // pluginStreamAcquire takes one slot for a client: from its own bucket, from
 // its /48's aggregate when it has one, and from the global ceiling - all or
-// nothing, under one lock.
-func pluginStreamAcquire(addr string) bool {
-	own, agg := clientBuckets(addr)
+// nothing, under one lock. It returns the buckets it charged, for
+// pluginStreamRelease. A proxy-class address (exemptFromShares) is charged
+// to the global ceiling alone: it is everybody behind the proxy, and eight
+// slots for it would be eight for the whole instance.
+func pluginStreamAcquire(addr string) ([]string, bool) {
+	var keys []string
+	limits := []int{pluginStreamPerClient, pluginStreamPerAggregate}
+	if !exemptFromShares(addr) {
+		own, agg := clientBuckets(addr)
+		keys = []string{own}
+		if agg != "" {
+			keys = append(keys, agg)
+		}
+	}
 	pluginStreamMu.Lock()
 	defer pluginStreamMu.Unlock()
-	if pluginStreamOpen >= pluginStreamGlobal || pluginStreamPerIP[own] >= pluginStreamPerClient {
-		return false
+	if pluginStreamOpen >= pluginStreamGlobal {
+		return nil, false
 	}
-	if agg != "" && pluginStreamPerIP[agg] >= pluginStreamPerAggregate {
-		return false
+	for i, k := range keys {
+		if pluginStreamPerIP[k] >= limits[i] {
+			return nil, false
+		}
 	}
-	pluginStreamPerIP[own]++
-	if agg != "" {
-		pluginStreamPerIP[agg]++
+	for _, k := range keys {
+		pluginStreamPerIP[k]++
 	}
 	pluginStreamOpen++
-	return true
+	return keys, true
 }
 
-func pluginStreamRelease(addr string) {
-	own, agg := clientBuckets(addr)
+func pluginStreamRelease(keys []string) {
 	pluginStreamMu.Lock()
 	defer pluginStreamMu.Unlock()
 	if pluginStreamOpen > 0 {
@@ -104,10 +115,7 @@ func pluginStreamRelease(addr string) {
 	}
 	// Deleting at zero matters: the key space is client IPs, so keeping
 	// spent entries would grow this map for the life of the process.
-	for _, k := range []string{own, agg} {
-		if k == "" {
-			continue
-		}
+	for _, k := range keys {
 		if n := pluginStreamPerIP[k] - 1; n > 0 {
 			pluginStreamPerIP[k] = n
 		} else {
@@ -191,11 +199,12 @@ func handlePluginStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !pluginStreamAcquire(addr) {
+	slots, ok := pluginStreamAcquire(addr)
+	if !ok {
 		apiError(w, r, "Busy", http.StatusServiceUnavailable)
 		return
 	}
-	defer pluginStreamRelease(addr)
+	defer pluginStreamRelease(slots)
 
 	ctx, cancel := context.WithTimeout(r.Context(), pluginStreamTimeout)
 	defer cancel()

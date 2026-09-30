@@ -149,8 +149,22 @@ func TestClientBuckets(t *testing.T) {
 			t.Errorf("%s: got (%q, %q), want (%q, %q)", c.addr, own, agg, c.own, c.agg)
 		}
 	}
-	if sourceKey("2001:db8:1:2::1") != sourceKey("2001:db8:1:3::1") || sourceKey("203.0.113.9") != "203.0.113.9" {
-		t.Error("sourceKey is not the /48 for IPv6 and the address for IPv4")
+	// Storage shares key on the /56, one subscriber's allocation, not the
+	// /48 a carrier hands out /56s from.
+	if shareKey("2001:db8:1:2::1") != shareKey("2001:db8:1:ff::1") || shareKey("2001:db8:1:2::1") != "2001:db8:1::/56" {
+		t.Error("two /64s of one /56 are different shares")
+	}
+	if shareKey("2001:db8:1:100::1") == shareKey("2001:db8:1:2::1") {
+		t.Error("two /56s of one /48 share a share")
+	}
+	if shareKey("203.0.113.9") != "203.0.113.9" {
+		t.Error("an IPv4 share is not the address")
+	}
+	// A proxy's address is everybody behind it: no share at all.
+	for _, a := range []string{"10.0.1.5", "172.18.0.2", "127.0.0.1", "100.64.0.9", "::1", "fd00::1", "not-an-ip"} {
+		if shareKey(a) != "" || !exemptFromShares(a) {
+			t.Errorf("%s holds a share", a)
+		}
 	}
 }
 

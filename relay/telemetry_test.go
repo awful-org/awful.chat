@@ -691,9 +691,9 @@ func TestTelemetrySourceShare(t *testing.T) {
 	telemetryDir = t.TempDir()
 	telemetryInitUsedBytes()
 	body := bytes.Repeat([]byte("x"), 1<<20)
-	source := sourceKey("2001:db8:5:6::1")
-	if other := sourceKey("2001:db8:5:ff::9"); other != source {
-		t.Fatalf("two /64s of one /48 are different sources: %q %q", source, other)
+	source := shareKey("2001:db8:5:6::1")
+	if other := shareKey("2001:db8:5:ff::9"); other != source {
+		t.Fatalf("two /64s of one /56 are different sources: %q %q", source, other)
 	}
 	stored := 0
 	for i := 0; ; i++ {
@@ -714,7 +714,7 @@ func TestTelemetrySourceShare(t *testing.T) {
 		t.Fatalf("one source holds %d bundles of %d bytes, share is %d", stored, len(body), telemetryMaxBytesPerSource)
 	}
 	// Another source still gets in, and expiry gives the share back.
-	if _, _, err := storeTelemetryBundle(sourceKey("198.51.100.3"), "peer-other-0000000000000000000000000000000", body); err != nil {
+	if _, _, err := storeTelemetryBundle(shareKey("198.51.100.3"), "peer-other-0000000000000000000000000000000", body); err != nil {
 		t.Fatalf("another source refused: %v", err)
 	}
 	if removed := sweepTelemetryOnce(time.Now().Add(telemetryTTL + time.Hour)); removed == 0 {

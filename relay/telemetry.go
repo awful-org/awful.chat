@@ -138,7 +138,8 @@ const (
 	telemetryGlobalMaxBytes = 128 << 20
 	telemetryGlobalMaxFiles = 4096
 	// The part of those ceilings one source may hold: an IPv4 address or an
-	// IPv6 /48 (sourceKey). peerIds are free to mint, so the per-peer quota
+	// IPv6 /56 (shareKey); a proxy-class address holds no share, see
+	// exemptFromShares. peerIds are free to mint, so the per-peer quota
 	// above bounds nothing on its own, and the rate limit refills every
 	// minute while a bundle lives a week: four 2 MiB uploads a minute from
 	// one address filled the whole store in sixteen minutes and closed it to
@@ -617,7 +618,7 @@ func handleTelemetryIngest(reg *registry) http.HandlerFunc {
 			apiError(w, r, "bad request", http.StatusBadRequest)
 			return
 		}
-		bundleId, status, err := storeTelemetryBundle(sourceKey(clientAddr(r)), peerId, full)
+		bundleId, status, err := storeTelemetryBundle(shareKey(clientAddr(r)), peerId, full)
 		if err != nil {
 			// The 507 message is a fact about the quota and safe to say. The
 			// 500 one is whatever os.MkdirAll or os.WriteFile returned, which
@@ -717,7 +718,7 @@ func telemetryInitUsedBytes() {
 // ("<peerId>/<id>.json", directly usable as the admin `id` query param).
 // Global overflow REFUSES (507); a peer over its own per-peer quota instead
 // EVICTS its oldest upload - see telemetryMaxPerPeer and
-// telemetryGlobalMaxBytes above. source is the uploader's sourceKey; a source
+// telemetryGlobalMaxBytes above. source is the uploader's shareKey; a source
 // over its share is refused too (429), because what it would fill belongs
 // to everyone else. An empty source is charged to nobody.
 func storeTelemetryBundle(source, peerId string, full []byte) (bundleId string, status int, err error) {

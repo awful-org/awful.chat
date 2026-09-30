@@ -110,7 +110,8 @@ const (
 	mailboxDepositLimit = 120
 	mailboxAuthedLimit  = 240
 	// The share of the global budget one source may hold at once: an IPv4
-	// address, or an IPv6 /48 (sourceKey). The deposit rate limit alone was
+	// address, or an IPv6 /56 (shareKey). A proxy-class address is charged
+	// to no share - see exemptFromShares. The deposit rate limit alone was
 	// not a ceiling on this - it bounds deposits per minute, blobs live
 	// for mailboxTTL, and a /56 was 256 separate rate-limit buckets, about
 	// 30,000 deposits a minute, which filled all 65,536 files in two
@@ -194,10 +195,17 @@ var mailboxSourceKey = func() []byte {
 	return k
 }()
 
-// mailboxSourceTag is the opaque per-process name of a request's source.
+// mailboxSourceTag is the opaque per-process name of a request's source,
+// or empty for a source that holds no share (exemptFromShares): a proxy's
+// address is everybody behind it, and a share applied to it would be a
+// ceiling on the whole mailbox.
 func mailboxSourceTag(r *http.Request) string {
+	key := shareKey(clientAddr(r))
+	if key == "" {
+		return ""
+	}
 	m := hmac.New(sha256.New, mailboxSourceKey)
-	m.Write([]byte(sourceKey(clientAddr(r))))
+	m.Write([]byte(key))
 	return hex.EncodeToString(m.Sum(nil)[:12])
 }
 
@@ -768,19 +776,23 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	// not its own: after that the box is shedding its own junk. Clearing a
 	// hundred real messages takes a hundred separate sources rather than a
 	// hundred requests.
-	sort.SliceStable(stored, func(i, j int) bool {
-		oi := mailboxBlobOrigin[req.Box+"/"+stored[i].name].source == source
-		oj := mailboxBlobOrigin[req.Box+"/"+stored[j].name].source == source
-		return oi && !oj
-	})
-	boxFull := len(stored)+1 > mailboxMaxMsgs || total+int64(len(blob)) > mailboxMaxBytes
-	ownInBox := len(stored) > 0 && mailboxBlobOrigin[req.Box+"/"+stored[0].name].source == source
-	// Over its share, a source may still deposit where doing so evicts one
-	// of its own blobs, which does not grow what it holds.
-	if held := mailboxHeld[source]; (held.files >= mailboxMaxHeldPerSource ||
-		held.bytes+charge > mailboxMaxHeldBytesPerSource) && !(boxFull && ownInBox) {
-		http.Error(w, "rate limited", http.StatusTooManyRequests)
-		return
+	// A source with no share (source == "") has no "own" blobs either: it
+	// sheds plain oldest-first, as before shares existed.
+	if source != "" {
+		sort.SliceStable(stored, func(i, j int) bool {
+			oi := mailboxBlobOrigin[req.Box+"/"+stored[i].name].source == source
+			oj := mailboxBlobOrigin[req.Box+"/"+stored[j].name].source == source
+			return oi && !oj
+		})
+		boxFull := len(stored)+1 > mailboxMaxMsgs || total+int64(len(blob)) > mailboxMaxBytes
+		ownInBox := len(stored) > 0 && mailboxBlobOrigin[req.Box+"/"+stored[0].name].source == source
+		// Over its share, a source may still deposit where doing so evicts
+		// one of its own blobs, which does not grow what it holds.
+		if held := mailboxHeld[source]; (held.files >= mailboxMaxHeldPerSource ||
+			held.bytes+charge > mailboxMaxHeldBytesPerSource) && !(boxFull && ownInBox) {
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
@@ -803,7 +815,9 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	mailboxFiles++
 	mailboxUsedBytes += charge
-	mailboxRecordBlob(req.Box, id, source, charge)
+	if source != "" {
+		mailboxRecordBlob(req.Box, id, source, charge)
+	}
 	total += int64(len(blob))
 
 	// A full box evicts its OLDEST blob rather than refusing the new one. The

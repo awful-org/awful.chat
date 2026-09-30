@@ -234,24 +234,40 @@ func TestPairingMalformedStartSpendsNoAttempt(t *testing.T) {
 	}
 }
 
-// One source holds at most pairingMaxLivePerSource pairings, so filling
-// the store takes many.
-func TestPairingLivePerSource(t *testing.T) {
+// One client holds at most pairingMaxLivePerClient live pairings and one
+// IPv6 /48 at most pairingMaxLivePerAggregate, so filling the store takes
+// many.
+func TestPairingLivePerClientAndAggregate(t *testing.T) {
 	resetPairing(t)
 	locators := "0123456789abcdefghjkmnpqrstvwxyz"
-	for i := 0; i < pairingMaxLivePerSource+1; i++ {
+	loc := func(i int) string { return string(locators[i/32]) + string(locators[i%32]) }
+	for i := 0; i < pairingMaxLivePerClient+1; i++ {
 		want := 200
-		if i == pairingMaxLivePerSource {
+		if i == pairingMaxLivePerClient {
 			want = http.StatusTooManyRequests
 		}
-		if rec := pairingRequest(t, "10.0.7.7", map[string]any{"action": "create", "locator": "a" + string(locators[i])}); rec.Code != want {
+		if rec := pairingRequest(t, "198.51.100.7", map[string]any{"action": "create", "locator": loc(i)}); rec.Code != want {
 			t.Fatalf("create %d: %d", i, rec.Code)
 		}
 	}
-	if rec := pairingRequest(t, "10.0.7.8", map[string]any{"action": "create", "locator": "zz"}); rec.Code != 200 {
-		t.Fatalf("another source refused: %d", rec.Code)
+	if rec := pairingRequest(t, "198.51.100.8", map[string]any{"action": "create", "locator": loc(100)}); rec.Code != 200 {
+		t.Fatalf("another client refused: %d", rec.Code)
+	}
+
+	// Many /64s of one /48: each is its own client, the /48 has a cap.
+	resetPairing(t)
+	for i := 0; i < pairingMaxLivePerAggregate+1; i++ {
+		want := 200
+		if i == pairingMaxLivePerAggregate {
+			want = http.StatusTooManyRequests
+		}
+		ip := fmt.Sprintf("[2001:db8:9:%x::1]", i)
+		if rec := pairingRequest(t, ip, map[string]any{"action": "create", "locator": loc(i)}); rec.Code != want {
+			t.Fatalf("/48 create %d: %d %s", i, rec.Code, rec.Body)
+		}
 	}
 }
+
 func TestPairingRejectsMalformedAndOrigin(t *testing.T) {
 	resetPairing(t)
 	oldStrict, oldDomain := strictOrigin, domain

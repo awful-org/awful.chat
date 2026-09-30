@@ -27,8 +27,9 @@ type pairingEntry struct {
 	stages   map[string]string
 	inbox    []pairingMessage
 	closed   bool
-	// The sourceKey of whoever created it, for pairingMaxLivePerSource.
-	owner string
+	// The creator's client bucket and its IPv6 /48, for the live-pairing
+	// caps; both empty for a creator that holds no share.
+	owner, ownerAgg string
 }
 
 var pairingMu sync.Mutex
@@ -71,15 +72,19 @@ const pairingMaxAttempts = 5
 //   - per locator: 2 x pairingMaxAttempts starts a minute, whoever sends
 //     them and whether or not a pairing is live there, which paces how fast
 //     any one pairing's attempts can be spent;
-//   - per source (an IPv4 address or IPv6 /48): pairingMaxLivePerSource
-//     pairings alive at once, so filling the store takes 32 separate
-//     allocations rather than one.
+//   - live pairings at once: pairingMaxLivePerClient per client (an IPv4
+//     address or IPv6 /64) and pairingMaxLivePerAggregate per IPv6 /48, so
+//     filling the store takes 32 addresses or eight /48s rather than one.
+//     A proxy-class creator holds no such share (exemptFromShares): that
+//     address is everybody behind the proxy, and 8 pairings would be the
+//     whole instance's ceiling.
 const (
-	pairingRequestsPerClient = 240
-	pairingStartsPerClient   = 10
-	pairingCreatesPerClient  = 10
-	pairingStartsPerLocator  = 2 * pairingMaxAttempts
-	pairingMaxLivePerSource  = 8
+	pairingRequestsPerClient   = 240
+	pairingStartsPerClient     = 10
+	pairingCreatesPerClient    = 10
+	pairingStartsPerLocator    = 2 * pairingMaxAttempts
+	pairingMaxLivePerClient    = 8
+	pairingMaxLivePerAggregate = 32
 )
 
 func handlePairing(w http.ResponseWriter, r *http.Request) {
@@ -157,14 +162,20 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		e = nil
 	}
 	if b.Action == "create" {
-		owner := sourceKey(clientAddr(r))
-		held := 0
+		var owner, ownerAgg string
+		if addr := clientAddr(r); !exemptFromShares(addr) {
+			owner, ownerAgg = clientBuckets(addr)
+		}
+		held, heldAgg := 0, 0
 		for _, other := range pairingStore {
-			if other.owner == owner {
+			if owner != "" && other.owner == owner {
 				held++
 			}
+			if ownerAgg != "" && other.ownerAgg == ownerAgg {
+				heldAgg++
+			}
 		}
-		if len(pairingStore) >= pairingMaxLive || held >= pairingMaxLivePerSource {
+		if len(pairingStore) >= pairingMaxLive || held >= pairingMaxLivePerClient || heldAgg >= pairingMaxLivePerAggregate {
 			apiError(w, r, "pairing unavailable", http.StatusTooManyRequests)
 			return
 		}
@@ -181,7 +192,7 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 			apiError(w, r, "unavailable", 500)
 			return
 		}
-		e = &pairingEntry{token: base64.RawURLEncoding.EncodeToString(token), expires: now.Add(5 * time.Minute), attempts: map[string][]pairingMessage{}, stages: map[string]string{}, owner: owner}
+		e = &pairingEntry{token: base64.RawURLEncoding.EncodeToString(token), expires: now.Add(5 * time.Minute), attempts: map[string][]pairingMessage{}, stages: map[string]string{}, owner: owner, ownerAgg: ownerAgg}
 		pairingStore[b.Locator] = e
 		inviteJSON(w, r, 200, map[string]string{"token": e.token})
 		return

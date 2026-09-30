@@ -270,10 +270,10 @@ func TestPluginStreamPerClientConcurrencyCap(t *testing.T) {
 	}
 
 	// A different client must not be caught by the first one's slots.
-	if !pluginStreamAcquire("203.0.113.78") {
+	if slots, ok := pluginStreamAcquire("203.0.113.78"); !ok {
 		t.Error("another client was refused by the first client's slots")
 	} else {
-		pluginStreamRelease("203.0.113.78")
+		pluginStreamRelease(slots)
 	}
 
 	close(release)
@@ -312,29 +312,31 @@ func TestPluginStreamRateLimitHasItsOwnBucket(t *testing.T) {
 // /64 is its own client, but the /48 they share has a ceiling of its own, so
 // one allocation can no longer hold every slot on the instance.
 func TestPluginStreamAggregateCapsAnIPv6Allocation(t *testing.T) {
-	held := []string{}
+	held := [][]string{}
 	defer func() {
-		for _, a := range held {
-			pluginStreamRelease(a)
+		for _, slots := range held {
+			pluginStreamRelease(slots)
 		}
 	}()
 	for i := 0; ; i++ {
 		// A fresh /64 inside one /56 each time.
 		addr := fmt.Sprintf("2001:db8:1:%x::1", i)
-		if !pluginStreamAcquire(addr) {
+		slots, ok := pluginStreamAcquire(addr)
+		if !ok {
 			if len(held) != pluginStreamPerAggregate {
 				t.Fatalf("the /48 held %d streams before being refused, want %d", len(held), pluginStreamPerAggregate)
 			}
 			break
 		}
-		held = append(held, addr)
+		held = append(held, slots)
 		if i > pluginStreamGlobal {
 			t.Fatal("one /48 reached the global ceiling")
 		}
 	}
 	// Another allocation is untouched by that one's ceiling.
-	if !pluginStreamAcquire("2001:db8:2::1") {
+	slots, ok := pluginStreamAcquire("2001:db8:2::1")
+	if !ok {
 		t.Fatal("a different /48 was refused")
 	}
-	pluginStreamRelease("2001:db8:2::1")
+	pluginStreamRelease(slots)
 }

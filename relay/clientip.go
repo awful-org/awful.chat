@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -131,9 +132,9 @@ func (s *trustedProxySet) refresh(ctx context.Context) {
 			if !s.failing[h] {
 				s.failing[h] = true
 				if prev := s.resolved[h]; len(prev) > 0 {
-					log.Printf("[relay] TRUSTED_PROXY_CIDRS: %s did not resolve (%v), still trusting its last address", h, err)
+					log.Printf("[relay] WARNING: TRUSTED_PROXY_CIDRS: %s no longer resolves (%v); still trusting its last address %v until it does", h, err, prev)
 				} else {
-					log.Printf("[relay] TRUSTED_PROXY_CIDRS: %s did not resolve (%v); until it does, clients behind it share ONE rate-limit bucket", h, err)
+					log.Printf("[relay] WARNING: TRUSTED_PROXY_CIDRS: %s resolves to nothing (%v). Until it does, X-Forwarded-For from it is ignored and every client behind it shares ONE rate-limit bucket; per-client storage and pairing shares are not applied to it", h, err)
 				}
 			}
 			s.mu.Unlock()
@@ -194,6 +195,23 @@ func (s *trustedProxySet) contains(a netip.Addr) bool {
 	return false
 }
 
+// describe lists what is trusted right now, for a log line.
+func (s *trustedProxySet) describe() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var parts []string
+	for _, p := range s.static {
+		parts = append(parts, p.String())
+	}
+	for _, h := range s.hosts {
+		parts = append(parts, fmt.Sprintf("%s=%v", h, s.resolved[h]))
+	}
+	if len(parts) == 0 {
+		return "nothing"
+	}
+	return strings.Join(parts, ", ")
+}
+
 // literalPrefixes is the configured CIDR and address entries, for the one
 // consumer that needs its answer once, at boot: the libp2p resource manager.
 func (s *trustedProxySet) literalPrefixes() []netip.Prefix {
@@ -230,7 +248,7 @@ func clientAddr(r *http.Request) string {
 	if !isTrustedProxy(remoteIP) {
 		if remoteIP != nil && (remoteIP.IsPrivate() || remoteIP.IsLoopback()) && r.Header.Get("X-Forwarded-For") != "" {
 			untrustedForwardHint.Do(func() {
-				log.Printf("[relay] a request from %s carries X-Forwarded-For but TRUSTED_PROXY_CIDRS does not trust it: if that is your reverse proxy, name it there, or every client behind it shares one rate-limit bucket", remote)
+				log.Printf("[relay] WARNING: a request from %s carries X-Forwarded-For but TRUSTED_PROXY_CIDRS does not trust it (trusted now: %s): if that is your reverse proxy, name it there, or every client behind it shares one rate-limit bucket. A hostname that resolves to a swarm VIP rather than the proxy's own address has this effect too", remote, trustedProxies.describe())
 			})
 		}
 		return remote
@@ -293,15 +311,36 @@ func clientBuckets(addr string) (own, agg string) {
 	return p64.String(), p48.String()
 }
 
-// sourceKey is the single coarsest bucket for an address - the IPv4
-// address, or the IPv6 /48 - for the budgets that are a SHARE of something
-// global (stored bytes, open streams) rather than a rate.
-func sourceKey(addr string) string {
-	own, agg := clientBuckets(addr)
-	if agg != "" {
-		return agg
+// exemptFromShares reports whether an address must not be held to a
+// per-source SHARE of something global - stored bytes, live pairings, open
+// streams. A proxy-class address (isProxyClassAddr) is every user behind
+// that proxy at once, and it is exactly what every request is keyed on when
+// TRUSTED_PROXY_CIDRS names nothing that resolves, or names a swarm VIP
+// rather than the address connections arrive from. A share applied to it
+// is a ceiling on the whole instance, so it gets the global limits alone,
+// as it did before shares existed. Its RATE limits still apply: those
+// predate this, and are what the boot warning about an unresolved
+// TRUSTED_PROXY_CIDRS entry is there to rescue.
+func exemptFromShares(addr string) bool {
+	a, err := netip.ParseAddr(addr)
+	return err != nil || isProxyClassAddr(a)
+}
+
+// shareKey is the key for a storage share (the mailbox's and telemetry's):
+// the IPv4 address, or the IPv6 /56 - one subscriber's allocation. Not the
+// /48: a mobile carrier hands its subscribers /64s or /56s out of shared
+// /48s, and one /48 share would lump all of them together. Empty for an
+// address exemptFromShares, which is charged to nobody.
+func shareKey(addr string) string {
+	if exemptFromShares(addr) {
+		return ""
 	}
-	return own
+	a := netip.MustParseAddr(addr).Unmap()
+	if a.Is4() {
+		return a.String()
+	}
+	p, _ := a.Prefix(56)
+	return p.String()
 }
 
 // rateKeyIP is the per-client bucket alone. Kept for the callers that only
