@@ -6,11 +6,12 @@ package main
 // proof), which kills the model. Operator-controlled on both axes:
 //
 //   PLUGIN_PROXY_HOSTS    comma list of exact hostnames plugins may reach
-//   PLUGIN_PROXY_SECRETS  comma list of NAME@host/path/prefix?param=value;
-//                         a request url may carry {{secret:NAME}} as the
-//                         whole value of that query parameter, on that host,
-//                         under that path, and the relay substitutes it
-//                         server-side so keys never reach clients
+//   PLUGIN_PROXY_SECRETS  comma list of NAME@host?param=value, or
+//                         NAME@host/path/prefix?param=value; a request url
+//                         may carry {{secret:NAME}} as the whole value of
+//                         that query parameter, on that host (under that
+//                         path, if one is given), and the relay substitutes
+//                         it server-side so keys never reach clients
 //
 // GET /plugin-proxy?url=<https url> - the host must be allowlisted, the
 // scheme https, redirects stay inside the allowlist, private/loopback IPs
@@ -186,11 +187,13 @@ func pluginProxyHosts() map[string]bool {
 
 type pluginSecret struct {
 	value string
-	// Where this secret may be sent: one host, a path prefix on it, and the
-	// one query parameter it fills. A secret bound to its host alone could
-	// still be put in ANY parameter on ANY path of that host - including an
-	// endpoint that echoes its query back, or logs it somewhere the caller
-	// can read - so a binding has to name all three.
+	// Where this secret may be sent: one host, the one query parameter it
+	// fills, and optionally a path prefix on that host ("/" when none is
+	// given). A secret bound to its host alone could be put in ANY parameter
+	// - a callback, a search term an upstream echoes back - so the parameter
+	// is always part of the binding. The path narrows it further, for a host
+	// that also serves an endpoint which echoes its query or logs it
+	// somewhere the caller can read.
 	host   string
 	path   string
 	param  string
@@ -201,13 +204,17 @@ var secretConfigWarn sync.Once
 
 // pluginProxySecrets parses PLUGIN_PROXY_SECRETS. Each entry is
 //
+//	NAME@host?param=value
 //	NAME@host/path/prefix?param=value
 //
-// e.g. STEAM@api.steampowered.com/ISteamUser/?key=abc123: the secret
-// STEAM is substituted only into a query parameter called "key", on
-// api.steampowered.com, for a path under /ISteamUser/. A prefix ending in
-// "/" matches below it; one without matches itself and its sub-paths. The
-// value is everything after the first "=", so it may contain "=".
+// e.g. STEAM@api.steampowered.com?key=abc123: the secret STEAM is
+// substituted only into a query parameter called "key", on
+// api.steampowered.com, on any path. The first form is exactly
+// NAME@host/?param=value. With a prefix, as in
+// STEAM@api.steampowered.com/ISteamUser/?key=abc123, only paths under
+// /ISteamUser/ qualify: a prefix ending in "/" matches below it, one
+// without matches itself and its sub-paths. The value is everything after
+// the first "=", so it may contain "=".
 //
 // The old forms NAME=value and NAME@host=value still parse but are never
 // substituted: they left the parameter and the path to the caller, which
@@ -239,14 +246,15 @@ func pluginProxySecrets() map[string]pluginSecret {
 	}
 	if len(legacy) > 0 {
 		secretConfigWarn.Do(func() {
-			log.Printf("[plugin-proxy] secrets %s are not bound to a host, path and parameter and will NOT be substituted; write them as NAME@host/path/prefix?param=value", strings.Join(legacy, ", "))
+			log.Printf("[plugin-proxy] secrets %s are not bound to a host, path and parameter and will NOT be substituted; write them as NAME@host?param=value", strings.Join(legacy, ", "))
 		})
 	}
 	return out
 }
 
-// parseSecretBinding splits "host/path/prefix?param". Anything malformed
-// comes back with an empty host or param, which leaves the secret unused.
+// parseSecretBinding splits "host?param" or "host/path/prefix?param"; no
+// path means "/", any path on the host. Anything malformed comes back with
+// an empty host or param, which leaves the secret unused.
 func parseSecretBinding(where string) (host, path, param string) {
 	where = strings.TrimSpace(where)
 	if where == "" || strings.ContainsAny(where, "#@") {

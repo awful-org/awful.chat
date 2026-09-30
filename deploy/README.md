@@ -253,13 +253,15 @@ which takes PROXY protocol on a Traefik TCP router plus PROXY protocol
 support in the relay's listener (it has none today), or the listener
 exposed directly without Traefik in front.
 
-**Plugin secrets are bound, one binding per name.** Each
-`PLUGIN_PROXY_SECRETS` entry is `NAME@host/path/prefix?param=value`: the
-relay substitutes `{{secret:NAME}}` only as the whole value of that query
-parameter, on that host, for a path under that prefix. A NAME holds a single
-binding - a later entry with the same NAME replaces the earlier one - so a
-plugin that calls several path prefixes on its host with the same key needs
-the prefix `/` (`STEAM@api.steampowered.com/?key=...`). The older
-`NAME@host=value` and `NAME=value` forms are no longer substituted; the relay
-names any it finds at boot, and the plugins using them report "not
+**Plugin secrets are bound, one binding per name.** A
+`PLUGIN_PROXY_SECRETS` entry is `NAME@host?param=value`, for example
+`STEAM@api.steampowered.com?key=your-steam-api-key`: the relay substitutes
+`{{secret:NAME}}` only as the whole value of that query parameter, and only
+on that host. A path prefix is optional hardening -
+`NAME@host/path/prefix?param=value` - for a host that also serves an endpoint
+which echoes its query back. A NAME holds a single binding - a later entry
+with the same NAME replaces the earlier one - so a plugin that calls several
+path prefixes on its host with the same key should leave the path out. The
+older `NAME@host=value` and `NAME=value` forms are no longer substituted; the
+relay names any it finds at boot, and the plugins using them report "not
 configured" until they are rewritten.

@@ -299,3 +299,48 @@ func TestPluginProxyRefusesSecretPlaceholderOutsideTheQuery(t *testing.T) {
 		t.Error("the refusal echoed the secret")
 	}
 }
+
+// NAME@host?param=value binds a secret to a host and a parameter, on any
+// path: exactly NAME@host/?param=value.
+func TestSecretWithoutAPathPrefix(t *testing.T) {
+	t.Setenv("PLUGIN_PROXY_SECRETS", "STEAM@api.steampowered.com?key=k&y 1, SLASH@api.steampowered.com/?key=k&y 1")
+	secrets := pluginProxySecrets()
+	plain, slash := secrets["STEAM"], secrets["SLASH"]
+	if plain.legacy || plain.host != "api.steampowered.com" || plain.path != "/" || plain.param != "key" || plain.value != "k&y 1" {
+		t.Fatalf("no-path form parsed wrong: %+v", plain)
+	}
+	if plain.host != slash.host || plain.path != slash.path || plain.param != slash.param {
+		t.Fatalf("NAME@host?p differs from NAME@host/?p: %+v vs %+v", plain, slash)
+	}
+
+	const host = "api.steampowered.com"
+	// Filled on any path of that host, in that parameter.
+	for _, raw := range []string{
+		"https://api.steampowered.com?key={{secret:steam}}",
+		"https://api.steampowered.com/?key={{secret:steam}}",
+		"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={{secret:steam}}&steamids=7",
+		"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1?format=json&key={{secret:steam}}",
+	} {
+		out, err := substituteSecrets(raw, secrets, host)
+		if err != nil {
+			t.Errorf("%s: %v", raw, err)
+			continue
+		}
+		if !strings.Contains(out, "key=k%26y+1") || strings.Contains(out, "{{secret:") {
+			t.Errorf("%s: not filled: %q", raw, out)
+		}
+	}
+	// Never on another host, and only as the whole value of that parameter.
+	for name, c := range map[string]struct{ raw, host string }{
+		"another host":         {"https://evil.example/?key={{secret:steam}}", "evil.example"},
+		"another parameter":    {"https://api.steampowered.com/x?callback={{secret:steam}}", host},
+		"glued to a value":     {"https://api.steampowered.com/x?key=echo{{secret:steam}}", host},
+		"value then more text": {"https://api.steampowered.com/x?key={{secret:steam}}tail", host},
+		"as a parameter name":  {"https://api.steampowered.com/x?{{secret:steam}}=1", host},
+		"a path that climbs":   {"https://api.steampowered.com/a/../b?key={{secret:steam}}", host},
+	} {
+		if out, err := substituteSecrets(c.raw, secrets, c.host); err == nil {
+			t.Errorf("%s: substituted into %q", name, out)
+		}
+	}
+}
