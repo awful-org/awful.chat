@@ -218,6 +218,13 @@ describe("trimContent", () => {
     expect(trimContent("`" + "c".repeat(300) + "`")).toBe("`" + "c".repeat(156) + "...`");
   });
 
+  it("never cuts a spoiler open", () => {
+    const cut = trimContent(pad(70) + "||the killer is " + "b".repeat(40) + "||");
+    expect(cut).toBe(pad(70).trimEnd() + "...");
+    const leading = trimContent("||" + "s".repeat(300) + "||");
+    expect(stripMarkdown(leading)).toBe("[spoiler]");
+  });
+
   it("does not back off to a backtick or bracket that never closes", () => {
     expect(trimContent("don`t " + pad(100))).toBe(("don`t " + pad(100)).slice(0, 157).trimEnd() + "...");
     expect(trimContent("ok :[ " + pad(100))).toBe(("ok :[ " + pad(100)).slice(0, 157).trimEnd() + "...");

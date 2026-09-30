@@ -387,6 +387,19 @@ describe("discord-style blocks", () => {
     expect(plain("- a\n      - b")).toBe("<ul><li>a<ul><li>b</li></ul></li></ul>");
     // Bullets then numbers at the same depth are two lists.
     expect(plain("- a\n1. b")).toBe("<ul><li>a</li></ul><ol><li>b</li></ol>");
+    // Siblings typed at the same indent stay siblings, however far in.
+    expect(plain("- a\n    - b\n    - c\n- d")).toBe(
+      "<ul><li>a<ul><li>b</li><li>c</li></ul></li><li>d</li></ul>",
+    );
+    expect(stripMarkdown("- a\n    - b\n    - c")).toBe("• a\n  • b\n  • c");
+  });
+
+  it("quotes a fence the quote opens with, and leaves a bare > as text", () => {
+    expect(plain("> ```js\n> x = 1\n> ```")).toBe('<blockquote><pre><code>x = 1</code></pre></blockquote>');
+    expect(plain(">>> ```\nx\n```")).toBe('<blockquote><pre><code>x</code></pre></blockquote>');
+    expect(plain(">")).toBe("&gt;");
+    expect(plain(">>>")).toBe("&gt;&gt;&gt;");
+    expect(plain(">\n>")).toBe("&gt;\n&gt;");
   });
 
   it("renders -# as subtext", () => {
@@ -404,6 +417,9 @@ describe("discord-style blocks", () => {
     expect(firstLinkedUrl("||[a](https://secret.example)|| and https://open.example")).toBe("https://open.example");
     expect(firstLinkedUrl("||https://secret.example||")).toBeNull();
     expect(linkTargets("||[a](https://secret.example)|| [b](https://open.example)")).toEqual(["https://open.example"]);
+    // Bars found where the renderer finds them: after an escaped bar, not in code.
+    expect(firstLinkedUrl(String.raw`\|||a https://secret.example||`)).toBeNull();
+    expect(firstLinkedUrl("`||` https://open.example `||`")).toBe("https://open.example");
   });
 
   it("finds links inside a quote for the preview", () => {

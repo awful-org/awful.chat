@@ -383,6 +383,32 @@ function classify(content: string, quotes = true): Line[] {
   const out: Line[] = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    // Before fences: "> ```js" opens a fence inside the quote, not a fence
+    // after a "> " lead that leaves the quote marks in the code.
+    if (quotes) {
+      // ">>> " quotes everything after it, to the end of the message.
+      const rest = /^>>>(?: (.*))?$/.exec(line);
+      if (rest) {
+        const body = [rest[1] ?? "", ...lines.slice(i + 1)].join("\n");
+        // A quote of nothing is no quote: a lone ">>>" stays text.
+        if (body.trim()) {
+          out.push({ kind: "quote", body });
+          break;
+        }
+      }
+      // "> " quotes its line; a run of them is one quote.
+      if (/^>(?: |$)/.test(line)) {
+        let end = i;
+        while (end < lines.length && /^>(?: |$)/.test(lines[end])) end++;
+        const body = lines.slice(i, end).map((l) => l.slice(2)).join("\n");
+        // Lines of bare ">" quote nothing and stay text, all of the run at
+        // once: rescanning it from each of its lines was quadratic.
+        if (body.trim()) out.push({ kind: "quote", body });
+        else for (let k = i; k < end; k++) out.push({ kind: "text", text: lines[k] });
+        i = end - 1;
+        continue;
+      }
+    }
     const fence = fenceAt(lines, i, closeAt);
     if (fence) {
       if (fence.lead) out.push({ kind: "text", text: fence.lead });
@@ -390,22 +416,6 @@ function classify(content: string, quotes = true): Line[] {
       if (fence.tail) out.push({ kind: "text", text: fence.tail });
       i = fence.end;
       continue;
-    }
-    if (quotes) {
-      // ">>> " quotes everything after it, to the end of the message.
-      const rest = /^>>>(?: (.*))?$/.exec(line);
-      if (rest) {
-        out.push({ kind: "quote", body: [rest[1] ?? "", ...lines.slice(i + 1)].join("\n") });
-        break;
-      }
-      // "> " quotes its line; a run of them is one quote.
-      if (/^>(?: |$)/.test(line)) {
-        const body: string[] = [];
-        while (i < lines.length && /^>(?: |$)/.test(lines[i])) body.push(lines[i++].slice(2));
-        i--;
-        out.push({ kind: "quote", body: body.join("\n") });
-        continue;
-      }
     }
     const subtext = /^-# (\S.*)$/.exec(line);
     if (subtext) {
@@ -437,6 +447,32 @@ function classify(content: string, quotes = true): Line[] {
 const SPOILED_RE = /(?<!\|)\|\|(?!\|)[^\n]*?(?<!\|)\|\|(?!\|)/g;
 
 /**
+ * The line with every spoiler blanked, its bars found where the renderer
+ * finds them: not inside a span it parks (an escape, code, a link, a
+ * mention), so "\|||a https://x.com||" hides the url here as it does on
+ * screen, and a "||" written as code hides nothing.
+ */
+function withoutSpoilers(text: string): string {
+  let mask = "";
+  let last = 0;
+  for (const m of text.matchAll(SPAN_RE)) {
+    const bare = m[6];
+    // A bare url's trimmed tail is text again, bars included.
+    const parked = bare !== undefined ? trimUrl(bare).url.length : m[0].length;
+    mask += text.slice(last, m.index) + " ".repeat(parked);
+    last = m.index + parked;
+  }
+  mask += text.slice(last);
+  let out = "";
+  last = 0;
+  for (const m of mask.matchAll(SPOILED_RE)) {
+    out += text.slice(last, m.index) + " ";
+    last = m.index + m[0].length;
+  }
+  return out + text.slice(last);
+}
+
+/**
  * Every stretch of inline text in the message, quotes included, fences not,
  * and spoilers left out: a link preview or a search snippet naming the site a
  * spoiler hides would give it away.
@@ -445,7 +481,7 @@ function* inlineTexts(content: string, quotes = true): Generator<string> {
   for (const line of classify(content, quotes)) {
     if (line.kind === "fence") continue;
     if (line.kind === "quote") yield* inlineTexts(line.body, false);
-    else yield line.text.replace(SPOILED_RE, " ");
+    else yield withoutSpoilers(line.text);
   }
 }
 
@@ -465,35 +501,49 @@ export function firstLinkedUrl(content: string): string | null {
   return null;
 }
 
+/** An open list: its kind, and how far in its first item was typed. */
+interface OpenList {
+  ordered: boolean;
+  indent: number;
+}
+
 /**
- * A run of list items as nested lists. An item may go one level deeper than
- * the one before it, never more; a change between bullets and numbers at the
- * same depth starts a new list. A numbered list starts where its first item
- * says, as "3." does in the typed text.
+ * Where list item `it` goes among the `open` lists, which it updates. It is
+ * a sibling in the shallowest open list typed as far in as it is, so "- a",
+ * "    - b", "    - c" keeps c beside b; with none, it opens a list one
+ * level in, never more. A change between bullets and numbers at a depth
+ * starts a new list there. `closed` is what it ends, innermost first.
+ * renderList draws by this and stripBlocks indents by it, so the two agree.
+ */
+function nest(open: OpenList[], it: Item): { depth: number; fresh: boolean; closed: OpenList[] } {
+  let depth = open.findIndex((l) => l.indent >= it.depth);
+  if (depth === -1) depth = open.length;
+  const fresh = open[depth]?.ordered !== it.ordered;
+  const closed = open.splice(fresh ? depth : depth + 1).reverse();
+  if (fresh) open.push({ ordered: it.ordered, indent: it.depth });
+  return { depth, fresh, closed };
+}
+
+const endList = (l: OpenList) => (l.ordered ? "</li></ol>" : "</li></ul>");
+
+/**
+ * A run of list items as nested lists (see nest). A numbered list starts
+ * where its first item says, as "3." does in the typed text.
  */
 function renderList(items: Item[], resolveName: ResolveName): string {
   let html = "";
-  const stack: boolean[] = [];
-  const close = () => {
-    html += stack.pop() ? "</li></ol>" : "</li></ul>";
-  };
+  const open: OpenList[] = [];
   for (const it of items) {
-    const depth = Math.min(it.depth, stack.length);
-    while (stack.length > depth + 1) close();
-    if (stack.length === depth + 1) {
-      if (stack[depth] === it.ordered) html += "</li>";
-      else close();
-    }
-    if (stack.length === depth) {
+    const { depth, fresh, closed } = nest(open, it);
+    html += closed.map(endList).join("");
+    if (!fresh) html += "</li>";
+    else
       html += it.ordered
         ? `<ol class="list-decimal pl-6"${it.n !== 1 ? ` start="${it.n}"` : ""}>`
         : `<ul class="${BULLET_CLASS[depth]} pl-5">`;
-      stack.push(it.ordered);
-    }
     html += `<li>${inline(it.text, resolveName)}`;
   }
-  while (stack.length) close();
-  return html;
+  return html + open.reverse().map(endList).join("");
 }
 
 /** One empty line, as a block: what a blank line beside a block becomes. */
@@ -580,13 +630,17 @@ export function renderMessageMarkdown(content: string, resolveName: ResolveName)
 const ENTITIES: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'" };
 
 function stripBlocks(content: string, name: ResolveName, quotes: boolean): string {
+  // Items indent by the depth they render at, not as typed: "- a" then
+  // "      - b" reads one level in, not three.
+  let open: OpenList[] = [];
   return classify(content, quotes)
     .map((line) => {
+      if (line.kind !== "item") open = [];
       if (line.kind === "fence") return code(line.body, name);
       if (line.kind === "quote") return stripBlocks(line.body, name, false);
       const text = inline(line.text, name, true, true);
       if (line.kind !== "item") return text;
-      const indent = "  ".repeat(line.depth);
+      const indent = "  ".repeat(nest(open, line).depth);
       return line.ordered ? `${indent}${line.n}. ${text}` : `${indent}• ${text}`;
     })
     .join("\n");
