@@ -247,6 +247,12 @@ services:
       # Same omission SFU_MAX_ROOMS had: read by sfu/index.ts, documented in
       # .env.example, never passed in - so setting it did nothing at all.
       SFU_REJOIN_PROBE_MS: ${SFU_REJOIN_PROBE_MS:-3000}
+      # The Origin a browser's signalling socket must come from: the app's
+      # own, https://DOMAIN, the same variable the relay's CORS reads. A
+      # page on any other site is refused at the upgrade. SFU_ALLOWED_ORIGINS
+      # adds more, comma-separated, for a second app origin.
+      DOMAIN: ${DOMAIN}
+      SFU_ALLOWED_ORIGINS: ${SFU_ALLOWED_ORIGINS:-}
     # NOT dokploy-network. Nothing routes to this service by hostname from
     # outside - it has no traefik labels, and its media ports are published
     # straight to the host - so the only thing the shared network bought was

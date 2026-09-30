@@ -136,8 +136,9 @@ do not forward, so a proxied hostname is a TURN server nobody can reach.
    ```sh
    cd deploy/sfu-satellite
    cp .env.example .env
-   # PUBLIC_IP     this server's public address
-   # SFU_HOSTNAME  a DNS name pointing at it
+   # PUBLIC_IP            this server's public address
+   # SFU_HOSTNAME         a DNS name pointing at it
+   # SFU_ALLOWED_ORIGINS  the main instance's app origin, https://<DOMAIN>
    docker compose up -d
    ```
 

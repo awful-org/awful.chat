@@ -2,6 +2,7 @@ import * as mediasoup from "mediasoup";
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
 import { envInteger } from "./config";
+import { clientKey, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
 import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin, verifyRoomAdmission } from "./auth";
 import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 import {
@@ -1494,6 +1495,10 @@ const HEARTBEAT_INTERVAL_MS = envInteger("SFU_HEARTBEAT_INTERVAL_MS", 10000);
 // indefinitely. Two heartbeat intervals is generous headroom for a real burst
 // (joining a busy room) to drain before this treats the pause as terminal.
 const BACKPRESSURE_DEADLINE_MS = HEARTBEAT_INTERVAL_MS * 2;
+// Which origins may open a signalling socket, and how many sockets may sit
+// unjoined - see sfu/admission.ts. Read once at boot, like everything above.
+const ADMISSION = loadAdmissionConfig();
+const pendingSockets = new PendingSockets(ADMISSION);
 
 async function main(): Promise<void> {
   worker = await mediasoup.createWorker({
@@ -1525,7 +1530,32 @@ async function main(): Promise<void> {
     console.error("[sfu] uncaught exception:", err);
   });
 
-  const wss = new WebSocketServer({ port: PORT, maxPayload: MAX_FRAME_BYTES });
+  if (ADMISSION.strict && ADMISSION.allowedOrigins.size === 0) {
+    // Production with no origin configured refuses every browser. Said
+    // loudly, because the symptom is calls failing with a handshake error
+    // while this process looks perfectly healthy.
+    console.error(
+      "[sfu] NODE_ENV=production but neither DOMAIN nor SFU_ALLOWED_ORIGINS is set: every browser connection will be refused",
+    );
+  } else if (ADMISSION.strict) {
+    console.log(`[sfu] accepting browser connections from ${[...ADMISSION.allowedOrigins].join(", ")}`);
+  } else {
+    console.log("[sfu] no DOMAIN or SFU_ALLOWED_ORIGINS: accepting browser connections from any origin (development)");
+  }
+
+  const wss = new WebSocketServer({
+    port: PORT,
+    maxPayload: MAX_FRAME_BYTES,
+    // The upgrade is refused before a socket exists for a browser page on
+    // any origin but the app's own: a signalling socket opened by some other
+    // site, in a visitor's browser, is that site acting as the visitor.
+    // Nothing is logged per refusal - a page that retries in a loop would
+    // otherwise be writing this process's log.
+    verifyClient: (info, done) => {
+      if (originAllowed(ADMISSION, info.origin || undefined)) done(true);
+      else done(false, 403, "Origin not allowed");
+    },
+  });
 
   // ws forwards the internal http server's "error" event onto the
   // WebSocketServer, and that is where a failure to listen at all arrives -
@@ -1558,7 +1588,19 @@ async function main(): Promise<void> {
     clearInterval(heartbeatInterval);
   });
 
-  wss.on("connection", (ws: WebSocket, _req: IncomingMessage) => {
+  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+    // A socket that has not joined yet is counted against its client until
+    // it joins or goes away. Each one is allowed JOIN_TIMEOUT_MS, and there
+    // was no limit on how many one address could hold at once.
+    const releasePending = pendingSockets.tryAcquire(
+      clientKey(ADMISSION, req.socket.remoteAddress, req.headers["x-forwarded-for"]),
+    );
+    if (!releasePending) {
+      // 1013: try again later. The client's own reconnect backoff does that.
+      ws.close(1013, "Too many unjoined connections");
+      return;
+    }
+    ws.once("close", releasePending);
     let joinNonce: string | null = newJoinNonce();
     const joinDeadline = Date.now() + JOIN_TIMEOUT_MS;
     const joinTimer = setTimeout(() => ws.terminate(), JOIN_TIMEOUT_MS);
@@ -1646,6 +1688,8 @@ async function main(): Promise<void> {
           return;
         }
         clearTimeout(joinTimer);
+        // Authenticated: no longer an anonymous pending socket.
+        releasePending();
 
         const existingRoom = rooms.get(joinMsg.roomCode);
         if (!existingRoom && routers.size >= MAX_ROOMS) {
