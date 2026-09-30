@@ -1143,9 +1143,9 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
       const override = await getOwnRoomProfile(roomCode, did);
       const scoped = await frameFor(resolveRoomProfile(profile, override?.fields), true);
       const scopedHash = frameHash(scoped);
-      if (!_profileEcho.shouldSend(`${pid}|${roomCode}`, scopedHash)) continue;
+      if (!_profileEcho.shouldSend(pid, scopedHash, Date.now(), roomCode)) continue;
       const delivered = await _transport.sendRoom(pid, roomCode, scoped).catch(() => false);
-      if (!delivered) _profileEcho.forget(`${pid}|${roomCode}`);
+      if (!delivered) _profileEcho.forget(pid, roomCode);
     }
   };
 

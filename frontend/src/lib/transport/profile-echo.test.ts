@@ -36,6 +36,28 @@ describe("profile echo", () => {
     expect(echo.shouldSend("peer2", h, 10)).toBe(true);
   });
 
+  it("sends identical inherited profiles once to each room and keeps main independent", () => {
+    const echo = new ProfileEcho();
+    const hash = frameHash(A);
+    expect(echo.shouldSend("peer1", hash, 0)).toBe(true);
+    expect(echo.shouldSend("peer1", hash, 1, "rd2_a")).toBe(true);
+    expect(echo.shouldSend("peer1", hash, 2, "rd2_b")).toBe(true);
+    expect(echo.shouldSend("peer1", hash, 3, "rd2_a")).toBe(false);
+    expect(echo.shouldSend("peer1", hash, 4, "rd2_b")).toBe(false);
+  });
+
+  it("forgets one failed room send or every scope on disconnect", () => {
+    const echo = new ProfileEcho();
+    const hash = frameHash(A);
+    echo.shouldSend("peer1", hash, 0, "rd2_a");
+    echo.shouldSend("peer1", hash, 0, "rd2_b");
+    echo.forget("peer1", "rd2_a");
+    expect(echo.shouldSend("peer1", hash, 1, "rd2_a")).toBe(true);
+    expect(echo.shouldSend("peer1", hash, 1, "rd2_b")).toBe(false);
+    echo.forget("peer1");
+    expect(echo.shouldSend("peer1", hash, 2, "rd2_b")).toBe(true);
+  });
+
   it("re-sends after a disconnect drops the record", () => {
     const echo = new ProfileEcho();
     const h = frameHash(A);
