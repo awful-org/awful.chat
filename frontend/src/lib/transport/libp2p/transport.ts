@@ -14,6 +14,7 @@ import { deriveRoomKeys, discoveryIdOf, type DiscoveryId, type RoomKeys, type Ro
 import { attachRoomStream, ROOM_PROTOCOL } from "$lib/room-security/stream";
 import type { SecureRoomChannel } from "$lib/room-security/channel";
 import { attachDmIntroduction, DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
+import { LobbyDialBudget } from "./dm-lobby-budget";
 import type { DmPqState } from "$lib/room-security/pq-dm";
 import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 import { onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
@@ -164,8 +165,8 @@ const RENDEZVOUS_PING_INTERVAL_MS = 20_000;
  * is 40s of silence on a link that should speak every 20s.
  */
 const RENDEZVOUS_PONG_MISSES_ALLOWED = 2;
-/** How often one peer found in a DM lobby is introduced again, at most. */
-const DM_LOBBY_RETRY_MS = 10 * 60_000;
+/** Lobby peers waiting out DM_LOBBY_INTRODUCE_DELAY_MS at once, at most. */
+const DM_LOBBY_PENDING_MAX = 32;
 /** Grace for an already-upgraded peer to show up in the post-quantum room. */
 const DM_LOBBY_INTRODUCE_DELAY_MS = 5_000;
 /**
@@ -285,7 +286,8 @@ export class LibP2PTransport implements PeerTransport {
     for (const localId of [...this.dmLobbyOf.keys()]) this.releaseDmLobby(localId);
     if (this.lobbyRegisterTimer) clearTimeout(this.lobbyRegisterTimer);
     this.lobbyRegisterTimer = null;
-    this.lobbyIntroducedAt.clear();
+    this.lobbyBudget.clear();
+    this.lobbyPending.clear();
     this.dmSessions.clear();
     this.secureOpening.clear();
   }
@@ -386,8 +388,9 @@ export class LibP2PTransport implements PeerTransport {
    * classical room with us is refused like any non-member), only watched.
    * Whoever turns up there is dialled and introduced, which upgrades them if
    * they can be and merely re-binds their DID if they cannot (an older
-   * build). Bounded per peer, so an older build is not re-introduced on
-   * every rendezvous reply.
+   * build). Bounded per peer, per lobby and overall (dm-lobby-budget.ts), so
+   * an older build is not re-introduced on every rendezvous reply and a
+   * relay listing made-up peers gets only a handful of dials out of us.
    *
    * Lobbies are second-class registrations, on purpose. The relay allows a
    * peer only so many REGISTERs into empty rooms a minute
@@ -406,7 +409,9 @@ export class LibP2PTransport implements PeerTransport {
   private dmLobbies = new Map<DiscoveryId, { localId: string; peerDid: string }>();
   private lobbyRegistered = new Set<DiscoveryId>();
   private lobbyRegisterTimer: TimerHandle | null = null;
-  private lobbyIntroducedAt = new Map<string, number>();
+  /** Who we may still introduce from a lobby - see dm-lobby-budget.ts. */
+  private lobbyBudget = new LobbyDialBudget();
+  private lobbyPending = new Set<string>();
 
   /** Hold (or keep) this conversation's classical ID as a lobby. */
   holdDmLobby(localId: string, anchor: DiscoveryId, peerDid: string): void {
@@ -436,6 +441,7 @@ export class LibP2PTransport implements PeerTransport {
     if (!anchor) return;
     this.dmLobbyOf.delete(localId);
     this.dmLobbies.delete(anchor);
+    this.lobbyBudget.forgetLobby(anchor);
     if (this.lobbyRegistered.delete(anchor) && !this.joinedRooms.has(anchor)) {
       this.rendezvousSend({ type: "UNREGISTER", room: anchor });
     }
@@ -450,15 +456,21 @@ export class LibP2PTransport implements PeerTransport {
     const lobby = this.dmLobbies.get(room);
     if (!lobby || !peer || peer === this.selfId() || this.isRelayPeer(peer)) return;
     const { localId, peerDid } = lobby;
-    const now = Date.now();
-    if (now - (this.lobbyIntroducedAt.get(peer) ?? -Infinity) < DM_LOBBY_RETRY_MS) return;
-    if (this.lobbyIntroducedAt.size >= 256) this.lobbyIntroducedAt.clear();
-    this.lobbyIntroducedAt.set(peer, now);
+    // The relay chooses who is listed here, so the cheap checks come first
+    // and bound what a listing of thousands of made-up peers can cost: one
+    // wait per peer, and only so many waiting at once.
+    if (this.lobbyPending.has(peer) || this.lobbyPending.size >= DM_LOBBY_PENDING_MAX ||
+        !this.lobbyBudget.mayTry(peer)) return;
+    this.lobbyPending.add(peer);
     // A device that has upgraded is in the lobby too and will be in the
     // post-quantum room with us moments later: give that the chance to land
-    // before paying for an introduction that would change nothing.
+    // before paying for an introduction that would change nothing. The
+    // budget is spent only on a real dial, so those devices - every one of
+    // the other side's upgraded devices shows up here - never use it up.
     setTimeout(() => {
+      this.lobbyPending.delete(peer);
       if (this.dmLobbies.get(room) !== lobby || this.isRoomPeer(localId, peer)) return;
+      if (!this.lobbyBudget.allow(room, peer)) return;
       void this.introduceDm(peer, peerDid);
     }, DM_LOBBY_INTRODUCE_DELAY_MS);
   }
