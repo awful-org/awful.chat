@@ -538,9 +538,12 @@ func pushDeliver(box string) {
 		key := pushEndpointKey(s.Endpoint)
 		if key == "" {
 			// Stored before the allowlist, or an operator has narrowed it
-			// since. It can never be sent to again, so it goes like a 410.
-			expired++
-			dead = append(dead, device)
+			// since. Skipped, not deleted: a PUSH_ALLOWED_HOSTS set by
+			// mistake must be undoable by setting it back, and a deleted
+			// subscription only returns when its device next re-subscribes.
+			// The device's own unsubscribe, or a 404/410 once it is allowed
+			// again, still removes it.
+			skipped++
 			continue
 		}
 		host := pushHost(key)

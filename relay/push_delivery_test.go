@@ -170,3 +170,37 @@ func TestPushFailingServiceAndBoxBackOff(t *testing.T) {
 		t.Fatalf("a failing service got %d sends, want it suspended after %d", n, pushHostFailThreshold)
 	}
 }
+
+// A subscription whose service the allowlist no longer covers is skipped,
+// not deleted, so a mistaken PUSH_ALLOWED_HOSTS can be undone.
+func TestPushOutsideTheAllowlistIsSkippedNotDeleted(t *testing.T) {
+	pushTestSetup(t)
+	resetPushDelivery(t)
+	fake := &fakePushService{status: 201}
+	fake.install()
+	did, priv := testDid(t)
+	box := mailboxIDForDid(did)
+	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, deviceID(60), "https://fcm.googleapis.com/fcm/send/keep"), handlePushSubscribe); w.Code != 204 {
+		t.Fatalf("subscribe: %d", w.Code)
+	}
+
+	saved := pushAllowedHosts
+	defer func() { pushAllowedHosts = saved }()
+	pushAllowedHosts = parsePushHosts("updates.push.services.mozilla.com") // the mistake
+	pushDeliver(box)
+	if fake.calls() != 0 {
+		t.Fatal("sent to a service outside the allowlist")
+	}
+	pushMu.Lock()
+	subs, _ := readPushBox(box)
+	pushMu.Unlock()
+	if len(subs) != 1 {
+		t.Fatal("the subscription was deleted, so undoing the setting cannot bring it back")
+	}
+
+	pushAllowedHosts = saved // undone
+	pushDeliver(box)
+	if fake.calls() != 1 {
+		t.Fatalf("after undoing the allowlist, %d sends, want 1", fake.calls())
+	}
+}
