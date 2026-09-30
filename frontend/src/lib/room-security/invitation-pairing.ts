@@ -168,10 +168,13 @@ export class InvitationPairingHost {
   }
   start(attempt: string, request: string): string {
     if (!this.active || this.attempts >= PAIRING_ATTEMPTS) throw new Error("Pairing expired or attempt limit reached");
-    this.attempts++;
     message(attempt);
     if (this.pending.has(attempt)) throw new Error("Repeated pairing attempt");
     const result = opaque.server.startLogin({ serverSetup: this.setup, registrationRecord: this.record, userIdentifier: this.locator, startLoginRequest: message(request), identifiers: identifiers(this.locator) });
+    // Counted only once the request parsed: anyone who can reach the relay
+    // could otherwise burn a live code with five pieces of junk. Each counted
+    // start is still the one password guess it buys.
+    this.attempts++;
     // A fresh ML-KEM key per attempt, never reused.
     const kem = ml_kem768.keygen();
     this.pending.set(attempt, { login: result.serverLoginState, kem });

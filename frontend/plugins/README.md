@@ -719,12 +719,15 @@ The host reads its api origin at runtime, so there is nothing to inline.
 
 The upstream host must be in the instance's `PLUGIN_PROXY_HOSTS` allowlist,
 and the url may carry `{{secret:NAME}}` placeholders that the relay fills
-from `PLUGIN_PROXY_SECRETS` server-side. Operators should bind secrets to
-their host (`STEAM@api.steampowered.com=key`): an unbound secret can be
-sent to any allowlisted host, which is a leak the moment a second host is
-allowlisted. A 204 means the instance is not configured for your plugin:
-say so in the card. Placeholders belong in QUERY STRINGS (values are
-query-escaped). GET only, https only, 2 MB response cap, responses cached
+from `PLUGIN_PROXY_SECRETS` server-side. Each secret is bound to one host,
+one path prefix and one query parameter
+(`STEAM@api.steampowered.com/ISteamUser/?key=your-key`), and the relay
+fills it only when the placeholder is the WHOLE value of that parameter on
+a path under that prefix - so a caller cannot move the key into another
+parameter, or onto an endpoint that echoes its query. Document the exact
+host, prefix and parameter your plugin uses. The older `NAME=value` and
+`NAME@host=value` forms are no longer filled. A 204 means the instance is
+not configured for your plugin: say so in the card. GET only, https only, 2 MB response cap, responses cached
 ~5 minutes, ~10 requests/minute per client. Document the hosts and secrets
 your plugin needs in its README.
 

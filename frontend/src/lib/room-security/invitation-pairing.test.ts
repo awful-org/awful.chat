@@ -37,6 +37,16 @@ it("rejects a wrong password and caps attempts at the inviter", async () => {
   expect(() => host.start(join.attempt, join.request)).toThrow("limit");
 });
 
+it("does not let malformed starts burn the code", async () => {
+  const host = await InvitationPairingHost.create(newRoomSecret());
+  for (let i = 0; i < PAIRING_ATTEMPTS * 2; i++) {
+    const junk = await startPairingJoin(formatPairingCode(host.locator, host.password));
+    expect(() => host.start(junk.attempt, "not-an-opaque-request")).toThrow();
+  }
+  const join = await startPairingJoin(formatPairingCode(host.locator, host.password));
+  expect(() => join.respond(host.start(join.attempt, join.request))).not.toThrow();
+});
+
 it("rejects expired and cancelled invitations, including pending proofs", async () => {
   let now = 0;
   const expired = await InvitationPairingHost.create(newRoomSecret(), () => now);
