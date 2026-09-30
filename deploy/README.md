@@ -223,15 +223,15 @@ half on the other, and each half would never see the other half in its
 next to its PeerID, but there is no code check that refuses a second
 replica outright.
 
-**`TRUSTED_PROXY_CIDRS` is optional hardening.** The relay's API port is
-reachable by every container on `dokploy-network`, not only Traefik, and the
-default trusted range (see `.env.example`) is the whole private address
-space - so on this compose shape, another container on the same box can
-forge `X-Forwarded-For` and pick its own bucket for every per-IP rate limit
-the relay has (`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`,
-`/plugin-stream`). That neighbour is something you deployed yourself, so the
-default stays convenient. To close it, set the variable to Traefik's own
-address on your `dokploy-network` as a single `/32` (`docker network inspect
-dokploy-network` lists it), and re-check it whenever Traefik is recreated:
-a stale value makes the relay treat Traefik as the client, and every user
-then shares one rate-limit bucket.
+**`TRUSTED_PROXY_CIDRS` names the proxy.** The relay believes
+`X-Forwarded-For` only from what this lists, and trusts nothing when it is
+empty. It used to trust the whole private address space by default, which on
+this compose shape let any other container on `dokploy-network` forge the
+header and pick its own bucket for every per-IP limit the relay has
+(`/turn-credentials`, `/invite`, `/mailbox`, `/push`, `/og`, `/plugin-proxy`,
+`/plugin-stream`, `/telemetry`). The compose now defaults it to
+`dokploy-traefik`, the name of Dokploy's Traefik container, which the relay
+re-resolves every 30 seconds so a recreated Traefik is followed rather than
+turned into "the client". If your proxy has another name, set it; the relay
+logs what the name resolved to at boot, and says so loudly when it resolves
+to nothing, because every user then shares one rate-limit bucket.

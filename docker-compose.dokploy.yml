@@ -75,20 +75,20 @@ services:
       # reaches an operator whose instance misbehaves. Defaults to
       # admin@${DOMAIN}.
       - PUSH_CONTACT=${PUSH_CONTACT:-}
-      # Whose X-Forwarded-For the relay believes, for rate limiting and the
-      # plugin proxy. Read by relay/pluginproxy.go and documented in
-      # .env.example, but never passed in until recently: an operator who added
-      # a CDN's ranges here got no error and no effect, which on a control that
-      # decides which client ip is believed is the worst way to fail.
+      # Whose X-Forwarded-For the relay believes, for every per-client limit
+      # it has. The relay itself trusts NOTHING when this is empty: every
+      # container on dokploy-network holds a private address, so the old
+      # "trust every private range" default let any neighbour forge the header
+      # and pick its own rate-limit bucket.
       #
-      # Optional. Unset, the relay trusts private ranges plus loopback, which
-      # is right behind Traefik alone. On this compose's shared dokploy-network
-      # every container holds a private address, so another container on the
-      # box could forge X-Forwarded-For and pick its own per-IP rate-limit
-      # bucket; an operator who wants that closed sets Traefik's /32 here (see
-      # .env.example). It is a rate-limit bypass for a neighbour you deployed
-      # yourself, so the default stays convenient rather than strict.
-      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-}
+      # The default below is the NAME of Dokploy's Traefik container, which
+      # docker's DNS answers on dokploy-network. The relay re-resolves it every
+      # 30s, so it follows Traefik across a recreate instead of going stale
+      # the way a hand-copied /32 does. If your Traefik runs under another
+      # name, or a CDN sits in front of it, set this (see .env.example). If it
+      # names nothing that resolves, the relay says so at boot and every user
+      # shares Traefik's one bucket until it does.
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-dokploy-traefik}
     volumes:
       - relay_data:/app/data
     networks:

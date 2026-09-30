@@ -1454,6 +1454,11 @@ func main() {
 	h.SetStreamHandler(RendezvousProtocol, reg.handleStream)
 	relaySelfPeerId = h.ID().String()
 
+	// Before the API answers anything: a hostname in TRUSTED_PROXY_CIDRS has
+	// to be resolved first, or the first requests after a restart are all
+	// keyed on the proxy itself.
+	startTrustedProxyResolver()
+
 	// HTTP server for OG and Klipy endpoints (run on separate internal port)
 	apiPort := "8081"
 	go func() {

@@ -227,7 +227,7 @@ whose context holds no repository declares no commit.
 | `SFU_REJOIN_PROBE_MS` | no | how often a client is probed to confirm its SFU session is still live, default 3000 |
 | `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
 | `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
-| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs whose `X-Forwarded-For` the relay believes. Unset means private ranges plus loopback, correct behind traefik alone. Opt-in hardening: set it to Traefik's own `/32` on `dokploy-network` so a neighbouring container on the same box cannot forge the header and dodge the relay's per-IP limits; add a CDN's ranges when one sits in front |
+| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs, addresses or hostnames whose `X-Forwarded-For` the relay believes. Empty trusts nothing (every request is keyed on its socket peer). The dokploy compose defaults it to `dokploy-traefik`, re-resolved every 30s so it survives Traefik being recreated; name your own proxy if it differs, and add a CDN's ranges when one sits in front. `private` restores the old trust-every-private-range behaviour |
 | `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |
