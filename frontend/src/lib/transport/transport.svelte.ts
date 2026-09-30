@@ -48,6 +48,11 @@ import {
   removeRoomParticipant,
   updateParticipantLastSeen,
   cleanupInactiveParticipants,
+  setDmRequest,
+  getDeletedFloor,
+  addRoomParticipants,
+  MAX_ROOM_PARTICIPANTS,
+  type DMRoom,
 } from "../storage";
 import { normalizeWireName } from "../wire-name";
 import {
@@ -87,6 +92,7 @@ import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
 import { verifyIncoming } from "./verify-incoming";
+import { messageIdAllowedFor, newMessageId } from "../message-id";
 import { LiveUpdateAdmission } from "../room-security/live-updates";
 
 const liveUpdateAdmission = new LiveUpdateAdmission();
@@ -167,6 +173,7 @@ import {
   dmPeerDidForRoom,
   dmRoomExists,
   ensureDmRoomForPeer,
+  isDmRequestRoom,
   offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
@@ -720,7 +727,8 @@ const _introductionHookDeps: IntroductionHookDeps = {
   // Arrows, not the functions themselves: dm.svelte imports this module, so
   // these bindings are only safe to read once both have finished loading.
   dmExists: (did) => dmRoomExists(did),
-  ensureDm: (did, state) => ensureDmRoomForPeer(did, state),
+  // Unsolicited: the introduction may be a stranger's. See EnsureDmOptions.
+  ensureDm: (did, state) => ensureDmRoomForPeer(did, state, { unsolicited: true }),
   replayPending: (peer, did) => _replayPendingDm(peer, did),
   heal: {
     schedule: (run, ms) => { setTimeout(run, ms); },
@@ -2115,6 +2123,19 @@ async function _handleSyncBatch(
   guard();
   await bulkPutMessages(fullMessages, guard);
   guard();
+  // Every row here verified under sigV3, which binds the room: its author
+  // wrote in this room, as of when they wrote it. That is how a member we
+  // have never been connected to gets listed, now that rosters from other
+  // members are not believed.
+  if (_protectedRoster(roomCode)) {
+    const authors = new Map<string, number>();
+    for (const m of fullMessages) {
+      if (m.senderId === identityStore.did) continue;
+      if (!Number.isFinite(m.timestamp)) continue;
+      authors.set(m.senderId, Math.max(authors.get(m.senderId) ?? 0, m.timestamp));
+    }
+    _noteAttestedMembers(roomCode, authors);
+  }
   for (const message of fullMessages) {
     await ensureMessageAttachmentOwnership(message.id, guard);
     guard();
@@ -2305,7 +2326,12 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
 // every incoming chat row needs exactly the same treatment (wireToMessage),
 // and that path must not import this module - it boots libp2p on import.
 
-async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
+async function _handleProfile(
+  peerId: string,
+  msg: WireProfile,
+  /** The verified channel it came over; null for a direct frame. */
+  channelRoom: string | null
+): Promise<void> {
   // Bind the DID to the peerId only on a signature over THIS connection's
   // peerId. The `did` field on its own is spoofable, and any peer could
   // otherwise claim someone else's identity and hijack their DM conversation
@@ -2352,6 +2378,27 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   }
   // Reconcile history with them either way; debounced, so a burst is one.
   _syncPeer(peerId);
+
+  // Their profile is kept - in memory and in storage - only when we share
+  // something with them: it came over a verified room or DM channel, or they
+  // are verified in one of ours right now. A direct frame passes the scope
+  // check, and any peer that can dial us could otherwise have us store a
+  // profile (up to ~1.4 MB of avatar and banner) per identity it mints. The
+  // same rule decides where OUR profile goes (profileDeliveryRoom), so every
+  // peer that sends us theirs legitimately does it over a shared channel.
+  // A legacy-only session (no protected rooms at all) has no such channel.
+  if (
+    channelRoom === null &&
+    profileDeliveryRoom(_transport.rooms(), peerId, (r) => _transport.peersInRoom(r)) === null
+  ) {
+    rec(ev("app.profile.reject", { peer: peerId, d: { reason: "scope" } }));
+    return;
+  }
+  // The frame that proved the binding came over this room's channel, so this
+  // is the first moment the room can vouch for them by DID.
+  if (channelRoom && _protectedRoster(channelRoom)) {
+    _noteAttestedMembers(channelRoom, new Map([[did, Date.now()]]));
+  }
 
   const avatarUrl = normalizeAvatarUrl(msg.avatarUrl);
   // `color` absent = older build, which has no such field - keep any cached
@@ -2705,6 +2752,36 @@ function _reconcileRoomUserBinding(peerId: string, did: string): void {
   }
 }
 
+/**
+ * A protected room's member list is not gossip: only an identity the room
+ * itself vouches for is listed - one heard over the room's verified channel
+ * under a proven binding, or one whose signed messages (sigV3 binds the room)
+ * we accepted. A member's say-so about somebody ELSE is not enough: it let
+ * any member list real people in a room they are not in (under their real
+ * names, where we hold their profile) or flood the list with junk.
+ */
+function _protectedRoster(room: string): boolean {
+  return room.startsWith("rd2_");
+}
+
+/** `did` is attested in `room` as of `at`: listed, and last seen then. */
+function _noteAttestedMembers(room: string, seen: Map<string, number>): void {
+  const now = Date.now();
+  const entries = [...seen]
+    .filter(([did]) => looksLikeDid(did))
+    .map(([did, at]) => [did, Math.min(at, now)] as const);
+  if (!entries.length) return;
+  addRoomParticipants(room, entries).catch(() => {});
+  if (room !== transportState.roomCode) return;
+  const users = new Set(transportState.roomUsers);
+  const before = users.size;
+  for (const [did] of entries) {
+    if (users.size >= MAX_ROOM_PARTICIPANTS) break;
+    users.add(did);
+  }
+  if (users.size !== before) transportState.roomUsers = [...users];
+}
+
 function _admitRoomMember(room: string, did: string): void {
   if (room !== transportState.roomCode) {
     // Another room we are subscribed to: record it, but do not touch the
@@ -2747,7 +2824,12 @@ function _handleJoinRoom(
   // they are on is bound to a DID that is in the roster - so a fabricated
   // entry reaches nobody until that identity actually connects.
   if (!looksLikeDid(claimedDid) && !looksLikePeerId(claimedDid)) return;
-  _admitRoomMember(room, claimedDid);
+  // A protected room lists only whom it attests (_protectedRoster). An
+  // unbound join is not lost: the sender's profile follows over this same
+  // channel and lists them then (_handleProfile).
+  if (!_protectedRoster(room) || _isSelfAnnouncement(fromPeerId, claimedDid)) {
+    _admitRoomMember(room, claimedDid);
+  }
   // The roster only went out on connect, so a peer switching into this room
   // over connections that were already up saw nobody but themselves until
   // the next connect. Answer the join with who is here.
@@ -2785,6 +2867,7 @@ function _handleLeaveRoom(
 const MAX_ROOM_USERS = 512;
 
 function _handleRoomUsersSync(
+  fromPeerId: string,
   msg: WireRoomUsersSync,
   room: string | null
 ): void {
@@ -2798,8 +2881,13 @@ function _handleRoomUsersSync(
   const participants = msg.participants;
   if (!Array.isArray(participants)) return;
   const selfDid = identityStore.did ?? _transport.selfId();
+  const senderDid = _peerIdToDid.get(fromPeerId);
   const valid = participants.filter(
-    (p) => typeof p === "string" && (looksLikeDid(p) || looksLikePeerId(p))
+    (p) =>
+      typeof p === "string" &&
+      (looksLikeDid(p) || looksLikePeerId(p)) &&
+      // In a protected room a roster vouches for its sender alone.
+      (!_protectedRoster(roomCode) || (room !== null && p === senderDid))
   );
   rec(
     ev("app.roomusers", {
@@ -2886,6 +2974,9 @@ function _announceMessage(
   msg: Message,
   opts: { viaMailbox?: boolean } = {}
 ): void {
+  // A message request makes no sound: a stranger minting identities would
+  // otherwise get a notification per identity.
+  if (isDmRequestRoom(msg.roomCode)) return;
   announceMessage(
     msg,
     {
@@ -2975,10 +3066,20 @@ async function _handleChatMessage(
   // The in-memory list holds only the open room's newest page; a replayed
   // message from a background room would always look "new" and re-notify.
   // Decided BEFORE the put below, which would otherwise satisfy the lookup.
-  const isNewMessage =
-    !transportState.messages.some((m) => m.id === msg.id) &&
-    !(await getMessage(msg.id));
+  const held =
+    transportState.messages.find((m) => m.id === msg.id) ??
+    (await getMessage(msg.id));
   guard();
+  const isNewMessage = !held;
+  // A row we hold under this id that is NOT this sender's message in this
+  // room means this one is not stored and never will be. It must not claim a
+  // watermark: that told every later digest we had the message, so no peer
+  // would ever offer it again - one squatted id silently erased it here for
+  // good. Nor does it get to fold into a card or seed files under that id.
+  if (held && (held.roomCode !== msg.roomCode || held.senderId !== msg.senderId)) {
+    console.warn("[chat] refused a message reusing the id of one we already hold");
+    return;
+  }
 
   // Only a genuinely new message is written: re-putting a replayed one
   // would overwrite the stored row with this handler's view of it.
@@ -3313,14 +3414,25 @@ _transport.on("disconnect", (peerId) => {
  * crypto (sender signature over the envelope, bound to us); the stream
  * path's transport-level binding plays no part here.
  */
-export function deliverMailboxDm(
+export async function deliverMailboxDm(
   senderDid: string,
   payload: DmPayload
 ): Promise<void> {
+  // A blob from before the user deleted this conversation is a replay: the
+  // relay has it only because it kept what we acked. Resolving (not throwing)
+  // lets the collector ack it again.
+  if ((payload.lamport ?? payload.ts) <= (await _deletedFloorFor(senderDid))) return;
   // AWAITABLE on purpose: the mailbox collector must not ack (= delete the
   // relay's only copy) until the local write actually settled - a locked
   // identity mid-drain throws here instead of vanishing the message.
   return _handleDmChatAsync(senderDid, senderDid, { payload }, true);
+}
+
+/** How far this sender's side of a deleted conversation went (storage.ts). */
+async function _deletedFloorFor(senderDid: string): Promise<number> {
+  const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
+  if (!roomCode) return 0;
+  return getDeletedFloor(roomCode, senderDid).catch(() => 0);
 }
 
 /**
@@ -3349,13 +3461,24 @@ export async function deliverMailboxBatch(
   const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
   guard();
   if (!roomCode || roomCode !== decoded.roomCode) return;
+  // Same replay rule as deliverMailboxDm, per row.
+  const floor = await _deletedFloorFor(senderDid);
+  guard();
+  const messages = decoded.messages.filter(
+    (m) => !(m?.senderId === senderDid && typeof m.lamport === "number" && m.lamport <= floor)
+  );
+  if (!messages.length) return;
   // The batch handler refuses a room we have not joined, and a conversation
   // whose first contact arrives through the mailbox has never been joined.
-  await ensureDmRoomForPeer(senderDid);
+  // No room means a stranger's request that did not fit: dropped.
+  if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return;
+  // A request this just created must be known as one before anything in the
+  // batch is announced (_announceMessage reads roomsStore).
+  await refreshDmRooms();
   guard();
   await _handleSyncBatch(
     roomCode,
-    decoded.messages,
+    messages,
     senderDid,
     decoded.live === true
   );
@@ -3418,7 +3541,10 @@ function _handleDmChatAsync(
 ): Promise<void> {
   const guard = captureDmOwnership();
   return (async () => {
-    const roomCode = await ensureDmRoomForPeer(peerId);
+    // Same binding verifyIncoming applies to room rows: a DM peer cannot file
+    // a row under an id someone else's message was bound to.
+    if (!messageIdAllowedFor(envelope.payload.id, senderDid)) return;
+    const roomCode = await ensureDmRoomForPeer(peerId, undefined, { unsolicited: true });
     guard();
     if (!roomCode) return;
 
@@ -3728,14 +3854,17 @@ _transport.on("message", (peerId, data, room) => {
     // Update last seen for this peer
     const did = _peerIdToDid.get(peerId);
     if (did && room) {
-      updateParticipantLastSeen(room, did).catch(() => {});
+      // Over a protected room's channel, a bound sender IS a member: list
+      // them (one rewrite, same as the last-seen update it replaces).
+      if (_protectedRoster(room)) _noteAttestedMembers(room, new Map([[did, Date.now()]]));
+      else updateParticipantLastSeen(room, did).catch(() => {});
     }
 
     const msg = decoded as AnyWireMessage;
 
     switch (msg.type) {
       case MessageType.Profile:
-        _handleProfile(peerId, msg);
+        _handleProfile(peerId, msg, room ?? null);
         break;
       case MessageType.CallPresence:
         _handleCallPresence(peerId, msg.inCall, msg.roomCode);
@@ -3831,7 +3960,7 @@ _transport.on("message", (peerId, data, room) => {
         _handleLeaveRoom(peerId, msg.peerId, room);
         break;
       case MessageType.RoomUsersSync:
-        _handleRoomUsersSync(msg, room);
+        _handleRoomUsersSync(peerId, msg, room);
         break;
       case MessageType.SyncDigest:
         _handleDigest(peerId, msg.roomCode, msg.watermarks).catch(() => {});
@@ -4016,6 +4145,9 @@ async function _joinSavedRooms(): Promise<void> {
     // DMs are handled by joinPhonebookDmRooms, which derives the room code
     // from the DID rather than trusting a stored one.
     if (isLegacyArchive(room.roomCode)) continue;
+    // A message request is joined when its sender turns up again (their
+    // introduction) or the user opens it - never just for starting up.
+    if ((room as DMRoom).request === true) continue;
     try {
       joinStoredRoom(_transport, room.roomCode, room);
     } catch {
@@ -4481,7 +4613,7 @@ export async function sendMessage(
   assertCurrent();
 
   let msg: Message = {
-    id: crypto.randomUUID(),
+    id: newMessageId(myId),
     roomCode,
     senderId: myId,
     senderName,
@@ -4560,6 +4692,8 @@ export async function sendFiles(
   if (roomCode.startsWith("dm-")) {
     const did = await dmPeerDidForRoom(roomCode);
     if (!did || await ensureDmRoomForPeer(did) !== roomCode) throw new Error("DM identity unavailable");
+    // Answering a message request accepts it, files included.
+    if (await setDmRequest(roomCode, false)) void refreshDmRooms();
   }
   if (!_transport.rooms().includes(roomCode)) throw new Error("Not in a room");
   assertCurrent();
@@ -4578,7 +4712,7 @@ export async function sendFiles(
     sourceByInfoHash.set(newSeed.infoHash, file);
   }
 
-  const messageId = crypto.randomUUID();
+  const messageId = newMessageId(identityStore.did ?? _transport.selfId());
   const attachmentIds: string[] = [];
   const createdAt = Date.now();
   // Measured here and carried with the announce so a receiver can reserve
@@ -4713,7 +4847,7 @@ export async function sendCard(
   const lamport = await nextMessageLamport(roomCode);
   assertCurrent();
 
-  const cardId = crypto.randomUUID();
+  const cardId = newMessageId(myId);
   const content = JSON.stringify({ pluginId, data: payload });
 
   let msg: Message = {
@@ -4794,7 +4928,7 @@ export async function sendUpdate(
     const content = JSON.stringify({ pluginId, cardId, data: payload });
     let wire: WirePluginEphemeral = {
       type: MessageType.PluginEphemeral,
-      id: crypto.randomUUID(),
+      id: newMessageId(myId),
       senderId: myId,
       senderName,
       timestamp: Date.now(),
@@ -4821,7 +4955,7 @@ export async function sendUpdate(
   const content = JSON.stringify({ pluginId, cardId, data: payload });
 
   let msg: Message = {
-    id: crypto.randomUUID(),
+    id: newMessageId(myId),
     roomCode,
     senderId: myId,
     senderName,
@@ -4894,7 +5028,7 @@ export function sendUpdateImmediately(
     return;
   const guard = captureSessionGuard();
   const msg = signMessage({
-    id: crypto.randomUUID(),
+    id: newMessageId(identityStore.did ?? _transport.selfId()),
     roomCode,
     senderId: identityStore.did ?? _transport.selfId(),
     senderName: immediatePluginSenderName(

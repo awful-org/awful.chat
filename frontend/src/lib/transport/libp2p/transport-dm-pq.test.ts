@@ -138,3 +138,17 @@ it("stops watching the lobby when the conversation is left or the identity locks
   t.clearRoomSecurity();
   expect(internal.dmLobbies.size).toBe(0);
 });
+
+it("forgets a deleted conversation's binding, freeing its slot and its anchor", () => {
+  const { t, internal } = transport();
+  const classical = newRoomSecret();
+  const d0 = deriveRoomKeys(classical).discoveryId;
+  t.joinSecureConversation(local, newRoomSecret(), classical, peer);
+  const bound = internal.secureAliases.size;
+  t.forgetConversation(local);
+  expect(internal.secureAliases.size).toBe(bound - 1);
+  expect(internal.secureLocalIds.has(d0)).toBe(false);
+  expect(internal.dmLobbies.size).toBe(0);
+  // Deleted means gone: the same conversation starts over, classically.
+  expect(() => t.joinSecureConversation(local, classical)).not.toThrow();
+});

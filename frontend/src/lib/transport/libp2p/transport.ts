@@ -1261,6 +1261,26 @@ export class LibP2PTransport implements PeerTransport {
     this.rendezvousSend({ type: "REGISTER", room: roomCode });
   }
 
+  /**
+   * A DM deleted for good: leave it AND drop its binding. leaveRoom keeps the
+   * binding so a stale send fails closed, but a deleted conversation has no
+   * sends left - and a dm- reference with no binding is refused on the wire
+   * anyway. Without this every conversation ever deleted held one of the 512
+   * bindings until reload, and junk message requests could use them up.
+   */
+  forgetConversation(localId: string): void {
+    this.leaveRoom(localId);
+    if (!localId.startsWith("dm-")) return;
+    const discoveryId = this.secureAliases.get(localId);
+    const anchor = this.dmAnchors.get(localId);
+    for (const id of [discoveryId, anchor]) {
+      if (id && this.secureLocalIds.get(id) === localId) this.secureLocalIds.delete(id);
+    }
+    this.secureAliases.delete(localId);
+    this.dmAnchors.delete(localId);
+    this.dmSessions.delete(localId);
+  }
+
   leaveRoom(roomCode: string): void {
     if (roomCode.startsWith("dm-")) this.releaseDmLobby(roomCode);
     roomCode = this.wireRoom(roomCode);

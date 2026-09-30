@@ -127,6 +127,15 @@ export interface DMRoom extends Room {
    * putRoom.
    */
   pq?: DmPqState;
+  /**
+   * A message request: the conversation was started by somebody who is not
+   * in the phonebook, shares no room with us and was never messaged by us
+   * (an introduction they made, or a mailbox delivery). Held apart, capped
+   * (dm.svelte.ts MAX_DM_REQUESTS), not joined at startup and not announced,
+   * until the user accepts it. Absent on every DM from before requests
+   * existed, which are all accepted.
+   */
+  request?: boolean;
 }
 
 export interface OwnProfile {
@@ -1951,15 +1960,25 @@ export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWr
 
 async function _putRoomNow(room: Room | DMRoom, guard: WriteGuard): Promise<void> {
   let carriedPq: DmPqState | undefined;
-  if (room.roomCode.startsWith("dm-") && !(room as DMRoom).pq) {
+  let carriedRequest: boolean | undefined;
+  if (
+    room.roomCode.startsWith("dm-") &&
+    (!(room as DMRoom).pq || (room as DMRoom).request === undefined)
+  ) {
     // An unreadable row has no state left to carry.
-    carriedPq = ((await getRoom(room.roomCode).catch(() => undefined)) as DMRoom | undefined)?.pq;
+    const stored = (await getRoom(room.roomCode).catch(() => undefined)) as DMRoom | undefined;
+    if (!(room as DMRoom).pq) carriedPq = stored?.pq;
+    // Same carry for a request: a writer rebuilding the row without the flag
+    // must not accept the request behind the user's back. Accepting writes
+    // `request: false` explicitly (setDmRequest).
+    if ((room as DMRoom).request === undefined) carriedRequest = stored?.request;
   }
   const database = await getDB();
   const roomWithParticipants = {
     ...room,
     participants: room.participants ?? [],
     ...(carriedPq ? { pq: carriedPq } : {}),
+    ...(carriedRequest !== undefined ? { request: carriedRequest } : {}),
   };
   guard();
   const sealed = await _seal("rooms", roomWithParticipants);
@@ -2060,6 +2079,21 @@ export async function setDmPqState(
   return changed;
 }
 
+/** Mark a DM as a message request, or accept one (false). */
+export async function setDmRequest(
+  roomCode: string,
+  request: boolean
+): Promise<boolean> {
+  let changed = false;
+  await _patchRoom(roomCode, (room) => {
+    if (room.type !== "dm") return null;
+    if (((room as DMRoom).request === true) === request) return null;
+    changed = true;
+    return { ...room, request } as DMRoom;
+  });
+  return changed;
+}
+
 /** Pin a room to the top of the sidebar, or unpin it (null). */
 export async function setRoomPinned(
   roomCode: string,
@@ -2106,18 +2140,48 @@ export async function getRoomParticipants(roomCode: string): Promise<string[]> {
   return room?.participants ?? [];
 }
 
+/**
+ * Members one room's record holds. Every add rewrites and reseals the whole
+ * record, so an uncapped list was a cost a peer could grow at will.
+ */
+export const MAX_ROOM_PARTICIPANTS = 512;
+
 export async function addRoomParticipant(
   roomCode: string,
   peerId: string
 ): Promise<void> {
+  await addRoomParticipants(roomCode, [[peerId, Date.now()]]);
+}
+
+/**
+ * Add members, or refresh when they were last seen, in ONE rewrite of the
+ * room record. A last-seen time only ever moves forward. New members past
+ * MAX_ROOM_PARTICIPANTS are not added.
+ */
+export async function addRoomParticipants(
+  roomCode: string,
+  seen: Iterable<readonly [did: string, at: number]>
+): Promise<void> {
   // participants are documented as DIDs; a raw peerId written here is never
   // matched by a leave (keyed by DID) and ghosts the member list for 7 days.
-  if (!peerId.startsWith("did:")) return;
+  const entries = [...seen].filter(([did]) => did.startsWith("did:"));
+  if (!entries.length) return;
   await _patchRoom(roomCode, (room) => {
     const participants = new Set(room.participants ?? []);
-    participants.add(peerId);
-    const participantLastSeen = room.participantLastSeen ?? {};
-    participantLastSeen[peerId] = Date.now();
+    const participantLastSeen = { ...(room.participantLastSeen ?? {}) };
+    let changed = false;
+    for (const [did, at] of entries) {
+      if (!participants.has(did)) {
+        if (participants.size >= MAX_ROOM_PARTICIPANTS) continue;
+        participants.add(did);
+        changed = true;
+      }
+      if (!((participantLastSeen[did] ?? 0) >= at)) {
+        participantLastSeen[did] = at;
+        changed = true;
+      }
+    }
+    if (!changed) return null;
     return { ...room, participants: [...participants], participantLastSeen };
   });
 }
@@ -2403,6 +2467,27 @@ export function pfpBlobURL(
  */
 function watermarkId(roomCode: string, senderId: string): string {
   return `${roomCode}:${senderId}`;
+}
+
+/**
+ * A deleted DM's floor: the sender's messages up to this lamport were in the
+ * conversation when it was deleted. The mailbox signature has no freshness,
+ * and a relay that kept blobs we had acked could otherwise hand them back
+ * later and rebuild the conversation. Kept in the watermarks store under a
+ * room key of its own, which deleting the room's rows does not touch.
+ */
+const DELETED_FLOOR = "deleted:";
+
+export function setDeletedFloor(
+  roomCode: string,
+  senderId: string,
+  lamport: number
+): Promise<void> {
+  return setWatermark(DELETED_FLOOR + roomCode, senderId, lamport);
+}
+
+export function getDeletedFloor(roomCode: string, senderId: string): Promise<number> {
+  return getWatermark(DELETED_FLOOR + roomCode, senderId);
 }
 
 export async function getWatermark(
