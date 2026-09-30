@@ -142,6 +142,7 @@ enum MessageType {
   VoiceRedial     = "voice_redial",
   RoomName        = "room_name",
   PluginEphemeral = "plugin_ephemeral",
+  Typing          = "typing",           // { typing: boolean }, see below
   JoinRoom        = "join_room",
   LeaveRoom       = "leave_room",
   RoomUsersSync   = "room_users_sync",
@@ -162,6 +163,18 @@ enum MessageType {
 // → delivered (their device acked: two ticks) → read (opened: green ticks).
 // Statuses never regress; queued DMs retry when the peer's profile arrives.
 // Only DMs show a status; room messages carry one internally and show none.
+
+// Typing indicators ride the Typing wire type in rooms AND DMs (a DM sends it
+// as a plain frame over its pairwise channel, not as a tagged envelope, so a
+// client that predates it drops it silently). The frame is { typing } and
+// nothing else: the authenticated channel names the sender and the room, and
+// the receiver names the typer from its own view of that peer. The composer
+// sends "typing" on the first keystroke and at most every 3s while the draft
+// changes, and "stopped" when the draft empties, the message goes out or the
+// view moves away. A receiver drops a typer 6s after their last frame, or
+// the moment their message lands. Never queued, never the mailbox, never
+// persisted. "Show when I'm typing" (on by default, per device) stops
+// sending; it does not hide anyone else's.
 
 // only chat types are persisted to IDB
 type ChatMessageType = MessageType.Text | MessageType.Reply | MessageType.Reaction
@@ -932,7 +945,11 @@ relay knows:   libp2p peerId + which roomCodes it registered (rendezvous);
                once a minute per identity when mail arrives. The vendor
                learns the timing of those wake-ups, never what they are
                about; the relay learns how many devices an identity has
-               subscribed
+               subscribed;
+               where traffic is relayed, the rhythm of typing indicators:
+               a small frame every few seconds to the room's peers while
+               someone writes (never their content; off with "Show when
+               I'm typing")
 never knows:   message content, file content, who sent a mailbox blob -
                all traffic it forwards is noise-encrypted end-to-end
                between peers, mailbox blobs are sealed to the recipient

@@ -32,6 +32,7 @@ import {
   setNotificationsEnabled,
 } from "$lib/notify.svelte";
 import { pushPrefs, setPushEnabled } from "$lib/push.svelte";
+import { setSendTyping, typingPrefs } from "$lib/typing.svelte";
 import { mailboxPrefs, setMailboxEnabled } from "$lib/transport/mailbox.svelte";
 import {
   getVoiceActiveInputDevice,
@@ -183,6 +184,20 @@ export const settingsCommands: CmdSource = () => {
       kind: "act",
       keepOpen: true,
       perform: () => setExternalMedia(!mediaPrefs.externalMedia),
+    },
+  });
+
+  cmds.push({
+    id: "settings.toggle:sendTyping",
+    title: "Show when I'm typing",
+    subtitle: "Let rooms and DMs see \"is typing…\" while you write",
+    keywords: ["toggle", "enable", "disable", "privacy", "typing", "indicator"],
+    group: "Settings",
+    badge: typingPrefs.sendTyping ? "On" : "Off",
+    action: {
+      kind: "act",
+      keepOpen: true,
+      perform: () => setSendTyping(!typingPrefs.sendTyping),
     },
   });
 

@@ -34,11 +34,12 @@ import {
   defaultPanelPosition,
   dmPanel,
 } from "$lib/dm-panel.svelte";
-import { MessageType, type Message } from "$lib/types/message";
+import { MessageType, type Message, type WireTyping } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
 import { prepareOutgoingText } from "./outgoing-text";
 import { dmInboxNotice } from "$lib/dm-inbox-notice";
-import { base64ToBytes, bytesToBase64 } from "$lib/utils";
+import { base64ToBytes, bytesToBase64, encode } from "$lib/utils";
+import { typingPrefs } from "$lib/typing.svelte";
 import { leaveCall } from "./call.svelte";
 import {
   _hydrateAndSeedAttachments,
@@ -643,6 +644,17 @@ export async function sendDirectMessage(
   transportState.dmVersion += 1;
 }
 
+/** The peer's live transport id, or null when they are not connected now. */
+function _connectedDmPeerId(peerIdOrDid: string): string | null {
+  let resolved = resolveDmPeerId(peerIdOrDid);
+  if (resolved && looksLikeDid(resolved)) {
+    resolved = didToPeerId(resolved, _peerIdToDid) ?? resolved;
+  }
+  return resolved && !looksLikeDid(resolved) && _transport.peers().includes(resolved)
+    ? resolved
+    : null;
+}
+
 /**
  * Send read acks to a peer for messages we just displayed.
  * Fire-and-forget: if the peer is offline the acks are simply dropped -
@@ -652,11 +664,8 @@ export async function sendDirectMessage(
 export function sendDmReadAcks(peerId: string, messageIds: string[]): void {
   if (!messageIds.length) return;
   const envelope = encodeDmReadEnvelope(messageIds);
-  let resolved = resolveDmPeerId(peerId);
-  if (resolved && looksLikeDid(resolved)) {
-    resolved = didToPeerId(resolved, _peerIdToDid) ?? resolved;
-  }
-  if (resolved && !looksLikeDid(resolved) && _transport.peers().includes(resolved)) {
+  const resolved = _connectedDmPeerId(peerId);
+  if (resolved) {
     void sendDmFrame(resolved, envelope).then((sent) => {
       if (!sent) return depositDmReceipt(peerId, envelope);
     }).catch(() => {});
@@ -666,6 +675,19 @@ export function sendDmReadAcks(peerId: string, messageIds: string[]): void {
   // sender's ticks were stuck at "sent" until the two of you next happened
   // to be online together, which for an offline-delivered DM could be never.
   void depositDmReceipt(peerId, envelope);
+}
+
+/**
+ * Tell a DM peer we are typing, or that we stopped. Only while they are
+ * online: unlike a receipt it never goes to the mailbox, where it would be
+ * read long after it stopped being true.
+ */
+export function sendDmTyping(peerId: string, typing: boolean): void {
+  if (typing && !typingPrefs.sendTyping) return;
+  const resolved = _connectedDmPeerId(peerId);
+  if (!resolved) return;
+  const frame: WireTyping = { type: MessageType.Typing, typing };
+  void sendDmFrame(resolved, encode(frame)).catch(() => {});
 }
 
 /** Seal a receipt into the peer's relay mailbox. Best effort by design. */

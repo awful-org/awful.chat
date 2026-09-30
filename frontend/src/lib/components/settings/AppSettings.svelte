@@ -27,6 +27,7 @@ import {
   setSidebarCollapsed,
   setShowRoomProfileInSidebar,
 } from "$lib/display-prefs.svelte";
+import { typingPrefs, setSendTyping } from "$lib/typing.svelte";
 import { Slider } from "$lib/components/ui/slider";
 import { Input } from "$lib/components/ui/input";
 import { Button } from "$lib/components/ui/button";
@@ -291,6 +292,20 @@ async function loadLocalFonts(): Promise<void> {
       </span>
     </div>
     <Switch aria-label="External previews and media" checked={mediaPrefs.externalMedia} onCheckedChange={setExternalMedia} />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Show when I'm typing</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Rooms and direct messages see "is typing…" while you write. Off stops
+        telling them; you still see when others are typing.
+      </span>
+    </div>
+    <Switch
+      aria-label="Show when I'm typing"
+      checked={typingPrefs.sendTyping}
+      onCheckedChange={(checked) => setSendTyping(checked)}
+    />
   </div>
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">
