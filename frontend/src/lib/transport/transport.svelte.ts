@@ -2,7 +2,7 @@ import { MediasoupVideo } from "./mediasoup";
 import { acceptsRoomScope } from "$lib/room-security/scope";
 import { captureDmOwnership, allowsUnsignedDmHistory } from "./dm-ownership";
 import { acceptsFileDescriptors } from "$lib/room-security/file-descriptor";
-import { profileDeliveryRoom } from "$lib/room-security/profile-route";
+import { profileDeliveryRoom, profileRoomsForPeer } from "$lib/room-security/profile-route";
 import {
   cachePluginSenderName,
   immediatePluginSenderName,
@@ -20,6 +20,7 @@ import { setErrorWithAutoClear } from "./call-error";
 import { blindValue } from "../storage-crypto";
 import {
   getOwnProfile,
+  getOwnRoomProfile,
   putMessage,
   bulkPutMessages,
   messageClearFieldsByIds,
@@ -50,6 +51,7 @@ import {
   cleanupInactiveParticipants,
 } from "../storage";
 import { normalizeWireName } from "../wire-name";
+import { resolveRoomProfile } from "../room-profile";
 import {
   MessageType,
   isFileSignalWireMessage,
@@ -1058,8 +1060,12 @@ function _sendRoomName(peerId?: string, roomCode: string | null = transportState
 
 async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   const profile = await getOwnProfile();
-  const name = profile?.nickname?.trim() || "Anonymous";
   const did = identityStore.did ?? null;
+  // Room capability is learned only from a verified main profile.
+  const supportingPeers = _roomProfilePeers;
+  const frameFor = async (source: typeof profile, roomScoped = false): Promise<Uint8Array> => {
+  const profile = source;
+  const name = profile?.nickname?.trim() || "Anonymous";
   let avatarUrl: string | null = profile?.pfpURL || null;
   if (!avatarUrl && profile?.pfpData) {
     const bytes = new Uint8Array(profile.pfpData);
@@ -1080,7 +1086,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     binding = null; // identity locked: the peer just will not bind us yet
   }
 
-  const payload = encode({
+  return encode({
     type: MessageType.Profile,
     name,
     did,
@@ -1089,6 +1095,8 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     peerId: _transport.selfId(),
     bindingSig: binding?.bindingSig,
     reply: isReply || undefined,
+    roomProfilesSupported: roomScoped ? undefined : true,
+    roomScoped: roomScoped || undefined,
     bannerUrl: bannerUrl ?? undefined,
     gradient2: profile?.gradient2 ?? undefined,
     gradient3: profile?.gradient3 ?? undefined,
@@ -1105,6 +1113,9 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
       ? undefined
       : true,
   });
+  };
+
+  const payload = await frameFor(profile);
 
   const hash = frameHash(payload);
   const sendTo = (pid: string): boolean => {
@@ -1118,11 +1129,24 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
 
   const sendProfileTo = async (pid: string): Promise<void> => {
     const room = profileDeliveryRoom(_transport.rooms(), pid, (r) => _transport.peersInRoom(r));
-    if (room === null || !sendTo(pid)) return;
-    const delivered = await (room === undefined
-      ? _transport.send(pid, payload)
-      : _transport.sendRoom(pid, room, payload)).catch(() => false);
-    if (!delivered) _profileEcho.forget(pid);
+    if (room === null) return;
+    if (sendTo(pid)) {
+      const delivered = await (room === undefined
+        ? _transport.send(pid, payload)
+        : _transport.sendRoom(pid, room, payload)).catch(() => false);
+      if (!delivered) _profileEcho.forget(pid);
+    }
+    if (!supportingPeers.has(pid) || !profile || !did) return;
+    for (const roomCode of profileRoomsForPeer(_transport.rooms(), pid, supportingPeers.has(pid), r => _transport.peersInRoom(r))) {
+      const roomRecord = await getRoom(roomCode);
+      if (roomRecord?.type !== "text") continue;
+      const override = await getOwnRoomProfile(roomCode, did);
+      const scoped = await frameFor(resolveRoomProfile(profile, override?.fields), true);
+      const scopedHash = frameHash(scoped);
+      if (!_profileEcho.shouldSend(`${pid}|${roomCode}`, scopedHash)) continue;
+      const delivered = await _transport.sendRoom(pid, roomCode, scoped).catch(() => false);
+      if (!delivered) _profileEcho.forget(`${pid}|${roomCode}`);
+    }
   };
 
   if (peerId) {
@@ -1191,6 +1215,7 @@ const _lastAppInbound = new Map<string, number>();
 const _profileRepair = new Map<string, { next: number; delay: number }>();
 /** One copy of an unchanged profile per peer per burst - see profile-echo.ts. */
 const _profileEcho = new ProfileEcho();
+const _roomProfilePeers = new Set<string>();
 
 if (typeof window !== "undefined") {
   setInterval(() => {
@@ -2293,6 +2318,8 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   const isNewMapping = _peerIdToDid.get(peerId) !== did;
   _setPeerDid(peerId, did);
   _reconcileRoomUserBinding(peerId, did);
+  const newRoomProfileSupport = msg.roomScoped !== true && msg.roomProfilesSupported === true && !_roomProfilePeers.has(peerId);
+  if (newRoomProfileSupport) _roomProfilePeers.add(peerId);
 
   // Queued DMs are keyed by DID, and the "connect" event fires before we
   // know the peer's DID - so the real flush happens here, once the profile
@@ -2312,6 +2339,9 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
   if (!msg.reply) {
     _sendProfile(peerId, true);
     _sendCallFramesTo(peerId);
+  } else if (newRoomProfileSupport) {
+    // The initial main frame was already sent before capability was known.
+    _sendProfile(peerId, true);
   }
   // Reconcile history with them either way; debounced, so a burst is one.
   _syncPeer(peerId);
@@ -3135,6 +3165,7 @@ _transport.on("streamLost", (peerId) => {
 });
 
 _transport.on("connect", (peerId) => {
+  _roomProfilePeers.delete(peerId);
   transportState.peers = _transport.peers();
   // The DID cannot be derived from the peerId any more (devices carry their
   // own libp2p keys); it arrives with the signed binding in the Profile.
@@ -3197,6 +3228,7 @@ _transport.on("disconnect", (peerId) => {
   _lastAppInbound.delete(peerId);
   _profileRepair.delete(peerId);
   _profileEcho.forget(peerId);
+  _roomProfilePeers.delete(peerId);
   // Same lifetime as the two above, and it was not being pruned. Deliberately
   // NOT _pendingDmByPeer: those are DMs already delivered to us and held only
   // until the sender's DID binds, so dropping them on a disconnect would throw
@@ -4232,6 +4264,7 @@ function _disconnectWithoutBroadcasting(): void {
   releaseNodeLock();
   stopTelemetryTaps();
   _peerIdToDid.clear();
+  _roomProfilePeers.clear();
   _pendingMoveClaims.clear();
   clearCardStates();
   // The search corpus is decrypted message text; it dies with the session

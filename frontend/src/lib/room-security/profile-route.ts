@@ -11,3 +11,12 @@ export function profileDeliveryRoom(
   if (!rooms.some(secure)) return undefined;
   return rooms.find((room) => secure(room) && members(room).includes(peer)) ?? null;
 }
+
+/** Chat rooms that may receive a targeted scoped profile for this peer. */
+export function profileRoomsForPeer(
+  rooms: readonly string[], peer: string, supported: boolean,
+  members: (room: string) => readonly string[],
+): string[] {
+  if (!supported) return [];
+  return rooms.filter(room => room.startsWith("rd2_") && members(room).includes(peer));
+}

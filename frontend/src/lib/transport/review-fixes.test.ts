@@ -1,10 +1,14 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { MessageType } from "$lib/types/message";
+import { MessageType, type WireProfile } from "$lib/types/message";
 
 const s = vi.hoisted(() => ({
   session: { did: "did:alice" } as { did: string } | null,
   locks: [] as (() => void)[], handlers: new Map<string, Function>(),
   profile: vi.fn(async (): Promise<any> => ({ nickname: "Alice" })),
+  roomProfile: vi.fn(async (room: string): Promise<any> => ({ fields: { nickname: room === "rd2_room" ? "A" : "B" } })),
+  direct: vi.fn(async (_peer: string, _frame: Uint8Array) => true),
+  roomSend: vi.fn(async (_peer: string, _room: string, _frame: Uint8Array) => true),
+  roomPeer: "peer1",
   lamport: vi.fn(async () => 1), put: vi.fn(async (_m: any, guard?: () => void) => { guard?.(); }),
   watermark: vi.fn(async (_r: string, _s: string, _l: number, guard?: () => void) => { guard?.(); }),
   sign: vi.fn((m: any) => m), broadcast: vi.fn(), reset: vi.fn(), disconnect: vi.fn(),
@@ -17,11 +21,13 @@ vi.mock("$lib/identity/identity", () => ({
 vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: { did: "did:alice" } }));
 vi.mock("./libp2p/transport", () => ({ LibP2PTransport: class {
   on(event: string, fn: Function) { s.handlers.set(event, fn); }
-  setDmIntroduction() {} selfId() { return "self"; } rooms() { return ["rd2_room", "dm-peer"]; }
-  peers() { return []; } peersInRoom() { return []; }
+  setDmIntroduction() {} selfId() { return "self"; } rooms() { return ["rd2_room", "rd2_b", "dm-peer"]; }
+  peers() { return []; } peersInRoom(room: string) { return room === "dm-peer" ? [] : [s.roomPeer]; }
+  isSecureRoom(room: string) { return room.startsWith("rd2_") || room.startsWith("dm-"); }
+  send = s.direct; sendRoom = s.roomSend;
   broadcast = s.broadcast; disconnect = s.disconnect;
 } }));
-vi.mock("./libp2p/voice", () => ({ LibP2PVoice: class {} }));
+vi.mock("./libp2p/voice", () => ({ LibP2PVoice: class { setCallPeers() {} } }));
 vi.mock("./mediasoup", () => ({ MediasoupVideo: class {
   setRoomAdmission() {} setJoinSigner() {} setCallPeerAdmission() {}
 } }));
@@ -31,9 +37,14 @@ vi.mock("./transmission.svelte", () => ({ initTransmission() {} }));
 vi.mock("./call.svelte", () => ({ leaveCall: vi.fn() }));
 vi.mock("./file/webtorrent", () => ({ WebTorrentFileTransport: class {
   on() {} setLocalFileLookup() {} setSignalSender() {} resetTransfers = s.reset;
+  onPeerDisconnect() {}
 } }));
 vi.mock("$lib/storage", () => ({
   getOwnProfile: s.profile, nextMessageLamport: s.lamport, putMessage: s.put,
+  getPeerProfile: async () => undefined, putPeerProfile: async () => {},
+  updateParticipantLastSeen: async () => {},
+  getOwnRoomProfile: s.roomProfile,
+  getRoom: async (room: string) => ({ roomCode: room, type: "text", createdAt: 1 }),
   setWatermark: s.watermark, markRoomSeen: vi.fn(async () => {}),
   getAttachmentsWithData: () => s.read ?? Promise.resolve(s.attachments),
   getMessage: async (id: string) => s.rows.get(id),
@@ -42,11 +53,11 @@ vi.mock("$lib/storage", () => ({
   getAttachmentsByMessage: async (id: string) => s.attachments.filter(a => a.messageId === id),
   putAttachment: async (a: any, guard: () => void) => { guard(); s.attachments.push(a); },
 }));
-vi.mock("$lib/messaging", () => ({ signMessage: s.sign }));
+vi.mock("$lib/messaging", () => ({ signMessage: s.sign, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true }));
 vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, roomsStore: { rooms: [] } }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
 vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));
-vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer" }));
+vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer", flushQueuedDmForPeer: async () => {} }));
 vi.mock("./verify-incoming", async original => ({ ...await original<typeof import("./verify-incoming")>(), verifyIncoming: async () => ({ ok: true }) }));
 vi.mock("../storage-crypto", () => ({ blindValue: async (v: string) => v }));
 vi.mock("../telemetry/taps", () => ({ stopTelemetryTaps: vi.fn(), installTelemetryTaps: vi.fn() }));
@@ -55,15 +66,48 @@ vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
 
 import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch } from "./transport.svelte";
-import { encode } from "$lib/utils";
+import { encode, decode } from "$lib/utils";
 import { hydrateLegacyAttachments } from "./files.svelte";
 import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
 
 beforeEach(() => {
   vi.clearAllMocks(); s.session = { did: "did:alice" }; s.rows.clear(); s.attachments = []; s.read = null;
+  s.roomPeer = "peer1";
   s.profile.mockResolvedValue({ nickname: "Alice" }); s.lamport.mockResolvedValue(1);
   transportState.roomCode = "rd2_room"; transportState.chatMode = "room";
   transportState.messages = []; transportState.fileTransfers = new Map();
+});
+
+it("sends scoped profiles after support first arrives in a main reply, without leaking to a DM", async () => {
+  const onMessage = s.handlers.get("message")!;
+  onMessage("peer1", encode({ type: MessageType.Profile, name: "Peer", did: "did:peer", avatarUrl: null,
+    peerId: "peer1", bindingSig: "sig", reply: true, roomProfilesSupported: true }), "rd2_room");
+  await vi.waitFor(() => expect(s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true)).toHaveLength(2));
+  const scoped = s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true)
+    .map(([, room, frame]) => [room, (decode(frame) as WireProfile).name]);
+  expect(scoped).toEqual([["rd2_room", "A"], ["rd2_b", "B"]]);
+  expect(s.roomSend.mock.calls.some(([, room, frame]) => room === "dm-peer" && (decode(frame) as WireProfile).roomScoped === true)).toBe(false);
+  s.roomProfile.mockResolvedValue({ fields: {} });
+  s.profile.mockResolvedValue({ nickname: "Shared" });
+  onMessage("peer1", encode({ type: MessageType.Profile, name: "Peer", did: "did:peer", avatarUrl: null,
+    peerId: "peer1", bindingSig: "sig", roomProfilesSupported: true }), "rd2_room");
+  await vi.waitFor(() => expect(s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true)).toHaveLength(4));
+  expect(s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true).slice(2)
+    .map(([, room, frame]) => [room, (decode(frame) as WireProfile).name])).toEqual([["rd2_room", "Shared"], ["rd2_b", "Shared"]]);
+});
+
+it("does not reuse support after a peer disconnects and returns with an old main frame", async () => {
+  s.roomPeer = "peer2";
+  const onMessage = s.handlers.get("message")!;
+  const main = (supported: boolean) => encode({ type: MessageType.Profile, name: "Peer", did: "did:peer", avatarUrl: null,
+    peerId: "peer2", bindingSig: "sig", reply: supported, ...(supported ? { roomProfilesSupported: true } : {}) });
+  onMessage("peer2", main(true), "rd2_room");
+  await vi.waitFor(() => expect(s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true)).toHaveLength(2));
+  s.handlers.get("disconnect")!("peer2");
+  s.roomSend.mockClear();
+  onMessage("peer2", main(false), "rd2_room");
+  await vi.waitFor(() => expect(s.roomSend).toHaveBeenCalled());
+  expect(s.roomSend.mock.calls.every(([, , frame]) => (decode(frame) as WireProfile).roomScoped !== true)).toBe(true);
 });
 
 const sends = [() => sendMessage("secret"), () => sendCard("poll", {}),
