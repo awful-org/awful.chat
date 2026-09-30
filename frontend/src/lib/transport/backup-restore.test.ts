@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { applyBackup } from "./backup-restore";
+import { applyBackup, importDatabase } from "./backup-restore";
 import { BACKUP_FORMAT, BACKUP_VERSION, type BackupFile } from "./backup";
 import {
   getAllMessages,
@@ -11,7 +11,15 @@ import {
   migrateAtRest,
   setAtRestOwner,
   wipeLocalDatabase,
+  putRoom,
+  getRoom,
+  putOwnRoomProfile,
+  getOwnRoomProfile,
+  deleteRoomProfilesForRoom,
+  getRoomDeletionMarker,
 } from "../storage";
+import { initStorageCrypto } from "../storage-crypto";
+import { deriveRoomKeys, newRoomSecret } from "../room-security/keys";
 import {
   createIdentity,
   isUnlocked,
@@ -20,6 +28,136 @@ import {
 } from "../identity/identity";
 
 const PASSWORD = "the password that was in use at backup time";
+
+describe("room profile import", () => {
+  const secret = newRoomSecret();
+  const code = deriveRoomKeys(secret).discoveryId;
+  const room = (generation: number) => ({ roomCode: code, roomSecret: secret, type: "text" as const,
+    name: "Sync", createdAt: generation, lastSeenLamport: 0, participants: [] });
+  const data = (overrides: Record<string, unknown> = {}) => ({
+    messages: [], attachments: [], pending: [], watermarks: [], yjsDocs: [],
+    rooms: [], profiles: [], savedGifs: [], roomProfiles: [], roomDeletions: [],
+    ...overrides,
+  }) as unknown as import("./backup").DatabaseExport;
+
+  beforeEach(async () => {
+    await wipeLocalDatabase();
+    await initStorageCrypto(new Uint8Array(32).fill(24));
+  });
+
+  it("restores a room override on a second device and merges independent field edits", async () => {
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Room Alice" },
+      fieldEdits: { nickname: { at: 110, id: "device-a" } },
+    }] }), "add");
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Room Alice");
+    await importDatabase(data({ roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { bio: "Hello" }, fieldEdits: { bio: { at: 120, id: "device-b" } },
+    }] }), "add");
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ nickname: "Room Alice", bio: "Hello" });
+  });
+
+  it("applies later reset tombstones and keeps a newer rejoin generation", async () => {
+    await putRoom(room(200));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 200,
+      fields: { nickname: "Old", bio: "Local" },
+      fieldEdits: { nickname: { at: 201, id: "a" }, bio: { at: 202, id: "a" } } });
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 200,
+      fields: { bio: null }, fieldEdits: { nickname: { at: 203, id: "b", reset: true },
+        bio: { at: 204, id: "b" } },
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(200);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ bio: null });
+  });
+
+  it("applies deletion before stale snapshot import in either order", async () => {
+    await putRoom(room(100));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Stale" } });
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Stale" },
+    }], roomDeletions: [{ roomCode: code, generation: 150, deletedAt: 151 }] }), "add");
+    expect(await getRoom(code)).toBeUndefined();
+    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+    expect((await getRoomDeletionMarker(code))?.generation).toBe(150);
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Stale" },
+    }] }), "add");
+    expect(await getRoom(code)).toBeUndefined();
+    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+    await putRoom(room(200));
+    await importDatabase(data({ rooms: [room(100)], roomDeletions: [{
+      roomCode: code, generation: 150, deletedAt: 151,
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(200);
+  });
+
+  it("normalizes independent joins, then applies a later leave without refreshing its timestamp", async () => {
+    await putRoom(room(200));
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Joined on A", pfpData: btoa("image") },
+      fieldEdits: { nickname: { at: 110, id: "a" } },
+    }] }), "add");
+    const imported = await getOwnRoomProfile(code, "did:alice");
+    expect(imported?.generation).toBe(200);
+    expect(imported?.fields.nickname).toBe("Joined on A");
+    expect([...new Uint8Array(imported?.fields.pfpData as ArrayBuffer)]).toEqual([...new TextEncoder().encode("image")]);
+    await importDatabase(data({ rooms: [room(100)], roomDeletions: [{
+      roomCode: code, generation: 100, deletedAt: 300,
+    }] }), "add");
+    expect(await getRoom(code)).toBeUndefined();
+    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+    await putRoom(room(400));
+    await importDatabase(data({ roomDeletions: [{
+      roomCode: code, generation: 100, deletedAt: 300,
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(400);
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+  });
+
+  it("keeps a remote marker alongside a later rejoin and rejects a subsequent old snapshot", async () => {
+    await putRoom(room(400));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 400,
+      fields: { nickname: "Rejoined" } });
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] }), "add");
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Rejoined");
+    await importDatabase(data({ rooms: [room(200)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 200, fields: { nickname: "Stale" },
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(400);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Rejoined");
+  });
+
+  it("retains a local override when another device contributes a newer join generation", async () => {
+    await putRoom(room(100));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Local" }, fieldEdits: { nickname: { at: 110, id: "a" } } });
+    await importDatabase(data({ rooms: [room(200)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 200,
+      fields: { bio: "Remote" }, fieldEdits: { bio: { at: 210, id: "b" } },
+    }] }), "add");
+    expect((await getOwnRoomProfile(code, "did:alice"))?.generation).toBe(200);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ nickname: "Local", bio: "Remote" });
+  });
+
+  it("clears profile rows on a local leave even if a newer marker already exists", async () => {
+    await putRoom(room(400));
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] }), "add");
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 400,
+      fields: { nickname: "Later" } });
+    await deleteRoomProfilesForRoom(code, 100, 200);
+    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+  });
+});
 
 /** A backup taken by an identity that no longer exists on this device. */
 async function backupFromAnIdentity(): Promise<BackupFile> {

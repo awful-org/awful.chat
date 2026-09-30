@@ -201,7 +201,7 @@ export async function saveRoom(roomCode: string, name: string, guard?: () => voi
     lastSeenLamport: 0,
     // createdAt also identifies this membership generation. An intentional
     // rejoin must outrank the leave marker even within the same millisecond.
-    createdAt: Math.max(Date.now(), (marker?.generation ?? 0) + 1),
+    createdAt: Math.max(Date.now(), (marker ? Math.max(marker.generation, marker.deletedAt) : 0) + 1),
     participants: [],
     participantLastSeen: {},
   };

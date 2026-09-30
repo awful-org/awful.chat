@@ -19,6 +19,15 @@ import {
   setWatermark,
   getOwnProfile,
   getPeerProfile,
+  getOwnRoomProfile,
+  getAllOwnRoomProfiles,
+  putOwnRoomProfile,
+  getAllRoomDeletionMarkers,
+  deleteRoomProfilesForRoom,
+  deleteRoom,
+  deleteMessagesForRoom,
+  roomDeletionCutoff,
+  putRoomDeletionMarker,
   markAtRestSweepNeeded,
 } from "../storage";
 import type { Message, Attachment, PendingMessage } from "../types/message";
@@ -36,6 +45,8 @@ import type {
   OwnProfile,
   SavedGif,
   WatermarkRecord,
+  RoomDeletionMarker,
+  OwnRoomProfileRecord,
 } from "../storage";
 import {
   bytesFromExport,
@@ -48,7 +59,61 @@ import {
   type DatabaseExport,
   EXPORT_SECTIONS,
   type ParsedBackupFile,
+  type RoomProfileExport,
+  isValidRoomDeletionMarker,
 } from "./backup";
+import type { RoomProfileField } from "../room-profile";
+
+export async function applyRoomDeletionMarkers(markers: unknown[]): Promise<void> {
+  for (const value of markers) {
+    if (!isValidRoomDeletionMarker(value)) continue;
+    const marker = value as RoomDeletionMarker;
+    const room = await getRoom(marker.roomCode);
+    const local = (await getAllRoomDeletionMarkers()).find(m => m.roomCode === marker.roomCode);
+    if (local && (roomDeletionCutoff(local) > roomDeletionCutoff(marker) ||
+        (roomDeletionCutoff(local) === roomDeletionCutoff(marker) && local.generation >= marker.generation))) continue;
+    if (room?.type === "text" && room.createdAt > roomDeletionCutoff(marker)) {
+      await putRoomDeletionMarker(marker);
+      continue;
+    }
+    await deleteRoomProfilesForRoom(marker.roomCode, marker.generation, marker.deletedAt);
+    if (room?.type === "text") {
+      await deleteMessagesForRoom(marker.roomCode);
+      await deleteRoom(marker.roomCode);
+    }
+  }
+}
+
+function roomProfileFromExport(raw: RoomProfileExport): OwnRoomProfileRecord {
+  const fields = { ...raw.fields } as OwnRoomProfileRecord["fields"];
+  for (const key of ["pfpData", "bannerData"] as const) {
+    const value = raw.fields[key];
+    if (typeof value === "string") {
+      const bytes = bytesFromExport(value);
+      if (bytes) fields[key] = bytes;
+      else delete fields[key];
+    }
+  }
+  return { ...raw, fields };
+}
+
+function mergeOwnRoomProfile(local: OwnRoomProfileRecord, remote: OwnRoomProfileRecord): OwnRoomProfileRecord {
+  const fields = { ...local.fields };
+  const fieldEdits = { ...local.fieldEdits };
+  const keys = new Set([...Object.keys(local.fields), ...Object.keys(remote.fields),
+    ...Object.keys(local.fieldEdits ?? {}), ...Object.keys(remote.fieldEdits ?? {})]) as Set<RoomProfileField>;
+  for (const key of keys) {
+    const before = local.fieldEdits?.[key] ?? { at: 0, id: "" };
+    const after = remote.fieldEdits?.[key] ?? { at: 0, id: "" };
+    if (after.at < before.at || (after.at === before.at && after.id < before.id)) continue;
+    if (after.at === before.at && after.id === before.id &&
+        Object.hasOwn(local.fields, key)) continue;
+    if (remote.fieldEdits?.[key]) fieldEdits[key] = remote.fieldEdits[key];
+    if (remote.fieldEdits?.[key]?.reset || !Object.hasOwn(remote.fields, key)) delete fields[key];
+    else (fields as Record<string, unknown>)[key] = remote.fields[key];
+  }
+  return { ...local, fields, fieldEdits };
+}
 import { unlockWithImportedMnemonic } from "../identity/identity";
 import type { MnemonicRecord } from "../identity/identity";
 
@@ -135,6 +200,8 @@ export async function importDatabase(
     yjsDocs,
     rooms,
     profiles,
+    roomProfiles,
+    roomDeletions,
     savedGifs,
     dropped: droppedRecords,
   } = sanitizeCollections({
@@ -145,6 +212,8 @@ export async function importDatabase(
     yjsDocs: data.yjsDocs,
     rooms: data.rooms,
     profiles: data.profiles,
+    roomProfiles: data.roomProfiles,
+    roomDeletions: data.roomDeletions,
     savedGifs: data.savedGifs,
   });
   if (droppedRecords > 0) {
@@ -162,6 +231,8 @@ export async function importDatabase(
     yjsDocs,
     rooms,
     profiles,
+    roomProfiles,
+    roomDeletions,
     savedGifs,
   };
 
@@ -240,6 +311,22 @@ async function importDatabaseInner(
   mode: "add" | "replace",
   onProgress?: (done: number, total: number) => void
 ): Promise<void> {
+  // Markers lead the import. A stale room snapshot must never recreate a
+  // room or override that another device has already left.
+  await applyRoomDeletionMarkers(data.roomDeletions ?? []);
+  const markers = new Map((await getAllRoomDeletionMarkers()).map(m => [m.roomCode, roomDeletionCutoff(m)]));
+  const survives = (roomCode: string, generation: number): boolean =>
+    generation > (markers.get(roomCode) ?? -1);
+  const incomingRooms = new Map(data.rooms.map(r => [r.roomCode, r]));
+  const staleRoom = (roomCode: string): boolean =>
+    markers.has(roomCode) && !survives(roomCode, incomingRooms.get(roomCode)?.createdAt ?? 0);
+  data = {
+    ...data,
+    messages: data.messages.filter(m => !staleRoom(m.roomCode)),
+    attachments: data.attachments.filter(a => !staleRoom(a.roomCode)),
+    watermarks: data.watermarks.filter(w => !staleRoom(w.roomCode)),
+    yjsDocs: data.yjsDocs.filter(doc => !doc.id.startsWith("channel:") || !staleRoom(doc.id.slice(8))),
+  };
   const total = EXPORT_SECTIONS.reduce((n, k) => n + (data[k]?.length ?? 0), 0);
   let done = 0;
   const tick = (n = 1): void => {
@@ -287,7 +374,7 @@ async function importDatabaseInner(
         data: bytesFromExport(a.data),
       } as Attachment)
     ),
-    ...data.rooms.map((r) => {
+    ...(data.rooms.filter(r => r.type !== "text" || survives(r.roomCode, r.createdAt ?? 0))).map((r) => {
       const importedRoom = pfpFromJson(r);
       if (mode === "add") {
         return (async () => {
@@ -386,6 +473,29 @@ async function importDatabaseInner(
     }),
   ];
   await Promise.all(writes.map((w) => w.then(() => tick())));
+  for (const local of await getAllOwnRoomProfiles()) {
+    const room = await getRoom(local.roomCode);
+    if (room?.type === "text" && room.createdAt !== local.generation &&
+        survives(local.roomCode, local.generation)) {
+      await putOwnRoomProfile({ ...local, generation: room.createdAt });
+    }
+  }
+  for (const raw of data.roomProfiles ?? []) {
+    if (survives(raw.roomCode, raw.generation)) {
+      const room = await getRoom(raw.roomCode);
+      if (room?.type === "text") {
+        // Separate devices can first join the same room at different times.
+        // The marker check above prevents an older, pre-leave override from
+        // being promoted into a deliberate rejoin.
+        const imported = { ...roomProfileFromExport(raw), generation: room.createdAt };
+        const local = mode === "add" ? await getOwnRoomProfile(raw.roomCode, raw.did) : undefined;
+        await putOwnRoomProfile(local && local.generation === imported.generation
+          ? mergeOwnRoomProfile(local, imported) : imported);
+      }
+    }
+    tick();
+  }
+  tick((data.roomDeletions ?? []).length);
 }
 
 // ── File backup (QR-less alternative to device sync) ─────────────────────────

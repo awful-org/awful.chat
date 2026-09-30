@@ -194,6 +194,15 @@ export interface RoomDeletionMarker {
   deletedAt: number;
 }
 
+export function roomDeletionCutoff(marker: RoomDeletionMarker): number {
+  return Math.max(marker.generation, marker.deletedAt);
+}
+
+function deletionMarkerIsNewer(incoming: RoomDeletionMarker, existing?: RoomDeletionMarker): boolean {
+  return !existing || roomDeletionCutoff(incoming) > roomDeletionCutoff(existing) ||
+    (roomDeletionCutoff(incoming) === roomDeletionCutoff(existing) && incoming.generation > existing.generation);
+}
+
 interface RoomProfileRow {
   id: string;
   roomCode: string;
@@ -2233,7 +2242,7 @@ export async function putOwnRoomProfile(
   const markerKey = await blindValue(roomProfileId("deletion", record.roomCode));
   const markerBefore = await database.get("roomProfiles", markerKey);
   const marker = await _open("roomProfiles", markerBefore);
-  if (marker && record.generation <= marker.generation) throw new Error("room generation was deleted");
+  if (marker && record.generation <= roomDeletionCutoff(marker as RoomDeletionMarker)) throw new Error("room generation was deleted");
   const fields = { ...record.fields };
   const pfpData = fields.pfpData instanceof ArrayBuffer ? fields.pfpData : undefined;
   const bannerData = fields.bannerData instanceof ArrayBuffer ? fields.bannerData : undefined;
@@ -2279,7 +2288,7 @@ export async function putPeerRoomProfile(
   const markerKey = await blindValue(roomProfileId("deletion", roomCode));
   const markerBefore = await database.get("roomProfiles", markerKey);
   const marker = await _open("roomProfiles", markerBefore);
-  if (marker && generation <= marker.generation) throw new Error("room generation was deleted");
+  if (marker && generation <= roomDeletionCutoff(marker as RoomDeletionMarker)) throw new Error("room generation was deleted");
   const { pfpData, bannerData, ...display } = profile;
   const sealed = await _seal("roomProfiles", {
     id: roomProfileId("peer", roomCode, profile.did), roomCode,
@@ -2294,20 +2303,37 @@ export async function putPeerRoomProfile(
 }
 
 /** Remove both profile kinds but keep the non-profile marker for later device sync. */
-export async function deleteRoomProfilesForRoom(roomCode: string, generation: number): Promise<void> {
+export async function deleteRoomProfilesForRoom(roomCode: string, generation: number, deletedAt = Date.now()): Promise<void> {
   const existing = await getRoomDeletionMarker(roomCode);
-  const nextGeneration = Math.max(generation, existing?.generation ?? 0);
+  const incoming = { roomCode, generation, deletedAt };
+  const replaceMarker = deletionMarkerIsNewer(incoming, existing);
   const database = await getDB();
-  const marker = await _seal("roomProfiles", {
+  const marker = replaceMarker ? await _seal("roomProfiles", {
     id: roomProfileId("deletion", roomCode), roomCode, did: "",
-    kind: "deletion" as const, generation: nextGeneration,
-    deletedAt: Date.now(),
-  });
+    kind: "deletion" as const, generation,
+    deletedAt,
+  }) : undefined;
   const tx = database.transaction("roomProfiles", "readwrite");
   const keys = await tx.store.index("byRoom").getAllKeys(await blindValue(roomCode));
-  for (const key of keys) await tx.store.delete(key);
-  await tx.store.put(marker);
+  const deletionKey = await blindValue(roomProfileId("deletion", roomCode));
+  for (const key of keys) {
+    if (!replaceMarker && key === deletionKey) continue;
+    await tx.store.delete(key);
+  }
+  if (marker) await tx.store.put(marker);
   await tx.done;
+}
+
+/** Preserve a remote leave event even if this device already rejoined later. */
+export async function putRoomDeletionMarker(marker: RoomDeletionMarker): Promise<void> {
+  const existing = await getRoomDeletionMarker(marker.roomCode);
+  if (!deletionMarkerIsNewer(marker, existing)) return;
+  const database = await getDB();
+  await database.put("roomProfiles", await _seal("roomProfiles", {
+    id: roomProfileId("deletion", marker.roomCode), roomCode: marker.roomCode,
+    did: "", kind: "deletion" as const, generation: marker.generation,
+    deletedAt: marker.deletedAt,
+  }));
 }
 
 export async function getOwnProfile(

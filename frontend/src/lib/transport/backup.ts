@@ -177,10 +177,9 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
       local.lastSeenLamport ?? 0,
       imported.lastSeenLamport ?? 0
     ),
-    createdAt: Math.min(
-      local.createdAt ?? Infinity,
-      imported.createdAt ?? Infinity
-    ),
+    // A deliberate rejoin creates a new room generation. An older snapshot
+    // must not roll it back below a deletion marker.
+    createdAt: Math.max(local.createdAt ?? 0, imported.createdAt ?? 0),
     participants: [
       ...new Set([
         ...(local.participants ?? []),

@@ -183,7 +183,7 @@ describe("mergeImportedRoom", () => {
       participantLastSeen: { "did:key:zA": 5, "did:key:zB": 80 },
     });
     expect(merged.lastSeenLamport).toBe(500);
-    expect(merged.createdAt).toBe(100);
+    expect(merged.createdAt).toBe(200);
     expect([...merged.participants].sort()).toEqual([
       "did:key:zA",
       "did:key:zB",
