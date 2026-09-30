@@ -27,10 +27,15 @@ type pairingEntry struct {
 	stages   map[string]string
 	inbox    []pairingMessage
 	closed   bool
+	// The creator's client bucket and its IPv6 /48, for the live-pairing
+	// caps; both empty for a creator that holds no share.
+	owner, ownerAgg string
 }
 
 var pairingMu sync.Mutex
 var pairingStore = map[string]*pairingEntry{}
+var pairingLastSweep time.Time
+
 // Lowercase Crockford base32, as the client draws them. The locator is two
 // characters: the pairing code is six (locator + four-character password),
 // short because the password can only be guessed live, five times, within
@@ -39,11 +44,48 @@ var pairingLocator = regexp.MustCompile(`^[0-9a-hjkmnp-tv-z]{2}$`)
 var pairingAttempt = regexp.MustCompile(`^[0-9a-hjkmnp-tv-z]{32}$`)
 var pairingPayload = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
+// pairingStartPayload is what a real start carries: an OPAQUE KE1
+// (startLoginRequest) - 96 bytes, 128 characters of unpadded base64url -
+// and nothing else. A start is what spends one of a pairing's
+// pairingMaxAttempts, so only a start of that exact shape may: anything
+// else is refused here with 400 and the pairing keeps its attempt. If the
+// OPAQUE suite ever changes size, this has to change with it.
+var pairingStartPayload = regexp.MustCompile(`^[A-Za-z0-9_-]{128}$`)
+
 // A quarter of the 1024 two-character locators, so a new pairing rarely
 // draws one already live - and when it does, create answers 409 and the
 // client draws again.
 const pairingMaxLive = 256
 const pairingMaxAttempts = 5
+
+// The per-client and per-locator budgets. There used to be GLOBAL buckets
+// as well - 300 starts and 300 creates a minute and 12,000 requests across
+// the instance - and a few dozen addresses at their per-IP limit emptied
+// them, refusing every real pairing on the instance for the rest of the
+// minute. Nothing needed them: the password is protected by the per-pairing
+// attempt budget, the store by pairingMaxLive, and the handler's own cost is
+// a map lookup. So every budget is now one no single party can drain for
+// anyone else:
+//
+//   - per client (an IPv4 address or IPv6 /64, with a /48 aggregate):
+//     240 requests, 10 starts and 10 creates a minute;
+//   - per locator: 2 x pairingMaxAttempts starts a minute, whoever sends
+//     them and whether or not a pairing is live there, which paces how fast
+//     any one pairing's attempts can be spent;
+//   - live pairings at once: pairingMaxLivePerClient per client (an IPv4
+//     address or IPv6 /64) and pairingMaxLivePerAggregate per IPv6 /48, so
+//     filling the store takes 32 addresses or eight /48s rather than one.
+//     A proxy-class creator holds no such share (exemptFromShares): that
+//     address is everybody behind the proxy, and 8 pairings would be the
+//     whole instance's ceiling.
+const (
+	pairingRequestsPerClient   = 240
+	pairingStartsPerClient     = 10
+	pairingCreatesPerClient    = 10
+	pairingStartsPerLocator    = 2 * pairingMaxAttempts
+	pairingMaxLivePerClient    = 8
+	pairingMaxLivePerAggregate = 32
+)
 
 func handlePairing(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -51,7 +93,7 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
 		return
 	}
-	if !rateAllow("pairing:"+clientIP(r), 240) || !rateAllow("pairing-global", 12000) {
+	if !rateAllowClient(r, "pairing:", pairingRequestsPerClient) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -70,27 +112,77 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "invalid pairing request", http.StatusBadRequest)
 		return
 	}
-	// Meter starts independently from polling, including misses, across all IPs.
-	if b.Action == "start" && (!rateAllow("pairing-start:"+clientIP(r), 10) || !rateAllow("pairing-start-global", 300)) {
+	// The request's own shape is checked before the locator is looked up, so
+	// a malformed request gets the same answer whether a pairing is live
+	// there or not.
+	switch b.Action {
+	case "create", "cancel", "host-poll":
+	case "join-poll":
+		if !pairingAttempt.MatchString(b.Attempt) {
+			apiError(w, r, "invalid attempt", 400)
+			return
+		}
+	case "start", "finish", "reply":
+		if !pairingAttempt.MatchString(b.Attempt) || len(b.Payload) > 2048 || !pairingPayload.MatchString(b.Payload) ||
+			(b.Action == "start" && !pairingStartPayload.MatchString(b.Payload)) {
+			apiError(w, r, "invalid message", 400)
+			return
+		}
+	default:
+		apiError(w, r, "invalid pairing request", 400)
+		return
+	}
+	// Meter starts independently from polling, including misses.
+	if b.Action == "start" && (!rateAllowClient(r, "pairing-start:", pairingStartsPerClient) ||
+		!rateAllow("pairing-start-loc:"+b.Locator, pairingStartsPerLocator)) {
 		apiError(w, r, "rate limited", 429)
+		return
+	}
+	if b.Action == "create" && !rateAllowClient(r, "pairing-create:", pairingCreatesPerClient) {
+		apiError(w, r, "pairing unavailable", http.StatusTooManyRequests)
 		return
 	}
 	pairingMu.Lock()
 	defer pairingMu.Unlock()
 	now := time.Now()
-	for key, e := range pairingStore {
-		if !now.Before(e.expires) {
-			delete(pairingStore, key)
+	// Expired pairings are swept at most once a second, not on every
+	// request: the walk is the only part of this handler whose cost grows
+	// with the store, and nothing else bounds how often it is asked for.
+	if now.Sub(pairingLastSweep) >= time.Second {
+		pairingLastSweep = now
+		for key, e := range pairingStore {
+			if !now.Before(e.expires) {
+				delete(pairingStore, key)
+			}
 		}
 	}
 	e := pairingStore[b.Locator]
+	if e != nil && !now.Before(e.expires) {
+		delete(pairingStore, b.Locator)
+		e = nil
+	}
 	if b.Action == "create" {
-		if !rateAllow("pairing-create:"+clientIP(r), 10) || !rateAllow("pairing-create-global", 300) || len(pairingStore) >= pairingMaxLive {
+		var owner, ownerAgg string
+		if addr := clientAddr(r); !exemptFromShares(addr) {
+			owner, ownerAgg = clientBuckets(addr)
+		}
+		held, heldAgg := 0, 0
+		for _, other := range pairingStore {
+			if owner != "" && other.owner == owner {
+				held++
+			}
+			if ownerAgg != "" && other.ownerAgg == ownerAgg {
+				heldAgg++
+			}
+		}
+		if len(pairingStore) >= pairingMaxLive || held >= pairingMaxLivePerClient || heldAgg >= pairingMaxLivePerAggregate {
 			apiError(w, r, "pairing unavailable", http.StatusTooManyRequests)
 			return
 		}
 		// A live pairing already holds this locator. Its own status, so the
-		// client knows to draw another rather than give up.
+		// client knows to draw another rather than give up. This does say a
+		// locator is live, to a caller spending its create budget to ask:
+		// the client needs it, and the locator is not the secret.
 		if e != nil {
 			apiError(w, r, "locator in use", http.StatusConflict)
 			return
@@ -100,13 +192,27 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 			apiError(w, r, "unavailable", 500)
 			return
 		}
-		e = &pairingEntry{token: base64.RawURLEncoding.EncodeToString(token), expires: now.Add(5 * time.Minute), attempts: map[string][]pairingMessage{}, stages: map[string]string{}}
+		e = &pairingEntry{token: base64.RawURLEncoding.EncodeToString(token), expires: now.Add(5 * time.Minute), attempts: map[string][]pairingMessage{}, stages: map[string]string{}, owner: owner, ownerAgg: ownerAgg}
 		pairingStore[b.Locator] = e
 		inviteJSON(w, r, 200, map[string]string{"token": e.token})
 		return
 	}
 	if e == nil {
-		apiError(w, r, "pairing expired", 404)
+		// No pairing here: answer exactly as a live one answers a caller that
+		// holds neither its token nor a known attempt. A distinct "expired"
+		// used to make every locator a free liveness probe - 1024 of them,
+		// polled for nothing - which is how an attacker found the live codes
+		// worth spending starts on. What a live pairing still reveals, it
+		// reveals only to a start, which costs one of its attempts and the
+		// caller's start budget.
+		switch {
+		case b.Token != "", b.Action == "cancel", b.Action == "host-poll":
+			apiError(w, r, "denied", 403)
+		case b.Action == "join-poll":
+			apiError(w, r, "unknown attempt", 404)
+		default:
+			apiError(w, r, "pairing rejected", 409)
+		}
 		return
 	}
 	host := b.Token != "" && subtle.ConstantTimeCompare([]byte(b.Token), []byte(e.token)) == 1
@@ -130,10 +236,6 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		reply = e.inbox
 		e.inbox = nil
 	case "join-poll":
-		if !pairingAttempt.MatchString(b.Attempt) {
-			apiError(w, r, "invalid attempt", 400)
-			return
-		}
 		messages, ok := e.attempts[b.Attempt]
 		if !ok {
 			apiError(w, r, "unknown attempt", 404)
@@ -142,10 +244,6 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		reply = messages
 		e.attempts[b.Attempt] = nil
 	default:
-		if !pairingAttempt.MatchString(b.Attempt) || len(b.Payload) > 2048 || !pairingPayload.MatchString(b.Payload) {
-			apiError(w, r, "invalid message", 400)
-			return
-		}
 		if !pairingDeliver(e, host, b.Action, b.Attempt, b.Kind, b.Payload) {
 			apiError(w, r, "pairing rejected", 409)
 			return

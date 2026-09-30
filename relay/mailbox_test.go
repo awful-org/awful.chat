@@ -95,11 +95,7 @@ func TestMailboxRoundTrip(t *testing.T) {
 	}
 
 	// Ack deletes it.
-	ts, sig = authFields(priv)
-	ackBody, _ := json.Marshal(map[string]any{
-		"did": did, "ts": ts, "sig": sig, "ids": []string{got[0].ID},
-	})
-	req = httptest.NewRequest("POST", "/mailbox/ack", bytes.NewReader(ackBody))
+	req = v2Request(t, "/mailbox/ack", mailboxActionAck, did, priv, map[string]any{"ids": []string{got[0].ID}})
 	w = httptest.NewRecorder()
 	handleMailboxAck(w, req)
 	if w.Code != 204 {
@@ -286,9 +282,7 @@ func TestMailboxChargesWholeBlocks(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || len(got) != 1 {
 		t.Fatalf("collect: %v %d", err, len(got))
 	}
-	ts, sig = authFields(priv)
-	ackBody, _ := json.Marshal(map[string]any{"did": did, "ts": ts, "sig": sig, "ids": []string{got[0].ID}})
-	req = httptest.NewRequest("POST", "/mailbox/ack", bytes.NewReader(ackBody))
+	req = v2Request(t, "/mailbox/ack", mailboxActionAck, did, priv, map[string]any{"ids": []string{got[0].ID}})
 	w = httptest.NewRecorder()
 	handleMailboxAck(w, req)
 	if w.Code != 204 {
@@ -331,12 +325,9 @@ func TestMailboxAckScopedToOwnBox(t *testing.T) {
 	}
 
 	// A acks that id (plus traversal attempts): B's blob must survive.
-	ts, sig = authFields(privA)
-	body, _ = json.Marshal(map[string]any{
-		"did": didA, "ts": ts, "sig": sig,
+	req = v2Request(t, "/mailbox/ack", mailboxActionAck, didA, privA, map[string]any{
 		"ids": []string{got[0].ID, "../" + mailboxIDForDid(didB) + "/" + got[0].ID, "..", "."},
 	})
-	req = httptest.NewRequest("POST", "/mailbox/ack", bytes.NewReader(body))
 	w = httptest.NewRecorder()
 	handleMailboxAck(w, req)
 	if w.Code != 204 {
@@ -527,11 +518,7 @@ func TestAckRejectsOverLongIDList(t *testing.T) {
 		ids = append(ids, fmt.Sprintf("%032x", i))
 	}
 
-	ts, sig := authFields(priv)
-	body, _ := json.Marshal(map[string]any{
-		"did": did, "ts": ts, "sig": sig, "ids": ids,
-	})
-	req := httptest.NewRequest("POST", "/mailbox/ack", bytes.NewReader(body))
+	req := v2Request(t, "/mailbox/ack", mailboxActionAck, did, priv, map[string]any{"ids": ids})
 	w := httptest.NewRecorder()
 	handleMailboxAck(w, req)
 	if w.Code != 400 {
@@ -540,11 +527,7 @@ func TestAckRejectsOverLongIDList(t *testing.T) {
 
 	// An ID list exactly at the limit must be accepted.
 	ids = ids[:mailboxMaxAckIDs]
-	ts, sig = authFields(priv)
-	body, _ = json.Marshal(map[string]any{
-		"did": did, "ts": ts, "sig": sig, "ids": ids,
-	})
-	req = httptest.NewRequest("POST", "/mailbox/ack", bytes.NewReader(body))
+	req = v2Request(t, "/mailbox/ack", mailboxActionAck, did, priv, map[string]any{"ids": ids})
 	w = httptest.NewRecorder()
 	handleMailboxAck(w, req)
 	if w.Code != 204 {
@@ -646,11 +629,7 @@ func TestAckNeverDrivesCountersNegative(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ts, sig := authFields(priv)
-	ackBody, _ := json.Marshal(map[string]any{
-		"did": did, "ts": ts, "sig": sig, "ids": []string{id},
-	})
-	req := httptest.NewRequest("POST", "/mailbox/ack", bytes.NewReader(ackBody))
+	req := v2Request(t, "/mailbox/ack", mailboxActionAck, did, priv, map[string]any{"ids": []string{id}})
 	rec := httptest.NewRecorder()
 	handleMailboxAck(rec, req)
 	if rec.Code != http.StatusNoContent {
@@ -794,8 +773,13 @@ type mailboxClient struct {
 func (m *mailboxClient) request(path string, body any, h http.HandlerFunc) *httptest.ResponseRecorder {
 	m.t.Helper()
 	m.n++
-	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	var req *http.Request
+	if sb, ok := body.(signedBody); ok {
+		req = sb.request(m.t, path)
+	} else {
+		raw, _ := json.Marshal(body)
+		req = httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	}
 	req.RemoteAddr = "10.0.0.1:4000"
 	req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.%d.%d", m.n/250, m.n%250))
 	w := httptest.NewRecorder()
@@ -815,10 +799,7 @@ func (m *mailboxClient) deposit(box string, blob []byte) {
 
 func (m *mailboxClient) collect(device string) []mailboxEntry {
 	m.t.Helper()
-	ts, sig := authFields(m.priv)
-	w := m.request("/mailbox/collect", map[string]any{
-		"did": m.did, "ts": ts, "sig": sig, "device": device,
-	}, handleMailboxCollect)
+	w := m.request("/mailbox/collect", signedBody{mailboxActionCollect, m.did, m.priv, map[string]any{"device": device}}, handleMailboxCollect)
 	if w.Code != 200 {
 		m.t.Fatalf("collect: got %d %s", w.Code, w.Body.String())
 	}
@@ -831,10 +812,7 @@ func (m *mailboxClient) collect(device string) []mailboxEntry {
 
 func (m *mailboxClient) ack(device string, ids []string) {
 	m.t.Helper()
-	ts, sig := authFields(m.priv)
-	w := m.request("/mailbox/ack", map[string]any{
-		"did": m.did, "ts": ts, "sig": sig, "device": device, "ids": ids,
-	}, handleMailboxAck)
+	w := m.request("/mailbox/ack", signedBody{mailboxActionAck, m.did, m.priv, map[string]any{"device": device, "ids": ids}}, handleMailboxAck)
 	if w.Code != 204 {
 		m.t.Fatalf("ack: got %d %s", w.Code, w.Body.String())
 	}

@@ -107,6 +107,12 @@ func extractMetaNumber(html string, keys []string) *int {
 	return &n
 }
 
+// absolutizeUrl resolves a page-supplied url against the page and returns it
+// only if the result is an absolute http or https url. The page is whatever
+// the preview fetched - anyone's - and these urls go straight into an img
+// src or a video element in every client that shows the preview, so a
+// javascript:, data: or file: url in og:image is the page choosing what
+// the app loads. Anything else is dropped as if the tag were absent.
 func absolutizeUrl(raw, base string) *string {
 	if raw == "" {
 		return nil
@@ -119,8 +125,16 @@ func absolutizeUrl(raw, base string) *string {
 	if err != nil {
 		return nil
 	}
+	if !isWebURL(result) {
+		return nil
+	}
 	s := result.String()
 	return &s
+}
+
+// isWebURL reports whether u is an absolute http or https url with a host.
+func isWebURL(u *url.URL) bool {
+	return u != nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.User == nil
 }
 
 // Ranges the stdlib predicates in isDisallowedIP do not cover but that are
@@ -135,6 +149,14 @@ var disallowedNets = func() []*net.IPNet {
 		"100.64.0.0/10", // CGNAT and Tailscale; the range coturn already denies
 		"198.18.0.0/15", // benchmarking, wired to internal test gear on some networks
 		"240.0.0.0/4",   // reserved, and covers the 255.255.255.255 broadcast address
+		// IPv6 transition ranges whose embedded IPv4 address cannot be read
+		// back reliably, so they are refused outright rather than decoded
+		// (the ones that can be decoded are, in embeddedIPv4). Local-use
+		// NAT64 puts the IPv4 address wherever the operator's prefix length
+		// says; Teredo obfuscates it and routes through a third-party relay.
+		// Neither serves a link preview anybody needs.
+		"64:ff9b:1::/48", // local-use NAT64 (RFC 8215)
+		"2001::/32",      // Teredo
 	}
 	out := make([]*net.IPNet, 0, len(cidrs))
 	for _, c := range cidrs {
@@ -184,8 +206,59 @@ func isDisallowedIP(ip net.IP) bool {
 			return true
 		}
 	}
+	// An IPv6 address that carries an IPv4 one is only as public as that
+	// IPv4 address. On a host with NAT64, 64:ff9b::a9fe:a9fe IS
+	// 169.254.169.254, the cloud metadata service, and none of the checks
+	// above look inside it.
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		return isDisallowedIP(v4)
+	}
 	return false
 }
+
+var (
+	nat64WellKnown = mustCIDR("64:ff9b::/96") // RFC 6052: IPv4 in the low 32 bits
+	sixToFour      = mustCIDR("2002::/16")    // RFC 3056: IPv4 in bits 16-47
+	ipv4Compatible = mustCIDR("::/96")        // deprecated RFC 4291 form, ::a.b.c.d
+)
+
+func mustCIDR(c string) *net.IPNet {
+	_, n, err := net.ParseCIDR(c)
+	if err != nil {
+		panic("bad CIDR " + c + ": " + err.Error())
+	}
+	return n
+}
+
+// embeddedIPv4 returns the IPv4 address an IPv6 transition address stands
+// for - NAT64's well-known prefix, 6to4, or the old IPv4-compatible form -
+// or nil for any other address.
+func embeddedIPv4(ip net.IP) net.IP {
+	if ip.To4() != nil {
+		return nil
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return nil
+	}
+	switch {
+	case nat64WellKnown.Contains(ip16):
+		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
+	case sixToFour.Contains(ip16):
+		return net.IPv4(ip16[2], ip16[3], ip16[4], ip16[5])
+	case ipv4Compatible.Contains(ip16):
+		// :: and ::1 are caught above; anything else here is ::a.b.c.d.
+		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
+	}
+	return nil
+}
+
+// allowedFetchPorts is where an outbound fetch may connect: the web's two
+// ports. A url may name any port, and the preview fetcher answering on
+// someone's behalf from inside this deployment's network made it a port
+// scanner for every public host - and anything that speaks HTTP-ish on
+// another port a way to have the relay send it requests.
+var allowedFetchPorts = map[string]bool{"80": true, "443": true}
 
 // ogSafeDial resolves the target host itself and refuses every address that is
 // not on the public internet, so neither an attacker-chosen hostname nor a
@@ -195,6 +268,9 @@ func ogSafeDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+	if !allowedFetchPorts[port] {
+		return nil, fmt.Errorf("disallowed port: %s", port)
 	}
 	// Resolve and validate all IPs returned by the resolver
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
@@ -262,7 +338,7 @@ func handleOgPreview(w http.ResponseWriter, r *http.Request) {
 	// a DNS lookup plus up to 10s of held goroutine and a 5MB read - the
 	// cheapest-for-attacker, dearest-for-server call here. Same budget as
 	// its plugin-proxy sibling.
-	if !rateAllow("og:"+clientIP(r), pluginProxyRateLimit) {
+	if !rateAllowClient(r, "og:", pluginProxyRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -279,8 +355,12 @@ func handleOgPreview(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Invalid URL", http.StatusBadRequest)
 		return
 	}
-	if targetURL.Scheme != "http" && targetURL.Scheme != "https" {
+	if !isWebURL(targetURL) {
 		apiError(w, r, "Only http/https URLs are supported", http.StatusBadRequest)
+		return
+	}
+	if p := targetURL.Port(); p != "" && !allowedFetchPorts[p] {
+		apiError(w, r, "Only ports 80 and 443 are supported", http.StatusBadRequest)
 		return
 	}
 

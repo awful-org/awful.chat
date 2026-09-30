@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -30,46 +31,52 @@ func resetRateLimiter(t *testing.T) {
 
 func TestSubstituteSecrets(t *testing.T) {
 	secrets := map[string]pluginSecret{
-		"STEAM": {value: "k&y 123", host: "api.steampowered.com"},
-		"OPEN":  {value: "free"},
+		"STEAM":  {value: "k&y 123", host: "api.steampowered.com", path: "/ISteamUser/", param: "key"},
+		"EXACT":  {value: "e", host: "api.example", path: "/v1/lookup", param: "token"},
+		"LEGACY": {value: "old", host: "api.steampowered.com", legacy: true},
 	}
-	out, err := substituteSecrets("https://x/?key={{secret:steam}}&id=7", secrets, "api.steampowered.com")
+	const host = "api.steampowered.com"
+	out, err := substituteSecrets("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={{secret:steam}}&id=7", secrets, host)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "https://x/?key=k%26y+123&id=7"
-	if out != want {
+	if want := "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=k%26y+123&id=7"; out != want {
 		t.Errorf("got %q want %q", out, want)
 	}
-	// A bound secret must NOT substitute for another host - this is the
-	// cross-host leakage the review flagged.
-	if _, err := substituteSecrets("https://x/?k={{secret:steam}}", secrets, "evil.example"); err == nil {
-		t.Error("host-bound secret leaked to another host")
+	if _, err := substituteSecrets("https://api.example/v1/lookup?token={{secret:exact}}", secrets, "api.example"); err != nil {
+		t.Errorf("exact path: %v", err)
 	}
-	// An unbound secret works for any host.
-	if out, err := substituteSecrets("https://x/?k={{secret:open}}", secrets, "evil.example"); err != nil || out != "https://x/?k=free" {
-		t.Errorf("unbound secret: %q %v", out, err)
+	if _, err := substituteSecrets("https://api.example/v1/lookup/more?token={{secret:exact}}", secrets, "api.example"); err != nil {
+		t.Errorf("below an exact path: %v", err)
 	}
-	if _, err := substituteSecrets("https://x/?key={{secret:missing}}", secrets, "h"); err == nil {
-		t.Error("missing secret must error")
+
+	// Every way of steering the key somewhere it was not bound to.
+	for name, raw := range map[string]string{
+		"another host":            "https://evil.example/ISteamUser/x?key={{secret:steam}}",
+		"another parameter":       "https://api.steampowered.com/ISteamUser/x?callback={{secret:steam}}",
+		"another path":            "https://api.steampowered.com/IEcho/x?key={{secret:steam}}",
+		"a path that climbs out":  "https://api.steampowered.com/ISteamUser/../IEcho/x?key={{secret:steam}}",
+		"an encoded climb":        "https://api.steampowered.com/ISteamUser%2F..%2FIEcho?key={{secret:steam}}",
+		"an empty segment":        "https://api.steampowered.com/ISteamUser//x?key={{secret:steam}}",
+		"a prefix lookalike":      "https://api.example/v1/lookupall?token={{secret:exact}}",
+		"glued to another value":  "https://api.steampowered.com/ISteamUser/x?key=echo{{secret:steam}}",
+		"as the parameter name":   "https://api.steampowered.com/ISteamUser/x?{{secret:steam}}=1",
+		"an unbound (old) secret": "https://api.steampowered.com/ISteamUser/x?key={{secret:legacy}}",
+		"a secret nobody set":     "https://api.steampowered.com/ISteamUser/x?key={{secret:missing}}",
+	} {
+		target := host
+		if name == "another host" {
+			target = "evil.example"
+		}
+		if name == "a prefix lookalike" {
+			target = "api.example"
+		}
+		if out, err := substituteSecrets(raw, secrets, target); err == nil {
+			t.Errorf("%s: substituted into %q", name, out)
+		}
 	}
 	if out, _ := substituteSecrets("https://x/plain", secrets, "h"); out != "https://x/plain" {
 		t.Errorf("plain url mangled: %q", out)
-	}
-}
-
-// A caller url carrying userinfo (https://u:p@allowed.host/x) would otherwise
-// reach Go's http.Client unchanged, which sends Authorization: Basic derived
-// from it to whatever allowlisted host the caller names - letting any caller
-// pick the credential an allowlisted upstream sees.
-func TestPluginProxyRejectsUserinfoInURL(t *testing.T) {
-	resetRateLimiter(t)
-	t.Setenv("PLUGIN_PROXY_HOSTS", "allowed.host")
-	req := httptest.NewRequest(http.MethodGet, "/plugin-proxy?url="+url.QueryEscape("https://u:p@allowed.host/x"), nil)
-	rec := httptest.NewRecorder()
-	handlePluginProxy(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a url with userinfo, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -77,16 +84,23 @@ func TestPluginProxyRateLimit(t *testing.T) {
 	resetRateLimiter(t)
 	ip := "203.0.113.9"
 	for i := 0; i < pluginProxyRateLimit; i++ {
-		if !pluginProxyAllow(ip) {
+		if !pluginProxyAllow(reqFrom(ip)) {
 			t.Fatalf("request %d refused inside the window", i)
 		}
 	}
-	if pluginProxyAllow(ip) {
+	if pluginProxyAllow(reqFrom(ip)) {
 		t.Error("request over the limit allowed")
 	}
-	if !pluginProxyAllow("203.0.113.10") {
+	if !pluginProxyAllow(reqFrom("203.0.113.10")) {
 		t.Error("another client caught by the first client's bucket")
 	}
+}
+
+// reqFrom is a request whose socket peer is addr, so it is its own client.
+func reqFrom(addr string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = net.JoinHostPort(addr, "1234")
+	return req
 }
 
 func TestPluginProxyEnvParsing(t *testing.T) {
@@ -95,13 +109,19 @@ func TestPluginProxyEnvParsing(t *testing.T) {
 	if !hosts["api.steampowered.com"] || !hosts["other.api"] || len(hosts) != 2 {
 		t.Errorf("hosts parsed wrong: %v", hosts)
 	}
-	t.Setenv("PLUGIN_PROXY_SECRETS", "steam@API.Steampowered.com=abc, FOO=a=b,")
+	t.Setenv("PLUGIN_PROXY_SECRETS", "steam@API.Steampowered.com/ISteamUser/?key=abc, FOO=a=b, BAR@host.example=x, BAZ@host.example/a/../b?k=y, TOP@host.example?k=a=b")
 	secrets := pluginProxySecrets()
-	if secrets["STEAM"].value != "abc" || secrets["STEAM"].host != "api.steampowered.com" {
-		t.Errorf("bound secret parsed wrong: %+v", secrets["STEAM"])
+	if s := secrets["STEAM"]; s.value != "abc" || s.host != "api.steampowered.com" || s.path != "/ISteamUser/" || s.param != "key" || s.legacy {
+		t.Errorf("bound secret parsed wrong: %+v", s)
 	}
-	if secrets["FOO"].value != "a=b" || secrets["FOO"].host != "" || len(secrets) != 2 {
-		t.Errorf("secrets parsed wrong: %v", secrets)
+	if s := secrets["TOP"]; s.value != "a=b" || s.path != "/" || s.param != "k" || s.legacy {
+		t.Errorf("host-wide secret parsed wrong: %+v", s)
+	}
+	// The old forms and anything malformed parse, but are never used.
+	for _, name := range []string{"FOO", "BAR", "BAZ"} {
+		if !secrets[name].legacy {
+			t.Errorf("%s should be unusable: %+v", name, secrets[name])
+		}
 	}
 }
 
@@ -125,36 +145,6 @@ func TestRateAllowConcurrent(t *testing.T) {
 	wg.Wait()
 	if allowed != 10 {
 		t.Fatalf("admitted %d, want exactly 10", allowed)
-	}
-}
-
-// X-Forwarded-For is a request header, so honouring it from a peer that is
-// not our own proxy let any direct caller pick its own rate-limit bucket -
-// every per-IP budget in the binary became a formality.
-func TestClientIPTrustsOnlyProxies(t *testing.T) {
-	cases := []struct {
-		name   string
-		remote string
-		xff    string
-		want   string
-	}{
-		{"direct caller cannot forge a bucket", "198.51.100.4:9000", "203.0.113.1", "198.51.100.4"},
-		{"behind the proxy the header is the client", "10.0.0.1:9000", "203.0.113.1", "203.0.113.1"},
-		{"a client-prepended hop is ignored", "10.0.0.1:9000", "203.0.113.1, 198.51.100.9", "198.51.100.9"},
-		{"a trusted extra hop is skipped", "10.0.0.1:9000", "203.0.113.1, 10.0.0.7", "203.0.113.1"},
-		{"no header falls back to the socket peer", "10.0.0.1:9000", "", "10.0.0.1"},
-		{"all-private hops keep the last one", "10.0.0.1:9000", "10.4.4.4", "10.4.4.4"},
-		{"garbage in the header is skipped", "10.0.0.1:9000", "203.0.113.1, not-an-ip", "203.0.113.1"},
-	}
-	for _, c := range cases {
-		req := httptest.NewRequest("GET", "/plugin-proxy", nil)
-		req.RemoteAddr = c.remote
-		if c.xff != "" {
-			req.Header.Set("X-Forwarded-For", c.xff)
-		}
-		if got := clientIP(req); got != c.want {
-			t.Errorf("%s: got %q want %q", c.name, got, c.want)
-		}
 	}
 }
 
@@ -297,7 +287,7 @@ func TestPluginProxyRefusesSecretPlaceholderOutsideTheQuery(t *testing.T) {
 
 	resetRateLimiter(t)
 	t.Setenv("PLUGIN_PROXY_HOSTS", "allowed.host")
-	t.Setenv("PLUGIN_PROXY_SECRETS", "KEY@allowed.host=s3cret")
+	t.Setenv("PLUGIN_PROXY_SECRETS", "KEY@allowed.host/v1/?key=s3cret")
 	req := httptest.NewRequest(http.MethodGet,
 		"/plugin-proxy?url="+url.QueryEscape("https://allowed.host/v1/{{secret:key}}/data"), nil)
 	rec := httptest.NewRecorder()
@@ -307,5 +297,50 @@ func TestPluginProxyRefusesSecretPlaceholderOutsideTheQuery(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "s3cret") {
 		t.Error("the refusal echoed the secret")
+	}
+}
+
+// NAME@host?param=value binds a secret to a host and a parameter, on any
+// path: exactly NAME@host/?param=value.
+func TestSecretWithoutAPathPrefix(t *testing.T) {
+	t.Setenv("PLUGIN_PROXY_SECRETS", "STEAM@api.steampowered.com?key=k&y 1, SLASH@api.steampowered.com/?key=k&y 1")
+	secrets := pluginProxySecrets()
+	plain, slash := secrets["STEAM"], secrets["SLASH"]
+	if plain.legacy || plain.host != "api.steampowered.com" || plain.path != "/" || plain.param != "key" || plain.value != "k&y 1" {
+		t.Fatalf("no-path form parsed wrong: %+v", plain)
+	}
+	if plain.host != slash.host || plain.path != slash.path || plain.param != slash.param {
+		t.Fatalf("NAME@host?p differs from NAME@host/?p: %+v vs %+v", plain, slash)
+	}
+
+	const host = "api.steampowered.com"
+	// Filled on any path of that host, in that parameter.
+	for _, raw := range []string{
+		"https://api.steampowered.com?key={{secret:steam}}",
+		"https://api.steampowered.com/?key={{secret:steam}}",
+		"https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={{secret:steam}}&steamids=7",
+		"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1?format=json&key={{secret:steam}}",
+	} {
+		out, err := substituteSecrets(raw, secrets, host)
+		if err != nil {
+			t.Errorf("%s: %v", raw, err)
+			continue
+		}
+		if !strings.Contains(out, "key=k%26y+1") || strings.Contains(out, "{{secret:") {
+			t.Errorf("%s: not filled: %q", raw, out)
+		}
+	}
+	// Never on another host, and only as the whole value of that parameter.
+	for name, c := range map[string]struct{ raw, host string }{
+		"another host":         {"https://evil.example/?key={{secret:steam}}", "evil.example"},
+		"another parameter":    {"https://api.steampowered.com/x?callback={{secret:steam}}", host},
+		"glued to a value":     {"https://api.steampowered.com/x?key=echo{{secret:steam}}", host},
+		"value then more text": {"https://api.steampowered.com/x?key={{secret:steam}}tail", host},
+		"as a parameter name":  {"https://api.steampowered.com/x?{{secret:steam}}=1", host},
+		"a path that climbs":   {"https://api.steampowered.com/a/../b?key={{secret:steam}}", host},
+	} {
+		if out, err := substituteSecrets(c.raw, secrets, c.host); err == nil {
+			t.Errorf("%s: substituted into %q", name, out)
+		}
 	}
 }

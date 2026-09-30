@@ -6,9 +6,12 @@ package main
 // proof), which kills the model. Operator-controlled on both axes:
 //
 //   PLUGIN_PROXY_HOSTS    comma list of exact hostnames plugins may reach
-//   PLUGIN_PROXY_SECRETS  comma list of NAME=value; a request url may carry
-//                         {{secret:NAME}} placeholders, substituted
-//                         server-side so keys never reach clients
+//   PLUGIN_PROXY_SECRETS  comma list of NAME@host?param=value, or
+//                         NAME@host/path/prefix?param=value; a request url
+//                         may carry {{secret:NAME}} as the whole value of
+//                         that query parameter, on that host (under that
+//                         path, if one is given), and the relay substitutes
+//                         it server-side so keys never reach clients
 //
 // GET /plugin-proxy?url=<https url> - the host must be allowlisted, the
 // scheme https, redirects stay inside the allowlist, private/loopback IPs
@@ -125,6 +128,16 @@ const pluginProxyRateWindow = time.Minute
 // rateAllow enforces a fixed window per key. Callers namespace the key
 // ("pp:"+ip, "mb:"+ip, ...) so hammering one feature cannot starve another.
 func rateAllow(key string, limit int) bool {
+	return rateAllowAll([]string{key}, []int{limit})
+}
+
+// rateAllowAll spends one request from every key at once, or from none of
+// them: each window is checked before any is charged, all under one lock.
+// Charging a client's own bucket for a request its /48 aggregate then
+// refused would make one party's flood eat into its own window for nothing,
+// and the reverse would let a refused request still count against the
+// neighbours it shares the aggregate with.
+func rateAllowAll(keys []string, limits []int) bool {
 	now := time.Now()
 	rateMu.Lock()
 	defer rateMu.Unlock()
@@ -138,115 +151,25 @@ func rateAllow(key string, limit int) bool {
 			}
 		}
 	}
-	e, ok := rateBy[key]
-	if !ok || now.After(e.resetAt) {
-		rateBy[key] = rateEntry{count: 1, resetAt: now.Add(pluginProxyRateWindow)}
-		return true
+	for i, key := range keys {
+		if e, ok := rateBy[key]; ok && !now.After(e.resetAt) && e.count >= limits[i] {
+			return false
+		}
 	}
-	if e.count >= limit {
-		return false
+	for _, key := range keys {
+		e, ok := rateBy[key]
+		if !ok || now.After(e.resetAt) {
+			rateBy[key] = rateEntry{count: 1, resetAt: now.Add(pluginProxyRateWindow)}
+			continue
+		}
+		e.count++
+		rateBy[key] = e
 	}
-	e.count++
-	rateBy[key] = e
 	return true
 }
 
-func pluginProxyAllow(ip string) bool {
-	return rateAllow("pp:"+ip, pluginProxyRateLimit)
-}
-
-// Peers whose X-Forwarded-For we believe. Behind traefik the socket peer is
-// traefik on the docker network, so private plus loopback is the whole trusted
-// set; TRUSTED_PROXY_CIDRS (comma-separated) replaces it for any other
-// topology, e.g. adding a CDN's ranges so its hop is skipped too.
-var trustedProxyNets = func() []*net.IPNet {
-	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXY_CIDRS"))
-	if raw == "" {
-		raw = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
-	}
-	var out []*net.IPNet
-	for _, c := range strings.Split(raw, ",") {
-		c = strings.TrimSpace(c)
-		if c == "" {
-			continue
-		}
-		if _, n, err := net.ParseCIDR(c); err == nil {
-			out = append(out, n)
-		} else {
-			log.Printf("[relay] ignoring unparseable TRUSTED_PROXY_CIDRS entry %q", c)
-		}
-	}
-	return out
-}()
-
-func isTrustedProxy(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	for _, n := range trustedProxyNets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// rateKeyIP is the address a rate limit is keyed on. An IPv6 client is
-// keyed on its /64: a single host routinely holds a whole /64 (and often a
-// /56), so per-address buckets would let it rotate through 2^64 fresh
-// identities and every per-client limit in this file would gate nothing.
-func rateKeyIP(s string) string {
-	ip := net.ParseIP(s)
-	if ip == nil || ip.To4() != nil {
-		return s
-	}
-	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
-}
-
-func clientIP(r *http.Request) string {
-	return rateKeyIP(clientAddr(r))
-}
-
-// clientAddr is the client's own address, trusting X-Forwarded-For only
-// from a proxy we deployed.
-func clientAddr(r *http.Request) string {
-	remote := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(remote); err == nil {
-		remote = host
-	}
-	// X-Forwarded-For is an ordinary request header, so it is only worth
-	// anything when the socket peer is a proxy we deployed. Reached directly -
-	// the dev compose publishes 8081, and nothing stops a container on the
-	// same network from doing it in production - the peer IS the client and
-	// its own header would let it pick its rate-limit bucket.
-	if !isTrustedProxy(net.ParseIP(remote)) {
-		return remote
-	}
-	var hops []string
-	for _, v := range r.Header.Values("X-Forwarded-For") {
-		for _, p := range strings.Split(v, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				hops = append(hops, p)
-			}
-		}
-	}
-	if len(hops) == 0 {
-		return remote
-	}
-	// Right to left, skipping hops that are themselves trusted proxies: every
-	// entry to the left of one our own proxy appended is client-supplied, so
-	// the rightmost entry that is not a known proxy is the closest thing to
-	// the real client that no client could have forged. If every hop looks
-	// like a proxy (a deployment whose users are on the same private network),
-	// the last one is still the one our proxy wrote.
-	for i := len(hops) - 1; i >= 0; i-- {
-		ip := net.ParseIP(hops[i])
-		if ip == nil || isTrustedProxy(ip) {
-			continue
-		}
-		return ip.String()
-	}
-	return hops[len(hops)-1]
+func pluginProxyAllow(r *http.Request) bool {
+	return rateAllowClient(r, "pp:", pluginProxyRateLimit)
 }
 
 var secretPlaceholderRe = regexp.MustCompile(`\{\{secret:([A-Za-z0-9_-]+)\}\}`)
@@ -264,17 +187,42 @@ func pluginProxyHosts() map[string]bool {
 
 type pluginSecret struct {
 	value string
-	// Host this secret may be sent to. Empty = any allowlisted host, which
-	// is safe with ONE host and a leak with two: any allowlisted upstream
-	// could be handed every unbound secret. Bind with NAME@host=value.
-	host string
+	// Where this secret may be sent: one host, the one query parameter it
+	// fills, and optionally a path prefix on that host ("/" when none is
+	// given). A secret bound to its host alone could be put in ANY parameter
+	// - a callback, a search term an upstream echoes back - so the parameter
+	// is always part of the binding. The path narrows it further, for a host
+	// that also serves an endpoint which echoes its query or logs it
+	// somewhere the caller can read.
+	host   string
+	path   string
+	param  string
+	legacy bool // configured in an old form; never substituted, see below
 }
 
-var unboundSecretWarn sync.Once
+var secretConfigWarn sync.Once
 
+// pluginProxySecrets parses PLUGIN_PROXY_SECRETS. Each entry is
+//
+//	NAME@host?param=value
+//	NAME@host/path/prefix?param=value
+//
+// e.g. STEAM@api.steampowered.com?key=abc123: the secret STEAM is
+// substituted only into a query parameter called "key", on
+// api.steampowered.com, on any path. The first form is exactly
+// NAME@host/?param=value. With a prefix, as in
+// STEAM@api.steampowered.com/ISteamUser/?key=abc123, only paths under
+// /ISteamUser/ qualify: a prefix ending in "/" matches below it, one
+// without matches itself and its sub-paths. The value is everything after
+// the first "=", so it may contain "=".
+//
+// The old forms NAME=value and NAME@host=value still parse but are never
+// substituted: they left the parameter and the path to the caller, which
+// is the leak this binding closes. The relay says so once at boot, naming
+// them, so an operator sees why a plugin now reports "not configured".
 func pluginProxySecrets() map[string]pluginSecret {
 	out := map[string]pluginSecret{}
-	var unbound []string
+	var legacy []string
 	for _, pair := range strings.Split(os.Getenv("PLUGIN_PROXY_SECRETS"), ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
@@ -284,22 +232,74 @@ func pluginProxySecrets() map[string]pluginSecret {
 		if !ok || k == "" {
 			continue
 		}
-		name, host, bound := strings.Cut(strings.TrimSpace(k), "@")
+		name, where, bound := strings.Cut(strings.TrimSpace(k), "@")
 		name = strings.ToUpper(strings.TrimSpace(name))
 		sec := pluginSecret{value: v}
 		if bound {
-			sec.host = strings.ToLower(strings.TrimSpace(host))
-		} else {
-			unbound = append(unbound, name)
+			sec.host, sec.path, sec.param = parseSecretBinding(where)
+		}
+		if sec.host == "" || sec.param == "" {
+			sec.legacy = true
+			legacy = append(legacy, name)
 		}
 		out[name] = sec
 	}
-	if len(unbound) > 0 {
-		unboundSecretWarn.Do(func() {
-			log.Printf("[plugin-proxy] secrets without a host binding (%s) can be sent to ANY allowlisted host; prefer NAME@host=value", strings.Join(unbound, ", "))
+	if len(legacy) > 0 {
+		secretConfigWarn.Do(func() {
+			log.Printf("[plugin-proxy] secrets %s are not bound to a host, path and parameter and will NOT be substituted; write them as NAME@host?param=value", strings.Join(legacy, ", "))
 		})
 	}
 	return out
+}
+
+// parseSecretBinding splits "host?param" or "host/path/prefix?param"; no
+// path means "/", any path on the host. Anything malformed comes back with
+// an empty host or param, which leaves the secret unused.
+func parseSecretBinding(where string) (host, path, param string) {
+	where = strings.TrimSpace(where)
+	if where == "" || strings.ContainsAny(where, "#@") {
+		return "", "", ""
+	}
+	u, err := url.Parse("https://" + where)
+	if err != nil || u.Host == "" || u.Port() != "" || u.RawPath != "" {
+		return "", "", ""
+	}
+	path = u.Path
+	if path == "" {
+		path = "/"
+	}
+	if !canonicalPath(path) {
+		return "", "", ""
+	}
+	param = u.RawQuery
+	if param == "" || strings.ContainsAny(param, "&=;%+") {
+		return "", "", ""
+	}
+	return strings.ToLower(u.Hostname()), path, param
+}
+
+// canonicalPath reports whether p says exactly one thing: absolute, no
+// "." or ".." segment, no empty segment. An upstream resolves those, so
+// "/allowed/../admin" would satisfy a prefix check the request does not.
+func canonicalPath(p string) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	segs := strings.Split(p[1:], "/")
+	for i, seg := range segs {
+		if seg == "." || seg == ".." || (seg == "" && i != len(segs)-1) {
+			return false
+		}
+	}
+	return true
+}
+
+// underPrefix reports whether path is the bound prefix or below it.
+func underPrefix(path, prefix string) bool {
+	if strings.HasSuffix(prefix, "/") {
+		return strings.HasPrefix(path, prefix)
+	}
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // errSecretOutsideQuery marks a url whose placeholder is not in the query.
@@ -309,9 +309,10 @@ func pluginProxySecrets() map[string]pluginSecret {
 var errSecretOutsideQuery = errors.New("secret placeholder outside the query")
 
 // substituteSecrets replaces {{secret:NAME}} placeholders for a request
-// bound for targetHost. A secret bound to a different host counts as
-// missing: the caller answers 204 and no upstream ever sees a key that was
-// not meant for it.
+// bound for targetHost. A secret bound elsewhere - another host, a path
+// outside its prefix, a parameter other than its own - counts as missing:
+// the caller answers 204 and no upstream ever sees a key that was not
+// meant for it.
 //
 // Only the QUERY is substituted, and a placeholder anywhere else is refused.
 // The doc always said placeholders belong in the query - values are
@@ -320,7 +321,9 @@ var errSecretOutsideQuery = errors.New("secret placeholder outside the query")
 // in the PATH and have it spliced in there: url.QueryEscape leaves '/'
 // unescaped, which is enough to steer the request to another path on the
 // allowlisted host and, for a secret containing one, to reveal it in the
-// upstream's own logs and error pages.
+// upstream's own logs and error pages. And a placeholder has to be the
+// whole value of its parameter, so the key cannot be glued onto some other
+// value the upstream would echo.
 func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -332,21 +335,38 @@ func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost s
 	if len(secretPlaceholderRe.FindAllString(raw, -1)) != len(secretPlaceholderRe.FindAllString(u.RawQuery, -1)) {
 		return "", errSecretOutsideQuery
 	}
-	targetHost = strings.ToLower(targetHost)
-	var missing string
-	u.RawQuery = secretPlaceholderRe.ReplaceAllStringFunc(u.RawQuery, func(m string) string {
-		name := strings.ToUpper(secretPlaceholderRe.FindStringSubmatch(m)[1])
-		if sec, ok := secrets[name]; ok && (sec.host == "" || sec.host == targetHost) {
-			return url.QueryEscape(sec.value)
-		}
-		if missing == "" {
-			missing = name
-		}
-		return m
-	})
-	if missing != "" {
-		return "", fmt.Errorf("secret %s not configured for %s", missing, targetHost)
+	if !secretPlaceholderRe.MatchString(u.RawQuery) {
+		return raw, nil
 	}
+	targetHost = strings.ToLower(targetHost)
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	pairs := strings.Split(u.RawQuery, "&")
+	for i, pair := range pairs {
+		if !secretPlaceholderRe.MatchString(pair) {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		m := secretPlaceholderRe.FindStringSubmatch(value)
+		name := ""
+		if m != nil {
+			name = strings.ToUpper(m[1])
+		}
+		sec, ok := secrets[name]
+		param, perr := url.QueryUnescape(key)
+		if m == nil || m[0] != value || !ok || sec.legacy || perr != nil ||
+			sec.host != targetHost || sec.param != param ||
+			u.RawPath != "" || !canonicalPath(path) || !underPrefix(path, sec.path) {
+			if name == "" {
+				name = "placeholder"
+			}
+			return "", fmt.Errorf("secret %s not configured for this use of %s", name, targetHost)
+		}
+		pairs[i] = key + "=" + url.QueryEscape(sec.value)
+	}
+	u.RawQuery = strings.Join(pairs, "&")
 	return u.String(), nil
 }
 
@@ -360,6 +380,11 @@ func pluginProxySafeDial(ctx context.Context, network, addr string) (net.Conn, e
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address: %w", err)
+	}
+	// Same two ports as the preview fetcher, for the same reason: an
+	// allowlisted HOST says nothing about which of its ports may be reached.
+	if !allowedFetchPorts[port] {
+		return nil, fmt.Errorf("disallowed port: %s", port)
 	}
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(ips) == 0 {
@@ -426,7 +451,7 @@ func handlePluginProxy(w http.ResponseWriter, r *http.Request) {
 		withCors(w, r, func(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) })
 		return
 	}
-	if !pluginProxyAllow(clientIP(r)) {
+	if !pluginProxyAllow(r) {
 		apiError(w, r, "Slow down", http.StatusTooManyRequests)
 		return
 	}

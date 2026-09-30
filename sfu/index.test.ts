@@ -715,3 +715,106 @@ describe("ms:diag with SFU_TELEMETRY unset", () => {
     }
   });
 });
+
+// The upgrade's Origin check and the cap on sockets that have not joined
+// yet (sfu/admission.ts). Its own process: both are read once at boot.
+describe("admission: origin allowlist and unjoined-socket cap", () => {
+  let ADMIT_PORT = 0;
+  let admitSfu: SpawnedSfu;
+
+  before(async () => {
+    ADMIT_PORT = await freePort([PORT]);
+    admitSfu = spawnSfu(ADMIT_PORT, {
+      DOMAIN: "chat.example",
+      SFU_MAX_PENDING_PER_PROXY: "3",
+      SFU_MAX_PENDING_PER_IP: "2",
+    });
+    await waitForServer(ADMIT_PORT);
+  });
+
+  after(async () => {
+    await admitSfu.stop();
+  });
+
+  type Attempt = { ws: WebSocket; status?: number; closeCode?: number; opened: boolean };
+
+  // Opens a socket and reports how it ended up: refused at the upgrade
+  // (status), accepted and then closed by the server (closeCode), or open.
+  function attempt(opts: { origin?: string; forwardedFor?: string } = {}): Promise<Attempt> {
+    const headers: Record<string, string> = {};
+    if (opts.forwardedFor) headers["X-Forwarded-For"] = opts.forwardedFor;
+    const ws = new WebSocket(wsUrl(ADMIT_PORT), { origin: opts.origin, headers });
+    return new Promise((resolve) => {
+      const a: Attempt = { ws, opened: false };
+      ws.once("unexpected-response", (req, res) => {
+        a.status = res.statusCode;
+        req.destroy();
+        resolve(a);
+      });
+      ws.once("error", () => resolve(a));
+      ws.once("open", () => {
+        a.opened = true;
+        // A refused-for-capacity socket is closed straight after opening;
+        // one that is admitted hears its join challenge first.
+        ws.once("close", (code) => {
+          a.closeCode = code;
+          resolve(a);
+        });
+        ws.once("message", () => resolve(a));
+      });
+    });
+  }
+
+  async function closeAll(list: Attempt[]): Promise<void> {
+    await Promise.all(
+      list.map(
+        (a) =>
+          new Promise<void>((resolve) => {
+            if (a.ws.readyState === WebSocket.CLOSED) return resolve();
+            a.ws.once("close", () => resolve());
+            a.ws.close();
+          }),
+      ),
+    );
+    // The server releases a slot on ITS close event, which can land just
+    // after the client's.
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  test("a browser on another site is refused at the upgrade; the app's own origin is not", async () => {
+    const evil = await attempt({ origin: "https://evil.example" });
+    assert.equal(evil.status, 403);
+    assert.equal(evil.opened, false);
+    const app = await attempt({ origin: "https://chat.example" });
+    assert.equal(app.opened, true);
+    assert.equal(app.closeCode, undefined);
+    const noOrigin = await attempt();
+    assert.equal(noOrigin.opened, true);
+    await closeAll([app, noOrigin]);
+  });
+
+  test("unjoined sockets are capped per client and per proxy", async () => {
+    // From 127.0.0.1 with no X-Forwarded-For: a trusted proxy naming nobody.
+    const viaProxy: Attempt[] = [];
+    for (let i = 0; i < 3; i++) viaProxy.push(await attempt());
+    assert.ok(viaProxy.every((a) => a.opened && a.closeCode === undefined));
+    const overProxy = await attempt();
+    assert.equal(overProxy.closeCode, 1013);
+    await closeAll(viaProxy);
+
+    // Named clients each get their own, smaller, allowance.
+    const client: Attempt[] = [];
+    for (let i = 0; i < 2; i++) client.push(await attempt({ forwardedFor: "203.0.113.5" }));
+    assert.ok(client.every((a) => a.opened && a.closeCode === undefined));
+    const over = await attempt({ forwardedFor: "203.0.113.5" });
+    assert.equal(over.closeCode, 1013);
+    const other = await attempt({ forwardedFor: "203.0.113.6" });
+    assert.equal(other.closeCode, undefined);
+    await closeAll([...client, other]);
+
+    // And the slots come back once those sockets are gone.
+    const again = await attempt({ forwardedFor: "203.0.113.5" });
+    assert.equal(again.closeCode, undefined);
+    await closeAll([again]);
+  });
+});

@@ -818,6 +818,12 @@ func TestRoomCapIsSharedAcrossAPeersStreams(t *testing.T) {
 func TestTotalCapLoggedResetsWhenTotalFalls(t *testing.T) {
 	r := newRegistry()
 	a, _ := newClient(r, "peer-a")
+	// Past the soft ceiling a peer still gets its guaranteed rooms, so the
+	// refusal this test is about only starts once a has used them.
+	liftEmptyRegisterBudget(r, "peer-a")
+	for i := range guaranteedRoomsPerPeer {
+		r.register(a, fmt.Sprintf("held-%d", i))
+	}
 	r.mu.Lock()
 	r.total = maxTotalRegistrations
 	r.totalCapLogged = true

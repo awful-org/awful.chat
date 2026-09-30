@@ -36,6 +36,14 @@ const pluginStreamPerClient = 8
 // single household can close the endpoint for everyone else.
 const pluginStreamGlobal = 1024
 
+// Streams one IPv6 /48 may hold open at once, across every /64 in it. The
+// per-client cap alone was per /64, so a /56 - one household's allocation -
+// was 256 clients and 2048 slots, past the global ceiling: one line could
+// hold every slot on the instance. A /48 now gets ipv6AggregateFactor
+// clients' worth, a few people's playback on one site, and it takes 32
+// separate /48s to fill the global ceiling.
+const pluginStreamPerAggregate = pluginStreamPerClient * ipv6AggregateFactor
+
 // hls.js fetches a segment every ~10s per quality level and bursts on seek,
 // so the proxy's 10/min would stall playback within the first minute.
 const pluginStreamRateLimit = 240
@@ -66,18 +74,40 @@ var (
 	pluginStreamOpen  int
 )
 
-func pluginStreamAcquire(ip string) bool {
+// pluginStreamAcquire takes one slot for a client: from its own bucket, from
+// its /48's aggregate when it has one, and from the global ceiling - all or
+// nothing, under one lock. It returns the buckets it charged, for
+// pluginStreamRelease. A proxy-class address (exemptFromShares) is charged
+// to the global ceiling alone: it is everybody behind the proxy, and eight
+// slots for it would be eight for the whole instance.
+func pluginStreamAcquire(addr string) ([]string, bool) {
+	var keys []string
+	limits := []int{pluginStreamPerClient, pluginStreamPerAggregate}
+	if !exemptFromShares(addr) {
+		own, agg := clientBuckets(addr)
+		keys = []string{own}
+		if agg != "" {
+			keys = append(keys, agg)
+		}
+	}
 	pluginStreamMu.Lock()
 	defer pluginStreamMu.Unlock()
-	if pluginStreamOpen >= pluginStreamGlobal || pluginStreamPerIP[ip] >= pluginStreamPerClient {
-		return false
+	if pluginStreamOpen >= pluginStreamGlobal {
+		return nil, false
 	}
-	pluginStreamPerIP[ip]++
+	for i, k := range keys {
+		if pluginStreamPerIP[k] >= limits[i] {
+			return nil, false
+		}
+	}
+	for _, k := range keys {
+		pluginStreamPerIP[k]++
+	}
 	pluginStreamOpen++
-	return true
+	return keys, true
 }
 
-func pluginStreamRelease(ip string) {
+func pluginStreamRelease(keys []string) {
 	pluginStreamMu.Lock()
 	defer pluginStreamMu.Unlock()
 	if pluginStreamOpen > 0 {
@@ -85,10 +115,12 @@ func pluginStreamRelease(ip string) {
 	}
 	// Deleting at zero matters: the key space is client IPs, so keeping
 	// spent entries would grow this map for the life of the process.
-	if n := pluginStreamPerIP[ip] - 1; n > 0 {
-		pluginStreamPerIP[ip] = n
-	} else {
-		delete(pluginStreamPerIP, ip)
+	for _, k := range keys {
+		if n := pluginStreamPerIP[k] - 1; n > 0 {
+			pluginStreamPerIP[k] = n
+		} else {
+			delete(pluginStreamPerIP, k)
+		}
 	}
 }
 
@@ -135,10 +167,10 @@ func handlePluginStream(w http.ResponseWriter, r *http.Request) {
 		withCors(w, r, func(w http.ResponseWriter) { w.WriteHeader(http.StatusNoContent) })
 		return
 	}
-	ip := clientIP(r)
+	addr := clientAddr(r)
 	// Its own bucket, so a plugin streaming video cannot drain the budget the
 	// buffered proxy hands out.
-	if !rateAllow("ps:"+ip, pluginStreamRateLimit) {
+	if !rateAllowClient(r, "ps:", pluginStreamRateLimit) {
 		apiError(w, r, "Slow down", http.StatusTooManyRequests)
 		return
 	}
@@ -167,11 +199,12 @@ func handlePluginStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !pluginStreamAcquire(ip) {
+	slots, ok := pluginStreamAcquire(addr)
+	if !ok {
 		apiError(w, r, "Busy", http.StatusServiceUnavailable)
 		return
 	}
-	defer pluginStreamRelease(ip)
+	defer pluginStreamRelease(slots)
 
 	ctx, cancel := context.WithTimeout(r.Context(), pluginStreamTimeout)
 	defer cancel()
