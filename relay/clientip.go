@@ -194,6 +194,14 @@ func (s *trustedProxySet) contains(a netip.Addr) bool {
 	return false
 }
 
+// literalPrefixes is the configured CIDR and address entries, for the one
+// consumer that needs its answer once, at boot: the libp2p resource manager.
+func (s *trustedProxySet) literalPrefixes() []netip.Prefix {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.static)
+}
+
 func isTrustedProxy(ip net.IP) bool {
 	a, ok := netip.AddrFromSlice(ip)
 	return ok && trustedProxies.contains(a)

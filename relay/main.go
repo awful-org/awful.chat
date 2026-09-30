@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/netip"
 	"os"
@@ -20,9 +21,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	circuitproto "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
@@ -1512,11 +1515,16 @@ const (
 // inbound connection to a peer runs through its relay reservation: past the
 // ninth user, peers simply could not reach each other, and the app reported
 // it as a reservation timeout.
+//
+// The per-address cap those lifts gave up lives in reservationGate
+// (relaygate.go) instead, which applies it only where the relay really sees
+// a client's address and not to the proxy's.
 func relayResources() relayv2.Resources {
 	res := relayv2.DefaultResources()
 	res.MaxReservations = connMgrHigh
-	// Per-IP and per-ASN are meaningless while the proxy is the only peer we
-	// see; the global ceiling above is the one that counts.
+	// Per-IP and per-ASN here cannot tell the proxy from a client, and the
+	// proxy is every user at once; reservationGate does the per-address
+	// limiting that can.
 	res.MaxReservationsPerIP = connMgrHigh
 	res.MaxReservationsPerASN = connMgrHigh
 	// MaxCircuits is the fourth ceiling relayv2.DefaultResources() sets, and
@@ -1565,7 +1573,10 @@ func relayResources() relayv2.Resources {
 // hole-punching stepping stone the "limited" flag was designed around, so
 // they must not carry a limit at all. The abuse bound is the resource
 // manager and relayResources above: per-peer and global reservation and
-// circuit counts, and the memory budget behind them.
+// circuit counts, and the memory budget behind them. Those resource-manager
+// numbers used to be go-libp2p's generic service defaults, scaled by the
+// host's memory, which nobody had chosen for a relay; relayCircuitLimits
+// now sets them explicitly.
 
 // No circuit ACL. One was tried on 2026-09-02: AllowConnect required both
 // ends of a circuit to hold a live rendezvous stream, which is how an app
@@ -1581,8 +1592,114 @@ func relayResources() relayv2.Resources {
 // keyed by peerId, not by stream, and that is a different design; the
 // abuse bound is the resource manager, see the note on unlimited circuits.
 
+// Connection limits for a PUBLIC source address - a connection the relay
+// really sees a client's address on. go-libp2p's defaults (8 per address,
+// 0.2 new a second) were lifted wholesale when every browser was found to
+// arrive from Traefik's one address, and with them went any bound on one
+// host: a single machine could open 1024 connections and hold every
+// reservation on the relay. These are the realistic numbers again, applied
+// only where they mean one client's network, never to a proxy (see
+// proxyPrefixLimits).
+//
+// 64 connections is a household or office behind one NAT, each person with
+// a tab or two and a device-sync node, all reconnecting at once after a
+// relay restart - which the burst of the same size covers. IPv6 is held per
+// /64 with an aggregate for the /48, like every other per-client budget.
+const (
+	maxConnsPerAddr      = 64
+	maxConnsPerAggregate = maxConnsPerAddr * ipv6AggregateFactor
+	newConnsPerAddrRPS   = 1.0
+)
+
+// proxyPrefixLimits are the source prefixes held only to the global
+// ceilings: loopback, the private and CGNAT ranges - where a proxy lives and
+// no internet client can connect from - and the literal entries of
+// TRUSTED_PROXY_CIDRS, for a proxy on a public address. A matching prefix
+// replaces the per-subnet limits, so none of them is ever a per-user cap on
+// what is really the whole service. Most specific first, as the resource
+// manager requires.
+func proxyPrefixLimits() (v4, v6 []rcmgr.NetworkPrefixLimit) {
+	add := func(p netip.Prefix, n int) {
+		l := rcmgr.NetworkPrefixLimit{Network: p.Masked(), ConnCount: n}
+		if p.Addr().Is4() {
+			v4 = append(v4, l)
+		} else {
+			v6 = append(v6, l)
+		}
+	}
+	add(netip.MustParsePrefix("127.0.0.0/8"), math.MaxInt)
+	add(netip.MustParsePrefix("::1/128"), math.MaxInt)
+	for _, c := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"} {
+		add(netip.MustParsePrefix(c), connMgrHigh*2)
+	}
+	for _, p := range trustedProxies.literalPrefixes() {
+		add(p, connMgrHigh*2)
+	}
+	return v4, v6
+}
+
+// relayCircuitLimits pins the resource-manager limits the relay service
+// and its hop and stop protocols run under. WithInfiniteLimits has to stay
+// (see the note on unlimited circuits), so these are what bound circuits:
+// how many are open at once relay-wide, and how many one peer holds.
+//
+// They were go-libp2p's generic service and protocol defaults before,
+// scaled by an eighth of the host's memory: on a small VPS about 700
+// concurrent circuits relay-wide and 64 per peer as a source. The numbers
+// here are no tighter than that on any box the relay runs on today - a
+// circuit carries a call's signalling, and a tighter number would fail
+// calls - but they are now chosen rather than inherited, and do not grow
+// with RAM. Each circuit is one inbound hop stream and one outbound stop
+// stream, plus 2 x BufferSize (4 KiB) of buffer charged to the service.
+func relayCircuitLimits(limits *rcmgr.PartialLimitConfig) {
+	if limits.Service == nil {
+		limits.Service = map[string]rcmgr.ResourceLimits{}
+	}
+	if limits.ServicePeer == nil {
+		limits.ServicePeer = map[string]rcmgr.ResourceLimits{}
+	}
+	if limits.Protocol == nil {
+		limits.Protocol = map[protocol.ID]rcmgr.ResourceLimits{}
+	}
+	if limits.ProtocolPeer == nil {
+		limits.ProtocolPeer = map[protocol.ID]rcmgr.ResourceLimits{}
+	}
+	// 2048 circuits at once relay-wide, four per connected peer at the
+	// connection ceiling; 8 MiB of their buffers, with headroom.
+	limits.Service[relayv2.ServiceName] = rcmgr.ResourceLimits{
+		StreamsInbound:  rcmgr.LimitVal(2048),
+		StreamsOutbound: rcmgr.LimitVal(2048),
+		Streams:         rcmgr.LimitVal(4096),
+		Memory:          rcmgr.LimitVal64(64 << 20),
+	}
+	// One peer: 128 circuits it opened and 128 it is the target of - one per
+	// online contact in a busy room, twice over.
+	limits.ServicePeer[relayv2.ServiceName] = rcmgr.ResourceLimits{
+		StreamsInbound:  rcmgr.LimitVal(128),
+		StreamsOutbound: rcmgr.LimitVal(128),
+		Streams:         rcmgr.LimitVal(256),
+		Memory:          rcmgr.LimitVal64(16 << 20),
+	}
+	limits.Protocol[circuitproto.ProtoIDv2Hop] = rcmgr.ResourceLimits{
+		StreamsInbound: rcmgr.LimitVal(2048),
+		Streams:        rcmgr.LimitVal(4096),
+	}
+	limits.ProtocolPeer[circuitproto.ProtoIDv2Hop] = rcmgr.ResourceLimits{
+		StreamsInbound: rcmgr.LimitVal(128),
+		Streams:        rcmgr.LimitVal(256),
+	}
+	limits.Protocol[circuitproto.ProtoIDv2Stop] = rcmgr.ResourceLimits{
+		StreamsOutbound: rcmgr.LimitVal(2048),
+		Streams:         rcmgr.LimitVal(4096),
+	}
+	limits.ProtocolPeer[circuitproto.ProtoIDv2Stop] = rcmgr.ResourceLimits{
+		StreamsOutbound: rcmgr.LimitVal(128),
+		Streams:         rcmgr.LimitVal(256),
+	}
+}
+
 // newResourceManager builds the libp2p resource manager for the relay.
-// Extracted so main_test.go can assert the ceiling it lifts.
+// Extracted so main_test.go can assert the ceilings it sets.
 func newResourceManager() (network.ResourceManager, error) {
 	// EVERY browser reaches this process from a single source IP - Traefik's,
 	// on the docker network - because the compose routes relay.<domain>
@@ -1598,19 +1715,19 @@ func newResourceManager() (network.ResourceManager, error) {
 	// device sync (the one feature that opens a SECOND libp2p node per
 	// device, doubling the count) tripped it first.
 	//
-	// So the per-subnet caps are raised to double the connection-manager
-	// ceiling (connMgrHigh * 2 = 1024) and the connection rate limiter is
-	// disabled: the connmgr (above) at 512 and the memory/stream limits from
-	// DefaultLimits stay as the real protection. The resource manager's
-	// System.ConnsInbound is also lifted to the same value so the connection
-	// manager remains the binding limit rather than the resource manager
-	// doing hard rejections.
-	// Per-IP limits only become meaningful again if the client address ever
-	// reaches us (PROXY protocol on the entrypoint, or a directly exposed
-	// listener) - see docs/spec.md.
-	subnetLimit := func(prefix int) rcmgr.ConnLimitPerSubnet {
-		return rcmgr.ConnLimitPerSubnet{ConnCount: connMgrHigh * 2, PrefixLength: prefix}
-	}
+	// So a proxy's address (proxyPrefixLimits) is held only to the global
+	// ceilings, and a public address - a client the relay really sees - to
+	// maxConnsPerAddr and a connection rate. The connmgr (above) at 512 and
+	// the memory/stream limits from DefaultLimits stay as the protection
+	// for the host. The resource manager's System.ConnsInbound is lifted to
+	// connMgrHigh * 2 so the connection manager remains the binding limit
+	// rather than the resource manager doing hard rejections.
+	//
+	// Behind Traefik the per-address limits never apply, because libp2p
+	// sees only Traefik: they would need the client's address carried to
+	// this listener (PROXY protocol on a TCP router, which this listener
+	// does not parse) or the listener exposed directly. See deploy/README.md.
+	proxyV4, proxyV6 := proxyPrefixLimits()
 	// The memory-scaled defaults also cap TOTAL inbound connections
 	// (System.ConnsInbound is 64 + 64*(scaledMiB/1024), so a small VPS lands
 	// well under connMgrHigh * 2). Those are hard rejections, while the
@@ -1629,15 +1746,39 @@ func newResourceManager() (network.ResourceManager, error) {
 	limits.Transient.Conns = rcmgr.LimitVal(connMgrHigh)
 	limits.Transient.ConnsInbound = rcmgr.LimitVal(connMgrHigh)
 	limits.Transient.ConnsOutbound = rcmgr.LimitVal(connMgrHigh)
+	relayCircuitLimits(&limits)
+
+	// New connections a second from one public source. A proxy prefix is
+	// listed with the zero Limit, which is no rate limit at all.
+	proxyRates := make([]rate.PrefixLimit, 0, len(proxyV4)+len(proxyV6))
+	for _, l := range append(append([]rcmgr.NetworkPrefixLimit{}, proxyV4...), proxyV6...) {
+		proxyRates = append(proxyRates, rate.PrefixLimit{Prefix: l.Network})
+	}
+	connRate := &rate.Limiter{
+		NetworkPrefixLimits: proxyRates,
+		SubnetRateLimiter: rate.SubnetLimiter{
+			IPv4SubnetLimits: []rate.SubnetLimit{
+				{PrefixLength: 32, Limit: rate.Limit{RPS: newConnsPerAddrRPS, Burst: maxConnsPerAddr}},
+			},
+			IPv6SubnetLimits: []rate.SubnetLimit{
+				{PrefixLength: 64, Limit: rate.Limit{RPS: newConnsPerAddrRPS, Burst: maxConnsPerAddr}},
+				{PrefixLength: 48, Limit: rate.Limit{RPS: newConnsPerAddrRPS * ipv6AggregateFactor, Burst: maxConnsPerAggregate}},
+			},
+			GracePeriod: time.Minute,
+		},
+	}
 
 	return rcmgr.NewResourceManager(
 		rcmgr.NewFixedLimiter(limits.Build(scaled)),
+		rcmgr.WithNetworkPrefixLimit(proxyV4, proxyV6),
 		rcmgr.WithLimitPerSubnet(
-			[]rcmgr.ConnLimitPerSubnet{subnetLimit(32)},
-			[]rcmgr.ConnLimitPerSubnet{subnetLimit(56), subnetLimit(48)},
+			[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 32, ConnCount: maxConnsPerAddr}},
+			[]rcmgr.ConnLimitPerSubnet{
+				{PrefixLength: 64, ConnCount: maxConnsPerAddr},
+				{PrefixLength: 48, ConnCount: maxConnsPerAggregate},
+			},
 		),
-		// Zero value = no rate limiting (see x/rate.Limiter).
-		rcmgr.WithConnRateLimiters(&rate.Limiter{}),
+		rcmgr.WithConnRateLimiters(connRate),
 	)
 }
 
@@ -1662,8 +1803,8 @@ func main() {
 	// at DEBUG by go-libp2p, so when the default per-IP cap was silently
 	// refusing connections the relay logs looked perfectly healthy. Run with
 	// GOLOG_LOG_LEVEL=rcmgr=debug to see individual rejections.
-	log.Printf("[relay] connection limits: connmgr %d/%d, per-subnet cap %d",
-		connMgrLow, connMgrHigh, connMgrHigh*2)
+	log.Printf("[relay] connection limits: connmgr %d/%d, %d per public address (%d per IPv6 /48), proxies and private ranges held only to the global %d",
+		connMgrLow, connMgrHigh, maxConnsPerAddr, maxConnsPerAggregate, connMgrHigh*2)
 
 	// Get port from env or default to 8080
 	httpPort := os.Getenv("HTTP_PORT")
@@ -1671,9 +1812,11 @@ func main() {
 		httpPort = "8080"
 	}
 
-	// Built before the host: the circuit-relay ACL below asks it whether a
-	// peer is one of ours.
 	reg := newRegistry()
+	res := relayResources()
+	// Per-address reservation limits, for the addresses that are one client's
+	// and not the proxy's - see relaygate.go.
+	gate := newReservationGate(res.ReservationTTL)
 
 	// libp2p WebSocket
 	h, err := libp2p.New(
@@ -1688,8 +1831,11 @@ func main() {
 		libp2p.ForceReachabilityPublic(),
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
-			relayv2.WithResources(relayResources()),
+			relayv2.WithResources(res),
+			// No per-circuit duration or byte limit - see the note on
+			// unlimited circuits. What bounds circuits is relayCircuitLimits.
 			relayv2.WithInfiniteLimits(),
+			relayv2.WithACL(gate),
 		),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
@@ -1774,6 +1920,8 @@ func main() {
 				return
 			}
 			lifecycleLogf("[peer] disconnect %s", short(peerId.String()))
+			// The relay drops the peer's reservation at this same moment.
+			gate.forget(peerId)
 			reg.disconnectPeer(peerId.String())
 		},
 	})

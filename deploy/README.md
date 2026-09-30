@@ -235,3 +235,19 @@ re-resolves every 30 seconds so a recreated Traefik is followed rather than
 turned into "the client". If your proxy has another name, set it; the relay
 logs what the name resolved to at boot, and says so loudly when it resolves
 to nothing, because every user then shares one rate-limit bucket.
+
+**The libp2p side cannot see client addresses.** Traefik routes
+`relay.<domain>` as HTTP, so the WebSocket that carries every browser's
+libp2p connection reaches the relay from Traefik's address, and libp2p reads
+no `X-Forwarded-For`. The relay's per-address limits there - 64 connections
+and 32 circuit-relay reservations per IPv4 address or IPv6 /64 (four times
+that per /48), a connection rate, and the per-source rendezvous budgets -
+therefore apply only to connections that arrive from a public address. A
+proxy's address (anything private, loopback or CGNAT, or a CIDR listed in
+`TRUSTED_PROXY_CIDRS`) is held to the global ceilings alone, because a
+per-address cap on it would be a cap on every user at once. On this compose
+shape that means those per-address limits are inactive: bringing them into
+effect needs the client's address carried to the relay's libp2p listener,
+which takes PROXY protocol on a Traefik TCP router plus PROXY protocol
+support in the relay's listener (it has none today), or the listener
+exposed directly without Traefik in front.
