@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/libp2p/go-libp2p/x/rate"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 // Coordinated v2 cutover: no v1 handler or protocol fallback. Legacy clients
@@ -193,6 +195,51 @@ const (
 	// figures of them - never gets near it.
 	maxEmptyRegisters   = 128
 	emptyRegisterWindow = time.Minute
+
+	// Every budget above is keyed by peerId, and a peerId is free: one host
+	// minted ~200 of them, created a few junk rooms, and joined those
+	// NON-empty rooms from every identity - which cost nothing, since only
+	// an empty room was ever charged - until maxTotalRegistrations was
+	// reached and every real REGISTER on the instance came back
+	// REGISTER_FAILED. Four more bounds close that, each keeping the two
+	// legitimate bursts working: a reconnect re-registering up to
+	// maxRoomsPerPeer rooms at once, and DM lobbies (up to 64) 70 s later.
+	//
+	// guaranteedRoomsPerPeer: maxTotalRegistrations is a SOFT ceiling. Past
+	// it a peer still gets its first guaranteedRoomsPerPeer rooms, so a
+	// filled registry degrades everyone to their first 64 rooms instead of
+	// locking every newcomer out. The hard bound is then maxTotalRegistrations
+	// + 64 x the peers the relay can hold at once - each needs a libp2p
+	// connection, and the resource manager caps those at connMgrHigh*2 - so
+	// at most ~65k registrations (~30 MB) past the soft ceiling.
+	guaranteedRoomsPerPeer = 64
+	// maxPeersPerRoom caps DISTINCT peers in one room. A room is a group
+	// chat whose members each hold a gossipsub mesh with the others; a
+	// browser does not sustain hundreds of those, so 512 is far past any
+	// room that works, and it stops one room absorbing an unbounded number
+	// of junk identities without costing them a single empty-room charge.
+	maxPeersPerRoom = 512
+	// maxJoinsPerPeer charges EVERY new membership, populated room or not,
+	// against one budget a peer's streams share. An empty room still costs
+	// maxEmptyRegisters on top, so it stays the dearer of the two. Twice
+	// the room cap: a whole reconnect burst plus its lobbies fits in one
+	// window with room to spare.
+	maxJoinsPerPeer = 2 * maxRoomsPerPeer
+	joinWindow      = time.Minute
+	// Per-SOURCE budgets, where the source is the connection's address: an
+	// IPv4 address or an IPv6 /64, plus an aggregate for the IPv6 /48 at
+	// ipv6AggregateFactor times each. Free peerIds from one host share
+	// these. They apply only to connections from a public address. Behind a
+	// proxy every browser arrives from the proxy's one address (see
+	// isProxyClassAddr), where a per-address budget would be a budget for
+	// the whole service, so there the per-peer budgets and the soft ceiling
+	// above are what remain. The per-source numbers are several users'
+	// worth - a household or an office behind one NAT, all reconnecting
+	// after a relay restart - and still a small slice of the registry: one
+	// address holds 4% of maxTotalRegistrations.
+	maxRoomsPerSource          = 8 * maxRoomsPerPeer
+	maxJoinsPerSource          = 8 * maxJoinsPerPeer
+	maxEmptyRegistersPerSource = 16 * maxEmptyRegisters
 )
 
 // rendezvousIdleTimeout closes a stream that has REGISTERed nothing yet and
@@ -238,8 +285,14 @@ type connectedClient struct {
 	out           chan []byte
 	done          chan struct{}
 	closeOnce     sync.Once
-	roomCapLogged bool          // guarded by registry.mu; keeps a capped peer from flooding the log
-	joinLeaveLog  membershipLog // guarded by registry.mu; caps the join/leave lines this stream can write
+	roomCapLogged bool // guarded by registry.mu; keeps a capped peer from flooding the log
+	refusalLogged bool // guarded by registry.mu; the same, for every other refusal
+	// The source buckets this stream's connection came from (see
+	// maxRoomsPerSource): source is the IPv4 address or IPv6 /64, sourceAgg
+	// the IPv6 /48. Both empty for a proxy-class or unknown address, which
+	// the per-source budgets do not apply to.
+	source, sourceAgg string
+	joinLeaveLog      membershipLog // guarded by registry.mu; caps the join/leave lines this stream can write
 
 	// Telemetry-only bookkeeping (relay/telemetry.go), guarded by
 	// registry.mu exactly like roomCapLogged and joinLeaveLog above - written
@@ -440,15 +493,35 @@ func newOpBudget(limit int, window time.Duration) *opBudget {
 }
 
 func (o *opBudget) allow(now time.Time) bool {
+	if !o.has(now) {
+		return false
+	}
+	o.left--
+	return true
+}
+
+// has reports whether the budget can spend one more, refilling it first
+// when the window has rolled over, without spending it.
+func (o *opBudget) has(now time.Time) bool {
 	if !o.started || now.Sub(o.windowStart) >= o.window {
 		o.started = true
 		o.windowStart = now
 		o.left = o.limit
 	}
-	if o.left <= 0 {
-		return false
+	return o.left > 0
+}
+
+// allowAll spends one from every budget, or from none: a join the source
+// refuses must not still cost the peer's own budget.
+func allowAll(now time.Time, budgets ...*opBudget) bool {
+	for _, b := range budgets {
+		if !b.has(now) {
+			return false
+		}
 	}
-	o.left--
+	for _, b := range budgets {
+		b.left--
+	}
 	return true
 }
 
@@ -524,6 +597,14 @@ type registry struct {
 	// Entries live exactly as long as clients[peerId] does, so the map stays
 	// bounded by the connection ceiling and not by anything a peer chooses.
 	emptyRegisters map[string]*opBudget
+	// peerId -> the membership budget shared by every stream that peer holds,
+	// see maxJoinsPerPeer. Same lifetime as emptyRegisters.
+	joins map[string]*opBudget
+	// source bucket -> what every stream from it holds and may still spend,
+	// see maxRoomsPerSource. An entry lives while any stream from that
+	// source does, so the map is bounded by connections, not by anything a
+	// peer chooses.
+	sources map[string]*sourceState
 	// Sum of len(c.rooms) over every live stream, kept incrementally because
 	// the only alternative is walking the whole registry on every REGISTER.
 	total int
@@ -537,6 +618,67 @@ func newRegistry() *registry {
 		rooms:          make(map[string]map[*connectedClient]struct{}),
 		clients:        make(map[string]map[*connectedClient]struct{}),
 		emptyRegisters: make(map[string]*opBudget),
+		joins:          make(map[string]*opBudget),
+		sources:        make(map[string]*sourceState),
+	}
+}
+
+// sourceState is one source bucket's footprint in the registry and its
+// budgets. held is the registrations its streams hold right now.
+type sourceState struct {
+	streams int
+	held    int
+	maxHeld int
+	joins   *opBudget
+	empty   *opBudget
+}
+
+// sourceKeysFor names the source buckets a connection from addr is budgeted
+// under, or none for an address the per-source budgets do not apply to.
+func sourceKeysFor(addr netip.Addr) (own, agg string) {
+	if !addr.IsValid() || isProxyClassAddr(addr) {
+		return "", ""
+	}
+	return clientBuckets(addr.String())
+}
+
+// sourceKeys returns the stream's source bucket keys that are set.
+func (c *connectedClient) sourceKeys() []string {
+	switch {
+	case c.source == "":
+		return nil
+	case c.sourceAgg == "":
+		return []string{c.source}
+	default:
+		return []string{c.source, c.sourceAgg}
+	}
+}
+
+// attachSource counts a new stream against its source bucket, creating the
+// bucket's state on its first stream. Caller holds r.mu.
+func (r *registry) attachSource(key string, factor int) {
+	st := r.sources[key]
+	if st == nil {
+		st = &sourceState{
+			maxHeld: maxRoomsPerSource * factor,
+			joins:   newOpBudget(maxJoinsPerSource*factor, joinWindow),
+			empty:   newOpBudget(maxEmptyRegistersPerSource*factor, emptyRegisterWindow),
+		}
+		r.sources[key] = st
+	}
+	st.streams++
+}
+
+// detachSource is attachSource's inverse, for a stream leaving the
+// registry. The budgets go with the last stream, like a peer's own. Caller
+// holds r.mu.
+func (r *registry) detachSource(key string) {
+	st := r.sources[key]
+	if st == nil {
+		return
+	}
+	if st.streams--; st.streams <= 0 {
+		delete(r.sources, key)
 	}
 }
 
@@ -546,6 +688,12 @@ func newRegistry() *registry {
 // than a stale session, and tearing it down made the two tabs reset each other
 // forever, wiping the loser's room membership every round.
 func (r *registry) addStream(peerId string, s rvStream) *connectedClient {
+	return r.addStreamFrom(peerId, s, netip.Addr{})
+}
+
+// addStreamFrom is addStream for a stream whose connection came from addr,
+// which decides the source buckets it is budgeted under.
+func (r *registry) addStreamFrom(peerId string, s rvStream, addr netip.Addr) *connectedClient {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -560,7 +708,17 @@ func (r *registry) addStream(peerId string, s rvStream) *connectedClient {
 	// A second stream joins the budget the peer already has; it never gets a
 	// fresh one.
 	r.emptyRegisterBudget(peerId)
+	if r.joins[peerId] == nil {
+		r.joins[peerId] = newOpBudget(maxJoinsPerPeer, joinWindow)
+	}
 	c := newConnectedClient(peerId, s)
+	c.source, c.sourceAgg = sourceKeysFor(addr)
+	if c.source != "" {
+		r.attachSource(c.source, 1)
+	}
+	if c.sourceAgg != "" {
+		r.attachSource(c.sourceAgg, ipv6AggregateFactor)
+	}
 	streams[c] = struct{}{}
 	return c
 }
@@ -710,6 +868,37 @@ func (r *registry) sendPeers(c *connectedClient, room string, others []string) {
 	}
 }
 
+// refuseLocked answers one REGISTER with registerCapped for reason, saying
+// line once per stream at most. Called with r.mu held; returns with it
+// released, and writes the line after releasing it.
+func (r *registry) refuseLocked(c *connectedClient, room, reason, line string) registerOutcome {
+	say := !c.refusalLogged
+	c.refusalLogged = true
+	c.diagCapped++
+	r.mu.Unlock()
+	if say {
+		log.Print(line)
+	}
+	diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": reason}})
+	return registerCapped
+}
+
+// distinctPeersAtLeast reports whether members holds at least n distinct
+// peerIds, stopping as soon as it knows.
+func distinctPeersAtLeast(members map[*connectedClient]struct{}, n int) bool {
+	if len(members) < n {
+		return false
+	}
+	seen := make(map[string]struct{}, n)
+	for m := range members {
+		seen[m.peerId] = struct{}{}
+		if len(seen) >= n {
+			return true
+		}
+	}
+	return false
+}
+
 // register admits c into room. readLoop answers registerCapped with an
 // explicit REGISTER_FAILED; registerOracleSilenced stays silent (see
 // maxEmptyRegisters); every other path either really succeeded or is
@@ -743,18 +932,21 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room)})
 		return registerJoined
 	}
-	if r.total >= maxTotalRegistrations {
+	held := r.roomsHeldByPeer(c.peerId)
+	// Past the soft ceiling only a peer still inside its guaranteed rooms
+	// gets in - see guaranteedRoomsPerPeer.
+	if r.total >= maxTotalRegistrations && held >= guaranteedRoomsPerPeer {
 		sayCapped := !r.totalCapLogged
 		r.totalCapLogged = true
 		c.diagCapped++
 		r.mu.Unlock()
 		if sayCapped {
-			log.Printf("[rv] registry is at its %d-registration ceiling, ignoring further REGISTERs", maxTotalRegistrations)
+			log.Printf("[rv] registry is at its %d-registration ceiling, only peers under %d rooms may join more", maxTotalRegistrations, guaranteedRoomsPerPeer)
 		}
 		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
 		return registerCapped
 	}
-	if r.roomsHeldByPeer(c.peerId) >= maxRoomsPerPeer {
+	if held >= maxRoomsPerPeer {
 		sayCapped := !c.roomCapLogged
 		c.roomCapLogged = true
 		c.diagCapped++
@@ -770,15 +962,49 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
 		return registerCapped
 	}
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil && st.held >= st.maxHeld {
+			return r.refuseLocked(c, room, "source-capped",
+				fmt.Sprintf("[rv] %s's network holds its %d-registration share, ignoring further REGISTERs", short(c.peerId), st.maxHeld))
+		}
+	}
 
 	members := r.rooms[room]
+	if !peerInRoom(members, c.peerId) && distinctPeersAtLeast(members, maxPeersPerRoom) {
+		return r.refuseLocked(c, room, "room-full",
+			fmt.Sprintf("[rv] room [%s] is at its %d-peer cap, refusing %s", logSafe(room), maxPeersPerRoom, short(c.peerId)))
+	}
+	// Every new membership is charged, to the peer and to its source, before
+	// anything about the room's population is consulted: this refusal must
+	// come out the same for an empty room and a populated one, or it would
+	// be the oracle the empty-register budget below exists to deny.
+	now := time.Now()
+	joinBudgets := []*opBudget{r.joins[c.peerId]}
+	emptyBudgets := []*opBudget{r.emptyRegisterBudget(c.peerId)}
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil {
+			joinBudgets = append(joinBudgets, st.joins)
+			emptyBudgets = append(emptyBudgets, st.empty)
+		}
+	}
+	if joinBudgets[0] == nil {
+		// Cannot happen for a live stream - addStreamFrom creates the budget
+		// and evict drops it with the peer's last stream - but a nil here
+		// would panic the whole relay, so it gets a fresh one instead.
+		joinBudgets[0] = newOpBudget(maxJoinsPerPeer, joinWindow)
+		r.joins[c.peerId] = joinBudgets[0]
+	}
+	if !allowAll(now, joinBudgets...) {
+		return r.refuseLocked(c, room, "join-rate",
+			fmt.Sprintf("[rv] %s is joining rooms faster than its budget allows, ignoring", short(c.peerId)))
+	}
 	// Whether the room has an OTHER member has to be read right here, under
 	// the same lock that is about to add c to it - a second lookup after
 	// unlocking could race a concurrent register into the same room and
 	// charge (or spare) the wrong REGISTER. An empty room is the oracle a
-	// code guesser is fishing for, so only THAT case spends the budget; a
-	// REGISTER into a room that already has somebody else in it is free.
-	if len(members) == 0 && !r.emptyRegisterBudget(c.peerId).allow(time.Now()) {
+	// code guesser is fishing for, so THAT case also spends the empty-room
+	// budget, per peer and per source.
+	if len(members) == 0 && !allowAll(now, emptyBudgets...) {
 		c.diagOracleSilenced++
 		r.mu.Unlock()
 		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "oracle"}})
@@ -795,6 +1021,11 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	members[c] = struct{}{}
 	c.rooms[room] = struct{}{}
 	r.total++
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil {
+			st.held++
+		}
+	}
 
 	// Snapshot under the lock: who to notify (every stream except this peer's
 	// own) and the peer list the joiner gets (one entry per distinct peerId,
@@ -887,6 +1118,11 @@ func (r *registry) doUnregister(c *connectedClient, room string) ([]*connectedCl
 	delete(members, c)
 	delete(c.rooms, room)
 	r.total--
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil {
+			st.held--
+		}
+	}
 	// A transient spike past the ceiling logs one line and sets
 	// totalCapLogged, then falls silent for the rest of the process even
 	// after total drops back down. Clear the flag here so the NEXT spike
@@ -957,12 +1193,16 @@ func (r *registry) evict(c *connectedClient) ([]departure, []leaveLine) {
 	}
 	streams := r.clients[c.peerId]
 	delete(streams, c)
+	for _, k := range c.sourceKeys() {
+		r.detachSource(k)
+	}
 	if len(streams) == 0 {
 		delete(r.clients, c.peerId)
 		// The budget outlives every stream but the last, so cycling streams
 		// buys no refill; only a full reconnect does, and that costs a libp2p
 		// connection the connection manager already bounds.
 		delete(r.emptyRegisters, c.peerId)
+		delete(r.joins, c.peerId)
 	}
 	return notifications, lines
 }
@@ -1083,7 +1323,14 @@ func (r *registry) handleStream(s network.Stream) {
 	// reset it back - a permanent flap that wiped the loser's rooms every round.
 	// A stream that registers after the registry has let it go is what RELAY-02
 	// was really about, and register/unregister guard that directly.
-	c := r.addStream(peerId, s)
+	// The connection's address decides which source buckets this stream is
+	// budgeted under - see maxRoomsPerSource.
+	var addr netip.Addr
+	if ip, err := manet.ToIP(s.Conn().RemoteMultiaddr()); err == nil {
+		addr, _ = netip.AddrFromSlice(ip)
+		addr = addr.Unmap()
+	}
+	c := r.addStreamFrom(peerId, s, addr)
 	if c == nil {
 		lifecycleLogf("[rv] %s already holds %d rendezvous streams, refusing another", short(peerId), maxStreamsPerPeer)
 		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseStreamCap}})

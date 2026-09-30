@@ -318,3 +318,35 @@ func rateAllowClient(r *http.Request, prefix string, limit int) bool {
 	}
 	return rateAllowAll([]string{prefix + own, prefix + agg}, []int{limit, limit * ipv6AggregateFactor})
 }
+
+// ── Proxy class ──────────────────────────────────────────────────────────
+
+// isProxyClassAddr reports whether a connection from this address may be
+// many users at once, and so must never be held to a per-user limit. That
+// is a trusted proxy, or any address no internet client can connect from
+// directly: loopback, private, link-local, CGNAT. The libp2p side of the
+// relay needs this where the HTTP side needs clientAddr, because libp2p
+// sees only the socket peer - behind Traefik, one address for everybody -
+// and a per-IP cap applied to that address is a cap on the whole service.
+//
+// Classing the private ranges as proxies unconditionally, rather than only
+// what TRUSTED_PROXY_CIDRS names, is deliberate and the opposite of the
+// X-Forwarded-For rule above: there, trusting too much lets a neighbour
+// forge an identity; here, trusting too little takes every user down at
+// once. A neighbour on the private network gains nothing but a generous
+// connection allowance, which it already had.
+func isProxyClassAddr(a netip.Addr) bool {
+	if !a.IsValid() {
+		return false
+	}
+	a = a.Unmap()
+	if a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
+		return true
+	}
+	if cgnatPrefix.Contains(a) {
+		return true
+	}
+	return trustedProxies.contains(a)
+}
+
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
