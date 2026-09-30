@@ -620,6 +620,13 @@ export const STORE_SPECS = {
     blind: ["did"],
     bytes: ["pfpData", "bannerData"],
   },
+  roomProfiles: {
+    storeName: "roomProfiles",
+    key: "id",
+    clear: [],
+    blind: ["id", "roomCode", "did"],
+    bytes: ["pfpData", "bannerData"],
+  },
   phonebook: {
     storeName: "phonebook",
     key: "peerId",
