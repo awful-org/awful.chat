@@ -2259,6 +2259,14 @@ export async function getPeerRoomProfile(roomCode: string, did: string): Promise
     : undefined;
 }
 
+export async function getAllPeerRoomProfiles(roomCode: string): Promise<PeerProfile[]> {
+  const database = await getDB();
+  const keys = await database.transaction("roomProfiles").store.index("byRoom").getAllKeys(await blindValue(roomCode));
+  const rows = await Promise.all(keys.map(async key => _open("roomProfiles", await database.get("roomProfiles", key))));
+  return rows.filter((row): row is RoomProfileRow => row?.kind === "peer" && !!row.profile)
+    .map(row => ({ ...row.profile!, pfpData: row.pfpData, bannerData: row.bannerData }));
+}
+
 export async function putPeerRoomProfile(
   roomCode: string, generation: number, profile: PeerProfile,
   guard: WriteGuard = captureWriteGuard(),

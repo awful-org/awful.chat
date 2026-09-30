@@ -37,6 +37,8 @@ import {
   getPeerProfile,
   putPeerProfile,
   getAllPeerProfiles,
+  getAllPeerRoomProfiles,
+  putPeerRoomProfile,
   putAttachment,
   getAttachmentsByInfoHash,
   getAttachmentsByMessage,
@@ -420,6 +422,8 @@ interface TransportState {
   peerAvatars: Map<string, string>;
   /** User-picked nickname colors, keyed like peerNames (by DID). */
   peerColors: Map<string, string>;
+  /** Room code -> DID -> last authenticated room profile. */
+  peerRoomProfiles: Map<string, Map<string, import("../storage").PeerProfile>>;
   /**
    * Did the room's first read fill a page?
    *
@@ -524,6 +528,7 @@ export const transportState = $state<TransportState>({
   peerDidVersion: 0,
   peerAvatars: new Map(),
   peerColors: new Map(),
+  peerRoomProfiles: new Map(),
   historyCapped: false,
   relayedPeers: new Set(),
   provenPeers: new Set(),
@@ -830,6 +835,20 @@ function _hydratePeerProfileMeta(): void {
     transportState.peerProfileMeta = meta;
   })
   .catch(() => {});
+}
+
+function _hydratePeerRoomProfiles(): void {
+  void getAllRooms().then(async rooms => {
+    const entries = await Promise.all(rooms.filter(r => r.type === "text")
+      .map(async r => [r.roomCode, await getAllPeerRoomProfiles(r.roomCode)] as const));
+    const scoped = new Map(transportState.peerRoomProfiles);
+    for (const [roomCode, profiles] of entries) {
+      const peers = new Map(profiles.map(p => [p.did, p]));
+      for (const [did, live] of scoped.get(roomCode) ?? []) peers.set(did, live);
+      scoped.set(roomCode, peers);
+    }
+    transportState.peerRoomProfiles = scoped;
+  }).catch(() => {});
 }
 
 const STATUS_RANK = { sending: 0, sent: 1, delivered: 2, read: 3 } as const;
@@ -1487,9 +1506,10 @@ export async function _loadHistory(
   stillCurrent: () => boolean = () => true
 ): Promise<void> {
   const page = { capped: false };
-  const [msgs, profiles] = await Promise.all([
+  const [msgs, profiles, roomProfiles] = await Promise.all([
     getMessages(roomCode, undefined, page),
     getAllPeerProfiles(),
+    getAllPeerRoomProfiles(roomCode),
   ]);
   if (!stillCurrent()) return;
   // Storage and the live view share the same logical sequence/ID ordering.
@@ -1515,6 +1535,9 @@ export async function _loadHistory(
     transportState.peerAvatars = avatars;
     transportState.peerColors = colors;
   }
+  const scoped = new Map(transportState.peerRoomProfiles);
+  scoped.set(roomCode, new Map(roomProfiles.map(p => [p.did, p])));
+  transportState.peerRoomProfiles = scoped;
 
   for (const msg of msgs) {
     if (msg.type !== MessageType.File || !msg.meta?.files?.length) continue;
@@ -2293,7 +2316,7 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
 // every incoming chat row needs exactly the same treatment (wireToMessage),
 // and that path must not import this module - it boots libp2p on import.
 
-async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
+async function _handleProfile(peerId: string, msg: WireProfile, room: string | null): Promise<void> {
   // Bind the DID to the peerId only on a signature over THIS connection's
   // peerId. The `did` field on its own is spoofable, and any peer could
   // otherwise claim someone else's identity and hijack their DM conversation
@@ -2311,6 +2334,38 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
     return;
   }
   const did = claimed as string;
+  if (msg.roomScoped === true) {
+    if (!room?.startsWith("rd2_") || !_transport.rooms().includes(room) ||
+        !_transport.isRoomPeer(room, peerId)) return;
+    const joinedRoom = await getRoom(room);
+    if (joinedRoom?.type !== "text") return;
+    if (did === (identityStore.did ?? "")) return;
+    const validated = validateProfileMeta({
+      bannerUrl: msg.bannerUrl, gradient2: msg.gradient2 ?? undefined,
+      gradient3: msg.gradient3 ?? undefined, tagText: msg.tagText,
+      tagTextColor: msg.tagTextColor, tagChipColor: msg.tagChipColor,
+      bio: msg.bio, nameEffect: msg.nameEffect,
+      nameShimmer: msg.nameShimmer, nameGlow: msg.nameGlow,
+    });
+    const peerProfile = {
+      did, isMe: false as const, nickname: normalizeWireName(msg.name),
+      pfpURL: normalizeAvatarUrl(msg.avatarUrl),
+      color: normalizeNicknameColor(msg.color) ?? undefined,
+      updatedAt: Date.now(), bannerURL: validated.bannerUrl,
+      gradient2: validated.gradient2, gradient3: validated.gradient3,
+      tagText: validated.tagText, tagTextColor: validated.tagTextColor,
+      tagChipColor: validated.tagChipColor, bio: validated.bio,
+      nameEffect: validated.nameEffect, nameShimmer: validated.nameShimmer,
+      nameGlow: validated.nameGlow,
+    };
+    await putPeerRoomProfile(room, joinedRoom.createdAt, peerProfile).catch(() => {});
+    const scoped = new Map(transportState.peerRoomProfiles);
+    const peers = new Map(scoped.get(room));
+    peers.set(did, peerProfile);
+    scoped.set(room, peers);
+    transportState.peerRoomProfiles = scoped;
+    return;
+  }
   rec(ev("app.profile.in", { peer: peerId }));
   // A proven peerId->DID binding is the only thing allowed to group two
   // peerIds under one identity ordinal - see the recorder's own warning.
@@ -3719,7 +3774,7 @@ _transport.on("message", (peerId, data, room) => {
 
     switch (msg.type) {
       case MessageType.Profile:
-        _handleProfile(peerId, msg);
+        _handleProfile(peerId, msg, room);
         break;
       case MessageType.CallPresence:
         _handleCallPresence(peerId, msg.inCall, msg.roomCode);
@@ -3940,6 +3995,7 @@ export async function connect() {
   if (transportState.relayConnected && _transport.p2pNode) return;
   // Post-unlock, so sealed profile rows are readable now.
   _hydratePeerProfileMeta();
+  _hydratePeerRoomProfiles();
   // Fetch fresh short-lived TURN credentials for this session (best-effort;
   // falls back to bundled ICE servers if the relay doesn't issue them).
   refreshTurnCredentials().catch(() => {});
@@ -4193,6 +4249,9 @@ export async function removeRoomCompletely(roomCode: string): Promise<void> {
     transportState.connected = false;
   }
   await removeRoom(roomCode);
+  const scoped = new Map(transportState.peerRoomProfiles);
+  scoped.delete(roomCode);
+  transportState.peerRoomProfiles = scoped;
 }
 
 export function leaveRoom(): void {
@@ -4291,6 +4350,7 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerNames = new Map();
   transportState.peerAvatars = new Map();
   transportState.peerColors = new Map();
+  transportState.peerRoomProfiles = new Map();
   transportState.peerInboxOff = new Set();
   _inboxHeardLive.clear();
   transportState.error = null;

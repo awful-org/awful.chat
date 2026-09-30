@@ -9,6 +9,7 @@ const s = vi.hoisted(() => ({
   direct: vi.fn(async (_peer: string, _frame: Uint8Array) => true),
   roomSend: vi.fn(async (_peer: string, _room: string, _frame: Uint8Array) => true),
   roomPeer: "peer1",
+  peerRoomRows: new Map<string, any[]>(), roomWrites: vi.fn(async (_room: string, _generation: number, _profile: any) => {}),
   lamport: vi.fn(async () => 1), put: vi.fn(async (_m: any, guard?: () => void) => { guard?.(); }),
   watermark: vi.fn(async (_r: string, _s: string, _l: number, guard?: () => void) => { guard?.(); }),
   sign: vi.fn((m: any) => m), broadcast: vi.fn(), reset: vi.fn(), disconnect: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock("./libp2p/transport", () => ({ LibP2PTransport: class {
   on(event: string, fn: Function) { s.handlers.set(event, fn); }
   setDmIntroduction() {} selfId() { return "self"; } rooms() { return ["rd2_room", "rd2_b", "dm-peer"]; }
   peers() { return []; } peersInRoom(room: string) { return room === "dm-peer" ? [] : [s.roomPeer]; }
+  isRoomPeer(room: string, peer: string) { return room !== "dm-peer" && peer === s.roomPeer; }
   isSecureRoom(room: string) { return room.startsWith("rd2_") || room.startsWith("dm-"); }
   send = s.direct; sendRoom = s.roomSend;
   broadcast = s.broadcast; disconnect = s.disconnect;
@@ -44,6 +46,8 @@ vi.mock("$lib/storage", () => ({
   getPeerProfile: async () => undefined, putPeerProfile: async () => {},
   updateParticipantLastSeen: async () => {},
   getOwnRoomProfile: s.roomProfile,
+  getAllPeerRoomProfiles: async (room: string) => s.peerRoomRows.get(room) ?? [],
+  putPeerRoomProfile: s.roomWrites,
   getRoom: async (room: string) => ({ roomCode: room, type: "text", createdAt: 1 }),
   setWatermark: s.watermark, markRoomSeen: vi.fn(async () => {}),
   getAttachmentsWithData: () => s.read ?? Promise.resolve(s.attachments),
@@ -73,9 +77,30 @@ import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
 beforeEach(() => {
   vi.clearAllMocks(); s.session = { did: "did:alice" }; s.rows.clear(); s.attachments = []; s.read = null;
   s.roomPeer = "peer1";
+  s.peerRoomRows.clear(); transportState.peerRoomProfiles = new Map();
   s.profile.mockResolvedValue({ nickname: "Alice" }); s.lamport.mockResolvedValue(1);
   transportState.roomCode = "rd2_room"; transportState.chatMode = "room";
   transportState.messages = []; transportState.fileTransfers = new Map();
+});
+
+it("keeps marked profiles in their authenticated room and leaves the main profile intact", async () => {
+  const onMessage = s.handlers.get("message")!;
+  const frame = (name: string, scoped = true) => encode({ type: MessageType.Profile, name,
+    did: "did:peer", peerId: "peer1", bindingSig: "sig", avatarUrl: null,
+    ...(scoped ? { roomScoped: true } : {}) });
+  onMessage("peer1", frame("Main", false), "rd2_room");
+  await vi.waitFor(() => expect(transportState.peerNames.get("did:peer")).toBe("Main"));
+  onMessage("peer1", frame("A"), "rd2_room");
+  onMessage("peer1", frame("B"), "rd2_b");
+  await vi.waitFor(() => expect(transportState.peerRoomProfiles.get("rd2_b")?.get("did:peer")?.nickname).toBe("B"));
+  expect(transportState.peerRoomProfiles.get("rd2_room")?.get("did:peer")?.nickname).toBe("A");
+  expect(transportState.peerNames.get("did:peer")).toBe("Main");
+  expect(s.roomWrites.mock.calls.map(([room, , p]) => [room, p.nickname])).toEqual([["rd2_room", "A"], ["rd2_b", "B"]]);
+  onMessage("peer1", frame("Unjoined"), "rd2_other");
+  onMessage("peer1", frame("Direct"), null);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(s.roomWrites).toHaveBeenCalledTimes(2);
+  expect(transportState.peerNames.get("did:peer")).toBe("Main");
 });
 
 it("sends scoped profiles after support first arrives in a main reply, without leaking to a DM", async () => {
