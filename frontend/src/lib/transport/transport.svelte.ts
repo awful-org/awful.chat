@@ -93,12 +93,13 @@ const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
 import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession, onIdentityLock } from "../identity/identity";
+import { pqKeyCertificate, type PqKeyCertificate } from "../identity/pq-identity";
 import {
-  pickPqKeyCertificate,
-  pqKeyCertificate,
-  verifyPqKeyCertificate,
-  type PqKeyCertificate,
-} from "../identity/pq-identity";
+  acceptProfilePqKey,
+  onIntroductionUpgraded,
+  onIntroductionVerified,
+  type IntroductionHookDeps,
+} from "./dm-pq-hooks";
 import { rememberPeerPqKey } from "../identity/pq-peers";
 import { captureSessionGuard } from "../identity/session-guard";
 import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
@@ -713,25 +714,21 @@ export const _transport = new LibP2PTransport();
 function currentIdentitySession() {
   try { return requireSession(); } catch { return null; }
 }
+const _introductionHookDeps: IntroductionHookDeps = {
+  boundDid: (peer) => _peerIdToDid.get(peer),
+  bind: (peer, did) => _setPeerDid(peer, did),
+  // Arrows, not the functions themselves: dm.svelte imports this module, so
+  // these bindings are only safe to read once both have finished loading.
+  dmExists: (did) => dmRoomExists(did),
+  ensureDm: (did, state) => ensureDmRoomForPeer(did, state),
+  replayPending: (peer, did) => _replayPendingDm(peer, did),
+};
 _transport.setDmIntroduction(() => {
   try { return requireSession(); } catch { return null; }
-}, async (peer, did, _secret, pqPending) => {
-  const previous = _peerIdToDid.get(peer);
-  if (previous && previous !== did) throw new Error("Conflicting device identity");
-  _setPeerDid(peer, did);
-  // With a post-quantum upgrade about to follow, a DM that does not exist yet
-  // is left for the upgrade to create under the hybrid key; joining it here
-  // would put it on the classical key for the moments in between. If the
-  // upgrade then fails, the next ensureDmRoomForPeer creates it classically,
-  // exactly as for a peer on an older build.
-  if (!pqPending || await dmRoomExists(did)) await ensureDmRoomForPeer(did);
-  _replayPendingDm(peer, did);
-}, async (peer, did, state) => {
-  // Both devices confirmed the same post-quantum key: record it and move the
-  // conversation onto it. Only for the DID this very introduction proved.
-  if (_peerIdToDid.get(peer) !== did) throw new Error("Conflicting device identity");
-  await ensureDmRoomForPeer(did, state);
-});
+}, (peer, did, _secret, pqPending) =>
+  // See dm-pq-hooks.ts for why a pending upgrade holds off creating the DM.
+  onIntroductionVerified(_introductionHookDeps, peer, did, pqPending),
+(peer, did, state) => onIntroductionUpgraded(_introductionHookDeps, peer, did, state));
 export const _voice = new LibP2PVoice(_transport, _dtln);
 export const _video = new MediasoupVideo();
 _video.setRoomAdmission((room, nonce, peer) => _transport.sfuAdmission(room, nonce, peer));
@@ -2369,24 +2366,15 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
     transportState.peerColors = colors;
   }
 
-  // A PQ key only counts once it verifies against the DID this connection
-  // just proved: the certificate is the DID's own signature, so a profile
-  // cannot attach someone else's key, or its own key to someone else. A
-  // missing or bad one is ignored, never a reason to drop a key we hold -
-  // the same person's other device may simply be on an older build.
-  const pqKey =
-    msg.pq !== undefined && verifyPqKeyCertificate(did, msg.pq)
-      ? pickPqKeyCertificate(msg.pq)
-      : undefined;
-  if (pqKey) rememberPeerPqKey(did, pqKey);
-  // The certificate is per profile, so per DEVICE: one person can run this
-  // build on one device and an older one on another. This device can do the
-  // post-quantum DM upgrade; if our DM with its owner is still classical,
-  // start the introduction that upgrades it (offerDmUpgrade checks the rest
-  // and rate-limits).
-  if (pqKey && did !== (identityStore.did ?? "")) {
-    offerDmUpgrade(peerId, did).catch(() => {});
-  }
+  // Their post-quantum key, verified against the DID just proved, and the
+  // DM upgrade it makes possible (dm-pq-hooks.ts).
+  const pqKey = acceptProfilePqKey(
+    { remember: rememberPeerPqKey, offerUpgrade: offerDmUpgrade },
+    peerId,
+    did,
+    identityStore.did ?? "",
+    msg.pq
+  );
 
   // Absent = on: the default, and what a build predating the field sends.
   const inboxOff = msg.inboxOff === true;
