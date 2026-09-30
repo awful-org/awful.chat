@@ -1,7 +1,8 @@
 import { identityStore } from "$lib/identity/identity.svelte";
 import { captureDmOwnership } from "./dm-ownership";
 import { requireSession, didToPublicKey } from "$lib/identity/identity";
-import { pairwiseRoomSecret } from "$lib/room-security/pairwise";
+import { hybridPairwiseRoomSecret, type DmPqState } from "$lib/room-security/pq-dm";
+import { joinDmConversation } from "$lib/room-security/room-lifecycle";
 import { refreshDmRooms } from "$lib/rooms.svelte";
 import { dropRoomCorpus } from "$lib/search/corpus.svelte";
 import {
@@ -19,6 +20,7 @@ import {
   nextDmLamport,
   putPhonebookEntry,
   putRoom,
+  setDmPqState,
   type DMRoom,
   getMessages,
 } from "$lib/storage";
@@ -836,8 +838,17 @@ export async function joinPhonebookDmRooms(): Promise<void> {
   }
 }
 
+/**
+ * Join (and if need be create) the DM with this person.
+ *
+ * `pqState` is a post-quantum state an introduction just agreed with them
+ * (room-security/pq-dm.ts). It is checked by deriving from it before anything
+ * is stored, then recorded, and the conversation moves onto the hybrid key in
+ * place: same room code, same history, a different key on the wire.
+ */
 export async function ensureDmRoomForPeer(
-  peerIdOrDid: string
+  peerIdOrDid: string,
+  pqState?: DmPqState
 ): Promise<string | null> {
   const guard = captureDmOwnership();
   const session = requireSession();
@@ -848,9 +859,24 @@ export async function ensureDmRoomForPeer(
   }
   const roomCode = peerDid ? await dmConversationCodeAsync(peerIdOrDid) : null;
   if (!roomCode || !peerDid) return null;
-  const existing = await getRoom(roomCode);
+  if (pqState) hybridPairwiseRoomSecret(session.privateKey, didToPublicKey(peerDid), pqState);
+  const existing = (await getRoom(roomCode)) as DMRoom | undefined;
   if (requireSession() !== session) throw new Error("Identity changed");
-  _transport.joinSecureConversation(roomCode, pairwiseRoomSecret(session.privateKey, didToPublicKey(peerDid)));
+  if (existing && pqState) {
+    await setDmPqState(roomCode, pqState);
+    if (requireSession() !== session) throw new Error("Identity changed");
+  }
+  try {
+    joinDmConversation(_transport, session, roomCode, peerDid, pqState ?? existing?.pq);
+  } catch (error) {
+    // An upgrade can land between the read above and this join, and the
+    // transport then (rightly) refuses the classical key. Read once more
+    // rather than fail a send over a race it already won.
+    if (pqState || existing?.pq) throw error;
+    const fresh = (await getRoom(roomCode)) as DMRoom | undefined;
+    if (requireSession() !== session || !fresh?.pq) throw error;
+    joinDmConversation(_transport, session, roomCode, peerDid, fresh.pq);
+  }
   const device = looksLikePeerId(peerIdOrDid) ? peerIdOrDid : didToPeerId(peerDid, _peerIdToDid);
   // A known profile is not proof the other device has opened this DM yet.
   // Explicit device inputs initiate first contact; DID-only restore is passive.
@@ -868,10 +894,43 @@ export async function ensureDmRoomForPeer(
     participants: [peerDid],
     participantLastSeen: {},
     participantDid: peerDid,
+    ...(pqState ? { pq: pqState } : {}),
   };
   await putRoom(room, guard);
   if (requireSession() !== session) throw new Error("Identity changed");
   return roomCode;
+}
+
+/** Whether we already have a DM with this person. */
+export async function dmRoomExists(peerDid: string): Promise<boolean> {
+  const roomCode = await dmConversationCodeAsync(peerDid);
+  return !!roomCode && (await getRoom(roomCode))?.type === "dm";
+}
+
+/**
+ * Upgrade our existing DM with this person to post-quantum, if the device
+ * we are talking to can: its profile carried a valid PQ key certificate,
+ * which only builds that know the upgrade send. The introduction does the
+ * rest (dm-introduction-stream.ts) and lands in ensureDmRoomForPeer with the
+ * agreed state. Once per device per ten minutes, so a device that keeps
+ * failing it is not introduced on every profile it sends.
+ */
+const _pqUpgradeTriedAt = new Map<string, number>();
+const PQ_UPGRADE_RETRY_MS = 10 * 60_000;
+export async function offerDmUpgrade(peerId: string, peerDid: string): Promise<void> {
+  if (!looksLikePeerId(peerId) || !looksLikeDid(peerDid) || peerDid === identityStore.did) return;
+  const now = Date.now();
+  if (now - (_pqUpgradeTriedAt.get(peerId) ?? -Infinity) < PQ_UPGRADE_RETRY_MS) return;
+  // Marked before the lookup too: profiles are frequent, and a DM that is
+  // already upgraded (or absent - a new DM is upgraded by its first
+  // introduction anyway) should not cost a database read on every one.
+  if (_pqUpgradeTriedAt.size >= 256) _pqUpgradeTriedAt.clear();
+  _pqUpgradeTriedAt.set(peerId, now);
+  const roomCode = await dmConversationCodeAsync(peerDid);
+  if (!roomCode) return;
+  const room = (await getRoom(roomCode)) as DMRoom | undefined;
+  if (!room || room.type !== "dm" || room.pq) return;
+  await _transport.introduceDm(peerId, peerDid);
 }
 
 export async function addToPhonebook(peerIdOrDid: string): Promise<void> {

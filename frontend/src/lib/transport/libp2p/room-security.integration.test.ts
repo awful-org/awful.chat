@@ -6,7 +6,9 @@ import { noise } from "@libp2p/noise";
 import { yamux } from "@libp2p/yamux";
 import { LibP2PTransport } from "./transport";
 import { ROOM_PROTOCOL } from "$lib/room-security/stream";
-import { newRoomSecret } from "$lib/room-security/keys";
+import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
+import { pairwiseRoomSecret } from "$lib/room-security/pairwise";
+import { hybridPairwiseRoomSecret, type DmPqState } from "$lib/room-security/pq-dm";
 import { DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { publicKeyToDid } from "$lib/identity/identity";
@@ -83,6 +85,45 @@ it("introduces account identities over actual device peers, then sends only in t
   const receive = vi.fn(); bob.transport.on("message", receive);
   expect(await alice.transport.sendRoom(bob.node.peerId.toString(), local, new Uint8Array([42]))).toBe(true);
   await vi.waitFor(() => expect(receive).toHaveBeenCalledWith(alice.node.peerId.toString(), new Uint8Array([42]), local));
+}, 15_000);
+
+it("upgrades a DM to its post-quantum key during the introduction and keeps talking", async () => {
+  const [alice, bob] = await Promise.all([peer(), peer()]);
+  function identity() {
+    const privateKey = crypto.getRandomValues(new Uint8Array(32));
+    const publicKey = new Uint8Array(ed25519.getPublicKey(privateKey));
+    return { privateKey, publicKey, did: publicKeyToDid(publicKey) };
+  }
+  const a = identity(), b = identity();
+  const local = await hashDmRoomCode(a.did, b.did);
+  const classicalA = pairwiseRoomSecret(a.privateKey, b.publicKey);
+  const classicalB = pairwiseRoomSecret(b.privateKey, a.publicKey);
+  const states: DmPqState[] = [];
+  alice.transport.setDmIntroduction(() => a, async (_device, _did, secret) => {
+    alice.transport.joinSecureConversation(local, secret);
+  }, async (_device, _did, state) => {
+    states.push(state);
+    alice.transport.joinSecureConversation(local, hybridPairwiseRoomSecret(a.privateKey, b.publicKey, state), classicalA);
+  });
+  bob.transport.setDmIntroduction(() => b, async (_device, _did, secret) => {
+    bob.transport.joinSecureConversation(local, secret);
+  }, async (_device, _did, state) => {
+    states.push(state);
+    bob.transport.joinSecureConversation(local, hybridPairwiseRoomSecret(b.privateKey, a.publicKey, state), classicalB);
+  });
+  await alice.node.peerStore.merge(bob.node.peerId, { multiaddrs: bob.node.getMultiaddrs() });
+  await alice.node.dial(bob.node.getMultiaddrs());
+  (alice.transport as any).dialPeer = async () => {};
+  expect(await alice.transport.introduceDm(bob.node.peerId.toString(), b.did)).toBe(true);
+  await vi.waitFor(() => expect(states).toHaveLength(2));
+  expect(states[0]).toEqual(states[1]);
+  // Both left the classical room; the conversation now lives on the hybrid one.
+  const classicalWire = deriveRoomKeys(classicalA).discoveryId;
+  expect((alice.transport as any).secureRooms.has(classicalWire)).toBe(false);
+  expect((bob.transport as any).secureRooms.has(classicalWire)).toBe(false);
+  const receive = vi.fn(); bob.transport.on("message", receive);
+  expect(await alice.transport.sendRoom(bob.node.peerId.toString(), local, new Uint8Array([99]))).toBe(true);
+  await vi.waitFor(() => expect(receive).toHaveBeenCalledWith(alice.node.peerId.toString(), new Uint8Array([99]), local));
 }, 15_000);
 
 it("does not authorize a real connected peer without the room capability", async () => {

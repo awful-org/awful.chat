@@ -164,7 +164,9 @@ import {
   dmConversationCodeAsync,
   dmPeerDid,
   dmPeerDidForRoom,
+  dmRoomExists,
   ensureDmRoomForPeer,
+  offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
   flushQueuedDmForPeer,
@@ -713,12 +715,22 @@ function currentIdentitySession() {
 }
 _transport.setDmIntroduction(() => {
   try { return requireSession(); } catch { return null; }
-}, async (peer, did) => {
+}, async (peer, did, _secret, pqPending) => {
   const previous = _peerIdToDid.get(peer);
   if (previous && previous !== did) throw new Error("Conflicting device identity");
   _setPeerDid(peer, did);
-  await ensureDmRoomForPeer(did);
+  // With a post-quantum upgrade about to follow, a DM that does not exist yet
+  // is left for the upgrade to create under the hybrid key; joining it here
+  // would put it on the classical key for the moments in between. If the
+  // upgrade then fails, the next ensureDmRoomForPeer creates it classically,
+  // exactly as for a peer on an older build.
+  if (!pqPending || await dmRoomExists(did)) await ensureDmRoomForPeer(did);
   _replayPendingDm(peer, did);
+}, async (peer, did, state) => {
+  // Both devices confirmed the same post-quantum key: record it and move the
+  // conversation onto it. Only for the DID this very introduction proved.
+  if (_peerIdToDid.get(peer) !== did) throw new Error("Conflicting device identity");
+  await ensureDmRoomForPeer(did, state);
 });
 export const _voice = new LibP2PVoice(_transport, _dtln);
 export const _video = new MediasoupVideo();
@@ -798,12 +810,6 @@ installTelemetryTaps({
 
 /** DIDs whose profile arrived live this session: storage must not overrule. */
 const _inboxHeardLive = new Set<string>();
-/**
- * Whether a DEVICE's last profile carried a valid PQ key certificate. Per
- * peerId, not per DID: one person can run a new build on one device and an
- * old one on another, and only the device itself says which it is.
- */
-const _peerPqCapable = new Map<string, boolean>();
 
 // Stored peer profile metadata is invisible until the peer re-broadcasts:
 // the reactive map only ever filled from live messages, so a reload emptied
@@ -2368,7 +2374,14 @@ async function _handleProfile(peerId: string, msg: WireProfile): Promise<void> {
       ? pickPqKeyCertificate(msg.pq)
       : undefined;
   if (pqKey) rememberPeerPqKey(did, pqKey);
-  _peerPqCapable.set(peerId, !!pqKey);
+  // The certificate is per profile, so per DEVICE: one person can run this
+  // build on one device and an older one on another. This device can do the
+  // post-quantum DM upgrade; if our DM with its owner is still classical,
+  // start the introduction that upgrades it (offerDmUpgrade checks the rest
+  // and rate-limits).
+  if (pqKey && did !== (identityStore.did ?? "")) {
+    offerDmUpgrade(peerId, did).catch(() => {});
+  }
 
   // Absent = on: the default, and what a build predating the field sends.
   const inboxOff = msg.inboxOff === true;
@@ -3234,7 +3247,6 @@ _transport.on("disconnect", (peerId) => {
   // until the sender's DID binds, so dropping them on a disconnect would throw
   // away messages that a reconnect would otherwise replay.
   _lastDigestAt.delete(peerId);
-  _peerPqCapable.delete(peerId);
   transportState.peers = _transport.peers();
   for (const listener of _peerDisconnectListeners) listener({ did });
   _fileTransport.onPeerDisconnect(peerId);
@@ -4293,7 +4305,6 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerColors = new Map();
   transportState.peerInboxOff = new Set();
   _inboxHeardLive.clear();
-  _peerPqCapable.clear();
   transportState.error = null;
   transportState.callPeerIds = new Set();
   transportState.pendingTransmissions = new Map();

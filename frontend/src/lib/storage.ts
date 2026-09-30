@@ -2,6 +2,7 @@ import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { validateStoredCapability } from "./room-security/keys";
 import { onIdentityLock } from "./identity/lock-events";
 import type { PqKeyCertificate } from "./identity/pq-identity";
+import type { DmPqState } from "./room-security/pq-dm";
 
 type WriteGuard = () => void;
 let writeEpoch = 0;
@@ -118,6 +119,13 @@ const PARTICIPANT_INACTIVE_MS = PARTICIPANT_INACTIVE_DAYS * 24 * 60 * 60 * 1000;
 export interface DMRoom extends Room {
   type: "dm";
   participantDid: string;
+  /**
+   * Set once the conversation is post-quantum (room-security/pq-dm.ts): the
+   * ML-KEM ciphertext its hybrid key is derived from. From then on the DM
+   * joins only under that key. Never removed by a write that lacks it - see
+   * putRoom.
+   */
+  pq?: DmPqState;
 }
 
 export interface OwnProfile {
@@ -1905,10 +1913,21 @@ export async function getDMRooms(): Promise<DMRoom[]> {
 
 export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWriteGuard()): Promise<void> {
   validateStoredCapability(room);
+  // A DM's post-quantum state only ever arrives, it never leaves. Writers
+  // that rebuild a record from an older read (a rename, an import of a row
+  // from a device that had not upgraded yet) would otherwise drop it, and the
+  // next start would join the conversation under the classical key again -
+  // a downgrade nobody asked for. Deleting the room is the way to lose it.
+  let carriedPq: DmPqState | undefined;
+  if (room.roomCode.startsWith("dm-") && !(room as DMRoom).pq) {
+    // An unreadable row has no state left to carry.
+    carriedPq = ((await getRoom(room.roomCode).catch(() => undefined)) as DMRoom | undefined)?.pq;
+  }
   const database = await getDB();
   const roomWithParticipants = {
     ...room,
     participants: room.participants ?? [],
+    ...(carriedPq ? { pq: carriedPq } : {}),
   };
   guard();
   const sealed = await _seal("rooms", roomWithParticipants);
@@ -1983,6 +2002,27 @@ async function _patchRoomNow(
   guard();
   await tx.store.put(sealed);
   });
+}
+
+/**
+ * Record that a DM is now post-quantum. Through the per-room patch queue so
+ * it cannot interleave with another patch and be written over; replacing an
+ * existing state is allowed (a later introduction may repair a bad one), and
+ * resolves false when there was nothing to change or no such DM.
+ */
+export async function setDmPqState(
+  roomCode: string,
+  state: DmPqState
+): Promise<boolean> {
+  let changed = false;
+  await _patchRoom(roomCode, (room) => {
+    if (room.type !== "dm") return null;
+    const current = (room as DMRoom).pq;
+    if (current?.ct === state.ct && current?.ek === state.ek) return null;
+    changed = true;
+    return { ...room, pq: state } as DMRoom;
+  });
+  return changed;
 }
 
 /** Pin a room to the top of the sidebar, or unpin it (null). */
