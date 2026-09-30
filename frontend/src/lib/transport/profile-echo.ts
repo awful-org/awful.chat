@@ -34,21 +34,24 @@ export function frameHash(bytes: Uint8Array): number {
   return h >>> 0;
 }
 
-/** Per-peer record of the last profile frame we sent them. */
+/** Per-peer, per-scope record of the last profile frame we sent. */
 export class ProfileEcho {
-  #sent = new Map<string, { hash: number; at: number }>();
+  #sent = new Map<string, Map<string, { hash: number; at: number }>>();
 
   constructor(private readonly windowMs: number = PROFILE_ECHO_WINDOW_MS) {}
 
   /** True if this frame should go out; records it when so. */
-  shouldSend(peerId: string, hash: number, now: number = Date.now()): boolean {
-    const last = this.#sent.get(peerId);
+  shouldSend(peerId: string, hash: number, now: number = Date.now(), scope = ""): boolean {
+    const scopes = this.#sent.get(peerId) ?? new Map();
+    const last = scopes.get(scope);
     if (last?.hash === hash && now - last.at < this.windowMs) return false;
-    this.#sent.set(peerId, { hash, at: now });
+    scopes.set(scope, { hash, at: now });
+    this.#sent.set(peerId, scopes);
     return true;
   }
 
-  forget(peerId: string): void {
-    this.#sent.delete(peerId);
+  forget(peerId: string, scope?: string): void {
+    if (scope === undefined) this.#sent.delete(peerId);
+    else this.#sent.get(peerId)?.delete(scope);
   }
 }

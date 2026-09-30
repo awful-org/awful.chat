@@ -80,6 +80,7 @@
   import DiagnosticsSettings from "./settings/DiagnosticsSettings.svelte";
   import PluginSettings from "./settings/PluginSettings.svelte";
   import AvatarPickerDialog from "./AvatarPickerDialog.svelte";
+  import { getScopedProfile, saveAvatar, saveScopedFields } from "$lib/profile.svelte";
   import QuirksNotice from "./QuirksNotice.svelte";
   import OssCredits from "./OssCredits.svelte";
 
@@ -109,10 +110,17 @@
   $effect(() => {
     if (open && uiState.settingsTab) {
       activeTab = uiState.settingsTab as SettingsTab;
+      selectedProfileRoom = uiState.settingsProfileRoom;
       uiState.settingsTab = null;
+      uiState.settingsProfileRoom = null;
     }
   });
   let avatarDialogOpen = $state(false);
+  let selectedProfileRoom = $state<string | null>(null);
+  let avatarPickerRoom = $state<string | null>(null);
+  $effect(() => {
+    if (!open) selectedProfileRoom = null;
+  });
   let isMobile = $state(false);
 
   const tabs = $state([
@@ -311,7 +319,9 @@
         <ProfileSettings
           {isMobile}
           {avatarDialogOpen}
-          onAvatarClick={() => (avatarDialogOpen = true)}
+          roomCode={selectedProfileRoom}
+          onRoomChange={(room) => (selectedProfileRoom = room)}
+          onAvatarClick={() => { avatarPickerRoom = selectedProfileRoom; avatarDialogOpen = true; }}
         />
       {:else if activeTab === "audio"}
         <AudioSettings />
@@ -349,7 +359,9 @@
             <ProfileSettings
               {isMobile}
               {avatarDialogOpen}
-              onAvatarClick={() => (avatarDialogOpen = true)}
+              roomCode={selectedProfileRoom}
+              onRoomChange={(room) => (selectedProfileRoom = room)}
+              onAvatarClick={() => { avatarPickerRoom = selectedProfileRoom; avatarDialogOpen = true; }}
             />
           {:else if activeTab === "audio"}
             <AudioSettings />
@@ -392,6 +404,9 @@
 
 <AvatarPickerDialog
   open={avatarDialogOpen}
+  scopeKey={avatarPickerRoom}
+  value={getScopedProfile(avatarPickerRoom).avatarUrl}
+  onSave={(url) => avatarPickerRoom ? saveScopedFields(avatarPickerRoom, { pfpURL: url ?? null }) : saveAvatar(url)}
   onClose={() => {
     avatarDialogOpen = false;
   }}

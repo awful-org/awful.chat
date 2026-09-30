@@ -620,6 +620,16 @@ export const STORE_SPECS = {
     blind: ["did"],
     bytes: ["pfpData", "bannerData"],
   },
+  roomProfiles: {
+    storeName: "roomProfiles",
+    key: "id",
+    // kind is three-valued (own / peer / deletion): hashing it hides nothing,
+    // and in the clear it is an index, so listing one kind no longer opens
+    // every peer's avatar bytes to throw them away.
+    clear: ["kind"],
+    blind: ["id", "roomCode", "did"],
+    bytes: ["pfpData", "bannerData"],
+  },
   phonebook: {
     storeName: "phonebook",
     key: "peerId",

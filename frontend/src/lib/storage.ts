@@ -2,6 +2,7 @@ import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { validateStoredCapability } from "./room-security/keys";
 import { sanitizePeerProfile } from "./profile-sanitize";
 import { onIdentityLock } from "./identity/lock-events";
+import type { RoomProfileFields, RoomProfileField } from "./room-profile";
 import type { PqKeyCertificate } from "./identity/pq-identity";
 import type { DmPqState } from "./room-security/pq-dm";
 
@@ -17,7 +18,7 @@ function captureWriteGuard(): WriteGuard {
 
 /** Abort pending IDB requests on lock; check ownership at the commit boundary. */
 async function guardedCommit(
-  database: AppDB, store: "messages" | "rooms" | "watermarks" | "attachments",
+  database: AppDB, store: "messages" | "rooms" | "watermarks" | "attachments" | "roomProfiles",
   guard: WriteGuard, write: (tx: any) => Promise<void>,
 ): Promise<void> {
   guard();
@@ -197,6 +198,50 @@ export interface PeerProfile {
   updatedAt: number;
 }
 
+export interface RoomProfileFieldEdit {
+  at: number;
+  id: string;
+  /** A reset inherits main and must win over older sync data. */
+  reset?: boolean;
+}
+
+export interface OwnRoomProfileRecord {
+  roomCode: string;
+  did: string;
+  generation: number;
+  fields: RoomProfileFields;
+  fieldEdits?: Partial<Record<RoomProfileField, RoomProfileFieldEdit>>;
+}
+
+export interface RoomDeletionMarker {
+  roomCode: string;
+  generation: number;
+  deletedAt: number;
+}
+
+export function roomDeletionCutoff(marker: RoomDeletionMarker): number {
+  return Math.max(marker.generation, marker.deletedAt);
+}
+
+function deletionMarkerIsNewer(incoming: RoomDeletionMarker, existing?: RoomDeletionMarker): boolean {
+  return !existing || roomDeletionCutoff(incoming) > roomDeletionCutoff(existing) ||
+    (roomDeletionCutoff(incoming) === roomDeletionCutoff(existing) && incoming.generation > existing.generation);
+}
+
+interface RoomProfileRow {
+  id: string;
+  roomCode: string;
+  did: string;
+  kind: "own" | "peer" | "deletion";
+  generation: number;
+  fields?: RoomProfileFields;
+  fieldEdits?: OwnRoomProfileRecord["fieldEdits"];
+  profile?: PeerProfile;
+  pfpData?: ArrayBuffer;
+  bannerData?: ArrayBuffer;
+  deletedAt?: number;
+}
+
 export interface WatermarkRecord {
   id: string; // "roomCode:senderId"
   roomCode: string;
@@ -281,6 +326,11 @@ type AppDB = IDBPDatabase<{
     key: Blinded;
     value: OwnProfile | PeerProfile;
   };
+  roomProfiles: {
+    key: Blinded;
+    value: RoomProfileRow;
+    indexes: { byRoom: Blinded; byKind: RoomProfileRow["kind"] };
+  };
   savedGifs: {
     key: string;
     value: SavedGif;
@@ -353,7 +403,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 6, {
+  db = (await openDB(dbName(), 8, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -441,6 +491,17 @@ async function openDatabase(): Promise<AppDB> {
         // Diagnostic event chunks, sealed (see STORE_SPECS). Never synced.
         const s = database.createObjectStore("diagnostics", { keyPath: "id" });
         s.createIndex("bySession", "sessionId", { unique: false });
+      }
+      if (oldVersion < 8) {
+        // v7 only ever existed in pre-release builds of room profiles, which
+        // sealed `kind` and had no byKind index; their rows cannot be found
+        // by kind, so the store starts over rather than half-working.
+        if (database.objectStoreNames.contains("roomProfiles")) {
+          database.deleteObjectStore("roomProfiles");
+        }
+        const store = database.createObjectStore("roomProfiles", { keyPath: "id" });
+        store.createIndex("byRoom", "roomCode", { unique: false });
+        store.createIndex("byKind", "kind", { unique: false });
       }
     },
     blocking() {
@@ -1955,7 +2016,28 @@ export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWr
   if (room.roomCode.startsWith("dm-")) {
     return _onRoomQueue(room.roomCode, () => _putRoomNow(room, guard));
   }
+  if (room.type === "text") {
+    return _onRoomQueue(room.roomCode, async () =>
+      _putRoomNow(await _withLiveGeneration(room), guard));
+  }
   return _putRoomNow(room, guard);
+}
+
+/**
+ * A room's createdAt is also its membership generation (room-profile.ts):
+ * room profiles are bound to it, and a leave marker refuses every generation
+ * at or below its cutoff. So a text room that is being CREATED here - by
+ * saveRoom, an invitation, a quick call or an import - must land above any
+ * marker, whichever path creates it and whatever clock wrote the marker, or
+ * every room-profile write for it would fail from then on. An existing row is
+ * left alone: its generation is already the one its profiles carry.
+ */
+async function _withLiveGeneration<T extends Room>(room: T): Promise<T> {
+  if (await getRoom(room.roomCode).catch(() => undefined)) return room;
+  const marker = await getRoomDeletionMarker(room.roomCode).catch(() => undefined);
+  if (!marker) return room;
+  const floor = roomDeletionCutoff(marker) + 1;
+  return (room.createdAt ?? 0) >= floor ? room : { ...room, createdAt: floor };
 }
 
 async function _putRoomNow(room: Room | DMRoom, guard: WriteGuard): Promise<void> {
@@ -2273,6 +2355,183 @@ export async function deleteRoom(roomCode: string): Promise<void> {
   await tx.store.delete(roomCode as Blinded);
   await tx.store.delete(blindedRoomCode);
   await tx.done;
+}
+
+function roomProfileId(kind: RoomProfileRow["kind"], roomCode: string, did = ""): string {
+  return `${kind}\0${roomCode}\0${did}`;
+}
+
+async function getRoomProfileRow(
+  kind: RoomProfileRow["kind"], roomCode: string, did = "",
+): Promise<RoomProfileRow | undefined> {
+  const database = await getDB();
+  const row = await database.get("roomProfiles", await blindValue(roomProfileId(kind, roomCode, did)));
+  return _open("roomProfiles", row);
+}
+
+export async function getRoomDeletionMarker(roomCode: string): Promise<RoomDeletionMarker | undefined> {
+  const row = await getRoomProfileRow("deletion", roomCode);
+  return row ? { roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt! } : undefined;
+}
+
+/** Rows of one kind, opening only those: peers' rows carry avatar bytes. */
+async function _roomProfileRowsOfKind(kind: RoomProfileRow["kind"]): Promise<RoomProfileRow[]> {
+  const database = await getDB();
+  const rows = await database.getAllFromIndex("roomProfiles", "byKind", kind);
+  return (await _openAll<RoomProfileRow>("roomProfiles", rows)).filter(row => row.kind === kind);
+}
+
+export async function getAllRoomDeletionMarkers(): Promise<RoomDeletionMarker[]> {
+  const rows = await _roomProfileRowsOfKind("deletion");
+  return rows.map(row => ({
+    roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt!,
+  }));
+}
+
+function ownRoomRecord(row: RoomProfileRow): OwnRoomProfileRecord {
+  return {
+    roomCode: row.roomCode, did: row.did, generation: row.generation,
+    fields: {
+      ...row.fields,
+      ...(row.pfpData ? { pfpData: row.pfpData } : {}),
+      ...(row.bannerData ? { bannerData: row.bannerData } : {}),
+    },
+    fieldEdits: row.fieldEdits,
+  };
+}
+
+export async function getOwnRoomProfile(roomCode: string, did: string): Promise<OwnRoomProfileRecord | undefined> {
+  const row = await getRoomProfileRow("own", roomCode, did);
+  return row?.kind === "own" ? ownRoomRecord(row) : undefined;
+}
+
+export async function getAllOwnRoomProfiles(): Promise<OwnRoomProfileRecord[]> {
+  return (await _roomProfileRowsOfKind("own")).map(ownRoomRecord);
+}
+
+export async function putOwnRoomProfile(
+  record: OwnRoomProfileRecord, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const room = await getRoom(record.roomCode);
+  if (room?.type !== "text" || room.createdAt !== record.generation) {
+    throw new Error("room generation is not joined");
+  }
+  const database = await getDB();
+  const markerKey = await blindValue(roomProfileId("deletion", record.roomCode));
+  const markerBefore = await database.get("roomProfiles", markerKey);
+  const marker = await _open("roomProfiles", markerBefore);
+  if (marker && record.generation <= roomDeletionCutoff(marker as RoomDeletionMarker)) throw new Error("room generation was deleted");
+  const fields = { ...record.fields };
+  const pfpData = fields.pfpData instanceof ArrayBuffer ? fields.pfpData : undefined;
+  const bannerData = fields.bannerData instanceof ArrayBuffer ? fields.bannerData : undefined;
+  if (pfpData) delete fields.pfpData;
+  if (bannerData) delete fields.bannerData;
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("own", record.roomCode, record.did),
+    roomCode: record.roomCode, did: record.did, kind: "own" as const,
+    generation: record.generation, fields, fieldEdits: record.fieldEdits,
+    pfpData, bannerData,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const current = await tx.store.get(markerKey);
+    if (_sealFingerprint(current) !== _sealFingerprint(markerBefore)) throw new Error("room generation was deleted");
+    await tx.store.put(sealed);
+  });
+}
+
+export async function getPeerRoomProfile(roomCode: string, did: string): Promise<PeerProfile | undefined> {
+  const row = await getRoomProfileRow("peer", roomCode, did);
+  return row?.kind === "peer" && row.profile
+    ? sanitizePeerProfile({ ...row.profile, pfpData: row.pfpData, bannerData: row.bannerData })
+    : undefined;
+}
+
+export async function getAllPeerRoomProfiles(roomCode: string): Promise<PeerProfile[]> {
+  const database = await getDB();
+  const keys = await database.transaction("roomProfiles").store.index("byRoom").getAllKeys(await blindValue(roomCode));
+  const rows = await Promise.all(keys.map(async key => _open("roomProfiles", await database.get("roomProfiles", key))));
+  return rows.filter((row): row is RoomProfileRow => row?.kind === "peer" && !!row.profile)
+    .map(row => sanitizePeerProfile({ ...row.profile!, pfpData: row.pfpData, bannerData: row.bannerData }));
+}
+
+/** A peer went back to its main profile in this room (WireProfile.roomInherit). */
+export async function deletePeerRoomProfile(
+  roomCode: string, did: string, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const database = await getDB();
+  const key = await blindValue(roomProfileId("peer", roomCode, did));
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    await tx.store.delete(key);
+  });
+}
+
+export async function putPeerRoomProfile(
+  roomCode: string, generation: number, profile: PeerProfile,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const room = await getRoom(roomCode);
+  if (room?.type !== "text" || room.createdAt !== generation) {
+    throw new Error("room generation is not joined");
+  }
+  const database = await getDB();
+  const markerKey = await blindValue(roomProfileId("deletion", roomCode));
+  const markerBefore = await database.get("roomProfiles", markerKey);
+  const marker = await _open("roomProfiles", markerBefore);
+  if (marker && generation <= roomDeletionCutoff(marker as RoomDeletionMarker)) throw new Error("room generation was deleted");
+  const { pfpData, bannerData, ...display } = profile;
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("peer", roomCode, profile.did), roomCode,
+    did: profile.did, kind: "peer" as const, generation,
+    profile: display, pfpData, bannerData,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const current = await tx.store.get(markerKey);
+    if (_sealFingerprint(current) !== _sealFingerprint(markerBefore)) throw new Error("room generation was deleted");
+    await tx.store.put(sealed);
+  });
+}
+
+/** Remove both profile kinds but keep the non-profile marker for later device sync. */
+export async function deleteRoomProfilesForRoom(
+  roomCode: string, generation: number, deletedAt = Date.now(),
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const existing = await getRoomDeletionMarker(roomCode);
+  const incoming = { roomCode, generation, deletedAt };
+  const replaceMarker = deletionMarkerIsNewer(incoming, existing);
+  const database = await getDB();
+  const marker = replaceMarker ? await _seal("roomProfiles", {
+    id: roomProfileId("deletion", roomCode), roomCode, did: "",
+    kind: "deletion" as const, generation,
+    deletedAt,
+  }) : undefined;
+  const blindedRoom = await blindValue(roomCode);
+  const deletionKey = await blindValue(roomProfileId("deletion", roomCode));
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const keys = await tx.store.index("byRoom").getAllKeys(blindedRoom);
+    for (const key of keys) {
+      if (!replaceMarker && key === deletionKey) continue;
+      await tx.store.delete(key);
+    }
+    if (marker) await tx.store.put(marker);
+  });
+}
+
+/** Preserve a remote leave event even if this device already rejoined later. */
+export async function putRoomDeletionMarker(
+  marker: RoomDeletionMarker, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const existing = await getRoomDeletionMarker(marker.roomCode);
+  if (!deletionMarkerIsNewer(marker, existing)) return;
+  const database = await getDB();
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("deletion", marker.roomCode), roomCode: marker.roomCode,
+    did: "", kind: "deletion" as const, generation: marker.generation,
+    deletedAt: marker.deletedAt,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    await tx.store.put(sealed);
+  });
 }
 
 export async function getOwnProfile(

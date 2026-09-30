@@ -2,7 +2,7 @@
   import GifImage from "./GifImage.svelte";
   import { mediaPrefs } from "$lib/media-prefs.svelte";
   import { transportState } from "$lib/transport/transport.svelte";
-  import { profileStore } from "$lib/profile.svelte";
+  import { getScopedProfile } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { nameEffectStyle } from "$lib/name-effect";
   import { Copy, Check, MessageSquare, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
@@ -27,6 +27,7 @@
     inPhonebook?: boolean;
     /** Shown on your OWN card only: jumps to profile editing. */
     onEdit?: () => void;
+    roomCode?: string | null;
   }
 
   let {
@@ -40,6 +41,7 @@
     onTogglePhonebook,
     inPhonebook = false,
     onEdit,
+    roomCode = null,
   }: Props = $props();
 
   // Our own metadata never enters peerProfileMeta (that map is fed by the
@@ -47,19 +49,39 @@
   const isSelf = $derived(did === identityStore.did);
   const profileMeta = $derived(
     isSelf
-      ? {
-          bannerUrl: profileStore.bannerUrl ?? undefined,
-          tagText: profileStore.tagText ?? undefined,
-          tagTextColor: profileStore.tagTextColor ?? undefined,
-          tagChipColor: profileStore.tagChipColor ?? undefined,
-          bio: profileStore.bio ?? undefined,
-          nameEffect: profileStore.nameEffect ?? undefined,
-          nameShimmer: profileStore.nameShimmer ?? undefined,
-          nameGlow: profileStore.nameGlow ?? undefined,
-          gradient2: profileStore.gradient2 ?? undefined,
-          gradient3: profileStore.gradient3 ?? undefined,
-        }
-      : transportState.peerProfileMeta.get(did)
+      ? (() => {
+          const scoped = getScopedProfile(roomCode);
+          return {
+          bannerUrl: scoped.bannerUrl ?? undefined,
+          tagText: scoped.tagText ?? undefined,
+          tagTextColor: scoped.tagTextColor ?? undefined,
+          tagChipColor: scoped.tagChipColor ?? undefined,
+          bio: scoped.bio ?? undefined,
+          nameEffect: scoped.nameEffect ?? undefined,
+          nameShimmer: scoped.nameShimmer ?? undefined,
+          nameGlow: scoped.nameGlow ?? undefined,
+          gradient2: scoped.gradient2 ?? undefined,
+          gradient3: scoped.gradient3 ?? undefined,
+          };
+        })()
+      : (() => {
+          const peer = roomCode?.startsWith("rd2_")
+            ? transportState.peerRoomProfiles.get(roomCode)?.get(did)
+            : undefined;
+          if (peer) return {
+            bannerUrl: peer.bannerURL,
+            tagText: peer.tagText,
+            tagTextColor: peer.tagTextColor,
+            tagChipColor: peer.tagChipColor,
+            bio: peer.bio,
+            nameEffect: peer.nameEffect,
+            nameShimmer: peer.nameShimmer,
+            nameGlow: peer.nameGlow,
+            gradient2: peer.gradient2,
+            gradient3: peer.gradient3,
+          };
+          return transportState.peerProfileMeta.get(did);
+        })()
   );
 
   const effectStyle = $derived(

@@ -114,6 +114,67 @@ describe("secure sync invitation and source authorization", () => {
     }
   });
 
+  it("applies target leaves before export and sends only own overrides with source markers", async () => {
+    const { createIdentity, lockIdentity } = await import("$lib/identity/identity");
+    await storage.wipeLocalDatabase();
+    const { keypair } = await createIdentity("room-sync-test-password");
+    const otherSecret = newRoomSecret();
+    const otherCode = deriveRoomKeys(otherSecret).discoveryId;
+    try {
+      await storage.putRoom({ roomCode: SECURE_ROOM, roomSecret: SECURE_SECRET,
+        type: "text", name: "Current", createdAt: 100, lastSeenLamport: 0, participants: [] });
+      await storage.putOwnRoomProfile({ roomCode: SECURE_ROOM, did: keypair.did, generation: 100,
+        fields: { nickname: "Room name", pfpData: new Uint8Array([1, 2]).buffer },
+        fieldEdits: { nickname: { at: 101, id: "source" } } });
+      await storage.putPeerRoomProfile(SECURE_ROOM, 100, { did: "did:peer", isMe: false,
+        nickname: "Never sync peer cache", updatedAt: 102 });
+      await storage.putRoom({ roomCode: otherCode, roomSecret: otherSecret,
+        type: "text", name: "Left on target", createdAt: 200, lastSeenLamport: 0, participants: [] });
+      await generateSyncCode();
+      const source = instances.at(-1);
+      const pairing = parsePlaintextToken(syncState.plaintextToken!)!;
+      source.emit("message", "target", new TextEncoder().encode(JSON.stringify({
+        type: "sync_export_request", payload: { token: pairing.token, mode: "add",
+          roomDeletions: [{ roomCode: otherCode, generation: 100, deletedAt: 300 }] },
+      })), pairing.roomCode);
+      await vi.waitFor(() => expect(source.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+      // A leave on the other device governs room profiles only: this device
+      // still holds the room in the generation the marker names, so it keeps
+      // it, its history, and does not adopt the marker.
+      expect((await storage.getRoom(otherCode))?.createdAt).toBe(200);
+      const sections = source.sent.filter((m: any) => m.type === "sync_export_data");
+      const overrides = sections.filter((m: any) => m.payload.section === "roomProfiles")
+        .flatMap((m: any) => m.payload.data);
+      expect(overrides).toEqual([{ roomCode: SECURE_ROOM, did: keypair.did, generation: 100,
+        fields: { nickname: "Room name", pfpData: btoa(String.fromCharCode(1, 2)) },
+        fieldEdits: { nickname: { at: 101, id: "source" } } }]);
+      expect(JSON.stringify(sections)).not.toContain("Never sync peer cache");
+      const deletions = sections.filter((m: any) => m.payload.section === "roomDeletions")
+        .flatMap((m: any) => m.payload.data);
+      expect(deletions).not.toContainEqual({ roomCode: otherCode, generation: 100, deletedAt: 300 });
+    } finally {
+      await cancelSync(); lockIdentity();
+    }
+  });
+
+  it("does not apply target markers without the full pairing token", async () => {
+    await storage.wipeLocalDatabase();
+    await (await import("../storage-crypto")).initStorageCrypto(new Uint8Array(32).fill(32));
+    const secret = newRoomSecret();
+    const code = deriveRoomKeys(secret).discoveryId;
+    await storage.putRoom({ roomCode: code, roomSecret: secret, type: "text",
+      name: "Keep", createdAt: 100, lastSeenLamport: 0, participants: [] });
+    await generateSyncCode();
+    const source = instances.at(-1);
+    const pairing = parsePlaintextToken(syncState.plaintextToken!)!;
+    source.emit("message", "target", new TextEncoder().encode(JSON.stringify({
+      type: "sync_export_request", payload: { token: "bad-token", mode: "add",
+        roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] },
+    })), pairing.roomCode);
+    await vi.waitFor(() => expect(source.sent.some((m: any) => m.type === "sync_error")).toBe(true));
+    expect((await storage.getRoom(code))?.createdAt).toBe(100);
+  });
+
   it("discards a pending QR result after a replacement session starts", async () => {
     let release!: (url: string) => void;
     const pending = new Promise<string>((resolve) => { release = resolve; });
@@ -431,6 +492,19 @@ describe("target ExportRequest delivery", () => {
     expect(requests(t)).toHaveLength(1);
   });
 
+  it("includes local leave markers in the initial authenticated export request", async () => {
+    await storage.wipeLocalDatabase();
+    await (await import("../storage-crypto")).initStorageCrypto(new Uint8Array(32).fill(31));
+    await storage.deleteRoomProfilesForRoom("room-left-here", 100, 300);
+    await connectAsTarget({ ...payload(), mode: "add" });
+    const t = instances.at(-1);
+    t.emit("connect", PEER_ID);
+    await vi.waitFor(() => expect(requests(t)).toHaveLength(1));
+    expect(requests(t)[0].payload.roomDeletions).toContainEqual({
+      roomCode: "room-left-here", generation: 100, deletedAt: 300,
+    });
+  });
+
   it("ignores completion outside the authenticated pairing room", async () => {
     await connectAsTarget(payload());
     const t = instances.at(-1);
@@ -521,6 +595,28 @@ describe("target-side identity handling", () => {
     await vi.waitFor(() => expect(importCalls).toHaveLength(1));
     return importCalls[0];
   }
+
+  it("passes received own overrides and leave markers to the importer", async () => {
+    await connectAsTarget({ roomCode: SECURE_ROOM, roomSecret: SECURE_SECRET,
+      token: TOKEN, expires: Date.now() + 60_000, peerId: PEER_ID, mode: "add" });
+    const t = instances.at(-1);
+    t.emit("connect", PEER_ID);
+    for (const [section, record] of [
+      ["roomProfiles", { roomCode: "room-a", did: "did:alice", generation: 100,
+        fields: { nickname: null }, fieldEdits: { nickname: { at: 120, id: "a", reset: true } } }],
+      ["roomDeletions", { roomCode: "room-b", generation: 100, deletedAt: 300 }],
+    ] as const) {
+      t.emit("message", PEER_ID, frame({ type: "sync_export_data", payload: {
+        section, data: [record], token: TOKEN, batchIndex: 0, totalBatches: 1,
+      } }));
+    }
+    await vi.waitFor(() => expect(t.sent.filter((m: any) => m.type === "sync_export_ack")).toHaveLength(2));
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete" }));
+    await vi.waitFor(() => expect(importCalls).toHaveLength(1));
+    expect(importCalls[0].data.roomProfiles).toEqual([{ roomCode: "room-a", did: "did:alice",
+      generation: 100, fields: { nickname: null }, fieldEdits: { nickname: { at: 120, id: "a", reset: true } } }]);
+    expect(importCalls[0].data.roomDeletions).toEqual([{ roomCode: "room-b", generation: 100, deletedAt: 300 }]);
+  });
 
   it("drops the identity section in add mode", async () => {
     const call = await runTarget("add");

@@ -4,6 +4,8 @@ import {
   getDMRooms,
   putRoom,
   deleteRoom,
+  deleteRoomProfilesForRoom,
+  getRoomDeletionMarker,
   getUnreadCount,
   getLastMessage,
   getRoom,
@@ -189,12 +191,17 @@ export async function saveRoom(roomCode: string, name: string, guard?: () => voi
     return;
   }
 
+  const marker = await getRoomDeletionMarker(roomCode);
+  guard?.();
+
   const room: Room = {
     roomCode,
     name,
     type: "text",
     lastSeenLamport: 0,
-    createdAt: Date.now(),
+    // createdAt also identifies this membership generation. An intentional
+    // rejoin must outrank the leave marker even within the same millisecond.
+    createdAt: Math.max(Date.now(), (marker ? Math.max(marker.generation, marker.deletedAt) : 0) + 1),
     participants: [],
     participantLastSeen: {},
   };
@@ -323,6 +330,14 @@ export async function removeRoom(roomCode: string): Promise<void> {
   // Before the storage delete: an in-flight search sweep must see the drop
   // and abandon its final index write for this room.
   dropRoomCorpus(roomCode);
+  const room = await getRoom(roomCode);
+  if (room?.type === "text") {
+    const marker = await getRoomDeletionMarker(roomCode);
+    await deleteRoomProfilesForRoom(
+      roomCode,
+      Math.max(Date.now(), room.createdAt, marker?.generation ?? 0) + 1,
+    );
+  }
   await deleteMessagesForRoom(roomCode);
   await deleteRoom(roomCode);
   roomsStore.rooms = roomsStore.rooms.filter((r) => r.roomCode !== roomCode);

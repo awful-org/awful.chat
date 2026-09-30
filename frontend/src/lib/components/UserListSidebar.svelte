@@ -19,7 +19,7 @@
     isInPhonebook,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
-  import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import GifImage from "./GifImage.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -83,6 +83,8 @@
   const peerAvatars = $derived(transportState.peerAvatars);
   const peerColors = $derived(transportState.peerColors);
   const peerProfileMeta = $derived(transportState.peerProfileMeta);
+  const peerRoomProfiles = $derived(transportState.peerRoomProfiles);
+  const currentRoomProfile = $derived(transportState.roomCode?.startsWith("rd2_") ? transportState.roomCode : null);
 
   const selfDid = $derived(selfId());
   const ownDid = $derived(identityStore.did);
@@ -181,30 +183,36 @@
       let tagChipColor: string | null = null;
 
       if (isSelf) {
-        name = profileStore.nickname || "You";
-        avatarUrl = profileStore.avatarUrl || null;
-        color = profileStore.color || null;
-        nameEffect = profileStore.nameEffect || null;
-        nameShimmer = profileStore.nameShimmer ?? null;
-        nameGlow = profileStore.nameGlow ?? null;
-        gradient2 = profileStore.gradient2 || null;
-        gradient3 = profileStore.gradient3 || null;
-        tagText = profileStore.tagText || null;
-        tagTextColor = profileStore.tagTextColor || null;
-        tagChipColor = profileStore.tagChipColor || null;
+        const own = getScopedProfile(currentRoomProfile);
+        name = own.nickname || "You";
+        avatarUrl = own.avatarUrl || null;
+        color = own.color || null;
+        nameEffect = own.nameEffect || null;
+        nameShimmer = own.nameShimmer ?? null;
+        nameGlow = own.nameGlow ?? null;
+        gradient2 = own.gradient2 || null;
+        gradient3 = own.gradient3 || null;
+        tagText = own.tagText || null;
+        tagTextColor = own.tagTextColor || null;
+        tagChipColor = own.tagChipColor || null;
       } else {
         // roomUsers can carry a raw peerId while these maps are DID-keyed.
         const nameKey = peerIdToDid(did) || did;
-        const known = peerNames.get(nameKey) || peerNames.get(did);
+        const scoped = currentRoomProfile ? peerRoomProfiles.get(currentRoomProfile)?.get(nameKey) ?? peerRoomProfiles.get(currentRoomProfile)?.get(did) : undefined;
+        const known = scoped?.nickname || peerNames.get(nameKey) || peerNames.get(did);
         named = !!known;
         name = known || did.slice(0, 12);
-        avatarUrl = peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
+        // A room profile is the whole presentation in this room: what it
+        // lacks was cleared there, so the main profile never fills it in.
+        avatarUrl = scoped
+          ? scoped.pfpURL || null
+          : peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
         color =
           displayPrefs.showPeerNicknameColors
-            ? peerColors.get(nameKey) || peerColors.get(did) || null
+            ? (scoped ? scoped.color : peerColors.get(nameKey) || peerColors.get(did)) || null
             : null;
         // Name effect: respect showPeerNicknameColors like color does
-        const meta = peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);
+        const meta = scoped ?? peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);
         if (displayPrefs.showPeerNicknameColors) {
           nameEffect = meta?.nameEffect || null;
           nameShimmer = meta?.nameShimmer ?? null;
@@ -623,7 +631,8 @@
     name={selectedUserForProfile.name}
     avatarUrl={selectedUserForProfile.avatarUrl ?? undefined}
     color={selectedUserForProfile.color ?? undefined}
-    onEdit={() => openSettings("profile")}
+    roomCode={currentRoomProfile}
+    onEdit={() => openSettings("profile", currentRoomProfile)}
     onMessage={() => {
       // Offline members too: their DID opens the conversation, and the DM
       // itself says if it will only land while you are both online.

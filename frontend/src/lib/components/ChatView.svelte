@@ -74,7 +74,7 @@
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
   import MentionInput from "./MentionInput.svelte";
   import UserListSidebar from "./UserListSidebar.svelte";
-  import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs, setCallChatWidth } from "$lib/display-prefs.svelte";
   import { resolveSplit } from "$lib/call-split";
   import SplitHandle from "./SplitHandle.svelte";
@@ -150,6 +150,7 @@
   } from "$lib/notify-prefs.svelte";
   import { takeDroppedReplyDraft } from "$lib/notify-intents";
   import { formatRoomCode } from "$lib/room-code";
+  import type { PeerProfile } from "$lib/storage";
 
   $effect(() => {
     loadProfile();
@@ -238,6 +239,7 @@
     peerAvatars,
     peerColors,
     peerProfileMeta,
+    peerRoomProfiles,
     fileTransfers,
     connecting,
   } = $derived(transportState);
@@ -1618,23 +1620,42 @@
     return (displayName(msg) || msg.senderId).charAt(0).toUpperCase();
   }
 
+  /**
+   * The sender's profile for this room, when they have one (room-profile.ts).
+   * It is the WHOLE presentation in this room: the sender resolved it against
+   * their main profile before sending, so a field it lacks was cleared on
+   * purpose and must not be filled in from the main profile.
+   */
+  function roomProfileOf(senderId: string): PeerProfile | undefined {
+    return roomCode.startsWith("rd2_")
+      ? peerRoomProfiles.get(roomCode)?.get(senderDid(senderId))
+      : undefined;
+  }
+
   function senderAvatar(senderId: string): string | undefined {
-    return (
-      peerAvatars.get(senderDid(senderId)) ?? peerAvatars.get(senderId)
-    );
+    const scoped = roomProfileOf(senderId);
+    if (scoped) return scoped.pfpURL;
+    return peerAvatars.get(senderDid(senderId)) ?? peerAvatars.get(senderId);
   }
 
   /** User-picked nickname color, keyed like names (by DID, peerId fallback). */
   function senderColor(senderId: string): string | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
+    const scoped = roomProfileOf(senderId);
+    if (scoped) return scoped.color;
     return peerColors.get(senderDid(senderId)) ?? peerColors.get(senderId);
+  }
+
+  /** The name-effect fields, from the room profile or else the main one. */
+  function senderMeta(senderId: string) {
+    const did = senderDid(senderId);
+    return roomProfileOf(senderId) ?? peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
   }
 
   /** Name effect, keyed like names (by DID, peerId fallback). Respects showPeerNicknameColors. */
   function senderEffect(senderId: string): string | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    return peerProfileMeta.get(did)?.nameEffect ?? peerProfileMeta.get(senderId)?.nameEffect;
+    return senderMeta(senderId)?.nameEffect;
   }
 
   /** Gradient stops for the gradient effect, keyed like names. */
@@ -1642,23 +1663,20 @@
     g2?: string;
     g3?: string;
   } {
-    const did = senderDid(senderId);
-    const meta = peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
-    return { g2: meta?.gradient2, g3: meta?.gradient3 };
+    const meta = senderMeta(senderId);
+    return { g2: meta?.gradient2 ?? undefined, g3: meta?.gradient3 ?? undefined };
   }
 
   /** Shimmer state for the name effect, keyed like names. Respects showPeerNicknameColors. */
   function senderShimmer(senderId: string): boolean | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    return peerProfileMeta.get(did)?.nameShimmer ?? peerProfileMeta.get(senderId)?.nameShimmer;
+    return senderMeta(senderId)?.nameShimmer;
   }
 
   /** Glow state for the name effect, keyed like names. Respects showPeerNicknameColors. */
   function senderGlow(senderId: string): boolean | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    return peerProfileMeta.get(did)?.nameGlow ?? peerProfileMeta.get(senderId)?.nameGlow;
+    return senderMeta(senderId)?.nameGlow;
   }
 
   /** Tag chip, keyed like names. Deliberately NOT behind
@@ -1667,8 +1685,7 @@
   function senderTag(
     senderId: string
   ): { text: string; textColor: string; chipColor: string } | null {
-    const did = senderDid(senderId);
-    const meta = peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
+    const meta = senderMeta(senderId);
     if (!meta?.tagText) return null;
     return {
       text: meta.tagText,
@@ -1681,7 +1698,7 @@
    *  on everything that person ever said, not just what they say next. */
   function displayNameFor(senderId: string, stored?: string): string {
     return (
-      peerNames.get(senderDid(senderId)) ||
+      roomProfileOf(senderId)?.nickname || peerNames.get(senderDid(senderId)) ||
       peerNames.get(senderId) ||
       stored ||
       senderId.slice(0, 8)
@@ -1751,14 +1768,15 @@
   function openProfileFromMessage(msg: Message): void {
     const own = isSelfSender(msg.senderId);
     const did = own ? selfId() : senderDid(msg.senderId);
+    const ownProfile = getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null);
     profileCardFor = {
       did,
-      name: own ? profileStore.nickname || "You" : displayName(msg),
+      name: own ? ownProfile.nickname || "You" : displayName(msg),
       avatarUrl: own
-        ? (profileStore.avatarUrl ?? undefined)
+        ? (ownProfile.avatarUrl ?? undefined)
         : (senderAvatar(msg.senderId) ?? undefined),
       color: own
-        ? (profileStore.color ?? undefined)
+        ? (ownProfile.color ?? undefined)
         : senderColor(msg.senderId),
     };
   }
@@ -2753,16 +2771,16 @@
                         ? 'bg-primary/20 text-primary'
                         : 'bg-secondary text-secondary-foreground'}"
                       style={isOwn
-                        ? profileStore.color
-                          ? `color: ${profileStore.color}`
+                        ? getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).color
+                          ? `color: ${getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).color}`
                           : ""
                         : senderColor(msg.senderId)
                           ? `color: ${senderColor(msg.senderId)}`
                           : ""}
                     >
-                      {#if isOwn && profileStore.avatarUrl}
+                      {#if isOwn && getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).avatarUrl}
                         <GifImage
-                          src={profileStore.avatarUrl}
+                          src={getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).avatarUrl ?? ""}
                           alt="You"
                           class="size-full object-cover"
                         />
@@ -2779,7 +2797,8 @@
                     </div>
                     <div class="flex min-w-0 items-baseline gap-2">
                       {#if isOwn}
-                        {@const effectStyle = nameEffectStyle(profileStore.nameEffect, profileStore.color, profileStore.gradient2 ?? undefined, profileStore.gradient3 ?? undefined, profileStore.nameShimmer, profileStore.nameGlow)}
+                        {@const own = getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null)}
+                        {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
                         <span
                           role="button"
                           tabindex="0"
@@ -2790,15 +2809,15 @@
                           class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
                             ? 'italic'
                             : ''} {effectStyle.class}"
-                          style={effectStyle.style || (profileStore.color ? `color: ${profileStore.color}` : "")}
+                          style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
                         >
-                          {profileStore.nickname || "You"}
+                          {own.nickname || "You"}
                         </span>
-                        {#if profileStore.tagText}
+                        {#if own.tagText}
                           <span
                             class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
-                            style={`background-color: ${profileStore.tagChipColor ?? "#e5e7eb"}; color: ${profileStore.tagTextColor ?? "#000000"}`}
-                            >{profileStore.tagText}</span
+                            style={`background-color: ${own.tagChipColor ?? "#e5e7eb"}; color: ${own.tagTextColor ?? "#000000"}`}
+                            >{own.tagText}</span
                           >
                         {/if}
                       {:else}
@@ -3391,7 +3410,8 @@
     name={profileCardFor.name}
     avatarUrl={profileCardFor.avatarUrl}
     color={profileCardFor.color}
-    onEdit={() => openSettings("profile")}
+    roomCode={roomCode.startsWith("rd2_") ? roomCode : null}
+    onEdit={() => openSettings("profile", roomCode.startsWith("rd2_") ? roomCode : null)}
     onMessage={dmTargetFor(profileCardFor.did)
       ? () => {
           const target = dmTargetFor(profileCardFor!.did)!;

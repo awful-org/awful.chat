@@ -40,7 +40,8 @@ export async function storeSecureInvitation(input: string, name?: string): Promi
       };
   await putRoom(room, guard);
   guard();
-  return room;
+  // putRoom may have raised a new room's generation above a leave marker.
+  return (await getRoom(roomCode)) ?? room;
 }
 
 export function storedRoomSecret(room: Room): RoomSecret {

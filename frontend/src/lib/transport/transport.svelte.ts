@@ -2,7 +2,7 @@ import { MediasoupVideo } from "./mediasoup";
 import { acceptsRoomScope } from "$lib/room-security/scope";
 import { captureDmOwnership, allowsUnsignedDmHistory } from "./dm-ownership";
 import { acceptsFileDescriptors } from "$lib/room-security/file-descriptor";
-import { profileDeliveryRoom } from "$lib/room-security/profile-route";
+import { profileDeliveryRoom, profileRoomsForPeer } from "$lib/room-security/profile-route";
 import {
   cachePluginSenderName,
   immediatePluginSenderName,
@@ -20,6 +20,7 @@ import { setErrorWithAutoClear } from "./call-error";
 import { blindValue } from "../storage-crypto";
 import {
   getOwnProfile,
+  getOwnRoomProfile,
   putMessage,
   bulkPutMessages,
   messageClearFieldsByIds,
@@ -36,6 +37,9 @@ import {
   getPeerProfile,
   putPeerProfile,
   getAllPeerProfiles,
+  getAllPeerRoomProfiles,
+  putPeerRoomProfile,
+  deletePeerRoomProfile,
   putAttachment,
   getAttachmentsByInfoHash,
   getAttachmentsByMessage,
@@ -55,6 +59,7 @@ import {
   type DMRoom,
 } from "../storage";
 import { normalizeWireName } from "../wire-name";
+import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
   MessageType,
   isFileSignalWireMessage,
@@ -361,6 +366,8 @@ function _parsePluginPayload(
 
 import { playPeerJoinSound, playPeerLeaveSound } from "../sounds";
 import { peerCallChime } from "./call-chime";
+import { sanitizePeerProfile } from "../profile-sanitize";
+import type { PeerProfile } from "../storage";
 
 export { appendSorted } from "./message-order";
 export type { Message };
@@ -435,6 +442,8 @@ interface TransportState {
   peerAvatars: Map<string, string>;
   /** User-picked nickname colors, keyed like peerNames (by DID). */
   peerColors: Map<string, string>;
+  /** Room code -> DID -> last authenticated room profile. */
+  peerRoomProfiles: Map<string, Map<string, import("../storage").PeerProfile>>;
   /**
    * Did the room's first read fill a page?
    *
@@ -539,6 +548,7 @@ export const transportState = $state<TransportState>({
   peerDidVersion: 0,
   peerAvatars: new Map(),
   peerColors: new Map(),
+  peerRoomProfiles: new Map(),
   historyCapped: false,
   relayedPeers: new Set(),
   provenPeers: new Set(),
@@ -864,6 +874,20 @@ function _hydratePeerProfileMeta(): void {
   .catch(() => {});
 }
 
+function _hydratePeerRoomProfiles(): void {
+  void getAllRooms().then(async rooms => {
+    const entries = await Promise.all(rooms.filter(r => r.type === "text")
+      .map(async r => [r.roomCode, await getAllPeerRoomProfiles(r.roomCode)] as const));
+    const scoped = new Map(transportState.peerRoomProfiles);
+    for (const [roomCode, profiles] of entries) {
+      const peers = new Map(profiles.map(p => [p.did, p]));
+      for (const [did, live] of scoped.get(roomCode) ?? []) peers.set(did, live);
+      scoped.set(roomCode, peers);
+    }
+    transportState.peerRoomProfiles = scoped;
+  }).catch(() => {});
+}
+
 const STATUS_RANK = { sending: 0, sent: 1, delivered: 2, read: 3 } as const;
 
 /**
@@ -1092,21 +1116,13 @@ function _sendRoomName(peerId?: string, roomCode: string | null = transportState
 
 async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   const profile = await getOwnProfile();
-  const name = profile?.nickname?.trim() || "Anonymous";
   const did = identityStore.did ?? null;
-  let avatarUrl: string | null = profile?.pfpURL || null;
-  if (!avatarUrl && profile?.pfpData) {
-    const bytes = new Uint8Array(profile.pfpData);
-    avatarUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
-  }
-
-  let bannerUrl: string | null = profile?.bannerURL || null;
-  if (!bannerUrl && profile?.bannerData) {
-    const bytes = new Uint8Array(profile.bannerData);
-    bannerUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
-  }
+  // Room capability is learned only from a verified main profile.
+  const supportingPeers = _roomProfilePeers;
 
   // Prove this DID owns our peerId; the receiver cannot derive it any more.
+  // Signed once per send, not once per frame: a peer sharing several rooms
+  // gets a main frame and a room frame for each.
   let binding: { did: string; bindingSig: string } | null = null;
   try {
     binding = signPeerBinding(_transport.selfId());
@@ -1116,40 +1132,70 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   // Our ML-KEM key, so peers can seal for us post-quantum (mailbox, DM
   // upgrade), signed by the same identity the binding proves. Separate from
   // the binding: without it we are merely a peer on an older build, and
-  // that must never cost the binding itself.
+  // that must never cost the binding itself. Main frames only: it belongs to
+  // the identity, not to a room's presentation of it.
   let pq: PqKeyCertificate | undefined;
   try {
     pq = binding ? pqKeyCertificate(requireSession()) : undefined;
   } catch {
     pq = undefined;
   }
+  // Only when off, so a DM to us can warn it needs both of us online.
+  // Imported lazily like dm.svelte does: the mailbox imports this module.
+  const inboxOff = (await import("./mailbox.svelte")).mailboxPrefs.enabled
+    ? undefined
+    : true;
 
-  const payload = encode({
-    type: MessageType.Profile,
-    name,
-    did,
-    avatarUrl,
-    color: profile?.color ?? null,
-    peerId: _transport.selfId(),
-    bindingSig: binding?.bindingSig,
-    reply: isReply || undefined,
-    bannerUrl: bannerUrl ?? undefined,
-    gradient2: profile?.gradient2 ?? undefined,
-    gradient3: profile?.gradient3 ?? undefined,
-    tagText: profile?.tagText ?? undefined,
-    tagTextColor: profile?.tagTextColor ?? undefined,
-    tagChipColor: profile?.tagChipColor ?? undefined,
-    bio: profile?.bio ?? undefined,
-    nameEffect: profile?.nameEffect ?? undefined,
-    nameShimmer: profile?.nameShimmer ?? undefined,
-    nameGlow: profile?.nameGlow ?? undefined,
-    // Only when off, so a DM to us can warn it needs both of us online.
-    // Imported lazily like dm.svelte does: the mailbox imports this module.
-    inboxOff: (await import("./mailbox.svelte")).mailboxPrefs.enabled
-      ? undefined
-      : true,
-    pq,
-  });
+  const imageUrl = (url: string | undefined, data: ArrayBuffer | undefined): string | null => {
+    if (url) return url;
+    if (!data) return null;
+    const bytes = new Uint8Array(data);
+    return `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
+  };
+
+  const frameFor = (source: typeof profile, roomScoped = false): Uint8Array =>
+    encode({
+      type: MessageType.Profile,
+      name: source?.nickname?.trim() || "Anonymous",
+      did,
+      avatarUrl: imageUrl(source?.pfpURL, source?.pfpData),
+      color: source?.color ?? null,
+      peerId: _transport.selfId(),
+      bindingSig: binding?.bindingSig,
+      reply: isReply || undefined,
+      roomProfilesSupported: roomScoped ? undefined : true,
+      roomScoped: roomScoped || undefined,
+      bannerUrl: imageUrl(source?.bannerURL, source?.bannerData) ?? undefined,
+      gradient2: source?.gradient2 ?? undefined,
+      gradient3: source?.gradient3 ?? undefined,
+      tagText: source?.tagText ?? undefined,
+      tagTextColor: source?.tagTextColor ?? undefined,
+      tagChipColor: source?.tagChipColor ?? undefined,
+      bio: source?.bio ?? undefined,
+      nameEffect: source?.nameEffect ?? undefined,
+      nameShimmer: source?.nameShimmer ?? undefined,
+      nameGlow: source?.nameGlow ?? undefined,
+      inboxOff: roomScoped ? undefined : inboxOff,
+      pq: roomScoped ? undefined : pq,
+    });
+
+  // A room with no overrides needs no copy of the profile: it is the main
+  // one, which the peer already has. It gets this instead - a frame with no
+  // profile in it, telling a receiver to drop any room copy it kept from
+  // before a reset, so stale overrides do not outlive the reset.
+  const inheritFrame = (): Uint8Array =>
+    encode({
+      type: MessageType.Profile,
+      name: "",
+      did,
+      avatarUrl: null,
+      peerId: _transport.selfId(),
+      bindingSig: binding?.bindingSig,
+      roomScoped: true,
+      roomInherit: true,
+    });
+
+  const payload = frameFor(profile);
 
   const hash = frameHash(payload);
   const sendTo = (pid: string): boolean => {
@@ -1163,11 +1209,26 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
 
   const sendProfileTo = async (pid: string): Promise<void> => {
     const room = profileDeliveryRoom(_transport.rooms(), pid, (r) => _transport.peersInRoom(r));
-    if (room === null || !sendTo(pid)) return;
-    const delivered = await (room === undefined
-      ? _transport.send(pid, payload)
-      : _transport.sendRoom(pid, room, payload)).catch(() => false);
-    if (!delivered) _profileEcho.forget(pid);
+    if (room === null) return;
+    if (sendTo(pid)) {
+      const delivered = await (room === undefined
+        ? _transport.send(pid, payload)
+        : _transport.sendRoom(pid, room, payload)).catch(() => false);
+      if (!delivered) _profileEcho.forget(pid);
+    }
+    if (!supportingPeers.has(pid) || !profile || !did) return;
+    for (const roomCode of profileRoomsForPeer(_transport.rooms(), pid, supportingPeers.has(pid), r => _transport.peersInRoom(r))) {
+      const roomRecord = await getRoom(roomCode);
+      if (roomRecord?.type !== "text") continue;
+      const override = await getOwnRoomProfile(roomCode, did);
+      const scoped = override && hasRoomOverrides(override.fields)
+        ? frameFor(resolveRoomProfile(profile, override.fields), true)
+        : inheritFrame();
+      const scopedHash = frameHash(scoped);
+      if (!_profileEcho.shouldSend(pid, scopedHash, Date.now(), roomCode)) continue;
+      const delivered = await _transport.sendRoom(pid, roomCode, scoped).catch(() => false);
+      if (!delivered) _profileEcho.forget(pid, roomCode);
+    }
   };
 
   if (peerId) {
@@ -1236,6 +1297,7 @@ const _lastAppInbound = new Map<string, number>();
 const _profileRepair = new Map<string, { next: number; delay: number }>();
 /** One copy of an unchanged profile per peer per burst - see profile-echo.ts. */
 const _profileEcho = new ProfileEcho();
+const _roomProfilePeers = new Set<string>();
 
 if (typeof window !== "undefined") {
   setInterval(() => {
@@ -1507,9 +1569,10 @@ export async function _loadHistory(
   stillCurrent: () => boolean = () => true
 ): Promise<void> {
   const page = { capped: false };
-  const [msgs, profiles] = await Promise.all([
+  const [msgs, profiles, roomProfiles] = await Promise.all([
     getMessages(roomCode, undefined, page),
     getAllPeerProfiles(),
+    getAllPeerRoomProfiles(roomCode),
   ]);
   if (!stillCurrent()) return;
   // Storage and the live view share the same logical sequence/ID ordering.
@@ -1535,6 +1598,13 @@ export async function _loadHistory(
     transportState.peerAvatars = avatars;
     transportState.peerColors = colors;
   }
+  // Merged, not replaced: a room frame that landed while storage was being
+  // read is newer than what the read returned.
+  const scoped = new Map(transportState.peerRoomProfiles);
+  const peers = new Map(roomProfiles.map(p => [p.did, p]));
+  for (const [did, live] of scoped.get(roomCode) ?? []) peers.set(did, live);
+  scoped.set(roomCode, peers);
+  transportState.peerRoomProfiles = scoped;
 
   for (const msg of msgs) {
     if (msg.type !== MessageType.File || !msg.meta?.files?.length) continue;
@@ -2326,6 +2396,59 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
 // every incoming chat row needs exactly the same treatment (wireToMessage),
 // and that path must not import this module - it boots libp2p on import.
 
+/**
+ * A peer's profile for one protected room (room-profile.ts). Kept only when
+ * it came over that room's own verified channel from a verified member, and
+ * put through the same checks as any stored profile.
+ */
+async function _handleScopedProfile(
+  peerId: string,
+  did: string,
+  msg: WireProfile,
+  room: string | null
+): Promise<void> {
+  if (!room?.startsWith("rd2_") || !_transport.rooms().includes(room) ||
+      !_transport.isRoomPeer(room, peerId)) return;
+  if (did === (identityStore.did ?? "")) return;
+  const joinedRoom = await getRoom(room);
+  if (joinedRoom?.type !== "text") return;
+  _noteAttestedMembers(room, new Map([[did, Date.now()]]));
+  if (msg.roomInherit === true) {
+    // They show their main profile here now: forget the room copy.
+    await deletePeerRoomProfile(room, did).catch(() => {});
+    if (transportState.peerRoomProfiles.get(room)?.has(did)) {
+      const scoped = new Map(transportState.peerRoomProfiles);
+      const peers = new Map(scoped.get(room));
+      peers.delete(did);
+      scoped.set(room, peers);
+      transportState.peerRoomProfiles = scoped;
+    }
+    return;
+  }
+  const peerProfile = sanitizePeerProfile({
+    did, isMe: false, nickname: msg.name, pfpURL: msg.avatarUrl ?? undefined,
+    color: msg.color ?? undefined, updatedAt: Date.now(),
+    bannerURL: msg.bannerUrl ?? undefined, gradient2: msg.gradient2 ?? undefined,
+    gradient3: msg.gradient3 ?? undefined, tagText: msg.tagText ?? undefined,
+    tagTextColor: msg.tagTextColor ?? undefined, tagChipColor: msg.tagChipColor ?? undefined,
+    bio: msg.bio ?? undefined, nameEffect: msg.nameEffect ?? undefined,
+    nameShimmer: msg.nameShimmer ?? undefined, nameGlow: msg.nameGlow ?? undefined,
+  } as PeerProfile);
+  try {
+    await putPeerRoomProfile(room, joinedRoom.createdAt, peerProfile);
+  } catch {
+    return;
+  }
+  const currentRoom = await getRoom(room);
+  if (currentRoom?.type !== "text" || currentRoom.createdAt !== joinedRoom.createdAt ||
+      !_transport.rooms().includes(room) || !_transport.isRoomPeer(room, peerId)) return;
+  const scoped = new Map(transportState.peerRoomProfiles);
+  const peers = new Map(scoped.get(room));
+  peers.set(did, peerProfile);
+  scoped.set(room, peers);
+  transportState.peerRoomProfiles = scoped;
+}
+
 async function _handleProfile(
   peerId: string,
   msg: WireProfile,
@@ -2365,6 +2488,16 @@ async function _handleProfile(
     _replayPendingDm(peerId, did);
   }
 
+  // A room-scoped frame travels on its own room's stream and can land before
+  // the main one, so it gets the binding bookkeeping above - and nothing
+  // else: no reply, no sync, no post-quantum key, no main-profile state.
+  if (msg.roomScoped === true) {
+    await _handleScopedProfile(peerId, did, msg, channelRoom);
+    return;
+  }
+  const newRoomProfileSupport = msg.roomProfilesSupported === true && !_roomProfilePeers.has(peerId);
+  if (newRoomProfileSupport) _roomProfilePeers.add(peerId);
+
   // Answer with everything about our current state, on EVERY profile we did
   // not ourselves provoke - not only when the mapping is new.
   //
@@ -2375,6 +2508,9 @@ async function _handleProfile(
   if (!msg.reply) {
     _sendProfile(peerId, true);
     _sendCallFramesTo(peerId);
+  } else if (newRoomProfileSupport) {
+    // The initial main frame was already sent before capability was known.
+    _sendProfile(peerId, true);
   }
   // Reconcile history with them either way; debounced, so a burst is one.
   _syncPeer(peerId);
@@ -3284,6 +3420,7 @@ _transport.on("streamLost", (peerId) => {
 });
 
 _transport.on("connect", (peerId) => {
+  _roomProfilePeers.delete(peerId);
   transportState.peers = _transport.peers();
   // The DID cannot be derived from the peerId any more (devices carry their
   // own libp2p keys); it arrives with the signed binding in the Profile.
@@ -3346,6 +3483,7 @@ _transport.on("disconnect", (peerId) => {
   _lastAppInbound.delete(peerId);
   _profileRepair.delete(peerId);
   _profileEcho.forget(peerId);
+  _roomProfilePeers.delete(peerId);
   // Same lifetime as the two above, and it was not being pruned. Deliberately
   // NOT _pendingDmByPeer: those are DMs already delivered to us and held only
   // until the sender's DID binds, so dropping them on a disconnect would throw
@@ -4085,6 +4223,7 @@ export async function connect() {
   if (transportState.relayConnected && _transport.p2pNode) return;
   // Post-unlock, so sealed profile rows are readable now.
   _hydratePeerProfileMeta();
+  _hydratePeerRoomProfiles();
   // Fetch fresh short-lived TURN credentials for this session (best-effort;
   // falls back to bundled ICE servers if the relay doesn't issue them).
   refreshTurnCredentials().catch(() => {});
@@ -4341,6 +4480,9 @@ export async function removeRoomCompletely(roomCode: string): Promise<void> {
     transportState.connected = false;
   }
   await removeRoom(roomCode);
+  const scoped = new Map(transportState.peerRoomProfiles);
+  scoped.delete(roomCode);
+  transportState.peerRoomProfiles = scoped;
 }
 
 export function leaveRoom(): void {
@@ -4412,6 +4554,7 @@ function _disconnectWithoutBroadcasting(): void {
   releaseNodeLock();
   stopTelemetryTaps();
   _peerIdToDid.clear();
+  _roomProfilePeers.clear();
   _pendingMoveClaims.clear();
   clearCardStates();
   // The search corpus is decrypted message text; it dies with the session
@@ -4438,6 +4581,7 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.peerNames = new Map();
   transportState.peerAvatars = new Map();
   transportState.peerColors = new Map();
+  transportState.peerRoomProfiles = new Map();
   transportState.peerInboxOff = new Set();
   _inboxHeardLive.clear();
   transportState.error = null;

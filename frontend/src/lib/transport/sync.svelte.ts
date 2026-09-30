@@ -24,6 +24,9 @@ import {
   setWatermark,
   getOwnProfile,
   getPeerProfile,
+  getAllOwnRoomProfiles,
+  getAllRoomDeletionMarkers,
+  roomDeletionCutoff,
 } from "../storage";
 import type { Message, Attachment, PendingMessage } from "../types/message";
 import { bytesToBase64 } from "../utils";
@@ -57,6 +60,7 @@ import {
   type BackupFile,
   type DatabaseExport,
   EXPORT_SECTIONS,
+  roomProfileToExport,
 } from "./backup";
 
 export { summarizeBackup, decryptBackup } from "./backup";
@@ -67,7 +71,7 @@ export {
   readBackupFile,
   importDatabase,
 } from "./backup-restore";
-import { importDatabase, type ImportOptions } from "./backup-restore";
+import { applyRoomDeletionMarkers, importDatabase, type ImportOptions } from "./backup-restore";
 export type { ImportOptions } from "./backup-restore";
 export type {
   BackupFile,
@@ -596,9 +600,10 @@ async function startSyncServer(): Promise<void> {
 
       if (msg.type === SyncMessageType.ExportRequest) {
         if (_authorizedExportPeer !== null) return;
-        const { mode, token } = (msg.payload ?? {}) as {
+        const { mode, token, roomDeletions } = (msg.payload ?? {}) as {
           mode?: "add" | "replace";
           token?: string;
+          roomDeletions?: unknown[];
         };
 
         // The room handshake proves the fresh 256-bit capability; require the
@@ -623,6 +628,9 @@ async function startSyncServer(): Promise<void> {
         syncState.isConnecting = false;
         syncState.isSyncing = true;
         const requestMode = mode ?? "replace";
+        if (requestMode === "add" && Array.isArray(roomDeletions)) {
+          await applyRoomDeletionMarkers(roomDeletions);
+        }
         console.log(
           `[Sync][Source] Received ExportRequest, mode: ${requestMode}, sending data...`
         );
@@ -710,7 +718,7 @@ async function sendExportData(
     // Send messages in batches with rate limiting
     const sections = EXPORT_SECTIONS.map((name) => ({
       name,
-      data: exportData[name] as unknown[],
+      data: (exportData[name] ?? []) as unknown[],
     }));
 
     let processed = 0;
@@ -907,9 +915,10 @@ export async function connectAsTarget(
      * a request that never left this one.
      */
     const requestExport = async (peerId: string): Promise<void> => {
+      const roomDeletions = mode === "add" ? await getAllRoomDeletionMarkers() : [];
       const frame = encode({
         type: SyncMessageType.ExportRequest,
-        payload: { mode, token: payload.token },
+        payload: { mode, token: payload.token, roomDeletions },
       });
       // ponytail: 3 tries, 2s apart; each send already spends the
       // transport's ~5.6s confirm budget before resolving false.
@@ -1154,6 +1163,8 @@ export async function connectAsTarget(
                     | PeerProfile
                     | OwnProfile
                   )[],
+                  roomProfiles: (receivedData.roomProfiles || []) as DatabaseExport["roomProfiles"],
+                  roomDeletions: (receivedData.roomDeletions || []) as DatabaseExport["roomDeletions"],
                   savedGifs: (receivedData.savedGifs || []) as SavedGif[],
                 },
                 mode,
@@ -1313,6 +1324,8 @@ async function exportDatabase(skipIdentity = false): Promise<DatabaseExport> {
     rooms,
     profiles,
     savedGifs,
+    roomProfiles,
+    roomDeletions,
   ] = await Promise.all([
     // The export format carries PLAINTEXT records (it has its own transport
     // encryption and validators that inspect fields), so sealed rows are
@@ -1338,6 +1351,8 @@ async function exportDatabase(skipIdentity = false): Promise<DatabaseExport> {
     db.getAll("rooms").then((r) => openRows(r, STORE_SPECS.rooms)),
     db.getAll("profiles").then((r) => openRows(r, STORE_SPECS.profiles)),
     db.getAll("savedGifs").then((r) => openRows(r, STORE_SPECS.savedGifs)),
+    getAllOwnRoomProfiles(),
+    getAllRoomDeletionMarkers(),
   ]);
 
   const result: DatabaseExport = {
@@ -1354,6 +1369,13 @@ async function exportDatabase(skipIdentity = false): Promise<DatabaseExport> {
     })),
     rooms: (rooms as (Room | DMRoom)[]).map(pfpToJson),
     profiles: (profiles as (PeerProfile | OwnProfile)[]).map(pfpToJson),
+    roomProfiles: roomProfiles.filter(r => {
+      const joined = (rooms as (Room | DMRoom)[]).find(room => room.roomCode === r.roomCode);
+      const marker = roomDeletions.find(m => m.roomCode === r.roomCode);
+      return (!keypair || r.did === keypair.did) && joined?.type === "text" &&
+        r.generation > (marker ? roomDeletionCutoff(marker) : -1);
+    }).map(roomProfileToExport),
+    roomDeletions,
     // Saved uploaded gifs carry bytes, and JSON.stringify(ArrayBuffer) is {} -
     // without this they silently arrived empty on the other device.
     savedGifs: (savedGifs as SavedGif[]).map((g) => ({

@@ -16,6 +16,7 @@ import {
   summarizeBackup,
   type BackupFile,
   bytesFromExport,
+  roomProfileToExport,
 } from "./backup";
 
 function backupJson(overrides: Record<string, unknown> = {}): string {
@@ -79,7 +80,53 @@ describe("parseBackup", () => {
     expect(data.rooms).toEqual([]);
     expect(data.attachments).toEqual([]);
     expect(data.savedGifs).toEqual([]);
+    expect(data.roomProfiles).toEqual([]);
+    expect(data.roomDeletions).toEqual([]);
     expect(data.exportedAt).toBe(0);
+  });
+});
+
+describe("room profile backup records", () => {
+  const base = {
+    messages: [], attachments: [], pending: [], watermarks: [], yjsDocs: [],
+    rooms: [], profiles: [], savedGifs: [],
+  };
+
+  it("retains explicit clears and edit clocks, and drops invalid fields or markers", () => {
+    const record = { roomCode: "rd2_a", did: "did:alice", generation: 100,
+      fields: { nickname: null, color: "#123456" },
+      fieldEdits: { nickname: { at: 101, id: "device-a" } } };
+    const result = sanitizeCollections({ ...base,
+      roomProfiles: [record, { ...record, fields: { inboxOff: true } },
+        { ...record, fields: { did: "spoofed identity" } },
+        { ...record, fieldEdits: { nickname: { at: -1, id: "bad" } } }],
+      roomDeletions: [{ roomCode: "rd2_b", generation: 120, deletedAt: 121 },
+        { roomCode: "rd2_b", generation: -1, deletedAt: 121 }],
+    });
+    expect(result.roomProfiles).toEqual([record]);
+    expect(result.roomDeletions).toEqual([{ roomCode: "rd2_b", generation: 120, deletedAt: 121 }]);
+    expect(result.dropped).toBe(4);
+  });
+
+  it("loads old backups without room collections", () => {
+    expect(BACKUP_VERSION).toBe(3);
+    const old = parseBackup(backupJson({ version: 2 }));
+    expect(old.roomProfiles).toEqual([]);
+    expect(old.roomDeletions).toEqual([]);
+  });
+
+  it("encodes nested avatar and banner bytes while preserving reset clocks", () => {
+    const record = roomProfileToExport({ roomCode: "rd2_a", did: "did:alice", generation: 100,
+      fields: { pfpData: new Uint8Array([1, 2]).buffer, bannerData: new Uint8Array([3]).buffer,
+        nickname: null },
+      fieldEdits: { nickname: { at: 101, id: "device", reset: true } },
+    });
+    expect(record.fields.pfpData).toBe(btoa(String.fromCharCode(1, 2)));
+    expect(record.fields.bannerData).toBe(btoa(String.fromCharCode(3)));
+    expect(record.fields.nickname).toBeNull();
+    expect(record.fieldEdits?.nickname).toEqual({ at: 101, id: "device", reset: true });
+    expect(sanitizeCollections({ messages: [], attachments: [], pending: [], watermarks: [],
+      yjsDocs: [], rooms: [], profiles: [], savedGifs: [], roomProfiles: [record] }).roomProfiles).toEqual([record]);
   });
 });
 
@@ -153,7 +200,7 @@ describe("mergeImportedRoom", () => {
       participantLastSeen: { "did:key:zA": 5, "did:key:zB": 80 },
     });
     expect(merged.lastSeenLamport).toBe(500);
-    expect(merged.createdAt).toBe(100);
+    expect(merged.createdAt).toBe(200);
     expect([...merged.participants].sort()).toEqual([
       "did:key:zA",
       "did:key:zB",
