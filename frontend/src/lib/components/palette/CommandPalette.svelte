@@ -128,7 +128,7 @@
       case "Backspace":
         // Read the live element value: on a key repeat the state write lags a
         // tick, which pops a page the user was still typing in.
-        if (palette.backspace((e.currentTarget as HTMLInputElement).value)) {
+        if (palette.backspace(inputEl?.value ?? "")) {
           e.preventDefault();
         }
         return;
@@ -170,6 +170,31 @@
         void palette.accept();
         return;
     }
+  }
+
+  /**
+   * A click anywhere in the palette must not take focus from the input.
+   *
+   * Rows, the back button and the forget button carry `tabindex="-1"` to stay
+   * out of the Tab sequence, but that still makes them focusable by a click:
+   * one click on a toggle row moved focus onto the row, and from then on
+   * Escape, the arrows and Enter reached nothing, since every key is handled
+   * on the input. Cancelling mousedown keeps focus where it is and still lets
+   * the click through.
+   */
+  function keepInputFocus(e: MouseEvent): void {
+    if (e.target !== inputEl) e.preventDefault();
+  }
+
+  /**
+   * Backstop for a key that arrives while focus is somewhere else in the
+   * palette anyway: send focus home and handle it there. Focusing during
+   * keydown also lands a typed character in the input.
+   */
+  function handleStrayKeydown(e: KeyboardEvent): void {
+    if (e.target === inputEl) return;
+    inputEl?.focus();
+    handleKeydown(e);
   }
 
   /**
@@ -215,6 +240,8 @@
              -translate-x-1/2 overflow-hidden rounded-lg border border-border
              bg-popover text-popover-foreground font-mono shadow-2xl duration-150"
       onpointermove={() => (pointerMoved = true)}
+      onmousedown={keepInputFocus}
+      onkeydown={handleStrayKeydown}
     >
       <Dialog.Title class="sr-only">Command palette</Dialog.Title>
       <Dialog.Description class="sr-only">
