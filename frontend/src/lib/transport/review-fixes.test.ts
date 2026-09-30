@@ -139,6 +139,16 @@ it("keeps marked profiles in their authenticated room and leaves the main profil
   expect(transportState.peerNames.get("did:peer")).toBe("Main");
 });
 
+it("rejects a validly bound scoped frame from a peer outside the transport room", async () => {
+  s.handlers.get("message")!("peer2", encode({ type: MessageType.Profile,
+    roomScoped: true, name: "Intruder", did: "did:outsider", peerId: "peer2",
+    bindingSig: "sig", avatarUrl: null }), "rd2_room");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(s.roomWrites).not.toHaveBeenCalled();
+  expect(transportState.peerRoomProfiles.get("rd2_room")?.has("did:outsider")).not.toBe(true);
+  expect(transportState.peerNames.has("did:outsider")).toBe(false);
+});
+
 it("sends scoped profiles after support first arrives in a main reply, without leaking to a DM", async () => {
   const onMessage = s.handlers.get("message")!;
   onMessage("peer1", encode({ type: MessageType.Profile, name: "Peer", did: "did:peer", avatarUrl: null,
