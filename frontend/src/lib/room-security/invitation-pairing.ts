@@ -94,7 +94,9 @@ function hashed(bytes: Uint8Array): string {
 
 /** The pre-v3 transfer key: the OPAQUE session key alone. */
 async function classicTransferKey(sessionKey: string, locator: string, attempt: string): Promise<CryptoKey> {
-  const key = hkdf(sha256, enc.encode(sessionKey), enc.encode(locator), enc.encode(`awful/pairing/v2/transfer/${attempt}`), 32);
+  const session = enc.encode(sessionKey);
+  const key = hkdf(sha256, session, enc.encode(locator), enc.encode(`awful/pairing/v2/transfer/${attempt}`), 32);
+  session.fill(0);
   try { return await crypto.subtle.importKey("raw", new Uint8Array(key), "AES-GCM", false, ["encrypt", "decrypt"]); }
   finally { key.fill(0); }
 }
@@ -109,13 +111,16 @@ async function hybridTransferKey(sessionKey: string, kemShared: Uint8Array, loca
   const info = enc.encode(JSON.stringify([`awful/pairing/v3/transfer/${attempt}`, hashed(ek), hashed(ct)]));
   const key = hkdf(sha256, ikm, enc.encode(locator), info, 32);
   ikm.fill(0);
+  session.fill(0);
   try { return await crypto.subtle.importKey("raw", new Uint8Array(key), "AES-GCM", false, ["encrypt", "decrypt"]); }
   finally { key.fill(0); }
 }
 
 /** The joiner's proof that it used THIS host key, under the OPAQUE session key. */
 function confirmation(sessionKey: string, locator: string, attempt: string, ek: Uint8Array, ct: Uint8Array): string {
-  const key = hkdf(sha256, enc.encode(sessionKey), enc.encode(locator), enc.encode(`awful/pairing/v3/confirm/${attempt}`), 32);
+  const session = enc.encode(sessionKey);
+  const key = hkdf(sha256, session, enc.encode(locator), enc.encode(`awful/pairing/v3/confirm/${attempt}`), 32);
+  session.fill(0);
   try {
     return base64url.encode(hmac(sha256, key, enc.encode(JSON.stringify(["awful/pairing/v3/confirm", hashed(ek), hashed(ct)]))));
   } finally { key.fill(0); }
@@ -251,6 +256,13 @@ export async function startPairingJoin(code: string) {
       }
       const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(nonce), additionalData: aad(locator, attempt) }, key, new Uint8Array(base64url.decode(parts[1])));
       return parseRoomSecret(new TextDecoder("utf-8", { fatal: true }).decode(plaintext));
+    },
+    /** A pairing that ends without a transfer (aborted, timed out, refused)
+     *  must not leave its ML-KEM secret in memory until collection. */
+    dispose(): void {
+      consumed = true;
+      sessionKey = "";
+      hybrid?.shared.fill(0);
     },
   };
 }

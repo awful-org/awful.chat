@@ -333,8 +333,12 @@ async function decryptBlob(
     // ML-KEM never fails to decapsulate: a forged or corrupted ciphertext
     // yields an unrelated secret (implicit rejection), and it is the AES-GCM
     // tag below that refuses it.
-    const kemShared = ml_kem768.decapsulate(kemCt, selfKemPriv);
-    selfKemPriv.fill(0);
+    let kemShared: Uint8Array;
+    try {
+      kemShared = ml_kem768.decapsulate(kemCt, selfKemPriv);
+    } finally {
+      selfKemPriv.fill(0);
+    }
     let key: CryptoKey;
     try {
       key = await deriveHybridKey(shared, kemShared, ephPub, selfXPub, kemCt, selfKemPub);

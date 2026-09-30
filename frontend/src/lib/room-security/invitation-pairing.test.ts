@@ -97,6 +97,14 @@ it("refuses a swapped ML-KEM key before sending anything", async () => {
   await expect(host.finish(join.attempt, finish)).rejects.toThrow("mismatch");
 });
 
+it("drops the joiner's secrets when a pairing ends without a transfer", async () => {
+  const { host, join, proof } = await prepared();
+  join.dispose();
+  // The host still delivers, but the joiner has nothing left to open it with.
+  const payload = await host.finish(join.attempt, proof);
+  await expect(join.open(payload)).rejects.toThrow("Invalid pairing transfer");
+});
+
 it("refuses a replaced ciphertext or confirmation", async () => {
   for (const part of [1, 2]) {
     const { host, join, proof } = await prepared();
