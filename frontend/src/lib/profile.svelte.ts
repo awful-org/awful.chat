@@ -5,7 +5,14 @@ import {
   updateOwnProfile,
   rekeyOwnProfile,
   pfpBlobURL,
+  getAllOwnRoomProfiles,
+  getOwnRoomProfile,
+  putOwnRoomProfile,
+  type OwnProfile,
+  type OwnRoomProfileRecord,
 } from "$lib/storage";
+import { roomsStore } from "$lib/rooms.svelte";
+import { hasRoomOverrides, resolveRoomProfile, type RoomProfileFields } from "$lib/room-profile";
 import { broadcastProfile } from "$lib/transport/transport.svelte";
 import { bytesToBase64, sniffImageMime } from "$lib/utils";
 
@@ -43,8 +50,94 @@ export const profileStore = $state<ProfileStore>({
 });
 
 let _blobUrl: string | undefined;
+export const roomProfileStore = $state<{ records: Map<string, OwnRoomProfileRecord> }>({ records: new Map() });
+function nextFieldEdit(previous?: { at: number }) {
+  const at = Math.max(Date.now(), (previous?.at ?? 0) + 1);
+  return { at, id: `${crypto.randomUUID()}` };
+}
+
+export function getScopedProfile(roomCode: string | null = null): ProfileStore {
+  if (!roomCode || !roomsStore.rooms.some(r => r.roomCode === roomCode && r.type === "text")) return profileStore;
+  const main: OwnProfile = {
+    did: identityStore.did ?? "", isMe: true, updatedAt: 0,
+    nickname: profileStore.nickname, pfpURL: profileStore.avatarUrl,
+    bannerURL: profileStore.bannerUrl, color: profileStore.color,
+    tagText: profileStore.tagText, tagTextColor: profileStore.tagTextColor,
+    tagChipColor: profileStore.tagChipColor, bio: profileStore.bio,
+    nameEffect: profileStore.nameEffect, nameShimmer: profileStore.nameShimmer,
+    nameGlow: profileStore.nameGlow, gradient2: profileStore.gradient2,
+    gradient3: profileStore.gradient3,
+  };
+  const record = roomProfileStore.records.get(roomCode);
+  const p = resolveRoomProfile(main, record?.did === main.did ? record.fields : undefined);
+  return {
+    nickname: p.nickname, avatarUrl: p.pfpURL ?? (p.pfpData ? `data:${sniffImageMime(new Uint8Array(p.pfpData))};base64,${bytesToBase64(new Uint8Array(p.pfpData))}` : undefined),
+    bannerUrl: p.bannerURL ?? (p.bannerData ? `data:${sniffImageMime(new Uint8Array(p.bannerData))};base64,${bytesToBase64(new Uint8Array(p.bannerData))}` : undefined),
+    color: p.color, tagText: p.tagText, tagTextColor: p.tagTextColor,
+    tagChipColor: p.tagChipColor, bio: p.bio, nameEffect: p.nameEffect,
+    nameShimmer: p.nameShimmer, nameGlow: p.nameGlow,
+    gradient2: p.gradient2, gradient3: p.gradient3,
+  };
+}
+
+export function hasScopedOverrides(roomCode: string): boolean {
+  return hasRoomOverrides(roomProfileStore.records.get(roomCode)?.fields ?? {});
+}
+
+export async function loadRoomProfile(roomCode: string): Promise<void> {
+  const did = identityStore.did;
+  if (!did) return;
+  const record = await getOwnRoomProfile(roomCode, did);
+  const next = new Map(roomProfileStore.records);
+  if (record) next.set(roomCode, record);
+  else next.delete(roomCode);
+  roomProfileStore.records = next;
+}
+
+/** Capture the scope at call time; serialize writes so concurrent field edits merge. */
+export async function saveScopedFields(roomCode: string, patch: RoomProfileFields): Promise<void> {
+  const did = identityStore.did;
+  const room = roomsStore.rooms.find(r => r.roomCode === roomCode && r.type === "text");
+  if (!did || !room) throw new Error("room is not joined");
+  await chained(async () => {
+    const existing = await getOwnRoomProfile(roomCode, did);
+    const fields = { ...(existing?.fields ?? {}), ...patch };
+    const fieldEdits = { ...existing?.fieldEdits };
+    for (const [key, other] of [["pfpURL", "pfpData"], ["pfpData", "pfpURL"], ["bannerURL", "bannerData"], ["bannerData", "bannerURL"]] as const) {
+      if (!Object.hasOwn(patch, key)) continue;
+      delete fields[other];
+      fieldEdits[other] = { ...nextFieldEdit(fieldEdits[other]), reset: true };
+    }
+    for (const field of Object.keys(patch) as (keyof RoomProfileFields)[]) {
+      fieldEdits[field] = nextFieldEdit(fieldEdits[field]);
+    }
+    const record: OwnRoomProfileRecord = { roomCode, did, generation: room.createdAt, fields, fieldEdits };
+    await putOwnRoomProfile(record);
+    roomProfileStore.records = new Map(roomProfileStore.records).set(roomCode, record);
+  });
+  broadcastProfile();
+}
+
+export async function resetScopedProfile(roomCode: string): Promise<void> {
+  const did = identityStore.did;
+  const room = roomsStore.rooms.find(r => r.roomCode === roomCode && r.type === "text");
+  if (!did || !room) throw new Error("room is not joined");
+  await chained(async () => {
+    const existing = await getOwnRoomProfile(roomCode, did);
+    const fieldEdits = { ...existing?.fieldEdits };
+    for (const field of Object.keys(existing?.fields ?? {}) as (keyof RoomProfileFields)[]) {
+      fieldEdits[field] = { ...nextFieldEdit(fieldEdits[field]), reset: true };
+    }
+    const record: OwnRoomProfileRecord = { roomCode, did, generation: room.createdAt, fields: {}, fieldEdits };
+    await putOwnRoomProfile(record);
+    roomProfileStore.records = new Map(roomProfileStore.records).set(roomCode, record);
+  });
+  broadcastProfile();
+}
 
 export async function loadProfile(): Promise<void> {
+  const ownRooms = await getAllOwnRoomProfiles();
+  roomProfileStore.records = new Map(ownRooms.filter(r => r.did === identityStore.did).map(r => [r.roomCode, r]));
   const p = await getOwnProfile(identityStore.did ?? undefined);
   if (!p) return;
   // Repair profiles written before the identity was known: the row was keyed
