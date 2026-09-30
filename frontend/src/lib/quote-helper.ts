@@ -50,21 +50,23 @@ export function getQuotableText(msg: Message, limit = 160): string {
 
 /**
  * The spans markdown.ts reads whole: a fence (or a one-line ```code```), a
- * code span, a [label](url).
+ * code span, a [label](url), a ||spoiler|| - cut open, its hidden text would
+ * show in the quote.
  */
-const SPAN_RE = /```[^]*?```|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s()<>"]+\)/g;
+const SPAN_RE = /```[^]*?```|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s()<>"]+\)|(?<!\|)\|\|(?!\|)[^\n]*?(?<!\|)\|\|(?!\|)/g;
 
 /**
  * Trim content to 160 characters with ellipsis if needed. Matches the snapshot
  * construction logic used when building reply snapshots on send.
  *
  * The snapshot is markdown, shown stripped (markdown.ts), so a cut through a
- * span the full text holds - a fence, a code span, a [label](url) - backs off
+ * span the full text holds - a fence, a code span, a [label](url), a
+ * spoiler - backs off
  * to before it rather than leave its half on show as raw syntax. Only spans
  * that really close count: a lone "`" or "[" is text in the full message too,
  * and cutting back to it dropped everything after it. A message that opens
- * with a fence or a code span has nothing before it to keep, so that one is
- * closed after the cut instead of quoted as a bare "...".
+ * with a fence, a code span or a spoiler has nothing before it to keep, so
+ * that one is closed after the cut instead of quoted as a bare "...".
  */
 export function trimContent(text: string, limit = 160): string {
   if (text.length <= limit) return text;
@@ -75,7 +77,7 @@ export function trimContent(text: string, limit = 160): string {
     if (start + m[0].length <= cut.length) continue;
     const before = cut.slice(0, start).trimEnd();
     if (before || m[0][0] === "[") return `${before}...`;
-    const tick = m[0].startsWith("```") ? "```" : "`";
+    const tick = m[0].startsWith("```") ? "```" : m[0].startsWith("||") ? "||" : "`";
     return `${cut.trimEnd()}...${tick === "```" && cut.includes("\n") ? "\n" : ""}${tick}`;
   }
   return `${cut.trimEnd()}...`;

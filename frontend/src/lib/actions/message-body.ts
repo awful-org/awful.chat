@@ -1,6 +1,7 @@
 /**
- * The fenced blocks in a rendered message body (markdown.ts): highlight each
- * one, and answer each one's copy button. Every block, not only the first.
+ * What a rendered message body (markdown.ts) needs once it is on screen:
+ * every fenced block highlighted, every copy button answered, and every
+ * spoiler revealed on a click or Enter/Space.
  *
  * Attached with the body's html as its argument, so a new body - an edit, a
  * late mention name - re-runs it and a stale highlight never lands.
@@ -21,7 +22,7 @@ export function stripControlChars(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "");
 }
 
-export function codeBlocks(html: string): Attachment<HTMLElement> {
+export function messageBody(html: string): Attachment<HTMLElement> {
   return (node) => {
     void html;
     let live = true;
@@ -55,8 +56,24 @@ export function codeBlocks(html: string): Attachment<HTMLElement> {
         .catch(() => {});
     });
 
+    const reveal = (e: Event): boolean => {
+      const spoiler = (e.target as Element | null)?.closest<HTMLElement>("[data-spoiler]");
+      if (!spoiler || !node.contains(spoiler) || spoiler.hasAttribute("data-revealed")) return false;
+      // The first click shows it; it does not also follow a link inside.
+      e.preventDefault();
+      spoiler.setAttribute("data-revealed", "");
+      spoiler.removeAttribute("role");
+      spoiler.removeAttribute("tabindex");
+      spoiler.removeAttribute("aria-label");
+      return true;
+    };
+    const onKeydown = (e: KeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") reveal(e);
+    };
+
     const timers = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>();
     const onClick = async (e: MouseEvent) => {
+      if (reveal(e)) return;
       const button = (e.target as Element | null)?.closest<HTMLElement>("[data-copy-code]");
       if (!button || !node.contains(button)) return;
       const text = button.closest("[data-code-block]")?.querySelector("pre")?.textContent ?? "";
@@ -80,10 +97,12 @@ export function codeBlocks(html: string): Attachment<HTMLElement> {
       );
     };
     node.addEventListener("click", onClick);
+    node.addEventListener("keydown", onKeydown);
 
     return () => {
       live = false;
       node.removeEventListener("click", onClick);
+      node.removeEventListener("keydown", onKeydown);
     };
   };
 }

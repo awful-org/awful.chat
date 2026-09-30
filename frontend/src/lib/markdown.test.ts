@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { firstLinkedUrl, renderMessageMarkdown, stripMarkdown, trimUrl } from "./markdown";
+import { firstLinkedUrl, linkTargets, renderMessageMarkdown, stripMarkdown, trimUrl } from "./markdown";
 
 const names: Record<string, string> = { "did:key:zAna": "Ana" };
 const md = (s: string) => renderMessageMarkdown(s, (did) => names[did] ?? did.slice(0, 8));
@@ -70,8 +70,10 @@ describe("inline markdown", () => {
   it("takes a backslash-escaped marker literally", () => {
     expect(plain(String.raw`\*not italic\*`)).toBe("*not italic*");
     expect(plain(String.raw`\# not a heading`)).toBe("# not a heading");
-    // "_" is no marker here, so a path keeps its backslash.
-    expect(plain(String.raw`C:\Users\_x`)).toBe(String.raw`C:\Users\_x`);
+    // "_" is a marker, so "\_" escapes it, as in Discord: a path that
+    // must keep every backslash belongs in `code`.
+    expect(plain(String.raw`C:\Users\_x`)).toBe("C:\\Users_x");
+    expect(plain("`C:\\Users\\_x`")).toBe("<code>C:\\Users\\_x</code>");
   });
 
   it("masks a link, http(s) only, showing where it goes on hover", () => {
@@ -324,5 +326,103 @@ describe("fenced blocks", () => {
 
   it("escapes a language that is not one", () => {
     expect(md('```"><img src=x onerror=alert(1)>\nx\n```')).not.toMatch(/<img/);
+  });
+});
+
+describe("discord-style inline markup", () => {
+  it("italicizes with underscores and underlines with two, leaving snake_case alone", () => {
+    expect(plain("_italic_")).toBe("<em>italic</em>");
+    expect(plain("__underline__")).toBe("<u>underline</u>");
+    expect(plain("___both___")).toBe("<em><u>both</u></em>");
+    expect(plain("__*mixed*__")).toBe("<u><em>mixed</em></u>");
+    expect(plain("snake_case_name and __init__.py")).toBe("snake_case_name and <u>init</u>.py");
+    expect(plain("a_b_c")).toBe("a_b_c");
+    expect(plain(String.raw`\_not italic\_`)).toBe("_not italic_");
+  });
+
+  it("hides a spoiler until revealed, and never names it in plain text", () => {
+    const html = md("the killer is ||the butler||");
+    expect(html).toContain('data-spoiler role="button" tabindex="0"');
+    expect(html).toMatch(/<span[^>]*data-spoiler[^>]*>the butler<\/span>$/);
+    expect(stripMarkdown("the killer is ||the butler||")).toBe("the killer is [spoiler]");
+    expect(stripMarkdown("||**bold** secret|| and ||two||")).toBe("[spoiler] and [spoiler]");
+  });
+
+  it("takes a spoiler around a link, and a lone bar as a bar", () => {
+    expect(md("||https://a.bc||")).toMatch(/data-spoiler[^>]*><a href="https:\/\/a\.bc"/);
+    expect(plain("a | b | c")).toBe("a | b | c");
+    expect(plain("|||x|||")).toBe("|||x|||");
+    expect(plain("||unclosed")).toBe("||unclosed");
+  });
+});
+
+describe("discord-style blocks", () => {
+  it("quotes a line, and a run of lines as one quote", () => {
+    expect(plain("> hello")).toBe("<blockquote>hello</blockquote>");
+    expect(plain("> one\n> **two**\nafter")).toBe("<blockquote>one\n<strong>two</strong></blockquote>after");
+    expect(plain(">_<")).toBe("&gt;_&lt;");
+  });
+
+  it("quotes the rest of the message after >>>", () => {
+    expect(plain("before\n>>> all\nof\n- this")).toBe(
+      "before<blockquote>all\nof<ul><li>this</li></ul></blockquote>",
+    );
+  });
+
+  it("does not nest quotes", () => {
+    expect(plain("> > inner")).toBe("<blockquote>&gt; inner</blockquote>");
+  });
+
+  it("numbers lists, starting where the first item says", () => {
+    expect(plain("1. one\n2. two")).toBe("<ol><li>one</li><li>two</li></ol>");
+    expect(plain("3. three\n4. four")).toBe('<ol start="3"><li>three</li><li>four</li></ol>');
+    expect(plain("1) paren")).toBe("<ol><li>paren</li></ol>");
+  });
+
+  it("nests lists by indentation, bullets and numbers mixed", () => {
+    expect(plain("- a\n  - b\n    1. c\n- d")).toBe(
+      "<ul><li>a<ul><li>b<ol><li>c</li></ol></li></ul></li><li>d</li></ul>",
+    );
+    // A jump of two levels goes one deeper, never more.
+    expect(plain("- a\n      - b")).toBe("<ul><li>a<ul><li>b</li></ul></li></ul>");
+    // Bullets then numbers at the same depth are two lists.
+    expect(plain("- a\n1. b")).toBe("<ul><li>a</li></ul><ol><li>b</li></ol>");
+    // Siblings typed at the same indent stay siblings, however far in.
+    expect(plain("- a\n    - b\n    - c\n- d")).toBe(
+      "<ul><li>a<ul><li>b</li><li>c</li></ul></li><li>d</li></ul>",
+    );
+    expect(stripMarkdown("- a\n    - b\n    - c")).toBe("• a\n  • b\n  • c");
+  });
+
+  it("quotes a fence the quote opens with, and leaves a bare > as text", () => {
+    expect(plain("> ```js\n> x = 1\n> ```")).toBe('<blockquote><pre><code>x = 1</code></pre></blockquote>');
+    expect(plain(">>> ```\nx\n```")).toBe('<blockquote><pre><code>x</code></pre></blockquote>');
+    expect(plain(">")).toBe("&gt;");
+    expect(plain(">>>")).toBe("&gt;&gt;&gt;");
+    expect(plain(">\n>")).toBe("&gt;\n&gt;");
+  });
+
+  it("renders -# as subtext", () => {
+    expect(plain("-# small print")).toBe("<div>small print</div>");
+    expect(plain("-#nope")).toBe("-#nope");
+  });
+
+  it("strips the new blocks to plain text", () => {
+    expect(stripMarkdown("> quoted _it_\n1. first\n  - sub\n-# fine print")).toBe(
+      "quoted it\n1. first\n  • sub\nfine print",
+    );
+  });
+
+  it("never previews or indexes a link a spoiler hides", () => {
+    expect(firstLinkedUrl("||[a](https://secret.example)|| and https://open.example")).toBe("https://open.example");
+    expect(firstLinkedUrl("||https://secret.example||")).toBeNull();
+    expect(linkTargets("||[a](https://secret.example)|| [b](https://open.example)")).toEqual(["https://open.example"]);
+    // Bars found where the renderer finds them: after an escaped bar, not in code.
+    expect(firstLinkedUrl(String.raw`\|||a https://secret.example||`)).toBeNull();
+    expect(firstLinkedUrl("`||` https://open.example `||`")).toBe("https://open.example");
+  });
+
+  it("finds links inside a quote for the preview", () => {
+    expect(firstLinkedUrl("> see [this](https://a.bc)")).toBe("https://a.bc");
   });
 });
