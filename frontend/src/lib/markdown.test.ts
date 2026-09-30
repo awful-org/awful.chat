@@ -38,6 +38,21 @@ describe("inline markdown", () => {
     }
   });
 
+  it("strikes with one tilde or two, when the pair matches", () => {
+    expect(plain("~a~")).toBe("<s>a</s>");
+    expect(plain("~aa~ and ~~bb~~")).toBe("<s>aa</s> and <s>bb</s>");
+    expect(plain("~**both**~")).toBe("<s><strong>both</strong></s>");
+    expect(plain("~a~~")).toBe("~a~~");
+    expect(plain("~~a~")).toBe("~~a~");
+  });
+
+  it("leaves a lone tilde that is not a strike alone", () => {
+    expect(plain("cd ~/a and ~/b")).toBe("cd ~/a and ~/b");
+    expect(plain("approx ~5 min, ~10 max")).toBe("approx ~5 min, ~10 max");
+    expect(plain("file~1~ and a~b~c")).toBe("file~1~ and a~b~c");
+    expect(plain("~ spaced ~")).toBe("~ spaced ~");
+  });
+
   it("leaves stray and spaced markers alone", () => {
     expect(plain("2 * 3 * 4")).toBe("2 * 3 * 4");
     expect(plain("snake*case*word")).toBe("snake*case*word");
