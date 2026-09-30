@@ -165,6 +165,10 @@ export interface WireChatMessage {
 
 export interface WireProfile {
   type: MessageType.Profile;
+  /** Advertised on main frames by clients that understand room profiles. */
+  roomProfilesSupported?: true;
+  /** Only an explicit true makes this a room profile; the transport supplies the room. */
+  roomScoped?: true;
   name: string;
   did: string | null;
   avatarUrl: string | null;
@@ -202,6 +206,11 @@ export interface WireProfile {
   inboxOff?: true;
   gradient2?: string | null;
   gradient3?: string | null;
+}
+
+/** An old profile sent through a room is still a main profile. */
+export function isRoomScopedProfile(profile: WireProfile): boolean {
+  return profile.roomScoped === true;
 }
 
 export interface WireCallPresence {
