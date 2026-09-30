@@ -281,6 +281,11 @@ func pluginProxySafeDial(ctx context.Context, network, addr string) (net.Conn, e
 	if err != nil {
 		return nil, fmt.Errorf("invalid address: %w", err)
 	}
+	// Same two ports as the preview fetcher, for the same reason: an
+	// allowlisted HOST says nothing about which of its ports may be reached.
+	if !allowedFetchPorts[port] {
+		return nil, fmt.Errorf("disallowed port: %s", port)
+	}
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil || len(ips) == 0 {
 		return nil, fmt.Errorf("lookup failed for %s", host)
