@@ -150,6 +150,7 @@
   } from "$lib/notify-prefs.svelte";
   import { takeDroppedReplyDraft } from "$lib/notify-intents";
   import { formatRoomCode } from "$lib/room-code";
+  import type { PeerProfile } from "$lib/storage";
 
   $effect(() => {
     loadProfile();
@@ -194,6 +195,9 @@
     incomingSharedFiles?: File[];
     incomingSharedText?: string;
     onConsumeIncomingShared?: () => void;
+    /** This DM is a message request (storage.ts DMRoom.request). */
+    dmRequest?: boolean;
+    onAcceptDmRequest?: () => void;
   }
 
   let {
@@ -207,6 +211,8 @@
     incomingSharedFiles = [],
     incomingSharedText = "",
     onConsumeIncomingShared,
+    dmRequest = false,
+    onAcceptDmRequest,
   }: Props = $props();
 
   // Reset scroll state when room changes
@@ -1614,26 +1620,42 @@
     return (displayName(msg) || msg.senderId).charAt(0).toUpperCase();
   }
 
+  /**
+   * The sender's profile for this room, when they have one (room-profile.ts).
+   * It is the WHOLE presentation in this room: the sender resolved it against
+   * their main profile before sending, so a field it lacks was cleared on
+   * purpose and must not be filled in from the main profile.
+   */
+  function roomProfileOf(senderId: string): PeerProfile | undefined {
+    return roomCode.startsWith("rd2_")
+      ? peerRoomProfiles.get(roomCode)?.get(senderDid(senderId))
+      : undefined;
+  }
+
   function senderAvatar(senderId: string): string | undefined {
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(senderDid(senderId)) : undefined;
-    return (
-      scoped?.pfpURL ?? peerAvatars.get(senderDid(senderId)) ?? peerAvatars.get(senderId)
-    );
+    const scoped = roomProfileOf(senderId);
+    if (scoped) return scoped.pfpURL;
+    return peerAvatars.get(senderDid(senderId)) ?? peerAvatars.get(senderId);
   }
 
   /** User-picked nickname color, keyed like names (by DID, peerId fallback). */
   function senderColor(senderId: string): string | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(senderDid(senderId)) : undefined;
-    return scoped?.color ?? peerColors.get(senderDid(senderId)) ?? peerColors.get(senderId);
+    const scoped = roomProfileOf(senderId);
+    if (scoped) return scoped.color;
+    return peerColors.get(senderDid(senderId)) ?? peerColors.get(senderId);
+  }
+
+  /** The name-effect fields, from the room profile or else the main one. */
+  function senderMeta(senderId: string) {
+    const did = senderDid(senderId);
+    return roomProfileOf(senderId) ?? peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
   }
 
   /** Name effect, keyed like names (by DID, peerId fallback). Respects showPeerNicknameColors. */
   function senderEffect(senderId: string): string | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(did) : undefined;
-    return scoped?.nameEffect ?? peerProfileMeta.get(did)?.nameEffect ?? peerProfileMeta.get(senderId)?.nameEffect;
+    return senderMeta(senderId)?.nameEffect;
   }
 
   /** Gradient stops for the gradient effect, keyed like names. */
@@ -1641,26 +1663,20 @@
     g2?: string;
     g3?: string;
   } {
-    const did = senderDid(senderId);
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(did) : undefined;
-    const meta = scoped ?? peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
-    return { g2: meta?.gradient2, g3: meta?.gradient3 };
+    const meta = senderMeta(senderId);
+    return { g2: meta?.gradient2 ?? undefined, g3: meta?.gradient3 ?? undefined };
   }
 
   /** Shimmer state for the name effect, keyed like names. Respects showPeerNicknameColors. */
   function senderShimmer(senderId: string): boolean | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(did) : undefined;
-    return scoped?.nameShimmer ?? peerProfileMeta.get(did)?.nameShimmer ?? peerProfileMeta.get(senderId)?.nameShimmer;
+    return senderMeta(senderId)?.nameShimmer;
   }
 
   /** Glow state for the name effect, keyed like names. Respects showPeerNicknameColors. */
   function senderGlow(senderId: string): boolean | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(did) : undefined;
-    return scoped?.nameGlow ?? peerProfileMeta.get(did)?.nameGlow ?? peerProfileMeta.get(senderId)?.nameGlow;
+    return senderMeta(senderId)?.nameGlow;
   }
 
   /** Tag chip, keyed like names. Deliberately NOT behind
@@ -1669,9 +1685,7 @@
   function senderTag(
     senderId: string
   ): { text: string; textColor: string; chipColor: string } | null {
-    const did = senderDid(senderId);
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(did) : undefined;
-    const meta = scoped ?? peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
+    const meta = senderMeta(senderId);
     if (!meta?.tagText) return null;
     return {
       text: meta.tagText,
@@ -1683,9 +1697,8 @@
   /** Live name wins over the one stored with the message, so a rename shows up
    *  on everything that person ever said, not just what they say next. */
   function displayNameFor(senderId: string, stored?: string): string {
-    const scoped = roomCode.startsWith("rd2_") ? peerRoomProfiles.get(roomCode)?.get(senderDid(senderId)) : undefined;
     return (
-      scoped?.nickname || peerNames.get(senderDid(senderId)) ||
+      roomProfileOf(senderId)?.nickname || peerNames.get(senderDid(senderId)) ||
       peerNames.get(senderId) ||
       stored ||
       senderId.slice(0, 8)
@@ -3059,6 +3072,24 @@
         <ArrowDown class="size-3" /> New messages below <ArrowDown
           class="size-3"
         />
+      </Button>
+    </div>
+  {/if}
+
+  {#if dmRequest}
+    <!-- Answering accepts too (sendDirectMessage); Delete is the same act as
+         deleting any conversation. -->
+    <div
+      role="status"
+      class="flex flex-wrap items-center gap-2 border-t border-border bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground"
+    >
+      <UserPlus class="size-3.5 shrink-0" />
+      <span class="min-w-0 flex-1">
+        Message request. They are not a contact and share no room with you.
+      </span>
+      <Button variant="ghost" size="sm" onclick={() => onLeave()}>Delete</Button>
+      <Button variant="secondary" size="sm" onclick={() => onAcceptDmRequest?.()}>
+        Accept
       </Button>
     </div>
   {/if}

@@ -40,8 +40,8 @@ it("mutually binds authenticated device peers and derives matching secrets over 
   const p = pair();
   expect(await p.initiator.ready).toBe(true);
   expect(await p.responder.ready).toBe(true);
-  expect(p.acceptedA).toHaveBeenCalledWith(p.bob.did, expect.any(String));
-  expect(p.acceptedB).toHaveBeenCalledWith(p.alice.did, p.acceptedA.mock.calls[0][1]);
+  expect(p.acceptedA).toHaveBeenCalledWith(p.bob.did, expect.any(String), expect.any(Boolean));
+  expect(p.acceptedB).toHaveBeenCalledWith(p.alice.did, p.acceptedA.mock.calls[0][1], expect.any(Boolean));
 });
 it("rejects connection substitution before publishing a DID binding", async () => {
   const p = pair(undefined, "mallory-device");

@@ -1,5 +1,6 @@
 import type { FileSignalEnvelope } from "$lib/transport/types";
 import { normalizeWireName, stripWireControls } from "$lib/wire-name";
+import type { PqKeyCertificate } from "$lib/identity/pq-identity";
 
 export enum MessageType {
   // chat - persisted to IDB, sent over wire
@@ -169,6 +170,11 @@ export interface WireProfile {
   roomProfilesSupported?: true;
   /** Only an explicit true makes this a room profile; the transport supplies the room. */
   roomScoped?: true;
+  /**
+   * On a room frame only: the sender has no overrides in this room, so it
+   * carries no profile and the receiver drops any room copy it holds.
+   */
+  roomInherit?: true;
   name: string;
   did: string | null;
   avatarUrl: string | null;
@@ -206,6 +212,14 @@ export interface WireProfile {
   inboxOff?: true;
   gradient2?: string | null;
   gradient3?: string | null;
+  /**
+   * The sender's ML-KEM-768 key with their DID's signature over it
+   * (identity/pq-identity.ts). Absent from older builds, which is also how a
+   * peer without post-quantum support is recognised. Self-certifying, so it
+   * is re-verified against the proven DID rather than trusted for arriving
+   * on a bound connection.
+   */
+  pq?: PqKeyCertificate;
 }
 
 /** An old profile sent through a room is still a main profile. */

@@ -1,7 +1,10 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
 import { validateStoredCapability } from "./room-security/keys";
+import { sanitizePeerProfile } from "./profile-sanitize";
 import { onIdentityLock } from "./identity/lock-events";
 import type { RoomProfileFields, RoomProfileField } from "./room-profile";
+import type { PqKeyCertificate } from "./identity/pq-identity";
+import type { DmPqState } from "./room-security/pq-dm";
 
 type WriteGuard = () => void;
 let writeEpoch = 0;
@@ -118,6 +121,22 @@ const PARTICIPANT_INACTIVE_MS = PARTICIPANT_INACTIVE_DAYS * 24 * 60 * 60 * 1000;
 export interface DMRoom extends Room {
   type: "dm";
   participantDid: string;
+  /**
+   * Set once the conversation is post-quantum (room-security/pq-dm.ts): the
+   * ML-KEM ciphertext its hybrid key is derived from. From then on the DM
+   * joins only under that key. Never removed by a write that lacks it - see
+   * putRoom.
+   */
+  pq?: DmPqState;
+  /**
+   * A message request: the conversation was started by somebody who is not
+   * in the phonebook, shares no room with us and was never messaged by us
+   * (an introduction they made, or a mailbox delivery). Held apart, capped
+   * (dm.svelte.ts MAX_DM_REQUESTS), not joined at startup and not announced,
+   * until the user accepts it. Absent on every DM from before requests
+   * existed, which are all accepted.
+   */
+  request?: boolean;
 }
 
 export interface OwnProfile {
@@ -170,6 +189,12 @@ export interface PeerProfile {
   /** Their offline inbox is off (from their profile). Kept so it is known
    *  while they are offline, which is exactly when it matters. */
   inboxOff?: boolean;
+  /**
+   * Their ML-KEM-768 key certificate, from a profile they sent. Kept so a
+   * message sealed for them while they are offline can still be sealed
+   * post-quantum; re-verified against the DID on every use.
+   */
+  pqKey?: PqKeyCertificate;
   updatedAt: number;
 }
 
@@ -304,7 +329,7 @@ type AppDB = IDBPDatabase<{
   roomProfiles: {
     key: Blinded;
     value: RoomProfileRow;
-    indexes: { byRoom: Blinded };
+    indexes: { byRoom: Blinded; byKind: RoomProfileRow["kind"] };
   };
   savedGifs: {
     key: string;
@@ -378,7 +403,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 7, {
+  db = (await openDB(dbName(), 8, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -467,9 +492,16 @@ async function openDatabase(): Promise<AppDB> {
         const s = database.createObjectStore("diagnostics", { keyPath: "id" });
         s.createIndex("bySession", "sessionId", { unique: false });
       }
-      if (oldVersion < 7) {
+      if (oldVersion < 8) {
+        // v7 only ever existed in pre-release builds of room profiles, which
+        // sealed `kind` and had no byKind index; their rows cannot be found
+        // by kind, so the store starts over rather than half-working.
+        if (database.objectStoreNames.contains("roomProfiles")) {
+          database.deleteObjectStore("roomProfiles");
+        }
         const store = database.createObjectStore("roomProfiles", { keyPath: "id" });
         store.createIndex("byRoom", "roomCode", { unique: false });
+        store.createIndex("byKind", "kind", { unique: false });
       }
     },
     blocking() {
@@ -1135,6 +1167,28 @@ export async function putMessage(message: Message, guard: WriteGuard = captureWr
   const sealed = await _seal("messages", message);
   await guardedCommit(database, "messages", guard, async tx => { await tx.store.put(sealed); });
   _notifyMessageStored(message);
+}
+
+/**
+ * The messages a MERGE import brings in: never a row already held. A backup
+ * is a file, possibly someone else's, and reusing a real message's id was how
+ * one replaced a genuine signed row with forged content under any sender.
+ * Resolves the number actually added.
+ */
+export async function bulkAddNewMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<number> {
+  const database = await getDB();
+  guard();
+  const sealed = await Promise.all(messages.map((m) => _seal("messages", m)));
+  const added: Message[] = [];
+  await guardedCommit(database, "messages", guard, async tx => {
+    for (let i = 0; i < sealed.length; i++) {
+      if ((await tx.store.getKey(messages[i].id)) !== undefined) continue;
+      await tx.store.put(sealed[i]);
+      added.push(messages[i]);
+    }
+  });
+  for (const m of added) _notifyMessageStored(m);
+  return added.length;
 }
 
 export async function bulkPutMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<void> {
@@ -1952,10 +2006,61 @@ export async function getDMRooms(): Promise<DMRoom[]> {
 
 export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWriteGuard()): Promise<void> {
   validateStoredCapability(room);
+  // A DM's post-quantum state only ever arrives, it never leaves. Writers
+  // that rebuild a record from an older read (a rename, an import of a row
+  // from a device that had not upgraded yet) would otherwise drop it, and the
+  // next start would join the conversation under the classical key again -
+  // a downgrade nobody asked for. Deleting the room is the way to lose it.
+  // The carry is read and written on the room's patch queue, so no
+  // setDmPqState (or another DM write) can land between the two.
+  if (room.roomCode.startsWith("dm-")) {
+    return _onRoomQueue(room.roomCode, () => _putRoomNow(room, guard));
+  }
+  if (room.type === "text") {
+    return _onRoomQueue(room.roomCode, async () =>
+      _putRoomNow(await _withLiveGeneration(room), guard));
+  }
+  return _putRoomNow(room, guard);
+}
+
+/**
+ * A room's createdAt is also its membership generation (room-profile.ts):
+ * room profiles are bound to it, and a leave marker refuses every generation
+ * at or below its cutoff. So a text room that is being CREATED here - by
+ * saveRoom, an invitation, a quick call or an import - must land above any
+ * marker, whichever path creates it and whatever clock wrote the marker, or
+ * every room-profile write for it would fail from then on. An existing row is
+ * left alone: its generation is already the one its profiles carry.
+ */
+async function _withLiveGeneration<T extends Room>(room: T): Promise<T> {
+  if (await getRoom(room.roomCode).catch(() => undefined)) return room;
+  const marker = await getRoomDeletionMarker(room.roomCode).catch(() => undefined);
+  if (!marker) return room;
+  const floor = roomDeletionCutoff(marker) + 1;
+  return (room.createdAt ?? 0) >= floor ? room : { ...room, createdAt: floor };
+}
+
+async function _putRoomNow(room: Room | DMRoom, guard: WriteGuard): Promise<void> {
+  let carriedPq: DmPqState | undefined;
+  let carriedRequest: boolean | undefined;
+  if (
+    room.roomCode.startsWith("dm-") &&
+    (!(room as DMRoom).pq || (room as DMRoom).request === undefined)
+  ) {
+    // An unreadable row has no state left to carry.
+    const stored = (await getRoom(room.roomCode).catch(() => undefined)) as DMRoom | undefined;
+    if (!(room as DMRoom).pq) carriedPq = stored?.pq;
+    // Same carry for a request: a writer rebuilding the row without the flag
+    // must not accept the request behind the user's back. Accepting writes
+    // `request: false` explicitly (setDmRequest).
+    if ((room as DMRoom).request === undefined) carriedRequest = stored?.request;
+  }
   const database = await getDB();
   const roomWithParticipants = {
     ...room,
     participants: room.participants ?? [],
+    ...(carriedPq ? { pq: carriedPq } : {}),
+    ...(carriedRequest !== undefined ? { request: carriedRequest } : {}),
   };
   guard();
   const sealed = await _seal("rooms", roomWithParticipants);
@@ -1989,9 +2094,12 @@ function _patchRoom(
   patch: (room: Room | DMRoom) => Room | DMRoom | null,
   guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
-  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(() =>
-    _patchRoomNow(roomCode, patch, guard)
-  );
+  return _onRoomQueue(roomCode, () => _patchRoomNow(roomCode, patch, guard));
+}
+
+/** Run one write to this room after every earlier queued one settled. */
+function _onRoomQueue(roomCode: string, write: () => Promise<void>): Promise<void> {
+  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(write);
   const settled = run.catch(() => {});
   _roomPatchQueue.set(roomCode, settled);
   void settled.then(() => {
@@ -2030,6 +2138,42 @@ async function _patchRoomNow(
   guard();
   await tx.store.put(sealed);
   });
+}
+
+/**
+ * Record that a DM is now post-quantum. Through the per-room patch queue so
+ * it cannot interleave with another patch and be written over; replacing an
+ * existing state is allowed (a later introduction may repair a bad one), and
+ * resolves false when there was nothing to change or no such DM.
+ */
+export async function setDmPqState(
+  roomCode: string,
+  state: DmPqState
+): Promise<boolean> {
+  let changed = false;
+  await _patchRoom(roomCode, (room) => {
+    if (room.type !== "dm") return null;
+    const current = (room as DMRoom).pq;
+    if (current?.ct === state.ct && current?.ek === state.ek) return null;
+    changed = true;
+    return { ...room, pq: state } as DMRoom;
+  });
+  return changed;
+}
+
+/** Mark a DM as a message request, or accept one (false). */
+export async function setDmRequest(
+  roomCode: string,
+  request: boolean
+): Promise<boolean> {
+  let changed = false;
+  await _patchRoom(roomCode, (room) => {
+    if (room.type !== "dm") return null;
+    if (((room as DMRoom).request === true) === request) return null;
+    changed = true;
+    return { ...room, request } as DMRoom;
+  });
+  return changed;
 }
 
 /** Pin a room to the top of the sidebar, or unpin it (null). */
@@ -2078,18 +2222,48 @@ export async function getRoomParticipants(roomCode: string): Promise<string[]> {
   return room?.participants ?? [];
 }
 
+/**
+ * Members one room's record holds. Every add rewrites and reseals the whole
+ * record, so an uncapped list was a cost a peer could grow at will.
+ */
+export const MAX_ROOM_PARTICIPANTS = 512;
+
 export async function addRoomParticipant(
   roomCode: string,
   peerId: string
 ): Promise<void> {
+  await addRoomParticipants(roomCode, [[peerId, Date.now()]]);
+}
+
+/**
+ * Add members, or refresh when they were last seen, in ONE rewrite of the
+ * room record. A last-seen time only ever moves forward. New members past
+ * MAX_ROOM_PARTICIPANTS are not added.
+ */
+export async function addRoomParticipants(
+  roomCode: string,
+  seen: Iterable<readonly [did: string, at: number]>
+): Promise<void> {
   // participants are documented as DIDs; a raw peerId written here is never
   // matched by a leave (keyed by DID) and ghosts the member list for 7 days.
-  if (!peerId.startsWith("did:")) return;
+  const entries = [...seen].filter(([did]) => did.startsWith("did:"));
+  if (!entries.length) return;
   await _patchRoom(roomCode, (room) => {
     const participants = new Set(room.participants ?? []);
-    participants.add(peerId);
-    const participantLastSeen = room.participantLastSeen ?? {};
-    participantLastSeen[peerId] = Date.now();
+    const participantLastSeen = { ...(room.participantLastSeen ?? {}) };
+    let changed = false;
+    for (const [did, at] of entries) {
+      if (!participants.has(did)) {
+        if (participants.size >= MAX_ROOM_PARTICIPANTS) continue;
+        participants.add(did);
+        changed = true;
+      }
+      if (!((participantLastSeen[did] ?? 0) >= at)) {
+        participantLastSeen[did] = at;
+        changed = true;
+      }
+    }
+    if (!changed) return null;
     return { ...room, participants: [...participants], participantLastSeen };
   });
 }
@@ -2200,10 +2374,16 @@ export async function getRoomDeletionMarker(roomCode: string): Promise<RoomDelet
   return row ? { roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt! } : undefined;
 }
 
-export async function getAllRoomDeletionMarkers(): Promise<RoomDeletionMarker[]> {
+/** Rows of one kind, opening only those: peers' rows carry avatar bytes. */
+async function _roomProfileRowsOfKind(kind: RoomProfileRow["kind"]): Promise<RoomProfileRow[]> {
   const database = await getDB();
-  const rows = await _openAll("roomProfiles", await database.getAll("roomProfiles"));
-  return rows.filter(row => row.kind === "deletion").map(row => ({
+  const rows = await database.getAllFromIndex("roomProfiles", "byKind", kind);
+  return (await _openAll<RoomProfileRow>("roomProfiles", rows)).filter(row => row.kind === kind);
+}
+
+export async function getAllRoomDeletionMarkers(): Promise<RoomDeletionMarker[]> {
+  const rows = await _roomProfileRowsOfKind("deletion");
+  return rows.map(row => ({
     roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt!,
   }));
 }
@@ -2226,9 +2406,7 @@ export async function getOwnRoomProfile(roomCode: string, did: string): Promise<
 }
 
 export async function getAllOwnRoomProfiles(): Promise<OwnRoomProfileRecord[]> {
-  const database = await getDB();
-  const rows = await _openAll("roomProfiles", await database.getAll("roomProfiles"));
-  return rows.filter(row => row.kind === "own").map(ownRoomRecord);
+  return (await _roomProfileRowsOfKind("own")).map(ownRoomRecord);
 }
 
 export async function putOwnRoomProfile(
@@ -2264,7 +2442,7 @@ export async function putOwnRoomProfile(
 export async function getPeerRoomProfile(roomCode: string, did: string): Promise<PeerProfile | undefined> {
   const row = await getRoomProfileRow("peer", roomCode, did);
   return row?.kind === "peer" && row.profile
-    ? { ...row.profile, pfpData: row.pfpData, bannerData: row.bannerData }
+    ? sanitizePeerProfile({ ...row.profile, pfpData: row.pfpData, bannerData: row.bannerData })
     : undefined;
 }
 
@@ -2273,7 +2451,18 @@ export async function getAllPeerRoomProfiles(roomCode: string): Promise<PeerProf
   const keys = await database.transaction("roomProfiles").store.index("byRoom").getAllKeys(await blindValue(roomCode));
   const rows = await Promise.all(keys.map(async key => _open("roomProfiles", await database.get("roomProfiles", key))));
   return rows.filter((row): row is RoomProfileRow => row?.kind === "peer" && !!row.profile)
-    .map(row => ({ ...row.profile!, pfpData: row.pfpData, bannerData: row.bannerData }));
+    .map(row => sanitizePeerProfile({ ...row.profile!, pfpData: row.pfpData, bannerData: row.bannerData }));
+}
+
+/** A peer went back to its main profile in this room (WireProfile.roomInherit). */
+export async function deletePeerRoomProfile(
+  roomCode: string, did: string, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const database = await getDB();
+  const key = await blindValue(roomProfileId("peer", roomCode, did));
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    await tx.store.delete(key);
+  });
 }
 
 export async function putPeerRoomProfile(
@@ -2303,7 +2492,10 @@ export async function putPeerRoomProfile(
 }
 
 /** Remove both profile kinds but keep the non-profile marker for later device sync. */
-export async function deleteRoomProfilesForRoom(roomCode: string, generation: number, deletedAt = Date.now()): Promise<void> {
+export async function deleteRoomProfilesForRoom(
+  roomCode: string, generation: number, deletedAt = Date.now(),
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
   const existing = await getRoomDeletionMarker(roomCode);
   const incoming = { roomCode, generation, deletedAt };
   const replaceMarker = deletionMarkerIsNewer(incoming, existing);
@@ -2313,27 +2505,33 @@ export async function deleteRoomProfilesForRoom(roomCode: string, generation: nu
     kind: "deletion" as const, generation,
     deletedAt,
   }) : undefined;
-  const tx = database.transaction("roomProfiles", "readwrite");
-  const keys = await tx.store.index("byRoom").getAllKeys(await blindValue(roomCode));
+  const blindedRoom = await blindValue(roomCode);
   const deletionKey = await blindValue(roomProfileId("deletion", roomCode));
-  for (const key of keys) {
-    if (!replaceMarker && key === deletionKey) continue;
-    await tx.store.delete(key);
-  }
-  if (marker) await tx.store.put(marker);
-  await tx.done;
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const keys = await tx.store.index("byRoom").getAllKeys(blindedRoom);
+    for (const key of keys) {
+      if (!replaceMarker && key === deletionKey) continue;
+      await tx.store.delete(key);
+    }
+    if (marker) await tx.store.put(marker);
+  });
 }
 
 /** Preserve a remote leave event even if this device already rejoined later. */
-export async function putRoomDeletionMarker(marker: RoomDeletionMarker): Promise<void> {
+export async function putRoomDeletionMarker(
+  marker: RoomDeletionMarker, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
   const existing = await getRoomDeletionMarker(marker.roomCode);
   if (!deletionMarkerIsNewer(marker, existing)) return;
   const database = await getDB();
-  await database.put("roomProfiles", await _seal("roomProfiles", {
+  const sealed = await _seal("roomProfiles", {
     id: roomProfileId("deletion", marker.roomCode), roomCode: marker.roomCode,
     did: "", kind: "deletion" as const, generation: marker.generation,
     deletedAt: marker.deletedAt,
-  }));
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    await tx.store.put(sealed);
+  });
 }
 
 export async function getOwnProfile(
@@ -2461,7 +2659,10 @@ export async function getPeerProfile(
     record = await database.get("profiles", did as Blinded);
   }
   if (!record || record.isMe) return undefined;
-  return _open("profiles", record as PeerProfile);
+  // Checked on the way out, like a live profile: a stored row may have come
+  // from a backup or an older build (profile-sanitize.ts).
+  const opened = await _open("profiles", record as PeerProfile);
+  return opened && sanitizePeerProfile(opened);
 }
 
 export async function putPeerProfile(profile: PeerProfile): Promise<void> {
@@ -2498,10 +2699,10 @@ export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
   if (_peerProfilesCache) return _peerProfilesCache;
   const database = await getDB();
   const all = await database.getAll("profiles");
-  const opened = await _openAll(
+  const opened = (await _openAll(
     "profiles",
     all.filter((p): p is PeerProfile => p.isMe === false)
-  );
+  )).map(sanitizePeerProfile);
   _peerProfilesCache = opened;
   return opened;
 }
@@ -2525,6 +2726,27 @@ export function pfpBlobURL(
  */
 function watermarkId(roomCode: string, senderId: string): string {
   return `${roomCode}:${senderId}`;
+}
+
+/**
+ * A deleted DM's floor: the sender's messages up to this lamport were in the
+ * conversation when it was deleted. The mailbox signature has no freshness,
+ * and a relay that kept blobs we had acked could otherwise hand them back
+ * later and rebuild the conversation. Kept in the watermarks store under a
+ * room key of its own, which deleting the room's rows does not touch.
+ */
+const DELETED_FLOOR = "deleted:";
+
+export function setDeletedFloor(
+  roomCode: string,
+  senderId: string,
+  lamport: number
+): Promise<void> {
+  return setWatermark(DELETED_FLOOR + roomCode, senderId, lamport);
+}
+
+export function getDeletedFloor(roomCode: string, senderId: string): Promise<number> {
+  return getWatermark(DELETED_FLOOR + roomCode, senderId);
 }
 
 export async function getWatermark(

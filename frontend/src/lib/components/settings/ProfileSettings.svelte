@@ -29,8 +29,17 @@
     Pencil,
     Plus,
     Trash2,
-    Hash,
+    User,
+    RotateCcw,
   } from "@lucide/svelte";
+  import {
+    Select,
+    SelectContent,
+    SelectGroup,
+    SelectGroupHeading,
+    SelectItem,
+    SelectTrigger,
+  } from "$lib/components/ui/select";
 
   interface Props {
     isMobile?: boolean;
@@ -42,7 +51,33 @@
 
   let { isMobile = false, avatarDialogOpen = false, onAvatarClick, roomCode = null, onRoomChange }: Props = $props();
   const scopedProfile = $derived(getScopedProfile(roomCode));
-  const joinedRooms = $derived(roomsStore.rooms.filter(r => r.type === "text" && !r.movedTo));
+  // Protected rooms only: a room profile is sent over a room's own verified
+  // channel, so an override in any other room would never leave this device.
+  const joinedRooms = $derived(roomsStore.rooms.filter(r =>
+    r.type === "text" && !r.movedTo && r.roomCode.startsWith("rd2_")));
+  const selectedRoom = $derived(joinedRooms.find(r => r.roomCode === roomCode));
+  let scopeList = $state<HTMLDivElement | null>(null);
+
+  // The list scrolls once there are more rooms than fit: keep the selected
+  // row in view when Profile opens on a room further down, and when the
+  // scope changes.
+  $effect(() => {
+    const selected = roomCode;
+    joinedRooms.length;
+    void tick().then(() => {
+      scopeList
+        ?.querySelector<HTMLElement>(`[data-scope="${selected ?? "main"}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  });
+
+  /** The second line of a row: who you are in that room. */
+  function scopeSubline(code: string | null): string {
+    if (!code) return "everywhere else";
+    if (!hasScopedOverrides(code)) return "same as Main";
+    const nickname = getScopedProfile(code).nickname;
+    return nickname !== getScopedProfile(null).nickname ? `you are ${nickname}` : "changed here";
+  }
   let saveError = $state("");
   let nameAtStart = "";
   let tagAtStart = "";
@@ -51,15 +86,33 @@
   let tagChipColorAtStart: string | undefined;
   let switching = $state(false);
   let bannerPickerRoom = $state<string | null>(null);
-  let scopeList = $state<HTMLDivElement | null>(null);
 
-  function roomNickname(code: string): string {
-    return getScopedProfile(code).nickname || "Anonymous";
+  /** A room override's field name to the resolved profile's. */
+  const SHOWN_AS: Record<string, keyof ReturnType<typeof getScopedProfile>> = {
+    nickname: "nickname", color: "color", bannerURL: "bannerUrl", tagText: "tagText",
+    tagTextColor: "tagTextColor", tagChipColor: "tagChipColor", bio: "bio",
+    nameEffect: "nameEffect", nameShimmer: "nameShimmer", nameGlow: "nameGlow",
+    gradient2: "gradient2", gradient3: "gradient3",
+  };
+
+  /**
+   * Only what differs from what the room shows now. Some controls save a
+   * pair (both tag colours, both gradient stops, the effect triple); writing
+   * the untouched half into the room pinned it there, so it stopped following
+   * the main profile.
+   */
+  function changedInRoom(scope: string, fields: Record<string, string | boolean | undefined>) {
+    const shown = getScopedProfile(scope);
+    return Object.fromEntries(Object.entries(fields).filter(([key, value]) =>
+      !(key in SHOWN_AS) || (shown[SHOWN_AS[key]] ?? undefined) !== (value ?? undefined)));
   }
 
   async function saveRoomOrMain(scope: string | null, fields: Record<string, string | boolean | undefined>, mainSave: () => Promise<void>) {
     try {
-      if (scope) await saveScopedFields(scope, roomEditFields(fields));
+      if (scope) {
+        const changed = changedInRoom(scope, fields);
+        if (Object.keys(changed).length) await saveScopedFields(scope, roomEditFields(changed));
+      }
       else await mainSave();
       saveError = "";
     } catch (error) {
@@ -102,25 +155,6 @@
     if (roomCode && joinedRooms.some(r => r.roomCode === roomCode)) {
       void loadRoomProfile(roomCode);
     }
-  });
-
-  // Keep the selected scope visible when Profile opens on a room farther down
-  // the list, and when the user changes scope manually.
-  $effect(() => {
-    const selected = roomCode;
-    joinedRooms.length;
-    void tick().then(() => {
-      const list = scopeList;
-      if (!list) return;
-      const target = Array.from(
-        list.querySelectorAll<HTMLElement>("[data-profile-scope]")
-      ).find((element) =>
-        selected === null
-          ? element.dataset.mainProfile === "true"
-          : element.dataset.roomCode === selected
-      );
-      target?.scrollIntoView({ block: "nearest" });
-    });
   });
 
   let nameValue = $state("");
@@ -343,9 +377,132 @@
   <p class="text-xs font-mono text-muted-foreground -mt-2">
     This card is what others see. Click any part of it to change it.
   </p>
+  {#snippet scopeRow(room: (typeof joinedRooms)[number] | null)}
+    {@const code = room?.roomCode ?? null}
+    {@const selected = roomCode === code}
+    <button
+      type="button"
+      role="option"
+      aria-selected={selected}
+      data-scope={code ?? "main"}
+      disabled={switching || bannerPickerOpen || avatarDialogOpen}
+      onclick={() => void selectRoom(code)}
+      class="flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm transition-colors cursor-pointer disabled:cursor-default {selected
+        ? 'bg-accent text-accent-foreground'
+        : 'text-muted-foreground hover:bg-accent/10 hover:text-foreground'}"
+    >
+      {@render scopeFace(room, selected)}
+    </button>
+  {/snippet}
+
+  {#snippet scopeFace(room: (typeof joinedRooms)[number] | null, filled: boolean)}
+    {@const code = room?.roomCode ?? null}
+    {#if room?.pfpURL}
+      <GifImage src={room.pfpURL} alt="" class="size-7 shrink-0 rounded-md object-cover" />
+    {:else}
+      <span
+        class="flex size-7 shrink-0 items-center justify-center rounded-md text-xs font-semibold {filled
+          ? 'bg-black/15 text-accent-foreground'
+          : room ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'}"
+      >
+        {#if room}{(room.name || "#").charAt(0).toUpperCase()}{:else}<User class="size-4 text-current" />{/if}
+      </span>
+    {/if}
+    <span class="min-w-0 flex-1 text-left">
+      <span class="block truncate font-mono">{room ? room.name || "Unnamed room" : "Main profile"}</span>
+      <span class="block truncate font-mono text-[10px] {filled ? 'text-accent-foreground/65' : 'text-muted-foreground/70'}">{scopeSubline(code)}</span>
+    </span>
+    {#if code && hasScopedOverrides(code)}
+      <span
+        class="size-1.5 shrink-0 rounded-full {filled ? 'bg-accent-foreground' : 'bg-primary'}"
+        title="Changed in this room"
+      ></span>
+    {/if}
+  {/snippet}
+
   {#if saveError}<p role="alert" class="text-xs text-destructive">{saveError}</p>{/if}
 
-  <div class="flex flex-col items-stretch gap-4 lg:flex-row lg:items-start lg:justify-center">
+  <div class="flex flex-col items-stretch gap-4 lg:flex-row lg:justify-center">
+  {#if joinedRooms.length > 0}
+    <!-- Which profile the card edits: Main, or one room's. Rows drawn like
+         the sidebar's room list, left of the card; above it on a phone.
+         Beside the card the list is exactly the card's height and scrolls
+         inside it: absolutely placed, it takes no part in the row's height,
+         so many rooms neither stretch the section nor stop short of it. -->
+    <div class="relative w-full lg:w-60 lg:shrink-0">
+      <div class="flex flex-col gap-1 lg:absolute lg:inset-0">
+      <!-- Narrow screens: one select above the card, which opens the same
+           rows. A list there pushed the card a whole screen down. -->
+      <div class="lg:hidden">
+        <Select
+          type="single"
+          value={roomCode ?? "main"}
+          disabled={switching || bannerPickerOpen || avatarDialogOpen}
+          onValueChange={(v) => void selectRoom(v === "main" ? null : v)}
+        >
+          <SelectTrigger
+            class="h-auto! w-full gap-2.5 bg-background px-2.5 py-2 text-sm"
+            aria-label="Profile shown in"
+          >
+            <span class="flex min-w-0 flex-1 items-center gap-2.5">{@render scopeFace(selectedRoom ?? null, false)}</span>
+          </SelectTrigger>
+          <SelectContent class="bg-popover border-border">
+            <!-- One wrapping span: the item styles its last span as the
+                 content row, and the face must stay one row inside it.
+                 Highlighted rows go green like the list's selected row. -->
+            <SelectItem value="main" class="py-2">
+              {#snippet children({ highlighted })}
+                <span class="flex min-w-0 flex-1 items-center gap-2.5">{@render scopeFace(null, highlighted)}</span>
+              {/snippet}
+            </SelectItem>
+            <SelectGroup>
+              <SelectGroupHeading class="font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70">Only in one room</SelectGroupHeading>
+              {#each joinedRooms as room (room.roomCode)}
+                <SelectItem value={room.roomCode} class="py-2">
+                  {#snippet children({ highlighted })}
+                    <span class="flex min-w-0 flex-1 items-center gap-2.5">{@render scopeFace(room, highlighted)}</span>
+                  {/snippet}
+                </SelectItem>
+              {/each}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+      </div>
+      <div
+        bind:this={scopeList}
+        role="listbox"
+        aria-label="Profile shown in"
+        class="hidden lg:flex lg:min-h-0 lg:flex-1 lg:flex-col lg:gap-0.5 lg:overflow-y-auto"
+      >
+        <!-- Main stays in reach while the rooms scroll under it. Opaque, and
+             the same colour as the section: bg-card is the dialog behind the
+             section, and bg-muted/30 is the section's own tint over it. -->
+        <div class="sticky top-0 z-10 bg-card">
+          <div class="bg-muted/30 pb-0.5">{@render scopeRow(null)}</div>
+        </div>
+        <p class="select-none px-2.5 pb-1 pt-2 font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70">Only in one room</p>
+        {#each joinedRooms as room (room.roomCode)}
+          {@render scopeRow(room)}
+        {/each}
+      </div>
+      {#if roomCode}
+        <p class="flex shrink-0 flex-col gap-1 px-2.5 pt-1 font-mono text-[11px] text-muted-foreground">
+          <span>Only people in {selectedRoom?.name || "this room"} see this. Anything you don't change follows Main.</span>
+          {#if hasScopedOverrides(roomCode)}
+            <button
+              type="button"
+              class="inline-flex w-fit cursor-pointer items-center gap-1 text-primary hover:underline"
+              onclick={async () => {
+                try { await resetScopedProfile(roomCode!); saveError = ""; }
+                catch { saveError = "Could not save profile. Try again."; }
+              }}
+            ><RotateCcw class="size-3" />Reset to Main</button>
+          {/if}
+        </p>
+      {/if}
+      </div>
+    </div>
+  {/if}
   <!-- max-w-md, the real card's own width. "What others see" is only true
        if the preview is the same shape: object-cover crops to the box, so a
        preview twice as wide showed a thin band through the middle of a
@@ -792,63 +949,6 @@
     </div>
   </div>
 
-  <aside class="w-full max-w-md rounded-lg border border-border/50 bg-card/70 p-2 lg:w-64 lg:max-w-none">
-    <div class="px-2 pb-2 pt-1">
-      <p class="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Profile scope</p>
-      <p class="mt-1 font-mono text-[11px] text-muted-foreground/70">Choose where this profile appears</p>
-    </div>
-    <div bind:this={scopeList} class="max-h-80 space-y-1 overflow-y-auto pr-1">
-      <button
-        type="button"
-        data-profile-scope
-        data-main-profile="true"
-        disabled={switching || bannerPickerOpen || avatarDialogOpen}
-        aria-current={roomCode === null ? "true" : undefined}
-        onclick={() => void selectRoom(null)}
-        class="flex w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-colors {roomCode === null ? 'border-primary/40 bg-primary/10 text-foreground shadow-sm' : 'border-transparent text-muted-foreground hover:bg-muted/70 hover:text-foreground'} disabled:cursor-default"
-      >
-        <span class="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground"><Hash class="size-4" /></span>
-        <span class="min-w-0 flex-1 truncate font-mono text-sm">Main Profile</span>
-        {#if roomCode === null}<span class="flex size-5 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">✓</span>{/if}
-      </button>
-      {#each joinedRooms as room (room.roomCode)}
-        {@const nickname = roomNickname(room.roomCode)}
-        {@const differs = nickname !== getScopedProfile(null).nickname}
-        {@const modified = hasScopedOverrides(room.roomCode)}
-        <button
-          type="button"
-          data-profile-scope
-          data-room-code={room.roomCode}
-          disabled={switching || bannerPickerOpen || avatarDialogOpen}
-          aria-current={roomCode === room.roomCode ? "true" : undefined}
-          onclick={() => void selectRoom(room.roomCode)}
-          class="flex w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition-colors {roomCode === room.roomCode ? 'border-primary/40 bg-primary/10 text-foreground shadow-sm' : 'border-transparent text-muted-foreground hover:bg-muted/70 hover:text-foreground'} disabled:cursor-default"
-        >
-          {#if room.pfpURL}
-            <GifImage src={room.pfpURL} alt="" class="size-8 shrink-0 rounded-md object-cover" />
-          {:else}
-            <span class="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/15 font-mono text-xs font-semibold text-primary">{(room.name || "#").charAt(0).toUpperCase()}</span>
-          {/if}
-          <span class="min-w-0 flex-1">
-            <span class="block truncate font-mono text-sm">{room.name || "Unnamed room"}</span>
-            {#if differs}<span class="block truncate font-mono text-[10px] {roomCode === room.roomCode ? 'text-primary/70' : 'text-muted-foreground/70'}">{nickname}</span>{/if}
-          </span>
-          <span class="mt-0.5 flex size-5 shrink-0 translate-y-1.5 items-center justify-center self-start">
-            {#if modified}<span class="font-mono text-sm font-bold text-red-400" title="Room profile has custom fields">*</span>{/if}
-          </span>
-          <span class="flex size-5 shrink-0 items-center justify-center">
-            {#if roomCode === room.roomCode}<span class="flex size-5 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">✓</span>{/if}
-          </span>
-        </button>
-      {/each}
-    </div>
-    {#if roomCode && hasScopedOverrides(roomCode)}
-      <Button variant="outline" class="mt-2 w-full border-primary/30 bg-primary/5 text-xs hover:bg-primary/10" onclick={async () => {
-        try { await resetScopedProfile(roomCode!); saveError = ""; }
-        catch { saveError = "Could not save profile. Try again."; }
-      }}>Reset to main profile</Button>
-    {/if}
-  </aside>
   </div>
 
   <AvatarPickerDialog

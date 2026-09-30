@@ -39,6 +39,7 @@ import {
   getAllPeerProfiles,
   getAllPeerRoomProfiles,
   putPeerRoomProfile,
+  deletePeerRoomProfile,
   putAttachment,
   getAttachmentsByInfoHash,
   getAttachmentsByMessage,
@@ -51,9 +52,14 @@ import {
   removeRoomParticipant,
   updateParticipantLastSeen,
   cleanupInactiveParticipants,
+  setDmRequest,
+  getDeletedFloor,
+  addRoomParticipants,
+  MAX_ROOM_PARTICIPANTS,
+  type DMRoom,
 } from "../storage";
 import { normalizeWireName } from "../wire-name";
-import { resolveRoomProfile } from "../room-profile";
+import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
   MessageType,
   isFileSignalWireMessage,
@@ -91,12 +97,21 @@ import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
 import { verifyIncoming } from "./verify-incoming";
+import { messageIdAllowedFor, newMessageId } from "../message-id";
 import { LiveUpdateAdmission } from "../room-security/live-updates";
 
 const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
 import { WORKLET_URL } from "../audio/worklet-url";
 import { requireSession, onIdentityLock } from "../identity/identity";
+import { pqKeyCertificate, type PqKeyCertificate } from "../identity/pq-identity";
+import {
+  acceptProfilePqKey,
+  onIntroductionUpgraded,
+  onIntroductionVerified,
+  type IntroductionHookDeps,
+} from "./dm-pq-hooks";
+import { rememberPeerPqKey } from "../identity/pq-peers";
 import { captureSessionGuard } from "../identity/session-guard";
 import { ensureMessageAttachmentOwnership } from "./attachment-ownership";
 import { isLegacyArchive, requireWritableRoom } from "$lib/room-security/legacy-archive";
@@ -161,7 +176,10 @@ import {
   dmConversationCodeAsync,
   dmPeerDid,
   dmPeerDidForRoom,
+  dmRoomExists,
   ensureDmRoomForPeer,
+  isDmRequestRoom,
+  offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
   flushQueuedDmForPeer,
@@ -348,6 +366,8 @@ function _parsePluginPayload(
 
 import { playPeerJoinSound, playPeerLeaveSound } from "../sounds";
 import { peerCallChime } from "./call-chime";
+import { sanitizePeerProfile } from "../profile-sanitize";
+import type { PeerProfile } from "../storage";
 
 export { appendSorted } from "./message-order";
 export type { Message };
@@ -711,15 +731,32 @@ export const _transport = new LibP2PTransport();
 function currentIdentitySession() {
   try { return requireSession(); } catch { return null; }
 }
+const _introductionHookDeps: IntroductionHookDeps = {
+  boundDid: (peer) => _peerIdToDid.get(peer),
+  bind: (peer, did) => _setPeerDid(peer, did),
+  // Arrows, not the functions themselves: dm.svelte imports this module, so
+  // these bindings are only safe to read once both have finished loading.
+  dmExists: (did) => dmRoomExists(did),
+  // Unsolicited: the introduction may be a stranger's. See EnsureDmOptions.
+  ensureDm: (did, state) => ensureDmRoomForPeer(did, state, { unsolicited: true }),
+  replayPending: (peer, did) => _replayPendingDm(peer, did),
+  heal: {
+    schedule: (run, ms) => { setTimeout(run, ms); },
+    connected: (peer) => _transport.peers().includes(peer),
+    meetsUnderNewKey: async (peer, did) => {
+      const room = await dmConversationCodeAsync(did);
+      return !!room && _transport.peersInRoom(room).includes(peer);
+    },
+    reintroduce: (peer, did) => _transport.introduceDm(peer, did),
+    note: (peer) => rec(ev("dm.pq.heal", { peer })),
+  },
+};
 _transport.setDmIntroduction(() => {
   try { return requireSession(); } catch { return null; }
-}, async (peer, did) => {
-  const previous = _peerIdToDid.get(peer);
-  if (previous && previous !== did) throw new Error("Conflicting device identity");
-  _setPeerDid(peer, did);
-  await ensureDmRoomForPeer(did);
-  _replayPendingDm(peer, did);
-});
+}, (peer, did, _secret, pqPending) =>
+  // See dm-pq-hooks.ts for why a pending upgrade holds off creating the DM.
+  onIntroductionVerified(_introductionHookDeps, peer, did, pqPending),
+(peer, did, state) => onIntroductionUpgraded(_introductionHookDeps, peer, did, state));
 export const _voice = new LibP2PVoice(_transport, _dtln);
 export const _video = new MediasoupVideo();
 _video.setRoomAdmission((room, nonce, peer) => _transport.sfuAdmission(room, nonce, peer));
@@ -1082,59 +1119,83 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   const did = identityStore.did ?? null;
   // Room capability is learned only from a verified main profile.
   const supportingPeers = _roomProfilePeers;
-  const frameFor = async (source: typeof profile, roomScoped = false): Promise<Uint8Array> => {
-  const profile = source;
-  const name = profile?.nickname?.trim() || "Anonymous";
-  let avatarUrl: string | null = profile?.pfpURL || null;
-  if (!avatarUrl && profile?.pfpData) {
-    const bytes = new Uint8Array(profile.pfpData);
-    avatarUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
-  }
-
-  let bannerUrl: string | null = profile?.bannerURL || null;
-  if (!bannerUrl && profile?.bannerData) {
-    const bytes = new Uint8Array(profile.bannerData);
-    bannerUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
-  }
 
   // Prove this DID owns our peerId; the receiver cannot derive it any more.
+  // Signed once per send, not once per frame: a peer sharing several rooms
+  // gets a main frame and a room frame for each.
   let binding: { did: string; bindingSig: string } | null = null;
   try {
     binding = signPeerBinding(_transport.selfId());
   } catch {
     binding = null; // identity locked: the peer just will not bind us yet
   }
+  // Our ML-KEM key, so peers can seal for us post-quantum (mailbox, DM
+  // upgrade), signed by the same identity the binding proves. Separate from
+  // the binding: without it we are merely a peer on an older build, and
+  // that must never cost the binding itself. Main frames only: it belongs to
+  // the identity, not to a room's presentation of it.
+  let pq: PqKeyCertificate | undefined;
+  try {
+    pq = binding ? pqKeyCertificate(requireSession()) : undefined;
+  } catch {
+    pq = undefined;
+  }
+  // Only when off, so a DM to us can warn it needs both of us online.
+  // Imported lazily like dm.svelte does: the mailbox imports this module.
+  const inboxOff = (await import("./mailbox.svelte")).mailboxPrefs.enabled
+    ? undefined
+    : true;
 
-  return encode({
-    type: MessageType.Profile,
-    name,
-    did,
-    avatarUrl,
-    color: profile?.color ?? null,
-    peerId: _transport.selfId(),
-    bindingSig: binding?.bindingSig,
-    reply: isReply || undefined,
-    roomProfilesSupported: roomScoped ? undefined : true,
-    roomScoped: roomScoped || undefined,
-    bannerUrl: bannerUrl ?? undefined,
-    gradient2: profile?.gradient2 ?? undefined,
-    gradient3: profile?.gradient3 ?? undefined,
-    tagText: profile?.tagText ?? undefined,
-    tagTextColor: profile?.tagTextColor ?? undefined,
-    tagChipColor: profile?.tagChipColor ?? undefined,
-    bio: profile?.bio ?? undefined,
-    nameEffect: profile?.nameEffect ?? undefined,
-    nameShimmer: profile?.nameShimmer ?? undefined,
-    nameGlow: profile?.nameGlow ?? undefined,
-    // Only when off, so a DM to us can warn it needs both of us online.
-    // Imported lazily like dm.svelte does: the mailbox imports this module.
-    inboxOff: (await import("./mailbox.svelte")).mailboxPrefs.enabled
-      ? undefined
-      : true,
-  });
+  const imageUrl = (url: string | undefined, data: ArrayBuffer | undefined): string | null => {
+    if (url) return url;
+    if (!data) return null;
+    const bytes = new Uint8Array(data);
+    return `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
   };
 
-  const payload = await frameFor(profile);
+  const frameFor = (source: typeof profile, roomScoped = false): Uint8Array =>
+    encode({
+      type: MessageType.Profile,
+      name: source?.nickname?.trim() || "Anonymous",
+      did,
+      avatarUrl: imageUrl(source?.pfpURL, source?.pfpData),
+      color: source?.color ?? null,
+      peerId: _transport.selfId(),
+      bindingSig: binding?.bindingSig,
+      reply: isReply || undefined,
+      roomProfilesSupported: roomScoped ? undefined : true,
+      roomScoped: roomScoped || undefined,
+      bannerUrl: imageUrl(source?.bannerURL, source?.bannerData) ?? undefined,
+      gradient2: source?.gradient2 ?? undefined,
+      gradient3: source?.gradient3 ?? undefined,
+      tagText: source?.tagText ?? undefined,
+      tagTextColor: source?.tagTextColor ?? undefined,
+      tagChipColor: source?.tagChipColor ?? undefined,
+      bio: source?.bio ?? undefined,
+      nameEffect: source?.nameEffect ?? undefined,
+      nameShimmer: source?.nameShimmer ?? undefined,
+      nameGlow: source?.nameGlow ?? undefined,
+      inboxOff: roomScoped ? undefined : inboxOff,
+      pq: roomScoped ? undefined : pq,
+    });
+
+  // A room with no overrides needs no copy of the profile: it is the main
+  // one, which the peer already has. It gets this instead - a frame with no
+  // profile in it, telling a receiver to drop any room copy it kept from
+  // before a reset, so stale overrides do not outlive the reset.
+  const inheritFrame = (): Uint8Array =>
+    encode({
+      type: MessageType.Profile,
+      name: "",
+      did,
+      avatarUrl: null,
+      peerId: _transport.selfId(),
+      bindingSig: binding?.bindingSig,
+      roomScoped: true,
+      roomInherit: true,
+    });
+
+  const payload = frameFor(profile);
 
   const hash = frameHash(payload);
   const sendTo = (pid: string): boolean => {
@@ -1160,7 +1221,9 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
       const roomRecord = await getRoom(roomCode);
       if (roomRecord?.type !== "text") continue;
       const override = await getOwnRoomProfile(roomCode, did);
-      const scoped = await frameFor(resolveRoomProfile(profile, override?.fields), true);
+      const scoped = override && hasRoomOverrides(override.fields)
+        ? frameFor(resolveRoomProfile(profile, override.fields), true)
+        : inheritFrame();
       const scopedHash = frameHash(scoped);
       if (!_profileEcho.shouldSend(pid, scopedHash, Date.now(), roomCode)) continue;
       const delivered = await _transport.sendRoom(pid, roomCode, scoped).catch(() => false);
@@ -1535,8 +1598,12 @@ export async function _loadHistory(
     transportState.peerAvatars = avatars;
     transportState.peerColors = colors;
   }
+  // Merged, not replaced: a room frame that landed while storage was being
+  // read is newer than what the read returned.
   const scoped = new Map(transportState.peerRoomProfiles);
-  scoped.set(roomCode, new Map(roomProfiles.map(p => [p.did, p])));
+  const peers = new Map(roomProfiles.map(p => [p.did, p]));
+  for (const [did, live] of scoped.get(roomCode) ?? []) peers.set(did, live);
+  scoped.set(roomCode, peers);
   transportState.peerRoomProfiles = scoped;
 
   for (const msg of msgs) {
@@ -2126,6 +2193,19 @@ async function _handleSyncBatch(
   guard();
   await bulkPutMessages(fullMessages, guard);
   guard();
+  // Every row here verified under sigV3, which binds the room: its author
+  // wrote in this room, as of when they wrote it. That is how a member we
+  // have never been connected to gets listed, now that rosters from other
+  // members are not believed.
+  if (_protectedRoster(roomCode)) {
+    const authors = new Map<string, number>();
+    for (const m of fullMessages) {
+      if (m.senderId === identityStore.did) continue;
+      if (!Number.isFinite(m.timestamp)) continue;
+      authors.set(m.senderId, Math.max(authors.get(m.senderId) ?? 0, m.timestamp));
+    }
+    _noteAttestedMembers(roomCode, authors);
+  }
   for (const message of fullMessages) {
     await ensureMessageAttachmentOwnership(message.id, guard);
     guard();
@@ -2316,7 +2396,65 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
 // every incoming chat row needs exactly the same treatment (wireToMessage),
 // and that path must not import this module - it boots libp2p on import.
 
-async function _handleProfile(peerId: string, msg: WireProfile, room: string | null): Promise<void> {
+/**
+ * A peer's profile for one protected room (room-profile.ts). Kept only when
+ * it came over that room's own verified channel from a verified member, and
+ * put through the same checks as any stored profile.
+ */
+async function _handleScopedProfile(
+  peerId: string,
+  did: string,
+  msg: WireProfile,
+  room: string | null
+): Promise<void> {
+  if (!room?.startsWith("rd2_") || !_transport.rooms().includes(room) ||
+      !_transport.isRoomPeer(room, peerId)) return;
+  if (did === (identityStore.did ?? "")) return;
+  const joinedRoom = await getRoom(room);
+  if (joinedRoom?.type !== "text") return;
+  _noteAttestedMembers(room, new Map([[did, Date.now()]]));
+  if (msg.roomInherit === true) {
+    // They show their main profile here now: forget the room copy.
+    await deletePeerRoomProfile(room, did).catch(() => {});
+    if (transportState.peerRoomProfiles.get(room)?.has(did)) {
+      const scoped = new Map(transportState.peerRoomProfiles);
+      const peers = new Map(scoped.get(room));
+      peers.delete(did);
+      scoped.set(room, peers);
+      transportState.peerRoomProfiles = scoped;
+    }
+    return;
+  }
+  const peerProfile = sanitizePeerProfile({
+    did, isMe: false, nickname: msg.name, pfpURL: msg.avatarUrl ?? undefined,
+    color: msg.color ?? undefined, updatedAt: Date.now(),
+    bannerURL: msg.bannerUrl ?? undefined, gradient2: msg.gradient2 ?? undefined,
+    gradient3: msg.gradient3 ?? undefined, tagText: msg.tagText ?? undefined,
+    tagTextColor: msg.tagTextColor ?? undefined, tagChipColor: msg.tagChipColor ?? undefined,
+    bio: msg.bio ?? undefined, nameEffect: msg.nameEffect ?? undefined,
+    nameShimmer: msg.nameShimmer ?? undefined, nameGlow: msg.nameGlow ?? undefined,
+  } as PeerProfile);
+  try {
+    await putPeerRoomProfile(room, joinedRoom.createdAt, peerProfile);
+  } catch {
+    return;
+  }
+  const currentRoom = await getRoom(room);
+  if (currentRoom?.type !== "text" || currentRoom.createdAt !== joinedRoom.createdAt ||
+      !_transport.rooms().includes(room) || !_transport.isRoomPeer(room, peerId)) return;
+  const scoped = new Map(transportState.peerRoomProfiles);
+  const peers = new Map(scoped.get(room));
+  peers.set(did, peerProfile);
+  scoped.set(room, peers);
+  transportState.peerRoomProfiles = scoped;
+}
+
+async function _handleProfile(
+  peerId: string,
+  msg: WireProfile,
+  /** The verified channel it came over; null for a direct frame. */
+  channelRoom: string | null
+): Promise<void> {
   // Bind the DID to the peerId only on a signature over THIS connection's
   // peerId. The `did` field on its own is spoofable, and any peer could
   // otherwise claim someone else's identity and hijack their DM conversation
@@ -2334,51 +2472,6 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
     return;
   }
   const did = claimed as string;
-  if (msg.roomScoped === true) {
-    if (!room?.startsWith("rd2_") || !_transport.rooms().includes(room) ||
-        !_transport.isRoomPeer(room, peerId)) return;
-    const joinedRoom = await getRoom(room);
-    if (joinedRoom?.type !== "text") return;
-    if (did === (identityStore.did ?? "")) return;
-    const isNewMapping = _peerIdToDid.get(peerId) !== did;
-    _setPeerDid(peerId, did);
-    if (isNewMapping) {
-      flushQueuedDmForPeer(peerId).catch(() => {});
-      _replayPendingDm(peerId, did);
-    }
-    const validated = validateProfileMeta({
-      bannerUrl: msg.bannerUrl, gradient2: msg.gradient2 ?? undefined,
-      gradient3: msg.gradient3 ?? undefined, tagText: msg.tagText,
-      tagTextColor: msg.tagTextColor, tagChipColor: msg.tagChipColor,
-      bio: msg.bio, nameEffect: msg.nameEffect,
-      nameShimmer: msg.nameShimmer, nameGlow: msg.nameGlow,
-    });
-    const peerProfile = {
-      did, isMe: false as const, nickname: normalizeWireName(msg.name),
-      pfpURL: normalizeAvatarUrl(msg.avatarUrl),
-      color: normalizeNicknameColor(msg.color) ?? undefined,
-      updatedAt: Date.now(), bannerURL: validated.bannerUrl,
-      gradient2: validated.gradient2, gradient3: validated.gradient3,
-      tagText: validated.tagText, tagTextColor: validated.tagTextColor,
-      tagChipColor: validated.tagChipColor, bio: validated.bio,
-      nameEffect: validated.nameEffect, nameShimmer: validated.nameShimmer,
-      nameGlow: validated.nameGlow,
-    };
-    try {
-      await putPeerRoomProfile(room, joinedRoom.createdAt, peerProfile);
-    } catch {
-      return;
-    }
-    const currentRoom = await getRoom(room);
-    if (currentRoom?.type !== "text" || currentRoom.createdAt !== joinedRoom.createdAt ||
-        !_transport.rooms().includes(room) || !_transport.isRoomPeer(room, peerId)) return;
-    const scoped = new Map(transportState.peerRoomProfiles);
-    const peers = new Map(scoped.get(room));
-    peers.set(did, peerProfile);
-    scoped.set(room, peers);
-    transportState.peerRoomProfiles = scoped;
-    return;
-  }
   rec(ev("app.profile.in", { peer: peerId }));
   // A proven peerId->DID binding is the only thing allowed to group two
   // peerIds under one identity ordinal - see the recorder's own warning.
@@ -2386,8 +2479,6 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
   const isNewMapping = _peerIdToDid.get(peerId) !== did;
   _setPeerDid(peerId, did);
   _reconcileRoomUserBinding(peerId, did);
-  const newRoomProfileSupport = msg.roomScoped !== true && msg.roomProfilesSupported === true && !_roomProfilePeers.has(peerId);
-  if (newRoomProfileSupport) _roomProfilePeers.add(peerId);
 
   // Queued DMs are keyed by DID, and the "connect" event fires before we
   // know the peer's DID - so the real flush happens here, once the profile
@@ -2396,6 +2487,16 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
     flushQueuedDmForPeer(peerId).catch(() => {});
     _replayPendingDm(peerId, did);
   }
+
+  // A room-scoped frame travels on its own room's stream and can land before
+  // the main one, so it gets the binding bookkeeping above - and nothing
+  // else: no reply, no sync, no post-quantum key, no main-profile state.
+  if (msg.roomScoped === true) {
+    await _handleScopedProfile(peerId, did, msg, channelRoom);
+    return;
+  }
+  const newRoomProfileSupport = msg.roomProfilesSupported === true && !_roomProfilePeers.has(peerId);
+  if (newRoomProfileSupport) _roomProfilePeers.add(peerId);
 
   // Answer with everything about our current state, on EVERY profile we did
   // not ourselves provoke - not only when the mapping is new.
@@ -2413,6 +2514,27 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
   }
   // Reconcile history with them either way; debounced, so a burst is one.
   _syncPeer(peerId);
+
+  // Their profile is kept - in memory and in storage - only when we share
+  // something with them: it came over a verified room or DM channel, or they
+  // are verified in one of ours right now. A direct frame passes the scope
+  // check, and any peer that can dial us could otherwise have us store a
+  // profile (up to ~1.4 MB of avatar and banner) per identity it mints. The
+  // same rule decides where OUR profile goes (profileDeliveryRoom), so every
+  // peer that sends us theirs legitimately does it over a shared channel.
+  // A legacy-only session (no protected rooms at all) has no such channel.
+  if (
+    channelRoom === null &&
+    profileDeliveryRoom(_transport.rooms(), peerId, (r) => _transport.peersInRoom(r)) === null
+  ) {
+    rec(ev("app.profile.reject", { peer: peerId, d: { reason: "scope" } }));
+    return;
+  }
+  // The frame that proved the binding came over this room's channel, so this
+  // is the first moment the room can vouch for them by DID.
+  if (channelRoom && _protectedRoster(channelRoom)) {
+    _noteAttestedMembers(channelRoom, new Map([[did, Date.now()]]));
+  }
 
   const avatarUrl = normalizeAvatarUrl(msg.avatarUrl);
   // `color` absent = older build, which has no such field - keep any cached
@@ -2436,6 +2558,16 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
     else colors.delete(did);
     transportState.peerColors = colors;
   }
+
+  // Their post-quantum key, verified against the DID just proved, and the
+  // DM upgrade it makes possible (dm-pq-hooks.ts).
+  const pqKey = acceptProfilePqKey(
+    { remember: rememberPeerPqKey, offerUpgrade: offerDmUpgrade },
+    peerId,
+    did,
+    identityStore.did ?? "",
+    msg.pq
+  );
 
   // Absent = on: the default, and what a build predating the field sends.
   const inboxOff = msg.inboxOff === true;
@@ -2503,6 +2635,7 @@ async function _handleProfile(peerId: string, msg: WireProfile, room: string | n
         nameGlow: validated.nameGlow,
         ...(inboxOff ? { inboxOff: true } : {}),
         ...(existing?.pfpData ? { pfpData: existing.pfpData } : {}),
+        ...(pqKey ?? existing?.pqKey ? { pqKey: pqKey ?? existing?.pqKey } : {}),
       }).catch(() => {})
     )
     .catch(() => {});
@@ -2755,6 +2888,36 @@ function _reconcileRoomUserBinding(peerId: string, did: string): void {
   }
 }
 
+/**
+ * A protected room's member list is not gossip: only an identity the room
+ * itself vouches for is listed - one heard over the room's verified channel
+ * under a proven binding, or one whose signed messages (sigV3 binds the room)
+ * we accepted. A member's say-so about somebody ELSE is not enough: it let
+ * any member list real people in a room they are not in (under their real
+ * names, where we hold their profile) or flood the list with junk.
+ */
+function _protectedRoster(room: string): boolean {
+  return room.startsWith("rd2_");
+}
+
+/** `did` is attested in `room` as of `at`: listed, and last seen then. */
+function _noteAttestedMembers(room: string, seen: Map<string, number>): void {
+  const now = Date.now();
+  const entries = [...seen]
+    .filter(([did]) => looksLikeDid(did))
+    .map(([did, at]) => [did, Math.min(at, now)] as const);
+  if (!entries.length) return;
+  addRoomParticipants(room, entries).catch(() => {});
+  if (room !== transportState.roomCode) return;
+  const users = new Set(transportState.roomUsers);
+  const before = users.size;
+  for (const [did] of entries) {
+    if (users.size >= MAX_ROOM_PARTICIPANTS) break;
+    users.add(did);
+  }
+  if (users.size !== before) transportState.roomUsers = [...users];
+}
+
 function _admitRoomMember(room: string, did: string): void {
   if (room !== transportState.roomCode) {
     // Another room we are subscribed to: record it, but do not touch the
@@ -2797,7 +2960,12 @@ function _handleJoinRoom(
   // they are on is bound to a DID that is in the roster - so a fabricated
   // entry reaches nobody until that identity actually connects.
   if (!looksLikeDid(claimedDid) && !looksLikePeerId(claimedDid)) return;
-  _admitRoomMember(room, claimedDid);
+  // A protected room lists only whom it attests (_protectedRoster). An
+  // unbound join is not lost: the sender's profile follows over this same
+  // channel and lists them then (_handleProfile).
+  if (!_protectedRoster(room) || _isSelfAnnouncement(fromPeerId, claimedDid)) {
+    _admitRoomMember(room, claimedDid);
+  }
   // The roster only went out on connect, so a peer switching into this room
   // over connections that were already up saw nobody but themselves until
   // the next connect. Answer the join with who is here.
@@ -2835,6 +3003,7 @@ function _handleLeaveRoom(
 const MAX_ROOM_USERS = 512;
 
 function _handleRoomUsersSync(
+  fromPeerId: string,
   msg: WireRoomUsersSync,
   room: string | null
 ): void {
@@ -2848,8 +3017,13 @@ function _handleRoomUsersSync(
   const participants = msg.participants;
   if (!Array.isArray(participants)) return;
   const selfDid = identityStore.did ?? _transport.selfId();
+  const senderDid = _peerIdToDid.get(fromPeerId);
   const valid = participants.filter(
-    (p) => typeof p === "string" && (looksLikeDid(p) || looksLikePeerId(p))
+    (p) =>
+      typeof p === "string" &&
+      (looksLikeDid(p) || looksLikePeerId(p)) &&
+      // In a protected room a roster vouches for its sender alone.
+      (!_protectedRoster(roomCode) || (room !== null && p === senderDid))
   );
   rec(
     ev("app.roomusers", {
@@ -2936,6 +3110,9 @@ function _announceMessage(
   msg: Message,
   opts: { viaMailbox?: boolean } = {}
 ): void {
+  // A message request makes no sound: a stranger minting identities would
+  // otherwise get a notification per identity.
+  if (isDmRequestRoom(msg.roomCode)) return;
   announceMessage(
     msg,
     {
@@ -3025,10 +3202,20 @@ async function _handleChatMessage(
   // The in-memory list holds only the open room's newest page; a replayed
   // message from a background room would always look "new" and re-notify.
   // Decided BEFORE the put below, which would otherwise satisfy the lookup.
-  const isNewMessage =
-    !transportState.messages.some((m) => m.id === msg.id) &&
-    !(await getMessage(msg.id));
+  const held =
+    transportState.messages.find((m) => m.id === msg.id) ??
+    (await getMessage(msg.id));
   guard();
+  const isNewMessage = !held;
+  // A row we hold under this id that is NOT this sender's message in this
+  // room means this one is not stored and never will be. It must not claim a
+  // watermark: that told every later digest we had the message, so no peer
+  // would ever offer it again - one squatted id silently erased it here for
+  // good. Nor does it get to fold into a card or seed files under that id.
+  if (held && (held.roomCode !== msg.roomCode || held.senderId !== msg.senderId)) {
+    console.warn("[chat] refused a message reusing the id of one we already hold");
+    return;
+  }
 
   // Only a genuinely new message is written: re-putting a replayed one
   // would overwrite the stored row with this handler's view of it.
@@ -3365,14 +3552,25 @@ _transport.on("disconnect", (peerId) => {
  * crypto (sender signature over the envelope, bound to us); the stream
  * path's transport-level binding plays no part here.
  */
-export function deliverMailboxDm(
+export async function deliverMailboxDm(
   senderDid: string,
   payload: DmPayload
 ): Promise<void> {
+  // A blob from before the user deleted this conversation is a replay: the
+  // relay has it only because it kept what we acked. Resolving (not throwing)
+  // lets the collector ack it again.
+  if ((payload.lamport ?? payload.ts) <= (await _deletedFloorFor(senderDid))) return;
   // AWAITABLE on purpose: the mailbox collector must not ack (= delete the
   // relay's only copy) until the local write actually settled - a locked
   // identity mid-drain throws here instead of vanishing the message.
   return _handleDmChatAsync(senderDid, senderDid, { payload }, true);
+}
+
+/** How far this sender's side of a deleted conversation went (storage.ts). */
+async function _deletedFloorFor(senderDid: string): Promise<number> {
+  const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
+  if (!roomCode) return 0;
+  return getDeletedFloor(roomCode, senderDid).catch(() => 0);
 }
 
 /**
@@ -3401,13 +3599,24 @@ export async function deliverMailboxBatch(
   const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
   guard();
   if (!roomCode || roomCode !== decoded.roomCode) return;
+  // Same replay rule as deliverMailboxDm, per row.
+  const floor = await _deletedFloorFor(senderDid);
+  guard();
+  const messages = decoded.messages.filter(
+    (m) => !(m?.senderId === senderDid && typeof m.lamport === "number" && m.lamport <= floor)
+  );
+  if (!messages.length) return;
   // The batch handler refuses a room we have not joined, and a conversation
   // whose first contact arrives through the mailbox has never been joined.
-  await ensureDmRoomForPeer(senderDid);
+  // No room means a stranger's request that did not fit: dropped.
+  if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return;
+  // A request this just created must be known as one before anything in the
+  // batch is announced (_announceMessage reads roomsStore).
+  await refreshDmRooms();
   guard();
   await _handleSyncBatch(
     roomCode,
-    decoded.messages,
+    messages,
     senderDid,
     decoded.live === true
   );
@@ -3470,7 +3679,10 @@ function _handleDmChatAsync(
 ): Promise<void> {
   const guard = captureDmOwnership();
   return (async () => {
-    const roomCode = await ensureDmRoomForPeer(peerId);
+    // Same binding verifyIncoming applies to room rows: a DM peer cannot file
+    // a row under an id someone else's message was bound to.
+    if (!messageIdAllowedFor(envelope.payload.id, senderDid)) return;
+    const roomCode = await ensureDmRoomForPeer(peerId, undefined, { unsolicited: true });
     guard();
     if (!roomCode) return;
 
@@ -3780,14 +3992,17 @@ _transport.on("message", (peerId, data, room) => {
     // Update last seen for this peer
     const did = _peerIdToDid.get(peerId);
     if (did && room) {
-      updateParticipantLastSeen(room, did).catch(() => {});
+      // Over a protected room's channel, a bound sender IS a member: list
+      // them (one rewrite, same as the last-seen update it replaces).
+      if (_protectedRoster(room)) _noteAttestedMembers(room, new Map([[did, Date.now()]]));
+      else updateParticipantLastSeen(room, did).catch(() => {});
     }
 
     const msg = decoded as AnyWireMessage;
 
     switch (msg.type) {
       case MessageType.Profile:
-        _handleProfile(peerId, msg, room);
+        _handleProfile(peerId, msg, room ?? null);
         break;
       case MessageType.CallPresence:
         _handleCallPresence(peerId, msg.inCall, msg.roomCode);
@@ -3883,7 +4098,7 @@ _transport.on("message", (peerId, data, room) => {
         _handleLeaveRoom(peerId, msg.peerId, room);
         break;
       case MessageType.RoomUsersSync:
-        _handleRoomUsersSync(msg, room);
+        _handleRoomUsersSync(peerId, msg, room);
         break;
       case MessageType.SyncDigest:
         _handleDigest(peerId, msg.roomCode, msg.watermarks).catch(() => {});
@@ -4069,6 +4284,9 @@ async function _joinSavedRooms(): Promise<void> {
     // DMs are handled by joinPhonebookDmRooms, which derives the room code
     // from the DID rather than trusting a stored one.
     if (isLegacyArchive(room.roomCode)) continue;
+    // A message request is joined when its sender turns up again (their
+    // introduction) or the user opens it - never just for starting up.
+    if ((room as DMRoom).request === true) continue;
     try {
       joinStoredRoom(_transport, room.roomCode, room);
     } catch {
@@ -4262,28 +4480,6 @@ export async function removeRoomCompletely(roomCode: string): Promise<void> {
     transportState.connected = false;
   }
   await removeRoom(roomCode);
-  const scoped = new Map(transportState.peerRoomProfiles);
-  scoped.delete(roomCode);
-  transportState.peerRoomProfiles = scoped;
-}
-
-/** Called after device sync has already removed the room from storage. */
-export function forgetSyncedRoom(roomCode: string): void {
-  if (!_transport.rooms().includes(roomCode) &&
-      !roomsStore.rooms.some(room => room.roomCode === roomCode) &&
-      transportState.roomCode !== roomCode &&
-      !transportState.peerRoomProfiles.has(roomCode)) return;
-  beginConversationOpen();
-  if (_transport.rooms().includes(roomCode)) _transport.leaveRoom(roomCode);
-  if (transportState.callRoomCode === roomCode) leaveCall();
-  if (transportState.roomCode === roomCode) {
-    transportState.roomCode = null;
-    transportState.roomName = "";
-    transportState.roomUsers = [];
-    transportState.messages = [];
-    transportState.connected = false;
-  }
-  roomsStore.rooms = roomsStore.rooms.filter(room => room.roomCode !== roomCode);
   const scoped = new Map(transportState.peerRoomProfiles);
   scoped.delete(roomCode);
   transportState.peerRoomProfiles = scoped;
@@ -4561,7 +4757,7 @@ export async function sendMessage(
   assertCurrent();
 
   let msg: Message = {
-    id: crypto.randomUUID(),
+    id: newMessageId(myId),
     roomCode,
     senderId: myId,
     senderName,
@@ -4640,6 +4836,8 @@ export async function sendFiles(
   if (roomCode.startsWith("dm-")) {
     const did = await dmPeerDidForRoom(roomCode);
     if (!did || await ensureDmRoomForPeer(did) !== roomCode) throw new Error("DM identity unavailable");
+    // Answering a message request accepts it, files included.
+    if (await setDmRequest(roomCode, false)) void refreshDmRooms();
   }
   if (!_transport.rooms().includes(roomCode)) throw new Error("Not in a room");
   assertCurrent();
@@ -4658,7 +4856,7 @@ export async function sendFiles(
     sourceByInfoHash.set(newSeed.infoHash, file);
   }
 
-  const messageId = crypto.randomUUID();
+  const messageId = newMessageId(identityStore.did ?? _transport.selfId());
   const attachmentIds: string[] = [];
   const createdAt = Date.now();
   // Measured here and carried with the announce so a receiver can reserve
@@ -4793,7 +4991,7 @@ export async function sendCard(
   const lamport = await nextMessageLamport(roomCode);
   assertCurrent();
 
-  const cardId = crypto.randomUUID();
+  const cardId = newMessageId(myId);
   const content = JSON.stringify({ pluginId, data: payload });
 
   let msg: Message = {
@@ -4874,7 +5072,7 @@ export async function sendUpdate(
     const content = JSON.stringify({ pluginId, cardId, data: payload });
     let wire: WirePluginEphemeral = {
       type: MessageType.PluginEphemeral,
-      id: crypto.randomUUID(),
+      id: newMessageId(myId),
       senderId: myId,
       senderName,
       timestamp: Date.now(),
@@ -4901,7 +5099,7 @@ export async function sendUpdate(
   const content = JSON.stringify({ pluginId, cardId, data: payload });
 
   let msg: Message = {
-    id: crypto.randomUUID(),
+    id: newMessageId(myId),
     roomCode,
     senderId: myId,
     senderName,
@@ -4974,7 +5172,7 @@ export function sendUpdateImmediately(
     return;
   const guard = captureSessionGuard();
   const msg = signMessage({
-    id: crypto.randomUUID(),
+    id: newMessageId(identityStore.did ?? _transport.selfId()),
     roomCode,
     senderId: identityStore.did ?? _transport.selfId(),
     senderName: immediatePluginSenderName(

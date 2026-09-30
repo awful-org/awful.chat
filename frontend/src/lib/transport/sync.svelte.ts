@@ -629,11 +629,7 @@ async function startSyncServer(): Promise<void> {
         syncState.isSyncing = true;
         const requestMode = mode ?? "replace";
         if (requestMode === "add" && Array.isArray(roomDeletions)) {
-          const removed = await applyRoomDeletionMarkers(roomDeletions);
-          if (removed.length) {
-            const { forgetSyncedRoom } = await import("./transport.svelte");
-            for (const roomCode of removed) forgetSyncedRoom(roomCode);
-          }
+          await applyRoomDeletionMarkers(roomDeletions);
         }
         console.log(
           `[Sync][Source] Received ExportRequest, mode: ${requestMode}, sending data...`
@@ -1195,15 +1191,6 @@ export async function connectAsTarget(
                 releaseCommit?.();
               });
               if (_transport !== targetTransport) return;
-              if (mode === "add" && receivedData.roomDeletions?.length) {
-                const { forgetSyncedRoom } = await import("./transport.svelte");
-                for (const marker of receivedData.roomDeletions ?? []) {
-                  if (marker && typeof marker === "object" && "roomCode" in marker &&
-                      typeof marker.roomCode === "string" && !(await getRoom(marker.roomCode))) {
-                    forgetSyncedRoom(marker.roomCode);
-                  }
-                }
-              }
               if (droppedRecords > 0) {
                 // The sync itself succeeded - this is a partial-data note,
                 // not a failure, so it doesn't route through syncError/the

@@ -11,6 +11,9 @@ import {
   putRoom,
   getRoom,
   setWatermark,
+  setDeletedFloor,
+  deleteMessagesForRoom,
+  getDeletedFloor,
   updateMessageStatus,
   wipeLocalDatabase,
   type Room,
@@ -34,6 +37,8 @@ import {
   getDB,
   migrateAtRest,
   addRoomParticipant,
+  addRoomParticipants,
+  MAX_ROOM_PARTICIPANTS,
   updateParticipantLastSeen,
   removeRoomParticipant,
   cleanupInactiveParticipants,
@@ -193,6 +198,15 @@ describe("identity-owned writes", () => {
 });
 
 describe("watermarks", () => {
+  it("keeps a deleted conversation's floor through the room's deletion", async () => {
+    await setWatermark("dm-x", "did:key:zPeer", 42);
+    await setDeletedFloor("dm-x", "did:key:zPeer", 42);
+    await deleteMessagesForRoom("dm-x");
+    expect(await getWatermark("dm-x", "did:key:zPeer")).toBe(0);
+    expect(await getDeletedFloor("dm-x", "did:key:zPeer")).toBe(42);
+    expect(await getWatermarksForRoom("dm-x")).toEqual({});
+  });
+
   it("stores and reads per-sender max lamport", async () => {
     await setWatermark("room-a", "alice", 5);
     expect(await getWatermark("room-a", "alice")).toBe(5);
@@ -845,6 +859,21 @@ describe("room participants and persistence", () => {
       "did:key:zBob"
     ];
     expect(secondTimestamp).toBeGreaterThanOrEqual(after);
+  });
+
+  it("adds many in one go, never past the cap, never moving last-seen back", async () => {
+    await putRoom(baseRoom);
+    await addRoomParticipant("room-persist", "did:key:zKept");
+    const kept = (await getRoom("room-persist"))!.participantLastSeen!["did:key:zKept"];
+    const flood = Array.from(
+      { length: MAX_ROOM_PARTICIPANTS + 50 },
+      (_, i) => [`did:key:zJunk${i}`, 1] as const
+    );
+    await addRoomParticipants("room-persist", [["did:key:zKept", 1], ...flood]);
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toHaveLength(MAX_ROOM_PARTICIPANTS);
+    expect(room?.participants).toContain("did:key:zKept");
+    expect(room?.participantLastSeen?.["did:key:zKept"]).toBe(kept);
   });
 
   it("removes a participant and its timestamp", async () => {

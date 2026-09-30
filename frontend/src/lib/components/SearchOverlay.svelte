@@ -226,8 +226,9 @@
                 : 'hover:bg-muted/60'}"
             >
               <span class="flex items-baseline gap-2">
+                <!-- The profile's name first: the one on the row is not signed. -->
                 <span class="truncate text-xs font-medium text-foreground">
-                  {hit.entry.senderName}
+                  {transportState.peerNames.get(hit.entry.senderDid) || hit.entry.senderName}
                 </span>
                 {#if !searchUi.scope}
                   <span class="truncate font-mono text-[10px] text-primary/80">

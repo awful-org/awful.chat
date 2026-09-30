@@ -96,6 +96,7 @@
     dmConversationCodeFor,
     openDmConversation,
     removeDmConversation,
+    acceptDmRequest,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import FloatingDmPanel from "$lib/components/FloatingDmPanel.svelte";
@@ -355,13 +356,18 @@
         avatarUrl: string | null;
         ts: number;
         text: string;
+        request: boolean;
       }
     >()
   );
   let dmUnread = $state(new Map<string, number>());
   let dmBuildRun = 0;
+  // Message requests keep their own badge in the list but stay out of the
+  // total: a stranger does not get to light up the app icon.
   const dmUnreadTotal = $derived(
-    [...dmUnread.values()].reduce((sum, n) => sum + n, 0)
+    [...dmUnread.entries()]
+      .filter(([roomCode]) => !dmInbox.get(roomCode)?.request)
+      .reduce((sum, [, n]) => sum + n, 0)
   );
   /** roomsStore.rooms laid out by the sidebar's pins, then its drag order. */
   const orderedRooms = $derived(
@@ -1204,6 +1210,13 @@
   const myId = $derived(selfId());
   const hasSidebar = $derived(roomsStore.rooms.length > 0);
   const isDmActive = $derived(transportState.chatMode === "dm");
+  const activeDmRequest = $derived(
+    isDmActive &&
+      !!activeRoomCode &&
+      roomsStore.dmRooms.some(
+        (r) => r.roomCode === activeRoomCode && r.request === true
+      )
+  );
   const dmEntries = $derived.by(() => {
     const map = new Map<
       string,
@@ -1213,6 +1226,7 @@
         avatarUrl?: string | null;
         addedAt: number;
         inPhonebook: boolean;
+        request: boolean;
       }
     >();
     // Keyed by every identity form: dmInbox keys are DIDs while entries may
@@ -1243,6 +1257,7 @@
             data.avatarUrl,
           addedAt: data.ts,
           inPhonebook: !!pb,
+          request: data.request && !pb,
         });
       }
       // Keep the newest: this used to fill a gap only when nothing was set
@@ -1336,6 +1351,7 @@
           avatarUrl: string | null;
           ts: number;
           text: string;
+          request: boolean;
         }
       >();
       const unreadNext = new Map<string, number>();
@@ -1395,6 +1411,7 @@
           avatarUrl,
           ts: last.timestamp,
           text: previewText(last),
+          request: room.request === true,
         });
 
         if (last) {
@@ -1557,6 +1574,10 @@
                 : handleRemoveRoom()}
             onOpenSidebar={hasSidebar ? () => (sidebarOpen = true) : undefined}
             onOpenDm={handleSelectDm}
+            dmRequest={activeDmRequest}
+            onAcceptDmRequest={() => {
+              if (activeDmPeerId) void acceptDmRequest(activeDmPeerId);
+            }}
             {incomingSharedFiles}
             {incomingSharedText}
             onConsumeIncomingShared={clearIncomingShared}

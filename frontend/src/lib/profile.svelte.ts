@@ -56,6 +56,22 @@ function nextFieldEdit(previous?: { at: number }) {
   return { at, id: `${crypto.randomUUID()}` };
 }
 
+/**
+ * A room image as a data URL, encoded once per buffer. getScopedProfile runs
+ * several times per own message on every render, and base64-encoding a
+ * half-megabyte avatar each time was the whole cost of it.
+ */
+const _dataUrls = new WeakMap<ArrayBuffer, string>();
+function dataUrlOf(data: ArrayBuffer): string {
+  let url = _dataUrls.get(data);
+  if (!url) {
+    const bytes = new Uint8Array(data);
+    url = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
+    _dataUrls.set(data, url);
+  }
+  return url;
+}
+
 export function getScopedProfile(roomCode: string | null = null): ProfileStore {
   if (!roomCode || !roomsStore.rooms.some(r => r.roomCode === roomCode && r.type === "text")) return profileStore;
   const main: OwnProfile = {
@@ -71,8 +87,8 @@ export function getScopedProfile(roomCode: string | null = null): ProfileStore {
   const record = roomProfileStore.records.get(roomCode);
   const p = resolveRoomProfile(main, record?.did === main.did ? record.fields : undefined);
   return {
-    nickname: p.nickname, avatarUrl: p.pfpURL ?? (p.pfpData ? `data:${sniffImageMime(new Uint8Array(p.pfpData))};base64,${bytesToBase64(new Uint8Array(p.pfpData))}` : undefined),
-    bannerUrl: p.bannerURL ?? (p.bannerData ? `data:${sniffImageMime(new Uint8Array(p.bannerData))};base64,${bytesToBase64(new Uint8Array(p.bannerData))}` : undefined),
+    nickname: p.nickname, avatarUrl: p.pfpURL ?? (p.pfpData ? dataUrlOf(p.pfpData) : undefined),
+    bannerUrl: p.bannerURL ?? (p.bannerData ? dataUrlOf(p.bannerData) : undefined),
     color: p.color, tagText: p.tagText, tagTextColor: p.tagTextColor,
     tagChipColor: p.tagChipColor, bio: p.bio, nameEffect: p.nameEffect,
     nameShimmer: p.nameShimmer, nameGlow: p.nameGlow,

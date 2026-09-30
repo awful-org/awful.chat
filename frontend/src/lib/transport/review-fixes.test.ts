@@ -59,12 +59,14 @@ vi.mock("$lib/storage", () => ({
   bulkPutMessages: async (rows: any[], guard: () => void) => { guard(); rows.forEach(m => s.rows.set(m.id, m)); },
   getAttachmentsByMessage: async (id: string) => s.attachments.filter(a => a.messageId === id),
   putAttachment: async (a: any, guard: () => void) => { guard(); s.attachments.push(a); },
+  getDeletedFloor: async () => 0, addRoomParticipants: async () => {}, MAX_ROOM_PARTICIPANTS: 512,
+  deletePeerRoomProfile: async () => {},
 }));
 vi.mock("$lib/messaging", () => ({ signMessage: s.sign, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true }));
-vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, roomsStore: { rooms: [] } }));
+vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, refreshDmRooms: async () => {}, roomsStore: { rooms: [], dmRooms: [] } }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
 vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));
-vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer", flushQueuedDmForPeer: async () => {} }));
+vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer", flushQueuedDmForPeer: async () => {}, isDmRequestRoom: () => false, offerDmUpgrade: () => {} }));
 vi.mock("./verify-incoming", async original => ({ ...await original<typeof import("./verify-incoming")>(), verifyIncoming: async () => ({ ok: true }) }));
 vi.mock("../storage-crypto", () => ({ blindValue: async (v: string) => v }));
 vi.mock("../telemetry/taps", () => ({ stopTelemetryTaps: vi.fn(), installTelemetryTaps: vi.fn() }));
@@ -72,7 +74,7 @@ vi.mock("./node-lock", () => ({ releaseNodeLock: vi.fn() }));
 vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
 
-import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch, peerIdToDid, forgetSyncedRoom } from "./transport.svelte";
+import { sendMessage, sendCard, sendUpdate, transportState, deliverMailboxBatch, peerIdToDid } from "./transport.svelte";
 import { roomsStore } from "$lib/rooms.svelte";
 import { encode, decode } from "$lib/utils";
 import { hydrateLegacyAttachments } from "./files.svelte";
@@ -108,17 +110,6 @@ it("does not republish a scoped profile after a failed write or a concurrent lea
   expect(transportState.peerRoomProfiles.get("rd2_room")?.has("did:peer")).not.toBe(true);
 });
 
-it("forgets a remotely deleted room from the live subscription and reactive profile cache", () => {
-  roomsStore.rooms = [{ roomCode: "rd2_room" } as any];
-  transportState.roomCode = "rd2_room";
-  transportState.peerRoomProfiles = new Map([["rd2_room", new Map([["did:peer", { nickname: "Room" } as any]])]]);
-  forgetSyncedRoom("rd2_room");
-  expect(s.leaveRoom).toHaveBeenCalledWith("rd2_room");
-  expect(roomsStore.rooms).toEqual([]);
-  expect(transportState.roomCode).toBeNull();
-  expect(transportState.peerRoomProfiles.has("rd2_room")).toBe(false);
-});
-
 it("keeps marked profiles in their authenticated room and leaves the main profile intact", async () => {
   const onMessage = s.handlers.get("message")!;
   const frame = (name: string, scoped = true) => encode({ type: MessageType.Profile, name,
@@ -137,6 +128,27 @@ it("keeps marked profiles in their authenticated room and leaves the main profil
   await new Promise(resolve => setTimeout(resolve, 0));
   expect(s.roomWrites).toHaveBeenCalledTimes(2);
   expect(transportState.peerNames.get("did:peer")).toBe("Main");
+});
+
+it("drops a peer's room copy when they go back to their main profile there", async () => {
+  const onMessage = s.handlers.get("message")!;
+  const scoped = (extra: Record<string, unknown>) => encode({ type: MessageType.Profile, name: "Room",
+    did: "did:peer", peerId: "peer1", bindingSig: "sig", avatarUrl: null, roomScoped: true, ...extra });
+  onMessage("peer1", scoped({}), "rd2_room");
+  await vi.waitFor(() => expect(transportState.peerRoomProfiles.get("rd2_room")?.get("did:peer")?.nickname).toBe("Room"));
+  onMessage("peer1", scoped({ name: "", roomInherit: true }), "rd2_room");
+  await vi.waitFor(() => expect(transportState.peerRoomProfiles.get("rd2_room")?.has("did:peer")).toBe(false));
+});
+
+it("stores a room profile only after the same checks a stored profile gets", async () => {
+  s.handlers.get("message")!("peer1", encode({ type: MessageType.Profile, name: "Room",
+    did: "did:peer", peerId: "peer1", bindingSig: "sig", avatarUrl: null, roomScoped: true,
+    color: "red;position:fixed", tagText: "ok", tagChipColor: "url(x)" }), "rd2_room");
+  await vi.waitFor(() => expect(transportState.peerRoomProfiles.get("rd2_room")?.get("did:peer")).toBeDefined());
+  const kept = transportState.peerRoomProfiles.get("rd2_room")!.get("did:peer")!;
+  expect(kept.color).toBeUndefined();
+  expect(kept.tagChipColor).toBeUndefined();
+  expect(kept.tagText).toBe("OK");
 });
 
 it("rejects a validly bound scoped frame from a peer outside the transport room", async () => {
@@ -163,8 +175,11 @@ it("sends scoped profiles after support first arrives in a main reply, without l
   onMessage("peer1", encode({ type: MessageType.Profile, name: "Peer", did: "did:peer", avatarUrl: null,
     peerId: "peer1", bindingSig: "sig", roomProfilesSupported: true }), "rd2_room");
   await vi.waitFor(() => expect(s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true)).toHaveLength(4));
-  expect(s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true).slice(2)
-    .map(([, room, frame]) => [room, (decode(frame) as WireProfile).name])).toEqual([["rd2_room", "Shared"], ["rd2_b", "Shared"]]);
+  // No overrides left: each room gets the small inherit frame, never a copy
+  // of the main profile (with its avatar) per shared room.
+  const after = s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as WireProfile).roomScoped === true).slice(2)
+    .map(([, room, frame]) => decode(frame) as WireProfile & { room?: string });
+  expect(after.map(f => [f.roomInherit, f.name, f.avatarUrl])).toEqual([[true, "", null], [true, "", null]]);
 });
 
 it("does not reuse support after a peer disconnects and returns with an old main frame", async () => {

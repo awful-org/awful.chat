@@ -35,6 +35,8 @@
     avatarUrl?: string | null;
     addedAt: number;
     inPhonebook?: boolean;
+    /** A message request: listed last, under its own heading. */
+    request?: boolean;
   }
 
   type DmContextAction =
@@ -102,6 +104,13 @@
     onOpenCreateJoin,
     onOpenPhonebook,
   }: Props = $props();
+
+  // Requests after every accepted conversation, whatever their recency.
+  const dmList = $derived([
+    ...phonebook.filter((e) => !e.request),
+    ...phonebook.filter((e) => e.request),
+  ]);
+  const firstRequest = $derived(dmList.find((e) => e.request)?.peerId);
 
   let contextMenu = $state<{ code: string; x: number; y: number } | null>(null);
 
@@ -645,7 +654,10 @@
           </div>
         {/each}
       {:else}
-        {#each phonebook as entry (entry.peerId)}
+        {#each dmList as entry (entry.peerId)}
+          {#if entry.peerId === firstRequest}
+            <div class="mx-2 my-1 h-px bg-border" aria-hidden="true"></div>
+          {/if}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <div
             role="none"
@@ -796,7 +808,14 @@
         </div>
       {/each}
     {:else}
-      {#each phonebook as entry (entry.peerId)}
+      {#each dmList as entry (entry.peerId)}
+        {#if entry.peerId === firstRequest}
+          <div
+            class="select-none px-2.5 pb-1 pt-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
+          >
+            Requests
+          </div>
+        {/if}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
           role="none"

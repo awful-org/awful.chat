@@ -6,9 +6,13 @@ import {
   getAllRooms,
   getDB,
   getKeypairRecord,
+  getMessage,
+  putMessage,
   getMnemonicRecord,
+  getPeerProfile,
   getWatermark,
   migrateAtRest,
+  putPeerProfile,
   setAtRestOwner,
   wipeLocalDatabase,
   putRoom,
@@ -17,6 +21,8 @@ import {
   getOwnRoomProfile,
   deleteRoomProfilesForRoom,
   getRoomDeletionMarker,
+  putIdentityRecord,
+  deleteRoom,
 } from "../storage";
 import { initStorageCrypto } from "../storage-crypto";
 import { deriveRoomKeys, newRoomSecret } from "../room-security/keys";
@@ -24,8 +30,11 @@ import {
   createIdentity,
   isUnlocked,
   lockIdentity,
+  publicKeyToDid,
   unlockIdentity,
 } from "../identity/identity";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { pqKeyCertificate } from "../identity/pq-identity";
 
 const PASSWORD = "the password that was in use at backup time";
 
@@ -43,6 +52,33 @@ describe("room profile import", () => {
   beforeEach(async () => {
     await wipeLocalDatabase();
     await initStorageCrypto(new Uint8Array(32).fill(24));
+    // Imports keep only this identity's own overrides.
+    await putIdentityRecord({ id: "keypair", did: "did:alice", publicKey: new Uint8Array(32) } as never);
+  });
+
+  it("drops another identity's overrides and sanitizes the values it keeps", async () => {
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [
+      { roomCode: code, did: "did:mallory", generation: 100, fields: { nickname: "Not me" } },
+      { roomCode: code, did: "did:alice", generation: 100, fields: {
+        color: "red;background:url(https://x/beacon);position:fixed",
+        tagChipColor: "#12345g", nickname: "  Alice  ", bio: null,
+        pfpData: btoa("x".repeat(600 * 1024)),
+      } },
+    ] }), "add");
+    expect(await getOwnRoomProfile(code, "did:mallory")).toBeUndefined();
+    const fields = (await getOwnRoomProfile(code, "did:alice"))?.fields;
+    expect(fields?.color).toBeUndefined();
+    expect(fields?.tagChipColor).toBeUndefined();
+    expect(fields?.pfpData).toBeUndefined();
+    expect(fields?.nickname).toBe("Alice");
+    expect(fields?.bio).toBeNull();
+  });
+
+  it("refuses a leave marker dated far in the future", async () => {
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 9e15, deletedAt: 9e15 }] }), "add");
+    expect(await getRoomDeletionMarker(code)).toBeUndefined();
+    await putRoom(room(100));
+    expect((await getRoom(code))?.createdAt).toBe(100);
   });
 
   it("restores a room override on a second device and merges independent field edits", async () => {
@@ -73,28 +109,28 @@ describe("room profile import", () => {
     expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ bio: null });
   });
 
-  it("applies deletion before stale snapshot import in either order", async () => {
+  it("never removes a room or its history for a leave on another device", async () => {
     await putRoom(room(100));
     await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 100,
-      fields: { nickname: "Stale" } });
-    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
-      roomCode: code, did: "did:alice", generation: 100,
-      fields: { nickname: "Stale" },
-    }], roomDeletions: [{ roomCode: code, generation: 150, deletedAt: 151 }] }), "add");
-    expect(await getRoom(code)).toBeUndefined();
-    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+      fields: { nickname: "Kept" } });
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 150, deletedAt: 151 }] }), "add");
+    // Still in the generation the marker names: nothing changes here.
+    expect((await getRoom(code))?.createdAt).toBe(100);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Kept");
+    expect(await getRoomDeletionMarker(code)).toBeUndefined();
+  });
+
+  it("keeps a left generation's overrides out when an old snapshot brings the room back", async () => {
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 150, deletedAt: 151 }] }), "add");
     expect((await getRoomDeletionMarker(code))?.generation).toBe(150);
     await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
       roomCode: code, did: "did:alice", generation: 100,
       fields: { nickname: "Stale" },
     }] }), "add");
-    expect(await getRoom(code)).toBeUndefined();
+    // The room is back - as a new generation above the marker, so its
+    // profiles can be written - but the left generation's override is not.
+    expect((await getRoom(code))?.createdAt).toBe(152);
     expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
-    await putRoom(room(200));
-    await importDatabase(data({ rooms: [room(100)], roomDeletions: [{
-      roomCode: code, generation: 150, deletedAt: 151,
-    }] }), "add");
-    expect((await getRoom(code))?.createdAt).toBe(200);
   });
 
   it("normalizes independent joins, then applies a later leave without refreshing its timestamp", async () => {
@@ -111,9 +147,11 @@ describe("room profile import", () => {
     await importDatabase(data({ rooms: [room(100)], roomDeletions: [{
       roomCode: code, generation: 100, deletedAt: 300,
     }] }), "add");
-    expect(await getRoom(code)).toBeUndefined();
-    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
-    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+    // A leave elsewhere: this device is still in the room, so it stays.
+    expect((await getRoom(code))?.createdAt).toBe(200);
+    expect(await getRoomDeletionMarker(code)).toBeUndefined();
+    await deleteRoomProfilesForRoom(code, 100, 300);
+    await deleteRoom(code);
     await putRoom(room(400));
     await importDatabase(data({ roomDeletions: [{
       roomCode: code, generation: 100, deletedAt: 300,
@@ -435,6 +473,79 @@ describe("a merge never adopts the incoming identity", () => {
     expect((await getAllRooms()).map((r) => r.roomCode)).toContain(
       "restoredroom0001"
     );
+  });
+});
+
+// The identity section is part of a file someone may have handed over
+// (security audit L3).
+describe("a backup's identity section is checked before it is trusted", () => {
+  it("refuses an iteration count no build ever wrote, which made unlocking spin", async () => {
+    const backup = await backupFromAnIdentity();
+    backup.identity!.mnemonic.iterations = 4_000_000_000;
+    await wipeLocalDatabase();
+    await expect(applyBackup(backup, "replace")).rejects.toThrow("Invalid backup");
+    expect(await getKeypairRecord()).toBeUndefined();
+  });
+
+  it("refuses a keypair whose public key is not its DID's", async () => {
+    const backup = await backupFromAnIdentity();
+    backup.identity!.keypair.did = publicKeyToDid(ed25519.getPublicKey(new Uint8Array(32).fill(7)));
+    await wipeLocalDatabase();
+    await expect(applyBackup(backup, "replace")).rejects.toThrow("does not match its DID");
+    expect(await getKeypairRecord()).toBeUndefined();
+  });
+});
+
+// A merged-in file could reuse a real message's id to replace it with forged
+// content under anyone's name (security audit M4).
+describe("a merge never overwrites or forges messages", () => {
+  it("keeps a message already held, drops a bad signature, adds genuinely new rows", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    const row = (id: string, content: string, extra: Record<string, unknown> = {}) => ({
+      id, roomCode: "restoredroom0001", senderId: "did:key:zBob", senderName: "Bob",
+      timestamp: 1, lamport: 1, type: "text", content, attachments: [], ...extra,
+    });
+    await putMessage(row("m-1", "the real message") as never);
+
+    await applyBackup({
+      ...incoming,
+      messages: [
+        row("m-1", "forged"),
+        row("m-2", "new and unsigned"),
+        row("m-3", "forged with a bad signature", { senderDid: "did:key:zBob", sig: "00".repeat(64), sigV: 3 }),
+      ],
+    } as unknown as BackupFile, "add");
+
+    expect((await getMessage("m-1"))?.content).toBe("the real message");
+    expect((await getMessage("m-2"))?.content).toBe("new and unsigned");
+    expect(await getMessage("m-3")).toBeUndefined();
+  });
+});
+
+// A peer's PQ key certificate is what lets this device seal for them
+// post-quantum while they are offline. A merged-in profile row from a device
+// that never heard it is usually NEWER (it saw their name change later), and
+// taking it wholesale quietly downgraded every message sealed to them.
+describe("a merge keeps a peer's post-quantum key", () => {
+  it("keeps the local certificate when a newer imported row has none", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    const peerSeed = crypto.getRandomValues(new Uint8Array(32));
+    const peerDid = publicKeyToDid(ed25519.getPublicKey(peerSeed));
+    const cert = pqKeyCertificate({ did: peerDid, privateKey: peerSeed });
+    await putPeerProfile({ did: peerDid, isMe: false, nickname: "old", updatedAt: 1, pqKey: cert });
+
+    await applyBackup({
+      ...incoming,
+      profiles: [{ did: peerDid, isMe: false, nickname: "new", updatedAt: 2 }],
+    } as unknown as BackupFile, "add");
+
+    const merged = await getPeerProfile(peerDid);
+    expect(merged?.nickname).toBe("new");
+    expect(merged?.pqKey).toEqual(cert);
   });
 });
 

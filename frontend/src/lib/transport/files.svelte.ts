@@ -27,6 +27,7 @@ import type { FileTransferSnapshot, FileSignalEnvelope } from "./types";
 import type { WebTorrentFileTransport } from "./file/webtorrent";
 import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 import { isLegacyArchive } from "$lib/room-security/legacy-archive";
+import { safeBlobType } from "$lib/safe-mime";
 
 let _fileTransport: WebTorrentFileTransport | null = null;
 let _initialized = false;
@@ -474,8 +475,9 @@ export async function _hydrateFileTransfersFromStorage(
       mimeType: attachment.mimeType,
       size: attachment.size,
     };
+    // The type is the sender's claim: see safe-mime.ts.
     const blobURL = URL.createObjectURL(
-      new Blob([attachment.data], { type: attachment.mimeType })
+      new Blob([attachment.data], { type: safeBlobType(attachment.mimeType) })
     );
     withFileTransfer({
       ...file,
@@ -564,7 +566,7 @@ export async function hydrateLegacyAttachments(
       infoHash: row.infoHash, filename: row.filename, mimeType: row.mimeType,
       size: row.size, status: "complete", progress: 1, done: true,
       seeding: false, peers: 0, seeders: 0,
-      blobURL: URL.createObjectURL(new Blob([row.data], { type: row.mimeType })),
+      blobURL: URL.createObjectURL(new Blob([row.data], { type: safeBlobType(row.mimeType) })),
     });
   }
 }

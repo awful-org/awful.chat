@@ -202,10 +202,14 @@
         const known = scoped?.nickname || peerNames.get(nameKey) || peerNames.get(did);
         named = !!known;
         name = known || did.slice(0, 12);
-        avatarUrl = scoped?.pfpURL || peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
+        // A room profile is the whole presentation in this room: what it
+        // lacks was cleared there, so the main profile never fills it in.
+        avatarUrl = scoped
+          ? scoped.pfpURL || null
+          : peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
         color =
           displayPrefs.showPeerNicknameColors
-            ? scoped?.color || peerColors.get(nameKey) || peerColors.get(did) || null
+            ? (scoped ? scoped.color : peerColors.get(nameKey) || peerColors.get(did)) || null
             : null;
         // Name effect: respect showPeerNicknameColors like color does
         const meta = scoped ?? peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);

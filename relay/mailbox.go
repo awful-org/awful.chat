@@ -27,11 +27,15 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -105,6 +109,17 @@ const (
 	// carrier's CGNAT, so the number has to cover several people at once.
 	mailboxDepositLimit = 120
 	mailboxAuthedLimit  = 240
+	// The share of the global budget one source may hold at once: an IPv4
+	// address, or an IPv6 /56 (shareKey). A proxy-class address is charged
+	// to no share - see exemptFromShares. The deposit rate limit alone was
+	// not a ceiling on this - it bounds deposits per minute, blobs live
+	// for mailboxTTL, and a /56 was 256 separate rate-limit buckets, about
+	// 30,000 deposits a minute, which filled all 65,536 files in two
+	// minutes and closed every box on the instance for two days. A
+	// sixteenth means at least sixteen separate allocations to do that
+	// now, and still leaves one busy carrier NAT thousands of pending DMs.
+	mailboxMaxHeldPerSource      = mailboxGlobalMaxFiles / 16
+	mailboxMaxHeldBytesPerSource = mailboxGlobalMaxBytes / 16
 	// Maximum IDs one ack request may carry. A real client acks what it just
 	// collected, which is a small number bounded by mailboxMaxMsgs. This limit
 	// leaves clear headroom and prevents the ack loop from doing unbounded
@@ -145,6 +160,84 @@ var mailboxIDRe = regexp.MustCompile(`^[0-9a-f]{1,32}$`)
 // mailboxMu serializes writes per process - deposit volume is tiny and a
 // single lock keeps the quota check race-free.
 var mailboxMu sync.Mutex
+
+// Which source deposited each blob, and how much of the global budget each
+// source holds - see mailboxMaxHeldPerSource. Memory only, guarded by
+// mailboxMu, and bounded by the blobs on disk. A restart forgets it, which
+// only means blobs from before the restart count against nobody's share.
+//
+// The relay already learns the depositor's address with every deposit
+// (docs/spec.md, "Server Privacy"); what is new is holding a link from a
+// stored blob back to it for the blob's lifetime. So the link is a keyed
+// hash of the coarse source bucket, not the address, under a key that
+// exists only in this process: it lets the relay tell "same source" from
+// "different source" and nothing else, and it is gone at the next restart.
+type mailboxOrigin struct {
+	source string
+	charge int64
+}
+
+type mailboxShare struct {
+	files int
+	bytes int64
+}
+
+var (
+	mailboxBlobOrigin = map[string]mailboxOrigin{} // "<box>/<id>" -> origin
+	mailboxHeld       = map[string]mailboxShare{}  // source -> what it holds
+)
+
+var mailboxSourceKey = func() []byte {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		panic("mailbox: no randomness for the source key: " + err.Error())
+	}
+	return k
+}()
+
+// mailboxSourceTag is the opaque per-process name of a request's source,
+// or empty for a source that holds no share (exemptFromShares): a proxy's
+// address is everybody behind it, and a share applied to it would be a
+// ceiling on the whole mailbox.
+func mailboxSourceTag(r *http.Request) string {
+	key := shareKey(clientAddr(r))
+	if key == "" {
+		return ""
+	}
+	m := hmac.New(sha256.New, mailboxSourceKey)
+	m.Write([]byte(key))
+	return hex.EncodeToString(m.Sum(nil)[:12])
+}
+
+// mailboxRecordBlob charges a stored blob to its source. Caller holds
+// mailboxMu.
+func mailboxRecordBlob(box, id, source string, charge int64) {
+	mailboxBlobOrigin[box+"/"+id] = mailboxOrigin{source: source, charge: charge}
+	h := mailboxHeld[source]
+	h.files++
+	h.bytes += charge
+	mailboxHeld[source] = h
+}
+
+// mailboxForgetBlob returns a removed blob's charge to its source. Every
+// site that removes a blob calls it, like the global counters. Caller holds
+// mailboxMu.
+func mailboxForgetBlob(box, id string) {
+	key := box + "/" + id
+	o, ok := mailboxBlobOrigin[key]
+	if !ok {
+		return
+	}
+	delete(mailboxBlobOrigin, key)
+	h := mailboxHeld[o.source]
+	h.files--
+	h.bytes -= o.charge
+	if h.files <= 0 {
+		delete(mailboxHeld, o.source)
+		return
+	}
+	mailboxHeld[o.source] = h
+}
 
 // didToPubKey decodes a did:key to the raw ed25519 public key. The app's
 // identity layer encodes WITHOUT the multibase 'z' (did:key:<base58> of
@@ -188,8 +281,6 @@ func mailboxIDForDid(did string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// verifyMailboxAuth checks the collect/ack proof: an ed25519 signature by
-// the did's key over "awful-mailbox:{unix-seconds}", fresh within the skew.
 // The canonical and non-canonical encodings of the eight ed25519 points with
 // order dividing 8. Rejecting them is what libsodium does and what
 // RFC8032-strict verifiers do; Go's stdlib does neither.
@@ -218,7 +309,16 @@ func isSmallOrderPubKey(pub []byte) bool {
 	return new(edwards25519.Point).MultByCofactor(p).Equal(edwards25519.NewIdentityPoint()) == 1
 }
 
+// verifyMailboxAuth checks the LEGACY (v1) proof: a signature over
+// "awful-mailbox:{unix-seconds}" and nothing else. See authenticateMailbox
+// for the one place it is still accepted, and why.
 func verifyMailboxAuth(did string, ts int64, sigB64 string) (string, error) {
+	return verifyMailboxSignature(did, ts, sigB64, []byte("awful-mailbox:"+strconv.FormatInt(ts, 10)))
+}
+
+// verifyMailboxSignature checks that sigB64 is the did's signature over msg,
+// made within the freshness window around ts, and returns the did's box.
+func verifyMailboxSignature(did string, ts int64, sigB64 string, msg []byte) (string, error) {
 	if d := time.Since(time.Unix(ts, 0)); d > mailboxAuthSkew || d < -mailboxAuthFutureSkew {
 		return "", fmt.Errorf("stale timestamp")
 	}
@@ -238,11 +338,148 @@ func verifyMailboxAuth(did string, ts int64, sigB64 string) (string, error) {
 	if isSmallOrderPubKey(pub) {
 		return "", fmt.Errorf("small-order public key")
 	}
-	msg := []byte("awful-mailbox:" + strconv.FormatInt(ts, 10))
 	if !ed25519.Verify(pub, msg, sig) {
 		return "", fmt.Errorf("bad signature")
 	}
 	return mailboxIDForDid(did), nil
+}
+
+// ── Request auth, v2 ─────────────────────────────────────────────────────
+
+// The v1 proof was a signature over "awful-mailbox:<ts>" and nothing else,
+// so ONE captured proof was good for about two and a half minutes on all
+// four authenticated calls: collect, ack, push subscribe and push
+// unsubscribe. The device field that scopes an ack sat outside the
+// signature too. Anyone who saw one request - a proxy log, a shared
+// network, a browser extension - could replay it as an ack naming the
+// victim's device (hiding its offline mail from it), subscribe their OWN
+// push endpoint to the victim's box, or unsubscribe the victim's.
+//
+// A v2 proof signs what the request does:
+//
+//	awful-mailbox:v2:<action>:<host>:<device>:<ts>:<hex sha256 of the body>
+//
+// action is one of the four below, host is the relay's Host as the client
+// addressed it (so a proof for one relay is worthless at another), device is
+// the body's device field, and the body hash covers everything else in the
+// request - the ack's ids, the subscription's endpoint and keys. The proof
+// travels in the Authorization header, which the CORS preflight already
+// allows, since it cannot be inside the body it signs. The client puts a
+// random nonce in the body, so two otherwise identical requests in the same
+// second are still two different proofs, and each proof is accepted once
+// (mailboxAuthFirstUse).
+const (
+	mailboxActionCollect  = "collect"
+	mailboxActionAck      = "ack"
+	pushActionSubscribe   = "push-subscribe"
+	pushActionUnsubscribe = "push-unsubscribe"
+	mailboxAuthScheme     = "AwfulMailbox-v2"
+)
+
+func mailboxAuthMessage(action, host, device string, ts int64, bodySha256Hex string) []byte {
+	return []byte("awful-mailbox:v2:" + action + ":" + host + ":" + device + ":" +
+		strconv.FormatInt(ts, 10) + ":" + bodySha256Hex)
+}
+
+// readMailboxBody reads an authenticated call's body whole, bounded, since
+// the v2 proof is over its exact bytes.
+func readMailboxBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return nil, false
+	}
+	return body, true
+}
+
+// authenticateMailbox proves the request's did for one action and returns
+// its box. A v2 proof comes in the Authorization header. Without one, the
+// v1 fields from the body are accepted for COLLECT ONLY, during the
+// transition:
+//
+// A cached app from before v2 keeps working for the thing that matters most
+// - receiving offline DMs - until it reloads, and collect is the one call
+// whose replay changes nothing: the blobs it returns are sealed to the
+// recipient, and a captured proof reveals only what is waiting (count,
+// padded sizes, times), not what it says. Its acks and push calls fail
+// until the reload, which costs a duplicate delivery (deduplicated by id)
+// and a missed wake-up, not a message. Those three are the calls a replay
+// can do harm with, so none of them takes v1. A v1 collect is not put
+// through the replay cache: v1 signatures are deterministic per second, so
+// an old client collecting twice in one second would be refused its own
+// second collect, and a replay of a read gains nothing a replay cache would
+// stop. Remove the v1 branch once old clients have aged out.
+func authenticateMailbox(r *http.Request, action string, body []byte, device, legacyDid string, legacyTs int64, legacySig string) (string, error) {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, mailboxAuthScheme+" ") {
+		f := strings.Fields(h[len(mailboxAuthScheme)+1:])
+		if len(f) != 3 {
+			return "", errors.New("malformed authorization")
+		}
+		ts, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			return "", errors.New("malformed timestamp")
+		}
+		sum := sha256.Sum256(body)
+		msg := mailboxAuthMessage(action, strings.ToLower(r.Host), device, ts, hex.EncodeToString(sum[:]))
+		box, err := verifyMailboxSignature(f[0], ts, f[2], msg)
+		if err != nil {
+			return "", err
+		}
+		// Keyed on the signature's BYTES, not its text. Lenient base64 lets
+		// the unused low bits of the last character vary, so one proof has
+		// sixteen spellings that all decode to the same signature, and a
+		// cache keyed on the string took each as a new proof. Strict
+		// decoding refuses the non-canonical spellings outright, and the
+		// byte key would catch any that slipped through.
+		sigBytes, err := base64.StdEncoding.Strict().DecodeString(f[2])
+		if err != nil {
+			return "", errors.New("malformed signature")
+		}
+		if !mailboxAuthFirstUse(string(sigBytes), ts) {
+			return "", errors.New("replayed proof")
+		}
+		return box, nil
+	}
+	if action != mailboxActionCollect {
+		return "", errors.New("this call needs a v2 proof")
+	}
+	return verifyMailboxAuth(legacyDid, legacyTs, legacySig)
+}
+
+// Proofs already accepted, so each one works once. An entry is needed only
+// while its timestamp is still inside the freshness window; after that the
+// timestamp check refuses the proof on its own. The cap bounds memory
+// against a flood of freshly signed proofs from free dids; past it the
+// oldest entries go first, which can only reopen a proof that has almost
+// certainly expired already - and a v2 replay repeats one request exactly,
+// so even that would do nothing new.
+const mailboxSeenMax = 1 << 16
+
+var (
+	mailboxSeenMu    sync.Mutex
+	mailboxSeen      = map[string]time.Time{}
+	mailboxSeenOrder []string
+)
+
+func mailboxAuthFirstUse(sig string, ts int64) bool {
+	now := time.Now()
+	expires := time.Unix(ts, 0).Add(mailboxAuthSkew + time.Second)
+	mailboxSeenMu.Lock()
+	defer mailboxSeenMu.Unlock()
+	for len(mailboxSeenOrder) > 0 {
+		oldest := mailboxSeenOrder[0]
+		if exp, ok := mailboxSeen[oldest]; ok && now.Before(exp) && len(mailboxSeenOrder) < mailboxSeenMax {
+			break
+		}
+		delete(mailboxSeen, oldest)
+		mailboxSeenOrder = mailboxSeenOrder[1:]
+	}
+	if exp, ok := mailboxSeen[sig]; ok && now.Before(exp) {
+		return false
+	}
+	mailboxSeen[sig] = expires
+	mailboxSeenOrder = append(mailboxSeenOrder, sig)
+	return true
 }
 
 func mailboxCORS(w http.ResponseWriter, r *http.Request) bool {
@@ -302,6 +539,8 @@ func mailboxInitUsedBytes() {
 	mailboxUsedBytes = 0
 	mailboxFiles = 0
 	mailboxBoxes = 0
+	mailboxBlobOrigin = map[string]mailboxOrigin{}
+	mailboxHeld = map[string]mailboxShare{}
 	boxes, _ := os.ReadDir(mailboxDir)
 	for _, b := range boxes {
 		if !b.IsDir() {
@@ -433,6 +672,7 @@ func evictOldestStaleBox() bool {
 			continue
 		}
 		if os.Remove(filepath.Join(dir, e.Name())) == nil {
+			mailboxForgetBlob(oldest, e.Name())
 			// Same non-negative guard as ack: a counter that can go negative
 			// silently disables the ceiling it enforces.
 			if charge := mailboxCharge(info.Size()); mailboxUsedBytes >= charge {
@@ -458,7 +698,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("mb:"+clientIP(r), mailboxDepositLimit) {
+	if !rateAllowClient(r, "mb:", mailboxDepositLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -479,6 +719,8 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad blob", http.StatusBadRequest)
 		return
 	}
+
+	source := mailboxSourceTag(r)
 
 	mailboxMu.Lock()
 	defer mailboxMu.Unlock()
@@ -537,6 +779,31 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "mailbox full", http.StatusInsufficientStorage)
 		return
 	}
+	// A full box sheds this source's OWN oldest blobs first, then everyone
+	// else's oldest. Anyone can still push a named user's pending mail out
+	// by depositing into their box - the box id is public and deposits are
+	// anonymous - but one source now only ever pushes out one blob that is
+	// not its own: after that the box is shedding its own junk. Clearing a
+	// hundred real messages takes a hundred separate sources rather than a
+	// hundred requests.
+	// A source with no share (source == "") has no "own" blobs either: it
+	// sheds plain oldest-first, as before shares existed.
+	if source != "" {
+		sort.SliceStable(stored, func(i, j int) bool {
+			oi := mailboxBlobOrigin[req.Box+"/"+stored[i].name].source == source
+			oj := mailboxBlobOrigin[req.Box+"/"+stored[j].name].source == source
+			return oi && !oj
+		})
+		boxFull := len(stored)+1 > mailboxMaxMsgs || total+int64(len(blob)) > mailboxMaxBytes
+		ownInBox := len(stored) > 0 && mailboxBlobOrigin[req.Box+"/"+stored[0].name].source == source
+		// Over its share, a source may still deposit where doing so evicts
+		// one of its own blobs, which does not grow what it holds.
+		if held := mailboxHeld[source]; (held.files >= mailboxMaxHeldPerSource ||
+			held.bytes+charge > mailboxMaxHeldBytesPerSource) && !(boxFull && ownInBox) {
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
@@ -558,6 +825,9 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 	mailboxFiles++
 	mailboxUsedBytes += charge
+	if source != "" {
+		mailboxRecordBlob(req.Box, id, source, charge)
+	}
 	total += int64(len(blob))
 
 	// A full box evicts its OLDEST blob rather than refusing the new one. The
@@ -574,6 +844,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		oldest := stored[0]
 		stored = stored[1:]
 		if os.Remove(filepath.Join(dir, oldest.name)) == nil {
+			mailboxForgetBlob(req.Box, oldest.name)
 			total -= oldest.size
 			mailboxUsedBytes -= mailboxCharge(oldest.size)
 			mailboxFiles--
@@ -606,7 +877,7 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 	// Unlimited, these endpoints were a free signature-verification and
 	// ReadDir sink for anyone with curl. 30/min covers the 5-minute collect
 	// loop plus its acks many times over.
-	if !rateAllow("mba:"+clientIP(r), mailboxAuthedLimit) {
+	if !rateAllowClient(r, "mba:", mailboxAuthedLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -616,7 +887,11 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		Sig    string `json:"sig"`
 		Device string `json:"device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 4096)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -624,7 +899,7 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	box, err := authenticateMailbox(r, mailboxActionCollect, body, req.Device, req.Did, req.Ts, req.Sig)
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -672,18 +947,19 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("mba:"+clientIP(r), mailboxAuthedLimit) {
+	if !rateAllowClient(r, "mba:", mailboxAuthedLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	var req struct {
-		Did    string   `json:"did"`
-		Ts     int64    `json:"ts"`
-		Sig    string   `json:"sig"`
 		IDs    []string `json:"ids"`
 		Device string   `json:"device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 16*1024)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -691,7 +967,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	box, err := authenticateMailbox(r, mailboxActionAck, body, req.Device, "", 0, "")
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -746,6 +1022,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 	for _, id := range validIDs {
 		p := filepath.Join(boxPath(box), id)
 		if info, err := os.Stat(p); err == nil && os.Remove(p) == nil {
+			mailboxForgetBlob(box, id)
 			charge := mailboxCharge(info.Size())
 			// Prevent counters from going negative. A counter that can go
 			// negative silently disables the ceiling it exists to enforce -
@@ -802,6 +1079,7 @@ func sweepMailboxOnce(now time.Time) int {
 			}
 			if info.ModTime().Before(cutoff) {
 				if os.Remove(filepath.Join(dir, e.Name())) == nil {
+					mailboxForgetBlob(b.Name(), e.Name())
 					mailboxUsedBytes -= mailboxCharge(info.Size())
 					mailboxFiles--
 				}

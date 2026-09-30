@@ -6,6 +6,8 @@
  * reason in chat code blocks.
  */
 
+import { canLoadMedia } from "./media-prefs.svelte";
+
 /**
  * Every language shiki bundles, by id and alias.
  *
@@ -135,6 +137,14 @@ export async function renderMarkdown(source: string): Promise<string> {
       node.setAttribute("target", "_blank");
       node.setAttribute("rel", "noopener noreferrer");
     }
+    // A peer's .md file must not load what the rest of the app would not:
+    // a remote image here was a tracking pixel that ignored the external
+    // media switch. srcset can name remote URLs too, so it goes.
+    node.removeAttribute("srcset");
+    for (const attr of ["src", "poster"]) {
+      const value = node.getAttribute(attr);
+      if (value !== null && !canLoadMedia(value)) node.removeAttribute(attr);
+    }
   });
   try {
     return await sanitizedMarkdown(marked, DOMPurify, source);
@@ -160,6 +170,9 @@ async function sanitizedMarkdown(
     // No <form>: a sanitized form is still a form, and a markdown file has
     // no business asking for input.
     FORBID_TAGS: ["form", "input", "button", "style"],
+    // No inline styles either: they allowed a full-screen fixed overlay over
+    // the app, the start of any phishing page.
+    FORBID_ATTR: ["style"],
   });
 }
 

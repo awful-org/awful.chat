@@ -14,8 +14,9 @@
    */
   import { onDestroy } from "svelte";
   import { getAttachmentsWithData, getMessages } from "$lib/storage";
-  import type { Message } from "$lib/transport/transport.svelte";
+  import { transportState, type Message } from "$lib/transport/transport.svelte";
   import { ChevronDown, ChevronUp, History } from "@lucide/svelte";
+  import { safeBlobType } from "$lib/safe-mime";
 
   let { roomCode, roomName }: { roomCode: string; roomName: string } = $props();
 
@@ -45,7 +46,7 @@
         // Legacy rows hold plaintext bytes; anything encrypted is not one of
         // this archive's and would only be ciphertext here.
         if (!a.data || a.encryption || saved.has(a.infoHash)) continue;
-        saved.set(a.infoHash, URL.createObjectURL(new Blob([a.data], { type: a.mimeType })));
+        saved.set(a.infoHash, URL.createObjectURL(new Blob([a.data], { type: safeBlobType(a.mimeType) })));
       }
       revokeAll();
       files = saved;
@@ -111,7 +112,7 @@
       {/if}
       {#each messages as msg (msg.id)}
         <article class="flex flex-col gap-0.5">
-          <span class="font-mono text-xs text-muted-foreground">{msg.senderName || msg.senderId}</span>
+          <span class="font-mono text-xs text-muted-foreground">{transportState.peerNames.get(msg.senderDid || msg.senderId) || msg.senderName || msg.senderId}</span>
           {#if msg.content}
             <p class="whitespace-pre-wrap break-words text-sm text-foreground">{msg.content}</p>
           {/if}

@@ -79,7 +79,7 @@ func handleTurnCredentials(w http.ResponseWriter, r *http.Request) {
 	// backoff starts at 3s - a flapping tab behind a shared NAT would trip a
 	// tighter budget and silently fall back to the static credentials.
 	const turnCredsRateLimit = 30
-	if !rateAllow("turn:"+clientIP(r), turnCredsRateLimit) {
+	if !rateAllowClient(r, "turn:", turnCredsRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}

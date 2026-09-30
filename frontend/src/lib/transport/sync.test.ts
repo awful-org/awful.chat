@@ -41,8 +41,6 @@ const { FakeTransport, instances } = vi.hoisted(() => {
   return { FakeTransport, instances };
 });
 vi.mock("./libp2p/transport", () => ({ LibP2PTransport: FakeTransport }));
-const { forgetSyncedRoom } = vi.hoisted(() => ({ forgetSyncedRoom: vi.fn() }));
-vi.mock("./transport.svelte", () => ({ forgetSyncedRoom }));
 
 // The import half is exercised in backup-restore.test.ts against a real
 // database; here only WHAT the target hands it matters.
@@ -140,8 +138,10 @@ describe("secure sync invitation and source authorization", () => {
           roomDeletions: [{ roomCode: otherCode, generation: 100, deletedAt: 300 }] },
       })), pairing.roomCode);
       await vi.waitFor(() => expect(source.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
-      expect(await storage.getRoom(otherCode)).toBeUndefined();
-      expect(forgetSyncedRoom).toHaveBeenCalledWith(otherCode);
+      // A leave on the other device governs room profiles only: this device
+      // still holds the room in the generation the marker names, so it keeps
+      // it, its history, and does not adopt the marker.
+      expect((await storage.getRoom(otherCode))?.createdAt).toBe(200);
       const sections = source.sent.filter((m: any) => m.type === "sync_export_data");
       const overrides = sections.filter((m: any) => m.payload.section === "roomProfiles")
         .flatMap((m: any) => m.payload.data);
@@ -151,7 +151,7 @@ describe("secure sync invitation and source authorization", () => {
       expect(JSON.stringify(sections)).not.toContain("Never sync peer cache");
       const deletions = sections.filter((m: any) => m.payload.section === "roomDeletions")
         .flatMap((m: any) => m.payload.data);
-      expect(deletions).toContainEqual({ roomCode: otherCode, generation: 100, deletedAt: 300 });
+      expect(deletions).not.toContainEqual({ roomCode: otherCode, generation: 100, deletedAt: 300 });
     } finally {
       await cancelSync(); lockIdentity();
     }
@@ -173,7 +173,6 @@ describe("secure sync invitation and source authorization", () => {
     })), pairing.roomCode);
     await vi.waitFor(() => expect(source.sent.some((m: any) => m.type === "sync_error")).toBe(true));
     expect((await storage.getRoom(code))?.createdAt).toBe(100);
-    expect(forgetSyncedRoom).not.toHaveBeenCalledWith(code);
   });
 
   it("discards a pending QR result after a replacement session starts", async () => {

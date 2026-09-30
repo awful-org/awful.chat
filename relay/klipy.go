@@ -129,7 +129,7 @@ func handleKlipySearch(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
 		return
 	}
-	if !rateAllow("klipy:"+clientIP(r), klipyRateLimit) {
+	if !rateAllowClient(r, "klipy:", klipyRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -183,7 +183,7 @@ func handleKlipyTrending(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
 		return
 	}
-	if !rateAllow("klipy:"+clientIP(r), klipyRateLimit) {
+	if !rateAllowClient(r, "klipy:", klipyRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}

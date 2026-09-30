@@ -10,10 +10,13 @@ import { identify, type Identify } from "@libp2p/identify";
 import { gossipsub, type GossipSub } from "@libp2p/gossipsub";
 import { keys } from "@libp2p/crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
-import { deriveRoomKeys, type DiscoveryId, type RoomKeys, type RoomSecret } from "$lib/room-security/keys";
+import { deriveRoomKeys, discoveryIdOf, type DiscoveryId, type RoomKeys, type RoomSecret } from "$lib/room-security/keys";
 import { attachRoomStream, ROOM_PROTOCOL } from "$lib/room-security/stream";
 import type { SecureRoomChannel } from "$lib/room-security/channel";
 import { attachDmIntroduction, DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
+import { LobbyDialBudget } from "./dm-lobby-budget";
+import { FrameAssembler, FrameTooLargeError } from "./frame-assembler";
+import type { DmPqState } from "$lib/room-security/pq-dm";
 import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 import { onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
 import { roomSfuAdmission } from "$lib/room-security/sfu";
@@ -163,6 +166,18 @@ const RENDEZVOUS_PING_INTERVAL_MS = 20_000;
  * is 40s of silence on a link that should speak every 20s.
  */
 const RENDEZVOUS_PONG_MISSES_ALLOWED = 2;
+/** Lobby peers waiting out DM_LOBBY_INTRODUCE_DELAY_MS at once, at most. */
+const DM_LOBBY_PENDING_MAX = 32;
+/** Grace for an already-upgraded peer to show up in the post-quantum room. */
+const DM_LOBBY_INTRODUCE_DELAY_MS = 5_000;
+/**
+ * DM lobbies register this long after being held: past the relay's one-minute
+ * empty-register window (maxEmptyRegisters in relay/main.go), so the room
+ * joins that caused them spend that window's budget, not the lobbies.
+ */
+const DM_LOBBY_REGISTER_DELAY_MS = 70_000;
+/** Lobbies held at once; each is a registration, usually into an empty room. */
+const DM_LOBBY_MAX = 64;
 /** Budget for the one-off liveness probe a network change triggers. */
 const RELAY_LIVENESS_TIMEOUT_MS = 5_000;
 
@@ -226,13 +241,21 @@ export class LibP2PTransport implements PeerTransport {
     return !local.startsWith("dm-") || !this.dmIdentityManaged ||
       (!!this.dmIdentity() && this.dmSessions.get(local) === this.dmIdentity());
   }
-  private dmVerified: (peer: string, did: string, secret: RoomSecret) => Promise<void> = async () => {};
+  private dmVerified: (peer: string, did: string, secret: RoomSecret, pqPending: boolean) => Promise<void> = async () => {};
+  private dmUpgraded: ((peer: string, did: string, state: DmPqState) => Promise<void>) | undefined;
   private dmIntroductions = new Map<Connection, { close: () => void; ready: Promise<boolean>; outgoing: boolean }>();
   private dmOpening = new Map<string, Promise<boolean>>();
 
+  /**
+   * `upgraded` receives a DM's post-quantum state once an introduction has
+   * agreed on one with that peer (room-security/pq-dm.ts); without it this
+   * device still answers introductions, but never upgrades a conversation.
+   * `pqPending` tells `verified` such an upgrade is about to follow.
+   */
   setDmIntroduction(identity: () => UnlockedSession | null,
-    verified: (peer: string, did: string, secret: RoomSecret) => Promise<void>): void {
-    this.dmIdentity = identity; this.dmVerified = verified; this.dmIdentityManaged = true;
+    verified: (peer: string, did: string, secret: RoomSecret, pqPending: boolean) => Promise<void>,
+    upgraded?: (peer: string, did: string, state: DmPqState) => Promise<void>): void {
+    this.dmIdentity = identity; this.dmVerified = verified; this.dmUpgraded = upgraded; this.dmIdentityManaged = true;
   }
 
   private attachIntroduction(stream: Stream, connection: Connection, initiate?: { expectedDid?: string }) {
@@ -246,9 +269,11 @@ export class LibP2PTransport implements PeerTransport {
     if (this.dmIntroductions.size >= 32 || !this.dmIdentity()) {
       stream.abort(new Error("Introduction unavailable")); return null;
     }
+    const upgraded = this.dmUpgraded;
     const handle = attachDmIntroduction({ stream, connection, local: this.selfId(),
       identity: this.dmIdentity, initiate,
-      verified: (did, secret) => this.dmVerified(connection.remotePeer.toString(), did, secret),
+      verified: (did, secret, pqPending) => this.dmVerified(connection.remotePeer.toString(), did, secret, pqPending),
+      upgraded: upgraded && ((did, state) => upgraded(connection.remotePeer.toString(), did, state)),
       onClose: () => { this.dmIntroductions.delete(connection); },
     });
     this.dmIntroductions.set(connection, { ...handle, outgoing: !!initiate });
@@ -259,6 +284,11 @@ export class LibP2PTransport implements PeerTransport {
   clearRoomSecurity(): void {
     for (const handle of this.dmIntroductions.values()) handle.close();
     for (const room of [...this.secureRooms.keys()]) this.leaveRoom(room);
+    for (const localId of [...this.dmLobbyOf.keys()]) this.releaseDmLobby(localId);
+    if (this.lobbyRegisterTimer) clearTimeout(this.lobbyRegisterTimer);
+    this.lobbyRegisterTimer = null;
+    this.lobbyBudget.clear();
+    this.lobbyPending.clear();
     this.dmSessions.clear();
     this.secureOpening.clear();
   }
@@ -300,26 +330,150 @@ export class LibP2PTransport implements PeerTransport {
     return room.startsWith("dm-") || this.wireRoom(room).startsWith("rd2_");
   }
 
-  /** Keep an existing DM storage ID while using a private capability on wire. */
-  joinSecureConversation(localId: string, secret: RoomSecret): DiscoveryId {
+  /**
+   * Keep an existing DM storage ID while using a private capability on wire.
+   *
+   * `classical` is passed when `secret` is the conversation's post-quantum
+   * secret (room-security/pq-dm.ts): it names the classical discovery ID the
+   * conversation is anchored at, whether or not it was ever joined there.
+   * That anchor is what allows moving a conversation that is live under its
+   * classical secret onto a post-quantum one in place - and only that way
+   * round: once bound post-quantum, a join with the classical secret alone
+   * is a conflict, exactly like any other capability swap, so a stale caller
+   * cannot drag the conversation back.
+   */
+  joinSecureConversation(localId: string, secret: RoomSecret, classical?: RoomSecret, peerDid?: string): DiscoveryId {
     if (!/^dm-[a-f0-9]{40}$/.test(localId)) throw new Error("Invalid local DM reference");
     const session = this.dmIdentity();
     if (this.dmIdentityManaged && !session) throw new Error("Identity locked");
     if (this.dmSessions.has(localId) && this.dmSessions.get(localId) !== session) this.leaveRoom(localId);
-    const { discoveryId } = deriveRoomKeys(secret);
+    const discoveryId = discoveryIdOf(secret);
+    const anchor = classical ? discoveryIdOf(classical) : discoveryId;
+    if (classical && anchor === discoveryId) throw new Error("Post-quantum secret is the classical one");
     const previous = this.secureAliases.get(localId);
     const owner = this.secureLocalIds.get(discoveryId);
-    if ((previous && previous !== discoveryId) || (owner && owner !== localId)) {
+    const known = this.dmAnchors.get(localId);
+    const anchorOwner = this.secureLocalIds.get(anchor);
+    const upgrade = !!classical && !!previous && previous !== discoveryId &&
+      (previous === anchor || known === anchor);
+    if ((known && known !== anchor) || (anchorOwner && anchorOwner !== localId) ||
+        (previous && previous !== discoveryId && !upgrade) || (owner && owner !== localId)) {
       throw new Error("Conflicting conversation capability");
     }
     if (!previous && this.secureAliases.size >= 512) throw new Error("Conversation binding limit");
     if (!previous && this.joinedRooms.has(localId)) {
       throw new Error("Leave legacy discovery before binding a protected conversation");
     }
+    // Leave the old wire room first: nothing may go out under the classical
+    // key once the post-quantum one exists.
+    if (upgrade) this.leaveRoom(localId);
     this.secureAliases.set(localId, discoveryId);
     this.secureLocalIds.set(discoveryId, localId);
+    this.secureLocalIds.set(anchor, localId);
+    this.dmAnchors.set(localId, anchor);
     if (session) this.dmSessions.set(localId, session);
+    if (classical && peerDid) this.holdDmLobby(localId, anchor, peerDid);
     return this.joinSecureRoom(secret);
+  }
+
+  /**
+   * DM lobbies. A device whose conversation went post-quantum stops joining
+   * it under the classical discovery ID - but the other side's devices that
+   * have not upgraded yet (one that was offline, a sibling restored later)
+   * still meet there, and nowhere else. Left alone they would never find an
+   * upgraded device again: no shared room, so no profile, so nothing to
+   * start the introduction that would upgrade them too.
+   *
+   * So the classical ID stays registered at the rendezvous as a lobby: never
+   * joined as a room (no keys, no traffic - a peer trying to open the
+   * classical room with us is refused like any non-member), only watched.
+   * Whoever turns up there is dialled and introduced, which upgrades them if
+   * they can be and merely re-binds their DID if they cannot (an older
+   * build). Bounded per peer, per lobby and overall (dm-lobby-budget.ts), so
+   * an older build is not re-introduced on every rendezvous reply and a
+   * relay listing made-up peers gets only a handful of dials out of us.
+   *
+   * Lobbies are second-class registrations, on purpose. The relay allows a
+   * peer only so many REGISTERs into empty rooms a minute
+   * (maxEmptyRegisters), and a lobby is usually empty - so a lobby must never
+   * crowd out a real room. They are registered in one batch well after
+   * whatever burst of room joins caused them, in a later budget window, and
+   * at most DM_LOBBY_MAX of them. A conversation past the cap still works;
+   * it only loses this way of finding stragglers.
+   *
+   * The relay decides who is listed in a lobby, so it would decide whom we
+   * dial and introduce. The introduction therefore expects the one identity
+   * the conversation is with, and ends for anyone else before binding them.
+   */
+  private dmAnchors = new Map<string, DiscoveryId>();
+  private dmLobbyOf = new Map<string, DiscoveryId>();
+  private dmLobbies = new Map<DiscoveryId, { localId: string; peerDid: string }>();
+  private lobbyRegistered = new Set<DiscoveryId>();
+  private lobbyRegisterTimer: TimerHandle | null = null;
+  /** Who we may still introduce from a lobby - see dm-lobby-budget.ts. */
+  private lobbyBudget = new LobbyDialBudget();
+  private lobbyPending = new Set<string>();
+
+  /** Hold (or keep) this conversation's classical ID as a lobby. */
+  holdDmLobby(localId: string, anchor: DiscoveryId, peerDid: string): void {
+    const held = this.dmLobbies.get(anchor);
+    if (this.dmLobbyOf.get(localId) === anchor && held?.peerDid === peerDid) return;
+    this.releaseDmLobby(localId);
+    if (this.dmLobbies.size >= DM_LOBBY_MAX) return;
+    this.dmLobbyOf.set(localId, anchor);
+    this.dmLobbies.set(anchor, { localId, peerDid });
+    this.scheduleLobbyRegistration();
+  }
+
+  private scheduleLobbyRegistration(): void {
+    if (this.lobbyRegisterTimer) return;
+    this.lobbyRegisterTimer = setTimeout(() => {
+      this.lobbyRegisterTimer = null;
+      for (const room of this.dmLobbies.keys()) {
+        if (this.lobbyRegistered.has(room) || this.joinedRooms.has(room)) continue;
+        this.lobbyRegistered.add(room);
+        this.rendezvousSend({ type: "REGISTER", room });
+      }
+    }, DM_LOBBY_REGISTER_DELAY_MS);
+  }
+
+  private releaseDmLobby(localId: string): void {
+    const anchor = this.dmLobbyOf.get(localId);
+    if (!anchor) return;
+    this.dmLobbyOf.delete(localId);
+    this.dmLobbies.delete(anchor);
+    this.lobbyBudget.forgetLobby(anchor);
+    if (this.lobbyRegistered.delete(anchor) && !this.joinedRooms.has(anchor)) {
+      this.rendezvousSend({ type: "UNREGISTER", room: anchor });
+    }
+  }
+
+  /** A lobby is watched, never joined; a room joined for real is not one. */
+  private isDmLobby(room: string): boolean {
+    return this.dmLobbies.has(room as DiscoveryId) && !this.joinedRooms.has(room);
+  }
+
+  private lobbyPeer(room: DiscoveryId, peer: string): void {
+    const lobby = this.dmLobbies.get(room);
+    if (!lobby || !peer || peer === this.selfId() || this.isRelayPeer(peer)) return;
+    const { localId, peerDid } = lobby;
+    // The relay chooses who is listed here, so the cheap checks come first
+    // and bound what a listing of thousands of made-up peers can cost: one
+    // wait per peer, and only so many waiting at once.
+    if (this.lobbyPending.has(peer) || this.lobbyPending.size >= DM_LOBBY_PENDING_MAX ||
+        !this.lobbyBudget.mayTry(peer)) return;
+    this.lobbyPending.add(peer);
+    // A device that has upgraded is in the lobby too and will be in the
+    // post-quantum room with us moments later: give that the chance to land
+    // before paying for an introduction that would change nothing. The
+    // budget is spent only on a real dial, so those devices - every one of
+    // the other side's upgraded devices shows up here - never use it up.
+    setTimeout(() => {
+      this.lobbyPending.delete(peer);
+      if (this.dmLobbies.get(room) !== lobby || this.isRoomPeer(localId, peer)) return;
+      if (!this.lobbyBudget.allow(room, peer)) return;
+      void this.introduceDm(peer, peerDid);
+    }, DM_LOBBY_INTRODUCE_DELAY_MS);
   }
   private secureOpening = new Map<string, Promise<SecureRoomChannel | null>>();
   private secureStreams = new Set<{
@@ -1107,7 +1261,28 @@ export class LibP2PTransport implements PeerTransport {
     this.rendezvousSend({ type: "REGISTER", room: roomCode });
   }
 
+  /**
+   * A DM deleted for good: leave it AND drop its binding. leaveRoom keeps the
+   * binding so a stale send fails closed, but a deleted conversation has no
+   * sends left - and a dm- reference with no binding is refused on the wire
+   * anyway. Without this every conversation ever deleted held one of the 512
+   * bindings until reload, and junk message requests could use them up.
+   */
+  forgetConversation(localId: string): void {
+    this.leaveRoom(localId);
+    if (!localId.startsWith("dm-")) return;
+    const discoveryId = this.secureAliases.get(localId);
+    const anchor = this.dmAnchors.get(localId);
+    for (const id of [discoveryId, anchor]) {
+      if (id && this.secureLocalIds.get(id) === localId) this.secureLocalIds.delete(id);
+    }
+    this.secureAliases.delete(localId);
+    this.dmAnchors.delete(localId);
+    this.dmSessions.delete(localId);
+  }
+
   leaveRoom(roomCode: string): void {
+    if (roomCode.startsWith("dm-")) this.releaseDmLobby(roomCode);
     roomCode = this.wireRoom(roomCode);
     for (const entry of this.secureStreams) {
       // Pending inbound handshakes do not yet have an admitted room. Closing
@@ -2285,34 +2460,29 @@ export class LibP2PTransport implements PeerTransport {
         this.resetOutboundStream(fromId);
       }
     }
-    let buf = new Uint8Array(0);
+    // Frames out of the stream's chunks, each byte copied once: see
+    // frame-assembler.ts for why merging per chunk had to go.
+    const assembler = new FrameAssembler(MAX_DIRECT_FRAME_BYTES);
 
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
         evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
 
-      const merged = new Uint8Array(buf.byteLength + chunk.byteLength);
-      merged.set(buf);
-      merged.set(chunk, buf.byteLength);
-      buf = merged;
-
-      while (buf.byteLength >= 4) {
-        const len = new DataView(buf.buffer, buf.byteOffset).getUint32(
-          0,
-          false
+      let frames: Uint8Array[];
+      try {
+        frames = assembler.push(chunk);
+      } catch (err) {
+        const len = err instanceof FrameTooLargeError ? err.bytes : -1;
+        console.warn(
+          `[LibP2PTransport] oversized direct frame (${len}b) from ${fromId.slice(-8)}, aborting stream`
         );
-        if (len > MAX_DIRECT_FRAME_BYTES) {
-          console.warn(
-            `[LibP2PTransport] oversized direct frame (${len}b) from ${fromId.slice(-8)}, aborting stream`
-          );
-          rec(ev("rv.frame.oversize", { peer: fromId, d: { bytes: len } }));
-          this.cleanupPeerStream(fromId);
-          stream.abort(new Error("frame too large"));
-          return;
-        }
-        if (buf.byteLength < 4 + len) break;
-        const payload = buf.slice(4, 4 + len);
-        buf = buf.slice(4 + len);
+        rec(ev("rv.frame.oversize", { peer: fromId, d: { bytes: len } }));
+        this.cleanupPeerStream(fromId);
+        stream.abort(new Error("frame too large"));
+        return;
+      }
+
+      for (const payload of frames) {
 
         // Anything at all from this peer proves it is alive.
         this.debugStats.framesIn++;
@@ -2467,6 +2637,9 @@ export class LibP2PTransport implements PeerTransport {
     for (const room of this.joinedRooms) {
       this.rendezvousSend({ type: "REGISTER", room });
     }
+    // Lobbies after the rooms, and later: see holdDmLobby.
+    this.lobbyRegistered.clear();
+    if (this.dmLobbies.size > 0) this.scheduleLobbyRegistration();
 
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
@@ -2687,6 +2860,10 @@ export class LibP2PTransport implements PeerTransport {
         break;
       }
       case "PEERS": {
+        if (this.isDmLobby(msg.room)) {
+          for (const peerId of msg.peers ?? []) this.lobbyPeer(msg.room as DiscoveryId, peerId);
+          break;
+        }
         for (const peerId of msg.peers ?? []) {
           if (peerId === selfId) continue;
           this.rememberRoomPeer(msg.room, peerId);
@@ -2707,6 +2884,10 @@ export class LibP2PTransport implements PeerTransport {
       case "PEER_JOINED": {
         const peerId = msg.peer;
         if (peerId === selfId) break;
+        if (this.isDmLobby(msg.room)) {
+          this.lobbyPeer(msg.room as DiscoveryId, peerId);
+          break;
+        }
         this.rememberRoomPeer(msg.room, peerId);
         if (msg.room.startsWith("rd2_")) {
           this.verifyDiscoveredRoomPeer(msg.room, peerId);

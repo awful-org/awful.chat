@@ -89,8 +89,13 @@ var pushReqN int
 func pushRequest(t *testing.T, path string, body any, h http.HandlerFunc) *httptest.ResponseRecorder {
 	t.Helper()
 	pushReqN++
-	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	var req *http.Request
+	if sb, ok := body.(signedBody); ok {
+		req = sb.request(t, path)
+	} else {
+		raw, _ := json.Marshal(body)
+		req = httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	}
 	req.RemoteAddr = "10.0.0.1:4000"
 	req.Header.Set("X-Forwarded-For", fmt.Sprintf("192.0.%d.%d", pushReqN/250, pushReqN%250))
 	w := httptest.NewRecorder()
@@ -98,15 +103,14 @@ func pushRequest(t *testing.T, path string, body any, h http.HandlerFunc) *httpt
 	return w
 }
 
-func subscribeBody(did string, priv ed25519.PrivateKey, device, endpoint string) map[string]any {
-	ts, sig := authFields(priv)
-	return map[string]any{
-		"did": did, "ts": ts, "sig": sig, "device": device,
+func subscribeBody(did string, priv ed25519.PrivateKey, device, endpoint string) signedBody {
+	return signedBody{pushActionSubscribe, did, priv, map[string]any{
+		"device": device,
 		"subscription": map[string]any{
 			"endpoint": endpoint,
 			"keys":     map[string]string{"p256dh": "BN" + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 63)), "auth": base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{9}, 16))},
 		},
-	}
+	}}
 }
 
 func TestPushSubscribeUnsubscribeRoundTrip(t *testing.T) {
@@ -138,10 +142,7 @@ func TestPushSubscribeUnsubscribeRoundTrip(t *testing.T) {
 		t.Fatalf("resubscribe should replace one device's entry, got %+v", subs)
 	}
 
-	ts, sig := authFields(priv)
-	w := pushRequest(t, "/push/unsubscribe", map[string]any{
-		"did": did, "ts": ts, "sig": sig, "device": device,
-	}, handlePushUnsubscribe)
+	w := pushRequest(t, "/push/unsubscribe", signedBody{pushActionUnsubscribe, did, priv, map[string]any{"device": device}}, handlePushUnsubscribe)
 	if w.Code != 204 {
 		t.Fatalf("unsubscribe: got %d %s", w.Code, w.Body.String())
 	}
@@ -161,12 +162,12 @@ func TestPushSubscribeRejectsBadInput(t *testing.T) {
 	if w := pushRequest(t, "/push/subscribe", bad, handlePushSubscribe); w.Code != 400 {
 		t.Fatalf("http endpoint: got %d, want 400", w.Code)
 	}
-	bad = subscribeBody(did, priv, "not-a-peer-id", "https://push.example.com/x")
+	bad = subscribeBody(did, priv, "not-a-peer-id", "https://updates.push.services.mozilla.com/wpush/v2/x")
 	if w := pushRequest(t, "/push/subscribe", bad, handlePushSubscribe); w.Code != 400 {
 		t.Fatalf("bad device: got %d, want 400", w.Code)
 	}
-	forged := subscribeBody(did, priv, device, "https://push.example.com/x")
-	forged["sig"] = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 64))
+	_, otherPriv := testDid(t)
+	forged := subscribeBody(did, otherPriv, device, "https://updates.push.services.mozilla.com/wpush/v2/x")
 	if w := pushRequest(t, "/push/subscribe", forged, handlePushSubscribe); w.Code != 401 {
 		t.Fatalf("forged signature: got %d, want 401", w.Code)
 	}
@@ -271,7 +272,7 @@ func TestPushGoneRemovesTheSubscription(t *testing.T) {
 	did, priv := testDid(t)
 	box := mailboxIDForDid(did)
 	device := deviceID(14)
-	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, device, "https://push.example.com/dead"), handlePushSubscribe); w.Code != 204 {
+	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, device, "https://updates.push.services.mozilla.com/wpush/v2/dead"), handlePushSubscribe); w.Code != 204 {
 		t.Fatalf("subscribe: got %d %s", w.Code, w.Body.String())
 	}
 
@@ -313,13 +314,10 @@ func TestPushDisabledAnswersAsSpecified(t *testing.T) {
 
 	did, priv := testDid(t)
 	device := deviceID(15)
-	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, device, "https://push.example.com/x"), handlePushSubscribe); w.Code != 404 {
+	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, device, "https://updates.push.services.mozilla.com/wpush/v2/x"), handlePushSubscribe); w.Code != 404 {
 		t.Fatalf("subscribe while disabled: got %d, want 404", w.Code)
 	}
-	ts, sig := authFields(priv)
-	if w := pushRequest(t, "/push/unsubscribe", map[string]any{
-		"did": did, "ts": ts, "sig": sig, "device": device,
-	}, handlePushUnsubscribe); w.Code != 404 {
+	if w := pushRequest(t, "/push/unsubscribe", signedBody{pushActionUnsubscribe, did, priv, map[string]any{"device": device}}, handlePushUnsubscribe); w.Code != 404 {
 		t.Fatalf("unsubscribe while disabled: got %d, want 404", w.Code)
 	}
 
