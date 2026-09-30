@@ -13,6 +13,7 @@ import {
   type MatchRange,
 } from "$lib/palette/scorer";
 import type { SearchQuery } from "./query";
+import { linkTargets, stripMarkdown } from "$lib/markdown";
 
 // Kind flags, matched by the has: filter.
 export const HAS_FILE = 1;
@@ -74,10 +75,14 @@ export function entryFromMessage(
   if (!SEARCHABLE.has(msg.type)) return null;
   const content = typeof msg.content === "string" ? msg.content : "";
 
-  let text = content;
+  let text = "";
   let flags = 0;
 
-  if (msg.type === MessageType.PluginCard) {
+  if (msg.type !== MessageType.PluginCard) {
+    // What the message reads as, markup dropped: "**launch**" is found by
+    // "launch", and a snippet does not show the asterisks.
+    text = [stripMarkdown(content), ...linkTargets(content)].filter(Boolean).join(" ");
+  } else {
     // A malformed card still yields an (empty) entry: the sealed index's
     // coverage check compares entry count against the searchable ROW count,
     // and a searchable row with no entry would read as a gap forever.

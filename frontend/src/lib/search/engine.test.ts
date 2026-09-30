@@ -38,6 +38,15 @@ describe("entryFromMessage", () => {
     expect(e.flags).toBe(0);
   });
 
+  it("indexes what the message reads as, markdown dropped", () => {
+    const e = entryFromMessage(msg({ content: "**Launch** is on *Friday*, see [the plan](https://a.bc)" }))!;
+    expect(e.text).toBe("Launch is on Friday, see the plan https://a.bc");
+    const hit = matchEntry(e, parseSearchQuery("launch friday"), NOW)!;
+    expect(hit.ranges).toEqual([{ start: 0, end: 6 }, { start: 13, end: 19 }]);
+    // The label is what shows; the target is still found by its domain.
+    expect(matchEntry(e, parseSearchQuery("a.bc"), NOW)).not.toBeNull();
+  });
+
   it("skips non-searchable types", () => {
     expect(entryFromMessage(msg({ type: MessageType.Reaction }))).toBeNull();
     expect(

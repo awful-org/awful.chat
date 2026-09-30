@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { firstLinkedUrl, renderMessageMarkdown, trimUrl } from "./markdown";
+import { firstLinkedUrl, renderMessageMarkdown, stripMarkdown, trimUrl } from "./markdown";
 
 const names: Record<string, string> = { "did:key:zAna": "Ana" };
 const md = (s: string) => renderMessageMarkdown(s, (did) => names[did] ?? did.slice(0, 8));
@@ -64,6 +64,14 @@ describe("inline markdown", () => {
     expect(plain("[x](data:text/html,hi)")).not.toContain("<a");
   });
 
+  it("will not mask a link behind a mention whose name reads as an address", () => {
+    const r = (did: string) => (did === "did:key:zEve" ? "paypal.com/login" : did);
+    const html = renderMessageMarkdown("[@[did:key:zEve]](https://evil.example)", r);
+    expect(html).toContain(">https://evil.example</a>");
+    expect(html).not.toMatch(/<a[^>]*>@paypal/);
+    expect(stripMarkdown("[@[did:key:zEve]](https://evil.example)", r)).toContain("https://evil.example");
+  });
+
   it("will not mask a link behind text that reads as another address", () => {
     const html = plain("[google.com](https://evil.example)");
     expect(html).not.toContain(">google.com</a>");
@@ -125,7 +133,21 @@ describe("block markdown", () => {
     expect(plain("one\ntwo")).toBe("one\ntwo");
     expect(plain("# Title\nbody")).toBe("<h1>Title</h1>body");
     expect(plain("intro\n- a\n- b\noutro")).toBe("intro<ul><li>a</li><li>b</li></ul>outro");
-    expect(plain("# Title\n\nbody")).toBe("<h1>Title</h1>\nbody");
+  });
+
+  it("keeps a blank line beside a block as a gap, one per blank line", () => {
+    const gap = "<div><br></div>";
+    expect(plain("# Title\n\nbody")).toBe(`<h1>Title</h1>${gap}body`);
+    expect(plain("para\n\n- a")).toBe(`para${gap}<ul><li>a</li></ul>`);
+    expect(plain("- a\n\n- b")).toBe(`<ul><li>a</li></ul>${gap}<ul><li>b</li></ul>`);
+    expect(plain("- a\n\n\n- b")).toBe(`<ul><li>a</li></ul>${gap}${gap}<ul><li>b</li></ul>`);
+    expect(plain("```\nx\n```\n\nafter")).toBe(`<pre><code>x</code></pre>${gap}after`);
+    expect(plain("# Title\n  \nbody")).toBe(`<h1>Title</h1>${gap}body`);
+    expect(plain("# Title\r\n\r\nbody")).toBe(`<h1>Title</h1>${gap}body`);
+  });
+
+  it("leaves blank lines between plain lines to the newlines, as before", () => {
+    expect(plain("one\n\ntwo")).toBe("one\n\ntwo");
   });
 
   it("renders a fenced block verbatim, and an unclosed fence as text", () => {
@@ -201,5 +223,55 @@ describe("firstLinkedUrl", () => {
     expect(firstLinkedUrl("`https://internal.example` then https://a.bc")).toBe("https://a.bc");
     expect(firstLinkedUrl("```\ncurl https://internal.example\n```")).toBeNull();
     expect(firstLinkedUrl(42 as unknown as string)).toBeNull();
+  });
+});
+
+describe("stripMarkdown", () => {
+  it("drops markup and keeps the words", () => {
+    expect(stripMarkdown("**bold** *italic* ~~gone~~ `code`")).toBe("bold italic gone code");
+    expect(stripMarkdown("# Heading\n- one\n* two")).toBe("Heading\n• one\n• two");
+    expect(stripMarkdown("[the docs](https://a.bc/x) and https://a.bc/y.")).toBe("the docs and https://a.bc/y.");
+    expect(stripMarkdown(String.raw`\*literal\*`)).toBe("*literal*");
+  });
+
+  it("keeps code, and a fence's contents, exactly as written", () => {
+    expect(stripMarkdown("`**not bold**`")).toBe("**not bold**");
+    expect(stripMarkdown("```py\n# comment\n- dash\n```")).toBe("# comment\n- dash");
+  });
+
+  it("leaves text that only looks like markup alone", () => {
+    expect(stripMarkdown("2 * 3 * 4 and snake*case*word")).toBe("2 * 3 * 4 and snake*case*word");
+    expect(stripMarkdown("a < b && c > d, \"quoted\" 'too'")).toBe("a < b && c > d, \"quoted\" 'too'");
+  });
+
+  it("keeps a look-alike link whole, so the text does not claim the wrong site", () => {
+    expect(stripMarkdown("[paypal.com](https://evil.example)")).toBe("[paypal.com](https://evil.example)");
+  });
+
+  it("names real mentions itself, and never one the sender escaped", () => {
+    const r = (did: string) => names[did] ?? did;
+    expect(stripMarkdown("**hi** @[did:key:zAna]", r)).toBe("hi @Ana");
+    expect(stripMarkdown("`@[did:key:zAna]`", r)).toBe("@Ana");
+    // Shown as literal text in the message, so literal in the notification.
+    expect(stripMarkdown(String.raw`@\[did:key:zAna\]`, r)).toBe("@[did:key:zAna]");
+    expect(stripMarkdown("@*[did:key:zAna]*", r)).toBe("@[did:key:zAna]");
+  });
+
+  it("keeps mention tokens as written without a resolver, for the search index", () => {
+    expect(stripMarkdown("**hi** @[did:key:zAna]")).toBe("hi @[did:key:zAna]");
+  });
+
+  it("returns nothing for content that is not a string", () => {
+    expect(stripMarkdown(7 as unknown as string)).toBe("");
+  });
+});
+
+describe("emphasis at scale", () => {
+  it("stays linear on interleaved markers a peer could send", () => {
+    const hostile = "*a ".repeat(4000) + "a~~ ".repeat(4000);
+    const started = performance.now();
+    stripMarkdown(hostile);
+    renderMessageMarkdown(hostile, (d) => d);
+    expect(performance.now() - started).toBeLessThan(500);
   });
 });

@@ -1,6 +1,7 @@
 import { MessageType, type Message } from "./types/message";
 import { closeNotificationsByTag, notifyMessage } from "./notify.svelte";
-import { humanizeMentions, mentionsMe } from "./mentions";
+import { mentionsMe } from "./mentions";
+import { stripMarkdown } from "./markdown";
 import { getManifest } from "./plugins/registry";
 import { getRoomNotifyMode } from "./notify-prefs.svelte";
 import { roomsStore } from "./rooms.svelte";
@@ -250,7 +251,7 @@ export function announceMessage(
         body = "posted a plugin card";
       }
     } else {
-      body = humanizeMentions(body, ctx.resolveName);
+      body = stripMarkdown(body, ctx.resolveName);
     }
 
     let title: string;

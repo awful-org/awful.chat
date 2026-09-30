@@ -136,8 +136,14 @@ async function flushIndexAppends(): Promise<void> {
 
 // ── sealed index (de)serialization ───────────────────────────────────────────
 
+/**
+ * Bumped when what an entry holds changes, so an index sealed before is
+ * rebuilt rather than trusted. 2: text is the message with markdown dropped.
+ */
+const INDEX_VERSION = 2;
+
 function encodeIndex(entries: SearchEntry[]): ArrayBuffer {
-  const bytes = new TextEncoder().encode(JSON.stringify({ v: 1, entries }));
+  const bytes = new TextEncoder().encode(JSON.stringify({ v: INDEX_VERSION, entries }));
   return bytes.buffer.slice(
     bytes.byteOffset,
     bytes.byteOffset + bytes.byteLength
@@ -150,7 +156,7 @@ function decodeIndex(data: ArrayBuffer): SearchEntry[] | null {
       v?: number;
       entries?: SearchEntry[];
     };
-    if (parsed.v !== 1 || !Array.isArray(parsed.entries)) return null;
+    if (parsed.v !== INDEX_VERSION || !Array.isArray(parsed.entries)) return null;
     return parsed.entries;
   } catch {
     return null;
