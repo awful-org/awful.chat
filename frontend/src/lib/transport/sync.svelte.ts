@@ -710,7 +710,7 @@ async function sendExportData(
     // Send messages in batches with rate limiting
     const sections = EXPORT_SECTIONS.map((name) => ({
       name,
-      data: exportData[name] as unknown[],
+      data: (exportData[name] ?? []) as unknown[],
     }));
 
     let processed = 0;

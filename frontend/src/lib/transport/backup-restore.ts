@@ -240,7 +240,7 @@ async function importDatabaseInner(
   mode: "add" | "replace",
   onProgress?: (done: number, total: number) => void
 ): Promise<void> {
-  const total = EXPORT_SECTIONS.reduce((n, k) => n + data[k].length, 0);
+  const total = EXPORT_SECTIONS.reduce((n, k) => n + (data[k]?.length ?? 0), 0);
   let done = 0;
   const tick = (n = 1): void => {
     done += n;

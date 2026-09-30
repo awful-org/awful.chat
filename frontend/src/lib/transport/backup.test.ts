@@ -79,7 +79,37 @@ describe("parseBackup", () => {
     expect(data.rooms).toEqual([]);
     expect(data.attachments).toEqual([]);
     expect(data.savedGifs).toEqual([]);
+    expect(data.roomProfiles).toEqual([]);
+    expect(data.roomDeletions).toEqual([]);
     expect(data.exportedAt).toBe(0);
+  });
+});
+
+describe("room profile backup records", () => {
+  const base = {
+    messages: [], attachments: [], pending: [], watermarks: [], yjsDocs: [],
+    rooms: [], profiles: [], savedGifs: [],
+  };
+
+  it("retains explicit clears and edit clocks, and drops invalid fields or markers", () => {
+    const record = { roomCode: "rd2_a", did: "did:alice", generation: 100,
+      fields: { nickname: null, color: "#123456" },
+      fieldEdits: { nickname: { at: 101, id: "device-a" } } };
+    const result = sanitizeCollections({ ...base,
+      roomProfiles: [record, { ...record, fields: { inboxOff: true } },
+        { ...record, fieldEdits: { nickname: { at: -1, id: "bad" } } }],
+      roomDeletions: [{ roomCode: "rd2_b", generation: 120, deletedAt: 121 },
+        { roomCode: "rd2_b", generation: -1, deletedAt: 121 }],
+    });
+    expect(result.roomProfiles).toEqual([record]);
+    expect(result.roomDeletions).toEqual([{ roomCode: "rd2_b", generation: 120, deletedAt: 121 }]);
+    expect(result.dropped).toBe(3);
+  });
+
+  it("loads old backups without room collections", () => {
+    const old = parseBackup(backupJson());
+    expect(old.roomProfiles).toEqual([]);
+    expect(old.roomDeletions).toEqual([]);
   });
 });
 

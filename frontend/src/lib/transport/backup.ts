@@ -20,7 +20,14 @@ import type {
   OwnProfile,
   SavedGif,
   WatermarkRecord,
+  OwnRoomProfileRecord,
+  RoomDeletionMarker,
 } from "../storage";
+import type { RoomProfileField } from "../room-profile";
+
+export type RoomProfileExport = Omit<OwnRoomProfileRecord, "fields"> & {
+  fields: Partial<Record<RoomProfileField, string | boolean | null>>;
+};
 
 export interface AttachmentExport {
   encryption?: Attachment["encryption"];
@@ -51,6 +58,8 @@ export const EXPORT_SECTIONS = [
   "attachments",
   "rooms",
   "profiles",
+  "roomProfiles",
+  "roomDeletions",
   "watermarks",
   "yjsDocs",
   "savedGifs",
@@ -84,6 +93,8 @@ export interface DatabaseExport {
   yjsDocs: { id: string; update: number[] }[];
   rooms: (Room | DMRoom)[];
   profiles: (PeerProfile | OwnProfile)[];
+  roomProfiles?: RoomProfileExport[];
+  roomDeletions?: RoomDeletionMarker[];
   savedGifs: SavedGif[];
 }
 
@@ -283,6 +294,8 @@ function parseBackupValue(parsed: unknown): BackupFile {
     yjsDocs: arr(d.yjsDocs),
     rooms: arr(d.rooms),
     profiles: arr(d.profiles),
+    roomProfiles: arr(d.roomProfiles),
+    roomDeletions: arr(d.roomDeletions),
     savedGifs: arr(d.savedGifs),
   };
 }
@@ -538,6 +551,41 @@ export function isValidProfileRecord(
   );
 }
 
+const ROOM_PROFILE_FIELDS = new Set([
+  "nickname", "pfpURL", "pfpData", "color", "bannerURL", "bannerData",
+  "tagText", "tagTextColor", "tagChipColor", "bio", "nameEffect",
+  "nameShimmer", "nameGlow", "gradient2", "gradient3",
+]);
+
+export function isValidRoomProfileRecord(value: unknown): value is RoomProfileExport {
+  if (!value || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  if (!isNonEmptyString(r.roomCode) || !isNonEmptyString(r.did) ||
+      !isFiniteNonNegative(r.generation) || !r.fields || typeof r.fields !== "object" ||
+      Array.isArray(r.fields)) return false;
+  const fields = r.fields as Record<string, unknown>;
+  if (Object.entries(fields).some(([key, field]) =>
+    !ROOM_PROFILE_FIELDS.has(key) ||
+    (field !== null && (key === "nameShimmer" || key === "nameGlow"
+      ? typeof field !== "boolean" : typeof field !== "string"))
+  )) return false;
+  if (r.fieldEdits === undefined) return true;
+  if (!r.fieldEdits || typeof r.fieldEdits !== "object" || Array.isArray(r.fieldEdits)) return false;
+  return Object.entries(r.fieldEdits as Record<string, unknown>).every(([key, edit]) => {
+    if (!ROOM_PROFILE_FIELDS.has(key) || !edit || typeof edit !== "object") return false;
+    const e = edit as Record<string, unknown>;
+    return isFiniteNonNegative(e.at) && isNonEmptyString(e.id) &&
+      (e.reset === undefined || typeof e.reset === "boolean");
+  });
+}
+
+export function isValidRoomDeletionMarker(value: unknown): value is RoomDeletionMarker {
+  if (!value || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  return isNonEmptyString(r.roomCode) && isFiniteNonNegative(r.generation) &&
+    isFiniteNonNegative(r.deletedAt);
+}
+
 export function isValidSavedGifRecord(g: unknown): g is SavedGif {
   if (!g || typeof g !== "object") return false;
   const r = g as Record<string, unknown>;
@@ -593,6 +641,8 @@ export interface SanitizedCollections {
   yjsDocs: { id: string; update: number[] }[];
   rooms: (Room | DMRoom)[];
   profiles: (PeerProfile | OwnProfile)[];
+  roomProfiles: RoomProfileExport[];
+  roomDeletions: RoomDeletionMarker[];
   savedGifs: SavedGif[];
   /** Total records dropped across every collection above. */
   dropped: number;
@@ -614,6 +664,8 @@ export function sanitizeCollections(data: {
   yjsDocs: unknown[];
   rooms: unknown[];
   profiles: unknown[];
+  roomProfiles?: unknown[];
+  roomDeletions?: unknown[];
   savedGifs: unknown[];
 }): SanitizedCollections {
   const messages = sanitize(data.messages, isValidMessageRecord);
@@ -623,6 +675,8 @@ export function sanitizeCollections(data: {
   const yjsDocs = sanitize(data.yjsDocs, isValidYjsDocRecord);
   const rooms = sanitize(data.rooms, isValidRoomRecord);
   const profiles = sanitize(data.profiles, isValidProfileRecord);
+  const roomProfiles = sanitize(data.roomProfiles ?? [], isValidRoomProfileRecord);
+  const roomDeletions = sanitize(data.roomDeletions ?? [], isValidRoomDeletionMarker);
   const savedGifs = sanitize(data.savedGifs, isValidSavedGifRecord);
 
   return {
@@ -633,6 +687,8 @@ export function sanitizeCollections(data: {
     yjsDocs: yjsDocs.records,
     rooms: rooms.records,
     profiles: profiles.records,
+    roomProfiles: roomProfiles.records,
+    roomDeletions: roomDeletions.records,
     savedGifs: savedGifs.records,
     dropped:
       messages.dropped +
@@ -642,6 +698,8 @@ export function sanitizeCollections(data: {
       yjsDocs.dropped +
       rooms.dropped +
       profiles.dropped +
+      roomProfiles.dropped +
+      roomDeletions.dropped +
       savedGifs.dropped,
   };
 }
