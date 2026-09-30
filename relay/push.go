@@ -56,10 +56,43 @@ const (
 	// wakes, so a second push would cost battery and tell the push vendor
 	// more about this box's traffic than it needs to know.
 	pushCoalesceWindow = time.Minute
-	// One worker drains this. A burst that outruns delivery drops wake-ups
+	// pushWorkers drain this. A burst that outruns delivery drops wake-ups
 	// rather than growing without bound - the mailbox still holds the
 	// message, and the next deposit or foreground collect finds it.
 	pushQueueDepth = 1024
+	// Delivery used to be ONE worker sending to a box's devices one at a
+	// time with a 15 s timeout each. Sixteen subscribed devices whose
+	// endpoints accepted TLS and never answered held that worker for four
+	// minutes per wake-up, and every real wake-up on the instance queued
+	// behind it until the queue overflowed and dropped them. Now: a pool of
+	// workers, a short timeout per send, a cap on sends in flight to any one
+	// push service, and a service or box that keeps failing is suspended
+	// with backoff instead of retried at full cost on every deposit. The
+	// allowlist below is what makes "never answers" rare in the first place:
+	// an endpoint has to be at a real push service.
+	pushWorkers = 8
+	// A push service answers in well under a second; five is generous for
+	// a slow mobile-network day and short enough that a hung send costs a
+	// worker five seconds, not fifteen.
+	pushSendTimeout = 5 * time.Second
+	// Sends in flight to one push service at once. Four workers' worth, so
+	// one service that has gone slow can occupy at most half the pool.
+	pushPerHostConcurrency = 4
+	// How long a send waits for a free slot at its push service before the
+	// wake-up is skipped for that device. The mailbox keeps the message;
+	// the next deposit tries again.
+	pushHostWait = 2 * time.Second
+	// A push service that fails this many sends in a row is suspended for a
+	// backoff that doubles, from pushHostBackoffMin to pushHostBackoffMax,
+	// and resets on the first success.
+	pushHostFailThreshold = 5
+	pushHostBackoffMin    = 30 * time.Second
+	pushHostBackoffMax    = 10 * time.Minute
+	// The same for one box whose every device failed this many deliveries
+	// in a row: its wake-ups are skipped for a doubling backoff.
+	pushBoxFailThreshold = 3
+	pushBoxBackoffMin    = time.Minute
+	pushBoxBackoffMax    = time.Hour
 	// Seconds a push service should hold an undelivered wake-up. A day, so a
 	// phone that was off overnight still gets told once it is back.
 	pushTTL = 86400
@@ -123,10 +156,171 @@ var (
 
 var pushQueue = make(chan string, pushQueueDepth)
 
-// One client for every push send, over the SSRF-safe transport the proxies
-// share (see pluginProxyTransport): a subscription endpoint is attacker
-// input, and a push service that hangs must not hold the worker forever.
-var pushHTTPClient = &http.Client{Timeout: 15 * time.Second, Transport: pluginProxyTransport}
+// One client for every push send, over the SSRF-safe dialer the proxies use
+// (see pluginProxySafeDial): a subscription endpoint is attacker input, and
+// a push service that hangs must not hold a worker for longer than one
+// pushSendTimeout.
+var pushHTTPClient = &http.Client{Timeout: pushSendTimeout, Transport: &http.Transport{
+	DialContext:         pluginProxySafeDial,
+	IdleConnTimeout:     90 * time.Second,
+	MaxIdleConns:        32,
+	MaxIdleConnsPerHost: pushPerHostConcurrency,
+}}
+
+// ── Push services ─────────────────────────────────────────────────────────
+
+// defaultPushHosts are the push services browsers actually hand out
+// endpoints at: Chrome, Edge-on-Android, Samsung Internet, Opera and Brave
+// use Firebase Cloud Messaging; Firefox uses Mozilla's autopush; Safari
+// (macOS 13+, iOS 16.4+) uses Apple's; Edge on Windows uses WNS. A "*."
+// entry matches any subdomain. PUSH_ALLOWED_HOSTS replaces this list for an
+// operator whose users need another service; "*" allows any https host,
+// which is how the relay behaved before and lets a subscriber aim the relay
+// at any server on the internet.
+var defaultPushHosts = []string{
+	"fcm.googleapis.com",
+	"updates.push.services.mozilla.com",
+	"web.push.apple.com",
+	"*.push.apple.com",
+	"*.notify.windows.com",
+}
+
+var pushAllowedHosts = parsePushHosts(os.Getenv("PUSH_ALLOWED_HOSTS"))
+
+func parsePushHosts(raw string) []string {
+	var out []string
+	for _, h := range strings.Split(raw, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		return defaultPushHosts
+	}
+	return out
+}
+
+// pushHostKey returns the allowlist entry an endpoint host falls under,
+// which is also the key its concurrency slots and backoff are kept under -
+// one per push SERVICE, not per hostname, so a service that spreads its
+// endpoints over many subdomains is still one service to be gentle with.
+// Empty when no entry allows the host.
+func pushHostKey(host string) string {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, h := range pushAllowedHosts {
+		switch {
+		case h == "*":
+			return host
+		case strings.HasPrefix(h, "*."):
+			if strings.HasSuffix(host, h[1:]) && len(host) > len(h)-1 {
+				return h
+			}
+		case host == h:
+			return h
+		}
+	}
+	return ""
+}
+
+type pushHostState struct {
+	slots          chan struct{}
+	fails          int
+	backoff        time.Duration
+	suspendedUntil time.Time
+}
+
+var (
+	pushHostsMu sync.Mutex
+	pushHosts   = map[string]*pushHostState{}
+)
+
+func pushHost(key string) *pushHostState {
+	pushHostsMu.Lock()
+	defer pushHostsMu.Unlock()
+	st := pushHosts[key]
+	if st == nil {
+		st = &pushHostState{slots: make(chan struct{}, pushPerHostConcurrency)}
+		pushHosts[key] = st
+	}
+	return st
+}
+
+// pushHostSuspended reports whether a push service is sitting out a backoff.
+func pushHostSuspended(st *pushHostState, now time.Time) bool {
+	pushHostsMu.Lock()
+	defer pushHostsMu.Unlock()
+	return now.Before(st.suspendedUntil)
+}
+
+// pushHostResult records one send's outcome at a push service. ok is any
+// answer at all from the service, including 404/410: those are about the
+// subscription, not about the service being unwell.
+func pushHostResult(st *pushHostState, ok bool, now time.Time) {
+	pushHostsMu.Lock()
+	defer pushHostsMu.Unlock()
+	if ok {
+		st.fails, st.backoff = 0, 0
+		return
+	}
+	st.fails++
+	if st.fails < pushHostFailThreshold {
+		return
+	}
+	st.backoff = nextBackoff(st.backoff, pushHostBackoffMin, pushHostBackoffMax)
+	st.suspendedUntil = now.Add(st.backoff)
+	st.fails = 0
+}
+
+func nextBackoff(cur, lo, hi time.Duration) time.Duration {
+	if cur < lo {
+		return lo
+	}
+	if cur*2 > hi {
+		return hi
+	}
+	return cur * 2
+}
+
+// Per-box failure state, see pushBoxFailThreshold. Only boxes that have
+// failed are here and a success deletes the entry, so it is bounded by the
+// subscribed boxes.
+type pushBoxState struct {
+	fails          int
+	backoff        time.Duration
+	suspendedUntil time.Time
+}
+
+var (
+	pushBoxFailMu sync.Mutex
+	pushBoxFail   = map[string]*pushBoxState{}
+)
+
+func pushBoxSuspended(box string, now time.Time) bool {
+	pushBoxFailMu.Lock()
+	defer pushBoxFailMu.Unlock()
+	st := pushBoxFail[box]
+	return st != nil && now.Before(st.suspendedUntil)
+}
+
+func pushBoxResult(box string, ok bool, now time.Time) {
+	pushBoxFailMu.Lock()
+	defer pushBoxFailMu.Unlock()
+	if ok {
+		delete(pushBoxFail, box)
+		return
+	}
+	st := pushBoxFail[box]
+	if st == nil {
+		st = &pushBoxState{}
+		pushBoxFail[box] = st
+	}
+	st.fails++
+	if st.fails >= pushBoxFailThreshold {
+		st.backoff = nextBackoff(st.backoff, pushBoxBackoffMin, pushBoxBackoffMax)
+		st.suspendedUntil = now.Add(st.backoff)
+		st.fails = 0
+	}
+}
 
 // pushSend is the one outbound call to a push service, behind a package-level
 // seam so a test can see what would go over the wire without one. It returns
@@ -334,9 +528,32 @@ func pushDeliver(box string) {
 		VAPIDPublicKey:  keys.PublicKey,
 		VAPIDPrivateKey: keys.PrivateKey,
 	}
-	sent, expired, failed := 0, 0, 0
+	now := time.Now()
+	if pushBoxSuspended(box, now) {
+		return
+	}
+	sent, expired, failed, skipped := 0, 0, 0, 0
 	var dead []string
 	for device, s := range subs {
+		key := pushEndpointKey(s.Endpoint)
+		if key == "" {
+			// Stored before the allowlist, or an operator has narrowed it
+			// since. It can never be sent to again, so it goes like a 410.
+			expired++
+			dead = append(dead, device)
+			continue
+		}
+		host := pushHost(key)
+		if pushHostSuspended(host, time.Now()) {
+			skipped++
+			continue
+		}
+		select {
+		case host.slots <- struct{}{}:
+		case <-time.After(pushHostWait):
+			skipped++
+			continue
+		}
 		status, err := pushSend(
 			&webpush.Subscription{
 				Endpoint: s.Endpoint,
@@ -345,6 +562,8 @@ func pushDeliver(box string) {
 			pushPayload,
 			opts,
 		)
+		<-host.slots
+		pushHostResult(host, err == nil && status < 500, time.Now())
 		switch {
 		case err != nil:
 			failed++
@@ -362,36 +581,58 @@ func pushDeliver(box string) {
 	if len(dead) > 0 {
 		pushRemoveDevices(box, dead)
 	}
+	if sent+failed > 0 {
+		pushBoxResult(box, sent > 0, time.Now())
+	}
 	// Counts only. An endpoint is a per-device identifier at a vendor and
 	// must never reach a log line.
-	log.Printf("[push] wake-up: %d sent, %d expired, %d failed", sent, expired, failed)
+	log.Printf("[push] wake-up: %d sent, %d expired, %d failed, %d skipped", sent, expired, failed, skipped)
 }
 
-// startPushWorker drains the queue on exactly one goroutine, so however many
-// deposits land at once the relay opens one push request at a time.
+// pushEndpointKey is the push service an endpoint belongs to, or empty when
+// it is not one this relay sends to.
+func pushEndpointKey(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return ""
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return ""
+	}
+	return pushHostKey(u.Hostname())
+}
+
+// startPushWorker drains the queue on pushWorkers goroutines, so however
+// many deposits land at once the relay has at most that many push requests
+// open, and one slow push service cannot hold all of them (see
+// pushPerHostConcurrency).
 func startPushWorker() {
 	if !pushEnabled {
 		return
 	}
 	pushInitCount()
-	go func() {
-		for box := range pushQueue {
-			pushDeliver(box)
-		}
-	}()
+	log.Printf("[push] sending to %s", strings.Join(pushAllowedHosts, ", "))
+	for range pushWorkers {
+		go func() {
+			for box := range pushQueue {
+				pushDeliver(box)
+			}
+		}()
+	}
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
 
-// validPushEndpoint accepts only an https URL small enough to store. The push
-// service is chosen by the browser, not by us, so there is no host allowlist
-// to apply - what bounds abuse is that subscribing needs a did signature.
+// validPushEndpoint accepts only an https URL small enough to store, on
+// port 443, at a push service the relay sends to (defaultPushHosts). The
+// browser picks the service, but browsers only pick from a handful; without
+// the allowlist a subscriber - dids are free - could point the relay at any
+// server on the internet and have it POST there on every deposit.
 func validPushEndpoint(raw string) bool {
 	if raw == "" || len(raw) > pushMaxEndpoint {
 		return false
 	}
-	u, err := url.Parse(raw)
-	return err == nil && u.Scheme == "https" && u.Host != ""
+	return pushEndpointKey(raw) != ""
 }
 
 // handlePushConfig tells the client whether to offer push at all, and hands

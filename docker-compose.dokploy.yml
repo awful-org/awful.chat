@@ -75,6 +75,10 @@ services:
       # reaches an operator whose instance misbehaves. Defaults to
       # admin@${DOMAIN}.
       - PUSH_CONTACT=${PUSH_CONTACT:-}
+      # Push services the relay sends to. Unset is the services browsers use
+      # (FCM, Mozilla, Apple, WNS); setting it replaces that list. See
+      # .env.example.
+      - PUSH_ALLOWED_HOSTS=${PUSH_ALLOWED_HOSTS:-}
       # Whose X-Forwarded-For the relay believes, for every per-client limit
       # it has. The relay itself trusts NOTHING when this is empty: every
       # container on dokploy-network holds a private address, so the old
