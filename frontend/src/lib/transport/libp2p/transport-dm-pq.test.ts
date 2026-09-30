@@ -3,17 +3,23 @@ vi.mock("@libp2p/webrtc", () => ({ webRTC: () => ({}) }));
 import { LibP2PTransport } from "./transport";
 import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
 
-afterEach(() => { vi.useRealTimers(); });
+const made: LibP2PTransport[] = [];
+afterEach(() => {
+  for (const t of made.splice(0)) t.clearRoomSecurity(); // no lobby timer outlives its test
+  vi.useRealTimers();
+});
 
 function transport() {
   const t = new LibP2PTransport();
+  made.push(t);
   const internal = t as any;
   internal.rendezvousSend = vi.fn();
   return { t, internal, register: internal.rendezvousSend as ReturnType<typeof vi.fn> };
 }
 const local = "dm-" + "a".repeat(40);
 
-it("moves a live classical DM onto its post-quantum secret in place", () => {
+it("moves a live classical DM onto its post-quantum secret in place", async () => {
+  vi.useFakeTimers();
   const { t, internal, register } = transport();
   const classical = newRoomSecret(), hybrid = newRoomSecret();
   const d0 = t.joinSecureConversation(local, classical);
@@ -27,8 +33,15 @@ it("moves a live classical DM onto its post-quantum secret in place", () => {
   expect(t.rooms()).toEqual([local]);
   expect(register).toHaveBeenCalledWith({ type: "UNREGISTER", room: d0 });
   expect(register).toHaveBeenLastCalledWith({ type: "REGISTER", room: d1 });
-  // ...and the classical ID is watched as a lobby, not joined as a room.
-  expect(register.mock.calls.filter(([m]) => m.type === "REGISTER" && m.room === d0)).toHaveLength(2);
+  // ...and the classical ID is watched as a lobby, not joined as a room -
+  // registered only after the relay's empty-register window has turned over,
+  // so it never takes budget from the room joins that caused it.
+  const lobbyRegisters = () => register.mock.calls.filter(([m]) => m.type === "REGISTER" && m.room === d0);
+  expect(lobbyRegisters()).toHaveLength(1); // the classical join, earlier
+  await vi.advanceTimersByTimeAsync(61_000);
+  expect(lobbyRegisters()).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(lobbyRegisters()).toHaveLength(2);
   expect(internal.joinedRooms.has(d0)).toBe(false);
 });
 
@@ -42,14 +55,27 @@ it("refuses to go back to the classical secret once post-quantum", () => {
   expect(t.joinSecureConversation(local, hybrid, classical)).toBe(deriveRoomKeys(hybrid).discoveryId);
 });
 
-it("joins a new conversation post-quantum directly, without ever joining classical", () => {
+it("joins a new conversation post-quantum directly, without ever joining classical", async () => {
+  vi.useFakeTimers();
   const { t, internal, register } = transport();
   const classical = newRoomSecret(), hybrid = newRoomSecret();
   const d0 = deriveRoomKeys(classical).discoveryId;
   t.joinSecureConversation(local, hybrid, classical);
   expect(internal.secureRooms.has(d0)).toBe(false);
+  expect(register).not.toHaveBeenCalledWith({ type: "REGISTER", room: d0 });
+  await vi.advanceTimersByTimeAsync(71_000);
   expect(register).toHaveBeenCalledWith({ type: "REGISTER", room: d0 });
+  expect(internal.secureRooms.has(d0)).toBe(false);
   expect(() => t.joinSecureConversation(local, classical)).toThrow("Conflicting");
+});
+
+it("holds a bounded number of lobbies", () => {
+  const { t, internal } = transport();
+  for (let i = 0; i < 70; i++) {
+    t.joinSecureConversation("dm-" + i.toString(16).padStart(40, "0"), newRoomSecret(), newRoomSecret());
+  }
+  expect(internal.dmLobbies.size).toBe(64);
+  t.clearRoomSecurity();
 });
 
 it("only rebinds onto a post-quantum secret of the SAME conversation", () => {
@@ -95,11 +121,13 @@ it("introduces peers found in the lobby, once per peer, unless already in the PQ
   expect(t.isSecureRoom(local)).toBe(true);
 });
 
-it("stops watching the lobby when the conversation is left or the identity locks", () => {
+it("stops watching the lobby when the conversation is left or the identity locks", async () => {
+  vi.useFakeTimers();
   const { t, internal, register } = transport();
   const classical = newRoomSecret();
   const d0 = deriveRoomKeys(classical).discoveryId;
   t.joinSecureConversation(local, newRoomSecret(), classical);
+  await vi.advanceTimersByTimeAsync(71_000);
   t.leaveRoom(local);
   expect(register).toHaveBeenCalledWith({ type: "UNREGISTER", room: d0 });
   expect(internal.dmLobbies.size).toBe(0);

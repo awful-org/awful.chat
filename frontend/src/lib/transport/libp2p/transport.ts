@@ -168,6 +168,14 @@ const RENDEZVOUS_PONG_MISSES_ALLOWED = 2;
 const DM_LOBBY_RETRY_MS = 10 * 60_000;
 /** Grace for an already-upgraded peer to show up in the post-quantum room. */
 const DM_LOBBY_INTRODUCE_DELAY_MS = 5_000;
+/**
+ * DM lobbies register this long after being held: past the relay's one-minute
+ * empty-register window (maxEmptyRegisters in relay/main.go), so the room
+ * joins that caused them spend that window's budget, not the lobbies.
+ */
+const DM_LOBBY_REGISTER_DELAY_MS = 70_000;
+/** Lobbies held at once; each is a registration, usually into an empty room. */
+const DM_LOBBY_MAX = 64;
 /** Budget for the one-off liveness probe a network change triggers. */
 const RELAY_LIVENESS_TIMEOUT_MS = 5_000;
 
@@ -275,6 +283,8 @@ export class LibP2PTransport implements PeerTransport {
     for (const handle of this.dmIntroductions.values()) handle.close();
     for (const room of [...this.secureRooms.keys()]) this.leaveRoom(room);
     for (const localId of [...this.dmLobbyOf.keys()]) this.releaseDmLobby(localId);
+    if (this.lobbyRegisterTimer) clearTimeout(this.lobbyRegisterTimer);
+    this.lobbyRegisterTimer = null;
     this.lobbyIntroducedAt.clear();
     this.dmSessions.clear();
     this.secureOpening.clear();
@@ -378,19 +388,42 @@ export class LibP2PTransport implements PeerTransport {
    * they can be and merely re-binds their DID if they cannot (an older
    * build). Bounded per peer, so an older build is not re-introduced on
    * every rendezvous reply.
+   *
+   * Lobbies are second-class registrations, on purpose. The relay allows a
+   * peer only so many REGISTERs into empty rooms a minute
+   * (maxEmptyRegisters), and a lobby is usually empty - so a lobby must never
+   * crowd out a real room. They are registered in one batch well after
+   * whatever burst of room joins caused them, in a later budget window, and
+   * at most DM_LOBBY_MAX of them. A conversation past the cap still works;
+   * it only loses this way of finding stragglers.
    */
   private dmAnchors = new Map<string, DiscoveryId>();
   private dmLobbyOf = new Map<string, DiscoveryId>();
   private dmLobbies = new Map<DiscoveryId, string>();
+  private lobbyRegistered = new Set<DiscoveryId>();
+  private lobbyRegisterTimer: TimerHandle | null = null;
   private lobbyIntroducedAt = new Map<string, number>();
 
-  /** Register (or keep) this conversation's classical ID as a lobby. */
+  /** Hold (or keep) this conversation's classical ID as a lobby. */
   holdDmLobby(localId: string, anchor: DiscoveryId): void {
     if (this.dmLobbyOf.get(localId) === anchor) return;
     this.releaseDmLobby(localId);
+    if (this.dmLobbies.size >= DM_LOBBY_MAX) return;
     this.dmLobbyOf.set(localId, anchor);
     this.dmLobbies.set(anchor, localId);
-    this.rendezvousSend({ type: "REGISTER", room: anchor });
+    this.scheduleLobbyRegistration();
+  }
+
+  private scheduleLobbyRegistration(): void {
+    if (this.lobbyRegisterTimer) return;
+    this.lobbyRegisterTimer = setTimeout(() => {
+      this.lobbyRegisterTimer = null;
+      for (const room of this.dmLobbies.keys()) {
+        if (this.lobbyRegistered.has(room) || this.joinedRooms.has(room)) continue;
+        this.lobbyRegistered.add(room);
+        this.rendezvousSend({ type: "REGISTER", room });
+      }
+    }, DM_LOBBY_REGISTER_DELAY_MS);
   }
 
   private releaseDmLobby(localId: string): void {
@@ -398,7 +431,9 @@ export class LibP2PTransport implements PeerTransport {
     if (!anchor) return;
     this.dmLobbyOf.delete(localId);
     this.dmLobbies.delete(anchor);
-    if (!this.joinedRooms.has(anchor)) this.rendezvousSend({ type: "UNREGISTER", room: anchor });
+    if (this.lobbyRegistered.delete(anchor) && !this.joinedRooms.has(anchor)) {
+      this.rendezvousSend({ type: "UNREGISTER", room: anchor });
+    }
   }
 
   /** A lobby is watched, never joined; a room joined for real is not one. */
@@ -2568,9 +2603,9 @@ export class LibP2PTransport implements PeerTransport {
     for (const room of this.joinedRooms) {
       this.rendezvousSend({ type: "REGISTER", room });
     }
-    for (const room of this.dmLobbies.keys()) {
-      this.rendezvousSend({ type: "REGISTER", room });
-    }
+    // Lobbies after the rooms, and later: see holdDmLobby.
+    this.lobbyRegistered.clear();
+    if (this.dmLobbies.size > 0) this.scheduleLobbyRegistration();
 
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
