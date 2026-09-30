@@ -26,6 +26,7 @@ vi.mock("$lib/storage", () => ({
   getRoom: async (room: string) => state.records.get(room),
   putRoom: async (room: any) => { state.records.set(room.roomCode, room); },
   getPhonebookEntries: async () => state.contacts,
+  setDmRequest: async () => false,
   nextDmLamport: async () => 1, putMessage: async () => {},
   setWatermark: async () => {}, markRoomSeen: async () => {},
 }));

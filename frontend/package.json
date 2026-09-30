@@ -68,6 +68,7 @@
     "@multiformats/multiaddr": "^13.0.3",
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
+    "@noble/post-quantum": "^0.7.1",
     "@scure/base": "^2.0.0",
     "@scure/bip39": "^2.0.1",
     "@serenity-kit/opaque": "1.1.0",

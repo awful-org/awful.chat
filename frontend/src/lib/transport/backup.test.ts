@@ -165,6 +165,15 @@ describe("mergeImportedRoom", () => {
     expect(merged.name).toBe("Local Name");
   });
 
+  it("keeps this device's post-quantum DM state over an imported one, and adopts one it lacks", () => {
+    const mine = { v: 1, ct: "mine", ek: "key" }, theirs = { v: 1, ct: "theirs", ek: "key" };
+    const dm = { ...local, roomCode: "dm-x", type: "dm" as const, participantDid: "did:key:zA" };
+    expect((mergeImportedRoom({ ...dm, pq: mine } as never, { ...dm, pq: theirs }) as { pq: unknown }).pq).toEqual(mine);
+    expect((mergeImportedRoom({ ...dm, pq: mine } as never, dm) as { pq?: unknown }).pq).toEqual(mine);
+    expect((mergeImportedRoom(dm as never, { ...dm, pq: theirs }) as { pq: unknown }).pq).toEqual(theirs);
+    expect(mergeImportedRoom(local, local)).not.toHaveProperty("pq");
+  });
+
   it("takes the imported watermark and name when they are the better ones", () => {
     const merged = mergeImportedRoom(
       { ...local, name: "abc", lastSeenLamport: 5 },

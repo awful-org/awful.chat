@@ -112,7 +112,11 @@ export async function buildCardState(
   // the definition when the row is missing or malformed keeps a card that is
   // rendering (from an in-memory row) foldable rather than inert.
   let ownerPluginId = definition.manifest.id;
-  const cardMsg = allMessages.find((m) => m.id === cardId);
+  // The CARD row: an update, or any other row, that happens to carry the
+  // card's id must not become the card - its sender would become the owner.
+  const cardMsg = allMessages.find(
+    (m) => m.id === cardId && m.type === MessageType.PluginCard
+  );
   if (cardMsg) {
     cardCtx = { senderDid: cardMsg.senderDid || cardMsg.senderId };
     try {

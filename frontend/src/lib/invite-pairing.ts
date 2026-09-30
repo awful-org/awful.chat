@@ -104,23 +104,29 @@ export async function hostInvitationPairing(secret: RoomSecret, onStatus: (statu
 export async function joinInvitationPairing(code: string, signal: AbortSignal): Promise<RoomSecret> {
   signal.throwIfAborted();
   const join = await startPairingJoin(code);
-  signal.throwIfAborted();
-  const base = { locator: join.locator, attempt: join.attempt };
-  await request({ ...base, action: "start", kind: "start", payload: join.request }, signal);
-  const deadline = Date.now() + 60_000;
-  while (!signal.aborted && Date.now() < deadline) {
-    const { messages } = await request({ ...base, action: "join-poll" }, signal);
-    for (const m of messages) {
-      if (m.attempt !== join.attempt) throw new Error("Invalid pairing attempt");
-      if (m.kind === "response") await request({ ...base, action: "finish", kind: "finish", payload: join.respond(m.payload) }, signal);
-      else if (m.kind === "transfer") {
-        const secret = await join.open(m.payload);
-        signal.throwIfAborted();
-        return secret;
+  // However the pairing ends - delivered, refused, cancelled, timed out -
+  // its secrets go with it.
+  try {
+    signal.throwIfAborted();
+    const base = { locator: join.locator, attempt: join.attempt };
+    await request({ ...base, action: "start", kind: "start", payload: join.request }, signal);
+    const deadline = Date.now() + 60_000;
+    while (!signal.aborted && Date.now() < deadline) {
+      const { messages } = await request({ ...base, action: "join-poll" }, signal);
+      for (const m of messages) {
+        if (m.attempt !== join.attempt) throw new Error("Invalid pairing attempt");
+        if (m.kind === "response") await request({ ...base, action: "finish", kind: "finish", payload: join.respond(m.payload) }, signal);
+        else if (m.kind === "transfer") {
+          const secret = await join.open(m.payload);
+          signal.throwIfAborted();
+          return secret;
+        }
+        else throw new Error("Invalid pairing message");
       }
-      else throw new Error("Invalid pairing message");
+      await pause();
     }
-    await pause();
+    throw new Error("Pairing cancelled or timed out. Keep the inviter online and request a new code.");
+  } finally {
+    join.dispose();
   }
-  throw new Error("Pairing cancelled or timed out. Keep the inviter online and request a new code.");
 }

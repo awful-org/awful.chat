@@ -150,6 +150,8 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   if (local.roomSecret && imported.roomSecret && local.roomSecret !== imported.roomSecret) {
     throw new Error("Imported room capability conflicts with the local room");
   }
+  const localPq = (local as { pq?: unknown }).pq;
+  const importedPq = (imported as { pq?: unknown }).pq;
   const participantLastSeen: Record<string, number> = {};
   for (const [did, ts] of Object.entries(local.participantLastSeen ?? {})) {
     participantLastSeen[did] = ts ?? 0;
@@ -162,6 +164,11 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
     ...(local.roomSecret || imported.roomSecret
       ? { roomSecret: local.roomSecret ?? imported.roomSecret }
       : {}),
+    // A DM's post-quantum state: this device's own wins. Ours came out of an
+    // introduction that confirmed it; an imported one only came out of a
+    // file, and on the decapsulating side a ciphertext cannot be checked
+    // without that confirmation (room-security/pq-dm.ts).
+    ...(localPq || importedPq ? { pq: localPq ?? importedPq } : {}),
     lastSeenLamport: Math.max(
       local.lastSeenLamport ?? 0,
       imported.lastSeenLamport ?? 0

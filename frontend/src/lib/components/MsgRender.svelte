@@ -81,6 +81,7 @@
     unpinWidget,
   } from "$lib/plugins/prefs.svelte";
   import type { PluginComponent } from "$lib/plugins/api";
+  import { canOpenAsPage } from "$lib/safe-mime";
 
   interface Props {
     msg: Message;
@@ -1442,20 +1443,25 @@
         </Tip>
       {/if}
 
-      <Tip text="Open in a new tab">
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            class="size-9 rounded-full bg-black/60 text-white inline-flex items-center justify-center hover:bg-black/80 cursor-pointer"
-            onclick={() =>
-              window.open(lightbox!.url, "_blank", "noopener,noreferrer")}
-            aria-label="Open in a new tab"
-          >
-            <ExternalLink class="size-4" />
-          </button>
-        {/snippet}
-      </Tip>
+      <!-- A blob URL is on the app's own origin: a peer's file opened as a
+           page runs as the app, so only types that cannot run anything open
+           (safe-mime.ts). A remote URL (a GIF service) is another origin. -->
+      {#if !lightbox!.url.startsWith("blob:") || canOpenAsPage(lightbox!.mimeType)}
+        <Tip text="Open in a new tab">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              class="size-9 rounded-full bg-black/60 text-white inline-flex items-center justify-center hover:bg-black/80 cursor-pointer"
+              onclick={() =>
+                window.open(lightbox!.url, "_blank", "noopener,noreferrer")}
+              aria-label="Open in a new tab"
+            >
+              <ExternalLink class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
       <Tip text="Download original">
         {#snippet children(props)}
           <button

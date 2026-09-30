@@ -5,6 +5,7 @@
  * this lived there it could not be tested, and it is the single function
  * standing between a peer and a forged message in someone else's name.
  */
+import { messageIdAllowedFor } from "../message-id";
 import { canonicalContentV3, verifySignature } from "../messaging";
 import type { WireChatMessage } from "../types/message";
 import { remoteLamportAllowed } from "./logical-clock";
@@ -49,6 +50,7 @@ export type VerifyReason =
   | "no-did"
   | "did-mismatch"
   | "no-room"
+  | "id-sender"
   | "bad-signature";
 
 export type VerifyVerdict = { ok: true } | { ok: false; reason: VerifyReason };
@@ -72,6 +74,12 @@ export async function verifyIncoming(
   const files = wire.meta?.files;
   if (Array.isArray(files) && files.length > MAX_MESSAGE_FILES) {
     return { ok: false, reason: "too-many-files" };
+  }
+  // Before the signature, and for unsigned rows too: a signature proves who
+  // wrote the row, never that the id it claims was theirs to use. See
+  // message-id.ts for the censorship an unbound id allowed.
+  if (!messageIdAllowedFor(wire.id, wire.senderId)) {
+    return { ok: false, reason: "id-sender" };
   }
   if (!wire.sig) {
     return opts.allowUnsigned === true

@@ -1,4 +1,5 @@
 import { decryptFileTo, encryptFileTo, type EncryptedFileDescriptor } from "./file-crypto";
+import { safeBlobType } from "$lib/safe-mime";
 
 /** The owner must release the staged file after the transfer/preview closes.
  * Keeping ciphertext and plaintext staging distinct avoids accidentally
@@ -49,7 +50,9 @@ async function stage(
     signal?.throwIfAborted();
     const snapshot = await handle.getFile();
     signal?.throwIfAborted();
-    return { file: new File([snapshot], name, { type: mimeType }), dispose };
+    // The sender's claimed type, through the allowlist (safe-mime.ts): this
+    // File becomes the blob URL every view of a downloaded file uses.
+    return { file: new File([snapshot], name, { type: safeBlobType(mimeType) }), dispose };
   } catch (error) {
     await writer?.abort(error).catch(() => {});
     await dispose().catch(() => {});

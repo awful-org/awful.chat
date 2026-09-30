@@ -194,6 +194,9 @@
     incomingSharedFiles?: File[];
     incomingSharedText?: string;
     onConsumeIncomingShared?: () => void;
+    /** This DM is a message request (storage.ts DMRoom.request). */
+    dmRequest?: boolean;
+    onAcceptDmRequest?: () => void;
   }
 
   let {
@@ -207,6 +210,8 @@
     incomingSharedFiles = [],
     incomingSharedText = "",
     onConsumeIncomingShared,
+    dmRequest = false,
+    onAcceptDmRequest,
   }: Props = $props();
 
   // Reset scroll state when room changes
@@ -3048,6 +3053,24 @@
         <ArrowDown class="size-3" /> New messages below <ArrowDown
           class="size-3"
         />
+      </Button>
+    </div>
+  {/if}
+
+  {#if dmRequest}
+    <!-- Answering accepts too (sendDirectMessage); Delete is the same act as
+         deleting any conversation. -->
+    <div
+      role="status"
+      class="flex flex-wrap items-center gap-2 border-t border-border bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground"
+    >
+      <UserPlus class="size-3.5 shrink-0" />
+      <span class="min-w-0 flex-1">
+        Message request. They are not a contact and share no room with you.
+      </span>
+      <Button variant="ghost" size="sm" onclick={() => onLeave()}>Delete</Button>
+      <Button variant="secondary" size="sm" onclick={() => onAcceptDmRequest?.()}>
+        Accept
       </Button>
     </div>
   {/if}

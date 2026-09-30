@@ -44,6 +44,7 @@ import {
   stopCallAudio,
 } from "$lib/transport/voice.svelte";
 import { CALL_SOUND_MAX_DURATION_MS } from "$lib/audio/call-audio-mixer";
+import { safeBlobType } from "$lib/safe-mime";
 
 export function makeHostApi(pluginId: string, roomCode: string): HostApi {
   const nowPlayingToken = Symbol(pluginId);
@@ -116,7 +117,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
         (a) => a.roomCode === roomCode && a.mimeType.startsWith("image/")
       );
       if (!row) return null;
-      if (row.data && !row.encryption) return new Blob([row.data], { type: row.mimeType });
+      if (row.data && !row.encryption) return new Blob([row.data], { type: safeBlobType(row.mimeType) });
 
       const { requestFileDownload, restoreFileAttachment } = await import(
         "$lib/transport/transport.svelte"

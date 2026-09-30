@@ -41,12 +41,13 @@ vi.mock("$lib/storage", () => ({
   bulkPutMessages: async (rows: any[], guard: () => void) => { guard(); rows.forEach(m => s.rows.set(m.id, m)); },
   getAttachmentsByMessage: async (id: string) => s.attachments.filter(a => a.messageId === id),
   putAttachment: async (a: any, guard: () => void) => { guard(); s.attachments.push(a); },
+  getDeletedFloor: async () => 0, addRoomParticipants: async () => {},
 }));
 vi.mock("$lib/messaging", () => ({ signMessage: s.sign }));
-vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, roomsStore: { rooms: [] } }));
+vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, refreshDmRooms: async () => {}, roomsStore: { rooms: [], dmRooms: [] } }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
 vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));
-vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer" }));
+vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer", isDmRequestRoom: () => false }));
 vi.mock("./verify-incoming", async original => ({ ...await original<typeof import("./verify-incoming")>(), verifyIncoming: async () => ({ ok: true }) }));
 vi.mock("../storage-crypto", () => ({ blindValue: async (v: string) => v }));
 vi.mock("../telemetry/taps", () => ({ stopTelemetryTaps: vi.fn(), installTelemetryTaps: vi.fn() }));

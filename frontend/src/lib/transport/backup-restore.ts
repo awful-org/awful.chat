@@ -10,7 +10,9 @@ import {
   wipeLocalDatabase,
   putIdentityRecord,
   bulkPutMessages,
+  bulkAddNewMessages,
   putAttachment,
+  getAttachment,
   putRoom,
   putPeerProfile,
   putOwnProfile,
@@ -49,7 +51,7 @@ import {
   EXPORT_SECTIONS,
   type ParsedBackupFile,
 } from "./backup";
-import { unlockWithImportedMnemonic } from "../identity/identity";
+import { publicKeyToDid, unlockWithImportedMnemonic, validPbkdf2Iterations } from "../identity/identity";
 import type { MnemonicRecord } from "../identity/identity";
 
 export interface ImportResult {
@@ -98,10 +100,26 @@ function mnemonicRecordFromExport(
     encrypted: new Uint8Array(identity.mnemonic.encrypted).buffer,
     // Absent = written before per-record counts existed = legacy 100k,
     // which is exactly what unlockIdentity assumes when it is undefined.
-    ...(typeof identity.mnemonic.iterations === "number"
-      ? { iterations: identity.mnemonic.iterations }
+    // Anything else must be a count this app could have written: a file
+    // claiming billions made every unlock spin.
+    ...(identity.mnemonic.iterations !== undefined
+      ? { iterations: checkedIterations(identity.mnemonic.iterations) }
       : {}),
   };
+}
+
+function checkedIterations(value: unknown): number {
+  if (!validPbkdf2Iterations(value)) throw new Error("Invalid backup: bad identity record");
+  return value;
+}
+
+/** The keypair section must at least be one key's own DID. */
+function checkedKeypair(identity: NonNullable<DatabaseExport["identity"]>): { did: string; publicKey: Uint8Array<ArrayBuffer> } {
+  const publicKey = new Uint8Array(identity.keypair.publicKey) as Uint8Array<ArrayBuffer>;
+  if (publicKey.length !== 32 || publicKeyToDid(publicKey) !== identity.keypair.did) {
+    throw new Error("Invalid backup: the identity's key does not match its DID");
+  }
+  return { did: identity.keypair.did, publicKey };
 }
 
 export async function importDatabase(
@@ -187,7 +205,8 @@ export async function importDatabase(
         throw new Error("Import cancelled - nothing on this device changed");
       }
       try {
-        await unlockWithImportedMnemonic(record, password, beforeCommit);
+        // Unlocking checks the phrase really is the DID the backup names.
+        await unlockWithImportedMnemonic(record, password, beforeCommit, checkedKeypair(identity).did);
         armed = true;
         break;
       } catch (err) {
@@ -235,6 +254,13 @@ export async function importDatabase(
 /** Messages per import transaction; see the loop in importDatabaseInner. */
 const IMPORT_CHUNK = 200;
 
+/** Drop rows whose signature is present but does not verify. */
+async function withoutForgedSignatures(messages: Message[]): Promise<Message[]> {
+  const { verifyMessage } = await import("../messaging");
+  const keep = await Promise.all(messages.map(async (m) => !m.sig || (await verifyMessage(m))));
+  return messages.filter((_, i) => keep[i]);
+}
+
 async function importDatabaseInner(
   data: DatabaseExport,
   mode: "add" | "replace",
@@ -254,11 +280,7 @@ async function importDatabaseInner(
     console.log("[Sync] Importing identity");
     const mnemonicRecord = mnemonicRecordFromExport(data.identity);
 
-    const keypairRecord = {
-      id: "keypair" as const,
-      did: data.identity.keypair.did,
-      publicKey: new Uint8Array(data.identity.keypair.publicKey),
-    };
+    const keypairRecord = { id: "keypair" as const, ...checkedKeypair(data.identity) };
 
     await putIdentityRecord(mnemonicRecord);
     await putIdentityRecord(keypairRecord);
@@ -277,16 +299,25 @@ async function importDatabaseInner(
   // real history that silence outlasted the source's ack clock.
   for (let i = 0; i < data.messages.length; i += IMPORT_CHUNK) {
     const chunk = data.messages.slice(i, i + IMPORT_CHUNK);
-    await bulkPutMessages(chunk);
+    if (mode === "add") {
+      // A merge keeps what is already here: see bulkAddNewMessages. And a
+      // row that carries a signature which does not verify is a forgery -
+      // every version a real row was ever signed with still verifies.
+      await bulkAddNewMessages(await withoutForgedSignatures(chunk));
+    } else {
+      await bulkPutMessages(chunk);
+    }
     tick(chunk.length);
   }
   const writes: Promise<unknown>[] = [
-    ...data.attachments.map((a) =>
-      putAttachment({
+    ...data.attachments.map(async (a) => {
+      // Likewise: a merge never replaces the bytes of a file already held.
+      if (mode === "add" && (await getAttachment(a.id))) return;
+      await putAttachment({
         ...a,
         data: bytesFromExport(a.data),
-      } as Attachment)
-    ),
+      } as Attachment);
+    }),
     ...data.rooms.map((r) => {
       const importedRoom = pfpFromJson(r);
       if (mode === "add") {
@@ -318,7 +349,16 @@ async function importDatabaseInner(
             const importedUpdatedAt = (importedProfile as PeerProfile).updatedAt ?? 0;
             const localUpdatedAt = (localProfile as PeerProfile | undefined)?.updatedAt ?? 0;
             if (importedUpdatedAt >= localUpdatedAt) {
-              await putPeerProfile(importedProfile as PeerProfile);
+              // A newer row from a device that never heard their PQ key must
+              // not erase the one this device holds: losing it quietly drops
+              // sealing for them back to X25519 only. Every use re-verifies
+              // the certificate, so keeping either copy trusts nothing new.
+              const pqKey =
+                (importedProfile as PeerProfile).pqKey ?? localProfile?.pqKey;
+              await putPeerProfile({
+                ...(importedProfile as PeerProfile),
+                ...(pqKey ? { pqKey } : {}),
+              });
             }
           }
         })();

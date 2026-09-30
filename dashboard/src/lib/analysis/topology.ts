@@ -409,6 +409,7 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "dm.mailbox.deposit":
     case "dm.mailbox.collect":
     case "dm.mailbox.drop":
+    case "dm.pq.heal":
     case "ice.turn.ok":
     case "ice.turn.unavailable":
     case "ice.turn.fail":
