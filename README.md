@@ -217,7 +217,7 @@ whose context holds no repository declares no commit.
 | `TURN_MIN_PORT` / `TURN_MAX_PORT` | no | coturn relay range, one port per allocation (default 49152-50151) |
 | `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide and per credential |
 | `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` and `/plugin-stream` (the streaming variant, for media a CDN will not serve cross-origin) |
-| `PLUGIN_PROXY_SECRETS` | no | `NAME@host=value` list; plugins reference `{{secret:NAME}}`, substituted server-side only for that host |
+| `PLUGIN_PROXY_SECRETS` | no | `NAME@host/path/prefix?param=value` list; plugins put `{{secret:NAME}}` as the whole value of that query parameter, and the relay substitutes it server-side only on that host under that path. The older `NAME@host=value` form is no longer substituted |
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
 | `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |

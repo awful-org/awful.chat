@@ -6,8 +6,10 @@ package main
 // proof), which kills the model. Operator-controlled on both axes:
 //
 //   PLUGIN_PROXY_HOSTS    comma list of exact hostnames plugins may reach
-//   PLUGIN_PROXY_SECRETS  comma list of NAME=value; a request url may carry
-//                         {{secret:NAME}} placeholders, substituted
+//   PLUGIN_PROXY_SECRETS  comma list of NAME@host/path/prefix?param=value;
+//                         a request url may carry {{secret:NAME}} as the
+//                         whole value of that query parameter, on that host,
+//                         under that path, and the relay substitutes it
 //                         server-side so keys never reach clients
 //
 // GET /plugin-proxy?url=<https url> - the host must be allowlisted, the
@@ -184,17 +186,36 @@ func pluginProxyHosts() map[string]bool {
 
 type pluginSecret struct {
 	value string
-	// Host this secret may be sent to. Empty = any allowlisted host, which
-	// is safe with ONE host and a leak with two: any allowlisted upstream
-	// could be handed every unbound secret. Bind with NAME@host=value.
-	host string
+	// Where this secret may be sent: one host, a path prefix on it, and the
+	// one query parameter it fills. A secret bound to its host alone could
+	// still be put in ANY parameter on ANY path of that host - including an
+	// endpoint that echoes its query back, or logs it somewhere the caller
+	// can read - so a binding has to name all three.
+	host   string
+	path   string
+	param  string
+	legacy bool // configured in an old form; never substituted, see below
 }
 
-var unboundSecretWarn sync.Once
+var secretConfigWarn sync.Once
 
+// pluginProxySecrets parses PLUGIN_PROXY_SECRETS. Each entry is
+//
+//	NAME@host/path/prefix?param=value
+//
+// e.g. STEAM@api.steampowered.com/ISteamUser/?key=abc123: the secret
+// STEAM is substituted only into a query parameter called "key", on
+// api.steampowered.com, for a path under /ISteamUser/. A prefix ending in
+// "/" matches below it; one without matches itself and its sub-paths. The
+// value is everything after the first "=", so it may contain "=".
+//
+// The old forms NAME=value and NAME@host=value still parse but are never
+// substituted: they left the parameter and the path to the caller, which
+// is the leak this binding closes. The relay says so once at boot, naming
+// them, so an operator sees why a plugin now reports "not configured".
 func pluginProxySecrets() map[string]pluginSecret {
 	out := map[string]pluginSecret{}
-	var unbound []string
+	var legacy []string
 	for _, pair := range strings.Split(os.Getenv("PLUGIN_PROXY_SECRETS"), ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
@@ -204,22 +225,73 @@ func pluginProxySecrets() map[string]pluginSecret {
 		if !ok || k == "" {
 			continue
 		}
-		name, host, bound := strings.Cut(strings.TrimSpace(k), "@")
+		name, where, bound := strings.Cut(strings.TrimSpace(k), "@")
 		name = strings.ToUpper(strings.TrimSpace(name))
 		sec := pluginSecret{value: v}
 		if bound {
-			sec.host = strings.ToLower(strings.TrimSpace(host))
-		} else {
-			unbound = append(unbound, name)
+			sec.host, sec.path, sec.param = parseSecretBinding(where)
+		}
+		if sec.host == "" || sec.param == "" {
+			sec.legacy = true
+			legacy = append(legacy, name)
 		}
 		out[name] = sec
 	}
-	if len(unbound) > 0 {
-		unboundSecretWarn.Do(func() {
-			log.Printf("[plugin-proxy] secrets without a host binding (%s) can be sent to ANY allowlisted host; prefer NAME@host=value", strings.Join(unbound, ", "))
+	if len(legacy) > 0 {
+		secretConfigWarn.Do(func() {
+			log.Printf("[plugin-proxy] secrets %s are not bound to a host, path and parameter and will NOT be substituted; write them as NAME@host/path/prefix?param=value", strings.Join(legacy, ", "))
 		})
 	}
 	return out
+}
+
+// parseSecretBinding splits "host/path/prefix?param". Anything malformed
+// comes back with an empty host or param, which leaves the secret unused.
+func parseSecretBinding(where string) (host, path, param string) {
+	where = strings.TrimSpace(where)
+	if where == "" || strings.ContainsAny(where, "#@") {
+		return "", "", ""
+	}
+	u, err := url.Parse("https://" + where)
+	if err != nil || u.Host == "" || u.Port() != "" || u.RawPath != "" {
+		return "", "", ""
+	}
+	path = u.Path
+	if path == "" {
+		path = "/"
+	}
+	if !canonicalPath(path) {
+		return "", "", ""
+	}
+	param = u.RawQuery
+	if param == "" || strings.ContainsAny(param, "&=;%+") {
+		return "", "", ""
+	}
+	return strings.ToLower(u.Hostname()), path, param
+}
+
+// canonicalPath reports whether p says exactly one thing: absolute, no
+// "." or ".." segment, no empty segment. An upstream resolves those, so
+// "/allowed/../admin" would satisfy a prefix check the request does not.
+func canonicalPath(p string) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	segs := strings.Split(p[1:], "/")
+	for i, seg := range segs {
+		if seg == "." || seg == ".." || (seg == "" && i != len(segs)-1) {
+			return false
+		}
+	}
+	return true
+}
+
+// underPrefix reports whether path is the bound prefix or below it.
+func underPrefix(path, prefix string) bool {
+	if strings.HasSuffix(prefix, "/") {
+		return strings.HasPrefix(path, prefix)
+	}
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
 }
 
 // errSecretOutsideQuery marks a url whose placeholder is not in the query.
@@ -229,9 +301,10 @@ func pluginProxySecrets() map[string]pluginSecret {
 var errSecretOutsideQuery = errors.New("secret placeholder outside the query")
 
 // substituteSecrets replaces {{secret:NAME}} placeholders for a request
-// bound for targetHost. A secret bound to a different host counts as
-// missing: the caller answers 204 and no upstream ever sees a key that was
-// not meant for it.
+// bound for targetHost. A secret bound elsewhere - another host, a path
+// outside its prefix, a parameter other than its own - counts as missing:
+// the caller answers 204 and no upstream ever sees a key that was not
+// meant for it.
 //
 // Only the QUERY is substituted, and a placeholder anywhere else is refused.
 // The doc always said placeholders belong in the query - values are
@@ -240,7 +313,9 @@ var errSecretOutsideQuery = errors.New("secret placeholder outside the query")
 // in the PATH and have it spliced in there: url.QueryEscape leaves '/'
 // unescaped, which is enough to steer the request to another path on the
 // allowlisted host and, for a secret containing one, to reveal it in the
-// upstream's own logs and error pages.
+// upstream's own logs and error pages. And a placeholder has to be the
+// whole value of its parameter, so the key cannot be glued onto some other
+// value the upstream would echo.
 func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -252,21 +327,38 @@ func substituteSecrets(raw string, secrets map[string]pluginSecret, targetHost s
 	if len(secretPlaceholderRe.FindAllString(raw, -1)) != len(secretPlaceholderRe.FindAllString(u.RawQuery, -1)) {
 		return "", errSecretOutsideQuery
 	}
-	targetHost = strings.ToLower(targetHost)
-	var missing string
-	u.RawQuery = secretPlaceholderRe.ReplaceAllStringFunc(u.RawQuery, func(m string) string {
-		name := strings.ToUpper(secretPlaceholderRe.FindStringSubmatch(m)[1])
-		if sec, ok := secrets[name]; ok && (sec.host == "" || sec.host == targetHost) {
-			return url.QueryEscape(sec.value)
-		}
-		if missing == "" {
-			missing = name
-		}
-		return m
-	})
-	if missing != "" {
-		return "", fmt.Errorf("secret %s not configured for %s", missing, targetHost)
+	if !secretPlaceholderRe.MatchString(u.RawQuery) {
+		return raw, nil
 	}
+	targetHost = strings.ToLower(targetHost)
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	pairs := strings.Split(u.RawQuery, "&")
+	for i, pair := range pairs {
+		if !secretPlaceholderRe.MatchString(pair) {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		m := secretPlaceholderRe.FindStringSubmatch(value)
+		name := ""
+		if m != nil {
+			name = strings.ToUpper(m[1])
+		}
+		sec, ok := secrets[name]
+		param, perr := url.QueryUnescape(key)
+		if m == nil || m[0] != value || !ok || sec.legacy || perr != nil ||
+			sec.host != targetHost || sec.param != param ||
+			u.RawPath != "" || !canonicalPath(path) || !underPrefix(path, sec.path) {
+			if name == "" {
+				name = "placeholder"
+			}
+			return "", fmt.Errorf("secret %s not configured for this use of %s", name, targetHost)
+		}
+		pairs[i] = key + "=" + url.QueryEscape(sec.value)
+	}
+	u.RawQuery = strings.Join(pairs, "&")
 	return u.String(), nil
 }
 

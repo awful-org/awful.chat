@@ -49,9 +49,10 @@ services:
       - TURN_PORT=${TURN_PORT:-}
       - TURN_URLS=${TURN_URLS:-}
       # Generic plugin proxy: allowlisted upstream hosts and named secrets
-      # substituted server-side ({{secret:NAME}}). Bind secrets to their
-      # host - NAME@host=value - so no other allowlisted upstream can ever
-      # receive them. What keeps API-using plugins "env + redeploy".
+      # substituted server-side ({{secret:NAME}}). Each secret is bound to a
+      # host, a path prefix and the one query parameter it fills -
+      # NAME@host/path/prefix?param=value - so it can reach nothing else.
+      # What keeps API-using plugins "env + redeploy".
       - PLUGIN_PROXY_HOSTS=${PLUGIN_PROXY_HOSTS:-}
       - PLUGIN_PROXY_SECRETS=${PLUGIN_PROXY_SECRETS:-}
       # Optional diagnostic collector. Unset means the /telemetry route

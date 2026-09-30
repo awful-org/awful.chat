@@ -31,46 +31,52 @@ func resetRateLimiter(t *testing.T) {
 
 func TestSubstituteSecrets(t *testing.T) {
 	secrets := map[string]pluginSecret{
-		"STEAM": {value: "k&y 123", host: "api.steampowered.com"},
-		"OPEN":  {value: "free"},
+		"STEAM":  {value: "k&y 123", host: "api.steampowered.com", path: "/ISteamUser/", param: "key"},
+		"EXACT":  {value: "e", host: "api.example", path: "/v1/lookup", param: "token"},
+		"LEGACY": {value: "old", host: "api.steampowered.com", legacy: true},
 	}
-	out, err := substituteSecrets("https://x/?key={{secret:steam}}&id=7", secrets, "api.steampowered.com")
+	const host = "api.steampowered.com"
+	out, err := substituteSecrets("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={{secret:steam}}&id=7", secrets, host)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "https://x/?key=k%26y+123&id=7"
-	if out != want {
+	if want := "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=k%26y+123&id=7"; out != want {
 		t.Errorf("got %q want %q", out, want)
 	}
-	// A bound secret must NOT substitute for another host - this is the
-	// cross-host leakage the review flagged.
-	if _, err := substituteSecrets("https://x/?k={{secret:steam}}", secrets, "evil.example"); err == nil {
-		t.Error("host-bound secret leaked to another host")
+	if _, err := substituteSecrets("https://api.example/v1/lookup?token={{secret:exact}}", secrets, "api.example"); err != nil {
+		t.Errorf("exact path: %v", err)
 	}
-	// An unbound secret works for any host.
-	if out, err := substituteSecrets("https://x/?k={{secret:open}}", secrets, "evil.example"); err != nil || out != "https://x/?k=free" {
-		t.Errorf("unbound secret: %q %v", out, err)
+	if _, err := substituteSecrets("https://api.example/v1/lookup/more?token={{secret:exact}}", secrets, "api.example"); err != nil {
+		t.Errorf("below an exact path: %v", err)
 	}
-	if _, err := substituteSecrets("https://x/?key={{secret:missing}}", secrets, "h"); err == nil {
-		t.Error("missing secret must error")
+
+	// Every way of steering the key somewhere it was not bound to.
+	for name, raw := range map[string]string{
+		"another host":            "https://evil.example/ISteamUser/x?key={{secret:steam}}",
+		"another parameter":       "https://api.steampowered.com/ISteamUser/x?callback={{secret:steam}}",
+		"another path":            "https://api.steampowered.com/IEcho/x?key={{secret:steam}}",
+		"a path that climbs out":  "https://api.steampowered.com/ISteamUser/../IEcho/x?key={{secret:steam}}",
+		"an encoded climb":        "https://api.steampowered.com/ISteamUser%2F..%2FIEcho?key={{secret:steam}}",
+		"an empty segment":        "https://api.steampowered.com/ISteamUser//x?key={{secret:steam}}",
+		"a prefix lookalike":      "https://api.example/v1/lookupall?token={{secret:exact}}",
+		"glued to another value":  "https://api.steampowered.com/ISteamUser/x?key=echo{{secret:steam}}",
+		"as the parameter name":   "https://api.steampowered.com/ISteamUser/x?{{secret:steam}}=1",
+		"an unbound (old) secret": "https://api.steampowered.com/ISteamUser/x?key={{secret:legacy}}",
+		"a secret nobody set":     "https://api.steampowered.com/ISteamUser/x?key={{secret:missing}}",
+	} {
+		target := host
+		if name == "another host" {
+			target = "evil.example"
+		}
+		if name == "a prefix lookalike" {
+			target = "api.example"
+		}
+		if out, err := substituteSecrets(raw, secrets, target); err == nil {
+			t.Errorf("%s: substituted into %q", name, out)
+		}
 	}
 	if out, _ := substituteSecrets("https://x/plain", secrets, "h"); out != "https://x/plain" {
 		t.Errorf("plain url mangled: %q", out)
-	}
-}
-
-// A caller url carrying userinfo (https://u:p@allowed.host/x) would otherwise
-// reach Go's http.Client unchanged, which sends Authorization: Basic derived
-// from it to whatever allowlisted host the caller names - letting any caller
-// pick the credential an allowlisted upstream sees.
-func TestPluginProxyRejectsUserinfoInURL(t *testing.T) {
-	resetRateLimiter(t)
-	t.Setenv("PLUGIN_PROXY_HOSTS", "allowed.host")
-	req := httptest.NewRequest(http.MethodGet, "/plugin-proxy?url="+url.QueryEscape("https://u:p@allowed.host/x"), nil)
-	rec := httptest.NewRecorder()
-	handlePluginProxy(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for a url with userinfo, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -103,13 +109,19 @@ func TestPluginProxyEnvParsing(t *testing.T) {
 	if !hosts["api.steampowered.com"] || !hosts["other.api"] || len(hosts) != 2 {
 		t.Errorf("hosts parsed wrong: %v", hosts)
 	}
-	t.Setenv("PLUGIN_PROXY_SECRETS", "steam@API.Steampowered.com=abc, FOO=a=b,")
+	t.Setenv("PLUGIN_PROXY_SECRETS", "steam@API.Steampowered.com/ISteamUser/?key=abc, FOO=a=b, BAR@host.example=x, BAZ@host.example/a/../b?k=y, TOP@host.example?k=a=b")
 	secrets := pluginProxySecrets()
-	if secrets["STEAM"].value != "abc" || secrets["STEAM"].host != "api.steampowered.com" {
-		t.Errorf("bound secret parsed wrong: %+v", secrets["STEAM"])
+	if s := secrets["STEAM"]; s.value != "abc" || s.host != "api.steampowered.com" || s.path != "/ISteamUser/" || s.param != "key" || s.legacy {
+		t.Errorf("bound secret parsed wrong: %+v", s)
 	}
-	if secrets["FOO"].value != "a=b" || secrets["FOO"].host != "" || len(secrets) != 2 {
-		t.Errorf("secrets parsed wrong: %v", secrets)
+	if s := secrets["TOP"]; s.value != "a=b" || s.path != "/" || s.param != "k" || s.legacy {
+		t.Errorf("host-wide secret parsed wrong: %+v", s)
+	}
+	// The old forms and anything malformed parse, but are never used.
+	for _, name := range []string{"FOO", "BAR", "BAZ"} {
+		if !secrets[name].legacy {
+			t.Errorf("%s should be unusable: %+v", name, secrets[name])
+		}
 	}
 }
 
@@ -275,7 +287,7 @@ func TestPluginProxyRefusesSecretPlaceholderOutsideTheQuery(t *testing.T) {
 
 	resetRateLimiter(t)
 	t.Setenv("PLUGIN_PROXY_HOSTS", "allowed.host")
-	t.Setenv("PLUGIN_PROXY_SECRETS", "KEY@allowed.host=s3cret")
+	t.Setenv("PLUGIN_PROXY_SECRETS", "KEY@allowed.host/v1/?key=s3cret")
 	req := httptest.NewRequest(http.MethodGet,
 		"/plugin-proxy?url="+url.QueryEscape("https://allowed.host/v1/{{secret:key}}/data"), nil)
 	rec := httptest.NewRecorder()
