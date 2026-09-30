@@ -76,7 +76,7 @@
   import { loadProfile } from "$lib/profile.svelte";
   import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
   import { consumeLatestSharedPayload } from "$lib/share-target";
-  import { humanizeMentions } from "$lib/mentions";
+  import { stripMarkdown } from "$lib/markdown";
   import CommandPalette from "./palette/CommandPalette.svelte";
   import SearchOverlay from "./SearchOverlay.svelte";
   import PluginConfirmModal from "./PluginConfirmModal.svelte";
@@ -167,7 +167,7 @@
         return "[plugin]";
       }
     }
-    return humanizeMentions(msg.content, resolveMentionDisplayName) || "(message)";
+    return stripMarkdown(msg.content, resolveMentionDisplayName) || "(message)";
   }
 
 

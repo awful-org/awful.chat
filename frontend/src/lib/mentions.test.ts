@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { renderMessageMarkdown } from "./markdown";
 import {
   buildMentionCandidates,
   humanize,
-  linkify,
   mentionsMe,
   segmentDraft,
   serialize,
@@ -369,7 +369,10 @@ describe("buildMentionCandidates", () => {
   });
 });
 
-describe("linkify", () => {
+// The message body renderer. It replaced mentions.ts's linkify, and these
+// cases, written against linkify, hold for it unchanged.
+describe("message body rendering", () => {
+  const linkify = renderMessageMarkdown;
   const resolve = (did: string) =>
     did === "did:key:zLink" ? "https://evil.example/pwn" : "Alice";
 

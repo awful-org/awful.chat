@@ -99,7 +99,7 @@
     resolveMentionDisplayName,
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
-  import { humanizeMentions } from "$lib/mentions";
+  import { stripMarkdown } from "$lib/markdown";
   import {
     pinnedMessagesOf,
     refreshPhonebook,
@@ -143,7 +143,7 @@
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
   import { formatSize, seededRandom } from "$lib/utils";
-  import { getQuotableText } from "$lib/quote-helper";
+  import { QUOTE_SHOWN_CHARS, getQuotableText } from "$lib/quote-helper";
   import InvitationDialog from "./InvitationDialog.svelte";
   import ArchivedHistory from "./ArchivedHistory.svelte";
   import { roomsStore } from "$lib/rooms.svelte";
@@ -992,14 +992,14 @@
   /** The words beside the pictures: the caption and any non-image files. */
   function pinnedPreview(msg: Message): string {
     if (msg.type === MessageType.File) {
-      const caption = humanizeMentions(msg.content ?? "", resolveMentionDisplayName);
+      const caption = stripMarkdown(msg.content ?? "", resolveMentionDisplayName);
       const others = (msg.meta?.files ?? [])
         .filter((f) => !f.mimeType?.startsWith("image/"))
         .map((f) => f.filename);
       return [caption, ...others].filter(Boolean).join(" · ");
     }
     if (isGifUrl(msg.content ?? "")) return "";
-    return humanizeMentions(msg.content ?? "", resolveMentionDisplayName);
+    return stripMarkdown(msg.content ?? "", resolveMentionDisplayName);
   }
 
   function openPinned(msg: Message): void {
@@ -1761,7 +1761,10 @@
     if (held) {
       // Use quotable text for held messages so image-only messages show
       // [image] instead of empty content. Held message is the source of truth.
-      return { name: displayName(held), content: getQuotableText(held) };
+      // Far more than the 160-character snapshot: it is stripped of markdown
+      // before it shows and the line truncates itself, so a cut through a
+      // link never reaches the screen.
+      return { name: displayName(held), content: getQuotableText(held, QUOTE_SHOWN_CHARS) };
     }
     // Snapshot from the wire is already built with quotable text
     return { name: r.senderName, content: r.content };
@@ -2776,10 +2779,7 @@
                     />
                     <span class="font-semibold">{q.name}</span>
                     <span class="truncate"
-                      >{humanizeMentions(
-                        q.content,
-                        resolveMentionDisplayName
-                      )}</span
+                      >{stripMarkdown(q.content, resolveMentionDisplayName)}</span
                     >
                   </button>
                 {/if}
@@ -3070,10 +3070,7 @@
                 {/each}
                 {#if sendingCaption}
                   <p class="whitespace-pre-wrap break-words text-sm">
-                    {humanizeMentions(
-                      sendingCaption,
-                      resolveMentionDisplayName
-                    )}
+                    {stripMarkdown(sendingCaption, resolveMentionDisplayName)}
                   </p>
                 {/if}
               </div>
@@ -3158,7 +3155,7 @@
           >
           <span class="mx-1">•</span>
           <span class="truncate"
-            >{humanizeMentions(getQuotableText(replyTarget), resolveMentionDisplayName)}</span
+            >{stripMarkdown(getQuotableText(replyTarget, QUOTE_SHOWN_CHARS), resolveMentionDisplayName)}</span
           >
         </div>
         <Tip text="Cancel reply (Esc)">

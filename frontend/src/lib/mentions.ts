@@ -120,40 +120,6 @@ export function humanize(
 }
 
 /**
- * A message body as renderable HTML: escaped, with URLs turned into links and
- * `@[did]` tokens into mention chips.
- *
- * ONE pass, deliberately. Linkifying after `humanize` ran the URL pattern over
- * the resolved display names too, so anyone whose nickname was a URL got a
- * real, clickable anchor inside the mention chip of every message that
- * mentioned them - a link of their choosing in someone else's words. Scanning
- * once means the URL pattern only ever sees the message body.
- *
- * Order is still the security property: escape the whole body FIRST, then
- * decorate. Mention tokens carry no HTML characters so they survive escaping,
- * and `humanize` escapes the display name itself.
- */
-export function linkify(
-  content: string,
-  resolveName: (did: string) => string
-): string {
-  if (typeof content !== "string") return "";
-  const escaped = escapeHtml(content);
-  // A url wins at any position it starts, so a token inside one stays part of
-  // the link rather than being rewritten inside an href. Same for an emoji:
-  // one inside a url stays in the link text, untouched.
-  return escaped.replace(
-    LINKIFY_RE,
-    (m, url: string | undefined, mention: string | undefined) =>
-      url
-        ? `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-primary hover:underline">${url}</a>`
-        : mention
-          ? humanize(mention, resolveName)
-          : `<span class="emoji">${m}</span>`
-  );
-}
-
-/**
  * One emoji as the eye sees it: a flag, a keycap, or a pictograph with its
  * skin tone, variation selector, tag sequence and ZWJ joins - so a family or a
  * profession stays ONE span and scales as one glyph.
@@ -165,11 +131,12 @@ export function linkify(
 const EMOJI_PART = String.raw`(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}️)(?:\p{Emoji_Modifier}|️)?[\u{E0020}-\u{E007F}]*`;
 const EMOJI = String.raw`\p{Regional_Indicator}{2}|[#*0-9]️?⃣|${EMOJI_PART}(?:‍(?:\p{Emoji_Presentation}|\p{Extended_Pictographic})(?:\p{Emoji_Modifier}|️)?)*`;
 
-/** Urls, then mention tokens, then emoji - wrapped for a size of their own. */
-const LINKIFY_RE = new RegExp(
-  String.raw`(https?:\/\/[^\s<]+)|(@\[[^[\]]+\])|(?:${EMOJI})`,
-  "giu"
-);
+const EMOJI_RE = new RegExp(EMOJI, "gu");
+
+/** Wrap every emoji in already-escaped text for a size of its own. */
+export function wrapEmoji(escaped: string): string {
+  return escaped.replace(EMOJI_RE, (m) => `<span class="emoji">${m}</span>`);
+}
 
 /**
  * Convert @[did] tokens in content to human-readable @Name mentions as plain text.
@@ -289,7 +256,7 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function escapeHtml(str: unknown): string {
+export function escapeHtml(str: unknown): string {
   // Coerced, not assumed: display names come off the wire with no runtime type
   // check, so resolveName can hand back a number or an object. `.replace` on
   // those throws, and this is the {@html} mention path - one malformed profile
