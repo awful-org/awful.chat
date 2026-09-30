@@ -18,6 +18,51 @@ export interface IntroductionHookDeps {
   dmExists(did: string): Promise<boolean>;
   ensureDm(did: string, state?: DmPqState): Promise<unknown>;
   replayPending(peer: string, did: string): void;
+  /** The check after an upgrade that the other device followed; see UPGRADE_HEAL_DELAY_MS. */
+  heal?: {
+    schedule(run: () => void, ms: number): void;
+    /** Still connected to that device at all. */
+    connected(peer: string): boolean;
+    /** That device is in our DM under its new (post-quantum) key. */
+    meetsUnderNewKey(peer: string, did: string): Promise<boolean>;
+    reintroduce(peer: string, did: string): Promise<unknown>;
+    /** For the diagnostics: a split was found and is being healed. */
+    note(peer: string): void;
+  };
+}
+
+/**
+ * How long after an upgrade to check the other device followed. The
+ * introduction's last frame is what makes the second device switch; if it is
+ * lost, one device is on the new key and the other on the old, and they no
+ * longer meet in the DM (dm-introduction-stream.ts). The DM lobby heals that
+ * too, but only after its registration delay - a minute or more. Checking
+ * here, with the device we just spoke to, heals it in seconds.
+ */
+export const UPGRADE_HEAL_DELAY_MS = 15_000;
+/** At most this many heals per device per window, so a device that keeps
+ *  failing costs a couple of introductions, never a loop. */
+const HEALS_PER_WINDOW = 2;
+const HEAL_WINDOW_MS = 10 * 60_000;
+const heals = new Map<string, number[]>();
+
+function mayHeal(peer: string, now: number): boolean {
+  const recent = (heals.get(peer) ?? []).filter((t) => now - t < HEAL_WINDOW_MS);
+  if (recent.length >= HEALS_PER_WINDOW) {
+    heals.set(peer, recent);
+    return false;
+  }
+  recent.push(now);
+  heals.delete(peer);
+  heals.set(peer, recent);
+  // Oldest first: bounded without forgetting everyone at once.
+  while (heals.size > 256) heals.delete(heals.keys().next().value as string);
+  return true;
+}
+
+/** Test hook: forget every heal. */
+export function _resetHealsForTests(): void {
+  heals.clear();
 }
 
 /**
@@ -53,6 +98,19 @@ export async function onIntroductionUpgraded(
 ): Promise<void> {
   if (deps.boundDid(peer) !== did) throw new Error("Conflicting device identity");
   await deps.ensureDm(did, state);
+  const heal = deps.heal;
+  if (!heal) return;
+  // Whichever side switched first can be left alone on the new key if the
+  // other never heard the last frame. Both sides check - the one that did
+  // follow finds the other there and does nothing.
+  heal.schedule(() => {
+    void (async () => {
+      if (!heal.connected(peer) || (await heal.meetsUnderNewKey(peer, did))) return;
+      if (!mayHeal(peer, Date.now())) return;
+      heal.note(peer);
+      await heal.reintroduce(peer, did);
+    })().catch(() => {});
+  }, UPGRADE_HEAL_DELAY_MS);
 }
 
 /**

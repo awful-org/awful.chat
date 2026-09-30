@@ -113,6 +113,7 @@ export type DiagKind =
   | "dm.mailbox.deposit"
   | "dm.mailbox.collect"
   | "dm.mailbox.drop"
+  | "dm.pq.heal"
   // ice / turn
   | "ice.turn.ok"
   | "ice.turn.unavailable"
@@ -177,7 +178,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 117;
+export const DIAG_KIND_COUNT = 118;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -271,6 +272,8 @@ export const KIND_SEV = {
   "dm.mailbox.deposit": "info",
   "dm.mailbox.collect": "info",
   "dm.mailbox.drop": "error",
+  // A DM upgrade where one device was left on the old key; healed in place.
+  "dm.pq.heal": "info",
   // ice / turn
   "ice.turn.ok": "info",
   "ice.turn.unavailable": "error",

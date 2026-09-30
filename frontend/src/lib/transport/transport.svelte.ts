@@ -722,6 +722,16 @@ const _introductionHookDeps: IntroductionHookDeps = {
   dmExists: (did) => dmRoomExists(did),
   ensureDm: (did, state) => ensureDmRoomForPeer(did, state),
   replayPending: (peer, did) => _replayPendingDm(peer, did),
+  heal: {
+    schedule: (run, ms) => { setTimeout(run, ms); },
+    connected: (peer) => _transport.peers().includes(peer),
+    meetsUnderNewKey: async (peer, did) => {
+      const room = await dmConversationCodeAsync(did);
+      return !!room && _transport.peersInRoom(room).includes(peer);
+    },
+    reintroduce: (peer, did) => _transport.introduceDm(peer, did),
+    note: (peer) => rec(ev("dm.pq.heal", { peer })),
+  },
 };
 _transport.setDmIntroduction(() => {
   try { return requireSession(); } catch { return null; }

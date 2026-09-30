@@ -1,12 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { publicKeyToDid } from "$lib/identity/identity";
 import { pqKeyCertificate } from "$lib/identity/pq-identity";
 import type { DmPqState } from "$lib/room-security/pq-dm";
 import {
+  _resetHealsForTests,
   acceptProfilePqKey,
   onIntroductionUpgraded,
   onIntroductionVerified,
+  UPGRADE_HEAL_DELAY_MS,
   type IntroductionHookDeps,
 } from "./dm-pq-hooks";
 
@@ -61,6 +63,75 @@ describe("onIntroductionUpgraded", () => {
     const unbound = deps();
     await expect(onIntroductionUpgraded(unbound.d, "peer", "did:a", STATE)).rejects.toThrow("Conflicting");
     expect([...other.calls, ...unbound.calls]).toEqual([]);
+  });
+});
+
+describe("healing a split after an upgrade", () => {
+  // The introduction's last frame lost: we switched, the other device did
+  // not, and the two no longer meet in the DM.
+  function healDeps(opts: { connected?: boolean; follows?: boolean } = {}) {
+    const { d, calls } = deps({ bound: "did:a" });
+    const timers: Array<{ run: () => void; ms: number }> = [];
+    const reintroduce = vi.fn(async () => {});
+    const note = vi.fn();
+    d.heal = {
+      schedule: (run, ms) => timers.push({ run, ms }),
+      connected: () => opts.connected ?? true,
+      meetsUnderNewKey: async () => opts.follows ?? false,
+      reintroduce,
+      note,
+    };
+    const fire = async () => {
+      const timer = timers.shift();
+      timer?.run();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return timer;
+    };
+    return { d, calls, reintroduce, note, fire };
+  }
+
+  beforeEach(() => _resetHealsForTests());
+
+  it("re-introduces a still-connected device that did not follow, after a short wait", async () => {
+    const h = healDeps();
+    await onIntroductionUpgraded(h.d, "peer", "did:a", STATE);
+    expect(h.reintroduce).not.toHaveBeenCalled();
+    const timer = await h.fire();
+    expect(timer?.ms).toBe(UPGRADE_HEAL_DELAY_MS);
+    expect(h.note).toHaveBeenCalledWith("peer");
+    expect(h.reintroduce).toHaveBeenCalledWith("peer", "did:a");
+  });
+
+  it("does nothing when the other device followed, or is gone", async () => {
+    for (const opts of [{ follows: true }, { connected: false }]) {
+      const h = healDeps(opts);
+      await onIntroductionUpgraded(h.d, "peer", "did:a", STATE);
+      await h.fire();
+      expect(h.reintroduce).not.toHaveBeenCalled();
+      expect(h.note).not.toHaveBeenCalled();
+    }
+  });
+
+  it("heals one device at most twice per window, never in a loop", async () => {
+    const h = healDeps();
+    for (let i = 0; i < 5; i++) {
+      await onIntroductionUpgraded(h.d, "peer", "did:a", STATE);
+      await h.fire();
+    }
+    expect(h.reintroduce).toHaveBeenCalledTimes(2);
+    // Another device has its own allowance.
+    const other = healDeps();
+    other.d.boundDid = () => "did:a";
+    await onIntroductionUpgraded(other.d, "peer2", "did:a", STATE);
+    await other.fire();
+    expect(other.reintroduce).toHaveBeenCalledWith("peer2", "did:a");
+  });
+
+  it("never lets a failed re-introduction escape", async () => {
+    const h = healDeps();
+    h.d.heal!.reintroduce = async () => { throw new Error("dial failed"); };
+    await onIntroductionUpgraded(h.d, "peer", "did:a", STATE);
+    await expect(h.fire()).resolves.toBeDefined();
   });
 });
 
