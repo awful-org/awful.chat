@@ -232,6 +232,19 @@ describe("post-quantum DM upgrade in the introduction", () => {
     expect(upgraded).not.toHaveBeenCalled();
   });
 
+  it("does not offer or confirm an upgrade it would have nowhere to store", async () => {
+    const alice = identity(), bob = identity();
+    const peer = manual("alice-device", "bob-device");
+    const responder = attachDmIntroduction({ stream: link(peer) as any, connection: conn("alice-device"),
+      local: "bob-device", identity: () => bob, verified: async () => {}, onClose: () => {} }); // no `upgraded`
+    closers.push(responder.close);
+    const mine = new DmIntroductionChallenge("alice-device", "bob-device");
+    peer.send({ did: alice.did, challenge: mine.challenge, pq: pqKeyCertificate(alice) });
+    const reply = await peer.frame(0);
+    expect(reply.pq).toBeUndefined();
+    expect((await mine.accept(b64.decode(reply.proof), alice)).pq).toBeUndefined();
+  });
+
   it("refuses the PQ form from a peer that was never offered it", async () => {
     const alice = identity(), bob = identity();
     const mine = new DmIntroductionChallenge("bob-device", "alice-device");

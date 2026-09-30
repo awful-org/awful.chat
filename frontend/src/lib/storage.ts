@@ -1918,6 +1918,15 @@ export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWr
   // from a device that had not upgraded yet) would otherwise drop it, and the
   // next start would join the conversation under the classical key again -
   // a downgrade nobody asked for. Deleting the room is the way to lose it.
+  // The carry is read and written on the room's patch queue, so no
+  // setDmPqState (or another DM write) can land between the two.
+  if (room.roomCode.startsWith("dm-")) {
+    return _onRoomQueue(room.roomCode, () => _putRoomNow(room, guard));
+  }
+  return _putRoomNow(room, guard);
+}
+
+async function _putRoomNow(room: Room | DMRoom, guard: WriteGuard): Promise<void> {
   let carriedPq: DmPqState | undefined;
   if (room.roomCode.startsWith("dm-") && !(room as DMRoom).pq) {
     // An unreadable row has no state left to carry.
@@ -1961,9 +1970,12 @@ function _patchRoom(
   patch: (room: Room | DMRoom) => Room | DMRoom | null,
   guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
-  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(() =>
-    _patchRoomNow(roomCode, patch, guard)
-  );
+  return _onRoomQueue(roomCode, () => _patchRoomNow(roomCode, patch, guard));
+}
+
+/** Run one write to this room after every earlier queued one settled. */
+function _onRoomQueue(roomCode: string, write: () => Promise<void>): Promise<void> {
+  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(write);
   const settled = run.catch(() => {});
   _roomPatchQueue.set(roomCode, settled);
   void settled.then(() => {

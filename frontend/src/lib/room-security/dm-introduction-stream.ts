@@ -66,11 +66,12 @@ export function attachDmIntroduction(options: {
   const identity = options.identity();
   const remote = connection.remotePeer.toString();
   const challenge = new DmIntroductionChallenge(options.local, remote);
-  // Our own certificate, advertised in our first frame. Without one (a seed
-  // that does not match its DID would be a bug elsewhere) this device
-  // behaves exactly like an older build.
+  // Our own certificate, advertised in our first frame. Without one this
+  // device behaves exactly like an older build - which is also what it must
+  // do with nowhere to put an agreed state: confirming an upgrade we then do
+  // not store would leave the other side on a key we never join.
   let ownCert: PqKeyCertificate | undefined;
-  try { ownCert = identity ? pqKeyCertificate(identity) : undefined; } catch { ownCert = undefined; }
+  try { ownCert = identity && options.upgraded ? pqKeyCertificate(identity) : undefined; } catch { ownCert = undefined; }
   let closed = false;
   let state = options.initiate ? "reply" : "hello";
   let expectedDid: string | undefined;

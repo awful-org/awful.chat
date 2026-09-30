@@ -63,6 +63,14 @@ export function deriveRoomKeys(secret: RoomSecret) {
 
 export type RoomKeys = ReturnType<typeof deriveRoomKeys>;
 
+/** Only the public ID, for callers that need nothing else: the keys derived
+ * alongside it are wiped rather than left for the collector. */
+export function discoveryIdOf(secret: RoomSecret): DiscoveryId {
+  const keys = deriveRoomKeys(secret);
+  keys.membershipKey.fill(0); keys.encryptionKey.fill(0); keys.sfuSigningSeed.fill(0);
+  return keys.discoveryId;
+}
+
 /** Validate at the persistence boundary too: imports must not attach a
  * capability to an unrelated public room identifier. */
 export function validateStoredCapability(room: { roomCode: string; roomSecret?: string }): void {

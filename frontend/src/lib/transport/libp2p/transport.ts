@@ -10,7 +10,7 @@ import { identify, type Identify } from "@libp2p/identify";
 import { gossipsub, type GossipSub } from "@libp2p/gossipsub";
 import { keys } from "@libp2p/crypto";
 import { peerIdFromString } from "@libp2p/peer-id";
-import { deriveRoomKeys, type DiscoveryId, type RoomKeys, type RoomSecret } from "$lib/room-security/keys";
+import { deriveRoomKeys, discoveryIdOf, type DiscoveryId, type RoomKeys, type RoomSecret } from "$lib/room-security/keys";
 import { attachRoomStream, ROOM_PROTOCOL } from "$lib/room-security/stream";
 import type { SecureRoomChannel } from "$lib/room-security/channel";
 import { attachDmIntroduction, DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
@@ -339,13 +339,13 @@ export class LibP2PTransport implements PeerTransport {
    * is a conflict, exactly like any other capability swap, so a stale caller
    * cannot drag the conversation back.
    */
-  joinSecureConversation(localId: string, secret: RoomSecret, classical?: RoomSecret): DiscoveryId {
+  joinSecureConversation(localId: string, secret: RoomSecret, classical?: RoomSecret, peerDid?: string): DiscoveryId {
     if (!/^dm-[a-f0-9]{40}$/.test(localId)) throw new Error("Invalid local DM reference");
     const session = this.dmIdentity();
     if (this.dmIdentityManaged && !session) throw new Error("Identity locked");
     if (this.dmSessions.has(localId) && this.dmSessions.get(localId) !== session) this.leaveRoom(localId);
-    const { discoveryId } = deriveRoomKeys(secret);
-    const anchor = classical ? deriveRoomKeys(classical).discoveryId : discoveryId;
+    const discoveryId = discoveryIdOf(secret);
+    const anchor = classical ? discoveryIdOf(classical) : discoveryId;
     if (classical && anchor === discoveryId) throw new Error("Post-quantum secret is the classical one");
     const previous = this.secureAliases.get(localId);
     const owner = this.secureLocalIds.get(discoveryId);
@@ -369,7 +369,7 @@ export class LibP2PTransport implements PeerTransport {
     this.secureLocalIds.set(anchor, localId);
     this.dmAnchors.set(localId, anchor);
     if (session) this.dmSessions.set(localId, session);
-    if (classical) this.holdDmLobby(localId, anchor);
+    if (classical && peerDid) this.holdDmLobby(localId, anchor, peerDid);
     return this.joinSecureRoom(secret);
   }
 
@@ -396,21 +396,26 @@ export class LibP2PTransport implements PeerTransport {
    * whatever burst of room joins caused them, in a later budget window, and
    * at most DM_LOBBY_MAX of them. A conversation past the cap still works;
    * it only loses this way of finding stragglers.
+   *
+   * The relay decides who is listed in a lobby, so it would decide whom we
+   * dial and introduce. The introduction therefore expects the one identity
+   * the conversation is with, and ends for anyone else before binding them.
    */
   private dmAnchors = new Map<string, DiscoveryId>();
   private dmLobbyOf = new Map<string, DiscoveryId>();
-  private dmLobbies = new Map<DiscoveryId, string>();
+  private dmLobbies = new Map<DiscoveryId, { localId: string; peerDid: string }>();
   private lobbyRegistered = new Set<DiscoveryId>();
   private lobbyRegisterTimer: TimerHandle | null = null;
   private lobbyIntroducedAt = new Map<string, number>();
 
   /** Hold (or keep) this conversation's classical ID as a lobby. */
-  holdDmLobby(localId: string, anchor: DiscoveryId): void {
-    if (this.dmLobbyOf.get(localId) === anchor) return;
+  holdDmLobby(localId: string, anchor: DiscoveryId, peerDid: string): void {
+    const held = this.dmLobbies.get(anchor);
+    if (this.dmLobbyOf.get(localId) === anchor && held?.peerDid === peerDid) return;
     this.releaseDmLobby(localId);
     if (this.dmLobbies.size >= DM_LOBBY_MAX) return;
     this.dmLobbyOf.set(localId, anchor);
-    this.dmLobbies.set(anchor, localId);
+    this.dmLobbies.set(anchor, { localId, peerDid });
     this.scheduleLobbyRegistration();
   }
 
@@ -442,8 +447,9 @@ export class LibP2PTransport implements PeerTransport {
   }
 
   private lobbyPeer(room: DiscoveryId, peer: string): void {
-    const localId = this.dmLobbies.get(room);
-    if (!localId || !peer || peer === this.selfId() || this.isRelayPeer(peer)) return;
+    const lobby = this.dmLobbies.get(room);
+    if (!lobby || !peer || peer === this.selfId() || this.isRelayPeer(peer)) return;
+    const { localId, peerDid } = lobby;
     const now = Date.now();
     if (now - (this.lobbyIntroducedAt.get(peer) ?? -Infinity) < DM_LOBBY_RETRY_MS) return;
     if (this.lobbyIntroducedAt.size >= 256) this.lobbyIntroducedAt.clear();
@@ -452,8 +458,8 @@ export class LibP2PTransport implements PeerTransport {
     // post-quantum room with us moments later: give that the chance to land
     // before paying for an introduction that would change nothing.
     setTimeout(() => {
-      if (this.dmLobbies.get(room) !== localId || this.isRoomPeer(localId, peer)) return;
-      void this.introduceDm(peer);
+      if (this.dmLobbies.get(room) !== lobby || this.isRoomPeer(localId, peer)) return;
+      void this.introduceDm(peer, peerDid);
     }, DM_LOBBY_INTRODUCE_DELAY_MS);
   }
   private secureOpening = new Map<string, Promise<SecureRoomChannel | null>>();

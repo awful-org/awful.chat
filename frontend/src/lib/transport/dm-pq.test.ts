@@ -75,11 +75,11 @@ it("moves an existing classical DM onto the agreed hybrid key, keeping its room"
   expect(await ensureDmRoomForPeer(remote.did, pq)).toBe(local);
   expect(state.records.get(local).pq).toEqual(pq);
   expect(state.transport.joinSecureConversation).toHaveBeenLastCalledWith(local,
-    hybridPairwiseRoomSecret(state.session!.privateKey, remote.publicKey, pq), classical);
+    hybridPairwiseRoomSecret(state.session!.privateKey, remote.publicKey, pq), classical, remote.did);
   // Every later join - a send, a restart - stays on the hybrid key.
   await ensureDmRoomForPeer(remote.did);
   expect(state.transport.joinSecureConversation).toHaveBeenLastCalledWith(local,
-    hybridPairwiseRoomSecret(state.session!.privateKey, remote.publicKey, pq), classical);
+    hybridPairwiseRoomSecret(state.session!.privateKey, remote.publicKey, pq), classical, remote.did);
 });
 
 it("creates a new DM already post-quantum", async () => {
@@ -111,7 +111,7 @@ it("fails closed on an unusable stored state: lobby only, never the classical ke
   await expect(ensureDmRoomForPeer(remote.did)).rejects.toThrow("post-quantum");
   expect(state.transport.joinSecureConversation).not.toHaveBeenCalled();
   expect(state.transport.holdDmLobby).toHaveBeenCalledWith(local,
-    deriveRoomKeys(pairwiseRoomSecret(state.session!.privateKey, remote.publicKey)).discoveryId);
+    deriveRoomKeys(pairwiseRoomSecret(state.session!.privateKey, remote.publicKey)).discoveryId, remote.did);
 });
 
 it("offers the upgrade only for a classical DM that exists, and not twice in a row", async () => {

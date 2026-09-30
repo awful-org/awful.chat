@@ -17,13 +17,14 @@ function transport() {
   return { t, internal, register: internal.rendezvousSend as ReturnType<typeof vi.fn> };
 }
 const local = "dm-" + "a".repeat(40);
+const peer = "did:key:zPeer";
 
 it("moves a live classical DM onto its post-quantum secret in place", async () => {
   vi.useFakeTimers();
   const { t, internal, register } = transport();
   const classical = newRoomSecret(), hybrid = newRoomSecret();
   const d0 = t.joinSecureConversation(local, classical);
-  const d1 = t.joinSecureConversation(local, hybrid, classical);
+  const d1 = t.joinSecureConversation(local, hybrid, classical, peer);
   expect(d1).toBe(deriveRoomKeys(hybrid).discoveryId);
   expect(d1).not.toBe(d0);
   // The classical room is left - keys gone, unregistered - before the new
@@ -49,10 +50,10 @@ it("refuses to go back to the classical secret once post-quantum", () => {
   const { t } = transport();
   const classical = newRoomSecret(), hybrid = newRoomSecret();
   t.joinSecureConversation(local, classical);
-  t.joinSecureConversation(local, hybrid, classical);
+  t.joinSecureConversation(local, hybrid, classical, peer);
   expect(() => t.joinSecureConversation(local, classical)).toThrow("Conflicting");
   // Re-joining the same post-quantum secret is fine.
-  expect(t.joinSecureConversation(local, hybrid, classical)).toBe(deriveRoomKeys(hybrid).discoveryId);
+  expect(t.joinSecureConversation(local, hybrid, classical, peer)).toBe(deriveRoomKeys(hybrid).discoveryId);
 });
 
 it("joins a new conversation post-quantum directly, without ever joining classical", async () => {
@@ -60,7 +61,7 @@ it("joins a new conversation post-quantum directly, without ever joining classic
   const { t, internal, register } = transport();
   const classical = newRoomSecret(), hybrid = newRoomSecret();
   const d0 = deriveRoomKeys(classical).discoveryId;
-  t.joinSecureConversation(local, hybrid, classical);
+  t.joinSecureConversation(local, hybrid, classical, peer);
   expect(internal.secureRooms.has(d0)).toBe(false);
   expect(register).not.toHaveBeenCalledWith({ type: "REGISTER", room: d0 });
   await vi.advanceTimersByTimeAsync(71_000);
@@ -72,7 +73,7 @@ it("joins a new conversation post-quantum directly, without ever joining classic
 it("holds a bounded number of lobbies", () => {
   const { t, internal } = transport();
   for (let i = 0; i < 70; i++) {
-    t.joinSecureConversation("dm-" + i.toString(16).padStart(40, "0"), newRoomSecret(), newRoomSecret());
+    t.joinSecureConversation("dm-" + i.toString(16).padStart(40, "0"), newRoomSecret(), newRoomSecret(), peer);
   }
   expect(internal.dmLobbies.size).toBe(64);
   t.clearRoomSecurity();
@@ -93,8 +94,8 @@ it("only rebinds onto a post-quantum secret of the SAME conversation", () => {
 it("allows replacing one post-quantum state by another for the same conversation", () => {
   const { t, internal } = transport();
   const classical = newRoomSecret(), first = newRoomSecret(), second = newRoomSecret();
-  t.joinSecureConversation(local, first, classical);
-  const d2 = t.joinSecureConversation(local, second, classical);
+  t.joinSecureConversation(local, first, classical, peer);
+  const d2 = t.joinSecureConversation(local, second, classical, peer);
   expect(internal.secureRooms.has(deriveRoomKeys(first).discoveryId)).toBe(false);
   expect(internal.secureRooms.has(d2)).toBe(true);
 });
@@ -104,7 +105,7 @@ it("introduces peers found in the lobby, once per peer, unless already in the PQ
   const { t, internal } = transport();
   const classical = newRoomSecret();
   const d0 = deriveRoomKeys(classical).discoveryId;
-  t.joinSecureConversation(local, newRoomSecret(), classical);
+  t.joinSecureConversation(local, newRoomSecret(), classical, peer);
   const introduce = vi.spyOn(t, "introduceDm").mockResolvedValue(true);
   internal.node = { peerId: { toString: () => "me" } };
   const roster = vi.fn();
@@ -115,7 +116,8 @@ it("introduces peers found in the lobby, once per peer, unless already in the PQ
   internal.handleRendezvousMsg("me", { type: "PEER_JOINED", room: d0, peer: "upgraded-device" });
   await vi.advanceTimersByTimeAsync(6_000);
   expect(introduce).toHaveBeenCalledTimes(1);
-  expect(introduce).toHaveBeenCalledWith("old-device");
+  // Only as the one identity this conversation is with.
+  expect(introduce).toHaveBeenCalledWith("old-device", peer);
   // A lobby is not a room: no roster, no membership, nothing to verify.
   expect(roster).not.toHaveBeenCalled();
   expect(t.isSecureRoom(local)).toBe(true);
@@ -126,12 +128,12 @@ it("stops watching the lobby when the conversation is left or the identity locks
   const { t, internal, register } = transport();
   const classical = newRoomSecret();
   const d0 = deriveRoomKeys(classical).discoveryId;
-  t.joinSecureConversation(local, newRoomSecret(), classical);
+  t.joinSecureConversation(local, newRoomSecret(), classical, peer);
   await vi.advanceTimersByTimeAsync(71_000);
   t.leaveRoom(local);
   expect(register).toHaveBeenCalledWith({ type: "UNREGISTER", room: d0 });
   expect(internal.dmLobbies.size).toBe(0);
-  t.joinSecureConversation(local, newRoomSecret(), classical);
+  t.joinSecureConversation(local, newRoomSecret(), classical, peer);
   expect(internal.dmLobbies.size).toBe(1);
   t.clearRoomSecurity();
   expect(internal.dmLobbies.size).toBe(0);

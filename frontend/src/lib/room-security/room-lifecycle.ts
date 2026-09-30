@@ -1,5 +1,5 @@
 import type { Room } from "$lib/storage";
-import { deriveRoomKeys, type DiscoveryId, type RoomSecret } from "./keys";
+import { discoveryIdOf, type DiscoveryId, type RoomSecret } from "./keys";
 import { storedRoomSecret } from "./invitations";
 import { requireSession, didToPublicKey, onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
 import { pairwiseRoomSecret, pairwiseLocalId } from "./pairwise";
@@ -9,8 +9,8 @@ import { ROOM_SECURITY_V2_RELEASED } from "./invitation-release";
 interface RoomTransport {
   joinRoom(roomCode: string): void;
   joinSecureRoom(secret: RoomSecret): string;
-  joinSecureConversation?(localId: string, secret: RoomSecret, classical?: RoomSecret): string;
-  holdDmLobby?(localId: string, anchor: DiscoveryId): void;
+  joinSecureConversation?(localId: string, secret: RoomSecret, classical?: RoomSecret, peerDid?: string): string;
+  holdDmLobby?(localId: string, anchor: DiscoveryId, peerDid?: string): void;
 }
 
 // Deriving the post-quantum secret costs an ML-KEM operation, and a DM is
@@ -55,10 +55,10 @@ export function joinDmConversation(
     if (cache.size >= 1024) cache.clear();
     cache.set(key, hybrid);
   } catch {
-    transport.holdDmLobby?.(roomCode, deriveRoomKeys(classical).discoveryId);
+    transport.holdDmLobby?.(roomCode, discoveryIdOf(classical), peerDid);
     throw new Error("DM post-quantum state is unusable");
   }
-  transport.joinSecureConversation(roomCode, hybrid, classical);
+  transport.joinSecureConversation(roomCode, hybrid, classical, peerDid);
 }
 
 /** Local record IDs, never invitation secrets, enter the room lifecycle. */

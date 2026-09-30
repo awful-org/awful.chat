@@ -36,6 +36,17 @@ it("never loses the state to a writer holding an older copy of the room", async 
   expect(now.pq).toEqual(state("a"));
 });
 
+it("keeps the state when a stale write and the upgrade are in flight together", async () => {
+  await putRoom(dm);
+  const stale = (await getRoom(code)) as DMRoom;
+  await Promise.all([setDmPqState(code, state("a")), putRoom({ ...stale, name: "one" })]);
+  expect(((await getRoom(code)) as DMRoom).pq).toEqual(state("a"));
+  await Promise.all([putRoom({ ...stale, name: "two" }), setDmPqState(code, state("b"))]);
+  const now = (await getRoom(code)) as DMRoom;
+  expect(now.pq).toEqual(state("b"));
+  expect(now.name).toBe("two");
+});
+
 it("does not touch rooms that are not DMs", async () => {
   await putRoom({ roomCode: "room-x", type: "text", name: "x", lastSeenLamport: 0, createdAt: 1, participants: [] });
   expect(await setDmPqState("room-x", state("a"))).toBe(false);
