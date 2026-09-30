@@ -15,6 +15,7 @@ import {
   mailboxIdForDid,
   type MailboxKind,
 } from "$lib/mailbox-crypto";
+import { peerPqKey } from "$lib/identity/pq-peers";
 import { parseDmEnvelope } from "./dm-codec";
 import {
   _transport,
@@ -117,12 +118,17 @@ export async function depositDmToMailbox(
   if (!recipientDid.startsWith("did:key:")) return "disabled";
   try {
     const session = requireSession();
+    // Hybrid (post-quantum) whenever they have published a PQ key: the relay
+    // keeps these blobs, and a stored blob is exactly what a recording
+    // attacker gets to keep. A lookup failure means v1, never no delivery.
+    const recipientPqKey = await peerPqKey(recipientDid).catch(() => null);
     const blob = await sealDmForMailbox({
       senderDid: session.did,
       senderPrivateKey: session.privateKey,
       recipientDid,
       envelope,
       kind,
+      recipientPqKey,
     });
     // Over the largest padding bucket: P2P retry is the only route left.
     if (!blob) return "oversized";
