@@ -39,7 +39,8 @@
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
-  import { linkify } from "$lib/mentions";
+  import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
+  import { escapeHtml } from "$lib/mentions";
   import { formatSize } from "$lib/utils";
   import { mediaBoxStyle } from "$lib/image-size";
   import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
@@ -567,13 +568,6 @@
     })();
   });
 
-  function firstUrl(text: string): string | null {
-    // Stops at a quote or angle bracket too, so a URL quoted inside other
-    // text does not drag the closing quote and what follows along.
-    const match = text.match(/https?:\/\/[^\s"'<>]+/i);
-    return match ? match[0] : null;
-  }
-
   function transferKey(file: FileEntry, index: number): string {
     return `${msg.id}:${file.infoHash}:${index}`;
   }
@@ -602,7 +596,10 @@
       after,
     };
   });
-  const linkedUrl = $derived(firstUrl(content));
+  // The first url the body renders as a link, trimmed the same way, so
+  // "(see https://a.b)" or [label](https://a.b) previews https://a.b, and a
+  // url written as code gets no preview.
+  const linkedUrl = $derived(firstLinkedUrl(content));
   const isGifMessage = $derived(isGifUrl(content));
   // Plugin cards and updates carry JSON, and a poster URL inside it is not
   // a link the person posted: the preview fetch was firing for every party
@@ -809,23 +806,9 @@
     }, 1200);
   }
 
-  // The shiki-failure fallback: escaping only "<" blocked tag injection but
-  // visibly mangled code containing "&"; full escaping matches escapeHtml.
-  function escapeForCodeFallback(code: string): string {
-    return escapeHtml(code);
-  }
-
-  function escapeHtml(text: string): string {
-    return text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/\"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
-
-  function linkifyText(text: string): string {
-    return linkify(text, resolveMentionDisplayName);
+  /** Every message body goes through here: markdown, links, mentions, emoji. */
+  function renderBody(text: string): string {
+    return renderMessageMarkdown(text, resolveMentionDisplayName);
   }
 
 
@@ -848,9 +831,10 @@
 >
   {#if isFileMessage}
     {#if content}
-      <!-- Through linkifyText like every other body: rendered raw, a caption
-           showed mention tokens as @[did:key:...] instead of the name. -->
-      <p class="whitespace-pre-wrap mb-2">{@html linkifyText(content)}</p>
+      <!-- Through renderBody like every other body: rendered raw, a caption
+           showed mention tokens as @[did:key:...] instead of the name. A div,
+           not a p: markdown can put a heading or a list in it. -->
+      <div class="whitespace-pre-wrap mb-2">{@html renderBody(content)}</div>
     {/if}
 
     <div class="space-y-2">
@@ -1069,7 +1053,7 @@
     </div>
   {:else if codeSegments}
     {#if codeSegments.before}
-      <p class="whitespace-pre-wrap mb-2">{@html linkifyText(codeSegments.before)}</p>
+      <div class="whitespace-pre-wrap mb-2">{@html renderBody(codeSegments.before)}</div>
     {/if}
     <div
       class="relative overflow-x-auto rounded-md border border-border/70 bg-muted/30 p-2 [&_.shiki]:bg-transparent! {codeSegments.after ? 'mb-2' : ''}"
@@ -1090,7 +1074,7 @@
         `<pre><code>${escapeHtml(codeSegments.code)}</code></pre>`}
     </div>
     {#if codeSegments.after}
-      <p class="whitespace-pre-wrap">{@html linkifyText(codeSegments.after)}</p>
+      <div class="whitespace-pre-wrap">{@html renderBody(codeSegments.after)}</div>
     {/if}
   {:else if isGifMessage}
     <div class="group relative inline-block">
@@ -1217,7 +1201,7 @@
       </div>
     {/if}
   {:else}
-    <p class="whitespace-pre-wrap">{@html linkifyText(content)}</p>
+    <div class="whitespace-pre-wrap">{@html renderBody(content)}</div>
 
     {#if mediaPrefs.externalMedia && linkedUrl && ogPreview}
       <div
