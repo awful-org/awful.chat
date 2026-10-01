@@ -22,6 +22,8 @@
    * row would stop the user from typing.
    */
   import { Dialog } from "bits-ui";
+  import { untrack } from "svelte";
+  import { uiState } from "$lib/ui-state.svelte";
   import { ArrowLeft, CornerDownLeft, Search, TriangleAlert } from "@lucide/svelte";
   import PaletteRow from "./PaletteRow.svelte";
   import { PaletteState } from "$lib/palette/palette.svelte";
@@ -63,6 +65,12 @@
     if (open) {
       palette.reset();
       pointerMoved = false;
+      // Opened for something in particular (Settings' tip opens it on ">").
+      // Untracked: taking the query must not re-run this and reset it again.
+      untrack(() => {
+        if (uiState.paletteQuery) palette.setQuery(uiState.paletteQuery);
+        uiState.paletteQuery = null;
+      });
     }
   });
 

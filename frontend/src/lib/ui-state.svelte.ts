@@ -19,6 +19,8 @@ export const uiState = $state({
    * Cmd/Ctrl+K, so anything outside that tree travels through here too.
    */
   paletteOpenRequested: false,
+  /** What the palette opens with typed, e.g. ">" for settings only. */
+  paletteQuery: null as string | null,
   /** Open the active room's capability/PAKE invitation dialog. */
   invitationRoomRequested: null as string | null,
   /**
@@ -84,7 +86,8 @@ export function requestReturnToCall(): void {
  * Ask for the command palette. The palette is owned by AppView, which also binds
  * Cmd/Ctrl+K, so anything outside that tree requests it here.
  */
-export function openPalette(): void {
+export function openPalette(query: string | null = null): void {
+  uiState.paletteQuery = query;
   uiState.paletteOpenRequested = true;
 }
 

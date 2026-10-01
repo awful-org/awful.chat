@@ -938,6 +938,8 @@
     if (!uiState.paletteOpenRequested) return;
     uiState.paletteOpenRequested = false;
     if (identityStore.isUnlocked) paletteOpen = true;
+    // A refused request must not leave its query for the next Cmd/Ctrl+K.
+    else uiState.paletteQuery = null;
   });
 
   // Manage the spotlight state: build tiles, calculate spotlight, and manage video.

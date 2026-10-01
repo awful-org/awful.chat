@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { uiState } from "$lib/ui-state.svelte";
+  import { openPalette, uiState } from "$lib/ui-state.svelte";
   import {
     Dialog,
     DialogContent,
@@ -164,6 +164,16 @@
   const closeHandler = (v: boolean) => {
     if (!v) onClose();
   };
+
+  /** What the palette's own shortcut is called on this machine. */
+  const modKey =
+    typeof navigator !== "undefined" && /Mac|iPhone|iPad/i.test(navigator.userAgent) ? "⌘" : "Ctrl";
+
+  /** Settings' tip: close this and open the palette on settings only. */
+  function searchInPalette(): void {
+    onClose();
+    openPalette(">");
+  }
 </script>
 
 {#snippet TabBar()}
@@ -407,10 +417,24 @@
       class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-0 sm:h-178.75 lg:h-195 flex flex-col overflow-hidden p-0"
       style="max-height: {Math.max(0, visibleHeight - 32)}px; top: {viewportTop + visibleHeight / 2}px;"
     >
-      <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
+      <!-- pr-12 clears the dialog's own close button, absolute at the right. -->
+      <DialogHeader class="flex-row items-center justify-between gap-4 px-6 py-4 pr-12 border-b border-border shrink-0">
         <DialogTitle class="font-mono text-base font-semibold"
           >Settings</DialogTitle
         >
+        <!-- Every setting is a row in the palette, under ">": a hint, not a
+             second search box. Clicking it takes you there. -->
+        <button
+          type="button"
+          onclick={searchInPalette}
+          class="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <span>Tip:</span>
+          <kbd class="rounded border border-border px-1">{modKey}</kbd><kbd class="rounded border border-border px-1">K</kbd>
+          <span>then</span>
+          <kbd class="rounded border border-border px-1">&gt;</kbd>
+          <span>finds any setting</span>
+        </button>
       </DialogHeader>
       <div class="min-h-0 flex-1 overflow-hidden px-4 pb-4">
         {@render DesktopContent()}
