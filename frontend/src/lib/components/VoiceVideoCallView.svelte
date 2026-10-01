@@ -94,7 +94,7 @@
     SquareArrowDownLeft,
   } from "@lucide/svelte";
   import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus, Users as UsersIcon, UserX } from "@lucide/svelte";
-import { profileStore, loadProfile } from "$lib/profile.svelte";
+import { loadProfile, getScopedProfile } from "$lib/profile.svelte";
 import {
   displayPrefs,
   setCallChatBeside,
@@ -244,7 +244,32 @@ import {
     )
   );
 
+  /**
+   * The room whose profiles this view shows: the room on screen, like
+   * callPeerIds. Not callRoomCode - in a call in room A while looking at
+   * room B, B's peers would wear A's room profiles (or, out of any call,
+   * none at all).
+   */
+  const profileRoom = $derived(
+    transportState.roomCode?.startsWith("rd2_") ? transportState.roomCode : null,
+  );
+
+  /**
+   * A peer's profile for this room, when they have one there
+   * (room-profile.ts). As in the chat, it is their WHOLE presentation in that
+   * room: a field it lacks was cleared on purpose, not left to the main one.
+   */
+  function callRoomProfile(peerId: string) {
+    if (!profileRoom) return undefined;
+    return transportState.peerRoomProfiles.get(profileRoom)?.get(peerIdToDid(peerId) || peerId);
+  }
+
+  /** Our own profile for this room: the scoped one, or the main one. */
+  const ownProfile = $derived(getScopedProfile(profileRoom));
+
   function getPeerLabel(peerId: string): string {
+    const scoped = callRoomProfile(peerId)?.nickname;
+    if (scoped) return scoped;
     const did = peerIdToDid(peerId);
     return peerNames.get(did) ?? peerNames.get(peerId) ?? peerId.slice(0, 8);
   }
@@ -269,15 +294,19 @@ import {
   }
 
   function getPeerAvatar(peerId: string): string | null {
+    const scoped = callRoomProfile(peerId);
+    if (scoped) return scoped.pfpURL ?? null;
     const did = peerIdToDid(peerId);
     return peerAvatars.get(did) ?? peerAvatars.get(peerId) ?? null;
   }
 
   function getPeerColor(peerId: string): string | null {
     if (peerId === selfId() || peerId === selfPeerId()) {
-      return profileStore.color ?? null;
+      return ownProfile.color ?? null;
     }
     if (!displayPrefs.showPeerNicknameColors) return null;
+    const scoped = callRoomProfile(peerId);
+    if (scoped) return scoped.color ?? null;
     const did = peerIdToDid(peerId);
     return (
       transportState.peerColors.get(peerId) ??
@@ -355,8 +384,8 @@ import {
     const byPeer = new Map(participants);
     result.push({
       id: "local-camera",
-      label: profileStore.nickname || "You",
-      avatarUrl: profileStore.avatarUrl,
+      label: ownProfile.nickname || "You",
+      avatarUrl: ownProfile.avatarUrl,
       isLocal: true,
       kind: "camera",
       videoTrack: localVideoTrack,
@@ -398,8 +427,8 @@ import {
     if (localScreenTrack) {
       result.push({
         id: "local-screen",
-        label: profileStore.nickname || "You",
-        avatarUrl: profileStore.avatarUrl,
+        label: ownProfile.nickname || "You",
+        avatarUrl: ownProfile.avatarUrl,
         isLocal: true,
         kind: "screen",
         videoTrack: localScreenTrack,
@@ -2852,6 +2881,7 @@ import {
     name={profileCardFor.name}
     avatarUrl={profileCardFor.avatarUrl}
     color={profileCardFor.color}
+    roomCode={profileRoom}
     onMessage={() => {
       const pid = profileCardFor!.peerId;
       profileCardFor = null;

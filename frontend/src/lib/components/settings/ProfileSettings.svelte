@@ -71,12 +71,10 @@
     });
   });
 
-  /** The second line of a row: who you are in that room. */
+  /** The second line of a row, or none: a room with its own profile shows it in the editor. */
   function scopeSubline(code: string | null): string {
     if (!code) return "everywhere else";
-    if (!hasScopedOverrides(code)) return "same as Main";
-    const nickname = getScopedProfile(code).nickname;
-    return nickname !== getScopedProfile(null).nickname ? `you are ${nickname}` : "changed here";
+    return hasScopedOverrides(code) ? "" : "same as Main";
   }
   let saveError = $state("");
   let nameAtStart = "";
@@ -397,6 +395,7 @@
 
   {#snippet scopeFace(room: (typeof joinedRooms)[number] | null, filled: boolean)}
     {@const code = room?.roomCode ?? null}
+    {@const subline = scopeSubline(code)}
     {#if room?.pfpURL}
       <GifImage src={room.pfpURL} alt="" class="size-7 shrink-0 rounded-md object-cover" />
     {:else}
@@ -410,7 +409,12 @@
     {/if}
     <span class="min-w-0 flex-1 text-left">
       <span class="block truncate font-mono">{room ? room.name || "Unnamed room" : "Main profile"}</span>
-      <span class="block truncate font-mono text-[10px] {filled ? 'text-accent-foreground/65' : 'text-muted-foreground/70'}">{scopeSubline(code)}</span>
+      <!-- Always two lines, blank for a room with its own profile (the dot
+           marks it), so every row and the picker keep one height. -->
+      <span
+        class="block truncate font-mono text-[10px] {filled ? 'text-accent-foreground/65' : 'text-muted-foreground/70'}"
+        aria-hidden={subline ? undefined : "true"}>{subline || "\u00a0"}</span
+      >
     </span>
     {#if code && hasScopedOverrides(code)}
       <span
