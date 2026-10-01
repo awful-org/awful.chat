@@ -50,6 +50,9 @@ RUN pnpm build
 # Pinned minor: a floating :alpine changes what runs on every build with no
 # diff to review.
 FROM nginx:1.30-alpine AS runner
+# jq: docker-entrypoint.d/41-awful-whats-new.sh trims GitHub's answer to the
+# few fields Settings > What's new shows.
+RUN apk add --no-cache jq
 COPY --from=builder /app/dist /usr/share/nginx/html
 # frontend/ prefixes here too: the context is the repo root (see the top of
 # this file). Only the --from=builder copy above is relative to the image.

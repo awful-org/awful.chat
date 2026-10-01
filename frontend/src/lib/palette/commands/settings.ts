@@ -7,6 +7,7 @@ import {
   Puzzle,
   RefreshCw,
   SlidersHorizontal,
+  Sparkles,
   User,
   Volume2,
 } from "@lucide/svelte";
@@ -72,6 +73,7 @@ const SETTINGS_TABS = [
   { id: "plugins", label: "Plugins", icon: Puzzle },
   { id: "quirks", label: "Quirks", icon: Info },
   { id: "oss", label: "OSS", icon: Heart },
+  { id: "whatsnew", label: "What's new", icon: Sparkles },
 ] as const;
 
 // Fills are exclusive - they all claim background-clip: text - so only these
