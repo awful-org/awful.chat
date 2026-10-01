@@ -5,7 +5,18 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 import { base64urlnopad } from "@scure/base";
 import { newRoomSecret } from "./keys";
-import { InvitationPairingHost, startPairingJoin, formatPairingCode, PAIRING_ATTEMPTS, PAIRING_TTL } from "./invitation-pairing";
+import {
+  InvitationPairingHost,
+  startPairingJoin,
+  formatPairingCode,
+  pairingLimits,
+  PAIRING_ATTEMPTS,
+  PAIRING_MAX_TTL,
+  PAIRING_MAX_USES,
+  PAIRING_MIN_TTL,
+  PAIRING_SPARE_ATTEMPTS,
+  PAIRING_TTL,
+} from "./invitation-pairing";
 
 async function prepared() {
   const secret = newRoomSecret();
@@ -147,4 +158,47 @@ it("still pairs a new joiner with an older host, the classic way", async () => {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: enc.encode(JSON.stringify(["awful/pairing/v2", locator, join.attempt])) }, key, enc.encode(secret));
   expect(await join.open(`${base64urlnopad.encode(nonce)}.${base64urlnopad.encode(new Uint8Array(ct))}`)).toBe(secret);
+});
+
+it("lets in as many people as the code was made for, then closes", async () => {
+  const secret = newRoomSecret();
+  const host = await InvitationPairingHost.create(secret, Date.now, { uses: 3 });
+  for (let person = 1; person <= 3; person++) {
+    const join = await startPairingJoin(formatPairingCode(host.locator, host.password));
+    const proof = join.respond(host.start(join.attempt, join.request));
+    expect(await join.open(await host.finish(join.attempt, proof))).toBe(secret);
+    expect(host.joined).toBe(person);
+    expect(host.active).toBe(person < 3);
+  }
+  const late = await startPairingJoin(formatPairingCode(host.locator, host.password));
+  expect(() => host.start(late.attempt, late.request)).toThrow();
+});
+
+it("budgets one try per person plus the spare, wrong guesses included", async () => {
+  const host = await InvitationPairingHost.create(newRoomSecret(), Date.now, { uses: 3 });
+  const wrong = (host.password[0] === "0" ? "1" : "0") + host.password.slice(1);
+  for (let i = 0; i < 3 + PAIRING_SPARE_ATTEMPTS; i++) {
+    const join = await startPairingJoin(formatPairingCode(host.locator, wrong));
+    host.start(join.attempt, join.request);
+  }
+  const join = await startPairingJoin(formatPairingCode(host.locator, host.password));
+  expect(() => host.start(join.attempt, join.request)).toThrow("limit");
+});
+
+it("lives as long as it was asked to", async () => {
+  let now = 0;
+  const host = await InvitationPairingHost.create(newRoomSecret(), () => now, { ttlMs: 60_000 });
+  const join = await startPairingJoin(formatPairingCode(host.locator, host.password));
+  now = 59_999;
+  expect(host.active).toBe(true);
+  now = 60_000;
+  expect(() => host.start(join.attempt, join.request)).toThrow("expired");
+});
+
+it("holds the limits to their bounds, defaulting to one person for five minutes", () => {
+  expect(pairingLimits()).toEqual({ uses: 1, ttlMs: PAIRING_TTL });
+  expect(pairingLimits({ uses: 0, ttlMs: 1 })).toEqual({ uses: 1, ttlMs: PAIRING_MIN_TTL });
+  expect(pairingLimits({ uses: 99, ttlMs: 3_600_000 })).toEqual({ uses: PAIRING_MAX_USES, ttlMs: PAIRING_MAX_TTL });
+  expect(pairingLimits({ uses: 4.6, ttlMs: Number.NaN })).toEqual({ uses: 5, ttlMs: PAIRING_TTL });
+  expect(PAIRING_ATTEMPTS).toBe(1 + PAIRING_SPARE_ATTEMPTS);
 });

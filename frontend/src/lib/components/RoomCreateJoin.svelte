@@ -518,9 +518,12 @@
             <div class="mt-1 text-xs text-muted-foreground">
               {#if now >= shortCodeExpiresAt}
                 Expired. Get a new one below.
-              {:else}
+              {:else if (live?.uses ?? 1) === 1}
                 Works once · {shortCodeLeft} left
                 <span class="block">Keep Awful.chat open until it's used</span>
+              {:else}
+                {live?.joined ?? 0} of {live?.uses} joined · {shortCodeLeft} left
+                <span class="block">Keep Awful.chat open until everyone's in</span>
               {/if}
             </div>
             <div class="mt-2 flex justify-center gap-2">

@@ -318,3 +318,139 @@ func TestPairingLocatorFormat(t *testing.T) {
 		}
 	}
 }
+
+func createPairingWith(t *testing.T, limits map[string]any) string {
+	t.Helper()
+	limits["action"] = "create"
+	rec := pairingRequest(t, "10.0.0.1", limits)
+	if rec.Code != 200 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	var body struct{ Token string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	return body.Token
+}
+
+// One full exchange for one person: start, response, finish, transfer.
+func pairingExchange(t *testing.T, token, attempt string) int {
+	t.Helper()
+	send := func(action, kind, payload, auth string) int {
+		return pairingRequest(t, "10.0.0.2", map[string]any{"action": action, "kind": kind, "payload": payload, "token": auth, "attempt": attempt}).Code
+	}
+	if code := send("start", "start", ke1("opaque_request"), ""); code != 200 {
+		return code
+	}
+	if code := send("reply", "response", "opaque_response", token); code != 200 {
+		return code
+	}
+	if code := send("finish", "finish", "proof", ""); code != 200 {
+		return code
+	}
+	return send("reply", "transfer", "nonce.ciphertext", token)
+}
+
+func TestPairingLetsInAsManyAsAskedThenCloses(t *testing.T) {
+	resetPairing(t)
+	token := createPairingWith(t, map[string]any{"uses": 3})
+	for i, c := range []string{"a", "b", "c"} {
+		if code := pairingExchange(t, token, strings.Repeat(c, 32)); code != 200 {
+			t.Fatalf("person %d: %d", i+1, code)
+		}
+	}
+	// The third transfer closed it: a fourth person cannot even start.
+	if code := pairingExchange(t, token, strings.Repeat("d", 32)); code != 409 {
+		t.Fatalf("closed code admitted a fourth start: %d", code)
+	}
+}
+
+func TestPairingAttemptsFollowTheUses(t *testing.T) {
+	resetPairing(t)
+	createPairingWith(t, map[string]any{"uses": 3})
+	// 3 people + 4 spare = 7 starts, the 8th refused.
+	for i := 0; i < 8; i++ {
+		rec := pairingRequest(t, "10.0.0.2", map[string]any{"action": "start", "kind": "start", "payload": ke1("opaque"), "attempt": strings.Repeat(string(rune('a'+i)), 32)})
+		want := 200
+		if i == 7 {
+			want = 409
+		}
+		if rec.Code != want {
+			t.Fatalf("start %d: %d", i+1, rec.Code)
+		}
+	}
+}
+
+func TestPairingLimitsAreBounded(t *testing.T) {
+	for _, bad := range []map[string]any{
+		{"uses": 26}, {"uses": -1}, {"ttl": 59}, {"ttl": 601}, {"ttl": -5},
+	} {
+		resetPairing(t)
+		bad["action"] = "create"
+		if rec := pairingRequest(t, "10.0.0.1", bad); rec.Code != 400 {
+			t.Fatalf("%v: %d", bad, rec.Code)
+		}
+	}
+	resetPairing(t)
+	// Limits belong to create alone.
+	if rec := pairingRequest(t, "10.0.0.1", map[string]any{"action": "host-poll", "token": "x", "uses": 2}); rec.Code != 400 {
+		t.Fatalf("limits on host-poll: %d", rec.Code)
+	}
+	createPairingWith(t, map[string]any{"uses": 25, "ttl": 600})
+	pairingMu.Lock()
+	e := pairingStore["k5"]
+	left := time.Until(e.expires)
+	pairingMu.Unlock()
+	if e.maxUses != 25 || e.maxAttempts != 29 || left < 9*time.Minute || left > 10*time.Minute {
+		t.Fatalf("got uses %d attempts %d ttl %v", e.maxUses, e.maxAttempts, left)
+	}
+}
+
+func TestPairingWithoutLimitsIsTheOldCode(t *testing.T) {
+	resetPairing(t)
+	createPairing(t)
+	pairingMu.Lock()
+	e := pairingStore["k5"]
+	left := time.Until(e.expires)
+	pairingMu.Unlock()
+	if e.maxUses != 1 || e.maxAttempts != 5 || left < 4*time.Minute || left > 5*time.Minute {
+		t.Fatalf("an older client's code changed: uses %d attempts %d ttl %v", e.maxUses, e.maxAttempts, left)
+	}
+}
+
+// A roomful finishing at once queues more than one host-poll may carry: the
+// client refuses more than 10 messages or 16 KiB, so the rest wait.
+func TestPairingHostPollHandsOutABoundedBatch(t *testing.T) {
+	resetPairing(t)
+	token := createPairingWith(t, map[string]any{"uses": 20})
+	finish := strings.Repeat("A", 1600)
+	pairingMu.Lock()
+	e := pairingStore["k5"]
+	for i := 0; i < 20; i++ {
+		e.inbox = append(e.inbox, pairingMessage{Attempt: fmt.Sprintf("%032d", i), Kind: "finish", Payload: finish})
+	}
+	pairingMu.Unlock()
+	got := 0
+	for polls := 0; got < 20; polls++ {
+		if polls > 10 {
+			t.Fatalf("only %d of 20 handed out", got)
+		}
+		rec := pairingRequest(t, "10.0.0.1", map[string]any{"action": "host-poll", "token": token})
+		if rec.Code != 200 || rec.Body.Len() > 16384 {
+			t.Fatalf("host-poll: %d, %d bytes", rec.Code, rec.Body.Len())
+		}
+		var body struct{ Messages []pairingMessage }
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Messages) == 0 || len(body.Messages) > 10 {
+			t.Fatalf("batch of %d", len(body.Messages))
+		}
+		for _, m := range body.Messages {
+			if m.Attempt != fmt.Sprintf("%032d", got) {
+				t.Fatalf("out of order: %s", m.Attempt)
+			}
+			got++
+		}
+	}
+}

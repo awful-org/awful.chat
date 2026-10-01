@@ -27,6 +27,10 @@ type pairingEntry struct {
 	stages   map[string]string
 	inbox    []pairingMessage
 	closed   bool
+	// What the creator asked for, bounded at create: how many people may be
+	// let in, and how many starts that buys (one each plus
+	// pairingSpareAttempts). delivered counts transfers; the last closes it.
+	maxUses, maxAttempts, delivered int
 	// The creator's client bucket and its IPv6 /48, for the live-pairing
 	// caps; both empty for a creator that holds no share.
 	owner, ownerAgg string
@@ -38,8 +42,8 @@ var pairingLastSweep time.Time
 
 // Lowercase Crockford base32, as the client draws them. The locator is two
 // characters: the pairing code is six (locator + four-character password),
-// short because the password can only be guessed live, five times, within
-// five minutes - see frontend/src/lib/room-security/invitation-pairing.ts.
+// short because the password can only be guessed live, a few times, within
+// minutes - see frontend/src/lib/room-security/invitation-pairing.ts.
 var pairingLocator = regexp.MustCompile(`^[0-9a-hjkmnp-tv-z]{2}$`)
 var pairingAttempt = regexp.MustCompile(`^[0-9a-hjkmnp-tv-z]{32}$`)
 var pairingPayload = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
@@ -56,7 +60,21 @@ var pairingStartPayload = regexp.MustCompile(`^[A-Za-z0-9_-]{128}$`)
 // draws one already live - and when it does, create answers 409 and the
 // client draws again.
 const pairingMaxLive = 256
-const pairingMaxAttempts = 5
+
+// What a creator may ask for. A code lets in 1 to pairingMaxUses people and
+// lives 1 to 10 minutes; one that asks for neither (an older client) gets one
+// person and five minutes, as every code used to. Each person spends a start,
+// and a code buys pairingSpareAttempts more for mistyped tries - the only
+// budget a guesser has against the four-character password: 29 tries at the
+// most, about 1 in 36,000 for a code that is gone within ten minutes.
+const (
+	pairingMaxUses       = 25
+	pairingSpareAttempts = 4
+	pairingMaxAttempts   = pairingMaxUses + pairingSpareAttempts
+	pairingMinTTL        = 60
+	pairingMaxTTL        = 600
+	pairingDefaultTTL    = 300
+)
 
 // The per-client and per-locator budgets. There used to be GLOBAL buckets
 // as well - 300 starts and 300 creates a minute and 12,000 requests across
@@ -68,10 +86,14 @@ const pairingMaxAttempts = 5
 // anyone else:
 //
 //   - per client (an IPv4 address or IPv6 /64, with a /48 aggregate):
-//     240 requests, 10 starts and 10 creates a minute;
+//     240 requests, 10 starts and 10 creates a minute. Ten, even though a
+//     group code may be typed by a roomful of people behind one address:
+//     the client waits and retries a 429 (invite-pairing.ts paced), so a
+//     group is slowed, not refused, and a single-person code keeps the
+//     guessing pace it always had;
 //   - per locator: 2 x pairingMaxAttempts starts a minute, whoever sends
 //     them and whether or not a pairing is live there, which paces how fast
-//     any one pairing's attempts can be spent;
+//     any one pairing's attempts can be spent, and lets a full group in;
 //   - live pairings at once: pairingMaxLivePerClient per client (an IPv4
 //     address or IPv6 /64) and pairingMaxLivePerAggregate per IPv6 /48, so
 //     filling the store takes 32 addresses or eight /48s rather than one.
@@ -105,6 +127,10 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 		Attempt string `json:"attempt"`
 		Kind    string `json:"kind"`
 		Payload string `json:"payload"`
+		// Create only: people to let in and seconds to live. Zero is the
+		// default; anything outside the bounds is refused, not clamped.
+		Uses int `json:"uses"`
+		TTL  int `json:"ttl"`
 	}
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	d.DisallowUnknownFields()
@@ -115,8 +141,17 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 	// The request's own shape is checked before the locator is looked up, so
 	// a malformed request gets the same answer whether a pairing is live
 	// there or not.
+	if b.Action != "create" && (b.Uses != 0 || b.TTL != 0) {
+		apiError(w, r, "invalid pairing request", 400)
+		return
+	}
 	switch b.Action {
-	case "create", "cancel", "host-poll":
+	case "create":
+		if b.Uses < 0 || b.Uses > pairingMaxUses || (b.TTL != 0 && (b.TTL < pairingMinTTL || b.TTL > pairingMaxTTL)) {
+			apiError(w, r, "invalid pairing limits", 400)
+			return
+		}
+	case "cancel", "host-poll":
 	case "join-poll":
 		if !pairingAttempt.MatchString(b.Attempt) {
 			apiError(w, r, "invalid attempt", 400)
@@ -192,7 +227,19 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 			apiError(w, r, "unavailable", 500)
 			return
 		}
-		e = &pairingEntry{token: base64.RawURLEncoding.EncodeToString(token), expires: now.Add(5 * time.Minute), attempts: map[string][]pairingMessage{}, stages: map[string]string{}, owner: owner, ownerAgg: ownerAgg}
+		uses, ttl := b.Uses, b.TTL
+		if uses == 0 {
+			uses = 1
+		}
+		if ttl == 0 {
+			ttl = pairingDefaultTTL
+		}
+		e = &pairingEntry{
+			token:   base64.RawURLEncoding.EncodeToString(token),
+			expires: now.Add(time.Duration(ttl) * time.Second),
+			maxUses: uses, maxAttempts: uses + pairingSpareAttempts,
+			attempts: map[string][]pairingMessage{}, stages: map[string]string{}, owner: owner, ownerAgg: ownerAgg,
+		}
 		pairingStore[b.Locator] = e
 		inviteJSON(w, r, 200, map[string]string{"token": e.token})
 		return
@@ -233,8 +280,7 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 			apiError(w, r, "denied", 403)
 			return
 		}
-		reply = e.inbox
-		e.inbox = nil
+		reply, e.inbox = pairingBatch(e.inbox)
 	case "join-poll":
 		messages, ok := e.attempts[b.Attempt]
 		if !ok {
@@ -255,13 +301,33 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 	inviteJSON(w, r, 200, map[string]any{"messages": reply})
 }
 
+// What one host-poll hands out: at most pairingPollMessages messages and
+// about pairingPollBytes, the rest kept for the next poll. The client
+// refuses a reply of more than 10 messages or 16 KiB, and a code for a group
+// can queue far more between two polls - a hybrid finish alone is ~1.6 KB.
+const (
+	pairingPollMessages = 10
+	pairingPollBytes    = 12 * 1024
+)
+
+func pairingBatch(inbox []pairingMessage) (batch, rest []pairingMessage) {
+	size := 0
+	for i, m := range inbox {
+		size += len(m.Attempt) + len(m.Kind) + len(m.Payload) + 64 // JSON keys and quotes
+		if i == pairingPollMessages || (i > 0 && size > pairingPollBytes) {
+			return inbox[:i:i], inbox[i:]
+		}
+	}
+	return inbox, nil
+}
+
 func pairingDeliver(e *pairingEntry, host bool, action, attempt, kind, payload string) bool {
 	if e.closed {
 		return false
 	}
 	m := pairingMessage{Attempt: attempt, Kind: kind, Payload: payload}
 	stage, exists := e.stages[attempt]
-	if action == "start" && !host && !exists && kind == "start" && len(e.attempts) < pairingMaxAttempts {
+	if action == "start" && !host && !exists && kind == "start" && len(e.attempts) < e.maxAttempts {
 		e.attempts[attempt] = nil
 		e.stages[attempt] = "start"
 		e.inbox = append(e.inbox, m)
@@ -275,9 +341,14 @@ func pairingDeliver(e *pairingEntry, host bool, action, attempt, kind, payload s
 	if action == "reply" && host && ((stage == "start" && kind == "response") || (stage == "finish" && kind == "transfer")) {
 		e.stages[attempt] = kind
 		e.attempts[attempt] = append(e.attempts[attempt], m)
+		// The last person it was made for closes it; until then the next
+		// one can still start.
 		if kind == "transfer" {
-			e.closed = true
-			e.inbox = nil
+			e.delivered++
+			if e.delivered >= e.maxUses {
+				e.closed = true
+				e.inbox = nil
+			}
 		}
 		return true
 	}

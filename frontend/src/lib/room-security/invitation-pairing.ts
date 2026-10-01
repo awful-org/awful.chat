@@ -7,12 +7,41 @@ import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 import { parseRoomSecret, type RoomSecret } from "./keys";
 
 export const PAIRING_TTL = 300_000;
+/** A code's lifetime, chosen by the inviter within these bounds (the relay holds the same). */
+export const PAIRING_MIN_TTL = 60_000;
+export const PAIRING_MAX_TTL = 600_000;
+/** How many people one code may let in. */
+export const PAIRING_MAX_USES = 25;
+/**
+ * Starts a code buys beyond one per person, for mistyped tries. Every start
+ * is a guess at the password, so the budget is uses + this: 5 for a code for
+ * one person, as before, and 29 at the most - about 1 in 36,000.
+ */
+export const PAIRING_SPARE_ATTEMPTS = 4;
+
+/** What an inviter chose for a code: people to let in and how long it lives. */
+export interface PairingLimits {
+  uses?: number;
+  ttlMs?: number;
+}
+
+/** The limits made whole and in bounds, the defaults for anything missing. */
+export function pairingLimits(limits: PairingLimits = {}): { uses: number; ttlMs: number } {
+  const uses = Number.isFinite(limits.uses) ? Math.round(limits.uses!) : 1;
+  const ttlMs = Number.isFinite(limits.ttlMs) ? Math.round(limits.ttlMs!) : PAIRING_TTL;
+  return {
+    uses: Math.min(PAIRING_MAX_USES, Math.max(1, uses)),
+    ttlMs: Math.min(PAIRING_MAX_TTL, Math.max(PAIRING_MIN_TTL, ttlMs)),
+  };
+}
+/** The try budget of a code for one person (see PAIRING_SPARE_ATTEMPTS). */
 export const PAIRING_ATTEMPTS = 5;
 /**
  * The code is SHORT on purpose - six characters a person reads out or types
  * - because OPAQUE lets its password be: nothing about it can be tested
  * offline, only by a live attempt against the inviter, at most
- * PAIRING_ATTEMPTS per code and only for PAIRING_TTL. Four characters of
+ * PAIRING_ATTEMPTS per code (more for a code that lets in more people:
+ * PAIRING_SPARE_ATTEMPTS) and only for its lifetime. Four characters of
  * password is 2^20 possibilities, so a guesser's odds per code are 5 in
  * ~1M. The two-character locator only finds the pairing at the relay; it
  * is not secret, and a collision there is answered 409 and retried with a
@@ -138,6 +167,9 @@ export class InvitationPairingHost {
   readonly locator = pairingRandom(PAIRING_LOCATOR_LENGTH);
   readonly password = pairingRandom(PAIRING_PASSWORD_LENGTH);
   readonly expiresAt: number;
+  /** People this code lets in, and how many it has. */
+  readonly uses: number;
+  joined = 0;
   private setup = "";
   private record = "";
   private secret: RoomSecret | null;
@@ -145,13 +177,15 @@ export class InvitationPairingHost {
   /** Per attempt: the OPAQUE login state and its one-off ML-KEM keypair. */
   private pending = new Map<string, { login: string; kem: { publicKey: Uint8Array; secretKey: Uint8Array } }>();
   private closed = false;
-  private constructor(secret: RoomSecret, private clock: () => number) {
+  private constructor(secret: RoomSecret, private clock: () => number, limits: PairingLimits) {
     this.secret = parseRoomSecret(secret);
-    this.expiresAt = clock() + PAIRING_TTL;
+    const { uses, ttlMs } = pairingLimits(limits);
+    this.uses = uses;
+    this.expiresAt = clock() + ttlMs;
   }
-  static async create(secret: RoomSecret, clock = Date.now): Promise<InvitationPairingHost> {
+  static async create(secret: RoomSecret, clock = Date.now, limits: PairingLimits = {}): Promise<InvitationPairingHost> {
     await opaque.ready;
-    const host = new InvitationPairingHost(secret, clock);
+    const host = new InvitationPairingHost(secret, clock, limits);
     host.setup = opaque.server.createSetup();
     const registration = opaque.client.startRegistration({ password: host.password });
     const response = opaque.server.createRegistrationResponse({ serverSetup: host.setup, userIdentifier: host.locator, registrationRequest: registration.registrationRequest });
@@ -167,7 +201,7 @@ export class InvitationPairingHost {
     this.pending.clear();
   }
   start(attempt: string, request: string): string {
-    if (!this.active || this.attempts >= PAIRING_ATTEMPTS) throw new Error("Pairing expired or attempt limit reached");
+    if (!this.active || this.attempts >= this.uses + PAIRING_SPARE_ATTEMPTS) throw new Error("Pairing expired or attempt limit reached");
     message(attempt);
     if (this.pending.has(attempt)) throw new Error("Repeated pairing attempt");
     const result = opaque.server.startLogin({ serverSetup: this.setup, registrationRecord: this.record, userIdentifier: this.locator, startLoginRequest: message(request), identifiers: identifiers(this.locator) });
@@ -199,7 +233,10 @@ export class InvitationPairingHost {
       }
       const kemShared = ml_kem768.decapsulate(ct, state.kem.secretKey);
       const secret = this.secret!;
-      this.cancel(); // Consume BEFORE asynchronous encryption or relay delivery.
+      // Count the person BEFORE asynchronous encryption or relay delivery,
+      // and consume the code with its last one.
+      this.joined++;
+      if (this.joined >= this.uses) this.cancel();
       let key: CryptoKey;
       try { key = await hybridTransferKey(sessionKey, kemShared, this.locator, attempt, state.kem.publicKey, ct); }
       finally { kemShared.fill(0); }
