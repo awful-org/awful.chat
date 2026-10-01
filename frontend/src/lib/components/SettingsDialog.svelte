@@ -65,6 +65,7 @@
     Activity,
     Info,
     Heart,
+    Sparkles,
     Puzzle,
     Github,
     Check,
@@ -83,6 +84,8 @@
   import { getScopedProfile, saveAvatar, saveScopedFields } from "$lib/profile.svelte";
   import QuirksNotice from "./QuirksNotice.svelte";
   import OssCredits from "./OssCredits.svelte";
+  import WhatsNewSettings from "./settings/WhatsNewSettings.svelte";
+  import { whatsNew } from "$lib/whats-new.svelte";
 
   type SettingsTab =
     | "profile"
@@ -92,6 +95,7 @@
     | "data"
     | "diagnostics"
     | "plugins"
+    | "whatsnew"
     | "quirks"
     | "oss";
 
@@ -137,6 +141,9 @@
     { id: "plugins" as SettingsTab, label: "Plugins", icon: Puzzle },
     { id: "quirks" as SettingsTab, label: "Quirks", icon: Info },
     { id: "oss" as SettingsTab, label: "OSS", icon: Heart },
+    // Always last: news, not a setting. On desktop it also sits at the foot
+    // of the column, apart from the tabs that change something.
+    { id: "whatsnew" as SettingsTab, label: "What's new", icon: Sparkles },
   ]);
 
   $effect(() => {
@@ -174,7 +181,10 @@
         type="button"
         onclick={() => (activeTab = tab.id)}
         aria-pressed={activeTab === tab.id}
-        class="flex shrink-0 items-center gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {activeTab ===
+        class="flex shrink-0 items-center gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {!isMobile &&
+        tab.id === 'whatsnew'
+          ? 'mt-auto'
+          : ''} {activeTab ===
         tab.id
           ? isMobile
             ? 'bg-muted text-foreground'
@@ -186,6 +196,9 @@
              at the same x and the column looks ragged. -->
         <tab.icon class="w-4 h-4 shrink-0" />
         <span class="truncate">{tab.label}</span>
+        {#if tab.id === "whatsnew" && whatsNew.unseen}
+          <span class="ml-auto size-2 shrink-0 rounded-full bg-primary" role="img" aria-label="New"></span>
+        {/if}
       </button>
     {/each}
   </div>
@@ -335,6 +348,8 @@
         <DiagnosticsSettings {activeTab} />
       {:else if activeTab === "plugins"}
         <PluginSettings />
+      {:else if activeTab === "whatsnew"}
+        <WhatsNewSettings />
       {:else if activeTab === "quirks"}
         {@render QuirksTab()}
       {:else if activeTab === "oss"}
@@ -375,6 +390,8 @@
             <DiagnosticsSettings {activeTab} />
           {:else if activeTab === "plugins"}
             <PluginSettings />
+          {:else if activeTab === "whatsnew"}
+            <WhatsNewSettings />
           {:else if activeTab === "quirks"}
             {@render QuirksTab()}
           {:else if activeTab === "oss"}

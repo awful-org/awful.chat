@@ -393,6 +393,9 @@ services:
       # no account, /qc is a call with no room.
       - APP_USE_QS=${USE_QS:-}
       - APP_USE_QC=${USE_QC:-}
+      # Settings > What's new, fetched from GitHub by this container at start
+      # (frontend/docker-entrypoint.d/41-awful-whats-new.sh). 0 turns it off.
+      - APP_WHATS_NEW=${WHATS_NEW:-}
     restart: unless-stopped
     # Drops every capability except what the stock nginx image needs: the
     # master starts as root and setuid/setgids its workers to the nginx user

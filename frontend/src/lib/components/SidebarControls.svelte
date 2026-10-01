@@ -37,6 +37,10 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import { toggleDeafen } from "$lib/transport/call.svelte";
+  import { loadWhatsNew, whatsNew } from "$lib/whats-new.svelte";
+
+  // Once per page: the list is small, and the dot on Settings needs it.
+  void loadWhatsNew();
 
   interface Props {
     /** Icon-rail layout: no name, no status text, controls stacked. */
@@ -302,10 +306,14 @@
         {...props}
         type="button"
         onclick={() => (audioSettingsOpen = true)}
-        aria-label="Settings"
-        class="flex items-center justify-center rounded-md size-8 cursor-pointer transition-colors text-muted-foreground hover:text-foreground hover:bg-muted"
+        aria-label={whatsNew.unseen ? "Settings, new release" : "Settings"}
+        class="relative flex items-center justify-center rounded-md size-8 cursor-pointer transition-colors text-muted-foreground hover:text-foreground hover:bg-muted"
       >
         <Settings class="size-4" />
+        {#if whatsNew.unseen}
+          <!-- A release this device has not opened: Settings > What's new. -->
+          <span class="absolute right-1 top-1 size-2 rounded-full bg-primary ring-2 ring-background"></span>
+        {/if}
       </button>
         {/snippet}
       </Tip>
