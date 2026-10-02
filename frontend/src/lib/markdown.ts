@@ -645,13 +645,19 @@ function* inlineTexts(content: string, quotes = true): Generator<string> {
  * The first url the rendered message actually links to - a masked link's
  * target, or a bare url trimmed as it is rendered - for the link preview. A
  * url written as code is not a link, so it gets no preview either.
+ *
+ * Its bidi controls come percent-encoded, as the browser sends them anyway,
+ * so where it goes is the same: MsgRender prints it under the message when
+ * no preview loads, as the text of a link, and "https://" with an override
+ * and "moc.lapyap@evil.example" after it drew there as a link to paypal.com.
  */
 export function firstLinkedUrl(content: string): string | null {
   if (typeof content !== "string") return null;
+  const shown = (url: string) => url.replace(REORDERS_ALL_RE, encodeURIComponent);
   for (const text of inlineTexts(content)) {
     for (const [, , , , , href, bare] of text.matchAll(SPAN_RE)) {
-      if (href !== undefined) return href;
-      if (bare !== undefined) return trimUrl(bare).url;
+      if (href !== undefined) return shown(href);
+      if (bare !== undefined) return shown(trimUrl(bare).url);
     }
   }
   return null;

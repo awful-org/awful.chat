@@ -472,6 +472,18 @@ describe("firstLinkedUrl", () => {
     expect(firstLinkedUrl("[https://good.com](https://evil.example)")).toBe("https://evil.example");
   });
 
+  it("gives a url's bidi controls percent-encoded, as the browser sends them", () => {
+    // MsgRender prints it under the message when no preview loads: "https://"
+    // with an override and "moc.lapyap@evil.example" after it drew there as a
+    // link to paypal.com, under an honest "here".
+    expect(firstLinkedUrl("[here](https://\u202emoc.lapyap@evil.example/)")).toBe(
+      "https://%E2%80%AEmoc.lapyap@evil.example/",
+    );
+    expect(firstLinkedUrl("see https://a.bc/\u2067x\u2069.")).toBe("https://a.bc/%E2%81%A7x%E2%81%A9");
+    // It goes where it went.
+    expect(new URL("https://a.bc/%E2%81%A7x").href).toBe(new URL("https://a.bc/\u2067x").href);
+  });
+
   it("skips a url written as code", () => {
     expect(firstLinkedUrl("`https://internal.example` then https://a.bc")).toBe("https://a.bc");
     expect(firstLinkedUrl("```\ncurl https://internal.example\n```")).toBeNull();
