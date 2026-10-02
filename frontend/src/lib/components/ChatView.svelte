@@ -67,6 +67,8 @@
   import MsgRender from "./MsgRender.svelte";
   import LocalPluginCard from "./LocalPluginCard.svelte";
   import { localPluginCards } from "$lib/plugins/local-cards.svelte";
+  import { pluginErrors, showPluginError } from "$lib/plugins/plugin-errors.svelte";
+  import PluginErrorRow from "./PluginErrorRow.svelte";
   import GifPicker from "./GifPicker.svelte";
   import GifImage from "./GifImage.svelte";
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
@@ -470,6 +472,9 @@
   const visibleLocalCards = $derived(
     localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
   );
+  const visiblePluginErrors = $derived(
+    pluginErrors.entries.filter((entry) => entry.roomCode === roomCode)
+  );
 
   const messageById = $derived(new Map(visibleMessages.map((m) => [m.id, m])));
 
@@ -566,6 +571,8 @@
     // The in-flight message too: it is not in visibleMessages, so without
     // this it appears below the fold and the send looks like it did nothing.
     sendingPreviews.length;
+    // A plugin's "only you" note lands at the bottom too.
+    visiblePluginErrors.length;
     if (!initialScrollDone) return;
     if (autoScroll && messagesEl) {
       setTimeout(() => scrollToBottom(), 0);
@@ -828,7 +835,14 @@
           });
         } catch (err) {
           console.error(`[chat] command /${commandName} failed:`, err);
-          sendError = err instanceof Error ? err.message : "Command failed; your draft has been kept.";
+          // The plugin's own words, in the chat where they were asked for;
+          // the draft stays for fixing.
+          showPluginError(
+            pluginId,
+            roomCode,
+            err instanceof Error && err.message ? err.message : `/${commandName} did not work. Your draft has been kept.`,
+          );
+          autoScroll = true;
         }
         return;
       }
@@ -3067,6 +3081,9 @@
           {/if}
         </div>
       {/if}
+      {#each visiblePluginErrors as entry (entry.id)}
+        <PluginErrorRow {entry} />
+      {/each}
     </div>
 
     {#if !isDmChat}

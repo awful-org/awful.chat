@@ -12,10 +12,7 @@ export default definePlugin({
     wheel: async (args: string, host: HostApi) => {
       const parsed = parseWheelArgs(args);
       if (!parsed) {
-        console.warn(
-          "[wheel] format: /wheel Question? option1, option2 (question optional)"
-        );
-        return;
+        throw new Error("The wheel needs at least two options: /wheel Who pays? Ana, Bo (the question is optional)");
       }
       await host.sendCard(parsed);
     },

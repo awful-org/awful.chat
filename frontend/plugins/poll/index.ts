@@ -12,8 +12,7 @@ export default definePlugin({
     poll: async (args: string, host: HostApi) => {
       const parsed = parsePollArgs(args);
       if (!parsed) {
-        console.warn("[poll] format: /poll Question? Option1, Option2, ...");
-        return;
+        throw new Error("A poll needs a question and at least two options: /poll Lunch? Pizza, Sushi");
       }
       await host.sendCard(parsed);
     },

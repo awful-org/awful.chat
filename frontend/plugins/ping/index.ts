@@ -141,8 +141,7 @@ export default definePlugin({
     ping: async (args: string, host: HostApi) => {
       const names = parsePingArgs(args);
       if (names.length === 0) {
-        console.warn("[ping] format: /ping @alice, @bob, @carol");
-        return;
+        throw new Error("Mention up to three people to ping: /ping @alice, @bob");
       }
       const online = host.peers();
       const targets: PingTarget[] = [];
@@ -150,13 +149,16 @@ export default definePlugin({
         const match = online.find(
           (p) => p.name.toLowerCase() === name.toLowerCase()
         );
-        // Silently pinging somebody who is not here would draw a graph of
-        // nothing but loss and look like their connection was the problem.
+        // Pinging somebody who is not here would draw a graph of nothing but
+        // loss and look like their connection was the problem: leave them
+        // out, and say so.
         if (match) targets.push({ did: match.did, name: match.name });
-        else console.warn(`[ping] nobody called ${name} is in this room`);
       }
-      if (targets.length === 0) return;
+      const missing = names.filter((name) => !targets.some((t) => t.name.toLowerCase() === name.toLowerCase()));
+      const nobody = `${missing.join(", ")} ${missing.length === 1 ? "isn't" : "aren't"} connected to this room right now`;
+      if (targets.length === 0) throw new Error(`Nobody to ping: ${nobody}.`);
       await host.sendCard({ targets });
+      if (missing.length) host.showError(`Pinging the rest: ${nobody}.`);
     },
   },
 });

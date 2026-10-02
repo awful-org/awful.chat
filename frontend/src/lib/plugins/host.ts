@@ -37,6 +37,7 @@ import { requestElementPip, setNowPlayingFor } from "./media-session";
 import { getCardState, onCardStateChange as onPluginCardStateChange } from "./state.svelte";
 import { MessageType } from "$lib/types/message";
 import { closeLocalCard, upsertLocalCard } from "./local-cards.svelte";
+import { showPluginError } from "./plugin-errors.svelte";
 import {
   getCallAudioBlockedReason,
   getCallCaptureBlockedReason,
@@ -55,6 +56,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       return upsertLocalCard(pluginId, roomCode, data).id;
     },
     closeLocalCard,
+    showError: (message) => showPluginError(pluginId, roomCode, message),
     callAudio: {
       blockedReason: getCallAudioBlockedReason,
       maxDurationMs: CALL_SOUND_MAX_DURATION_MS,
