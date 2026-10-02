@@ -7,6 +7,7 @@ import {
   isSaneDimension,
   mediaBoxStyle,
   profileImageFits,
+  stillFrameGrows,
   stillFrameSize,
 } from "./image-size";
 import { bytesToBase64 } from "./utils";
@@ -243,6 +244,36 @@ describe("stillFrameSize", () => {
       expect(Math.abs(drawn.width - shown.width), `${w}x${h}@${ratio}`).toBeLessThanOrEqual(1);
       expect(Math.abs(drawn.height - shown.height), `${w}x${h}@${ratio}`).toBeLessThanOrEqual(1);
       expect(Math.max(frame.width, frame.height)).toBeLessThanOrEqual(1024);
+    }
+  });
+});
+
+describe("stillFrameGrows", () => {
+  it("draws the first frame, and again only when the box needs more pixels", () => {
+    expect(stillFrameGrows(undefined, { width: 64, height: 64 })).toBe(true);
+    // Past a breakpoint, or zoomed in: more pixels either way.
+    expect(stillFrameGrows({ width: 64, height: 64 }, { width: 80, height: 80 })).toBe(true);
+    expect(stillFrameGrows({ width: 64, height: 48 }, { width: 64, height: 50 })).toBe(true);
+    // Smaller or the same keeps the frame it has.
+    expect(stillFrameGrows({ width: 64, height: 64 }, { width: 40, height: 40 })).toBe(false);
+    expect(stillFrameGrows({ width: 64, height: 64 }, { width: 64, height: 64 })).toBe(false);
+  });
+
+  it("settles after the frame it draws moves the box", () => {
+    // A GIF in a message lays out at its canvas's size: each redraw resizes
+    // the canvas, and so the box it is measured from again.
+    for (const ratio of [1, 1.5, 2, 3]) {
+      const shown = fitMessageBox(1200, 900);
+      let drawn: { width: number; height: number } | undefined;
+      let draws = 0;
+      for (let pass = 0; pass < 5; pass++) {
+        const needed = stillFrameSize(1200, 900, shown.width, shown.height, ratio)!;
+        if (!stillFrameGrows(drawn, needed)) break;
+        drawn = needed;
+        draws++;
+        Object.assign(shown, fitMessageBox(drawn.width, drawn.height));
+      }
+      expect(draws, `@${ratio}`).toBe(1);
     }
   });
 });

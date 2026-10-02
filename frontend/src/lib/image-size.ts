@@ -438,3 +438,15 @@ export function stillFrameSize(
     height: Math.max(1, Math.round(naturalHeight * scale)),
   };
 }
+
+/**
+ * Whether a still frame drawn at `drawn` (undefined before the first) is
+ * drawn again for a box that now needs `needed`: only to grow. A box that
+ * grows after the first frame, past a breakpoint or with a zoom, gets a
+ * sharp one; one that shrinks keeps the sharper frame it has; and a redraw,
+ * which can move the box, cannot set off redraws without end, each being
+ * larger than the last, up to stillFrameSize's bound.
+ */
+export function stillFrameGrows(drawn: Size | undefined, needed: Size): boolean {
+  return !drawn || needed.width > drawn.width || needed.height > drawn.height;
+}

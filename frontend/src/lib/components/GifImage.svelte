@@ -4,6 +4,7 @@
   import {
     animatedView,
     canDecodeStillFrame,
+    stillFrameGrows,
     stillFrameSize,
   } from "$lib/image-size";
   /**
@@ -30,7 +31,8 @@
    * server could then answer with another image than the one checked.
    *
    * The still frame is drawn at the size it is shown, not the image's own:
-   * each canvas is a backing store of its own.
+   * each canvas is a backing store of its own. It is drawn again when its
+   * box needs more pixels than it has, after a breakpoint or a zoom.
    */
   interface Props {
     src: string;
@@ -141,8 +143,8 @@
         // every other canvas's: read here, it forced a layout per frame.
         canvas.width = w;
         canvas.height = h;
+        let drawn: { width: number; height: number } | undefined;
         observer = new ResizeObserver(([entry]) => {
-          observer?.disconnect();
           const size = stillFrameSize(
             w,
             h,
@@ -150,14 +152,21 @@
             entry.contentRect.height,
             devicePixelRatio
           );
-          if (!size) return;
+          if (!size || !stillFrameGrows(drawn, size)) return;
+          drawn = size;
           canvas.width = size.width;
           canvas.height = size.height;
           canvas
             .getContext("2d")
             ?.drawImage(img, 0, 0, size.width, size.height);
         });
-        observer.observe(canvas);
+        try {
+          // Its device pixels too, where the browser counts them: a zoom
+          // changes those and leaves the box's CSS size as it was.
+          observer.observe(canvas, { box: "device-pixel-content-box" });
+        } catch {
+          observer.observe(canvas);
+        }
       })
       .catch(() => {});
     return () => {
