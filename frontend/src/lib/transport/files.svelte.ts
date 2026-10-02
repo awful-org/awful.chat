@@ -20,9 +20,11 @@ import type {
   Attachment,
   FileEntry,
   FileSignalWireMessage,
+  Message,
 } from "$lib/types/message";
 import { base64ToBytes, encode } from "$lib/utils";
 import { mediaPrefs } from "$lib/media-prefs.svelte";
+import { untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 import type { FileTransferSnapshot, FileSignalEnvelope } from "./types";
 import type { WebTorrentFileTransport } from "./file/webtorrent";
@@ -160,13 +162,29 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     // shown from here.
     if (asked) return restoreStoredFile(stored);
     // Nobody asked - a message arriving, a seeder announcing it. Held here,
-    // it stays held until it is asked for or a room open shows it: every
-    // peer announces all it holds on connecting, and showing each file it
-    // named decrypted into memory the files of rooms nobody had opened.
+    // it stays held until its message is loaded or it is asked for (see
+    // _showsByItself): every peer announces all it holds on connecting, and
+    // showing each file it named decrypted into memory the files of rooms
+    // nobody had opened.
     if (!withBytes.has(stored.id) && !(await getFileTransport().holdsCiphertext(stored))) return false;
     if (epoch !== _fileEpoch) return false;
-    _markHeld(stored);
+    _markHeld([stored]);
     return true;
+  });
+
+  // A held file shows by itself once its message is loaded in the open
+  // conversation (see _showsByItself): the first page of a room open, an
+  // older page scrolled back to, a message arriving. A look through the
+  // loaded messages each time they change; nothing is read until a file
+  // is to be shown.
+  $effect.root(() => {
+    $effect(() => {
+      const roomCode = transportState.roomCode;
+      const messages = transportState.messages;
+      untrack(() => {
+        if (roomCode) void _showLoadedHeldFiles(roomCode, messages).catch(() => {});
+      });
+    });
   });
 
   _fileTransport.on("signal", (peerId, envelope) => {
@@ -176,9 +194,9 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
   _fileTransport.on("transfer", (snapshot) => {
     // A protected file seeded from its ciphertext alone - a peer asked for
     // it - is held here but was never decrypted, so it is not on screen:
-    // it stays a file to ask for (auto-download, or its Download button),
-    // which shows it from this device's copy. As "seeding" it showed
-    // neither the picture nor the button.
+    // it stays held, shown from this device's copy once its message is
+    // loaded or it is asked for. As "seeding" it showed neither the picture
+    // nor the Download button.
     const unseen =
       !!snapshot.encryption && snapshot.status === "seeding" && !snapshot.blobURL &&
       !transportState.fileTransfers.get(snapshot.infoHash)?.blobURL;
@@ -438,24 +456,32 @@ export async function fileFingerprint(file: File): Promise<string> {
 }
 
 export function withFileTransfer(snapshot: FileTransferSnapshot): void {
-  const prev = transportState.fileTransfers.get(snapshot.infoHash);
+  withFileTransfers([snapshot]);
+}
 
-  // Every blobURL offered here was minted for this map alone, and an infoHash
-  // names exactly one set of bytes - so the URL already on screen is as good
-  // as any newer one. Keep it and drop the duplicate; swapping revoked a URL
-  // that something still rendering (or re-sending) could hand back.
-  const blobURLToUse = prev?.blobURL ?? snapshot.blobURL;
-  if (snapshot.blobURL && snapshot.blobURL !== blobURLToUse) {
-    URL.revokeObjectURL(snapshot.blobURL);
-  }
-
-  const nextSnapshot: FileTransferSnapshot = {
-    ...(prev ?? {}),
-    ...snapshot,
-    blobURL: blobURLToUse,
-  } as FileTransferSnapshot;
+/** withFileTransfer for many files at once: one copy of the map, not one
+ *  per file - a room open marks every file the room holds. */
+function withFileTransfers(snapshots: FileTransferSnapshot[]): void {
+  if (!snapshots.length) return;
   const next = new Map(transportState.fileTransfers);
-  next.set(snapshot.infoHash, nextSnapshot);
+  for (const snapshot of snapshots) {
+    const prev = next.get(snapshot.infoHash);
+
+    // Every blobURL offered here was minted for this map alone, and an infoHash
+    // names exactly one set of bytes - so the URL already on screen is as good
+    // as any newer one. Keep it and drop the duplicate; swapping revoked a URL
+    // that something still rendering (or re-sending) could hand back.
+    const blobURLToUse = prev?.blobURL ?? snapshot.blobURL;
+    if (snapshot.blobURL && snapshot.blobURL !== blobURLToUse) {
+      URL.revokeObjectURL(snapshot.blobURL);
+    }
+
+    next.set(snapshot.infoHash, {
+      ...(prev ?? {}),
+      ...snapshot,
+      blobURL: blobURLToUse,
+    } as FileTransferSnapshot);
+  }
   transportState.fileTransfers = next;
 }
 
@@ -532,17 +558,82 @@ export async function _announceStoredFilesTo(peerId: string): Promise<void> {
 }
 
 /**
- * How much a room open decrypts by itself, every file together. A decrypted
- * file lives in memory for as long as it is shown (see stageDecryptedFile),
- * and reading back every file a room held cost as much memory as the room's
- * whole history: a picture-heavy room could end the tab on a phone. Newest
- * first, as long as a file fits; the rest wait to be asked for - auto-download
- * as they come on screen, or their Download button - and are then shown from
- * this device's copy (the restore handed to setLocalFileLookup), never
- * fetched again. A file already on screen, or being shown because it came on
- * screen, takes nothing from it.
+ * What a held file needs to be shown without anyone asking for it: to be a
+ * picture, a video or a sound - what renders in its message - within the
+ * auto-download ceiling, with its message loaded in the open conversation.
+ * A decrypted file stays in memory for the session (see stageDecryptedFile),
+ * so what is shown by itself follows the page: decrypting every file a room
+ * held on its first open cost as much memory as the room's whole history,
+ * and a picture-heavy room could end the tab on a phone. Whoever sent it and
+ * whatever auto-download says, since nothing is fetched. Anything else this
+ * device holds waits for its Download button, which shows it from here at
+ * once (the restore handed to setLocalFileLookup).
  */
-const EAGER_RESTORE_BUDGET_BYTES = AUTO_DOWNLOAD_MAX_BYTES;
+function _showsByItself(file: Pick<FileEntry, "mimeType" | "size">): boolean {
+  return file.size <= AUTO_DOWNLOAD_MAX_BYTES && /^(image|video|audio)\//.test(file.mimeType);
+}
+
+/** The protected files each conversation read back this session holds on
+ *  this device, by infoHash: their rows, without the bytes. */
+const _heldFiles = new Map<string, Map<string, Attachment>>();
+/** Held files waiting to be shown by themselves, decrypted one at a time. */
+const _showQueue = new Map<string, Attachment>();
+let _showing: Promise<void> | null = null;
+/** Held files this session has tried to show by itself: one that will not
+ *  open is not decrypted again every time the page changes. Its Download
+ *  button still tries. */
+const _autoShown = new Set<string>();
+
+/**
+ * Show the held files of the messages `roomCode` has loaded (see
+ * _showsByItself): on its first open, and whenever its page changes after.
+ * Newest first, as a conversation opens at its newest message.
+ */
+export function _showLoadedHeldFiles(
+  roomCode: string,
+  messages: readonly Message[] = transportState.messages,
+): Promise<void> {
+  const held = _heldFiles.get(roomCode);
+  if (held?.size) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].roomCode !== roomCode) continue;
+      for (const file of messages[i].meta?.files ?? []) {
+        const row = held.get(file.infoHash);
+        if (!row || _autoShown.has(row.infoHash) || !_showsByItself(row)) continue;
+        if (transportState.fileTransfers.get(row.infoHash)?.blobURL) continue;
+        _showQueue.set(row.infoHash, row);
+      }
+    }
+  }
+  return _drainShowQueue();
+}
+
+function _drainShowQueue(): Promise<void> {
+  if (!_showing && _showQueue.size) {
+    const run = _showQueued(_fileEpoch).finally(() => {
+      if (_showing !== run) return;
+      _showing = null;
+      // Queued between the last file and this.
+      if (_showQueue.size) void _drainShowQueue();
+    });
+    _showing = run;
+  }
+  return _showing ?? Promise.resolve();
+}
+
+async function _showQueued(epoch: number): Promise<void> {
+  while (_showQueue.size && epoch === _fileEpoch) {
+    const [infoHash, row] = _showQueue.entries().next().value as [string, Attachment];
+    _showQueue.delete(infoHash);
+    // Left meanwhile: shown when the conversation is loaded again.
+    if (row.roomCode !== transportState.roomCode) continue;
+    const current = transportState.fileTransfers.get(infoHash);
+    if (current?.blobURL || current?.status === "downloading") continue;
+    _autoShown.add(infoHash);
+    // One file that will not open must not keep the rest from showing.
+    await restoreStoredFile(row).catch(() => false);
+  }
+}
 
 export async function _hydrateFileTransfersFromStorage(
   roomCode: string
@@ -559,41 +650,33 @@ export async function _hydrateFileTransfersFromStorage(
   const seedable = await getAttachmentsWithData(roomCode, { skipBytes: secure, withBytes });
   if (epoch !== _fileEpoch) return [];
   const dedup = new Map<string, Attachment>();
+  const held = new Map<string, Attachment>();
   /** Rows small enough to carry their file that do not: it is in this
    *  device's file store alone (see _keepRowCopies). */
-  const bare = new Map<string, Attachment[]>();
+  const bare: Attachment[] = [];
   // Newest first: they are the ones on screen, and the room used to fill
   // in in storage key order - effectively at random.
   for (const attachment of [...seedable].sort((a, b) => b.createdAt - a.createdAt)) {
     if (!attachment.data && !attachment.encryption) continue;
     if (!dedup.has(attachment.infoHash))
       dedup.set(attachment.infoHash, attachment);
-    if (attachment.encryption && !withBytes.has(attachment.id) && attachment.size <= MAX_PERSISTED_ATTACHMENT_BYTES) {
-      bare.set(attachment.infoHash, [...(bare.get(attachment.infoHash) ?? []), attachment]);
+    if (!attachment.encryption) continue;
+    if (!held.has(attachment.infoHash)) held.set(attachment.infoHash, attachment);
+    if (!withBytes.has(attachment.id) && attachment.size <= MAX_PERSISTED_ATTACHMENT_BYTES) {
+      bare.push(attachment);
     }
   }
 
-  let budget = EAGER_RESTORE_BUDGET_BYTES;
+  // Every protected file this device holds is counted as held here, shown
+  // or not; the ones on the page are then shown by themselves.
+  _heldFiles.set(roomCode, held);
+  _markHeld(held.values());
+  if (bare.length) void _keepRowCopies(bare).catch(() => {});
+  await _showLoadedHeldFiles(roomCode);
+
   for (const attachment of dedup.values()) {
     if (epoch !== _fileEpoch) return [];
-    if (attachment.encryption) {
-      const { infoHash } = attachment;
-      const current = transportState.fileTransfers.get(infoHash);
-      // On screen already (sent, downloaded or opened before), being shown
-      // because it came on screen, or being fetched.
-      if (current?.blobURL || current?.status === "downloading" || _restoring.has(infoHash)) continue;
-      if (attachment.size > budget) {
-        _markHeld(attachment);
-        continue;
-      }
-      budget -= attachment.size;
-      // One file that will not open must not keep the rest of the room's
-      // from showing.
-      const shown = await restoreStoredFile(attachment).catch(() => false);
-      const rows = bare.get(infoHash);
-      if (shown && rows) void _keepRowCopies(rows).catch(() => {});
-      continue;
-    }
+    if (attachment.encryption) continue;
     if (roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) continue;
     if (!attachment.data) continue;
     const file: FileEntry = {
@@ -620,36 +703,43 @@ export async function _hydrateFileTransfersFromStorage(
   return [...dedup.values()];
 }
 
-/** A held file a room open left for later: its Download button, with this
- *  device counted as a seeder. A transfer under way, or one that failed and
- *  says why, is left as it is. */
-function _markHeld(attachment: Attachment): void {
-  const current = transportState.fileTransfers.get(attachment.infoHash);
-  if (current && current.status !== "pending") return;
-  withFileTransfer({
-    infoHash: attachment.infoHash, filename: attachment.filename,
-    mimeType: attachment.mimeType, size: attachment.size,
-    encryption: attachment.encryption, width: attachment.width, height: attachment.height,
-    status: "pending", progress: 0, done: false, seeding: false, peers: 0,
-    seeders: Math.max(1, current?.seeders ?? 0),
-  });
+/** Held files nothing has shown yet: their Download button, with this device
+ *  counted as a seeder. A file on screen, a transfer under way, or one that
+ *  failed and says why, is left as it is. */
+function _markHeld(attachments: Iterable<Attachment>): void {
+  const snapshots: FileTransferSnapshot[] = [];
+  for (const attachment of attachments) {
+    const current = transportState.fileTransfers.get(attachment.infoHash);
+    if (current?.blobURL || (current && current.status !== "pending")) continue;
+    snapshots.push({
+      infoHash: attachment.infoHash, filename: attachment.filename,
+      mimeType: attachment.mimeType, size: attachment.size,
+      encryption: attachment.encryption, width: attachment.width, height: attachment.height,
+      status: "pending", progress: 0, done: false, seeding: false, peers: 0,
+      seeders: Math.max(1, current?.seeders ?? 0),
+    });
+  }
+  withFileTransfers(snapshots);
 }
 
 /**
  * Rows that never got their copy of the file - its download finished before
  * the row was stored, or the write failed - get it now, once: a backup or a
  * synced device carries a file only in its row. Showing a stored file used to
- * rewrite every row it touched, every session; only these need it.
+ * rewrite every row it touched, every session; only these need it, shown or
+ * not, and none needs a decrypt: the durable ciphertext, authenticated when
+ * it was kept, is copied as it is. One file at a time, in the background.
  */
 async function _keepRowCopies(rows: Attachment[]): Promise<void> {
   const guard = fileOperationGuard();
-  const ciphertext = await getFileTransport().persistableCiphertext(
-    rows[0].infoHash,
-    MAX_PERSISTED_ATTACHMENT_BYTES
-  );
-  guard();
-  if (!ciphertext) return;
-  await Promise.all(rows.map((row) => updateAttachmentData(row.id, ciphertext, guard)));
+  const byFile = new Map<string, Attachment[]>();
+  for (const row of rows) byFile.set(row.infoHash, [...(byFile.get(row.infoHash) ?? []), row]);
+  for (const [infoHash, fileRows] of byFile) {
+    const ciphertext = await getFileTransport().persistableCiphertext(infoHash, MAX_PERSISTED_ATTACHMENT_BYTES);
+    guard();
+    if (!ciphertext) continue;
+    await Promise.all(fileRows.map((row) => updateAttachmentData(row.id, ciphertext, guard)));
+  }
 }
 
 /**
@@ -783,6 +873,10 @@ export function _resetAttachmentHydration(): void {
   _seedableRead = null;
   _persistedStatus.clear();
   _restoring.clear();
+  _heldFiles.clear();
+  _showQueue.clear();
+  _autoShown.clear();
+  _showing = null;
   _hydratedRooms.clear();
   _hydrating.clear();
   attachmentHydration.rooms.clear();

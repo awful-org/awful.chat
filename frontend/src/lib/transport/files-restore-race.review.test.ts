@@ -18,7 +18,12 @@ vi.mock("$lib/storage", () => ({
   updateAttachmentStatus: async () => {},
   updateAttachmentData: async () => {},
 }));
-const transportState = { fileTransfers: new Map<string, { blobURL?: string }>() };
+// The picture's message is on the page the room opens at.
+const transportState = {
+  roomCode: "rd2_room",
+  messages: [{ id: "m-pic", roomCode: "rd2_room", meta: { files: [{ infoHash: "h-pic", mimeType: "image/png", size: 8 }] } }],
+  fileTransfers: new Map<string, { blobURL?: string }>(),
+};
 vi.mock("./transport.svelte", () => ({
   _peerIdToDid: new Map(),
   MAX_PERSISTED_ATTACHMENT_BYTES: 5 * 1024 * 1024,

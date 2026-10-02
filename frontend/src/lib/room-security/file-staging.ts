@@ -82,8 +82,9 @@ export async function stageEncryptedFile(
  * at-rest encryption, readable at the unlock screen and untouched by the
  * duress wipe. A Blob is the browser's to keep and to release: it goes with
  * the last URL and reference to it. Memory is the cost: every decrypted file
- * stays resident while it is shown, which is why a room open decrypts only so
- * much by itself (files.svelte.ts). And a browser short of memory may still
+ * stays resident for the session, which is why a stored file is decrypted
+ * only when it is asked for or its message is on the page, never just for
+ * being held (files.svelte.ts). And a browser short of memory may still
  * page a large Blob out to its own temporary storage - Chromium does, and on
  * a phone its in-memory share is small - which it clears only when it next
  * starts, so a browser killed meanwhile leaves that copy on disk until then.
