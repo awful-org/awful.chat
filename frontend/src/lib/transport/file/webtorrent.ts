@@ -15,7 +15,7 @@ import { ev, errText } from "../../telemetry/event";
 import { rec, refs } from "../../telemetry/recorder";
 import type { FileEntry } from "../../types/message";
 import { encryptedFileSize, opaqueFileName } from "../../room-security/file-descriptor";
-import { stageEncryptedFile, stageDecryptedFile, type StagedFile } from "../../room-security/file-staging";
+import { stageEncryptedFile, stageDecryptedFile } from "../../room-security/file-staging";
 import { readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-store";
 import { CiphertextChunkStore, OPFSChunkStore } from "./opfs-store";
 import { OPFSLease, STAGING_DIR } from "./opfs-lease";
@@ -308,7 +308,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private addingTorrents = new Set<string>();
   private seedingByHash = new Map<string, boolean>();
   private lifecycle = new AbortController();
-  private plaintext = new Map<string, StagedFile>();
+  /** The decrypted files this session has shown, in memory (see stageDecryptedFile). */
+  private plaintext = new Map<string, File>();
   private publishing = new Set<string>();
   /**
    * Owner of this session's piece stores and send staging in OPFS. A new one
@@ -330,9 +331,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         // copy once that exists: no piece store copies it a third time.
         const pieces = new CiphertextChunkStore(ENCRYPTED_PIECE_LENGTH, staged.file);
         const descriptor = await this.seedSingle(staged.file, {
-          infoHash: "", filename: source.name, mimeType: source.type || "application/octet-stream",
-          size: source.size, encryption: staged.encryption,
-        }, pieces);
+          descriptor: {
+            infoHash: "", filename: source.name, mimeType: source.type || "application/octet-stream",
+            size: source.size, encryption: staged.encryption,
+          },
+          pieces,
+        });
         pieces.source = await writeCiphertext(descriptor.infoHash, staged.file, signal);
         pieces.reopen = () => readCiphertext(descriptor.infoHash);
         descriptors.push(descriptor);
@@ -390,13 +394,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.upsertTransfer({
       ...descriptor, status: "seeding", progress: 1, done: true, seeding: true,
       peers: prev?.peers ?? 0, seeders: seeders.size, error: undefined,
-      blobURL: URL.createObjectURL(plain.file),
+      blobURL: URL.createObjectURL(plain),
     });
     // The application deliberately does not adopt transport-owned blob URLs.
     // Recovery must deliver the authenticated file through the same publication
     // event as a network download so hydration can mint its own usable URL -
     // marked as read back from this device, so nothing stores it again.
-    this.emit("downloaded", infoHash, plain.file, true);
+    this.emit("downloaded", infoHash, plain, true);
     return true;
   }
 
@@ -435,7 +439,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     if (!file || file.size !== expected) return false;
     signal.throwIfAborted();
     const pieces = new CiphertextChunkStore(ENCRYPTED_PIECE_LENGTH, file, () => readCiphertext(infoHash));
-    await this.seedSingle(new File([file], opaqueFileName(descriptor), { type: "application/octet-stream" }), descriptor, pieces);
+    await this.seedSingle(new File([file], opaqueFileName(descriptor), { type: "application/octet-stream" }), { descriptor, pieces });
     return true;
   }
 
@@ -986,7 +990,6 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   resetTransfers(): void {
     this.lifecycle.abort();
     this.lifecycle = new AbortController();
-    for (const staged of this.plaintext.values()) void staged.dispose();
     this.plaintext.clear();
     this.publishing.clear();
     this.storedSeeds.clear();
@@ -1038,21 +1041,20 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
   private async seedSingle(
     file: File,
-    protectedDescriptor?: FileEntry,
-    /** The ciphertext's own pieces, so seeding copies nothing (see CiphertextChunkStore). */
-    pieces?: CiphertextChunkStore,
+    /** A protected file: its descriptor, and the ciphertext's own pieces, so
+     *  seeding copies nothing (see CiphertextChunkStore). */
+    protectedSeed?: { descriptor: FileEntry; pieces: CiphertextChunkStore },
   ): Promise<FileEntry> {
     const signal = this.lifecycle.signal;
+    const protectedDescriptor = protectedSeed?.descriptor;
     const client = await this.client();
     signal.throwIfAborted();
     return new Promise<FileEntry>((resolve, reject) => {
       const torrent = client.seed(
         file,
-        { announce: [], ...(protectedDescriptor ? {
+        { announce: [], ...(protectedSeed ? {
           name: file.name, pieceLength: ENCRYPTED_PIECE_LENGTH, private: true, storeCacheSlots: 2,
-          ...(pieces
-            ? { preloadedStore: pieces as unknown as WebTorrentType.TorrentOptions["preloadedStore"] }
-            : { store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeOpts: { lease: this.lease } }),
+          preloadedStore: protectedSeed.pieces as unknown as WebTorrentType.TorrentOptions["preloadedStore"],
         } : {}) },
         (created: any) => {
           if (signal.aborted || (protectedDescriptor?.infoHash && protectedDescriptor.infoHash !== created.infoHash)) {
@@ -1149,14 +1151,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const client = await this.client();
     let torrent = client.get(infoHash) as unknown as TorrentLike | null;
     if (!torrent && this.localFileLookup) {
+      // A protected file the lookup seeds itself, from its ciphertext
+      // (seedStoredFile), and answers null; only a plain file comes back to
+      // be seeded here - and never one known as protected, whatever a lookup
+      // hands back.
       const file = await this.localFileLookup(infoHash).catch(() => null);
-      if (file) {
-        const descriptor = this.knownFiles.get(infoHash) as FileEntry | undefined;
-        // Served as ciphertext, never decrypted on its way out.
-        if (descriptor?.encryption) await this.seedStoredFile(descriptor, await file.arrayBuffer()).catch(() => {});
-        else await this.seedFiles([file]).catch(() => {});
-        torrent = client.get(infoHash) as unknown as TorrentLike | null;
-      }
+      const known = this.knownFiles.get(infoHash) as FileEntry | undefined;
+      if (file && !known?.encryption) await this.seedFiles([file]).catch(() => {});
       torrent = client.get(infoHash) as unknown as TorrentLike | null;
     }
     // The wire can die during the seed above, and a torrent we neither hold
@@ -1424,13 +1425,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           if (!file.createReadStream) throw new Error("Streaming torrent support required");
           const ciphertext = await writeCiphertext(infoHash, file.createReadStream(), signal);
           const plain = await stageDecryptedFile(ciphertext, descriptor.encryption!, descriptor.filename, descriptor.mimeType, signal);
-          if (signal.aborted) { await plain.dispose(); return; }
+          if (signal.aborted) return;
           this.plaintext.set(infoHash, plain);
           this.localSeedHashes.add(infoHash);
           this.seedingByHash.set(infoHash, true);
           this.upsertTransfer({ ...descriptor, status: "seeding", done: true, seeding: true,
-            progress: 1, peers: torrent.numPeers ?? 0, seeders: 1, blobURL: URL.createObjectURL(plain.file) });
-          this.emit("downloaded", infoHash, plain.file);
+            progress: 1, peers: torrent.numPeers ?? 0, seeders: 1, blobURL: URL.createObjectURL(plain) });
+          this.emit("downloaded", infoHash, plain);
         })().catch(async () => {
           await removeCiphertext(infoHash).catch(() => {});
           torrent.destroy?.();

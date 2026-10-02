@@ -1,9 +1,9 @@
 import { decryptFileTo, encryptFileTo, type EncryptedFileDescriptor } from "./file-crypto";
 import { safeBlobType } from "$lib/safe-mime";
 
-/** The owner must release the staged file after the transfer/preview closes.
- * Keeping ciphertext and plaintext staging distinct avoids accidentally
- * re-seeding decrypted bytes under a protected attachment descriptor. */
+/** Staged ciphertext. The owner must release it once the transfer holds its
+ * durable copy. Only ciphertext is ever staged, so decrypted bytes can never
+ * be re-seeded under a protected attachment descriptor by mistake. */
 export interface StagedFile {
   file: File;
   dispose(): Promise<void>;
@@ -94,7 +94,7 @@ export async function stageDecryptedFile(
   filename: string,
   mimeType: string,
   signal?: AbortSignal,
-): Promise<StagedFile> {
+): Promise<File> {
   signal?.throwIfAborted();
   let parts: Blob[] = [];
   await decryptFileTo(ciphertext, encryption, new WritableStream<Uint8Array>({
@@ -110,5 +110,5 @@ export async function stageDecryptedFile(
   // File becomes the blob URL every view of a downloaded file uses.
   const file = new File(parts, filename, { type: safeBlobType(mimeType) });
   parts = [];
-  return { file, async dispose() {} };
+  return file;
 }

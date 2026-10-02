@@ -35,11 +35,10 @@ it("stages only opaque ciphertext for seeding and publishes plaintext after auth
   expect(encrypted.file.type).toBe("application/octet-stream");
   expect(await encrypted.file.text()).not.toContain("private contents");
   const plain = await stageDecryptedFile(encrypted.file, encrypted.encryption, original.name, original.type);
-  expect(await plain.file.text()).toBe("private contents");
-  expect(plain.file.name).toBe(original.name);
+  expect(await plain.text()).toBe("private contents");
+  expect(plain.name).toBe(original.name);
   await encrypted.dispose();
   await encrypted.dispose();
-  await plain.dispose();
   expect(entries.size).toBe(0);
 });
 
@@ -47,14 +46,14 @@ it("never writes the decrypted copy to disk", async () => {
   const original = new File(["scanned passport"], "passport.txt", { type: "text/plain" });
   const encrypted = await stageEncryptedFile(original, directory);
   const plain = await stageDecryptedFile(encrypted.file, encrypted.encryption, original.name, original.type);
-  expect(await plain.file.text()).toBe("scanned passport");
+  expect(await plain.text()).toBe("scanned passport");
   expect(entries.size).toBe(1); // the caller's ciphertext, nothing else
   const onDisk = await new Blob([...entries.values()].flat()).text();
   expect(onDisk).not.toContain("scanned passport");
   // No storage at all: decryption does not need it.
   vi.stubGlobal("navigator", { storage: {} });
   const again = await stageDecryptedFile(encrypted.file, encrypted.encryption, original.name, original.type);
-  expect(await again.file.text()).toBe("scanned passport");
+  expect(await again.text()).toBe("scanned passport");
 });
 
 it("discards staging on failed authentication, without returning partial plaintext", async () => {
