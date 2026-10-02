@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { otherSideCameraId, preferBackCamera } from "./qr-scanner.svelte";
 
 describe("preferBackCamera", () => {
@@ -58,5 +58,64 @@ describe("otherSideCameraId", () => {
 
   it("offers nothing with a single camera", () => {
     expect(otherSideCameraId([cam("a", "Back Camera")], "a")).toBeNull();
+  });
+});
+
+describe("jsQR", () => {
+  afterEach(() => {
+    vi.doUnmock("jsqr");
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  /** Just enough of a camera, a page and a video element to start a scan. */
+  function fakeCamera(): void {
+    const track = { stop() {}, getSettings: () => ({ deviceId: "cam" }), getCapabilities: () => ({}) };
+    const stream = { getVideoTracks: () => [track], getTracks: () => [track] };
+    vi.stubGlobal("navigator", {
+      mediaDevices: {
+        getUserMedia: async () => stream,
+        enumerateDevices: async () => [{ kind: "videoinput", deviceId: "cam", label: "Back Camera" }],
+      },
+    });
+    const video = { setAttribute() {}, play: async () => {}, remove() {}, readyState: 0 };
+    vi.stubGlobal("document", {
+      getElementById: () => ({ replaceChildren() {} }),
+      createElement: (tag: string) => (tag === "video" ? video : { getContext: () => ({}) }),
+    });
+  }
+
+  // jsQR is only the fallback for a platform with no QR detector of its own,
+  // and it used to be downloaded and parsed with every page.
+  it("is loaded only by a scan on a platform without a QR detector", async () => {
+    vi.resetModules();
+    let loads = 0;
+    vi.doMock("jsqr", async (importOriginal) => {
+      loads++;
+      return await importOriginal();
+    });
+    const scanner = await import("./qr-scanner.svelte");
+    expect(loads).toBe(0);
+
+    fakeCamera();
+    vi.stubGlobal(
+      "BarcodeDetector",
+      class {
+        static async getSupportedFormats() {
+          return ["qr_code"];
+        }
+        async detect() {
+          return [];
+        }
+      }
+    );
+    await scanner.startQrScan("view", () => false);
+    await scanner.stopQrScan();
+    expect(loads).toBe(0);
+
+    vi.stubGlobal("BarcodeDetector", undefined);
+    await scanner.startQrScan("view", () => false);
+    await scanner.stopQrScan();
+    expect(loads).toBe(1);
   });
 });
