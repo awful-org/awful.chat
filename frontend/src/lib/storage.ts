@@ -1563,12 +1563,18 @@ const MESSAGE_STATUS_RANK: Record<MessageStatus, number> = {
  * earlier in that room was read too. Acks only name the page the reader had
  * loaded, so cascade the status down the backlog. Returns the ids that
  * actually changed so callers can update in-memory copies.
+ *
+ * `after` is how far an earlier cascade in the room already reached: only
+ * rows above it are walked. Every receipt used to walk the whole room, one
+ * IndexedDB round trip per row, holding up every write to the store behind it.
  */
 export async function markOwnMessagesReadUpTo(
   roomCode: string,
   senderId: string,
-  lamport: number
+  lamport: number,
+  after = -1
 ): Promise<string[]> {
+  if (lamport <= after) return [];
   const database = await getDB();
   // status lives inside the sealed blob, so this is a three-step cascade:
   // collect candidates by clear senderId, decrypt/filter/re-seal outside any
@@ -1576,7 +1582,7 @@ export async function markOwnMessagesReadUpTo(
   const blindRoomCode = await blindValue(roomCode);
   const blindedSenderId = await blindValue(senderId);
   const blindedRange = IDBKeyRange.bound(
-    [blindRoomCode, 0],
+    [blindRoomCode, after + 1],
     [blindRoomCode, lamport]
   );
 
@@ -1604,7 +1610,7 @@ export async function markOwnMessagesReadUpTo(
   // During migration, also walk the plaintext range in a separate transaction
   if (!isMigrationComplete()) {
     const plaintextRange = IDBKeyRange.bound(
-      [roomCode, 0],
+      [roomCode, after + 1],
       [roomCode, lamport]
     );
     cursor = await database

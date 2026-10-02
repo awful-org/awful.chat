@@ -539,6 +539,15 @@ describe("markOwnMessagesReadUpTo", () => {
     expect((await getMessage("theirs"))?.status).toBe("delivered");
     expect((await getMessage("own-1"))?.status).toBe("read");
   });
+
+  it("walks only above where an earlier cascade reached", async () => {
+    await bulkPutMessages([
+      msg({ id: "below", senderId: "me", lamport: 5, status: "sent" }),
+      msg({ id: "above", senderId: "me", lamport: 15, status: "sent" }),
+    ]);
+    expect(await markOwnMessagesReadUpTo("room-a", "me", 20, 10)).toEqual(["above"]);
+    expect((await getMessage("below"))?.status).toBe("sent");
+  });
 });
 
 describe("at-rest encryption", () => {

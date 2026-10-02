@@ -33,6 +33,7 @@ import {
   setWatermark,
   markRoomSeen,
   markOwnMessagesReadUpTo,
+  onMessageStored,
   nextMessageLamport,
   getPeerProfile,
   putPeerProfile,
@@ -978,6 +979,31 @@ async function _receiptsForDmWith(
 }
 
 /**
+ * How far each DM's read cascade has reached: every message of ours at or
+ * below `upTo` is read, so a receipt walks only from there up. It walked the
+ * whole conversation every time - one IndexedDB round trip per row, on every
+ * message the other side read, ahead of every write to the store. One of
+ * ours stored at or below it later (another device's, a write that lost a
+ * race) moves it back down, and a walk that saw one of ours stored while it
+ * ran does not move it on. Per session: after a reload each DM walks once.
+ */
+const _readCascade = new Map<string, { upTo: number; stores: number }>();
+let _readCascadeWatching = false;
+onIdentityLock(() => _readCascade.clear());
+
+function _watchOwnStores(): void {
+  if (_readCascadeWatching) return;
+  _readCascadeWatching = true;
+  onMessageStored((m) => {
+    const cascade = _readCascade.get(m.roomCode);
+    if (!cascade || m.status === "read" || !isSelfSender(m.senderId)) return;
+    if (!Number.isSafeInteger(m.lamport)) return;
+    cascade.upTo = Math.min(cascade.upTo, m.lamport - 1);
+    cascade.stores += 1;
+  });
+}
+
+/**
  * `who` names the other party, so the room is the DM with them: every id
  * here already passed _receiptsForDmWith for that room. The room code has to
  * be derived again rather than read off the rows, because the rows hold it
@@ -1002,7 +1028,13 @@ async function _cascadeReadAcks(
     lamport = Math.max(lamport, m.lamport);
   }
   if (!lamport) return;
-  const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport);
+  _watchOwnStores();
+  let cascade = _readCascade.get(roomCode);
+  if (!cascade) _readCascade.set(roomCode, (cascade = { upTo: -1, stores: 0 }));
+  if (lamport <= cascade.upTo) return;
+  const stores = cascade.stores;
+  const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport, cascade.upTo);
+  if (cascade.stores === stores) cascade.upTo = Math.max(cascade.upTo, lamport);
   if (!changed.length) return;
   const changedSet = new Set(changed);
   transportState.messages = transportState.messages.map((m) =>

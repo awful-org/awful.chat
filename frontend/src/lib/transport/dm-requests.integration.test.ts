@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { publicKeyToDid, type UnlockedSession } from "$lib/identity/identity";
 
-// The message-request paths end to end: the real transport, DM and storage
+// DMs and message requests end to end: the real transport, DM and storage
 // modules (fake-indexeddb, real at-rest crypto); only the libp2p class, the
 // media stack, the notification sink and the relay mailbox are stand-ins.
 const s = vi.hoisted(() => ({
@@ -18,7 +18,6 @@ const s = vi.hoisted(() => ({
   deposits: [] as { to: string; envelope: Uint8Array; kind?: string }[],
   announce: vi.fn(),
   introduce: vi.fn(async (_peer: string, _did?: string) => true),
-  forget: vi.fn(),
 }));
 
 vi.mock("$lib/identity/identity", async (original) => ({
@@ -55,7 +54,6 @@ vi.mock("./libp2p/transport", () => ({
     forgetConversation(localId: string) {
       s.bound.delete(localId);
       s.joined.delete(localId);
-      s.forget(localId);
     }
     leaveRoom(room: string) { s.joined.delete(room); }
     introduceDm(peer: string, did?: string) { return s.introduce(peer, did); }
@@ -71,6 +69,10 @@ vi.mock("./libp2p/transport", () => ({
   },
 }));
 vi.mock("./ice-server-list", () => ({ refreshTurnCredentials: async () => {} }));
+vi.mock("$lib/storage", async (original) => {
+  const real = await original<typeof import("$lib/storage")>();
+  return { ...real, markOwnMessagesReadUpTo: vi.fn(real.markOwnMessagesReadUpTo) };
+});
 vi.mock("./libp2p/voice", () => ({ LibP2PVoice: class { setCallPeers() {} activePeers() { return []; } } }));
 vi.mock("./mediasoup", () => ({
   MediasoupVideo: class {
@@ -128,6 +130,8 @@ import {
   getMessage,
   getRoom,
   getRoomParticipants,
+  markOwnMessagesReadUpTo,
+  putMessage,
   putRoom,
   wipeLocalDatabase,
   type DMRoom,
@@ -138,7 +142,13 @@ import { canonicalContentV3 } from "$lib/messaging";
 import { dmPqEncapsulate, dmPqRole } from "$lib/room-security/pq-dm";
 import { derivePqKemKeypair } from "$lib/identity/pq-identity";
 import { roomsStore } from "$lib/rooms.svelte";
-import { encodeDmChatEnvelope, hashDmRoomCode, parseDmEnvelope, type DmPayload } from "./dm-codec";
+import {
+  encodeDmChatEnvelope,
+  encodeDmReadEnvelope,
+  hashDmRoomCode,
+  parseDmEnvelope,
+  type DmPayload,
+} from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
 
 function identity(): UnlockedSession {
@@ -213,8 +223,15 @@ function receipts() {
   return out;
 }
 
+/** Roster frames that left; DM envelopes are binary and are not one. */
 const rosters = () =>
-  s.sent.filter((f) => (decode(f.data) as { type?: string })?.type === MessageType.RoomUsersSync);
+  s.sent.filter((f) => {
+    try {
+      return (decode(f.data) as { type?: string })?.type === MessageType.RoomUsersSync;
+    } catch {
+      return false;
+    }
+  });
 
 it("files a stranger's mailbox DM as a request holding that message", async () => {
   const stranger = identity().did;
@@ -602,5 +619,46 @@ describe("an introduction alone makes no DM (S08.1)", () => {
     await settled();
     expect(s.bound.has(await code(silent))).toBe(false);
     disconnectTransport();
+  });
+});
+
+describe("a read receipt walks only what it has not walked before (P03.9)", () => {
+  const walks = () => vi.mocked(markOwnMessagesReadUpTo).mock.calls.map(([, , upTo, after]) => [upTo, after]);
+
+  /** One of our own messages in the DM, delivered but not yet read. */
+  async function ours(room: string, lamport: number): Promise<string> {
+    const id = newMessageId(s.session!.did);
+    await putMessage({ id, roomCode: room, senderId: s.session!.did, senderName: "You", timestamp: lamport,
+      lamport, type: MessageType.Text, content: `#${lamport}`, attachments: [], status: "delivered" });
+    return id;
+  }
+
+  it("cascades each stretch of the conversation once", async () => {
+    const { who, device, code } = await dmPeer();
+    await ensureDmRoomForPeer(who.did);
+    const [first, second, third] = [await ours(code, 10), await ours(code, 20), await ours(code, 30)];
+    const read = async (id: string) => {
+      receive(device, encodeDmReadEnvelope([id]), code);
+      await settled();
+    };
+    await read(second);
+    await read(third);
+    await read(first);
+    expect(walks()).toEqual([[20, -1], [30, 20]]);
+    expect((await getMessage(first))?.status).toBe("read");
+  });
+
+  it("walks back down for one of ours stored below that point unread", async () => {
+    const { who, device, code } = await dmPeer();
+    await ensureDmRoomForPeer(who.did);
+    const top = await ours(code, 30);
+    receive(device, encodeDmReadEnvelope([top]), code);
+    await settled();
+    const late = await ours(code, 25);
+    const newest = await ours(code, 40);
+    receive(device, encodeDmReadEnvelope([newest]), code);
+    await settled();
+    expect(walks()).toEqual([[30, -1], [40, 24]]);
+    expect((await getMessage(late))?.status).toBe("read");
   });
 });
