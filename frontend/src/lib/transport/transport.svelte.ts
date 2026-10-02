@@ -1764,6 +1764,14 @@ async function _handleDigest(
   // that row is stored. A room is held from every digest we send until it
   // is answered, and a live message landing meanwhile used to read as one
   // we lacked - we asked for it, and the peer pushed it back.
+  // What that gives up: a held row can sit above rows of its sender we never
+  // got, and a peer showing it no longer makes us ask, so once the hold ends
+  // and the row is claimed, those are not offered again. Before rooms were
+  // held, every live message claimed over such a gap the moment it landed,
+  // so nothing is lost that was kept then. Asking instead pushed the held
+  // rows back on nearly every exchange in a room with an older build, whose
+  // silence holds the room 15s per digest, and each push that completed fanned
+  // out digests that held it again.
   const advertised = _inboundPushes.withClaims(
     peerId,
     roomCode,
@@ -3370,7 +3378,11 @@ async function _handleChatMessage(
   // side. Measured against the ROOM's clock, not the sender's last lamport:
   // in a conversation a sender's lamport jumps every time somebody else
   // spoke, so nearly every message used to fire a digest at its sender, each
-  // costing them a read of the room.
+  // costing them a read of the room. What that gives up: a row missed from
+  // one sender while others kept the room's clock moving is no gap here. A
+  // reconnect's digests still find it; a frame lost on a channel that stayed
+  // up is found only by a digest exchanged before that sender's next message
+  // arrives.
   if (receivedFromPeerId) {
     _repairBackoff.reset(receivedFromPeerId, roomCode);
     if (clock > 0 && msg.lamport > clock + 1) {

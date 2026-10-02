@@ -374,7 +374,11 @@ on connect (both peers):
 also sent:
   → on a gap: a live message more than one past the ROOM's lamport clock
     (not the sender's last lamport, which jumps whenever someone else
-    spoke) - a digest to its sender, for that message's room
+    spoke) - a digest to its sender, for that message's room. A row missed
+    from one sender while others kept the clock moving is no gap: a
+    reconnect's digests find it, but a frame lost on a channel that stayed
+    up is found only by a digest exchanged before that sender's next
+    message arrives
   → by the 15s repair tick, to a peer silent that long, for the open room
     and one background room per tick - backing off per peer and room
     (15s, 30s, ... up to 5 minutes) while exchanges find nothing missing
@@ -438,7 +442,12 @@ on receive SyncBatch:
       an older build never sends SyncNone, so when it has nothing to push
       the wait runs out after 15s
     - those waiting advances count as held when a peer's digest is weighed:
-      a row we stored but have not claimed yet is not one to ask them for
+      a row we stored but have not claimed yet is not one to ask them for.
+      The cost: such a row can sit above rows of its sender we never got,
+      and once it is claimed nobody offers those again - the gap every live
+      message claimed over at once before rooms were held. Asking instead
+      had peers push the held rows back on nearly every exchange in a room
+      with an older build, whose silence holds the room 15s per digest
     - an older build whose push stops short (it lost batches past the
       channel's window, newest first) would re-send the same newest rows on
       every digest: what it delivered is advertised to that peer alone, for
