@@ -344,10 +344,13 @@ export class MediasoupVideo implements VideoTransport {
     this.drainQueuedProducers();
   }
 
-  // Consumes in flight, keyed by producer id. See consumeProducer.
-  private inflightConsumes: Map<string, Promise<void>> = new Map();
-  // Producers whose ms:producer-closed came while a consume for them was in
-  // flight. See consumeProducerInner.
+  // Consumes in flight, keyed by producer id, each with the peer whose stream
+  // it is, so that ms:peer-left can find theirs. See consumeProducer.
+  private inflightConsumes: Map<string, { peerId: string; done: Promise<void> }> =
+    new Map();
+  // Producers that closed while a consume for them was in flight, by
+  // ms:producer-closed or with their owner's ms:peer-left. See
+  // consumeProducerInner.
   private closedWhileConsuming: Set<string> = new Set();
 
   // The remote cameras something on screen shows, by peerId, or null for no
@@ -1484,6 +1487,16 @@ export class MediasoupVideo implements VideoTransport {
         for (const [producerId, peerId] of [...this.parkedCameras]) {
           if (peerId === msg.peerId) this.parkedCameras.delete(producerId);
         }
+        // Their producers closed with them, and the SFU says so with this
+        // frame alone: no ms:producer-closed follows (sfu/index.ts
+        // handlePeerLeft). So a consume still out for one of them is marked
+        // here as that frame would mark it, and drops the consumer it gets
+        // (consumeProducerInner). Landing after peerLeft, it brought them
+        // back as joined with a track that never plays, and once parked it
+        // left an entry nothing cleared.
+        for (const [producerId, inflight] of this.inflightConsumes) {
+          if (inflight.peerId === msg.peerId) this.closedWhileConsuming.add(producerId);
+        }
         if (this.active.has(msg.peerId)) {
           this.active.delete(msg.peerId);
           this.consumers.get(msg.peerId)?.forEach((c) => {
@@ -1611,19 +1624,19 @@ export class MediasoupVideo implements VideoTransport {
           d: { phase: "dedup", producer: producerId, source },
         })
       );
-      return inflight;
+      return inflight.done;
     }
     const p = this.consumeProducerInner(peerId, producerId, source).finally(
       () => {
         // Identity-checked: a rebuild may have already replaced this entry
         // with a consume against the fresh transport.
-        if (this.inflightConsumes.get(producerId) === p) {
+        if (this.inflightConsumes.get(producerId)?.done === p) {
           this.inflightConsumes.delete(producerId);
           this.closedWhileConsuming.delete(producerId);
         }
       }
     );
-    this.inflightConsumes.set(producerId, p);
+    this.inflightConsumes.set(producerId, { peerId, done: p });
     return p;
   }
 
@@ -1685,11 +1698,12 @@ export class MediasoupVideo implements VideoTransport {
       return;
     }
     // The producer closed after the SFU answered this consume, while the
-    // consumer was still being built here. Its ms:producer-closed found
-    // nothing to close and has already told the app the stream is gone, so
-    // this track would never carry a frame: a frozen tile until the stall
-    // sweep re-consumed it into "That stream has ended". The close-consumer
-    // is a courtesy: the SFU dropped its consumer along with the producer.
+    // consumer was still being built here: by ms:producer-closed, which found
+    // nothing to close, or with its owner's ms:peer-left, after which the app
+    // holds nothing of theirs. This track would never carry a frame: a
+    // frozen tile until the stall sweep re-consumed it into "That stream has
+    // ended", or a departed peer back in the call. The close-consumer is a
+    // courtesy: the SFU dropped its consumer along with the producer.
     if (this.closedWhileConsuming.has(producerId)) {
       consumer.close();
       this.signal({ type: "ms:close-consumer", producerId });
@@ -1891,7 +1905,9 @@ export class MediasoupVideo implements VideoTransport {
       if (err instanceof Error && err.message === PRODUCER_GONE) {
         // The camera went off while parked, and its close raced this.
         this.parkedCameras.delete(producerId);
-        this.emit("trackRemoved", peerId, "camera", "video");
+        if (!this.filledByAnother(peerId, "camera", "video", producerId)) {
+          this.emit("trackRemoved", peerId, "camera", "video");
+        }
         return;
       }
       if (attempt === 1) {
@@ -1912,8 +1928,41 @@ export class MediasoupVideo implements VideoTransport {
       // shows it afresh (setWantedCameras) - not while it stays shown, which
       // would retry for as long as the SFU kept failing it. A dead session
       // is the rejoin ladder's, whose replay consumes every camera anew.
-      this.emit("trackRemoved", peerId, "camera", "video");
+      if (!this.filledByAnother(peerId, "camera", "video", producerId)) {
+        this.emit("trackRemoved", peerId, "camera", "video");
+      }
     });
+  }
+
+  /**
+   * Whether a stream other than producerId fills this peer's place for this
+   * source and kind in the app: a live consumer, or a parked camera whose
+   * last track it keeps. trackRemoved names a peer, a source and a kind,
+   * never a producer, so one sent for a stream that is gone would take the
+   * other one's picture with it - a parked entry left behind by a peer who
+   * then came back used to blank their new camera that way.
+   */
+  private filledByAnother(
+    peerId: string,
+    source: VideoSource,
+    kind: "audio" | "video",
+    producerId: string
+  ): boolean {
+    const live = this.consumers
+      .get(peerId)
+      ?.some(
+        (c) =>
+          c.source === source &&
+          c.consumer.kind === kind &&
+          c.consumer.producerId !== producerId &&
+          !c.consumer.closed
+      );
+    if (live) return true;
+    if (source !== "camera") return false;
+    for (const [id, peer] of this.parkedCameras) {
+      if (peer === peerId && id !== producerId) return true;
+    }
+    return false;
   }
 
   private clearUnparkRetry(producerId: string): void {
