@@ -1404,6 +1404,8 @@ if (typeof window !== "undefined") {
           // chime as a drop, not a silent vanishing.
           _peerCallSound(roomNext.get(pid), false, idsNext.has(pid));
           roomNext.delete(pid);
+          // Out of the call is out of its audience, as when they leave it.
+          _dropViewer(pid);
           idsNext.delete(pid);
           statesNext.delete(pid);
           _callPeerSeen.delete(pid);
