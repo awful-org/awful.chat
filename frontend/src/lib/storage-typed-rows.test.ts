@@ -129,6 +129,41 @@ describe("typed reads", () => {
     expect(ids(await getPluginCardMessages("room-a"))).toEqual([card.id]);
   });
 
+  // Deleting a room took its rows out of storage but not out of here: they
+  // stayed in memory, decrypted, until the room was read again or pushed out.
+  it("leave memory with a deleted room, a read under way included", async () => {
+    await seed("room-a");
+    await getPluginCardMessages("room-a");
+    // A read of the room's reactions, held mid-decrypt until the room is gone.
+    const decrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+    let resume!: () => void;
+    const paused = new Promise<void>((r) => (resume = r));
+    const held = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+      await paused;
+      return decrypt(...args);
+    });
+    try {
+      const underway = getMessagesOfTypes("room-a", [MessageType.Reaction]);
+      await vi.waitFor(() => expect(held).toHaveBeenCalled());
+      await deleteMessagesForRoom("room-a");
+      resume();
+      // It still answers its caller...
+      expect(await underway).toHaveLength(4);
+    } finally {
+      held.mockRestore();
+    }
+    // ... and keeps nothing: with nothing held for the room, nothing is
+    // checked against it, and the next reader goes straight to storage.
+    const count = vi.spyOn(IDBIndex.prototype, "count");
+    try {
+      expect(await getPluginCardMessages("room-a")).toEqual([]);
+      expect(count).not.toHaveBeenCalled();
+    } finally {
+      count.mockRestore();
+    }
+    expect(await getMessagesOfTypes("room-a", [MessageType.Reaction])).toEqual([]);
+  });
+
   // P03.5: the prior of every reaction click was a whole-room read.
   it("answer reaction clicks without reading the room", async () => {
     await seed("room-a");

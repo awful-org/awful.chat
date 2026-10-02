@@ -1172,9 +1172,10 @@ async function _readTypedRows(
       sorted: new Map(),
       bytes,
     };
-    // Not past a lock or a closed database: a read that straddled either
-    // still answers its caller, but keeps nothing.
-    if (epoch === writeEpoch && db === database) {
+    // Not past a lock, a closed database or the room's deletion (which drops
+    // `pending`): a read that straddled one still answers its caller, but
+    // keeps nothing.
+    if (epoch === writeEpoch && db === database && _typedPending.get(roomCode) === pending) {
       _typedRows.delete(roomCode);
       _typedRows.set(roomCode, loaded);
       _trimTypedRows(roomCode);
@@ -1183,6 +1184,16 @@ async function _readTypedRows(
   } finally {
     if (_typedPending.get(roomCode) === pending) _typedPending.delete(roomCode);
   }
+}
+
+/**
+ * A deleted room's rows go from memory with it, now rather than whenever the
+ * room is read again or pushed out. Whoever asks next reads afresh.
+ */
+function _dropTypedRows(roomCode: string): void {
+  _typedRows.delete(roomCode);
+  _typedPending.delete(roomCode);
+  _typedLoads.delete(roomCode);
 }
 
 function _trimTypedRows(keep: string): void {
@@ -1722,6 +1733,8 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
     await writeTx.objectStore("watermarks").delete(wm.id as Blinded);
   }
   await writeTx.done;
+  // Its plugin and reaction rows, held decrypted, go with it.
+  _dropTypedRows(roomCode);
   // The Yjs snapshot lives in its own store; a leftover one would resurrect
   // the shared doc if the same room code is ever joined again. Delete both the
   // blinded key (if migrated) and the plaintext key (if legacy).
