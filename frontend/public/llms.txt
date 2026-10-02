@@ -49,13 +49,17 @@ Key properties:
   for calls and screen shares
 - Instance plugins: watch-together, polls, and more, bundled at build time
   and compiled into the app, so they are part of what a build hash covers
+- Apps: /app <url> opens any website as a sandboxed tile in a call; sites
+  that speak the awful contract get the session and per-session player ids,
+  never anyone's identity
 - Device sync via QR code between your own devices; encrypted backup files
   for restoring elsewhere
 - Verifiable builds: every instance publishes the commit it runs, and
   awful-verify (https://github.com/awful-org/awful-verify) checks that the
   served code matches the published source
 - No analytics, no trackers, no third-party scripts beyond an optional
-  YouTube embed inside the watch-together plugin
+  YouTube embed inside the watch-together plugin, and websites someone opens
+  in a call with /app, each sandboxed and behind a notice
 - Self-hostable: Docker Compose with a Go relay, mediasoup SFU, coturn
 
 ## Links
@@ -64,4 +68,5 @@ Key properties:
 - [Source code](https://github.com/awful-org/awful.chat): open source, self-hosting instructions in the README
 - [Protocol and storage spec](https://github.com/awful-org/awful.chat/blob/main/docs/spec.md): how identity, messages, the mailbox and at-rest encryption work
 - [Plugins](https://github.com/awful-org/awful.chat/blob/main/frontend/plugins/README.md): writing and installing plugins
+- [The awful contract](https://github.com/awful-org/awful.chat/blob/main/docs/awful-contract.md): how a website runs as an app in a call
 - [Curated plugins](https://github.com/awful-org/awfully-awesome)

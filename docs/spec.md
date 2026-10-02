@@ -1093,8 +1093,10 @@ Purpose: Fetch preview metadata through the relay. The relay sees the complete
 Privacy: App Settings > External previews and media is on by default.
          When disabled, message preview metadata requests and core remote
          avatars/GIFs are blocked. Local/blob/data attachments remain available.
-         GIF search, explicitly opened links, and plugin network access are
-         separate user-initiated surfaces, not covered by this media switch.
+         GIF search, explicitly opened links, plugin network access and
+         websites opened as apps (/app, a sandboxed iframe that sees the
+         client's IP, after a notice; docs/awful-contract.md) are separate
+         user-initiated surfaces, not covered by this media switch.
 Endpoint: /og/preview?url=<encoded_url> on the Go relay's API port
          (/og is an alias; /klipy/* proxies GIF search the same way)
 Response: JSON { title, description, image, siteName, url, video, mediaType }

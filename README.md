@@ -53,9 +53,13 @@ group video.
   profile per room, which messages, member lists and call tiles follow there.
 - **Plugins**: instance-level, Minecraft-mods style. Drop a folder or point
   `PLUGIN_SOURCES` at GitHub repos and redeploy; ships with `/wheel`,
-  `/poll` and `/ping`, with more at
+  `/poll`, `/ping` and `/app`, with more at
   [awful-org/awfully-awesome](https://github.com/awful-org/awfully-awesome).
   See [frontend/plugins/README.md](frontend/plugins/README.md).
+- **Apps**: `/app <url> [anything]` opens any website as a tile in the call,
+  in a sandbox, after a notice that it sees your IP. Sites that speak
+  [the awful contract](docs/awful-contract.md) learn the session and who is
+  playing - never who anyone is.
 - **Multi-device**: several devices on one identity, QR device sync,
   encrypted backups, and optional biometric unlock (fingerprint or security
   key via WebAuthn PRF).
@@ -113,7 +117,8 @@ coturn      TURN server for voice fallback (compose only, stock image)
 
 Full data model, sync protocol, wire formats and crypto details:
 [docs/spec.md](docs/spec.md). Plugin surface design:
-[docs/plugin-surface.md](docs/plugin-surface.md).
+[docs/plugin-surface.md](docs/plugin-surface.md). What a website does to run
+as an app: [docs/awful-contract.md](docs/awful-contract.md).
 
 ## Development
 
