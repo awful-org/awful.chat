@@ -67,15 +67,28 @@ it("removes what older builds left - decrypted attachments included - once no ot
   await self.sweep();
   expect(paths()).toHaveLength(2);
 
-  // Our own node lock is not somebody else's - once our lease's own lock
-  // says which page we are. Until then every lock counts as another page's.
+  // A Lock Manager that does not say whose lock is whose: every one counts
+  // as another page's.
   locks.held.delete("awful-quick-0011223344556677");
   locks.held.set("awful:node", "this-page");
+  const query = locks.query;
+  locks.query = async () => {
+    const { held, pending } = await query();
+    return { held: held.map(({ name, mode }) => ({ name, mode, clientId: undefined as never })), pending };
+  };
   await self.sweep();
   expect(paths()).toHaveLength(2);
-  await self.directory(STAGING_DIR);
+  locks.query = query;
+
+  // This page's own node lock, and a quick call's storage lock it holds
+  // itself, are not somebody else's - even for a lease nothing has used yet,
+  // which holds no lock of its own to tell this page by. That is the lease
+  // every sweep runs on: a page starting, and a lock.
+  locks.held.set("awful-quick-8899aabbccddeeff", "this-page");
   await self.sweep();
   expect(paths()).toEqual([]);
+  // The lock that told which page this is went with the sweep.
+  expect([...locks.held.keys()].sort()).toEqual(["awful-quick-8899aabbccddeeff", "awful:node"]);
 });
 
 it("holds no lock until it is first used", async () => {

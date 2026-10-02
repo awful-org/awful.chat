@@ -209,6 +209,29 @@ it("a starting session clears what closed ones left, and a lock clears its own",
   await vi.waitFor(() => expect(temporary()).toEqual([]));
 });
 
+it("clears what older builds left while this very page holds the node lock, at start and on lock", async () => {
+  const locks = fakeLocks();
+  vi.stubGlobal("navigator", { storage: disk.storage, locks });
+  // An older build's decrypted attachment, and the seat this page holds:
+  // connect() takes the node lock, and a lock runs its sweep before
+  // letting it go.
+  const plaintext = "room-v2-transfers/3a1392f4-7763-43e2-a8a9-7cd8fb556978";
+  disk.entries.set(plaintext, new Blob(["private medical report"]));
+  locks.held.set("awful:node", "this-page");
+  const t = transport();
+  await vi.waitFor(() => expect(disk.entries.has(plaintext)).toBe(false));
+  disk.entries.set(plaintext, new Blob(["private medical report"]));
+  t.resetTransfers();
+  await vi.waitFor(() => expect(disk.entries.has(plaintext)).toBe(false));
+  // Another page of the app may be an older build still using it.
+  locks.held.set("awful:node", "another-page");
+  disk.entries.set(plaintext, new Blob(["private medical report"]));
+  t.resetTransfers();
+  transport();
+  await new Promise(r => setTimeout(r, 30));
+  expect(disk.entries.has(plaintext)).toBe(true);
+});
+
 it("fails closed without OPFS instead of seeding plaintext", async () => {
   vi.stubGlobal("navigator", { storage: {} });
   await expect(transport().seedEncryptedFiles([new File(["secret"], "name")])).rejects.toThrow("storage support");

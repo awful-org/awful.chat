@@ -125,10 +125,7 @@ export class OPFSLease {
   async sweep(): Promise<void> {
     const locks = globalThis.navigator?.locks;
     if (!locks || !globalThis.navigator?.storage?.getDirectory) return;
-    // Our own lock, when there is one, is how the query below tells this
-    // page's locks from everybody else's.
-    await this.held;
-    const unleasedAreFree = await noOtherPage(locks, LOCK_PREFIX + this.id);
+    const unleasedAreFree = await noOtherPage(locks);
     const root = await navigator.storage.getDirectory();
     for (const area of AREAS) {
       const parent = await root.getDirectoryHandle(area).catch(() => null);
@@ -152,18 +149,30 @@ export class OPFSLease {
   }
 }
 
-/** No other page of this origin runs the app or a quick call right now. */
-async function noOtherPage(locks: LockManager, ownLock: string): Promise<boolean> {
+/**
+ * No other page of this origin runs the app or a quick call right now.
+ *
+ * The query names the page behind every lock, and this page's own - its node
+ * lock, a quick call's storage lock - must not count. A probe lock, held just
+ * for the query, says which page this is. The lease's own lock could not: a
+ * sweep runs on a lease nothing has used yet, which holds none, so this
+ * page's node lock counted as another page's and older entries were only
+ * ever removed at boot, before the node lock was taken.
+ */
+async function noOtherPage(locks: LockManager): Promise<boolean> {
+  const probe = `awful:opfs-probe:${crypto.randomUUID()}`;
   try {
-    const { held = [], pending = [] } = await locks.query();
-    const self = held.find((lock) => lock.name === ownLock)?.clientId;
-    // Without our own lock in the list there is no telling whose is whose:
-    // count every lock as somebody else's.
-    return ![...held, ...pending].some(
-      (lock) =>
-        (self === undefined || lock.clientId !== self) &&
-        (lock.name === "awful:node" || !!lock.name?.startsWith("awful-quick-"))
-    );
+    return await locks.request(probe, async () => {
+      const { held = [], pending = [] } = await locks.query();
+      const self = held.find((lock) => lock.name === probe)?.clientId;
+      // No telling whose is whose: count every lock as somebody else's.
+      if (self === undefined) return false;
+      return ![...held, ...pending].some(
+        (lock) =>
+          lock.clientId !== self &&
+          (lock.name === "awful:node" || !!lock.name?.startsWith("awful-quick-"))
+      );
+    });
   } catch {
     return false;
   }
