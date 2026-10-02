@@ -483,6 +483,38 @@ describe("WebTorrentFileTransport", () => {
     expect(t.getTransfer(hash)?.status).toBe("downloading");
   });
 
+  it("a click while an automatic ask is still looking on this device counts as a click", async () => {
+    const hash = "f".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    let answer!: (held: boolean) => void;
+    const restore = vi.fn(() => new Promise<boolean>((resolve) => (answer = resolve)));
+    t.setLocalFileLookup(async () => null, restore);
+    t.onPeerConnect("alice");
+    t.registerSeeder(encrypted, "alice");
+    // Given up on: every dial at alice spent, and the transfer failed.
+    const internals = t as never as {
+      wtAttempts: Map<string, number>;
+      transfers: Map<string, object>;
+    };
+    internals.wtAttempts.set(`${hash}:alice`, 6);
+    internals.transfers.set(hash, { ...t.getTransfer(hash), status: "failed" });
+    // Alice announcing it again asks for it by itself...
+    t.registerSeeder(encrypted, "alice");
+    // ...and the user clicks Download while that looks on this device.
+    t.ensureDownload(encrypted, { retry: true });
+    expect(restore).toHaveBeenCalledOnce();
+    // Not here: the click is what the fetch gets, so it starts over.
+    answer(false);
+    await vi.waitFor(() => expect(addCalls).toEqual([hash]));
+    expect(livePeers.length).toBe(1);
+    expect(t.getTransfer(hash)?.status).toBe("downloading");
+  });
+
   it("seeds a stored file on demand when a peer dials for it", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     t.setLocalFileLookup(async () =>

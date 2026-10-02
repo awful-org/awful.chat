@@ -463,8 +463,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     null;
 
   private localRestore: ((infoHash: string) => Promise<boolean>) | null = null;
-  /** Files being looked for on this device before anything is fetched. */
-  private checkingLocal = new Set<string>();
+  /**
+   * Files being looked for on this device before anything is fetched, with
+   * the strongest ask made meanwhile: a click (retry) that lands while an
+   * automatic ask is looking must still be a click if the file is not here.
+   */
+  private checkingLocal = new Map<string, { retry?: boolean }>();
 
   /** Storage lives a layer up; this is how it offers files we have not
    *  seeded - and, with `restore`, shows a protected file it holds when a
@@ -758,12 +762,17 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     // its Download button - is shown from that copy, not fetched again.
     const restore = this.localRestore;
     if (encrypted && restore && existing?.status !== "downloading") {
-      if (this.checkingLocal.has(file.infoHash)) return;
-      this.checkingLocal.add(file.infoHash);
+      const checking = this.checkingLocal.get(file.infoHash);
+      if (checking) {
+        if (opts?.retry) checking.retry = true;
+        return;
+      }
+      const ask = { retry: opts?.retry };
+      this.checkingLocal.set(file.infoHash, ask);
       const signal = this.lifecycle.signal;
       void restore(file.infoHash).catch(() => false).then((shown) => {
-        this.checkingLocal.delete(file.infoHash);
-        if (!shown && !signal.aborted) this.fetchFile(file, opts);
+        if (this.checkingLocal.get(file.infoHash) === ask) this.checkingLocal.delete(file.infoHash);
+        if (!shown && !signal.aborted) this.fetchFile(file, ask);
       });
       return;
     }
