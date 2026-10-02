@@ -6,7 +6,9 @@
    */
   import { Button } from "$lib/components/ui/button";
   import type { CardProps } from "$lib/plugins/api";
+  import { newestCardOf, watchRoomCards } from "$lib/plugins/call-tiles.svelte";
   import { presentPlayers, type AppState } from "./logic";
+  import { manifest } from "./manifest";
   import SiteAddress from "./SiteAddress.svelte";
   import SiteIcon from "./SiteIcon.svelte";
 
@@ -28,26 +30,19 @@
 
   // A newer app in this room took the call's tile (the host shows only the
   // newest card per plugin), so this one is over even if its starter never
-  // said so - someone else's /app cannot end it for them.
-  let replaced = $state(false);
+  // said so - someone else's /app cannot end it for them. Which card is the
+  // newest comes from the call tiles' own answer, which moves only when a
+  // card is stored: asking host.cards() on every card-state change re-read
+  // the room's cards for every vote and every heartbeat, from every app
+  // card on screen. Watched on the flag, not the state: every heartbeat is
+  // a new state object.
+  const ended = $derived(app.ended);
   $effect(() => {
-    // Replaced stays replaced: stop asking once it is.
-    if (app.ended || replaced) return;
-    let alive = true;
-    const check = () =>
-      void host
-        .cards()
-        .then((cards) => {
-          if (alive) replaced = cards.length > 0 && cards[cards.length - 1].id !== card.id;
-        })
-        .catch(() => {});
-    check();
-    const off = host.onCardStateChange(check);
-    return () => {
-      alive = false;
-      off();
-    };
+    if (ended) return;
+    return watchRoomCards(card.roomCode);
   });
+  const newest = $derived(newestCardOf(card.roomCode, manifest.id));
+  const replaced = $derived(!!newest && newest !== card.id);
 
   async function end(): Promise<void> {
     if (ending) return;

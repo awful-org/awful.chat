@@ -663,10 +663,11 @@ import {
   }
 
   $effect(() => {
-    // Rescan when the call room changes, when card state folds (votes,
-    // queue changes), and when new cards land in the open room's view.
+    // Recompute when the call room changes and when card state folds (votes,
+    // queue changes). A card stored in the call room is call-tiles' own to
+    // hear: the open room's message list, which this used to follow, moves
+    // with every chat line - and each move re-read the call room's history.
     void cardStateTickForPlugins;
-    void transportState.messages.length;
     void refreshCallTiles(transportState.callRoomCode ?? null);
   });
   let cardStateTickForPlugins = $state(0);

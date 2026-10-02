@@ -60,7 +60,11 @@ const appCard = (sender: string) =>
     })
   );
 
-/** What AppCard did: ask on mount and on every card-state tick until answered. */
+/**
+ * What AppCard used to do - ask on mount and on every card-state tick until
+ * answered. It reads the call tiles' answer now; any plugin may still call
+ * host.cards() this way, so it has to stay cheap when one does.
+ */
 function mountAppCard(host: ReturnType<typeof makeHostApi>, cardId: string, calls: { n: number }) {
   let answered = false;
   let off = () => {};
@@ -103,7 +107,7 @@ describe("a room full of one member's app cards", () => {
     decrypts.mockClear();
 
     // A room open: the newest page's cards build their state, as MsgRender
-    // does, and each AppCard asks the host for the room's app cards.
+    // does, and each card asks the host for the room's app cards.
     const host = makeHostApi("app", ROOM);
     const onScreen = cards.slice(-50);
     const calls = { n: 0 };
