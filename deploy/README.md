@@ -246,6 +246,12 @@ backstop, not a ceiling. On a small box lower `RELAY_MAX_CONNS` first, then
 a container memory limit on top turns running out into a restart of the relay,
 which drops every tab at once. The relay prints both values at boot.
 
+`RELAY_GOMEMLIMIT` goes to the Go runtime as it is, and the runtime takes only
+its own units: a whole number of `MiB` or `GiB`, such as `768MiB` or `1GiB`
+(or plain bytes). `1G`, `768MB`, `512m` or `1.5GiB` do not mean roughly the
+same - they stop the relay at boot with "malformed GOMEMLIMIT", and it does not
+come back until the value is fixed.
+
 ## What cannot be multiplied yet
 
 The **relay** is single. It holds the rendezvous registry (who is in which

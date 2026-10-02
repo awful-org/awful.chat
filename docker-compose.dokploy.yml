@@ -103,7 +103,8 @@ services:
       # The Go runtime's soft memory limit: the garbage collector works harder
       # as the relay nears it instead of letting the heap double. Keep it
       # above what RELAY_MAX_CONNS needs at full load (about 550 MB at 2048)
-      # and below what the box can give the relay.
+      # and below what the box can give the relay. Go's units only (768MiB,
+      # 1GiB): 1G or 768MB stop the relay at boot.
       - GOMEMLIMIT=${RELAY_GOMEMLIMIT:-768MiB}
     volumes:
       - relay_data:/app/data
