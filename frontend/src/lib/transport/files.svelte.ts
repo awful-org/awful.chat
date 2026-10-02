@@ -145,16 +145,28 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
       type: stored.mimeType,
       lastModified: stored.createdAt,
     });
-  }, async (infoHash) => {
-    // A download asked for a protected file this device holds: shown from
-    // here, never fetched again (see EAGER_RESTORE_BUDGET_BYTES). One on
-    // screen already - sent from here this session - needs nothing.
+  }, async (infoHash, asked) => {
+    // A download asked for a protected file: one this device holds is never
+    // fetched again. One on screen already - sent from here this session,
+    // or shown before - needs nothing.
     if (transportState.fileTransfers.get(infoHash)?.blobURL) return true;
     const epoch = _fileEpoch;
-    const stored = (await getAttachmentsByInfoHash(infoHash, { skipBytes: true }))
-      .find((attachment) => attachment.encryption);
+    const withBytes = new Set<string>();
+    const rows = (await getAttachmentsByInfoHash(infoHash, { skipBytes: true, withBytes }))
+      .filter((attachment) => attachment.encryption);
+    const stored = rows.find((attachment) => withBytes.has(attachment.id)) ?? rows[0];
     if (epoch !== _fileEpoch || !stored) return false;
-    return restoreStoredFile(stored);
+    // Its Download button, a plugin, auto-download as it comes on screen:
+    // shown from here.
+    if (asked) return restoreStoredFile(stored);
+    // Nobody asked - a message arriving, a seeder announcing it. Held here,
+    // it stays held until it is asked for or a room open shows it: every
+    // peer announces all it holds on connecting, and showing each file it
+    // named decrypted into memory the files of rooms nobody had opened.
+    if (!withBytes.has(stored.id) && !(await getFileTransport().holdsCiphertext(stored))) return false;
+    if (epoch !== _fileEpoch) return false;
+    _markHeld(stored);
+    return true;
   });
 
   _fileTransport.on("signal", (peerId, envelope) => {

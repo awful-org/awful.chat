@@ -703,8 +703,10 @@ room open (first time in a session), newest first:
   because it came on screen, costs nothing. The rest are left "pending":
   auto-download asks for media as it comes on screen, anything else waits
   for its Download button - and a file this device holds is then shown
-  from it (webtorrent.ts ensureDownload), never fetched again. One restore
-  per file at a time, whoever asks (files.svelte.ts restoreStoredFile).
+  from it (webtorrent.ts ensureDownload), never fetched again. An ask
+  nobody made - a message arriving, a peer announcing what it holds -
+  leaves a held file held, not decrypted. One restore per file at a time,
+  whoever asks (files.svelte.ts restoreStoredFile).
 
 serving (a peer's link connects for a file with no torrent here):
   seed room-v2-ciphertext/<infoHash> as it is - the original opaque name

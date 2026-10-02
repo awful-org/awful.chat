@@ -1732,16 +1732,18 @@ export async function getAttachmentsByInfoHash(
   infoHash: string,
   /** Metadata only, the file bytes left sealed: for the callers that want
    *  a row's room, status or descriptor and would otherwise decrypt the
-   *  whole file to learn it - several of them once per block served. */
-  opts?: { skipBytes?: boolean }
+   *  whole file to learn it - several of them once per block served.
+   *  `withBytes` is filled with the ids of the rows that carry their bytes,
+   *  as getAttachmentsWithData does. */
+  opts?: { skipBytes?: boolean; withBytes?: Set<string> }
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedInfoHash = await blindValue(infoHash);
-  return _openAllHealing(
-    "attachments",
-    await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash),
-    opts
-  );
+  const rows = await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash);
+  for (const row of rows) {
+    if (rowHasBytes(row, "data")) opts?.withBytes?.add(row.id);
+  }
+  return _openAllHealing("attachments", rows, opts);
 }
 
 /**

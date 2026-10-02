@@ -15,9 +15,11 @@ vi.mock("$lib/storage", () => ({
     calls.push(`row-bytes:${id}`);
     return withBytes.get(id);
   },
-  getAttachmentsByInfoHash: async (hash: string, opts?: { skipBytes?: boolean }) => {
+  getAttachmentsByInfoHash: async (hash: string, opts?: { skipBytes?: boolean; withBytes?: Set<string> }) => {
     calls.push(`by-hash:${opts?.skipBytes ? "meta" : "bytes"}`);
-    return rows.filter((r) => r.infoHash === hash);
+    const found = rows.filter((r) => r.infoHash === hash);
+    for (const r of found) if (withBytes.has(r.id)) opts?.withBytes?.add(r.id);
+    return found;
   },
   getAttachmentsByMessage: async () => [],
   getAttachmentsWithData: async (_room: string, opts?: { skipBytes?: boolean; withBytes?: Set<string> }) => {
@@ -41,15 +43,16 @@ const broken = new Set<string>();
 const files = {
   handlers: {} as Record<string, (...args: unknown[]) => void>,
   lookup: null as ((infoHash: string) => Promise<File | null>) | null,
-  restore: null as ((infoHash: string) => Promise<boolean>) | null,
+  restore: null as ((infoHash: string, asked: boolean) => Promise<boolean>) | null,
   on(event: string, handler: (...args: unknown[]) => void) { this.handlers[event] = handler; },
   setLocalFileLookup(
     fn: (infoHash: string) => Promise<File | null>,
-    restore: (infoHash: string) => Promise<boolean>,
+    restore: (infoHash: string, asked: boolean) => Promise<boolean>,
   ) { this.lookup = fn; this.restore = restore; },
   seedFiles: async () => [],
   getTransfer: () => undefined,
   persistableCiphertext: vi.fn(async (): Promise<ArrayBuffer | undefined> => undefined),
+  holdsCiphertext: vi.fn(async (row: Attachment) => durable.has(row.infoHash)),
   restoreEncryptedFile: vi.fn(async (row: Attachment, data?: ArrayBuffer) => {
     calls.push(`show:${row.id}:${data ? "row" : "store"}`);
     if (broken.has(row.id)) throw new Error("authentication failed");
@@ -80,6 +83,7 @@ beforeEach(() => {
   withBytes.set("mid", { ...row("mid", 2), data: new ArrayBuffer(8) });
   files.restoreEncryptedFile.mockClear();
   files.seedStoredFile.mockClear();
+  files.holdsCiphertext.mockClear();
   files.persistableCiphertext.mockReset();
   files.persistableCiphertext.mockResolvedValue(undefined);
 });
@@ -133,9 +137,9 @@ it("leaves a held file over the auto-download ceiling for its Download button, t
   expect(transportState.fileTransfers.get("h-video")).toMatchObject({ status: "pending", seeders: 1 });
   // Asked for (its button, or the auto-download of a video on screen): shown
   // from this device's copy - and a file this device does not hold is not.
-  expect(await files.restore!("h-video")).toBe(true);
+  expect(await files.restore!("h-video", true)).toBe(true);
   expect(calls.at(-1)).toBe("show:video:store");
-  expect(await files.restore!("h-unknown")).toBe(false);
+  expect(await files.restore!("h-unknown", true)).toBe(false);
 });
 
 it("decrypts at most a budget of a room's files by itself, newest first, and leaves the rest held", async () => {
@@ -155,7 +159,7 @@ it("decrypts at most a budget of a room's files by itself, newest first, and lea
     expect(transportState.fileTransfers.get(hash)).toMatchObject({ status: "pending", seeders: 1 });
   }
   // Asked for, it is shown from here like any other.
-  expect(await files.restore!("h-mid")).toBe(true);
+  expect(await files.restore!("h-mid", true)).toBe(true);
   expect(calls.at(-1)).toBe("show:mid:store");
 });
 
@@ -171,7 +175,7 @@ it("a file coming on screen while the room opens is decrypted once, and takes no
     return true;
   });
   // Auto-download asks for the newest picture as it renders...
-  const shown = files.restore!("h-new");
+  const shown = files.restore!("h-new", true);
   await settle();
   // ...while the room open reads its files back.
   const hydration = _hydrateAndSeedAttachments("rd2_room");
@@ -183,8 +187,22 @@ it("a file coming on screen while the room opens is decrypted once, and takes no
 
 it("does not decrypt a file already on screen when it is asked for", async () => {
   transportState.fileTransfers.set("h-new", { blobURL: "blob:sent-this-session" });
-  expect(await files.restore!("h-new")).toBe(true);
+  expect(await files.restore!("h-new", true)).toBe(true);
   expect(calls).toEqual([]);
+});
+
+it("an ask nobody made leaves a held file held: nothing decrypted, nothing fetched", async () => {
+  // A seeder announcing it, a message arriving: true, it is here.
+  expect(await files.restore!("h-new", false)).toBe(true);
+  // Held in its row alone: found without reading the bytes.
+  expect(await files.restore!("h-mid", false)).toBe(true);
+  expect(files.restoreEncryptedFile).not.toHaveBeenCalled();
+  expect(calls.filter((c) => c.startsWith("row-bytes:"))).toEqual([]);
+  expect(transportState.fileTransfers.get("h-new")).toMatchObject({ status: "pending", seeders: 1 });
+  // Not here: it is fetched.
+  durable.delete("h-old");
+  expect(await files.restore!("h-old", false)).toBe(false);
+  expect(await files.restore!("h-unknown", false)).toBe(false);
 });
 
 it("keeps a protected file served from its ciphertext, but never shown here, a file to ask for", async () => {

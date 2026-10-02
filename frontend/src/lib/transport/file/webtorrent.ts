@@ -350,6 +350,14 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     return file && file.size <= maxBytes ? file.arrayBuffer() : undefined;
   }
 
+  /** Whether this device's durable store holds the whole ciphertext of a
+   *  protected file: a look at its size, nothing read or decrypted. */
+  async holdsCiphertext(descriptor: FileEntry): Promise<boolean> {
+    let expected: number;
+    try { expected = encryptedFileSize(descriptor); } catch { return false; }
+    return (await readCiphertext(descriptor.infoHash))?.size === expected;
+  }
+
   /** The durable copy, written only when it is not there already: every
    * session's first look at a file used to write all of it out again. */
   private async keepCiphertext(infoHash: string, ciphertext: Blob, signal: AbortSignal): Promise<File> {
@@ -462,20 +470,22 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private localFileLookup: ((infoHash: string) => Promise<File | null>) | null =
     null;
 
-  private localRestore: ((infoHash: string) => Promise<boolean>) | null = null;
+  private localRestore: ((infoHash: string, asked: boolean) => Promise<boolean>) | null = null;
   /**
    * Files being looked for on this device before anything is fetched, with
    * the strongest ask made meanwhile: a click (retry) that lands while an
-   * automatic ask is looking must still be a click if the file is not here.
+   * automatic ask is looking must still be a click.
    */
   private checkingLocal = new Map<string, { retry?: boolean }>();
 
   /** Storage lives a layer up; this is how it offers files we have not
-   *  seeded - and, with `restore`, shows a protected file it holds when a
-   *  download is asked for one (true when it did). */
+   *  seeded - and, with `restore`, looks for a protected file on this device
+   *  before one is fetched. True when the file is here: shown, when someone
+   *  `asked` for it (a click, a plugin, the auto-download of a file coming
+   *  on screen), and otherwise left held, not decrypted. */
   setLocalFileLookup(
     fn: (infoHash: string) => Promise<File | null>,
-    restore?: (infoHash: string) => Promise<boolean>,
+    restore?: (infoHash: string, asked: boolean) => Promise<boolean>,
   ): void {
     this.localFileLookup = fn;
     this.localRestore = restore ?? null;
@@ -758,8 +768,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     if ((existing?.status === "complete" || existing?.status === "seeding") && !held) {
       return;
     }
-    // A protected file this device already holds - one a room open left for
-    // its Download button - is shown from that copy, not fetched again.
+    // A protected file this device already holds is never fetched again.
+    // Asked for, it is shown from that copy; an ask nobody made - a message
+    // arriving, a seeder announcing it - leaves it held. Peers announce
+    // everything they hold in every room they share with us whenever they
+    // connect, and showing each file they named decrypted into memory the
+    // files of rooms nobody had opened.
     const restore = this.localRestore;
     if (encrypted && restore && existing?.status !== "downloading") {
       const checking = this.checkingLocal.get(file.infoHash);
@@ -768,11 +782,15 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         return;
       }
       const ask = { retry: opts?.retry };
+      const asked = !!ask.retry;
       this.checkingLocal.set(file.infoHash, ask);
       const signal = this.lifecycle.signal;
-      void restore(file.infoHash).catch(() => false).then((shown) => {
+      void restore(file.infoHash, asked).catch(() => false).then((here) => {
         if (this.checkingLocal.get(file.infoHash) === ask) this.checkingLocal.delete(file.infoHash);
-        if (!shown && !signal.aborted) this.fetchFile(file, ask);
+        if (signal.aborted) return;
+        if (!here) this.fetchFile(file, ask);
+        // Left held, and then clicked while that was being looked into.
+        else if (!asked && ask.retry) this.ensureDownload(file, { retry: true });
       });
       return;
     }

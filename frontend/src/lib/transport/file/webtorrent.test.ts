@@ -515,6 +515,57 @@ describe("WebTorrentFileTransport", () => {
     expect(t.getTransfer(hash)?.status).toBe("downloading");
   });
 
+  it("an ask nobody made leaves a protected file this device holds where it is: not shown, not fetched", async () => {
+    const hash = "c".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    const restore = vi.fn(async (_infoHash: string, _asked: boolean) => true);
+    t.setLocalFileLookup(async () => null, restore);
+    t.onPeerConnect("alice");
+    // A seeder announcing it, or its message arriving again.
+    t.registerSeeder(encrypted, "alice");
+    t.ensureDownload(encrypted);
+    await tick();
+    await tick();
+    expect(restore.mock.calls).toEqual([[hash, false]]);
+    expect(addCalls).toEqual([]);
+    expect(livePeers.length).toBe(0);
+    expect(t.getTransfer(hash)?.status).toBe("pending");
+    // Asked for, it is shown.
+    t.ensureDownload(encrypted, { retry: true });
+    await tick();
+    expect(restore.mock.calls.at(-1)).toEqual([hash, true]);
+    expect(addCalls).toEqual([]);
+  });
+
+  it("a click on a held file while an automatic ask is still looking shows it", async () => {
+    const hash = "d".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    const answers: Array<(here: boolean) => void> = [];
+    const restore = vi.fn((_infoHash: string, _asked: boolean) => new Promise<boolean>((resolve) => answers.push(resolve)));
+    t.setLocalFileLookup(async () => null, restore);
+    t.ensureDownload(encrypted);
+    // The user clicks Download while the automatic ask looks...
+    t.ensureDownload(encrypted, { retry: true });
+    expect(restore).toHaveBeenCalledOnce();
+    // ...which finds it held and leaves it: the click still shows it.
+    answers[0](true);
+    await vi.waitFor(() => expect(restore).toHaveBeenCalledTimes(2));
+    expect(restore.mock.calls[1]).toEqual([hash, true]);
+    answers[1](true);
+    await tick();
+    expect(addCalls).toEqual([]);
+  });
+
   it("seeds a stored file on demand when a peer dials for it", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     t.setLocalFileLookup(async () =>

@@ -30,9 +30,9 @@ const decrypts: string[] = [];
 let release!: () => void;
 let gate = new Promise<void>((r) => (release = r));
 const files = {
-  restore: null as ((infoHash: string) => Promise<boolean>) | null,
+  restore: null as ((infoHash: string, asked: boolean) => Promise<boolean>) | null,
   on() {},
-  setLocalFileLookup(_fn: unknown, restore: (infoHash: string) => Promise<boolean>) { this.restore = restore; },
+  setLocalFileLookup(_fn: unknown, restore: (infoHash: string, asked: boolean) => Promise<boolean>) { this.restore = restore; },
   seedFiles: async () => [],
   getTransfer: () => undefined,
   persistableCiphertext: async () => undefined,
@@ -63,7 +63,7 @@ it("decrypts a visible stored picture once when the room open and its render-tim
   await new Promise((r) => setTimeout(r, 0));
   // ...and the row renders: MsgRender's auto-download asks for the picture,
   // which ensureDownload answers with the local restore.
-  const shown = files.restore!("h-pic");
+  const shown = files.restore!("h-pic", true);
   release();
   await Promise.all([hydration, shown]);
   expect(decrypts).toEqual(["pic"]);
