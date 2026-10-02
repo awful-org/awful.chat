@@ -1119,6 +1119,9 @@ function _sendRoomName(peerId?: string, roomCode: string | null = transportState
 
 /** `missingOnly`, with a peerId: send them only what they were never delivered. */
 async function _sendProfile(peerId?: string, isReply = false, missingOnly = false): Promise<void> {
+  // A lock landing while this call is under way must not leave the profile it
+  // read kept in _profileFrames after the lock cleared it.
+  const generation = _profileFrames.generation;
   const profile = await getOwnProfile();
   const did = identityStore.did ?? null;
   // Room capability is learned only from a verified main profile.
@@ -1162,9 +1165,11 @@ async function _sendProfile(peerId?: string, isReply = false, missingOnly = fals
     return url;
   };
 
-  // Built only when nothing built before matches (_profileFrames): a room
-  // click or a resume that changed nothing encodes nothing.
-  const frameFor = (source: typeof profile, roomScoped = false, reply = isReply): { frame: Uint8Array; hash: number } => {
+  // Built only when the last of its kind does not match (_profileFrames): a
+  // room click or a resume that changed nothing encodes nothing. `room`: a
+  // room's own profile, scoped to it.
+  const frameFor = (source: typeof profile, room?: string, reply = isReply): { frame: Uint8Array; hash: number } => {
+    const roomScoped = room !== undefined;
     // An uploaded image goes where its URL would, and a URL wins over one.
     const avatar = source?.pfpURL ? undefined : source?.pfpData;
     const banner = source?.bannerURL ? undefined : source?.bannerData;
@@ -1193,11 +1198,11 @@ async function _sendProfile(peerId?: string, isReply = false, missingOnly = fals
       pq: roomScoped ? undefined : pq,
     };
     // Same fields in the same order, so the same bytes on the wire as ever.
-    return _profileFrames.get(JSON.stringify(fields), [avatar, banner], () => encode({
+    return _profileFrames.get(room ?? "", reply, JSON.stringify(fields), [avatar, banner], () => encode({
       ...fields,
       ...(avatar ? { avatarUrl: dataUrl(avatar) } : {}),
       ...(banner ? { bannerUrl: dataUrl(banner) } : {}),
-    }));
+    }), generation);
   };
 
   // A room with no overrides needs no copy of the profile: it is the main
@@ -1219,7 +1224,7 @@ async function _sendProfile(peerId?: string, isReply = false, missingOnly = fals
   const { frame: payload, hash } = frameFor(profile);
   // What the peer holds once this lands. A reply carries the same profile as
   // the frame that provoked it, so the reply flag is not part of it.
-  const held = isReply ? frameFor(profile, false, false).hash : hash;
+  const held = isReply ? frameFor(profile, undefined, false).hash : hash;
   const sendTo = (pid: string): boolean => {
     if (!_profileEcho.shouldSend(pid, hash)) {
       _stats.profilesSkipped++;
@@ -1242,11 +1247,11 @@ async function _sendProfile(peerId?: string, isReply = false, missingOnly = fals
         const resolved = override && hasRoomOverrides(override.fields)
           ? resolveRoomProfile(profile, override.fields)
           : null;
-        const built = resolved ? frameFor(resolved, true) : null;
+        const built = resolved ? frameFor(resolved, roomCode) : null;
         const frame = built?.frame ?? inheritFrame();
         const scopedHash = built?.hash ?? frameHash(frame);
         return { frame, hash: scopedHash,
-          held: resolved && isReply ? frameFor(resolved, true, false).hash : scopedHash };
+          held: resolved && isReply ? frameFor(resolved, roomCode, false).hash : scopedHash };
       })().catch(() => null);
       scopedFrames.set(roomCode, built);
     }
@@ -1282,6 +1287,9 @@ async function _sendProfile(peerId?: string, isReply = false, missingOnly = fals
     await sendProfileTo(peerId, missingOnly);
     return;
   }
+
+  // A room we have left needs none of its own frames kept.
+  _profileFrames.retain(["", ..._transport.rooms()]);
 
   // A session with no protected rooms publishes into each room's gossipsub
   // topic, one frame per room.
@@ -4723,6 +4731,10 @@ function _disconnectWithoutBroadcasting(): void {
   stopTelemetryTaps();
   _peerIdToDid.clear();
   _roomProfilePeers.clear();
+  // Our decrypted avatar and banner live on in the encoded frames, and who
+  // was delivered them belongs to the session that just ended.
+  _profileFrames.clear();
+  _profileEcho.clear();
   _pendingMoveClaims.clear();
   clearCardStates();
   // The search corpus is decrypted message text; it dies with the session

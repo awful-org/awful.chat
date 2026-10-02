@@ -8,6 +8,7 @@ const s = vi.hoisted(() => ({
   rooms: ["rd2_a", "rd2_b", "rd2_c"],
   peers: ["p1", "p2", "p3"],
   profile: vi.fn(async (): Promise<any> => ({ nickname: "Alice", pfpData: new Uint8Array(4096).fill(7).buffer })),
+  roomProfile: vi.fn(async (_room: string, _did: string): Promise<any> => undefined),
   roomSend: vi.fn(async (_peer: string, _room: string, _frame: Uint8Array) => true),
   broadcast: vi.fn(async (_frame: Uint8Array, _room: string) => {}),
   direct: vi.fn(async (_peer: string, _frame: Uint8Array) => true),
@@ -43,7 +44,7 @@ vi.mock("$lib/storage", () => ({
   getPeerProfile: async () => undefined, putPeerProfile: async () => {},
   updateParticipantLastSeen: async () => {}, addRoomParticipants: async () => {},
   addRoomParticipant: async () => {}, getRoomParticipants: async () => [],
-  getOwnRoomProfile: async () => undefined,
+  getOwnRoomProfile: s.roomProfile,
   getRoom: async (room: string) => ({ roomCode: room, type: "text", createdAt: 1 }),
   MAX_ROOM_PARTICIPANTS: 512,
 }));
@@ -63,7 +64,7 @@ vi.mock("$lib/utils", async (original) => {
   return { ...utils, bytesToBase64: vi.fn(utils.bytesToBase64) };
 });
 
-import { broadcastProfile } from "./transport.svelte";
+import { broadcastProfile, disconnectTransport } from "./transport.svelte";
 import { bytesToBase64, decode, encode, sniffImageMime } from "$lib/utils";
 
 /** Full profiles handed to the transport, by peer, oldest first. */
@@ -83,6 +84,7 @@ beforeEach(() => {
   s.roomSend.mockClear(); s.broadcast.mockClear(); s.direct.mockClear();
   s.roomSend.mockImplementation(async () => true);
   s.profile.mockResolvedValue({ nickname: "Alice", pfpData: new Uint8Array(4096).fill(7).buffer });
+  s.roomProfile.mockResolvedValue(undefined);
   // A disconnect is what wipes a peer's record; start every case from none.
   for (const peer of s.peers) s.handlers.get("disconnect")?.(peer);
 });
@@ -206,4 +208,78 @@ it("sends members the relay lists again nothing they hold, and one it lists anew
     s.handlers.get("disconnect")!("p4");
   }
   expect(profilesTo()).toHaveLength(4);
+});
+
+/** Times our 4096-byte avatar was base64'd into a frame. */
+const avatarEncodes = () => vi.mocked(bytesToBase64).mock.calls.filter(([bytes]) => bytes.length === 4096).length;
+
+it("encodes nothing on a room click however many rooms have a profile of their own", async () => {
+  s.rooms.push("rd2_d", "rd2_e", "rd2_f");
+  try {
+    // Fresh buffers on every read, as storage decrypts them, and a nickname of its own in every room.
+    s.profile.mockImplementation(async () => ({ nickname: "Alice D", pfpData: new Uint8Array(4096).fill(3).buffer }));
+    s.roomProfile.mockImplementation(async (room: string) => ({ fields: { nickname: `Alice in ${room}` } }));
+    vi.mocked(bytesToBase64).mockClear();
+    // p1 introduces itself as taking room profiles: the reply carries ours and each room's.
+    s.handlers.get("message")!("p1", encode({ type: MessageType.Profile, name: "Bob", did: "did:bob",
+      peerId: "p1", bindingSig: "sig", avatarUrl: null, roomProfilesSupported: true }), "rd2_a");
+    const scoped = () => s.roomSend.mock.calls.filter(([, , frame]) => (decode(frame) as { roomScoped?: boolean }).roomScoped);
+    await vi.waitFor(() => expect(scoped()).toHaveLength(6));
+    expect(avatarEncodes()).toBe(1);
+    for (let click = 0; click < 5; click++) {
+      vi.setSystemTime(Date.now() + 60_000);
+      broadcastProfile();
+    }
+    await settle();
+    // A click asks for the main frame and six rooms' own. Only four were
+    // kept, so each pushed out the next one asked for and all were built
+    // again, avatar and all, on every click.
+    expect(avatarEncodes()).toBe(1);
+    expect(scoped()).toHaveLength(6);
+  } finally {
+    s.rooms.splice(3);
+  }
+});
+
+it("forgets the frames it encoded, and who was delivered them, when the session ends", async () => {
+  s.profile.mockImplementation(async () => ({ nickname: "Alice E", pfpData: new Uint8Array(4096).fill(4).buffer }));
+  vi.mocked(bytesToBase64).mockClear();
+  broadcastProfile();
+  await vi.waitFor(() => expect(profilesTo()).toHaveLength(3));
+  expect(avatarEncodes()).toBe(1);
+  // A lock runs the same teardown. Our decrypted avatar lived on in the frame.
+  disconnectTransport();
+  vi.setSystemTime(Date.now() + 60_000);
+  broadcastProfile();
+  await vi.waitFor(() => expect(profilesTo()).toHaveLength(6));
+  expect(avatarEncodes()).toBe(2);
+});
+
+it("keeps nothing it encoded after a lock that landed while it read a room's profile", async () => {
+  s.profile.mockImplementation(async () => ({ nickname: "Alice F", pfpData: new Uint8Array(4096).fill(5).buffer }));
+  // rd2_a has an avatar of its own, read - and decrypted - fresh every time.
+  let lockDuringRead = true;
+  s.roomProfile.mockImplementation(async (room: string) => {
+    if (room !== "rd2_a") return undefined;
+    if (lockDuringRead) {
+      lockDuringRead = false;
+      disconnectTransport();
+    }
+    return { fields: { pfpData: new Uint8Array(2048).fill(6).buffer } };
+  });
+  const roomAvatarEncodes = () => vi.mocked(bytesToBase64).mock.calls.filter(([bytes]) => bytes.length === 2048).length;
+  vi.mocked(bytesToBase64).mockClear();
+  const introduce = () => s.handlers.get("message")!("p1", encode({ type: MessageType.Profile, name: "Bob",
+    did: "did:bob", peerId: "p1", bindingSig: "sig", avatarUrl: null, roomProfilesSupported: true }), "rd2_a");
+  const toRoomA = () => s.roomSend.mock.calls.filter(([, room, frame]) =>
+    room === "rd2_a" && (decode(frame) as { roomScoped?: boolean }).roomScoped);
+  introduce();
+  await vi.waitFor(() => expect(toRoomA()).toHaveLength(1));
+  expect(roomAvatarEncodes()).toBe(1);
+  // The next session asks for the same frame: it is built from what that
+  // session reads, not found kept from the call the lock interrupted.
+  vi.setSystemTime(Date.now() + 60_000);
+  introduce();
+  await vi.waitFor(() => expect(toRoomA()).toHaveLength(2));
+  expect(roomAvatarEncodes()).toBe(2);
 });

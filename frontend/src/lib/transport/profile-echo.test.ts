@@ -91,6 +91,18 @@ describe("profile echo", () => {
     expect(echo.holds("peer1", h)).toBe(false);
   });
 
+  it("forgets every peer's records when the session ends", () => {
+    const echo = new ProfileEcho();
+    const h = frameHash(A);
+    echo.shouldSend("peer1", h, 0);
+    echo.delivered("peer1", h);
+    echo.delivered("peer2", h, "rd2_a");
+    echo.clear();
+    expect(echo.holds("peer1", h)).toBe(false);
+    expect(echo.holds("peer2", h, "rd2_a")).toBe(false);
+    expect(echo.shouldSend("peer1", h, 1)).toBe(true);
+  });
+
   it("separates frames that differ only late in a large payload", () => {
     const big = new Uint8Array(200_000);
     const other = new Uint8Array(200_000);
@@ -106,29 +118,74 @@ describe("profile frames", () => {
   it("builds a frame once for the same fields and image bytes, and again when either changes", () => {
     const frames = new ProfileFrames();
     const build = vi.fn(() => new Uint8Array([build.mock.calls.length]));
-    const first = frames.get("alice", [image(7), undefined], build);
+    const first = frames.get("", false, "alice", [image(7), undefined], build);
     expect(first.hash).toBe(frameHash(first.frame));
-    expect(frames.get("alice", [image(7), undefined], build)).toBe(first);
+    expect(frames.get("", false, "alice", [image(7), undefined], build)).toBe(first);
     expect(build).toHaveBeenCalledOnce();
     const edited = new Uint8Array(image(7));
     edited[edited.length - 1] = 8;
-    expect(frames.get("alice", [edited.buffer, undefined], build)).not.toBe(first);
-    expect(frames.get("alice", [image(7), image(1)], build)).not.toBe(first);
-    expect(frames.get("alice, renamed", [image(7), image(1)], build)).not.toBe(first);
+    expect(frames.get("", false, "alice", [edited.buffer, undefined], build)).not.toBe(first);
+    expect(frames.get("", false, "alice", [image(7), image(1)], build)).not.toBe(first);
+    expect(frames.get("", false, "alice, renamed", [image(7), image(1)], build)).not.toBe(first);
     expect(build).toHaveBeenCalledTimes(4);
   });
 
-  it("keeps only so many, the least recently asked for going first", () => {
-    const frames = new ProfileFrames(2);
-    const build = vi.fn(() => new Uint8Array([1]));
-    frames.get("main", [], build);
-    frames.get("room a", [], build);
-    frames.get("main", [], build);
-    frames.get("room b", [], build);
+  it("keeps every frame one call asks for, however many rooms have a profile of their own", () => {
+    const frames = new ProfileFrames();
+    const build = vi.fn(() => new Uint8Array([build.mock.calls.length]));
+    const rooms = Array.from({ length: 8 }, (_, i) => `rd2_${i}`);
+    // A reply's lookups, in the order _sendProfile makes them: the main frame
+    // in both forms, then each room's in both.
+    const call = () => {
+      frames.get("", true, "main, reply", [image(7)], build);
+      frames.get("", false, "main", [image(7)], build);
+      for (const room of rooms) {
+        frames.get(room, true, `${room}, reply`, [image(7)], build);
+        frames.get(room, false, room, [image(7)], build);
+      }
+    };
+    call();
+    expect(build).toHaveBeenCalledTimes(18);
+    // Four were kept, least recently used first out, so every lookup of the
+    // next call found its frame pushed out and built it again.
+    call();
+    call();
+    expect(build).toHaveBeenCalledTimes(18);
+  });
+
+  it("replaces the last frame of a kind rather than keeping it beside the new one", () => {
+    const frames = new ProfileFrames();
+    const build = vi.fn(() => new Uint8Array([build.mock.calls.length]));
+    frames.get("", false, "alice", [], build);
+    frames.get("", false, "alice, renamed", [], build);
+    frames.get("", false, "alice", [], build);
     expect(build).toHaveBeenCalledTimes(3);
-    frames.get("main", [], build);
+  });
+
+  it("drops the frames of rooms left, and every frame when the session ends", () => {
+    const frames = new ProfileFrames();
+    const build = vi.fn(() => new Uint8Array([build.mock.calls.length]));
+    for (const scope of ["", "rd2_a", "rd2_b"]) frames.get(scope, false, scope, [image(1)], build);
+    frames.retain(["", "rd2_a"]);
+    frames.get("", false, "", [image(1)], build);
+    frames.get("rd2_a", false, "rd2_a", [image(1)], build);
     expect(build).toHaveBeenCalledTimes(3);
-    frames.get("room a", [], build);
+    frames.get("rd2_b", false, "rd2_b", [image(1)], build);
     expect(build).toHaveBeenCalledTimes(4);
+    frames.clear();
+    frames.get("", false, "", [image(1)], build);
+    expect(build).toHaveBeenCalledTimes(5);
+  });
+
+  it("keeps nothing built by a call that began before the session ended", () => {
+    const frames = new ProfileFrames();
+    const build = vi.fn(() => new Uint8Array([build.mock.calls.length]));
+    const began = frames.generation;
+    frames.clear();
+    frames.get("", false, "alice", [image(2)], build, began);
+    frames.get("", false, "alice", [image(2)], build);
+    expect(build).toHaveBeenCalledTimes(2);
+    frames.get("", false, "alice", [image(2)], build);
+    expect(build).toHaveBeenCalledTimes(2);
   });
 });

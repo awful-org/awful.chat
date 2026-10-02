@@ -81,41 +81,75 @@ export class ProfileEcho {
       this.#held.get(peerId)?.delete(scope);
     }
   }
+
+  /** Every record: a lock or a logout ends the session they were kept for. */
+  clear(): void {
+    this.#sent.clear();
+    this.#held.clear();
+  }
 }
 
 /**
- * Encoded profile frames, kept by what went into them.
+ * Encoded profile frames, the last one built of each kind: the main frame
+ * and each room's own, each plain and in its reply form.
  *
  * A room click or a resume asks whether any peer lacks our profile, and the
  * answer is the frame's hash - so the frame was built every time: avatar and
  * banner base64'd into it and the whole thing hashed, megabytes of work on
  * the main thread with an uploaded image, nearly always to find that every
  * peer already had it. A frame made of the same fields and the same image
- * bytes as one built before is that one. Only a few are kept - the main
- * frame, its reply form, a room or two with a profile of its own - since
- * each holds its images and its encoding.
+ * bytes as the last of its kind is that one.
+ *
+ * One of each kind, rather than a few of any: a call asks for the main frame
+ * and then each room's in turn, the same order every time, so once a call
+ * needed more than were kept each one pushed out the next to be asked for,
+ * and every frame was built again on every click. A change replaces the
+ * frame of its kind instead of piling up beside it.
  */
 export class ProfileFrames {
-  #frames = new Map<string, { images: ReadonlyArray<ArrayBuffer | undefined>; frame: Uint8Array; hash: number }>();
-
-  constructor(private readonly max = 4) {}
+  /** By scope - "" for the main profile, else the room's code - then by form. */
+  #frames = new Map<string, Map<boolean, {
+    key: string; images: ReadonlyArray<ArrayBuffer | undefined>; frame: Uint8Array; hash: number;
+  }>>();
+  #generation = 0;
 
   /**
-   * The frame `build` makes, and its hash. `key` must name everything in it
-   * but the image bytes; those are compared byte for byte.
+   * How many times clear() has run. A call that read the profile before a
+   * lock passes the count it began with to get(), and so keeps nothing it
+   * builds after the lock.
    */
-  get(key: string, images: ReadonlyArray<ArrayBuffer | undefined>,
-    build: () => Uint8Array): { frame: Uint8Array; hash: number } {
-    let entry = this.#frames.get(key);
-    this.#frames.delete(key);
-    if (!entry || entry.images.length !== images.length ||
-        !entry.images.every((bytes, i) => sameBytes(bytes, images[i]))) {
-      const frame = build();
-      entry = { images, frame, hash: frameHash(frame) };
+  get generation(): number { return this.#generation; }
+
+  /**
+   * The frame `build` makes for `scope`, in its reply form or not, and its
+   * hash. `key` must name everything in it but the image bytes; those are
+   * compared byte for byte.
+   */
+  get(scope: string, reply: boolean, key: string, images: ReadonlyArray<ArrayBuffer | undefined>,
+    build: () => Uint8Array, generation = this.#generation): { frame: Uint8Array; hash: number } {
+    const last = this.#frames.get(scope)?.get(reply);
+    if (last && last.key === key && last.images.length === images.length &&
+        last.images.every((bytes, i) => sameBytes(bytes, images[i]))) return last;
+    const frame = build();
+    const built = { key, images, frame, hash: frameHash(frame) };
+    if (generation === this.#generation) {
+      let forms = this.#frames.get(scope);
+      if (!forms) this.#frames.set(scope, forms = new Map());
+      forms.set(reply, built);
     }
-    this.#frames.set(key, entry);
-    if (this.#frames.size > this.max) this.#frames.delete(this.#frames.keys().next().value!);
-    return entry;
+    return built;
+  }
+
+  /** Drop the frames of every scope not named: a room we have left needs none. */
+  retain(scopes: Iterable<string>): void {
+    const keep = new Set(scopes);
+    for (const scope of [...this.#frames.keys()]) if (!keep.has(scope)) this.#frames.delete(scope);
+  }
+
+  /** Drop them all: a lock or a logout ends the session they were built for. */
+  clear(): void {
+    this.#frames.clear();
+    this.#generation++;
   }
 }
 
