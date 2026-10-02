@@ -1,8 +1,8 @@
 <script lang="ts">
   /**
    * An app in the call. The host mounts this once the person joins the tile;
-   * a one-time disclosure per site comes first, then the site in a sandboxed
-   * iframe that speaks the awful contract
+   * the disclosure comes first, unless they turned it off for this site, then
+   * the site in a sandboxed iframe that speaks the awful contract
    * (docs/awful-contract.md) through this component and nothing else.
    *
    * What the site gets is decided here: the session, what the starter typed
@@ -11,6 +11,7 @@
    */
   import { onDestroy } from "svelte";
   import { Button } from "$lib/components/ui/button";
+  import { Switch } from "$lib/components/ui/switch";
   import type { CallTileProps } from "$lib/plugins/api";
   import { HEARTBEAT_MS, playerId, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
@@ -29,6 +30,8 @@
     cardState.origin && hasAgreed(cardState.origin) ? "open" : "disclose",
   );
   let frame = $state<HTMLIFrameElement | null>(null);
+  /** "Don't show again for this site" - off unless the person turns it on. */
+  let remember = $state(false);
   /**
    * How many times the app has said `ready` since it opened; 0 until then.
    * A count, not a flag: a page that reloads or navigates inside the frame
@@ -79,7 +82,7 @@
   }
 
   function agreeAndOpen(): void {
-    agree(app.origin);
+    if (remember) agree(app.origin);
     phase = "open";
   }
 
@@ -207,6 +210,10 @@
           <p><span class="text-white/60">It gets:</span> your name in this call and a player id that only means something here.</p>
           <p><span class="text-white/60">Not:</span> who you are, this conversation's name or messages, or other rooms.</p>
           <p class="text-amber-300">It sees your IP address. Never type your recovery words or password into an app.</p>
+          <label class="flex cursor-pointer items-center gap-2 text-white/80">
+            <Switch aria-label="Don't show again for {site}" bind:checked={remember} />
+            <span>Don't show again for {site}</span>
+          </label>
           <Button size="sm" class="w-full font-mono text-xs cursor-pointer" onclick={agreeAndOpen}>Open app</Button>
         </div>
       </div>

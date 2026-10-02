@@ -1,7 +1,8 @@
 /**
- * Sites this device has agreed to open apps from, after the disclosure. Per
- * device, by origin: agreeing on a phone says nothing about a laptop, and
- * agreeing to je.frav.in says nothing about any other site.
+ * Sites the person chose not to see the disclosure for again. Per device, by
+ * origin: the origin is what receives the IP, cookies and storage, so every
+ * app on je.frav.in is the same site to the person, and none on any other.
+ * A phone's choice says nothing about a laptop.
  */
 
 const KEY = "awful:apps-sites:v1";
@@ -27,5 +28,14 @@ export function agree(origin: string): void {
     localStorage.setItem(KEY, JSON.stringify(sites.slice(-MAX_SITES)));
   } catch {
     // Storage blocked: the disclosure shows again next time, nothing worse.
+  }
+}
+
+/** Show the disclosure for this site again. */
+export function forget(origin: string): void {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(read().filter((o) => o !== origin)));
+  } catch {
+    // Storage blocked: nothing was remembered to begin with.
   }
 }

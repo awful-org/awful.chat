@@ -33,8 +33,11 @@ with the same person's id in another session. No host secret is involved, so
 nothing new needs protecting.
 
 The site does learn the IP address of everyone who opens it, because it
-serves the page. That is what the one-time disclosure per site is for; it is
-remembered per browser, not per account.
+serves the page. That is what the disclosure is for. It shows every time
+unless the person turns on "Don't show again" for that site - by origin,
+because the origin is what receives the IP, cookies and storage, so every
+app on one site is the same site to them. The choice is kept per browser,
+not per account, and the tile's right-click menu undoes it.
 
 ## The tile
 

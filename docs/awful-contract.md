@@ -26,10 +26,10 @@ What it **does** send is listed in section 4: display names, a player id that
 only means something to you, in this one session, and what the person who
 started the app typed after its URL.
 
-Before someone opens an app from a site for the first time, the host tells
-them, once per site: which site it is, what it will receive (their name in
-the call and a player id), what it will not, and that the site sees their IP
-address, because it serves the page. The site's address stays visible on the
+Before someone opens an app, the host tells them which site it is, what it
+will receive (their name in the call and a player id), what it will not, and
+that the site sees their IP address, because it serves the page. They can
+choose not to be told again for that site. The site's address stays visible on the
 tile for as long as it is open.
 
 ## 2. Starting and opening an app

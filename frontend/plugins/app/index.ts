@@ -2,6 +2,7 @@ import { definePlugin, type HostApi } from "$lib/plugins/api";
 import { manifest } from "./manifest";
 import AppCard from "./AppCard.svelte";
 import AppTile from "./AppTile.svelte";
+import { forget, hasAgreed } from "./consent";
 import { initialState, parseAppCommand, presentPlayers, randomToken, reduce, type AppState } from "./logic";
 
 export default definePlugin<AppState>({
@@ -12,8 +13,19 @@ export default definePlugin<AppState>({
   reduce,
   callTileActive: (s) => !s.ended && !!s.url,
   callTileViewers: (s) => presentPlayers(s).map((p) => p.name),
-  callTileMenu: ({ card, cardState, host }) =>
-    host.selfDid() === cardState.starter && !cardState.ended
+  callTileMenu: ({ card, cardState, host }) => [
+    // The way back from "Don't show again": the notice shows next time.
+    ...(cardState.origin && hasAgreed(cardState.origin)
+      ? [
+          {
+            id: "notice",
+            label: "Show the notice again",
+            icon: "lucide:shield-alert",
+            run: () => forget(cardState.origin),
+          },
+        ]
+      : []),
+    ...(host.selfDid() === cardState.starter && !cardState.ended
       ? [
           {
             id: "end",
@@ -23,7 +35,8 @@ export default definePlugin<AppState>({
             run: () => host.sendUpdate(card.id, { t: "end" }),
           },
         ]
-      : [],
+      : []),
+  ],
   commands: {
     app: async (args: string, host: HostApi) => {
       const parsed = parseAppCommand(args);
