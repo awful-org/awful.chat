@@ -373,6 +373,15 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const signal = this.lifecycle.signal;
     const descriptor = fileEntry(stored);
     const { infoHash } = descriptor;
+    const shown = this.plaintext.get(infoHash);
+    if (shown) {
+      // Decrypted already this session: published again as it is, not a
+      // second copy of it in memory.
+      const snapshot = this.transfers.get(infoHash);
+      if (snapshot) this.emit("transfer", snapshot);
+      this.emit("downloaded", infoHash, shown, true);
+      return true;
+    }
     const ciphertext = data ? new Blob([data]) : await readCiphertext(infoHash);
     if (!ciphertext) return false;
     const plain = await stageDecryptedFile(ciphertext, encryption, descriptor.filename, descriptor.mimeType, signal);
@@ -413,6 +422,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
    * opaque name and piece size so the signed infoHash comes out the same.
    * Never re-encrypt: doing so changes it. `data` is the attachment row's
    * copy, for a file this device's durable store does not hold.
+   *
+   * The first serve of a file in a session still hashes its whole ciphertext:
+   * webtorrent builds a torrent before it can seed one, preloaded pieces or
+   * not. That is seconds for a file of hundreds of MB on a phone, and the
+   * peer waits; a link that times out meanwhile is dialled again and finds
+   * the seed ready. Before, every room open paid it for every file it held,
+   * asked for or not.
    */
   seedStoredFile(descriptor: FileEntry, data?: ArrayBuffer): Promise<boolean> {
     const { infoHash } = descriptor;
@@ -730,13 +746,18 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
     this.knownFiles.set(file.infoHash, file);
     const existing = this.transfers.get(file.infoHash);
-    if (existing?.status === "complete" || existing?.status === "seeding") {
+    const encrypted = !!(file as FileEntry).encryption;
+    // Seeded from its ciphertext alone - a peer asked for it, or it was sent
+    // from here - a protected file is held but was never decrypted here.
+    // Nothing to fetch, and still something to show.
+    const held = encrypted && existing?.status === "seeding" && !this.plaintext.has(file.infoHash);
+    if ((existing?.status === "complete" || existing?.status === "seeding") && !held) {
       return;
     }
     // A protected file this device already holds - one a room open left for
     // its Download button - is shown from that copy, not fetched again.
     const restore = this.localRestore;
-    if ((file as FileEntry).encryption && restore && existing?.status !== "downloading") {
+    if (encrypted && restore && existing?.status !== "downloading") {
       if (this.checkingLocal.has(file.infoHash)) return;
       this.checkingLocal.add(file.infoHash);
       const signal = this.lifecycle.signal;
@@ -746,6 +767,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       });
       return;
     }
+    if (held) return;
     this.fetchFile(file, opts);
   }
 

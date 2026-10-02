@@ -81,8 +81,12 @@ export async function stageEncryptedFile(
  * picture and document opened that session on disk in the clear, outside the
  * at-rest encryption, readable at the unlock screen and untouched by the
  * duress wipe. A Blob is the browser's to keep and to release: it goes with
- * the last URL and reference to it, and nothing it was paged out to outlives
- * the browser.
+ * the last URL and reference to it. Memory is the cost: every decrypted file
+ * stays resident while it is shown, which is why a room open decrypts only so
+ * much by itself (files.svelte.ts). And a browser short of memory may still
+ * page a large Blob out to its own temporary storage - Chromium does, and on
+ * a phone its in-memory share is small - which it clears only when it next
+ * starts, so a browser killed meanwhile leaves that copy on disk until then.
  *
  * Each authenticated chunk becomes a Blob of its own straight away, so the
  * script heap holds one chunk at a time however large the file is; the File

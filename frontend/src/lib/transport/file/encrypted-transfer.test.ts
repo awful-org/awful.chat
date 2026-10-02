@@ -145,9 +145,11 @@ it("showing a stored file again writes nothing and seeds nothing", async () => {
   const { descriptor, bytes, original } = await offer();
   const before = new Map(disk.entries);
   const restarted = transport(); const downloaded = vi.fn(); restarted.on("downloaded", downloaded);
-  // From the durable copy, and from the row's own copy of the same bytes.
+  // From the durable copy, and - in another session - from the row's own
+  // copy of the same bytes.
   expect(await restarted.restoreEncryptedFile(descriptor)).toBe(true);
-  expect(await restarted.restoreEncryptedFile({ ...descriptor, data: bytes } as FileEntry, bytes)).toBe(true);
+  const fromRow = transport(); fromRow.on("downloaded", downloaded);
+  expect(await fromRow.restoreEncryptedFile({ ...descriptor, data: bytes } as FileEntry, bytes)).toBe(true);
   expect(new Map(disk.entries)).toEqual(before);
   expect([...disk.entries].every(([path, blob]) => before.get(path) === blob)).toBe(true);
   expect(seeds).toHaveLength(1);
@@ -155,7 +157,22 @@ it("showing a stored file again writes nothing and seeds nothing", async () => {
   expect(downloaded.mock.calls.map(call => call[2])).toEqual([true, true]);
   expect(await downloaded.mock.calls[1][1].text()).toBe(await original.text());
   // The transfer holds the descriptor only, never the row's bytes.
-  expect(restarted.getTransfer(descriptor.infoHash)).not.toHaveProperty("data");
+  expect(fromRow.getTransfer(descriptor.infoHash)).not.toHaveProperty("data");
+});
+
+it("decrypts a stored file once a session, however often it is shown", async () => {
+  const { descriptor, original } = await offer();
+  const restarted = transport(); const downloaded = vi.fn(); restarted.on("downloaded", downloaded);
+  expect(await restarted.restoreEncryptedFile(descriptor)).toBe(true);
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const again = await restarted.restoreEncryptedFile(descriptor);
+  const decrypts = decrypt.mock.calls.length;
+  decrypt.mockRestore();
+  expect(again).toBe(true);
+  expect(decrypts).toBe(0);
+  // The same file, published again for whoever lost its picture.
+  expect(downloaded.mock.calls[1][1]).toBe(downloaded.mock.calls[0][1]);
+  expect(await downloaded.mock.calls[1][1].text()).toBe(await original.text());
 });
 
 it("keeps one durable copy of a row's bytes when this device's file store has none", async () => {
@@ -166,7 +183,8 @@ it("keeps one durable copy of a row's bytes when this device's file store has no
   expect(await restarted.restoreEncryptedFile(descriptor, bytes)).toBe(true);
   const kept = disk.entries.get(`room-v2-ciphertext/${descriptor.infoHash}`);
   expect(await kept?.arrayBuffer()).toEqual(bytes);
-  expect(await restarted.restoreEncryptedFile(descriptor, bytes)).toBe(true);
+  // The next session finds it there and writes nothing.
+  expect(await transport().restoreEncryptedFile(descriptor, bytes)).toBe(true);
   expect(disk.entries.get(`room-v2-ciphertext/${descriptor.infoHash}`)).toBe(kept);
 });
 
@@ -230,6 +248,32 @@ it("clears what older builds left while this very page holds the node lock, at s
   transport();
   await new Promise(r => setTimeout(r, 30));
   expect(disk.entries.has(plaintext)).toBe(true);
+});
+
+it("shows a file it serves from ciphertext when it is asked for, from here and only once", async () => {
+  const { descriptor, original } = await offer();
+  const restarted = transport();
+  const downloaded = vi.fn(); restarted.on("downloaded", downloaded);
+  const restore = vi.fn((infoHash: string) => restarted.restoreEncryptedFile({ ...descriptor, infoHash }));
+  restarted.setLocalFileLookup(async () => null, restore);
+  // A peer asked for it: seeding, never decrypted here.
+  expect(await restarted.seedStoredFile(descriptor)).toBe(true);
+  expect(restarted.getTransfer(descriptor.infoHash)?.status).toBe("seeding");
+  expect(restarted.getTransfer(descriptor.infoHash)?.blobURL).toBeUndefined();
+  const add = vi.spyOn(Client.prototype, "add");
+  // Its Download button, or auto-download as it comes on screen.
+  restarted.ensureDownload(descriptor, { retry: true });
+  await vi.waitFor(() => expect(downloaded).toHaveBeenCalledOnce());
+  expect(await downloaded.mock.calls[0][1].text()).toBe(await original.text());
+  expect(restarted.getTransfer(descriptor.infoHash)?.blobURL).toBeTruthy();
+  // Shown now: asking again does nothing.
+  restarted.ensureDownload(descriptor, { retry: true });
+  await new Promise(r => setTimeout(r, 10));
+  expect(restore).toHaveBeenCalledOnce();
+  // And nothing was ever fetched for it.
+  expect(add).not.toHaveBeenCalled();
+  add.mockRestore();
+  expect(restarted.getTransfer(descriptor.infoHash)?.status).toBe("seeding");
 });
 
 it("fails closed without OPFS instead of seeding plaintext", async () => {

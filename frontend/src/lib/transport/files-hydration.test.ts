@@ -134,3 +134,67 @@ it("leaves a held file over the auto-download ceiling for its Download button, t
   expect(calls.at(-1)).toBe("show:video:store");
   expect(await files.restore!("h-unknown")).toBe(false);
 });
+
+it("decrypts at most a budget of a room's files by itself, newest first, and leaves the rest held", async () => {
+  const MB = 1024 * 1024;
+  rows = [
+    { ...row("new", 4), size: 40 * MB },
+    { ...row("mid", 3), size: 30 * MB },
+    { ...row("old", 2), size: 20 * MB },
+    { ...row("oldest", 1), size: 10 * MB },
+  ];
+  durable = new Set(["h-new", "h-mid", "h-old", "h-oldest"]);
+  withBytes.clear();
+  await _hydrateAndSeedAttachments("rd2_room");
+  // 40 MB, then 30 that no longer fit, then 20 that do: 64 MB in all.
+  expect(calls.filter((c) => c.startsWith("show:"))).toEqual(["show:new:store", "show:old:store"]);
+  for (const hash of ["h-mid", "h-oldest"]) {
+    expect(transportState.fileTransfers.get(hash)).toMatchObject({ status: "pending", seeders: 1 });
+  }
+  // Asked for, it is shown from here like any other.
+  expect(await files.restore!("h-mid")).toBe(true);
+  expect(calls.at(-1)).toBe("show:mid:store");
+});
+
+it("a file coming on screen while the room opens is decrypted once, and takes nothing from the budget", async () => {
+  const MB = 1024 * 1024;
+  rows = [{ ...row("new", 2), size: 60 * MB }, { ...row("old", 1), size: 60 * MB }];
+  durable = new Set(["h-new", "h-old"]);
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  files.restoreEncryptedFile.mockImplementationOnce(async (r: Attachment) => {
+    calls.push(`show:${r.id}:store`);
+    await gate;
+    return true;
+  });
+  // Auto-download asks for the newest picture as it renders...
+  const shown = files.restore!("h-new");
+  await settle();
+  // ...while the room open reads its files back.
+  const hydration = _hydrateAndSeedAttachments("rd2_room");
+  await settle();
+  release();
+  await Promise.all([shown, hydration]);
+  expect(calls.filter((c) => c.startsWith("show:"))).toEqual(["show:new:store", "show:old:store"]);
+});
+
+it("does not decrypt a file already on screen when it is asked for", async () => {
+  transportState.fileTransfers.set("h-new", { blobURL: "blob:sent-this-session" });
+  expect(await files.restore!("h-new")).toBe(true);
+  expect(calls).toEqual([]);
+});
+
+it("keeps a protected file served from its ciphertext, but never shown here, a file to ask for", async () => {
+  const served = {
+    infoHash: "h-new", filename: "new.png", mimeType: "image/png", size: 8, encryption: {} as never,
+    status: "seeding", progress: 1, done: true, seeding: true, peers: 1, seeders: 1,
+  };
+  files.handlers.transfer(served);
+  expect(transportState.fileTransfers.get("h-new")).toMatchObject({ status: "pending", seeders: 1 });
+  // Shown, it is seeding like any other.
+  files.handlers.transfer({ ...served, blobURL: "blob:transport-owned" });
+  expect(transportState.fileTransfers.get("h-new")).toMatchObject({ status: "seeding" });
+  transportState.fileTransfers = new Map([["h-new", { blobURL: "blob:sent-this-session" }]]);
+  files.handlers.transfer(served);
+  expect(transportState.fileTransfers.get("h-new")).toMatchObject({ status: "seeding" });
+});

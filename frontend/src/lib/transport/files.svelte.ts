@@ -147,12 +147,14 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     });
   }, async (infoHash) => {
     // A download asked for a protected file this device holds: shown from
-    // here, never fetched again (see EAGER_RESTORE_MAX_BYTES).
+    // here, never fetched again (see EAGER_RESTORE_BUDGET_BYTES). One on
+    // screen already - sent from here this session - needs nothing.
+    if (transportState.fileTransfers.get(infoHash)?.blobURL) return true;
     const epoch = _fileEpoch;
     const stored = (await getAttachmentsByInfoHash(infoHash, { skipBytes: true }))
       .find((attachment) => attachment.encryption);
     if (epoch !== _fileEpoch || !stored) return false;
-    return _restoreStoredFile(stored);
+    return restoreStoredFile(stored);
   });
 
   _fileTransport.on("signal", (peerId, envelope) => {
@@ -160,12 +162,24 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
   });
 
   _fileTransport.on("transfer", (snapshot) => {
+    // A protected file seeded from its ciphertext alone - a peer asked for
+    // it - is held here but was never decrypted, so it is not on screen:
+    // it stays a file to ask for (auto-download, or its Download button),
+    // which shows it from this device's copy. As "seeding" it showed
+    // neither the picture nor the button.
+    const unseen =
+      !!snapshot.encryption && snapshot.status === "seeding" && !snapshot.blobURL &&
+      !transportState.fileTransfers.get(snapshot.infoHash)?.blobURL;
     // Never adopt the file transport's own blobURL: it keeps that URL in its
     // own map and re-sends it on every wire/upload/seed event, so once this
     // map had swapped it for a URL of ours (and revoked it), the next event
     // swapped the dead one back in - and the room, already marked hydrated,
     // never rebuilt it. The picture for a download is minted below instead.
-    withFileTransfer({ ...snapshot, blobURL: undefined });
+    withFileTransfer({
+      ...snapshot,
+      blobURL: undefined,
+      ...(unseen ? { status: "pending" as const, done: false } : {}),
+    });
 
     const { infoHash, status } = snapshot;
     if (
@@ -503,14 +517,17 @@ export async function _announceStoredFilesTo(peerId: string): Promise<void> {
 }
 
 /**
- * The largest held file a room open decrypts by itself: the ceiling a fetch
- * nobody asked for already has. A decrypted file lives in memory (see
- * stageDecryptedFile), and a room with a 2 GB video somewhere in its history
- * must not cost 2 GB of it on every visit. A held file over this shows its
- * Download button, and asking for it shows it from this device's own copy
- * (the restore handed to setLocalFileLookup), not from the swarm.
+ * How much a room open decrypts by itself, every file together. A decrypted
+ * file lives in memory for as long as it is shown (see stageDecryptedFile),
+ * and reading back every file a room held cost as much memory as the room's
+ * whole history: a picture-heavy room could end the tab on a phone. Newest
+ * first, as long as a file fits; the rest wait to be asked for - auto-download
+ * as they come on screen, or their Download button - and are then shown from
+ * this device's copy (the restore handed to setLocalFileLookup), never
+ * fetched again. A file already on screen, or being shown because it came on
+ * screen, takes nothing from it.
  */
-const EAGER_RESTORE_MAX_BYTES = AUTO_DOWNLOAD_MAX_BYTES;
+const EAGER_RESTORE_BUDGET_BYTES = AUTO_DOWNLOAD_MAX_BYTES;
 
 export async function _hydrateFileTransfersFromStorage(
   roomCode: string
@@ -534,23 +551,23 @@ export async function _hydrateFileTransfersFromStorage(
       dedup.set(attachment.infoHash, attachment);
   }
 
+  let budget = EAGER_RESTORE_BUDGET_BYTES;
   for (const attachment of dedup.values()) {
     if (epoch !== _fileEpoch) return [];
     if (attachment.encryption) {
-      // Already on screen this session: sent, downloaded or opened before.
-      if (transportState.fileTransfers.get(attachment.infoHash)?.blobURL) continue;
-      if (attachment.size > EAGER_RESTORE_MAX_BYTES) {
-        withFileTransfer({
-          infoHash: attachment.infoHash, filename: attachment.filename,
-          mimeType: attachment.mimeType, size: attachment.size,
-          encryption: attachment.encryption, width: attachment.width, height: attachment.height,
-          status: "pending", progress: 0, done: false, seeding: false, peers: 0, seeders: 1,
-        });
+      const { infoHash } = attachment;
+      const current = transportState.fileTransfers.get(infoHash);
+      // On screen already (sent, downloaded or opened before), being shown
+      // because it came on screen, or being fetched.
+      if (current?.blobURL || current?.status === "downloading" || _restoring.has(infoHash)) continue;
+      if (attachment.size > budget) {
+        _markHeld(attachment);
         continue;
       }
+      budget -= attachment.size;
       // One file that will not open must not keep the rest of the room's
       // from showing.
-      await _restoreStoredFile(attachment).catch(() => {});
+      await restoreStoredFile(attachment).catch(() => {});
       continue;
     }
     if (roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) continue;
@@ -579,9 +596,44 @@ export async function _hydrateFileTransfersFromStorage(
   return [...dedup.values()];
 }
 
+/** A held file a room open left for later: its Download button, with this
+ *  device counted as a seeder. A transfer under way, or one that failed and
+ *  says why, is left as it is. */
+function _markHeld(attachment: Attachment): void {
+  const current = transportState.fileTransfers.get(attachment.infoHash);
+  if (current && current.status !== "pending") return;
+  withFileTransfer({
+    infoHash: attachment.infoHash, filename: attachment.filename,
+    mimeType: attachment.mimeType, size: attachment.size,
+    encryption: attachment.encryption, width: attachment.width, height: attachment.height,
+    status: "pending", progress: 0, done: false, seeding: false, peers: 0,
+    seeders: Math.max(1, current?.seeders ?? 0),
+  });
+}
+
+/**
+ * Show one stored protected file at a time, whoever asks: a room open, the
+ * file coming on screen (auto-download through the local restore) and a
+ * plugin reading it used to decrypt it once each, all at once, and keep
+ * every copy in memory.
+ */
+const _restoring = new Map<string, Promise<boolean>>();
+
 /** Show one stored protected file: from this device's durable ciphertext
  *  when it holds it, else from the attachment row's own copy. False when
  *  neither is here. */
+export function restoreStoredFile(attachment: Attachment): Promise<boolean> {
+  const { infoHash } = attachment;
+  let restoring = _restoring.get(infoHash);
+  if (!restoring) {
+    const restore = _restoreStoredFile(attachment).finally(() => {
+      if (_restoring.get(infoHash) === restore) _restoring.delete(infoHash);
+    });
+    _restoring.set(infoHash, (restoring = restore));
+  }
+  return restoring;
+}
+
 async function _restoreStoredFile(attachment: Attachment): Promise<boolean> {
   const epoch = _fileEpoch;
   const transport = getFileTransport();
@@ -689,6 +741,7 @@ export function _resetAttachmentHydration(): void {
   _seedable = null;
   _seedableRead = null;
   _persistedStatus.clear();
+  _restoring.clear();
   _hydratedRooms.clear();
   _hydrating.clear();
   attachmentHydration.rooms.clear();

@@ -103,7 +103,10 @@ Query doctrine: bulk index getAll of raw sealed rows, filter on clear
         (see frontend/src/lib/storage-crypto.ts)
 Files:  outside IndexedDB, OPFS holds file ciphertext only (see File
         Transfer); a decrypted attachment exists only in memory, as a Blob,
-        so it never outlives the browser and no lock or wipe has to chase it.
+        so no lock or wipe has to chase it. A browser short of memory may
+        page a large Blob to its own temporary storage (Chromium does, and
+        its in-memory share is small on a phone), cleared only when it next
+        starts - which is one reason a room open decrypts only so much.
 ```
 
 ---
@@ -694,14 +697,23 @@ room open (first time in a session), newest first:
   file IN MEMORY from room-v2-ciphertext, or from the row's data when this
   device has no durable copy (which is then written, once) → blobURL.
   Nothing is seeded, re-hashed or rewritten, and the rows are not touched.
-  A file over the auto-download ceiling (64MB) is left "pending" with its
-  Download button; a download asked for a file this device holds is shown
-  from it (webtorrent.ts ensureDownload), never fetched again.
+  A decrypted file stays in memory while it is shown, so the pass decrypts
+  64MB at most, newest first, as
+  long as each file fits; a file already on screen, or already being shown
+  because it came on screen, costs nothing. The rest are left "pending":
+  auto-download asks for media as it comes on screen, anything else waits
+  for its Download button - and a file this device holds is then shown
+  from it (webtorrent.ts ensureDownload), never fetched again. One restore
+  per file at a time, whoever asks (files.svelte.ts restoreStoredFile).
 
 serving (a peer's link connects for a file with no torrent here):
   seed room-v2-ciphertext/<infoHash> as it is - the original opaque name
   and 256 KiB pieces, so the infoHash is the signed one - with the pieces
-  read from the file itself (CiphertextChunkStore). Never decrypted.
+  read from the file itself (CiphertextChunkStore). Never decrypted, and so
+  not on screen: the file stays "pending" here until it is asked for. The
+  first serve in a session hashes the ciphertext (webtorrent builds the
+  torrent before seeding it) - seconds for hundreds of MB on a phone - and
+  a link that times out meanwhile is dialled again and finds the seed.
 
 status: written to the rows when it changes, read without the file bytes.
 A torrent's progress becomes a snapshot at most every 250 ms.
@@ -719,7 +731,8 @@ decrypted file:
   a quick call's storage lock. The duress wipe removes all of OPFS.
 
 blobURL:
-  created: download done, or room open; always from an in-memory File
+  created: download done, room open, or a held file asked for; always from
+           an in-memory File
   revoked: session reset (lock, identity switch) or page unload
 ```
 
