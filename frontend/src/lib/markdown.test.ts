@@ -124,6 +124,63 @@ describe("inline markdown", () => {
     }
   });
 
+  it("reads a label as it draws, so what cannot be seen does not hide an address", () => {
+    const disguised = [
+      // Nothing to see: zero-width characters, a soft hyphen, a joiner, a
+      // variation selector, a tag character, a combining mark, a hair space.
+      "paypal.\u200bcom",
+      "paypal\u200b.com",
+      "pay\u00adpal.c\u00adom",
+      "paypal.\u2060com",
+      "paypal.\u200ccom",
+      "paypal.\ufeffcom",
+      "paypal.c\u034fom",
+      "paypal.co\ufe0fm",
+      "paypal.\u{E0020}com",
+      "paypal.c\u0337om",
+      "paypal.\u200acom",
+      // A letter that passes for ASCII, in the domain's last part.
+      "paypal.c\u03bfm",
+      "paypal.\u0441om",
+      "paypal.\u0441\u043e",
+      "paypal.c\u3147m",
+      // A dot that is not one, and letters in another form.
+      "paypal\ua4f8com",
+      "paypal\ufe52com",
+      "paypal\u0660com",
+      "\uff50\uff41\uff59\uff50\uff41\uff4c\uff0e\uff43\uff4f\uff4d",
+      "\u{1D429}\u{1D41A}\u{1D432}\u{1D429}\u{1D41A}\u{1D425}.\u{1D41C}\u{1D428}\u{1D426}",
+      // A whole url, split where it cannot be seen.
+      "https:/\u200b/www\u200b.paypal\u200b.com/login",
+      // Drawn backwards: an override shows "t.co" from text that spells "oc.t".
+      "\u202eoc.t",
+    ];
+    for (const label of disguised) {
+      const html = plain(`[${label}](https://evil.example/login)`);
+      expect(html, label).toContain(">https://evil.example/login</a>");
+      expect(html, label).not.toContain(`>${label}</a>`);
+      expect(stripMarkdown(`[${label}](https://evil.example/login)`), label).toContain("https://evil.example/login");
+    }
+  });
+
+  it("still masks a label in any language that is not an address", () => {
+    const labels = [
+      "Instala\u00e7\u00e3o do servidor",
+      "caf\u00e9 com leite",
+      "H\u01b0\u1edbng d\u1eabn s\u1eed d\u1ee5ng",
+      "col\u00b7lecci\u00f3",
+      "\u041c\u043e\u0441\u043a\u0432\u0430",
+      "\u65e5\u672c\u8a9e\u306e\u30da\u30fc\u30b8\u3002\u8a73\u3057\u304f\u306f\u3053\u3061\u3089",
+      "iPhone\u306e\u4f7f\u3044\u65b9\u3002\u8a73\u3057\u304f",
+      "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 photos",
+      "e.g. this one",
+      "v1.2 notes",
+    ];
+    for (const label of labels) {
+      expect(plain(`[${label}](https://a.bc/x)`), label).toContain(`title="https://a.bc/x"`);
+    }
+  });
+
   it("links bare urls without the punctuation around them", () => {
     expect(plain("see https://a.bc/d.")).toBe(
       'see <a href="https://a.bc/d" target="_blank" rel="noopener noreferrer">https://a.bc/d</a>.',

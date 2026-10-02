@@ -88,12 +88,39 @@ const SPAN_RE = new RegExp(
 /**
  * Text that reads as an address. A masked link showing one is how a link
  * that says one site and opens another is made, so it is not masked: the
- * real url shows instead. Tested with the markup taken out, so
- * "**paypal.com**" or "`paypal.com`" is still read as an address, and with
- * the dots that draw like one ("paypal․com").
+ * real url shows instead.
+ *
+ * Tested as it draws, not as it is spelled: "paypal.com" with a zero-width
+ * space after the dot, or a Greek ο in "com", passed for plain text.
+ *  - The markup goes ("**paypal.com**", "`paypal.com`"), and so does what
+ *    draws as nothing: zero-width characters, soft hyphens, joiners,
+ *    variation selectors, tag characters, combining marks, the hair space.
+ *  - Compatibility forms fold ("ｐａｙｐａｌ．ｃｏｍ"), and what draws as a dot
+ *    reads as one ("paypal․com", "paypalꓸcom").
+ *  - A letter or digit outside ASCII reads as one that could pass for an
+ *    ASCII one, so "paypal.cοm" is an address. Not Chinese or Japanese,
+ *    whose sentences run on after a full stop with no space between.
+ * A label that reorders itself (a bidi override, embedding or isolate) is
+ * never masked: an override draws "t.co" from text that spells "oc.t".
  */
-const LOOKS_LIKE_URL_RE = /:\/\/|\bwww[.\u2024\u3002\uFF0E\uFF61]|\w[.\u2024\u3002\uFF0E\uFF61][a-z]{2,}(?![a-z0-9])/i;
-const looksLikeUrl = (label: string) => LOOKS_LIKE_URL_RE.test(label.replace(/[*~_|\x60\\]/g, ""));
+const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
+/** Markup, and what draws as nothing. Before NFKD, which makes the hair space a space. */
+const UNSEEN_RE = /[\p{Default_Ignorable_Code_Point}\u200A*~_|\x60\\]/gu;
+/** A full stop, or what Unicode's confusables list says draws as one. */
+const DOT_LIKE_RE = /[\u0660\u06F0\u0701\u0702\u3002\uA4F8\uA60E\u{10A50}\u{1D16D}]/gu;
+const MARK_RE = /\p{M}/gu;
+const LOOKALIKE_RE = /(?![\p{ASCII}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])[\p{L}\p{N}]/gu;
+const REORDERS_RE = /[\u202A-\u202E\u2066-\u2069]/;
+function looksLikeUrl(label: string): boolean {
+  if (REORDERS_RE.test(label)) return true;
+  const drawn = label
+    .replace(UNSEEN_RE, "")
+    .normalize("NFKD")
+    .replace(DOT_LIKE_RE, ".")
+    .replace(MARK_RE, "")
+    .replace(LOOKALIKE_RE, "x");
+  return LOOKS_LIKE_URL_RE.test(drawn);
+}
 
 /**
  * A url found in running text, without the punctuation that ends the
