@@ -52,10 +52,21 @@ describe("/app {url} {args}", () => {
       expect(parseAppUrl(bad, own), bad).toBeNull();
       expect(appUrlProblem(bad, own), bad).toMatch(/can't start with awful\.chat/);
     }
-    // "www." on the instance's name is the same name.
+    // "www." on the instance's name is the same name, and in front of the
+    // app's host it reads as the instance just the same.
     expect(parseAppUrl("https://awful.chat.attacker.net", "www.awful.chat")).toBeNull();
+    for (const bad of ["https://www.awful.chat/", "https://www.awful.chat.securesession.attacker.net/"]) {
+      expect(parseAppUrl(bad, own), bad).toBeNull();
+      expect(parseAppUrl(bad, "www.awful.chat"), bad).toBeNull();
+      expect(appUrlProblem(bad, own), bad).toMatch(/can't start with awful\.chat/);
+    }
     // Not the same name: these end where they end, and show it.
-    for (const ok of ["https://games.awful.chat/", "https://awful.chatroom.net/", "https://notawful.chat.example/"]) {
+    for (const ok of [
+      "https://games.awful.chat/",
+      "https://awful.chatroom.net/",
+      "https://notawful.chat.example/",
+      "https://www.awful.chatroom.net/",
+    ]) {
       expect(parseAppUrl(ok, own), ok).not.toBeNull();
       expect(appUrlProblem(ok, own), ok).toBeNull();
     }

@@ -34,14 +34,17 @@
   // newest comes from the call tiles' own answer, which moves only when a
   // card is stored: asking host.cards() on every card-state change re-read
   // the room's cards for every vote and every heartbeat, from every app
-  // card on screen. Watched on the flag, not the state: every heartbeat is
-  // a new state object.
+  // card on screen. Watched on the flag and the room, not on the objects
+  // carrying them: every heartbeat is a new state, every status change
+  // (sent, delivered) a new message, and a watch rebuilt for each let a
+  // replaced card pass for running until the room was read again.
   const ended = $derived(app.ended);
+  const roomCode = $derived(card.roomCode);
   $effect(() => {
     if (ended) return;
-    return watchRoomCards(card.roomCode);
+    return watchRoomCards(roomCode);
   });
-  const newest = $derived(newestCardOf(card.roomCode, manifest.id));
+  const newest = $derived(newestCardOf(roomCode, manifest.id));
   const replaced = $derived(!!newest && newest !== card.id);
 
   async function end(): Promise<void> {

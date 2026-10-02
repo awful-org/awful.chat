@@ -66,8 +66,8 @@ An app is a page at an `https:` URL that:
 
 Any `https:` URL a room member opens is allowed, with the notice in section 1,
 except a host longer than 64 characters, or one that starts with the instance's
-own name (`awful.chat.example.net` on awful.chat): that reads as the instance to
-anyone reading from the left.
+own name, `www.` or not (`awful.chat.example.net` on awful.chat): that reads as
+the instance to anyone reading from the left.
 
 ## 4. Messages
 

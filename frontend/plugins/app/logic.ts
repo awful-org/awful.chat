@@ -71,10 +71,10 @@ function readUrl(input: string): URL | null {
  * Why a host is refused, or null. One that starts with this instance's own
  * name (awful.chat.<anything>.attacker.net) is that name to anyone reading
  * it from the left, and the instance itself would be framing its own pages.
- * "www." on the instance's name counts the same. Judged against the address
- * this client is on: each person is kept from their own instance's name, so
- * on an instance served under two names a card can open under one and not
- * the other.
+ * "www." in front of either name counts the same: www.awful.chat.<anything>
+ * reads as the instance too. Judged against the address this client is on:
+ * each person is kept from their own instance's name, so on an instance
+ * served under two names a card can open under one and not the other.
  */
 function hostProblem(hostname: string, instance: string | undefined): string | null {
   if (hostname.length > MAX_HOST) {
@@ -82,8 +82,9 @@ function hostProblem(hostname: string, instance: string | undefined): string | n
   }
   const own = instance?.toLowerCase().replace(/\.$/, "");
   if (own) {
+    const bare = hostname.replace(/^www\./, "");
     for (const name of new Set([own, own.replace(/^www\./, "")])) {
-      if (hostname === name || hostname.startsWith(`${name}.`)) {
+      if (bare === name || bare.startsWith(`${name}.`)) {
         return `An app's address can't start with ${name}, this site's own name.`;
       }
     }
