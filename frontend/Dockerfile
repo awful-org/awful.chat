@@ -47,6 +47,13 @@ COPY .git /.git
 
 RUN pnpm build
 
+# A gzip -9 copy beside each script and stylesheet, which nginx serves as is
+# (gzip_static) instead of compressing every request at level 1. Here, not in
+# `pnpm build`: the copies are for this image's nginx, and dist/ itself stays
+# what the reproducibility check hashes. See scripts/precompress.mjs for what
+# is left out (index.html, JSON) and why.
+RUN node scripts/precompress.mjs dist
+
 # Pinned minor: a floating :alpine changes what runs on every build with no
 # diff to review.
 FROM nginx:1.30-alpine AS runner
