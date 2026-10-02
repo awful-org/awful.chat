@@ -123,13 +123,15 @@ export const roomCommands: CmdSource = (host) => {
   if (activeCode) {
     cmds.push({
       id: "room.copyLink",
-      title: "Copy room link",
+      title: "Copy permanent room link",
+      subtitle: "Never expires; anyone it reaches can join. A short code has limits",
+      keywords: ["invite", "link", "permanent"],
       group: "Rooms",
       icon: Link,
       action: {
         kind: "act",
         perform: () => {
-          // Fragment form - see RoomCreateJoin's handleCopy.
+          // The saved invitation link, fragment form (see RoomCreateJoin's createdLink).
           // On failure the invite dialog shows the link, or why there is none.
           savedRoomInvitationLink(window.location.origin, activeCode)
             .then((url) => navigator.clipboard.writeText(url))
@@ -168,12 +170,12 @@ export const roomCommands: CmdSource = (host) => {
       },
     });
 
-    // The header's invite menu, minus nothing: the invite dialog (QR and
-    // short code), and the OS share sheet where the browser has one.
+    // The header's Invite: the invite dialog, short code first, then the
+    // permanent link; and the OS share sheet where the browser has one.
     cmds.push({
       id: "room.copyShortCode",
-      title: "Invite with QR code or short code",
-      keywords: ["invite", "qr", "short code", "share"],
+      title: "Invite people with a short code",
+      keywords: ["invite", "qr", "short code", "share", "people"],
       group: "Rooms",
       icon: KeyRound,
       action: {
@@ -184,7 +186,7 @@ export const roomCommands: CmdSource = (host) => {
     if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
       cmds.push({
         id: "room.shareLink",
-        title: "Share room link",
+        title: "Share permanent room link",
         keywords: ["invite", "send"],
         group: "Rooms",
         icon: Share2,

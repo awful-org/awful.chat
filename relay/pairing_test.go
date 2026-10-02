@@ -365,6 +365,23 @@ func TestPairingLetsInAsManyAsAskedThenCloses(t *testing.T) {
 	}
 }
 
+// Someone who started on a code that then filled up is told at their next
+// poll, not left waiting for a reply that will never come.
+func TestPairingClosedCodeRefusesWaitingJoiners(t *testing.T) {
+	resetPairing(t)
+	token := createPairingWith(t, map[string]any{"uses": 1})
+	late := strings.Repeat("z", 32)
+	if rec := pairingRequest(t, "10.0.0.3", map[string]any{"action": "start", "kind": "start", "payload": ke1("late"), "attempt": late}); rec.Code != 200 {
+		t.Fatalf("late start: %d", rec.Code)
+	}
+	if code := pairingExchange(t, token, strings.Repeat("a", 32)); code != 200 {
+		t.Fatalf("first person: %d", code)
+	}
+	if rec := pairingRequest(t, "10.0.0.3", map[string]any{"action": "join-poll", "attempt": late}); rec.Code != 409 {
+		t.Fatalf("waiting joiner on a closed code: %d", rec.Code)
+	}
+}
+
 func TestPairingAttemptsFollowTheUses(t *testing.T) {
 	resetPairing(t)
 	createPairingWith(t, map[string]any{"uses": 3})

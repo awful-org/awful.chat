@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { savedRoomInvitationLink } from "$lib/room-security/invitations";
   import { onDestroy, tick, untrack } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
@@ -53,7 +52,6 @@
     RefreshCw,
     MailX,
     EllipsisVertical,
-    QrCode,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -1202,19 +1200,14 @@
       invitationOpen = true;
     }
   });
-  function invitationUrl(): Promise<string> {
-    return inviteLink
-      ? Promise.resolve(inviteLink)
-      : savedRoomInvitationLink(window.location.origin, roomCode);
-  }
-
+  // Copy and share are a quick call's: a room's Invite opens the invite
+  // dialog instead (short code first), so only `inviteLink` is ever sent.
   async function copyCode() {
     copyMenuOpen = false;
+    if (!inviteLink) return;
     try {
-      await navigator.clipboard.writeText(await invitationUrl());
+      await navigator.clipboard.writeText(inviteLink);
     } catch {
-      // The dialog shows the link to copy by hand, or why there is none.
-      if (!inviteLink) invitationOpen = true;
       return;
     }
     copied = true;
@@ -1231,19 +1224,15 @@
 
   async function shareLink() {
     copyMenuOpen = false;
+    if (!inviteLink) return;
     try {
-      await navigator.share({ url: await invitationUrl() });
+      await navigator.share({ url: inviteLink });
     } catch (err) {
       // Dismissing the sheet is not a failure and must not silently copy
       // something the user decided not to send.
       if ((err as Error)?.name === "AbortError") return;
       await copyCode();
     }
-  }
-
-  async function copyShortCode() {
-    copyMenuOpen = false;
-    invitationOpen = true;
   }
 
   /**
@@ -2194,19 +2183,25 @@
           <!-- Desktop only: the phone header has no room for it next to the
                room name; its overflow sheet carries the same actions. -->
           <div class="relative hidden sm:block" data-copy-menu>
-            <Tip text={copied ? "Copied" : "Copy invite"}>
+            <!-- A room's Invite opens the invite dialog, short code first: the
+                 permanent link is the least private invite there is, so it is
+                 no longer the one-click default. A quick call's link is the
+                 call itself and has no short code: that keeps its menu. -->
+            <Tip text={inviteLink ? (copied ? "Copied" : "Copy invite") : "Invite people"}>
               {#snippet children(props)}
             <button
               {...props}
               type="button"
-              onclick={() => (copyMenuOpen = !copyMenuOpen)}
-              aria-label="Copy invite"
-              aria-haspopup="menu"
-              aria-expanded={copyMenuOpen}
+              onclick={() => (inviteLink ? (copyMenuOpen = !copyMenuOpen) : (invitationOpen = true))}
+              aria-label={inviteLink ? "Copy invite" : "Invite people"}
+              aria-haspopup={inviteLink ? "menu" : "dialog"}
+              aria-expanded={inviteLink ? copyMenuOpen : undefined}
               class="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
             >
               <span>Invite</span>
-              {#if copied}
+              {#if !inviteLink}
+                <UserPlus class="size-3 mb-0.5" />
+              {:else if copied}
                 <Check class="size-3 text-primary" />
               {:else}
                 <Copy class="size-3 mb-0.5" />
@@ -2236,17 +2231,6 @@
                   >
                     <Share2 class="size-3.5" />
                     Share link
-                  </button>
-                {/if}
-                {#if !inviteLink}
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onclick={copyShortCode}
-                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted cursor-pointer"
-                  >
-                    <QrCode class="size-3.5" />
-                    QR or short code
                   </button>
                 {/if}
               </div>
@@ -2503,38 +2487,40 @@
               <Users class="size-4 text-muted-foreground" />
               {showUserList ? "Hide users" : "Show users"}
             </button>
-            <button
-              type="button"
-              onclick={() => {
-                moreOpen = false;
-                void copyCode();
-              }}
-              class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
-            >
-              <Copy class="size-4 text-muted-foreground" />
-              Copy invite link
-            </button>
-            {#if canShare}
+            {#if inviteLink}
               <button
                 type="button"
                 onclick={() => {
                   moreOpen = false;
-                  void shareLink();
+                  void copyCode();
                 }}
                 class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
               >
-                <Share2 class="size-4 text-muted-foreground" />
-                Share invite link
+                <Copy class="size-4 text-muted-foreground" />
+                Copy invite link
               </button>
-            {/if}
-            {#if !inviteLink}
+              {#if canShare}
+                <button
+                  type="button"
+                  onclick={() => {
+                    moreOpen = false;
+                    void shareLink();
+                  }}
+                  class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+                >
+                  <Share2 class="size-4 text-muted-foreground" />
+                  Share invite link
+                </button>
+              {/if}
+            {:else}
+              <!-- Short code first, as on desktop (the invite dialog). -->
               <button
                 type="button"
-                onclick={() => { moreOpen = false; void copyShortCode(); }}
+                onclick={() => { moreOpen = false; invitationOpen = true; }}
                 class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
               >
-                <QrCode class="size-4 text-muted-foreground" />
-                QR or short code
+                <UserPlus class="size-4 text-muted-foreground" />
+                Invite people
               </button>
             {/if}
           {:else}

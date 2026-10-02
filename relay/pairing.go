@@ -287,6 +287,13 @@ func handlePairing(w http.ResponseWriter, r *http.Request) {
 			apiError(w, r, "unknown attempt", 404)
 			return
 		}
+		// A code that let in everyone it was made for answers no one else:
+		// a joiner it never got to is told now, not left polling until the
+		// code's whole lifetime runs out.
+		if e.closed && len(messages) == 0 && e.stages[b.Attempt] != "transfer" {
+			apiError(w, r, "pairing rejected", 409)
+			return
+		}
 		reply = messages
 		e.attempts[b.Attempt] = nil
 	default:

@@ -20,7 +20,8 @@
   interface Props {
     busy?: boolean;
     onSubmit: (limits: { uses: number; ttlMs: number }) => void;
-    onBack: () => void;
+    /** Shown as a Back button when the panel was opened from something else. */
+    onBack?: () => void;
   }
   let { busy = false, onSubmit, onBack }: Props = $props();
 
@@ -85,7 +86,9 @@
     </div>
   </div>
   <div class="flex gap-2">
-    <Button variant="ghost" size="sm" class="font-mono text-xs cursor-pointer" onclick={onBack}>Back</Button>
+    {#if onBack}
+      <Button variant="ghost" size="sm" class="font-mono text-xs cursor-pointer" onclick={onBack}>Back</Button>
+    {/if}
     <Button size="sm" class="flex-1 font-mono text-xs cursor-pointer" disabled={busy} onclick={submit}>
       {busy ? "Getting a code..." : "Get code"}
     </Button>
