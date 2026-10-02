@@ -358,6 +358,15 @@ export interface SearchIndexRecord {
   lastLamport: number;
   /** JSON bytes of SearchEntry[]; sealed via the `bytes` spec. */
   data: ArrayBuffer;
+  /**
+   * How many of the room's message rows (of every type) sat below
+   * lastLamport when the index was written. Sealed with the row's other
+   * fields, and absent on rows older builds wrote: they never read it, and a
+   * row without it is checked the old way. A count that still matches means
+   * nothing landed underneath the index since, so only the rows from
+   * lastLamport up need reading to bring it current.
+   */
+  rowsBelow?: number;
 }
 
 /**
@@ -1218,9 +1227,16 @@ export async function getSearchIndex(
   }
 }
 
-export async function putSearchIndex(record: SearchIndexRecord): Promise<void> {
+export async function putSearchIndex(
+  record: SearchIndexRecord,
+  /** Asked once the row is sealed, right before the write: a room deleted
+   *  while its index was being sealed must not get the index back. */
+  stillWanted?: () => boolean
+): Promise<void> {
   const database = await getDB();
-  await database.put("searchIndex", await _seal("searchIndex", record));
+  const sealed = await _seal("searchIndex", record);
+  if (stillWanted && !stillWanted()) return;
+  await database.put("searchIndex", sealed);
 }
 
 export async function deleteSearchIndex(roomCode: string): Promise<void> {
@@ -1361,35 +1377,85 @@ export async function deleteDiagnostics(): Promise<void> {
  * cost. The count is the half that matters: a repair sync backfills OLDER
  * messages, which move no lamport high-water mark at all, so "lastLamport
  * is current" alone would bless an index that silently lost them.
+ *
+ * `countBelow` is the same count for rows below the given lamport only.
+ *
+ * Every row of the room is read, so only an index row written before
+ * rowsBelow existed comes here, once; countRowsBelow is the check after
+ * that. One bulk read, not a cursor: an await per row held the store for
+ * the whole walk, and a send issued meanwhile waited the better part of a
+ * second.
  */
 export async function getSearchableStats(
   roomCode: string,
-  types: readonly ChatMessageType[]
-): Promise<{ newestLamport: number; count: number }> {
-  const database = await getDB();
+  types: readonly ChatMessageType[],
+  below = 0
+): Promise<{ newestLamport: number; count: number; countBelow: number }> {
   const wanted = new Set<ChatMessageType>(types);
-  const blindRoomCode = await blindValue(roomCode);
-  const ranges: Blinded[] = [blindRoomCode];
-  if (!isMigrationComplete()) ranges.push(roomCode as Blinded);
   let newest = 0;
   let count = 0;
-  for (const code of ranges) {
-    let cursor = await database
-      .transaction("messages")
-      .store.index("byRoomLamport")
-      .openCursor(
-        IDBKeyRange.bound([code, 0], [code, Number.MAX_SAFE_INTEGER]),
-        "prev"
-      );
-    while (cursor) {
-      if (wanted.has(cursor.value.type)) {
-        newest = Math.max(newest, cursor.value.lamport);
-        count += 1;
-      }
-      cursor = await cursor.continue();
+  let countBelow = 0;
+  for (const row of await _rawRoomMessages(roomCode)) {
+    if (!wanted.has(row.type)) continue;
+    newest = Math.max(newest, row.lamport);
+    count += 1;
+    if (row.lamport < below) countBelow += 1;
+  }
+  return { newestLamport: newest, count, countBelow };
+}
+
+/** The room's index ranges: the blinded one, and during the migration window
+ *  the plaintext one as well. */
+async function _roomLamportRanges(
+  roomCode: string,
+  from: number,
+  to: number,
+  openTop: boolean
+): Promise<IDBKeyRange[]> {
+  const codes: Blinded[] = [await blindValue(roomCode)];
+  if (!isMigrationComplete()) codes.push(roomCode as Blinded);
+  return codes.map((code) => IDBKeyRange.bound([code, from], [code, to], false, openTop));
+}
+
+/**
+ * How many of the room's rows, of any type, sit below `lamport`. The index
+ * counts them in the database itself - no row is read, let alone opened -
+ * which is what makes the search index's coverage check cheap enough to run
+ * every time a room is first searched.
+ */
+export async function countRowsBelow(roomCode: string, lamport: number): Promise<number> {
+  if (lamport <= 0) return 0;
+  const database = await getDB();
+  const ranges = await _roomLamportRanges(roomCode, 0, lamport, true);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const counts = await Promise.all(ranges.map((range) => index.count(range)));
+  return counts.reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * The room's rows of the given types from `lamport` up, decrypted, oldest
+ * first: what a search index that ends at `lamport` is missing. type and id
+ * are clear fields, so rows of other types, and rows the index already
+ * holds (`known`), never pay for a decrypt.
+ */
+export async function getSearchableSince(
+  roomCode: string,
+  lamport: number,
+  types: readonly ChatMessageType[],
+  known?: ReadonlySet<string>
+): Promise<Message[]> {
+  const database = await getDB();
+  const ranges = await _roomLamportRanges(roomCode, lamport, Number.MAX_SAFE_INTEGER, false);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const wanted = new Set<ChatMessageType>(types);
+  const byId = new Map<string, Message>();
+  for (const rows of await Promise.all(ranges.map((range) => index.getAll(range)))) {
+    for (const row of rows) {
+      if (wanted.has(row.type) && !known?.has(row.id)) byId.set(row.id, row);
     }
   }
-  return { newestLamport: newest, count };
+  const opened = await _openAll<Message>("messages", [...byId.values()]);
+  return opened.sort(compareMessages);
 }
 
 export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
