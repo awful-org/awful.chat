@@ -101,6 +101,11 @@ vi.mock("./mailbox.svelte", () => ({
     return "sent";
   },
 }));
+// Counted, not replaced: each call decrypts every DM record.
+vi.mock("$lib/rooms.svelte", async (original) => {
+  const real = await original<typeof import("$lib/rooms.svelte")>();
+  return { ...real, refreshDmRooms: vi.fn(real.refreshDmRooms) };
+});
 
 import {
   _peerIdToDid,
@@ -108,12 +113,21 @@ import {
   deliverMailboxDm,
   transportState,
 } from "./transport.svelte";
-import { MAX_UNSOLICITED_DMS } from "./dm.svelte";
-import { getDMRooms, getLastMessage, putRoom, wipeLocalDatabase } from "$lib/storage";
+import { MAX_DMS_JOINED_FOR_THEM, MAX_UNSOLICITED_DMS, ensureDmRoomForPeer } from "./dm.svelte";
+import {
+  getDMRooms,
+  getLastMessage,
+  getMessage,
+  getRoom,
+  putMessage,
+  putRoom,
+  wipeLocalDatabase,
+  type DMRoom,
+} from "$lib/storage";
 import { encode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
-import { roomsStore } from "$lib/rooms.svelte";
+import { refreshDmRooms, roomsStore } from "$lib/rooms.svelte";
 import { hashDmRoomCode, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
 import { notifyIdentityLock } from "$lib/identity/lock-events";
@@ -256,4 +270,75 @@ describe("a dropped first contact still spends the session's budget", () => {
     await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
     expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
   }, 60_000);
+});
+
+// A mailbox batch for a DM that cannot be joined - others hold every join
+// they may - stays in the mailbox and comes back on every collect. Each time
+// it re-read every DM record (and, for a new conversation, made it and took
+// it away again) before finding it could not be joined.
+describe("a mailbox batch for a DM that cannot be joined", () => {
+  /** A DM stored earlier, accepted, with one message from them in it. */
+  async function savedDm(did: string): Promise<string> {
+    const roomCode = await code(did);
+    await putRoom({ roomCode, type: "dm", name: "", lastSeenLamport: 0, createdAt: 1, participants: [did],
+      participantLastSeen: {}, participantDid: did, request: false } as DMRoom);
+    await putMessage({ id: newMessageId(did), roomCode, senderId: did, senderName: "", timestamp: 1, lamport: 1,
+      type: MessageType.Text, content: "earlier", attachments: [], status: "delivered" });
+    return roomCode;
+  }
+  const batchFrom = (as: UnlockedSession, room: string, lamport = 1) => {
+    const card = signedWire(as, room, { lamport });
+    return { card, blob: encode({ type: MessageType.SyncBatch, roomCode: room, messages: [card], batchIndex: 0, totalBatches: 1 }) };
+  };
+
+  it("is kept without re-reading the DM list or making anything", async () => {
+    for (let i = 0; i < MAX_DMS_JOINED_FOR_THEM; i++) {
+      const did = identity().did;
+      await savedDm(did);
+      await ensureDmRoomForPeer(did, undefined, { unsolicited: true });
+    }
+    const joins = s.joins;
+    const late = identity();
+    const { card, blob } = batchFrom(late, await savedDm(late.did), 2);
+    vi.mocked(refreshDmRooms).mockClear();
+    await expect(deliverMailboxBatch(late.did, blob)).rejects.toThrow("Conversation not joined");
+    expect(await getMessage(card.id)).toBeUndefined();
+
+    const stranger = identity();
+    const strangerRoom = await code(stranger.did);
+    await expect(deliverMailboxBatch(stranger.did, batchFrom(stranger, strangerRoom).blob))
+      .rejects.toThrow("Conversation not joined");
+    expect(await getRoom(strangerRoom)).toBeUndefined();
+    expect(refreshDmRooms).not.toHaveBeenCalled();
+    expect(s.joins).toBe(joins);
+  }, 60_000);
+
+  // Each collect admitted such a first contact again, charged it and took
+  // it away: with no attacker at all, the session's new conversations ran
+  // out one kept blob at a time.
+  it("holds no first contact back, however many such blobs come back", async () => {
+    for (let i = 0; i < MAX_DMS_JOINED_FOR_THEM; i++) {
+      const did = identity().did;
+      await savedDm(did);
+      await ensureDmRoomForPeer(did, undefined, { unsolicited: true });
+    }
+    for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+      const sender = identity();
+      await expect(deliverMailboxBatch(sender.did, batchFrom(sender, await code(sender.did)).blob))
+        .rejects.toThrow("Conversation not joined");
+    }
+    // Stored, if not joined: it carries on through the mailbox.
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }, 60_000);
+
+  it("and taken into one that can be, still without re-reading the DM list", async () => {
+    const peer = identity();
+    const { card, blob } = batchFrom(peer, await savedDm(peer.did), 2);
+    vi.mocked(refreshDmRooms).mockClear();
+    await deliverMailboxBatch(peer.did, blob);
+    expect(await getMessage(card.id)).toBeDefined();
+    expect(refreshDmRooms).not.toHaveBeenCalled();
+  });
 });

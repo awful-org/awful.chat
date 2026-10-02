@@ -1530,6 +1530,17 @@ function _joinAccount(
   return theirs.size < MAX_DMS_JOINED_FOR_THEM ? "theirs" : null;
 }
 
+/**
+ * Whether the other side writing in this conversation could have it joined
+ * now: it is joined already, or there is room left in what others can keep
+ * joined (MAX_DMS_JOINED_FOR_THEM). A mailbox batch for one that cannot
+ * waits in the mailbox and comes back on every collect, so this is asked
+ * before anything is made or re-read for it.
+ */
+export function dmJoinableForThem(roomCode: string): boolean {
+  return _joinAccount(requireSession(), roomCode, true) !== null;
+}
+
 function _noteJoin(
   session: UnlockedSession,
   roomCode: string,

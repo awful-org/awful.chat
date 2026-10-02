@@ -181,6 +181,7 @@ import {
   dmConversationCodeAsync,
   dmPeerDid,
   dmPeerDidForRoom,
+  dmJoinableForThem,
   dmRoomExists,
   dropDmIfEmpty,
   ensureDmRoomForPeer,
@@ -3754,17 +3755,20 @@ export async function deliverMailboxBatch(
   const existed = await dmRoomExists(senderDid);
   guard();
   if (!existed && !(await _anyRowTakable(roomCode, messages, senderDid, live))) return;
-  // The batch handler refuses a room we have not joined, and a conversation
-  // whose first contact arrives through the mailbox has never been joined.
-  // No room means a new conversation that did not fit: like a text, it
-  // stays in the mailbox for a later collect.
-  if (!(await _ensureDmForBatch(senderDid, guard))) {
+  // The batch handler takes nothing for a conversation we have not joined,
+  // and one past what others can keep joined (dm.svelte.ts,
+  // MAX_DMS_JOINED_FOR_THEM) is not joined for a batch: the blob waits in
+  // the mailbox until it can be. Asked before anything is made or re-read
+  // for it, as such a blob comes back on every collect.
+  if (!dmJoinableForThem(roomCode)) throw new Error("Conversation not joined");
+  // A conversation whose first contact arrives through the mailbox has
+  // never been joined. No room means a new conversation that did not fit:
+  // like a text, it stays in the mailbox for a later collect.
+  if (!(await _ensureDmForBatch(senderDid, guard, existed))) {
     throw new Error("No room for a new conversation");
   }
   try {
-    // Stored but not joined: past what others can keep joined (dm.svelte.ts,
-    // MAX_DMS_JOINED_FOR_THEM). The batch handler takes nothing for a room
-    // not joined, so the blob waits in the mailbox until it is.
+    // Not joined after all: the bound filled up meanwhile.
     if (!_transport.rooms().includes(roomCode)) throw new Error("Conversation not joined");
     await _handleSyncBatch(roomCode, messages, senderDid, live);
   } finally {
@@ -3874,11 +3878,20 @@ function _rowReadable(row: unknown, roomCode: string): boolean {
 }
 
 /**
- * Create the conversation a DM batch is the first contact of, as a request.
- * False when there is no room for it (a new conversation that did not fit).
+ * Join the conversation a DM batch is for, creating it - a request, from a
+ * stranger - when the batch is its first contact. False when there is no
+ * room for a new one (a new conversation that did not fit). The DM list is
+ * re-read only for one just made: that decrypts every DM record, and a
+ * mailbox batch for a DM we already have can come back on every collect.
  */
-async function _ensureDmForBatch(senderDid: string, guard: () => void): Promise<boolean> {
+async function _ensureDmForBatch(
+  senderDid: string,
+  guard: () => void,
+  existed = false
+): Promise<boolean> {
   if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return false;
+  guard();
+  if (existed) return true;
   // A request this just created must be known as one before anything in the
   // batch is announced (_announceMessage reads roomsStore).
   await refreshDmRooms();
