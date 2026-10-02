@@ -73,6 +73,11 @@
     onpointerdown: trigger.press,
     onfocus: trigger.focus,
     onblur: trigger.blur,
+    // Using the control - Enter or Space on a focused one too - hides the
+    // tip, as bits-ui's trigger does on click. In the capture phase: every
+    // child sets its own onclick after these props, which replaces an
+    // onclick given here (it replaced Tip's as well).
+    onclickcapture: trigger.activate,
   });
 </script>
 

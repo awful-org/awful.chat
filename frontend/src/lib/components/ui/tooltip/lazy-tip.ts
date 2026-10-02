@@ -4,8 +4,9 @@
  *
  * The rules are bits-ui's trigger's, which Tip uses: a pointer that rests on
  * the control for the delay shows it, keyboard focus shows it at once, and
- * leaving, blurring or pressing hides it. A finger has no hover, and focus
- * that comes from a press is not keyboard focus, so neither shows anything.
+ * leaving, blurring, pressing or using it hides it. A finger has no hover,
+ * and focus that comes from a press is not keyboard focus, so neither shows
+ * anything.
  */
 export interface TipTrigger {
   pointerEnter(e: PointerEvent): void;
@@ -14,6 +15,8 @@ export interface TipTrigger {
   press(e: PointerEvent): void;
   focus(e: FocusEvent): void;
   blur(): void;
+  /** The control was used: a click, from a pointer or from Enter or Space. */
+  activate(): void;
   /** The component went away: nothing may fire after this. */
   dispose(): void;
 }
@@ -70,6 +73,10 @@ export function createTipTrigger(opts: {
       opts.show(e.currentTarget as HTMLElement);
     },
     blur() {
+      cancel();
+      opts.hide();
+    },
+    activate() {
       cancel();
       opts.hide();
     },

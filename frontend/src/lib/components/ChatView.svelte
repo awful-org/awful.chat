@@ -55,8 +55,7 @@
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
-  import { Tip } from "$lib/components/ui/tooltip";
-  import LazyTip from "$lib/components/ui/tooltip/lazy-tip.svelte";
+  import { LazyTip, Tip } from "$lib/components/ui/tooltip";
   import { Separator } from "$lib/components/ui/separator";
   import {
     Drawer,

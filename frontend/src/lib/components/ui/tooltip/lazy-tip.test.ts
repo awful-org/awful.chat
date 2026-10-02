@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTipTrigger } from "./lazy-tip";
 
@@ -96,6 +97,28 @@ describe("lazy tip trigger", () => {
     vi.advanceTimersByTime(1000);
     expect(show).not.toHaveBeenCalled();
     expect(hide).toHaveBeenCalled();
+  });
+
+  it("hides when the control is used, from the keyboard as well", () => {
+    const el = control();
+    trigger.focus(focusOn(el));
+    expect(show).toHaveBeenCalledTimes(1);
+    // Enter or Space on a focused button is a click, with no press before it.
+    trigger.activate();
+    expect(hide).toHaveBeenCalledTimes(1);
+    // A show still waiting goes with it.
+    trigger.pointerEnter(pointer(el));
+    trigger.activate();
+    vi.advanceTimersByTime(1000);
+    expect(show).toHaveBeenCalledTimes(1);
+  });
+
+  // Every control under a tip sets its own onclick after the props it is
+  // handed, which replaces an onclick among them: the tip listens to the
+  // click in the capture phase instead.
+  it("hears the click under the control's own onclick", () => {
+    const source = readFileSync("src/lib/components/ui/tooltip/lazy-tip.svelte", "utf8");
+    expect(source).toContain("onclickcapture: trigger.activate");
   });
 
   it("fires nothing once disposed", () => {

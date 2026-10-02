@@ -15,8 +15,7 @@
   import { apiUrl } from "$lib/runtime-config";
   import { isGifUrl } from "$lib/media-url";
   import { remotePreviewUrl } from "$lib/preview-url";
-  import { Tip } from "$lib/components/ui/tooltip";
-  import LazyTip from "$lib/components/ui/tooltip/lazy-tip.svelte";
+  import { LazyTip, Tip } from "$lib/components/ui/tooltip";
   import {
     ChevronDown,
     Download,
