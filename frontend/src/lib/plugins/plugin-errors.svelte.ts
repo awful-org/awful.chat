@@ -19,6 +19,12 @@ export interface PluginErrorEntry {
 
 /** A sentence or two, not a stack trace. */
 export const MAX_ERROR_LENGTH = 300;
+/**
+ * How long a note stays before it goes by itself (PluginErrorRow's bar,
+ * held while the cursor is on it). Long enough to read two lines and the
+ * usage they quote.
+ */
+export const ERROR_LINGER_MS = 8_000;
 /** Per room: older ones go first. */
 export const MAX_ERRORS_PER_ROOM = 3;
 
