@@ -42,6 +42,7 @@ vi.mock("$lib/storage", () => ({
   getOwnProfile: s.profile,
   getPeerProfile: async () => undefined, putPeerProfile: async () => {},
   updateParticipantLastSeen: async () => {}, addRoomParticipants: async () => {},
+  addRoomParticipant: async () => {}, getRoomParticipants: async () => [],
   getOwnRoomProfile: async () => undefined,
   getRoom: async (room: string) => ({ roomCode: room, type: "text", createdAt: 1 }),
   MAX_ROOM_PARTICIPANTS: 512,
@@ -56,9 +57,14 @@ vi.mock("../telemetry/taps", () => ({ stopTelemetryTaps: vi.fn(), installTelemet
 vi.mock("./node-lock", () => ({ releaseNodeLock: vi.fn() }));
 vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
+// Counted, so a frame built for nothing shows.
+vi.mock("$lib/utils", async (original) => {
+  const utils = await original<typeof import("$lib/utils")>();
+  return { ...utils, bytesToBase64: vi.fn(utils.bytesToBase64) };
+});
 
 import { broadcastProfile } from "./transport.svelte";
-import { decode, encode } from "$lib/utils";
+import { bytesToBase64, decode, encode, sniffImageMime } from "$lib/utils";
 
 /** Full profiles handed to the transport, by peer, oldest first. */
 function profilesTo(peer?: string) {
@@ -156,4 +162,48 @@ it("starts the copies one at a time, letting the event loop run in between", asy
   await vi.waitFor(() => expect(profilesTo()).toHaveLength(3));
   // All three used to be started, and sealed, in the one task that began them.
   expect(startedBeforeTheNextTask).toBe(1);
+});
+
+it("encodes an unchanged avatar once however many room clicks ask, into the same bytes as ever", async () => {
+  // Fresh buffers on every read, as storage decrypts them.
+  const avatar = () => new Uint8Array(4096).fill(9).buffer;
+  s.profile.mockImplementation(async () => ({ nickname: "Alice C", pfpData: avatar() }));
+  const base64 = vi.mocked(bytesToBase64);
+  base64.mockClear();
+  broadcastProfile();
+  await vi.waitFor(() => expect(profilesTo()).toHaveLength(3));
+  for (let click = 0; click < 5; click++) {
+    vi.setSystemTime(Date.now() + 60_000);
+    broadcastProfile();
+  }
+  await settle();
+  expect(profilesTo()).toHaveLength(3);
+  expect(base64).toHaveBeenCalledOnce();
+  const actual = await vi.importActual<typeof import("$lib/utils")>("$lib/utils");
+  const bytes = new Uint8Array(avatar());
+  const [, , frame] = s.roomSend.mock.calls.find(([, , f]) => (decode(f) as { type: string }).type === MessageType.Profile)!;
+  expect(frame).toEqual(encode({
+    type: MessageType.Profile, name: "Alice C", did: "did:alice",
+    avatarUrl: `data:${sniffImageMime(bytes)};base64,${actual.bytesToBase64(bytes)}`,
+    color: null, peerId: "self", bindingSig: "sig", roomProfilesSupported: true,
+  }));
+});
+
+it("sends members the relay lists again nothing they hold, and one it lists anew our profile", async () => {
+  broadcastProfile();
+  await vi.waitFor(() => expect(profilesTo()).toHaveLength(3));
+  vi.setSystemTime(Date.now() + 60_000); // past the burst window
+  // A rendezvous reconnect: every room's members, listed again.
+  for (const room of s.rooms) s.handlers.get("roomPeers")!(room, s.peers);
+  await settle();
+  expect(profilesTo()).toHaveLength(3);
+  s.peers.push("p4");
+  try {
+    s.handlers.get("roomPeers")!("rd2_a", ["p4"]);
+    await vi.waitFor(() => expect(profilesTo("p4")).toHaveLength(1));
+  } finally {
+    s.peers.pop();
+    s.handlers.get("disconnect")!("p4");
+  }
+  expect(profilesTo()).toHaveLength(4);
 });

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { ProfileEcho, PROFILE_ECHO_WINDOW_MS, frameHash } from "./profile-echo";
+import { describe, expect, it, vi } from "vitest";
+import { ProfileEcho, ProfileFrames, PROFILE_ECHO_WINDOW_MS, frameHash } from "./profile-echo";
 
 const A = new Uint8Array([1, 2, 3]);
 const B = new Uint8Array([1, 2, 4]);
@@ -96,5 +96,39 @@ describe("profile echo", () => {
     const other = new Uint8Array(200_000);
     other[199_999] = 1;
     expect(frameHash(big)).not.toBe(frameHash(other));
+  });
+});
+
+describe("profile frames", () => {
+  // Every read of the profile decrypts fresh buffers, so the bytes are what count.
+  const image = (fill: number) => new Uint8Array(64 * 1024).fill(fill).buffer;
+
+  it("builds a frame once for the same fields and image bytes, and again when either changes", () => {
+    const frames = new ProfileFrames();
+    const build = vi.fn(() => new Uint8Array([build.mock.calls.length]));
+    const first = frames.get("alice", [image(7), undefined], build);
+    expect(first.hash).toBe(frameHash(first.frame));
+    expect(frames.get("alice", [image(7), undefined], build)).toBe(first);
+    expect(build).toHaveBeenCalledOnce();
+    const edited = new Uint8Array(image(7));
+    edited[edited.length - 1] = 8;
+    expect(frames.get("alice", [edited.buffer, undefined], build)).not.toBe(first);
+    expect(frames.get("alice", [image(7), image(1)], build)).not.toBe(first);
+    expect(frames.get("alice, renamed", [image(7), image(1)], build)).not.toBe(first);
+    expect(build).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps only so many, the least recently asked for going first", () => {
+    const frames = new ProfileFrames(2);
+    const build = vi.fn(() => new Uint8Array([1]));
+    frames.get("main", [], build);
+    frames.get("room a", [], build);
+    frames.get("main", [], build);
+    frames.get("room b", [], build);
+    expect(build).toHaveBeenCalledTimes(3);
+    frames.get("main", [], build);
+    expect(build).toHaveBeenCalledTimes(3);
+    frames.get("room a", [], build);
+    expect(build).toHaveBeenCalledTimes(4);
   });
 });

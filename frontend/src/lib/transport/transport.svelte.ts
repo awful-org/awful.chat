@@ -213,7 +213,7 @@ import {
   syncProgress,
 } from "./sync-progress.svelte";
 import { issueLamport, observeLamport, remoteLamportAllowed } from "./logical-clock";
-import { ProfileEcho, frameHash } from "./profile-echo";
+import { ProfileEcho, ProfileFrames, frameHash } from "./profile-echo";
 import { initVoice } from "./voice.svelte";
 import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
 import { ev } from "../telemetry/event";
@@ -1117,7 +1117,8 @@ function _sendRoomName(peerId?: string, roomCode: string | null = transportState
   } else _transport.broadcast(payload, roomCode);
 }
 
-async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
+/** `missingOnly`, with a peerId: send them only what they were never delivered. */
+async function _sendProfile(peerId?: string, isReply = false, missingOnly = false): Promise<void> {
   const profile = await getOwnProfile();
   const did = identityStore.did ?? null;
   // Room capability is learned only from a verified main profile.
@@ -1151,31 +1152,34 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
 
   // Encoded once per image for the whole call, however many frames carry it.
   const dataUrls = new Map<ArrayBuffer, string>();
-  const imageUrl = (url: string | undefined, data: ArrayBuffer | undefined): string | null => {
-    if (url) return url;
-    if (!data) return null;
-    let dataUrl = dataUrls.get(data);
-    if (dataUrl === undefined) {
+  const dataUrl = (data: ArrayBuffer): string => {
+    let url = dataUrls.get(data);
+    if (url === undefined) {
       const bytes = new Uint8Array(data);
-      dataUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
-      dataUrls.set(data, dataUrl);
+      url = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
+      dataUrls.set(data, url);
     }
-    return dataUrl;
+    return url;
   };
 
-  const frameFor = (source: typeof profile, roomScoped = false, reply = isReply): Uint8Array =>
-    encode({
+  // Built only when nothing built before matches (_profileFrames): a room
+  // click or a resume that changed nothing encodes nothing.
+  const frameFor = (source: typeof profile, roomScoped = false, reply = isReply): { frame: Uint8Array; hash: number } => {
+    // An uploaded image goes where its URL would, and a URL wins over one.
+    const avatar = source?.pfpURL ? undefined : source?.pfpData;
+    const banner = source?.bannerURL ? undefined : source?.bannerData;
+    const fields = {
       type: MessageType.Profile,
       name: source?.nickname?.trim() || "Anonymous",
       did,
-      avatarUrl: imageUrl(source?.pfpURL, source?.pfpData),
+      avatarUrl: source?.pfpURL || null,
       color: source?.color ?? null,
       peerId: _transport.selfId(),
       bindingSig: binding?.bindingSig,
       reply: reply || undefined,
       roomProfilesSupported: roomScoped ? undefined : true,
       roomScoped: roomScoped || undefined,
-      bannerUrl: imageUrl(source?.bannerURL, source?.bannerData) ?? undefined,
+      bannerUrl: source?.bannerURL || undefined,
       gradient2: source?.gradient2 ?? undefined,
       gradient3: source?.gradient3 ?? undefined,
       tagText: source?.tagText ?? undefined,
@@ -1187,7 +1191,14 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
       nameGlow: source?.nameGlow ?? undefined,
       inboxOff: roomScoped ? undefined : inboxOff,
       pq: roomScoped ? undefined : pq,
-    });
+    };
+    // Same fields in the same order, so the same bytes on the wire as ever.
+    return _profileFrames.get(JSON.stringify(fields), [avatar, banner], () => encode({
+      ...fields,
+      ...(avatar ? { avatarUrl: dataUrl(avatar) } : {}),
+      ...(banner ? { bannerUrl: dataUrl(banner) } : {}),
+    }));
+  };
 
   // A room with no overrides needs no copy of the profile: it is the main
   // one, which the peer already has. It gets this instead - a frame with no
@@ -1205,12 +1216,10 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
       roomInherit: true,
     });
 
-  const payload = frameFor(profile);
-
-  const hash = frameHash(payload);
+  const { frame: payload, hash } = frameFor(profile);
   // What the peer holds once this lands. A reply carries the same profile as
   // the frame that provoked it, so the reply flag is not part of it.
-  const held = isReply ? frameHash(frameFor(profile, false, false)) : hash;
+  const held = isReply ? frameFor(profile, false, false).hash : hash;
   const sendTo = (pid: string): boolean => {
     if (!_profileEcho.shouldSend(pid, hash)) {
       _stats.profilesSkipped++;
@@ -1233,10 +1242,11 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
         const resolved = override && hasRoomOverrides(override.fields)
           ? resolveRoomProfile(profile, override.fields)
           : null;
-        const frame = resolved ? frameFor(resolved, true) : inheritFrame();
-        const scopedHash = frameHash(frame);
+        const built = resolved ? frameFor(resolved, true) : null;
+        const frame = built?.frame ?? inheritFrame();
+        const scopedHash = built?.hash ?? frameHash(frame);
         return { frame, hash: scopedHash,
-          held: resolved && isReply ? frameHash(frameFor(resolved, true, false)) : scopedHash };
+          held: resolved && isReply ? frameFor(resolved, true, false).hash : scopedHash };
       })().catch(() => null);
       scopedFrames.set(roomCode, built);
     }
@@ -1269,7 +1279,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   };
 
   if (peerId) {
-    await sendProfileTo(peerId);
+    await sendProfileTo(peerId, missingOnly);
     return;
   }
 
@@ -1346,6 +1356,8 @@ const _lastAppInbound = new Map<string, number>();
 const _profileRepair = new Map<string, { next: number; delay: number }>();
 /** One copy of an unchanged profile per peer per burst - see profile-echo.ts. */
 const _profileEcho = new ProfileEcho();
+/** Our profile frames as last encoded - see profile-echo.ts. */
+const _profileFrames = new ProfileFrames();
 const _roomProfilePeers = new Set<string>();
 
 if (typeof window !== "undefined") {
@@ -3451,7 +3463,10 @@ _transport.on("status", (status) => {
 _transport.on("roomPeers", (room, peerIds) => {
   if (!_transport.rooms().includes(room)) return;
   for (const pid of peerIds) {
-    _sendProfile(pid);
+    // Only what they lack: the relay re-lists every member after each
+    // rendezvous reconnect. A peer that really lost ours reloaded, and gets
+    // it regardless - from the connect handler, or as the reply to its own.
+    _sendProfile(pid, false, true);
     flushQueuedDmForPeer(pid).catch(() => {});
     // The other half of the connect handler's gate. Everything there that
     // names a room code is refused for a peer the relay had not yet placed
