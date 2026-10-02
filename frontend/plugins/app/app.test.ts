@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_ARGS,
   MAX_GAME,
+  MAX_HOST,
   PRESENCE_TTL_MS,
+  appUrlProblem,
   initialState,
   parseAppCommand,
   parseAppUrl,
@@ -34,6 +36,44 @@ describe("/app {url} {args}", () => {
     for (const bad of ["http://je.frav.in", "javascript:alert(1)", "data:text/html,hi", "https://user:pw@je.frav.in", "localhost", "", "ftp://a.bc"]) {
       expect(parseAppUrl(bad), bad).toBeNull();
     }
+  });
+
+  // An app on awful.chat.<padding>.attacker.net read as the instance itself
+  // wherever its address was cut at the end, which was everywhere it showed.
+  it("refuses a host that starts with this site's own name", () => {
+    const own = "awful.chat";
+    for (const bad of [
+      "https://awful.chat/",
+      "https://awful.chat.securesessionverificationformembersonly.attacker.net/unlock",
+      "awful.chat.attacker.net",
+      "https://AWFUL.CHAT.attacker.net",
+      "https://awful.chat./",
+    ]) {
+      expect(parseAppUrl(bad, own), bad).toBeNull();
+      expect(appUrlProblem(bad, own), bad).toMatch(/can't start with awful\.chat/);
+    }
+    // "www." on the instance's name is the same name.
+    expect(parseAppUrl("https://awful.chat.attacker.net", "www.awful.chat")).toBeNull();
+    // Not the same name: these end where they end, and show it.
+    for (const ok of ["https://games.awful.chat/", "https://awful.chatroom.net/", "https://notawful.chat.example/"]) {
+      expect(parseAppUrl(ok, own), ok).not.toBeNull();
+      expect(appUrlProblem(ok, own), ok).toBeNull();
+    }
+  });
+
+  it("refuses a host long enough to be padding", () => {
+    const host = `${"a".repeat(MAX_HOST - "x.net".length - 1)}.x.net`;
+    expect(host).toHaveLength(MAX_HOST);
+    expect(parseAppUrl(`https://${host}/`)).not.toBeNull();
+    expect(parseAppUrl(`https://b${host}/`)).toBeNull();
+    expect(appUrlProblem(`https://b${host}/`)).toMatch(/at most 64/);
+    // A card from an older build carrying one is unusable here, and takes no tile.
+    expect(initialState({ ...card, url: `https://b${host}/` }, { senderDid: ANA }).ended).toBe(true);
+  });
+
+  it("explains only a refused host, not a malformed address", () => {
+    expect(appUrlProblem("not a url")).toBeNull();
+    expect(appUrlProblem("https://je.frav.in")).toBeNull();
   });
 
   it("passes what follows the URL to the app, bounded", () => {

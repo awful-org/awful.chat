@@ -7,13 +7,13 @@
   import { Button } from "$lib/components/ui/button";
   import type { CardProps } from "$lib/plugins/api";
   import { presentPlayers, type AppState } from "./logic";
+  import SiteAddress from "./SiteAddress.svelte";
   import SiteIcon from "./SiteIcon.svelte";
 
   let { card, cardState, host }: CardProps<AppState> = $props();
 
   // $derived: a const would capture the prop once and miss every update.
   const app = $derived(cardState);
-  const site = $derived(app.url ? new URL(app.url).host : "");
   const mine = $derived(host.selfDid() === app.starter);
   // The clock, ticking while the app runs: someone whose tab closed sends no
   // "leave", and only time passing takes them off the list.
@@ -64,13 +64,14 @@
 
 <div class="flex w-full flex-col gap-2 font-mono">
   {#if !app.url}
-    <p class="text-xs text-muted-foreground">This app can't be opened: its address is missing or not https.</p>
+    <p class="text-xs text-muted-foreground">This app can't be opened: its address is missing, not https, or not one an app may use.</p>
   {:else}
     <div class="flex items-center gap-2">
       <SiteIcon url={app.url} class="size-8 text-sm" />
+      <!-- Never cut at the end: that is where the site's real name is. -->
       <div class="min-w-0">
-        <p class="truncate text-sm font-semibold text-foreground">{site}</p>
-        <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>
+        <SiteAddress url={app.url} class="text-sm font-semibold text-foreground" />
+        <SiteAddress url={app.url} path class="text-[11px] text-muted-foreground" />
       </div>
     </div>
     {#if app.args}

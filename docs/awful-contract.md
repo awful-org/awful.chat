@@ -32,7 +32,8 @@ Before someone opens an app, the host tells them which site it is, what it
 will receive (their name in the call and a player id), what it will not, and
 that the site sees their IP address, because it serves the page. They can
 choose not to be told again for that site. The site's address stays visible on the
-tile for as long as it is open.
+tile for as long as it is open, and where it does not fit, it is cut at the start,
+never at the end: the end is what names your site.
 
 ## 2. Starting and opening an app
 
@@ -63,7 +64,10 @@ An app is a page at an `https:` URL that:
 - **sizes itself to the tile.** The tile is the iframe's viewport and changes
   size (focus, fullscreen, pop-out, phones). Do not assume a minimum.
 
-Any `https:` URL a room member opens is allowed, with the notice in section 1.
+Any `https:` URL a room member opens is allowed, with the notice in section 1,
+except a host longer than 64 characters, or one that starts with the instance's
+own name (`awful.chat.example.net` on awful.chat): that reads as the instance to
+anyone reading from the left.
 
 ## 4. Messages
 
