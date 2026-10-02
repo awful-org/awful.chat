@@ -366,8 +366,10 @@ so. To read one:
 4. Optional, on your own instance: set `TELEMETRY_ENABLED=1` on the relay, and
    the user turns **Allow upload to this instance** on. The relay then staples
    its OWN view of that peer to the bundle - registration outcomes and the real
-   reason a rendezvous stream closed, which the client cannot know. Read
-   `docs/spec.md` "Server Privacy" first: this is a real disclosure change.
+   reason a rendezvous stream closed, which the client cannot know. It keeps a
+   peer's events for half an hour after the last one, so upload soon after the
+   problem. Read `docs/spec.md` "Server Privacy" first: this is a real
+   disclosure change.
 5. Set `SFU_TELEMETRY=1` for the third vantage, and capture the container logs
    with timestamps: `docker logs -t <sfu>` and `docker logs -t <relay>`.
 

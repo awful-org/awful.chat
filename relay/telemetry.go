@@ -103,8 +103,18 @@ const (
 	// (RING_CAPACITY, frontend/src/lib/telemetry/ring.ts): the relay only
 	// ever sees its OWN rendezvous protocol events for one peer, not the
 	// whole app-layer traffic a client vantage covers, so far fewer events
-	// carry the same useful window.
+	// carry the same useful window. A ring grows to this as events arrive
+	// rather than being allocated whole: allocated up front it was 21 KiB
+	// for every peerId the relay ever saw, read only if that peer uploads.
 	telemetryRingCapacity = 256
+	// A peer's ring is dropped once nothing has been recorded for it for this
+	// long. Nothing freed a ring when its peer left, so the table filled to
+	// telemetryMaxTrackedPeers with peers long gone - quick pages and device
+	// sync mint a fresh peerId every session - and held 90 to 350 MiB of
+	// resident memory until a restart. Half an hour leaves time to upload a
+	// bundle after a problem; a peer still connected records its next close,
+	// open or register into a new ring.
+	telemetryRingIdle = 30 * time.Minute
 	// Distinct peers the relay will hold a ring for at once. Unlike the
 	// registry's own maxTotalRegistrations, nothing else bounds this map's
 	// growth - a peer only needs to open and close one rendezvous stream to
@@ -227,17 +237,18 @@ type relayDiagEvent struct {
 	D map[string]any `json:"d,omitempty"`
 }
 
-// peerDiag is one peer's diagnostic ring: a pre-allocated array plus a head
-// index, exactly the frontend's DiagRing (ring.ts) - wraparound overwrites
-// the oldest event and increments dropped rather than growing or shifting.
+// peerDiag is one peer's diagnostic ring, like the frontend's DiagRing
+// (ring.ts): once full, wraparound overwrites the oldest event and
+// increments dropped rather than growing or shifting. Until then it grows as
+// events arrive, up to telemetryRingCapacity.
 type peerDiag struct {
 	mu        sync.Mutex
-	events    []relayDiagEvent
-	head      int // next write index
-	filled    int // valid slots, <= len(events)
-	dropped   int // evicted by wraparound
-	nextSeq   int // never resets while this peer's entry lives
-	lastTouch time.Time
+	peerId    string           // what every event's Peer points at
+	events    []relayDiagEvent // oldest first until full, then a ring
+	head      int              // next write index once full
+	dropped   int              // evicted by wraparound
+	nextSeq   int              // never resets while this peer's entry lives
+	lastTouch time.Time        // guarded by diagMu, not mu
 }
 
 func (pd *peerDiag) push(e relayDiagEvent) {
@@ -245,11 +256,19 @@ func (pd *peerDiag) push(e relayDiagEvent) {
 	defer pd.mu.Unlock()
 	pd.nextSeq++
 	e.Seq = pd.nextSeq
-	if pd.filled >= len(pd.events) {
-		pd.dropped++
-	} else {
-		pd.filled++
+	e.Peer = &pd.peerId
+	if len(pd.events) < telemetryRingCapacity {
+		if len(pd.events) == cap(pd.events) {
+			// Doubling, but never past the capacity: append's own growth
+			// rounds up and left a full ring with room for over 300.
+			grown := make([]relayDiagEvent, len(pd.events), min(max(2*cap(pd.events), 4), telemetryRingCapacity))
+			copy(grown, pd.events)
+			pd.events = grown
+		}
+		pd.events = append(pd.events, e)
+		return
 	}
+	pd.dropped++
 	pd.events[pd.head] = e
 	pd.head = (pd.head + 1) % len(pd.events)
 }
@@ -258,13 +277,11 @@ func (pd *peerDiag) push(e relayDiagEvent) {
 func (pd *peerDiag) snapshot() ([]relayDiagEvent, int) {
 	pd.mu.Lock()
 	defer pd.mu.Unlock()
-	out := make([]relayDiagEvent, pd.filled)
-	if pd.filled < len(pd.events) {
-		copy(out, pd.events[:pd.filled])
-	} else {
-		n := copy(out, pd.events[pd.head:])
-		copy(out[n:], pd.events[:pd.head])
-	}
+	// head stays 0 until the ring is full, so this is a plain copy before
+	// then.
+	out := make([]relayDiagEvent, len(pd.events))
+	n := copy(out, pd.events[pd.head:])
+	copy(out[n:], pd.events[:pd.head])
 	return out, pd.dropped
 }
 
@@ -275,7 +292,27 @@ func (pd *peerDiag) snapshot() ([]relayDiagEvent, int) {
 var (
 	diagMu    sync.Mutex
 	diagPeers = map[string]*peerDiag{}
+	// When diagRecord last dropped idle rings; see telemetryRingIdle.
+	diagLastSwept time.Time
 )
+
+// diagReasons holds one shared D map per constant reason an event can carry,
+// so a ring full of rv.close or rv.send.fail events does not hold a map of
+// its own per event - those were 350 bytes each, and a peer sending junk
+// frames could fill every slot with them. The maps are never written after
+// they are made. Keyed by the field and value, both from fixed vocabularies
+// in this package.
+var diagReasons sync.Map
+
+// diagReason returns the shared {key: value} map for an event's D.
+func diagReason(key, value string) map[string]any {
+	k := key + "\x00" + value
+	if m, ok := diagReasons.Load(k); ok {
+		return m.(map[string]any)
+	}
+	m, _ := diagReasons.LoadOrStore(k, map[string]any{key: value})
+	return m.(map[string]any)
+}
 
 // diagSeverityFor is diagRecord's default severity per kind, matching the
 // classes KIND_SEV (frontend/src/lib/telemetry/schema.ts) draws for every
@@ -324,15 +361,23 @@ func diagRecord(peerId string, e relayDiagEvent) {
 	now := time.Now()
 	e.T = now.UnixMilli()
 	e.Sev = diagSeverityFor(e.Kind)
-	e.Peer = &peerId
 
 	diagMu.Lock()
+	// The same opportunistic sweep as rateAllow's, at most once a minute.
+	if now.Sub(diagLastSwept) > time.Minute {
+		diagLastSwept = now
+		for id, pd := range diagPeers {
+			if now.Sub(pd.lastTouch) >= telemetryRingIdle {
+				delete(diagPeers, id)
+			}
+		}
+	}
 	pd, ok := diagPeers[peerId]
 	if !ok {
 		if len(diagPeers) >= telemetryMaxTrackedPeers {
 			evictOldestPeerLocked()
 		}
-		pd = &peerDiag{events: make([]relayDiagEvent, telemetryRingCapacity)}
+		pd = &peerDiag{peerId: peerId}
 		diagPeers[peerId] = pd
 	}
 	pd.lastTouch = now

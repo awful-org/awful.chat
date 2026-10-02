@@ -878,8 +878,9 @@ EXITS (each gated, all off by default)
 THREE VANTAGES ON ONE SESSION
   client:    the bundle above
   relay:     stapled at ingest - registry counts, per-stream open/close with
-             the REAL close reason, and a per-peer event ring.
-             relay/telemetry.go
+             the REAL close reason, and a per-peer event ring (up to 256
+             events, dropped once nothing has been recorded for that peer
+             for 30 minutes). relay/telemetry.go
   sfu:       ms:diag returns a live snapshot (transports, producers,
              consumers, room siblings); SFU_TELEMETRY=1 also prints one
              [sfu-telemetry] JSON line per room per 10s sweep.

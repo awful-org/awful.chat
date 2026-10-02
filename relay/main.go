@@ -857,7 +857,7 @@ func (r *registry) sendTo(c *connectedClient, msg serverMsg) {
 		// will not complete, which is how one dead tab stalled a whole room.
 		// It has missed frames either way, so it has to reconnect to resync.
 		log.Printf("[rv] %s is not reading its stream, dropping it", short(c.peerId))
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseOutboxFull}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", relayCloseOutboxFull)})
 		c.shutdown()
 	}
 }
@@ -944,7 +944,7 @@ func (r *registry) refuseLocked(c *connectedClient, room, reason, line string) r
 	if say {
 		log.Print(line)
 	}
-	diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": reason}})
+	diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", reason)})
 	return registerCapped
 }
 
@@ -1008,7 +1008,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		if sayCapped {
 			log.Printf("[rv] registry is at its %d-registration ceiling, only peers under %d rooms may join more", maxTotalRegistrations, guaranteedRoomsPerPeer)
 		}
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", "capped")})
 		return registerCapped
 	}
 	if held >= maxRoomsPerPeer {
@@ -1024,7 +1024,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		if sayCapped {
 			log.Printf("[rv] %s hit the %d-room cap, ignoring further REGISTERs", short(c.peerId), maxRoomsPerPeer)
 		}
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", "capped")})
 		return registerCapped
 	}
 	for _, k := range c.sourceKeys() {
@@ -1072,7 +1072,7 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	if len(members) == 0 && !allowAll(now, emptyBudgets...) {
 		c.diagOracleSilenced++
 		r.mu.Unlock()
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "oracle"}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", "oracle")})
 		return registerOracleSilenced
 	}
 	if members == nil {
@@ -1343,7 +1343,7 @@ func (r *registry) disconnectPeer(peerId string) {
 	// rooms are torn down before its own readLoop had a chance to notice
 	// and record its own close reason - "evicted" names exactly that.
 	for range doomed {
-		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseEvicted}})
+		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", relayCloseEvicted)})
 	}
 	diagRecord(peerId, relayDiagEvent{Kind: "peer.disconnect"})
 
@@ -1398,7 +1398,7 @@ func (r *registry) handleStream(s network.Stream) {
 	c := r.addStreamFrom(peerId, s, addr)
 	if c == nil {
 		lifecycleLogf("[rv] %s already holds %d rendezvous streams, refusing another", short(peerId), maxStreamsPerPeer)
-		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseStreamCap}})
+		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", relayCloseStreamCap)})
 		s.Reset()
 		return
 	}
@@ -1424,17 +1424,21 @@ func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) s
 
 	// Every complaint this stream can provoke comes out of one small budget:
 	// maxMsgLen has no lower bound, so a peer can stream tiny junk frames at
-	// line rate and would otherwise get a log line for each one.
+	// line rate and would otherwise get a log line for each one. The
+	// rv.send.fail event that goes with a complaint is recorded only when the
+	// line is: unbudgeted, a peer sending junk filled its telemetry ring with
+	// them, and the relay held every such ring until it restarted.
 	budget := &logBudget{left: maxStreamLogLines}
 	membershipOps := newOpBudget(maxMembershipOps, membershipOpWindow)
-	warn := func(format string, args ...any) {
+	warn := func(format string, args ...any) bool {
 		if !budget.allow() {
-			return
+			return false
 		}
 		log.Printf(format, args...)
 		if budget.spent() {
 			log.Printf("[rv] %s used up its log budget, further complaints about this stream are dropped", short(peerId))
 		}
+		return true
 	}
 
 	// Set once the stream has registered a room; from then on it gets
@@ -1483,15 +1487,17 @@ readLoop:
 
 			var msg clientMsg
 			if err := json.Unmarshal(payload, &msg); err != nil {
-				warn("[rv] bad message from %s: %v", short(peerId), err)
-				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "malformed"}})
+				if warn("[rv] bad message from %s: %v", short(peerId), err) {
+					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: diagReason("reason", "malformed")})
+				}
 				continue
 			}
 
 			if msg.Type == "REGISTER" || msg.Type == "UNREGISTER" {
 				if !validRoom(msg.Room) {
-					warn("[rv] %s sent an unusable room id (%d bytes), ignoring", short(peerId), len(msg.Room))
-					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "bad-room"}})
+					if warn("[rv] %s sent an unusable room id (%d bytes), ignoring", short(peerId), len(msg.Room)) {
+						diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: diagReason("reason", "bad-room")})
+					}
 					if msg.Type == "REGISTER" {
 						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
 					}
@@ -1509,8 +1515,9 @@ readLoop:
 				// including rooms the flapper was never in. A real client
 				// registers each room once per connection.
 				if !membershipOps.allow(time.Now()) {
-					warn("[rv] %s is changing rooms faster than %d/%s, ignoring", short(peerId), maxMembershipOps, membershipOpWindow)
-					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", Room: diagRoomRef(msg.Room), D: map[string]any{"reason": "rate-limited"}})
+					if warn("[rv] %s is changing rooms faster than %d/%s, ignoring", short(peerId), maxMembershipOps, membershipOpWindow) {
+						diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", Room: diagRoomRef(msg.Room), D: diagReason("reason", "rate-limited")})
+					}
 					if msg.Type == "REGISTER" {
 						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
 					}
@@ -1550,13 +1557,14 @@ readLoop:
 				// this loop. Old clients ignore unknown frame types.
 				r.sendTo(c, serverMsg{Type: "PONG"})
 			default:
-				warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type))
-				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "unknown-type"}})
+				if warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type)) {
+					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: diagReason("reason", "unknown-type")})
+				}
 			}
 		}
 	}
 
-	diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": reason}})
+	diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", reason)})
 	return reason
 }
 
