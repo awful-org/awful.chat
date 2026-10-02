@@ -26,6 +26,15 @@ function transport() {
   return { t, internal, room };
 }
 
+/** A room stream as attachSecureStream records it, bookkeeping only: inbound from bob unless told otherwise. */
+function roomStream(fields: Record<string, unknown> = {}) {
+  return {
+    connection: { status: "open" }, peer: "bob", outgoing: false, room: null, channel: null,
+    usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null,
+    close: vi.fn(), getChannel: () => null, ...fields,
+  };
+}
+
 it("queues room channel openings past the concurrent limit instead of refusing them", async () => {
   const { t, internal, room } = transport();
   let inFlight = 0, most = 0;
@@ -99,4 +108,30 @@ it("tries a listed pair that never proved its room again, backing off, until it 
   sweep(600_000);
   sweep(600_000);
   expect(ensure).toHaveBeenCalledTimes(2);
+});
+
+it("keeps our young channel to a larger peer through a crossing hello, and lets theirs replace it only once proven", () => {
+  vi.useFakeTimers();
+  const { internal, room } = transport();
+  internal.node = { peerId: { toString: () => "alice" } }; // smaller than bob
+  const ours = roomStream({ outgoing: true, room, channel: { verified: true }, provenAt: Date.now() });
+  internal.secureStreams.add(ours);
+  // Theirs is let in beside ours, which stays: one they had given up never proves.
+  const crossing = roomStream();
+  internal.secureStreams.add(crossing);
+  expect(internal.admitRoomStream(crossing, room)).toBe(true);
+  expect(ours.close).not.toHaveBeenCalled();
+  expect(crossing.replaces).toBe(ours);
+  // Past the handshake window a hello of theirs can only mean their end of ours is gone.
+  vi.advanceTimersByTime(10_000);
+  const reopened = roomStream();
+  internal.secureStreams.add(reopened);
+  expect(internal.admitRoomStream(reopened, room)).toBe(true);
+  expect(ours.close).toHaveBeenCalledOnce();
+  expect(crossing.close).toHaveBeenCalledOnce();
+  expect(reopened.replaces).toBeNull();
+  // Still refused outright while ours has yet to prove.
+  internal.secureStreams.clear();
+  internal.secureStreams.add(roomStream({ outgoing: true, room }));
+  expect(internal.admitRoomStream(roomStream(), room)).toBe(false);
 });

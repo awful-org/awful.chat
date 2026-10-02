@@ -699,7 +699,10 @@ direct streams:    4-byte big-endian length-prefixed frames
 room channels:     one /awful/room/2.0.0 stream per protected room and peer,
                    opened by either side; when both open one at once, the
                    stream the smaller peerId started is kept (as for DM
-                   introductions)
+                   introductions), even when the larger peer's hello lands
+                   after it proved: for 10 s after, a stream the larger peer
+                   opens for the room is let in beside it and replaces it
+                   only once it proves too
                    up to 256 proven per connection plus 64 handshakes, and
                    1024 proven in all; past that the least recently used one
                    quiet for 30 s is closed, and the next send reopens it

@@ -211,6 +211,12 @@ const ROOM_CHANNELS_MAX = 1024;
 const ROOM_CHANNEL_QUIET_MS = 30_000;
 /** Inbound handshakes under way at once, across every connection. */
 const ROOM_HANDSHAKES_MAX = 256;
+/**
+ * How long after our channel to a peer with a larger ID proves itself a
+ * fresh stream of theirs for the same room may still be the one they opened
+ * as ours crossed it - the handshake's own 10 s (admitRoomStream).
+ */
+const ROOM_CROSSING_MS = 10_000;
 /** Room channels being opened at once, and how many more may wait a turn. */
 const ROOM_OPENINGS_MAX = 64;
 const ROOM_OPENINGS_QUEUED_MAX = 4096;
@@ -241,8 +247,12 @@ type RoomStreamEntry = {
   channel: SecureRoomChannel | null;
   /** Last send or receipt, for choosing which idle channel to close first. */
   usedAt: number;
+  /** When it proved its room. */
+  provenAt: number;
   /** Closed by us because the peer's own stream for the room won (admitRoomStream). */
   superseded: boolean;
+  /** Ours, let stay beside this inbound one until this one proves its room too (admitRoomStream). */
+  replaces: RoomStreamEntry | null;
   close: () => void;
   getChannel: () => SecureRoomChannel | null;
 };
@@ -591,7 +601,8 @@ export class LibP2PTransport implements PeerTransport {
     }
     const entry: RoomStreamEntry = {
       connection, peer, outgoing: !!initiate, room: initiate?.discoveryId ?? null, channel: null,
-      usedAt: Date.now(), superseded: false, close: () => {}, getChannel: () => null,
+      usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null,
+      close: () => {}, getChannel: () => null,
     };
     this.secureStreams.add(entry);
     const handle = attachRoomStream({
@@ -599,7 +610,10 @@ export class LibP2PTransport implements PeerTransport {
       admit: (room) => this.admitRoomStream(entry, room),
       onReady: (room, channel) => {
         if (!this.secureRooms.has(room) || !this.dmCurrent(room)) { entry.close(); return; }
-        entry.room = room; entry.channel = channel; entry.usedAt = Date.now();
+        entry.room = room; entry.channel = channel; entry.usedAt = entry.provenAt = Date.now();
+        // Theirs proved, so it was no crossing: their end of ours is gone.
+        entry.replaces?.close();
+        entry.replaces = null;
         // News only. A channel reopened for a member already counted changes
         // nothing the app can see, and announcing it would replay the app's
         // whole catch-up for that member on every reopen.
@@ -636,11 +650,22 @@ export class LibP2PTransport implements PeerTransport {
    * for the room gives way to the new one: a peer opens another only when
    * its end of the first is gone - it reloaded, or closed it as idle and
    * the reset has not landed here yet.
+   *
+   * Except ours, when we are the smaller peer, for ROOM_CROSSING_MS after it
+   * proved. Over two connections the larger peer's hello can land after
+   * ours has proven itself, by when they have closed that stream in ours'
+   * favour - and closing ours for it left neither end a channel, with what
+   * was sent on ours in between reported sent and lost. So theirs is let in
+   * beside ours and takes over only once it proves too: one they gave up
+   * never does, and one they opened because their end of ours is gone does.
    */
   private admitRoomStream(entry: RoomStreamEntry, room: DiscoveryId): boolean {
     for (const other of [...this.secureStreams]) {
       if (other === entry || other.room !== room || other.peer !== entry.peer || other.connection.status !== "open") continue;
-      if (other.outgoing && !other.channel && this.selfId() < entry.peer) return false;
+      if (other.outgoing && this.selfId() < entry.peer) {
+        if (!other.channel) return false;
+        if (Date.now() - other.provenAt < ROOM_CROSSING_MS) { entry.replaces = other; continue; }
+      }
       other.superseded = other.outgoing && !other.channel;
       other.close();
     }
