@@ -59,15 +59,32 @@ type rvStream interface {
 }
 
 const (
-	// How long a single frame may take to reach one peer before its stream is
+	// How long one write may take to reach one peer before its stream is
 	// treated as dead. Only that peer's own writer goroutine ever waits this
 	// long, so nobody else's work is queued behind it.
 	streamWriteTimeout = 5 * time.Second
-	// Outbox depth per peer. A reconnecting peer re-REGISTERs every room it is
-	// in at once, so the queue has to absorb a burst of PEERS/PEER_JOINED
-	// frames; a peer still behind after this many is not reading its stream at
-	// all and gets dropped.
-	sendQueueDepth = 256
+	// Outbox bounds per stream, in frames and in bytes, whichever comes
+	// first. A reconnecting peer re-REGISTERs every room it is in at once,
+	// and everyone else's reconnect lands PEER_JOINED frames on it in the
+	// same instant, so the queue has to absorb a burst; a peer still this
+	// far behind is not reading its stream at all and gets dropped. It was a
+	// 256-frame channel, which a peer's own reconnect with a few hundred
+	// rooms could fill before its writer goroutine was even scheduled - on a
+	// one-core box every time - and the dropped tab's PEER_LEFT and
+	// PEER_JOINED two seconds later filled other tabs' outboxes in turn,
+	// which is how a relay restart became a minute of tabs evicting each
+	// other. A stream that really stops reading is caught by the write
+	// deadline above anyway; these bound the memory it holds meanwhile.
+	sendQueueDepth = 4096
+	sendQueueBytes = 512 << 10
+	// The writer sends everything queued in writes of up to this many bytes,
+	// with the frames back to back exactly as they would have been sent one
+	// at a time (the client reads any number of frames from one chunk). One
+	// write per frame was one yamux frame and one syscall per frame, most of
+	// the relay's CPU during a reconnect burst. Twice the largest frame, so
+	// a full PEERS frame always fits with others; small enough that the
+	// client's per-chunk buffer copies stay cheap.
+	writeBatchBytes = 2 * maxMsgLen
 	// maxMsgLen bounds one rendezvous frame, in both directions. readLoop
 	// resets the stream when a peer's declared length goes over it. sendTo
 	// refuses to build an outbound frame that goes over it too. The client
@@ -285,7 +302,13 @@ type connectedClient struct {
 	// the sending peer's goroutine. Writing inline meant one peer that stopped
 	// reading its stream stalled every other member of its rooms for the whole
 	// write deadline, because go-yamux blocks once the receiver's window fills.
-	out           chan []byte
+	// The queue is a slice under outMu rather than a buffered channel, so it
+	// is bounded in bytes (sendQueueBytes) and costs an idle stream nothing;
+	// outReady (capacity 1) wakes the writer.
+	outMu         sync.Mutex
+	outFrames     [][]byte
+	outBytes      int
+	outReady      chan struct{}
 	done          chan struct{}
 	closeOnce     sync.Once
 	roomCapLogged bool // guarded by registry.mu; keeps a capped peer from flooding the log
@@ -319,7 +342,7 @@ func newConnectedClient(peerId string, s rvStream) *connectedClient {
 		peerId:       peerId,
 		stream:       s,
 		rooms:        make(map[string]struct{}),
-		out:          make(chan []byte, sendQueueDepth),
+		outReady:     make(chan struct{}, 1),
 		done:         make(chan struct{}),
 		diagRef:      fmt.Sprintf("s%x", time.Now().UnixNano()),
 		diagOpenedAt: time.Now(),
@@ -328,21 +351,62 @@ func newConnectedClient(peerId string, s rvStream) *connectedClient {
 	return c
 }
 
-// writeLoop owns every write to the stream, so two frames can never interleave
-// and the deadline covers exactly one write.
+// writeLoop owns every write to the stream, so two frames can never
+// interleave, and each wake-up writes everything queued by then in as few
+// writes as writeBatchBytes allows. The deadline covers one write.
 func (c *connectedClient) writeLoop() {
 	for {
 		select {
-		case frame := <-c.out:
-			c.stream.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
-			if _, err := c.stream.Write(frame); err != nil {
-				c.shutdown()
-				return
-			}
+		case <-c.outReady:
 		case <-c.done:
 			return
 		}
+		c.outMu.Lock()
+		frames := c.outFrames
+		c.outFrames, c.outBytes = nil, 0
+		c.outMu.Unlock()
+		for len(frames) > 0 {
+			// How many of the queued frames go in this write. A lone frame is
+			// written as it is; only a run of them is copied into one buffer,
+			// so an idle stream holds no buffer of its own.
+			n, size := 1, len(frames[0])
+			for n < len(frames) && size+len(frames[n]) <= writeBatchBytes {
+				size += len(frames[n])
+				n++
+			}
+			batch := frames[0]
+			if n > 1 {
+				batch = make([]byte, 0, size)
+				for _, f := range frames[:n] {
+					batch = append(batch, f...)
+				}
+			}
+			frames = frames[n:]
+			c.stream.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+			if _, err := c.stream.Write(batch); err != nil {
+				c.shutdown()
+				return
+			}
+		}
 	}
+}
+
+// enqueue hands a frame to this client's writer, or reports false when the
+// outbox is already as far behind as sendQueueDepth and sendQueueBytes allow.
+func (c *connectedClient) enqueue(frame []byte) bool {
+	c.outMu.Lock()
+	if len(c.outFrames) >= sendQueueDepth || c.outBytes+len(frame) > sendQueueBytes {
+		c.outMu.Unlock()
+		return false
+	}
+	c.outFrames = append(c.outFrames, frame)
+	c.outBytes += len(frame)
+	c.outMu.Unlock()
+	select {
+	case c.outReady <- struct{}{}:
+	default: // already signalled; the writer takes everything queued
+	}
+	return true
 }
 
 // shutdown stops the writer goroutine and tears the stream down. Resetting the
@@ -785,11 +849,9 @@ func (r *registry) sendTo(c *connectedClient, msg serverMsg) {
 	frame[3] = byte(len(data))
 	copy(frame[4:], data)
 
-	select {
-	case c.out <- frame:
-		// Handed to this client's writer goroutine; the caller (some other
-		// peer's read loop) never waits on the network.
-	default:
+	// Handed to this client's writer goroutine; the caller (some other peer's
+	// read loop) never waits on the network.
+	if !c.enqueue(frame) {
 		// A full outbox means the peer is not draining its stream. Dropping it
 		// is the point: the alternative is blocking the caller on a write that
 		// will not complete, which is how one dead tab stalled a whole room.
@@ -1441,8 +1503,8 @@ readLoop:
 			case "REGISTER", "UNREGISTER":
 				// Refuse the OPERATION, not just its log line. Each membership
 				// change fans a frame out to every other stream in the room,
-				// and a peer flapping one shared room fills another member's
-				// outbox in ~130 messages - at which point sendTo drops that
+				// and a peer flapping one shared room could fill another
+				// member's outbox - at which point sendTo drops that
 				// member, and dropping it evicts it from every room it holds,
 				// including rooms the flapper was never in. A real client
 				// registers each room once per connection.
