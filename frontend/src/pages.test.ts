@@ -81,6 +81,22 @@ const HEAVY = [
 ];
 
 describe("the setup and unlock screens", () => {
+  /**
+   * The icon and UI component libraries, which the test compiled module by
+   * module - about 1,650 icons and 400 bits-ui files, most of its 20 s - to
+   * learn nothing: neither imports any of the app. Each is a stub that
+   * answers any name, a component or a namespace of them (Dialog.Root), and
+   * nothing renders on import.
+   */
+  const LIBRARIES = ["@lucide/svelte", "bits-ui"];
+  function libraryStub(): object {
+    const named = (name: string | symbol) => typeof name === "string" && name !== "then";
+    const anything: object = new Proxy(function stub() {}, {
+      get: (_, name) => (named(name) ? anything : undefined),
+    });
+    return new Proxy({}, { get: (_, name) => (named(name) ? anything : undefined), has: (_, name) => named(name) });
+  }
+
   /** Each heavy module as a stub that records being loaded. */
   function watchHeavy() {
     const loaded: string[] = [];
@@ -90,10 +106,11 @@ describe("the setup and unlock screens", () => {
         return {};
       });
     }
+    for (const library of LIBRARIES) vi.doMock(library, libraryStub);
     return loaded;
   }
   afterEach(() => {
-    for (const path of HEAVY) vi.doUnmock(path);
+    for (const path of [...HEAVY, ...LIBRARIES]) vi.doUnmock(path);
   });
 
   // An invite link's first visit, and every launch that starts at the unlock
