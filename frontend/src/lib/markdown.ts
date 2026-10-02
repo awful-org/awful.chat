@@ -94,22 +94,39 @@ const SPAN_RE = new RegExp(
  * space after the dot, or a Greek ο in "com", passed for plain text.
  *  - The markup goes ("**paypal.com**", "`paypal.com`"), and so does what
  *    draws as nothing: zero-width characters, soft hyphens, joiners,
- *    variation selectors, tag characters, combining marks, the hair space.
+ *    variation selectors, tag characters, combining marks, and the spaces
+ *    narrower than a word space ("paypal .com" with a thin one).
  *  - Compatibility forms fold ("ｐａｙｐａｌ．ｃｏｍ"), and what draws as a dot
  *    reads as one ("paypal․com", "paypalꓸcom").
- *  - A letter or digit outside ASCII reads as one that could pass for an
- *    ASCII one, so "paypal.cοm" is an address. Not Chinese or Japanese,
- *    whose sentences run on after a full stop with no space between.
+ *  - Anything else outside ASCII, a letter, a digit or a symbol, reads as
+ *    a character that could pass for an ASCII one, so "paypal.cοm" and
+ *    "paypa∣.com" are addresses. Not Chinese or Japanese, whose sentences
+ *    run on after a full stop with no space between.
  * A label that reorders itself (a bidi override, embedding or isolate) is
  * never masked: an override draws "t.co" from text that spells "oc.t".
  */
 const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
-/** Markup, and what draws as nothing. Before NFKD, which makes the hair space a space. */
-const UNSEEN_RE = /[\p{Default_Ignorable_Code_Point}\u200A*~_|\x60\\]/gu;
-/** A full stop, or what Unicode's confusables list says draws as one. */
-const DOT_LIKE_RE = /[\u0660\u06F0\u0701\u0702\u3002\uA4F8\uA60E\u{10A50}\u{1D16D}]/gu;
+/**
+ * Markup, and what draws as nothing or almost nothing: the spaces narrower
+ * than a word space (six-per-em, punctuation, thin, hair, narrow no-break)
+ * go before NFKD would make them an ordinary space. An ordinary space stays,
+ * so "e.g. this" is no address.
+ */
+const UNSEEN_RE = /[\p{Default_Ignorable_Code_Point}\u2006\u2008-\u200A\u202F*~_|\x60\\]/gu;
+/**
+ * A full stop, or what Unicode's confusables list says draws as one. The
+ * Arabic-Indic zeros only on their own: beside another such digit they are
+ * part of a number, and a label holding the year 2024 is no address.
+ */
+const DOT_LIKE_RE =
+  /[\u0701\u0702\u3002\uA4F8\uA60E\u{10A50}\u{1D16D}]|(?<![\u0660-\u0669\u06F0-\u06F9])[\u0660\u06F0](?![\u0660-\u0669\u06F0-\u06F9])/gu;
 const MARK_RE = /\p{M}/gu;
-const LOOKALIKE_RE = /(?![\p{ASCII}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])[\p{L}\p{N}]/gu;
+/**
+ * By script extension, so the marks Japanese shares between its scripts
+ * (the long vowel mark, the middle dot) count as Japanese too.
+ */
+const LOOKALIKE_RE =
+  /[^\p{ASCII}\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/gu;
 const REORDERS_RE = /[\u202A-\u202E\u2066-\u2069]/;
 function looksLikeUrl(label: string): boolean {
   if (REORDERS_RE.test(label)) return true;

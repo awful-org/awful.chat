@@ -127,7 +127,8 @@ describe("inline markdown", () => {
   it("reads a label as it draws, so what cannot be seen does not hide an address", () => {
     const disguised = [
       // Nothing to see: zero-width characters, a soft hyphen, a joiner, a
-      // variation selector, a tag character, a combining mark, a hair space.
+      // variation selector, a tag character, a combining mark, and spaces
+      // narrower than a word space.
       "paypal.\u200bcom",
       "paypal\u200b.com",
       "pay\u00adpal.c\u00adom",
@@ -139,11 +140,20 @@ describe("inline markdown", () => {
       "paypal.\u{E0020}com",
       "paypal.c\u0337om",
       "paypal.\u200acom",
+      "paypal\u2009.com",
+      "paypal.\u2006com",
+      "paypal\u2008.com",
+      "paypal\u202f.com",
       // A letter that passes for ASCII, in the domain's last part.
       "paypal.c\u03bfm",
       "paypal.\u0441om",
       "paypal.\u0441\u043e",
       "paypal.c\u3147m",
+      // A symbol that draws as a letter, beside the dot or in the last part.
+      "paypa\u2223.com",
+      "paypa\u05c0.com",
+      "googl\u212e.com",
+      "paypal.\u2229et",
       // A dot that is not one, and letters in another form.
       "paypal\ua4f8com",
       "paypal\ufe52com",
@@ -172,6 +182,11 @@ describe("inline markdown", () => {
       "\u041c\u043e\u0441\u043a\u0432\u0430",
       "\u65e5\u672c\u8a9e\u306e\u30da\u30fc\u30b8\u3002\u8a73\u3057\u304f\u306f\u3053\u3061\u3089",
       "iPhone\u306e\u4f7f\u3044\u65b9\u3002\u8a73\u3057\u304f",
+      // Japanese's long vowel mark before a full stop, then Latin letters.
+      "\u30b5\u30fc\u30d0\u30fc\u3002iOS\u7248\u3082",
+      // A year in Arabic-Indic digits, whose zero is drawn as a dot.
+      "\u062a\u0642\u0631\u064a\u0631 \u0662\u0660\u0662\u0664",
+      "\u06af\u0632\u0627\u0631\u0634 \u06f2\u06f0\u06f2\u06f4",
       "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 photos",
       "e.g. this one",
       "v1.2 notes",
