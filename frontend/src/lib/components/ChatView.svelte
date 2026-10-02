@@ -106,6 +106,7 @@
     trimMessageView,
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
+  import { compareMessages } from "$lib/transport/message-order";
   import { stripMarkdown } from "$lib/markdown";
   import {
     pinnedMessagesOf,
@@ -678,16 +679,40 @@
    * Drop held rows the window no longer needs, while it follows the newest
    * at the bottom: the view held every message it was ever given for as long
    * as the room was open. They are in storage; scrolling back reads them.
-   * Never while a jump is filling in the history it is about to show.
+   * Never while a jump is filling in the history it is about to show, and
+   * never the message being replied to: the reply is built from it.
    */
   function trimHeld(): void {
     if (chatWindow !== null || !autoScroll || loadingMore) return;
     if (revealInFlight() || uiState.jumpToMessage?.roomCode === roomCode) return;
-    const keepFrom = trimPoint(visibleMessages);
+    const keepFrom = trimPoint(visibleMessages, replyTarget);
     if (!keepFrom) return;
+    // Pins on their way out stay where the pinned panel looks for what is
+    // not held, rather than showing as gone until storage is read again.
+    const leaving = pinnedIds.flatMap((id) => {
+      const msg = messageById.get(id);
+      return msg && compareMessages(msg, keepFrom) < 0 ? [msg] : [];
+    });
+    if (leaving.length > 0) {
+      const next = new Map(pinnedFromStore);
+      for (const msg of leaving) next.set(msg.id, msg);
+      pinnedFromStore = next;
+    }
     trimMessageView(roomCode, keepFrom);
     hasMoreHistory = true;
   }
+
+  // The list emptied while the same conversation stays open: it is being
+  // opened again - selecting the room on screen re-joins it, which reloads
+  // its newest page - and it lands on its newest rows like any opening. A
+  // window held back in history would mount nothing of that page.
+  $effect(() => {
+    if (visibleMessages.length > 0) return;
+    chatWindow = null;
+    autoScroll = true;
+    initialScrollDone = false;
+    hasMoreHistory = true;
+  });
 
   // New rows at the newest end are what grows the held list while it is
   // followed; rows loaded at the old end are there to be read.
@@ -1140,6 +1165,23 @@
         }, 900);
       })
     );
+  }
+
+  /**
+   * A reply's quote was clicked. The quoted message may no longer be held -
+   * the view lets go of rows far back - so one that is not is found in
+   * storage and revealed the way a search hit or a pin is.
+   */
+  async function jumpToQuoted(messageId: string): Promise<void> {
+    if (messageById.has(messageId)) {
+      jumpToMessage(messageId);
+      return;
+    }
+    const room = roomCode;
+    const quoted = await getMessage(messageId).catch(() => undefined);
+    // Only within this conversation: a quote names any id it likes.
+    if (!quoted || quoted.roomCode !== room || roomCode !== room) return;
+    await revealMessage(room, quoted.id, quoted.lamport);
   }
 
   // Pinned messages: private to this user, stored on the room record.
@@ -2986,7 +3028,7 @@
                   <button
                     type="button"
                     class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
-                    onclick={() => jumpToMessage(msg.replyTo!.id)}
+                    onclick={() => void jumpToQuoted(msg.replyTo!.id)}
                   >
                     <Reply
                       size="16"

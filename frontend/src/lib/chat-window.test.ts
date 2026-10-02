@@ -125,4 +125,17 @@ describe("chat window", () => {
     const mounted = windowRange(list, null);
     expect(list.slice(mounted.from, mounted.to).every((row) => kept.includes(row))).toBe(true);
   });
+
+  // Replying to a message far back, then going back to the newest: the
+  // trim took the message being replied to, its banner went, and the reply
+  // went out as a plain message.
+  it("keeps the message being replied to, and everything after it", () => {
+    const list = rows(TRIM_AT + 100);
+    const target = list[30];
+    expect(trimPoint(list, target)).toEqual(target);
+    // Newer than the cut anyway: the cut stays where it was.
+    expect(trimPoint(list, list[list.length - 5])).toEqual(trimPoint(list));
+    // At the oldest row held, nothing would go: no trim at all.
+    expect(trimPoint(list, list[0])).toBeNull();
+  });
 });

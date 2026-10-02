@@ -5387,7 +5387,9 @@ export async function loadMoreMessages(
   if (!older.length) return false;
   // The pages join the view where its oldest row was when the read began.
   // If the view was cut above that meanwhile (ChatView drops held rows it
-  // no longer shows), they would sit under a gap: they stay in storage.
+  // no longer shows, a rejoin reloads the newest page), they would sit
+  // under a gap: they stay in storage. They are still there to load, which
+  // is the answer: "no more" here hid the button for the rest of the visit.
   const floor = transportState.messages[0];
   if (
     floor &&
@@ -5395,7 +5397,7 @@ export async function loadMoreMessages(
       ? floor.lamport > beforeLamport
       : MSG_ORDER(floor, beforeLamport) > 0)
   ) {
-    return false;
+    return true;
   }
   const existingIds = new Set(transportState.messages.map((m) => m.id));
   const newOnes = older.filter((m) => !existingIds.has(m.id));

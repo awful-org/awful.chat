@@ -63,7 +63,8 @@ export function windowRange(
   window: ChatWindow
 ): WindowRange {
   const length = list.length;
-  if (window === null) return { from: Math.max(0, length - FOLLOW_ROWS), to: length };
+  const follow = { from: Math.max(0, length - FOLLOW_ROWS), to: length };
+  if (window === null) return follow;
   const from = indexOf(list, window.start);
   let to = length;
   if (window.end !== null) {
@@ -71,6 +72,10 @@ export function windowRange(
     to = end < length && list[end].id === window.end.id ? end + 1 : end;
   }
   to = Math.max(from, Math.min(to, from + MAX_ROWS));
+  // None of the window's rows are in the list any more: it was replaced
+  // under it - a conversation opened again reloads its newest page - and
+  // a window over rows that are gone would mount nothing at all.
+  if (to === from && length > 0) return follow;
   return { from, to };
 }
 
@@ -111,9 +116,17 @@ export function around(list: readonly MessageCursor[], index: number): ChatWindo
 
 /**
  * Where to cut the held list while following the newest: the oldest row to
- * keep, or null while it is short enough to leave alone.
+ * keep, or null while it is short enough to leave alone - or when the cut
+ * would drop nothing. `keep` is a held row that must stay, the message
+ * being replied to: the cut goes no newer than it.
  */
-export function trimPoint(list: readonly MessageCursor[]): MessageCursor | null {
+export function trimPoint(
+  list: readonly MessageCursor[],
+  keep: MessageCursor | null = null
+): MessageCursor | null {
   if (list.length <= TRIM_AT) return null;
-  return cursorOf(list[list.length - HOLD_ROWS]);
+  let cut = list[list.length - HOLD_ROWS];
+  if (keep && compareMessages(keep, cut) < 0) cut = keep;
+  if (compareMessages(cut, list[0]) <= 0) return null;
+  return cursorOf(cut);
 }
