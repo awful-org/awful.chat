@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -360,12 +361,20 @@ var ogHTTPClient = &http.Client{
 // nothing a browser could cache. Concurrent asks for the same url share one
 // fetch. A failure is remembered too, briefly, so a dead link is not fetched
 // again for every viewer. Bounded on entries and bytes and evicted oldest
-// first, like the plugin proxy's cache: the urls are the caller's choice.
+// first, like the plugin proxy's cache. The bytes are each url's as well as
+// its answer's: the urls are the caller's choice, and a failure is kept with
+// nothing but its url, so counting answers alone let a thousand made-up
+// urls of a megabyte each sit in an "8 MiB" cache.
 const (
 	ogCacheTTL        = time.Hour
 	ogCacheFailTTL    = 5 * time.Minute
 	ogCacheMaxEntries = 1024
 	ogCacheMaxBytes   = 8 << 20
+	// The longest url that is kept, or that later asks wait on: an even share
+	// of the bytes. A link is a few hundred bytes, while the relay reads
+	// request lines of up to a megabyte, and a handful of urls that long
+	// would otherwise take the whole budget and every real preview with it.
+	ogCacheMaxKeyBytes = ogCacheMaxBytes / ogCacheMaxEntries
 )
 
 type ogCacheEntry struct {
@@ -395,27 +404,29 @@ func ogCacheDropLocked(key string) {
 	if !ok {
 		return
 	}
-	ogCacheBytes -= len(e.body)
+	ogCacheBytes -= len(key) + len(e.body)
 	delete(ogCache, key)
-	for i, k := range ogCacheOrder {
-		if k == key {
-			ogCacheOrder = append(ogCacheOrder[:i], ogCacheOrder[i+1:]...)
-			break
-		}
+	// slices.Delete clears the slot it vacates, so the order list does not
+	// keep a dropped url alive behind its length.
+	if i := slices.Index(ogCacheOrder, key); i >= 0 {
+		ogCacheOrder = slices.Delete(ogCacheOrder, i, i+1)
 	}
 }
 
-// ogCacheStoreLocked keeps an answer, nil for a failure. Caller holds
-// ogCacheMu.
+// ogCacheStoreLocked keeps an answer, nil for a failure, unless its url is
+// longer than ogCacheMaxKeyBytes. Caller holds ogCacheMu.
 func ogCacheStoreLocked(key string, body []byte, now time.Time) {
 	ogCacheDropLocked(key)
+	if len(key) > ogCacheMaxKeyBytes {
+		return
+	}
 	ttl := ogCacheTTL
 	if body == nil {
 		ttl = ogCacheFailTTL
 	}
 	ogCache[key] = ogCacheEntry{body: body, expires: now.Add(ttl)}
 	ogCacheOrder = append(ogCacheOrder, key)
-	ogCacheBytes += len(body)
+	ogCacheBytes += len(key) + len(body)
 	for len(ogCacheOrder) > 0 && (len(ogCacheOrder) > ogCacheMaxEntries || ogCacheBytes > ogCacheMaxBytes) {
 		ogCacheDropLocked(ogCacheOrder[0])
 	}
@@ -427,6 +438,17 @@ func ogCacheStoreLocked(key string, body []byte, now time.Time) {
 // not be fetched, or 429.
 func ogPreviewFor(r *http.Request, target *url.URL) (body []byte, status int) {
 	key := target.String()
+	if len(key) > ogCacheMaxKeyBytes {
+		// Neither kept nor shared: each ask for a url this long fetches it
+		// and is charged for it, as every preview was before the cache. An
+		// ask that joins a running fetch spends no budget, so sharing would
+		// let any number of them wait out the fetch, each holding its
+		// megabyte of url, for the price of one.
+		if !rateAllowClient(r, "og:", pluginProxyRateLimit) {
+			return nil, http.StatusTooManyRequests
+		}
+		return ogAnswer(ogBuild(target))
+	}
 	ogCacheMu.Lock()
 	if e, ok := ogCache[key]; ok {
 		if time.Now().Before(e.expires) {
@@ -482,15 +504,21 @@ func ogRunFetch(key string, target *url.URL, call *ogCall) {
 		ogCacheMu.Unlock()
 		close(call.done)
 	}()
+	call.body = ogBuild(target)
+}
+
+// ogBuild fetches a page and returns its preview as the JSON answer, or nil
+// when it could not be fetched.
+func ogBuild(target *url.URL) []byte {
 	html, finalUrl := ogFetchPage(target)
 	if html == "" {
-		return
+		return nil
 	}
 	body, err := json.Marshal(ogParse(html, finalUrl))
 	if err != nil {
-		return
+		return nil
 	}
-	call.body = append(body, '\n')
+	return append(body, '\n')
 }
 
 // ogFetchPage fetches the page a preview is built from: the first candidate

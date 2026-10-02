@@ -1111,7 +1111,9 @@ Caching: the relay keeps each answer in memory for an hour (a failure for
          only a real fetch spends the per-address rate budget. Answers carry
          Cache-Control: private, max-age=3600 (300 for a failure) so the
          browser does not ask again on every redraw. The relay holds the
-         URLs it was asked about for that long.
+         URLs it was asked about for that long, within 1024 entries and
+         8 MiB counting URLs and answers alike; a URL over 8 KiB is fetched
+         for each ask and never kept.
 Security: URL allowlist/blocklist, size limits, timeout protection
 ```
 

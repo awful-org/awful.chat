@@ -174,21 +174,84 @@ func TestOgPreviewFailureIsRememberedBriefly(t *testing.T) {
 	}
 }
 
-// The urls are the caller's choice, so the cache is bounded on entries and
-// bytes whatever anyone asks for.
+// The urls are the caller's choice, and so are the pages behind them, so the
+// cache is bounded on entries and on bytes - every url's as well as every
+// answer's - whatever anyone asks for.
 func TestOgPreviewCacheIsBounded(t *testing.T) {
 	resetOgCache(t)
 	ogCacheMu.Lock()
 	defer ogCacheMu.Unlock()
-	big := make([]byte, 64<<10)
+	now := time.Now()
 	for i := 0; i < ogCacheMaxEntries+500; i++ {
-		ogCacheStoreLocked("https://example.com/"+strconv.Itoa(i), big, time.Now())
+		// Urls from short to the longest kept, and answers from none (a
+		// failure) to large.
+		key := "https://example.com/" + strconv.Itoa(i) + "?" + strings.Repeat("k", (i*509)%(ogCacheMaxKeyBytes-64))
+		var body []byte
+		if i%3 != 0 {
+			body = make([]byte, (i*7919)%(64<<10))
+		}
+		ogCacheStoreLocked(key, body, now)
+
+		held := 0
+		for k, e := range ogCache {
+			held += len(k) + len(e.body)
+		}
+		if held != ogCacheBytes {
+			t.Fatalf("store %d: the cache holds %d bytes of urls and answers but counts %d", i, held, ogCacheBytes)
+		}
+		if held > ogCacheMaxBytes || len(ogCache) > ogCacheMaxEntries || len(ogCacheOrder) != len(ogCache) {
+			t.Fatalf("store %d: %d entries (%d in order) holding %d bytes, caps %d and %d",
+				i, len(ogCache), len(ogCacheOrder), held, ogCacheMaxEntries, ogCacheMaxBytes)
+		}
 	}
-	if len(ogCache) > ogCacheMaxEntries || len(ogCacheOrder) != len(ogCache) {
-		t.Fatalf("cache holds %d entries (%d in order), cap %d", len(ogCache), len(ogCacheOrder), ogCacheMaxEntries)
+	// A url past its share is not kept at all.
+	long := "https://example.com/long?" + strings.Repeat("k", ogCacheMaxKeyBytes)
+	ogCacheStoreLocked(long, []byte("{}"), now)
+	if _, ok := ogCache[long]; ok {
+		t.Fatalf("a %d-byte url was kept, longest kept is %d", len(long), ogCacheMaxKeyBytes)
 	}
-	if ogCacheBytes > ogCacheMaxBytes {
-		t.Fatalf("cache holds %d bytes, cap %d", ogCacheBytes, ogCacheMaxBytes)
+}
+
+// A failure is kept with nothing but its url, and the relay reads request
+// lines of up to a megabyte, so a cache that counted only answers held a
+// thousand made-up urls - a gigabyte - inside its 8 MiB. A url longer than
+// its share is now fetched for each ask, charged to it, and never kept.
+func TestOgPreviewLongURLsAreNeitherKeptNorShared(t *testing.T) {
+	resetRateLimiter(t)
+	resetOgCache(t)
+	up := &fakeOgUpstream{fail: true}
+	up.install(t)
+
+	pad := strings.Repeat("a", 64<<10)
+	for i := 0; i < 100; i++ {
+		resetRateLimiter(t) // stands in for a few addresses, or a few minutes
+		if w := ogRequest(t, "198.51.100.1", "https://attacker.example/"+strconv.Itoa(i)+"?"+pad); w.Code != http.StatusBadGateway {
+			t.Fatalf("ask %d: %d", i, w.Code)
+		}
+	}
+	ogCacheMu.Lock()
+	entries, held, inflight := len(ogCache), ogCacheBytes, len(ogInflight)
+	ogCacheMu.Unlock()
+	if entries != 0 || held != 0 || inflight != 0 {
+		t.Fatalf("100 failed asks for 64 KiB urls left %d entries and %d bytes in the cache, %d in flight", entries, held, inflight)
+	}
+
+	// The same long link asked again is fetched again, and each ask spends
+	// its address's budget.
+	resetRateLimiter(t)
+	up.fail = false
+	link := "https://example.com/long?" + pad
+	before := up.fetches.Load()
+	for i := 0; i < pluginProxyRateLimit; i++ {
+		if w := ogRequest(t, "203.0.113.30", link); w.Code != http.StatusOK {
+			t.Fatalf("ask %d for a long link: %d", i, w.Code)
+		}
+	}
+	if n := up.fetches.Load() - before; n != pluginProxyRateLimit {
+		t.Fatalf("%d asks for one long link cost %d fetches, want one each", pluginProxyRateLimit, n)
+	}
+	if w := ogRequest(t, "203.0.113.30", link); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("an ask past the budget for a long link got %d, want 429", w.Code)
 	}
 }
 
