@@ -7,7 +7,7 @@ const state = vi.hoisted(() => ({
   session: null as UnlockedSession | null,
   identity: { did: null as string | null },
   records: new Map<string, any>(), contacts: [] as any[], rooms: [] as any[],
-  bindings: new Map<string, string>(),
+  bindings: new Map<string, string>(), roomReads: 0,
   transport: { selfId: () => "12D3-local-device", peers: () => [],
     isRoomPeer: () => true, joinSecureConversation: vi.fn(), joinRoom: vi.fn(),
     introduceDm: vi.fn(async () => true), sendRoom: vi.fn(async () => true), send: vi.fn(), },
@@ -28,7 +28,7 @@ vi.mock("$lib/messaging", () => ({ signMessage: (m: unknown) => m }));
 vi.mock("$lib/storage", () => ({
   getRoom: async (room: string) => state.records.get(room),
   putRoom: async (room: any) => { state.records.set(room.roomCode, room); },
-  getAllRooms: async () => [...state.rooms, ...state.records.values()],
+  getAllRooms: async () => { state.roomReads++; return [...state.rooms, ...state.records.values()]; },
   getDMRooms: async () => [...state.records.values()],
   setDmRequest: async (roomCode: string, request: boolean) => {
     const room = state.records.get(roomCode);
@@ -37,6 +37,7 @@ vi.mock("$lib/storage", () => ({
     return true;
   },
   getPhonebookEntries: async () => state.contacts,
+  getLastMessage: async () => undefined,
   nextDmLamport: async () => 1, putMessage: async () => {},
   setWatermark: async () => {}, markRoomSeen: async () => {},
 }));
@@ -107,6 +108,17 @@ it("drops new strangers once the requests are full, joining nothing", async () =
   expect(await ensureDmRoomForPeer(late, undefined, { unsolicited: true })).toBeNull();
   expect(state.records.has(await room(late))).toBe(false);
   expect(state.transport.joinSecureConversation).not.toHaveBeenCalled();
+});
+
+it("reads what admitting a stranger takes once for a burst, not once per sender", async () => {
+  for (let i = 0; i < MAX_DM_REQUESTS; i++) {
+    await ensureDmRoomForPeer(identity().did, undefined, { unsolicited: true });
+  }
+  state.roomReads = 0;
+  for (let i = 0; i < 10; i++) {
+    expect(await ensureDmRoomForPeer(identity().did, undefined, { unsolicited: true })).toBeNull();
+  }
+  expect(state.roomReads).toBe(1);
 });
 
 it("holds the cap under a burst", async () => {

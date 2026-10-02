@@ -181,6 +181,7 @@ import {
   dmPeerDid,
   dmPeerDidForRoom,
   dmRoomExists,
+  dropDmIfEmpty,
   ensureDmRoomForPeer,
   isDmRequestRoom,
   offerDmUpgrade,
@@ -189,6 +190,7 @@ import {
   flushQueuedDmForPeer,
   joinPhonebookDmRooms,
   noteMailboxDeposit,
+  pruneEmptyDmRequests,
   queueDmMessage,
   resolveDmDisplayName,
   sendDirectMessage,
@@ -3701,16 +3703,19 @@ export async function deliverMailboxBatch(
     (m) => !(m?.senderId === senderDid && typeof m.lamport === "number" && m.lamport <= floor)
   );
   if (!messages.length) return;
+  const live = decoded.live === true;
+  const existed = await dmRoomExists(senderDid);
+  guard();
+  if (!existed && !(await _anyRowTakable(roomCode, messages, senderDid, live))) return;
   // The batch handler refuses a room we have not joined, and a conversation
   // whose first contact arrives through the mailbox has never been joined.
-  // No room means a stranger's request that did not fit: dropped.
-  if (!(await _ensureDmForBatch(senderDid, guard))) return;
-  await _handleSyncBatch(
-    roomCode,
-    messages,
-    senderDid,
-    decoded.live === true
-  );
+  // No room means a stranger's request that did not fit: like a text, it
+  // stays in the mailbox for the next collect.
+  if (!(await _ensureDmForBatch(senderDid, guard))) {
+    throw new Error("Message requests are full");
+  }
+  await _handleSyncBatch(roomCode, messages, senderDid, live);
+  if (!existed) await dropDmIfEmpty(roomCode);
 }
 
 /**
@@ -3739,6 +3744,7 @@ async function _handleDmBatch(
     guard();
     if ((await dmConversationCodeAsync(senderDid).catch(() => null)) !== room) return;
     guard();
+    if (!(await _anyRowTakable(room, msg.messages, senderDid, live))) return;
     if (!(await _ensureDmForBatch(senderDid, guard))) return;
     created = true;
   }
@@ -3746,6 +3752,7 @@ async function _handleDmBatch(
     batchIndex: msg.batchIndex,
     totalBatches: msg.totalBatches,
   });
+  if (created) await dropDmIfEmpty(room);
   // The DM list orders and shows conversations by their last row, and only
   // the text path refreshed it: a card into a DM that was not on screen
   // left the list unaware of it. Live sends only: a history repair arrives
@@ -3755,6 +3762,32 @@ async function _handleDmBatch(
   await refreshDmRooms();
   guard();
   transportState.dmVersion += 1;
+}
+
+/**
+ * Whether a first-contact batch has a row the batch handler could take. A
+ * conversation is made for one, and for nothing less: junk is refused
+ * before it costs a request slot, and answered like junk (acked away)
+ * rather than kept in the mailbox for a slot to free up. A row that passes
+ * here and is refused later still leaves nothing: see dropDmIfEmpty.
+ */
+async function _anyRowTakable(
+  roomCode: string,
+  rows: WireChatMessage[],
+  senderDid: string,
+  live: boolean
+): Promise<boolean> {
+  const verdicts = await Promise.all(
+    rows.map(async (m) => {
+      try {
+        const allowUnsigned = allowsUnsignedDmHistory(m, senderDid, live);
+        return (await _verifyIncoming(m, { room: roomCode, allowUnsigned })).ok;
+      } catch {
+        return false;
+      }
+    })
+  );
+  return verdicts.some(Boolean);
 }
 
 /**
@@ -3831,26 +3864,44 @@ function _handleDmChatAsync(
     // Same binding verifyIncoming applies to room rows: a DM peer cannot file
     // a row under an id someone else's message was bound to.
     if (!messageIdAllowedFor(envelope.payload.id, senderDid)) return;
+    const wireTs = envelope.payload.ts;
+    const wireLamport = envelope.payload.lamport;
+    // Preserve assigned logical values on every device, irrespective of its
+    // clock. Legacy envelopes without a counter use their original timestamp
+    // deterministically, never this receiver's arrival time.
+    const lamport = wireLamport ?? wireTs;
+    // Everything that can refuse this message is checked before the
+    // conversation is made. A new one (a stranger's request above all) used
+    // to be stored first, so a refused message - a lamport past what the
+    // clock takes, an id we already hold - left an empty request behind.
+    const expected = await dmConversationCodeAsync(senderDid);
+    guard();
+    if (!expected || !remoteLamportAllowed(expected, lamport)) return;
+    // A message we already hold has nothing new to store: it is answered in
+    // a conversation we have, never one made for it.
+    if (
+      (await messageClearFieldsByIds([envelope.payload.id])).size > 0 &&
+      !(await dmRoomExists(senderDid))
+    ) return;
     const roomCode = await ensureDmRoomForPeer(peerId, undefined, { unsolicited: true });
     guard();
-    if (!roomCode) return;
+    if (!roomCode) {
+      // No room for a new conversation: the requests are full. The mailbox
+      // copy stays there, for the next collect once there is room, instead
+      // of being acked away as if it had arrived.
+      if (viaMailbox) throw new Error("Message requests are full");
+      return;
+    }
 
     const reaction = envelope.payload.reaction;
     // Timestamp sanitization affects display only, never the sequence stored
     // in sync/read watermarks. Old envelopes may carry epoch-sized counters.
-    const wireTs = envelope.payload.ts;
     const ts =
       Number.isSafeInteger(wireTs) &&
       wireTs > 0 &&
       wireTs <= Date.now() + MAX_DM_LAMPORT_SKEW
         ? wireTs
         : Date.now();
-    const wireLamport = envelope.payload.lamport;
-    // Preserve assigned logical values on every device, irrespective of its
-    // clock. Legacy envelopes without a counter use their original timestamp
-    // deterministically, never this receiver's arrival time.
-    const lamport = wireLamport ?? wireTs;
-    if (!remoteLamportAllowed(roomCode, lamport)) return;
     const msg: Message = {
       id: envelope.payload.id,
       roomCode,
@@ -4461,7 +4512,11 @@ async function _joinSavedRooms(): Promise<void> {
     }
   }
   // Not awaited in the join order any more: housekeeping, once per session.
-  void _sweepInactiveParticipants(rooms);
+  // Empty requests first: the sweep rewrites every room record, and a
+  // rewrite racing a delete puts the record back.
+  void pruneEmptyDmRequests(rooms)
+    .catch(() => {})
+    .then(() => _sweepInactiveParticipants(rooms));
 }
 
 /**

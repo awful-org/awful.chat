@@ -66,9 +66,11 @@ vi.mock("./libp2p/transport", () => ({
     async send() { return true; }
     async broadcast() {}
     async disconnect() {}
+    async connect() {}
     dialNow() {}
   },
 }));
+vi.mock("./ice-server-list", () => ({ refreshTurnCredentials: async () => {} }));
 vi.mock("./libp2p/voice", () => ({ LibP2PVoice: class { setCallPeers() {} activePeers() { return []; } } }));
 vi.mock("./mediasoup", () => ({
   MediasoupVideo: class {
@@ -100,8 +102,17 @@ vi.mock("./mailbox.svelte", () => ({
   },
 }));
 
-import { deliverMailboxDm, transportState, _peerIdToDid, markSeen } from "./transport.svelte";
 import {
+  _peerIdToDid,
+  connect,
+  deliverMailboxBatch,
+  deliverMailboxDm,
+  disconnectTransport,
+  markSeen,
+  transportState,
+} from "./transport.svelte";
+import {
+  MAX_DM_REQUESTS,
   acceptDmRequest,
   ensureDmRoomForPeer,
   isDmRequestRoom,
@@ -110,7 +121,16 @@ import {
   closeDmPanel,
   sendDirectMessage,
 } from "./dm.svelte";
-import { getRoom, wipeLocalDatabase, getLastMessage, getRoomParticipants, getMessage } from "$lib/storage";
+import {
+  getDMRooms,
+  getLastMessage,
+  getMessage,
+  getRoom,
+  getRoomParticipants,
+  putRoom,
+  wipeLocalDatabase,
+  type DMRoom,
+} from "$lib/storage";
 import { encode, decode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
@@ -390,5 +410,80 @@ describe("a message request sends no receipts until accepted (S08.5)", () => {
     await vi.waitFor(() =>
       expect(receipts().filter((r) => r.type === "read")).toEqual([{ to: stranger, type: "read", ids: [first.id] }])
     );
+  });
+});
+
+describe("a request is made by a message, never an empty room (S08.3)", () => {
+  const code = (did: string) => hashDmRoomCode(s.session!.did, did);
+  const batch = (room: string, messages: unknown[]) =>
+    encode({ type: MessageType.SyncBatch, roomCode: room, messages, batchIndex: 0, totalBatches: 1 });
+
+  /** A request an older build left behind: stored, with nothing in it. */
+  async function emptyRequest(): Promise<string> {
+    const did = identity().did;
+    const roomCode = await code(did);
+    const room: DMRoom = {
+      roomCode, type: "dm", name: "", lastSeenLamport: 0, createdAt: Date.now() - 3_600_000,
+      participants: [did], participantLastSeen: {}, participantDid: did, request: true,
+    };
+    await putRoom(room);
+    return roomCode;
+  }
+
+  it("leaves no room for a first message it refuses", async () => {
+    const stranger = identity().did;
+    await deliverMailboxDm(stranger, chat(stranger, "x", { lamport: 2 ** 49 }));
+    expect(await getRoom(await code(stranger))).toBeUndefined();
+  });
+
+  it("leaves no room for a first message whose id we already hold", async () => {
+    const first = identity().did, squatter = identity().did;
+    await deliverMailboxDm(first, chat(first, "mine", { id: "legacy-id-1" }));
+    await deliverMailboxDm(squatter, chat(squatter, "not yours", { id: "legacy-id-1" }));
+    expect(await getRoom(await code(squatter))).toBeUndefined();
+  });
+
+  it("leaves no room for a batch whose every row is refused, live or from the mailbox", async () => {
+    const mailed = identity().did;
+    await deliverMailboxBatch(mailed, batch(await code(mailed), [{}]));
+    await deliverMailboxBatch(mailed, batch(await code(mailed), [null]));
+    expect(await getRoom(await code(mailed))).toBeUndefined();
+
+    const live = await dmPeer("12D3-stranger");
+    receive(live.device, batch(live.code, [{ type: MessageType.PluginCard, id: "x", senderId: live.who.did }]), live.code);
+    await settled();
+    expect(await getRoom(live.code)).toBeUndefined();
+    expect(await getDMRooms()).toEqual([]);
+  });
+
+  it("counts only requests somebody wrote in", async () => {
+    for (let i = 0; i < MAX_DM_REQUESTS; i++) await emptyRequest();
+    const stranger = identity().did;
+    await deliverMailboxDm(stranger, chat(stranger));
+    expect((await getLastMessage(await code(stranger)))?.content).toBe("hello");
+  });
+
+  it("keeps a DM the full requests cannot take in the mailbox, instead of acking it away", async () => {
+    for (let i = 0; i < MAX_DM_REQUESTS; i++) {
+      const sender = identity().did;
+      await deliverMailboxDm(sender, chat(sender));
+    }
+    const late = identity();
+    const lateRoom = await code(late.did);
+    await expect(deliverMailboxDm(late.did, chat(late.did))).rejects.toThrow();
+    await expect(deliverMailboxBatch(late.did, batch(lateRoom, [signedWire(late, lateRoom)]))).rejects.toThrow();
+    // Junk is still answered as junk: acked away, never kept for a slot.
+    await expect(deliverMailboxBatch(late.did, batch(lateRoom, [{}]))).resolves.toBeUndefined();
+    expect(await getRoom(lateRoom)).toBeUndefined();
+  });
+
+  it("deletes the empty requests an older build left, on connecting", async () => {
+    const empty = await emptyRequest();
+    const stranger = identity().did;
+    await deliverMailboxDm(stranger, chat(stranger));
+    await connect();
+    await vi.waitFor(async () => expect(await getRoom(empty)).toBeUndefined());
+    expect(await getRoom(await code(stranger))).toMatchObject({ request: true });
+    disconnectTransport();
   });
 });

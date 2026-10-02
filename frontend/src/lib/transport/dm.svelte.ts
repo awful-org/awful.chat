@@ -1,6 +1,11 @@
 import { identityStore } from "$lib/identity/identity.svelte";
 import { captureDmOwnership } from "./dm-ownership";
-import { requireSession, didToPublicKey } from "$lib/identity/identity";
+import {
+  requireSession,
+  didToPublicKey,
+  onIdentityLock,
+  type UnlockedSession,
+} from "$lib/identity/identity";
 import { hybridPairwiseRoomSecret, type DmPqState } from "$lib/room-security/pq-dm";
 import { joinDmConversation } from "$lib/room-security/room-lifecycle";
 import { refreshDmRooms } from "$lib/rooms.svelte";
@@ -19,6 +24,7 @@ import {
   putMessage,
   markRoomSeen,
   setWatermark,
+  getLastMessage,
   getLastMessageFrom,
   nextDmLamport,
   putPhonebookEntry,
@@ -26,6 +32,8 @@ import {
   setDmPqState,
   setDmRequest,
   type DMRoom,
+  type PhonebookEntry,
+  type Room,
   getMessages,
 } from "$lib/storage";
 import { roomsStore } from "$lib/rooms.svelte";
@@ -880,11 +888,13 @@ export async function joinPhonebookDmRooms(): Promise<void> {
 
 /**
  * Message requests held at once. Past this, a stranger's new conversation is
- * dropped: every request is a stored room, a relay registration while it is
- * joined and one of the transport's 512 conversation bindings, so a script
- * minting identities could otherwise fill all three - and bury the user's
- * real rooms at the relay, which caps a peer's registrations into empty
- * rooms. Deleting requests makes room for new ones.
+ * dropped (a copy in the mailbox stays there for a later collect): every
+ * request is a stored room, a relay registration while it is joined and one
+ * of the transport's 512 conversation bindings, so a script minting
+ * identities could otherwise fill all three - and bury the user's real rooms
+ * at the relay, which caps a peer's registrations into empty rooms. Only
+ * requests somebody wrote in count (_heldRequests), and deleting requests
+ * makes room for new ones.
  */
 export const MAX_DM_REQUESTS = 20;
 
@@ -903,19 +913,93 @@ function _noteSolicited(peerIdOrDid: string | null | undefined): void {
   _solicited.add(peerIdOrDid);
 }
 
+/**
+ * How long a request takes a slot before anything is in it. It is stored a
+ * moment before its first message, and a burst must not slip past the cap
+ * in between.
+ */
+const REQUEST_SETTLE_MS = 60_000;
+
+/** Whether anything was ever written in this conversation. Unreadable counts as yes. */
+async function _holdsMessages(roomCode: string): Promise<boolean> {
+  return !!(await getLastMessage(roomCode).catch(() => true));
+}
+
+/**
+ * Requests that take a slot: the ones somebody wrote in, and any made a
+ * moment ago. Every stored request used to count, and a request was stored
+ * before its message was checked - so twenty refused messages, from anyone
+ * who knows our DID, left twenty empty requests that nothing listed and
+ * nothing could delete, and no stranger reached us again.
+ */
+async function _heldRequests(rooms: (Room | DMRoom)[], now: number): Promise<number> {
+  const requests = rooms.filter((r) => r.type === "dm" && (r as DMRoom).request === true);
+  const held = await Promise.all(
+    requests.map(async (r) =>
+      now - (r.createdAt ?? 0) < REQUEST_SETTLE_MS || (await _holdsMessages(r.roomCode))
+    )
+  );
+  return held.filter(Boolean).length;
+}
+
+/**
+ * What admitting a new conversation reads: our contacts, every room's
+ * members and the requests that take a slot. Read once for a burst, not per
+ * sender: a mailbox drain admits one after another, a DM the full requests
+ * cannot take waits in the mailbox and comes back every collect, and each
+ * read decrypts every contact and room record we hold. Dropped whenever
+ * this module stores, accepts or deletes a DM, and kept a second at most.
+ */
+interface AdmissionView {
+  session: UnlockedSession;
+  generation: number;
+  at: number;
+  contacts: PhonebookEntry[];
+  roomMates: Set<string>;
+  held: number;
+}
+const ADMISSION_VIEW_MS = 1_000;
+let _admission: AdmissionView | null = null;
+let _admissionGeneration = 0;
+
+function _admissionChanged(): void {
+  _admissionGeneration += 1;
+}
+onIdentityLock(() => {
+  _admission = null;
+  _admissionChanged();
+});
+
+async function _admissionView(): Promise<AdmissionView> {
+  const session = requireSession();
+  const now = Date.now();
+  const cached = _admission;
+  if (
+    cached?.session === session &&
+    cached.generation === _admissionGeneration &&
+    now - cached.at < ADMISSION_VIEW_MS
+  ) {
+    return cached;
+  }
+  const generation = _admissionGeneration;
+  const [contacts, rooms] = await Promise.all([getPhonebookEntries(), getAllRooms()]);
+  const roomMates = new Set(
+    rooms.filter((r) => r.type !== "dm").flatMap((r) => r.participants ?? [])
+  );
+  const held = await _heldRequests(rooms, now);
+  _admission = { session, generation, at: now, contacts, roomMates, held };
+  return _admission;
+}
+
 /** In the phonebook, in a room with us, or reached out to by us. */
-async function _isKnownDmPeer(peerDid: string): Promise<boolean> {
+function _isKnownDmPeer(peerDid: string, view: AdmissionView): boolean {
   for (const id of _solicited) {
     if (id === peerDid || dmPeerDid(id) === peerDid) return true;
   }
-  const phonebook = await getPhonebookEntries();
-  if (phonebook.some((e) => e.did === peerDid || dmPeerDid(e.peerId) === peerDid)) {
+  if (view.contacts.some((e) => e.did === peerDid || dmPeerDid(e.peerId) === peerDid)) {
     return true;
   }
-  const rooms = await getAllRooms();
-  return rooms.some(
-    (r) => r.type !== "dm" && (r.participants ?? []).includes(peerDid)
-  );
+  return view.roomMates.has(peerDid);
 }
 
 /**
@@ -929,15 +1013,58 @@ function _admitUnsolicited(
   roomCode: string
 ): Promise<"known" | "request" | "full"> {
   const run = _requestChain.then(async () => {
-    if (await _isKnownDmPeer(peerDid)) return "known" as const;
+    const view = await _admissionView();
+    if (_isKnownDmPeer(peerDid, view)) return "known" as const;
     if (_requestsInFlight.has(roomCode)) return "request" as const;
-    const held = (await getDMRooms()).filter((r) => r.request === true).length;
-    if (held + _requestsInFlight.size >= MAX_DM_REQUESTS) return "full" as const;
+    if (view.held + _requestsInFlight.size >= MAX_DM_REQUESTS) return "full" as const;
     _requestsInFlight.add(roomCode);
     return "request" as const;
   });
   _requestChain = run.catch(() => {});
   return run;
+}
+
+/**
+ * Undo a conversation made for a first contact that brought nothing in: a
+ * batch whose every row was refused. Left, it was an empty request that
+ * nothing listed and nothing could delete.
+ */
+export async function dropDmIfEmpty(roomCode: string): Promise<void> {
+  const guard = captureDmOwnership();
+  if (await _holdsMessages(roomCode)) return;
+  guard();
+  _transport.forgetConversation(roomCode);
+  await deleteRoom(roomCode);
+  _admissionChanged();
+  await refreshDmRooms();
+  guard();
+  transportState.dmVersion += 1;
+}
+
+/**
+ * The message requests an older build stored with nothing in them - made
+ * for an introduction alone, or for a message it then refused. They held a
+ * request slot each, for good. Run at connect; one made a moment ago is
+ * left alone, as its first message may still be on its way into storage.
+ */
+export async function pruneEmptyDmRequests(rooms: (Room | DMRoom)[]): Promise<void> {
+  const guard = captureDmOwnership();
+  const now = Date.now();
+  let pruned = false;
+  for (const room of rooms) {
+    if (room.type !== "dm" || (room as DMRoom).request !== true) continue;
+    if (now - (room.createdAt ?? 0) < REQUEST_SETTLE_MS) continue;
+    if (await _holdsMessages(room.roomCode)) continue;
+    guard();
+    _transport.forgetConversation(room.roomCode);
+    await deleteRoom(room.roomCode);
+    _admissionChanged();
+    pruned = true;
+  }
+  if (!pruned) return;
+  await refreshDmRooms();
+  guard();
+  transportState.dmVersion += 1;
 }
 
 /** Whether this DM is a message request the user has not accepted. */
@@ -981,6 +1108,7 @@ export async function acceptIfDmRequest(
   peerIdOrDid: string
 ): Promise<boolean> {
   if (!(await setDmRequest(roomCode, false))) return false;
+  _admissionChanged();
   await refreshDmRooms();
   _sendHeldReadReceipt(roomCode, peerIdOrDid);
   return true;
@@ -1109,6 +1237,7 @@ async function _joinDm(
     request,
   };
   await putRoom(room, guard);
+  _admissionChanged();
   if (requireSession() !== session) throw new Error("Identity changed");
   // isDmRequestRoom and the request banner read the sidebar's copy, which
   // only a refresh used to bring this into: until then the request was
@@ -1190,6 +1319,7 @@ export async function addToPhonebook(peerIdOrDid: string): Promise<void> {
     addedAt: keeper?.addedAt ?? Date.now(),
     favorite: keeper?.favorite,
   });
+  _admissionChanged();
   await ensureDmRoomForPeer(did);
 }
 
@@ -1222,6 +1352,7 @@ export async function removeFromPhonebook(peerIdOrDid: string): Promise<void> {
       await deletePhonebookEntry(e.peerId);
     }
   }
+  _admissionChanged();
 }
 
 export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
@@ -1278,6 +1409,7 @@ export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
       await deleteRoom(roomCode);
     })
   );
+  _admissionChanged();
 
   if (
     transportState.chatMode === "dm" &&
