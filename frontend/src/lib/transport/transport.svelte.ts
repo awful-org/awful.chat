@@ -90,7 +90,8 @@ import {
   type Attachment,
 } from "../types/message";
 import {
-  refreshUnreadCount,
+  noteRoomRead,
+  noteUnreadArrivals,
   removeRoom,
   refreshDmRooms,
   renameRoom,
@@ -2350,7 +2351,9 @@ async function _storeSyncBatch(
   }
   const outcome: BatchOutcome = { held: heldRows, floors: rejectedFloor };
 
-  refreshUnreadCount(roomCode).catch(() => {});
+  // Only rows stored just now: a recount of the whole unread backlog per
+  // batch made catching up on a neglected room quadratic.
+  noteUnreadArrivals(roomCode, fullMessages);
   for (const m of fullMessages) noteRoomActivity(m.roomCode, m.timestamp);
 
   // No `live` gate here: `unannounced` already encodes the policy, and it is
@@ -3406,7 +3409,9 @@ async function _handleChatMessage(
   if (Number.isSafeInteger(msg.lamport) && msg.lamport >= 0) {
     setWatermark(msg.roomCode, msg.senderId, msg.lamport, guard).catch(() => {});
   }
-  refreshUnreadCount(msg.roomCode).catch(() => {});
+  // A new message is one more unread, never a recount of the room's whole
+  // backlog; a copy of one already held is none.
+  if (isNewMessage) noteUnreadArrivals(msg.roomCode, [msg]);
   noteRoomActivity(msg.roomCode, msg.timestamp);
 
   // DM rooms now start with "dm-" (hash-based format)
@@ -5567,9 +5572,7 @@ export async function markSeen(): Promise<void> {
       ),
     };
   }
-  const next = new Map(roomsStore.unreadCounts);
-  next.set(roomCode, 0);
-  roomsStore.unreadCounts = next;
+  noteRoomRead(roomCode);
 }
 
 export function broadcastProfile(): void {

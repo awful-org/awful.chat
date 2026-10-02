@@ -65,13 +65,17 @@ vi.mock("$lib/storage", () => ({
   getAttachmentsByMessage: async () => [],
   putAttachment: async () => {},
   updateMessageStatus: async () => {},
+  getWatermarksForRoom: async () => ({}),
+  holdWatermarks: () => {},
+  releaseWatermarks: async () => {},
+  commitWatermark: async () => {},
 }));
 vi.mock("./attachment-ownership", () => ({
   ensureMessageAttachmentOwnership: async (id: string) => { s.attachmentRepairs.push(id); },
 }));
 vi.mock("$lib/messaging", () => ({ signMessage: (m: any) => ({ ...m, sig: "sig", sigV: 3, senderDid: m.senderId }) }));
 vi.mock("$lib/rooms.svelte", () => ({
-  noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, refreshDmRooms: async () => {},
+  noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(), refreshDmRooms: async () => {},
   roomsStore: { rooms: [], dmRooms: [] },
 }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
@@ -87,6 +91,7 @@ vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
 
 import { _peerIdToDid, sendMessage, transportState } from "./transport.svelte";
+import { noteUnreadArrivals } from "$lib/rooms.svelte";
 import { decode, encode } from "$lib/utils";
 
 const ROOM = "rd2_room";
@@ -189,4 +194,18 @@ it("sends a live message once to a member the room broadcast already reached", a
   const copies = s.roomSend.mock.calls.filter(([, , frame]) =>
     (decode(frame) as { type?: string }).type === MessageType.SyncBatch);
   expect(copies.map(([peer]) => peer)).toEqual(["peer2"]);
+});
+
+it("counts a live message as unread once, and a copy of one already held not at all", async () => {
+  const onMessage = s.handlers.get("message")!;
+  const counted = vi.mocked(noteUnreadArrivals);
+  counted.mockClear();
+  onMessage("peer1", encode(row(7)), ROOM);
+  await vi.waitFor(() => expect(s.rows.has("row-7")).toBe(true));
+  await vi.waitFor(() => expect(counted).toHaveBeenCalledTimes(1));
+  expect(counted.mock.calls[0][0]).toBe(ROOM);
+  onMessage("peer1", encode(row(7)), ROOM);
+  onMessage("peer1", batch([row(7)], { live: true }), ROOM);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(counted).toHaveBeenCalledTimes(1);
 });

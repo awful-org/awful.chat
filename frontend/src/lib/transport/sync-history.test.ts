@@ -111,7 +111,7 @@ vi.mock("$lib/storage", () => ({
 vi.mock("./attachment-ownership", () => ({ ensureMessageAttachmentOwnership: async () => {} }));
 vi.mock("$lib/messaging", () => ({}));
 vi.mock("$lib/rooms.svelte", () => ({
-  noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, refreshDmRooms: async () => {},
+  noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(), refreshDmRooms: async () => {},
   roomsStore: { rooms: [], dmRooms: [] },
 }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
