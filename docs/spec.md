@@ -475,7 +475,9 @@ ordering does not make relay reservations independent of UTC.
 
 ```txt
 peer joins room → rendezvous on the Go relay (/awful/rendezvous/2.0.0,
-length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT)
+length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT;
+a stream that fails or drops is reopened after 2 s, doubling to 60 s,
+jittered, and back to 2 s once the relay answers on one)
 → dials peers via libp2p (WebRTC direct, circuit-relay fallback, 3 dial
 attempts with backoff) → gossipsub topic app:room:{roomCode} per room
 

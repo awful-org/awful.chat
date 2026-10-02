@@ -150,7 +150,16 @@ function pongFrame(nonce: number): Uint8Array {
     JSON.stringify({ type: "__pong", n: nonce, w: Date.now() })
   );
 }
+/**
+ * First rendezvous retry, and the ceiling it backs off to.
+ *
+ * A flat 2s turned a relay restart into every client re-dialling it every
+ * two seconds, in lockstep, for as long as it was down - and all of them at
+ * once the moment it came back. Jittered and doubling like the relay
+ * reconnect, and back to the first delay once a stream has proven itself.
+ */
 const RENDEZVOUS_RECONNECT_DELAY_MS = 2_000;
+const RENDEZVOUS_RECONNECT_MAX_MS = 60_000;
 /**
  * How often a registered rendezvous stream proves it is alive. The relay
  * closes a registered stream that stays quiet for three intervals
@@ -911,6 +920,9 @@ export class LibP2PTransport implements PeerTransport {
   private rendezvousPongSeen = false;
   private rendezvousPongAt = 0;
   private rendezvousPingsSincePong = 0;
+  /** Current rendezvous-retry backoff, and the one retry waiting to fire. */
+  private rendezvousRetryDelay = RENDEZVOUS_RECONNECT_DELAY_MS;
+  private rendezvousRetryTimer: TimerHandle | null = null;
   /**
    * navigator says the radio is down. Dialling into that is a storm with no
    * chance of connecting and a phone battery paying for it, so every dial
@@ -1273,6 +1285,7 @@ export class LibP2PTransport implements PeerTransport {
     this.rendezvousPongSeen = false;
     this.rendezvousPongAt = 0;
     this.rendezvousPingsSincePong = 0;
+    this.stopRendezvousRetry();
     this.relayReconnectDelay = RELAY_RECONNECT_DELAY_MS;
     this.offline =
       typeof navigator !== "undefined" &&
@@ -1620,6 +1633,7 @@ export class LibP2PTransport implements PeerTransport {
       clearInterval(this.reconcileTimer);
       this.reconcileTimer = null;
     }
+    this.stopRendezvousRetry();
 
     if (!this.node) return;
 
@@ -2956,7 +2970,7 @@ export class LibP2PTransport implements PeerTransport {
         type: "rendezvous-failed",
         message: "Failed to connect to relay - retrying...",
       });
-      setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
+      this.scheduleRendezvousRetry();
       return;
     }
 
@@ -2971,6 +2985,13 @@ export class LibP2PTransport implements PeerTransport {
     if (previous && previous !== stream) {
       previous.abort(new Error("rendezvous stream superseded"));
     }
+    // A stream is open, by this path or the relay reconnect's: any retry
+    // still waiting would only open another to supersede it.
+    if (this.rendezvousRetryTimer) {
+      clearTimeout(this.rendezvousRetryTimer);
+      this.rendezvousRetryTimer = null;
+    }
+    const openedAt = Date.now();
 
     this.startRendezvousPing(stream);
 
@@ -3015,6 +3036,10 @@ export class LibP2PTransport implements PeerTransport {
           const msg = JSON.parse(
             FRAME_DECODER.decode(payload)
           ) as RendezvousServerMsg;
+          // The relay is answering: the next drop starts from the first delay.
+          if (this.rendezvousStream === stream) {
+            this.rendezvousRetryDelay = RENDEZVOUS_RECONNECT_DELAY_MS;
+          }
           this.handleRendezvousMsg(selfId, msg);
         } catch (err) {
           // Swallowing this lost the frame with no signal and no reconnect.
@@ -3059,9 +3084,41 @@ export class LibP2PTransport implements PeerTransport {
           type: "rendezvous-reconnecting",
           message: "Relay disconnected - reconnecting...",
         });
-        setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
+        // A stream that served for a ping interval was a working one, even
+        // from a relay too old to answer: this drop is the first of its kind.
+        // One closed straight after opening keeps the backoff where it is.
+        if (Date.now() - openedAt >= RENDEZVOUS_PING_INTERVAL_MS) {
+          this.rendezvousRetryDelay = RENDEZVOUS_RECONNECT_DELAY_MS;
+        }
+        this.scheduleRendezvousRetry();
       }
     });
+  }
+
+  /**
+   * Open the rendezvous again, after the current backoff. One retry at a
+   * time: a failed open and a closed stream can both ask for the same drop.
+   * Nothing is dialled while the radio is down; coming back online repairs
+   * the relay link, which reopens the rendezvous itself.
+   */
+  private scheduleRendezvousRetry(): void {
+    if (this.rendezvousRetryTimer || this.intentionalDisconnect || !this.node) return;
+    const base = this.rendezvousRetryDelay;
+    this.rendezvousRetryDelay = Math.min(base * 2, RENDEZVOUS_RECONNECT_MAX_MS);
+    this.rendezvousRetryTimer = setTimeout(() => {
+      this.rendezvousRetryTimer = null;
+      if (this.offline) {
+        this.scheduleRendezvousRetry();
+        return;
+      }
+      void this.startRendezvous();
+    }, base + Math.random() * base * 0.3);
+  }
+
+  private stopRendezvousRetry(): void {
+    if (this.rendezvousRetryTimer) clearTimeout(this.rendezvousRetryTimer);
+    this.rendezvousRetryTimer = null;
+    this.rendezvousRetryDelay = RENDEZVOUS_RECONNECT_DELAY_MS;
   }
 
   /**
