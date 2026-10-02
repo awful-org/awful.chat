@@ -20,8 +20,7 @@ import {
 import { getManifest } from "$lib/plugins/registry";
 import {
   entryFromMessage,
-  matchEntry,
-  rankHits,
+  searchEntries,
   type SearchEntry,
   type SearchHit,
 } from "./engine";
@@ -48,8 +47,41 @@ const _rooms = new Map<string, RoomCorpus>();
 /** Bumped whenever any corpus grows; the overlay re-derives results on it. */
 export const corpusState = $state({ version: 0 });
 
-function bump(): void {
+/**
+ * How often growth is announced. A sweep lands a page of fifty rows at a
+ * time, and every announcement re-ran the whole search over everything swept
+ * so far - typing during a 10,000-message sweep ran it two hundred times.
+ */
+const BUMP_EVERY_MS = 250;
+let _bumpedAt = 0;
+let _bumpTimer: ReturnType<typeof setTimeout> | null = null;
+
+function announce(): void {
+  _bumpedAt = Date.now();
   corpusState.version += 1;
+}
+
+/** A corpus grew: tell the overlay now, or at the end of the current window. */
+function bump(): void {
+  if (_bumpTimer) return;
+  const wait = _bumpedAt + BUMP_EVERY_MS - Date.now();
+  if (wait <= 0) {
+    announce();
+    return;
+  }
+  _bumpTimer = setTimeout(() => {
+    _bumpTimer = null;
+    announce();
+  }, wait);
+}
+
+/** A room finished, or went away: that shows at once. */
+function bumpNow(): void {
+  if (_bumpTimer) {
+    clearTimeout(_bumpTimer);
+    _bumpTimer = null;
+  }
+  announce();
 }
 
 function pluginNameOf(pluginId: string): string | undefined {
@@ -191,7 +223,7 @@ export async function ensureRoomCorpus(roomCode: string): Promise<void> {
       if (stored && stored.length === stats.count) {
         for (const entry of stored) add(c, entry);
         c.done = true;
-        bump();
+        bumpNow();
         return;
       }
     }
@@ -215,7 +247,7 @@ export async function ensureRoomCorpus(roomCode: string): Promise<void> {
       before = msgs[0];
     }
     c.done = true;
-    bump();
+    bumpNow();
 
     // The room may have been deleted while the sweep read it - its corpus
     // object is dropped then, so a stale identity means this write would
@@ -259,16 +291,12 @@ export function searchRooms(
   nowMs = Date.now()
 ): SearchHit[] {
   void corpusState.version;
-  const hits: SearchHit[] = [];
+  const lists: SearchEntry[][] = [];
   for (const roomCode of roomCodes) {
     const c = _rooms.get(roomCode);
-    if (!c) continue;
-    for (const entry of c.entries) {
-      const hit = matchEntry(entry, q, nowMs);
-      if (hit) hits.push(hit);
-    }
+    if (c) lists.push(c.entries);
   }
-  return rankHits(hits, limit);
+  return searchEntries(lists, q, limit, nowMs);
 }
 
 export function scopeProgress(roomCodes: readonly string[]): ScopeProgress {
@@ -294,7 +322,7 @@ export function scopeProgress(roomCodes: readonly string[]): ScopeProgress {
 export function dropRoomCorpus(roomCode: string): void {
   _rooms.delete(roomCode);
   _pendingIndex.delete(roomCode);
-  bump();
+  bumpNow();
 }
 
 /** Session teardown: identity switch or disconnect. Memory only - the
@@ -306,5 +334,5 @@ export function clearSearchCorpus(): void {
     clearTimeout(_flushTimer);
     _flushTimer = null;
   }
-  bump();
+  bumpNow();
 }

@@ -8,10 +8,15 @@ import {
   entryFromMessage,
   matchEntry,
   rankHits,
+  scoreEntry,
+  searchEntries,
   snippetFor,
+  type SearchEntry,
+  type SearchHit,
   type SearchableMessage,
 } from "./engine";
 import { parseSearchQuery } from "./query";
+import { matchExact } from "$lib/palette/scorer";
 
 const NOW = 1_756_000_000_000;
 
@@ -214,6 +219,134 @@ describe("rankHits", () => {
     const ranked = rankHits([a, b], 10);
     expect(ranked[0].entry.lamport).toBe(2);
     expect(rankHits([a, b], 1)).toHaveLength(1);
+  });
+});
+
+describe("searchEntries", () => {
+  // A seeded generator, so a failure names the corpus that broke it.
+  function corpus(seed: number, size: number): SearchEntry[] {
+    let state = seed;
+    const next = () => {
+      state = (state * 1103515245 + 12345) % 2147483648;
+      return state / 2147483648;
+    };
+    const words = ["deploy", "the", "relay", "thing", "then", "hello", "dep", "ship"];
+    const names = ["Alice", "Bob", "Carol"];
+    const out: SearchEntry[] = [];
+    for (let i = 0; i < size; i++) {
+      const count = 1 + Math.floor(next() * 5);
+      const text = Array.from(
+        { length: count },
+        () => words[Math.floor(next() * words.length)]
+      ).join(" ");
+      const name = names[Math.floor(next() * names.length)];
+      out.push(
+        entryFromMessage(
+          msg({
+            content: text,
+            // Few distinct lamports and days, so exact ties are common.
+            lamport: Math.floor(next() * 20),
+            timestamp: NOW - Math.floor(next() * 4) * 24 * 60 * 60 * 1000,
+            senderName: name,
+            senderDid: `did:key:${name.toLowerCase()}`,
+          })
+        )!
+      );
+    }
+    return out;
+  }
+
+  function fullRanking(lists: SearchEntry[][], query: string, limit: number): SearchHit[] {
+    const hits: SearchHit[] = [];
+    for (const list of lists) {
+      for (const entry of list) {
+        const hit = matchEntry(entry, parseSearchQuery(query), NOW);
+        if (hit) hits.push(hit);
+      }
+    }
+    return rankHits(hits, limit);
+  }
+
+  it("keeps the best hits in the order a full ranking gives, ties included", () => {
+    for (const seed of [1, 7, 42]) {
+      const lists = [corpus(seed, 400), corpus(seed + 1, 300)];
+      for (const query of ["t", "the", "dep", "deploy then", '"lo"', "from:bo", "from:did:key:c th"]) {
+        for (const limit of [1, 5, 80, 2000]) {
+          const got = searchEntries(lists, parseSearchQuery(query), limit, NOW);
+          const want = fullRanking(lists, query, limit);
+          expect(got.map((h) => h.entry.id), `${seed} ${query} ${limit}`).toEqual(
+            want.map((h) => h.entry.id)
+          );
+          expect(got.map((h) => h.score)).toEqual(want.map((h) => h.score));
+          expect(got.map((h) => h.ranges)).toEqual(want.map((h) => h.ranges));
+        }
+      }
+    }
+  });
+
+  it("returns nothing for a limit of zero, or when nothing matches", () => {
+    const lists = [corpus(3, 50)];
+    expect(searchEntries(lists, parseSearchQuery("the"), 0, NOW)).toEqual([]);
+    expect(searchEntries(lists, parseSearchQuery("zebra"), 80, NOW)).toEqual([]);
+  });
+
+  it("scores exactly what matchEntry scores, and rejects what it rejects", () => {
+    const entries = corpus(11, 200);
+    for (const query of ["de", "relay", '"y th"', "has:link", "from:alice ship"]) {
+      const q = parseSearchQuery(query);
+      for (const entry of entries) {
+        const hit = matchEntry(entry, q, NOW);
+        const score = scoreEntry(entry, q, NOW);
+        if (hit) expect(score).toBe(hit.score);
+        else expect(score).toBeLessThan(0);
+      }
+    }
+  });
+
+  // The ranking pass scores without the palette's matchExact so it builds no
+  // positions arrays; the numbers must stay the ones matchExact gave.
+  it("scores terms the way matchExact did", () => {
+    const WORD = /[\p{L}\p{N}_]/u;
+    const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u;
+    function previousScore(low: string, term: { text: string; exact: boolean }): number | null {
+      if (term.exact || UNSPACED.test(term.text[0])) {
+        return matchExact(low, term.text)?.score ?? null;
+      }
+      for (let at = low.indexOf(term.text); at >= 0; at = low.indexOf(term.text, at + 1)) {
+        if (at > 0 && WORD.test(low[at - 1])) continue;
+        const end = at + term.text.length;
+        const whole = end === low.length || !WORD.test(low[end]);
+        return matchExact(low.slice(at), term.text)!.score + (whole ? term.text.length * 8 : 0);
+      }
+      return null;
+    }
+    const texts = ["deploy went fine", "redeploy", "the deployment", "deploy", "明日のデプロイ", "x deploy_y"];
+    for (const text of texts) {
+      const entry = entryFromMessage(msg({ content: text, timestamp: NOW }))!;
+      for (const query of ["deploy", "dep", '"ploy"', "デプロイ", "went fine"]) {
+        const q = parseSearchQuery(query);
+        let expected: number | null = 0;
+        for (const term of q.terms) {
+          const s = previousScore(entry.low, term);
+          expected = s === null || expected === null ? null : expected + s;
+        }
+        const score = scoreEntry(entry, q, NOW);
+        if (expected === null) expect(score, `${text} / ${query}`).toBeLessThan(0);
+        else expect(score, `${text} / ${query}`).toBe(1 + expected);
+      }
+    }
+  });
+
+  it("ranks a hit whose timestamp is not a number, rather than scoring it NaN", () => {
+    const odd = {
+      ...entryFromMessage(msg({ content: "deploy" }))!,
+      timestamp: "soon" as unknown as number,
+    };
+    const fine = entryFromMessage(msg({ content: "deploy", lamport: 99 }))!;
+    const score = scoreEntry(odd, parseSearchQuery("deploy"), NOW);
+    expect(Number.isFinite(score)).toBe(true);
+    const ranked = searchEntries([[odd, fine]], parseSearchQuery("deploy"), 1, NOW);
+    expect(ranked).toHaveLength(1);
   });
 });
 

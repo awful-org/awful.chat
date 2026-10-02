@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteMessagesForRoom,
   getSearchIndex,
@@ -11,6 +11,7 @@ import { initStorageCrypto } from "$lib/storage-crypto";
 import { MessageType, type Message } from "$lib/types/message";
 import {
   clearSearchCorpus,
+  corpusState,
   ensureRoomCorpus,
   searchRooms,
   scopeProgress,
@@ -37,11 +38,19 @@ function msg(overrides: Partial<Message> = {}): Message {
   };
 }
 
+function many(count: number, overrides: Partial<Message> = {}): Message[] {
+  return Array.from({ length: count }, () => msg(overrides));
+}
+
 beforeEach(async () => {
   await initStorageCrypto(TEST_KEY);
   await wipeLocalDatabase();
   clearSearchCorpus();
   seq = 0;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("search corpus", () => {
@@ -126,5 +135,16 @@ describe("search corpus", () => {
     );
     await ensureRoomCorpus("room-a");
     expect(searchRooms(parseSearchQuery("thumbs"), ["room-a"])).toHaveLength(0);
+  });
+
+  it("announces a sweep's growth a couple of times, not once per page", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    await bulkPutMessages(many(500));
+    const before = corpusState.version;
+    await ensureRoomCorpus("room-a");
+    // Ten pages. Each announcement re-ran the whole search being typed.
+    const announced = corpusState.version - before;
+    expect(announced).toBeGreaterThanOrEqual(1);
+    expect(announced).toBeLessThanOrEqual(2);
   });
 });
