@@ -691,6 +691,18 @@ max per message:   64 KB
 SyncBatch:         max 20 messages per batch
 direct streams:    4-byte big-endian length-prefixed frames
                    (chat DM envelopes, file signaling, rendezvous)
+room channels:     one /awful/room/2.0.0 stream per protected room and peer,
+                   opened by either side; when both open one at once, the
+                   stream the smaller peerId started is kept (as for DM
+                   introductions)
+                   up to 256 proven per connection plus 64 handshakes, and
+                   1024 proven in all; past that the least recently used one
+                   quiet for 30 s is closed, and the next send reopens it
+                   a member stays a member while connected, channel open or
+                   not, until the room is left, the relay sends PEER_LEFT, or
+                   a fresh channel is refused twice
+                   openings: 64 at once, the rest queued; a pair the relay
+                   lists that has no channel is retried, 5 s doubling to 5 min
 ```
 
 ---

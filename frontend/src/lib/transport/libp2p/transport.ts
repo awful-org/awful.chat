@@ -16,6 +16,7 @@ import type { SecureRoomChannel } from "$lib/room-security/channel";
 import { attachDmIntroduction, DM_INTRODUCTION_PROTOCOL } from "$lib/room-security/dm-introduction-stream";
 import { LobbyDialBudget } from "./dm-lobby-budget";
 import { FrameAssembler, FrameTooLargeError } from "./frame-assembler";
+import { RoomOpenings } from "./room-openings";
 import type { DmPqState } from "$lib/room-security/pq-dm";
 import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 import { onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
@@ -180,6 +181,33 @@ const DM_LOBBY_REGISTER_DELAY_MS = 70_000;
 const DM_LOBBY_MAX = 64;
 /** Budget for the one-off liveness probe a network change triggers. */
 const RELAY_LIVENESS_TIMEOUT_MS = 5_000;
+/**
+ * Room channels - one /awful/room/2.0.0 stream per room and peer - that one
+ * connection may hold once they have proven their room, and the handshakes
+ * it may have under way on top. Both used to share one cap of 32, counting
+ * both directions, and libp2p's own default is 32 inbound streams per
+ * protocol: two devices sharing a 17th room could not open it at all, and a
+ * user's own phone and laptop share every room. libp2p is told the same
+ * numbers (handleRoomStreams); an older peer still holds us to its 32.
+ */
+const ROOM_CHANNELS_PER_CONNECTION = 256;
+const ROOM_HANDSHAKES_PER_CONNECTION = 64;
+/**
+ * Proven room channels held at once. Past this the least recently used one
+ * that has carried nothing for ROOM_CHANNEL_QUIET_MS is closed; its member
+ * stays a member, and the next send to them opens a fresh channel
+ * (trimRoomChannels).
+ */
+const ROOM_CHANNELS_MAX = 1024;
+const ROOM_CHANNEL_QUIET_MS = 30_000;
+/** Inbound handshakes under way at once, across every connection. */
+const ROOM_HANDSHAKES_MAX = 256;
+/** Room channels being opened at once, and how many more may wait a turn. */
+const ROOM_OPENINGS_MAX = 64;
+const ROOM_OPENINGS_QUEUED_MAX = 4096;
+/** Retrying a pair the relay lists in a room that has not proven it yet. */
+const ROOM_PROVE_RETRY_MS = 5_000;
+const ROOM_PROVE_RETRY_MAX_MS = 5 * 60_000;
 
 type RendezvousClientMsg =
   | { type: "REGISTER"; room: string }
@@ -191,6 +219,24 @@ type RendezvousServerMsg =
   | { type: "PEER_JOINED"; room: string; peer: string }
   | { type: "PEER_LEFT"; room: string; peer: string }
   | { type: "PONG" };
+
+/** One room stream, opened by either end, before and after it proves its room. */
+type RoomStreamEntry = {
+  connection: Connection;
+  peer: string;
+  /** We opened it. */
+  outgoing: boolean;
+  /** From the start when we open it, from its hello when they do. */
+  room: DiscoveryId | null;
+  /** Set once both ends have proven the room. */
+  channel: SecureRoomChannel | null;
+  /** Last send or receipt, for choosing which idle channel to close first. */
+  usedAt: number;
+  /** Closed by us because the peer's own stream for the room won (admitRoomStream). */
+  superseded: boolean;
+  close: () => void;
+  getChannel: () => SecureRoomChannel | null;
+};
 
 /**
  * `navigator.connection`, which is not in lib.dom yet. A phone hopping
@@ -291,6 +337,9 @@ export class LibP2PTransport implements PeerTransport {
     this.lobbyPending.clear();
     this.dmSessions.clear();
     this.secureOpening.clear();
+    this.roomOpenings.clear();
+    this.roomMembers.clear();
+    this.roomProveRetry.clear();
   }
 
   introduceDm(peer: string, expectedDid?: string): Promise<boolean> {
@@ -476,12 +525,31 @@ export class LibP2PTransport implements PeerTransport {
     }, DM_LOBBY_INTRODUCE_DELAY_MS);
   }
   private secureOpening = new Map<string, Promise<SecureRoomChannel | null>>();
-  private secureStreams = new Set<{
-    connection: Connection;
-    room: DiscoveryId | null;
-    channel: SecureRoomChannel | null;
-    close: () => void;
-  }>();
+  private secureStreams = new Set<RoomStreamEntry>();
+  private roomOpenings = new RoomOpenings(ROOM_OPENINGS_MAX, ROOM_OPENINGS_QUEUED_MAX);
+  /**
+   * Who has proven each room to us, and over which connection it last did.
+   *
+   * peersInRoom used to be the set of open channels, so a channel that
+   * closed took its member with it - and every room path gates on
+   * peersInRoom, so that member silently stopped hearing from us: no chat,
+   * typing, presence or sync, until the relay happened to list them again.
+   * Channels close for plenty of reasons that are not the member leaving: we
+   * close idle ones past ROOM_CHANNELS_MAX, the other end does the same, a
+   * write stalls. So membership lives here, counted while the member stays
+   * connected, and the next send opens a fresh channel, which proves it
+   * again. It ends when we leave the room, when the relay says they left,
+   * or when a fresh channel is refused.
+   */
+  private roomMembers = new Map<DiscoveryId, Map<string, Connection>>();
+  /** "room\npeer" -> the next try for a pair the relay lists that has not proven the room. */
+  private roomProveRetry = new Map<string, { at: number; delay: number }>();
+  private roomRefusalWarnedAt = new Map<string, number>();
+  /** When idle channels close (trimRoomChannels); a field so tests can bring it closer. */
+  private roomChannelLimits = {
+    total: ROOM_CHANNELS_MAX, perConnection: ROOM_CHANNELS_PER_CONNECTION, idleMs: ROOM_CHANNEL_QUIET_MS,
+  };
+  private roomTrimQueued = false;
 
   /** Explicit v2 API: only the derived public ID reaches rendezvous. */
   joinSecureRoom(secret: RoomSecret): DiscoveryId {
@@ -493,37 +561,188 @@ export class LibP2PTransport implements PeerTransport {
     return keys.discoveryId;
   }
 
-  private attachSecureStream(stream: Stream, connection: Connection, initiate?: RoomKeys) {
+  private attachSecureStream(stream: Stream, connection: Connection, initiate?: RoomKeys): RoomStreamEntry | null {
     for (const old of this.secureStreams) if (old.connection.status !== "open") old.close();
-    if (this.secureStreams.size >= 256 ||
-        [...this.secureStreams].filter((e) => e.connection === connection).length >= 32) {
-      stream.abort(new Error("Room connection limit"));
-      return null;
+    const peer = connection.remotePeer.toString();
+    if (!initiate) {
+      // A handshake is what anybody who can reach us can make us hold, so
+      // handshakes are what is capped here. Channels that have proven a
+      // room are bounded by closing idle ones instead (trimRoomChannels).
+      let total = 0, here = 0;
+      for (const entry of this.secureStreams) {
+        if (entry.outgoing || entry.channel) continue;
+        total++;
+        if (entry.connection === connection) here++;
+      }
+      if (total >= ROOM_HANDSHAKES_MAX || here >= ROOM_HANDSHAKES_PER_CONNECTION) {
+        this.noteRoomRefusal("handshakes", peer);
+        stream.abort(new Error("Room connection limit"));
+        return null;
+      }
     }
-    const entry = { connection, room: null as DiscoveryId | null,
-      channel: null as SecureRoomChannel | null, close: () => {} };
+    const entry: RoomStreamEntry = {
+      connection, peer, outgoing: !!initiate, room: initiate?.discoveryId ?? null, channel: null,
+      usedAt: Date.now(), superseded: false, close: () => {}, getChannel: () => null,
+    };
     this.secureStreams.add(entry);
     const handle = attachRoomStream({
       stream, connection, local: this.selfId(), rooms: this.secureRooms, initiate,
+      admit: (room) => this.admitRoomStream(entry, room),
       onReady: (room, channel) => {
         if (!this.secureRooms.has(room) || !this.dmCurrent(room)) { entry.close(); return; }
-        entry.room = room; entry.channel = channel;
-        this.emit("roomPeers", this.localRoom(room), this.peersInRoom(room));
+        entry.room = room; entry.channel = channel; entry.usedAt = Date.now();
+        // News only. A channel reopened for a member already counted changes
+        // nothing the app can see, and announcing it would replay the app's
+        // whole catch-up for that member on every reopen.
+        if (this.noteRoomMember(room, peer, connection)) this.emit("roomPeers", this.localRoom(room), [peer]);
+        if (this.trimRoomChannels() && !this.roomTrimQueued) {
+          // Channels proven in the same burst are still finishing their last
+          // handshake frame: one more pass once they have, not at the next tick.
+          this.roomTrimQueued = true;
+          setTimeout(() => { this.roomTrimQueued = false; this.trimRoomChannels(); }, 0);
+        }
       },
       onData: (room, data) => {
+        entry.usedAt = Date.now();
         if (this.secureRooms.has(room) && this.dmCurrent(room) && connection.status === "open") {
-          this.emit("message", connection.remotePeer.toString(), data, this.localRoom(room));
+          this.emit("message", peer, data, this.localRoom(room));
         }
       },
       onClose: () => { this.secureStreams.delete(entry); },
     });
     entry.close = handle.close;
-    return handle;
+    entry.getChannel = handle.getChannel;
+    return entry;
+  }
+
+  /**
+   * An inbound stream has named its room: keep it, or refuse it.
+   *
+   * Both ends of a pair learn of each other from the same rendezvous reply
+   * and open a channel at the same moment, so every pair ended up holding
+   * two - twice the streams against every limit - and nothing ever closed
+   * the spare. Simultaneous opening now converges on the stream the smaller
+   * peer ID started, as DM introductions do, so both ends reach the same
+   * answer without a word about it. Any other stream the peer already had
+   * for the room gives way to the new one: a peer opens another only when
+   * its end of the first is gone - it reloaded, or closed it as idle and
+   * the reset has not landed here yet.
+   */
+  private admitRoomStream(entry: RoomStreamEntry, room: DiscoveryId): boolean {
+    for (const other of [...this.secureStreams]) {
+      if (other === entry || other.room !== room || other.peer !== entry.peer || other.connection.status !== "open") continue;
+      if (other.outgoing && !other.channel && this.selfId() < entry.peer) return false;
+      other.superseded = other.outgoing && !other.channel;
+      other.close();
+    }
+    entry.room = room;
+    return true;
+  }
+
+  /**
+   * Count a member in; true when that is news - a new member, or one on a
+   * different connection than before, which is what a reload looks like
+   * (the relay keeps the old circuit reading "open" for a while).
+   */
+  private noteRoomMember(room: DiscoveryId, peer: string, connection: Connection): boolean {
+    let members = this.roomMembers.get(room);
+    if (!members) this.roomMembers.set(room, members = new Map());
+    const before = members.get(peer);
+    members.set(peer, connection);
+    this.roomProveRetry.delete(`${room}\n${peer}`);
+    return before !== connection;
+  }
+
+  /** The proven channel a peer has with us for a room, on a connection still open. */
+  private liveRoomChannel(room: DiscoveryId, peer: string): RoomStreamEntry | null {
+    for (const entry of this.secureStreams) {
+      if (entry.room === room && entry.peer === peer && entry.channel?.verified &&
+          entry.connection.status === "open") return entry;
+    }
+    return null;
+  }
+
+  /** A handshake under way between us for a room - theirs or ours. */
+  private roomHandshake(room: DiscoveryId, peer: string): SecureRoomChannel | null {
+    for (const entry of this.secureStreams) {
+      if (entry.room !== room || entry.peer !== peer || entry.channel || entry.connection.status !== "open") continue;
+      const pending = entry.getChannel();
+      if (pending) return pending;
+    }
+    return null;
+  }
+
+  private isRoomMember(room: DiscoveryId, peer: string): boolean {
+    return (this.roomMembers.get(room)?.has(peer) === true && this.connectedPeers.has(peer)) ||
+      this.liveRoomChannel(room, peer) !== null;
+  }
+
+  /**
+   * Close the least recently used idle room channels past the limits, and
+   * say whether any limit is still exceeded.
+   *
+   * Their members stay members (roomMembers) and the next send to them
+   * opens a fresh channel, so running out of room costs a handshake, never a
+   * member. Only a channel that has carried nothing either way for a while
+   * is closed: the other end cannot see it coming, and a frame it sent the
+   * moment ours closed would be lost - the quieter the channel, the less
+   * likely that is. One in use waits for a later pass, so the limits bend
+   * for real traffic instead of churning it.
+   */
+  private trimRoomChannels(): boolean {
+    const { total, perConnection, idleMs } = this.roomChannelLimits;
+    if (this.secureStreams.size <= Math.min(total, perConnection)) return false;
+    const quietSince = Date.now() - idleMs;
+    const closeIdle = (entries: RoomStreamEntry[], limit: number): number => {
+      let excess = entries.filter((e) => e.channel?.verified).length - limit;
+      if (excess <= 0) return 0;
+      const idle = entries.filter((e) => e.channel?.idle && e.usedAt <= quietSince).sort((a, b) => a.usedAt - b.usedAt);
+      for (const entry of idle) {
+        if (excess <= 0) break;
+        excess--;
+        this.debugStats.roomChannelsClosedIdle++;
+        entry.close();
+      }
+      return excess;
+    };
+    const proven = [...this.secureStreams].filter((e) => e.channel?.verified);
+    let over = closeIdle(proven, total);
+    const byConnection = new Map<Connection, RoomStreamEntry[]>();
+    for (const entry of proven) {
+      const list = byConnection.get(entry.connection);
+      if (list) list.push(entry);
+      else byConnection.set(entry.connection, [entry]);
+    }
+    for (const entries of byConnection.values()) over += closeIdle(entries, perConnection);
+    return over > 0;
+  }
+
+  /**
+   * A room channel we could not have, said out loud. These were silent: the
+   * member simply never heard from us in that room, and nothing anywhere
+   * said why.
+   */
+  private noteRoomRefusal(reason: "handshakes" | "queue" | "refused", peer: string, room?: DiscoveryId): void {
+    this.debugStats.roomChannelRefusals++;
+    rec(ev("session.config", {
+      sev: "warn", peer, room: room ? refs().roomRef(room) : null, d: { roomChannel: "refused", reason },
+    }));
+    const now = Date.now();
+    if (now - (this.roomRefusalWarnedAt.get(reason) ?? 0) < 30_000) return;
+    this.roomRefusalWarnedAt.set(reason, now);
+    console.warn(`[LibP2PTransport] room channel refused (${reason}) for ${peer.slice(-8)}`);
   }
 
   async sendSecureRoom(peerId: string, room: DiscoveryId, data: Uint8Array): Promise<boolean> {
-    const channel = await this.ensureSecureRoom(peerId, room);
-    return channel && this.dmCurrent(room) ? channel.send(data) : false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const channel = await this.ensureSecureRoom(peerId, room);
+      if (!channel || !this.dmCurrent(room)) return false;
+      const sent = await channel.trySend(data);
+      if (sent !== "unsent") return sent === "sent";
+      // Closed before any of it went - the other end closed it as idle, or
+      // it lost to a duplicate - so once more, on a fresh channel.
+    }
+    return false;
   }
 
   /** Room-scoped application traffic must use this instead of raw send().
@@ -558,35 +777,87 @@ export class LibP2PTransport implements PeerTransport {
     const keys = this.secureRooms.get(room);
     const node = this.node;
     if (!keys || !node || peerId === this.selfId() || this.isRelayPeer(peerId)) return Promise.resolve(null);
-      for (const entry of this.secureStreams) {
-        if (entry.room === room && entry.connection.status === "open" &&
-            entry.connection.remotePeer.toString() === peerId && entry.channel?.verified) {
-          return Promise.resolve(entry.channel);
-        }
-      }
+    const live = this.liveRoomChannel(room, peerId);
+    if (live?.channel) {
+      live.usedAt = Date.now();
+      // A live channel is proof enough to keep counting them once it closes,
+      // even if a relay bounce's PEER_LEFT dropped them in between.
+      if (!this.roomMembers.get(room)?.has(peerId)) this.noteRoomMember(room, peerId, live.connection);
+      return Promise.resolve(live.channel);
+    }
     const openingKey = `${room}:${peerId}`;
     const existing = this.secureOpening.get(openingKey);
     if (existing) return existing;
-    if (this.secureOpening.size >= 64) return Promise.resolve(null);
-    const job = (async () => {
-      const signal = AbortSignal.timeout(30_000);
-      const connection = await node.dial(peerIdFromString(peerId), { signal });
-      if (this.node !== node || this.secureRooms.get(room) !== keys) return null;
-      const stream = await connection.newStream(ROOM_PROTOCOL, { runOnLimitedConnection: true, signal });
-      if (this.node !== node || this.secureRooms.get(room) !== keys) {
-        stream.abort(new Error("Room session ended")); return null;
-      }
-      const handle = this.attachSecureStream(stream, connection, keys);
-      const channel = handle?.getChannel();
-      if (!channel) return null;
-      await channel.ready;
-      if (this.node !== node || this.secureRooms.get(room) !== keys || !this.dmCurrent(room)) { channel.close(); return null; }
-      return channel;
-    })().catch(() => null).finally(() => {
+    const job = this.openSecureRoom(node, keys, peerId).catch(() => null).finally(() => {
       if (this.secureOpening.get(openingKey) === job) this.secureOpening.delete(openingKey);
     });
     this.secureOpening.set(openingKey, job);
     return job;
+  }
+
+  /**
+   * Open a room channel to a peer, or join the one already being opened
+   * between us. A handshake that fails gets one more try: ours loses the
+   * race to the peer's own opening now and then, and an older peer at its
+   * own limit turns streams away until one of its others closes.
+   */
+  private async openSecureRoom(node: Libp2p<AppServices>, keys: RoomKeys, peerId: string): Promise<SecureRoomChannel | null> {
+    const room = keys.discoveryId;
+    const current = () => this.node === node && this.secureRooms.get(room) === keys && this.dmCurrent(room);
+    let refusals = 0;
+    for (let pass = 0; pass < 4 && refusals < 2 && current(); pass++) {
+      // Theirs, or a stream we left behind: joined rather than raced.
+      for (let waits = 0; waits < 3; waits++) {
+        const pending = this.liveRoomChannel(room, peerId) ? null : this.roomHandshake(room, peerId);
+        if (!pending) break;
+        await pending.ready.catch(() => {});
+      }
+      if (!current()) return null;
+      const live = this.liveRoomChannel(room, peerId);
+      if (live?.channel) return live.channel;
+      const end = this.roomOpenings.tryEnter() ?? await this.roomOpenings.enter();
+      if (!end) {
+        this.noteRoomRefusal("queue", peerId, room);
+        return null;
+      }
+      let entry: RoomStreamEntry | null = null;
+      try {
+        if (!current()) return null;
+        const signal = AbortSignal.timeout(30_000);
+        const connection = await node.dial(peerIdFromString(peerId), { signal });
+        if (!current()) return null;
+        const stream = await connection.newStream(ROOM_PROTOCOL, { runOnLimitedConnection: true, signal });
+        if (!current()) { stream.abort(new Error("Room session ended")); return null; }
+        if (this.liveRoomChannel(room, peerId) || this.roomHandshake(room, peerId)) {
+          // Theirs got here while ours was opening.
+          stream.abort(new Error("Room channel already opening"));
+          continue;
+        }
+        entry = this.attachSecureStream(stream, connection, keys);
+        const channel = entry?.getChannel();
+        if (!channel) return null;
+        await channel.ready;
+      } catch {
+        // No stream at all is the network's doing - nothing to try again
+        // here. A handshake that went nowhere is the peer's answer, unless
+        // it was ours that gave way to theirs.
+        if (!entry) return null;
+        if (!entry.superseded) refusals++;
+        continue;
+      } finally {
+        end();
+      }
+      if (!current()) { entry?.close(); return null; }
+      if (entry?.channel?.verified) return entry.channel;
+    }
+    if (refusals >= 2 && current() && !this.liveRoomChannel(room, peerId)) {
+      // Turned away twice: whatever proved the room before no longer does.
+      // They left it without the relay saying so, or cannot hold another
+      // channel; either way they are not reachable here now.
+      this.roomMembers.get(room)?.delete(peerId);
+      this.noteRoomRefusal("refused", peerId, room);
+    }
+    return null;
   }
 
   private verifyDiscoveredRoomPeer(room: string, peer: string): void {
@@ -770,6 +1041,8 @@ export class LibP2PTransport implements PeerTransport {
     pingsIn: 0,
     pongsIn: 0,
     suppressedStreamErrors: 0,
+    roomChannelRefusals: 0,
+    roomChannelsClosedIdle: 0,
   };
 
   // set to true only by disconnect() - prevents any reconnect logic from firing
@@ -916,6 +1189,11 @@ export class LibP2PTransport implements PeerTransport {
     };
     for (const entry of this.secureStreams) entry.close();
     this.secureOpening.clear();
+    // A new node means new connections to everyone: rooms are proven afresh
+    // as the relay lists their members again.
+    this.roomOpenings.clear();
+    this.roomMembers.clear();
+    this.roomProveRetry.clear();
     this.installStreamNoiseFilter();
     this.intentionalDisconnect = false;
 
@@ -1062,9 +1340,7 @@ export class LibP2PTransport implements PeerTransport {
     );
     assertCurrent();
 
-    await this.node.handle(ROOM_PROTOCOL, (stream: Stream, connection: Connection) => {
-      this.attachSecureStream(stream, connection);
-    }, { force: true, runOnLimitedConnection: true });
+    await this.handleRoomStreams(this.node);
     assertCurrent();
 
     await this.node.handle(DM_INTRODUCTION_PROTOCOL, (stream: Stream, connection: Connection) => {
@@ -1247,6 +1523,19 @@ export class LibP2PTransport implements PeerTransport {
     this.startRendezvous();
   }
 
+  /**
+   * Take room streams, with libp2p's per-connection limits for the protocol
+   * raised to ours: proven channels plus handshakes, either direction (its
+   * default is 32 inbound). Its own method so the integration tests register
+   * exactly what a real node does.
+   */
+  private async handleRoomStreams(node: Libp2p<AppServices>): Promise<void> {
+    const limit = ROOM_CHANNELS_PER_CONNECTION + ROOM_HANDSHAKES_PER_CONNECTION;
+    await node.handle(ROOM_PROTOCOL, (stream: Stream, connection: Connection) => {
+      this.attachSecureStream(stream, connection);
+    }, { force: true, runOnLimitedConnection: true, maxInboundStreams: limit, maxOutboundStreams: limit });
+  }
+
   joinRoom(roomCode: string): void {
     if (ROOM_SECURITY_V2_RELEASED && !roomCode.startsWith("rd2_")) throw new Error("Legacy rooms are read-only");
     roomCode = this.wireRoom(roomCode);
@@ -1293,6 +1582,10 @@ export class LibP2PTransport implements PeerTransport {
     if (keys) {
       keys.membershipKey.fill(0); keys.encryptionKey.fill(0); keys.sfuSigningSeed.fill(0);
       this.secureRooms.delete(roomCode as DiscoveryId);
+    }
+    this.roomMembers.delete(roomCode as DiscoveryId);
+    for (const key of this.roomProveRetry.keys()) {
+      if (key.startsWith(`${roomCode}\n`)) this.roomProveRetry.delete(key);
     }
     if (!this.joinedRooms.has(roomCode)) return;
     this.joinedRooms.delete(roomCode);
@@ -1494,14 +1787,26 @@ export class LibP2PTransport implements PeerTransport {
    * decide who may be told that a room exists: a room code is the room's only
    * membership secret, so naming a room to somebody outside it hands them the
    * key to it.
+   *
+   * A protected room asks the peers themselves instead: those that proved
+   * it over a channel and are still connected, whether or not that channel
+   * is open right now (roomMembers) - a send to one whose channel closed
+   * opens it again.
    */
   peersInRoom(room: string): string[] {
     if (!this.dmCurrent(room)) return [];
     room = this.wireRoom(room);
     if (room.startsWith("dm-")) return [];
-    if (room.startsWith("rd2_")) return [...new Set([...this.secureStreams]
-      .filter((e) => e.room === room && e.connection.status === "open" && e.channel?.verified)
-      .map((e) => e.connection.remotePeer.toString()))];
+    if (room.startsWith("rd2_")) {
+      const peers = new Set<string>();
+      for (const e of this.secureStreams) {
+        if (e.room === room && e.connection.status === "open" && e.channel?.verified) peers.add(e.peer);
+      }
+      for (const peer of this.roomMembers.get(room as DiscoveryId)?.keys() ?? []) {
+        if (this.connectedPeers.has(peer)) peers.add(peer);
+      }
+      return [...peers];
+    }
     const known = this.roomPeers.get(room);
     if (!known) return [];
     return [...known].filter((p) => this.connectedPeers.has(p));
@@ -1521,7 +1826,7 @@ export class LibP2PTransport implements PeerTransport {
     if (!this.dmCurrent(room)) return false;
     room = this.wireRoom(room);
     if (room.startsWith("dm-")) return false;
-    if (room.startsWith("rd2_")) return this.peersInRoom(room).includes(peerId);
+    if (room.startsWith("rd2_")) return this.isRoomMember(room as DiscoveryId, peerId);
     return this.roomPeers.get(room)?.has(peerId) === true;
   }
 
@@ -1889,6 +2194,9 @@ export class LibP2PTransport implements PeerTransport {
     }
     this.probeSilentPeers();
     this.retryMissingRoomPeers();
+    this.retryUnprovenRoomPeers();
+    // Channels busy when the limit was last reached are closable now.
+    this.trimRoomChannels();
     this.upgradeRelayedPeers(byPeer);
   }
 
@@ -2041,6 +2349,39 @@ export class LibP2PTransport implements PeerTransport {
         // every time.
         this.nextDialAt.set(peerId, now + next + Math.random() * next * 0.3);
         this.dialPeer(peerId).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Try again, backing off, for every pair the relay lists in a protected
+   * room we are in that has not proven it: connected, yet no channel. A pair
+   * used to get one attempt, when the rendezvous named it, and one refused
+   * then - every limit was full at startup, or the handshake timed out -
+   * never got another: the two stayed deaf to each other in that room for
+   * the rest of the session. Same hidden and offline rules as the dials
+   * above.
+   */
+  private retryUnprovenRoomPeers(): void {
+    if (this.intentionalDisconnect || !this.node || this.offline) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+    const now = Date.now();
+    for (const [room, peers] of this.roomPeers) {
+      if (!room.startsWith("rd2_") || !this.joinedRooms.has(room) || !this.secureRooms.has(room as DiscoveryId)) continue;
+      for (const peer of peers) {
+        if (!this.connectedPeers.has(peer) || this.isRoomMember(room as DiscoveryId, peer) ||
+            this.secureOpening.has(`${room}:${peer}`)) continue;
+        const key = `${room}\n${peer}`;
+        const retry = this.roomProveRetry.get(key);
+        // First seen here: the attempt the rendezvous reply made gets its turn.
+        if (!retry) {
+          this.roomProveRetry.set(key, { at: now + ROOM_PROVE_RETRY_MS, delay: ROOM_PROVE_RETRY_MS });
+          continue;
+        }
+        if (now < retry.at) continue;
+        const delay = Math.min(retry.delay * 2, ROOM_PROVE_RETRY_MAX_MS);
+        this.roomProveRetry.set(key, { at: now + delay + Math.random() * delay * 0.3, delay });
+        void this.ensureSecureRoom(peer, room as DiscoveryId);
       }
     }
   }
@@ -2904,6 +3245,11 @@ export class LibP2PTransport implements PeerTransport {
         // Stop retrying somebody who has gone.
         this.roomPeers.get(msg.room)?.delete(msg.peer);
         this.nextDialAt.delete(msg.peer);
+        // And stop counting them in. A channel still open keeps them until it
+        // closes; a closed one is no longer theirs to reopen, and if they come
+        // back the fresh channel is news again, catch-up and all.
+        this.roomMembers.get(msg.room as DiscoveryId)?.delete(msg.peer);
+        this.roomProveRetry.delete(`${msg.room}\n${msg.peer}`);
         break;
       }
     }

@@ -12,6 +12,8 @@ export function attachRoomStream(options: {
   local: string;
   rooms: ReadonlyMap<DiscoveryId, RoomKeys>;
   initiate?: RoomKeys;
+  /** Asked when an inbound stream names a room we hold, before any reply: false refuses it. */
+  admit?: (room: DiscoveryId) => boolean;
   onReady: (room: DiscoveryId, channel: SecureRoomChannel) => void;
   onData: (room: DiscoveryId, data: Uint8Array) => void;
   onClose: () => void;
@@ -87,6 +89,7 @@ export function attachRoomStream(options: {
           if (!isMembershipHello(frame)) throw new Error("Expected membership hello");
           const keys = options.rooms.get(frame.room as DiscoveryId);
           if (!keys) throw new Error("Unknown room");
+          if (options.admit && !options.admit(keys.discoveryId)) throw new Error("Room stream refused");
           create(keys, "responder");
         }
         channel!.receive(frame, length);
