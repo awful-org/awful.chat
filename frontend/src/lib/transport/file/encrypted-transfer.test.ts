@@ -71,7 +71,9 @@ it("seeds only opaque ciphertext, authenticates before publication, and restarts
   expect(seeds[0].file.name).not.toContain("diagnosis");
   expect(seeds[0].file.type).toBe("application/octet-stream");
   expect(await seeds[0].file.text()).not.toContain("medical");
-  expect(seeds[0].opts.store).toBeTruthy();
+  // Pieces read from the ciphertext itself: no piece store copies it.
+  expect(seeds[0].opts.preloadedStore).toBeTruthy();
+  expect(seeds[0].opts.store).toBeUndefined();
   expect(JSON.stringify(seeds[0].opts)).not.toContain(descriptor.encryption!.key);
   const receiver = transport();
   const downloaded = vi.fn(); receiver.on("downloaded", downloaded);
@@ -85,9 +87,14 @@ it("seeds only opaque ciphertext, authenticates before publication, and restarts
   sender.resetTransfers(); receiver.resetTransfers();
   const restarted = transport();
   expect(await restarted.restoreEncryptedFile(descriptor)).toBe(true);
-  expect(seeds[1].file.name).toBe(seeds[0].file.name);
-  expect(await seeds[1].file.arrayBuffer()).toEqual(bytes);
   expect(restarted.getTransfer(descriptor.infoHash)?.blobURL).toBeTruthy();
+  expect(restarted.getTransfer(descriptor.infoHash)?.seeding).toBe(true);
+  expect(seeds).toHaveLength(1); // shown, not seeded
+  // A peer asking for it gets the very same torrent back.
+  expect(await restarted.seedStoredFile(descriptor)).toBe(true);
+  expect(seeds[1].file.name).toBe(seeds[0].file.name);
+  expect(seeds[1].opts.pieceLength).toBe(seeds[0].opts.pieceLength);
+  expect(await seeds[1].file.arrayBuffer()).toEqual(bytes);
 });
 
 it.each(["key", "tamper", "truncation"])("never publishes or reseeds plaintext after %s failure", async kind => {
@@ -132,6 +139,57 @@ it("a finished download and a restore leave no plaintext anywhere on disk", asyn
   // runs nothing, and the plaintext must already be nowhere but in memory.
   expect([...disk.entries.keys()].filter(k => k.startsWith("room-v2-transfers/"))).toEqual([]);
   expect(await downloaded.mock.calls[0][1].text()).toBe(secret);
+});
+
+it("showing a stored file again writes nothing and seeds nothing", async () => {
+  const { descriptor, bytes, original } = await offer();
+  const before = new Map(disk.entries);
+  const restarted = transport(); const downloaded = vi.fn(); restarted.on("downloaded", downloaded);
+  // From the durable copy, and from the row's own copy of the same bytes.
+  expect(await restarted.restoreEncryptedFile(descriptor)).toBe(true);
+  expect(await restarted.restoreEncryptedFile({ ...descriptor, data: bytes } as FileEntry, bytes)).toBe(true);
+  expect(new Map(disk.entries)).toEqual(before);
+  expect([...disk.entries].every(([path, blob]) => before.get(path) === blob)).toBe(true);
+  expect(seeds).toHaveLength(1);
+  // Marked as read back from storage, so nobody stores it again.
+  expect(downloaded.mock.calls.map(call => call[2])).toEqual([true, true]);
+  expect(await downloaded.mock.calls[1][1].text()).toBe(await original.text());
+  // The transfer holds the descriptor only, never the row's bytes.
+  expect(restarted.getTransfer(descriptor.infoHash)).not.toHaveProperty("data");
+});
+
+it("keeps one durable copy of a row's bytes when this device's file store has none", async () => {
+  const { descriptor, bytes } = await offer();
+  disk.entries.delete(`room-v2-ciphertext/${descriptor.infoHash}`);
+  const restarted = transport();
+  expect(await restarted.restoreEncryptedFile(descriptor)).toBe(false);
+  expect(await restarted.restoreEncryptedFile(descriptor, bytes)).toBe(true);
+  const kept = disk.entries.get(`room-v2-ciphertext/${descriptor.infoHash}`);
+  expect(await kept?.arrayBuffer()).toEqual(bytes);
+  expect(await restarted.restoreEncryptedFile(descriptor, bytes)).toBe(true);
+  expect(disk.entries.get(`room-v2-ciphertext/${descriptor.infoHash}`)).toBe(kept);
+});
+
+it("serves a stored file from its ciphertext as it is: nothing decrypted, nothing copied", async () => {
+  const { descriptor, bytes } = await offer();
+  const restarted = transport();
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const before = new Map(disk.entries);
+  // Two peers asking at once get one seed.
+  const [a, b] = await Promise.all([restarted.seedStoredFile(descriptor), restarted.seedStoredFile(descriptor)]);
+  expect([a, b]).toEqual([true, true]);
+  expect(decrypt).not.toHaveBeenCalled();
+  decrypt.mockRestore();
+  expect(seeds).toHaveLength(2);
+  expect(seeds[1].opts.store).toBeUndefined();
+  expect(new Map(disk.entries)).toEqual(before);
+  const piece = await new Promise<Uint8Array>((resolve, reject) =>
+    seeds[1].opts.preloadedStore.get(0, (e: unknown, buf: Uint8Array) => (e ? reject(e) : resolve(buf))));
+  expect(new Uint8Array(piece)).toEqual(new Uint8Array(bytes));
+  expect(restarted.getTransfer(descriptor.infoHash)?.status).toBe("seeding");
+  // A file this device holds no ciphertext for is not served at all.
+  disk.entries.delete(`room-v2-ciphertext/${descriptor.infoHash}`);
+  expect(await transport().seedStoredFile(descriptor)).toBe(false);
 });
 
 it("a starting session clears what closed ones left, and a lock clears its own", async () => {

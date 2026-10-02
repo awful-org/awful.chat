@@ -327,7 +327,8 @@ export type FileSignalEnvelope =
 export interface FileTransferEvents {
   signal: (peerId: string, envelope: FileSignalEnvelope) => void;
   transfer: (snapshot: FileTransferSnapshot) => void;
-  downloaded: (infoHash: string, blob: Blob) => void;
+  /** `restored`: read back from this device's own storage, not fetched. */
+  downloaded: (infoHash: string, blob: Blob, restored?: boolean) => void;
 }
 
 export interface FileTransferTransport {

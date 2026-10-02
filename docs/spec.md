@@ -674,8 +674,10 @@ the key travels only inside the signed, end-to-end encrypted message;
 WebTorrent sees an opaque name and ciphertext.
 
 send:
-  1. encrypt into OPFS staging (ciphertext) → seed it → infoHash
-  2. keep the ciphertext in room-v2-ciphertext/<infoHash>
+  1. encrypt into OPFS staging (ciphertext) → seed it, pieces read from the
+     file itself → infoHash
+  2. keep the ciphertext in room-v2-ciphertext/<infoHash>; the seed reads
+     from there on
   3. store Attachment { infoHash, encryption, status: "seeding" },
      data: the ciphertext when it is 5MB or less
   4. broadcast the message with the file descriptors
@@ -687,15 +689,25 @@ receive:
      IN MEMORY, no File until every chunk authenticates → blobURL
      → status: "seeding" (data: the ciphertext when 5MB or less)
 
-room open:
-  the room's stored attachments are decrypted from the stored ciphertext
-  (in memory) and seeded again
+room open (first time in a session), newest first:
+  read the room's rows (attachments.byRoom, metadata only) → decrypt each
+  file IN MEMORY from room-v2-ciphertext, or from the row's data when this
+  device has no durable copy (which is then written, once) → blobURL.
+  Nothing is seeded, re-hashed or rewritten, and the rows are not touched.
+
+serving (a peer's link connects for a file with no torrent here):
+  seed room-v2-ciphertext/<infoHash> as it is - the original opaque name
+  and 256 KiB pieces, so the infoHash is the signed one - with the pieces
+  read from the file itself (CiphertextChunkStore). Never decrypted.
+
+status: written to the rows when it changes, read without the file bytes.
+A torrent's progress becomes a snapshot at most every 250 ms.
 
 OPFS (the origin's private file system) holds ciphertext only, never a
 decrypted file:
   room-v2-ciphertext/<infoHash>   durable, until a wipe
-  room-v2-pieces/<lease>/...      a torrent's piece store, for one session
-  room-v2-transfers/<lease>/...   a send's ciphertext while it is seeded
+  room-v2-pieces/<lease>/...      a download's piece store, for one session
+  room-v2-transfers/<lease>/...   a send's ciphertext until it is kept
   <lease>: each file transport (transport/file/opfs-lease.ts) holds the Web
   Lock "awful:opfs:<lease>" for its session. A page starting, and a lock,
   remove every lease directory whose lock is free (its page closed or

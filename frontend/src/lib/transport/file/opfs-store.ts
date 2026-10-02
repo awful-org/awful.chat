@@ -48,3 +48,46 @@ export class OPFSChunkStore {
     }).then(() => cb(), cb);
   }
 }
+
+/**
+ * The same contract, read straight out of one whole ciphertext file - a
+ * seed's `preloadedStore`. Seeding through OPFSChunkStore copied every piece
+ * of a file this device already held into a new directory, once per session
+ * and file: a room's pictures written out again on every reload. Here the
+ * pieces are slices of the file itself: nothing is copied, and nothing is
+ * written or removed, because the file belongs to whoever made it (the
+ * durable store, or a send's staging until the durable copy exists).
+ */
+export class CiphertextChunkStore {
+  constructor(
+    readonly chunkLength: number,
+    /** Replaced, not reread, when the bytes move to their durable copy. */
+    public source: Blob,
+    /** A fresh handle on the file, for when the browser drops a stale one. */
+    public reopen?: () => Promise<Blob | null>,
+  ) {}
+  put(_index: number, _bytes: Uint8Array, cb: (error?: unknown) => void) {
+    // A seed holds every piece already: nothing is ever downloaded into it.
+    queueMicrotask(() => cb(new Error("Read-only piece store")));
+  }
+  get(index: number, opts: { offset?: number; length?: number } | null | ((error: unknown, bytes?: Buffer) => void), callback?: (error: unknown, bytes?: Buffer) => void) {
+    const cb = typeof opts === "function" ? opts : callback!;
+    const range = (typeof opts === "function" ? null : opts) ?? {};
+    const start = index * this.chunkLength + (range.offset ?? 0);
+    const end = range.length === undefined
+      ? Math.min((index + 1) * this.chunkLength, this.source.size)
+      : start + range.length;
+    const read = async (blob: Blob) => Buffer.from(await blob.slice(start, end).arrayBuffer());
+    void read(this.source).catch(async (error) => {
+      // An OPFS file read after it was written again fails; a fresh handle
+      // has the same bytes, since the file under one infoHash only ever
+      // holds that infoHash's ciphertext.
+      const fresh = await this.reopen?.();
+      if (!fresh) throw error;
+      this.source = fresh;
+      return read(fresh);
+    }).then(bytes => cb(null, bytes), cb);
+  }
+  close(cb: (error?: unknown) => void) { queueMicrotask(() => cb()); }
+  destroy(cb: (error?: unknown) => void) { queueMicrotask(() => cb()); }
+}

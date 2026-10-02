@@ -1,5 +1,6 @@
 import {
   attachmentEpoch,
+  getAttachment,
   getAttachmentsByInfoHash,
   getAttachmentsByMessage,
   getAttachmentsWithData,
@@ -121,14 +122,23 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
   // conversation is the one currently open.
   _fileTransport.setLocalFileLookup(async (infoHash) => {
     const epoch = _fileEpoch;
-    const stored = (await getAttachmentsByInfoHash(infoHash)).find(
-      (attachment) => attachment.data || attachment.encryption
-    );
+    const rows = await getAttachmentsByInfoHash(infoHash, { skipBytes: true });
     if (epoch !== _fileEpoch) return null;
-    if (stored?.encryption) {
-      await getFileTransport().restoreEncryptedFile(stored, stored.data);
+    const encrypted = rows.find((attachment) => attachment.encryption);
+    if (encrypted) {
+      // Served as the ciphertext it is. This used to decrypt the file, and
+      // publish it, just because a peer asked - for a conversation that need
+      // not even be open.
+      if (await getFileTransport().seedStoredFile(encrypted)) return null;
+      // Not in this device's file store (a restored backup, a synced
+      // device): the row's own copy, read only now that it is needed.
+      const full = await getAttachment(encrypted.id);
+      if (epoch === _fileEpoch && full?.data) await getFileTransport().seedStoredFile(full, full.data);
       return null;
     }
+    if (!rows.length) return null;
+    const stored = (await getAttachmentsByInfoHash(infoHash)).find((attachment) => attachment.data);
+    if (epoch !== _fileEpoch) return null;
     if (!stored?.data) return null;
     if (stored.roomCode.startsWith("rd2_") || stored.roomCode.startsWith("dm-")) return null;
     return new File([stored.data], stored.filename, {
@@ -166,13 +176,16 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     }
   });
 
-  _fileTransport.on("downloaded", (infoHash, blob) => {
+  _fileTransport.on("downloaded", (infoHash, blob, restored) => {
     const guard = fileOperationGuard();
     const current = transportState.fileTransfers.get(infoHash);
     if (current && !current.blobURL) {
       withFileTransfer({ ...current, blobURL: URL.createObjectURL(blob) });
     }
-    _persistDownloadedBlob(infoHash, blob).catch(() => {});
+    // Read back from this device's own storage, there is nothing new to
+    // keep: storing it anyway re-sealed the row of every file in every room
+    // opened, once a session.
+    if (!restored) _persistDownloadedBlob(infoHash, blob).catch(() => {});
 
     getAttachmentsByInfoHash(infoHash, { skipBytes: true })
       .then(async (attachments) => {
@@ -489,10 +502,15 @@ export async function _hydrateFileTransfersFromStorage(
     return [];
   }
   const epoch = _fileEpoch;
-  const seedable = await getAttachmentsWithData(roomCode);
+  // A secure room's files come back from this device's file store, so the
+  // copies inside their rows stay sealed unless a file has nothing else.
+  const secure = roomCode.startsWith("rd2_") || roomCode.startsWith("dm-");
+  const seedable = await getAttachmentsWithData(roomCode, { skipBytes: secure });
   if (epoch !== _fileEpoch) return [];
   const dedup = new Map<string, Attachment>();
-  for (const attachment of seedable) {
+  // Newest first: they are the ones on screen, and the room used to fill
+  // in in storage key order - effectively at random.
+  for (const attachment of [...seedable].sort((a, b) => b.createdAt - a.createdAt)) {
     if (!attachment.data && !attachment.encryption) continue;
     if (!dedup.has(attachment.infoHash))
       dedup.set(attachment.infoHash, attachment);
@@ -501,7 +519,11 @@ export async function _hydrateFileTransfersFromStorage(
   for (const attachment of dedup.values()) {
     if (epoch !== _fileEpoch) return [];
     if (attachment.encryption) {
-      await getFileTransport().restoreEncryptedFile(attachment, attachment.data);
+      // Already on screen this session: sent, downloaded or opened before.
+      if (transportState.fileTransfers.get(attachment.infoHash)?.blobURL) continue;
+      // One file that will not open must not keep the rest of the room's
+      // from showing.
+      await _restoreStoredFile(attachment).catch(() => {});
       continue;
     }
     if (roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) continue;
@@ -530,6 +552,23 @@ export async function _hydrateFileTransfersFromStorage(
   return [...dedup.values()];
 }
 
+/** Show one stored protected file: from this device's durable ciphertext
+ *  when it holds it, else from the attachment row's own copy. */
+async function _restoreStoredFile(attachment: Attachment): Promise<void> {
+  const epoch = _fileEpoch;
+  const transport = getFileTransport();
+  if (attachment.data) {
+    await transport.restoreEncryptedFile(attachment, attachment.data);
+    return;
+  }
+  // A durable copy that will not open (damaged on disk) falls back to the
+  // row's, as one that is missing does.
+  if (await transport.restoreEncryptedFile(attachment).catch(() => false)) return;
+  const full = await getAttachment(attachment.id);
+  if (epoch !== _fileEpoch || !full?.data) return;
+  await transport.restoreEncryptedFile(full, full.data);
+}
+
 export async function _resumeAttachmentSeeding(
   roomCode: string,
   prefetched?: Attachment[]
@@ -544,11 +583,9 @@ export async function _resumeAttachmentSeeding(
   const dedup = new Map<string, Attachment>();
   for (const attachment of seedable) {
     if (epoch !== _fileEpoch) return;
-    if (attachment.encryption) {
-      if (!getFileTransport().getTransfer(attachment.infoHash)?.seeding)
-        await getFileTransport().restoreEncryptedFile(attachment, attachment.data);
-      continue;
-    }
+    // Protected files are seeded when a peer asks for one (seedStoredFile,
+    // through the local file lookup), straight from their ciphertext.
+    if (attachment.encryption) continue;
     if (roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) continue;
     if (!attachment.data) continue;
     if (!dedup.has(attachment.infoHash))
@@ -574,11 +611,13 @@ export async function _resumeAttachmentSeeding(
 }
 
 /**
- * Blob URLs + torrent re-seeding from ONE decrypt pass, meant to run in the
- * BACKGROUND of a room open. Awaiting this in the open path froze the UI
- * for as long as it takes to decrypt every stored image and re-hash it for
- * WebTorrent - after a restart with a picture-heavy room, that read as the
- * app being dead. Images now pop in as they hydrate instead.
+ * Blob URLs for the room's stored files, meant to run in the BACKGROUND of a
+ * room open. Awaiting this in the open path froze the UI for as long as it
+ * takes to decrypt every stored image - after a restart with a picture-heavy
+ * room, that read as the app being dead. Images now pop in as they hydrate
+ * instead. Protected files are not seeded here: a peer that asks for one
+ * gets it from its ciphertext (seedStoredFile), with nothing decrypted,
+ * re-hashed or written for the files nobody asks for.
  */
 /**
  * Which room's stored attachments are being read back right now. Between a
@@ -609,15 +648,14 @@ export async function hydrateLegacyAttachments(
 }
 const _hydrating = new Map<string, number>();
 /**
- * Rooms whose attachments have already been decrypted, blob-URL'd and
- * re-seeded this session. A room switch does NOT clear
- * transportState.fileTransfers and WebTorrent seeding is global once
- * started, so all of that work survives a reopen - redoing it (decrypt
- * every stored image, re-hash each for WebTorrent) on every back-and-forth
- * was the heaviest thing a room open did, for no gain. New attachments that
- * arrive while away are hydrated by their own receipt path, not this bulk
- * pass. Cleared by _resetAttachmentHydration when the transfer map itself is
- * reset (a new session), so a reconnect rebuilds from scratch.
+ * Rooms whose attachments have already been decrypted and blob-URL'd this
+ * session. A room switch does NOT clear transportState.fileTransfers, so
+ * that work survives a reopen - redoing it (decrypt every stored image) on
+ * every back-and-forth was the heaviest thing a room open did, for no gain.
+ * New attachments that arrive while away are hydrated by their own receipt
+ * path, not this bulk pass. Cleared by _resetAttachmentHydration when the
+ * transfer map itself is reset (a new session), so a reconnect rebuilds from
+ * scratch.
  */
 const _hydratedRooms = new Set<string>();
 
