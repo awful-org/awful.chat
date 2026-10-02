@@ -615,10 +615,11 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   /**
-   * Which remote cameras are worth receiving: the ones something on screen
-   * shows (the stage, the floating panel and picture in picture, a popped
-   * out window), by peerId. Null means no opinion, and every camera is
-   * received.
+   * Which remote cameras are worth receiving, by peerId: the ones something
+   * on screen shows (the stage, the floating panel and picture in picture, a
+   * popped out window), and whoever is talking, whom the spotlight may move
+   * to next (call-tiles.ts, wantedCameras). Null means no opinion, and every
+   * camera is received.
    *
    * Every camera used to be consumed for the whole call at full size and
    * decoded whether anything showed it or not: in another room, with people

@@ -4,6 +4,7 @@ import {
   remoteCameraTileId,
   wantedCameras,
   type CallState,
+  type CameraSurfaces,
 } from "./call-tiles";
 
 describe("buildCallTiles", () => {
@@ -272,28 +273,79 @@ describe("buildCallTiles", () => {
 
 describe("wantedCameras", () => {
   const camera = (peerId: string, isLocal = false) => ({
+    id: isLocal ? "local-camera" : remoteCameraTileId(peerId),
     kind: "camera" as const,
     isLocal,
     peerId,
   });
+  const share = (peerId: string) => ({
+    id: `remote-screen-${peerId}`,
+    kind: "screen" as const,
+    isLocal: false,
+    peerId,
+  });
+  const shown = (surfaces: Partial<CameraSurfaces>): CameraSurfaces => ({
+    stage: [],
+    spotlight: null,
+    pinnedTileId: null,
+    poppedOut: [],
+    speaking: [],
+    selfId: "self",
+    ...surfaces,
+  });
 
   it("is what the stage has on screen when nothing else shows a camera", () => {
-    expect(wantedCameras(["a", "b"], null, [])).toEqual(new Set(["a", "b"]));
+    expect(wantedCameras(shown({ stage: ["a", "b"] }))).toEqual(new Set(["a", "b"]));
   });
 
   it("is nothing at all when no surface shows a camera", () => {
     // Another room open, the panel showing a share: no camera is worth
     // receiving, where every one used to be decoded at full size.
-    const share = { kind: "screen" as const, isLocal: false, peerId: "a" };
-    expect(wantedCameras([], share, [])).toEqual(new Set());
+    expect(wantedCameras(shown({ spotlight: share("a") }))).toEqual(new Set());
   });
 
   it("adds the spotlight's camera: the floating panel and picture in picture show it", () => {
-    expect(wantedCameras(["a"], camera("b"), [])).toEqual(new Set(["a", "b"]));
+    expect(
+      wantedCameras(shown({ stage: ["a"], spotlight: camera("b") }))
+    ).toEqual(new Set(["a", "b"]));
   });
 
   it("never asks for our own camera, which is not received", () => {
-    expect(wantedCameras([], camera("self", true), [])).toEqual(new Set());
+    expect(
+      wantedCameras(shown({ spotlight: camera("self", true), speaking: ["self"] }))
+    ).toEqual(new Set());
+  });
+
+  it("adds whoever is talking, before the spotlight can move to them", () => {
+    // Rule 3 hands the spotlight over after 1.5 s of speech. Asked for only
+    // at the switch, a parked camera put a black picture in the floating
+    // panel and picture in picture for the round trip it takes to return.
+    expect(
+      wantedCameras(shown({ spotlight: camera("a"), speaking: ["b", "self"] }))
+    ).toEqual(new Set(["a", "b"]));
+    expect(wantedCameras(shown({ speaking: ["b"] }))).toEqual(new Set(["b"]));
+  });
+
+  it("adds no one for talking while a pin holds the spotlight", () => {
+    const pinned = camera("a");
+    expect(
+      wantedCameras(shown({ spotlight: pinned, pinnedTileId: pinned.id, speaking: ["b"] }))
+    ).toEqual(new Set(["a"]));
+  });
+
+  it("adds no one for talking while a watched share holds the spotlight", () => {
+    expect(
+      wantedCameras(shown({ spotlight: share("a"), speaking: ["b"] }))
+    ).toEqual(new Set());
+  });
+
+  it("a pin on a tile that is gone holds nothing", () => {
+    // Rule 1 skips a pin whose tile left; the speakers rule decides again.
+    expect(
+      wantedCameras(
+        shown({ spotlight: camera("a"), pinnedTileId: remoteCameraTileId("gone"), speaking: ["b"] })
+      )
+    ).toEqual(new Set(["a", "b"]));
   });
 
   it("adds a camera popped out into its own window, by the stage's tile id", () => {
@@ -313,7 +365,9 @@ describe("wantedCameras", () => {
     expect(popped).toBe(remoteCameraTileId("peer-c"));
 
     expect(
-      wantedCameras([], null, [popped, "remote-screen-peer-d", "local-camera"])
+      wantedCameras(
+        shown({ poppedOut: [popped, "remote-screen-peer-d", "local-camera"] })
+      )
     ).toEqual(new Set(["peer-c"]));
   });
 });

@@ -750,6 +750,10 @@ Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
   - it stays received only while something shows it: a camera tile the
     stage has on screen (IntersectionObserver), the spotlight (floating
     panel, picture in picture), or a popped-out window
+  - and while its owner is speaking, unless a pin or a watched share holds
+    the spotlight: a speaker takes the spotlight after 1.5 s of speech, and
+    a camera asked for at the first word is playing by then rather than
+    black for the round trip
   - unshown for 5 s → ms:close-consumer and a local close; newly shown →
     a fresh ms:consume + ms:resume-consumer (the SFU asks for a keyframe on
     resume). No new wire message
