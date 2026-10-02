@@ -26,6 +26,7 @@ package main
 // peer-to-peer and are never deposited), hard caps everywhere.
 
 import (
+	"container/list"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
@@ -524,6 +525,52 @@ var (
 	mailboxBoxes     int
 )
 
+// mailboxBoxOrder is every box directory, the one deposited into longest ago
+// at the front, and mailboxBoxAt finds a box in it. It is what makes
+// evictOldestStaleBox one look at the front: that used to list and stat every
+// box under mailboxMu - 32,768 of them at the ceiling, over a tenth of a
+// second each time, on every deposit for a new recipient - and while nothing
+// was stale it found nothing and the next deposit did it all again, so a few
+// sources depositing to fresh boxes stalled every deposit, collect and ack on
+// the instance. Built from directory times at boot, moved on every deposit,
+// and every site that removes a box directory forgets it here, like the
+// counters above. Guarded by mailboxMu.
+var (
+	mailboxBoxOrder = list.New()
+	mailboxBoxAt    = map[string]*list.Element{}
+)
+
+// mailboxBoxAge is one entry of mailboxBoxOrder. Every blob in the box was
+// deposited at or before lastDeposit, so once that is past the TTL nothing in
+// the box is still pending.
+type mailboxBoxAge struct {
+	box         string
+	lastDeposit time.Time
+}
+
+// mailboxTouchBox records a deposit into box. Caller holds mailboxMu.
+func mailboxTouchBox(box string, now time.Time) {
+	if el, ok := mailboxBoxAt[box]; ok {
+		el.Value.(*mailboxBoxAge).lastDeposit = now
+		mailboxBoxOrder.MoveToBack(el)
+		return
+	}
+	mailboxBoxAt[box] = mailboxBoxOrder.PushBack(&mailboxBoxAge{box: box, lastDeposit: now})
+}
+
+// mailboxForgetBox drops a box whose directory is gone. Caller holds
+// mailboxMu.
+func mailboxForgetBox(box string) {
+	if el, ok := mailboxBoxAt[box]; ok {
+		mailboxBoxOrder.Remove(el)
+		delete(mailboxBoxAt, box)
+	}
+}
+
+// mailboxListBoxes lists the mailbox directory. Only boot and the hourly
+// sweep walk every box; a seam so a test can hold the deposit path to that.
+var mailboxListBoxes = func() ([]os.DirEntry, error) { return os.ReadDir(mailboxDir) }
+
 // mailboxCharge is what a blob costs the global budget: at least one
 // filesystem block, whatever its logical length.
 func mailboxCharge(size int64) int64 {
@@ -541,12 +588,20 @@ func mailboxInitUsedBytes() {
 	mailboxBoxes = 0
 	mailboxBlobOrigin = map[string]mailboxOrigin{}
 	mailboxHeld = map[string]mailboxShare{}
-	boxes, _ := os.ReadDir(mailboxDir)
+	mailboxBoxOrder.Init()
+	mailboxBoxAt = map[string]*list.Element{}
+	var ages []*mailboxBoxAge
+	boxes, _ := mailboxListBoxes()
 	for _, b := range boxes {
 		if !b.IsDir() {
 			continue
 		}
 		mailboxBoxes++
+		if mailboxBoxRe.MatchString(b.Name()) {
+			if info, err := b.Info(); err == nil {
+				ages = append(ages, &mailboxBoxAge{box: b.Name(), lastDeposit: info.ModTime()})
+			}
+		}
 		entries, _ := os.ReadDir(filepath.Join(mailboxDir, b.Name()))
 		for _, e := range entries {
 			if info, err := e.Info(); err == nil {
@@ -554,6 +609,17 @@ func mailboxInitUsedBytes() {
 				mailboxFiles++
 			}
 		}
+	}
+	// A directory's time moves with every file created in it, so it is at
+	// least as late as the newest blob's deposit.
+	sort.Slice(ages, func(i, j int) bool {
+		if ages[i].lastDeposit.Equal(ages[j].lastDeposit) {
+			return ages[i].box < ages[j].box
+		}
+		return ages[i].lastDeposit.Before(ages[j].lastDeposit)
+	})
+	for _, a := range ages {
+		mailboxBoxAt[a.box] = mailboxBoxOrder.PushBack(a)
 	}
 }
 
@@ -639,31 +705,18 @@ func aliveBlobs(box string) map[string]struct{} {
 
 // evictOldestStaleBox frees one box directory when the box ceiling is hit, so
 // a flood of tiny deposits cannot close the door on every NEW recipient for a
-// full TTL while the boxes it created sit expired. A directory's mtime moves
-// on every deposit and every ack, so one older than the TTL holds nothing that
-// has not already expired: those are the only candidates, and the oldest goes
-// first. The sweeper collects them too, but only hourly, and refusing real
-// deposits in between is the failure this avoids. Caller holds mailboxMu.
+// full TTL while the boxes it created sit expired. A box last deposited into
+// longer ago than the TTL holds nothing that has not already expired: those
+// are the only candidates, and the oldest goes first - the front of
+// mailboxBoxOrder, so this looks at one box, never all of them. The sweeper
+// collects them too, but only hourly, and refusing real deposits in between
+// is the failure this avoids. Caller holds mailboxMu.
 func evictOldestStaleBox() bool {
-	cutoff := time.Now().Add(-mailboxTTL)
-	var oldest string
-	var oldestMod time.Time
-	boxes, _ := os.ReadDir(mailboxDir)
-	for _, b := range boxes {
-		if !b.IsDir() || !mailboxBoxRe.MatchString(b.Name()) {
-			continue
-		}
-		info, err := b.Info()
-		if err != nil || !info.ModTime().Before(cutoff) {
-			continue
-		}
-		if oldest == "" || info.ModTime().Before(oldestMod) {
-			oldest, oldestMod = b.Name(), info.ModTime()
-		}
-	}
-	if oldest == "" {
+	el := mailboxBoxOrder.Front()
+	if el == nil || !el.Value.(*mailboxBoxAge).lastDeposit.Before(time.Now().Add(-mailboxTTL)) {
 		return false
 	}
+	oldest := el.Value.(*mailboxBoxAge).box
 	dir := filepath.Join(mailboxDir, oldest)
 	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
@@ -683,9 +736,10 @@ func evictOldestStaleBox() bool {
 			}
 		}
 	}
-	if os.Remove(dir) != nil { // succeeds only when empty
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) { // succeeds only when empty
 		return false
 	}
+	mailboxForgetBox(oldest)
 	if mailboxBoxes > 0 {
 		mailboxBoxes--
 	}
@@ -823,6 +877,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	if newBox {
 		mailboxBoxes++
 	}
+	mailboxTouchBox(req.Box, time.Now())
 	mailboxFiles++
 	mailboxUsedBytes += charge
 	if source != "" {
@@ -1048,6 +1103,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 		writeAckIndex(box, idx)
 	}
 	if os.Remove(boxPath(box)) == nil { // succeeds only when empty
+		mailboxForgetBox(box)
 		if mailboxBoxes > 0 {
 			mailboxBoxes--
 		}
@@ -1060,7 +1116,7 @@ func handleMailboxAck(w http.ResponseWriter, r *http.Request) {
 // TTL is the only thing that still frees a blob every device has acked.
 func sweepMailboxOnce(now time.Time) int {
 	cutoff := now.Add(-mailboxTTL)
-	boxes, _ := os.ReadDir(mailboxDir)
+	boxes, _ := mailboxListBoxes()
 	removed := 0
 	for _, b := range boxes {
 		dir := filepath.Join(mailboxDir, b.Name())
@@ -1095,6 +1151,7 @@ func sweepMailboxOnce(now time.Time) int {
 			writeAckIndex(b.Name(), idx)
 		}
 		if os.Remove(dir) == nil { // only if empty
+			mailboxForgetBox(b.Name())
 			mailboxBoxes--
 		}
 		mailboxMu.Unlock()

@@ -683,9 +683,10 @@ func TestMailboxBoxCeilingTracksBytesAndEvictsStaleBoxes(t *testing.T) {
 		os.Chtimes(dir, when, when)
 	}
 
+	// What a boot finds on disk: the counters and the order boxes go in.
+	mailboxInitUsedBytes()
 	mailboxMu.Lock()
 	mailboxBoxes = mailboxGlobalMaxBoxes
-	mailboxFiles, mailboxUsedBytes = 2, 2*mailboxBlockSize
 	mailboxMu.Unlock()
 
 	n := 0
@@ -978,5 +979,74 @@ func TestAckIndexIsNotEvictedAsABlob(t *testing.T) {
 	idx := readAckIndex(box)
 	if _, still := idx[first[0].ID]; still {
 		t.Fatal("an evicted blob left its device list behind in the ack index")
+	}
+}
+
+// At the box ceiling every deposit for a new recipient used to list and stat
+// every box under mailboxMu - over a tenth of a second at 32,768 boxes - and,
+// with nothing stale, find nothing and leave the next deposit to do it all
+// again, so a few sources stalled every deposit, collect and ack on the
+// instance. It now looks at the one box deposited into longest ago.
+func TestNewBoxAtTheCeilingDoesNotWalkTheMailbox(t *testing.T) {
+	freshMailbox(t)
+	var boxes []string
+	for i := 0; i < 300; i++ {
+		box := fmt.Sprintf("%064x", i+1)
+		boxes = append(boxes, box)
+		if code := depositFrom(t, fmt.Sprintf("203.0.%d.%d", i/250, i%250+1), box, []byte("x")); code != http.StatusNoContent {
+			t.Fatalf("deposit %d: %d", i, code)
+		}
+	}
+	// A deposit into a box moves it to the back of the line.
+	if code := depositFrom(t, "203.0.9.9", boxes[0], []byte("y")); code != http.StatusNoContent {
+		t.Fatalf("deposit into an existing box: %d", code)
+	}
+	mailboxMu.Lock()
+	front := mailboxBoxOrder.Front().Value.(*mailboxBoxAge).box
+	mailboxBoxes = mailboxGlobalMaxBoxes
+	mailboxMu.Unlock()
+	if front != boxes[1] {
+		t.Fatalf("the box deposited into longest ago is %s.., want %s..", front[:8], boxes[1][:8])
+	}
+
+	walks := 0
+	saved := mailboxListBoxes
+	mailboxListBoxes = func() ([]os.DirEntry, error) {
+		walks++
+		return saved()
+	}
+	t.Cleanup(func() { mailboxListBoxes = saved })
+	// And the directory cannot be listed at all from here on (unless the
+	// tests run as root), so a deposit that still needed a walk to find a
+	// stale box would find none.
+	dir := mailboxDir
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	for i := 0; i < 50; i++ {
+		box := fmt.Sprintf("%064x", 1000+i)
+		if code := depositFrom(t, fmt.Sprintf("198.51.100.%d", i+1), box, []byte("x")); code != http.StatusInsufficientStorage {
+			t.Fatalf("new box %d at the ceiling with nothing stale: %d, want 507", i, code)
+		}
+	}
+	// An existing box still takes mail at the ceiling.
+	if code := depositFrom(t, "198.51.100.200", boxes[5], []byte("x")); code != http.StatusNoContent {
+		t.Fatalf("an existing box at the box ceiling: %d", code)
+	}
+
+	// Once the front box is past the TTL, it is the one reclaimed.
+	mailboxMu.Lock()
+	mailboxBoxOrder.Front().Value.(*mailboxBoxAge).lastDeposit = time.Now().Add(-mailboxTTL - time.Hour)
+	mailboxMu.Unlock()
+	if code := depositFrom(t, "198.51.100.201", fmt.Sprintf("%064x", 5000), []byte("x")); code != http.StatusNoContent {
+		t.Fatalf("a new box with a stale one to reclaim: %d", code)
+	}
+	if _, err := os.Stat(boxPath(boxes[1])); !os.IsNotExist(err) {
+		t.Fatal("the stale box was not the one reclaimed")
+	}
+	if walks != 0 {
+		t.Fatalf("deposits at the box ceiling walked the whole mailbox %d times", walks)
 	}
 }
