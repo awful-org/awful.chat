@@ -20,6 +20,8 @@ export interface PluginCallTile {
   roomCode: string;
   /** Names using the tile right now, for the host's audience chip. */
   viewers: string[];
+  /** The plugin's `callTileFocusOnJoin`; absent means true. */
+  focusOnJoin?: boolean;
 }
 
 export const callTilesState = $state({
@@ -73,7 +75,13 @@ async function _scan(roomCode: string): Promise<void> {
         } catch {
           // A viewers hook must never take the tile down with it.
         }
-        byPlugin.set(pluginId, { pluginId, cardId: msg.id, roomCode, viewers });
+        byPlugin.set(pluginId, {
+          pluginId,
+          cardId: msg.id,
+          roomCode,
+          viewers,
+          focusOnJoin: plugin.callTileFocusOnJoin !== false,
+        });
       } else {
         // The newest card decides for its plugin even when inactive -
         // an older still-"active" card must not resurrect the tile.

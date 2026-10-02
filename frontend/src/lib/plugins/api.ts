@@ -476,6 +476,13 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
    */
   callTileViewers?(cardState: State): string[];
   /**
+   * Whether joining your tile also focuses it, the way opening a stream
+   * puts it on the big stage. Default true: someone who just chose to join
+   * a game or a watch party wants it in front of them. Set false for a tile
+   * meant to sit in the grid beside the cameras (a scoreboard, a timer).
+   */
+  callTileFocusOnJoin?: boolean;
+  /**
    * Extra rows for the tile's right-click menu, built on demand when the
    * user opens it - so this one is NOT pure: read whatever the controls need
    * and close over the host. It is asked per right-click, never cached.

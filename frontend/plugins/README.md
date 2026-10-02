@@ -330,7 +330,9 @@ host }`); `localCard` has its own (below):
   tile, and optionally `callTileViewers(cardState)` returning the display
   names using it - the host shows them in the same audience chip screen
   shares get. Both must be deterministic: every client evaluates them on
-  the same folded state. The host renders the tile content inside a
+  the same folded state. Joining a tile also focuses it, like opening a
+  stream; set `callTileFocusOnJoin: false` for a tile meant to sit in the
+  grid beside the cameras (a scoreboard, a timer). The host renders the tile content inside a
   pointer-events-none layer (clicking the tile focuses it, like any
   stream) - give your interactive controls `pointer-events-auto`, and
   know the mount is PERSISTENT: it survives focus changes and filters, so

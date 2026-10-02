@@ -213,6 +213,8 @@ import {
     pluginRoomCode?: string;
     /** Plugin tiles: names using it, for the audience chip. */
     pluginViewers?: string[];
+    /** Plugin tiles: joining also focuses it (the plugin's choice). */
+    pluginFocusOnJoin?: boolean;
   }
 
   let {
@@ -483,6 +485,7 @@ import {
         cardId: pt.cardId,
         pluginRoomCode: pt.roomCode,
         pluginViewers: pt.viewers,
+        pluginFocusOnJoin: pt.focusOnJoin !== false,
       });
     }
     return result;
@@ -490,6 +493,12 @@ import {
 
   // What plugin tiles the user opted into (click-to-join, like shares).
   let joinedPluginTiles = $state(new Set<string>());
+
+  /** Join a plugin tile - and focus it, unless its plugin said not to. */
+  function joinPluginTile(tile: TileData): void {
+    joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+    if (tile.pluginFocusOnJoin) callFocus.pinnedTileId = tile.id;
+  }
 
   // ── Persistent plugin layer ─────────────────────────────────────────────
   // A joined plugin tile's content (a YouTube iframe) cannot survive a
@@ -1000,7 +1009,7 @@ import {
         setTransmissionOutputVolume(1);
         break;
       case "join-plugin":
-        joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+        joinPluginTile(tile);
         break;
       case "leave-plugin":
         joinedPluginTiles = new Set(
@@ -1692,9 +1701,7 @@ import {
         />
         <button
           type="button"
-          onclick={() => {
-            joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
-          }}
+          onclick={() => joinPluginTile(tile)}
           class="cursor-pointer rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm transition-all hover:border-primary/50 hover:shadow-md"
         >
           Join {tile.label}
