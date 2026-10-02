@@ -113,6 +113,7 @@ import {
 } from "./transport.svelte";
 import {
   MAX_DM_REQUESTS,
+  MAX_UNSOLICITED_DMS,
   acceptDmRequest,
   ensureDmRoomForPeer,
   isDmRequestRoom,
@@ -134,6 +135,8 @@ import {
 import { encode, decode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
+import { dmPqEncapsulate, dmPqRole } from "$lib/room-security/pq-dm";
+import { derivePqKemKeypair } from "$lib/identity/pq-identity";
 import { roomsStore } from "$lib/rooms.svelte";
 import { encodeDmChatEnvelope, hashDmRoomCode, parseDmEnvelope, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
@@ -484,6 +487,120 @@ describe("a request is made by a message, never an empty room (S08.3)", () => {
     await connect();
     await vi.waitFor(async () => expect(await getRoom(empty)).toBeUndefined());
     expect(await getRoom(await code(stranger))).toMatchObject({ request: true });
+    disconnectTransport();
+  });
+});
+
+describe("an introduction alone makes no DM (S08.1)", () => {
+  const code = (did: string) => hashDmRoomCode(s.session!.did, did);
+  const introduce = (device: string, did: string, pqPending = false) =>
+    s.hooks.verified!(device, did, "r2_unused", pqPending);
+
+  /** A room we share whose member list holds these identities - which any member can arrange. */
+  async function sharedRoom(dids: string[]) {
+    await putRoom({ roomCode: "SHAREDROOM1", type: "text", name: "shared", lastSeenLamport: 0,
+      createdAt: Date.now(), participants: dids, participantLastSeen: {} });
+  }
+
+  /** The post-quantum state an introduction with `peer` would agree on. */
+  function pqStateWith(peer: UnlockedSession) {
+    const me = s.session!;
+    const mine = dmPqRole(me.privateKey, peer.publicKey) === "encapsulator";
+    const [enc, dec] = mine ? [me, peer] : [peer, me];
+    return dmPqEncapsulate(enc.privateKey, dec.publicKey, derivePqKemKeypair(dec.privateKey).publicKey);
+  }
+
+  it("joins for the first message to arrive by, and stores the DM with that message", async () => {
+    const mate = identity();
+    await sharedRoom([mate.did]);
+    const room = await code(mate.did);
+    await introduce("12D3-mate", mate.did);
+    expect(s.bound.has(room)).toBe(true);
+    expect(await getRoom(room)).toBeUndefined();
+
+    s.roomPeers.set(room, new Set(["12D3-mate"]));
+    receive("12D3-mate", encodeDmChatEnvelope(chat(mate.did)), room);
+    await vi.waitFor(async () => expect(await getRoom(room)).toMatchObject({ request: false }));
+    expect((await getLastMessage(room))?.content).toBe("hello");
+  });
+
+  it("stores the DM under the post-quantum key its introduction agreed", async () => {
+    const peer = identity();
+    const state = pqStateWith(peer);
+    const room = await code(peer.did);
+    await introduce("12D3-pq", peer.did, true);
+    await s.hooks.upgraded!("12D3-pq", peer.did, state);
+    expect(await getRoom(room)).toBeUndefined();
+    s.roomPeers.set(room, new Set(["12D3-pq"]));
+    receive("12D3-pq", encodeDmChatEnvelope(chat(peer.did)), room);
+    await vi.waitFor(async () => expect(await getRoom(room)).toMatchObject({ pq: state, request: true }));
+  });
+
+  it("files no bare message in a DM nobody stored, and leaves it to the batch that follows", async () => {
+    const mate = identity();
+    await sharedRoom([mate.did]);
+    const room = await code(mate.did);
+    await introduce("12D3-mate", mate.did);
+    s.roomPeers.set(room, new Set(["12D3-mate"]));
+    const wire = signedWire(mate, room, { type: MessageType.PluginCard,
+      content: JSON.stringify({ pluginId: "poll", cardId: "c1", data: {} }) });
+    receive("12D3-mate", wire, room);
+    await settled();
+    expect(await getMessage(wire.id)).toBeUndefined();
+    receive("12D3-mate", { type: MessageType.SyncBatch, roomCode: room, messages: [wire],
+      batchIndex: 0, totalBatches: 1, live: true }, room);
+    await vi.waitFor(async () => expect(await getMessage(wire.id)).toBeDefined());
+    expect(await getRoom(room)).toMatchObject({ request: false });
+  });
+
+  it("cannot run the conversation bindings out with identities a room member mints", async () => {
+    const minted = Array.from({ length: 100 }, () => identity().did);
+    await sharedRoom(minted);
+    for (const [i, did] of minted.entries()) await introduce(`12D3-minted-${i}`, did);
+    expect(s.bound.size).toBeLessThanOrEqual(32);
+    expect(await getDMRooms()).toEqual([]);
+  });
+
+  it("binds an empty DM an older build stored no more than a new one", async () => {
+    const minted = Array.from({ length: 100 }, () => identity().did);
+    for (const did of minted) {
+      const room: DMRoom = { roomCode: await code(did), type: "dm", name: "", lastSeenLamport: 0,
+        createdAt: 1, participants: [did], participantLastSeen: {}, participantDid: did, request: false };
+      await putRoom(room);
+    }
+    for (const [i, did] of minted.entries()) await introduce(`12D3-minted-${i}`, did);
+    expect(s.bound.size).toBeLessThanOrEqual(32);
+    // One already joined - a contact's, say - stays joined.
+    const contact = identity().did;
+    await ensureDmRoomForPeer(contact);
+    for (const [i, did] of minted.entries()) await introduce(`12D3-again-${i}`, did);
+    expect(s.bound.has(await code(contact))).toBe(true);
+  });
+
+  it("takes only so many new conversations a session from people it does not know for sure", async () => {
+    const minted = Array.from({ length: MAX_UNSOLICITED_DMS + 1 }, () => identity().did);
+    await sharedRoom(minted);
+    for (const did of minted.slice(0, -1)) await deliverMailboxDm(did, chat(did));
+    const last = minted.at(-1)!;
+    await expect(deliverMailboxDm(last, chat(last))).rejects.toThrow();
+    expect(await getRoom(await code(last))).toBeUndefined();
+    // Somebody we reached out to is never held back.
+    const friend = identity().did;
+    await ensureDmRoomForPeer(friend);
+    await deliverMailboxDm(friend, chat(friend));
+    expect((await getLastMessage(await code(friend)))?.content).toBe("hello");
+  });
+
+  it("joins at connect only the saved DMs somebody wrote in", async () => {
+    const spoken = identity().did, silent = identity().did;
+    await ensureDmRoomForPeer(spoken);
+    await deliverMailboxDm(spoken, chat(spoken));
+    await ensureDmRoomForPeer(silent);
+    s.bound.clear(); s.joined.clear();
+    await connect();
+    await vi.waitFor(async () => expect(s.bound.has(await code(spoken))).toBe(true));
+    await settled();
+    expect(s.bound.has(await code(silent))).toBe(false);
     disconnectTransport();
   });
 });

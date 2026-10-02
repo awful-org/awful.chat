@@ -899,6 +899,33 @@ export async function joinPhonebookDmRooms(): Promise<void> {
 export const MAX_DM_REQUESTS = 20;
 
 /**
+ * New conversations nobody here asked for, per unlocked session, from people
+ * we do not know for sure: strangers' requests and members of rooms we
+ * share. Sharing a room proves nothing about anyone - a member can list
+ * identities it mints in a protected room (a profile over the room's channel
+ * is all it takes), and each was "known", so one member could open DM after
+ * DM with us until the transport's 512 conversation bindings were gone.
+ * Contacts and people we reached out to are never counted. Past it, a new
+ * conversation is held back like a full request: dropped live, left in the
+ * mailbox for the next session.
+ */
+export const MAX_UNSOLICITED_DMS = 64;
+let _unsolicitedSpent: { session: UnlockedSession; count: number } | null = null;
+
+/**
+ * Conversations joined for an introduction alone, with nothing stored. The
+ * other side has just opened a DM with us, so the channel has to be up for
+ * their first message to arrive live; but the DM is stored only with that
+ * message, or when the user opens it. An introduction never followed by one
+ * used to leave a DM behind that nothing listed and nothing could delete,
+ * joined again at every start. Oldest out first past the bound - nothing is
+ * lost with one, their next introduction joins it again. A post-quantum
+ * state the introduction agreed waits here for the DM it is stored with.
+ */
+const MAX_PROVISIONAL_DMS = 32;
+const _provisional = new Map<string, DmPqState | undefined>();
+
+/**
  * Whoever this session reached out to, by peerId or DID. An introduction we
  * start comes back through the same hook as one a stranger starts, often
  * before our own call has stored the room, and must not come back a request.
@@ -968,6 +995,9 @@ function _admissionChanged(): void {
 onIdentityLock(() => {
   _admission = null;
   _admissionChanged();
+  _unsolicitedSpent = null;
+  for (const roomCode of _provisional.keys()) _transport.forgetConversation(roomCode);
+  _provisional.clear();
 });
 
 async function _admissionView(): Promise<AdmissionView> {
@@ -991,37 +1021,88 @@ async function _admissionView(): Promise<AdmissionView> {
   return _admission;
 }
 
-/** In the phonebook, in a room with us, or reached out to by us. */
-function _isKnownDmPeer(peerDid: string, view: AdmissionView): boolean {
+/** In the phonebook, or reached out to by us. */
+function _isTrustedDmPeer(peerDid: string, view: AdmissionView): boolean {
   for (const id of _solicited) {
     if (id === peerDid || dmPeerDid(id) === peerDid) return true;
   }
-  if (view.contacts.some((e) => e.did === peerDid || dmPeerDid(e.peerId) === peerDid)) {
-    return true;
-  }
-  return view.roomMates.has(peerDid);
+  return view.contacts.some((e) => e.did === peerDid || dmPeerDid(e.peerId) === peerDid);
 }
 
 /**
- * Decide, one at a time so the cap holds under a burst, what an unsolicited
+ * Decide, one at a time so the caps hold under a burst, what an unsolicited
  * new conversation becomes: an ordinary DM (someone we know), a request, or
- * nothing (the requests are full). A "request" verdict reserves a slot until
- * the caller releases it, once the room is stored or abandoned.
+ * nothing (the requests, or this session's new conversations, are full). A
+ * "request" verdict reserves a slot until the caller releases it, once the
+ * room is stored or abandoned. `reserve` false asks without taking anything:
+ * an introduction's join stores nothing, its first message is admitted again.
  */
 function _admitUnsolicited(
   peerDid: string,
-  roomCode: string
+  roomCode: string,
+  reserve = true
 ): Promise<"known" | "request" | "full"> {
   const run = _requestChain.then(async () => {
     const view = await _admissionView();
-    if (_isKnownDmPeer(peerDid, view)) return "known" as const;
+    if (_isTrustedDmPeer(peerDid, view)) return "known" as const;
+    if (_unsolicitedSpent?.session !== view.session) {
+      _unsolicitedSpent = { session: view.session, count: 0 };
+    }
+    const spent = _unsolicitedSpent;
+    if (spent.count >= MAX_UNSOLICITED_DMS) return "full" as const;
+    if (view.roomMates.has(peerDid)) {
+      if (reserve) spent.count += 1;
+      return "known" as const;
+    }
     if (_requestsInFlight.has(roomCode)) return "request" as const;
     if (view.held + _requestsInFlight.size >= MAX_DM_REQUESTS) return "full" as const;
-    _requestsInFlight.add(roomCode);
+    if (reserve) {
+      _requestsInFlight.add(roomCode);
+      spent.count += 1;
+    }
     return "request" as const;
   });
   _requestChain = run.catch(() => {});
   return run;
+}
+
+/**
+ * Join a conversation an introduction alone asked for, storing nothing (see
+ * _provisional). The oldest such join makes way past the bound.
+ */
+function _joinProvisionally(
+  session: ReturnType<typeof requireSession>,
+  roomCode: string,
+  peerDid: string,
+  pqState: DmPqState | undefined
+): string {
+  if (!_provisional.has(roomCode)) {
+    for (const oldest of _provisional.keys()) {
+      if (_provisional.size < MAX_PROVISIONAL_DMS) break;
+      _provisional.delete(oldest);
+      _transport.forgetConversation(oldest);
+    }
+  }
+  joinDmConversation(_transport, session, roomCode, peerDid, pqState);
+  _provisional.delete(roomCode);
+  _provisional.set(roomCode, pqState);
+  return roomCode;
+}
+
+/**
+ * The saved DMs to join at connect: the ones somebody wrote in. Joining
+ * every stored DM was how the empty ones an introduction alone had made (an
+ * older build stored those) took their conversation bindings back at every
+ * start. One nobody wrote in has nothing to carry on: it is joined when it
+ * is opened, or when the other side introduces themselves again. Contacts
+ * are joined by joinPhonebookDmRooms whatever they hold, requests not at all.
+ */
+export async function savedDmsToJoin(rooms: (Room | DMRoom)[]): Promise<DMRoom[]> {
+  const dms = rooms.filter(
+    (r): r is DMRoom => r.type === "dm" && (r as DMRoom).request !== true
+  );
+  const written = await Promise.all(dms.map((r) => _holdsMessages(r.roomCode)));
+  return dms.filter((_, i) => written[i]);
 }
 
 /**
@@ -1143,6 +1224,12 @@ export interface EnsureDmOptions {
    * acceptDmRequest, or answering it, accepts a request.
    */
   unsolicited?: boolean;
+  /**
+   * An introduction alone, unsolicited as well: a DM we hold is joined as it
+   * is, a new one only joined - stored with its first message (see
+   * _provisional).
+   */
+  provisional?: boolean;
 }
 
 /**
@@ -1160,7 +1247,8 @@ export async function ensureDmRoomForPeer(
 ): Promise<string | null> {
   const guard = captureDmOwnership();
   const session = requireSession();
-  if (!opts.unsolicited) _noteSolicited(peerIdOrDid);
+  const unsolicited = opts.unsolicited || opts.provisional;
+  if (!unsolicited) _noteSolicited(peerIdOrDid);
   let peerDid = dmPeerDid(peerIdOrDid);
   if (!peerDid && looksLikePeerId(peerIdOrDid)) {
     await _transport.introduceDm(peerIdOrDid);
@@ -1168,18 +1256,38 @@ export async function ensureDmRoomForPeer(
   }
   const roomCode = peerDid ? await dmConversationCodeAsync(peerIdOrDid) : null;
   if (!roomCode || !peerDid) return null;
-  if (!opts.unsolicited) _noteSolicited(peerDid);
+  if (!unsolicited) _noteSolicited(peerDid);
   if (pqState) hybridPairwiseRoomSecret(session.privateKey, didToPublicKey(peerDid), pqState);
   const existing = (await getRoom(roomCode)) as DMRoom | undefined;
   if (requireSession() !== session) throw new Error("Identity changed");
+  // Joined for an introduction until now: stored under the key it agreed.
+  if (!existing) pqState ??= _provisional.get(roomCode);
   let request = false;
-  if (!existing && opts.unsolicited) {
-    const verdict = await _admitUnsolicited(peerDid, roomCode);
+  if (!existing && unsolicited) {
+    const verdict = await _admitUnsolicited(peerDid, roomCode, !opts.provisional);
     if (verdict === "full") {
-      console.warn("[dm] message requests are full; dropped a new conversation");
+      console.warn("[dm] no room for a new conversation now; dropped one");
       return null;
     }
     request = verdict === "request";
+  }
+  if (!existing && opts.provisional) {
+    return _joinProvisionally(session, roomCode, peerDid, pqState);
+  }
+  // An empty DM nobody joined this session - one an older build stored for
+  // an introduction alone - is joined the same bounded way, or introducing
+  // themselves as each of those identities again took the bindings back.
+  // Its record still takes a key the introduction agreed.
+  if (
+    existing &&
+    opts.provisional &&
+    !_transport.rooms().includes(roomCode) &&
+    !(await _holdsMessages(roomCode))
+  ) {
+    guard();
+    if (pqState) await setDmPqState(roomCode, pqState);
+    guard();
+    return _joinProvisionally(session, roomCode, peerDid, pqState ?? existing.pq);
   }
   try {
     return await _joinDm(session, guard, peerIdOrDid, peerDid, roomCode, existing, pqState, request);
@@ -1221,7 +1329,10 @@ async function _joinDm(
     await _transport.introduceDm(device, peerDid);
     if (requireSession() !== session) throw new Error("Identity changed");
   }
-  if (existing) return roomCode;
+  if (existing) {
+    _provisional.delete(roomCode);
+    return roomCode;
+  }
   const room: DMRoom = {
     roomCode,
     type: "dm",
@@ -1238,6 +1349,7 @@ async function _joinDm(
   };
   await putRoom(room, guard);
   _admissionChanged();
+  _provisional.delete(roomCode);
   if (requireSession() !== session) throw new Error("Identity changed");
   // isDmRequestRoom and the request banner read the sidebar's copy, which
   // only a refresh used to bring this into: until then the request was
@@ -1394,6 +1506,7 @@ export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
   for (const roomCode of candidates) {
     if (transportState.callRoomCode === roomCode) leaveCall();
     _transport.forgetConversation(roomCode);
+    _provisional.delete(roomCode);
   }
   await Promise.all(
     [...candidates].map(async (roomCode) => {

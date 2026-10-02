@@ -184,6 +184,7 @@ import {
   dropDmIfEmpty,
   ensureDmRoomForPeer,
   isDmRequestRoom,
+  savedDmsToJoin,
   offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
@@ -743,8 +744,9 @@ const _introductionHookDeps: IntroductionHookDeps = {
   // Arrows, not the functions themselves: dm.svelte imports this module, so
   // these bindings are only safe to read once both have finished loading.
   dmExists: (did) => dmRoomExists(did),
-  // Unsolicited: the introduction may be a stranger's. See EnsureDmOptions.
-  ensureDm: (did, state) => ensureDmRoomForPeer(did, state, { unsolicited: true }),
+  // An introduction alone, maybe a stranger's: a new DM is joined but only
+  // stored with its first message. See EnsureDmOptions.provisional.
+  ensureDm: (did, state) => ensureDmRoomForPeer(did, state, { provisional: true }),
   replayPending: (peer, did) => _replayPendingDm(peer, did),
   heal: {
     schedule: (run, ms) => { setTimeout(run, ms); },
@@ -3307,6 +3309,11 @@ async function _handleChatMessage(
     console.warn("[chat] refused a message reusing the id of one we already hold");
     return;
   }
+  // A DM is stored with its first message, by the batch copy every bare one
+  // is followed by (_handleDmBatch, which admits it - a stranger's becomes
+  // a request). Until then there is no conversation to file this in.
+  if (isNewMessage && roomCode.startsWith("dm-") && (await getRoom(roomCode))?.type !== "dm") return;
+  guard();
 
   // Only a genuinely new message is written: re-putting a replayed one
   // would overwrite the stored row with this handler's view of it.
@@ -3709,10 +3716,10 @@ export async function deliverMailboxBatch(
   if (!existed && !(await _anyRowTakable(roomCode, messages, senderDid, live))) return;
   // The batch handler refuses a room we have not joined, and a conversation
   // whose first contact arrives through the mailbox has never been joined.
-  // No room means a stranger's request that did not fit: like a text, it
-  // stays in the mailbox for the next collect.
+  // No room means a new conversation that did not fit: like a text, it
+  // stays in the mailbox for a later collect.
   if (!(await _ensureDmForBatch(senderDid, guard))) {
-    throw new Error("Message requests are full");
+    throw new Error("No room for a new conversation");
   }
   await _handleSyncBatch(roomCode, messages, senderDid, live);
   if (!existed) await dropDmIfEmpty(roomCode);
@@ -3792,7 +3799,7 @@ async function _anyRowTakable(
 
 /**
  * Create the conversation a DM batch is the first contact of, as a request.
- * False when there is no room for it (a stranger's request that did not fit).
+ * False when there is no room for it (a new conversation that did not fit).
  */
 async function _ensureDmForBatch(senderDid: string, guard: () => void): Promise<boolean> {
   if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return false;
@@ -3886,10 +3893,10 @@ function _handleDmChatAsync(
     const roomCode = await ensureDmRoomForPeer(peerId, undefined, { unsolicited: true });
     guard();
     if (!roomCode) {
-      // No room for a new conversation: the requests are full. The mailbox
-      // copy stays there, for the next collect once there is room, instead
-      // of being acked away as if it had arrived.
-      if (viaMailbox) throw new Error("Message requests are full");
+      // No room for a new conversation now: the requests, or this session's
+      // new conversations, are full. The mailbox copy stays there for a
+      // later collect, instead of being acked away as if it had arrived.
+      if (viaMailbox) throw new Error("No room for a new conversation");
       return;
     }
 
@@ -4496,13 +4503,7 @@ async function _joinSavedRooms(): Promise<void> {
   // pass happened unsubscribed: gossip for those rooms was not delivered,
   // the relay had not been told we were in them, and no peer in them could
   // be dialled. Nothing about the sweep needs to precede a subscription.
-  for (const room of rooms) {
-    // DMs are handled by joinPhonebookDmRooms, which derives the room code
-    // from the DID rather than trusting a stored one.
-    if (isLegacyArchive(room.roomCode)) continue;
-    // A message request is joined when its sender turns up again (their
-    // introduction) or the user opens it - never just for starting up.
-    if ((room as DMRoom).request === true) continue;
+  const join = (room: (typeof rooms)[number]) => {
     try {
       joinStoredRoom(_transport, room.roomCode, room);
     } catch {
@@ -4510,7 +4511,19 @@ async function _joinSavedRooms(): Promise<void> {
       // Never include the record or secret in diagnostics.
       console.warn("[room] skipped a saved room with an invalid invitation");
     }
+  };
+  for (const room of rooms) {
+    // DMs are handled by joinPhonebookDmRooms, which derives the room code
+    // from the DID rather than trusting a stored one.
+    if (isLegacyArchive(room.roomCode)) continue;
+    // A message request is joined when its sender turns up again (their
+    // introduction) or the user opens it - never just for starting up.
+    if ((room as DMRoom).request === true) continue;
+    // A DM only once it is known to hold something: below.
+    if (room.type === "dm") continue;
+    join(room);
   }
+  for (const room of await savedDmsToJoin(rooms)) join(room);
   // Not awaited in the join order any more: housekeeping, once per session.
   // Empty requests first: the sweep rewrites every room record, and a
   // rewrite racing a delete puts the record back.
