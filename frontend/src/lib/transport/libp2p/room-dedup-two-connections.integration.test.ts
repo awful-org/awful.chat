@@ -163,6 +163,10 @@ for (const skew of [0, 25]) {
     console.log(`skew ${skew}: sendRoom returned ${result}; delivered ${atSmall.mock.calls.length}; channels small=${
       verifiedChannels(small.transport, room)} large=${verifiedChannels(large.transport, room)}`);
     expect(atSmall).toHaveBeenCalledWith(largeId, new Uint8Array([42]), room);
+    // Delivered is not enough: with the crossing closing the proven channel,
+    // this frame still arrived on it, and then neither end held one.
+    expect({ small: verifiedChannels(small.transport, room), large: verifiedChannels(large.transport, room) })
+      .toEqual({ small: 1, large: 1 });
   }, 20_000);
 }
 
