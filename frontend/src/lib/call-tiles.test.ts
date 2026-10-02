@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { buildCallTiles, type CallState } from "./call-tiles";
+import { buildCallTiles, wantedCameras, type CallState } from "./call-tiles";
 
 describe("buildCallTiles", () => {
   let state: CallState;
@@ -262,5 +262,51 @@ describe("buildCallTiles", () => {
     expect(screenTile?.startedAt).toBeDefined();
     expect(typeof screenTile?.startedAt).toBe("number");
     expect(screenTile?.startedAt).toBeGreaterThan(0);
+  });
+});
+
+describe("wantedCameras", () => {
+  const camera = (peerId: string, isLocal = false) => ({
+    kind: "camera" as const,
+    isLocal,
+    peerId,
+  });
+
+  it("is what the stage has on screen when nothing else shows a camera", () => {
+    expect(wantedCameras(["a", "b"], null, [])).toEqual(new Set(["a", "b"]));
+  });
+
+  it("is nothing at all when no surface shows a camera", () => {
+    // Another room open, the panel showing a share: no camera is worth
+    // receiving, where every one used to be decoded at full size.
+    const share = { kind: "screen" as const, isLocal: false, peerId: "a" };
+    expect(wantedCameras([], share, [])).toEqual(new Set());
+  });
+
+  it("adds the spotlight's camera: the floating panel and picture in picture show it", () => {
+    expect(wantedCameras(["a"], camera("b"), [])).toEqual(new Set(["a", "b"]));
+  });
+
+  it("never asks for our own camera, which is not received", () => {
+    expect(wantedCameras([], camera("self", true), [])).toEqual(new Set());
+  });
+
+  it("adds a camera popped out into its own window, by the stage's tile id", () => {
+    const tiles = buildCallTiles({
+      participants: new Map([
+        ["peer-c", { videoTrack: null, screenTrack: null }],
+      ]),
+      localCameraStream: null,
+      localScreenStream: null,
+      cameraOff: true,
+      watchingTransmissions: new Map(),
+      selfId: "self",
+      trackStartTimes: new Map(),
+    });
+    const popped = tiles.find((t) => t.peerId === "peer-c")!.id;
+
+    expect(
+      wantedCameras([], null, [popped, "remote-screen-peer-d", "local-camera"])
+    ).toEqual(new Set(["peer-c"]));
   });
 });

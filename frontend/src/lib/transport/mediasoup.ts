@@ -24,6 +24,14 @@ export const PRODUCER_GONE = "That stream has ended";
 /** Producer announcements held waiting for a device or a roster entry. */
 const MAX_QUEUED_PRODUCERS = 64;
 
+/**
+ * How long a remote camera may go unshown before its stream is closed (see
+ * setWantedCameras). Long enough that a glance at a share and back, or a
+ * scroll past a thumbnail, costs nothing; short next to how long people
+ * watch a share or another room.
+ */
+export const CAMERA_PARK_GRACE_MS = 5_000;
+
 // ── Message types (mirrored on the SFU server) ────────────────────────────────
 
 interface MSGetCapabilities {
@@ -327,6 +335,16 @@ export class MediasoupVideo implements VideoTransport {
 
   // Consumes in flight, keyed by producer id. See consumeProducer.
   private inflightConsumes: Map<string, Promise<void>> = new Map();
+
+  // The remote cameras something on screen shows, by peerId, or null for no
+  // opinion (every camera received). See setWantedCameras.
+  private wantedCameras: ReadonlySet<string> | null = null;
+  // Cameras not received because nothing showed them: producerId → peerId.
+  // The app still holds each one's last track - see setWantedCameras - unless
+  // bringing it back failed twice (unparkCamera).
+  private parkedCameras: Map<string, string> = new Map();
+  // Cameras going unshown, by producerId: parked when the timer runs out.
+  private parkTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   // Last time a broken recv transport was rebuilt, so the rebuild (which
   // re-consumes, and so can fail again) cannot become its own loop.
   private lastRecvRecoveryAt = 0;
@@ -445,6 +463,9 @@ export class MediasoupVideo implements VideoTransport {
     this.pendingTransmissions.clear();
     this.pendingScreenProducerIds.clear();
     this.watchingTransmissionPeers.clear();
+    this.clearParkedCameras();
+    // The next call starts with no opinion, until its own screen says.
+    this.wantedCameras = null;
     this.queuedProducers = [];
     this.device = null;
     this.sendTransport = null;
@@ -574,6 +595,48 @@ export class MediasoupVideo implements VideoTransport {
   /** Returns a copy of pending transmissions: peerId → producerId. */
   getPendingTransmissions(): Map<string, string> {
     return new Map(this.pendingTransmissions);
+  }
+
+  /**
+   * Which remote cameras are worth receiving: the ones something on screen
+   * shows (the stage, the floating panel and picture in picture, a popped
+   * out window), by peerId. Null means no opinion, and every camera is
+   * received.
+   *
+   * Every camera used to be consumed for the whole call at full size and
+   * decoded whether anything showed it or not: in another room, with people
+   * hidden in the grid, behind a focused share. Eleven cameras cost a
+   * desktop two cores and about 25 Mbps down, and only stopping the stream
+   * gives that back: with no <video> at all, Chrome's receive pipeline still
+   * spends four fifths of it.
+   *
+   * So a camera nothing shows for CAMERA_PARK_GRACE_MS is parked: its
+   * consumer is closed on the SFU (which then stops forwarding it) and here.
+   * Shown again, it is consumed afresh; the SFU creates every consumer paused
+   * and asks the sender for a keyframe on resume, so it comes back on a
+   * clean frame a round trip later. Nothing new on the wire: these are the
+   * close and consume frames the stall path already uses.
+   *
+   * A parked camera emits no trackRemoved. The person's camera is still on,
+   * it is only not being received, and everything that asks whether they
+   * have video - the spotlight's choice, the grid's "streaming" filter, this
+   * very visibility - must keep saying yes, or a parked camera would never
+   * be shown again. The app keeps the last track until the fresh consume
+   * replaces it, and loses it with ms:producer-closed like any other.
+   *
+   * Screen shares are never parked: watching one is the user's own choice,
+   * and the "who is watching" list is announced from those consumers.
+   */
+  setWantedCameras(peers: ReadonlySet<string> | null): void {
+    this.wantedCameras = peers;
+    for (const [producerId, peerId] of [...this.parkedCameras]) {
+      if (this.cameraWanted(peerId)) this.unparkCamera(peerId, producerId);
+    }
+    for (const [peerId, cs] of this.consumers) {
+      for (const c of cs) {
+        if (c.source === "camera") this.reviewCamera(peerId, c);
+      }
+    }
   }
 
   on<K extends keyof VideoEvents>(event: K, handler: VideoEvents[K]): void {
@@ -858,6 +921,14 @@ export class MediasoupVideo implements VideoTransport {
         this.emit("trackRemoved", peer, c.source, c.consumer.kind);
       });
     }
+    // Parked cameras too: the app holds their last track, and a camera that
+    // went off while the socket was down is never announced as closed. The
+    // replay brings back every one still on, through the ordinary consume.
+    // What is on screen (wantedCameras) is not session state and stays.
+    for (const peer of this.parkedCameras.values()) {
+      this.emit("trackRemoved", peer, "camera", "video");
+    }
+    this.clearParkedCameras();
     this.consumers.clear();
     this.consumerStats.clear();
     this.inflightConsumes.clear();
@@ -1375,10 +1446,16 @@ export class MediasoupVideo implements VideoTransport {
         }
         break;
       case "ms:peer-left":
+        // peerLeft takes every track the app holds for them, the last one of
+        // a parked camera included.
+        for (const [producerId, peerId] of [...this.parkedCameras]) {
+          if (peerId === msg.peerId) this.parkedCameras.delete(producerId);
+        }
         if (this.active.has(msg.peerId)) {
           this.active.delete(msg.peerId);
           this.consumers.get(msg.peerId)?.forEach((c) => {
             this.consumerStats.delete(c.consumer.id);
+            this.clearParkTimer(c.consumer.producerId);
             c.consumer.close();
           });
           this.consumers.delete(msg.peerId);
@@ -1411,6 +1488,14 @@ export class MediasoupVideo implements VideoTransport {
             this.consumers.delete(peerId);
           }
         });
+        this.clearParkTimer(msg.producerId);
+        // A parked camera has no consumer left to close, but the app still
+        // holds its last track as "camera on": the camera is off now.
+        const parkedPeer = this.parkedCameras.get(msg.producerId);
+        if (parkedPeer !== undefined) {
+          this.parkedCameras.delete(msg.producerId);
+          this.emit("trackRemoved", parkedPeer, msg.source, msg.kind);
+        }
 
         if (msg.source === "screen") {
           const ids = this.pendingScreenProducerIds.get(msg.peerId);
@@ -1580,8 +1665,15 @@ export class MediasoupVideo implements VideoTransport {
       })
     );
 
+    const entry: Consumer = { consumer, source };
     if (!this.consumers.has(peerId)) this.consumers.set(peerId, []);
-    this.consumers.get(peerId)!.push({ consumer, source });
+    this.consumers.get(peerId)!.push(entry);
+    if (source === "camera") {
+      // Received (again): not parked, until nothing on screen shows it for
+      // the grace period - see setWantedCameras.
+      this.parkedCameras.delete(producerId);
+      this.reviewCamera(peerId, entry);
+    }
 
     if (!this.active.has(peerId)) {
       this.active.add(peerId);
@@ -1659,6 +1751,119 @@ export class MediasoupVideo implements VideoTransport {
         );
       }
     }
+  }
+
+  private cameraWanted(peerId: string): boolean {
+    return this.wantedCameras === null || this.wantedCameras.has(peerId);
+  }
+
+  /**
+   * Start, or call off, the grace period of one live camera consumer.
+   * Keyed by producer, so a consumer replaced meanwhile (a stall, a rebuilt
+   * recv transport) is still the one the timer parks.
+   */
+  private reviewCamera(peerId: string, c: Consumer): void {
+    const producerId = c.consumer.producerId;
+    if (this.cameraWanted(peerId)) {
+      this.clearParkTimer(producerId);
+      return;
+    }
+    if (this.parkTimers.has(producerId)) return;
+    this.parkTimers.set(
+      producerId,
+      setTimeout(() => {
+        this.parkTimers.delete(producerId);
+        if (this.cameraWanted(peerId)) return;
+        const live = this.consumers
+          .get(peerId)
+          ?.find(
+            (e) =>
+              e.source === "camera" &&
+              e.consumer.producerId === producerId &&
+              !e.consumer.closed
+          );
+        if (live) this.parkCamera(peerId, live);
+      }, CAMERA_PARK_GRACE_MS)
+    );
+  }
+
+  private clearParkTimer(producerId: string): void {
+    const timer = this.parkTimers.get(producerId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.parkTimers.delete(producerId);
+  }
+
+  /** Stop receiving a camera nothing shows. See setWantedCameras. */
+  private parkCamera(peerId: string, c: Consumer): void {
+    const producerId = c.consumer.producerId;
+    // The SFU first, as the stall path does: a consumer closed only here
+    // would go on being forwarded to nobody, and the next ms:consume would
+    // hit the server's duplicate path and get this same consumer back.
+    this.signal({ type: "ms:close-consumer", producerId });
+    c.consumer.close();
+    this.consumerStats.delete(c.consumer.id);
+    const list = this.consumers.get(peerId);
+    if (list) {
+      const remaining = list.filter((entry) => entry !== c);
+      if (remaining.length > 0) this.consumers.set(peerId, remaining);
+      else this.consumers.delete(peerId);
+    }
+    this.parkedCameras.set(producerId, peerId);
+    rec(
+      ev("sfu.consume", {
+        peer: peerId,
+        d: { phase: "parked", producer: producerId, source: "camera" },
+      })
+    );
+  }
+
+  /**
+   * Receive a parked camera again. The consume itself takes it off the
+   * parked list (consumeProducerInner), and its trackAdded replaces the
+   * last track the app kept.
+   */
+  private unparkCamera(peerId: string, producerId: string, attempt = 1): void {
+    // Already on its way back: what is on screen can change several times
+    // within one consume, and each would hang another handler on it.
+    if (this.inflightConsumes.has(producerId)) return;
+    this.consumeProducer(peerId, producerId, "camera").catch((err) => {
+      // Closed, left or rebuilt in the meantime: nothing left to undo.
+      if (this.parkedCameras.get(producerId) !== peerId) return;
+      rec(
+        ev("sfu.consume.failed", {
+          peer: peerId,
+          d: { err: errText(err), phase: "unpark", attempt, producer: producerId },
+        })
+      );
+      if (err instanceof Error && err.message === PRODUCER_GONE) {
+        // The camera went off while parked, and its close raced this.
+        this.parkedCameras.delete(producerId);
+        this.emit("trackRemoved", peerId, "camera", "video");
+        return;
+      }
+      if (attempt === 1) {
+        // Once more, as an announced camera's first consume is retried
+        // (consumeProducerWithRetry).
+        setTimeout(() => {
+          if (this.parkedCameras.get(producerId) !== peerId) return;
+          if (this.cameraWanted(peerId)) this.unparkCamera(peerId, producerId, 2);
+        }, 3_000);
+        return;
+      }
+      // Twice over: the stale picture goes, so the tile shows the person
+      // rather than a frozen frame, but the camera stays parked and the
+      // next change in what is on screen tries again. A dead session is
+      // the rejoin ladder's, whose replay consumes every camera afresh.
+      this.emit("trackRemoved", peerId, "camera", "video");
+    });
+  }
+
+  /** Forget every parked camera and pending park, emitting nothing. */
+  private clearParkedCameras(): void {
+    for (const timer of this.parkTimers.values()) clearTimeout(timer);
+    this.parkTimers.clear();
+    this.parkedCameras.clear();
   }
 
   /**

@@ -7,6 +7,9 @@
 
 import type { SpotlightTile } from "./spotlight";
 
+/** A remote camera tile's id is this and the peerId, here and on the stage. */
+const REMOTE_CAMERA = "remote-camera-";
+
 export interface CallState {
   /** Map of peerId to participant state with media tracks */
   participants: Map<
@@ -65,7 +68,7 @@ export function buildCallTiles(state: CallState): SpotlightTile[] {
   // Remote camera tiles - one per peer, regardless of track state.
   for (const [peerId, p] of state.participants) {
     result.push({
-      id: `remote-camera-${peerId}`,
+      id: `${REMOTE_CAMERA}${peerId}`,
       kind: "camera",
       isLocal: false,
       peerId,
@@ -128,4 +131,30 @@ export function buildCallTiles(state: CallState): SpotlightTile[] {
   }
 
   return result;
+}
+
+/**
+ * The remote cameras something on screen shows, by peerId: the ones worth
+ * receiving (MediasoupVideo.setWantedCameras). Every other camera can stop
+ * coming in until one of these surfaces shows it again.
+ *
+ * @param stage Peers whose camera tile the call stage has on screen.
+ * @param spotlight The spotlight tile. The floating panel and picture in
+ *   picture show it, and so does the hidden video that keeps picture in
+ *   picture ready to open on a tab switch.
+ * @param poppedOut Ids of the tiles in a window of their own.
+ */
+export function wantedCameras(
+  stage: Iterable<string>,
+  spotlight: Pick<SpotlightTile, "kind" | "isLocal" | "peerId"> | null,
+  poppedOut: Iterable<string>
+): Set<string> {
+  const wanted = new Set(stage);
+  if (spotlight && spotlight.kind === "camera" && !spotlight.isLocal) {
+    wanted.add(spotlight.peerId);
+  }
+  for (const id of poppedOut) {
+    if (id.startsWith(REMOTE_CAMERA)) wanted.add(id.slice(REMOTE_CAMERA.length));
+  }
+  return wanted;
 }

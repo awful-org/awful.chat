@@ -745,6 +745,20 @@ Screen share audio (share-audio.ts):
     mid-call (own-audio suppression leaving nothing to send, or an
     output-device change) is reported instead of silently dead
 
+Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
+  - every remote camera producer is consumed when announced, as before
+  - it stays received only while something shows it: a camera tile the
+    stage has on screen (IntersectionObserver), the spotlight (floating
+    panel, picture in picture), or a popped-out window
+  - unshown for 5 s → ms:close-consumer and a local close; shown again →
+    a fresh ms:consume + ms:resume-consumer (the SFU asks for a keyframe on
+    resume). No new wire message
+  - while parked the app keeps the last track (no trackRemoved), so "has
+    video" stays true for the spotlight and the grid filters; a parked
+    camera's ms:producer-closed, peer-left or a rejoin removes it
+  - screen shares are never parked; no opinion yet (or no call) = every
+    camera received
+
 Screen share transmissions:
   - remote screen producers emit transmissionAvailable(peerId, producerId)
   - UI shows pending "Click to watch" tile (not auto-consumed)

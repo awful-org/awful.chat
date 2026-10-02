@@ -125,6 +125,7 @@ import {
   sameTileRects,
   type TileRects,
 } from "$lib/call-tile-rects";
+import { stageCameraHidden, stageCameraShown } from "$lib/call-cameras.svelte";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
 import type { PeerVoiceQuality } from "$lib/call-quality";
@@ -329,6 +330,61 @@ import {
   // the panel never tore the analysers down, leaking the AudioContext and the
   // poll loop for the rest of the session. This component only READS
   // speakers.speaking for its rings.
+
+  // ── Which cameras are on screen ───────────────────────────────────────────
+  //
+  // A remote camera is received only while something shows it (see
+  // call-cameras.svelte.ts). The stage's part is every remote camera tile
+  // actually on screen: not filtered away by the grid menu, not hidden
+  // behind a focused share, not scrolled out of the thumbnail strip. One
+  // IntersectionObserver answers all of those, and a tile the layout does
+  // not render at all is simply not observed. Tiles, not <video>s: an avatar
+  // tile on screen wants the camera too, the moment one is turned on.
+  let cameraTileObserver: IntersectionObserver | null = null;
+  const observedCameraTiles = new Map<Element, string>();
+
+  function cameraOnScreen(node: HTMLElement, peerId: string | null) {
+    let current: string | null = null;
+    const start = (id: string | null) => {
+      current = id;
+      if (id === null) return;
+      observedCameraTiles.set(node, id);
+      if (typeof IntersectionObserver === "undefined") {
+        stageCameraShown(node, id);
+        return;
+      }
+      cameraTileObserver ??= new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const tilePeer = observedCameraTiles.get(entry.target);
+          if (tilePeer === undefined) continue;
+          if (entry.isIntersecting) stageCameraShown(entry.target, tilePeer);
+          else stageCameraHidden(entry.target);
+        }
+      });
+      cameraTileObserver.observe(node);
+    };
+    const end = () => {
+      if (current === null) return;
+      observedCameraTiles.delete(node);
+      cameraTileObserver?.unobserve(node);
+      stageCameraHidden(node);
+      current = null;
+    };
+    start(peerId);
+    return {
+      update(id: string | null) {
+        if (id === current) return;
+        end();
+        start(id);
+      },
+      destroy: end,
+    };
+  }
+
+  $effect(() => () => {
+    cameraTileObserver?.disconnect();
+    cameraTileObserver = null;
+  });
 
   // ── Video / Audio actions ─────────────────────────────────────────────────
 
@@ -1765,6 +1821,9 @@ import {
   <div
     role="none"
     oncontextmenu={(e) => openTileMenu(e, tile)}
+    use:cameraOnScreen={tile.kind === "camera" && !tile.isLocal
+      ? tile.peerId
+      : null}
     class="relative {isFocused ? 'w-full h-full' : ''} {compact
       ? 'aspect-video'
       : ''}"
