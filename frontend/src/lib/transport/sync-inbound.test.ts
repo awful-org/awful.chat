@@ -77,15 +77,31 @@ describe("a paced push", () => {
     const { tracker, mark } = harness();
     const rows = history(200);
     const frames = pacedFrames(rows);
-    const headCount = frames.filter((f) => f.frame.order === "head").length;
-    for (const f of frames) await tracker.batch("peer1", ROOM, f.frame, async () => outcome(f.rows));
-    // Every "asc" batch is in: everything below the head is claimed...
-    expect(Math.max(mark("did:a"), mark("did:b"), mark("did:c"))).toBe(150);
-    // ...and the head waits for SyncComplete.
+    expect(frames.filter((f) => f.frame.order === "head").length).toBeGreaterThan(0);
+    for (const f of frames.slice(0, -1)) {
+      await tracker.batch("peer1", ROOM, f.frame, async () => outcome(f.rows));
+    }
+    // All but the last "asc" batch: everything up to there is claimed, and
+    // the newest page waits for the push to be whole.
+    expect(Math.max(mark("did:a"), mark("did:b"), mark("did:c"))).toBe(140);
+    const last = frames.at(-1)!;
+    await tracker.batch("peer1", ROOM, last.frame, async () => outcome(last.rows));
     await tracker.complete("peer1", ROOM);
     expect(Math.max(mark("did:a"), mark("did:b"), mark("did:c"))).toBe(200);
     expect(stillOffered(rows, mark)).toEqual([]);
-    expect(headCount).toBeGreaterThan(0);
+  });
+
+  it("completes a push whose SyncComplete arrives before its first batch", async () => {
+    // A DM batch takes a detour on the way in; a one-batch push's
+    // SyncComplete, sent right behind it, can get here first.
+    const { tracker, mark, held } = harness();
+    const rows = history(10);
+    const [only] = pacedFrames(rows);
+    await tracker.complete("peer1", ROOM);
+    await tracker.batch("peer1", ROOM, only.frame, async () => outcome(only.rows));
+    await tracker.complete("peer1", ROOM);
+    expect(stillOffered(rows, mark)).toEqual([]);
+    expect(held.has(ROOM)).toBe(false);
   });
 
   it("leaves no hole when it stops short: the next push offers exactly what is missing", async () => {
@@ -152,12 +168,16 @@ describe("a paced push", () => {
 });
 
 describe("an older build's push", () => {
-  it("claims nothing until it completes, then everything", async () => {
+  it("claims nothing until every batch it announced is in, then everything", async () => {
     const { tracker, mark } = harness();
     const rows = history(100);
     const frames = oldFrames(rows);
-    for (const f of frames) await tracker.batch("old", ROOM, f.frame, async () => outcome(f.rows));
+    for (const f of frames.slice(0, -1)) {
+      await tracker.batch("old", ROOM, f.frame, async () => outcome(f.rows));
+    }
     expect(mark("did:a")).toBe(-1);
+    const last = frames.at(-1)!;
+    await tracker.batch("old", ROOM, last.frame, async () => outcome(last.rows));
     await tracker.complete("old", ROOM);
     expect(stillOffered(rows, mark)).toEqual([]);
   });

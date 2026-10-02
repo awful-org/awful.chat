@@ -13,7 +13,10 @@
 //  - "asc" batches (oldest first, from builds that pace their pushes) claim
 //    as each one is stored, as long as every earlier batch of the push was;
 //  - "head" batches, and every batch of an older build's push, claim once
-//    the push completes: SyncComplete after every batch it announced;
+//    the push completes: every batch it announced arrived, in order. That
+//    alone tells a whole push from a cut-off one (an older build's lost
+//    batches never arrive), so it does not wait on SyncComplete, which a DM
+//    batch's detour on the way in can let arrive first;
 //  - meanwhile every other advance in the room, live messages included,
 //    waits in storage (holdWatermarks) and is written once a push into the
 //    room completes - or, when we asked for history and none came, shortly
@@ -85,8 +88,6 @@ interface Push {
   /** Its frames are handled one at a time, in arrival order. */
   chain: Promise<void>;
   timer: ReturnType<typeof setTimeout> | null;
-  /** SyncComplete arrived; it takes effect once every announced batch is in. */
-  completing: boolean;
   ended: boolean;
   /** Settles when the push is over, however it ended. */
   done: Promise<void>;
@@ -128,6 +129,8 @@ function* entries(pending: Map<string, number[]>): Iterable<readonly [string, nu
 
 export class InboundPushes {
   private pushes = new Map<string, Push>();
+  /** Pushes with every batch in, still being handled: settled with them. */
+  private finishing = new Map<string, Promise<void>>();
   private rooms = new Map<string, RoomState>();
   private claims = new Map<string, Map<string, number>>();
 
@@ -195,22 +198,22 @@ export class InboundPushes {
       await this.account(p, order, outcome);
     });
     p.chain = run.catch(() => {});
-    if (p.completing && p.next >= p.total) this.finish(p);
+    // Every batch it announced is in: the push is whole (or, broken, over).
+    if (p.total > 0 && p.next >= p.total) this.finish(p);
     return run;
   }
 
   /**
-   * The pusher's SyncComplete for the room. Settles once the push is over -
-   * after its last batch, or when it stalls.
+   * The pusher's SyncComplete for the room. Settles once the push is over and
+   * its batches are handled. A push still missing a batch keeps waiting for
+   * it - a DM batch takes a detour on the way in and can arrive after this -
+   * until the stall; one already broken ends now.
    */
   complete(peer: string, room: string): Promise<void> {
-    const p = this.pushes.get(`${peer}|${room}`);
-    if (!p) return Promise.resolve();
-    p.completing = true;
-    // A batch can reach us after the SyncComplete behind it (a DM batch
-    // takes a detour first): wait for every batch the push announced, or
-    // let the stall end it.
-    if (p.broken || p.next >= p.total) this.finish(p);
+    const key = `${peer}|${room}`;
+    const p = this.pushes.get(key);
+    if (!p) return this.finishing.get(key) ?? Promise.resolve();
+    if (p.broken) this.finish(p);
     else this.arm(p);
     return p.done;
   }
@@ -245,6 +248,7 @@ export class InboundPushes {
       if (state.expecting) clearTimeout(state.expecting);
     }
     this.pushes.clear();
+    this.finishing.clear();
     this.rooms.clear();
     this.claims.clear();
   }
@@ -287,7 +291,6 @@ export class InboundPushes {
       floors: new Map(),
       chain: before ? before.chain : Promise.resolve(),
       timer: null,
-      completing: false,
       ended: false,
       done,
       settleDone,
@@ -351,6 +354,10 @@ export class InboundPushes {
     // Over from here, whatever its queued batches still do: a later frame
     // starts another push.
     this.pushes.delete(p.key);
+    this.finishing.set(p.key, p.done);
+    void p.done.then(() => {
+      if (this.finishing.get(p.key) === p.done) this.finishing.delete(p.key);
+    });
     p.chain = p.chain
       .then(async () => {
         let claimed = !p.broken && !p.partial && p.total > 0 && p.next === p.total;

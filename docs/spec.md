@@ -413,7 +413,10 @@ on receive SyncBatch:
     - "asc" batches claim as each is stored, while every earlier batch of the
       push was stored too (a missing or refused batch stops the claims)
     - "head" batches, and an older build's unmarked batches, claim only once
-      the push completes: SyncComplete after every batch it announced
+      the push completes: every batch it announced (totalBatches) arrived,
+      in order - which also tells a cut-off push from a whole one. It does
+      not wait on SyncComplete, which can arrive before the last batch: a DM
+      batch takes a detour on the way in
     - rows already held count: their stored lamport, not the copy's
     - while a push into the room is open, or one stopped short and none has
       completed since, or for 15s after we sent a digest, every other
@@ -438,7 +441,7 @@ on receive SyncBatch:
     after 20s without a frame
 
 on receive SyncComplete:
-  → after the push's queued batches: claim its head rows (see above)
+  → once the push's batches are all in and handled (or it stalls):
   → flush the room's parked rows; re-sort in-memory list if out of order
   → send SyncDigest to all OTHER connected peers (gossip propagation)
     so data spreads through partial meshes without requiring direct connections
