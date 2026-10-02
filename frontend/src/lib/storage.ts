@@ -2860,6 +2860,15 @@ export function watermarksHeld(roomCode: string): boolean {
   return _watermarkHolds.has(roomCode);
 }
 
+/**
+ * The advances a held room is waiting to write, by sender. Rows we already
+ * hold: a digest must not advertise them yet (that is the hold), but nor is
+ * a peer that has them ahead of us.
+ */
+export function heldWatermarks(roomCode: string): ReadonlyMap<string, number> {
+  return _watermarkHolds.get(roomCode) ?? new Map();
+}
+
 /** Stop holding the room and write what waited. */
 export async function releaseWatermarks(
   roomCode: string,

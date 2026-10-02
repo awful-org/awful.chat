@@ -150,6 +150,7 @@ enum MessageType {
   SyncDigest      = "sync_digest",
   SyncBatch       = "sync_batch",
   SyncComplete    = "sync_complete",
+  SyncNone        = "sync_none",        // a digest's answer when no push follows
 }
 
 // NOTE: DM delivery/read receipts are implemented, but NOT via these wire
@@ -343,10 +344,11 @@ interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatM
                              live?: boolean            // one send's direct copy, not history repair
                              order?: "head" | "asc" }  // place in a paced push; absent from older senders
 interface WireSyncComplete { type: MessageType.SyncComplete }
+interface WireSyncNone     { type: MessageType.SyncNone }      // absent from older senders
 
 type AnyWireMessage =
   | WireChatMessage | WireProfile | WireCallPresence | WireRoomName
-  | WireSyncDigest | WireSyncBatch | WireSyncComplete
+  | WireSyncDigest | WireSyncBatch | WireSyncComplete | WireSyncNone
 
 // helpers
 function wireToMessage(wire: WireChatMessage, roomCode: string): Message  // adds roomCode + attachments: []
@@ -398,6 +400,11 @@ on receive SyncDigest:
       reading the next frame keeps up with
     - a refused frame is retried (250ms, 1s), then the push stops; the
       SyncComplete goes out only once every batch was accepted
+  → a digest that brings no push - nothing they lack, the push window not
+    open yet, or a read that found nothing - is answered with SyncNone, so
+    the asker stops holding its room for it (below). A push already running
+    to that peer answers instead. Older builds never send SyncNone, and
+    ignore it as a type they do not know
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
@@ -421,9 +428,13 @@ on receive SyncBatch:
       does not wait on SyncComplete either
     - rows already held count: their stored lamport, not the copy's
     - while a push into the room is open, or one stopped short and none has
-      completed since, or for 15s after we sent a digest, every other
+      completed since, or a digest we sent is unanswered, every other
       advance there (live messages, our own sends) waits in memory and is
-      written when that ends
+      written when that ends. A digest is answered by its peer's push (which
+      holds the room itself from its first frame), SyncComplete or SyncNone;
+      an older build answers none of them, so its wait runs out after 15s
+    - those waiting advances count as held when a peer's digest is weighed:
+      a row we stored but have not claimed yet is not one to ask them for
     - an older build whose push stops short (it lost batches past the
       channel's window, newest first) would re-send the same newest rows on
       every digest: what it delivered is advertised to that peer alone, for

@@ -21,6 +21,7 @@ import { InboundPushes, type BatchOutcome, type HeldRow } from "./sync-inbound";
 import {
   PAGE_SIZE,
   commitWatermark,
+  heldWatermarks,
   holdWatermarks,
   releaseWatermarks,
   senderMaxLamports,
@@ -1569,9 +1570,11 @@ async function _sendDigestForRoom(
     return;
   }
   // The digest may bring a push. From the moment it is read until that push
-  // starts, a live message must not claim past the rows it is asking for -
-  // and if no push comes, the hold simply runs out.
-  _inboundPushes.expect(roomCode);
+  // starts, a live message must not claim past the rows it is asking for.
+  // The peer's answer ends the hold: its push, which holds the room itself
+  // until it completes, or a SyncNone. An older build sends no SyncNone, so
+  // for it the hold runs out on its own.
+  _inboundPushes.expect(peerId, roomCode);
   // Plus, for an older build whose push stopped short, what that push did
   // deliver: told to that peer alone, or it re-sends the same rows forever.
   const watermarks = _inboundPushes.withClaims(
@@ -1587,10 +1590,11 @@ async function _sendDigestForRoom(
       d: { watermarks: Object.keys(watermarks).length },
     })
   );
-  await _transport.sendRoom(
-    peerId, roomCode,
-    encode({ type: MessageType.SyncDigest, roomCode, watermarks })
-  );
+  const sent = await _transport
+    .sendRoom(peerId, roomCode, encode({ type: MessageType.SyncDigest, roomCode, watermarks }))
+    .catch(() => false);
+  // A digest that never went out brings no push.
+  if (!sent) _inboundPushes.answered(peerId, roomCode);
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -1736,6 +1740,10 @@ async function _handleDigest(
   // backlog runs for a while, and the reply below must not wait behind it.
   if (theyAreMissing.length > 0 && allowSyncReaction(`push|${peerId}|${roomCode}`)) {
     void _pushMissingTo(peerId, roomCode, theirWatermarks).catch(() => {});
+  } else if (!_pushesOut.has(`${peerId}|${roomCode}`)) {
+    // No push answers this digest, so say so. A push already running to
+    // them answers it instead: it holds their room itself.
+    _sendSyncNone(peerId, roomCode);
   }
 
   // A digest only tells the SENDER what they lack, so one exchange heals one
@@ -1748,11 +1756,18 @@ async function _handleDigest(
   // not a reason to ask for a push we would only refuse again - and asking
   // would bounce a digest back and forth every exchange. Same for what an
   // older build's short push already gave us: that peer is told we hold it.
+  // And for an advance a held room is still waiting to write (storage.ts):
+  // that row is stored. A room is held from every digest we send until it
+  // is answered, and a live message landing meanwhile used to read as one
+  // we lacked - we asked for it, and the peer pushed it back.
   const advertised = _inboundPushes.withClaims(
     peerId,
     roomCode,
     _withRefused(roomCode, { ...mine })
   );
+  for (const [sid, lamport] of heldWatermarks(roomCode)) {
+    if ((advertised[sid] ?? -1) < lamport) advertised[sid] = lamport;
+  }
   const weAreBehind = Object.keys(theirWatermarks).some(
     (sid) => (theirWatermarks[sid] ?? -1) > (advertised[sid] ?? -1)
   );
@@ -1794,6 +1809,18 @@ function _promoteSentByWatermark(
 /** Pushes in flight, by "peer|room": one at a time to each peer per room. */
 const _pushesOut = new Set<string>();
 
+/**
+ * Tell a peer its digest brings no push from us. It holds the room from the
+ * moment it sent the digest until it hears (sync-inbound.ts), and with no
+ * answer it waited out the whole EXPECT_PUSH_MS after every digest - in a
+ * busy room, nearly all the time. Older builds ignore the frame.
+ */
+function _sendSyncNone(peerId: string, roomCode: string): void {
+  _transport
+    .sendRoom(peerId, roomCode, encode({ type: MessageType.SyncNone, roomCode }))
+    .catch(() => {});
+}
+
 async function _pushMissingTo(
   peerId: string,
   roomCode: string,
@@ -1824,7 +1851,10 @@ async function _pushRows(
   const missing = await getMessagesAboveWatermarks(roomCode, theirWatermarks);
   guard();
 
-  if (!missing.length) return;
+  if (!missing.length) {
+    _sendSyncNone(peerId, roomCode);
+    return;
+  }
 
   // Re-attach inline bytes for small files we still hold: this is what lets
   // a peer who was offline at send time get the image at all - attachment
@@ -3330,7 +3360,7 @@ async function _handleChatMessage(
       // rows the digest is asking for. For the message's own room, not the
       // one on screen, and past the debounce: a detected gap is the strongest
       // signal we get, and a routine exchange must not swallow it.
-      _inboundPushes.expect(roomCode);
+      _inboundPushes.expect(receivedFromPeerId, roomCode);
       _sendDigestForRoom(receivedFromPeerId, roomCode).catch(() => {});
     }
   }
@@ -4365,6 +4395,16 @@ _transport.on("message", (peerId, data, room) => {
           break;
         }
         _handleSyncComplete(peerId, msg.roomCode);
+        break;
+      case MessageType.SyncNone:
+        // The peer's answer to a digest of ours: no push is coming, so the
+        // room need not wait for one. Only ever ends what we asked that peer.
+        if (typeof msg.roomCode !== "string") break;
+        if (room?.startsWith("dm-") && msg.roomCode === room) {
+          _inDmSyncOrder(peerId, room, guard, () => _inboundPushes.answered(peerId, msg.roomCode));
+          break;
+        }
+        _inboundPushes.answered(peerId, msg.roomCode);
         break;
       case MessageType.Text:
       case MessageType.Reply:

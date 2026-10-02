@@ -67,6 +67,7 @@ vi.mock("$lib/storage", () => ({
   updateMessageStatus: async () => {},
   getWatermarksForRoom: async () => ({}),
   holdWatermarks: () => {},
+  heldWatermarks: () => new Map(),
   releaseWatermarks: async () => {},
   commitWatermark: async () => {},
 }));

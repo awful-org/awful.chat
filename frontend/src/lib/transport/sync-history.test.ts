@@ -102,6 +102,7 @@ vi.mock("$lib/storage", () => ({
   },
   commitWatermark: async (room: string, sender: string, lamport: number) => commit(room, sender, lamport),
   holdWatermarks: (room: string) => { if (!s.holds.has(room)) s.holds.set(room, new Map()); },
+  heldWatermarks: (room: string) => s.holds.get(room) ?? new Map(),
   releaseWatermarks: async (room: string) => {
     const held = s.holds.get(room);
     s.holds.delete(room);
@@ -237,7 +238,7 @@ it("keeps a cut-off push from an older build from claiming past what it did not 
   expect(mark(row(201).senderId)).toBe(201);
 });
 
-it("answers a digest that lacks nothing without reading anything to push, or using up the push window", async () => {
+it("answers a digest that lacks nothing with SyncNone alone: no read, and the push window kept", async () => {
   for (let l = 1; l <= 30; l++) s.rows.set(row(l).id, row(l));
   const theirs: Record<string, number> = {};
   for (const m of s.rows.values()) theirs[m.senderId] = Math.max(theirs[m.senderId] ?? -1, m.lamport);
@@ -246,12 +247,38 @@ it("answers a digest that lacks nothing without reading anything to push, or usi
   for (let i = 0; i < 5; i++) send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: theirs });
   await new Promise((r) => setTimeout(r, 20));
   expect(s.pushReads).toBe(0);
-  expect(s.frames).toEqual([]);
-  // The window is still there for a digest that does lack something.
+  // Each asker is told no push is coming, so it stops holding its room.
+  expect(s.frames.map((f) => f.frame)).toEqual(
+    Array(5).fill({ type: MessageType.SyncNone, roomCode: ROOM })
+  );
+  // The window is still there for a digest that does lack something, and
+  // the push is its whole answer.
+  s.frames = [];
   const behind = { ...theirs, [SENDERS[0]]: 0 };
   send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: behind });
   await vi.waitFor(() => expect(s.frames.at(-1)?.frame.type).toBe(MessageType.SyncComplete));
   expect(s.pushReads).toBe(1);
+  expect(s.frames.some((f) => f.frame.type === MessageType.SyncNone)).toBe(false);
+});
+
+it("answers SyncNone when the push finds nothing to send after all", async () => {
+  // A watermark for a sender none of whose rows are here: the digest looks
+  // like it lacks something, the read finds nothing.
+  s.watermarks.set(`${ROOM}|${SENDERS[0]}`, 40);
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: { [SENDERS[0]]: 10 } });
+  await vi.waitFor(() => expect(s.frames.map((f) => f.frame.type)).toEqual([MessageType.SyncNone]));
+  expect(s.pushReads).toBe(1);
+});
+
+it("answers nothing while a push to that peer is still running: the push answers", async () => {
+  for (let l = 1; l <= 120; l++) s.rows.set(row(l).id, row(l));
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: {} });
+  await vi.waitFor(() => expect(s.frames.length).toBeGreaterThan(0));
+  // A second digest while the paced push is still going.
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: {} });
+  await vi.waitFor(() => expect(s.frames.at(-1)?.frame.type).toBe(MessageType.SyncComplete), { timeout: 5000 });
+  expect(s.frames.some((f) => f.frame.type === MessageType.SyncNone)).toBe(false);
+  expect(s.frames.filter((f) => f.frame.type === MessageType.SyncComplete)).toHaveLength(1);
 });
 
 it("takes a lamport jump as a gap only against the room's clock", async () => {

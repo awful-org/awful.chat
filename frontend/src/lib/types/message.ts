@@ -28,6 +28,7 @@ export enum MessageType {
   SyncDigest = "sync_digest",
   SyncBatch = "sync_batch",
   SyncComplete = "sync_complete",
+  SyncNone = "sync_none",
   // DM delivery/read receipts do NOT use MessageType - they are tagged
   // binary envelopes over the direct stream (see dm-codec.ts)
 }
@@ -368,6 +369,18 @@ export interface WireSyncComplete {
   roomCode: string;
 }
 
+/**
+ * The answer to a digest that brings no push: nothing to send, or a push
+ * not allowed yet. The asker holds the room from its digest until the push
+ * starts (sync-inbound.ts), and this lets it stop at once. Older builds
+ * never send it, so the asker's wait for them still runs out on its own,
+ * and they ignore it as a type they do not know.
+ */
+export interface WireSyncNone {
+  type: MessageType.SyncNone;
+  roomCode: string;
+}
+
 // File wire
 export interface FileSignalWireMessage {
   type: "__file_signal";
@@ -409,7 +422,8 @@ export type AnyWireMessage =
   | WireRoomUsersSync
   | WireSyncDigest
   | WireSyncBatch
-  | WireSyncComplete;
+  | WireSyncComplete
+  | WireSyncNone;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

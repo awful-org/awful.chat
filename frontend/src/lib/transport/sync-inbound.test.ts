@@ -235,11 +235,47 @@ describe("an older build's push", () => {
 describe("holding a room", () => {
   it("holds while a digest may still bring a push, then lets go", async () => {
     const { tracker, held, released } = harness();
-    tracker.expect(ROOM);
+    tracker.expect("peer1", ROOM);
     expect(held.has(ROOM)).toBe(true);
     await vi.advanceTimersByTimeAsync(EXPECT + 1);
     expect(held.has(ROOM)).toBe(false);
     expect(released).toEqual([ROOM]);
+  });
+
+  it("lets go as soon as the peer it asked says no push is coming", async () => {
+    const { tracker, held, released } = harness();
+    tracker.expect("peer1", ROOM);
+    tracker.answered("peer1", ROOM);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(held.has(ROOM)).toBe(false);
+    expect(released).toEqual([ROOM]);
+  });
+
+  it("holds until every peer it asked has answered, and only that peer's answer counts", async () => {
+    const { tracker, held } = harness();
+    tracker.expect("peer1", ROOM);
+    tracker.expect("old", ROOM);
+    tracker.answered("peer1", ROOM);
+    // An answer from somebody we did not ask ends nothing.
+    tracker.answered("stranger", ROOM);
+    await vi.advanceTimersByTimeAsync(EXPECT / 2);
+    expect(held.has(ROOM)).toBe(true);
+    // An older build never answers: its wait runs out on its own.
+    await vi.advanceTimersByTimeAsync(EXPECT);
+    expect(held.has(ROOM)).toBe(false);
+  });
+
+  it("passes the hold from a digest to the push that answers it", async () => {
+    const { tracker, held } = harness();
+    tracker.expect("peer1", ROOM);
+    const frames = pacedFrames(history(30));
+    await tracker.batch("peer1", ROOM, frames[0].frame, async () => outcome(frames[0].rows));
+    // Long past the digest's wait, the push is still open: still held.
+    await vi.advanceTimersByTimeAsync(EXPECT + 1);
+    expect(held.has(ROOM)).toBe(true);
+    await tracker.batch("peer1", ROOM, frames[1].frame, async () => outcome(frames[1].rows));
+    await tracker.complete("peer1", ROOM);
+    expect(held.has(ROOM)).toBe(false);
   });
 
   it("holds from a push's first frame until it completes", async () => {

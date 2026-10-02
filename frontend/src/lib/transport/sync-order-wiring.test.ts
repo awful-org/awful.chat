@@ -102,6 +102,7 @@ vi.mock("$lib/storage", () => ({
   },
   commitWatermark: async (room: string, sender: string, lamport: number) => commit(room, sender, lamport),
   holdWatermarks: (room: string) => { if (!s.holds.has(room)) s.holds.set(room, new Map()); },
+  heldWatermarks: (room: string) => s.holds.get(room) ?? new Map(),
   releaseWatermarks: async (room: string) => {
     const held = s.holds.get(room);
     s.holds.delete(room);

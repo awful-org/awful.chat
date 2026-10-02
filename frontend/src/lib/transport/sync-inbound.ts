@@ -18,8 +18,12 @@
 //    batches never arrive), so it does not wait on SyncComplete either;
 //  - meanwhile every other advance in the room, live messages included,
 //    waits in storage (holdWatermarks) and is written once a push into the
-//    room completes - or, when we asked for history and none came, shortly
-//    after asking.
+//    room completes. A digest we send holds the room the same way until the
+//    peer answers it: its push's first frame, or a SyncNone saying none is
+//    coming - or, from an older build, which never says so, until the wait
+//    runs out. Holding for that whole wait after every digest kept a busy
+//    room held nearly all the time, and every exchange in it read as us
+//    being behind on messages we already had.
 // An older build whose push stopped short would re-send the same newest rows
 // on every digest, for good. What it did deliver is remembered for that peer
 // alone (withClaims) and advertised only to it; any other peer is still
@@ -59,9 +63,10 @@ export interface InboundDeps {
 /** A push with no frame for this long has stopped. Same clock as the pill. */
 export const PUSH_STALL_MS = SYNC_STALL_MS;
 /**
- * How long a digest keeps the room held while the push it asked for gets
- * going: the pusher reads and decrypts what we lack before its first frame.
- * Past it with no push, there was nothing to send.
+ * How long a digest keeps the room held when the peer never answers it: an
+ * older build sends no SyncNone, and a push takes a while to start - the
+ * pusher reads and decrypts what we lack before its first frame. Past it
+ * with no push, there was nothing to send.
  */
 export const EXPECT_PUSH_MS = 15_000;
 /** Peer+room claim sets kept, and senders per set. */
@@ -97,8 +102,8 @@ interface RoomState {
   open: Set<Push>;
   /** A push stopped short and none has completed since. */
   owed: boolean;
-  /** We asked for history and the push may still be on its way. */
-  expecting: ReturnType<typeof setTimeout> | null;
+  /** Peers we asked for history that have not answered yet: by peer, its wait. */
+  expecting: Map<string, ReturnType<typeof setTimeout>>;
 }
 
 function validRow(row: HeldRow): boolean {
@@ -141,14 +146,34 @@ export class InboundPushes {
     }
   ) {}
 
-  /** We just asked a peer for this room's history: a push may be on its way. */
-  expect(room: string): void {
+  /**
+   * We just asked `peer` for this room's history: a push may be on its way.
+   * The room is held until that peer answers - its push's first frame, its
+   * SyncComplete, or a SyncNone - or the wait runs out.
+   */
+  expect(peer: string, room: string): void {
     const state = this.room(room);
-    if (state.expecting) clearTimeout(state.expecting);
-    state.expecting = setTimeout(() => {
-      state.expecting = null;
+    const before = state.expecting.get(peer);
+    if (before) clearTimeout(before);
+    const timer = setTimeout(() => {
+      if (state.expecting.get(peer) !== timer) return;
+      state.expecting.delete(peer);
       void this.settle(room).catch(() => {});
     }, this.opts.expectMs);
+    state.expecting.set(peer, timer);
+  }
+
+  /**
+   * `peer` answered what we asked it for this room: a push from it is open
+   * (and holds the room itself), or none is coming.
+   */
+  answered(peer: string, room: string): void {
+    const state = this.rooms.get(room);
+    const timer = state?.expecting.get(peer);
+    if (!state || timer === undefined) return;
+    clearTimeout(timer);
+    state.expecting.delete(peer);
+    void this.settle(room).catch(() => {});
   }
 
   /**
@@ -183,6 +208,8 @@ export class InboundPushes {
     if (valid) p.next = index + 1;
     p.phase = order;
     this.arm(p);
+    // Its push is open from here, and holds the room until it ends.
+    this.answered(peer, room);
     const run = p.chain.then(async () => {
       let outcome: BatchOutcome | null = null;
       try {
@@ -210,10 +237,17 @@ export class InboundPushes {
   complete(peer: string, room: string): Promise<void> {
     const key = `${peer}|${room}`;
     const p = this.pushes.get(key);
-    if (!p) return this.finishing.get(key) ?? Promise.resolve();
-    if (p.broken) this.finish(p);
-    else this.arm(p);
-    return p.done;
+    let done: Promise<void>;
+    if (!p) {
+      done = this.finishing.get(key) ?? Promise.resolve();
+    } else {
+      if (p.broken) this.finish(p);
+      else this.arm(p);
+      done = p.done;
+    }
+    // Whatever we asked it, the peer is done answering.
+    this.answered(peer, room);
+    return done;
   }
 
   /** What we advertise to `peer` for `room`: `watermarks` plus its claims. */
@@ -243,7 +277,7 @@ export class InboundPushes {
       p.settleDone();
     }
     for (const state of this.rooms.values()) {
-      if (state.expecting) clearTimeout(state.expecting);
+      for (const timer of state.expecting.values()) clearTimeout(timer);
     }
     this.pushes.clear();
     this.finishing.clear();
@@ -254,7 +288,7 @@ export class InboundPushes {
   private room(room: string): RoomState {
     let state = this.rooms.get(room);
     if (!state) {
-      state = { open: new Set(), owed: false, expecting: null };
+      state = { open: new Set(), owed: false, expecting: new Map() };
       this.rooms.set(room, state);
     }
     this.deps.hold(room);
@@ -412,7 +446,7 @@ export class InboundPushes {
 
   private async settle(room: string): Promise<void> {
     const state = this.rooms.get(room);
-    if (!state || state.open.size || state.owed || state.expecting) return;
+    if (!state || state.open.size || state.owed || state.expecting.size) return;
     this.rooms.delete(room);
     await this.deps.release(room);
   }
