@@ -22,11 +22,17 @@ group video.
 
 ## Features
 
-- **Rooms** with shareable invite links, message history that syncs
-  peer-to-peer, replies, emoji reactions, code blocks with syntax
-  highlighting, and link previews.
-- **Direct messages** with an offline queue, delivery and read receipts, and
-  a phonebook of saved contacts.
+- **Rooms** with message history that syncs peer-to-peer, replies, emoji
+  reactions, Discord-style markdown (bold, italic, underline, strikethrough,
+  spoilers, quotes, lists, code blocks with syntax highlighting), typing
+  indicators, and link previews.
+- **Invites by short code**: six characters you read out, send or show as a
+  QR, letting in only the people (up to 25) and minutes (up to 10) you
+  choose. Each room also has a permanent link, folded away behind a warning:
+  it never expires and lets in whoever it reaches.
+- **Direct messages** with an offline queue, delivery and read receipts, a
+  phonebook of saved contacts, and message requests: a DM from a stranger
+  waits under Requests, without notifying, until you accept it.
 - **@Mentions** with autocomplete: tamper-proof (they ride inside the signed
   message), rename-proof (always show the current name), and the mentioned
   person gets a highlighted message and a notification.
@@ -43,7 +49,8 @@ group video.
   images, video, audio and GIFs, a GIF picker with saved favorites, and
   small files delivered inside the message itself so they load instantly.
 - **Profiles**: avatar, banner (image or GIF), a colored tag chip, bio, and
-  name effects (gradient, shimmer, glow, rainbow).
+  name effects (gradient, shimmer, glow, rainbow), and optionally a separate
+  profile per room, which messages, member lists and call tiles follow there.
 - **Plugins**: instance-level, Minecraft-mods style. Drop a folder or point
   `PLUGIN_SOURCES` at GitHub repos and redeploy; ships with `/wheel`,
   `/poll` and `/ping`, with more at

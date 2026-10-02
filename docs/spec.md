@@ -764,16 +764,25 @@ Late join behavior:
 ## Room Codes
 
 ```txt
-text:  13 characters of Crockford base32 (65 bits), shown as
-       XXXX-XXXX-XXXX-X - see frontend/src/lib/room-code.ts. Older rooms
-       keep the code they were born with: 16 hex chars (64 bits) from
-       2026-08-28, 6 hex chars (24 bits) before that. A room cannot be
-       re-keyed without becoming a different room, and every layer treats a
-       code as an opaque string. The code is the room's ONLY membership
-       secret - it names the gossipsub topic, keys the relay rendezvous, and
-       is the SFU join key - so no direct frame that carries it (digest, room
-       name, roster, call presence) goes to a peer the relay has not listed
-       in that room (see _sendDigestForRoom and peersInRoom).
+room:  a room secret, "r2_" + 32 random bytes as lowercase base32 (RFC 4648,
+       no padding, 52 characters) - see room-security/keys.ts. It is the
+       room's capability: holding it is membership. A permanent invite link
+       carries it after the "#" (/r/#r2_...) so it never reaches a server,
+       and it is sealed at rest. Peers, the relay and the SFU see only the
+       derived public ID, "rd2_" + 32 bytes of base32 (deriveRoomKeys), which
+       finds the room but cannot join it. Rooms from before security v2
+       (13-character Crockford, or 16 or 6 hex) open as read-only archives
+       and can be moved to a new room (room-security/legacy-move.ts).
+short: six characters, a 2-character public locator and a 4-character
+       password in lowercase Crockford base32 (k5t-8r5), that hand the room
+       secret over OPAQUE through the relay's /invite mailbox, with an
+       ML-KEM-768 secret alongside - see room-security/invitation-pairing.ts.
+       The inviter chooses how many people it lets in (1-25) and how long it
+       lives (1, 5 or 10 minutes); it allows one start per person plus four
+       for mistyped tries, the relay holds it to the same limits
+       (relay/pairing.go), and it closes after the last person. The
+       inviter's app answers each pairing, so it must stay open while the
+       code is live. /r/#<code> is the same code as a link.
 DM:    "dm-" + hex(sha256(sort([didA, didB]).join("|")))[0..40]
        (deterministic - both peers derive the same room without coordination)
 ```
@@ -1070,11 +1079,10 @@ draft on rejected sends and show the error; offline queued delivery still uses
 the existing sending status. Attachment availability follows ordinary file
 transfer rules.
 
-Join accepts supported room links through the shared room-code parser.
-Unknown or expired short aliases produce an error; ambiguous six-hex legacy
-codes require explicit legacy joining. Short-code displays track the returned
-TTL and regenerate on copying after expiry. Global alias lookup admission
-runs before lookup for both existing and missing codes.
+Join accepts a permanent link (r2_ after the "#"), a short code typed or as
+/r/#<code>, or a QR of either, through the shared parser (invite.ts). A legacy
+code opens only its read-only archive. A short code that has expired, been
+cancelled or let in everyone it was made for is refused at once.
 
 ## Open Graph (OG) Proxy
 
