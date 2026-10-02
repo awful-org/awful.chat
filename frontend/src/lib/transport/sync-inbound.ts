@@ -73,6 +73,13 @@ export const EXPECT_PUSH_MS = 15_000;
 /** Peer+room claim sets kept, and senders per set. */
 const MAX_CLAIMED = 256;
 const MAX_CLAIM_SENDERS = 4096;
+/**
+ * Senders with a refused row that one push keeps a floor for. Their ids come
+ * from rows that failed verification, so the peer picks them; past this the
+ * push claims nothing at all rather than grow, or claim past a floor it
+ * could not keep.
+ */
+const MAX_FLOOR_SENDERS = 4096;
 
 interface Push {
   key: string;
@@ -87,9 +94,15 @@ interface Push {
   broken: boolean;
   /** Worked out against claims we advertised to this peer: it cannot prove a whole history. */
   partial: boolean;
-  /** Rows held but not claimable until the push completes. */
-  pending: Map<string, number[]>;
+  /**
+   * Rows held but not claimable until the push completes, each once: a row
+   * we already hold skips verification, so a peer could re-send the same
+   * ones for as long as it liked. Bounded by the rows we hold.
+   */
+  pending: Map<string, Set<number>>;
   floors: Map<string, number>;
+  /** More refused senders than it may keep floors for: it claims nothing. */
+  overflowed: boolean;
   /** Its frames are handled one at a time, in arrival order. */
   chain: Promise<void>;
   timer: ReturnType<typeof setTimeout> | null;
@@ -132,7 +145,7 @@ function claimable(
   return best;
 }
 
-function* entries(pending: Map<string, number[]>): Iterable<readonly [string, number]> {
+function* entries(pending: Map<string, Set<number>>): Iterable<readonly [string, number]> {
   for (const [senderId, lamports] of pending) {
     for (const lamport of lamports) yield [senderId, lamport] as const;
   }
@@ -340,6 +353,7 @@ export class InboundPushes {
       partial: !!claims,
       pending: new Map(),
       floors: new Map(),
+      overflowed: false,
       chain: before ? before.chain : Promise.resolve(),
       timer: null,
       ended: false,
@@ -362,8 +376,15 @@ export class InboundPushes {
   }
 
   private async account(p: Push, order: PushOrder | undefined, outcome: BatchOutcome): Promise<void> {
+    if (p.overflowed) return;
     for (const [senderId, lamport] of outcome.floors) {
       const at = p.floors.get(senderId);
+      if (at === undefined && p.floors.size >= MAX_FLOOR_SENDERS) {
+        p.overflowed = true;
+        p.broken = true;
+        p.pending.clear();
+        return;
+      }
       if (at === undefined || lamport < at) p.floors.set(senderId, lamport);
     }
     const rows = outcome.held.filter(validRow);
@@ -382,9 +403,9 @@ export class InboundPushes {
       return;
     }
     for (const row of rows) {
-      const list = p.pending.get(row.senderId);
-      if (list) list.push(row.lamport);
-      else p.pending.set(row.senderId, [row.lamport]);
+      const lamports = p.pending.get(row.senderId);
+      if (lamports) lamports.add(row.lamport);
+      else p.pending.set(row.senderId, new Set([row.lamport]));
     }
   }
 

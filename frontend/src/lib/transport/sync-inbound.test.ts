@@ -324,3 +324,51 @@ describe("holding a room", () => {
     expect(held.has(ROOM)).toBe(true);
   });
 });
+
+describe("what one push keeps", () => {
+  /** The pushes still open, to see what one of them holds on to. */
+  const open = (tracker: InboundPushes) =>
+    (tracker as unknown as {
+      pushes: Map<string, { pending: Map<string, Set<number>>; floors: Map<string, number> }>;
+    }).pushes;
+
+  // A row we already hold skips verification, so a member could re-send the
+  // same ones under any totalBatches it liked, for as long as it liked - and
+  // every copy was kept until the push ended.
+  it("keeps a re-sent row once, however often it comes", async () => {
+    const { tracker } = harness();
+    const rows = history(20);
+    for (let i = 0; i < 500; i++) {
+      await tracker.batch("member", ROOM, { batchIndex: i, totalBatches: Number.MAX_SAFE_INTEGER },
+        async () => outcome(rows));
+    }
+    const push = open(tracker).get(`member|${ROOM}`)!;
+    expect([...push.pending.values()].reduce((n, lamports) => n + lamports.size, 0)).toBe(20);
+  });
+
+  // The senders a refused row names are the peer's to invent, one more floor
+  // each. Past what it may keep, the push claims nothing at all: never past
+  // a floor it had to drop.
+  it("claims nothing once refused rows name more senders than it keeps floors for", async () => {
+    const { tracker, mark } = harness();
+    const rows = history(40);
+    const frames = pacedFrames(rows);
+    const invented = new Map(Array.from({ length: 5_000 }, (_, i) => [`did:x${i}`, 1] as const));
+    await tracker.batch("member", ROOM, frames[0].frame, async () => outcome(frames[0].rows, invented));
+    expect(open(tracker).get(`member|${ROOM}`)!.floors.size).toBeLessThanOrEqual(4096);
+    await tracker.batch("member", ROOM, frames[1].frame, async () => outcome(frames[1].rows));
+    await tracker.complete("member", ROOM);
+    expect(stillOffered(rows, mark)).toHaveLength(40);
+  });
+
+  it("claims as before with a refused row or two", async () => {
+    const { tracker, mark } = harness();
+    const rows = history(40);
+    const frames = pacedFrames(rows);
+    await tracker.batch("member", ROOM, frames[0].frame, async () =>
+      outcome(frames[0].rows, new Map([["did:x", 1]])));
+    await tracker.batch("member", ROOM, frames[1].frame, async () => outcome(frames[1].rows));
+    await tracker.complete("member", ROOM);
+    expect(stillOffered(rows, mark)).toEqual([]);
+  });
+});
