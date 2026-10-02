@@ -1572,9 +1572,11 @@ async function _sendDigestForRoom(
   // The digest may bring a push. From the moment it is read until that push
   // starts, a live message must not claim past the rows it is asking for.
   // The peer's answer ends the hold: its push, which holds the room itself
-  // until it completes, or a SyncNone. An older build sends no SyncNone, so
-  // for it the hold runs out on its own.
-  _inboundPushes.expect(peerId, roomCode);
+  // until it completes, or a SyncNone echoing this digest's nonce. An older
+  // build sends no SyncNone, so for it the hold runs out on its own. Before
+  // the first await, so a caller's own message is held by the time this
+  // returns.
+  const nonce = _inboundPushes.expect(peerId, roomCode);
   // Plus, for an older build whose push stopped short, what that push did
   // deliver: told to that peer alone, or it re-sends the same rows forever.
   const watermarks = _inboundPushes.withClaims(
@@ -1591,10 +1593,10 @@ async function _sendDigestForRoom(
     })
   );
   const sent = await _transport
-    .sendRoom(peerId, roomCode, encode({ type: MessageType.SyncDigest, roomCode, watermarks }))
+    .sendRoom(peerId, roomCode, encode({ type: MessageType.SyncDigest, roomCode, watermarks, nonce }))
     .catch(() => false);
   // A digest that never went out brings no push.
-  if (!sent) _inboundPushes.answered(peerId, roomCode);
+  if (!sent) _inboundPushes.answered(peerId, roomCode, nonce);
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -1663,7 +1665,9 @@ export async function _loadHistory(
 async function _handleDigest(
   peerId: string,
   roomCode: string,
-  theirWatermarks: Record<string, number>
+  theirWatermarks: Record<string, number>,
+  /** Peer-chosen; echoed by the SyncNone that answers this digest. */
+  nonce?: unknown
 ): Promise<void> {
   // Only reconcile a room we have actually joined - never a room the sender
   // merely named, and never fall back to whatever room the UI has open.
@@ -1739,11 +1743,11 @@ async function _handleDigest(
   // no longer uses the window up. Not awaited: a paced push of a long
   // backlog runs for a while, and the reply below must not wait behind it.
   if (theyAreMissing.length > 0 && allowSyncReaction(`push|${peerId}|${roomCode}`)) {
-    void _pushMissingTo(peerId, roomCode, theirWatermarks).catch(() => {});
+    void _pushMissingTo(peerId, roomCode, theirWatermarks, nonce).catch(() => {});
   } else if (!_pushesOut.has(`${peerId}|${roomCode}`)) {
     // No push answers this digest, so say so. A push already running to
     // them answers it instead: it holds their room itself.
-    _sendSyncNone(peerId, roomCode);
+    _sendSyncNone(peerId, roomCode, nonce);
   }
 
   // A digest only tells the SENDER what they lack, so one exchange heals one
@@ -1813,18 +1817,24 @@ const _pushesOut = new Set<string>();
  * Tell a peer its digest brings no push from us. It holds the room from the
  * moment it sent the digest until it hears (sync-inbound.ts), and with no
  * answer it waited out the whole EXPECT_PUSH_MS after every digest - in a
- * busy room, nearly all the time. Older builds ignore the frame.
+ * busy room, nearly all the time. Older builds ignore the frame. The
+ * digest's nonce goes back with it: the peer may have sent another digest
+ * since, and this answer must not end the wait that one set.
  */
-function _sendSyncNone(peerId: string, roomCode: string): void {
-  _transport
-    .sendRoom(peerId, roomCode, encode({ type: MessageType.SyncNone, roomCode }))
-    .catch(() => {});
+function _sendSyncNone(peerId: string, roomCode: string, nonce: unknown): void {
+  const frame =
+    typeof nonce === "number" && Number.isSafeInteger(nonce)
+      ? { type: MessageType.SyncNone, roomCode, nonce }
+      : { type: MessageType.SyncNone, roomCode };
+  _transport.sendRoom(peerId, roomCode, encode(frame)).catch(() => {});
 }
 
 async function _pushMissingTo(
   peerId: string,
   roomCode: string,
-  theirWatermarks: Record<string, number>
+  theirWatermarks: Record<string, number>,
+  /** The digest's, for a SyncNone if there turns out to be nothing to push. */
+  nonce?: unknown
 ): Promise<void> {
   if (!roomCode) return;
   // One push at a time to a peer per room. A paced push of a big backlog
@@ -1834,7 +1844,7 @@ async function _pushMissingTo(
   if (_pushesOut.has(key)) return;
   _pushesOut.add(key);
   try {
-    await _pushRows(peerId, roomCode, theirWatermarks);
+    await _pushRows(peerId, roomCode, theirWatermarks, nonce);
   } finally {
     _pushesOut.delete(key);
   }
@@ -1843,7 +1853,8 @@ async function _pushMissingTo(
 async function _pushRows(
   peerId: string,
   roomCode: string,
-  theirWatermarks: Record<string, number>
+  theirWatermarks: Record<string, number>,
+  nonce: unknown
 ): Promise<void> {
   const guard = captureDmOwnership();
   // Filter on clear senderId/lamport BEFORE decrypting: only the rows
@@ -1852,7 +1863,7 @@ async function _pushRows(
   guard();
 
   if (!missing.length) {
-    _sendSyncNone(peerId, roomCode);
+    _sendSyncNone(peerId, roomCode, nonce);
     return;
   }
 
@@ -4385,7 +4396,7 @@ _transport.on("message", (peerId, data, room) => {
         _handleRoomUsersSync(peerId, msg, room);
         break;
       case MessageType.SyncDigest:
-        _handleDigest(peerId, msg.roomCode, msg.watermarks).catch(() => {});
+        _handleDigest(peerId, msg.roomCode, msg.watermarks, msg.nonce).catch(() => {});
         break;
       case MessageType.SyncBatch:
         if (room?.startsWith("dm-") && msg.roomCode === room) {
@@ -4411,16 +4422,20 @@ _transport.on("message", (peerId, data, room) => {
         }
         _handleSyncComplete(peerId, msg.roomCode);
         break;
-      case MessageType.SyncNone:
+      case MessageType.SyncNone: {
         // The peer's answer to a digest of ours: no push is coming, so the
-        // room need not wait for one. Only ever ends what we asked that peer.
-        if (typeof msg.roomCode !== "string") break;
+        // room need not wait for one. Only ever ends what we asked that peer,
+        // and only as the answer to the latest digest we sent it: the nonce
+        // that digest carried, echoed. Every build that sends SyncNone does.
+        const nonce = msg.nonce;
+        if (typeof msg.roomCode !== "string" || typeof nonce !== "number") break;
         if (room?.startsWith("dm-") && msg.roomCode === room) {
-          _inDmSyncOrder(peerId, room, guard, () => _inboundPushes.answered(peerId, msg.roomCode));
+          _inDmSyncOrder(peerId, room, guard, () => _inboundPushes.answered(peerId, msg.roomCode, nonce));
           break;
         }
-        _inboundPushes.answered(peerId, msg.roomCode);
+        _inboundPushes.answered(peerId, msg.roomCode, nonce);
         break;
+      }
       case MessageType.Text:
       case MessageType.Reply:
       case MessageType.Reaction:

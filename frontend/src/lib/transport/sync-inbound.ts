@@ -23,7 +23,9 @@
 //    coming - or, from an older build, which never says so, until the wait
 //    runs out. Holding for that whole wait after every digest kept a busy
 //    room held nearly all the time, and every exchange in it read as us
-//    being behind on messages we already had.
+//    being behind on messages we already had. A SyncNone echoes the nonce of
+//    the digest it answers, so the answer to an earlier digest does not end
+//    the wait a later one set.
 // An older build whose push stopped short would re-send the same newest rows
 // on every digest, for good. What it did deliver is remembered for that peer
 // alone (withClaims) and advertised only to it; any other peer is still
@@ -101,8 +103,14 @@ interface RoomState {
   open: Set<Push>;
   /** A push stopped short and none has completed since. */
   owed: boolean;
-  /** Peers we asked for history that have not answered yet: by peer, its wait. */
-  expecting: Map<string, ReturnType<typeof setTimeout>>;
+  /** Peers asked for history and not answered yet: by peer, the digest's wait. */
+  expecting: Map<string, Expectation>;
+}
+
+interface Expectation {
+  /** Carried by the digest, and echoed by the SyncNone that answers it. */
+  nonce: number;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 function validRow(row: HeldRow): boolean {
@@ -136,6 +144,7 @@ export class InboundPushes {
   private finishing = new Map<string, Promise<void>>();
   private rooms = new Map<string, RoomState>();
   private claims = new Map<string, Map<string, number>>();
+  private nonces = 0;
 
   constructor(
     private readonly deps: InboundDeps,
@@ -148,29 +157,40 @@ export class InboundPushes {
   /**
    * We just asked `peer` for this room's history: a push may be on its way.
    * The room is held until that peer answers - its push's first frame, its
-   * SyncComplete, or a SyncNone - or the wait runs out.
+   * SyncComplete, or a SyncNone - or the wait runs out. Returns the nonce
+   * the digest carries; a SyncNone echoes it.
    */
-  expect(peer: string, room: string): void {
+  expect(peer: string, room: string): number {
     const state = this.room(room);
     const before = state.expecting.get(peer);
-    if (before) clearTimeout(before);
-    const timer = setTimeout(() => {
-      if (state.expecting.get(peer) !== timer) return;
-      state.expecting.delete(peer);
-      void this.settle(room).catch(() => {});
-    }, this.opts.expectMs);
-    state.expecting.set(peer, timer);
+    if (before) clearTimeout(before.timer);
+    const nonce = ++this.nonces;
+    const wait: Expectation = {
+      nonce,
+      timer: setTimeout(() => {
+        if (state.expecting.get(peer) !== wait) return;
+        state.expecting.delete(peer);
+        void this.settle(room).catch(() => {});
+      }, this.opts.expectMs),
+    };
+    state.expecting.set(peer, wait);
+    return nonce;
   }
 
   /**
    * `peer` answered what we asked it for this room: a push from it is open
-   * (and holds the room itself), or none is coming.
+   * (and holds the room itself), or none is coming. With a `nonce`, only an
+   * answer to the latest digest we sent it counts. Two digests can be out to
+   * one peer at once - a repair digest, then a gap's - and the SyncNone
+   * answering the first used to end the wait the second had set, letting the
+   * gap message claim before the push it asked for began.
    */
-  answered(peer: string, room: string): void {
+  answered(peer: string, room: string, nonce?: number): void {
     const state = this.rooms.get(room);
-    const timer = state?.expecting.get(peer);
-    if (!state || timer === undefined) return;
-    clearTimeout(timer);
+    const wait = state?.expecting.get(peer);
+    if (!state || !wait) return;
+    if (nonce !== undefined && nonce !== wait.nonce) return;
+    clearTimeout(wait.timer);
     state.expecting.delete(peer);
     void this.settle(room).catch(() => {});
   }
@@ -276,7 +296,7 @@ export class InboundPushes {
       p.settleDone();
     }
     for (const state of this.rooms.values()) {
-      for (const timer of state.expecting.values()) clearTimeout(timer);
+      for (const wait of state.expecting.values()) clearTimeout(wait.timer);
     }
     this.pushes.clear();
     this.finishing.clear();

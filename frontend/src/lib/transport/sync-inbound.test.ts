@@ -244,20 +244,36 @@ describe("holding a room", () => {
 
   it("lets go as soon as the peer it asked says no push is coming", async () => {
     const { tracker, held, released } = harness();
-    tracker.expect("peer1", ROOM);
-    tracker.answered("peer1", ROOM);
+    const nonce = tracker.expect("peer1", ROOM);
+    tracker.answered("peer1", ROOM, nonce);
     await vi.advanceTimersByTimeAsync(0);
     expect(held.has(ROOM)).toBe(false);
     expect(released).toEqual([ROOM]);
   });
 
+  // A repair digest, then a gap's digest to the same peer before it answered
+  // the first: the answer to the first must not end the wait the gap's set,
+  // or the gap message claims before the push it asked for begins.
+  it("ends a wait only on the answer to the latest digest sent that peer", async () => {
+    const { tracker, held } = harness();
+    const first = tracker.expect("peer1", ROOM);
+    const second = tracker.expect("peer1", ROOM);
+    expect(second).not.toBe(first);
+    tracker.answered("peer1", ROOM, first);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(held.has(ROOM)).toBe(true);
+    tracker.answered("peer1", ROOM, second);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(held.has(ROOM)).toBe(false);
+  });
+
   it("holds until every peer it asked has answered, and only that peer's answer counts", async () => {
     const { tracker, held } = harness();
-    tracker.expect("peer1", ROOM);
+    const nonce = tracker.expect("peer1", ROOM);
     tracker.expect("old", ROOM);
-    tracker.answered("peer1", ROOM);
+    tracker.answered("peer1", ROOM, nonce);
     // An answer from somebody we did not ask ends nothing.
-    tracker.answered("stranger", ROOM);
+    tracker.answered("stranger", ROOM, nonce);
     await vi.advanceTimersByTimeAsync(EXPECT / 2);
     expect(held.has(ROOM)).toBe(true);
     // An older build never answers: its wait runs out on its own.

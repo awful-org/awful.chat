@@ -339,12 +339,13 @@ interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
 interface WireRoomName     { type: MessageType.RoomName;     name: string }
 
 // sync - wire only
-interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
+interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number>;
+                             nonce?: number }          // echoed by its SyncNone; absent from older senders
 interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number;
                              live?: boolean            // one send's direct copy, not history repair
                              order?: "head" | "asc" }  // place in a paced push; absent from older senders
 interface WireSyncComplete { type: MessageType.SyncComplete }
-interface WireSyncNone     { type: MessageType.SyncNone }      // absent from older senders
+interface WireSyncNone     { type: MessageType.SyncNone;     nonce?: number }  // the digest it answers; absent from older senders
 
 type AnyWireMessage =
   | WireChatMessage | WireProfile | WireCallPresence | WireRoomName
@@ -401,10 +402,10 @@ on receive SyncDigest:
     - a refused frame is retried (250ms, 1s), then the push stops; the
       SyncComplete goes out only once every batch was accepted
   → a digest that brings no push - nothing they lack, the push window not
-    open yet, or a read that found nothing - is answered with SyncNone, so
-    the asker stops holding its room for it (below). A push already running
-    to that peer answers instead. Older builds never send SyncNone, and
-    ignore it as a type they do not know
+    open yet, or a read that found nothing - is answered with SyncNone,
+    echoing the digest's nonce, so the asker stops holding its room for it
+    (below). A push already running to that peer answers instead. Older
+    builds never send SyncNone, and ignore it as a type they do not know
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
@@ -431,7 +432,9 @@ on receive SyncBatch:
       completed since, or a digest we sent is unanswered, every other
       advance there (live messages, our own sends) waits in memory and is
       written when that ends. A digest is answered by its peer's push (which
-      holds the room itself from its first frame), SyncComplete or SyncNone;
+      holds the room itself from its first frame), SyncComplete or a
+      SyncNone carrying that digest's nonce - with two digests out to one
+      peer, the answer to the first does not end the wait the second set;
       an older build never sends SyncNone, so when it has nothing to push
       the wait runs out after 15s
     - those waiting advances count as held when a peer's digest is weighed:

@@ -270,6 +270,29 @@ it("answers SyncNone when the push finds nothing to send after all", async () =>
   expect(s.pushReads).toBe(1);
 });
 
+// The asker may have sent another digest since, and only its answer to the
+// latest ends its wait: each SyncNone names the digest it answers.
+it("echoes the digest's nonce in its SyncNone, and only a number", async () => {
+  for (let l = 1; l <= 30; l++) s.rows.set(row(l).id, row(l));
+  const theirs: Record<string, number> = {};
+  for (const m of s.rows.values()) theirs[m.senderId] = Math.max(theirs[m.senderId] ?? -1, m.lamport);
+  for (const [sender, lamport] of Object.entries(theirs)) s.watermarks.set(`${ROOM}|${sender}`, lamport);
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: theirs, nonce: 7 });
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: theirs, nonce: "7" });
+  await vi.waitFor(() => expect(s.frames).toHaveLength(2));
+  // Looks behind, but the push finds nothing to send after all.
+  s.watermarks.set(`${ROOM}|did:key:gone`, 40);
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM,
+    watermarks: { ...theirs, "did:key:gone": 10 }, nonce: 9 });
+  await vi.waitFor(() => expect(s.frames).toHaveLength(3));
+  expect(s.frames.map((f) => f.frame)).toEqual(expect.arrayContaining([
+    { type: MessageType.SyncNone, roomCode: ROOM, nonce: 7 },
+    { type: MessageType.SyncNone, roomCode: ROOM },
+    { type: MessageType.SyncNone, roomCode: ROOM, nonce: 9 },
+  ]));
+  expect(s.pushReads).toBe(1);
+});
+
 it("answers nothing while a push to that peer is still running: the push answers", async () => {
   for (let l = 1; l <= 120; l++) s.rows.set(row(l).id, row(l));
   send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: {} });

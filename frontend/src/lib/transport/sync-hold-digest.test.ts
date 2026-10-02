@@ -128,6 +128,7 @@ vi.mock("../plugins/registry", () => ({ getPlugin: async () => null }));
 vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
 
 import { _peerIdToDid, transportState } from "./transport.svelte";
+import { observedLamport } from "./logical-clock";
 import { _resetSyncThrottle } from "./sync-throttle";
 import { _resetSyncProgress } from "./sync-progress.svelte";
 import { encode } from "$lib/utils";
@@ -145,6 +146,12 @@ function row(lamport: number): WireChatMessage & { roomCode: string } {
 }
 
 const send = (peer: string, frame: unknown) => s.handlers.get("message")!(peer, encode(frame), ROOM);
+/** The digests we sent `peer`, oldest first. */
+const digestsTo = (peer: string) =>
+  s.frames.filter((f) => f.peer === peer && f.frame.type === MessageType.SyncDigest).map((f) => f.frame);
+/** A current build's answer to our latest digest: no push is coming. */
+const noPush = (peer: string, digest = digestsTo(peer).at(-1)) =>
+  send(peer, { type: MessageType.SyncNone, roomCode: ROOM, nonce: digest.nonce });
 
 beforeEach(() => {
   s.rows.clear();
@@ -214,7 +221,7 @@ it("writes a held live message's claim as soon as the peer it asked says no push
   // Held: the digest to peer1 might still bring a push.
   expect(s.watermarks.get(`${ROOM}|${b}`)).toBe(28);
   // peer1 has nothing to send. The claim lands now, not when the wait runs out.
-  send("peer1", { type: MessageType.SyncNone, roomCode: ROOM });
+  noPush("peer1");
   await vi.waitFor(() => expect(s.watermarks.get(`${ROOM}|${b}`)).toBe(31), { timeout: 1_000 });
   expect(s.holds.has(ROOM)).toBe(false);
 });
@@ -228,12 +235,40 @@ it("ends no hold on a SyncNone from a peer it did not ask", async () => {
     f.peer === "peer1" && f.frame.type === MessageType.SyncDigest)).toBe(true));
   send("peer2", { ...row(31), roomCode: undefined });
   await vi.waitFor(() => expect(s.holds.get(ROOM)?.get(b)).toBe(31));
-  // peer2 was not asked: its word says nothing about peer1's push.
-  send("peer2", { type: MessageType.SyncNone, roomCode: ROOM });
+  // peer2 was not asked: its word says nothing about peer1's push, even
+  // naming the digest peer1 was sent.
+  noPush("peer2", digestsTo("peer1").at(-1));
   await new Promise((r) => setTimeout(r, 30));
   expect(s.watermarks.get(`${ROOM}|${b}`)).toBe(28);
   expect(s.holds.has(ROOM)).toBe(true);
   // Clean up for the next test: peer1 answers.
-  send("peer1", { type: MessageType.SyncNone, roomCode: ROOM });
+  noPush("peer1");
   await vi.waitFor(() => expect(s.holds.has(ROOM)).toBe(false));
+});
+
+// A routine digest, then a gap's digest to the same peer before it answered
+// the first. The answer to the first used to end the wait the second had
+// set, and the gap message claimed over the rows the second was asking for:
+// were that push cut off, they were never offered again.
+it("keeps a gap message's claim waiting until the peer answers the gap's own digest", async () => {
+  for (let l = 1; l <= 30; l++) s.rows.set(row(l).id, row(l));
+  for (const l of [30, 28, 29]) s.watermarks.set(`${ROOM}|${row(l).senderId}`, l);
+  send("peer2", { type: MessageType.SyncComplete, roomCode: ROOM });
+  await vi.waitFor(() => expect(digestsTo("peer1")).toHaveLength(1));
+  // The room's clock is module state: move it, then jump well past it.
+  send("peer2", { ...row(31), roomCode: undefined });
+  await vi.waitFor(() => expect(s.rows.has(row(31).id)).toBe(true));
+  const gap = row(observedLamport(ROOM) + 10);
+  send("peer1", { ...gap, roomCode: undefined });
+  await vi.waitFor(() => expect(digestsTo("peer1")).toHaveLength(2));
+  await vi.waitFor(() => expect(s.holds.get(ROOM)?.get(gap.senderId)).toBe(gap.lamport));
+  // peer1 answers the routine digest: no push for that one.
+  noPush("peer1", digestsTo("peer1")[0]);
+  await new Promise((r) => setTimeout(r, 30));
+  expect(s.watermarks.get(`${ROOM}|${gap.senderId}`)).toBeLessThan(gap.lamport);
+  expect(s.holds.has(ROOM)).toBe(true);
+  // Its answer to the gap's digest is the one that ends the wait.
+  noPush("peer1");
+  await vi.waitFor(() => expect(s.watermarks.get(`${ROOM}|${gap.senderId}`)).toBe(gap.lamport));
+  expect(s.holds.has(ROOM)).toBe(false);
 });

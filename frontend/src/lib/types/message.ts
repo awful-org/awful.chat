@@ -339,6 +339,11 @@ export interface WireSyncDigest {
   type: MessageType.SyncDigest;
   roomCode: string; // the room this digest is for - receiver must have joined it
   watermarks: Record<string, number>; // senderId → maxLamport
+  /**
+   * Names this digest, for the SyncNone that answers it (sync-inbound.ts).
+   * Absent from older senders; older receivers ignore it.
+   */
+  nonce?: number;
 }
 
 export interface WireSyncBatch {
@@ -379,6 +384,11 @@ export interface WireSyncComplete {
 export interface WireSyncNone {
   type: MessageType.SyncNone;
   roomCode: string;
+  /**
+   * The nonce of the digest this answers: only an answer to the latest
+   * digest ends the asker's wait. Absent when that digest carried none.
+   */
+  nonce?: number;
 }
 
 // File wire
