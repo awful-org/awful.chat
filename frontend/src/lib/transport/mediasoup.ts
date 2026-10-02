@@ -263,6 +263,17 @@ const DEAD_TRANSPORT_STATES: Record<string, true> = {
   closed: true,
 };
 
+/** Same members, or both null (no opinion). */
+function sameSet(
+  a: ReadonlySet<string> | null,
+  b: ReadonlySet<string> | null
+): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
 /**
  * Mediasoup SFU video implementation.
  * Handles camera and screen share via server-side fan-out.
@@ -348,6 +359,8 @@ export class MediasoupVideo implements VideoTransport {
   private parkedCameras: Map<string, string> = new Map();
   // Cameras going unshown, by producerId: parked when the timer runs out.
   private parkTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  // Parked cameras waiting to be tried a second time, by producerId.
+  private unparkRetries: Map<string, ReturnType<typeof setTimeout>> = new Map();
   // Last time a broken recv transport was rebuilt, so the rebuild (which
   // re-consumes, and so can fail again) cannot become its own loop.
   private lastRecvRecoveryAt = 0;
@@ -632,9 +645,23 @@ export class MediasoupVideo implements VideoTransport {
    * and the "who is watching" list is announced from those consumers.
    */
   setWantedCameras(peers: ReadonlySet<string> | null): void {
-    this.wantedCameras = peers;
+    const before = this.wantedCameras;
+    // The app pushes whenever anything it shows changes, mostly with the
+    // same cameras in it.
+    if (sameSet(before, peers)) return;
+    // A copy: the caller's set stays the caller's.
+    this.wantedCameras = peers === null ? null : new Set(peers);
+    // Only cameras something has just started to show come back. One shown
+    // all along and still parked is one that failed to come back twice
+    // (unparkCamera); retrying it on every push retried it in a loop, since
+    // the pushes come with any change to the roster or to who is talking,
+    // that failure's own trackRemoved included. It is tried again once it
+    // has gone unshown and is shown again, or by a rejoin's replay.
     for (const [producerId, peerId] of [...this.parkedCameras]) {
-      if (this.cameraWanted(peerId)) this.unparkCamera(peerId, producerId);
+      const wasWanted = before === null || before.has(peerId);
+      if (!wasWanted && this.cameraWanted(peerId)) {
+        this.unparkCamera(peerId, producerId);
+      }
     }
     for (const [peerId, cs] of this.consumers) {
       for (const c of cs) {
@@ -1849,6 +1876,8 @@ export class MediasoupVideo implements VideoTransport {
     // Already on its way back: what is on screen can change several times
     // within one consume, and each would hang another handler on it.
     if (this.inflightConsumes.has(producerId)) return;
+    // Shown afresh while a second try waited: this one starts over.
+    this.clearUnparkRetry(producerId);
     this.consumeProducer(peerId, producerId, "camera").catch((err) => {
       // Closed, left or rebuilt in the meantime: nothing left to undo.
       if (this.parkedCameras.get(producerId) !== peerId) return;
@@ -1866,25 +1895,39 @@ export class MediasoupVideo implements VideoTransport {
       }
       if (attempt === 1) {
         // Once more, as an announced camera's first consume is retried
-        // (consumeProducerWithRetry).
-        setTimeout(() => {
-          if (this.parkedCameras.get(producerId) !== peerId) return;
-          if (this.cameraWanted(peerId)) this.unparkCamera(peerId, producerId, 2);
-        }, 3_000);
+        // (consumeProducerWithRetry). Kept, so that leaving calls it off.
+        this.unparkRetries.set(
+          producerId,
+          setTimeout(() => {
+            this.unparkRetries.delete(producerId);
+            if (this.parkedCameras.get(producerId) !== peerId) return;
+            if (this.cameraWanted(peerId)) this.unparkCamera(peerId, producerId, 2);
+          }, 3_000)
+        );
         return;
       }
       // Twice over: the stale picture goes, so the tile shows the person
-      // rather than a frozen frame, but the camera stays parked and the
-      // next change in what is on screen tries again. A dead session is
-      // the rejoin ladder's, whose replay consumes every camera afresh.
+      // rather than a frozen frame. The camera stays parked until something
+      // shows it afresh (setWantedCameras) - not while it stays shown, which
+      // would retry for as long as the SFU kept failing it. A dead session
+      // is the rejoin ladder's, whose replay consumes every camera anew.
       this.emit("trackRemoved", peerId, "camera", "video");
     });
   }
 
-  /** Forget every parked camera and pending park, emitting nothing. */
+  private clearUnparkRetry(producerId: string): void {
+    const timer = this.unparkRetries.get(producerId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.unparkRetries.delete(producerId);
+  }
+
+  /** Forget every parked camera and every timer for one, emitting nothing. */
   private clearParkedCameras(): void {
     for (const timer of this.parkTimers.values()) clearTimeout(timer);
     this.parkTimers.clear();
+    for (const timer of this.unparkRetries.values()) clearTimeout(timer);
+    this.unparkRetries.clear();
     this.parkedCameras.clear();
   }
 

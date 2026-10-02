@@ -750,9 +750,13 @@ Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
   - it stays received only while something shows it: a camera tile the
     stage has on screen (IntersectionObserver), the spotlight (floating
     panel, picture in picture), or a popped-out window
-  - unshown for 5 s → ms:close-consumer and a local close; shown again →
+  - unshown for 5 s → ms:close-consumer and a local close; newly shown →
     a fresh ms:consume + ms:resume-consumer (the SFU asks for a keyframe on
     resume). No new wire message
+  - a failed return is tried once more after 3 s; failing twice drops the
+    kept track (the tile shows the person), and the camera is tried again
+    only once it goes unshown and is shown again, or by a rejoin's replay.
+    An equal set of shown cameras changes nothing
   - while parked the app keeps the last track (no trackRemoved), so "has
     video" stays true for the spotlight and the grid filters; a parked
     camera's ms:producer-closed, peer-left or a rejoin removes it
