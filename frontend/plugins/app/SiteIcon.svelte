@@ -30,7 +30,13 @@
   const show = $derived(!!src && canLoadMedia(src));
 </script>
 
-<span class="grid shrink-0 place-items-center overflow-hidden rounded-md bg-primary/15 font-semibold text-primary {className}">
+<!-- Gray behind a real icon, whose own colors should not fight the theme's
+     green; the letter keeps the green badge the rest of the app uses. -->
+<span
+  class="grid shrink-0 place-items-center overflow-hidden rounded-md font-semibold {show
+    ? 'bg-muted'
+    : 'bg-primary/15 text-primary'} {className}"
+>
   {#if show}
     <img
       {src}
