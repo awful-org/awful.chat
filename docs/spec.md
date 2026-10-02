@@ -270,11 +270,17 @@ interface PeerProfile {
 // A peer's avatar or banner URL is kept only if it is http(s), or a base64
 // raster data: URL (no SVG; ~1.4 MB, a banner ~1.5 MB) whose header claims
 // at most 4096 px a side. GIF, PNG, WebP and JPEG headers are read, others
-// pass. Checked on receipt and again on every load from storage. An animated
-// one (and a GIF in a message) shows once a copy of it has loaded and its
-// size is known: past 4096x4096 pixels it is a placeholder, never decoded.
-// Its still frame is drawn at the size it is shown (1024 px a side at most),
-// and what plays is that same copy, not the url fetched again.
+// pass. Checked on receipt and again on every load from storage.
+//
+// An image GifImage takes for animated (a data:image/gif or data:image/webp,
+// a .gif or .webp url, or one its caller marks animated, as a GIF in a
+// message) shows once a copy of it has loaded and its size is known: past
+// 4096x4096 pixels it is a placeholder, never decoded. Its still frame is
+// drawn at the size it is shown (1024 px a side at most, drawn again when
+// that box grows), and what plays is that same copy, not the url fetched
+// again. Any other image is a plain img that the browser decodes at full
+// size, once per url however many places show it: a linked avatar whose url
+// names no animated format, a link preview's image, the lightbox's image.
 ```
 
 ### Identity struct
