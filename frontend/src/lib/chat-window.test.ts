@@ -7,6 +7,7 @@ import {
   TRIM_AT,
   around,
   hold,
+  planJump,
   showNewer,
   showOlder,
   trimPoint,
@@ -137,5 +138,32 @@ describe("chat window", () => {
     expect(trimPoint(list, list[list.length - 5])).toEqual(trimPoint(list));
     // At the oldest row held, nothing would go: no trim at all.
     expect(trimPoint(list, list[0])).toBeNull();
+  });
+
+  // A quote, or a plugin card's way back to itself, naming a row the view
+  // had let go of - or never read, older than the first page - did nothing.
+  it("plans a jump: a held row is shown, one not held is read from storage, once", () => {
+    const list = rows(300);
+    const range = windowRange(list, null);
+    expect(planJump(list, range, list[250].id, false)).toEqual({
+      kind: "show",
+      index: 250,
+      mounted: true,
+    });
+    // Held, not mounted: shown in a window around it.
+    expect(planJump(list, range, list[30].id, false)).toEqual({
+      kind: "show",
+      index: 30,
+      mounted: false,
+    });
+    expect(planJump(list, range, "m-let-go", false)).toEqual({ kind: "reveal" });
+    // The jump a reveal ends with: what it did not bring in is not a row
+    // this list shows, and storage is not read for it again.
+    expect(planJump(list, range, "m-let-go", true)).toEqual({ kind: "none" });
+    expect(planJump(list, range, list[30].id, true)).toEqual({
+      kind: "show",
+      index: 30,
+      mounted: false,
+    });
   });
 });

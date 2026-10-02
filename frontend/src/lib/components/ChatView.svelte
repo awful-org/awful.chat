@@ -114,10 +114,11 @@
   } from "$lib/rooms.svelte";
   import { getMessage } from "$lib/storage";
   import { openSearch } from "$lib/search/ui.svelte";
-  import { revealInFlight, revealMessage } from "$lib/reveal-message";
+  import { revealInFlight, revealMessage, revealStored } from "$lib/reveal-message";
   import {
     around,
     hold,
+    planJump,
     showNewer,
     showOlder,
     trimPoint,
@@ -1140,18 +1141,21 @@
     const jump = uiState.jumpToMessage;
     if (!jump || jump.roomCode !== roomCode || !initialScrollDone) return;
     uiState.jumpToMessage = null;
-    untrack(() => jumpToMessage(jump.messageId));
+    untrack(() => jumpToMessage(jump.messageId, jump.revealed));
   });
 
-  function jumpToMessage(messageId: string) {
-    const index = visibleMessages.findIndex((m) => m.id === messageId);
-    if (index < 0 || !messagesEl) return;
+  /** Scroll to a message and flash it - one this view does not hold, from
+   *  storage (chat-window.ts, planJump). */
+  function jumpToMessage(messageId: string, revealed = false) {
+    const plan = planJump(visibleMessages, range, messageId, revealed);
+    if (plan.kind === "reveal") void revealStored(roomCode, messageId);
+    if (plan.kind !== "show" || !messagesEl) return;
     // Held but not mounted: a window around it first, held still so the
     // rows around it stay while it is read.
-    const moved = index < range.from || index >= range.to;
+    const moved = !plan.mounted;
     if (moved) {
       autoScroll = false;
-      chatWindow = around(visibleMessages, index);
+      chatWindow = around(visibleMessages, plan.index);
     }
     void tick().then(() =>
       requestAnimationFrame(() => {
@@ -1164,23 +1168,6 @@
         }, 900);
       })
     );
-  }
-
-  /**
-   * A reply's quote was clicked. The quoted message may no longer be held -
-   * the view lets go of rows far back - so one that is not is found in
-   * storage and revealed the way a search hit or a pin is.
-   */
-  async function jumpToQuoted(messageId: string): Promise<void> {
-    if (messageById.has(messageId)) {
-      jumpToMessage(messageId);
-      return;
-    }
-    const room = roomCode;
-    const quoted = await getMessage(messageId).catch(() => undefined);
-    // Only within this conversation: a quote names any id it likes.
-    if (!quoted || quoted.roomCode !== room || roomCode !== room) return;
-    await revealMessage(room, quoted.id, quoted.lamport);
   }
 
   // Pinned messages: private to this user, stored on the room record.
@@ -3027,7 +3014,7 @@
                   <button
                     type="button"
                     class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
-                    onclick={() => void jumpToQuoted(msg.replyTo!.id)}
+                    onclick={() => jumpToMessage(msg.replyTo!.id)}
                   >
                     <Reply
                       size="16"

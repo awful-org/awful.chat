@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
  * back (chat-window.ts, where the rules are tested). These are the places
  * the view itself has to take part, read from the component the way
  * msg-render-listeners.test.ts reads MsgRender: there is no DOM in these
- * tests.
+ * tests. They check the wiring only - that the view hands the rule what it
+ * needs - and what comes of it was checked in a browser.
  */
 const source = readFileSync("src/lib/components/ChatView.svelte", "utf8");
 
@@ -31,11 +32,15 @@ describe("ChatView's window over the rows it holds", () => {
     );
   });
 
-  // A quote whose message the view has let go of did nothing when clicked.
-  it("finds a quoted message that is not held in storage", () => {
-    const quoted = body("jumpToQuoted");
-    expect(quoted).toContain("getMessage(messageId)");
-    expect(quoted).toContain("revealMessage(room, quoted.id, quoted.lamport)");
-    expect(source).toContain("onclick={() => void jumpToQuoted(msg.replyTo!.id)}");
+  // A quote, a plugin card's "go to" or a plugin's openMessage naming a row
+  // the view had let go of did nothing. Every jump goes one way: planJump
+  // decides (chat-window.test.ts), revealStored reads storage
+  // (reveal-message.test.ts).
+  it("sends every jump through the one path that reads storage", () => {
+    const jump = body("jumpToMessage");
+    expect(jump).toContain("planJump(visibleMessages, range, messageId, revealed)");
+    expect(jump).toContain('if (plan.kind === "reveal") void revealStored(roomCode, messageId);');
+    expect(source).toContain("untrack(() => jumpToMessage(jump.messageId, jump.revealed));");
+    expect(source).toContain("onclick={() => jumpToMessage(msg.replyTo!.id)}");
   });
 });

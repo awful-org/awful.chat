@@ -1,3 +1,4 @@
+import { getMessage } from "$lib/storage";
 import {
   loadMoreMessages,
   transportState,
@@ -42,7 +43,24 @@ export async function revealMessage(
       await loadMoreMessages(oldest, { to: { lamport, id }, pages: MAX_PAGES });
       if (transportState.roomCode !== roomCode) return;
     }
-    requestJumpToMessage(roomCode, id);
+    requestJumpToMessage(roomCode, id, true);
+  } finally {
+    _inFlight -= 1;
+  }
+}
+
+/**
+ * Reveal a message the open conversation does not hold, found by id alone:
+ * a quote, or a plugin card's way back to itself. ChatView lets go of rows
+ * far back, and either can be older than the first page. Only one of this
+ * conversation's: a quote or a plugin names any id it likes.
+ */
+export async function revealStored(roomCode: string, id: string): Promise<void> {
+  _inFlight += 1;
+  try {
+    const stored = await getMessage(id).catch(() => undefined);
+    if (!stored || stored.roomCode !== roomCode) return;
+    await revealMessage(roomCode, stored.id, stored.lamport);
   } finally {
     _inFlight -= 1;
   }

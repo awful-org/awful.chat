@@ -114,6 +114,33 @@ export function around(list: readonly MessageCursor[], index: number): ChatWindo
   return held(list, from, Math.min(list.length, from + FOLLOW_ROWS));
 }
 
+/** What a jump to one message does with the rows held (planJump). */
+export type JumpPlan =
+  /** Held: scrolled to, after a window around it if it is not mounted. */
+  | { kind: "show"; index: number; mounted: boolean }
+  /** Not held: read from storage and revealed (reveal-message.ts). */
+  | { kind: "reveal" }
+  /** Still not held after a reveal: not a row this list shows. */
+  | { kind: "none" };
+
+/**
+ * A jump to the row `id`. One the list does not hold is read from storage:
+ * the view lets go of rows far back, and a quote or a plugin card can be
+ * older than the first page - such a jump did nothing. Not twice, though:
+ * `revealed` says the jump comes from a reveal, which read everything it
+ * could.
+ */
+export function planJump(
+  list: readonly MessageCursor[],
+  range: WindowRange,
+  id: string,
+  revealed: boolean
+): JumpPlan {
+  const index = list.findIndex((row) => row.id === id);
+  if (index < 0) return { kind: revealed ? "none" : "reveal" };
+  return { kind: "show", index, mounted: index >= range.from && index < range.to };
+}
+
 /**
  * Where to cut the held list while following the newest: the oldest row to
  * keep, or null while it is short enough to leave alone - or when the cut
