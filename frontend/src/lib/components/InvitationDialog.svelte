@@ -9,12 +9,13 @@
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import { Tip } from "$lib/components/ui/tooltip";
-  import { Check, CircleAlert, Copy, Keyboard, RefreshCw, Share2, TriangleAlert } from "@lucide/svelte";
+  import { Check, CircleAlert, Copy, Keyboard, RefreshCw, Share2 } from "@lucide/svelte";
+  import ShortCodeLimits from "./ShortCodeLimits.svelte";
+  import PermanentLinkNotice from "./PermanentLinkNotice.svelte";
   import { savedRoomInvitationLink, parseSecureInvitation } from "$lib/room-security/invitations";
   import { cancelShortCode, hostShortCode, liveShortCode, shortCodeLink, shortCodeOutcome } from "$lib/short-codes.svelte";
   import type { RoomSecret } from "$lib/room-security/keys";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
-  import { PAIRING_MAX_USES, pairingLimits } from "$lib/room-security/invitation-pairing";
   import QRCode from "qrcode";
   let { roomCode, open = $bindable(false) }: { roomCode: string; open?: boolean } = $props();
   let link = $state("");
@@ -31,17 +32,8 @@
   let unavailable = $state(false);
   let copiedWhat = $state<"link" | "code" | null>(null);
   let busy = $state(false);
-  // The short code's limits, chosen before asking for one.
+  // The short code's limits are chosen (ShortCodeLimits) before asking for one.
   let configuring = $state(false);
-  let people = $state<number | null>(1);
-  let minutes = $state(5);
-  const PEOPLE_PICKS = [1, 5, 10, 20];
-  const MINUTE_PICKS = [1, 5, 10];
-  const peopleId = $props.id();
-  /** The typed number, whole and within 1..25 (an empty field is one person). */
-  function peopleCount(): number {
-    return pairingLimits({ uses: people ?? 1 }).uses;
-  }
   let now = $state(Date.now());
   let generation = 0;
   const canShare =
@@ -76,15 +68,14 @@
     const s = Math.max(0, Math.ceil((codeExpiresAt - now) / 1000));
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
   });
-  async function pairing() {
+  async function pairing(limits: { uses: number; ttlMs: number }) {
     if (busy || !secret) return;
     const current = generation;
     busy = true;
     say("");
     try {
       requireRoomSecurityRelease();
-      people = peopleCount();
-      await hostShortCode(secret, { uses: people, ttlMs: minutes * 60_000 });
+      await hostShortCode(secret, limits);
       if (current === generation) configuring = false;
     } catch { if (current === generation) say("Couldn't get a short code right now. Share the full link instead.", true); }
     finally { if (current === generation) busy = false; }
@@ -173,16 +164,7 @@
             Share invite link
           </Button>
         {/if}
-        <!-- The link is the room's capability itself: nothing can expire it
-             or count who uses it. A short code is the invite with limits. -->
-        <p class="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
-          <TriangleAlert class="mt-0.5 size-3.5 shrink-0 text-amber-500" />
-          <span>
-            This link never expires and has no limit: anyone who gets it can join, now
-            or later, including people it is forwarded to. To choose how many people
-            and for how long, use a short code.
-          </span>
-        </p>
+        <PermanentLinkNotice />
       {/if}
 
       <div class="space-y-2">
@@ -226,58 +208,7 @@
             </div>
           </div>
         {:else if link && configuring}
-          <!-- The limits are the code's own: the relay holds it to them too. -->
-          <div class="space-y-3 rounded-lg border border-border p-3 font-mono">
-            <div class="space-y-1.5">
-              <label for={peopleId} class="block text-xs text-foreground">People who can join</label>
-              <Input
-                id={peopleId}
-                type="number"
-                inputmode="numeric"
-                min="1"
-                max={PAIRING_MAX_USES}
-                step="1"
-                bind:value={people}
-                onblur={() => (people = peopleCount())}
-                class="h-8 font-mono"
-              />
-              <div class="flex gap-1">
-                {#each PEOPLE_PICKS as n (n)}
-                  <button
-                    type="button"
-                    aria-pressed={people === n}
-                    onclick={() => (people = n)}
-                    class="flex-1 cursor-pointer rounded-md border px-2 py-1 text-xs transition-colors {people === n
-                      ? 'border-primary bg-primary/15 text-primary'
-                      : 'border-border text-muted-foreground hover:text-foreground'}">{n}</button
-                  >
-                {/each}
-              </div>
-            </div>
-            <div class="space-y-1.5">
-              <span class="block text-xs text-foreground">Valid for</span>
-              <div class="flex gap-1" role="group" aria-label="Valid for">
-                {#each MINUTE_PICKS as m (m)}
-                  <button
-                    type="button"
-                    aria-pressed={minutes === m}
-                    onclick={() => (minutes = m)}
-                    class="flex-1 cursor-pointer rounded-md border px-2 py-1 text-xs transition-colors {minutes === m
-                      ? 'border-primary bg-primary/15 text-primary'
-                      : 'border-border text-muted-foreground hover:text-foreground'}">{m} min</button
-                  >
-                {/each}
-              </div>
-            </div>
-            <div class="flex gap-2">
-              <Button variant="ghost" size="sm" class="font-mono text-xs cursor-pointer" onclick={() => (configuring = false)}>
-                Back
-              </Button>
-              <Button size="sm" class="flex-1 font-mono text-xs cursor-pointer" disabled={busy} onclick={pairing}>
-                {busy ? "Getting a code..." : "Get code"}
-              </Button>
-            </div>
-          </div>
+          <ShortCodeLimits {busy} onBack={() => (configuring = false)} onSubmit={pairing} />
         {:else if link}
           <Button
             variant="ghost"

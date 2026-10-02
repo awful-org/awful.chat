@@ -10,6 +10,8 @@
   import { onDestroy, tick } from "svelte";
   import QRCode from "qrcode";
   import { Check, Clipboard, Copy, Keyboard, LogIn, Menu, Plus, QrCode, ScanLine, Share2 } from "@lucide/svelte";
+  import ShortCodeLimits from "./ShortCodeLimits.svelte";
+  import PermanentLinkNotice from "./PermanentLinkNotice.svelte";
   import QrScanner from "./QrScanner.svelte";
   import {
     Dialog,
@@ -115,6 +117,7 @@
       showQr = false;
       scanning = false;
       shortCodeError = null;
+      configuringShort = false;
       // The focused Create button is gone; joining is the next step.
       void tick().then(() => joinCreatedButton?.focus());
       qr = await QRCode.toDataURL(`${window.location.origin}/r/#${code}`, { width: 280, margin: 2 });
@@ -184,12 +187,16 @@
 
   // Like the invite dialog: getting a code shows it, to read aloud or type
   // in; "Copy link" beside it copies its short link.
-  async function handleGetShort() {
+  // Getting one asks for its limits first (ShortCodeLimits), as the invite
+  // dialog does.
+  let configuringShort = $state(false);
+  async function handleGetShort(limits: { uses: number; ttlMs: number }) {
     if (pairingBusy || !createdSecret) return;
     pairingBusy = true;
     shortCodeError = null;
     try {
-      await hostShortCode(createdSecret);
+      await hostShortCode(createdSecret, limits);
+      configuringShort = false;
     } catch {
       if (alive) shortCodeError = "Couldn't get a short code right now. Share the full link instead.";
     } finally { pairingBusy = false; }
@@ -197,15 +204,19 @@
 
   async function handleCopyShort() {
     if (pairingBusy || !createdSecret) return;
-    pairingBusy = true;
     shortCodeError = null;
-    let code: string;
-    try {
-      code = (await hostShortCode(createdSecret)).code;
-    } catch {
-      if (alive) shortCodeError = "Couldn't get a short code right now. Share the full link instead.";
-      return;
-    } finally { pairingBusy = false; }
+    // The code on screen is the one to copy: asking hostShortCode again
+    // would replace a group code near its end with a one-person code.
+    let code = shortCode && Date.now() < shortCodeExpiresAt ? shortCode : null;
+    if (!code) {
+      pairingBusy = true;
+      try {
+        code = (await hostShortCode(createdSecret)).code;
+      } catch {
+        if (alive) shortCodeError = "Couldn't get a short code right now. Share the full link instead.";
+        return;
+      } finally { pairingBusy = false; }
+    }
     if (!alive) return;
     try { await navigator.clipboard.writeText(shortCodeLink(code)); shortCopied = true; }
     catch { shortCodeError = "Couldn't copy. Select the code below and copy it."; }
@@ -509,6 +520,7 @@
             Share invite link
           </Button>
         {/if}
+        <PermanentLinkNotice />
 
         {#if shortCode}
           <div class="rounded-lg bg-muted px-3 py-2 text-center">
@@ -552,15 +564,18 @@
             </div>
           </div>
         {:else}
-          <Button
-            variant="ghost"
-            disabled={pairingBusy}
-            class="w-full font-mono text-xs text-muted-foreground cursor-pointer"
-            onclick={handleGetShort}
-          >
-            <Keyboard class="size-3.5" />
-            {pairingBusy ? "Getting a short code..." : "Get a short code"}
-          </Button>
+          {#if configuringShort}
+            <ShortCodeLimits busy={pairingBusy} onBack={() => (configuringShort = false)} onSubmit={handleGetShort} />
+          {:else}
+            <Button
+              variant="ghost"
+              class="w-full font-mono text-xs text-muted-foreground cursor-pointer"
+              onclick={() => (configuringShort = true)}
+            >
+              <Keyboard class="size-3.5" />
+              Get a short code with limits
+            </Button>
+          {/if}
         {/if}
 
         <button

@@ -35,7 +35,7 @@ export function pairingLimits(limits: PairingLimits = {}): { uses: number; ttlMs
   };
 }
 /** The try budget of a code for one person (see PAIRING_SPARE_ATTEMPTS). */
-export const PAIRING_ATTEMPTS = 5;
+export const PAIRING_ATTEMPTS = 1 + PAIRING_SPARE_ATTEMPTS;
 /**
  * The code is SHORT on purpose - six characters a person reads out or types
  * - because OPAQUE lets its password be: nothing about it can be tested

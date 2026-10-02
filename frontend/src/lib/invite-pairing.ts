@@ -1,6 +1,7 @@
 import { apiUrl } from "./runtime-config";
 import {
   InvitationPairingHost,
+  PAIRING_MAX_TTL,
   PAIRING_TTL,
   formatPairingCode,
   pairingLimits,
@@ -170,7 +171,14 @@ export async function hostInvitationPairing(
           ? `Code expired after ${host.joined} of ${host.uses} joined.`
           : "Pairing expired. Generate a new code.");
       }
-    } catch { if (!cancelled) onStatus("Pairing stopped. Generate a new code."); }
+    } catch {
+      if (!cancelled) {
+        onStatus("Pairing stopped. Generate a new code.");
+        // No one answers this code any more: close it at the relay too, so
+        // the people still to join are refused rather than left waiting.
+        void request({ action: "cancel", locator: host.locator, token }).catch(() => {});
+      }
+    }
     finally { host.cancel(); signal?.removeEventListener("abort", cancel); }
   };
   void run();
@@ -187,8 +195,10 @@ export async function joinInvitationPairing(code: string, signal: AbortSignal): 
     const base = { locator: join.locator, attempt: join.attempt };
     // A minute of the inviter's attention, not counting time the relay asked
     // us to wait: a group behind one network is paced, not timed out.
-    let deadline = Date.now() + 60_000;
-    const alive = () => Date.now() < deadline;
+    // Never past the longest a code can live, however often it was paced.
+    const started = Date.now();
+    let deadline = started + 60_000;
+    const alive = () => { const t = Date.now(); return t < deadline && t < started + PAIRING_MAX_TTL; };
     const waited = (ms: number) => { deadline += ms; };
     await paced(() => request({ ...base, action: "start", kind: "start", payload: join.request }, signal), alive, signal, waited);
     while (!signal.aborted && alive()) {
