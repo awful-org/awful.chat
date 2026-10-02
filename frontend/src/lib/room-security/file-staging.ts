@@ -102,10 +102,11 @@ export async function stageDecryptedFile(
 ): Promise<File> {
   signal?.throwIfAborted();
   let parts: Blob[] = [];
-  await decryptFileTo(ciphertext, encryption, new WritableStream<Uint8Array>({
+  // decryptFileTo hands over a fresh array per chunk, which the Blob copies.
+  await decryptFileTo(ciphertext, encryption, new WritableStream<Uint8Array<ArrayBuffer>>({
     write(chunk) {
       signal?.throwIfAborted();
-      parts.push(new Blob([new Uint8Array(chunk)]));
+      parts.push(new Blob([chunk]));
     },
     close() { signal?.throwIfAborted(); },
     abort() { parts = []; },
