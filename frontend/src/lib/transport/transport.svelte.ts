@@ -97,7 +97,7 @@ import type { FileDescriptor, FileTransferSnapshot } from "./types";
 import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
-import { verifyIncoming } from "./verify-incoming";
+import { verifyIncoming, type VerifyVerdict } from "./verify-incoming";
 import { messageIdAllowedFor, newMessageId } from "../message-id";
 import { LiveUpdateAdmission } from "../room-security/live-updates";
 
@@ -1928,27 +1928,109 @@ async function _handleSyncBatch(
       messages.length
     );
   }
+  // Rows we already hold are settled BEFORE anything is verified. A verify
+  // is a synchronous pure-JS ed25519 check on the main thread, and a resync
+  // hands us the same backlog once per connected member - so verifying first
+  // and deduplicating after paid for every copy of every row: seconds of
+  // back-to-back long tasks on a phone coming back to a busy room. A held row
+  // needs no verdict, because it is never stored or shown again (below).
+  // Clear fields only: nothing is decrypted for this.
+  const known = await messageClearFieldsByIds(messages.map((w) => w.id));
+  guard();
+  // messageClearFieldsByIds returns blinded roomCode and senderId, so we need
+  // to blind the wire values before comparing.
+  const blindedRoomCode = known.size ? await blindValue(roomCode) : "";
+  guard();
+  const blindedSenderIds = new Map<string, Promise<string>>();
+  for (const w of messages) {
+    if (!known.has(w.id) || typeof w.senderId !== "string") continue;
+    if (!blindedSenderIds.has(w.senderId)) {
+      blindedSenderIds.set(w.senderId, blindValue(w.senderId));
+    }
+  }
+  const resolved = new Map<string, string>();
+  for (const [did, promise] of blindedSenderIds) {
+    resolved.set(did, await promise);
+    guard();
+  }
+  // bulkPutMessages puts BY id, so an incoming row whose id we already hold
+  // REPLACES that row rather than adding one. A message id is therefore a
+  // capability over an existing message, and ids travel in the clear on the
+  // wire, so two things have to be refused:
+  //
+  //  - a different ROOM: the row we hold would be moved into the sender's
+  //    room, destroying it where it belongs. A valid signature does not
+  //    prevent this for sigV2, whose canonical binds no room.
+  //  - a different SENDER: any room member could take the id off one of your
+  //    messages, sign a row of their own under it (their own DID, so the
+  //    signature verifies honestly) and overwrite yours on every peer that
+  //    accepts the batch. Not impersonation - destruction.
+  //
+  // Beyond that: an id we ALREADY hold is never overwritten, even when the
+  // room and sender match. The v3 canonical covers the id, sender, lamport,
+  // content, reaction, replyTo.id, type and room - but NOT the timestamp,
+  // NOT the sender name, NOT a reply snapshot's text and NOT a file's
+  // dimensions. So a room member could take a row it holds (yours included),
+  // rewrite those, re-push it under the ORIGINAL signature, and have
+  // bulkPutMessages replace your copy on every peer that accepted the batch,
+  // altering reported dates and attribution. Signed content cannot
+  // legitimately change, so the row we hold is authoritative and re-delivery
+  // is a no-op - which is also why it needs no verdict.
+  const held: WireChatMessage[] = [];
+  const hijacks: WireChatMessage[] = [];
+  const fresh: WireChatMessage[] = [];
+  for (const w of messages) {
+    const row = known.get(w.id);
+    if (!row) fresh.push(w);
+    else if (row.roomCode === blindedRoomCode && row.senderId === resolved.get(w.senderId)) held.push(w);
+    else hijacks.push(w);
+  }
+  if (hijacks.length) {
+    console.warn(
+      `[sync] refused ${hijacks.length} message(s) reusing the id of one we already hold`
+    );
+    rec(
+      ev("app.sync.drop", {
+        peer: fromPeerId ?? null,
+        room: refs().roomRef(roomCode),
+        d: { count: hijacks.length, reason: "id-reuse" },
+      })
+    );
+  }
+  // One thing a re-push CAN legitimately add to a row we already hold: the
+  // attachment rows, which storage drops when they will not decrypt. The
+  // repair reads the descriptor from the HELD row, never from this copy -
+  // and only a file has any.
+  for (const w of held) {
+    if (w.type !== MessageType.File) continue;
+    await ensureMessageAttachmentOwnership(w.id, guard);
+    guard();
+  }
+  if (!fresh.length) return;
+
   const verdicts = await Promise.all(
-    messages.map((m) =>
+    fresh.map((m) =>
       _verifyIncoming(m, { room: roomCode, allowUnsigned: allowUnsignedFor(m) })
+        // One malformed row is one refused row, not a lost batch.
+        .catch((): VerifyVerdict => ({ ok: false, reason: "bad-signature" }))
     )
   );
-  const verified = messages.filter((_, i) => verdicts[i].ok);
+  const verified = fresh.filter((_, i) => verdicts[i].ok);
   guard();
-  if (verified.length < messages.length) {
+  if (verified.length < fresh.length) {
     const reasons: Record<string, number> = {};
     for (const v of verdicts) {
       if (!v.ok) reasons[v.reason] = (reasons[v.reason] ?? 0) + 1;
     }
     console.warn(
-      `[sync] dropped ${messages.length - verified.length} message(s) with invalid signatures`,
+      `[sync] dropped ${fresh.length - verified.length} message(s) with invalid signatures`,
       reasons
     );
     rec(
       ev("app.sync.drop", {
         peer: fromPeerId ?? null,
         room: refs().roomRef(roomCode),
-        d: { count: messages.length - verified.length, reason: "bad-signature" },
+        d: { count: fresh.length - verified.length, reason: "bad-signature" },
       })
     );
   }
@@ -1981,7 +2063,7 @@ async function _handleSyncBatch(
   // permanent blackhole.
   const rejectedFloor = new Map<string, number>();
   const permanentMax = new Map<string, number>();
-  messages.forEach((m, i) => {
+  fresh.forEach((m, i) => {
     if (verdicts[i].ok) return;
     if (typeof m.senderId !== "string" || !m.senderId) return;
     if (!Number.isSafeInteger(m.lamport) || m.lamport < 0) return;
@@ -2045,7 +2127,7 @@ async function _handleSyncBatch(
   // proves who wrote the row, not that its payload is within the limits every
   // send path enforces (see _parsePluginPayload). Backfill is a persist path
   // too, so an unusable row is dropped here rather than stored and folded.
-  let usable: WireChatMessage[] = [];
+  const usable: WireChatMessage[] = [];
   for (const w of verified) {
     const isPlugin =
       w.type === MessageType.PluginCard || w.type === MessageType.PluginUpdate;
@@ -2086,83 +2168,6 @@ async function _handleSyncBatch(
       continue;
     }
     usable.push(w);
-  }
-  if (!usable.length) return;
-
-  // bulkPutMessages puts BY id, so an incoming row whose id we already hold
-  // REPLACES that row rather than adding one. A message id is therefore a
-  // capability over an existing message, and ids travel in the clear on the
-  // wire, so two things have to be refused:
-  //
-  //  - a different ROOM: the row we hold would be moved into the sender's
-  //    room, destroying it where it belongs. A valid signature does not
-  //    prevent this for sigV2, whose canonical binds no room.
-  //  - a different SENDER: any room member could take the id off one of your
-  //    messages, sign a row of their own under it (their own DID, so the
-  //    signature verifies honestly) and overwrite yours on every peer that
-  //    accepts the batch. Not impersonation - destruction.
-  //
-  // Re-delivery of the same message by the same sender still overwrites,
-  // which is what makes sync idempotent.
-  const known = await messageClearFieldsByIds(usable.map((w) => w.id));
-  guard();
-  // messageClearFieldsByIds returns blinded roomCode and senderId, so we need
-  // to blind the wire values before comparing.
-  const blindedRoomCode = await blindValue(roomCode);
-  guard();
-  // Blind all wire sender IDs for the comparison; usable may be large.
-  const blindedSenderIds = new Map<string, Promise<string>>();
-  for (const w of usable) {
-    if (!blindedSenderIds.has(w.senderId)) {
-      blindedSenderIds.set(w.senderId, blindValue(w.senderId));
-    }
-  }
-  const resolved = new Map<string, string>();
-  for (const [did, promise] of blindedSenderIds) {
-    resolved.set(did, await promise);
-    guard();
-  }
-  const hijacks = usable.filter((w) => {
-    const held = known.get(w.id);
-    if (!held) return false;
-    // Compare blinded stored values with blinded wire values.
-    const blindedSenderId = resolved.get(w.senderId);
-    return held.roomCode !== blindedRoomCode || held.senderId !== blindedSenderId;
-  });
-  if (hijacks.length) {
-    console.warn(
-      `[sync] refused ${hijacks.length} message(s) reusing the id of one we already hold`
-    );
-    rec(
-      ev("app.sync.drop", {
-        peer: fromPeerId ?? null,
-        room: refs().roomRef(roomCode),
-        d: { count: hijacks.length, reason: "id-reuse" },
-      })
-    );
-    const refused = new Set(hijacks.map((w) => w.id));
-    usable = usable.filter((w) => !refused.has(w.id));
-    if (!usable.length) return;
-  }
-
-  // Beyond the hijack check: an id we ALREADY hold is never overwritten, even
-  // when the room and sender match. The v3 canonical covers the id, sender,
-  // lamport, content, reaction, replyTo.id, type and room - but NOT the
-  // timestamp, NOT the sender name, NOT a reply snapshot's text and NOT a
-  // file's dimensions. So a room member could take a row it holds (yours
-  // included), rewrite those, re-push it under the ORIGINAL signature, and
-  // have bulkPutMessages replace your copy on every peer that accepted the
-  // batch, altering reported dates and attribution. Signed content cannot legitimately
-  // change, so the row we hold is authoritative and re-delivery is a no-op.
-  const duplicates = usable.filter((w) => known.has(w.id));
-  usable = usable.filter((w) => !known.has(w.id));
-  // One thing a re-push CAN legitimately add to a row we already hold: inline
-  // attachment bytes, which never reach storage with the row itself. Adopt
-  // those before dropping the duplicate - the descriptor they are checked
-  // against (infoHash, size) is inside the signature that just verified.
-  for (const w of duplicates) {
-    await ensureMessageAttachmentOwnership(w.id, guard);
-    guard();
   }
   if (!usable.length) return;
 
@@ -4730,8 +4735,14 @@ export async function restoreFileAttachment(attachment: Attachment): Promise<boo
  * same insurance: after the publish, hand each connected peer that is KNOWN to
  * be in the room a one-message SyncBatch. The batch receive path verifies
  * signatures, refuses rooms it has not joined, dedups against storage and the
- * view, and evicts plugin card state - so the duplicate costs nothing when
- * gossip worked, and saves a refresh when it did not.
+ * view, and evicts plugin card state.
+ *
+ * In a protected room the "broadcast" is no publish at all: it is one send
+ * per member over that member's verified room channel, the same ordered
+ * channel the direct copy would take. So a member it reached got the message
+ * twice and verified it twice, for nothing. The copy now goes only to
+ * members the broadcast did not reach - a roster member whose channel is not
+ * verified yet, which sendRoom opens.
  *
  * Membership-gated on purpose: the roomCode is the room's join secret, and
  * roomUsers holds the DIDs that already possess it. A connected-but-unbound
@@ -4740,6 +4751,11 @@ export async function restoreFileAttachment(attachment: Attachment): Promise<boo
 function _broadcastChatWire(wire: WireChatMessage, roomCode: string): boolean {
   const payload = encode(wire);
   _transport.broadcast(payload, roomCode);
+  // The broadcast picks its members synchronously, as it starts, so this is
+  // exactly the set it is sending to.
+  const reached = new Set(
+    roomCode.startsWith("rd2_") ? _transport.peersInRoom(roomCode) : []
+  );
   rec(
     ev("app.msg.out", {
       room: refs().roomRef(roomCode),
@@ -4767,6 +4783,7 @@ function _broadcastChatWire(wire: WireChatMessage, roomCode: string): boolean {
   const batch = batchOf(wire);
   const members = new Set(transportState.roomUsers);
   for (const pid of _transport.peers()) {
+    if (reached.has(pid)) continue;
     const did = _peerIdToDid.get(pid);
     if (!did || !members.has(did)) continue;
     _transport.sendRoom(pid, roomCode, batch).catch(() => {});

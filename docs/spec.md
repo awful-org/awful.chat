@@ -374,9 +374,16 @@ on receive SyncDigest:
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
+  → drop ids already held BEFORE verifying (clear fields, no decrypt): a
+    held row is never overwritten, so its copy needs no verdict, and a held
+    id from another room or sender is refused. Only the rest are verified;
+    a signature that already verified this session is not checked again
   → bulkPut to IDB (idempotent - put by id)
   → update watermarks (max semantics)
-  → live batch (one send's direct copy): merge into the view now
+  → live batch (one send's direct copy): merge into the view now. In a
+    protected room the sender gives this copy only to roster members its
+    broadcast did not reach - the broadcast already went down the same
+    verified channel to everyone else
   → repair batch: park rows for the view (sync-view.ts), flushed ONCE per
     burst - 250ms quiet, 1s at most, or on SyncComplete. At the flush, rows
     at/above the loaded window's floor are appended; anything below it (or
