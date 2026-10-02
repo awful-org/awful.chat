@@ -9,7 +9,7 @@
    * after the URL, display names, per-session player ids. Never a DID, the
    * room, its secret or its name.
    */
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { Button } from "$lib/components/ui/button";
   import { Switch } from "$lib/components/ui/switch";
   import { Check, Maximize2, Minimize2, TriangleAlert, X } from "@lucide/svelte";
@@ -24,13 +24,15 @@
 
   const app = $derived(cardState);
   const site = $derived(app.url ? new URL(app.url).host : "");
-  const selfDid = host.selfDid();
+  const selfDid = $derived(host.selfDid());
   const mine = $derived(selfDid === app.starter);
 
   // Mounted = joined. "closed" is the app having closed itself; leaving the
   // tile is the host's own Leave, which unmounts this.
+  // The card's origin as it was when the tile mounted: a later change of
+  // site is a new card, never a reason to skip the disclosure.
   let phase = $state<"disclose" | "open" | "closed">(
-    cardState.origin && hasAgreed(cardState.origin) ? "open" : "disclose",
+    untrack(() => (cardState.origin && hasAgreed(cardState.origin) ? "open" : "disclose")),
   );
   let frame = $state<HTMLIFrameElement | null>(null);
   /** "Don't show again for this site" - off unless the person turns it on. */
