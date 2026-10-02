@@ -206,7 +206,7 @@ import {
 } from "./files.svelte";
 import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
 import type { MessageCursor } from "./message-order";
-import { sameFields, withEntry } from "./peer-maps";
+import { sameFields, sameProfile, withEntry } from "./peer-maps";
 import { createSyncViewBuffer } from "./sync-view";
 import {
   noteSyncBatch,
@@ -2446,6 +2446,10 @@ async function _handleScopedProfile(
   const currentRoom = await getRoom(room);
   if (currentRoom?.type !== "text" || currentRoom.createdAt !== joinedRoom.createdAt ||
       !_transport.rooms().includes(room) || !_transport.isRoomPeer(room, peerId)) return;
+  // A frame that repeats what is known replaces no map, as in _handleProfile
+  // (peer-maps.ts): the room's names and avatars on screen all read this one.
+  const known = transportState.peerRoomProfiles.get(room)?.get(did);
+  if (known && sameProfile(known, peerProfile)) return;
   const scoped = new Map(transportState.peerRoomProfiles);
   const peers = new Map(scoped.get(room));
   peers.set(did, peerProfile);

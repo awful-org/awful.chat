@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { sameFields, withEntry } from "./peer-maps";
+import type { PeerProfile } from "$lib/storage";
+import { sameFields, sameProfile, withEntry } from "./peer-maps";
 
 describe("withEntry", () => {
   it("hands back the same map when the frame repeats what it holds", () => {
@@ -46,5 +47,18 @@ describe("sameFields", () => {
     expect(sameFields({ a: 1 }, { a: 2 })).toBe(false);
     expect(sameFields({ a: 1 }, { a: 1, b: undefined })).toBe(false);
     expect(sameFields({ a: undefined }, { b: undefined })).toBe(false);
+  });
+});
+
+describe("sameProfile", () => {
+  const profile: PeerProfile = { did: "did:key:a", isMe: false, nickname: "Room", updatedAt: 1 };
+
+  it("takes a frame that repeats a profile, later, for the same", () => {
+    expect(sameProfile(profile, { ...profile, updatedAt: 2 })).toBe(true);
+  });
+
+  it("tells any other change apart", () => {
+    expect(sameProfile(profile, { ...profile, nickname: "Other", updatedAt: 2 })).toBe(false);
+    expect(sameProfile(profile, { ...profile, color: "#fff" })).toBe(false);
   });
 });

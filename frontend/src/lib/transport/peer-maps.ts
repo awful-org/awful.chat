@@ -38,3 +38,12 @@ export function sameFields(a: object, b: object): boolean {
   if (keys.length !== Object.keys(right).length) return false;
   return keys.every((key) => Object.hasOwn(right, key) && Object.is(left[key], right[key]));
 }
+
+/**
+ * Whether two profiles say the same thing, whenever each arrived: a room
+ * profile is stamped with the time its frame came in, so one frame that
+ * repeats another differs from it there and nowhere else.
+ */
+export function sameProfile<T extends { updatedAt?: number }>(a: T, b: T): boolean {
+  return sameFields({ ...a, updatedAt: 0 }, { ...b, updatedAt: 0 });
+}
