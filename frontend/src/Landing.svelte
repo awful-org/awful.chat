@@ -42,6 +42,10 @@
       a: "No. Chat messages, files and voice calls are end-to-end encrypted and travel peer-to-peer - the relay introduces peers, forwards encrypted traffic, and holds a 48-hour encrypted mailbox for offline DMs it cannot open (on by default, can be turned off in settings). The one exception is group video and screen share, which route through the SFU server, as the table above shows.",
     },
     {
+      q: "How do I invite people to a room?",
+      a: "Give them a short code. You choose how many people it lets in, up to 25, and how long it lasts, up to 10 minutes; they type it, open it as a link or scan its QR, and it stops working once they are in or the time runs out. Your app hands the room over, so it only works while you have the app open. Each room also has a permanent link, which never expires and lets in anyone who has it, including whoever it gets forwarded to: share that one only with people you would hand a key to.",
+    },
+    {
       q: "Can I host it myself?",
       a: "Yes. The whole stack is open source and ships as one Docker Compose file: the web app, a Go relay, a mediasoup SFU and a TURN server. Clone the repo, set a few env vars, run one docker compose command, and you have your own private chat instance that never talks to ours.",
     },
@@ -101,7 +105,7 @@
   ];
 
   const serverVisibility = [
-    { canSee: true, label: "Room code" },
+    { canSee: true, label: "Room ID (not its key)" },
     { canSee: true, label: "Video*" },
     { canSee: true, label: "Connection details" },
     { canSee: false, label: "Message content" },
@@ -113,9 +117,9 @@
   {
     category: "ENCRYPTION",
     title: "Noise Protocol",
-    subtitle: "+ Ed25519",
+    subtitle: "+ Ed25519 + ML-KEM",
     description:
-      "End-to-end encrypted connections with Noise protocol. Every message is cryptographically signed with your identity key.",
+      "End-to-end encrypted connections with Noise protocol and an encrypted channel per room. Every message is signed with your identity key; direct messages and invites add post-quantum ML-KEM.",
     classes: "bento-item-lg",
   },
     {

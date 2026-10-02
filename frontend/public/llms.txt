@@ -25,7 +25,18 @@ them (USE_QS / USE_QC):
 
 Key properties:
 - No sign-up: create an identity locally, back it up with 12 words
-- End-to-end encrypted messaging (noise protocol between peers)
+- End-to-end encrypted messaging (noise protocol between peers, and an
+  authenticated, encrypted channel per room)
+- Rooms are a 256-bit secret; the relay and media server only ever see a
+  derived public ID that cannot join. Invite by short code - six characters,
+  limited to the people (up to 25) and minutes (up to 10) the inviter
+  chooses, handed over with OPAQUE - or by a permanent link that carries the
+  secret after the "#", so it never reaches a server
+- Post-quantum: DM keys, the offline mailbox and short-code handovers add
+  ML-KEM-768 to the elliptic-curve exchange
+- Discord-style markdown (bold, italic, underline, strikethrough, spoilers,
+  quotes, lists, code blocks), typing indicators, a separate profile per room,
+  and message requests for DMs from strangers
 - Signed messages (ed25519) to prevent impersonation
 - Delivery and read receipts for direct messages
 - Offline DMs: an encrypted 48-hour relay mailbox (sealed to the recipient,

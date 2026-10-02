@@ -50,7 +50,7 @@
     {
       icon: Send,
       title: "DMs are the only messages that wait for you",
-      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms.",
+      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms. A DM from someone who is not a contact and shares no room with you arrives as a request: it does not notify you, and waits under Requests until you accept it.",
     },
     {
       icon: RefreshCw,
@@ -59,8 +59,8 @@
     },
     {
       icon: Hash,
-      title: "The invite link is the key to the room",
-      body: "Anyone holding a room's invite link can join it. There are no roles, bans or moderation tools yet, so share it only with people you want in the room.",
+      title: "A short code invites; the permanent link is the key",
+      body: "A short code lets in the number of people you choose, for up to 10 minutes, and only while your app is open: it is the careful way to invite someone. The room's permanent link never expires - anyone holding it can join, now or later, including anyone it is forwarded to. Either way, whoever gets in holds the room like any member and can invite others too. There are no roles, bans or moderation tools yet.",
     },
     {
       icon: FileDown,
