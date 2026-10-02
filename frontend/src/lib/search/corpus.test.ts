@@ -7,7 +7,6 @@ import {
   putSearchIndex,
   bulkPutMessages,
   wipeLocalDatabase,
-  getSearchableStats,
 } from "$lib/storage";
 import { initStorageCrypto } from "$lib/storage-crypto";
 import { MessageType, type Message } from "$lib/types/message";
@@ -76,9 +75,7 @@ describe("search corpus", () => {
 
     const record = await getSearchIndex("room-a");
     expect(record).toBeDefined();
-    expect(record!.lastLamport).toBe(
-      (await getSearchableStats("room-a", [MessageType.Text])).newestLamport
-    );
+    expect(record!.lastLamport).toBe(1);
 
     // "Next session": memory gone, index row still there.
     clearSearchCorpus();
@@ -268,13 +265,37 @@ describe("sealed index writes", () => {
     expect((await getSearchIndex("room-a"))!.lastLamport).toBe(24);
   });
 
+  // Only this tab writes here, and the hook hears all of it - so the index
+  // keeps its count, and the next session reads only what came after it.
+  it("vouches for every row this tab stored: messages, reactions, and rows stored twice", async () => {
+    await searchedBefore("room-a", "alpha");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+
+    const live = msg({ content: "the live one" });
+    await putMessage(live);
+    await putMessage(msg({ type: MessageType.Reaction, content: "+1", reactionTo: live.id }));
+    // A sync batch that repeats a row just stored, and one held since before.
+    await bulkPutMessages([live, msg({ id: "msg-5", lamport: 5, content: "alpha" })]);
+
+    await saveSearchIndexes();
+    const written = await getSearchIndex("room-a");
+    expect(written!.lastLamport).toBe(21);
+    expect(written!.rowsBelow).toBe(20);
+
+    clearSearchCorpus();
+    const sweep = vi.spyOn(storage, "getMessages");
+    await ensureRoomCorpus("room-a");
+    expect(sweep).not.toHaveBeenCalled();
+    expect(searchRooms(parseSearchQuery("live"), ["room-a"])).toHaveLength(1);
+  });
+
   it("gives a room deleted mid-write no index back", async () => {
     await searchedBefore("room-a", "alpha");
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     await putMessage(msg({ content: "about to go" }));
     const put = vi.spyOn(storage, "putSearchIndex");
-    const count = storage.countRowsBelow;
-    vi.spyOn(storage, "countRowsBelow").mockImplementationOnce(async (roomCode, lamport) => {
+    const count = storage.countRoomRows;
+    vi.spyOn(storage, "countRoomRows").mockImplementationOnce(async (roomCode, lamport) => {
       // The room is deleted while its index is being written.
       dropRoomCorpus("room-a");
       await deleteMessagesForRoom("room-a");

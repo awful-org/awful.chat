@@ -7,6 +7,7 @@
  * message that arrived since the row was written.
  */
 import {
+  countRoomRows,
   countRowsBelow,
   getMessages,
   getSearchableSince,
@@ -50,6 +51,14 @@ interface RoomCorpus {
   dirty: boolean;
   /** When this session last wrote the room's index (0: not yet). */
   savedAt: number;
+  /**
+   * The room's rows in storage when the build began, before it read any:
+   * how many there were and the newest lamport among them. The build takes
+   * in every one of those, so with `added` this is what the corpus has seen.
+   */
+  base: { rows: number; newest: number } | null;
+  /** Rows this tab stored since, each certainly not one of `base`'s. */
+  added: Set<string>;
 }
 
 const _rooms = new Map<string, RoomCorpus>();
@@ -110,6 +119,8 @@ function corpusFor(roomCode: string): RoomCorpus {
       lastLamport: 0,
       dirty: false,
       savedAt: 0,
+      base: null,
+      added: new Set(),
     };
     _rooms.set(roomCode, c);
   }
@@ -124,6 +135,19 @@ function add(c: RoomCorpus, entry: SearchEntry): boolean {
     c.sweptTo = entry.timestamp;
   if (entry.lamport > c.lastLamport) c.lastLamport = entry.lamport;
   return true;
+}
+
+/**
+ * A row this tab stored in a room with a corpus: counted as seen when it is
+ * certainly not one storage held when the build began - newer than all of
+ * them, or a searchable message the finished build did not find. A row the
+ * hook cannot tell apart, such as an old reaction stored again or a
+ * backfilled one, is left out: the count then comes up short of storage's,
+ * and the next index write vouches for nothing (saveIndex).
+ */
+function noteStored(c: RoomCorpus, msg: Message, newEntry: boolean): void {
+  if (!c.base || c.added.has(msg.id)) return;
+  if (msg.lamport > c.base.newest || (newEntry && c.done)) c.added.add(msg.id);
 }
 
 // ── live append ──────────────────────────────────────────────────────────────
@@ -141,12 +165,17 @@ function ensureHook(): void {
     const c = _rooms.get(msg.roomCode);
     if (!c) return;
     const entry = entryFromMessage(msg, pluginNameOf);
-    if (!entry || !add(c, entry)) return;
+    const fresh = entry !== null && add(c, entry);
+    noteStored(c, msg, fresh);
+    if (!fresh) return;
     c.dirty = true;
     bump();
     scheduleSave();
   });
-  // Leaving the page is the last chance to keep what this session indexed.
+  // Leaving the page writes what is due, so a session that ends soon after
+  // a search still leaves its index behind. A room written in the last five
+  // minutes waits its turn as ever: what it lacks is read from storage the
+  // next time it is searched.
   if (typeof document !== "undefined") {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") void saveSearchIndexes();
@@ -215,18 +244,25 @@ export async function saveSearchIndexes(): Promise<void> {
 
 async function saveIndex(roomCode: string, c: RoomCorpus): Promise<void> {
   const lastLamport = c.lastLamport;
-  // Counted BEFORE the entries are taken. A row stored in between then sits
-  // in the entries but not in the count, which the next session reads as
-  // stale and rebuilds. The other order could count a row that never made
-  // it into the entries, and that index would pass the check without it.
-  const rowsBelow = await countRowsBelow(roomCode, lastLamport);
+  // The entries are taken right after the count, with no await between: a
+  // row this tab stored before the count is in both, one stored after it in
+  // neither.
+  const counts = await countRoomRows(roomCode, lastLamport);
   if (_rooms.get(roomCode) !== c) return;
   const record: SearchIndexRecord = {
     roomCode,
     lastLamport,
-    rowsBelow,
     data: encodeIndex(c.entries),
   };
+  // rowsBelow says the entries hold every searchable row below lastLamport,
+  // and the next session trusts it to read only from there up. That holds
+  // only while storage has no row this corpus has not seen. Another tab of
+  // this profile stores rows the hook never hears of - the one that took
+  // the node over, while this one kept its corpus - and counting those in
+  // put a backfilled message out of search for good. Without the count the
+  // next session checks the index against every row, and rebuilds it if
+  // something is missing.
+  if (c.base && counts.rows === c.base.rows + c.added.size) record.rowsBelow = counts.below;
   c.dirty = false;
   c.savedAt = Date.now();
   try {
@@ -277,8 +313,9 @@ function decodeIndex(data: ArrayBuffer): SearchEntry[] | null {
  * Messages below it do arrive: a repair sync backfills OLDER history, which
  * moves no high-water mark at all. So the row records how many rows sat
  * below lastLamport when it was written, and the database counts them again
- * now. A row an older build wrote has no such count; it is checked the old
- * way, against every row of the room, once, and written back with one.
+ * now. A row without that count - an older build wrote it, or a session
+ * that could not vouch for every row (saveIndex) - is checked the old way,
+ * against every row of the room, once, and written back with one.
  */
 async function coversBelow(
   roomCode: string,
@@ -307,6 +344,15 @@ export async function ensureRoomCorpus(roomCode: string): Promise<void> {
   if (c.done || c.sweeping) return;
   c.sweeping = true;
   try {
+    // What storage holds before anything is read, for the index writes to
+    // check against (saveIndex). A row stored before this count is in it,
+    // and the build below takes it in; one this tab stores after it, the
+    // hook counts.
+    c.base = null;
+    c.added.clear();
+    const { rows, newest } = await countRoomRows(roomCode);
+    c.base = { rows, newest };
+
     // A sealed index is one decrypt for the whole room. When nothing has
     // been stored underneath it since it was written, the rows from its
     // lastLamport up are all it lacks, and they are all that is read: a

@@ -353,18 +353,20 @@ type AppDB = IDBPDatabase<{
 /** Sealed per-room search index: entries serialized as encrypted bytes. */
 export interface SearchIndexRecord {
   roomCode: string;
-  /** Highest lamport of any message folded into `data`. Clear on disk so
-   *  staleness is checkable without a decrypt. */
+  /** Highest lamport of any message folded into `data`. Clear on disk, where
+   *  older builds read it (see STORE_SPECS.searchIndex). */
   lastLamport: number;
   /** JSON bytes of SearchEntry[]; sealed via the `bytes` spec. */
   data: ArrayBuffer;
   /**
    * How many of the room's message rows (of every type) sat below
-   * lastLamport when the index was written. Sealed with the row's other
-   * fields, and absent on rows older builds wrote: they never read it, and a
-   * row without it is checked the old way. A count that still matches means
-   * nothing landed underneath the index since, so only the rows from
-   * lastLamport up need reading to bring it current.
+   * lastLamport when the index was written, all of them folded into `data`
+   * as far as they are searchable. Sealed with the row's other fields.
+   * Absent on rows older builds wrote, which never read it, and on rows
+   * written by a session that could not vouch for every row below - another
+   * tab stored some it never saw: such a row is checked the old way. A count
+   * that still matches means nothing landed underneath the index since, so
+   * only the rows from lastLamport up need reading to bring it current.
    */
   rowsBelow?: number;
 }
@@ -1372,36 +1374,31 @@ export async function deleteDiagnostics(): Promise<void> {
 }
 
 /**
- * Newest lamport AND row count among a room's rows of the given types, read
- * from CLEAR fields only - the search index staleness check, at no decrypt
- * cost. The count is the half that matters: a repair sync backfills OLDER
- * messages, which move no lamport high-water mark at all, so "lastLamport
- * is current" alone would bless an index that silently lost them.
+ * How many of a room's rows of the given types sit below `below`, read from
+ * CLEAR fields only, at no decrypt cost: the coverage check for a search
+ * index row written without rowsBelow - by an older build, or by a session
+ * that could not vouch for every row (corpus.svelte.ts). The count is what
+ * matters: a repair sync backfills OLDER messages, which move no lamport
+ * high-water mark at all, so "lastLamport is current" alone would bless an
+ * index that silently lost them.
  *
- * `countBelow` is the same count for rows below the given lamport only.
- *
- * Every row of the room is read, so only an index row written before
- * rowsBelow existed comes here, once; countRowsBelow is the check after
- * that. One bulk read, not a cursor: an await per row held the store for
- * the whole walk, and a send issued meanwhile waited the better part of a
+ * Every row of the room is read, so such an index row comes here once, and
+ * is written back with its count; countRowsBelow is the check after that.
+ * One bulk read, not a cursor: an await per row held the store for the
+ * whole walk, and a send issued meanwhile waited the better part of a
  * second.
  */
 export async function getSearchableStats(
   roomCode: string,
   types: readonly ChatMessageType[],
-  below = 0
-): Promise<{ newestLamport: number; count: number; countBelow: number }> {
+  below: number
+): Promise<{ countBelow: number }> {
   const wanted = new Set<ChatMessageType>(types);
-  let newest = 0;
-  let count = 0;
   let countBelow = 0;
   for (const row of await _rawRoomMessages(roomCode)) {
-    if (!wanted.has(row.type)) continue;
-    newest = Math.max(newest, row.lamport);
-    count += 1;
-    if (row.lamport < below) countBelow += 1;
+    if (wanted.has(row.type) && row.lamport < below) countBelow += 1;
   }
-  return { newestLamport: newest, count, countBelow };
+  return { countBelow };
 }
 
 /** The room's index ranges: the blinded one, and during the migration window
@@ -1430,6 +1427,37 @@ export async function countRowsBelow(roomCode: string, lamport: number): Promise
   const index = database.transaction("messages").store.index("byRoomLamport");
   const counts = await Promise.all(ranges.map((range) => index.count(range)));
   return counts.reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * The room's rows of any type, counted by the index like countRowsBelow:
+ * how many there are, how many of them sit below `lamport`, and the newest
+ * lamport among them. One transaction, so the three agree with each other
+ * and with the writes around them: a row stored meanwhile is in all of them
+ * or in none.
+ */
+export async function countRoomRows(
+  roomCode: string,
+  lamport = 0
+): Promise<{ rows: number; below: number; newest: number }> {
+  const database = await getDB();
+  const all = await _roomLamportRanges(roomCode, 0, Number.MAX_SAFE_INTEGER, false);
+  const under =
+    lamport > 0
+      ? all.map((range) => IDBKeyRange.bound(range.lower, [range.lower[0], lamport], false, true))
+      : [];
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const [rows, below, tops] = await Promise.all([
+    Promise.all(all.map((range) => index.count(range))),
+    Promise.all(under.map((range) => index.count(range))),
+    Promise.all(all.map((range) => index.openKeyCursor(range, "prev"))),
+  ]);
+  const sum = (counts: number[]) => counts.reduce((total, n) => total + n, 0);
+  return {
+    rows: sum(rows),
+    below: sum(below),
+    newest: Math.max(0, ...tops.map((cursor) => (cursor ? cursor.key[1] : 0))),
+  };
 }
 
 /**
