@@ -16,6 +16,14 @@ import {
   REFUSED_MAX_SENDERS,
 } from "./refused-lamports";
 import { allowSyncReaction } from "./sync-throttle";
+import { planPush, runPush } from "./sync-push";
+import { InboundPushes, type BatchOutcome, type HeldRow } from "./sync-inbound";
+import {
+  PAGE_SIZE,
+  commitWatermark,
+  holdWatermarks,
+  releaseWatermarks,
+} from "../storage";
 import { setErrorWithAutoClear } from "./call-error";
 import { blindValue } from "../storage-crypto";
 import {
@@ -1267,6 +1275,14 @@ const _lastDigestAt = new Map<string, number>();
 /** "room|senderId" -> highest lamport we have seen, for the gap hint above. */
 const _lastSeenLamport = new Map<string, number>();
 
+/** What a push of history did, and what its rows may claim. */
+const _inboundPushes = new InboundPushes({
+  commit: (room, senderId, lamport) => commitWatermark(room, senderId, lamport),
+  hold: (room) => holdWatermarks(room),
+  release: (room) => releaseWatermarks(room),
+});
+onIdentityLock(() => _inboundPushes.reset());
+
 function _syncPeer(peerId: string, force = false): void {
   const now = Date.now();
   if (!force && now - (_lastDigestAt.get(peerId) ?? 0) < SYNC_DEBOUNCE_MS) {
@@ -1547,9 +1563,12 @@ async function _sendDigestForRoom(
   if (!opts.peerKnowsRoom && !_transport.peersInRoom(roomCode).includes(peerId)) {
     return;
   }
-  const watermarks = _withRefused(
+  // Plus, for an older build whose push stopped short, what that push did
+  // deliver: told to that peer alone, or it re-sends the same rows forever.
+  const watermarks = _inboundPushes.withClaims(
+    peerId,
     roomCode,
-    await getWatermarksForRoom(roomCode)
+    _withRefused(roomCode, await getWatermarksForRoom(roomCode))
   );
   _stats.digestsOut++;
   rec(
@@ -1559,10 +1578,13 @@ async function _sendDigestForRoom(
       d: { watermarks: Object.keys(watermarks).length },
     })
   );
-  await _transport.sendRoom(
+  const sent = await _transport.sendRoom(
     peerId, roomCode,
     encode({ type: MessageType.SyncDigest, roomCode, watermarks })
   );
+  // A push may be on its way: until it starts, a live message must not
+  // claim past the rows it is about to deliver.
+  if (sent) _inboundPushes.expect(roomCode);
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
@@ -1677,34 +1699,27 @@ async function _handleDigest(
   // is what retires that clock.
   _promoteSentByWatermark(roomCode, theirWatermarks);
 
-  let mine = await getWatermarksForRoom(roomCode);
+  const mine = await getWatermarksForRoom(roomCode);
 
   // Throttled BEFORE the work, not just before the send.
   //
   // Deciding what a peer is missing costs getSenderMaxLamports, which reads
-  // every row in the room off the lamport index (twice, when the watermark
-  // store also needs rebuilding), and the push that follows decrypts and
-  // re-uploads whatever it finds. The window used to sit on the send alone,
-  // so a member looping empty digests still bought a full-room scan per
-  // frame - throttling the reaction while leaving the amplifier running.
-  // Consuming the window on a digest that turns out to need no push is the
-  // deliberate cost: the scan is what has to be rationed, and the two cases
-  // are indistinguishable before it runs. One push hands over everything
-  // missing and the repair tick is slower than this window, so honest flows
-  // are unaffected.
+  // every row in the room off the lamport index, and the push that follows
+  // decrypts and re-uploads whatever it finds. The window used to sit on the
+  // send alone, so a member looping empty digests still bought a full-room
+  // scan per frame - throttling the reaction while leaving the amplifier
+  // running. Consuming the window on a digest that turns out to need no push
+  // is the deliberate cost: the scan is what has to be rationed, and the two
+  // cases are indistinguishable before it runs. One push hands over
+  // everything missing and the repair tick is slower than this window, so
+  // honest flows are unaffected.
+  //
+  // No watermarks are rebuilt from stored rows here any more. That claimed
+  // each sender's highest stored row, and a push now stores rows it has not
+  // yet proved contiguous: a room with history but no watermark rows simply
+  // advertises none, takes one push of what it holds back as duplicates, and
+  // the completed push claims them.
   if (allowSyncReaction(`push|${peerId}|${roomCode}`)) {
-    // History written before watermarks existed for this room (all DMs until
-    // now) leaves `mine` empty, which reads as "nothing to compare" and makes
-    // reconciliation a no-op. Rebuild once from what is actually stored.
-    if (Object.keys(mine).length === 0) {
-      // Clear fields suffice for watermarks too - no decrypt for the rebuild.
-      const rebuilt = await getSenderMaxLamports(roomCode);
-      for (const [sid, lamport] of rebuilt) {
-        await setWatermark(roomCode, sid, lamport);
-      }
-      if (rebuilt.size) mine = await getWatermarksForRoom(roomCode);
-    }
-
     // Senders we hold messages from, not senders we happen to have a
     // watermark row for. A partial watermark map (one row lost, or written
     // before a sender was known) silently excluded that sender from every
@@ -1733,8 +1748,13 @@ async function _handleDigest(
   // Measured against what our next digest would ADVERTISE, refused claims
   // included: being "behind" on history we have already refused for good is
   // not a reason to ask for a push we would only refuse again - and asking
-  // would bounce a digest back and forth every exchange.
-  const advertised = _withRefused(roomCode, { ...mine });
+  // would bounce a digest back and forth every exchange. Same for what an
+  // older build's short push already gave us: that peer is told we hold it.
+  const advertised = _inboundPushes.withClaims(
+    peerId,
+    roomCode,
+    _withRefused(roomCode, { ...mine })
+  );
   const weAreBehind = Object.keys(theirWatermarks).some(
     (sid) => (theirWatermarks[sid] ?? -1) > (advertised[sid] ?? -1)
   );
@@ -1769,24 +1789,40 @@ function _promoteSentByWatermark(
   }
 }
 
+/** Pushes in flight, by "peer|room": one at a time to each peer per room. */
+const _pushesOut = new Set<string>();
+
 async function _pushMissingTo(
   peerId: string,
   roomCode: string,
   theirWatermarks: Record<string, number>
 ): Promise<void> {
   if (!roomCode) return;
+  // One push at a time to a peer per room. A paced push of a big backlog
+  // outlasts the reaction window, and a second one beside it would only send
+  // the same rows again, interleaved with the first.
+  const key = `${peerId}|${roomCode}`;
+  if (_pushesOut.has(key)) return;
+  _pushesOut.add(key);
+  try {
+    await _pushRows(peerId, roomCode, theirWatermarks);
+  } finally {
+    _pushesOut.delete(key);
+  }
+}
+
+async function _pushRows(
+  peerId: string,
+  roomCode: string,
+  theirWatermarks: Record<string, number>
+): Promise<void> {
+  const guard = captureDmOwnership();
   // Filter on clear senderId/lamport BEFORE decrypting: only the rows
   // actually going onto the wire pay for crypto, instead of the whole room.
   const missing = await getMessagesAboveWatermarks(roomCode, theirWatermarks);
+  guard();
 
   if (!missing.length) return;
-
-  // Newest first. The receiver renders one page - the newest - and parks
-  // everything older in storage behind "load older" (_mergeSyncedIntoView),
-  // so the first frame on the wire should be the one their screen is going
-  // to keep. Oldest first meant that page was the LAST to arrive, with every
-  // earlier frame painted and then pushed out of view by the next.
-  missing.sort((a, b) => MSG_ORDER(b, a));
 
   // Re-attach inline bytes for small files we still hold: this is what lets
   // a peer who was offline at send time get the image at all - attachment
@@ -1809,45 +1845,52 @@ async function _pushMissingTo(
     })
   );
 
-  // Size-aware batching: BATCH_SIZE messages that each carry inline bytes
-  // would blow the 4MB frame cap, so a batch closes early on bytes too.
+  // The newest page first, so the screen it lands on fills at once, then
+  // everything older OLDEST first, so whatever part of the push arrives
+  // leaves no gap below it (sync-push.ts). Size-aware: BATCH_SIZE messages
+  // that each carry inline bytes would blow the 4MB frame cap, so a batch
+  // closes early on bytes too.
   const MAX_BATCH_BYTES = 1_500_000;
-  const sizeOf = (m: WireChatMessage) =>
-    (m.content?.length ?? 0) +
-    (m.meta?.files?.reduce((n, f) => n + (f.inline?.length ?? 0), 0) ?? 0) +
-    512;
-  const batches: WireChatMessage[][] = [];
-  let cur: WireChatMessage[] = [];
-  let curBytes = 0;
-  for (const m of enriched) {
-    const sz = sizeOf(m);
-    if (
-      cur.length &&
-      (cur.length >= BATCH_SIZE || curBytes + sz > MAX_BATCH_BYTES)
-    ) {
-      batches.push(cur);
-      cur = [];
-      curBytes = 0;
+  const batches = planPush(enriched, {
+    batchSize: BATCH_SIZE,
+    pageSize: PAGE_SIZE,
+    maxBatchBytes: MAX_BATCH_BYTES,
+    sizeOf: (m: WireChatMessage) =>
+      (m.content?.length ?? 0) +
+      (m.meta?.files?.reduce((n, f) => n + (f.inline?.length ?? 0), 0) ?? 0) +
+      512,
+  });
+
+  // Every frame waits for the channel to take the one before it. The loop
+  // used to fire them all at once and never look at the answer: past the
+  // channel's 32-frame window every batch, and the SyncComplete behind them,
+  // was refused and dropped. SyncComplete now goes out only once every batch
+  // was accepted - it is what tells the receiver the whole push arrived.
+  const frame = (i: number) =>
+    i < batches.length
+      ? encode({
+          type: MessageType.SyncBatch,
+          roomCode,
+          messages: batches[i].rows,
+          batchIndex: i,
+          totalBatches: batches.length,
+          order: batches[i].order,
+        })
+      : encode({ type: MessageType.SyncComplete, roomCode });
+  await runPush(
+    batches.length + 1,
+    (i) => _transport.sendRoom(peerId, roomCode, frame(i)),
+    {
+      alive: () => {
+        try {
+          guard();
+        } catch {
+          return false;
+        }
+        return _transport.rooms().includes(roomCode);
+      },
     }
-    cur.push(m);
-    curBytes += sz;
-  }
-  if (cur.length) batches.push(cur);
-
-  for (let i = 0; i < batches.length; i++) {
-    _transport.sendRoom(
-      peerId, roomCode,
-      encode({
-        type: MessageType.SyncBatch,
-        roomCode,
-        messages: batches[i],
-        batchIndex: i,
-        totalBatches: batches.length,
-      })
-    );
-  }
-
-  _transport.sendRoom(peerId, roomCode, encode({ type: MessageType.SyncComplete, roomCode }));
+  );
 }
 
 async function _handleSyncBatch(
@@ -1860,21 +1903,49 @@ async function _handleSyncBatch(
    * recovered message.
    */
   live = false,
-  /** Where this frame sits in its push - for the syncing pill, nothing else. */
-  progress?: { batchIndex: number; totalBatches: number }
+  /**
+   * Where this frame sits in its push: for the syncing pill, and for what
+   * its rows may claim (sync-inbound.ts).
+   */
+  progress?: { batchIndex: number; totalBatches: number; order?: unknown }
 ): Promise<void> {
+  // A repair frame is one batch of a push. A push's frames are handled one at
+  // a time, in order, and what their rows claim is decided across the push.
+  if (!live && progress && fromPeerId) {
+    await _inboundPushes.batch(fromPeerId, roomCode, progress, () =>
+      _storeSyncBatch(roomCode, messages, fromPeerId, live, progress, false)
+    );
+    return;
+  }
+  await _storeSyncBatch(roomCode, messages, fromPeerId, live, progress, true);
+}
+
+/**
+ * Verify and store one batch, and say which of its rows we now hold - null
+ * when the frame is refused whole. `claimRows`: a live copy or a mailbox
+ * batch claims its new rows here, as any live message does; a push's rows
+ * claim through sync-inbound.ts.
+ */
+async function _storeSyncBatch(
+  roomCode: string,
+  messages: WireChatMessage[],
+  fromPeerId: string | undefined,
+  live: boolean,
+  progress: { batchIndex: number; totalBatches: number } | undefined,
+  claimRows: boolean
+): Promise<BatchOutcome | null> {
   const guard = captureDmOwnership();
   // Bind incoming history to the room named in the (signed-message-bearing)
   // batch, and only if we actually joined it - a peer cannot inject history
   // into whatever room the receiver currently has open.
   if (!messages.length || !roomCode || !_transport.rooms().includes(roomCode))
-    return;
+    return null;
   // Nothing bounded the row count. A single 4 MB frame (MAX_DIRECT_FRAME_BYTES)
   // holds ~10,500 rows, and the verification loop below is synchronous - ed25519
   // verify is pure JS with no yield - so one frame froze the tab for ~19s, and
   // repeated frames froze it for good. Every sender emits at most BATCH_SIZE
   // (_pushMissingTo), so 4x that is generous for anything honest.
-  if (messages.length > BATCH_SIZE * 4) return;
+  if (messages.length > BATCH_SIZE * 4) return null;
   // DM conversations: only the counterparty - or another of OUR OWN paired
   // devices (same DID, which the counterparty-derived code can never match) -
   // may relay this history. The room code is derived from the two DIDs, so
@@ -1899,7 +1970,7 @@ async function _handleSyncBatch(
   // from messages sent after signing; the counterparty's half is unaffected.
   let unsignedFrom: string | null = null;
   if (roomCode.startsWith("dm-")) {
-    if (!fromPeerId) return;
+    if (!fromPeerId) return null;
     const fromDid = dmPeerDid(fromPeerId);
     const isOwnDevice = !!fromDid && fromDid === identityStore.did;
     if (isOwnDevice) {
@@ -1909,7 +1980,7 @@ async function _handleSyncBatch(
         () => null
       );
       guard();
-      if (expected !== roomCode) return;
+      if (expected !== roomCode) return null;
       // expected === roomCode already proves fromDid resolved; be explicit.
       unsignedFrom = fromDid;
     }
@@ -2006,7 +2077,14 @@ async function _handleSyncBatch(
     await ensureMessageAttachmentOwnership(w.id, guard);
     guard();
   }
-  if (!fresh.length) return;
+  // What this batch leaves us holding, for the push it belongs to: a row we
+  // held already counts as much as one stored now. Its lamport is the one we
+  // stored, never this unverified copy's.
+  const heldRows: HeldRow[] = held.map((w) => ({
+    senderId: w.senderId,
+    lamport: known.get(w.id)!.lamport,
+  }));
+  if (!fresh.length) return { held: heldRows, floors: new Map() };
 
   const verdicts = await Promise.all(
     fresh.map((m) =>
@@ -2122,7 +2200,7 @@ async function _handleSyncBatch(
       _noteRefused(roomCode, sid, lamport);
     }
   }
-  if (!verified.length) return;
+  if (!verified.length) return { held: heldRows, floors: rejectedFloor };
   // Plugin rows get the same caps coming in as going out: a valid signature
   // proves who wrote the row, not that its payload is within the limits every
   // send path enforces (see _parsePluginPayload). Backfill is a persist path
@@ -2169,7 +2247,7 @@ async function _handleSyncBatch(
     }
     usable.push(w);
   }
-  if (!usable.length) return;
+  if (!usable.length) return { held: heldRows, floors: rejectedFloor };
 
   const fullMessages = usable.map((w) => wireToMessage(w, roomCode));
 
@@ -2254,6 +2332,10 @@ async function _handleSyncBatch(
   for (const m of fullMessages) {
     // Observe only this conversation's counter.
     lamportReceive(m.roomCode, m.lamport);
+    heldRows.push({ senderId: m.senderId, lamport: m.lamport });
+    // A push's rows claim through sync-inbound.ts, which knows whether
+    // anything below them is still missing.
+    if (!claimRows) continue;
     // A watermark of NaN (or a lamport that arrived as a string) sticks:
     // setWatermark advances on `existing.maxLamport < maxLamport`, and every
     // comparison against NaN is false, so the row can never move again and
@@ -2265,6 +2347,7 @@ async function _handleSyncBatch(
       guard();
     }
   }
+  const outcome: BatchOutcome = { held: heldRows, floors: rejectedFloor };
 
   refreshUnreadCount(roomCode).catch(() => {});
   for (const m of fullMessages) noteRoomActivity(m.roomCode, m.timestamp);
@@ -2282,12 +2365,13 @@ async function _handleSyncBatch(
   // frame as it arrived replaced the array, re-ran the derived chain and
   // autoscrolled tens of times a second while a backlog poured in, which is
   // the flicker that survived keeping row identity across re-reads.
-  if (transportState.roomCode !== roomCode) return;
+  if (transportState.roomCode !== roomCode) return outcome;
   if (live) {
     await _mergeSyncedIntoView(roomCode, fullMessages);
-    return;
+    return outcome;
   }
   _syncView.add(roomCode, fullMessages);
+  return outcome;
 }
 
 const _syncView = createSyncViewBuffer((roomCode, rows) => {
@@ -2361,6 +2445,14 @@ function _handleSyncComplete(peerId: string, roomCode?: string): void {
   // a background room that had just synced never told anybody else about it -
   // it healed only via the slow one-room-per-tick rotation.
   const room = roomCode ?? transportState.roomCode;
+  // Behind the push's own batches, which are still handled one at a time:
+  // only once every one of them is stored may the push claim its rows, and
+  // only then is it really done for the view, the pill and the room.
+  const done = room ? _inboundPushes.complete(peerId, room) : Promise.resolve();
+  void done.then(() => _settleSyncComplete(peerId, room)).catch(() => {});
+}
+
+function _settleSyncComplete(peerId: string, room: string | null): void {
   if (room) {
     // Whatever this push parked for the view goes on screen now, and the
     // pill for it comes down.
@@ -3669,7 +3761,7 @@ export async function deliverMailboxBatch(
 async function _handleDmBatch(
   peerId: string,
   room: string,
-  msg: { messages: WireChatMessage[]; live?: boolean; batchIndex: number; totalBatches: number },
+  msg: { messages: WireChatMessage[]; live?: boolean; batchIndex: number; totalBatches: number; order?: unknown },
 ): Promise<void> {
   const guard = captureDmOwnership();
   const senderDid = _peerIdToDid.get(peerId);
@@ -3688,6 +3780,7 @@ async function _handleDmBatch(
   await _handleSyncBatch(room, msg.messages, peerId, live, {
     batchIndex: msg.batchIndex,
     totalBatches: msg.totalBatches,
+    order: msg.order,
   });
   // The DM list orders and shows conversations by their last row, and only
   // the text path refreshed it: a card into a DM that was not on screen

@@ -1393,6 +1393,7 @@ export async function getSearchableStats(
 }
 
 export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
+  _watermarkHolds.delete(roomCode);
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   // The room's search index goes with its messages.
@@ -2767,7 +2768,68 @@ export async function getWatermark(
   return record?.maxLamport ?? 0;
 }
 
+/**
+ * Rooms with a history push in them that has not completed, and the
+ * watermark advances waiting on it.
+ *
+ * A watermark says "I hold everything this sender wrote up to here", and
+ * nobody offers what is below it again. While a push is unfinished, the rows
+ * it stored can sit above rows it has not delivered yet - and a live message
+ * from the same sender would claim straight over that gap, for good. So
+ * while a room is held, setWatermark keeps the advance here, and it is
+ * written when a push into the room completes (sync-inbound.ts decides).
+ * If the session ends first it is simply lost: the next digest asks for
+ * those rows again, and they come back as duplicates a completed push
+ * claims.
+ */
+const _watermarkHolds = new Map<string, Map<string, number>>();
+/** Senders kept per held room; past it an advance is dropped, never grown. */
+const MAX_HELD_SENDERS = 4096;
+// A push belongs to the session that received it.
+onIdentityLock(() => _watermarkHolds.clear());
+
+export function holdWatermarks(roomCode: string): void {
+  if (!_watermarkHolds.has(roomCode)) _watermarkHolds.set(roomCode, new Map());
+}
+
+export function watermarksHeld(roomCode: string): boolean {
+  return _watermarkHolds.has(roomCode);
+}
+
+/** Stop holding the room and write what waited. */
+export async function releaseWatermarks(
+  roomCode: string,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const waiting = _watermarkHolds.get(roomCode);
+  if (!waiting) return;
+  _watermarkHolds.delete(roomCode);
+  for (const [senderId, maxLamport] of waiting) {
+    await commitWatermark(roomCode, senderId, maxLamport, guard);
+  }
+}
+
+/** Advance a watermark - or, while a push into the room is open, wait. */
 export async function setWatermark(
+  roomCode: string,
+  senderId: string,
+  maxLamport: number,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const waiting = _watermarkHolds.get(roomCode);
+  if (!waiting) return commitWatermark(roomCode, senderId, maxLamport, guard);
+  guard();
+  if (!Number.isSafeInteger(maxLamport) || maxLamport < 0) return;
+  const at = waiting.get(senderId);
+  if (at === undefined && waiting.size >= MAX_HELD_SENDERS) return;
+  if (at === undefined || at < maxLamport) waiting.set(senderId, maxLamport);
+}
+
+/**
+ * Write a watermark now, holds or not. For a claim already known to skip
+ * nothing: a completed push's rows, or what waited on one.
+ */
+export async function commitWatermark(
   roomCode: string,
   senderId: string,
   maxLamport: number,
@@ -2999,6 +3061,7 @@ export async function wipeLocalDatabase(): Promise<void> {
   }
   invalidatePeerProfilesCache();
   _readableWatermarks.clear();
+  _watermarkHolds.clear();
   await deleteDB(dbName());
   await (await import("./transport/file/ciphertext-store")).wipeCiphertext();
 }
@@ -3011,6 +3074,7 @@ export function closeDatabase(): void {
     db.close();
     db = null;
   }
+  _watermarkHolds.clear();
 }
 
 // ── at-rest migration ────────────────────────────────────────────────────────

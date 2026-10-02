@@ -353,6 +353,14 @@ export interface WireSyncBatch {
    * older senders, which is why quiet is the default.
    */
   live?: boolean;
+  /**
+   * Where this batch sits in a paced push (sync-push.ts). "head": the newest
+   * page, sent first so the receiver's screen fills at once. "asc": the rest,
+   * oldest first, so whatever prefix arrives leaves no gap below it and can
+   * be claimed as it lands. Absent from older senders and from live batches;
+   * such a push is claimed only once it completes (sync-inbound.ts).
+   */
+  order?: "head" | "asc";
 }
 
 export interface WireSyncComplete {

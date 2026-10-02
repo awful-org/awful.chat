@@ -339,7 +339,9 @@ interface WireRoomName     { type: MessageType.RoomName;     name: string }
 
 // sync - wire only
 interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
-interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number }
+interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number;
+                             live?: boolean            // one send's direct copy, not history repair
+                             order?: "head" | "asc" }  // place in a paced push; absent from older senders
 interface WireSyncComplete { type: MessageType.SyncComplete }
 
 type AnyWireMessage =
@@ -368,9 +370,19 @@ on connect (both peers):
 
 on receive SyncDigest:
   → compare their watermarks against mine
-  → push everything they're missing as SyncBatch[] + SyncComplete,
-    NEWEST FIRST: the receiver keeps one page on screen (the newest) and
-    parks the rest in storage, so batch 0 is the page they will render
+  → push everything they're missing as SyncBatch[] + SyncComplete
+    (sync-push.ts), one push at a time per peer and room:
+    - order "head": the newest page first (the 50 rows a page shows, plus
+      any plugin updates between them), so the page they render arrives
+      first; a push that fits on one page has no head
+    - order "asc": everything older, OLDEST first, so whatever part of the
+      push arrives leaves no gap below it
+    - each frame goes out once the room channel accepted the one before
+      (it refuses past 32 frames / 4 MB in flight); 4 back to back, then
+      one per 100ms, which an older receiver verifying each batch before
+      reading the next frame keeps up with
+    - a refused frame is retried (250ms, 1s), then the push stops; the
+      SyncComplete goes out only once every batch was accepted
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
@@ -379,11 +391,28 @@ on receive SyncBatch:
     id from another room or sender is refused. Only the rest are verified;
     a signature that already verified this session is not checked again
   → bulkPut to IDB (idempotent - put by id)
-  → update watermarks (max semantics)
-  → live batch (one send's direct copy): merge into the view now. In a
-    protected room the sender gives this copy only to roster members its
-    broadcast did not reach - the broadcast already went down the same
-    verified channel to everyone else
+  → claim watermarks (max semantics, never regress) - but a watermark says
+    "I hold everything this sender wrote up to here", and nobody offers what
+    is below it again, so a push only claims what cannot skip a row
+    (sync-inbound.ts). A push's batches are handled one at a time, in order:
+    - "asc" batches claim as each is stored, while every earlier batch of the
+      push was stored too (a missing or refused batch stops the claims)
+    - "head" batches, and an older build's unmarked batches, claim only once
+      the push completes: SyncComplete after every batch it announced
+    - rows already held count: their stored lamport, not the copy's
+    - while a push into the room is open, or one stopped short and none has
+      completed since, or for 15s after we sent a digest, every other
+      advance there (live messages, our own sends) waits in memory and is
+      written when that ends
+    - an older build whose push stops short (it lost batches past the
+      channel's window, newest first) would re-send the same newest rows on
+      every digest: what it delivered is advertised to that peer alone, for
+      the session; every other peer is still asked for everything
+  → live batch (one send's direct copy): claims row by row, like any live
+    message - waiting while the room is held as above - and merges into the
+    view now. In a protected room the sender gives this copy only to roster
+    members its broadcast did not reach - the broadcast already went down
+    the same verified channel to everyone else
   → repair batch: park rows for the view (sync-view.ts), flushed ONCE per
     burst - 250ms quiet, 1s at most, or on SyncComplete. At the flush, rows
     at/above the loaded window's floor are appended; anything below it (or
@@ -394,6 +423,7 @@ on receive SyncBatch:
     after 20s without a frame
 
 on receive SyncComplete:
+  → after the push's queued batches: claim its head rows (see above)
   → flush the room's parked rows; re-sort in-memory list if out of order
   → send SyncDigest to all OTHER connected peers (gossip propagation)
     so data spreads through partial meshes without requiring direct connections

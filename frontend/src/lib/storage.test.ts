@@ -11,6 +11,10 @@ import {
   putRoom,
   getRoom,
   setWatermark,
+  commitWatermark,
+  holdWatermarks,
+  releaseWatermarks,
+  watermarksHeld,
   setDeletedFloor,
   deleteMessagesForRoom,
   getDeletedFloor,
@@ -226,6 +230,31 @@ describe("watermarks", () => {
       alice: 4,
       bob: 9,
     });
+  });
+
+  it("waits while a push holds the room, and writes what waited on release", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await setWatermark("room-a", "alice", 5);
+    await setWatermark("room-b", "bob", 3);
+    expect(await getWatermark("room-a", "alice")).toBe(0);
+    expect(await getWatermark("room-b", "bob")).toBe(3);
+    // A completed push's own claim is proved, so it does not wait.
+    await commitWatermark("room-a", "carol", 4);
+    expect(await getWatermark("room-a", "carol")).toBe(4);
+    await releaseWatermarks("room-a");
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 7, carol: 4 });
+    await setWatermark("room-a", "alice", 9);
+    expect(await getWatermark("room-a", "alice")).toBe(9);
+  });
+
+  it("forgets what waited when the room's history is deleted", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await deleteMessagesForRoom("room-a");
+    expect(watermarksHeld("room-a")).toBe(false);
+    await releaseWatermarks("room-a");
+    expect(await getWatermark("room-a", "alice")).toBe(0);
   });
 });
 
