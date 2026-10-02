@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { DmInboxReads } from "./dm-inbox-reads";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DM_STORED_REBUILD_MS, DmInboxReads } from "./dm-inbox-reads";
 import { MessageType, type Message } from "./types/message";
 
 function message(roomCode: string, lamport: number): Message {
@@ -87,5 +87,56 @@ describe("DmInboxReads", () => {
     const out = await reads.read(rooms, () => true);
     expect(out?.get("dm-0")).toEqual({ last: undefined, unread: 0 });
     expect(unreadCount).not.toHaveBeenCalled();
+  });
+});
+
+// A row stored by a path that tells the list nothing - a card from the
+// mailbox, a history push that stopped before its SyncComplete - left the
+// list stale until the next DM event. A stored row builds it again.
+describe("DmInboxReads: building the list again", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  function scheduled() {
+    const rebuild = vi.fn();
+    const reads = new DmInboxReads({
+      lastMessage: async () => undefined,
+      unreadCount: async () => 0,
+      rebuild,
+    });
+    return { rebuild, reads };
+  }
+
+  it("builds it once soon after a row is stored, however many follow meanwhile", async () => {
+    const { rebuild, reads } = scheduled();
+    reads.noteStored("dm-1");
+    // A history push: a batch every 150ms, into one conversation or two.
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(150);
+      reads.noteStored(i % 2 ? "dm-1" : "dm-2");
+    }
+    expect(rebuild).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(DM_STORED_REBUILD_MS);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    // The next row starts another wait, not another build at once.
+    reads.noteStored("dm-1");
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(DM_STORED_REBUILD_MS);
+    expect(rebuild).toHaveBeenCalledTimes(2);
+  });
+
+  it("builds nothing for a row stored outside a conversation", async () => {
+    const { rebuild, reads } = scheduled();
+    reads.noteStored("rd2_room");
+    await vi.advanceTimersByTimeAsync(DM_STORED_REBUILD_MS * 2);
+    expect(rebuild).not.toHaveBeenCalled();
+  });
+
+  it("drops a build still waiting once the list is gone", async () => {
+    const { rebuild, reads } = scheduled();
+    reads.noteStored("dm-1");
+    reads.dispose();
+    await vi.advanceTimersByTimeAsync(DM_STORED_REBUILD_MS * 2);
+    expect(rebuild).not.toHaveBeenCalled();
   });
 });

@@ -7,7 +7,23 @@
 // message and unread backlog. Most of those changes touch one conversation or
 // none. So each conversation's reads are kept, and read again only when a row
 // was stored into it or its read mark moved.
+//
+// Rebuilding on DM events alone left the list stale wherever a row is stored
+// with no event after it: a file or card collected from the mailbox, a
+// history push that stopped before its SyncComplete, our own app update sent
+// from a pinned widget into a conversation that is not open. The profile
+// frames that used to rebuild the list all the time had hidden that. So a
+// stored row also builds the list again, soon after, whichever path stored
+// it.
 import type { Message } from "$lib/types/message";
+
+/**
+ * How soon a stored row builds the list again - and at most that often, so a
+ * history push, a batch every 150ms, costs one build a second rather than one
+ * per batch. A path that tells the list itself (dmVersion) is not delayed:
+ * the build this brings after it then finds nothing left to read.
+ */
+export const DM_STORED_REBUILD_MS = 1_000;
 
 export interface DmConversation {
   roomCode: string;
@@ -28,18 +44,36 @@ export class DmInboxReads {
   private kept = new Map<string, Kept>();
   /** Rows stored per conversation this session: a new one makes its reads stale. */
   private stored = new Map<string, number>();
+  private rebuildTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly deps: {
       lastMessage: (roomCode: string) => Promise<Message | undefined>;
       unreadCount: (roomCode: string, lastSeenLamport: number) => Promise<number>;
-    }
+      /** Build the list again: rows were stored (DM_STORED_REBUILD_MS). */
+      rebuild?: () => void;
+    },
+    private readonly rebuildMs = DM_STORED_REBUILD_MS
   ) {}
 
-  /** A row was stored: that conversation, if it is one, has to be read again. */
+  /**
+   * A row was stored: that conversation, if it is one, has to be read again,
+   * and the list built again soon.
+   */
   noteStored(roomCode: string): void {
     if (!roomCode.startsWith("dm-")) return;
     this.stored.set(roomCode, (this.stored.get(roomCode) ?? 0) + 1);
+    if (!this.deps.rebuild || this.rebuildTimer) return;
+    this.rebuildTimer = setTimeout(() => {
+      this.rebuildTimer = null;
+      this.deps.rebuild?.();
+    }, this.rebuildMs);
+  }
+
+  /** The list is gone: a build still waiting is dropped. */
+  dispose(): void {
+    if (this.rebuildTimer) clearTimeout(this.rebuildTimer);
+    this.rebuildTimer = null;
   }
 
   /**

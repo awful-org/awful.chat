@@ -3796,6 +3796,14 @@ export async function deliverMailboxBatch(
     senderDid,
     decoded.live === true
   );
+  // The DM list rebuilds on DM events, and the only one here - the refresh
+  // above - came before the row was stored: the list read the conversation
+  // too early and was never told again. A stale preview and unread count,
+  // and a first contact whose only message is a file or a card was not
+  // listed at all. The rooms that refresh read are still current: storing a
+  // row changes none of them.
+  guard();
+  transportState.dmVersion += 1;
 }
 
 /**
