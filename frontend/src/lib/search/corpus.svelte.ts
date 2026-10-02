@@ -17,6 +17,7 @@ import {
   putSearchIndex,
   type SearchIndexRecord,
 } from "$lib/storage";
+import { blindValue, type Blinded } from "$lib/storage-crypto";
 import {
   MessageType,
   type ChatMessageType,
@@ -59,6 +60,12 @@ interface RoomCorpus {
   base: { rows: number; newest: number } | null;
   /** Rows this tab stored since, each certainly not one of `base`'s. */
   added: Set<string>;
+  /**
+   * The room's index row key when the build began: its code blinded under
+   * the storage key the rows were read with. The index is written under
+   * that key or not at all (putSearchIndex).
+   */
+  rowKey: Blinded | null;
 }
 
 const _rooms = new Map<string, RoomCorpus>();
@@ -121,6 +128,7 @@ function corpusFor(roomCode: string): RoomCorpus {
       savedAt: 0,
       base: null,
       added: new Set(),
+      rowKey: null,
     };
     _rooms.set(roomCode, c);
   }
@@ -277,6 +285,7 @@ async function saveIndex(roomCode: string, c: RoomCorpus): Promise<void> {
   c.savedAt = Date.now();
   try {
     await putSearchIndex(record, {
+      rowKey: c.rowKey ?? undefined,
       // Rows deleted while the index is sealed: the write counts them again,
       // in one transaction with it.
       minRows: counts.rows,
@@ -358,12 +367,13 @@ export async function ensureRoomCorpus(roomCode: string): Promise<void> {
   if (c.done || c.sweeping) return;
   c.sweeping = true;
   try {
-    // What storage holds before anything is read, for the index writes to
-    // check against (saveIndex). A row stored before this count is in it,
-    // and the build below takes it in; one this tab stores after it, the
-    // hook counts.
+    // What storage holds before anything is read, and under which key, for
+    // the index writes to check against (saveIndex). A row stored before
+    // this count is in it, and the build below takes it in; one this tab
+    // stores after it, the hook counts.
     c.base = null;
     c.added.clear();
+    c.rowKey = await blindValue(roomCode);
     const { rows, newest } = await countRoomRows(roomCode);
     c.base = { rows, newest };
 

@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as storageCrypto from "./storage-crypto";
-import { initStorageCrypto } from "./storage-crypto";
+import {
+  beginPlaintextImport,
+  blindValue,
+  clearStorageCrypto,
+  initStorageCrypto,
+} from "./storage-crypto";
 import {
   bulkPutMessages,
   deleteMessagesForRoom,
+  getDB,
   getSearchIndex,
   putSearchIndex,
   wipeLocalDatabase,
@@ -14,11 +20,13 @@ import { MessageType, type Message } from "./types/message";
 /**
  * A room's sealed search index is the text of every searchable message in
  * it. It is written only while the room has its rows, counted in the
- * transaction that writes it; a room's deletion takes it along in the
- * transaction that takes the rows.
+ * transaction that writes it, and only sealed under the key its entries
+ * were read with; a room's deletion takes it along in the transaction that
+ * takes the rows.
  */
 
 const KEY = new Uint8Array(32).fill(7);
+const RESTORED_KEY = new Uint8Array(32).fill(9);
 
 function msg(i: number): Message {
   return {
@@ -65,6 +73,34 @@ it("writes no index for a room that lost rows since they were counted", async ()
   await bulkPutMessages(rows);
   expect(await putSearchIndex(record(), { minRows: 4 })).toBe(false);
   expect(await getSearchIndex("room-a")).toBeUndefined();
+});
+
+// A restore that takes the device over arms the backup's identity with no
+// lock event, wipes the database and imports that account's rows, while
+// the session it replaces still holds its search corpus.
+it("seals no index under a key other than the one its entries were read with", async () => {
+  const readWith = await blindValue("room-a");
+  await initStorageCrypto(RESTORED_KEY);
+  await wipeLocalDatabase();
+  await bulkPutMessages(rows);
+
+  expect(await putSearchIndex(record(), { rowKey: readWith })).toBe(false);
+  expect(await getSearchIndex("room-a")).toBeUndefined();
+  expect(await putSearchIndex(record(), { rowKey: await blindValue("room-a") })).toBe(true);
+});
+
+// An import onto a device with no key armed passes rows through unsealed
+// (beginPlaintextImport) until the first unlock seals them.
+it("never writes an index unsealed, not even in an import's plaintext window", async () => {
+  clearStorageCrypto();
+  const endImport = beginPlaintextImport();
+  try {
+    await bulkPutMessages(rows);
+    expect(await putSearchIndex(record())).toBe(false);
+  } finally {
+    endImport();
+  }
+  expect(await (await getDB()).getAll("searchIndex")).toEqual([]);
 });
 
 it("takes along an index another tab writes while the room is being deleted", async () => {

@@ -1230,7 +1230,8 @@ export async function getSearchIndex(
 }
 
 /**
- * Write a room's sealed search index, unless the room is gone. Returns
+ * Write a room's sealed search index, unless the room is gone or the row
+ * would not be sealed under the key its entries were read with. Returns
  * whether it was written.
  *
  * An index row exists only while its room has rows. The rows are counted
@@ -1244,6 +1245,14 @@ export async function getSearchIndex(
 export async function putSearchIndex(
   record: SearchIndexRecord,
   options: {
+    /**
+     * The row's key as the entries were read: the room code blinded under
+     * the storage key of the time (corpus.svelte.ts). A row that seals to
+     * another key is not written: the storage key changed since, which a
+     * restore does without a lock event, and this session's message text
+     * would be sealed into the database that replaces it.
+     */
+    rowKey?: Blinded;
     /** The room's rows when the entries were checked against them. Fewer
      *  by the time of the write means rows were deleted meanwhile. */
     minRows?: number;
@@ -1252,9 +1261,13 @@ export async function putSearchIndex(
     stillWanted?: () => boolean;
   } = {}
 ): Promise<boolean> {
-  const { minRows = 1, stillWanted } = options;
+  const { rowKey, minRows = 1, stillWanted } = options;
   const database = await getDB();
   const sealed = await _seal("searchIndex", record);
+  // The index is message text: never on disk unsealed, which an import's
+  // plaintext window (no key armed) would otherwise allow.
+  if (!isSealed(sealed)) return false;
+  if (rowKey !== undefined && sealed.roomCode !== rowKey) return false;
   const ranges = await _roomLamportRanges(record.roomCode, 0, Number.MAX_SAFE_INTEGER, false);
   if (stillWanted && !stillWanted()) return false;
   const tx = database.transaction(["messages", "searchIndex"], "readwrite");
