@@ -11,8 +11,53 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+const (
+	// 2h, not the original 12h: this credential is carried in a plaintext
+	// turn: URL (no TLS TURN is offered - see defaultTurnURLs), so a shorter
+	// TTL bounds how long a credential that leaked off the wire stays usable.
+	// Still comfortably longer than any call or transfer. The response
+	// carries the time left, and the client reads it and re-arms its own
+	// refresh at half of it (frontend/src/lib/transport/ice-server-list.ts,
+	// refreshTurnCredentials), so a tab open for days never runs on a
+	// credential whose embedded expiry timestamp has already passed.
+	turnCredTTL = 2 * time.Hour
+	// Live credentials one client may hold: an IPv4 address or an IPv6 /64,
+	// and ipv6AggregateFactor times that for its /48. coturn caps each
+	// credential at --user-quota allocations and the whole server at
+	// --total-quota, but a credential was free, so one address minted
+	// twenty-five of them in a minute and held all 300 allocations of the
+	// default pool - relayed calls and transfers failed for everybody who
+	// needs TURN, on every server sharing TURN_SECRET, for as long as it
+	// kept re-minting. Past this count the client is handed the newest of
+	// the ones it holds again. A browser holds two at a time (its current
+	// credential and the previous one, still valid for its last hour), so
+	// six is three browsers behind one address before any of them share.
+	turnMaxLivePerClient = 6
+	// A credential handed out again still has at least this long to run;
+	// when the newest has less, a fresh one is minted, so a client holds at
+	// most one more than turnMaxLivePerClient.
+	turnReissueMinLife = 30 * time.Minute
+)
+
+// turnLive is what each client bucket holds: the credentials minted for it
+// that have not expired, oldest first. One credential sits in its client's
+// own bucket and, for IPv6, in its /48's as well. Bounded by the buckets
+// that asked within the last turnCredTTL, at most turnMaxLivePerClient+1
+// credentials each.
+var (
+	turnMu        sync.Mutex
+	turnLive      = map[string][]*turnCredential{}
+	turnLastSwept time.Time
+)
+
+type turnCredential struct {
+	username string
+	expiry   int64 // unix seconds, as in the username
+}
 
 // defaultTurnURLs is what clients get when TURN_URLS is unset: this
 // instance's own coturn, derived from DOMAIN.
@@ -92,35 +137,6 @@ func handleTurnCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2h, not the original 12h: this credential is carried in a plaintext
-	// turn: URL (no TLS TURN is offered - see defaultTurnURLs), so a shorter
-	// TTL bounds how long a credential that leaked off the wire stays usable.
-	// Still comfortably longer than any call or transfer. The response below
-	// carries this ttl, and the client reads it and re-arms its own refresh
-	// at half of it (frontend/src/lib/transport/ice-server-list.ts,
-	// refreshTurnCredentials), so a tab open for days never runs on a
-	// credential whose embedded expiry timestamp has already passed.
-	const ttl = 2 * 60 * 60 // 2h
-	expiry := time.Now().Unix() + ttl
-	// coturn's REST form is "<expiry>[:<id>]". The id half matters: coturn
-	// keys --user-quota on the whole username, so minting a bare timestamp put
-	// every client that asked in the same wall-clock second into ONE
-	// 12-allocation bucket. A voice call is a mesh (one peer connection per
-	// peer, two allocations each) and file transfer uses the same ICE list, so
-	// a handful of simultaneous joiners exhausted a shared quota and relay
-	// candidates simply stopped appearing. It also makes an abusive session
-	// distinguishable in coturn's logs.
-	idBytes := make([]byte, 8)
-	if _, err := rand.Read(idBytes); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	username := strconv.FormatInt(expiry, 10) + ":" + hex.EncodeToString(idBytes)
-
-	mac := hmac.New(sha1.New, []byte(secret))
-	mac.Write([]byte(username))
-	credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-
 	urls := defaultTurnURLs()
 	if env := strings.TrimSpace(os.Getenv("TURN_URLS")); env != "" {
 		var custom []string
@@ -144,14 +160,112 @@ func handleTurnCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now()
+	cred, err := turnCredentialFor(r, now)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	mac := hmac.New(sha1.New, []byte(secret))
+	mac.Write([]byte(cred.username))
+	credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
 	resp := map[string]any{
-		"username":   username,
+		"username":   cred.username,
 		"credential": credential,
-		"ttl":        ttl,
-		"urls":       urls,
+		// Seconds this credential has left, which is the full TTL for a
+		// fresh one and less for one handed out again.
+		"ttl":  cred.expiry - now.Unix(),
+		"urls": urls,
 	}
 	withCors(w, r, func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	})
+}
+
+// turnCredentialFor picks the credential for r's client: a fresh one, or -
+// once the client already holds turnMaxLivePerClient - the newest it holds,
+// again. A proxy-class address is everybody behind it (exemptFromShares), so
+// it is no one client and gets a fresh credential every time, as every
+// client did before.
+func turnCredentialFor(r *http.Request, now time.Time) (*turnCredential, error) {
+	addr := clientAddr(r)
+	if exemptFromShares(addr) {
+		return mintTurnCredential(now)
+	}
+	own, agg := clientBuckets(addr)
+	keys, limits := []string{own}, []int{turnMaxLivePerClient}
+	if agg != "" {
+		keys = append(keys, agg)
+		limits = append(limits, turnMaxLivePerClient*ipv6AggregateFactor)
+	}
+
+	turnMu.Lock()
+	defer turnMu.Unlock()
+	// Same opportunistic sweep as rateAllow: without it a bucket that never
+	// asks again keeps its expired credentials for the life of the process.
+	if now.Sub(turnLastSwept) > time.Minute {
+		turnLastSwept = now
+		for k := range turnLive {
+			turnLiveLocked(k, now)
+		}
+	}
+	for i, k := range keys {
+		live := turnLiveLocked(k, now)
+		if len(live) < limits[i] {
+			continue
+		}
+		if newest := live[len(live)-1]; newest.expiry-now.Unix() >= int64(turnReissueMinLife/time.Second) {
+			return newest, nil
+		}
+	}
+	c, err := mintTurnCredential(now)
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range keys {
+		turnLive[k] = append(turnLive[k], c)
+	}
+	return c, nil
+}
+
+// turnLiveLocked drops a bucket's expired credentials and returns the rest,
+// oldest first. They were minted in order with one TTL, so the expired ones
+// are always a prefix. Caller holds turnMu.
+func turnLiveLocked(key string, now time.Time) []*turnCredential {
+	live := turnLive[key]
+	i := 0
+	for i < len(live) && live[i].expiry <= now.Unix() {
+		i++
+	}
+	if i == len(live) {
+		delete(turnLive, key)
+		return nil
+	}
+	if i > 0 {
+		live = append([]*turnCredential(nil), live[i:]...)
+		turnLive[key] = live
+	}
+	return live
+}
+
+func mintTurnCredential(now time.Time) (*turnCredential, error) {
+	// coturn's REST form is "<expiry>[:<id>]". The id half matters: coturn
+	// keys --user-quota on the whole username, so minting a bare timestamp put
+	// every client that asked in the same wall-clock second into ONE
+	// 12-allocation bucket. A voice call is a mesh (one peer connection per
+	// peer, two allocations each) and file transfer uses the same ICE list, so
+	// a handful of simultaneous joiners exhausted a shared quota and relay
+	// candidates simply stopped appearing. It also makes an abusive session
+	// distinguishable in coturn's logs.
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return nil, err
+	}
+	expiry := now.Add(turnCredTTL).Unix()
+	return &turnCredential{
+		username: strconv.FormatInt(expiry, 10) + ":" + hex.EncodeToString(idBytes),
+		expiry:   expiry,
+	}, nil
 }

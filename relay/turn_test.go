@@ -1,13 +1,13 @@
 package main
 
 import (
-	"reflect"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -187,6 +187,7 @@ type turnResponse struct {
 func turnBody(t *testing.T) turnResponse {
 	t.Helper()
 	resetRateLimiter(t)
+	resetTurnCredentials(t)
 	req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
 	rec := httptest.NewRecorder()
 	handleTurnCredentials(rec, req)

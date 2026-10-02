@@ -282,7 +282,16 @@ services:
   # pool size gone and the dead urls removed that is ~2 per connection, and 51
   # is comfortable for the current handful of users. Bumped to 100 for
   # headroom anyway - with network_mode: host nothing is published per port,
-  # so the range size costs nothing at deploy time.
+  # so the range size costs nothing at deploy time. It is 1000 now
+  # (TURN_MIN_PORT/TURN_MAX_PORT).
+  #
+  # --user-quota caps the allocations of one credential and --total-quota is
+  # the pool for everybody. A credential costs nothing to ask for, so the
+  # relay hands one address at most seven live ones (25 per IPv6 /48; see
+  # turnMaxLivePerClient in relay/turn.go): with these defaults one address
+  # holds at most 84 of 900 allocations, and filling the pool takes about
+  # eleven. Keep the pool inside the relay port range, one port per
+  # allocation, and keep it ten times what one address can hold.
   #
   # Loopback and link-local are denied because host networking puts coturn on
   # the host's stack: without them a relay peer reaches services bound to
@@ -357,7 +366,7 @@ services:
       --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       --min-port=${TURN_MIN_PORT:-49152}
       --max-port=${TURN_MAX_PORT:-50151}
-      --total-quota=${TURN_TOTAL_QUOTA:-300}
+      --total-quota=${TURN_TOTAL_QUOTA:-900}
       --user-quota=${TURN_USER_QUOTA:-12}
       ${TURN_TLS_ARGS:-}
     network_mode: host
