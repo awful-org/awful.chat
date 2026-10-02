@@ -97,11 +97,16 @@ const SPAN_RE = new RegExp(
  *    variation selectors, tag characters, combining marks, and the spaces
  *    narrower than a word space ("paypal .com" with a thin one).
  *  - Compatibility forms fold ("ｐａｙｐａｌ．ｃｏｍ"), and what draws as a dot
- *    reads as one ("paypal․com", "paypalꓸcom").
+ *    reads as one ("paypal․com", "paypalꓸcom"). Not the middle dot, drawn
+ *    raised, which passes for a full stop only at a glance: French and
+ *    Catalan write it between letters ("étudiant·es", "col·lecció").
  *  - Anything else outside ASCII, a letter, a digit or a symbol, reads as
  *    a character that could pass for an ASCII one, so "paypal.cοm" and
  *    "paypa∣.com" are addresses. Not Chinese or Japanese, whose sentences
- *    run on after a full stop with no space between.
+ *    run on after a full stop with no space between, nor the letters of
+ *    scripts that write one inside a word ("จ.เชียงใหม่", "மு.கருணாநிதி"):
+ *    Unicode's confusables list has none of those letters passing for an
+ *    ASCII one, only their digits, which still count.
  * Text that can lay itself out in another order than it is spelled is
  * never masked: an override draws "t.co" from text that spells "oc.t", and
  * between two right-to-left marks "w.3org" draws as "w3.org".
@@ -127,10 +132,13 @@ const DOT_LIKE_RE =
 const MARK_RE = /\p{M}/gu;
 /**
  * By script extension, so the marks Japanese shares between its scripts
- * (the long vowel mark, the middle dot) count as Japanese too.
+ * (the long vowel mark, the middle dot) count as Japanese too. The other
+ * scripts by script alone, and their letters only: their digits, and a
+ * Devanagari danda (which passes for an l, and which Bengali and others
+ * share), still read as look-alikes.
  */
 const LOOKALIKE_RE =
-  /[^\p{ASCII}\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/gu;
+  /(?!(?=\p{L})[\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Devanagari}\p{Script=Bengali}\p{Script=Gurmukhi}\p{Script=Gujarati}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Sinhala}])[^\p{ASCII}\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/gu;
 /** Bidi overrides, embeddings and isolates. */
 const REORDERS_RE = /[\u202A-\u202E\u2066-\u2069]/;
 const REORDERS_ALL_RE = new RegExp(REORDERS_RE.source, "g");

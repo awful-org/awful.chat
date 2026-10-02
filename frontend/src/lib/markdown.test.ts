@@ -149,9 +149,15 @@ describe("inline markdown", () => {
       "paypal.\u0441om",
       "paypal.\u0441\u043e",
       "paypal.c\u3147m",
+      "paypal.c\u0d20m",
+      // A digit, in a script whose letters pass for none.
+      "paypal.c\u0e50m",
+      "paypal.c\u0ed0m",
+      "paypal.c\u17e0m",
       // A symbol that draws as a letter, beside the dot or in the last part.
       "paypa\u2223.com",
       "paypa\u05c0.com",
+      "paypa\u0964.com",
       "googl\u212e.com",
       "paypal.\u2229et",
       // A dot that is not one, and letters in another form.
@@ -266,6 +272,14 @@ describe("inline markdown", () => {
       // Meetei Mayek's heavy tone mark, on a Meetei syllable.
       "\uabc3\uabe4\uabc7\uabe9\uabec\uabc2\uabe3\uabdf",
       "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 photos",
+      // A full stop inside a word, in scripts whose letters pass for no ASCII one.
+      "\u0e08.\u0e40\u0e0a\u0e35\u0e22\u0e07\u0e43\u0e2b\u0e21\u0e48",
+      "\u0e1e.\u0e28.\u0e52\u0e55\u0e56\u0e57",
+      "\u0eaa.\u0e9b.\u0e9b.\u0ea5\u0eb2\u0ea7",
+      "\u1796.\u179f.\u17e2\u17e5\u17e6\u17e7",
+      "\u0bae\u0bc1.\u0b95\u0bb0\u0bc1\u0ba3\u0bbe\u0ba8\u0bbf\u0ba4\u0bbf",
+      "\u0921\u0949.\u0930\u093e\u092e",
+      "\u09a1\u09be.\u09b0\u09b9\u09ae\u09be\u09a8",
       "e.g. this one",
       "v1.2 notes",
     ];
