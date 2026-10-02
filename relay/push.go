@@ -18,10 +18,12 @@ package main
 // /push/unsubscribe deletes it.
 //
 // WHAT THE RELAY SENDS. The whole message is {"t":"mail"} - "check your
-// box". No sender, no room, no count, no content, and at most one per box
-// per minute, so the wake-up stream is not a finer traffic-analysis channel
-// than the deposit stream a push service would already see. Everything real
-// stays sealed in the mailbox blob the device collects once it is awake.
+// box". No sender, no room, no count, no content, at most one per box per
+// minute, and to one device only once until that device has collected its
+// box (pushRearmAfter), so the wake-up stream is not a finer traffic-analysis
+// channel than the deposit stream a push service would already see.
+// Everything real stays sealed in the mailbox blob the device collects once
+// it is awake.
 
 import (
 	"container/list"
@@ -61,6 +63,17 @@ const (
 	// wakes, so a second push would cost battery and tell the push vendor
 	// more about this box's traffic than it needs to know.
 	pushCoalesceWindow = time.Minute
+	// After a wake-up reaches a device, that device is not woken again until
+	// it has collected its box - or subscribed again, which every unlock
+	// does - or this long has passed. A deposit is anonymous and names no
+	// sender, and the service worker shows every push as "New message", so
+	// with the minute above as the only limit anyone who knew a did could
+	// make a closed phone ring every minute, junk and message requests
+	// alike, and blocking somebody did nothing. One push already says
+	// everything waiting: until the device has looked, a second one says
+	// nothing new. What remains is one ring per hour that the app stays
+	// closed; real mail still wakes it at once after every collect.
+	pushRearmAfter = time.Hour
 	// pushWorkers drain this. A burst that outruns delivery drops wake-ups
 	// rather than growing without bound - the mailbox still holds the
 	// message, and the next deposit or foreground collect finds it.
@@ -187,6 +200,14 @@ var (
 	pushSentMu   sync.Mutex
 	pushLastSent = map[string]time.Time{}
 	pushLastSwep time.Time
+
+	// pushTold is when each device of a box was last woken, for
+	// pushRearmAfter. An entry goes when that device collects or subscribes,
+	// or once it is older than pushRearmAfter, so the map only ever holds
+	// devices woken within the last hour or so.
+	pushToldMu    sync.Mutex
+	pushTold      = map[string]map[string]time.Time{}
+	pushToldSwept time.Time
 )
 
 var pushQueue = make(chan string, pushQueueDepth)
@@ -666,6 +687,61 @@ func pushNotifyBox(box string) {
 	}
 }
 
+// pushWaiting reports whether a wake-up reached device within pushRearmAfter
+// and the device has not collected its box since.
+func pushWaiting(box, device string, now time.Time) bool {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	told, ok := pushTold[box][device]
+	return ok && now.Sub(told) < pushRearmAfter
+}
+
+// pushMarkTold records that a wake-up reached device.
+func pushMarkTold(box, device string, now time.Time) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	// The same opportunistic sweep as pushNotifyBox's: an entry past
+	// pushRearmAfter holds nothing back any more.
+	if now.Sub(pushToldSwept) > pushRearmAfter {
+		pushToldSwept = now
+		for b, devices := range pushTold {
+			for d, told := range devices {
+				if now.Sub(told) >= pushRearmAfter {
+					delete(devices, d)
+				}
+			}
+			if len(devices) == 0 {
+				delete(pushTold, b)
+			}
+		}
+	}
+	devices := pushTold[box]
+	if devices == nil {
+		devices = map[string]time.Time{}
+		pushTold[box] = devices
+	}
+	devices[device] = now
+}
+
+// pushCollected re-arms wake-ups for a device that has just looked at its
+// box: collected it, or subscribed again on unlock. An empty device - a
+// client that does not name itself - re-arms every device of the box, which
+// errs towards waking one once too often rather than never.
+func pushCollected(box, device string) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	if device == "" {
+		delete(pushTold, box)
+		return
+	}
+	if devices := pushTold[box]; devices != nil {
+		delete(devices, device)
+		if len(devices) == 0 {
+			delete(pushTold, box)
+		}
+	}
+}
+
 // pushDeliver sends the wake-up to every device subscribed to one box. Worker
 // goroutine only - never a deposit's request path.
 func pushDeliver(box string) {
@@ -699,9 +775,14 @@ func pushDeliver(box string) {
 	if pushBoxSuspended(box, now) {
 		return
 	}
-	sent, expired, failed, skipped := 0, 0, 0, 0
+	sent, expired, failed, skipped, waiting := 0, 0, 0, 0, 0
 	var dead []string
 	for device, s := range subs {
+		if pushWaiting(box, device, now) {
+			// Already told, and has not looked yet: see pushRearmAfter.
+			waiting++
+			continue
+		}
 		key := pushEndpointKey(s.Endpoint)
 		if key == "" {
 			// Stored before the allowlist, or an operator has narrowed it
@@ -744,6 +825,7 @@ func pushDeliver(box string) {
 			dead = append(dead, device)
 		case status >= 200 && status < 300:
 			sent++
+			pushMarkTold(box, device, time.Now())
 		default:
 			failed++
 		}
@@ -754,9 +836,14 @@ func pushDeliver(box string) {
 	if sent+failed > 0 {
 		pushBoxResult(box, sent > 0, time.Now())
 	}
+	if sent+expired+failed+skipped == 0 {
+		// Every device was already told. Saying so for each deposit would be
+		// a line a minute per box somebody keeps depositing into.
+		return
+	}
 	// Counts only. An endpoint is a per-device identifier at a vendor and
 	// must never reach a log line.
-	log.Printf("[push] wake-up: %d sent, %d expired, %d failed, %d skipped", sent, expired, failed, skipped)
+	log.Printf("[push] wake-up: %d sent, %d expired, %d failed, %d skipped, %d already told", sent, expired, failed, skipped, waiting)
 }
 
 // pushEndpointKey is the push service an endpoint belongs to, or empty when
@@ -934,6 +1021,9 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
+	// A device subscribes on every unlock, so it is awake and about to
+	// collect: its next wake-up can go out.
+	pushCollected(box, req.Device)
 	w.WriteHeader(http.StatusNoContent)
 }
 

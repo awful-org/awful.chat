@@ -904,6 +904,9 @@ func handleMailboxCollect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// This device has looked at its box, so the next deposit may wake it
+	// again (pushRearmAfter).
+	pushCollected(box, req.Device)
 	// Under mailboxMu only for the small index read, not for the blob reads
 	// below: collect deliberately does no I/O under the lock that a deposit
 	// would then queue behind.

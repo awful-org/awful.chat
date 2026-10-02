@@ -39,6 +39,10 @@ func pushTestSetup(t *testing.T) {
 	pushLastSent = map[string]time.Time{}
 	pushLastSwep = time.Time{}
 	pushSentMu.Unlock()
+	pushToldMu.Lock()
+	pushTold = map[string]map[string]time.Time{}
+	pushToldSwept = time.Time{}
+	pushToldMu.Unlock()
 	t.Cleanup(func() {
 		pushDir, pushVapidPath, pushSend, pushEnabled = savedDir, savedVapid, savedSend, savedEnabled
 		drainPushQueue()
@@ -377,5 +381,89 @@ func TestPushSubjectAlwaysHasAScheme(t *testing.T) {
 	t.Setenv("PUSH_CONTACT", "")
 	if got := pushSubject(); got != "mailto:admin@example.invalid" && got != "mailto:admin@"+domain {
 		t.Fatalf("pushSubject() = %q with no contact set", got)
+	}
+}
+
+// A deposit is anonymous, so anyone who knows a did could make a closed
+// phone ring "New message" every minute, junk or not. A device is now woken
+// once, and not again until it has looked at its box or an hour has passed;
+// one device collecting does not re-arm another.
+func TestPushWakesADeviceOnceUntilItCollects(t *testing.T) {
+	pushTestSetup(t)
+	resetPushDelivery(t)
+	mailboxDir = t.TempDir()
+	fake := &fakePushService{status: 201}
+	fake.install()
+
+	did, priv := testDid(t)
+	box := mailboxIDForDid(did)
+	phone, desktop := deviceID(70), deviceID(71)
+	endpoint := map[string]string{
+		phone:   "https://fcm.googleapis.com/fcm/send/phone",
+		desktop: "https://updates.push.services.mozilla.com/wpush/v2/desktop",
+	}
+	for _, d := range []string{phone, desktop} {
+		if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, d, endpoint[d]), handlePushSubscribe); w.Code != 204 {
+			t.Fatalf("subscribe: got %d %s", w.Code, w.Body.String())
+		}
+	}
+
+	m := &mailboxClient{t: t, did: did, priv: priv}
+	// One anonymous deposit a minute, the most the per-box window allows,
+	// each delivered as a worker would.
+	deposit := func() []string {
+		t.Helper()
+		pushSentMu.Lock()
+		delete(pushLastSent, box)
+		pushSentMu.Unlock()
+		before := fake.calls()
+		m.deposit(box, []byte{0})
+		drainPushQueue()
+		pushDeliver(box)
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		var woke []string
+		for _, s := range fake.subs[before:] {
+			woke = append(woke, s.Endpoint)
+		}
+		return woke
+	}
+
+	if woke := deposit(); len(woke) != 2 {
+		t.Fatalf("the first deposit woke %d devices, want both", len(woke))
+	}
+	for i := 0; i < 5; i++ {
+		if woke := deposit(); len(woke) != 0 {
+			t.Fatalf("deposit %d rang %v again before either device looked", i+2, woke)
+		}
+	}
+
+	// The desktop collects. Its next deposit wakes it; the phone, still in a
+	// pocket, stays told.
+	m.collect(desktop)
+	if woke := deposit(); len(woke) != 1 || woke[0] != endpoint[desktop] {
+		t.Fatalf("after the desktop collected, a deposit woke %v, want the desktop alone", woke)
+	}
+
+	// An hour on, the phone is told again even though it never looked.
+	pushToldMu.Lock()
+	pushTold[box][phone] = time.Now().Add(-pushRearmAfter - time.Second)
+	pushToldMu.Unlock()
+	if woke := deposit(); len(woke) != 1 || woke[0] != endpoint[phone] {
+		t.Fatalf("an hour later a deposit woke %v, want the phone alone", woke)
+	}
+
+	// A collect that names no device re-arms the whole box.
+	m.collect("")
+	if woke := deposit(); len(woke) != 2 {
+		t.Fatalf("after an unnamed collect a deposit woke %d devices, want both", len(woke))
+	}
+
+	// Unlocking subscribes again, which re-arms that device too.
+	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, phone, endpoint[phone]), handlePushSubscribe); w.Code != 204 {
+		t.Fatalf("re-subscribe: got %d", w.Code)
+	}
+	if woke := deposit(); len(woke) != 1 || woke[0] != endpoint[phone] {
+		t.Fatalf("after the phone unlocked a deposit woke %v, want the phone alone", woke)
 	}
 }

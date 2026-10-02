@@ -69,8 +69,11 @@ identifier held by the vendor: while the subscription lives it links the device
 to the identity, and the vendor sees the timing of every wake-up. What the
 relay sends through it is the whole disclosure - `{"t":"mail"}`, meaning "check
 your box", with no sender, no room, no count and no content, at most one per
-mailbox per minute - and everything real stays sealed in the blob the device
-collects once it is awake. Subscribing is per device and opt-in in the app,
+mailbox per minute and one per device until that device has collected (or an
+hour has passed) - and everything real stays sealed in the blob the device
+collects once it is awake. Deposits are anonymous, so the relay cannot tell a
+contact's DM from a stranger's message request or junk: any of them can still
+make a closed app ring once, but no longer every minute. Subscribing is per device and opt-in in the app,
 unsubscribing deletes the endpoint, and `PUSH_ENABLED=0` removes the surface
 entirely, at the cost of offline DMs never reaching a closed phone until the
 user opens it.

@@ -951,10 +951,13 @@ relay knows:   libp2p peerId + which roomCodes it registered (rendezvous);
                one push endpoint per device - a stable identifier issued by
                the phone's push vendor (Apple, Google, Mozilla) - and it
                sends that vendor a content-free "check your box" at most
-               once a minute per identity when mail arrives. The vendor
-               learns the timing of those wake-ups, never what they are
-               about; the relay learns how many devices an identity has
-               subscribed;
+               once a minute per identity when mail arrives, and to a
+               device once until that device collects (or an hour
+               passes). The vendor learns the timing of those wake-ups,
+               never what they are about; the relay learns how many
+               devices an identity has subscribed. A deposit names no
+               sender, so anyone who knows a DID - a message request
+               included - can still make a closed app ring once;
                where traffic is relayed, the rhythm of typing indicators:
                a small frame every few seconds to the room's peers while
                someone writes (never their content; off with "Show when
