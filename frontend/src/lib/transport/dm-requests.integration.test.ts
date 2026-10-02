@@ -115,7 +115,9 @@ import {
 } from "./transport.svelte";
 import {
   MAX_DM_REQUESTS,
+  MAX_DMS_JOINED_FOR_THEM,
   MAX_UNSOLICITED_DMS,
+  SAVED_DMS_JOINED_AT_CONNECT,
   acceptDmRequest,
   ensureDmRoomForPeer,
   isDmRequestRoom,
@@ -133,10 +135,12 @@ import {
   getRoomParticipants,
   markOwnMessagesReadUpTo,
   putMessage,
+  putPhonebookEntry,
   putRoom,
   wipeLocalDatabase,
   type DMRoom,
 } from "$lib/storage";
+import { notifyIdentityLock } from "$lib/identity/lock-events";
 import { encode, decode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
@@ -650,6 +654,86 @@ describe("an introduction alone makes no DM (S08.1)", () => {
     await settled();
     expect(s.bound.has(await code(silent))).toBe(false);
     disconnectTransport();
+  });
+
+  /** A DM stored earlier, accepted, with one message from them in it. */
+  async function savedDm(did: string, extra: Partial<DMRoom> = {}): Promise<string> {
+    const roomCode = await code(did);
+    await putRoom({ roomCode, type: "dm", name: "", lastSeenLamport: 0, createdAt: 1, participants: [did],
+      participantLastSeen: {}, participantDid: did, request: false, ...extra } as DMRoom);
+    await putMessage({ id: newMessageId(did), roomCode, senderId: did, senderName: "", timestamp: 1, lamport: 1,
+      type: MessageType.Text, content: "earlier", attachments: [], status: "delivered" });
+    return roomCode;
+  }
+
+  it("joins at connect a contact's DM, and of the rest the ones read last, a bounded few", async () => {
+    const contact = identity().did;
+    await savedDm(contact);
+    await putPhonebookEntry({ peerId: contact, did: contact, nickname: "Carol", addedAt: 1 });
+    const others = Array.from({ length: SAVED_DMS_JOINED_AT_CONNECT + 10 }, () => identity().did);
+    // Newest stored first, unless the user read it: the oldest one, read.
+    for (const [i, did] of others.entries()) {
+      await savedDm(did, { createdAt: 100 + i, lastSeenLamport: i === 0 ? 1 : 0 });
+    }
+    s.bound.clear(); s.joined.clear();
+    await connect();
+    await vi.waitFor(() => expect(s.bound.size).toBe(SAVED_DMS_JOINED_AT_CONNECT + 1));
+    await settled();
+    expect(s.bound.size).toBe(SAVED_DMS_JOINED_AT_CONNECT + 1);
+    expect(s.bound.has(await code(contact))).toBe(true);
+    expect(s.bound.has(await code(others[0]))).toBe(true);
+    expect(s.bound.has(await code(others.at(-1)!))).toBe(true);
+    expect(s.bound.has(await code(others[1]))).toBe(false);
+    disconnectTransport();
+  });
+
+  it("joins no more for others in a session than its bound, however many saved DMs they hold", async () => {
+    const peers = Array.from({ length: MAX_DMS_JOINED_FOR_THEM + 8 }, () => identity().did);
+    for (const [i, did] of peers.entries()) {
+      await savedDm(did);
+      await introduce(`12D3-saved-${i}`, did);
+    }
+    expect(s.bound.size).toBe(MAX_DMS_JOINED_FOR_THEM);
+    // Past it a DM still takes their messages: it only is not joined.
+    const late = peers.at(-1)!;
+    await deliverMailboxDm(late, chat(late, "still here", { lamport: 2 }));
+    expect((await getLastMessage(await code(late)))?.content).toBe("still here");
+    expect(s.bound.has(await code(late))).toBe(false);
+    // Whoever the user writes to is joined whatever the others hold.
+    const friend = identity().did;
+    await ensureDmRoomForPeer(friend);
+    expect(s.bound.has(await code(friend))).toBe(true);
+    await ensureDmRoomForPeer(late);
+    expect(s.bound.has(await code(late))).toBe(true);
+  });
+
+  it("keeps a mailbox batch for a DM it could not join in the mailbox, and takes it once joined", async () => {
+    for (let i = 0; i < MAX_DMS_JOINED_FOR_THEM; i++) {
+      const did = identity().did;
+      await savedDm(did);
+      await introduce(`12D3-saved-${i}`, did);
+    }
+    const late = identity();
+    const room = await savedDm(late.did);
+    const card = signedWire(late, room, { lamport: 2 });
+    const blob = encode({ type: MessageType.SyncBatch, roomCode: room, messages: [card], batchIndex: 0, totalBatches: 1 });
+    await expect(deliverMailboxBatch(late.did, blob)).rejects.toThrow();
+    expect(await getMessage(card.id)).toBeUndefined();
+    await openDmConversation(late.did);
+    await deliverMailboxBatch(late.did, blob);
+    expect(await getMessage(card.id)).toBeDefined();
+  });
+
+  it("lets go of every conversation it joined for others when it locks", async () => {
+    const friend = identity().did;
+    await ensureDmRoomForPeer(friend);
+    const saved = identity().did;
+    await savedDm(saved);
+    await introduce("12D3-saved", saved);
+    await introduce("12D3-new", identity().did);
+    expect(s.bound.size).toBe(3);
+    notifyIdentityLock();
+    expect([...s.bound]).toEqual([await code(friend)]);
   });
 });
 

@@ -647,7 +647,9 @@ Client collect: on unlock/startup, fetch + unseal + ack, and never before
   this device's node has started: collect and ack always name the device.
   Undecryptable blobs are poison-acked (deleted) so they cannot wedge the
   box; transient failures keep the blob for the next poll, and so does a
-  stranger's DM that the full message requests cannot take yet.
+  stranger's DM that the full message requests cannot take yet, and a DM
+  batch (files, cards) for a conversation left unjoined because others
+  already hold all the joins they may (dm.svelte.ts, MAX_DMS_JOINED_FOR_THEM).
   Message-id dedup against storage stops replays.
 
 What the relay learns: THAT a DID has mail and roughly when - never

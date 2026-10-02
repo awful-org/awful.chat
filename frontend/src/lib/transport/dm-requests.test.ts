@@ -8,7 +8,7 @@ const state = vi.hoisted(() => ({
   identity: { did: null as string | null },
   records: new Map<string, any>(), contacts: [] as any[], rooms: [] as any[],
   bindings: new Map<string, string>(), roomReads: 0,
-  transport: { selfId: () => "12D3-local-device", peers: () => [],
+  transport: { selfId: () => "12D3-local-device", peers: () => [], rooms: () => [],
     isRoomPeer: () => true, joinSecureConversation: vi.fn(), joinRoom: vi.fn(),
     introduceDm: vi.fn(async () => true), sendRoom: vi.fn(async () => true), send: vi.fn(), },
 }));

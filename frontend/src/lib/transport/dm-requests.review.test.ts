@@ -117,14 +117,20 @@ vi.mock("./mailbox.svelte", () => ({
   },
 }));
 
-import { _peerIdToDid, transportState } from "./transport.svelte";
-import { ensureDmRoomForPeer } from "./dm.svelte";
-import { getMessage, getRoom, putRoom, wipeLocalDatabase } from "$lib/storage";
+import {
+  _peerIdToDid,
+  connect,
+  deliverMailboxDm,
+  disconnectTransport,
+  transportState,
+} from "./transport.svelte";
+import { MAX_UNSOLICITED_DMS, SAVED_DMS_JOINED_AT_CONNECT, ensureDmRoomForPeer } from "./dm.svelte";
+import { getDMRooms, getMessage, getRoom, putRoom, wipeLocalDatabase } from "$lib/storage";
 import { encode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
 import { roomsStore } from "$lib/rooms.svelte";
-import { hashDmRoomCode } from "./dm-codec";
+import { hashDmRoomCode, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
 
 function identity(): UnlockedSession {
@@ -143,6 +149,10 @@ function signedWire(as: UnlockedSession, room: string, extra: Partial<Message> =
   };
   const sig = ed25519.sign(new TextEncoder().encode(canonicalContentV3(msg)), as.privateKey);
   return messageToWire({ ...msg, senderDid: as.did, sig: hex(sig), sigV: 3 });
+}
+
+function chat(from: string, text = "hello", extra: Partial<DmPayload> = {}): DmPayload {
+  return { id: newMessageId(from), text, ts: Date.now(), lamport: 1, ...extra };
 }
 
 const code = (did: string) => hashDmRoomCode(s.session!.did, did);
@@ -239,4 +249,32 @@ describe("an empty DM an older build stored stays in the bounded join", () => {
     }
     expect(s.bound.size).toBeLessThanOrEqual(32);
   }, 60_000);
+});
+
+// MAX_UNSOLICITED_DMS resets with every unlock, and the DMs it admits for
+// identities a room member attested are stored as accepted DMs holding a
+// message. Every one of them was joined at each connect, so eight unlocks
+// gave a room member's minted identities the transport's 512 bindings.
+describe("what others have stored with us is not all joined at connect", () => {
+  it("a room member's minted identities pile up across unlocks, but connecting joins a bounded few", async () => {
+    const minted = Array.from({ length: 2 * MAX_UNSOLICITED_DMS }, () => identity().did);
+    // A room we share whose member list holds them - which any member of a
+    // protected room can arrange with a profile per identity.
+    await putRoom({ roomCode: "SHAREDROOM1", type: "text", name: "shared", lastSeenLamport: 0,
+      createdAt: Date.now(), participants: minted, participantLastSeen: {} });
+    for (const did of minted.slice(0, MAX_UNSOLICITED_DMS)) await deliverMailboxDm(did, chat(did));
+    // The next unlock of the same identity: a new session object.
+    s.session = { ...s.session! };
+    for (const did of minted.slice(MAX_UNSOLICITED_DMS)) await deliverMailboxDm(did, chat(did));
+    const stored = await getDMRooms();
+    expect(stored.length).toBe(2 * MAX_UNSOLICITED_DMS);
+    expect(stored.every((r) => r.request !== true)).toBe(true);
+
+    s.bound.clear(); s.joined.clear();
+    await connect();
+    await vi.waitFor(() => expect(s.bound.size).toBe(SAVED_DMS_JOINED_AT_CONNECT), { timeout: 20_000 });
+    await settled();
+    expect(s.bound.size).toBe(SAVED_DMS_JOINED_AT_CONNECT);
+    disconnectTransport();
+  }, 120_000);
 });

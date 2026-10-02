@@ -7,7 +7,7 @@ import {
   type UnlockedSession,
 } from "$lib/identity/identity";
 import { hybridPairwiseRoomSecret, type DmPqState } from "$lib/room-security/pq-dm";
-import { joinDmConversation } from "$lib/room-security/room-lifecycle";
+import { joinDmConversation, joinStoredRoom } from "$lib/room-security/room-lifecycle";
 import { refreshDmRooms } from "$lib/rooms.svelte";
 import { dropRoomCorpus } from "$lib/search/corpus.svelte";
 import {
@@ -907,7 +907,8 @@ export const MAX_DM_REQUESTS = 20;
  * DM with us until the transport's 512 conversation bindings were gone.
  * Contacts and people we reached out to are never counted. Past it, a new
  * conversation is held back like a full request: dropped live, left in the
- * mailbox for the next session.
+ * mailbox for the next session. What such DMs can keep joined is bounded
+ * apart, across sessions too: MAX_DMS_JOINED_FOR_THEM.
  */
 export const MAX_UNSOLICITED_DMS = 64;
 let _unsolicitedSpent: { session: UnlockedSession; count: number } | null = null;
@@ -924,6 +925,40 @@ let _unsolicitedSpent: { session: UnlockedSession; count: number } | null = null
  */
 const MAX_PROVISIONAL_DMS = 32;
 const _provisional = new Map<string, DmPqState | undefined>();
+
+/**
+ * Conversations joined on the other side's account rather than the user's:
+ * a saved DM restored at connect, or one joined because the other side
+ * wrote or introduced themselves - any DM but a contact's or one the user
+ * opened or wrote in this session. Each holds one of the transport's 512
+ * conversation bindings, and what others can make us hold has to leave the
+ * rest to the user. A member of a room we share can have up to
+ * MAX_UNSOLICITED_DMS new DMs from identities it mints stored with us each
+ * session, and every stored DM was joined again at each connect, so a few
+ * unlocks gave them every binding. Past the bound a conversation is still
+ * stored and carries on through the mailbox; opening it joins it. Released
+ * on lock with the rest of the session.
+ */
+export const MAX_DMS_JOINED_FOR_THEM = 128;
+/**
+ * How many saved DMs connecting joins, the ones the user read last first.
+ * The rest of the bound is left for whoever turns up during the session.
+ */
+export const SAVED_DMS_JOINED_AT_CONNECT = 64;
+let _forThem: { session: UnlockedSession; rooms: Set<string> } | null = null;
+
+/** This session's joins on the other side's account (MAX_DMS_JOINED_FOR_THEM). */
+function _joinedForThem(session: UnlockedSession): Set<string> {
+  if (_forThem?.session !== session) _forThem = { session, rooms: new Set() };
+  return _forThem.rooms;
+}
+
+/** Leave a conversation for good, whoever's account it was joined on. */
+function _forgetJoin(roomCode: string): void {
+  _transport.forgetConversation(roomCode);
+  _provisional.delete(roomCode);
+  _forThem?.rooms.delete(roomCode);
+}
 
 /**
  * Whoever this session reached out to, by peerId or DID. An introduction we
@@ -1004,8 +1039,13 @@ onIdentityLock(() => {
   _admission = null;
   _admissionChanged();
   _unsolicitedSpent = null;
-  for (const roomCode of _provisional.keys()) _transport.forgetConversation(roomCode);
+  // Their bindings too: kept across a lock, they piled up unlock after
+  // unlock in a page that was never reloaded.
+  for (const roomCode of [..._provisional.keys(), ...(_forThem?.rooms ?? [])]) {
+    _transport.forgetConversation(roomCode);
+  }
   _provisional.clear();
+  _forThem = null;
 });
 
 async function _admissionView(): Promise<AdmissionView> {
@@ -1084,6 +1124,12 @@ function _joinProvisionally(
   peerDid: string,
   pqState: DmPqState | undefined
 ): string {
+  if (_joinedForThem(session).has(roomCode)) {
+    // Already counted on their account: joined again there, under the key
+    // it has now.
+    joinDmConversation(_transport, session, roomCode, peerDid, pqState);
+    return roomCode;
+  }
   if (!_provisional.has(roomCode)) {
     for (const oldest of _provisional.keys()) {
       if (_provisional.size < MAX_PROVISIONAL_DMS) break;
@@ -1098,19 +1144,61 @@ function _joinProvisionally(
 }
 
 /**
- * The saved DMs to join at connect: the ones somebody wrote in. Joining
- * every stored DM was how the empty ones an introduction alone had made (an
- * older build stored those) took their conversation bindings back at every
- * start. One nobody wrote in has nothing to carry on: it is joined when it
- * is opened, or when the other side introduces themselves again. Contacts
- * are joined by joinPhonebookDmRooms whatever they hold, requests not at all.
+ * Join the saved DMs at connect, on the other side's account (see
+ * MAX_DMS_JOINED_FOR_THEM): the ones somebody wrote in, those the user read
+ * last first, at most SAVED_DMS_JOINED_AT_CONNECT. Joining every stored DM
+ * gave whoever could get DMs stored with us the conversation bindings, at
+ * every start: the empty ones an older build made for introductions alone,
+ * and the ones a room member's minted identities pile up session after
+ * session. One left out is joined when the user opens it, or when the other
+ * side writes or introduces themselves while there is room. Contacts are
+ * joined by joinPhonebookDmRooms whatever they hold, requests not at all.
  */
-export async function savedDmsToJoin(rooms: (Room | DMRoom)[]): Promise<DMRoom[]> {
-  const dms = rooms.filter(
-    (r): r is DMRoom => r.type === "dm" && (r as DMRoom).request !== true
+export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
+  const session = requireSession();
+  const contacts = new Set(
+    (await getPhonebookEntries()).map((e) => dmPeerDid(e.did ?? e.peerId))
   );
-  const written = await Promise.all(dms.map((r) => _holdsMessages(r.roomCode)));
-  return dms.filter((_, i) => written[i]);
+  const saved = rooms
+    .filter(
+      (r): r is DMRoom =>
+        r.type === "dm" &&
+        (r as DMRoom).request !== true &&
+        !contacts.has((r as DMRoom).participantDid)
+    )
+    .sort(
+      (a, b) =>
+        (b.lastSeenLamport ?? 0) - (a.lastSeenLamport ?? 0) ||
+        (b.createdAt ?? 0) - (a.createdAt ?? 0)
+    );
+  const written = await Promise.all(saved.map((r) => _holdsMessages(r.roomCode)));
+  if (requireSession() !== session) return;
+  const theirs = _joinedForThem(session);
+  let joined = 0;
+  for (const [i, room] of saved.entries()) {
+    if (joined >= SAVED_DMS_JOINED_AT_CONNECT) break;
+    if (!written[i]) continue;
+    const roomCode = room.roomCode;
+    // Opened by the user in the meantime: joined on their account already.
+    if (
+      _transport.rooms().includes(roomCode) &&
+      !theirs.has(roomCode) &&
+      !_provisional.has(roomCode)
+    ) {
+      continue;
+    }
+    if (!theirs.has(roomCode) && theirs.size >= MAX_DMS_JOINED_FOR_THEM) break;
+    try {
+      joinStoredRoom(_transport, roomCode, room);
+    } catch {
+      // Never include the record or secret in diagnostics.
+      console.warn("[dm] skipped a saved DM that could not be joined");
+      continue;
+    }
+    _provisional.delete(roomCode);
+    theirs.add(roomCode);
+    joined += 1;
+  }
 }
 
 /**
@@ -1122,7 +1210,7 @@ export async function dropDmIfEmpty(roomCode: string): Promise<void> {
   const guard = captureDmOwnership();
   if (await _holdsMessages(roomCode)) return;
   guard();
-  _transport.forgetConversation(roomCode);
+  _forgetJoin(roomCode);
   await deleteRoom(roomCode);
   _admissionChanged();
   await refreshDmRooms();
@@ -1145,7 +1233,7 @@ export async function pruneEmptyDmRequests(rooms: (Room | DMRoom)[]): Promise<vo
     if (now - (room.createdAt ?? 0) < REQUEST_SETTLE_MS) continue;
     if (await _holdsMessages(room.roomCode)) continue;
     guard();
-    _transport.forgetConversation(room.roomCode);
+    _forgetJoin(room.roomCode);
     await deleteRoom(room.roomCode);
     _admissionChanged();
     pruned = true;
@@ -1301,9 +1389,45 @@ export async function ensureDmRoomForPeer(
     return _joinProvisionally(session, roomCode, peerDid, pqState ?? existing.pq);
   }
   try {
-    return await _joinDm(session, guard, peerIdOrDid, peerDid, roomCode, existing, pqState, request);
+    return await _joinDm(session, guard, peerIdOrDid, peerDid, roomCode, existing, pqState, request, !!unsolicited);
   } finally {
     if (request) _requestsInFlight.delete(roomCode);
+  }
+}
+
+/**
+ * Whose account a join goes on: the user's, the other side's (within
+ * MAX_DMS_JOINED_FOR_THEM), still the introduction's that joined it
+ * (_provisional) - or nobody's, and then it is not joined at all.
+ */
+function _joinAccount(
+  session: UnlockedSession,
+  roomCode: string,
+  forThem: boolean
+): "user" | "theirs" | "introduction" | null {
+  if (!forThem) return "user";
+  if (_provisional.has(roomCode)) return "introduction";
+  const theirs = _joinedForThem(session);
+  if (theirs.has(roomCode)) return "theirs";
+  // Joined for the user already: it stays the user's.
+  if (_transport.rooms().includes(roomCode)) return "user";
+  return theirs.size < MAX_DMS_JOINED_FOR_THEM ? "theirs" : null;
+}
+
+function _noteJoin(
+  session: UnlockedSession,
+  roomCode: string,
+  account: "user" | "theirs" | "introduction"
+): void {
+  const theirs = _joinedForThem(session);
+  if (account === "user") {
+    _provisional.delete(roomCode);
+    theirs.delete(roomCode);
+  } else if (account === "theirs" || theirs.size < MAX_DMS_JOINED_FOR_THEM) {
+    // An introduction's join that a message is now stored in leaves the
+    // bound that evicts, while there is room in this one.
+    _provisional.delete(roomCode);
+    theirs.add(roomCode);
   }
 }
 
@@ -1315,35 +1439,40 @@ async function _joinDm(
   roomCode: string,
   existing: DMRoom | undefined,
   pqState: DmPqState | undefined,
-  request: boolean
+  request: boolean,
+  /** Nobody here asked for it: joined on the other side's account. */
+  forThem: boolean
 ): Promise<string | null> {
   if (requireSession() !== session) throw new Error("Identity changed");
   if (existing && pqState) {
     await setDmPqState(roomCode, pqState);
     if (requireSession() !== session) throw new Error("Identity changed");
   }
-  try {
-    joinDmConversation(_transport, session, roomCode, peerDid, pqState ?? existing?.pq);
-  } catch (error) {
-    // An upgrade can land between the read above and this join, and the
-    // transport then (rightly) refuses the classical key. Read once more
-    // rather than fail a send over a race it already won.
-    if (pqState || existing?.pq) throw error;
-    const fresh = (await getRoom(roomCode)) as DMRoom | undefined;
-    if (requireSession() !== session || !fresh?.pq) throw error;
-    joinDmConversation(_transport, session, roomCode, peerDid, fresh.pq);
+  // Past the bound on what others can make us join, the conversation is
+  // stored all the same and carries on through the mailbox.
+  const account = _joinAccount(session, roomCode, forThem);
+  if (account) {
+    try {
+      joinDmConversation(_transport, session, roomCode, peerDid, pqState ?? existing?.pq);
+    } catch (error) {
+      // An upgrade can land between the read above and this join, and the
+      // transport then (rightly) refuses the classical key. Read once more
+      // rather than fail a send over a race it already won.
+      if (pqState || existing?.pq) throw error;
+      const fresh = (await getRoom(roomCode)) as DMRoom | undefined;
+      if (requireSession() !== session || !fresh?.pq) throw error;
+      joinDmConversation(_transport, session, roomCode, peerDid, fresh.pq);
+    }
+    _noteJoin(session, roomCode, account);
+    const device = looksLikePeerId(peerIdOrDid) ? peerIdOrDid : didToPeerId(peerDid, _peerIdToDid);
+    // A known profile is not proof the other device has opened this DM yet.
+    // Explicit device inputs initiate first contact; DID-only restore is passive.
+    if (device === peerIdOrDid && !_transport.isRoomPeer(roomCode, device)) {
+      await _transport.introduceDm(device, peerDid);
+      if (requireSession() !== session) throw new Error("Identity changed");
+    }
   }
-  const device = looksLikePeerId(peerIdOrDid) ? peerIdOrDid : didToPeerId(peerDid, _peerIdToDid);
-  // A known profile is not proof the other device has opened this DM yet.
-  // Explicit device inputs initiate first contact; DID-only restore is passive.
-  if (device === peerIdOrDid && !_transport.isRoomPeer(roomCode, device)) {
-    await _transport.introduceDm(device, peerDid);
-    if (requireSession() !== session) throw new Error("Identity changed");
-  }
-  if (existing) {
-    _provisional.delete(roomCode);
-    return roomCode;
-  }
+  if (existing) return roomCode;
   const room: DMRoom = {
     roomCode,
     type: "dm",
@@ -1360,7 +1489,9 @@ async function _joinDm(
   };
   await putRoom(room, guard);
   _admissionChanged();
-  _provisional.delete(roomCode);
+  // Our own introduction comes back through the stranger's hook, often
+  // before this store: a provisional join it made meanwhile is ours.
+  if (account === "user") _provisional.delete(roomCode);
   if (requireSession() !== session) throw new Error("Identity changed");
   // isDmRequestRoom and the request banner read the sidebar's copy, which
   // only a refresh used to bring this into: until then the request was
@@ -1516,8 +1647,7 @@ export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
   // conversations - junk message requests above all - used them up.
   for (const roomCode of candidates) {
     if (transportState.callRoomCode === roomCode) leaveCall();
-    _transport.forgetConversation(roomCode);
-    _provisional.delete(roomCode);
+    _forgetJoin(roomCode);
   }
   await Promise.all(
     [...candidates].map(async (roomCode) => {

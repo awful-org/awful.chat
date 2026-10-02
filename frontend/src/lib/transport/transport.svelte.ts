@@ -185,7 +185,7 @@ import {
   dropDmIfEmpty,
   ensureDmRoomForPeer,
   isDmRequestRoom,
-  savedDmsToJoin,
+  joinSavedDms,
   offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
@@ -3753,6 +3753,13 @@ export async function deliverMailboxBatch(
   if (!(await _ensureDmForBatch(senderDid, guard))) {
     throw new Error("No room for a new conversation");
   }
+  // Stored but not joined: past what others can keep joined (dm.svelte.ts,
+  // MAX_DMS_JOINED_FOR_THEM). The batch handler takes nothing for a room
+  // not joined, so the blob waits in the mailbox until it is.
+  if (!_transport.rooms().includes(roomCode)) {
+    if (!existed) await dropDmIfEmpty(roomCode);
+    throw new Error("Conversation not joined");
+  }
   await _handleSyncBatch(roomCode, messages, senderDid, live);
   if (!existed) await dropDmIfEmpty(roomCode);
 }
@@ -4541,15 +4548,6 @@ async function _joinSavedRooms(): Promise<void> {
   // pass happened unsubscribed: gossip for those rooms was not delivered,
   // the relay had not been told we were in them, and no peer in them could
   // be dialled. Nothing about the sweep needs to precede a subscription.
-  const join = (room: (typeof rooms)[number]) => {
-    try {
-      joinStoredRoom(_transport, room.roomCode, room);
-    } catch {
-      // One damaged invitation must not prevent other rooms reconnecting.
-      // Never include the record or secret in diagnostics.
-      console.warn("[room] skipped a saved room with an invalid invitation");
-    }
-  };
   for (const room of rooms) {
     // DMs are handled by joinPhonebookDmRooms, which derives the room code
     // from the DID rather than trusting a stored one.
@@ -4557,11 +4555,17 @@ async function _joinSavedRooms(): Promise<void> {
     // A message request is joined when its sender turns up again (their
     // introduction) or the user opens it - never just for starting up.
     if ((room as DMRoom).request === true) continue;
-    // A DM only once it is known to hold something: below.
+    // Other DMs below, and not every one of them: see joinSavedDms.
     if (room.type === "dm") continue;
-    join(room);
+    try {
+      joinStoredRoom(_transport, room.roomCode, room);
+    } catch {
+      // One damaged invitation must not prevent other rooms reconnecting.
+      // Never include the record or secret in diagnostics.
+      console.warn("[room] skipped a saved room with an invalid invitation");
+    }
   }
-  for (const room of await savedDmsToJoin(rooms)) join(room);
+  await joinSavedDms(rooms).catch(() => {});
   // Not awaited in the join order any more: housekeeping, once per session.
   // Empty requests first: the sweep rewrites every room record, and a
   // rewrite racing a delete puts the record back.
