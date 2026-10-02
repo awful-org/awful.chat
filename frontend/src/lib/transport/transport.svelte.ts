@@ -1149,14 +1149,21 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     ? undefined
     : true;
 
+  // Encoded once per image for the whole call, however many frames carry it.
+  const dataUrls = new Map<ArrayBuffer, string>();
   const imageUrl = (url: string | undefined, data: ArrayBuffer | undefined): string | null => {
     if (url) return url;
     if (!data) return null;
-    const bytes = new Uint8Array(data);
-    return `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
+    let dataUrl = dataUrls.get(data);
+    if (dataUrl === undefined) {
+      const bytes = new Uint8Array(data);
+      dataUrl = `data:${sniffImageMime(bytes)};base64,${bytesToBase64(bytes)}`;
+      dataUrls.set(data, dataUrl);
+    }
+    return dataUrl;
   };
 
-  const frameFor = (source: typeof profile, roomScoped = false): Uint8Array =>
+  const frameFor = (source: typeof profile, roomScoped = false, reply = isReply): Uint8Array =>
     encode({
       type: MessageType.Profile,
       name: source?.nickname?.trim() || "Anonymous",
@@ -1165,7 +1172,7 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
       color: source?.color ?? null,
       peerId: _transport.selfId(),
       bindingSig: binding?.bindingSig,
-      reply: isReply || undefined,
+      reply: reply || undefined,
       roomProfilesSupported: roomScoped ? undefined : true,
       roomScoped: roomScoped || undefined,
       bannerUrl: imageUrl(source?.bannerURL, source?.bannerData) ?? undefined,
@@ -1201,6 +1208,9 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
   const payload = frameFor(profile);
 
   const hash = frameHash(payload);
+  // What the peer holds once this lands. A reply carries the same profile as
+  // the frame that provoked it, so the reply flag is not part of it.
+  const held = isReply ? frameHash(frameFor(profile, false, false)) : hash;
   const sendTo = (pid: string): boolean => {
     if (!_profileEcho.shouldSend(pid, hash)) {
       _stats.profilesSkipped++;
@@ -1210,27 +1220,51 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     return true;
   };
 
-  const sendProfileTo = async (pid: string): Promise<void> => {
+  // A room's own frame is the same for every peer, so it is built once per
+  // room for the whole call rather than read from storage per peer.
+  const scopedFrames = new Map<string, Promise<{ frame: Uint8Array; hash: number; held: number } | null>>();
+  const scopedFrame = (roomCode: string) => {
+    let built = scopedFrames.get(roomCode);
+    if (!built) {
+      built = (async () => {
+        const roomRecord = await getRoom(roomCode);
+        if (roomRecord?.type !== "text" || !profile || !did) return null;
+        const override = await getOwnRoomProfile(roomCode, did);
+        const resolved = override && hasRoomOverrides(override.fields)
+          ? resolveRoomProfile(profile, override.fields)
+          : null;
+        const frame = resolved ? frameFor(resolved, true) : inheritFrame();
+        const scopedHash = frameHash(frame);
+        return { frame, hash: scopedHash,
+          held: resolved && isReply ? frameHash(frameFor(resolved, true, false)) : scopedHash };
+      })().catch(() => null);
+      scopedFrames.set(roomCode, built);
+    }
+    return built;
+  };
+
+  /** `missingOnly`: skip what the peer already holds - see ProfileEcho. */
+  const sendProfileTo = async (pid: string, missingOnly = false): Promise<void> => {
     const room = profileDeliveryRoom(_transport.rooms(), pid, (r) => _transport.peersInRoom(r));
     if (room === null) return;
-    if (sendTo(pid)) {
+    if (missingOnly && _profileEcho.holds(pid, held)) {
+      _stats.profilesSkipped++;
+    } else if (sendTo(pid)) {
       const delivered = await (room === undefined
         ? _transport.send(pid, payload)
         : _transport.sendRoom(pid, room, payload)).catch(() => false);
-      if (!delivered) _profileEcho.forget(pid);
+      if (delivered) _profileEcho.delivered(pid, held);
+      else _profileEcho.forget(pid);
     }
     if (!supportingPeers.has(pid) || !profile || !did) return;
     for (const roomCode of profileRoomsForPeer(_transport.rooms(), pid, supportingPeers.has(pid), r => _transport.peersInRoom(r))) {
-      const roomRecord = await getRoom(roomCode);
-      if (roomRecord?.type !== "text") continue;
-      const override = await getOwnRoomProfile(roomCode, did);
-      const scoped = override && hasRoomOverrides(override.fields)
-        ? frameFor(resolveRoomProfile(profile, override.fields), true)
-        : inheritFrame();
-      const scopedHash = frameHash(scoped);
-      if (!_profileEcho.shouldSend(pid, scopedHash, Date.now(), roomCode)) continue;
-      const delivered = await _transport.sendRoom(pid, roomCode, scoped).catch(() => false);
-      if (!delivered) _profileEcho.forget(pid, roomCode);
+      const scoped = await scopedFrame(roomCode);
+      if (!scoped) continue;
+      if (missingOnly && _profileEcho.holds(pid, scoped.held, roomCode)) continue;
+      if (!_profileEcho.shouldSend(pid, scoped.hash, Date.now(), roomCode)) continue;
+      const delivered = await _transport.sendRoom(pid, roomCode, scoped.frame).catch(() => false);
+      if (delivered) _profileEcho.delivered(pid, scoped.held, roomCode);
+      else _profileEcho.forget(pid, roomCode);
     }
   };
 
@@ -1239,20 +1273,32 @@ async function _sendProfile(peerId?: string, isReply = false): Promise<void> {
     return;
   }
 
-  // Reach everyone who could care: every room we are in (not just the one on
-  // screen) and every connected peer directly. A single broadcast to the
-  // active room missed peers in other shared rooms, and was silently dropped
-  // when the gossipsub mesh had not formed yet - which is why a changed
-  // nickname or avatar often never showed up for anyone.
-  for (const room of _transport.rooms()) {
-    if (_transport.rooms().some((r) => _transport.isSecureRoom(r)) && !_transport.isSecureRoom(room)) continue;
-    _transport.broadcast(payload, room);
+  // A session with no protected rooms publishes into each room's gossipsub
+  // topic, one frame per room.
+  if (!_transport.rooms().some((r) => _transport.isSecureRoom(r))) {
+    for (const room of _transport.rooms()) _transport.broadcast(payload, room);
   }
-  for (const pid of _transport.peers()) {
-    void sendProfileTo(pid);
-  }
+  // And every connected peer gets it once, over a room the two share
+  // (sendProfileTo), and only if it lacks this profile. Every protected room
+  // used to get a copy too, sealed separately for each member - on every room
+  // click, resume and network change, avatar and all, so one click could put
+  // hundreds of copies through the main thread in a single task. When one
+  // does have to go to many peers - an edit - they start one at a time, with
+  // the event loop let in between.
+  void (async () => {
+    for (const pid of _transport.peers()) {
+      const fresh = !_profileEcho.holds(pid, held);
+      void sendProfileTo(pid, true);
+      if (fresh) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  })();
 }
 
+/**
+ * Make sure every connected peer holds our current profile. Peers that do are
+ * skipped, so a room click or a resume that changed nothing sends nothing,
+ * and a change reaches each peer once.
+ */
 async function _broadcastProfile(): Promise<void> {
   await _sendProfile().catch(() => {});
 }

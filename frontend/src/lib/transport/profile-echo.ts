@@ -34,9 +34,19 @@ export function frameHash(bytes: Uint8Array): number {
   return h >>> 0;
 }
 
-/** Per-peer, per-scope record of the last profile frame we sent. */
+/**
+ * Per-peer, per-scope record of the last profile frame we sent, and of what
+ * each peer was last delivered.
+ */
 export class ProfileEcho {
   #sent = new Map<string, Map<string, { hash: number; at: number }>>();
+  /**
+   * The content each peer holds, per scope, by hash. Unlike the burst window
+   * this lasts until a send to them fails or they disconnect: a broadcast -
+   * every room click, every network change - goes only to the peers that
+   * lack the current profile, which when nothing changed is nobody.
+   */
+  #held = new Map<string, Map<string, number>>();
 
   constructor(private readonly windowMs: number = PROFILE_ECHO_WINDOW_MS) {}
 
@@ -50,8 +60,25 @@ export class ProfileEcho {
     return true;
   }
 
+  /** A send of this content reached the peer. */
+  delivered(peerId: string, hash: number, scope = ""): void {
+    const scopes = this.#held.get(peerId) ?? new Map();
+    scopes.set(scope, hash);
+    this.#held.set(peerId, scopes);
+  }
+
+  /** Whether the peer was last delivered exactly this content. */
+  holds(peerId: string, hash: number, scope = ""): boolean {
+    return this.#held.get(peerId)?.get(scope) === hash;
+  }
+
   forget(peerId: string, scope?: string): void {
-    if (scope === undefined) this.#sent.delete(peerId);
-    else this.#sent.get(peerId)?.delete(scope);
+    if (scope === undefined) {
+      this.#sent.delete(peerId);
+      this.#held.delete(peerId);
+    } else {
+      this.#sent.get(peerId)?.delete(scope);
+      this.#held.get(peerId)?.delete(scope);
+    }
   }
 }

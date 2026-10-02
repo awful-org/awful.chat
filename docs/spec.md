@@ -334,6 +334,9 @@ interface WireChatMessage {
 interface WireProfile      { type: MessageType.Profile;      name: string; did: string | null; avatarUrl: string | null
                              // proof that `did` owns the sending peerId, see Peer Identity Binding
                              peerId?: string; bindingSig?: string }
+// A profile goes to each connected peer once, over one room the two share,
+// and again only when it changes: a room click, a resume or a network change
+// sends it only to peers that were never delivered the current one.
 interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
 interface WireRoomName     { type: MessageType.RoomName;     name: string }
 

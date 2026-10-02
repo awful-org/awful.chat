@@ -66,6 +66,31 @@ describe("profile echo", () => {
     expect(echo.shouldSend("peer1", h, 10)).toBe(true);
   });
 
+  it("remembers what each peer was delivered, past the burst window, per scope", () => {
+    const echo = new ProfileEcho();
+    const a = frameHash(A), b = frameHash(B);
+    expect(echo.holds("peer1", a)).toBe(false);
+    echo.delivered("peer1", a);
+    echo.delivered("peer1", b, "rd2_a");
+    expect(echo.holds("peer1", a)).toBe(true);
+    expect(echo.holds("peer1", b)).toBe(false); // changed: they lack it
+    expect(echo.holds("peer1", b, "rd2_a")).toBe(true);
+    expect(echo.holds("peer1", a, "rd2_a")).toBe(false);
+    expect(echo.holds("peer2", a)).toBe(false);
+  });
+
+  it("forgets deliveries with the rest: one scope on a failed send, everything on disconnect", () => {
+    const echo = new ProfileEcho();
+    const h = frameHash(A);
+    echo.delivered("peer1", h);
+    echo.delivered("peer1", h, "rd2_a");
+    echo.forget("peer1", "rd2_a");
+    expect(echo.holds("peer1", h, "rd2_a")).toBe(false);
+    expect(echo.holds("peer1", h)).toBe(true);
+    echo.forget("peer1");
+    expect(echo.holds("peer1", h)).toBe(false);
+  });
+
   it("separates frames that differ only late in a large payload", () => {
     const big = new Uint8Array(200_000);
     const other = new Uint8Array(200_000);
