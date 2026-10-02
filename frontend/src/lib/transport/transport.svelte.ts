@@ -3809,6 +3809,13 @@ async function _handleDmBatch(
  * before it costs a request slot, and answered like junk (acked away)
  * rather than kept in the mailbox for a slot to free up. A row that passes
  * here and is refused later still leaves nothing: see dropDmIfEmpty.
+ *
+ * Held to the batch handler's own row cap, and checked before it: a
+ * stranger's 4 MB frame of one signed row repeated ten thousand times was
+ * verified row by row, one synchronous task, and froze the tab for seconds
+ * at a time - as often as they sent it, since a refused batch makes no
+ * conversation and leaves the channel open. One row that passes is enough,
+ * so the check stops there.
  */
 async function _anyRowTakable(
   roomCode: string,
@@ -3816,17 +3823,16 @@ async function _anyRowTakable(
   senderDid: string,
   live: boolean
 ): Promise<boolean> {
-  const verdicts = await Promise.all(
-    rows.map(async (m) => {
-      try {
-        const allowUnsigned = allowsUnsignedDmHistory(m, senderDid, live);
-        return (await _verifyIncoming(m, { room: roomCode, allowUnsigned })).ok;
-      } catch {
-        return false;
-      }
-    })
-  );
-  return verdicts.some(Boolean);
+  if (!Array.isArray(rows) || rows.length > BATCH_SIZE * 4) return false;
+  for (const m of rows) {
+    try {
+      const allowUnsigned = allowsUnsignedDmHistory(m, senderDid, live);
+      if ((await _verifyIncoming(m, { room: roomCode, allowUnsigned })).ok) return true;
+    } catch {
+      // A row that cannot even be checked is not one to take.
+    }
+  }
+  return false;
 }
 
 /**
