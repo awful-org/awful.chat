@@ -77,6 +77,8 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "picture-in-picture",
   "call-tile-menu",
   "palette-commands",
+  "self-name",
+  "activity",
 ]);
 
 export interface UpdateCtx {
@@ -126,6 +128,15 @@ export interface HostApi {
   roomCode(): string;
   /** This user's DID, the same value `ctx.senderDid` carries for their own updates. */
   selfDid(): string;
+  /** This user's display name, the same value `ctx.senderName` carries for their own updates. */
+  selfName(): string;
+  /**
+   * What this user is doing in your call tile, under their name in their
+   * own user list ("Playing Jeopardy"); null clears it. Local: everyone
+   * else's row comes from `callTileActivities(cardState)`. The host clears
+   * it when your tile unmounts.
+   */
+  setActivity(label: string | null): void;
   /** Peers connected right now, with the display names the host knows. */
   peers(): Array<{ did: string; name: string }>;
   /** A peer left. Returns unsubscribe; call it when your surface unmounts. */
@@ -358,10 +369,18 @@ export interface WidgetProps<State = unknown> {
 
 /**
  * Props of the `callTile` surface: the card's, plus whether the call's own
- * controls are showing, so your overlays move with them.
+ * controls are showing, so your overlays move with them, and whether the
+ * tile is on the stage.
  */
 export interface CallTileProps<State = unknown> extends CardProps<State> {
   chromeVisible: boolean;
+  /** This tile is the focused one, on the big stage. */
+  focused: boolean;
+  /**
+   * Focus or unfocus this tile, as clicking it does. For a visible button:
+   * an iframe swallows the clicks that would otherwise reach the tile.
+   */
+  setFocused(focused: boolean): void;
 }
 
 /**
@@ -472,6 +491,21 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
    * same audience chip screen-share transmissions get.
    */
   callTileViewers?(cardState: State): string[];
+  /**
+   * Whether joining your tile also focuses it, the way opening a stream
+   * puts it on the big stage. Default true: someone who just chose to join
+   * a game or a watch party wants it in front of them. Set false for a tile
+   * meant to sit in the grid beside the cameras (a scoreboard, a timer).
+   */
+  callTileFocusOnJoin?: boolean;
+  /**
+   * What each person is doing in your tile, by DID, shown under their name
+   * in the call's user list: `{ "did:key:...": "Playing Jeopardy" }`.
+   * PURE, like `callTileViewers`. The host keeps one plain line of up to 48
+   * characters. Your own row is `host.setActivity`: your own live updates
+   * never fold back to you, so your state never lists you.
+   */
+  callTileActivities?(cardState: State): Record<string, string>;
   /**
    * Extra rows for the tile's right-click menu, built on demand when the
    * user opens it - so this one is NOT pure: read whatever the controls need

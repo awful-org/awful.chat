@@ -3641,17 +3641,70 @@ export async function deliverMailboxBatch(
   // The batch handler refuses a room we have not joined, and a conversation
   // whose first contact arrives through the mailbox has never been joined.
   // No room means a stranger's request that did not fit: dropped.
-  if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return;
-  // A request this just created must be known as one before anything in the
-  // batch is announced (_announceMessage reads roomsStore).
-  await refreshDmRooms();
-  guard();
+  if (!(await _ensureDmForBatch(senderDid, guard))) return;
   await _handleSyncBatch(
     roomCode,
     messages,
     senderDid,
     decoded.live === true
   );
+}
+
+/**
+ * A DM batch over the conversation's own channel: files, plugin cards and
+ * plugin updates, the direct copy of each live send. When it is the FIRST
+ * thing someone sends - a poll, an app - the conversation does not exist on
+ * this side yet: the channel is up, so the rows stored, but no DM record
+ * meant nothing listed it and it was never seen. Text creates the record as
+ * it lands (_handleDmChatAsync); this does the same for a batch, with
+ * deliverMailboxBatch's check that the room is the one derived from the
+ * sender's bound DID.
+ */
+async function _handleDmBatch(
+  peerId: string,
+  room: string,
+  msg: { messages: WireChatMessage[]; live?: boolean; batchIndex: number; totalBatches: number },
+): Promise<void> {
+  const guard = captureDmOwnership();
+  const senderDid = _peerIdToDid.get(peerId);
+  const live = msg.live === true;
+  let created = false;
+  // Another of OUR OWN devices mirrors conversations it already holds: there
+  // is no DM "with" ourselves to create, and the code derived from our own
+  // DID never matches, so this check would drop every mirrored batch.
+  if (senderDid && senderDid !== identityStore.did && !(await dmRoomExists(senderDid))) {
+    guard();
+    if ((await dmConversationCodeAsync(senderDid).catch(() => null)) !== room) return;
+    guard();
+    if (!(await _ensureDmForBatch(senderDid, guard))) return;
+    created = true;
+  }
+  await _handleSyncBatch(room, msg.messages, peerId, live, {
+    batchIndex: msg.batchIndex,
+    totalBatches: msg.totalBatches,
+  });
+  // The DM list orders and shows conversations by their last row, and only
+  // the text path refreshed it: a card into a DM that was not on screen
+  // left the list unaware of it. Live sends only: a history repair arrives
+  // as many batches, and re-reading every DM record per batch is wasted.
+  if (!live && !created) return;
+  guard();
+  await refreshDmRooms();
+  guard();
+  transportState.dmVersion += 1;
+}
+
+/**
+ * Create the conversation a DM batch is the first contact of, as a request.
+ * False when there is no room for it (a stranger's request that did not fit).
+ */
+async function _ensureDmForBatch(senderDid: string, guard: () => void): Promise<boolean> {
+  if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return false;
+  // A request this just created must be known as one before anything in the
+  // batch is announced (_announceMessage reads roomsStore).
+  await refreshDmRooms();
+  guard();
+  return true;
 }
 
 /**
@@ -4144,6 +4197,10 @@ _transport.on("message", (peerId, data, room) => {
         _handleDigest(peerId, msg.roomCode, msg.watermarks).catch(() => {});
         break;
       case MessageType.SyncBatch:
+        if (room?.startsWith("dm-") && msg.roomCode === room) {
+          _handleDmBatch(peerId, room, msg).catch(() => {});
+          break;
+        }
         _handleSyncBatch(
           msg.roomCode,
           msg.messages,

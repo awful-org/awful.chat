@@ -44,6 +44,7 @@
   } from "$lib/components/ui/drawer";
   import UserProfileCard from "./UserProfileCard.svelte";
   import { openSettings } from "$lib/ui-state.svelte";
+  import { activityFor } from "$lib/plugins/activity.svelte";
 
   interface Props {
     open: boolean;
@@ -75,6 +76,8 @@
     isRelayed: boolean;
     inCall: boolean;
     sharing: boolean;
+    /** What a call tile says they are doing there ("Playing Jeopardy"). */
+    activity: string | null;
   }
 
   const roomUsers = $derived(transportState.roomUsers);
@@ -264,6 +267,7 @@
         isRelayed: userIsRelayed,
         inCall,
         sharing: inCall && sharing,
+        activity: inCall ? activityFor(did, isSelf, transportState.roomCode) : null,
         tagText,
         tagTextColor,
         tagChipColor,
@@ -475,7 +479,7 @@
         {user.sharing
           ? "Sharing screen"
           : user.inCall
-            ? "In call"
+            ? (user.activity ?? "In call")
             : user.isOnline
               ? "Online"
               : user.isConnecting

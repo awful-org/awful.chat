@@ -213,6 +213,8 @@ import {
     pluginRoomCode?: string;
     /** Plugin tiles: names using it, for the audience chip. */
     pluginViewers?: string[];
+    /** Plugin tiles: joining also focuses it (the plugin's choice). */
+    pluginFocusOnJoin?: boolean;
   }
 
   let {
@@ -483,6 +485,7 @@ import {
         cardId: pt.cardId,
         pluginRoomCode: pt.roomCode,
         pluginViewers: pt.viewers,
+        pluginFocusOnJoin: pt.focusOnJoin !== false,
       });
     }
     return result;
@@ -490,6 +493,12 @@ import {
 
   // What plugin tiles the user opted into (click-to-join, like shares).
   let joinedPluginTiles = $state(new Set<string>());
+
+  /** Join a plugin tile - and focus it, unless its plugin said not to. */
+  function joinPluginTile(tile: TileData): void {
+    joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+    if (tile.pluginFocusOnJoin) callFocus.pinnedTileId = tile.id;
+  }
 
   // ── Persistent plugin layer ─────────────────────────────────────────────
   // A joined plugin tile's content (a YouTube iframe) cannot survive a
@@ -1000,7 +1009,7 @@ import {
         setTransmissionOutputVolume(1);
         break;
       case "join-plugin":
-        joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+        joinPluginTile(tile);
         break;
       case "leave-plugin":
         joinedPluginTiles = new Set(
@@ -1088,6 +1097,8 @@ import {
   const gridViewActive = $derived(
     gridView.people !== "all" || !gridView.screens || !gridView.apps
   );
+  /** The grid menu button in the stage's top-left corner is drawn. */
+  const gridMenuShown = $derived(gridViewActive || tiles.length > 1);
   const tileHasVideo = (t: TileData) =>
     t.videoTrack !== null ||
     (t.kind === "transmission" && !!t.isPending) ||
@@ -1605,6 +1616,8 @@ import {
     >
       <!-- Content lives in the persistent layer; this is only the anchor
            the layer follows, plus the chrome painted above it. -->
+      <!-- Focused, the tile owns the stage's top-left corner, where the
+           grid menu button sits when shown: Leave moves to its right. -->
       <!-- "Leave", not "Stop watching": the same word for every plugin, and
            the mirror of the "Join {tile.label}" affordance this tile replaced.
            A plugin is not always something you watch - a party is something
@@ -1624,7 +1637,9 @@ import {
               );
             }}
             aria-label="Leave {tile.label}"
-            class="absolute left-1.5 top-1.5 z-30 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 transition-opacity hover:bg-red-500/45 focus-visible:pointer-events-auto focus-visible:opacity-100 {isSmallScreen ||
+            class="absolute {isFocused && gridMenuShown
+              ? 'left-14 sm:left-16'
+              : 'left-1.5'} top-1.5 z-30 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 transition-opacity hover:bg-red-500/45 focus-visible:pointer-events-auto focus-visible:opacity-100 {isSmallScreen ||
             pluginTileHovered(tile.id)
               ? ''
               : 'pointer-events-none opacity-0'}"
@@ -1692,9 +1707,7 @@ import {
         />
         <button
           type="button"
-          onclick={() => {
-            joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
-          }}
+          onclick={() => joinPluginTile(tile)}
           class="cursor-pointer rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm transition-all hover:border-primary/50 hover:shadow-md"
         >
           Join {tile.label}
@@ -2120,6 +2133,8 @@ import {
           cardId={pt.cardId!}
           roomCode={pt.pluginRoomCode!}
           chromeVisible={dockedControls ? panelMouse !== null : controlsVisible}
+          focused={callFocus.pinnedTileId === pt.id}
+          setFocused={(on) => (callFocus.pinnedTileId = on ? pt.id : null)}
         />
       </div>
     {/each}
@@ -2577,7 +2592,7 @@ import {
          video AND some tile without. It also stays up whenever a filter is
          active, so a filter picked from the menu always has a way out even
          once everyone is streaming. -->
-    {#if gridViewActive || tiles.length > 1}
+    {#if gridMenuShown}
       <Tip text="Configure what the grid shows">
         {#snippet children(props)}
           <button

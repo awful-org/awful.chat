@@ -7,6 +7,8 @@
 import type { HostApi } from "./api";
 import { seededRandom } from "$lib/utils";
 import { identityStore } from "$lib/identity/identity.svelte";
+import { profileStore } from "$lib/profile.svelte";
+import { setSelfActivity } from "./activity.svelte";
 import { captureSessionGuard } from "$lib/identity/session-guard";
 import {
   onBeforeDisconnect,
@@ -196,6 +198,10 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       return true;
     },
     selfDid: () => identityStore.did || "",
+    // The name this user's own updates carry (sendUpdate signs the main
+    // profile's nickname), so a plugin can list itself the way peers see it.
+    selfName: () => profileStore.nickname?.trim() || "Anonymous",
+    setActivity: (label) => setSelfActivity(pluginId, label),
     peers: () =>
       transportState.peers.map((peerId) => {
         const did = peerIdToDid(peerId);

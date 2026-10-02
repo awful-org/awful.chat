@@ -55,7 +55,7 @@
     },
     {
       q: "Does it have plugins?",
-      a: "Yes. Instances can ship plugins - watch-together listening parties, polls, a shared-Steam-library roulette - and a curated collection is maintained at awful-org/awfully-awesome. Operators pull them in with one deploy variable, and anyone can write their own.",
+      a: "Yes. Instances can ship plugins - watch-together listening parties, polls, a shared-Steam-library roulette - and a curated collection is maintained at awful-org/awfully-awesome. Operators pull them in with one deploy variable, and anyone can write their own. And /app opens any website - a game, a board - as a tile in a call.",
       link: {
         href: "https://github.com/awful-org/awfully-awesome",
         label: "Browse the curated plugins",
