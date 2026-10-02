@@ -103,6 +103,7 @@
     markSeen,
     requestFileDownload,
     resolveMentionDisplayName,
+    trimMessageView,
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
   import { stripMarkdown } from "$lib/markdown";
@@ -113,7 +114,16 @@
   } from "$lib/rooms.svelte";
   import { getMessage } from "$lib/storage";
   import { openSearch } from "$lib/search/ui.svelte";
-  import { revealMessage } from "$lib/reveal-message";
+  import { revealInFlight, revealMessage } from "$lib/reveal-message";
+  import {
+    around,
+    hold,
+    showNewer,
+    showOlder,
+    trimPoint,
+    windowRange,
+    type ChatWindow,
+  } from "$lib/chat-window";
   import { REPLY_THRESHOLD, dragOffset, swipeAction } from "$lib/swipe";
   import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
@@ -231,6 +241,7 @@
     roomCode;
     initialScrollDone = false;
     autoScroll = true;
+    chatWindow = null;
     // hasMoreHistory too. This component is not keyed by room, so switching
     // rooms does not remount it: paging to the top of one room set this false
     // and every other room then opened with no way to page back for the rest
@@ -476,6 +487,25 @@
       (m) => RENDERABLE_TYPES.has(m.type) && m.roomCode === roomCode
     )
   );
+
+  /**
+   * Which of them are mounted (chat-window.ts): null follows the newest; a
+   * window held still keeps the reader's place while they are up in
+   * history. Every row is a whole component tree, and mounting every message
+   * held was a frozen frame of seconds when a catch-up landed hundreds.
+   */
+  let chatWindow = $state<ChatWindow>(null);
+  const range = $derived(windowRange(visibleMessages, chatWindow));
+  const renderedMessages = $derived(visibleMessages.slice(range.from, range.to));
+  /** The newest message held is mounted. */
+  const atNewest = $derived(range.to >= visibleMessages.length);
+  /**
+   * Following the newest at the bottom. The list is pinned to the bottom
+   * then, so the browser's own scroll anchoring is switched off: as rows
+   * left the top of the window it moved the view to keep them in place,
+   * and the scroll that made read as the reader scrolling away.
+   */
+  const following = $derived(chatWindow === null && autoScroll);
   const visibleLocalCards = $derived(
     localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
   );
@@ -542,7 +572,9 @@
       _scrollQueued = true;
       requestAnimationFrame(() => {
         _scrollQueued = false;
-        if (!messagesEl) return;
+        // Asked for while following; the reader may have been taken
+        // elsewhere since (a jump to a message), and that wins.
+        if (!messagesEl || !autoScroll) return;
         messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: "instant" });
       });
       return;
@@ -555,39 +587,150 @@
     messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior });
   }
 
+  /** A window move is being anchored: the scrolling it causes is not the
+   *  reader's. */
+  let shifting = false;
+
   function handleScroll() {
     if (!messagesEl) return;
     const { scrollHeight, scrollTop, clientHeight } = messagesEl;
+    const fromBottom = scrollHeight - scrollTop - clientHeight;
     // "At the bottom" within 120px: the old 40px meant stopping half a
     // message short of the end - one flick of momentum scroll on mobile -
-    // silently stopped the view from following new arrivals.
-    autoScroll = scrollHeight - scrollTop - clientHeight < 120;
+    // silently stopped the view from following new arrivals. The bottom of
+    // a window short of the newest messages is not the end.
+    const atBottom = fromBottom < 120;
+    autoScroll = atBottom && atNewest;
+    if (!initialScrollDone || shifting) return;
+    if (chatWindow === null && !atBottom) {
+      // The reader left the bottom: hold the window, so what arrives below
+      // does not push the rows being read off its top.
+      chatWindow = hold(visibleMessages, range);
+    } else if (chatWindow !== null && autoScroll) {
+      // Back at the newest: follow it again, with only its rows mounted.
+      void anchored(() => (chatWindow = null)).then(trimHeld);
+      return;
+    }
     // Reaching the top fetches the next page - the button alone was gated on
     // 50+ VISIBLE messages, and a page full of invisible rows (reactions,
     // plugin updates) kept the count below that forever: two weeks of
     // history with no way to scroll to it.
-    if (scrollTop < 80 && initialScrollDone && canLoadOlder && !loadingMore) {
-      void loadOlderPreservingScroll();
+    if (scrollTop < 80) void showOlderRows();
+    else if (!atNewest && fromBottom < 400) void showNewerRows();
+  }
+
+  /** The next older rows: those already held first, then a page from
+   *  storage. */
+  async function showOlderRows() {
+    if (shifting || loadingMore) return;
+    if (range.from === 0) {
+      if (!canLoadOlder) return;
+      // Hold the window first, so the page lands above it unmounted until
+      // the anchored move below shows it.
+      if (chatWindow === null) chatWindow = hold(visibleMessages, range);
+      await handleLoadMore();
+      if (range.from === 0) return;
+    }
+    await anchored(() => (chatWindow = showOlder(visibleMessages, range)));
+  }
+
+  async function showNewerRows() {
+    if (shifting || atNewest) return;
+    await anchored(() => (chatWindow = showNewer(visibleMessages, range)));
+  }
+
+  /**
+   * Change what is mounted without moving what is on screen: the row at the
+   * top of the view stays where it was, whatever went in or came out above
+   * it. Browsers that anchor scrolling would do this for rows added; Safari
+   * does not, and rows taken away need it everywhere.
+   */
+  async function anchored(change: () => void): Promise<void> {
+    const el = messagesEl;
+    if (!el) {
+      change();
+      return;
+    }
+    shifting = true;
+    try {
+      const anchor = topRow(el);
+      const before = anchor?.getBoundingClientRect().top ?? 0;
+      change();
+      await tick();
+      if (anchor?.isConnected) {
+        el.scrollTop += anchor.getBoundingClientRect().top - before;
+      }
+    } finally {
+      shifting = false;
     }
   }
 
-  /** Prepending grows the container upward; without compensation the view
-   *  jumps to the oldest loaded message and re-triggers the top fetch. */
-  async function loadOlderPreservingScroll() {
-    if (!messagesEl) return;
-    const prevHeight = messagesEl.scrollHeight;
-    const prevTop = messagesEl.scrollTop;
-    await handleLoadMore();
-    await tick();
-    if (messagesEl) {
-      messagesEl.scrollTop = prevTop + (messagesEl.scrollHeight - prevHeight);
+  /** The first message row at least partly in view. */
+  function topRow(el: HTMLElement): HTMLElement | null {
+    const top = el.getBoundingClientRect().top;
+    for (const row of el.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+      if (row.getBoundingClientRect().bottom > top) return row;
     }
+    return null;
+  }
+
+  /**
+   * Drop held rows the window no longer needs, while it follows the newest
+   * at the bottom: the view held every message it was ever given for as long
+   * as the room was open. They are in storage; scrolling back reads them.
+   * Never while a jump is filling in the history it is about to show.
+   */
+  function trimHeld(): void {
+    if (chatWindow !== null || !autoScroll || loadingMore) return;
+    if (revealInFlight() || uiState.jumpToMessage?.roomCode === roomCode) return;
+    const keepFrom = trimPoint(visibleMessages);
+    if (!keepFrom) return;
+    trimMessageView(roomCode, keepFrom);
+    hasMoreHistory = true;
+  }
+
+  // New rows at the newest end are what grows the held list while it is
+  // followed; rows loaded at the old end are there to be read.
+  let newestSeen: string | undefined;
+  $effect(() => {
+    const newest = visibleMessages.at(-1)?.id;
+    if (newest === newestSeen) return;
+    newestSeen = newest;
+    untrack(trimHeld);
+  });
+
+  // Sending - or anything else that asks the view to follow - while the
+  // window sits back in history brings the newest rows back, or what was
+  // just sent would land out of sight. Scrolling never asks this: it
+  // follows only once the newest rows are on.
+  $effect(() => {
+    if (autoScroll && chatWindow !== null && !atNewest) untrack(toNewest);
+  });
+
+  /** "New messages below": the newest rows, mounted if they are not. */
+  function toNewest() {
+    if (atNewest) {
+      scrollToBottom("smooth");
+      autoScroll = true;
+      return;
+    }
+    // A smooth scroll through a list being swapped under it goes nowhere:
+    // put the newest rows up, then go to them at once.
+    chatWindow = null;
+    autoScroll = true;
+    void tick().then(() => {
+      scrollToBottom();
+      trimHeld();
+    });
   }
 
   $effect(() => {
     if (initialScrollDone || !messagesEl || visibleMessages.length === 0)
       return;
     requestAnimationFrame(() => {
+      // Opening a conversation lands on its newest message, whatever a
+      // scroll event said while it was being laid out.
+      autoScroll = true;
       scrollToBottom();
       initialScrollDone = true;
     });
@@ -973,17 +1116,30 @@
     const jump = uiState.jumpToMessage;
     if (!jump || jump.roomCode !== roomCode || !initialScrollDone) return;
     uiState.jumpToMessage = null;
-    requestAnimationFrame(() => jumpToMessage(jump.messageId));
+    untrack(() => jumpToMessage(jump.messageId));
   });
 
   function jumpToMessage(messageId: string) {
-    const el = document.getElementById(`msg-${messageId}`);
-    if (!el || !messagesEl) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
-    setTimeout(() => {
-      el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
-    }, 900);
+    const index = visibleMessages.findIndex((m) => m.id === messageId);
+    if (index < 0 || !messagesEl) return;
+    // Held but not mounted: a window around it first, held still so the
+    // rows around it stay while it is read.
+    const moved = index < range.from || index >= range.to;
+    if (moved) {
+      autoScroll = false;
+      chatWindow = around(visibleMessages, index);
+    }
+    void tick().then(() =>
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`msg-${messageId}`);
+        if (!el || !messagesEl) return;
+        el.scrollIntoView({ behavior: moved ? "instant" : "smooth", block: "center" });
+        el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
+        setTimeout(() => {
+          el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
+        }, 900);
+      })
+    );
   }
 
   // Pinned messages: private to this user, stored on the room record.
@@ -2734,20 +2890,20 @@
       ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
       style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
         ? ' touch-action: pan-y;'
-        : ''}"
+        : ''}{following ? ' overflow-anchor: none;' : ''}"
       class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
     >
       <!-- A room moved from an old one carries that room's history on top,
            once the new room's own history has run out above. -->
-      {#if movedFromRoom && !canLoadOlder}
+      {#if movedFromRoom && !canLoadOlder && range.from === 0}
         <ArchivedHistory roomCode={movedFromRoom.roomCode} roomName={movedFromRoom.name} />
       {/if}
-      {#if canLoadOlder && visibleMessages.length > 0}
+      {#if (canLoadOlder || range.from > 0) && visibleMessages.length > 0}
         <div class="flex justify-center py-2">
           <Button
             variant="ghost"
             size="sm"
-            onclick={loadOlderPreservingScroll}
+            onclick={showOlderRows}
             disabled={loadingMore}
             class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
           >
@@ -2765,8 +2921,12 @@
         </div>
       {:else}
         <div class="space-y-0.5">
-          {#each visibleMessages as msg, i (msg.id)}
-            {@const prev = visibleMessages[i - 1]}
+          {#each renderedMessages as msg, i (msg.id)}
+            <!-- The first row mounted reads as first, date and name shown,
+                 whatever is held above it: rows landing above the window
+                 change nothing on screen until the window takes them in,
+                 which it does without moving the view (anchored). -->
+            {@const prev = renderedMessages[i - 1]}
             {@const showDate = shouldShowDateSep(
               msg.timestamp,
               prev?.timestamp
@@ -3148,10 +3308,7 @@
         variant="secondary"
         size="sm"
         class="rounded-full shadow-md font-mono text-xs"
-        onclick={() => {
-          scrollToBottom("smooth");
-          autoScroll = true;
-        }}
+        onclick={toNewest}
       >
         <ArrowDown class="size-3" /> New messages below <ArrowDown
           class="size-3"

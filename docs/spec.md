@@ -382,6 +382,10 @@ on receive SyncBatch:
     at/above the loaded window's floor are appended; anything below it (or
     everything, for an empty view) triggers ONE re-read of the newest page,
     identity-preserving, and stays in storage behind "load older"
+  → the view mounts a window of what it holds - the newest 100 rows while it
+    follows the bottom, 200 at most (chat-window.ts). While it follows, a
+    view holding over 400 rows lets go of all but the newest 200 (storage
+    keeps them), which moves the floor up
   → count the frame for the room's syncing pill (sync-progress.svelte.ts):
     batchIndex/totalBatches across every pusher, cleared on SyncComplete or
     after 20s without a frame

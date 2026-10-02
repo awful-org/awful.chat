@@ -5358,16 +5358,45 @@ export async function toggleReaction(
 }
 
 export async function loadMoreMessages(
-  beforeLamport: number | MessageCursor
+  beforeLamport: number | MessageCursor,
+  /**
+   * Keep reading pages until one reaches this message, `pages` at most, and
+   * put them all in the view in ONE update. A jump to a search hit or a
+   * pinned message far back took one update per page, each of them
+   * rebuilding everything derived from the whole view.
+   */
+  reach?: { to: MessageCursor; pages: number }
 ): Promise<boolean> {
   const roomCode = transportState.roomCode;
   if (!roomCode) return false;
-  const page = { capped: false };
-  const older = await getMessages(roomCode, beforeLamport, page);
-  // The user can switch rooms while the page loads; prepending the old
-  // room's backlog into the new room's view crosses histories.
-  if (transportState.roomCode !== roomCode) return false;
+  const older: Message[] = [];
+  let cursor = beforeLamport;
+  let capped = false;
+  for (let i = 0; i < (reach ? reach.pages : 1); i++) {
+    const page = { capped: false };
+    const rows = await getMessages(roomCode, cursor, page);
+    // The user can switch rooms while the page loads; prepending the old
+    // room's backlog into the new room's view crosses histories.
+    if (transportState.roomCode !== roomCode) return false;
+    older.push(...rows);
+    capped = page.capped;
+    if (!rows.length || !page.capped) break;
+    if (!reach || MSG_ORDER(rows[0], reach.to) <= 0) break;
+    cursor = rows[0];
+  }
   if (!older.length) return false;
+  // The pages join the view where its oldest row was when the read began.
+  // If the view was cut above that meanwhile (ChatView drops held rows it
+  // no longer shows), they would sit under a gap: they stay in storage.
+  const floor = transportState.messages[0];
+  if (
+    floor &&
+    (typeof beforeLamport === "number"
+      ? floor.lamport > beforeLamport
+      : MSG_ORDER(floor, beforeLamport) > 0)
+  ) {
+    return false;
+  }
   const existingIds = new Set(transportState.messages.map((m) => m.id));
   const newOnes = older.filter((m) => !existingIds.has(m.id));
   transportState.messages = [...newOnes, ...transportState.messages].sort(
@@ -5375,7 +5404,23 @@ export async function loadMoreMessages(
   );
   // "more exists" comes from the raw page size: dedup can shrink newOnes on
   // a full page, which used to hide the load-older button early.
-  return page.capped;
+  return capped;
+}
+
+/**
+ * Drop the open conversation's rows older than `keepFrom` from the view.
+ *
+ * The view only ever grew: every live message, load-older page and catch-up
+ * stayed in it as long as the room was open. ChatView calls this while it
+ * follows the newest messages, when none of what goes is on screen. All of
+ * it is in storage, behind load-older.
+ */
+export function trimMessageView(roomCode: string, keepFrom: MessageCursor): void {
+  if (transportState.roomCode !== roomCode) return;
+  const kept = transportState.messages.filter((m) => MSG_ORDER(m, keepFrom) >= 0);
+  if (kept.length === transportState.messages.length) return;
+  transportState.messages = kept;
+  transportState.historyCapped = true;
 }
 
 /**
