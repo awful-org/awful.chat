@@ -432,7 +432,8 @@ on receive SyncBatch:
       advance there (live messages, our own sends) waits in memory and is
       written when that ends. A digest is answered by its peer's push (which
       holds the room itself from its first frame), SyncComplete or SyncNone;
-      an older build answers none of them, so its wait runs out after 15s
+      an older build never sends SyncNone, so when it has nothing to push
+      the wait runs out after 15s
     - those waiting advances count as held when a peer's digest is weighed:
       a row we stored but have not claimed yet is not one to ask them for
     - an older build whose push stops short (it lost batches past the
