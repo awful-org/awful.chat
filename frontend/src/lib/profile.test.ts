@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: { did: "did:test:me" } }));
+vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: { did: "did:test:me", isUnlocked: true } }));
 vi.mock("$lib/transport/transport.svelte", () => ({ broadcastProfile: vi.fn() }));
 vi.mock("$lib/storage", () => ({
   getOwnProfile: vi.fn(), putOwnProfile: vi.fn(), updateOwnProfile: vi.fn(),
