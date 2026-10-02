@@ -53,6 +53,30 @@ import {
 } from "$lib/transport/voice.svelte";
 import { CALL_SOUND_MAX_DURATION_MS } from "$lib/audio/call-audio-mixer";
 import { safeBlobType } from "$lib/safe-mime";
+import { createPluginSendCaps } from "./flood-cap";
+
+/**
+ * Receivers drop a person's cards and persisted updates past a per-room cap
+ * (flood-cap.ts), without a word, and a dropped row seldom comes back. So
+ * the same caps hold here, for every plugin and host in a room together,
+ * and what receivers would drop is refused before it is sent. With the
+ * sending window's slack (SEND_SLACK_MS), only arrivals bunched up by more
+ * than that - or a second device sending as the same person - can still
+ * meet a full window on the far side.
+ */
+const sendCaps = createPluginSendCaps();
+
+/** A slot under the cap, to give back if the send fails; or why not. */
+function takeSendSlot(kind: "card" | "update", roomCode: string): () => void {
+  const slot = sendCaps[kind](roomCode, identityStore.did || "");
+  if (!slot.ok) {
+    const seconds = Math.max(1, Math.ceil(slot.waitMs / 1000));
+    throw new Error(
+      `Too many ${kind}s at once. Try again in ${seconds} second${seconds === 1 ? "" : "s"}.`
+    );
+  }
+  return slot.release;
+}
 
 export function makeHostApi(pluginId: string, roomCode: string): HostApi {
   const nowPlayingToken = Symbol(pluginId);
@@ -84,14 +108,29 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
     },
     pictureInPicture: (video) => requestElementPip(video),
     async sendCard(payload) {
-      const { sendCard } = await import("$lib/transport/transport.svelte");
-      return sendCard(pluginId, payload, roomCode);
+      const release = takeSendSlot("card", roomCode);
+      try {
+        const { sendCard } = await import("$lib/transport/transport.svelte");
+        return await sendCard(pluginId, payload, roomCode);
+      } catch (err) {
+        // A send that throws was, all but always, refused before it went
+        // out (a bad payload, a room left): its slot is free again.
+        release();
+        throw err;
+      }
     },
     async sendUpdate(cardId, payload, opts) {
-      const { sendUpdate } = await import("$lib/transport/transport.svelte");
-      // Bound to the host's room, not the open one: a pinned widget votes
-      // in ITS card's room even while the user reads another.
-      return sendUpdate(pluginId, cardId, payload, opts, roomCode);
+      // Ephemerals keep their own cap, in the transport.
+      const release = opts?.ephemeral ? () => {} : takeSendSlot("update", roomCode);
+      try {
+        const { sendUpdate } = await import("$lib/transport/transport.svelte");
+        // Bound to the host's room, not the open one: a pinned widget votes
+        // in ITS card's room even while the user reads another.
+        return await sendUpdate(pluginId, cardId, payload, opts, roomCode);
+      } catch (err) {
+        release();
+        throw err;
+      }
     },
     roomCode: () => roomCode,
     async roomContext(options) {
@@ -230,6 +269,10 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       return onPluginCardStateChange(listener);
     },
     sendUpdateImmediately(cardId, payload) {
+      // Past the cap, receivers would drop it while this client kept its own
+      // copy, and the two would disagree for good. At teardown there is no
+      // one to tell, so it is not sent.
+      if (!sendCaps.update(roomCode, identityStore.did || "").ok) return;
       // Same binding as sendUpdate: the card's room, never the open one.
       sendUpdateImmediately(pluginId, cardId, payload, roomCode);
     },

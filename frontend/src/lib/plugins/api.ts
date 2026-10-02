@@ -111,7 +111,9 @@ export interface HostApi {
    * Post a card to the host's room. `payload` is what `initialState`
    * receives on every client, so seed options and questions from it; it is
    * JSON, capped at 16 KB. Resolves to the card's id, which updates name.
-   * Receivers take at most 10 cards a minute from one person in a room.
+   * Receivers take at most 10 cards a minute from one person in a room,
+   * all plugins together; past that this rejects ("Too many cards at
+   * once...") rather than send what they would drop.
    */
   sendCard(payload: unknown): Promise<string>;
   /**
@@ -119,7 +121,8 @@ export interface HostApi {
    * (lamport, senderId, updateId) on every client, into your `reduce`.
    * `{ ephemeral: true }` sends live only, never stored or replayed
    * (cursors, ticks), capped at about four a second per sender; persisted
-   * ones at 20 per 10 s from one person in a room, all plugins together.
+   * ones at 20 per 10 s from one person in a room, all plugins together,
+   * and past that this rejects rather than send what receivers would drop.
    * JSON, 4 KB; anything larger is refused.
    */
   sendUpdate(
@@ -153,8 +156,9 @@ export interface HostApi {
    */
   onBeforeDisconnect(listener: () => void): () => void;
   /**
-   * The teardown-safe `sendUpdate`: no async work, same room binding, for
-   * the `onBeforeDisconnect` beacon. Fire and forget.
+   * The teardown-safe `sendUpdate`: no async work, same room binding, same
+   * cap (past it, nothing is sent), for the `onBeforeDisconnect` beacon.
+   * Fire and forget.
    */
   sendUpdateImmediately(cardId: string, payload: unknown): void;
   /**

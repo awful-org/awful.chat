@@ -1987,7 +1987,9 @@ async function _handleSyncBatch(
     // - otherwise wrapping updates or cards in live batches routes straight
     // around them. A repair batch is exempt: a legitimate backfill hands over
     // a room's whole plugin history at once, and dropping rows there would
-    // lose history rather than delay it.
+    // lose history rather than delay it. So a member who marks live rows as
+    // repair is not capped here either; what keeps a pile of cards from
+    // stalling a room is that its rows are read once, not this cap.
     if (
       live &&
       pluginPayload &&
@@ -3130,8 +3132,12 @@ async function _handleChatMessage(
   // The flood cap covered ephemerals only, so persisted updates - which cost
   // strictly more (a store, a watermark, a fold) - were unlimited, and cards,
   // stored for good and rendered for everyone, still were. Dropped rather
-  // than stored: nothing here claims a watermark for it, so a row wrongly
-  // caught by the window is still recoverable through history repair.
+  // than stored, and nothing here claims a watermark for it - but watermarks
+  // only move forward, so once a later row from the same sender is stored
+  // this one is behind it: it comes back only if the gap that row shows sets
+  // off a sync that wins the race to its watermark, or when the room is
+  // synced from nothing. Hence the sending side keeps to the same caps, with
+  // slack for arrivals that bunch up (plugins/host.ts).
   if (
     pluginPayload &&
     ((wire.type === MessageType.PluginUpdate &&

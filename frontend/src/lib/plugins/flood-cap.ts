@@ -1,7 +1,9 @@
 /**
  * Flood caps for plugin traffic coming IN: so many messages per sender per
  * window, the rest dropped. The transport checks every plugin row and
- * ephemeral against these before it stores, folds or renders anything.
+ * ephemeral against these before it stores, folds or renders anything. The
+ * host keeps the same caps going OUT (createPluginSendCaps), so what a
+ * receiver would drop is refused before it is sent.
  */
 
 /** Ephemerals: about four a second per plugin per sender - a cursor tick. */
@@ -77,5 +79,64 @@ export function createPluginFloodCaps(now: () => number = Date.now) {
       update(`${roomCode}|${senderId}`, id),
     card: (roomCode: string, senderId: string, id: string) =>
       card(`${roomCode}|${senderId}`, id),
+  };
+}
+
+/**
+ * How much longer than a receiver's window the sending side counts over.
+ * Messages can arrive closer together than they left - a slow one, then a
+ * quick one - so keeping to the limit within exactly the window is not
+ * enough to stay under it on arrival.
+ */
+export const SEND_SLACK_MS = 5_000;
+
+export type SendSlot = { ok: true; release(): void } | { ok: false; waitMs: number };
+
+/**
+ * The sending side of a cap: one slot per message, refused while the last
+ * `limit` slots all fall within the window (plus SEND_SLACK_MS). A sliding
+ * window where the receiver's is fixed: a receiver's window starts at
+ * whichever message it heard first, and only "never more than the limit in
+ * ANY stretch that long" holds wherever that was. A slot can be given back
+ * by a send that never went out.
+ */
+export function createSendCap(
+  limit: number,
+  windowMs: number,
+  now: () => number = () => performance.now()
+): (key: string) => SendSlot {
+  const span = windowMs + SEND_SLACK_MS;
+  const taken = new Map<string, number[]>();
+  return (key) => {
+    const t = now();
+    const times = taken.get(key) ?? [];
+    taken.set(key, times);
+    while (times.length && t - times[0] >= span) times.shift();
+    if (times.length >= limit) return { ok: false, waitMs: times[0] + span - t };
+    times.push(t);
+    let released = false;
+    return {
+      ok: true,
+      release: () => {
+        if (released) return;
+        released = true;
+        const i = times.lastIndexOf(t);
+        if (i !== -1) times.splice(i, 1);
+      },
+    };
+  };
+}
+
+/**
+ * The sending side of the update and card caps, per room and sender as the
+ * receivers count them. Ephemerals need none here: the transport drops those
+ * over their cap before they leave.
+ */
+export function createPluginSendCaps(now?: () => number) {
+  const update = createSendCap(UPDATE_FLOOD_LIMIT, UPDATE_FLOOD_WINDOW, now);
+  const card = createSendCap(CARD_FLOOD_LIMIT, CARD_FLOOD_WINDOW, now);
+  return {
+    update: (roomCode: string, senderId: string) => update(`${roomCode}|${senderId}`),
+    card: (roomCode: string, senderId: string) => card(`${roomCode}|${senderId}`),
   };
 }
