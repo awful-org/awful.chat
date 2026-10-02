@@ -811,9 +811,10 @@ consequences worth knowing before you publish one:
 - The bundle an instance serves depends on its plugin set, so your code is
   inside the bytes anyone checking that instance will hash. A change you push
   changes what every instance running you serves.
-- An instance is expected to pin you (`PLUGIN_SOURCES=owner/repo@sha`).
-  Tag releases, and do not rewrite history on a tag people pin - a pinned ref
-  that changes underneath is exactly what pinning is meant to prevent.
+- An instance is expected to pin you by a whole commit sha
+  (`PLUGIN_SOURCES=owner/repo@<40-character sha>`). Tag releases, and do not
+  rewrite history on a tag people use - a ref that changes underneath is
+  exactly what pinning is meant to prevent.
 
 ## Installing plugins from outside this repo
 
@@ -826,9 +827,9 @@ PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
 ```
 
 - Accepted forms: a github url, `user/repo`, either with `@ref` or `#ref`
-  (tag, branch or commit), or a local path in dev. Prefer `@` in an
-  environment variable: a `.env` file treats `#` as the start of a comment,
-  so `owner/repo#sha` arrives at the build as `owner/repo`.
+  (tag, branch or a commit's whole sha), or a local path in dev. Prefer `@`
+  in an environment variable: a `.env` file treats `#` as the start of a
+  comment, so `owner/repo#sha` arrives at the build as `owner/repo`.
 - A source can hold ONE plugin (manifest.ts at its root) or a PACK: plugin
   folders at the root or under `plugins/`.
 - Removing an entry removes the plugin on the next deploy. Fetched plugins
@@ -836,10 +837,13 @@ PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
   loudly rather than silently shipping without it.
 - A source with no ref fails the build: it fetches HEAD of a third-party
   repo with no integrity check, so the same env value can ship different
-  code on the next build. Pin it (`user/repo@<commit-sha>`), or set
-  `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to opt in anyway. Every fetched source
-  logs its tarball's sha256 so you can confirm two fetches pulled the same
-  bytes.
+  code on the next build. Pin it by the commit's whole 40-character sha
+  (`user/repo@<commit-sha>`): the build then checks that the tarball GitHub
+  sends is that commit, and refuses it otherwise. An abbreviated sha fails
+  the build too, because it pins nothing - git resolves a branch or tag of
+  the same name first. Set `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to opt in to
+  either anyway. Every fetched source logs the commit its tarball names and
+  the tarball's sha256, so you can confirm two fetches pulled the same bytes.
 - Trust: a fetched plugin runs with the same trust as the app itself, in
   every user's browser, unsandboxed. Only list sources you trust like your
   own code.
