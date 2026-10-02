@@ -49,6 +49,11 @@ card and the end.
 
 Ending is a stored update, accepted only from the starter. Anyone can leave.
 
+One app at a time: the call shows only the newest card's tile, so a new
+`/app` ends the ones its sender started earlier, for real. Someone else's
+cannot be ended by anyone but them; its card says it was replaced by a
+newer app instead of claiming it still runs.
+
 The iframe is sandboxed (`allow-scripts allow-same-origin allow-forms
 allow-popups`) with no referrer and no delegated features. `allow-same-origin`
 is the site's own origin, which it needs for its own storage and cookies; it

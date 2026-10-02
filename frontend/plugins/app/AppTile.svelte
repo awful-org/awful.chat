@@ -12,7 +12,7 @@
   import { onDestroy } from "svelte";
   import { Button } from "$lib/components/ui/button";
   import { Switch } from "$lib/components/ui/switch";
-  import { Maximize2, Minimize2 } from "@lucide/svelte";
+  import { Check, Maximize2, Minimize2, TriangleAlert, X } from "@lucide/svelte";
   import type { CallTileProps } from "$lib/plugins/api";
   import { HEARTBEAT_MS, playerId, playing, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
@@ -214,28 +214,32 @@
       ? 'pl-26'
       : 'pl-12'} pr-14 text-[11px]">
     <span class="truncate text-white/90" title={app.url}>{site}</span>
-    <!-- Said out loud: the app's own page takes every click inside it, so
-         "click the tile to focus it" only works on this header. -->
-    <button
-      type="button"
-      onclick={(event) => {
-        event.stopPropagation();
-        setFocused(!focused);
-      }}
-      class="pointer-events-auto ml-auto flex shrink-0 cursor-pointer items-center gap-1 rounded-md bg-white/10 px-2 py-0.5 text-white/90 hover:bg-white/20"
-    >
-      {#if focused}<Minimize2 class="size-3" />Unfocus{:else}<Maximize2 class="size-3" />Focus{/if}
-    </button>
-    {#if mine && chromeVisible && phase !== "disclose"}
+    <div class="ml-auto flex shrink-0 items-center gap-1.5">
+      {#if mine && chromeVisible && phase !== "disclose"}
+        <button
+          type="button"
+          onclick={(event) => {
+            event.stopPropagation();
+            end();
+          }}
+          class="pointer-events-auto shrink-0 cursor-pointer rounded-md bg-white/10 px-2 py-0.5 text-red-300 hover:bg-white/20">End for everyone</button
+        >
+      {/if}
+      <!-- Said out loud: the app's own page takes every click inside it, so
+           "click the tile to focus it" only works on this header. Last and
+           one width either way, so it never moves as End comes and goes or
+           its label flips. -->
       <button
         type="button"
         onclick={(event) => {
           event.stopPropagation();
-          end();
+          setFocused(!focused);
         }}
-        class="pointer-events-auto shrink-0 cursor-pointer rounded-md bg-white/10 px-2 py-0.5 text-red-300 hover:bg-white/20">End for everyone</button
+        class="pointer-events-auto flex w-[5.5rem] shrink-0 cursor-pointer items-center justify-center gap-1 rounded-md bg-white/10 py-0.5 text-white/90 hover:bg-white/20"
       >
-    {/if}
+        {#if focused}<Minimize2 class="size-3" />Unfocus{:else}<Maximize2 class="size-3" />Focus{/if}
+      </button>
+    </div>
   </div>
   <div class="relative min-h-0 flex-1">
     {#if phase === "open"}
@@ -249,14 +253,35 @@
       ></iframe>
     {:else if phase === "disclose"}
       <!-- Scrolls in a small tile, so it takes the pointer; m-auto rather than
-           centering the scroller, which would clip the top when it overflows. -->
-      <div class="pointer-events-auto flex h-full w-full overflow-y-auto p-3">
-        <div class="m-auto max-w-sm space-y-2 text-xs leading-relaxed">
-          <p class="text-sm font-semibold">Open <span class="text-primary">{site}</span>?</p>
-          <p><span class="text-white/60">It gets:</span> your name in this call and a player id that only means something here.</p>
-          <p><span class="text-white/60">Not:</span> who you are, this conversation's name or messages, or other rooms.</p>
-          <p class="text-amber-300">It sees your IP address. Never type your recovery words or password into an app.</p>
-          <label class="flex cursor-pointer items-center gap-2 text-white/80">
+           centering the scroller, which would clip the top when it overflows.
+           The host's own card, in the host's colors: this is Awful.chat
+           speaking, before the site gets a single pixel. -->
+      <div class="pointer-events-auto flex h-full w-full overflow-y-auto bg-background p-3 text-foreground">
+        <div class="m-auto w-full max-w-sm space-y-3 rounded-lg border border-border bg-card p-4 text-xs leading-relaxed text-card-foreground shadow-sm">
+          <div class="flex items-center gap-2">
+            <span class="grid size-8 shrink-0 place-items-center rounded-md bg-primary/15 text-sm font-semibold text-primary"
+              >{site.charAt(0).toUpperCase()}</span
+            >
+            <div class="min-w-0">
+              <p class="truncate text-sm font-semibold">Open {site}?</p>
+              <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>
+            </div>
+          </div>
+          <ul class="space-y-1.5">
+            <li class="flex gap-2">
+              <Check class="mt-0.5 size-3.5 shrink-0 text-primary" />
+              <span>It gets your name in this call and a player id that only means something here.</span>
+            </li>
+            <li class="flex gap-2">
+              <X class="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+              <span class="text-muted-foreground">Never who you are, this conversation's name or messages, or other rooms.</span>
+            </li>
+            <li class="flex gap-2">
+              <TriangleAlert class="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+              <span>It sees your IP address. Never type your recovery words or password into an app.</span>
+            </li>
+          </ul>
+          <label class="flex cursor-pointer items-center gap-2 border-t border-border pt-3 text-muted-foreground">
             <Switch aria-label="Don't show again for {site}" bind:checked={remember} />
             <span>Don't show again for {site}</span>
           </label>

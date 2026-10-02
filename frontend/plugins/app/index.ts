@@ -45,12 +45,24 @@ export default definePlugin<AppState>({
       if (!parsed) {
         throw new Error("Use /app https://example.com, then anything the app should get (up to 256 characters).");
       }
+      const before = await host.cards().catch(() => []);
       await host.sendCard({
         url: parsed.url.href,
         sessionId: randomToken("s_"),
         salt: randomToken(),
         args: parsed.args,
       });
+      // One app at a time: the call only shows the newest anyway, so the
+      // ones you started end for real instead of lingering as "running".
+      // Someone else's can only be ended by them; their card says it was
+      // replaced (AppCard).
+      const self = host.selfDid();
+      for (const c of before) {
+        const state = c.state as AppState | undefined;
+        if (c.senderDid === self && state && !state.ended) {
+          await host.sendUpdate(c.id, { t: "end" }).catch(() => {});
+        }
+      }
     },
   },
 });
