@@ -5,12 +5,14 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,11 +141,8 @@ func TestTurnCredentialsAggregateIPv6(t *testing.T) {
 	}
 }
 
-// coturn checks a credential's expiry only when an allocation is made, and
-// an allocation its client keeps refreshing outlives it, so what the cap
-// really bounds is how fast one client gathers allocations: however often
-// it asks, it gets at most one more than its cap of new credentials within
-// any credential lifetime.
+// However often one client asks, it gets at most one more than its cap of
+// new credentials within any credential lifetime.
 func TestTurnOneClientGetsAFewCredentialsPerLifetime(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -163,7 +162,7 @@ func TestTurnOneClientGetsAFewCredentialsPerLifetime(t *testing.T) {
 		for ask, now := 0, start; now.Sub(start) < 24*time.Hour; ask, now = ask+1, now.Add(2*time.Second) {
 			req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
 			req.RemoteAddr = net.JoinHostPort(tc.addr(ask), "5000")
-			cred, err := turnCredentialFor(req, now)
+			cred, err := turnCredentialFor(req, now, "s")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -182,6 +181,116 @@ func TestTurnOneClientGetsAFewCredentialsPerLifetime(t *testing.T) {
 			}
 		}
 		t.Logf("%s, asking every 2s, got %d credentials in a day", tc.name, len(minted))
+	}
+}
+
+// coturnQuota counts allocations as the pinned coturn (4.17.2) does under
+// --use-auth-secret: --total-quota for the server, and one --user-quota
+// counter per user, where the user is the part of a username after
+// "<digits>:" (check_new_allocation_quota, through get_real_username in its
+// userdb.c). Nothing is ever released here: the client keeps refreshing
+// every allocation, which coturn allows past the credential's expiry.
+type coturnQuota struct {
+	perUser, total, held int
+	byUser               map[string]int
+}
+
+func (q *coturnQuota) allocate(username string) bool {
+	user := username
+	if before, after, ok := strings.Cut(username, ":"); ok {
+		user = before
+		if strings.Trim(before, "0123456789") == "" {
+			user = after
+		}
+	}
+	if q.held >= q.total || q.byUser[user] >= q.perUser {
+		return false
+	}
+	q.byUser[user]++
+	q.held++
+	return true
+}
+
+// The attack: ask as often as the rate limit allows, for three days, fill
+// every new credential's quota, and keep every allocation alive. While each
+// credential carried a fresh id, one address added 84 allocations every two
+// hours this way and held the whole default pool after about a day. Its
+// credentials carry a fixed few ids now, and coturn counts one quota per id,
+// so it holds those ids' worth and no more, however long it keeps going.
+func TestTurnOneClientHoldsAFewIDsForGood(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr func(ask int) string
+		ids  int
+	}{
+		{"an IPv4 address", func(int) string { return "198.51.100.99" }, turnMaxLivePerClient + 1},
+		{"an IPv6 /48, from a new /64 each time", func(ask int) string {
+			return "2001:db8:2:" + strconv.FormatInt(int64(ask%65536), 16) + "::1"
+		}, turnMaxLivePerClient*ipv6AggregateFactor + 1},
+	} {
+		resetTurnCredentials(t)
+		coturn := &coturnQuota{perUser: 12, total: 900, byUser: map[string]int{}}
+		ids := map[string]bool{}
+		req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
+		start := time.Unix(1_900_000_000, 0)
+		for ask, now := 0, start; now.Sub(start) < 72*time.Hour; ask, now = ask+1, now.Add(2*time.Second) {
+			req.RemoteAddr = net.JoinHostPort(tc.addr(ask), "5000")
+			cred, err := turnCredentialFor(req, now, "s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, id, _ := strings.Cut(cred.username, ":")
+			ids[id] = true
+			for coturn.allocate(cred.username) {
+			}
+		}
+		if len(ids) != tc.ids {
+			t.Errorf("%s used %d credential ids in three days, want %d", tc.name, len(ids), tc.ids)
+		}
+		if want := tc.ids * coturn.perUser; coturn.held != want {
+			t.Errorf("%s holds %d of %d allocations after three days, want %d", tc.name, coturn.held, coturn.total, want)
+		}
+	}
+}
+
+// The ids are keyed on TURN_SECRET, not on anything a restart forgets: if
+// the relay came back with a new set for every address, each address could
+// gather another set's worth of allocations at every deploy. And they are
+// the client's own: another address shares none of them, nor their quota.
+func TestTurnClientIDsSurviveARestart(t *testing.T) {
+	idForm := regexp.MustCompile(`^[0-9a-f]{16}$`)
+	idsOf := func(addr string, start time.Time) map[string]bool {
+		t.Helper()
+		ids := map[string]bool{}
+		req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
+		req.RemoteAddr = net.JoinHostPort(addr, "5000")
+		for now := start; now.Sub(start) < 12*time.Hour; now = now.Add(time.Minute) {
+			cred, err := turnCredentialFor(req, now, "s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, id, _ := strings.Cut(cred.username, ":")
+			if !idForm.MatchString(id) {
+				t.Fatalf("username %q: the id is not sixteen hex digits", cred.username)
+			}
+			ids[id] = true
+		}
+		return ids
+	}
+	start := time.Unix(1_900_000_000, 0)
+	resetTurnCredentials(t)
+	before := idsOf("198.51.100.120", start)
+	if len(before) != turnMaxLivePerClient+1 {
+		t.Fatalf("one address used %d ids in twelve hours, want %d", len(before), turnMaxLivePerClient+1)
+	}
+	resetTurnCredentials(t) // the relay restarts
+	if after := idsOf("198.51.100.120", start.Add(13*time.Hour)); !maps.Equal(before, after) {
+		t.Fatalf("after a restart one address was handed ids %v, before it %v", after, before)
+	}
+	for id := range idsOf("198.51.100.121", start) {
+		if before[id] {
+			t.Fatalf("two addresses were handed the id %s, so they share its quota", id)
+		}
 	}
 }
 
@@ -217,7 +326,7 @@ func TestTurnBrowsersBehindOneAddressShareItsCredentials(t *testing.T) {
 			if now.Sub(start) > 8*time.Hour {
 				break
 			}
-			cred, err := turnCredentialFor(req, now)
+			cred, err := turnCredentialFor(req, now, "s")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -249,11 +358,10 @@ func TestTurnBrowsersBehindOneAddressShareItsCredentials(t *testing.T) {
 	}
 }
 
-// The relay bounds what one client holds only in credentials; coturn turns
-// that into allocations, and keeps one that is refreshed past its
-// credential. The shipped quota defaults have to keep what one address can
-// add in a credential's lifetime to a small part of the pool - so filling
-// it takes one address about a day - and the pool inside the relay port
+// The relay bounds one client to a few credential ids; coturn turns each
+// into --user-quota allocations. The shipped quota defaults have to keep
+// what one address can hold to a small part of the pool - so filling it
+// takes eleven addresses at once - and the pool inside the relay port
 // range, or the numbers above protect nothing.
 func TestTurnQuotaDefaultsKeepOneClientToASmallShare(t *testing.T) {
 	quota := func(src []byte, name string) int {
@@ -271,9 +379,9 @@ func TestTurnQuotaDefaultsKeepOneClientToASmallShare(t *testing.T) {
 		}
 		total, perUser := quota(src, "total-quota"), quota(src, "user-quota")
 		minPort, maxPort := quota(src, "min-port"), quota(src, "max-port")
-		added := (turnMaxLivePerClient + 1) * perUser
-		if added*10 > total {
-			t.Errorf("%s: one address can add %d of %d allocations every %v, over a tenth", path, added, total, turnCredTTL)
+		held := (turnMaxLivePerClient + 1) * perUser
+		if held*10 > total {
+			t.Errorf("%s: one address can hold %d of %d allocations, over a tenth", path, held, total)
 		}
 		if total > maxPort-minPort+1 {
 			t.Errorf("%s: --total-quota %d is more than the %d relay ports", path, total, maxPort-minPort+1)

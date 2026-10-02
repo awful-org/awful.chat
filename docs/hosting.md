@@ -126,11 +126,11 @@ hash the app already has.
   are for an instance with a box to itself.
 - coturn is one per host by design (host network), shared by every stack on
   that machine. Credentials are HMAC-minted per instance already; only the
-  quotas are per server. Each relay hands one address at most seven live
-  credentials, so on a shared coturn one address can add seven times
-  `--user-quota` allocations every two hours per tenant, and keeps them while
-  it refreshes them: size `--total-quota` for the tenants on the host. Big
-  tenants get their own.
+  quotas are per server. The credentials each relay hands one address carry
+  at most seven ids between them, and coturn counts `--user-quota` per id, so
+  on a shared coturn one address holds at most seven times `--user-quota`
+  allocations per tenant (an IPv6 /48 25 times): size `--total-quota` for the
+  tenants on the host. Big tenants get their own.
 - An SFU pool, per region, a few well-connected boxes. A tenant that outgrows
   its host gets `VITE_SFU_URLS` pointed at the pool. Rooms land on one server
   by rendezvous hashing of the room code, everyone in a room computes the same

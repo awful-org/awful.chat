@@ -227,7 +227,7 @@ whose context holds no repository declares no commit.
 | `TURN_URLS` | no | the TURN URL list served to clients, comma-separated (below) |
 | `SFU_RTC_MIN_PORT` / `SFU_RTC_MAX_PORT` | no | SFU media range, published and allocated from (default 61000-61499) |
 | `TURN_MIN_PORT` / `TURN_MAX_PORT` | no | coturn relay range, one port per allocation (default 49152-50151) |
-| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide (default 900) and per credential (default 12). The relay hands one address at most seven live credentials, so one address can add at most seven times the per-credential quota every two hours (below) |
+| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide (default 900) and per credential id (default 12). The credentials the relay hands one address carry at most seven ids between them, so one address holds at most seven times the per-id quota (below) |
 | `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` and `/plugin-stream` (the streaming variant, for media a CDN will not serve cross-origin) |
 | `PLUGIN_PROXY_SECRETS` | no | `NAME@host?param=value` list (e.g. `STEAM@api.steampowered.com?key=...`); plugins put `{{secret:NAME}}` as the whole value of that query parameter, and the relay substitutes it server-side only on that host. `NAME@host/path/prefix?param=value` also restricts the path. The older `NAME@host=value` form is no longer substituted |
 | `RELAY_MAX_CONNS` / `RELAY_GOMEMLIMIT` | no | how many connections (open tabs) the relay holds at once, default 2048, with four times as many relayed circuits, and the relay's soft memory limit, default 768MiB. Past the first, new connections are refused and retried rather than open tabs dropped. See [deploy/README.md](deploy/README.md), "Relay capacity" |
@@ -304,17 +304,20 @@ stranger exhausting it does not slow them down, it locks them out.
 
 Minted credentials alone do not stop that, because anyone can ask for one. So
 the relay hands one address at most seven live credentials (25 per IPv6 /48)
-and gives its newest out again past that, coturn's `--user-quota` caps each
-credential at 12 allocations, and `--total-quota` (900 by default, inside the
-1000-port range) is the pool. That limits a rate, not a total: coturn checks a
+and gives its newest out again past that, and every credential it hands one
+address carries one of the same seven ids (25 for a /48). coturn's
+`--user-quota` caps the allocations under each id at 12, whatever the
+credential's expiry, and `--total-quota` (900 by default, inside the 1000-port
+range) is the pool. The ids are what make that a cap: coturn checks a
 credential's expiry only when an allocation is made, and an allocation kept
-refreshed outlives it, so one address can add at most 84 allocations every
-two hours. Filling the pool takes about eleven addresses at once, or one
-address about a day (an IPv6 /48 about six hours), where it used to take one
-address a minute. The browsers behind one busy address share the limit too:
-all of them are handed its newest credential, and share its 12 allocations
-for new connections. Raise `TURN_TOTAL_QUOTA` with the port range, and keep it
-ten times what one address can add in two hours.
+refreshed outlives it, so while every credential had an id of its own one
+address could gather the whole pool in a day. Now one address holds at most
+84 allocations however long it keeps at it, and one IPv6 /48 300, so filling
+the pool takes about eleven addresses (or three /48s) at once, where it used
+to take one address a minute. The browsers behind one busy address share the
+limit too: all of them are handed its newest credential, and share its 12
+allocations for new connections. Raise `TURN_TOTAL_QUOTA` with the port range,
+and keep it ten times what one address can hold.
 
 **When TURN times out.** The credential fetch succeeding proves nothing: it
 comes from the relay, and the allocation goes to coturn. If a bundle shows

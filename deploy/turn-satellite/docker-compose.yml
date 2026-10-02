@@ -52,14 +52,14 @@ services:
     # (an admin UI, an exporter, a stray database), straight through the
     # provider's ingress firewall.
     #
-    # --user-quota caps the allocations of one credential and --total-quota is
-    # the pool for everybody. The main instance's relay hands one address at
-    # most seven live credentials (25 per IPv6 /48), so with these defaults one
-    # address can add at most 84 of 900 allocations every two hours. coturn
-    # keeps an allocation that is refreshed past its credential's expiry, so
-    # filling the pool takes about eleven addresses at once, or one address
-    # about a day. The pool stays inside the 1000-port relay range, one port
-    # per allocation; widen the range before raising it.
+    # --user-quota caps the allocations under one credential id and
+    # --total-quota is the pool for everybody. The credentials the main
+    # instance's relay hands one address carry at most seven ids between them
+    # (25 for an IPv6 /48), and coturn counts the quota per id whatever a
+    # credential's expiry, so with these defaults one address holds at most 84
+    # of 900 allocations and filling the pool takes about eleven addresses at
+    # once. The pool stays inside the 1000-port relay range, one port per
+    # allocation; widen the range before raising it.
     #
     # Keep every argument below a real flag: this is a folded block, so a "#"
     # line inside it becomes a literal argument rather than a comment.
