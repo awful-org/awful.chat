@@ -1,5 +1,13 @@
 import { apiUrl } from "./runtime-config";
-import { InvitationPairingHost, formatPairingCode, startPairingJoin } from "./room-security/invitation-pairing";
+import {
+  InvitationPairingHost,
+  PAIRING_MAX_TTL,
+  PAIRING_TTL,
+  formatPairingCode,
+  pairingLimits,
+  startPairingJoin,
+  type PairingLimits,
+} from "./room-security/invitation-pairing";
 import type { RoomSecret } from "./room-security/keys";
 
 interface Message { attempt: string; kind: string; payload: string }
@@ -48,18 +56,67 @@ async function request(body: Record<string, unknown>, signal?: AbortSignal): Pro
 }
 const pause = () => new Promise<void>(resolve => setTimeout(resolve, 1500));
 
-export async function hostInvitationPairing(secret: RoomSecret, onStatus: (status: string) => void, signal?: AbortSignal) {
+/** How long a rate-limited pairing request waits before it asks again. */
+const RATE_LIMIT_WAIT_MS = 5_000;
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+  });
+}
+
+/**
+ * Send a pairing request, and when the relay says slow down (429), wait and
+ * send it again while `alive()` holds. The relay paces an address - a
+ * roomful of people typing one group code behind one network is one address
+ * - and a refusal there used to end that person's join for good. A paced
+ * request spends nothing: the relay refuses before it counts an attempt.
+ * `onWait` hears each wait, so a deadline can leave it out.
+ */
+async function paced<T>(send: () => Promise<T>, alive: () => boolean, signal?: AbortSignal, onWait?: (ms: number) => void): Promise<T> {
+  for (;;) {
+    try {
+      return await send();
+    } catch (err) {
+      if (!(err instanceof PairingRequestError && err.status === 429) || !alive()) throw err;
+      await wait(RATE_LIMIT_WAIT_MS, signal);
+      onWait?.(RATE_LIMIT_WAIT_MS);
+    }
+  }
+}
+
+/**
+ * Host a short code for a room until it has let in everyone it was made for,
+ * runs out, or is cancelled. `onJoined` hears each person who got in;
+ * `onStatus` hears once, when the code is over.
+ */
+export async function hostInvitationPairing(
+  secret: RoomSecret,
+  onStatus: (status: string) => void,
+  signal?: AbortSignal,
+  limits: PairingLimits = {},
+  onJoined?: (joined: number) => void,
+) {
   signal?.throwIfAborted();
+  const { uses, ttlMs } = pairingLimits(limits);
   const controller = new AbortController();
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   let host!: InvitationPairingHost;
   let token: string | undefined;
   for (let tries = 1; ; tries++) {
     // A new host per try: the locator is bound into its OPAQUE registration.
-    host = await InvitationPairingHost.create(secret);
+    host = await InvitationPairingHost.create(secret, Date.now, { uses, ttlMs });
     try {
       combined.throwIfAborted();
-      ({ token } = await request({ action: "create", locator: host.locator }, combined));
+      // The relay holds the code to the same limits, whatever this tab does.
+      // Defaults go unsaid: a relay from before limits refuses the fields.
+      ({ token } = await request({
+        action: "create", locator: host.locator,
+        ...(uses !== 1 && { uses }),
+        ...(ttlMs !== PAIRING_TTL && { ttl: Math.round(ttlMs / 1000) }),
+      }, combined));
       break;
     } catch (err) {
       host.cancel();
@@ -80,7 +137,8 @@ export async function hostInvitationPairing(secret: RoomSecret, onStatus: (statu
   const run = async () => {
     try {
       while (host.active && !cancelled) {
-        const { messages } = await request({ action: "host-poll", locator: host.locator, token }, controller.signal);
+        const alive = () => host.active && !cancelled;
+        const { messages } = await paced(() => request({ action: "host-poll", locator: host.locator, token }, controller.signal), alive, controller.signal);
         for (const m of messages) {
           if (cancelled || !host.active) break;
           let payload: string;
@@ -88,17 +146,43 @@ export async function hostInvitationPairing(secret: RoomSecret, onStatus: (statu
             payload = m.kind === "start" ? host.start(m.attempt, m.payload) : m.kind === "finish" ? await host.finish(m.attempt, m.payload) : "";
           } catch { continue; } // Host counts every start, including malformed requests.
           if (!payload || cancelled) continue;
-          await request({ action: "reply", locator: host.locator, token, attempt: m.attempt, kind: m.kind === "start" ? "response" : "transfer", payload }, controller.signal);
-          if (m.kind === "finish") { onStatus("Invitation delivered. This code is now used."); return; }
+          // A transfer is still owed after the code closes on its last person.
+          await paced(
+            () => request({ action: "reply", locator: host.locator, token, attempt: m.attempt, kind: m.kind === "start" ? "response" : "transfer", payload }, controller.signal),
+            () => !cancelled,
+            controller.signal,
+          );
+          if (m.kind === "finish") {
+            onJoined?.(host.joined);
+            if (host.joined >= host.uses) {
+              onStatus(host.uses === 1
+                ? "Invitation delivered. This code is now used."
+                : `All ${host.uses} people joined. This code is now used.`);
+              return;
+            }
+          }
         }
-        await pause();
+        // A full batch may have more behind it (the relay hands out a few
+        // at a time): ask again at once.
+        if (!messages.length) await pause();
       }
-      if (!cancelled) onStatus("Pairing expired. Generate a new code.");
-    } catch { if (!cancelled) onStatus("Pairing stopped. Generate a new code."); }
+      if (!cancelled) {
+        onStatus(host.joined > 0
+          ? `Code expired after ${host.joined} of ${host.uses} joined.`
+          : "Pairing expired. Generate a new code.");
+      }
+    } catch {
+      if (!cancelled) {
+        onStatus("Pairing stopped. Generate a new code.");
+        // No one answers this code any more: close it at the relay too, so
+        // the people still to join are refused rather than left waiting.
+        void request({ action: "cancel", locator: host.locator, token }).catch(() => {});
+      }
+    }
     finally { host.cancel(); signal?.removeEventListener("abort", cancel); }
   };
   void run();
-  return { code: formatPairingCode(host.locator, host.password), expiresAt: host.expiresAt, cancel };
+  return { code: formatPairingCode(host.locator, host.password), expiresAt: host.expiresAt, uses: host.uses, cancel };
 }
 
 export async function joinInvitationPairing(code: string, signal: AbortSignal): Promise<RoomSecret> {
@@ -109,13 +193,22 @@ export async function joinInvitationPairing(code: string, signal: AbortSignal): 
   try {
     signal.throwIfAborted();
     const base = { locator: join.locator, attempt: join.attempt };
-    await request({ ...base, action: "start", kind: "start", payload: join.request }, signal);
-    const deadline = Date.now() + 60_000;
-    while (!signal.aborted && Date.now() < deadline) {
-      const { messages } = await request({ ...base, action: "join-poll" }, signal);
+    // A minute of the inviter's attention, not counting time the relay asked
+    // us to wait: a group behind one network is paced, not timed out.
+    // Never past the longest a code can live, however often it was paced.
+    const started = Date.now();
+    let deadline = started + 60_000;
+    const alive = () => { const t = Date.now(); return t < deadline && t < started + PAIRING_MAX_TTL; };
+    const waited = (ms: number) => { deadline += ms; };
+    await paced(() => request({ ...base, action: "start", kind: "start", payload: join.request }, signal), alive, signal, waited);
+    while (!signal.aborted && alive()) {
+      const { messages } = await paced(() => request({ ...base, action: "join-poll" }, signal), alive, signal, waited);
       for (const m of messages) {
         if (m.attempt !== join.attempt) throw new Error("Invalid pairing attempt");
-        if (m.kind === "response") await request({ ...base, action: "finish", kind: "finish", payload: join.respond(m.payload) }, signal);
+        if (m.kind === "response") {
+          const proof = join.respond(m.payload);
+          await paced(() => request({ ...base, action: "finish", kind: "finish", payload: proof }, signal), alive, signal, waited);
+        }
         else if (m.kind === "transfer") {
           const secret = await join.open(m.payload);
           signal.throwIfAborted();
