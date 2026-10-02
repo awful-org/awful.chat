@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,9 +46,17 @@ const pluginProxyCacheTTL = 5 * time.Minute
 // exact key, so an entry nobody asks for a second time used to stay resident
 // for the life of the process. A plain map under a mutex, not sync.Map, for
 // the same reason the rate limiter below uses one: the size bookkeeping has
-// to be atomic with the insert.
+// to be atomic with the insert. The bytes are each key's as well as its
+// body's, as in the /og cache: the key is the whole url, and counting bodies
+// alone let a few hundred urls of a megabyte each sit outside the 64 MiB.
 const pluginProxyCacheMaxEntries = 512
 const pluginProxyCacheMaxBytes = 64 << 20
+
+// The longest key that is kept: an even share of the bytes. A card's url is
+// a few hundred bytes, while the relay reads request lines of up to a
+// megabyte, and a few dozen urls that long would otherwise push every other
+// card's answer out.
+const pluginProxyCacheMaxKeyBytes = pluginProxyCacheMaxBytes / pluginProxyCacheMaxEntries
 
 var (
 	pluginProxyCacheMu    sync.Mutex
@@ -69,13 +78,12 @@ func pluginProxyCacheDropLocked(key string) {
 	if !ok {
 		return
 	}
-	pluginProxyCacheBytes -= len(e.body)
+	pluginProxyCacheBytes -= len(key) + len(e.body)
 	delete(pluginProxyCache, key)
-	for i, k := range pluginProxyCacheOrder {
-		if k == key {
-			pluginProxyCacheOrder = append(pluginProxyCacheOrder[:i], pluginProxyCacheOrder[i+1:]...)
-			break
-		}
+	// slices.Delete clears the slot it vacates, so the order list does not
+	// keep a dropped url alive behind its length.
+	if i := slices.Index(pluginProxyCacheOrder, key); i >= 0 {
+		pluginProxyCacheOrder = slices.Delete(pluginProxyCacheOrder, i, i+1)
 	}
 }
 
@@ -93,13 +101,19 @@ func pluginProxyCached(key string) (pluginProxyCacheEntry, bool) {
 	return pluginProxyCacheEntry{}, false
 }
 
+// pluginProxyStore keeps an answer, unless its key is longer than
+// pluginProxyCacheMaxKeyBytes: a url that long is fetched again on every
+// ask, as if there were no cache.
 func pluginProxyStore(key string, body []byte, contentType string) {
 	pluginProxyCacheMu.Lock()
 	defer pluginProxyCacheMu.Unlock()
 	pluginProxyCacheDropLocked(key) // a refresh must not be counted twice
+	if len(key) > pluginProxyCacheMaxKeyBytes {
+		return
+	}
 	pluginProxyCache[key] = pluginProxyCacheEntry{body: body, contentType: contentType, expires: time.Now().Add(pluginProxyCacheTTL)}
 	pluginProxyCacheOrder = append(pluginProxyCacheOrder, key)
-	pluginProxyCacheBytes += len(body)
+	pluginProxyCacheBytes += len(key) + len(body)
 	for len(pluginProxyCacheOrder) > 0 &&
 		(len(pluginProxyCacheOrder) > pluginProxyCacheMaxEntries || pluginProxyCacheBytes > pluginProxyCacheMaxBytes) {
 		pluginProxyCacheDropLocked(pluginProxyCacheOrder[0])
