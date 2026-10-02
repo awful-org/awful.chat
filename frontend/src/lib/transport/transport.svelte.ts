@@ -1568,6 +1568,10 @@ async function _sendDigestForRoom(
   if (!opts.peerKnowsRoom && !_transport.peersInRoom(roomCode).includes(peerId)) {
     return;
   }
+  // The digest may bring a push. From the moment it is read until that push
+  // starts, a live message must not claim past the rows it is asking for -
+  // and if no push comes, the hold simply runs out.
+  _inboundPushes.expect(roomCode);
   // Plus, for an older build whose push stopped short, what that push did
   // deliver: told to that peer alone, or it re-sends the same rows forever.
   const watermarks = _inboundPushes.withClaims(
@@ -1583,13 +1587,10 @@ async function _sendDigestForRoom(
       d: { watermarks: Object.keys(watermarks).length },
     })
   );
-  const sent = await _transport.sendRoom(
+  await _transport.sendRoom(
     peerId, roomCode,
     encode({ type: MessageType.SyncDigest, roomCode, watermarks })
   );
-  // A push may be on its way: until it starts, a live message must not
-  // claim past the rows it is about to deliver.
-  if (sent) _inboundPushes.expect(roomCode);
 }
 
 // ── History ───────────────────────────────────────────────────────────────────
