@@ -3175,9 +3175,32 @@ function _announceMessage(
   msg: Message,
   opts: { viaMailbox?: boolean } = {}
 ): void {
+  if (!msg.roomCode.startsWith("dm-")) {
+    _announce(msg, opts);
+    return;
+  }
   // A message request makes no sound: a stranger minting identities would
-  // otherwise get a notification per identity.
+  // otherwise get a notification per identity. The stored record decides,
+  // not just the sidebar's copy of it, which missed a request stored a
+  // moment earlier: a stranger's bare message over the DM's channel, or a
+  // live batch, rang the phone with a text of their choosing. A DM with no
+  // record is no conversation we hold, and is as quiet.
   if (isDmRequestRoom(msg.roomCode)) return;
+  let guard: () => void;
+  try { guard = captureDmOwnership(); } catch { return; }
+  void getRoom(msg.roomCode)
+    .then((room) => {
+      guard();
+      if (room?.type !== "dm" || (room as DMRoom).request === true) return;
+      // Titled as the conversation is: by the name their proven profile
+      // gave, never the frame's senderName, which is unsigned and theirs to
+      // pick per message.
+      _announce({ ...msg, senderName: resolveDmDisplayName(msg.senderId) }, opts);
+    })
+    .catch(() => {});
+}
+
+function _announce(msg: Message, opts: { viaMailbox?: boolean }): void {
   announceMessage(
     msg,
     {

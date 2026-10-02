@@ -101,10 +101,11 @@ vi.mock("./mailbox.svelte", () => ({
 }));
 
 import { deliverMailboxDm, transportState, _peerIdToDid } from "./transport.svelte";
-import { openDmConversation, ensureDmRoomForPeer } from "./dm.svelte";
-import { getRoom, wipeLocalDatabase, getLastMessage, getRoomParticipants } from "$lib/storage";
+import { openDmConversation, ensureDmRoomForPeer, isDmRequestRoom } from "./dm.svelte";
+import { getRoom, wipeLocalDatabase, getLastMessage, getRoomParticipants, getMessage } from "$lib/storage";
 import { encode, decode } from "$lib/utils";
-import { MessageType } from "$lib/types/message";
+import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
+import { canonicalContentV3 } from "$lib/messaging";
 import { roomsStore } from "$lib/rooms.svelte";
 import { hashDmRoomCode, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
@@ -113,6 +114,19 @@ function identity(): UnlockedSession {
   const privateKey = crypto.getRandomValues(new Uint8Array(32));
   const publicKey = new Uint8Array(ed25519.getPublicKey(privateKey));
   return { privateKey, publicKey, did: publicKeyToDid(publicKey) };
+}
+
+const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+/** A chat row signed by `as` for `room`, the way its own client would. */
+function signedWire(as: UnlockedSession, room: string, extra: Partial<Message> = {}): WireChatMessage {
+  const msg: Message = {
+    id: newMessageId(as.did), roomCode: room, senderId: as.did, senderName: "Them",
+    timestamp: Date.now(), lamport: 1, type: MessageType.Text, content: "hi", attachments: [],
+    ...extra,
+  };
+  const sig = ed25519.sign(new TextEncoder().encode(canonicalContentV3(msg)), as.privateKey);
+  return messageToWire({ ...msg, senderDid: as.did, sig: hex(sig), sigV: 3 });
 }
 
 function chat(from: string, text = "hello", extra: Partial<DmPayload> = {}): DmPayload {
@@ -254,5 +268,45 @@ describe("only someone in our call is listed as watching it (G01.2)", () => {
     watch("12D3-member", "rd2_call", [SELF]);
     presence("12D3-member", "rd2_other");
     expect(viewersOf(SELF)).toEqual([]);
+  });
+});
+
+describe("a message request makes no sound until accepted (S08.2)", () => {
+  it("is known as a request from the moment it is stored", async () => {
+    const { who, code } = await dmPeer("12D3-stranger");
+    await ensureDmRoomForPeer(who.did, undefined, { unsolicited: true });
+    expect(isDmRequestRoom(code)).toBe(true);
+  });
+
+  it("does not announce a stranger's bare message in a request just made", async () => {
+    const { who, device, code } = await dmPeer("12D3-stranger");
+    await ensureDmRoomForPeer(who.did, undefined, { unsolicited: true });
+    roomsStore.dmRooms = [];
+    const wire = signedWire(who, code);
+    receive(device, wire, code);
+    await vi.waitFor(async () => expect(await getMessage(wire.id)).toBeDefined());
+    await settled();
+    expect(s.announce).not.toHaveBeenCalled();
+  });
+
+  it("does not announce a live batch into a request either", async () => {
+    const { who, device, code } = await dmPeer("12D3-stranger");
+    await ensureDmRoomForPeer(who.did, undefined, { unsolicited: true });
+    roomsStore.dmRooms = [];
+    const wire = signedWire(who, code);
+    receive(device, { type: MessageType.SyncBatch, roomCode: code, messages: [wire],
+      batchIndex: 0, totalBatches: 1, live: true }, code);
+    await vi.waitFor(async () => expect(await getMessage(wire.id)).toBeDefined());
+    await settled();
+    expect(s.announce).not.toHaveBeenCalled();
+  });
+
+  it("titles a DM by the name its sender's profile proved, never the frame's", async () => {
+    const { who, device, code } = await dmPeer();
+    await ensureDmRoomForPeer(who.did);
+    transportState.peerNames = new Map([[who.did, "Bob"]]);
+    receive(device, signedWire(who, code, { senderName: "Your Bank" }), code);
+    await vi.waitFor(() => expect(s.announce).toHaveBeenCalledOnce());
+    expect(s.announce.mock.calls[0][0]).toMatchObject({ senderName: "Bob", senderId: who.did });
   });
 });

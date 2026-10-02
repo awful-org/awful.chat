@@ -1055,6 +1055,12 @@ async function _joinDm(
   };
   await putRoom(room, guard);
   if (requireSession() !== session) throw new Error("Identity changed");
+  // isDmRequestRoom and the request banner read the sidebar's copy, which
+  // only a refresh used to bring this into: until then the request was
+  // treated as an accepted DM.
+  if (request && !roomsStore.dmRooms.some((r) => r.roomCode === roomCode)) {
+    roomsStore.dmRooms = [...roomsStore.dmRooms, room];
+  }
   return roomCode;
 }
 
