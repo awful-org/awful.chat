@@ -112,3 +112,29 @@ it("does not send data on an unverified or closed connection", async () => {
   expect(await c.send(new Uint8Array([1]))).toBe(false);
   expect(write).not.toHaveBeenCalled();
 });
+
+it("tells a message that never left apart from one refused or broken on the way", async () => {
+  const { a, b } = await pair();
+  // Refused here: the channel stays up, and a resend elsewhere would bypass the cap.
+  expect(await a.trySend(new Uint8Array(MAX_ROOM_MESSAGE + 1))).toBe("failed");
+  expect(a.verified).toBe(true);
+  expect(await a.trySend(new Uint8Array([1]))).toBe("sent");
+  // Closed before anything was written: safe to send again on a fresh channel.
+  a.close();
+  expect(await a.trySend(new Uint8Array([2]))).toBe("unsent");
+  // Broken part way: some of it may have arrived, so it is not resent.
+  const writes: unknown[] = [];
+  const keys = deriveRoomKeys(newRoomSecret());
+  let peer!: SecureRoomChannel;
+  const c = new SecureRoomChannel(keys, "carol", "dave", "initiator", async (f) => {
+    writes.push(f);
+    if (writes.length > 2) { c.close(); throw new Error("stream gone"); }
+    queueMicrotask(() => peer.receive(f, JSON.stringify(f).length));
+  }, () => {}, () => {});
+  peer = new SecureRoomChannel(keys, "dave", "carol", "responder", async (f) => {
+    queueMicrotask(() => c.receive(f, JSON.stringify(f).length));
+  }, () => {}, () => {});
+  channels.push(c, peer, b);
+  await c.ready;
+  expect(await c.trySend(new Uint8Array(300_000))).toBe("failed");
+});
