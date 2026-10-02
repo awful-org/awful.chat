@@ -10,6 +10,7 @@
   import { isGifUrl } from "$lib/media-url";
   import { remotePreviewUrl } from "$lib/preview-url";
   import { Tip } from "$lib/components/ui/tooltip";
+  import LazyTip from "$lib/components/ui/tooltip/lazy-tip.svelte";
   import {
     ChevronDown,
     Download,
@@ -789,7 +790,7 @@
                  gone from this device after a reload, and the only way back
                  is pulling it from a peer who still holds it. -->
             {#if !transfer || transfer.status === "pending" || transfer.status === "failed"}
-              <Tip text="Download">
+              <LazyTip text="Download">
                 {#snippet children(props)}
               <button
                 {...props}
@@ -801,7 +802,7 @@
                 <Download class="size-3.5" />
               </button>
                 {/snippet}
-              </Tip>
+              </LazyTip>
             {/if}
           </div>
 
@@ -1067,7 +1068,7 @@
             </span>
           {/if}
           {#if pluginHasWidget}
-            <Tip
+            <LazyTip
               text={pluginIsPinned
                 ? "Unpin from the sidebar"
                 : "Pin this plugin to the sidebar"}
@@ -1094,7 +1095,7 @@
                   {pluginIsPinned ? "pinned" : "pin"}
                 </button>
               {/snippet}
-            </Tip>
+            </LazyTip>
           {/if}
         </div>
         {#if pluginHostApi}
@@ -1254,7 +1255,7 @@
        One tick: the relay holds it. Two: their device has it. Green: they
        opened it. -->
   {#if isOwn && isDmMessage && msg.status}
-    <Tip text={statusTip}>
+    <LazyTip text={statusTip}>
       {#snippet children(props)}
         <span
           {...props}
@@ -1279,7 +1280,7 @@
           {/if}
         </span>
       {/snippet}
-    </Tip>
+    </LazyTip>
   {/if}
 </div>
 

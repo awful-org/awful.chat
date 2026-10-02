@@ -56,6 +56,7 @@
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
   import { Tip } from "$lib/components/ui/tooltip";
+  import LazyTip from "$lib/components/ui/tooltip/lazy-tip.svelte";
   import { Separator } from "$lib/components/ui/separator";
   import {
     Drawer,
@@ -2949,7 +2950,7 @@
                         ?.entries() ?? [])] as [emoji, users] (emoji)}
                       {#if users.size > 0}
                         {@const reacted = users.has(selfId()) || users.has(myPeerId())}
-                        <Tip text={reactorNames(users)}>
+                        <LazyTip text={reactorNames(users)}>
                           {#snippet children(props)}
                             <button
                               {...props}
@@ -2967,7 +2968,7 @@
                               <span>{users.size}</span>
                             </button>
                           {/snippet}
-                        </Tip>
+                        </LazyTip>
                       {/if}
                     {/each}
                   </div>
@@ -2989,7 +2990,7 @@
                     ? 'opacity-100'
                     : ''} transition-opacity flex items-center gap-1 pr-1"
                 >
-                  <Tip text="React">
+                  <LazyTip text="React">
                     {#snippet children(props)}
                   <button
                     {...props}
@@ -3009,8 +3010,8 @@
                     <Smile class="size-3.5" />
                   </button>
                     {/snippet}
-                  </Tip>
-                  <Tip text="Reply">
+                  </LazyTip>
+                  <LazyTip text="Reply">
                     {#snippet children(props)}
                   <button
                     {...props}
@@ -3026,9 +3027,9 @@
                     <Reply class="size-3.5" />
                   </button>
                     {/snippet}
-                  </Tip>
+                  </LazyTip>
                   {#if !ephemeral}
-                    <Tip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                    <LazyTip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
                       {#snippet children(props)}
                     <button
                       {...props}
@@ -3051,7 +3052,7 @@
                       {/if}
                     </button>
                       {/snippet}
-                    </Tip>
+                    </LazyTip>
                   {/if}
                 </div>
                 {#if pinnedSet.has(msg.id)}
