@@ -188,7 +188,10 @@ the widget, call tile, local card and settings surfaces have `WidgetProps`,
 
 Updates attach to a card. `host.sendUpdate(cardId, data)` persists and
 replays; `{ ephemeral: true }` sends live-only (cursors, ticks) and is
-capped at about 4 per second per sender. Your `reduce(state, update, ctx)`
+capped at about 4 per second per sender. Receivers cap the rest too: 20
+persisted updates per 10 seconds from one person in a room, every plugin's
+together, and 10 cards a minute, dropping what is over - one human action
+should be one update. Your `reduce(state, update, ctx)`
 folds them: history first in a deterministic order, then live. Keep it
 pure, keep it a function of its inputs, and the same state materializes
 on every client and every reload. The context carries `{ senderDid,

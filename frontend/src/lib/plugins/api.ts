@@ -111,14 +111,16 @@ export interface HostApi {
    * Post a card to the host's room. `payload` is what `initialState`
    * receives on every client, so seed options and questions from it; it is
    * JSON, capped at 16 KB. Resolves to the card's id, which updates name.
+   * Receivers take at most 10 cards a minute from one person in a room.
    */
   sendCard(payload: unknown): Promise<string>;
   /**
    * Attach an update to a card. Persisted and replayed in fold order
    * (lamport, senderId, updateId) on every client, into your `reduce`.
    * `{ ephemeral: true }` sends live only, never stored or replayed
-   * (cursors, ticks), capped at about four a second per sender. JSON,
-   * 4 KB; anything larger is refused.
+   * (cursors, ticks), capped at about four a second per sender; persisted
+   * ones at 20 per 10 s from one person in a room, all plugins together.
+   * JSON, 4 KB; anything larger is refused.
    */
   sendUpdate(
     cardId: string,
