@@ -396,8 +396,8 @@ on receive SyncDigest:
       push arrives leaves no gap below it
     - each frame goes out once the room channel accepted the one before
       (it refuses past 32 frames / 4 MB in flight); 4 back to back, then
-      one per 100ms, which an older receiver verifying each batch before
-      reading the next frame keeps up with
+      one per 150ms, which an older receiver on a slow phone - verifying
+      each batch before it reads the next frame - keeps ahead of
     - a refused frame is retried (250ms, 1s), then the push stops; the
       SyncComplete goes out only once every batch was accepted
   → a digest that brings no push - nothing they lack, the push window not

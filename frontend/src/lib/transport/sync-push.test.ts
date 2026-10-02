@@ -121,6 +121,24 @@ describe("runPush", () => {
     });
     expect(waits).toEqual(Array(7 - PUSH_PACE.burst).fill(PUSH_PACE.paceMs));
   });
+
+  it("never fills an older phone's channel queue, however long the push", async () => {
+    // An older receiver handles a frame - 20 verifies, about 113 ms on a
+    // phone-class CPU (6x throttle) - before it reads the next one, and
+    // closes the channel once 32 frames wait.
+    const HANDLE_MS = 113;
+    let now = 0;
+    let busyUntil = 0;
+    const finishes: number[] = [];
+    let most = 0;
+    await runPush(500, async () => {
+      busyUntil = Math.max(now, busyUntil) + HANDLE_MS;
+      finishes.push(busyUntil);
+      most = Math.max(most, finishes.filter((t) => t > now).length);
+      return true;
+    }, { sleep: async (ms) => { now += ms; } });
+    expect(most).toBeLessThan(32);
+  });
 });
 
 // The room channel itself refuses past 32 frames in flight. This is the

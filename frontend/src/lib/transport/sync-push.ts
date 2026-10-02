@@ -96,12 +96,17 @@ export interface PushPace {
 }
 
 /**
- * Fast enough for a phone-class receiver on an older build, which verifies
- * each batch (about 70-115 ms for 20 rows) before it reads the next frame off
- * the channel, and closes the channel once 32 frames wait unread. 10,000
- * rows take under a minute; the head is in the burst.
+ * Slow enough for a phone-class receiver on an older build. It verifies each
+ * batch inside the room channel's processing, before the next frame is read
+ * off it - about 70 ms for 20 rows at 4x CPU throttle, 110 ms at 6x - and
+ * closes the channel once 32 frames wait unread, losing all of them. At one
+ * frame per 100 ms the slowest of those fell behind a little with every
+ * frame, and a long push could still overflow it; 150 ms stays ahead. A
+ * current receiver verifies off that path and keeps up with any pace.
+ * 10,000 rows take about 75 seconds; the head, the first screen, is in the
+ * burst.
  */
-export const PUSH_PACE: PushPace = { burst: 4, paceMs: 100, retryMs: [250, 1_000] };
+export const PUSH_PACE: PushPace = { burst: 4, paceMs: 150, retryMs: [250, 1_000] };
 
 /**
  * Send frames 0..count-1 in order, each once the one before was accepted.
