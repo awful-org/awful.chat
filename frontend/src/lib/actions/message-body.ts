@@ -9,6 +9,128 @@
 import type { Attachment } from "svelte/attachments";
 
 /**
+ * Highlighted html by language and code, used longest ago first (a Map
+ * keeps insertion order). Highlighting runs on the main thread, and the
+ * message list is not virtualized: every block was tokenized again on each
+ * mount - the room reopened, scrolled back to, the message re-rendered.
+ */
+const highlighted = new Map<string, string>();
+let highlightedChars = 0;
+const CACHE_ENTRIES = 200;
+/** About 4 MB of html at most; one block's is a few hundred KB at worst. */
+const CACHE_CHARS = 2_000_000;
+/** In flight, so blocks that ask at once share one tokenization. */
+const pending = new Map<string, Promise<string | null>>();
+
+const cacheKey = (code: string, lang: string) => `${lang}\n${code}`;
+
+/** The html this block was highlighted to before, if it is still kept. */
+export function cachedHighlight(code: string, lang: string): string | undefined {
+  const key = cacheKey(code, lang);
+  const html = highlighted.get(key);
+  if (html !== undefined) {
+    highlighted.delete(key);
+    highlighted.set(key, html);
+  }
+  return html;
+}
+
+function remember(key: string, html: string): void {
+  if (html.length > CACHE_CHARS) return;
+  const before = highlighted.get(key);
+  if (before !== undefined) {
+    highlighted.delete(key);
+    highlightedChars -= before.length;
+  }
+  highlighted.set(key, html);
+  highlightedChars += html.length;
+  for (const [old, oldHtml] of highlighted) {
+    if (highlighted.size <= CACHE_ENTRIES && highlightedChars <= CACHE_CHARS) break;
+    highlighted.delete(old);
+    highlightedChars -= oldHtml.length;
+  }
+}
+
+/**
+ * The block as highlighted html, or null for a language shiki has no
+ * grammar for, or cannot load right now. A failure is not kept: offline,
+ * a grammar's chunk fails to load, and it may load the next time.
+ */
+export function highlightCode(code: string, lang: string): Promise<string | null> {
+  const hit = cachedHighlight(code, lang);
+  if (hit !== undefined) return Promise.resolve(hit);
+  const key = cacheKey(code, lang);
+  let work = pending.get(key);
+  if (!work) {
+    // Loaded on demand: the highlighter engine plus its wasm is well over
+    // half a megabyte, and most sessions never see a code block.
+    work = import("shiki")
+      .then(({ codeToHtml }) => codeToHtml(code, { lang, theme: "github-dark" }))
+      .then(
+        (html) => {
+          remember(key, html);
+          return html;
+        },
+        () => null
+      )
+      .finally(() => pending.delete(key));
+    pending.set(key, work);
+  }
+  return work;
+}
+
+/**
+ * The block replaced by its highlighted copy. It keeps the block's own
+ * classes (the room left for the copy button, the code font and size):
+ * shiki's <pre> has none of them.
+ */
+function swapIn(pre: HTMLElement, html: string): void {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const next = tpl.content.firstElementChild;
+  if (!next) return;
+  next.classList.add(...pre.classList);
+  pre.replaceWith(next);
+}
+
+/**
+ * Blocks on screen and not yet highlighted, done one per idle moment: the
+ * first loads shiki's engine and wasm, and tokenizing a long block takes a
+ * while, all on the main thread, so none of it runs while a room opens or
+ * scrolls, nor in one long stretch for a page of blocks.
+ */
+const queue: { pre: HTMLElement; live: () => boolean }[] = [];
+let draining = false;
+
+function whenIdle(run: () => void): void {
+  if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 1000 });
+  else setTimeout(run, 50);
+}
+
+function drain(): void {
+  const next = queue.shift();
+  const done = () => {
+    if (queue.length) whenIdle(drain);
+    else draining = false;
+  };
+  if (!next || !next.live() || !next.pre.isConnected) return done();
+  void highlightCode(next.pre.textContent ?? "", next.pre.dataset.lang || "text")
+    .then((html) => {
+      // An unknown language keeps the plain block it already is.
+      if (html !== null && next.live() && next.pre.isConnected) swapIn(next.pre, html);
+    })
+    .catch(() => {})
+    .finally(done);
+}
+
+function enqueue(pre: HTMLElement, live: () => boolean): void {
+  queue.push({ pre, live });
+  if (draining) return;
+  draining = true;
+  whenIdle(drain);
+}
+
+/**
  * Drop the C0 controls, keeping only newline and tab (and DEL, which behaves
  * like one).
  *
@@ -26,34 +148,38 @@ export function messageBody(html: string): Attachment<HTMLElement> {
   return (node) => {
     void html;
     let live = true;
+    const isLive = () => live;
+    let observer: IntersectionObserver | undefined;
 
     // After this flush: the body's {@html} may not be in the DOM yet when an
     // attachment on its parent runs.
     queueMicrotask(() => {
       const blocks = [...node.querySelectorAll<HTMLElement>("pre[data-lang]")];
       if (!live || !blocks.length) return;
-      // Loaded on demand: the highlighter engine plus its wasm is well over
-      // half a megabyte, and most sessions never see a code block.
-      void import("shiki")
-        .then(({ codeToHtml }) => {
-          for (const pre of blocks) {
-            codeToHtml(pre.textContent ?? "", { lang: pre.dataset.lang || "text", theme: "github-dark" })
-              .then((highlighted) => {
-                if (!live || !pre.isConnected) return;
-                const tpl = document.createElement("template");
-                tpl.innerHTML = highlighted;
-                const next = tpl.content.firstElementChild;
-                if (!next) return;
-                // Keep the block's own classes (the room left for the copy
-                // button, the code font and size): shiki's <pre> has none of them.
-                next.classList.add(...pre.classList);
-                pre.replaceWith(next);
-              })
-              // An unknown language keeps the plain block it already is.
-              .catch(() => {});
+      const waiting: HTMLElement[] = [];
+      for (const pre of blocks) {
+        // Highlighted before: in place at once, with no plain block first.
+        const html = cachedHighlight(pre.textContent ?? "", pre.dataset.lang || "text");
+        if (html !== undefined) swapIn(pre, html);
+        else waiting.push(pre);
+      }
+      if (!waiting.length) return;
+      if (typeof IntersectionObserver !== "function") {
+        for (const pre of waiting) enqueue(pre, isLive);
+        return;
+      }
+      // The rest as they come on screen: a block scrolled past is never done.
+      observer = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            observer?.unobserve(entry.target);
+            enqueue(entry.target as HTMLElement, isLive);
           }
-        })
-        .catch(() => {});
+        },
+        { rootMargin: "200px" }
+      );
+      for (const pre of waiting) observer.observe(pre);
     });
 
     const reveal = (e: Event): boolean => {
@@ -101,6 +227,7 @@ export function messageBody(html: string): Attachment<HTMLElement> {
 
     return () => {
       live = false;
+      observer?.disconnect();
       node.removeEventListener("click", onClick);
       node.removeEventListener("keydown", onKeydown);
     };
