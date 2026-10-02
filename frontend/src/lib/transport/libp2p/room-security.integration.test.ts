@@ -242,14 +242,21 @@ it("gives two devices sharing 40 rooms one channel per room, all delivering both
 it("closes the least recently used idle channels past the limit, and reopens them on the next send", async () => {
   const pair = await sharedRooms(6);
   const { alice, bob, rooms, a, b } = pair;
-  // Three at most, and no quiet period first, so it happens at once.
-  (alice.transport as any).roomChannelLimits = { total: 3, perConnection: 3, idleMs: 0 };
   const roster = vi.fn();
   alice.transport.on("roomPeers", roster);
   pair.discover();
-  await vi.waitFor(() => expect(roster).toHaveBeenCalledTimes(6), { timeout: 20_000 });
+  await vi.waitFor(() => {
+    expect(roster).toHaveBeenCalledTimes(6);
+    for (const room of rooms) expect(bob.transport.isRoomPeer(room, a)).toBe(true);
+  }, { timeout: 20_000 });
+  // Three at most, and no quiet period first, so the next pass - the
+  // reconcile tick's - closes three at once. Set only now: the quiet period
+  // is also what lets the other end finish a handshake before its channel
+  // can close, and at zero a channel could go before Bob had proven it.
+  (alice.transport as any).roomChannelLimits = { total: 3, perConnection: 3, idleMs: 0 };
   const held = () => [...channelsPerRoom(alice.transport).values()].reduce((sum, n) => sum + n, 0);
-  await vi.waitFor(() => expect(held()).toBe(3));
+  (alice.transport as any).trimRoomChannels();
+  expect(held()).toBe(3);
   expect((alice.transport as any).debugStats.roomChannelsClosedIdle).toBe(3);
   // Closed is not gone: both ends still count the other in, in every room.
   for (const room of rooms) {
