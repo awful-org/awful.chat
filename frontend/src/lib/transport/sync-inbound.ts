@@ -15,8 +15,7 @@
 //  - "head" batches, and every batch of an older build's push, claim once
 //    the push completes: every batch it announced arrived, in order. That
 //    alone tells a whole push from a cut-off one (an older build's lost
-//    batches never arrive), so it does not wait on SyncComplete, which a DM
-//    batch's detour on the way in can let arrive first;
+//    batches never arrive), so it does not wait on SyncComplete either;
 //  - meanwhile every other advance in the room, live messages included,
 //    waits in storage (holdWatermarks) and is written once a push into the
 //    room completes - or, when we asked for history and none came, shortly
@@ -206,8 +205,7 @@ export class InboundPushes {
   /**
    * The pusher's SyncComplete for the room. Settles once the push is over and
    * its batches are handled. A push still missing a batch keeps waiting for
-   * it - a DM batch takes a detour on the way in and can arrive after this -
-   * until the stall; one already broken ends now.
+   * it until the stall; one already broken ends now.
    */
   complete(peer: string, room: string): Promise<void> {
     const key = `${peer}|${room}`;

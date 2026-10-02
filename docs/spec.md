@@ -409,14 +409,16 @@ on receive SyncBatch:
   → claim watermarks (max semantics, never regress) - but a watermark says
     "I hold everything this sender wrote up to here", and nobody offers what
     is below it again, so a push only claims what cannot skip a row
-    (sync-inbound.ts). A push's batches are handled one at a time, in order:
+    (sync-inbound.ts). A push's batches are handled one at a time, in the
+    order they arrived - a DM's frames, which look the conversation up on
+    the way in, wait in line per peer and conversation so none overtakes
+    the one before it, its SyncComplete included:
     - "asc" batches claim as each is stored, while every earlier batch of the
       push was stored too (a missing or refused batch stops the claims)
     - "head" batches, and an older build's unmarked batches, claim only once
       the push completes: every batch it announced (totalBatches) arrived,
-      in order - which also tells a cut-off push from a whole one. It does
-      not wait on SyncComplete, which can arrive before the last batch: a DM
-      batch takes a detour on the way in
+      in order - which also tells a cut-off push from a whole one, so it
+      does not wait on SyncComplete either
     - rows already held count: their stored lamport, not the copy's
     - while a push into the room is open, or one stopped short and none has
       completed since, or for 15s after we sent a digest, every other

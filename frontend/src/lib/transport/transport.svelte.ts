@@ -3807,6 +3807,40 @@ async function _handleDmBatch(
 }
 
 /**
+ * A DM conversation's sync frames from one peer, handled in the order they
+ * arrived. A batch looks the conversation up before it reaches the push
+ * tracker (dmRoomExists: a hash, an IndexedDB read and a decrypt), and those
+ * lookups do not take equal time, so a batch could overtake the one sent
+ * before it. The tracker places each batch of a push by its index, so it took
+ * the push for broken: the overtaking rows were stored but never claimed, and
+ * the conversation stayed held until some later push completed. A room batch
+ * reaches the tracker synchronously and needs none of this. The SyncComplete
+ * behind a DM push waits in the same line, behind its batches.
+ */
+const _dmSyncQueue = new Map<string, Promise<void>>();
+
+function _inDmSyncOrder(
+  peerId: string,
+  room: string,
+  guard: () => void,
+  run: () => unknown
+): void {
+  const key = `${peerId}|${room}`;
+  const next = (_dmSyncQueue.get(key) ?? Promise.resolve())
+    .then(async () => {
+      // A frame that arrived before the identity changed is not handled
+      // under the next one.
+      guard();
+      await run();
+    })
+    .catch(() => {});
+  _dmSyncQueue.set(key, next);
+  void next.then(() => {
+    if (_dmSyncQueue.get(key) === next) _dmSyncQueue.delete(key);
+  });
+}
+
+/**
  * Create the conversation a DM batch is the first contact of, as a request.
  * False when there is no room for it (a stranger's request that did not fit).
  */
@@ -4310,7 +4344,7 @@ _transport.on("message", (peerId, data, room) => {
         break;
       case MessageType.SyncBatch:
         if (room?.startsWith("dm-") && msg.roomCode === room) {
-          _handleDmBatch(peerId, room, msg).catch(() => {});
+          _inDmSyncOrder(peerId, room, guard, () => _handleDmBatch(peerId, msg.roomCode, msg));
           break;
         }
         // The order travels with the frame, as it does for a DM: without it
@@ -4326,6 +4360,10 @@ _transport.on("message", (peerId, data, room) => {
         ).catch(() => {});
         break;
       case MessageType.SyncComplete:
+        if (room?.startsWith("dm-") && msg.roomCode === room) {
+          _inDmSyncOrder(peerId, room, guard, () => _handleSyncComplete(peerId, msg.roomCode));
+          break;
+        }
         _handleSyncComplete(peerId, msg.roomCode);
         break;
       case MessageType.Text:

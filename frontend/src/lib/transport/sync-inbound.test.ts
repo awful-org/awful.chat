@@ -92,8 +92,8 @@ describe("a paced push", () => {
   });
 
   it("completes a push whose SyncComplete arrives before its first batch", async () => {
-    // A DM batch takes a detour on the way in; a one-batch push's
-    // SyncComplete, sent right behind it, can get here first.
+    // Not what the transport hands it any more - a DM's frames now wait in
+    // line - but a push must not depend on the order of its SyncComplete.
     const { tracker, mark, held } = harness();
     const rows = history(10);
     const [only] = pacedFrames(rows);
