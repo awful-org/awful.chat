@@ -4,7 +4,7 @@ import App from "./App.svelte";
 import { loadRuntimeConfig } from "$lib/runtime-config";
 import { sweepOrphanQuickStorage } from "$lib/quick/quick-storage";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
-import { pageFor, preloadPage } from "./pages";
+import { firstPage, preloadPage, routeFor } from "./pages";
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
 // ReloadPrompt.svelte. A second registerSW() here used to race it - each
@@ -46,12 +46,13 @@ window.addEventListener("vite:preloadError", (event) => {
 // refreshes it behind the app (runtime-config.ts).
 const config = loadRuntimeConfig();
 
-// The app itself is not in this bundle (pages.ts). An invite link or /app
-// starts downloading it now, alongside the configuration, rather than once
-// the app has mounted and read the identity; it runs when App shows it.
+// The pages are not in this bundle (pages.ts). An invite link or /app starts
+// downloading its first screen - the setup or unlock form, with the app to
+// follow once that is up - now, alongside the configuration, rather than
+// once App has mounted and read the identity; it runs when App shows it.
 // After loadRuntimeConfig, which has already applied a saved copy: whether
 // /qs and /qc exist is part of the configuration.
-preloadPage(pageFor(window.location.pathname));
+preloadPage(firstPage(routeFor(window.location.pathname)));
 
 await config;
 

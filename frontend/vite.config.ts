@@ -98,6 +98,7 @@ export default defineConfig(({ mode }) => ({
     nodePolyfills(),
     pageChunks({
       app: "/src/lib/components/AppView.svelte",
+      gate: "/src/lib/components/IdentityGate.svelte",
       qs: "/src/lib/components/QuickSend.svelte",
       qc: "/src/lib/components/QuickCall.svelte",
     }),

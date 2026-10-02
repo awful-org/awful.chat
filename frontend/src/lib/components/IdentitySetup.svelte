@@ -19,19 +19,22 @@
   import type { KeypairRecord } from "$lib/identity/identity";
   import { enroll } from "$lib/identity/identity.svelte";
   import { ArrowLeft, Smartphone, Info, Upload } from "@lucide/svelte";
+  // From the backup's own modules: sync.svelte.ts re-exports them, but brings
+  // the whole transport with it, and this screen is the first an invite link
+  // shows - before the app is even downloaded (IdentityGate.svelte).
+  import { readBackupFile, applyBackup } from "$lib/transport/backup-restore";
   import {
-    readBackupFile,
-    applyBackup,
     summarizeBackup,
     decryptBackup,
     type BackupFile,
     type BackupSummary,
     type EncryptedBackupFile,
-  } from "$lib/transport/sync.svelte";
+  } from "$lib/transport/backup";
   import { saveRememberedPassword } from "$lib/identity/remembered-password";
   import { requestPersistentStorage } from "$lib/storage";
-  import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
+  import type DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import QuirksNotice from "$lib/components/QuirksNotice.svelte";
+  import { untrack } from "svelte";
   import {
     Dialog,
     DialogContent,
@@ -74,6 +77,20 @@
   let restorePasswordConfirm = $state("");
 
   let syncDialogOpen = $state(false);
+  // Loaded the first time it opens, not with the screen: it brings the
+  // transport with it (the identity arrives over the relay).
+  let SyncDialog = $state.raw<typeof DeviceSyncDialog | null>(null);
+  $effect(() => {
+    if (!syncDialogOpen || untrack(() => SyncDialog)) return;
+    import("$lib/components/DeviceSyncDialog.svelte").then(
+      (module) => (SyncDialog = module.default),
+      (err) => {
+        // Closed again, so the next open tries again.
+        console.error("[setup] device sync could not load", err);
+        syncDialogOpen = false;
+      }
+    );
+  });
 
   // Restore from a backup FILE, which the setup screen never offered before:
   // import lived only in Settings, and Settings needs an unlocked identity -
@@ -928,15 +945,17 @@
     </DialogContent>
   </Dialog>
 
-  <DeviceSyncDialog
-    bind:open={syncDialogOpen}
-    onClose={() => {
-      syncDialogOpen = false;
-    }}
-    onComplete={() => {
-      // Reload to unlock the synced identity
-      window.location.reload();
-    }}
-    flowMode="receive"
-  />
+  {#if SyncDialog}
+    <SyncDialog
+      bind:open={syncDialogOpen}
+      onClose={() => {
+        syncDialogOpen = false;
+      }}
+      onComplete={() => {
+        // Reload to unlock the synced identity
+        window.location.reload();
+      }}
+      flowMode="receive"
+    />
+  {/if}
 </div>

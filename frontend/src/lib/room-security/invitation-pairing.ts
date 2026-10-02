@@ -5,6 +5,7 @@ import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 import { parseRoomSecret, type RoomSecret } from "./keys";
+import { PAIRING_LOCATOR_LENGTH, PAIRING_PASSWORD_LENGTH, parsePairingCode } from "./pairing-code";
 
 /**
  * OPAQUE, loaded the first time a code is made or redeemed. The library
@@ -69,25 +70,14 @@ export const PAIRING_ATTEMPTS = 1 + PAIRING_SPARE_ATTEMPTS;
  * fresh one (invite-pairing.ts).
  *
  * Lowercase Crockford base32: no i, l, o or u to confuse, and typed input
- * folds those to 1 and 0, in any case.
+ * folds those to 1 and 0, in any case. Reading and writing a code live in
+ * pairing-code.ts, which needs none of the cryptography below.
  */
-export const PAIRING_LOCATOR_LENGTH = 2;
-export const PAIRING_PASSWORD_LENGTH = 4;
+export { PAIRING_LOCATOR_LENGTH, PAIRING_PASSWORD_LENGTH, parsePairingCode, formatPairingCode } from "./pairing-code";
 const alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
 const enc = new TextEncoder();
 export function pairingRandom(length: number): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(length)), b => alphabet[b & 31]).join("");
-}
-export function parsePairingCode(input: string): { locator: string; password: string } | null {
-  const raw = input.trim().toLowerCase().replace(/[-\s]/g, "").replace(/o/g, "0").replace(/[il]/g, "1");
-  const length = PAIRING_LOCATOR_LENGTH + PAIRING_PASSWORD_LENGTH;
-  if (raw.length !== length || !/^[0-9a-hjkmnp-tv-z]+$/.test(raw)) return null;
-  return { locator: raw.slice(0, PAIRING_LOCATOR_LENGTH), password: raw.slice(PAIRING_LOCATOR_LENGTH) };
-}
-/** Shown as two groups of three - "k5t-8r5" - whatever the split. */
-export function formatPairingCode(locator: string, password: string): string {
-  const code = locator + password;
-  return `${code.slice(0, 3)}-${code.slice(3)}`;
 }
 const identifiers = (locator: string) => ({ client: `awful/pairing/v2/joiner/${locator}`, server: `awful/pairing/v2/inviter/${locator}` });
 function message(value: string): string {

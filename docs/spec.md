@@ -1041,6 +1041,12 @@ Service Worker: /sw.js. Precaches the shell and hashed assets (not the
   starts from it, applying the fresh read when it lands, so only a first
   launch waits on the network for it. registerType "prompt": a new
   build waits until the user accepts the reload.
+Startup: the entry bundle is the landing page. /app and /r/ first show the
+  setup or unlock screen from a chunk of their own and fetch the app behind
+  it in idle time (not under Save-Data); the app mounts at the first unlock
+  and keeps the screen after, its own lock screen included. /qs and /qc are
+  chunks of their own. index.html carries each page's chunk list, which
+  main.ts preloads while /config.json is read.
 Install: the deferred beforeinstallprompt is captured at boot and offered
   once the app is usable; iOS gets Share > Add to Home Screen guidance.
 Share Target: POST /share-target (multipart: title, text, url, files),

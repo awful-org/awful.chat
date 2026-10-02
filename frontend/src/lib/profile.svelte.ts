@@ -13,8 +13,19 @@ import {
 } from "$lib/storage";
 import { roomsStore } from "$lib/rooms.svelte";
 import { hasRoomOverrides, resolveRoomProfile, type RoomProfileFields } from "$lib/room-profile";
-import { broadcastProfile } from "$lib/transport/transport.svelte";
 import { bytesToBase64, sniffImageMime } from "$lib/utils";
+
+/**
+ * Tell the peers about a change. The transport is imported when there is one
+ * to send, not with this module: the setup screen asks for the name and the
+ * avatar through here, and it shows before the app - libp2p, the call stack
+ * - has even downloaded (IdentityGate.svelte).
+ */
+function broadcastProfile(): void {
+  void import("$lib/transport/transport.svelte")
+    .then((transport) => transport.broadcastProfile())
+    .catch(() => {});
+}
 
 interface ProfileStore {
   nickname: string;

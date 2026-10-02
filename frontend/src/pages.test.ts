@@ -3,10 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 /**
  * The app, /qs and /qc used to be static imports of App.svelte, which made
  * the whole app one entry chunk: the landing page waited for all ~2.9 MB of
- * it before painting anything.
+ * it before painting anything. And the app's own setup and unlock screens
+ * lived inside AppView, so an invite link's first visit still waited for
+ * nearly all of it before showing a form.
  */
 
-const PAGES = ["AppView", "QuickSend", "QuickCall"] as const;
+const PAGES = ["AppView", "IdentityGate", "QuickSend", "QuickCall"] as const;
 
 /** Every page and prompt as a stub, counting which pages were loaded. */
 function stubComponents() {
@@ -30,10 +32,11 @@ afterEach(() => {
     vi.doUnmock(`$lib/components/${name}.svelte`);
   }
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("the startup bundle", () => {
-  it("does not load the app, /qs or /qc to show the landing page", async () => {
+  it("does not load the app, its setup screens, /qs or /qc to show the landing page", async () => {
     const loaded = stubComponents();
     await import("./App.svelte");
     expect(loaded).toEqual([]);
@@ -49,7 +52,8 @@ describe("the startup bundle", () => {
     expect(loaded).toEqual(["AppView"]);
   });
 
-  it("tries a failed load again instead of keeping the failure", async () => {
+  it("tries a failed load again instead of keeping the failure, and says why it failed", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     let attempts = 0;
     vi.doMock("$lib/components/QuickSend.svelte", () => {
       if (attempts++ === 0) throw new Error("offline");
@@ -57,51 +61,106 @@ describe("the startup bundle", () => {
     });
     const { loadPage } = await import("./pages");
     await expect(loadPage("qs")).rejects.toThrow();
+    // The screen only says "could not load"; a module that threw is a bug.
+    expect(logged).toHaveBeenCalledWith("[pages] qs could not load", expect.any(Error));
     await expect(loadPage("qs")).resolves.toBeTypeOf("function");
     expect(attempts).toBe(2);
   });
 });
 
-describe("pageFor", () => {
-  // Has to agree with App.svelte's route effect.
-  it("names the page an address shows", async () => {
-    const { pageFor } = await import("./pages");
-    expect(pageFor("/")).toBeNull();
-    expect(pageFor("/r/")).toBe("app");
-    expect(pageFor("/r/k5t-8r5")).toBe("app");
-    expect(pageFor("/app")).toBe("app");
-    expect(pageFor("/share-target")).toBe("app");
-    // App.svelte matches these exactly: "/app/" is the landing page.
-    expect(pageFor("/app/")).toBeNull();
-    expect(pageFor("/r")).toBeNull();
+/**
+ * Modules the setup and unlock screens must not bring with them. The device
+ * sync dialog is one through sync.svelte, which it imports.
+ */
+const HEAVY = [
+  "$lib/components/AppView.svelte",
+  "$lib/transport/transport.svelte",
+  "$lib/transport/sync.svelte",
+  "$lib/transport/libp2p/transport",
+  "$lib/room-security/invitation-pairing",
+];
+
+describe("the setup and unlock screens", () => {
+  /** Each heavy module as a stub that records being loaded. */
+  function watchHeavy() {
+    const loaded: string[] = [];
+    for (const path of HEAVY) {
+      vi.doMock(path, () => {
+        loaded.push(path);
+        return {};
+      });
+    }
+    return loaded;
+  }
+  afterEach(() => {
+    for (const path of HEAVY) vi.doUnmock(path);
+  });
+
+  // An invite link's first visit, and every launch that starts at the unlock
+  // screen, used to wait for libp2p, the call UI and the transport (about
+  // 2 MB) before the form appeared. The app now loads behind them.
+  it("load none of the app", async () => {
+    const loaded = watchHeavy();
+    await import("$lib/components/IdentityGate.svelte");
+    expect(loaded).toEqual([]);
+  }, 60_000);
+
+  it("(the watch works: the device sync dialog does bring the transport)", async () => {
+    const loaded = watchHeavy();
+    await import("$lib/components/DeviceSyncDialog.svelte").catch(() => {});
+    expect(loaded).toContain("$lib/transport/sync.svelte");
+  }, 60_000);
+});
+
+describe("routeFor", () => {
+  // App.svelte routes with it, and main.ts preloads from it before App runs.
+  it("names what an address shows", async () => {
+    const { routeFor } = await import("./pages");
+    expect(routeFor("/")).toBe("landing");
+    expect(routeFor("/r/")).toBe("app");
+    expect(routeFor("/r/k5t-8r5")).toBe("app");
+    expect(routeFor("/app")).toBe("app");
+    expect(routeFor("/share-target")).toBe("app");
+    // Matched exactly: "/app/" is the landing page.
+    expect(routeFor("/app/")).toBe("landing");
+    expect(routeFor("/r")).toBe("landing");
   });
 
   it("knows /qs and /qc only when the instance serves them", async () => {
-    const { pageFor } = await import("./pages");
+    const { routeFor } = await import("./pages");
     const { setRuntimeConfig } = await import("$lib/runtime-config");
-    expect(pageFor("/qs")).toBeNull();
-    expect(pageFor("/qc/")).toBeNull();
+    expect(routeFor("/qs")).toBe("landing");
+    expect(routeFor("/qc/")).toBe("landing");
     setRuntimeConfig({ useQs: true, useQc: true });
-    expect(pageFor("/qs")).toBe("qs");
-    expect(pageFor("/qc/")).toBe("qc");
+    expect(routeFor("/qs")).toBe("qs");
+    expect(routeFor("/qc/")).toBe("qc");
+  });
+
+  it("starts the app's address at the setup and unlock screens", async () => {
+    const { firstPage } = await import("./pages");
+    expect(firstPage("app")).toBe("gate");
+    expect(firstPage("qs")).toBe("qs");
+    expect(firstPage("qc")).toBe("qc");
+    expect(firstPage("landing")).toBeNull();
   });
 });
 
-describe("preloadPage", () => {
-  /** A head that records what is appended, and the list index.html carries. */
-  function page(list: string | null) {
-    const head: Record<string, string>[] = [];
-    vi.stubGlobal("document", {
-      getElementById: (id: string) => (id === "page-chunks" && list !== null ? { textContent: list } : null),
-      createElement: () => ({}),
-      head: { appendChild: (link: Record<string, string>) => head.push({ ...link }) },
-    });
-    return head;
-  }
+/** A head that records what is appended, and the list index.html carries. */
+function page(list: string | null) {
+  const head: Record<string, string>[] = [];
+  vi.stubGlobal("document", {
+    getElementById: (id: string) => (id === "page-chunks" && list !== null ? { textContent: list } : null),
+    createElement: () => ({}),
+    head: { appendChild: (link: Record<string, string>) => head.push({ ...link }) },
+  });
+  return head;
+}
 
-  it("fetches the page's chunks and styles without running them", async () => {
+describe("preloadPage", () => {
+  it("fetches the page's chunks and styles without running them, once", async () => {
     const head = page(JSON.stringify({ app: ["/assets/AppView-x.js", "/assets/app-y.css"], qs: ["/assets/QuickSend-z.js"] }));
     const { preloadPage } = await import("./pages");
+    preloadPage("app");
     preloadPage("app");
     expect(head).toEqual([
       { rel: "modulepreload", crossOrigin: "", href: "/assets/AppView-x.js" },
@@ -122,5 +181,33 @@ describe("preloadPage", () => {
       preloadPage(which);
       expect(head).toEqual([]);
     }
+  });
+});
+
+describe("prefetchPage", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  // The app behind the setup screen: worth having by the time the password
+  // is typed, but never at the cost of the screen that is up.
+  it("waits for an idle moment", async () => {
+    const head = page(JSON.stringify({ app: ["/assets/AppView-x.js"] }));
+    let idle: (() => void) | undefined;
+    vi.stubGlobal("requestIdleCallback", (fn: () => void) => void (idle = fn));
+    vi.stubGlobal("navigator", {});
+    const { prefetchPage } = await import("./pages");
+    prefetchPage("app");
+    expect(head).toEqual([]);
+    idle?.();
+    expect(head).toHaveLength(1);
+  });
+
+  it("leaves it alone when the browser asks to save data", async () => {
+    const head = page(JSON.stringify({ app: ["/assets/AppView-x.js"] }));
+    vi.stubGlobal("navigator", { connection: { saveData: true } });
+    const { prefetchPage } = await import("./pages");
+    prefetchPage("app");
+    await vi.runAllTimersAsync();
+    expect(head).toEqual([]);
   });
 });
