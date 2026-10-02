@@ -50,9 +50,7 @@ async function stage(
     signal?.throwIfAborted();
     const snapshot = await handle.getFile();
     signal?.throwIfAborted();
-    // The sender's claimed type, through the allowlist (safe-mime.ts): this
-    // File becomes the blob URL every view of a downloaded file uses.
-    return { file: new File([snapshot], name, { type: safeBlobType(mimeType) }), dispose };
+    return { file: new File([snapshot], name, { type: mimeType }), dispose };
   } catch (error) {
     await writer?.abort(error).catch(() => {});
     await dispose().catch(() => {});
@@ -72,13 +70,43 @@ export async function stageEncryptedFile(source: File, signal?: AbortSignal): Pr
   return { ...staged, file: new File([staged.file], `${encryption.id}.bin`, { type: "application/octet-stream" }), encryption };
 }
 
-/** No plaintext File becomes visible until every chunk authenticates. */
-export function stageDecryptedFile(
+/**
+ * No plaintext File becomes visible until every chunk authenticates.
+ *
+ * Held in memory, never written to OPFS. The decrypted copy used to be staged
+ * in room-v2-transfers beside the ciphertext, and only an explicit lock ever
+ * removed it: closing the tab, a crash or the OS killing the PWA left every
+ * picture and document opened that session on disk in the clear, outside the
+ * at-rest encryption, readable at the unlock screen and untouched by the
+ * duress wipe. A Blob is the browser's to keep and to release: it goes with
+ * the last URL and reference to it, and nothing it was paged out to outlives
+ * the browser.
+ *
+ * Each authenticated chunk becomes a Blob of its own straight away, so the
+ * script heap holds one chunk at a time however large the file is; the File
+ * is put together from them only after the last one authenticates.
+ */
+export async function stageDecryptedFile(
   ciphertext: Blob,
   encryption: EncryptedFileDescriptor,
   filename: string,
   mimeType: string,
   signal?: AbortSignal,
 ): Promise<StagedFile> {
-  return stage(filename, mimeType, output => decryptFileTo(ciphertext, encryption, output), signal);
+  signal?.throwIfAborted();
+  let parts: Blob[] = [];
+  await decryptFileTo(ciphertext, encryption, new WritableStream<Uint8Array>({
+    write(chunk) {
+      signal?.throwIfAborted();
+      parts.push(new Blob([new Uint8Array(chunk)]));
+    },
+    close() { signal?.throwIfAborted(); },
+    abort() { parts = []; },
+  }));
+  signal?.throwIfAborted();
+  // The sender's claimed type, through the allowlist (safe-mime.ts): this
+  // File becomes the blob URL every view of a downloaded file uses.
+  const file = new File(parts, filename, { type: safeBlobType(mimeType) });
+  parts = [];
+  return { file, async dispose() {} };
 }

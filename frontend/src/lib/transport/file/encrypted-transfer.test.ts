@@ -116,6 +116,24 @@ it("reset cancels an in-flight download without late plaintext publication", asy
   expect([...disk.entries.keys()].filter(k => k.startsWith("room-v2-transfers/"))).toEqual([]);
 });
 
+it("a finished download and a restore leave no plaintext anywhere on disk", async () => {
+  const { descriptor, bytes, original } = await offer();
+  const receiver = transport(); const downloaded = vi.fn(); receiver.on("downloaded", downloaded);
+  await deliver(receiver, descriptor, bytes);
+  await vi.waitFor(() => expect(downloaded).toHaveBeenCalledOnce());
+  // The next session opens the conversation and shows the file again.
+  const restarted = transport();
+  expect(await restarted.restoreEncryptedFile(descriptor)).toBe(true);
+  const secret = await original.text();
+  for (const [path, blob] of disk.entries) {
+    expect(await blob.text(), path).not.toContain(secret);
+  }
+  // ...without leaving the session it ran in: a tab closed without a lock
+  // runs nothing, and the plaintext must already be nowhere but in memory.
+  expect([...disk.entries.keys()].filter(k => k.startsWith("room-v2-transfers/"))).toEqual([]);
+  expect(await downloaded.mock.calls[0][1].text()).toBe(secret);
+});
+
 it("fails closed without OPFS instead of seeding plaintext", async () => {
   vi.stubGlobal("navigator", { storage: {} });
   await expect(transport().seedEncryptedFiles([new File(["secret"], "name")])).rejects.toThrow("storage support");

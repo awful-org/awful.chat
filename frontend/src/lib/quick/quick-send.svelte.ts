@@ -11,8 +11,9 @@
  * for the bytes. It does NOT import transport.svelte.ts, which would drag in
  * the message store, the attachment store and at-rest crypto - all of which
  * exist to remember things this page must not remember. Descriptors and keys
- * stay in memory. The encrypted file API stages bytes in OPFS; teardown aborts
- * transfers, disposes plaintext staging and removes retained ciphertext.
+ * stay in memory. The encrypted file API stages ciphertext in OPFS and keeps
+ * plaintext in memory only; teardown aborts transfers and removes retained
+ * ciphertext.
  *
  * The same two consequences as sync.svelte.ts, for the same reason: this is a
  * SECOND libp2p node in the profile, so it connects with no key seed (a fresh
