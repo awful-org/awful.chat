@@ -21,9 +21,12 @@ function loadOpaque(): Promise<typeof Opaque> {
     return opaque;
   })().catch((err) => {
     // Not kept: offline, or a deploy that replaced the chunk, and the next
-    // pairing should try again rather than fail the same way forever.
+    // pairing should try again rather than fail the same way forever. The
+    // first failure in a minute reloads the page before it gets here (main.ts
+    // takes a chunk that will not load for a stale deploy); a second one is
+    // said plainly, where a code being redeemed shows its error.
     opaqueLoad = null;
-    throw err;
+    throw new Error("Couldn't load short codes. Check your connection and try again.", { cause: err });
   });
   return opaqueLoad;
 }

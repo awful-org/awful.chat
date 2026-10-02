@@ -45,3 +45,21 @@ it("loads OPAQUE once, on the first pairing, and pairs with it", async () => {
   expect(await join.open(await host.finish(join.attempt, proof))).toBe(secret);
   expect(loads.count).toBe(1);
 });
+
+// A code being redeemed shows its error as it is, and the browser's text for a
+// chunk that did not download means nothing to the person holding the code.
+it("says plainly when OPAQUE could not be downloaded, and tries again next time", async () => {
+  vi.resetModules();
+  let loads = 0;
+  vi.doMock("@serenity-kit/opaque", async (importOriginal) => {
+    if (loads++ === 0) throw new TypeError("Failed to fetch dynamically imported module");
+    return await importOriginal();
+  });
+  const pairing = await import("./invitation-pairing");
+  await expect(pairing.startPairingJoin("k5t-8r5")).rejects.toThrow(
+    "Couldn't load short codes. Check your connection and try again."
+  );
+  const host = await pairing.InvitationPairingHost.create(newRoomSecret());
+  expect(host.locator).toHaveLength(2);
+  expect(loads).toBe(2);
+});

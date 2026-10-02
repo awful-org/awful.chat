@@ -118,4 +118,24 @@ describe("jsQR", () => {
     await scanner.stopQrScan();
     expect(loads).toBe(1);
   });
+
+  // The browser's own text names the chunk's https URL, so the dialogs - which
+  // show a message only when it is about https - showed it as a camera problem.
+  it("says plainly when it could not be downloaded, and tries again on the next scan", async () => {
+    vi.resetModules();
+    let loads = 0;
+    vi.doMock("jsqr", async (importOriginal) => {
+      if (loads++ === 0) {
+        throw new TypeError("Failed to fetch dynamically imported module: https://awful.example/assets/jsQR-x.js");
+      }
+      return await importOriginal();
+    });
+    const scanner = await import("./qr-scanner.svelte");
+    fakeCamera();
+    vi.stubGlobal("BarcodeDetector", undefined);
+    await expect(scanner.startQrScan("view", () => false)).rejects.toThrow(scanner.SCANNER_NOT_LOADED);
+    await scanner.startQrScan("view", () => false);
+    await scanner.stopQrScan();
+    expect(loads).toBe(2);
+  });
 });
