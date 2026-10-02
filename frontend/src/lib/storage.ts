@@ -934,33 +934,266 @@ export async function getAllMessages(roomCode: string): Promise<Message[]> {
  * room history and froze the UI for seconds on every rescan.
  */
 export async function getPluginCardMessages(
-  roomCode: string
+  roomCode: string,
+  snapshot?: { version?: number }
 ): Promise<Message[]> {
-  return getMessagesOfTypes(roomCode, [MessageType.PluginCard]);
+  return getMessagesOfTypes(roomCode, [MessageType.PluginCard], snapshot);
 }
 
 /**
- * Only the room's messages of the given clear types, decrypted. Same cursor
- * trick as getPluginCardMessages: rows that fail the clear-field filter
- * never pay for crypto.
+ * Only the room's messages of the given clear types, decrypted, in lamport
+ * order (id breaks ties, as the index does). Answered from the room's typed
+ * rows (below), so only the first read pays for the room. `snapshot.version`
+ * names the rows this answer came from: the same version is the same rows,
+ * which lets a caller keep what it built from them. The array is the
+ * caller's; the messages in it are shared - read them, never change them.
  */
 export async function getMessagesOfTypes(
   roomCode: string,
-  types: ChatMessageType[]
+  types: ChatMessageType[],
+  snapshot?: { version?: number }
 ): Promise<Message[]> {
-  // One bulk read, then filter on clear fields, then decrypt survivors.
-  // NOT a cursor: an await per row is an IDB round-trip per message, and
-  // walking a big room that way (recurring, per digest) jammed the
-  // database enough to delay live attachment writes and sends. Sealed
-  // message rows are small; materializing them raw is the cheap part -
-  // the decrypt is what must stay scoped.
-  const rows = await _rawRoomMessages(roomCode);
   const wanted = new Set<ChatMessageType>(types);
-  const opened = await _openAll(
-    "messages",
-    rows.filter((r) => wanted.has(r.type))
+  const held = await _typedRowsFor(roomCode, wanted);
+  if (snapshot) snapshot.version = held.version;
+  const key = [...wanted].sort().join(",");
+  let sorted = held.sorted.get(key);
+  if (!sorted) {
+    sorted = [...held.rows.values()]
+      .filter((m) => wanted.has(m.type))
+      .sort(_typedOrder);
+    held.sorted.set(key, sorted);
+  }
+  return sorted.slice();
+}
+
+// ── typed rows, kept decrypted ───────────────────────────────────────────────
+//
+// Plugin cards, plugin updates and reactions, per room, decrypted once and
+// kept. Each of these reads was a getAll over EVERY row of the room plus a
+// decrypt of the matching ones, and they come in crowds: a room open builds
+// every plugin card on screen, a call keeps asking which cards are tiles,
+// every reaction click asks for the reaction rows - and one member's pile of
+// cards made a room open cost one such read per card, on every member's
+// client.
+//
+// Kept current by the stored-message hook, which every write path fires, and
+// checked before each use against the room's row count, which costs the
+// database a walk over keys and the page nothing: a change the hook cannot
+// see (a deleted room, another tab) moves the count, and a moved count is a
+// fresh read, never a stale answer. Locking drops it with everything else
+// decrypted.
+
+interface TypedRows {
+  /** The handle it was read through: a reopened database is another one. */
+  database: AppDB;
+  /** Rows of EVERY type in the room that this copy accounts for. */
+  count: number;
+  /** The types `rows` holds in full. */
+  types: Set<ChatMessageType>;
+  rows: Map<string, Message>;
+  /** Moves whenever `rows` does. */
+  version: number;
+  /** Sorted answers by type set, until `rows` moves. */
+  sorted: Map<string, Message[]>;
+  /** Roughly what `rows` weighs, for TYPED_ROWS_BYTES. */
+  bytes: number;
+}
+
+/** By room, least recently used first. */
+const _typedRows = new Map<string, TypedRows>();
+const _typedLoads = new Map<string, Promise<TypedRows>>();
+/** Rows stored while a room's read is in flight, merged when it lands. */
+const _typedPending = new Map<string, Message[]>();
+let _typedVersion = 0;
+let _typedHooked = false;
+/**
+ * How many rooms stay decrypted, and roughly how much of them. The bytes are
+ * the real bound; the room count is generous because a pinned plugin widget
+ * looks at every saved room every few seconds, and a small count would push
+ * the open room and the call's out each time. The room just read always
+ * stays, whatever its size: a room heavy with rows is exactly the one that
+ * must not be read again on every card.
+ */
+const TYPED_ROWS_ROOMS = 32;
+const TYPED_ROWS_BYTES = 24 * 1024 * 1024;
+
+function _typedOrder(a: Message, b: Message): number {
+  return a.lamport - b.lamport || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function _typedRowBytes(m: Message): number {
+  return 256 + (m.content?.length ?? 0) * 2;
+}
+
+function _hookTypedRows(): void {
+  if (_typedHooked) return;
+  _typedHooked = true;
+  onMessageStored(_noteTypedRow);
+  onIdentityLock(() => {
+    _typedRows.clear();
+    _typedPending.clear();
+  });
+}
+
+function _noteTypedRow(msg: Message): void {
+  _typedPending.get(msg.roomCode)?.push(msg);
+  const held = _typedRows.get(msg.roomCode);
+  if (!held) return;
+  if (!held.types.has(msg.type)) {
+    // Taken as new. If it was a rewrite of a row we hold no copy of, the
+    // count disagrees on the next read and that read starts over.
+    held.count += 1;
+    return;
+  }
+  const before = held.rows.get(msg.id);
+  if (before) held.bytes -= _typedRowBytes(before);
+  else held.count += 1;
+  const row = { ...msg };
+  held.rows.set(msg.id, row);
+  held.bytes += _typedRowBytes(row);
+  held.version = ++_typedVersion;
+  held.sorted.clear();
+}
+
+/** Every row of the room, in both ranges while the blinding sweep runs. */
+async function _roomRowCount(database: AppDB, roomCode: string): Promise<number> {
+  const blindRoomCode = await blindValue(roomCode);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const blinded = index.count(
+    IDBKeyRange.bound([blindRoomCode, 0], [blindRoomCode, Number.MAX_SAFE_INTEGER])
   );
-  return opened.sort((a, b) => a.lamport - b.lamport);
+  if (isMigrationComplete()) return blinded;
+  const plaintext = index.count(
+    IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER])
+  );
+  return (await blinded) + (await plaintext);
+}
+
+function _coversTypes(held: TypedRows, wanted: Set<ChatMessageType>): boolean {
+  for (const t of wanted) if (!held.types.has(t)) return false;
+  return true;
+}
+
+async function _typedRowsFor(
+  roomCode: string,
+  wanted: Set<ChatMessageType>
+): Promise<TypedRows> {
+  _hookTypedRows();
+  const database = await getDB();
+  const held = _typedRows.get(roomCode);
+  if (held && held.database === database && _coversTypes(held, wanted)) {
+    const count = await _roomRowCount(database, roomCode);
+    if (_typedRows.get(roomCode) === held && count === held.count) {
+      _typedRows.delete(roomCode);
+      _typedRows.set(roomCode, held);
+      return held;
+    }
+  }
+  return _loadTypedRows(roomCode, database, wanted);
+}
+
+/** One read per room at a time; everyone asking meanwhile shares it. */
+function _loadTypedRows(
+  roomCode: string,
+  database: AppDB,
+  wanted: Set<ChatMessageType>
+): Promise<TypedRows> {
+  const inflight = _typedLoads.get(roomCode);
+  if (inflight) {
+    return inflight.then((loaded) =>
+      loaded.database === database && _coversTypes(loaded, wanted)
+        ? loaded
+        : _loadTypedRows(roomCode, database, wanted)
+    );
+  }
+  const load = _readTypedRows(roomCode, database, wanted);
+  _typedLoads.set(roomCode, load);
+  void load
+    .finally(() => {
+      if (_typedLoads.get(roomCode) === load) _typedLoads.delete(roomCode);
+    })
+    .catch(() => {});
+  return load;
+}
+
+async function _readTypedRows(
+  roomCode: string,
+  database: AppDB,
+  wanted: Set<ChatMessageType>
+): Promise<TypedRows> {
+  const epoch = writeEpoch;
+  const prev = _typedRows.get(roomCode);
+  const reuse = prev?.database === database ? prev : undefined;
+  const types = new Set<ChatMessageType>([...(reuse?.types ?? []), ...wanted]);
+  const pending: Message[] = [];
+  _typedPending.set(roomCode, pending);
+  try {
+    // One bulk read, then filter on clear fields, then decrypt survivors.
+    // NOT a cursor: an await per row is an IDB round-trip per message, and
+    // walking a big room that way (recurring, per digest) jammed the
+    // database enough to delay live attachment writes and sends. Sealed
+    // message rows are small; materializing them raw is the cheap part -
+    // the decrypt is what must stay scoped.
+    const raw = await _rawRoomMessages(roomCode);
+    // A row already held decrypted is not decrypted again: a type joining
+    // the set, or a count that moved, costs only the rows that are new.
+    const rows = new Map<string, Message>();
+    const toOpen: Message[] = [];
+    for (const r of raw) {
+      if (!types.has(r.type)) continue;
+      const kept = reuse?.rows.get(r.id);
+      if (kept && kept.type === r.type && kept.lamport === r.lamport) {
+        rows.set(r.id, kept);
+      } else {
+        toOpen.push(r);
+      }
+    }
+    for (const m of await _openAll<Message>("messages", toOpen)) rows.set(m.id, m);
+    // Rows stored while this read ran are in its snapshot or after it; either
+    // way they belong here, and only the ones after it change the count.
+    const ids = new Set(raw.map((r) => r.id));
+    let count = raw.length;
+    for (const m of pending) {
+      if (!ids.has(m.id)) {
+        ids.add(m.id);
+        count += 1;
+      }
+      if (types.has(m.type)) rows.set(m.id, { ...m });
+    }
+    let bytes = 0;
+    for (const m of rows.values()) bytes += _typedRowBytes(m);
+    const loaded: TypedRows = {
+      database,
+      count,
+      types,
+      rows,
+      version: ++_typedVersion,
+      sorted: new Map(),
+      bytes,
+    };
+    // Not past a lock or a closed database: a read that straddled either
+    // still answers its caller, but keeps nothing.
+    if (epoch === writeEpoch && db === database) {
+      _typedRows.delete(roomCode);
+      _typedRows.set(roomCode, loaded);
+      _trimTypedRows(roomCode);
+    }
+    return loaded;
+  } finally {
+    if (_typedPending.get(roomCode) === pending) _typedPending.delete(roomCode);
+  }
+}
+
+function _trimTypedRows(keep: string): void {
+  let bytes = 0;
+  for (const held of _typedRows.values()) bytes += held.bytes;
+  for (const [roomCode, held] of _typedRows) {
+    if (_typedRows.size <= TYPED_ROWS_ROOMS && bytes <= TYPED_ROWS_BYTES) break;
+    if (roomCode === keep) continue;
+    _typedRows.delete(roomCode);
+    bytes -= held.bytes;
+  }
 }
 
 /** Raw (still-sealed) message rows for a room - one bulk index read. */
