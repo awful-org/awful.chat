@@ -29,8 +29,7 @@
 // alone (withClaims) and advertised only to it; any other peer is still
 // asked for everything, so a current build fills the gap.
 import { SYNC_STALL_MS } from "./sync-progress.svelte";
-
-export type PushOrder = "head" | "asc";
+import type { PushOrder } from "./sync-push";
 
 export interface HeldRow {
   senderId: string;
