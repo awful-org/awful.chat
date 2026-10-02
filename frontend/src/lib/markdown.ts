@@ -95,8 +95,19 @@ const looksLikeUrl = (label: string) => LOOKS_LIKE_URL_RE.test(label.replace(/[*
  * A url found in running text, without the punctuation that ends the
  * sentence around it: "see https://a.b/c." links to /c, and "(https://a.b)"
  * leaves the closing parenthesis out unless the url opened one itself.
+ *
+ * The parentheses are counted once and the count kept as they are dropped:
+ * recounting the url for every ")" was quadratic, and a peer's url followed
+ * by 16k of them held every render of the message for seconds. Only ")" and
+ * punctuation are ever dropped, so the count of "(" never changes.
  */
 export function trimUrl(url: string): { url: string; rest: string } {
+  let opened = 0;
+  let closed = 0;
+  for (const ch of url) {
+    if (ch === "(") opened++;
+    else if (ch === ")") closed++;
+  }
   let end = url.length;
   for (;;) {
     const ch = url[end - 1];
@@ -104,12 +115,10 @@ export function trimUrl(url: string): { url: string; rest: string } {
       end--;
       continue;
     }
-    if (ch === ")") {
-      const body = url.slice(0, end);
-      if ((body.match(/\(/g)?.length ?? 0) < (body.match(/\)/g)?.length ?? 0)) {
-        end--;
-        continue;
-      }
+    if (ch === ")" && opened < closed) {
+      end--;
+      closed--;
+      continue;
     }
     break;
   }

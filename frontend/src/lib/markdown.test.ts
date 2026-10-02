@@ -230,6 +230,26 @@ describe("trimUrl", () => {
     expect(trimUrl("https://a.bc/x_(y)")).toEqual({ url: "https://a.bc/x_(y)", rest: "" });
     expect(trimUrl("https://a.bc/?q=1!")).toEqual({ url: "https://a.bc/?q=1", rest: "!" });
   });
+
+  it("keeps the parentheses the url opened, however many follow it", () => {
+    expect(trimUrl("https://a.bc/x_(y)))")).toEqual({ url: "https://a.bc/x_(y)", rest: "))" });
+    expect(trimUrl("https://a.bc/((x)))")).toEqual({ url: "https://a.bc/((x))", rest: ")" });
+    expect(trimUrl("https://a.bc/(x)).)")).toEqual({ url: "https://a.bc/(x)", rest: ").)" });
+  });
+
+  it("stays linear on a url a peer follows with thousands of parentheses", () => {
+    // Recounting the url's parentheses for every ")" it dropped was
+    // quadratic: one message of a url and 16k of them held every render of
+    // it, and every notification and preview, for seconds.
+    const hostile = "https://a.b/" + ")".repeat(16372);
+    const started = performance.now();
+    expect(trimUrl(hostile)).toEqual({ url: "https://a.b/", rest: ")".repeat(16372) });
+    expect(firstLinkedUrl(hostile)).toBe("https://a.b/");
+    renderMessageMarkdown(hostile, (d) => d);
+    stripMarkdown(hostile);
+    linkTargets(hostile);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
 });
 
 describe("firstLinkedUrl", () => {
