@@ -2,9 +2,11 @@
 
 How a website runs inside Awful.chat as an **app**: a game, a board, a shared
 page, opened by someone in a room with `/app <url>` and shown as a tile in the
-call. This is what a site implements to be "awful compatible". It is short on
-purpose: one way to be embedded, one handshake, and later one optional proof
-of who a player is.
+call. Any site that allows being framed (section 3) opens as one; nothing else
+is required. A site that also speaks the messages in section 4 learns the
+session and who is playing - that is what "awful compatible" means here. It
+is short on purpose: one way to be embedded, one handshake, and later one
+optional proof of who a player is.
 
 Three parties are named throughout:
 

@@ -1,7 +1,9 @@
 # Apps
 
-Opens a website made for Awful.chat - a game, a board, a shared page - as a
-tile in the call.
+Opens any website as a tile in the call - a game, a board, a shared page.
+It only has to allow being framed. A site that also speaks
+[the awful contract](../../../docs/awful-contract.md) learns the session and
+who is playing, and can show "Playing <game>" in the user list.
 
 ```
 /app je.frav.in ROOM42
@@ -9,8 +11,6 @@ tile in the call.
 
 Everything after the address, up to 256 characters, goes to the site as
 `session.args`: a room code on its side, a game mode, whatever it defines.
-How a site becomes "awful compatible" is in
-[the awful contract](../../../docs/awful-contract.md).
 
 ## Why an iframe and not a plugin
 

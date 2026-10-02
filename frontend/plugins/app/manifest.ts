@@ -3,7 +3,7 @@ import type { PluginManifest } from "$lib/plugins/api";
 export const manifest: PluginManifest = {
   id: "app",
   name: "Apps",
-  description: "Open a website made for Awful.chat - a game, a board, a shared page - as a tile in the call.",
+  description: "Open any website as a tile in the call - a game, a board, a shared page.",
   icon: "lucide:app-window",
   author: "awful.chat",
   license: "Apache-2.0",
