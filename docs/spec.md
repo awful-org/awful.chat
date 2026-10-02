@@ -643,10 +643,12 @@ Relay side (relay/mailbox.go):
   or read receipt - so receipts and attachments reach a sleeping phone
   too, not only text. Blobs without a kind are chat.
 
-Client collect: on unlock/startup, fetch + unseal + ack. Undecryptable
-  blobs are poison-acked (deleted) so they cannot wedge the box; transient
-  failures keep the blob for the next poll. Message-id dedup against
-  storage stops replays.
+Client collect: on unlock/startup, fetch + unseal + ack, and never before
+  this device's node has started: collect and ack always name the device.
+  Undecryptable blobs are poison-acked (deleted) so they cannot wedge the
+  box; transient failures keep the blob for the next poll, and so does a
+  stranger's DM that the full message requests cannot take yet.
+  Message-id dedup against storage stops replays.
 
 What the relay learns: THAT a DID has mail and roughly when - never
   content, never which identity sent it (ephemeral key, no sender field
