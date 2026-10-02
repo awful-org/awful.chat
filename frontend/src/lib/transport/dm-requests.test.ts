@@ -37,7 +37,7 @@ vi.mock("$lib/storage", () => ({
     return true;
   },
   getPhonebookEntries: async () => state.contacts,
-  getLastMessage: async () => undefined,
+  roomHoldsMessages: async () => false,
   nextDmLamport: async () => 1, putMessage: async () => {},
   setWatermark: async () => {}, markRoomSeen: async () => {},
 }));

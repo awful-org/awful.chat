@@ -24,7 +24,7 @@ import {
   putMessage,
   markRoomSeen,
   setWatermark,
-  getLastMessage,
+  roomHoldsMessages,
   getLastMessageFrom,
   nextDmLamport,
   putPhonebookEntry,
@@ -947,9 +947,17 @@ function _noteSolicited(peerIdOrDid: string | null | undefined): void {
  */
 const REQUEST_SETTLE_MS = 60_000;
 
-/** Whether anything was ever written in this conversation. Unreadable counts as yes. */
+/**
+ * Whether anything was ever written in this conversation, from the index
+ * alone: no row is opened, so one that will not open still counts. A read
+ * that fails counts as yes.
+ */
 async function _holdsMessages(roomCode: string): Promise<boolean> {
-  return !!(await getLastMessage(roomCode).catch(() => true));
+  try {
+    return await roomHoldsMessages(roomCode);
+  } catch {
+    return true;
+  }
 }
 
 /**

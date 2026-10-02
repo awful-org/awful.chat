@@ -125,6 +125,7 @@ import {
   sendDirectMessage,
 } from "./dm.svelte";
 import {
+  getDB,
   getDMRooms,
   getLastMessage,
   getMessage,
@@ -504,6 +505,20 @@ describe("a request is made by a message, never an empty room (S08.3)", () => {
     await connect();
     await vi.waitFor(async () => expect(await getRoom(empty)).toBeUndefined());
     expect(await getRoom(await code(stranger))).toMatchObject({ request: true });
+    disconnectTransport();
+  });
+
+  it("does not take a request whose only message will not open for an empty one", async () => {
+    const empty = await emptyRequest();
+    const unreadable = await emptyRequest();
+    await putMessage({ id: "sealed-elsewhere", roomCode: unreadable, senderId: identity().did, senderName: "",
+      timestamp: 1, lamport: 1, type: MessageType.Text, content: "x", attachments: [], status: "delivered" });
+    // A clear field rewritten around the seal: the row no longer opens.
+    const db = await getDB();
+    await db.put("messages", { ...(await db.get("messages", "sealed-elsewhere")), status: "read" } as never);
+    await connect();
+    await vi.waitFor(async () => expect(await getRoom(empty)).toBeUndefined());
+    expect(await getRoom(unreadable)).toMatchObject({ request: true });
     disconnectTransport();
   });
 });

@@ -47,6 +47,8 @@ import {
   setRoomPositions,
   setMessagePinned,
   deleteRoom,
+  getLastMessage,
+  roomHoldsMessages,
 } from "./storage";
 import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { STORE_SPECS, inspectRow, isCurrentAad, sealRow } from "./storage-crypto";
@@ -547,6 +549,20 @@ describe("markOwnMessagesReadUpTo", () => {
     ]);
     expect(await markOwnMessagesReadUpTo("room-a", "me", 20, 10)).toEqual(["above"]);
     expect((await getMessage("below"))?.status).toBe("sent");
+  });
+});
+
+describe("roomHoldsMessages", () => {
+  it("answers from the index alone, so a row that will not open still counts", async () => {
+    expect(await roomHoldsMessages("room-a")).toBe(false);
+    await putMessage(msg({ id: "only", status: "sent" }));
+    // A clear field rewritten around the seal: the row no longer opens.
+    const db = await getDB();
+    await db.put("messages", { ...(await db.get("messages", "only")), status: "read" } as never);
+    // getLastMessage drops a row it cannot open, and so read the room as empty.
+    expect(await getLastMessage("room-a")).toBeUndefined();
+    expect(await roomHoldsMessages("room-a")).toBe(true);
+    expect(await roomHoldsMessages("room-b")).toBe(false);
   });
 });
 

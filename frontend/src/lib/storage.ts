@@ -796,6 +796,31 @@ export async function getLastMessage(
 }
 
 /**
+ * Whether anything is stored in a room: one key read from the index, nothing
+ * opened or decrypted. For the checks that only ask whether a conversation is
+ * empty, which getLastMessage answered by decrypting its newest row - once per
+ * saved DM at every connect, before any of them was joined.
+ */
+export async function roomHoldsMessages(roomCode: string): Promise<boolean> {
+  const database = await getDB();
+  const blindRoomCode = await blindValue(roomCode);
+  const blinded = await database
+    .transaction("messages")
+    .store.index("byRoomLamport")
+    .getKey(
+      IDBKeyRange.bound([blindRoomCode, 0], [blindRoomCode, Number.MAX_SAFE_INTEGER])
+    );
+  if (blinded !== undefined) return true;
+  if (isMigrationComplete()) return false;
+  // During migration a row may still sit under the plaintext room code.
+  const plaintext = await database
+    .transaction("messages")
+    .store.index("byRoomLamport")
+    .getKey(IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER]));
+  return plaintext !== undefined;
+}
+
+/**
  * Logical allocation for ALL conversations, including legacy epoch-sized DM
  * counters. Stored rows and durable sync watermarks establish a floor even
  * after reload or history pruning. No wall-clock reading participates.
