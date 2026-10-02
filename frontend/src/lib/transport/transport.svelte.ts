@@ -4313,12 +4313,16 @@ _transport.on("message", (peerId, data, room) => {
           _handleDmBatch(peerId, room, msg).catch(() => {});
           break;
         }
+        // The order travels with the frame, as it does for a DM: without it
+        // a current build's push reads as an older build's, so it claims
+        // nothing until it is whole and is answered with claims that hide
+        // whatever it did not deliver (sync-inbound.ts).
         _handleSyncBatch(
           msg.roomCode,
           msg.messages,
           peerId,
           msg.live === true,
-          { batchIndex: msg.batchIndex, totalBatches: msg.totalBatches }
+          { batchIndex: msg.batchIndex, totalBatches: msg.totalBatches, order: msg.order }
         ).catch(() => {});
         break;
       case MessageType.SyncComplete:
