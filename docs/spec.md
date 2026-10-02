@@ -16,9 +16,11 @@ with reactionTo/reactionEmoji/reactionOp), resolved at render time.
 ## IndexedDB Schema (idb)
 
 ```typescript
-// Current schema is v6 - v2 added savedGifs, v3 re-keyed profiles by did,
+// Current schema is v9 - v2 added savedGifs, v3 re-keyed profiles by did,
 // v4 added phonebook, v5 and v6 added the searchIndex and diagnostics stores
-// and the blinded indexes below. This listing is the v1 shape for
+// and the blinded indexes below, v8 rebuilt roomProfiles, and v9 added
+// attachments.byRoom (the blinded roomCode, so a room's files are read
+// without walking every room's). This listing is the v1 shape for
 // orientation; storage.ts is the authoritative upgrade path.
 export async function getDB(): Promise<AppDB> {
   // singleton - one connection for app lifetime

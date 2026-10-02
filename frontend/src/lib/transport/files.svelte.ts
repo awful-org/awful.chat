@@ -394,12 +394,28 @@ export function withFileTransfer(snapshot: FileTransferSnapshot): void {
  */
 let _seedable: { epoch: number; entries: Awaited<ReturnType<typeof getSeedableFiles>> } | null =
   null;
+/**
+ * The walk in progress, shared. Peers bind in bursts - every one at startup,
+ * a roomful after a relay bounce - and each started a walk of its own over the
+ * whole store before any of them could fill the cache.
+ */
+let _seedableRead: { epoch: number; fileEpoch: number; read: ReturnType<typeof getSeedableFiles> } | null =
+  null;
 
 async function _seedableEntries() {
   if (_seedable?.epoch === attachmentEpoch()) return _seedable.entries;
   const epoch = attachmentEpoch();
   const fileEpoch = _fileEpoch;
-  const entries = await getSeedableFiles();
+  let pending = _seedableRead;
+  if (pending?.epoch !== epoch || pending.fileEpoch !== fileEpoch) {
+    const read = getSeedableFiles();
+    pending = _seedableRead = { epoch, fileEpoch, read };
+    const clear = () => {
+      if (_seedableRead?.read === read) _seedableRead = null;
+    };
+    read.then(clear, clear);
+  }
+  const entries = await pending.read;
   if (fileEpoch !== _fileEpoch) return [];
   if (epoch === attachmentEpoch()) _seedable = { epoch, entries };
   return entries;
@@ -587,6 +603,7 @@ const _hydratedRooms = new Set<string>();
 export function _resetAttachmentHydration(): void {
   _fileEpoch++;
   _seedable = null;
+  _seedableRead = null;
   _hydratedRooms.clear();
   _hydrating.clear();
   attachmentHydration.rooms.clear();

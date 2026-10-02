@@ -291,6 +291,7 @@ type AppDB = IDBPDatabase<{
       byMessage: Blinded;
       byInfoHash: Blinded;
       byStatus: string;
+      byRoom: Blinded;
     };
   };
   pending: {
@@ -403,7 +404,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 8, {
+  db = (await openDB(dbName(), 9, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -502,6 +503,17 @@ async function openDatabase(): Promise<AppDB> {
         const store = database.createObjectStore("roomProfiles", { keyPath: "id" });
         store.createIndex("byRoom", "roomCode", { unique: false });
         store.createIndex("byKind", "kind", { unique: false });
+      }
+      if (oldVersion < 9) {
+        // Opening a room picked its files out of the whole store: every row
+        // of every room, file bytes and all, read to keep a handful. The
+        // index is over the stored roomCode - blinded on sealed rows, the
+        // plaintext on rows the blinding sweep has not reached - exactly
+        // like messages.byRoom; existing rows are indexed as it is built,
+        // and nothing about a row changes.
+        transaction
+          .objectStore("attachments")
+          .createIndex("byRoom", "roomCode", { unique: false });
       }
     },
     blocking() {
@@ -1738,34 +1750,52 @@ export async function getAttachmentsByInfoHash(
  * usable while the sweep runs.
  */
 export async function getAttachmentsWithData(
-  roomCode: string
+  roomCode: string,
+  /** Metadata only: the file bytes stay sealed and are let go as each row
+   *  is read, for callers that fetch one row's bytes if they need them. */
+  opts?: { skipBytes?: boolean }
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedRoomCode = await blindValue(roomCode);
+  const keys = [blindedRoomCode];
+  if (!isMigrationComplete() && roomCode !== blindedRoomCode) {
+    keys.push(roomCode as Blinded);
+  }
   // Select by the bytes, not the status: rows written before the status
   // rank guards could be stuck at "downloading"/"failed" WITH data present,
   // and filtering on status made those images unrenderable forever.
-  // rowHasBytes sees the bytes whether the row is sealed or legacy, and the
-  // filter runs BEFORE decryption so no-data rows never cost a decrypt.
-  // A cursor, not getAll: every room's multi-MB sealed blobs materialized
-  // at once just to pick this room's - a real memory spike on phones for
-  // every single room open.
+  // rowHasBytes sees the bytes whether the row is sealed or legacy.
+  // The room's own rows only, through byRoom: this used to walk the whole
+  // store, every room's multi-MB sealed blobs, on every room's first open -
+  // and as one long read transaction that the room's own writes queued
+  // behind. A cursor still, so skipBytes can drop each row's blob as it goes.
+  const index = database.transaction("attachments").store.index("byRoom");
   const matches: Attachment[] = [];
-  let cursor = await database.transaction("attachments").store.openCursor();
-  while (cursor) {
-    const a = cursor.value;
-    if (
-      (a.roomCode === blindedRoomCode || a.roomCode === roomCode)
-    ) {
-      matches.push(a);
+  const seen = new Set<string>();
+  const withBytes = new Set<string>();
+  for (const key of keys) {
+    let cursor = await index.openCursor(key);
+    while (cursor) {
+      const row = cursor.value;
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        if (rowHasBytes(row, "data")) withBytes.add(row.id);
+        if (opts?.skipBytes) {
+          const { data: _d, ...meta } = row as Attachment & { _encBytes?: unknown };
+          delete (meta as { _encBytes?: unknown })._encBytes;
+          matches.push(meta as Attachment);
+        } else {
+          matches.push(row);
+        }
+      }
+      cursor = await cursor.continue();
     }
-    cursor = await cursor.continue();
   }
-  const opened = await _openAllHealing<Attachment>("attachments", matches);
+  const opened = await _openAllHealing<Attachment>("attachments", matches, opts);
   const { readCiphertext } = await import("./transport/file/ciphertext-store");
   const available: Attachment[] = [];
   for (const a of opened) {
-    if (a.data || (a.encryption && await readCiphertext(a.infoHash).catch(() => null))) available.push(a);
+    if (withBytes.has(a.id) || (a.encryption && await readCiphertext(a.infoHash).catch(() => null))) available.push(a);
   }
   return available;
 }
