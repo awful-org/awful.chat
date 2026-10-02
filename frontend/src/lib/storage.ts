@@ -1757,8 +1757,10 @@ export async function getAttachmentsByInfoHash(
 export async function getAttachmentsWithData(
   roomCode: string,
   /** Metadata only: the file bytes stay sealed and are let go as each row
-   *  is read, for callers that fetch one row's bytes if they need them. */
-  opts?: { skipBytes?: boolean }
+   *  is read, for callers that fetch one row's bytes if they need them.
+   *  `withBytes` is filled with the ids of the rows that carry their bytes,
+   *  which a row read that way can no longer tell by itself. */
+  opts?: { skipBytes?: boolean; withBytes?: Set<string> }
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedRoomCode = await blindValue(roomCode);
@@ -1784,7 +1786,10 @@ export async function getAttachmentsWithData(
       const row = cursor.value;
       if (!seen.has(row.id)) {
         seen.add(row.id);
-        if (rowHasBytes(row, "data")) withBytes.add(row.id);
+        if (rowHasBytes(row, "data")) {
+          withBytes.add(row.id);
+          opts?.withBytes?.add(row.id);
+        }
         if (opts?.skipBytes) {
           const { data: _d, ...meta } = row as Attachment & { _encBytes?: unknown };
           delete (meta as { _encBytes?: unknown })._encBytes;

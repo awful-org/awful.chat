@@ -20,13 +20,14 @@ vi.mock("$lib/storage", () => ({
     return rows.filter((r) => r.infoHash === hash);
   },
   getAttachmentsByMessage: async () => [],
-  getAttachmentsWithData: async (_room: string, opts?: { skipBytes?: boolean }) => {
+  getAttachmentsWithData: async (_room: string, opts?: { skipBytes?: boolean; withBytes?: Set<string> }) => {
     calls.push(`room:${opts?.skipBytes ? "meta" : "bytes"}`);
+    for (const id of withBytes.keys()) opts?.withBytes?.add(id);
     return rows;
   },
   putAttachment: async () => {},
   updateAttachmentStatus: async () => { calls.push("write-status"); },
-  updateAttachmentData: async () => { calls.push("write-data"); },
+  updateAttachmentData: async (id: string) => { calls.push(`write-data:${id}`); },
 }));
 const transportState = { fileTransfers: new Map<string, { blobURL?: string }>() };
 vi.mock("./transport.svelte", () => ({
@@ -48,7 +49,7 @@ const files = {
   ) { this.lookup = fn; this.restore = restore; },
   seedFiles: async () => [],
   getTransfer: () => undefined,
-  persistableCiphertext: vi.fn(async () => undefined),
+  persistableCiphertext: vi.fn(async (): Promise<ArrayBuffer | undefined> => undefined),
   restoreEncryptedFile: vi.fn(async (row: Attachment, data?: ArrayBuffer) => {
     calls.push(`show:${row.id}:${data ? "row" : "store"}`);
     if (broken.has(row.id)) throw new Error("authentication failed");
@@ -79,7 +80,8 @@ beforeEach(() => {
   withBytes.set("mid", { ...row("mid", 2), data: new ArrayBuffer(8) });
   files.restoreEncryptedFile.mockClear();
   files.seedStoredFile.mockClear();
-  files.persistableCiphertext.mockClear();
+  files.persistableCiphertext.mockReset();
+  files.persistableCiphertext.mockResolvedValue(undefined);
 });
 
 it("shows a room's stored files newest first, reading a row's bytes only when nothing else holds them", async () => {
@@ -106,7 +108,8 @@ it("stores nothing for a file read back from storage, and still stores a real do
   files.handlers.downloaded("h-new", new Blob(["x"]), true);
   await settle();
   expect(files.persistableCiphertext).not.toHaveBeenCalled();
-  expect(calls.filter((c) => c.startsWith("write-"))).toEqual([]);
+  // Not even a look at its rows: there is nothing to keep or seed.
+  expect(calls).toEqual([]);
   files.handlers.downloaded("h-new", new Blob(["x"]));
   await settle();
   expect(files.persistableCiphertext).toHaveBeenCalledOnce();
@@ -197,4 +200,14 @@ it("keeps a protected file served from its ciphertext, but never shown here, a f
   transportState.fileTransfers = new Map([["h-new", { blobURL: "blob:sent-this-session" }]]);
   files.handlers.transfer(served);
   expect(transportState.fileTransfers.get("h-new")).toMatchObject({ status: "seeding" });
+});
+
+it("gives a row that never got its copy of the file one, once, and leaves the rest of the rows alone", async () => {
+  files.persistableCiphertext.mockResolvedValue(new ArrayBuffer(8));
+  await _hydrateAndSeedAttachments("rd2_room");
+  await settle();
+  // "mid" carries its bytes; "new" and "old" were kept only in this
+  // device's file store.
+  expect(calls.filter((c) => c.startsWith("write-")).sort()).toEqual(["write-data:new", "write-data:old"]);
+  expect(files.persistableCiphertext.mock.calls.map((c) => (c as unknown[])[0]).sort()).toEqual(["h-new", "h-old"]);
 });

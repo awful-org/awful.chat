@@ -206,8 +206,11 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     }
     // Read back from this device's own storage, there is nothing new to
     // keep: storing it anyway re-sealed the row of every file in every room
-    // opened, once a session.
-    if (!restored) _persistDownloadedBlob(infoHash, blob).catch(() => {});
+    // opened, once a session (a row missing its copy is mended by the room
+    // open instead - see _keepRowCopies). Nor anything to seed below: a
+    // stored file is always a protected one.
+    if (restored) return;
+    _persistDownloadedBlob(infoHash, blob).catch(() => {});
 
     getAttachmentsByInfoHash(infoHash, { skipBytes: true })
       .then(async (attachments) => {
@@ -540,15 +543,22 @@ export async function _hydrateFileTransfersFromStorage(
   // A secure room's files come back from this device's file store, so the
   // copies inside their rows stay sealed unless a file has nothing else.
   const secure = roomCode.startsWith("rd2_") || roomCode.startsWith("dm-");
-  const seedable = await getAttachmentsWithData(roomCode, { skipBytes: secure });
+  const withBytes = new Set<string>();
+  const seedable = await getAttachmentsWithData(roomCode, { skipBytes: secure, withBytes });
   if (epoch !== _fileEpoch) return [];
   const dedup = new Map<string, Attachment>();
+  /** Rows small enough to carry their file that do not: it is in this
+   *  device's file store alone (see _keepRowCopies). */
+  const bare = new Map<string, Attachment[]>();
   // Newest first: they are the ones on screen, and the room used to fill
   // in in storage key order - effectively at random.
   for (const attachment of [...seedable].sort((a, b) => b.createdAt - a.createdAt)) {
     if (!attachment.data && !attachment.encryption) continue;
     if (!dedup.has(attachment.infoHash))
       dedup.set(attachment.infoHash, attachment);
+    if (attachment.encryption && !withBytes.has(attachment.id) && attachment.size <= MAX_PERSISTED_ATTACHMENT_BYTES) {
+      bare.set(attachment.infoHash, [...(bare.get(attachment.infoHash) ?? []), attachment]);
+    }
   }
 
   let budget = EAGER_RESTORE_BUDGET_BYTES;
@@ -567,7 +577,9 @@ export async function _hydrateFileTransfersFromStorage(
       budget -= attachment.size;
       // One file that will not open must not keep the rest of the room's
       // from showing.
-      await restoreStoredFile(attachment).catch(() => {});
+      const shown = await restoreStoredFile(attachment).catch(() => false);
+      const rows = bare.get(infoHash);
+      if (shown && rows) void _keepRowCopies(rows).catch(() => {});
       continue;
     }
     if (roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) continue;
@@ -609,6 +621,23 @@ function _markHeld(attachment: Attachment): void {
     status: "pending", progress: 0, done: false, seeding: false, peers: 0,
     seeders: Math.max(1, current?.seeders ?? 0),
   });
+}
+
+/**
+ * Rows that never got their copy of the file - its download finished before
+ * the row was stored, or the write failed - get it now, once: a backup or a
+ * synced device carries a file only in its row. Showing a stored file used to
+ * rewrite every row it touched, every session; only these need it.
+ */
+async function _keepRowCopies(rows: Attachment[]): Promise<void> {
+  const guard = fileOperationGuard();
+  const ciphertext = await getFileTransport().persistableCiphertext(
+    rows[0].infoHash,
+    MAX_PERSISTED_ATTACHMENT_BYTES
+  );
+  guard();
+  if (!ciphertext) return;
+  await Promise.all(rows.map((row) => updateAttachmentData(row.id, ciphertext, guard)));
 }
 
 /**

@@ -696,9 +696,9 @@ room open (first time in a session), newest first:
   read the room's rows (attachments.byRoom, metadata only) → decrypt each
   file IN MEMORY from room-v2-ciphertext, or from the row's data when this
   device has no durable copy (which is then written, once) → blobURL.
-  Nothing is seeded, re-hashed or rewritten, and the rows are not touched.
-  A decrypted file stays in memory while it is shown, so the pass decrypts
-  64MB at most, newest first, as
+  Nothing is seeded, re-hashed or rewritten; a row that never got its copy
+  of a file of 5MB or less gets it, once. A decrypted file stays in memory
+  while it is shown, so the pass decrypts 64MB at most, newest first, as
   long as each file fits; a file already on screen, or already being shown
   because it came on screen, costs nothing. The rest are left "pending":
   auto-download asks for media as it comes on screen, anything else waits
