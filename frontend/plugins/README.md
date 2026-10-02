@@ -130,6 +130,7 @@ the sections below or right here when one line covers it:
 | `peers()` | Connected peers as `{ did, name }` |
 | `onPeerDisconnect(cb)` / `onBeforeDisconnect(cb)` | A peer left / this page is going away; both return unsubscribe |
 | `showLocalCard(data?)` / `closeLocalCard(id)` | Open (returns its id) / close the private floating surface |
+| `showError(message)` | Tell the person who caused it why something did not work, in a note only they see in this room's chat; never sent or stored |
 | `setNowPlaying(info \| null)` | OS media surface (lock screen, media keys); `pipVideo` names the auto-PiP target |
 | `pictureInPicture(video)` | The browser's own floating window for a video the plugin renders |
 | `ping(did, opts?)` / `isRelayed(did)` | One link probe / is this peer relayed |
@@ -269,6 +270,19 @@ file layer, not through card payloads.
 **Slash commands** register from the `commands` map; `/wheel a, b, c`
 calls your handler with the raw argument string. Commands of disabled
 plugins do not autocomplete and do not fire.
+
+**Never fail silently.** Throw an `Error` whose message says what to type
+instead - `throw new Error("A poll needs two options: /poll Lunch? Pizza,
+Sushi")` - and the host shows it in a note only that person sees, in the
+chat, with your plugin's name, and keeps their draft to fix. A
+`console.warn` reaches nobody: to the person typing, the command did
+nothing. For trouble after the command returned (a link that would not
+load, someone who left), call `host.showError(message)`: the same note.
+Plain text, a sentence or two; the host trims it to one line of 300
+characters. A note belongs to the room the host is bound to and is
+dropped after a minute if nobody looked; a host with no room (the settings
+surface) has nowhere to show one, so there it does nothing - say it in
+your own UI instead.
 
 **Palette commands** add rows to the Ctrl+K palette. List them eagerly in
 `manifest.paletteCommands` (`name`, `title`, optional `subtitle`) so the
@@ -425,7 +439,7 @@ of mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
 `call-audio`, `call-capture`, `clock-sample`, `local-card`,
 `now-playing`, `plugin-stream`, `picture-in-picture`, `call-tile-menu`,
-`palette-commands`, `self-name`, `activity`.
+`palette-commands`, `self-name`, `activity`, `error-card`.
 Declare only what you truly cannot function without. A feature that only adds a button is
 better guarded at the call site (`typeof host.pictureInPicture ===
 "function"`) so the plugin still loads on an older app and just hides the

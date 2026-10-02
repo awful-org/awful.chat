@@ -155,6 +155,7 @@ import {
   touchCardStates,
 } from "../plugins/state.svelte";
 import { clearLocalCards } from "../plugins/local-cards.svelte";
+import { clearPluginErrors } from "../plugins/plugin-errors.svelte";
 import { clearPluginConfirms } from "../plugins/confirm.svelte";
 import { clearSearchCorpus } from "../search/corpus.svelte";
 import { announceMessage } from "../announce";
@@ -4669,6 +4670,7 @@ function _disconnectWithoutBroadcasting(): void {
   // Session-only plugin surfaces die with the session - a signout to another
   // identity must not inherit the previous identity's private cards.
   clearLocalCards();
+  clearPluginErrors();
   // Pending plugin questions die as declines with it.
   clearPluginConfirms();
   transportState.peerDidVersion += 1;

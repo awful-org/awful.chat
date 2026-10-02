@@ -103,7 +103,7 @@ export function summarize(samples: Sample[]): Stats {
  * Names only - resolving them to DIDs needs the room, which the caller has
  * and this does not.
  */
-export function parsePingArgs(args: string): string[] {
+export function parsePingArgs(args: string, limit = MAX_TARGETS): string[] {
   return [
     ...new Set(
       args
@@ -111,7 +111,7 @@ export function parsePingArgs(args: string): string[] {
         .map((t) => t.trim().replace(/^@/, ""))
         .filter(Boolean)
     ),
-  ].slice(0, MAX_TARGETS);
+  ].slice(0, limit);
 }
 
 /**

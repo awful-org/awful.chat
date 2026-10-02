@@ -79,6 +79,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "palette-commands",
   "self-name",
   "activity",
+  "error-card",
 ]);
 
 export interface UpdateCtx {
@@ -289,6 +290,15 @@ export interface HostApi {
   showLocalCard(data?: unknown): string;
   /** Close a local card by the id `showLocalCard` returned. */
   closeLocalCard(id: string): void;
+  /**
+   * Tell the person who caused it why this did not work - "Mention someone
+   * to ping: /ping @alice" - in a note only they see, in this room's chat.
+   * Never sent or stored. A command that throws gets the same note with its
+   * error's message, so use this for what goes wrong after a command
+   * returned, or where throwing is not an option. Plain text, one or two
+   * sentences.
+   */
+  showError(message: string): void;
   /** Play a local audio blob through this user's outgoing call track.
    *  Sounds are scoped to the calling plugin: several of this plugin's clips
    *  can layer (the host caps concurrency and evicts the oldest), and stop()
