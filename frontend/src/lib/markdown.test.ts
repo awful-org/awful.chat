@@ -91,13 +91,13 @@ describe("inline markdown", () => {
 
   it("takes the innermost brackets as a link's label", () => {
     expect(plain("[a [b](https://x.yz)")).toBe(
-      '[a <a href="https://x.yz" title="https://x.yz" target="_blank" rel="noopener noreferrer">b</a>',
+      '[a <a href="https://x.yz" title="https://x.yz" target="_blank" rel="noopener noreferrer" dir="ltr">b</a>',
     );
   });
 
   it("masks a link, http(s) only, showing where it goes on hover", () => {
     expect(plain("[the docs](https://example.com/a)")).toBe(
-      '<a href="https://example.com/a" title="https://example.com/a" target="_blank" rel="noopener noreferrer">the docs</a>',
+      '<a href="https://example.com/a" title="https://example.com/a" target="_blank" rel="noopener noreferrer" dir="ltr">the docs</a>',
     );
     expect(plain("[**bold** label](https://a.bc)")).toContain("><strong>bold</strong> label</a>");
     expect(plain("[x](javascript:alert(1))")).not.toContain("<a");
@@ -196,23 +196,50 @@ describe("inline markdown", () => {
     }
   });
 
+  it("keeps a link's text in its own order, whatever is typed around or inside it", () => {
+    // An override typed before a link and closed after it reversed the text
+    // inside: a masked "oc.t" drew as "t.co", and a bare url as another
+    // host's. Each link is an isolate, left to right, which nothing outside
+    // reaches and a right-to-left mark inside cannot turn around.
+    const outside = [
+      "\u202e[oc.t](https://evil.example/login)\u202c",
+      "\u202e see https://evil.example/moc.lapyap//:sptth \u202c",
+      "\u202b[\u200fco\u200f.\u200ft](https://evil.example/login)\u202c",
+      "\u2067[paypal.com](https://evil.example/login)\u2069",
+    ];
+    for (const s of outside) {
+      const tags = [...md(s).matchAll(/<a [^>]*>/g)].map((m) => m[0]);
+      expect(tags, s).toHaveLength(1);
+      expect(tags[0], s).toContain(' dir="ltr"');
+    }
+    // One inside a url, where the url is shown: "https://" then an override
+    // then "moc.lapyap@evil.example" drew as a link to paypal.com.
+    const inside = "https://\u202emoc.lapyap@evil.example/";
+    const shown = "https://moc.lapyap@evil.example/";
+    expect(md(inside)).toContain(`>${shown}</a>`);
+    expect(md(`[paypal.com](${inside})`)).toContain(`>${shown}</a>`);
+    expect(md(`[the docs](${inside})`)).toContain(` title="${shown}"`);
+    // Where it goes is left alone: the browser encodes the override.
+    expect(md(inside)).toContain(`href="${inside}"`);
+  });
+
   it("links bare urls without the punctuation around them", () => {
     expect(plain("see https://a.bc/d.")).toBe(
-      'see <a href="https://a.bc/d" target="_blank" rel="noopener noreferrer">https://a.bc/d</a>.',
+      'see <a href="https://a.bc/d" target="_blank" rel="noopener noreferrer" dir="ltr">https://a.bc/d</a>.',
     );
     expect(plain("(https://a.bc)")).toContain(">https://a.bc</a>)");
     expect(plain("https://en.wikipedia.org/wiki/Foo_(bar)")).toContain(">https://en.wikipedia.org/wiki/Foo_(bar)</a>");
     expect(plain("**https://a.bc**")).toBe(
-      '<strong><a href="https://a.bc" target="_blank" rel="noopener noreferrer">https://a.bc</a></strong>',
+      '<strong><a href="https://a.bc" target="_blank" rel="noopener noreferrer" dir="ltr">https://a.bc</a></strong>',
     );
   });
 
   it("never puts emphasis inside a url, and emphasizes one wrapped in markers", () => {
     expect(plain("https://a.bc/*x*/~~y~~/z")).toBe(
-      '<a href="https://a.bc/*x*/~~y~~/z" target="_blank" rel="noopener noreferrer">https://a.bc/*x*/~~y~~/z</a>',
+      '<a href="https://a.bc/*x*/~~y~~/z" target="_blank" rel="noopener noreferrer" dir="ltr">https://a.bc/*x*/~~y~~/z</a>',
     );
     expect(plain("~~https://a.bc~~")).toBe(
-      '<s><a href="https://a.bc" target="_blank" rel="noopener noreferrer">https://a.bc</a></s>',
+      '<s><a href="https://a.bc" target="_blank" rel="noopener noreferrer" dir="ltr">https://a.bc</a></s>',
     );
   });
 
@@ -276,7 +303,7 @@ describe("block markdown", () => {
     expect(html).toBe(
       "<strong>bold</strong>\n<em>italic</em>\n<s>strikethrough</s>\n<code>inline code</code>" +
         "<h1>Heading</h1><ul><li>list item</li></ul>" +
-        '<a href="https://example.com" title="https://example.com" target="_blank" rel="noopener noreferrer">link</a>',
+        '<a href="https://example.com" title="https://example.com" target="_blank" rel="noopener noreferrer" dir="ltr">link</a>',
     );
   });
 });

@@ -103,7 +103,8 @@ const SPAN_RE = new RegExp(
  *    "paypa∣.com" are addresses. Not Chinese or Japanese, whose sentences
  *    run on after a full stop with no space between.
  * A label that reorders itself (a bidi override, embedding or isolate) is
- * never masked: an override draws "t.co" from text that spells "oc.t".
+ * never masked: an override draws "t.co" from text that spells "oc.t". One
+ * typed around the link cannot reach its text: see anchor.
  */
 const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
 /**
@@ -128,6 +129,7 @@ const MARK_RE = /\p{M}/gu;
 const LOOKALIKE_RE =
   /[^\p{ASCII}\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/gu;
 const REORDERS_RE = /[\u202A-\u202E\u2066-\u2069]/;
+const REORDERS_ALL_RE = new RegExp(REORDERS_RE.source, "g");
 function looksLikeUrl(label: string): boolean {
   if (REORDERS_RE.test(label)) return true;
   const drawn = label
@@ -173,9 +175,20 @@ export function trimUrl(url: string): { url: string; rest: string } {
   return { url: url.slice(0, end), rest: url.slice(end) };
 }
 
+/**
+ * A link, its text a bidi isolate laid out left to right, and with no bidi
+ * control of its own. An override typed before the link and closed after
+ * it reversed the text inside, so a masked "oc.t" drew as "t.co", and a
+ * bare url as another host's; one inside a url reversed the rest of it, and
+ * "https://" with "moc.lapyap@evil.example" after an override drew as a
+ * link to paypal.com. Not dir="auto" nor <bdi>: an invisible right-to-left
+ * mark at the start of a label then makes the label right to left, and
+ * "co.t" draws as "t.co" again.
+ */
 function anchor(href: string, html: string, title?: string): string {
-  const t = title ? ` title="${escapeHtml(title)}"` : "";
-  return `<a href="${escapeHtml(href)}"${t} target="_blank" rel="noopener noreferrer" class="${LINK_CLASS}">${html}</a>`;
+  const t = title ? ` title="${escapeHtml(title.replace(REORDERS_ALL_RE, ""))}"` : "";
+  const text = html.replace(REORDERS_ALL_RE, "");
+  return `<a href="${escapeHtml(href)}"${t} target="_blank" rel="noopener noreferrer" dir="ltr" class="${LINK_CLASS}">${text}</a>`;
 }
 
 /** Code shows mentions by name, as text, and nothing else is interpreted. */
