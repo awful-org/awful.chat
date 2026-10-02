@@ -1105,7 +1105,12 @@ Privacy: App Settings > External previews and media is on by default.
 Endpoint: /og/preview?url=<encoded_url> on the Go relay's API port
          (/og is an alias; /klipy/* proxies GIF search the same way)
 Response: JSON { title, description, image, siteName, url, video, mediaType }
-Caching: Server-side caching with TTL
+Caching: the relay keeps each answer in memory for an hour (a failure for
+         five minutes), concurrent asks for one URL share a single fetch, and
+         only a real fetch spends the per-address rate budget. Answers carry
+         Cache-Control: private, max-age=3600 (300 for a failure) so the
+         browser does not ask again on every redraw. The relay holds the
+         URLs it was asked about for that long.
 Security: URL allowlist/blocklist, size limits, timeout protection
 ```
 
