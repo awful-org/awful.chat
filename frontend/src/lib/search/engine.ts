@@ -2,7 +2,7 @@
  * Message search engine: corpus entries, filter matching, ranking.
  *
  * Pure module - no storage, no UI, no $state - so the whole pipeline is
- * unit-testable. Terms match at word starts (matchWordPrefix), quoted
+ * unit-testable. Terms match at word starts (wordStartAt), quoted
  * phrases anywhere; only the short sender name in from: stays fuzzy.
  */
 import { MessageType, type ChatMessageType } from "$lib/types/message";
@@ -142,7 +142,15 @@ const START_BONUS = 20;
 /** Per character, on top, for a term that is a whole word. */
 const WHOLE_WORD_SCORE = 8;
 
-/** Where an unquoted term matches: the first word that starts with it. */
+/**
+ * Where an unquoted term matches: the first WORD that begins with it. "dep"
+ * finds "deploy", "ploy" does not, and neither do letters that merely occur
+ * in order somewhere. This used the palette's fuzzy scorer, which is right
+ * for a few dozen short titles and wrong for message text - a paragraph
+ * contains almost any handful of letters in order, so most of a room
+ * matched. Scored like matchExact, plus a bonus for the whole word
+ * (termScoreAt).
+ */
 function wordStartAt(lowText: string, lowTerm: string): number {
   if (lowTerm.length === 0) return -1;
   if (UNSPACED.test(lowTerm[0])) return lowText.indexOf(lowTerm);
@@ -171,28 +179,11 @@ function termScoreAt(lowText: string, term: SearchTerm, at: number): number {
   return run + START_BONUS + (wholeWord ? lowTerm.length * WHOLE_WORD_SCORE : 0);
 }
 
-/**
- * An unquoted term matches where a WORD begins with it: "dep" finds
- * "deploy", "ploy" does not, and neither do letters that merely occur in
- * order somewhere. This used the palette's fuzzy scorer, which is right for
- * a few dozen short titles and wrong for message text - a paragraph contains
- * almost any handful of letters in order, so most of a room matched.
- * Scored like matchExact, plus a bonus for matching the whole word.
- */
-export function matchWordPrefix(lowText: string, lowTerm: string) {
-  const term = { text: lowTerm, exact: false };
-  const at = termAt(lowText, term);
-  if (at < 0) return null;
-  const positions: number[] = [];
-  for (let i = 0; i < lowTerm.length; i++) positions.push(at + i);
-  return { score: termScoreAt(lowText, term, at), positions };
-}
-
 /** Recency half-life: a hit ages to half its score every 30 days. */
 const HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Whether an entry passes a from: filter. */
-export type FromFilter = (entry: SearchEntry, from: string) => boolean;
+type FromFilter = (entry: SearchEntry, from: string) => boolean;
 
 function fromMatches(entry: SearchEntry, from: string): boolean {
   return (
@@ -206,7 +197,7 @@ function fromMatches(entry: SearchEntry, from: string): boolean {
  * holds thousands of messages from a handful of people, and the fuzzy name
  * match lowercased and scored the same name once per message.
  */
-export function rememberingFromFilter(): FromFilter {
+function rememberingFromFilter(): FromFilter {
   const byName = new Map<string, boolean>();
   const byDid = new Map<string, boolean>();
   return (entry, from) => {
@@ -228,7 +219,7 @@ export function rememberingFromFilter(): FromFilter {
 /**
  * The rank score of one entry, or -1 when any filter or term fails. Builds
  * nothing: ranking a corpus calls this once per entry, and only the hits
- * that make the cut are turned into SearchHits (matchEntry).
+ * that make the cut are turned into SearchHits (searchEntries).
  */
 export function scoreEntry(
   entry: SearchEntry,
@@ -268,6 +259,10 @@ function rangesFor(entry: SearchEntry, q: SearchQuery): MatchRange[] {
  * Match one entry against a parsed query. Null when any filter or term
  * fails. Zero terms with a filter is valid ("has:image") and ranks purely
  * by recency.
+ *
+ * Searching does not go through here: searchEntries scores every entry and
+ * builds a hit only for those that make the cut. This is the one-entry
+ * form the tests hold searchEntries to.
  */
 export function matchEntry(
   entry: SearchEntry,
@@ -279,14 +274,6 @@ export function matchEntry(
   return { entry, score, ranges: rangesFor(entry, q) };
 }
 
-/** Sort best-first; recency (lamport) breaks ties. Truncates to `limit`. */
-export function rankHits(hits: SearchHit[], limit: number): SearchHit[] {
-  hits.sort(
-    (a, b) => b.score - a.score || b.entry.lamport - a.entry.lamport
-  );
-  return hits.length > limit ? hits.slice(0, limit) : hits;
-}
-
 interface Ranked {
   entry: SearchEntry;
   score: number;
@@ -294,7 +281,8 @@ interface Ranked {
   seq: number;
 }
 
-/** Whether `a` ranks below `b`, in rankHits's order. */
+/** Whether `a` ranks below `b`: by score, then the newer (higher lamport)
+ *  first, then scan order. */
 function ranksBelow(a: Ranked, b: Ranked): boolean {
   if (a.score !== b.score) return a.score < b.score;
   if (a.entry.lamport !== b.entry.lamport) return a.entry.lamport < b.entry.lamport;
@@ -303,8 +291,8 @@ function ranksBelow(a: Ranked, b: Ranked): boolean {
 
 /**
  * The best `limit` hits across the given entry lists, best first - the same
- * list and order as matching every entry and handing all the hits to
- * rankHits.
+ * list and order as matching every entry (matchEntry) and stable-sorting
+ * all the hits by score, recency breaking ties.
  *
  * It keeps a heap of the best `limit` instead: a one-letter query matches
  * most of every room, and sorting all of those hits, each with its own

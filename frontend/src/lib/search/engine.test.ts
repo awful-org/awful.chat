@@ -7,7 +7,6 @@ import {
   HAS_LINK,
   entryFromMessage,
   matchEntry,
-  rankHits,
   scoreEntry,
   searchEntries,
   snippetFor,
@@ -204,25 +203,19 @@ describe("matchEntry", () => {
   });
 });
 
-describe("rankHits", () => {
-  it("sorts best-first, lamport breaks ties, truncates", () => {
-    const a = matchEntry(
-      entryFromMessage(msg({ content: "deploy", lamport: 1 }))!,
-      parseSearchQuery("deploy"),
-      NOW
-    )!;
-    const b = matchEntry(
-      entryFromMessage(msg({ content: "deploy", lamport: 2 }))!,
-      parseSearchQuery("deploy"),
-      NOW
-    )!;
-    const ranked = rankHits([a, b], 10);
-    expect(ranked[0].entry.lamport).toBe(2);
-    expect(rankHits([a, b], 1)).toHaveLength(1);
-  });
-});
-
 describe("searchEntries", () => {
+  it("ranks best-first, the newer of two equal hits first, and keeps `limit`", () => {
+    const q = parseSearchQuery("deploy");
+    const older = entryFromMessage(msg({ content: "deploy", lamport: 1, timestamp: NOW }))!;
+    const newer = entryFromMessage(msg({ content: "deploy", lamport: 2, timestamp: NOW }))!;
+    expect(searchEntries([[older, newer]], q, 10, NOW).map((h) => h.entry.lamport)).toEqual([2, 1]);
+    expect(searchEntries([[older, newer]], q, 1, NOW)).toHaveLength(1);
+    // Score before recency: the whole word beats a word it only begins.
+    const whole = entryFromMessage(msg({ content: "deploy now", lamport: 0, timestamp: NOW }))!;
+    const part = entryFromMessage(msg({ content: "deployed now", lamport: 9, timestamp: NOW }))!;
+    expect(searchEntries([[part, whole]], q, 10, NOW).map((h) => h.entry.lamport)).toEqual([0, 9]);
+  });
+
   // A seeded generator, so a failure names the corpus that broke it.
   function corpus(seed: number, size: number): SearchEntry[] {
     let state = seed;
@@ -256,6 +249,8 @@ describe("searchEntries", () => {
     return out;
   }
 
+  // What searchEntries must agree with: every entry matched, every hit
+  // sorted (a stable sort, so scan order settles exact ties), then cut.
   function fullRanking(lists: SearchEntry[][], query: string, limit: number): SearchHit[] {
     const hits: SearchHit[] = [];
     for (const list of lists) {
@@ -264,7 +259,8 @@ describe("searchEntries", () => {
         if (hit) hits.push(hit);
       }
     }
-    return rankHits(hits, limit);
+    hits.sort((a, b) => b.score - a.score || b.entry.lamport - a.entry.lamport);
+    return hits.slice(0, limit);
   }
 
   it("keeps the best hits in the order a full ranking gives, ties included", () => {
