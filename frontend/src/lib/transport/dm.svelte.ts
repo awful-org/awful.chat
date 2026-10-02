@@ -1078,12 +1078,37 @@ function _isTrustedDmPeer(peerDid: string, view: AdmissionView): boolean {
 }
 
 /**
+ * Joins an introduction alone may cost us a minute, from anyone not in the
+ * phonebook and not reached out to. Each is a relay registration, and once
+ * MAX_PROVISIONAL_DMS are held each also sends the oldest away - a departure
+ * that closes every room handshake still in progress. An introduction costs
+ * its sender nothing but a minted identity, so a stranger who knew our
+ * device could keep that churning, one join and one departure per
+ * introduction. Past this an introduction joins nothing, and the first
+ * message it was for comes through the mailbox instead.
+ */
+export const INTRODUCTION_JOINS_PER_MINUTE = 16;
+let _introductionJoins: { session: UnlockedSession; at: number[] } | null = null;
+
+function _chargeIntroductionJoin(session: UnlockedSession): boolean {
+  const now = Date.now();
+  if (_introductionJoins?.session !== session) _introductionJoins = { session, at: [] };
+  const at = _introductionJoins.at;
+  while (at.length > 0 && now - at[0] >= 60_000) at.shift();
+  if (at.length >= INTRODUCTION_JOINS_PER_MINUTE) return false;
+  at.push(now);
+  return true;
+}
+
+/**
  * Decide, one at a time so the caps hold under a burst, what an unsolicited
  * new conversation becomes: an ordinary DM (someone we know), a request, or
  * nothing (the requests, or this session's new conversations, are full). A
  * "request" verdict reserves a slot until the caller releases it, once the
- * room is stored or abandoned. `reserve` false asks without taking anything:
- * an introduction's join stores nothing, its first message is admitted again.
+ * room is stored or abandoned. `reserve` false asks without taking anything
+ * a message would: an introduction's join stores nothing, and its first
+ * message is admitted again. The join itself is charged, though, unless
+ * they are a contact or someone we reached out to.
  */
 function _admitUnsolicited(
   peerDid: string,
@@ -1093,22 +1118,48 @@ function _admitUnsolicited(
   const run = _requestChain.then(async () => {
     const view = await _admissionView();
     if (_isTrustedDmPeer(peerDid, view)) return "known" as const;
-    if (_unsolicitedSpent?.session !== view.session) {
-      _unsolicitedSpent = { session: view.session, count: 0 };
+    const verdict = _admitUntrusted(peerDid, roomCode, reserve, view);
+    if (!reserve && verdict !== "full" && !_chargeIntroductionJoin(view.session)) {
+      return "full" as const;
     }
-    const spent = _unsolicitedSpent;
-    if (spent.count >= MAX_UNSOLICITED_DMS) return "full" as const;
-    if (view.roomMates.has(peerDid)) {
-      if (reserve) spent.count += 1;
-      return "known" as const;
-    }
-    if (_requestsInFlight.has(roomCode)) return "request" as const;
-    if (view.held + _requestsInFlight.size >= MAX_DM_REQUESTS) return "full" as const;
-    if (reserve) {
-      _requestsInFlight.add(roomCode);
-      spent.count += 1;
-    }
-    return "request" as const;
+    return verdict;
+  });
+  _requestChain = run.catch(() => {});
+  return run;
+}
+
+function _admitUntrusted(
+  peerDid: string,
+  roomCode: string,
+  reserve: boolean,
+  view: AdmissionView
+): "known" | "request" | "full" {
+  if (_unsolicitedSpent?.session !== view.session) {
+    _unsolicitedSpent = { session: view.session, count: 0 };
+  }
+  const spent = _unsolicitedSpent;
+  if (spent.count >= MAX_UNSOLICITED_DMS) return "full";
+  if (view.roomMates.has(peerDid)) {
+    if (reserve) spent.count += 1;
+    return "known";
+  }
+  if (_requestsInFlight.has(roomCode)) return "request";
+  if (view.held + _requestsInFlight.size >= MAX_DM_REQUESTS) return "full";
+  if (reserve) {
+    _requestsInFlight.add(roomCode);
+    spent.count += 1;
+  }
+  return "request";
+}
+
+/**
+ * Whether an introduction alone may join a DM we hold with nothing in it:
+ * charged like a new one (INTRODUCTION_JOINS_PER_MINUTE).
+ */
+function _admitIntroductionJoin(peerDid: string): Promise<boolean> {
+  const run = _requestChain.then(async () => {
+    const view = await _admissionView();
+    return _isTrustedDmPeer(peerDid, view) || _chargeIntroductionJoin(view.session);
   });
   _requestChain = run.catch(() => {});
   return run;
@@ -1359,7 +1410,9 @@ export async function ensureDmRoomForPeer(
   // Joined for an introduction until now: stored under the key it agreed.
   if (!existing) pqState ??= _provisional.get(roomCode);
   let request = false;
-  if (!existing && unsolicited) {
+  // Another introduction for one an introduction already joined is joined
+  // again as it is (an upgrade may have moved its key), and charged nothing.
+  if (!existing && unsolicited && !(opts.provisional && _provisional.has(roomCode))) {
     const verdict = await _admitUnsolicited(peerDid, roomCode, !opts.provisional);
     if (verdict === "full") {
       console.warn("[dm] no room for a new conversation now; dropped one");
@@ -1386,6 +1439,16 @@ export async function ensureDmRoomForPeer(
     guard();
     if (pqState) await setDmPqState(roomCode, pqState);
     guard();
+    // Charged like a new one, unless an account holds it already.
+    if (
+      !_provisional.has(roomCode) &&
+      !_joinedForThem(session).has(roomCode) &&
+      !(await _admitIntroductionJoin(peerDid))
+    ) {
+      console.warn("[dm] no room for a new conversation now; dropped one");
+      return null;
+    }
+    if (requireSession() !== session) throw new Error("Identity changed");
     return _joinProvisionally(session, roomCode, peerDid, pqState ?? existing.pq);
   }
   try {

@@ -124,7 +124,12 @@ import {
   disconnectTransport,
   transportState,
 } from "./transport.svelte";
-import { MAX_UNSOLICITED_DMS, SAVED_DMS_JOINED_AT_CONNECT, ensureDmRoomForPeer } from "./dm.svelte";
+import {
+  INTRODUCTION_JOINS_PER_MINUTE,
+  MAX_UNSOLICITED_DMS,
+  SAVED_DMS_JOINED_AT_CONNECT,
+  ensureDmRoomForPeer,
+} from "./dm.svelte";
 import { getDMRooms, getMessage, getRoom, putRoom, wipeLocalDatabase } from "$lib/storage";
 import { encode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
@@ -132,6 +137,7 @@ import { canonicalContentV3 } from "$lib/messaging";
 import { roomsStore } from "$lib/rooms.svelte";
 import { hashDmRoomCode, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
+import { notifyIdentityLock } from "$lib/identity/lock-events";
 
 function identity(): UnlockedSession {
   const privateKey = crypto.getRandomValues(new Uint8Array(32));
@@ -163,6 +169,9 @@ const receive = (peer: string, frame: unknown, room: string | null) =>
 const settled = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 beforeEach(async () => {
+  // Each test is a session of its own, and a session ends with a lock: what
+  // the last one joined for others is let go of, as in the app.
+  notifyIdentityLock();
   await wipeLocalDatabase();
   vi.clearAllMocks();
   s.session = identity();
@@ -277,4 +286,29 @@ describe("what others have stored with us is not all joined at connect", () => {
     expect(s.bound.size).toBe(SAVED_DMS_JOINED_AT_CONNECT);
     disconnectTransport();
   }, 120_000);
+});
+
+// An introduction alone stores nothing and takes no request slot, so it was
+// charged nothing: a stranger who knew our peerId made us join (a relay
+// registration) and, past the 32 provisional joins, send one away (an
+// unregistration, and the close of every room handshake in progress) per
+// introduction, one minted identity each. Before introductions stopped
+// making DMs, the request cap stopped strangers at 20 joins.
+describe("joins for introductions from strangers are budgeted", () => {
+  it("a burst from fresh identities joins only so many a minute, and sends nothing away", async () => {
+    const N = 300;
+    for (let i = 0; i < N; i++) await introduce(`12D3-s-${i}`, identity().did);
+    expect(s.joins).toBe(INTRODUCTION_JOINS_PER_MINUTE);
+    expect(s.forgets).toBe(0);
+    expect(await getDMRooms()).toEqual([]);
+    // A minute on, the budget is back - and only that much of it.
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      for (let i = 0; i < N; i++) await introduce(`12D3-t-${i}`, identity().did);
+    } finally {
+      now.mockRestore();
+    }
+    expect(s.joins).toBe(2 * INTRODUCTION_JOINS_PER_MINUTE);
+    expect(s.forgets).toBe(0);
+  }, 60_000);
 });
