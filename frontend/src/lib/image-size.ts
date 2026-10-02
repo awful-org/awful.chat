@@ -374,11 +374,30 @@ export function profileImageFits(dataUrl: string): boolean {
  */
 const MAX_FRAME_SIDE = 1024;
 
-/** Past this an image is not decoded for a still frame: 4096x4096 is 64 MB decoded. */
+/**
+ * Past this an animated image is not decoded at all, for a still frame or
+ * to play: 4096x4096 is 64 MB decoded.
+ */
 const MAX_FRAME_PIXELS = 4096 * 4096;
 
 export function canDecodeStillFrame(width: number, height: number): boolean {
   return width > 0 && height > 0 && width * height <= MAX_FRAME_PIXELS;
+}
+
+/**
+ * What GifImage shows of an animated image, by the size a copy of it
+ * loaded out of the page turned out to be: undefined while that loads,
+ * null if it failed. Only "shown" draws a still frame or mounts the img
+ * that plays it. The browser decodes that img at full size, once per url,
+ * so an image past MAX_FRAME_PIXELS, or one whose size is not known, never
+ * gets one: each of a peer's GIF links could cost a gigabyte.
+ */
+export function animatedView(
+  size: Size | null | undefined
+): "loading" | "shown" | "too-large" | "failed" {
+  if (size === undefined) return "loading";
+  if (size === null) return "failed";
+  return size.width * size.height > MAX_FRAME_PIXELS ? "too-large" : "shown";
 }
 
 /**

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  animatedView,
   canDecodeStillFrame,
   dataUrlImageSize,
   declaredImageSize,
@@ -243,5 +244,20 @@ describe("stillFrameSize", () => {
       expect(Math.abs(drawn.height - shown.height), `${w}x${h}@${ratio}`).toBeLessThanOrEqual(1);
       expect(Math.max(frame.width, frame.height)).toBeLessThanOrEqual(1024);
     }
+  });
+});
+
+describe("animatedView", () => {
+  it("plays nothing until the image's size is known, and nothing past the bound", () => {
+    // GifImage mounts the img that plays only for "shown": the browser
+    // decodes that img at full size, so a peer's GIF link that claims
+    // 16383x16383 must never get one, nor one not yet checked.
+    expect(animatedView(undefined)).toBe("loading");
+    expect(animatedView(null)).toBe("failed");
+    expect(animatedView({ width: 498, height: 280 })).toBe("shown");
+    expect(animatedView({ width: 4096, height: 4096 })).toBe("shown");
+    expect(animatedView({ width: 16383, height: 16383 })).toBe("too-large");
+    expect(animatedView({ width: 4097, height: 4096 })).toBe("too-large");
+    expect(animatedView({ width: 1, height: 16_777_217 })).toBe("too-large");
   });
 });
