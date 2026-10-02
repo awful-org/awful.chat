@@ -449,3 +449,25 @@ describe("connecting joins the saved DMs the user read last", () => {
     disconnectTransport();
   }, 60_000);
 });
+
+// _solicited outlived the session: whoever the page had ever reached out to
+// stayed "known", and the user's own at connect, across locks.
+describe("whom the user reached out to is forgotten when the identity locks", () => {
+  it("a DM opened before a lock is not the user's after it", async () => {
+    const friend = identity().did;
+    const room = await code(friend);
+    expect(await openDmConversation(friend)).toBe(true);
+    // Locked, and unlocked again: a session of its own.
+    notifyIdentityLock();
+    s.session = { ...s.session! };
+    s.joined.clear(); s.bound.clear();
+    transportState.relayConnected = false;
+    await connect();
+    await settled();
+    await settled();
+    // Nothing in it, and nobody opened it this session: left out.
+    expect(await getRoom(room)).toBeDefined();
+    expect(s.joined.has(room)).toBe(false);
+    disconnectTransport();
+  }, 30_000);
+});

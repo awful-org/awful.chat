@@ -1068,6 +1068,11 @@ onIdentityLock(() => {
   _admission = null;
   _admissionChanged();
   _unsolicited = null;
+  // Whom the user reached out to is this session's too: kept, it covered
+  // everyone since the page loaded, across locks, as known (no request)
+  // and as the user's own at connect.
+  _solicited.clear();
+  _requestsInFlight.clear();
   // Their bindings too: kept across a lock, they piled up unlock after
   // unlock in a page that was never reloaded.
   for (const roomCode of [..._provisional.keys(), ...(_forThem?.rooms ?? [])]) {
