@@ -253,6 +253,8 @@ type RoomStreamEntry = {
   superseded: boolean;
   /** Ours, let stay beside this inbound one until this one proves its room too (admitRoomStream). */
   replaces: RoomStreamEntry | null;
+  /** The relay said its peer left the room after it proved (ensureSecureRoom). */
+  departed: boolean;
   close: () => void;
   getChannel: () => SecureRoomChannel | null;
 };
@@ -601,7 +603,7 @@ export class LibP2PTransport implements PeerTransport {
     }
     const entry: RoomStreamEntry = {
       connection, peer, outgoing: !!initiate, room: initiate?.discoveryId ?? null, channel: null,
-      usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null,
+      usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null, departed: false,
       close: () => {}, getChannel: () => null,
     };
     this.secureStreams.add(entry);
@@ -815,8 +817,11 @@ export class LibP2PTransport implements PeerTransport {
     if (live?.channel) {
       live.usedAt = Date.now();
       // A live channel is proof enough to keep counting them once it closes,
-      // even if a relay bounce's PEER_LEFT dropped them in between.
-      if (!this.roomMembers.get(room)?.has(peerId)) this.noteRoomMember(room, peerId, live.connection);
+      // even if a relay bounce's PEER_LEFT dropped them in between - but not
+      // one the relay has since said they left: that is the reset of their
+      // leaving still on its way, and it proves nothing past its close. The
+      // relay listing them again clears that (verifyDiscoveredRoomPeer).
+      if (!live.departed && !this.roomMembers.get(room)?.has(peerId)) this.noteRoomMember(room, peerId, live.connection);
       return Promise.resolve(live.channel);
     }
     const openingKey = `${room}:${peerId}`;
@@ -897,6 +902,11 @@ export class LibP2PTransport implements PeerTransport {
   private verifyDiscoveredRoomPeer(room: string, peer: string): void {
     const keys = this.secureRooms.get(room as DiscoveryId);
     if (!keys) return;
+    // The relay lists them in the room again: a PEER_LEFT before this was a
+    // relay bounce, and their open channel counts as proof once more.
+    for (const entry of this.secureStreams) {
+      if (entry.room === room && entry.peer === peer) entry.departed = false;
+    }
     // dialPeer knows the relay's circuit addresses; ordinary node.dial does not
     // necessarily have an address for a freshly discovered peer yet.
     void this.dialPeer(peer).then(() => {
@@ -3332,6 +3342,12 @@ export class LibP2PTransport implements PeerTransport {
         // back the fresh channel is news again, catch-up and all.
         this.roomMembers.get(msg.room as DiscoveryId)?.delete(msg.peer);
         this.roomProveRetry.delete(`${msg.room}\n${msg.peer}`);
+        // Nor may a send over one still open count them back in: this can land
+        // before the reset of the channel their leaving closed. One proven
+        // after it is a member back, and counts.
+        for (const entry of this.secureStreams) {
+          if (entry.room === msg.room && entry.peer === msg.peer && entry.channel) entry.departed = true;
+        }
         break;
       }
     }

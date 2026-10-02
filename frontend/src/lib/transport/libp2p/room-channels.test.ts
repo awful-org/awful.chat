@@ -30,7 +30,7 @@ function transport() {
 function roomStream(fields: Record<string, unknown> = {}) {
   return {
     connection: { status: "open" }, peer: "bob", outgoing: false, room: null, channel: null,
-    usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null,
+    usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null, departed: false,
     close: vi.fn(), getChannel: () => null, ...fields,
   };
 }
@@ -134,4 +134,31 @@ it("keeps our young channel to a larger peer through a crossing hello, and lets 
   internal.secureStreams.clear();
   internal.secureStreams.add(roomStream({ outgoing: true, room }));
   expect(internal.admitRoomStream(roomStream(), room)).toBe(false);
+});
+
+it("does not count a member the relay says left back in over the channel their leaving is closing, unless it lists them again", async () => {
+  const { t, internal, room } = transport();
+  internal.node = { peerId: { toString: () => "alice" } };
+  internal.dialPeer = vi.fn(async () => {});
+  internal.connectedPeers.add("bob");
+  const channel = { verified: true };
+  const live = roomStream({ room, channel, provenAt: Date.now() });
+  internal.secureStreams.add(live);
+  internal.roomMembers.set(room, new Map([["bob", live.connection]]));
+  internal.handleRendezvousMsg("alice", { type: "PEER_LEFT", room, peer: "bob" });
+  // A send before the reset of their channel lands still goes over it...
+  expect(await internal.ensureSecureRoom("bob", room)).toBe(channel);
+  expect(t.isRoomPeer(room, "bob")).toBe(true);
+  // ...and once it lands, they are gone: that send proved nothing.
+  internal.secureStreams.delete(live);
+  expect(t.isRoomPeer(room, "bob")).toBe(false);
+  // A relay bounce instead - PEER_LEFT, then listed again - and the channel
+  // still open is proof once more.
+  const bounced = roomStream({ room, channel, provenAt: Date.now() });
+  internal.secureStreams.add(bounced);
+  internal.handleRendezvousMsg("alice", { type: "PEER_LEFT", room, peer: "bob" });
+  internal.handleRendezvousMsg("alice", { type: "PEER_JOINED", room, peer: "bob" });
+  await vi.waitFor(() => expect(internal.roomMembers.get(room)?.has("bob")).toBe(true));
+  internal.secureStreams.delete(bounced);
+  expect(t.isRoomPeer(room, "bob")).toBe(true);
 });
