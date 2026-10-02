@@ -148,7 +148,8 @@ export interface CameraSurfaces {
   /**
    * The spotlight tile. The floating panel and picture in picture show it,
    * and so does the hidden video that keeps picture in picture ready to
-   * open on a tab switch.
+   * open on a tab switch. Null where nothing computes one: a quick call
+   * (/qc) has no AppView, so no panel and no picture in picture.
    */
   spotlight: Pick<SpotlightTile, "id" | "kind" | "isLocal" | "peerId"> | null;
   /** The tile the user pinned (callFocus), or null. */
@@ -173,16 +174,19 @@ export function wantedCameras(shown: CameraSurfaces): Set<string> {
     wanted.add(spotlight.peerId);
   }
   // Whoever is talking may be the spotlight in a moment: rule 3 hands it
-  // over after 1.5 s of speech (spotlight.ts). A parked camera takes a round
-  // trip and a keyframe to come back, so one first asked for at the switch
-  // put a black picture in the floating panel and picture in picture on
-  // most changes of speaker. Asked for at the first word, it is playing by
-  // then. Not while a pin or a watched share holds the spotlight (rules 1
-  // and 2), when no speaker can take it.
+  // over after SPEAKER_TAKEOVER_MS of speech (spotlight.ts). A parked camera
+  // takes a round trip and a keyframe to come back, so one first asked for
+  // at the switch put a black picture in the floating panel and picture in
+  // picture on most changes of speaker. Asked for at the first word, it is
+  // playing by then, for as long as the takeover stays well above that
+  // round trip (call-tiles.test.ts holds it to that). Not while a pin or a
+  // watched share holds the spotlight (rules 1 and 2), when no speaker can
+  // take it, nor where there is no spotlight to take: in a quick call only
+  // the stage shows cameras, and it says which itself.
   const held =
-    spotlight !== null &&
-    (spotlight.id === shown.pinnedTileId ||
-      (spotlight.kind === "screen" && !spotlight.isLocal));
+    spotlight === null ||
+    spotlight.id === shown.pinnedTileId ||
+    (spotlight.kind === "screen" && !spotlight.isLocal);
   if (!held) {
     for (const peerId of shown.speaking) {
       if (peerId !== shown.selfId) wanted.add(peerId);

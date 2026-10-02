@@ -6,6 +6,7 @@ import {
   type CallState,
   type CameraSurfaces,
 } from "./call-tiles";
+import { SPEAKER_TAKEOVER_MS, spotlight } from "./spotlight";
 
 describe("buildCallTiles", () => {
   let state: CallState;
@@ -323,7 +324,52 @@ describe("wantedCameras", () => {
     expect(
       wantedCameras(shown({ spotlight: camera("a"), speaking: ["b", "self"] }))
     ).toEqual(new Set(["a", "b"]));
-    expect(wantedCameras(shown({ speaking: ["b"] }))).toEqual(new Set(["b"]));
+  });
+
+  it("adds no one for talking where there is no spotlight to take", () => {
+    // A quick call (/qc) has no AppView, so no floating panel and no picture
+    // in picture: a talker the stage does not show was received for nothing.
+    expect(wantedCameras(shown({ speaking: ["b"] }))).toEqual(new Set());
+    expect(wantedCameras(shown({ stage: ["b"], speaking: ["b"] }))).toEqual(new Set(["b"]));
+  });
+
+  it("asks for a talker at least an unpark's time before the spotlight can move to them", () => {
+    // Bringing a parked camera back is a consume round trip to the SFU, the
+    // local SDP work and a keyframe from the sender: a few hundred
+    // milliseconds on an ordinary call, so a second is a generous ceiling.
+    // The warm-up only beats the black picture while rule 3's takeover stays
+    // above it.
+    const UNPARK_BUDGET_MS = 1_000;
+    expect(SPEAKER_TAKEOVER_MS).toBeGreaterThanOrEqual(UNPARK_BUDGET_MS);
+
+    const track = {} as MediaStreamTrack;
+    const tiles = [
+      { ...camera("self", true), videoTrack: null },
+      { ...camera("a"), videoTrack: track },
+      { ...camera("b"), videoTrack: track },
+    ];
+    const firstWord = 60_000;
+    const speakers = {
+      speaking: new Set(["b"]),
+      speakingSince: new Map([["b", firstWord]]),
+      lastSpokeAt: new Map([
+        ["a", 0],
+        ["b", firstWord],
+      ]),
+    };
+    const incumbent = remoteCameraTileId("a");
+
+    // From b's first word, b's camera is asked for...
+    expect(
+      wantedCameras(shown({ spotlight: camera("a"), speaking: speakers.speaking }))
+    ).toEqual(new Set(["a", "b"]));
+    // ...and the spotlight is still a's when it is back.
+    expect(
+      spotlight(tiles, null, null, speakers, incumbent, firstWord + UNPARK_BUDGET_MS)
+    ).toBe(incumbent);
+    expect(
+      spotlight(tiles, null, null, speakers, incumbent, firstWord + SPEAKER_TAKEOVER_MS)
+    ).toBe(remoteCameraTileId("b"));
   });
 
   it("adds no one for talking while a pin holds the spotlight", () => {

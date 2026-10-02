@@ -12,7 +12,8 @@
  *     picture in picture;
  *   - the tiles popped out into windows of their own.
  *
- * Plus whoever is talking, whom the spotlight may move to next.
+ * Plus whoever is talking, whom the spotlight may move to next, where there
+ * is a spotlight: a quick call (/qc) has no AppView to compute one.
  *
  * The push to the SFU client lives here rather than in the stage because it
  * has to outlast the stage: the stage unmounts the moment the user opens

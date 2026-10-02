@@ -135,4 +135,15 @@ describe("call-cameras: what the SFU client is told to receive", () => {
 
     expect(pushed()).toEqual(new Set(["peer-b"]));
   });
+
+  it("asks for no one who is talking in a quick call, where nothing computes a spotlight", () => {
+    // /qc mounts the stage without AppView: no floating panel, no picture
+    // in picture, and the spotlight store stays empty.
+    stageCameraShown(tile(), "peer-a");
+    h.speakers.speaking = new Set(["peer-d"]);
+
+    pushWantedCameras();
+
+    expect(pushed()).toEqual(new Set(["peer-a"]));
+  });
 });

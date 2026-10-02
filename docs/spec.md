@@ -751,9 +751,10 @@ Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
     stage has on screen (IntersectionObserver), the spotlight (floating
     panel, picture in picture), or a popped-out window
   - and while its owner is speaking, unless a pin or a watched share holds
-    the spotlight: a speaker takes the spotlight after 1.5 s of speech, and
-    a camera asked for at the first word is playing by then rather than
-    black for the round trip
+    the spotlight, or there is none (a quick call has no floating panel or
+    picture in picture): a speaker takes the spotlight after 1.5 s of
+    speech (SPEAKER_TAKEOVER_MS), and a camera asked for at the first word
+    is playing by then rather than black for the round trip
   - unshown for 5 s → ms:close-consumer and a local close; newly shown →
     a fresh ms:consume + ms:resume-consumer (the SFU asks for a keyframe on
     resume). No new wire message
