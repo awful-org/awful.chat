@@ -1,5 +1,6 @@
 <script lang="ts">
   import { canLoadMedia } from "$lib/media-prefs.svelte";
+  import { canDecodeStillFrame, stillFrameSize } from "$lib/image-size";
   /**
    * An image that can hold an animated GIF still. Browsers cannot pause a
    * GIF, so a canvas keeps the first frame and the animated img only exists
@@ -13,6 +14,11 @@
    *
    * animate: true = always play, false = always frozen, "hover" = play
    * while the pointer is over it.
+   *
+   * The still frame is drawn at the size it is shown, not the image's own:
+   * each canvas is a backing store of its own, and a peer's 16383x16383
+   * avatar cost a gigabyte in every place it appeared. An image past
+   * canDecodeStillFrame's bound is never decoded for a frame at all.
    */
   interface Props {
     src: string;
@@ -60,17 +66,39 @@
     if (!allowed || !isAnimated || !canvasEl) return;
     const canvas = canvasEl;
     const img = new Image();
-    img.src = src;
     let cancelled = false;
-    img
-      .decode()
-      .then(() => {
-        if (cancelled) return;
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        canvas.getContext("2d")?.drawImage(img, 0, 0);
-      })
-      .catch(() => {});
+    // The size is known once it loads, from the header, before any decode.
+    img.onload = () => {
+      if (cancelled) return;
+      const { naturalWidth: w, naturalHeight: h } = img;
+      if (!canDecodeStillFrame(w, h)) return;
+      img
+        .decode()
+        .then(() => {
+          if (cancelled) return;
+          // At the image's own size the canvas lays out in the box it is
+          // shown in, set by the page (an avatar) or by the image (a GIF in
+          // a message). Nothing is drawn at that size, so no backing store
+          // is ever made for it.
+          canvas.width = w;
+          canvas.height = h;
+          const size = stillFrameSize(
+            w,
+            h,
+            canvas.clientWidth,
+            canvas.clientHeight,
+            devicePixelRatio
+          );
+          if (!size) return;
+          canvas.width = size.width;
+          canvas.height = size.height;
+          canvas
+            .getContext("2d")
+            ?.drawImage(img, 0, 0, size.width, size.height);
+        })
+        .catch(() => {});
+    };
+    img.src = src;
     return () => {
       cancelled = true;
     };

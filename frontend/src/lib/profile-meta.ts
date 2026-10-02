@@ -3,6 +3,7 @@
  * Used at the trust boundary (receiving wire profiles) and by ProfileSettings.
  */
 
+import { profileImageFits } from "./image-size";
 import { normalizeAvatarUrl } from "./utils";
 
 // Same raster allowlist as avatars, with the banner's larger inline budget.
@@ -85,10 +86,11 @@ export function validateProfileMeta(meta: Partial<ValidatedProfileMeta>): Valida
   }
 
   // The shared picker supports uploads AND linked images/GIFs. Match avatar
-  // normalization so banners visible to their owner also survive transmission.
+  // normalization so banners visible to their owner also survive transmission,
+  // the size an inline one's header claims included.
   if (typeof meta.bannerUrl === "string" && meta.bannerUrl.length <= 1_500_000) {
     const bannerUrl = meta.bannerUrl.startsWith("data:")
-      ? (DATA_BANNER_RE.test(meta.bannerUrl) ? meta.bannerUrl : undefined)
+      ? (DATA_BANNER_RE.test(meta.bannerUrl) && profileImageFits(meta.bannerUrl) ? meta.bannerUrl : undefined)
       : normalizeAvatarUrl(meta.bannerUrl);
     if (bannerUrl) result.bannerUrl = bannerUrl;
   }

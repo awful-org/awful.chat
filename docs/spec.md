@@ -266,6 +266,13 @@ interface PeerProfile {
 //   pfpData present → URL.createObjectURL(new Blob([pfpData])) at runtime
 //   pfpURL present  → use directly as <img src>
 //   setting one clears the other
+//
+// A peer's avatar or banner URL is kept only if it is http(s), or a base64
+// raster data: URL (no SVG; ~1.4 MB, a banner ~1.5 MB) whose header claims
+// at most 4096 px a side. GIF, PNG, WebP and JPEG headers are read, others
+// pass. Checked on receipt and again on every load from storage. The still
+// frame of an animated one is drawn at the size it is shown (1024 px a side
+// at most), and not at all past 4096x4096 pixels.
 ```
 
 ### Identity struct

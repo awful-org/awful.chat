@@ -162,6 +162,13 @@ describe("validateProfileMeta", () => {
       }
     });
 
+    it("drops an inline banner that claims more than 4096 px a side", () => {
+      const bomb = "data:image/gif;base64,R0lGODlh/z//P4AAAAAAAP///ywAAAAA/z//PwACAkwBADs=";
+      expect(validateProfileMeta({ bannerUrl: bomb }).bannerUrl).toBeUndefined();
+      const banner = "data:image/gif;base64,R0lGODlhSANoAYAAAAAAAP///ywAAAAASANoAQACAkwBADs=";
+      expect(validateProfileMeta({ bannerUrl: banner }).bannerUrl).toBe(banner);
+    });
+
     it("drops URLs over 1.5 MB", () => {
       const longUrl = "data:image/png;base64," + "a".repeat(1_500_001);
       expect(validateProfileMeta({ bannerUrl: longUrl }).bannerUrl).toBeUndefined();
