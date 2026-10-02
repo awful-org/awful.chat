@@ -249,6 +249,16 @@ async function saveIndex(roomCode: string, c: RoomCorpus): Promise<void> {
   // neither.
   const counts = await countRoomRows(roomCode, lastLamport);
   if (_rooms.get(roomCode) !== c) return;
+  // Storage holds fewer rows than the corpus took in: the room was deleted,
+  // in this tab or in another one of the profile, whose deletion this tab
+  // never hears of. The entries are the text of messages that are gone,
+  // and they are not written back. (A row the storage self-repair removed
+  // as unreadable counts the same way; the next build counts without it.)
+  const seen = c.base ? c.base.rows + c.added.size : 0;
+  if (counts.rows === 0 || counts.rows < seen) {
+    c.dirty = false;
+    return;
+  }
   const record: SearchIndexRecord = {
     roomCode,
     lastLamport,
@@ -262,14 +272,18 @@ async function saveIndex(roomCode: string, c: RoomCorpus): Promise<void> {
   // put a backfilled message out of search for good. Without the count the
   // next session checks the index against every row, and rebuilds it if
   // something is missing.
-  if (c.base && counts.rows === c.base.rows + c.added.size) record.rowsBelow = counts.below;
+  if (c.base && counts.rows === seen) record.rowsBelow = counts.below;
   c.dirty = false;
   c.savedAt = Date.now();
   try {
-    // The room may be deleted while its index is sealed - its corpus object
-    // is dropped then, and this write would resurrect an index row for a
-    // room whose messages are gone.
-    await putSearchIndex(record, () => _rooms.get(roomCode) === c);
+    await putSearchIndex(record, {
+      // Rows deleted while the index is sealed: the write counts them again,
+      // in one transaction with it.
+      minRows: counts.rows,
+      // The room may be deleted in this tab meanwhile - its corpus object
+      // is dropped then.
+      stillWanted: () => _rooms.get(roomCode) === c,
+    });
   } catch (err) {
     c.dirty = true;
     throw err;

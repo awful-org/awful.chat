@@ -1229,16 +1229,42 @@ export async function getSearchIndex(
   }
 }
 
+/**
+ * Write a room's sealed search index, unless the room is gone. Returns
+ * whether it was written.
+ *
+ * An index row exists only while its room has rows. The rows are counted
+ * in one transaction with the write, and deleteMessagesForRoom drops the
+ * row in the transaction that drops the messages, so whichever of the two
+ * runs second, no index outlives its room. That holds across tabs too: a
+ * tab that kept its search corpus after another tab took the node never
+ * hears of a deletion there, and its next write would bring back the text
+ * of every message in the deleted room.
+ */
 export async function putSearchIndex(
   record: SearchIndexRecord,
-  /** Asked once the row is sealed, right before the write: a room deleted
-   *  while its index was being sealed must not get the index back. */
-  stillWanted?: () => boolean
-): Promise<void> {
+  options: {
+    /** The room's rows when the entries were checked against them. Fewer
+     *  by the time of the write means rows were deleted meanwhile. */
+    minRows?: number;
+    /** Asked once the row is sealed, and again right before the write: a
+     *  room deleted in this tab meanwhile must not get the index back. */
+    stillWanted?: () => boolean;
+  } = {}
+): Promise<boolean> {
+  const { minRows = 1, stillWanted } = options;
   const database = await getDB();
   const sealed = await _seal("searchIndex", record);
-  if (stillWanted && !stillWanted()) return;
-  await database.put("searchIndex", sealed);
+  const ranges = await _roomLamportRanges(record.roomCode, 0, Number.MAX_SAFE_INTEGER, false);
+  if (stillWanted && !stillWanted()) return false;
+  const tx = database.transaction(["messages", "searchIndex"], "readwrite");
+  const index = tx.objectStore("messages").index("byRoomLamport");
+  const counts = await Promise.all(ranges.map((range) => index.count(range)));
+  const rows = counts.reduce((sum, n) => sum + n, 0);
+  const write = rows >= Math.max(1, minRows) && (!stillWanted || stillWanted());
+  if (write) await tx.objectStore("searchIndex").put(sealed);
+  await tx.done;
+  return write;
 }
 
 export async function deleteSearchIndex(roomCode: string): Promise<void> {
@@ -1562,9 +1588,13 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
 
   // Delete in a separate transaction
   const writeTx = database.transaction(
-    ["messages", "attachments", "watermarks"],
+    ["messages", "attachments", "watermarks", "searchIndex"],
     "readwrite"
   );
+  // The index row again, with the rows: another tab may have written it
+  // since the delete above. putSearchIndex counts the rows in its own
+  // transaction, so none is written once they are gone.
+  await writeTx.objectStore("searchIndex").delete(blindRoomCode);
   for (const attId of attachmentIds) {
     await writeTx.objectStore("attachments").delete(attId);
     _attachmentEpoch += 1;
