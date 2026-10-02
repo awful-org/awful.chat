@@ -1729,13 +1729,18 @@ export async function getAttachmentsByMessage(
 }
 
 export async function getAttachmentsByInfoHash(
-  infoHash: string
+  infoHash: string,
+  /** Metadata only, the file bytes left sealed: for the callers that want
+   *  a row's room, status or descriptor and would otherwise decrypt the
+   *  whole file to learn it - several of them once per block served. */
+  opts?: { skipBytes?: boolean }
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedInfoHash = await blindValue(infoHash);
   return _openAllHealing(
     "attachments",
-    await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash)
+    await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash),
+    opts
   );
 }
 
@@ -1913,10 +1918,19 @@ export async function updateAttachmentStatus(
 ): Promise<void> {
   guard();
   const database = await getDB();
-  const attachment = await _openHealing<Attachment>(
-    "attachments",
-    await database.get("attachments", id)
-  );
+  const stored = await database.get("attachments", id);
+  guard();
+  // The status is clear on the stored row, so whether this changes anything
+  // is known before opening it - and opening it means decrypting the file
+  // bytes it carries, which the seeding path used to do for nothing on
+  // every block it served.
+  if (
+    !stored ||
+    ATTACHMENT_STATUS_RANK[stored.status] >= ATTACHMENT_STATUS_RANK[status]
+  ) {
+    return;
+  }
+  const attachment = await _openHealing<Attachment>("attachments", stored);
   guard();
   if (!attachment) return;
   if (

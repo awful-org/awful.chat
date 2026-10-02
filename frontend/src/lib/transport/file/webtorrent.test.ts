@@ -243,6 +243,45 @@ describe("WebTorrentFileTransport", () => {
     expect(livePeers.length).toBe(0);
   });
 
+  it("a seed serving block after block has nothing new to tell the app", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    await t.seedFiles([new File([new Uint8Array(10)], "cat.png", { type: "image/png" })]);
+    const torrent = torrents.get(HASH)!;
+    torrent.progress = 1;
+    const snapshots: unknown[] = [];
+    t.on("transfer", (s) => snapshots.push(s));
+    // A request in, a header and a block out: three reports per 16 KiB.
+    for (let i = 0; i < 300; i++) torrent.emit(i % 3 ? "upload" : "download");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(snapshots).toHaveLength(0);
+    expect(t.getTransfer(HASH)?.status).toBe("seeding");
+  });
+
+  it("a download's progress becomes a snapshot at most every quarter second", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.ensureDownload(file);
+    await tick();
+    await tick();
+    const torrent = torrents.get(HASH)!;
+    const snapshots: Array<{ progress: number }> = [];
+    t.on("transfer", (s) => snapshots.push(s));
+    vi.useFakeTimers();
+    try {
+      for (let i = 1; i <= 300; i++) {
+        torrent.progress = i / 300;
+        torrent.emit("download");
+      }
+      expect(snapshots).toHaveLength(1);
+      vi.advanceTimersByTime(250);
+      // The latest progress, not the second report's.
+      expect(snapshots.map((s) => s.progress)).toEqual([1 / 300, 1]);
+      vi.advanceTimersByTime(1_000);
+      expect(snapshots).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a real disconnect starts the count over", async () => {
     vi.useFakeTimers();
     try {

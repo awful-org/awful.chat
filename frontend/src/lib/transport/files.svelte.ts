@@ -46,19 +46,34 @@ function getFileTransport(): WebTorrentFileTransport {
   return _fileTransport;
 }
 
+/** False when no row holds the file yet - its message is still being stored. */
 async function _persistAttachmentStatusForInfoHash(
   infoHash: string,
   status: Attachment["status"],
   guard = fileOperationGuard(),
-): Promise<void> {
-  const attachments = await getAttachmentsByInfoHash(infoHash);
+): Promise<boolean> {
+  // The ids and statuses only: the file bytes stay sealed.
+  const attachments = await getAttachmentsByInfoHash(infoHash, { skipBytes: true });
   guard();
   await Promise.all(
     attachments.map((attachment) =>
-      updateAttachmentStatus(attachment.id, status, guard)
+      attachment.status === status
+        ? undefined
+        : updateAttachmentStatus(attachment.id, status, guard)
     )
   );
+  return attachments.length > 0;
 }
+
+/**
+ * The status each file's rows were last brought to this session. A torrent
+ * reports itself for every block it moves - a request in, a header and a
+ * block out, three times per 16 KiB served - and every report re-read the
+ * file's rows twice, decrypting the whole file each time, to find the
+ * status already written: serving one 5 MB picture to one peer decrypted
+ * gigabytes, and the reads queued up faster than they drained.
+ */
+const _persistedStatus = new Map<string, Attachment["status"]>();
 
 async function _persistDownloadedBlob(
   infoHash: string,
@@ -66,7 +81,7 @@ async function _persistDownloadedBlob(
 ): Promise<void> {
   const guard = fileOperationGuard();
   const fileTransport = getFileTransport();
-  const attachments = await getAttachmentsByInfoHash(infoHash);
+  const attachments = await getAttachmentsByInfoHash(infoHash, { skipBytes: true });
   guard();
   if (!attachments.length) return;
 
@@ -134,15 +149,20 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     // never rebuilt it. The picture for a download is minted below instead.
     withFileTransfer({ ...snapshot, blobURL: undefined });
 
+    const { infoHash, status } = snapshot;
     if (
-      snapshot.status === "seeding" ||
-      snapshot.status === "complete" ||
-      snapshot.status === "failed"
+      (status === "seeding" || status === "complete" || status === "failed") &&
+      _persistedStatus.get(infoHash) !== status
     ) {
-      _persistAttachmentStatusForInfoHash(
-        snapshot.infoHash,
-        snapshot.status
-      ).catch(() => {});
+      _persistedStatus.set(infoHash, status);
+      // No row yet, or a write that failed: the next report tries again.
+      const retry = () => {
+        if (_persistedStatus.get(infoHash) === status) _persistedStatus.delete(infoHash);
+      };
+      _persistAttachmentStatusForInfoHash(infoHash, status).then(
+        (stored) => { if (!stored) retry(); },
+        retry,
+      );
     }
   });
 
@@ -154,7 +174,7 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     }
     _persistDownloadedBlob(infoHash, blob).catch(() => {});
 
-    getAttachmentsByInfoHash(infoHash)
+    getAttachmentsByInfoHash(infoHash, { skipBytes: true })
       .then(async (attachments) => {
         guard();
         const existingTransfer = transportState.fileTransfers.get(infoHash);
@@ -193,7 +213,8 @@ async function routeFileSignal(peerId: string, envelope: FileSignalEnvelope): Pr
  * not merely from someone who shares an unrelated conversation. */
 export async function fileRoomForPeer(peerId: string, infoHash: string, incomingRoom?: string | null): Promise<string | null> {
   const epoch = _fileEpoch;
-  const attachments = await getAttachmentsByInfoHash(infoHash);
+  // Every file signal asks this, once per candidate: rooms only, no bytes.
+  const attachments = await getAttachmentsByInfoHash(infoHash, { skipBytes: true });
   if (epoch !== _fileEpoch) return null;
   const did = _peerIdToDid.get(peerId);
   const rooms = new Set(attachments.map(a => a.roomCode));
@@ -604,6 +625,7 @@ export function _resetAttachmentHydration(): void {
   _fileEpoch++;
   _seedable = null;
   _seedableRead = null;
+  _persistedStatus.clear();
   _hydratedRooms.clear();
   _hydrating.clear();
   attachmentHydration.rooms.clear();

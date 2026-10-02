@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   closeDatabase,
+  getAttachmentsByInfoHash,
   getAttachmentsWithData,
   putAttachment,
+  updateAttachmentStatus,
   wipeLocalDatabase,
 } from "./storage";
 import { STORE_SPECS, initStorageCrypto, sealRow } from "./storage-crypto";
@@ -40,6 +42,27 @@ it("opens a room's files through its index, never walking the store", async () =
   expect(meta.map((r) => r.id).sort()).toEqual(["a0", "a1", "a2"]);
   expect(meta.every((r) => r.data === undefined)).toBe(true);
   expect(decrypt).toHaveBeenCalledTimes(3);
+});
+
+it("a status that changes nothing is settled without opening the row", async () => {
+  await putAttachment(row("a", "room-a", 1024 * 1024));
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const encrypt = vi.spyOn(crypto.subtle, "encrypt");
+  // What every block a seed serves used to cost: the whole file, twice.
+  await updateAttachmentStatus("a", "seeding");
+  await updateAttachmentStatus("a", "complete");
+  expect(decrypt).not.toHaveBeenCalled();
+  expect(encrypt).not.toHaveBeenCalled();
+  expect((await getAttachmentsByInfoHash("h-a"))[0].status).toBe("seeding");
+});
+
+it("looks a file up by infoHash without its bytes when asked to", async () => {
+  await putAttachment(row("a", "room-a", 1024 * 1024));
+  const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+  const [meta] = await getAttachmentsByInfoHash("h-a", { skipBytes: true });
+  expect(meta).toMatchObject({ id: "a", roomCode: "room-a", status: "seeding" });
+  expect(meta.data).toBeUndefined();
+  expect(decrypt).toHaveBeenCalledTimes(1); // the small metadata blob only
 });
 
 it("a database from before the index finds its rows through it once upgraded", async () => {

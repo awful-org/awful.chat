@@ -39,6 +39,14 @@ type TorrentLike = {
 
 /** How often the file links are compared against the seeders we know of. */
 const WT_RECONCILE_MS = 5_000;
+/**
+ * How often one torrent's progress may become a snapshot. webtorrent reports
+ * every block that moves - a request in, a header and a block out, about
+ * three reports per 16 KiB served - and each one was a full snapshot for the
+ * app: the reactive transfer map copied, the stored status looked up again.
+ * Four a second still moves a progress bar smoothly.
+ */
+const WT_PROGRESS_MS = 250;
 /** Ceiling on the per-pair retry wait. */
 const WT_RETRY_MAX_MS = 60_000;
 /**
@@ -1185,30 +1193,61 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       if (signal.aborted) return;
       const isSeeding = this.seedingByHash.get(infoHash) ?? seeding;
       const existing = this.transfers.get(infoHash);
+      // A torrent we seed is "seeding" whatever webtorrent's done flag
+      // says: it stays false for a seed here, and the first wire event
+      // used to rewrite the sender's own file to "downloading" - which
+      // then had the reconcile tick dialling peers for a file we hold.
+      const status = isSeeding
+        ? "seeding"
+        : torrent.done && (!encrypted || this.plaintext.has(infoHash))
+          ? "complete"
+          : "downloading";
+      const progress = torrent.progress ?? existing?.progress ?? 0;
+      const done = isSeeding || (torrent.done && (!encrypted || this.plaintext.has(infoHash)));
+      const peers = torrent.numPeers ?? existing?.peers ?? 0;
+      const seeders = this.seedersByHash.get(infoHash)?.size ?? existing?.seeders ?? 0;
+      // Nothing anyone can see moved - a seed serving one more block - so
+      // there is nothing to tell the app.
+      if (
+        existing?.status === status && existing.progress === progress &&
+        existing.done === done && existing.seeding === isSeeding &&
+        existing.peers === peers && existing.seeders === seeders
+      ) return;
       this.upsertTransfer({
         ...descriptor,
         infoHash,
         filename: descriptor.filename,
         mimeType: descriptor.mimeType,
         size: descriptor.size,
-        // A torrent we seed is "seeding" whatever webtorrent's done flag
-        // says: it stays false for a seed here, and the first wire event
-        // used to rewrite the sender's own file to "downloading" - which
-        // then had the reconcile tick dialling peers for a file we hold.
-        status: isSeeding
-          ? "seeding"
-          : torrent.done && (!encrypted || this.plaintext.has(infoHash))
-            ? "complete"
-            : "downloading",
-        progress: torrent.progress ?? existing?.progress ?? 0,
-        done: isSeeding || (torrent.done && (!encrypted || this.plaintext.has(infoHash))),
+        status,
+        progress,
+        done,
         seeding: isSeeding,
-        peers: torrent.numPeers ?? existing?.peers ?? 0,
-        seeders:
-          this.seedersByHash.get(infoHash)?.size ?? existing?.seeders ?? 0,
+        peers,
+        seeders,
         blobURL: existing?.blobURL,
         error: existing?.error,
       });
+    };
+    // Progress, at most once a WT_PROGRESS_MS: the first report at once,
+    // the latest of any that follow when the interval is up.
+    let progressTimer: ReturnType<typeof setTimeout> | null = null;
+    let progressDue = false;
+    const pushProgress = () => {
+      if (progressTimer) {
+        progressDue = true;
+        return;
+      }
+      pushUpdate();
+      progressTimer = setTimeout(() => {
+        progressTimer = null;
+        if (!progressDue) return;
+        progressDue = false;
+        // Not for a torrent given up on since (a size lie, a failed
+        // authentication, a reset): its last word stands.
+        if (!this.attachedTorrents.has(infoHash) || (torrent as { destroyed?: boolean }).destroyed) return;
+        pushProgress();
+      }, WT_PROGRESS_MS);
     };
 
     if (this.attachedTorrents.has(infoHash)) {
@@ -1223,9 +1262,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       if (!enforceSignedLength()) pushUpdate();
     });
     if (enforceSignedLength()) return;
-    torrent.on("download", pushUpdate);
-    torrent.on("upload", pushUpdate);
-    torrent.on("wire", pushUpdate);
+    torrent.on("download", pushProgress);
+    torrent.on("upload", pushProgress);
+    torrent.on("wire", pushProgress);
 
     torrent.on("done", () => {
       if (signal.aborted || enforceSignedLength()) return;

@@ -4036,7 +4036,7 @@ _transport.on("message", (peerId, data, room) => {
         fileRoomForPeer(peerId, file.infoHash, room)
           .then(async (shared) => {
             if (!shared) return;
-            const stored = (await getAttachmentsByInfoHash(file.infoHash)).find(a => a.roomCode === shared);
+            const stored = (await getAttachmentsByInfoHash(file.infoHash, { skipBytes: true })).find(a => a.roomCode === shared);
             if (!stored || !acceptsFileDescriptors(shared, [stored])) return;
             // The signed stored message owns the descriptor, not a seeder's
             // unsigned inventory announcement (which may substitute its key).
