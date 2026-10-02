@@ -1,4 +1,4 @@
-/** Compiled release decision, validated in docs/security-v2-release-validation.md.
+/** Compiled release decision for room security v2 (#94), on since it shipped.
  * Never controllable by a URL, localStorage, or relay response. */
 export const ROOM_SECURITY_V2_RELEASED: boolean = true;
 
