@@ -387,8 +387,8 @@ on receive SyncDigest:
     that lacks nothing costs no read of the room
   → push everything they're missing as SyncBatch[] + SyncComplete -
     throttled per peer and room (10s), the push being what costs; it reads
-    only from the lowest watermark they have for anyone I hold rows from
-    (sync-push.ts), one push at a time per peer and room:
+    only from the lowest of their watermarks for a sender they are behind
+    on (sync-push.ts), one push at a time per peer and room:
     - order "head": the newest page first (the 50 rows a page shows, plus
       any plugin updates between them), so the page they render arrives
       first; a push that fits on one page has no head

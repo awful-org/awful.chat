@@ -1049,18 +1049,21 @@ export async function getMessagesAboveWatermarks(
   roomCode: string,
   watermarks: Record<string, number>
 ): Promise<Message[]> {
-  // Only rows above the lowest watermark the peer has for anyone we hold
-  // rows from can be missing, so the read starts there instead of at the
+  // Only rows above the peer's watermark for a sender it is behind on can be
+  // missing, so the read starts at the lowest of those instead of at the
   // room's first row: a member back from a short absence lacks the last few
-  // rows, not the whole history. A peer that lacks a sender entirely still
-  // reads from the start.
+  // rows, not the whole history. Not the lowest over every sender: one who
+  // posted once, long ago, kept the peer's mark for them at that old row and
+  // dragged nearly every read back to the start of the room. A peer that
+  // lacks a sender entirely still reads from the start.
   const held = await senderMaxLamports(roomCode);
-  if (!held.size) return [];
   let floor = Infinity;
-  for (const senderId of held.keys()) {
+  for (const [senderId, max] of held) {
     const at = watermarks[senderId];
-    floor = Math.min(floor, typeof at === "number" && Number.isSafeInteger(at) ? at : -1);
+    const theirs = typeof at === "number" && Number.isSafeInteger(at) ? at : -1;
+    if (theirs < max) floor = Math.min(floor, theirs);
   }
+  if (floor === Infinity) return [];
   const rows = await _rawRoomMessages(roomCode, Math.max(0, floor + 1));
   // Build maps of watermarks for both blinded and plaintext forms to handle
   // the migration window. A legacy row has plaintext senderId and needs the
