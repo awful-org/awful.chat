@@ -4,6 +4,7 @@ import App from "./App.svelte";
 import { loadRuntimeConfig } from "$lib/runtime-config";
 import { sweepOrphanQuickStorage } from "$lib/quick/quick-storage";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
+import { pageFor, preloadPage } from "./pages";
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
 // ReloadPrompt.svelte. A second registerSW() here used to race it - each
@@ -43,7 +44,16 @@ window.addEventListener("vite:preloadError", (event) => {
 // actually serves. A missing config.json resolves immediately, and so does
 // any launch after the first: it starts from the copy the last one kept and
 // refreshes it behind the app (runtime-config.ts).
-await loadRuntimeConfig();
+const config = loadRuntimeConfig();
+
+// The app itself is not in this bundle (pages.ts). An invite link or /app
+// starts downloading it now, alongside the configuration, rather than once
+// the app has mounted and read the identity; it runs when App shows it.
+// After loadRuntimeConfig, which has already applied a saved copy: whether
+// /qs and /qc exist is part of the configuration.
+preloadPage(pageFor(window.location.pathname));
+
+await config;
 
 // Databases a crashed quick page left behind. /qc does its OWN switch, once
 // the person has said whether they are a guest or their account - it has to

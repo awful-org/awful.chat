@@ -1,6 +1,5 @@
 <script lang="ts">
   import { identityStore, init } from "$lib/identity/identity.svelte";
-  import AppView from "$lib/components/AppView.svelte";
   import Landing from "./Landing.svelte";
   import InstallPrompt from "$lib/components/InstallPrompt.svelte";
   import NotifyPrompt from "$lib/components/NotifyPrompt.svelte";
@@ -10,8 +9,9 @@
   import { parseRoomCode } from "$lib/palette/query";
   import { useQc, useQs } from "$lib/runtime-config";
   import { applyRouteMeta } from "$lib/page-meta";
-  import QuickSend from "$lib/components/QuickSend.svelte";
-  import QuickCall from "$lib/components/QuickCall.svelte";
+  // The app, /qs and /qc are chunks of their own, so the landing page paints
+  // from a small entry (pages.ts, whose pageFor must match the routes here).
+  import { loadPage, type LazyPage } from "./pages";
 
   let currentRoute = $state<"landing" | "app" | "qs" | "qc">("landing");
 
@@ -151,6 +151,37 @@
 <InstallPrompt />
 <NotifyPrompt />
 
+{#snippet waiting()}
+  <div class="min-h-screen bg-background flex items-center justify-center">
+    <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
+  </div>
+{/snippet}
+
+<!--
+  A page that is not in the startup bundle: the same pulse while its chunk
+  arrives, and a way out if it never does (offline on a first visit, say).
+-->
+{#snippet lazyPage(page: LazyPage)}
+  {#await loadPage(page)}
+    {@render waiting()}
+  {:then Page}
+    <Page />
+  {:catch}
+    <div
+      class="min-h-screen bg-background flex flex-col items-center justify-center gap-3 p-4 text-center"
+    >
+      <p class="font-mono text-xs text-muted-foreground">
+        Awful.chat could not load. Check your connection and try again.
+      </p>
+      <button
+        type="button"
+        class="font-mono text-xs text-foreground underline"
+        onclick={() => window.location.reload()}>Try again</button
+      >
+    </div>
+  {/await}
+{/snippet}
+
 <!--
   /qc before the spinner: its "use my account" unlock can auto-login with a
   remembered password, and that raises `initializing` too. Swapping the page
@@ -159,15 +190,13 @@
   route is only ever "qc" once boot has finished, so this skips nothing.
 -->
 {#if currentRoute === "qc"}
-  <QuickCall />
+  {@render lazyPage("qc")}
 {:else if identityStore.initializing}
-  <div class="min-h-screen bg-background flex items-center justify-center">
-    <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
-  </div>
+  {@render waiting()}
 {:else if currentRoute === "qs"}
-  <QuickSend />
+  {@render lazyPage("qs")}
 {:else if currentRoute === "landing"}
   <Landing />
 {:else}
-  <AppView />
+  {@render lazyPage("app")}
 {/if}
