@@ -1518,12 +1518,14 @@ export class MediasoupVideo implements VideoTransport {
 
       case "ms:producer-closed": {
         // Close all consumers for this producer and emit trackRemoved
+        let told = false;
         this.consumers.forEach((consumerList, peerId) => {
           const filtered = consumerList.filter((c) => {
             if (c.consumer.producerId === msg.producerId) {
               this.consumerStats.delete(c.consumer.id);
               c.consumer.close();
               this.emit("trackRemoved", peerId, msg.source, msg.kind);
+              told = true;
               return false;
             }
             return true;
@@ -1534,11 +1536,6 @@ export class MediasoupVideo implements VideoTransport {
             this.consumers.delete(peerId);
           }
         });
-        // A consume still out for it has no consumer to close yet: it drops
-        // the one it gets (consumeProducerInner).
-        if (this.inflightConsumes.has(msg.producerId)) {
-          this.closedWhileConsuming.add(msg.producerId);
-        }
         this.clearParkTimer(msg.producerId);
         // A parked camera has no consumer left to close, but the app still
         // holds its last track as "camera on": the camera is off now.
@@ -1546,6 +1543,24 @@ export class MediasoupVideo implements VideoTransport {
         if (parkedPeer !== undefined) {
           this.parkedCameras.delete(msg.producerId);
           this.emit("trackRemoved", parkedPeer, msg.source, msg.kind);
+          told = true;
+        }
+        // A consume still out for it has no consumer to close yet: it drops
+        // the one it gets (consumeProducerInner). When that consume stands in
+        // for one the app still shows - a stalled consumer, or any a rebuilt
+        // recv transport lost - nothing above found the old track to report,
+        // and the app kept it as on for good: say it is gone now, unless
+        // another stream has taken its place. For a first consume the app
+        // holds nothing, and this changes nothing there.
+        const inflight = this.inflightConsumes.get(msg.producerId);
+        if (inflight) {
+          this.closedWhileConsuming.add(msg.producerId);
+          if (
+            !told &&
+            !this.filledByAnother(inflight.peerId, msg.source, msg.kind, msg.producerId)
+          ) {
+            this.emit("trackRemoved", inflight.peerId, msg.source, msg.kind);
+          }
         }
 
         if (msg.source === "screen") {
@@ -1698,12 +1713,13 @@ export class MediasoupVideo implements VideoTransport {
       return;
     }
     // The producer closed after the SFU answered this consume, while the
-    // consumer was still being built here: by ms:producer-closed, which found
-    // nothing to close, or with its owner's ms:peer-left, after which the app
-    // holds nothing of theirs. This track would never carry a frame: a
-    // frozen tile until the stall sweep re-consumed it into "That stream has
-    // ended", or a departed peer back in the call. The close-consumer is a
-    // courtesy: the SFU dropped its consumer along with the producer.
+    // consumer was still being built here: by ms:producer-closed, which has
+    // told the app whatever it held of this stream is gone, or with its
+    // owner's ms:peer-left, after which the app holds nothing of theirs.
+    // This track would never carry a frame: a frozen tile until the stall
+    // sweep re-consumed it into "That stream has ended", or a departed peer
+    // back in the call. The close-consumer is a courtesy: the SFU dropped
+    // its consumer along with the producer.
     if (this.closedWhileConsuming.has(producerId)) {
       consumer.close();
       this.signal({ type: "ms:close-consumer", producerId });

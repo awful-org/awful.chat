@@ -769,6 +769,9 @@ Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
     (which the SFU sends alone): the late consumer is closed with
     ms:close-consumer and never reaches the app as a track, for any
     consume, first or not
+  - when that consume stands in for a track the app still holds (a stall's
+    re-consume, a rebuilt recv transport), ms:producer-closed tells the app
+    the track is gone (trackRemoved), as it does for a live consumer
   - screen shares are never parked; no opinion yet (or no call) = every
     camera received
 

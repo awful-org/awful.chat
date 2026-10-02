@@ -1114,4 +1114,70 @@ describe("cameras nothing on screen shows are not received (G05.1)", () => {
     expect(removed).not.toHaveBeenCalled();
     expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
   });
+
+  it("a stalled camera turned off while it is consumed again is reported off", async () => {
+    const { video, internals, built, consume, holdBuilds, signalIn } = session();
+    await consume("peer-a", "cam-a", "camera");
+    // Not a byte comes in: the sweep's two misses in a row.
+    (built[0] as unknown as { getStats: () => Promise<Map<string, unknown>> }).getStats =
+      async () => new Map([["in", { type: "inbound-rtp", bytesReceived: 100 }]]);
+    const added = vi.fn();
+    const removed = vi.fn();
+    video.on("trackAdded", added);
+    video.on("trackRemoved", removed);
+
+    const release = holdBuilds();
+    for (let i = 0; i < 3; i++) {
+      (internals.sweepConsumerStats as () => void).call(video);
+      await settle();
+    }
+    expect((internals.inflightConsumes as Map<string, unknown>).has("cam-a")).toBe(true);
+    // The stalled consumer is already off the list, so closing the camera
+    // finds nothing to close.
+    signalIn({
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await settle();
+
+    // The app held the stalled track as "camera on", for good.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    expect(added).not.toHaveBeenCalled();
+    expect((internals.inflightConsumes as Map<string, unknown>).size).toBe(0);
+  });
+
+  it("a camera turned off while a rebuilt recv transport consumes it again is reported off", async () => {
+    const { video, internals, consume, holdBuilds, signalIn } = session();
+    await consume("peer-a", "cam-a", "camera");
+    const transport = internals.recvTransport;
+    const added = vi.fn();
+    const removed = vi.fn();
+    video.on("trackAdded", added);
+    video.on("trackRemoved", removed);
+
+    const release = holdBuilds();
+    (internals.rebuildRecvTransport as () => void).call(video);
+    // The fresh transport, which ensureRecvTransport would have built.
+    internals.recvTransport = transport;
+    await settle();
+    expect((internals.inflightConsumes as Map<string, unknown>).has("cam-a")).toBe(true);
+    signalIn({
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await settle();
+
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    expect(added).not.toHaveBeenCalled();
+  });
 });
