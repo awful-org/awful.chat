@@ -696,25 +696,35 @@ func pushWaiting(box, device string, now time.Time) bool {
 	return ok && now.Sub(told) < pushRearmAfter
 }
 
+// pushSweepTold drops the entries past pushRearmAfter, which hold nothing
+// back any more, at most once a pushRearmAfter: the same opportunistic
+// sweep as pushNotifyBox's. It used to run only when a wake-up was sent, so
+// while every deposit found its devices already told, or every send failed,
+// nothing was swept. pushDeliver runs it now, for every wake-up a deposit
+// queues.
+func pushSweepTold(now time.Time) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	if now.Sub(pushToldSwept) <= pushRearmAfter {
+		return
+	}
+	pushToldSwept = now
+	for b, devices := range pushTold {
+		for d, told := range devices {
+			if now.Sub(told) >= pushRearmAfter {
+				delete(devices, d)
+			}
+		}
+		if len(devices) == 0 {
+			delete(pushTold, b)
+		}
+	}
+}
+
 // pushMarkTold records that a wake-up reached device.
 func pushMarkTold(box, device string, now time.Time) {
 	pushToldMu.Lock()
 	defer pushToldMu.Unlock()
-	// The same opportunistic sweep as pushNotifyBox's: an entry past
-	// pushRearmAfter holds nothing back any more.
-	if now.Sub(pushToldSwept) > pushRearmAfter {
-		pushToldSwept = now
-		for b, devices := range pushTold {
-			for d, told := range devices {
-				if now.Sub(told) >= pushRearmAfter {
-					delete(devices, d)
-				}
-			}
-			if len(devices) == 0 {
-				delete(pushTold, b)
-			}
-		}
-	}
 	devices := pushTold[box]
 	if devices == nil {
 		devices = map[string]time.Time{}
@@ -745,6 +755,9 @@ func pushCollected(box, device string) {
 // pushDeliver sends the wake-up to every device subscribed to one box. Worker
 // goroutine only - never a deposit's request path.
 func pushDeliver(box string) {
+	// Here rather than in pushNotifyBox, which runs under the deposit's
+	// mailbox lock.
+	pushSweepTold(time.Now())
 	// readPushBox hands back a map of its own, so the sends below happen off
 	// the lock and a slow push service never blocks a subscribe.
 	pushMu.Lock()

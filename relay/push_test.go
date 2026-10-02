@@ -467,3 +467,66 @@ func TestPushWakesADeviceOnceUntilItCollects(t *testing.T) {
 		t.Fatalf("after the phone unlocked a deposit woke %v, want the phone alone", woke)
 	}
 }
+
+// Told devices were swept only when a wake-up was sent. While every deposit
+// found its devices already told - the state the told gate exists to make -
+// or every send failed, an entry long past pushRearmAfter stayed. Every
+// queued wake-up sweeps now, sent or not, and a device told within the hour
+// stays told.
+func TestPushToldIsSweptWhileNothingIsSent(t *testing.T) {
+	pushTestSetup(t)
+	resetPushDelivery(t)
+	mailboxDir = t.TempDir()
+	fake := &fakePushService{status: 201}
+	fake.install()
+
+	m := &mailboxClient{t: t}
+	wake := func(box string) {
+		t.Helper()
+		pushSentMu.Lock()
+		delete(pushLastSent, box)
+		pushSentMu.Unlock()
+		m.deposit(box, []byte{0})
+		drainPushQueue()
+		pushDeliver(box)
+	}
+	subscribe := func(seed byte) (box, device string) {
+		t.Helper()
+		did, priv := testDid(t)
+		device = deviceID(seed)
+		if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, device, "https://fcm.googleapis.com/fcm/send/"+device), handlePushSubscribe); w.Code != 204 {
+			t.Fatalf("subscribe: got %d %s", w.Code, w.Body.String())
+		}
+		return mailboxIDForDid(did), device
+	}
+	quiet, quietDevice := subscribe(80)
+	busy, busyDevice := subscribe(81)
+	wake(quiet)
+	wake(busy)
+	if n := fake.calls(); n != 2 {
+		t.Fatalf("two first deposits sent %d wake-ups, want 2", n)
+	}
+
+	// The first device was told over an hour ago and has not looked since,
+	// and the last sweep was as long ago.
+	pushToldMu.Lock()
+	pushTold[quiet][quietDevice] = time.Now().Add(-pushRearmAfter - time.Minute)
+	pushToldSwept = time.Now().Add(-pushRearmAfter - time.Minute)
+	pushToldMu.Unlock()
+
+	// Mail for the second box, whose device is still told: nothing is sent.
+	wake(busy)
+	if n := fake.calls(); n != 2 {
+		t.Fatalf("a deposit for a device already told sent a wake-up (%d sends)", n)
+	}
+	pushToldMu.Lock()
+	_, kept := pushTold[quiet]
+	_, told := pushTold[busy][busyDevice]
+	pushToldMu.Unlock()
+	if kept {
+		t.Error("an entry past pushRearmAfter outlived a sweep because no wake-up was sent")
+	}
+	if !told {
+		t.Error("the sweep dropped a device told within the hour, so it would ring again")
+	}
+}
