@@ -2973,6 +2973,10 @@ function _handleJoinRoom(
 ): void {
   if (!room) return;
   if (!claimedDid) return;
+  // A DM has no roster to join: its members are its two parties. A join
+  // over one put whatever DID it named on the DM's member list, and was
+  // answered with the roster on screen.
+  if (room.startsWith("dm-")) return;
   // A shape check, deliberately NOT a self-announcement check.
   //
   // Demanding one (holding an unbound sender's join until their Profile
@@ -3047,6 +3051,10 @@ function _handleRoomUsersSync(
   const roomCode = room ?? msg.roomCode;
   if (!roomCode) return;
   if (room === null && !_transport.rooms().includes(roomCode)) return;
+  // Same as a join: a DM's peer has no roster to give, and one that tries
+  // is handing over somebody else's room (an older build answers a DM's
+  // join with whatever roster it had on screen).
+  if (roomCode.startsWith("dm-")) return;
   const participants = msg.participants;
   if (!Array.isArray(participants)) return;
   const selfDid = identityStore.did ?? _transport.selfId();
@@ -3491,9 +3499,15 @@ async function _sendRoomUsers(
   // peer that dials us - so it handed out the join secret AND the member
   // list to strangers.
   if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
+  // A DM's members are its two parties, and the peer asking is one of them:
+  // there is nothing to tell. Answering one handed the DM's peer - a
+  // stranger's request included - whatever roster was on screen.
+  if (roomCode.startsWith("dm-")) return;
   const selfDid = identityStore.did ?? _transport.selfId();
+  // The on-screen list only while it is this room's: during a switch it
+  // is still filling, or belongs to another conversation.
   const known =
-    roomCode === transportState.roomCode
+    roomCode === transportState.roomCode && transportState.chatMode === "room"
       ? transportState.roomUsers
       : await getRoomParticipants(roomCode);
   const participants = [...new Set([...known, selfDid])];

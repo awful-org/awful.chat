@@ -374,6 +374,10 @@ export async function openDmConversation(
   transportState.roomCode = roomCode;
   transportState.roomName = resolveDmDisplayName(resolvedPeerId);
   transportState.messages = [];
+  // The roster belongs to the room being left. Kept, it was answered to
+  // this DM's peer as the DM's own (a stranger's request included): every
+  // member of the last private room opened, offline ones too.
+  transportState.roomUsers = [];
   await _loadHistory(roomCode, stillCurrent);
   // Blob URLs for saved attachments AND re-seeding (a peer sees 0 seeders
   // for a file we are plainly looking at without the torrent), from one
