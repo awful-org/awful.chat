@@ -2494,6 +2494,13 @@ function _settleSyncComplete(peerId: string, room: string | null): void {
     _syncView.settle(room);
     noteSyncComplete(room, peerId);
   }
+  if (room?.startsWith("dm-")) {
+    // The DM list rebuilds on DM events, and a history repair's batches are
+    // none: its preview and unread count stayed stale until the next DM.
+    // Once per push, and only a conversation a row was stored into is read
+    // again (dm-inbox-reads.ts).
+    transportState.dmVersion += 1;
+  }
   if (room && transportState.roomCode === room) {
     // Only when actually out of order: the unconditional sort replaced the
     // array identity on EVERY inbound SyncComplete, re-running the view's

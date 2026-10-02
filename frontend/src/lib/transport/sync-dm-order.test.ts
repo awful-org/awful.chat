@@ -193,3 +193,18 @@ it("claims a whole DM push even when the lookup in front of the tracker finishes
   await vi.advanceTimersByTimeAsync(40_000);
   expect({ marks: SENDERS.map(mark), held: s.holds.has(DM) }).toEqual({ marks: [30, 29], held: false });
 });
+
+it("has the DM list read the conversation again once, when a history push into it completes", async () => {
+  vi.useFakeTimers();
+  const history = Array.from({ length: 60 }, (_, i) => row(i + 101));
+  const batches = planPush(history, { batchSize: 20, pageSize: 50, maxBatchBytes: 1_500_000, sizeOf: () => 512 });
+  const before = transportState.dmVersion;
+  batches.forEach((b, i) => send({ type: MessageType.SyncBatch, roomCode: DM, batchIndex: i,
+    totalBatches: batches.length, order: b.order, messages: b.rows }));
+  await vi.advanceTimersByTimeAsync(100);
+  // Repair batches are not DM events: nothing yet.
+  expect(transportState.dmVersion).toBe(before);
+  send({ type: MessageType.SyncComplete, roomCode: DM });
+  await vi.advanceTimersByTimeAsync(100);
+  expect(transportState.dmVersion).toBe(before + 1);
+});
