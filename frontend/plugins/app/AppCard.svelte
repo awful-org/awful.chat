@@ -7,6 +7,7 @@
   import { Button } from "$lib/components/ui/button";
   import type { CardProps } from "$lib/plugins/api";
   import { presentPlayers, type AppState } from "./logic";
+  import SiteIcon from "./SiteIcon.svelte";
 
   let { card, cardState, host }: CardProps<AppState> = $props();
 
@@ -66,9 +67,7 @@
     <p class="text-xs text-muted-foreground">This app can't be opened: its address is missing or not https.</p>
   {:else}
     <div class="flex items-center gap-2">
-      <span class="grid size-8 shrink-0 place-items-center rounded-md bg-primary/15 text-sm font-semibold text-primary"
-        >{site.charAt(0).toUpperCase()}</span
-      >
+      <SiteIcon url={app.url} class="size-8 text-sm" />
       <div class="min-w-0">
         <p class="truncate text-sm font-semibold text-foreground">{site}</p>
         <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>

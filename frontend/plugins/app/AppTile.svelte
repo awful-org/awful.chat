@@ -17,6 +17,7 @@
   import { HEARTBEAT_MS, playerId, playing, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
   import { agree, hasAgreed } from "./consent";
+  import SiteIcon from "./SiteIcon.svelte";
 
   let { card, cardState, host, chromeVisible, focused, setFocused }: CallTileProps<AppState> = $props();
 
@@ -259,9 +260,7 @@
       <div class="pointer-events-auto flex h-full w-full overflow-y-auto bg-background p-3 text-foreground">
         <div class="m-auto w-full max-w-sm space-y-3 rounded-lg border border-border bg-card p-4 text-xs leading-relaxed text-card-foreground shadow-sm">
           <div class="flex items-center gap-2">
-            <span class="grid size-8 shrink-0 place-items-center rounded-md bg-primary/15 text-sm font-semibold text-primary"
-              >{site.charAt(0).toUpperCase()}</span
-            >
+            <SiteIcon url={app.url} class="size-8 text-sm" />
             <div class="min-w-0">
               <p class="truncate text-sm font-semibold">Open {site}?</p>
               <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>

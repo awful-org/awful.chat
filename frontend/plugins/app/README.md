@@ -39,6 +39,12 @@ because the origin is what receives the IP, cookies and storage, so every
 app on one site is the same site to them. The choice is kept per browser,
 not per account, and the tile's right-click menu undoes it.
 
+The card shows the site's icon, fetched straight from the site
+(`/favicon.ico`, then a few other usual places) with no referrer, and only
+while "External previews and media" is on: like a link preview's image, it
+shows the site the IP of everyone who sees the card, not just who opens it.
+Off, or with no icon found, it is the site's first letter.
+
 ## The tile
 
 Each person opens the app themselves. Presence is ephemeral updates: `join`
