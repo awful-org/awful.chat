@@ -67,6 +67,29 @@ function late(stream: any, ms: number, kinds = ["message", "close"]) {
   };
 }
 
+/** The stream as attachRoomStream sees it, able to go deaf: no more events, and closing it sends no reset. */
+function deafable(stream: any) {
+  const target = new EventTarget();
+  let deaf = false;
+  const forward = (event: Event) => {
+    if (deaf) return;
+    target.dispatchEvent(Object.assign(new Event(event.type), { data: (event as any).data }));
+  };
+  stream.addEventListener("message", forward);
+  stream.addEventListener("close", forward);
+  return {
+    proxy: {
+      get status() { return stream.status; },
+      addEventListener: target.addEventListener.bind(target),
+      removeEventListener: target.removeEventListener.bind(target),
+      send: (frame: Uint8Array) => stream.send(frame),
+      onDrain: (options?: unknown) => stream.onDrain(options),
+      abort: (err: Error) => { if (!deaf) stream.abort(err); },
+    },
+    goDeaf: () => { deaf = true; },
+  };
+}
+
 async function twoConnections() {
   const [p1, p2] = await Promise.all([peer(), peer()]);
   const [small, large] = p1.node.peerId.toString() < p2.node.peerId.toString() ? [p1, p2] : [p2, p1];
@@ -221,6 +244,48 @@ it("lets the larger peer replace a channel it lost moments after it proved, and 
   // Its fresh stream is no crossing: let in, it proves, and it takes over.
   expect(await large.transport.sendRoom(smallId, room, new Uint8Array([9]))).toBe(true);
   await vi.waitFor(() => expect(atSmall).toHaveBeenCalledWith(largeId, new Uint8Array([9]), room));
+  expect({ small: verifiedChannels(small.transport, room), large: verifiedChannels(large.transport, room) })
+    .toEqual({ small: 1, large: 1 });
+}, 20_000);
+
+it("holds what the smaller peer sends while the larger peer's fresh stream proves, and it arrives", async () => {
+  const { small, large, smallId, largeId } = await twoConnections();
+  // The larger end's view of the streams the smaller one opens can go deaf.
+  const deafen: Array<() => void> = [];
+  const attach = large.internal.attachSecureStream.bind(large.internal);
+  large.internal.attachSecureStream = (stream: any, connection: Connection, initiate?: unknown) => {
+    if (initiate) return attach(stream, connection, initiate);
+    const view = deafable(stream);
+    deafen.push(view.goDeaf);
+    return attach(view.proxy, connection, initiate);
+  };
+  const secret = newRoomSecret();
+  const room = small.transport.joinSecureRoom(secret);
+  large.transport.joinSecureRoom(secret);
+  small.internal.verifyDiscoveredRoomPeer(room, largeId);
+  await vi.waitFor(() => {
+    expect(small.transport.isRoomPeer(room, largeId)).toBe(true);
+    expect(large.transport.isRoomPeer(room, smallId)).toBe(true);
+  });
+  // The larger end loses its end of the smaller peer's young channel with no
+  // reset reaching the smaller one - a reload over a circuit still reading open.
+  for (const goDeaf of deafen) goDeaf();
+  for (const entry of [...large.internal.secureStreams]) entry.close();
+  // The smaller end sends the moment the larger peer's fresh hello is let in.
+  let duringHandshake: Promise<boolean> | null = null;
+  const admit = small.internal.admitRoomStream.bind(small.internal);
+  small.internal.admitRoomStream = (entry: any, r: string) => {
+    const ok = admit(entry, r);
+    if (ok && !duringHandshake) duringHandshake = small.transport.sendRoom(largeId, room, new Uint8Array([5]));
+    return ok;
+  };
+  const atLarge = vi.fn();
+  large.transport.on("message", atLarge);
+  expect(await large.transport.sendRoom(smallId, room, new Uint8Array([9]))).toBe(true);
+  await vi.waitFor(() => expect(duringHandshake).not.toBeNull());
+  // It used to go on the old channel, whose far end was gone: reported sent, and lost.
+  expect(await duringHandshake!).toBe(true);
+  await vi.waitFor(() => expect(atLarge).toHaveBeenCalledWith(smallId, new Uint8Array([5]), room));
   expect({ small: verifiedChannels(small.transport, room), large: verifiedChannels(large.transport, room) })
     .toEqual({ small: 1, large: 1 });
 }, 20_000);

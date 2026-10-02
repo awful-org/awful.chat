@@ -32,8 +32,15 @@ function roomStream(fields: Record<string, unknown> = {}) {
   return {
     connection: { status: "open" }, peer: "bob", outgoing: false, room: null, channel: null,
     usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null, departed: false,
-    close: vi.fn(), getChannel: () => null, ...fields,
+    settled: Promise.resolve(), close: vi.fn(), getChannel: () => null, ...fields,
   };
+}
+
+/** A promise and the function that resolves it. */
+function later() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 it("queues room channel openings past the concurrent limit instead of refusing them", async () => {
@@ -135,6 +142,47 @@ it("keeps our young channel to a larger peer through a crossing hello, and lets 
   internal.secureStreams.clear();
   internal.secureStreams.add(roomStream({ outgoing: true, room }));
   expect(internal.admitRoomStream(roomStream(), room)).toBe(false);
+});
+
+it("holds a send while a stream of theirs proves itself beside ours, then sends on whichever stands", async () => {
+  const { t, internal, room } = transport();
+  internal.node = { peerId: { toString: () => "alice" } }; // smaller than bob
+  const sender = () => ({ verified: true, trySend: vi.fn(async () => "sent") });
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  // Their end of ours is gone, and they opened another: theirs proves.
+  const oursChannel = sender(), theirsChannel = sender();
+  const ours = roomStream({ outgoing: true, room, channel: oursChannel, provenAt: Date.now() });
+  const proving = later();
+  const theirs = roomStream({ room, replaces: ours, settled: proving.promise });
+  internal.secureStreams.add(ours);
+  internal.secureStreams.add(theirs);
+  const held = t.sendSecureRoom("bob", room, new Uint8Array([5]));
+  await flush();
+  // Sent on ours, it would have been reported sent and gone nowhere.
+  expect(oursChannel.trySend).not.toHaveBeenCalled();
+  theirs.channel = theirsChannel as any;
+  theirs.replaces = null;
+  internal.secureStreams.delete(ours);
+  proving.resolve();
+  expect(await held).toBe(true);
+  expect(theirsChannel.trySend).toHaveBeenCalledWith(new Uint8Array([5]));
+  expect(oursChannel.trySend).not.toHaveBeenCalled();
+
+  // A crossing instead: theirs was given up, and fails. Ours stands.
+  internal.secureStreams.clear();
+  const kept = roomStream({ outgoing: true, room, channel: oursChannel, provenAt: Date.now() });
+  const failing = later();
+  const crossing = roomStream({ room, replaces: kept, settled: failing.promise });
+  internal.secureStreams.add(kept);
+  internal.secureStreams.add(crossing);
+  const waiting = t.sendSecureRoom("bob", room, new Uint8Array([6]));
+  await flush();
+  expect(oursChannel.trySend).not.toHaveBeenCalled();
+  internal.secureStreams.delete(crossing);
+  failing.resolve();
+  expect(await waiting).toBe(true);
+  expect(oursChannel.trySend).toHaveBeenCalledWith(new Uint8Array([6]));
 });
 
 it("does not count a member the relay says left back in over the channel their leaving is closing, unless it lists them again", async () => {

@@ -255,6 +255,8 @@ type RoomStreamEntry = {
   replaces: RoomStreamEntry | null;
   /** The relay said its peer left the room after it proved (ensureSecureRoom). */
   departed: boolean;
+  /** Resolves once it has proven its room or closed, whichever comes first. */
+  settled: Promise<void>;
   close: () => void;
   getChannel: () => SecureRoomChannel | null;
 };
@@ -601,9 +603,11 @@ export class LibP2PTransport implements PeerTransport {
         return null;
       }
     }
+    let settle!: () => void;
     const entry: RoomStreamEntry = {
       connection, peer, outgoing: !!initiate, room: initiate?.discoveryId ?? null, channel: null,
       usedAt: Date.now(), provenAt: 0, superseded: false, replaces: null, departed: false,
+      settled: new Promise<void>((resolve) => { settle = resolve; }),
       close: () => {}, getChannel: () => null,
     };
     this.secureStreams.add(entry);
@@ -616,6 +620,7 @@ export class LibP2PTransport implements PeerTransport {
         // Theirs proved, so it was no crossing: their end of ours is gone.
         entry.replaces?.close();
         entry.replaces = null;
+        settle();
         // News only. A channel reopened for a member already counted changes
         // nothing the app can see, and announcing it would replay the app's
         // whole catch-up for that member on every reopen.
@@ -633,7 +638,7 @@ export class LibP2PTransport implements PeerTransport {
           this.emit("message", peer, data, this.localRoom(room));
         }
       },
-      onClose: () => { this.secureStreams.delete(entry); },
+      onClose: () => { this.secureStreams.delete(entry); settle(); },
     });
     entry.close = handle.close;
     entry.getChannel = handle.getChannel;
@@ -660,6 +665,9 @@ export class LibP2PTransport implements PeerTransport {
    * was sent on ours in between reported sent and lost. So theirs is let in
    * beside ours and takes over only once it proves too: one they gave up
    * never does, and one they opened because their end of ours is gone does.
+   * Until it has done one or the other, our sends to them in the room wait
+   * for it (ensureSecureRoom): if their end of ours is gone, a frame sent on
+   * ours meanwhile would be reported sent and lost.
    */
   private admitRoomStream(entry: RoomStreamEntry, room: DiscoveryId): boolean {
     for (const other of [...this.secureStreams]) {
@@ -694,6 +702,14 @@ export class LibP2PTransport implements PeerTransport {
     for (const entry of this.secureStreams) {
       if (entry.room === room && entry.peer === peer && entry.channel?.verified &&
           entry.connection.status === "open") return entry;
+    }
+    return null;
+  }
+
+  /** Theirs, let in beside this channel of ours and not yet proven (admitRoomStream). */
+  private roomContender(ours: RoomStreamEntry): RoomStreamEntry | null {
+    for (const entry of this.secureStreams) {
+      if (entry.replaces === ours && entry.connection.status === "open") return entry;
     }
     return null;
   }
@@ -822,6 +838,12 @@ export class LibP2PTransport implements PeerTransport {
       // leaving still on its way, and it proves nothing past its close. The
       // relay listing them again clears that (verifyDiscoveredRoomPeer).
       if (!live.departed && !this.roomMembers.get(room)?.has(peerId)) this.noteRoomMember(room, peerId, live.connection);
+      // A stream of theirs proving itself beside it is one they gave up as
+      // ours crossed it, or one they opened because their end of ours is
+      // gone, and only how it ends says which (admitRoomStream). Until then
+      // a frame sent on ours could go nowhere.
+      const contender = this.roomContender(live);
+      if (contender) return contender.settled.then(() => this.ensureSecureRoom(peerId, room));
       return Promise.resolve(live.channel);
     }
     const openingKey = `${room}:${peerId}`;
