@@ -296,11 +296,6 @@ export class InboundPushes {
     return watermarks;
   }
 
-  /** Is anything about this room still waiting on a push? */
-  holding(room: string): boolean {
-    return this.rooms.has(room);
-  }
-
   /** Forget everything: the session that received these pushes is over. */
   reset(): void {
     for (const p of this.pushes.values()) {

@@ -17,7 +17,6 @@ import {
   heldWatermarks,
   holdWatermarks,
   releaseWatermarks,
-  watermarksHeld,
   setDeletedFloor,
   deleteMessagesForRoom,
   getDeletedFloor,
@@ -266,9 +265,12 @@ describe("watermarks", () => {
     holdWatermarks("room-a");
     await setWatermark("room-a", "alice", 7);
     await deleteMessagesForRoom("room-a");
-    expect(watermarksHeld("room-a")).toBe(false);
+    expect(heldWatermarks("room-a")).toEqual(new Map());
     await releaseWatermarks("room-a");
     expect(await getWatermark("room-a", "alice")).toBe(0);
+    // No longer held: an advance is written at once.
+    await setWatermark("room-a", "bob", 3);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ bob: 3 });
   });
 });
 

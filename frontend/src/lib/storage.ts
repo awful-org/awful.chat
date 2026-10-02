@@ -2870,10 +2870,6 @@ export function holdWatermarks(roomCode: string): void {
   if (!_watermarkHolds.has(roomCode)) _watermarkHolds.set(roomCode, new Map());
 }
 
-export function watermarksHeld(roomCode: string): boolean {
-  return _watermarkHolds.has(roomCode);
-}
-
 /**
  * The advances a held room is waiting to write, by sender. Rows we already
  * hold: a digest must not advertise them yet (that is the hold), but nor is
