@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { fakeOPFS } from "./opfs-test-helper";
+import { fakeLocks, fakeOPFS } from "./opfs-test-helper";
 import type { FileEntry } from "../../types/message";
 
 const clients: Client[] = [];
@@ -132,6 +132,23 @@ it("a finished download and a restore leave no plaintext anywhere on disk", asyn
   // runs nothing, and the plaintext must already be nowhere but in memory.
   expect([...disk.entries.keys()].filter(k => k.startsWith("room-v2-transfers/"))).toEqual([]);
   expect(await downloaded.mock.calls[0][1].text()).toBe(secret);
+});
+
+it("a starting session clears what closed ones left, and a lock clears its own", async () => {
+  vi.stubGlobal("navigator", { storage: disk.storage, locks: fakeLocks() });
+  const temporary = () => [...disk.entries.keys()].filter(k => !k.startsWith("room-v2-ciphertext/"));
+  // An older build's tab that was closed without a lock, and a crashed one.
+  disk.entries.set("room-v2-transfers/3a1392f4-7763-43e2-a8a9-7cd8fb556978", new Blob(["private medical report"]));
+  disk.entries.set("room-v2-pieces/0123456789abcdef/0", new Blob(["ciphertext piece"]));
+  const t = transport();
+  await vi.waitFor(() => expect(temporary()).toEqual([]));
+
+  const { lease } = t as never as { lease: { id: string; directory(area: string): Promise<FileSystemDirectoryHandle> } };
+  const pieces = await lease.directory("room-v2-pieces");
+  await (await (await pieces.getFileHandle("0", { create: true })).createWritable()).close();
+  expect(temporary()).toEqual([`room-v2-pieces/${lease.id}/0`]);
+  t.resetTransfers();
+  await vi.waitFor(() => expect(temporary()).toEqual([]));
 });
 
 it("fails closed without OPFS instead of seeding plaintext", async () => {

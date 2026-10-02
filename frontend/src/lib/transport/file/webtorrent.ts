@@ -18,6 +18,7 @@ import { encryptedFileSize, opaqueFileName } from "../../room-security/file-desc
 import { stageEncryptedFile, stageDecryptedFile, type StagedFile } from "../../room-security/file-staging";
 import { readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-store";
 import { OPFSChunkStore } from "./opfs-store";
+import { OPFSLease, STAGING_DIR } from "./opfs-lease";
 
 type TorrentLike = {
   infoHash: string;
@@ -283,6 +284,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private lifecycle = new AbortController();
   private plaintext = new Map<string, StagedFile>();
   private publishing = new Set<string>();
+  /**
+   * Owner of this session's piece stores and send staging in OPFS. A new one
+   * per session (see resetTransfers), so the entries of the session that
+   * ended can go without racing the one that starts.
+   */
+  private lease = new OPFSLease();
 
   /** New protected sends only. The returned descriptor contains a secret and
    * must travel inside an authenticated room message, never public discovery. */
@@ -290,7 +297,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const signal = this.lifecycle.signal;
     const descriptors: FileEntry[] = [];
     for (const source of files) {
-      const staged = await stageEncryptedFile(source, signal);
+      const staged = await stageEncryptedFile(source, await this.lease.directory(STAGING_DIR), signal);
       try {
         signal.throwIfAborted();
         const descriptor = await this.seedSingle(staged.file, {
@@ -375,6 +382,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       }
       this.reconcileWtPeers();
     });
+    // What earlier sessions left in OPFS goes as this one starts: nothing
+    // removes it on the way out of a closed tab, a crash or an OS kill.
+    void this.lease.sweep().catch(() => {});
   }
 
   /**
@@ -640,7 +650,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           }
           const added = client.add(file.infoHash, {
             announce: [],
-            ...((file as FileEntry).encryption ? { store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeCacheSlots: 2 } : {}),
+            ...((file as FileEntry).encryption ? { store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeOpts: { lease: this.lease }, storeCacheSlots: 2 } : {}),
           }) as TorrentLike;
           this.attachTorrent(added, false, file);
         })
@@ -854,6 +864,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     const client = this.clientP;
     this.clientP = null;
     void client?.then(c => c.destroy(() => {}));
+    // Their files go with them, under a lease of their own: the next session
+    // writes under a new one, so nothing it makes can be caught up in this.
+    // Then whatever closed tabs left behind, as at startup.
+    const ended = this.lease;
+    this.lease = new OPFSLease();
+    const lease = this.lease;
+    void ended.end().catch(() => {}).then(() => lease.sweep()).catch(() => {});
     for (const peer of this.wtPeers.values()) {
       peer.destroy();
     }
@@ -881,6 +898,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.iceUnsubscribe?.();
     this.iceUnsubscribe = null;
     this.resetTransfers();
+    // No session follows a destroy: its fresh lease goes too.
+    void this.lease.end().catch(() => {});
     this.connectedPeers.clear();
     this.clientP?.then((client) => client.destroy(() => {}));
     this.clientP = null;
@@ -893,7 +912,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     return new Promise<FileEntry>((resolve, reject) => {
       const torrent = client.seed(
         file,
-        { announce: [], ...(protectedDescriptor ? { name: file.name, pieceLength: 256 * 1024, private: true, store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeCacheSlots: 2 } : {}) },
+        { announce: [], ...(protectedDescriptor ? { name: file.name, pieceLength: 256 * 1024, private: true, store: OPFSChunkStore as unknown as WebTorrentType.TorrentOptions["store"], storeOpts: { lease: this.lease }, storeCacheSlots: 2 } : {}) },
         (created: any) => {
           if (signal.aborted || (protectedDescriptor?.infoHash && protectedDescriptor.infoHash !== created.infoHash)) {
             created.destroy();

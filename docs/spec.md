@@ -99,6 +99,9 @@ Query doctrine: bulk index getAll of raw sealed rows, filter on clear
         with multi-MB byte rows (attachments); openRow supports skipBytes
         to leave large buffers sealed when the caller only needs metadata.
         (see frontend/src/lib/storage-crypto.ts)
+Files:  outside IndexedDB, OPFS holds file ciphertext only (see File
+        Transfer); a decrypted attachment exists only in memory, as a Blob,
+        so it never outlives the browser and no lock or wipe has to chase it.
 ```
 
 ---
@@ -662,24 +665,45 @@ What the relay learns: THAT a DID has mail and roughly when - never
 ## File Transfer
 
 ```txt
+Secure rooms (rd2_) and DMs. Every file is encrypted before it leaves the
+device (room-security/file-crypto.ts: a fresh key per file, 1 MiB AES-GCM
+chunks bound to the file id, size and chunk index). The descriptor holding
+the key travels only inside the signed, end-to-end encrypted message;
+WebTorrent sees an opaque name and ciphertext.
+
 send:
-  1. wtClient.seed(file, { announce: [] }) → infoHash
-  2. store Attachment { infoHash, status: "seeding" }
-  3. if size < 5MB: store data: ArrayBuffer
-  4. broadcast WireMessage with FileMeta
+  1. encrypt into OPFS staging (ciphertext) → seed it → infoHash
+  2. keep the ciphertext in room-v2-ciphertext/<infoHash>
+  3. store Attachment { infoHash, encryption, status: "seeding" },
+     data: the ciphertext when it is 5MB or less
+  4. broadcast the message with the file descriptors
 
 receive:
   1. store Attachment { status: "pending" }
   2. wtClient.add(infoHash) → status: "downloading"
-  3. torrent.on("done") → blobURL → status: "complete"
-  4. if size < 5MB: store ArrayBuffer
+  3. torrent done → ciphertext to room-v2-ciphertext/<infoHash> → decrypted
+     IN MEMORY, no File until every chunk authenticates → blobURL
+     → status: "seeding" (data: the ciphertext when 5MB or less)
 
-startup:
-  re-seed all complete attachments that have data
+room open:
+  the room's stored attachments are decrypted from the stored ciphertext
+  (in memory) and seeded again
+
+OPFS (the origin's private file system) holds ciphertext only, never a
+decrypted file:
+  room-v2-ciphertext/<infoHash>   durable, until a wipe
+  room-v2-pieces/<lease>/...      a torrent's piece store, for one session
+  room-v2-transfers/<lease>/...   a send's ciphertext while it is seeded
+  <lease>: each file transport (transport/file/opfs-lease.ts) holds the Web
+  Lock "awful:opfs:<lease>" for its session. A page starting, and a lock,
+  remove every lease directory whose lock is free (its page closed or
+  crashed) - nothing can on the way out of a closed tab - and entries from
+  before leases existed once no other page holds or waits for awful:node or
+  a quick call's storage lock. The duress wipe removes all of OPFS.
 
 blobURL:
-  created: torrent done
-  revoked: message scrolls out of virtual list OR beforeunload
+  created: download done, or room open; always from an in-memory File
+  revoked: session reset (lock, identity switch) or page unload
 ```
 
 ---

@@ -3,10 +3,11 @@ import { stageDecryptedFile, stageEncryptedFile } from "./file-staging";
 
 let entries: Map<string, BlobPart[]>;
 let afterWrite: (() => void) | undefined;
+let directory: FileSystemDirectoryHandle;
 beforeEach(() => {
   entries = new Map();
   afterWrite = undefined;
-  const directory = {
+  directory = {
     async getFileHandle(name: string) {
       entries.set(name, []);
       return {
@@ -23,16 +24,13 @@ beforeEach(() => {
       };
     },
     async removeEntry(name: string) { entries.delete(name); },
-  };
-  vi.stubGlobal("navigator", { storage: { async getDirectory() {
-    return { async getDirectoryHandle() { return directory; } };
-  } } });
+  } as never;
 });
 afterEach(() => vi.unstubAllGlobals());
 
 it("stages only opaque ciphertext for seeding and publishes plaintext after authentication", async () => {
   const original = new File(["private contents"], "secret-name.txt", { type: "text/plain" });
-  const encrypted = await stageEncryptedFile(original);
+  const encrypted = await stageEncryptedFile(original, directory);
   expect(encrypted.file.name).not.toContain("secret-name");
   expect(encrypted.file.type).toBe("application/octet-stream");
   expect(await encrypted.file.text()).not.toContain("private contents");
@@ -47,7 +45,7 @@ it("stages only opaque ciphertext for seeding and publishes plaintext after auth
 
 it("never writes the decrypted copy to disk", async () => {
   const original = new File(["scanned passport"], "passport.txt", { type: "text/plain" });
-  const encrypted = await stageEncryptedFile(original);
+  const encrypted = await stageEncryptedFile(original, directory);
   const plain = await stageDecryptedFile(encrypted.file, encrypted.encryption, original.name, original.type);
   expect(await plain.file.text()).toBe("scanned passport");
   expect(entries.size).toBe(1); // the caller's ciphertext, nothing else
@@ -60,7 +58,7 @@ it("never writes the decrypted copy to disk", async () => {
 });
 
 it("discards staging on failed authentication, without returning partial plaintext", async () => {
-  const encrypted = await stageEncryptedFile(new File(["secret"], "name"));
+  const encrypted = await stageEncryptedFile(new File(["secret"], "name"), directory);
   const bytes = new Uint8Array(await encrypted.file.arrayBuffer());
   bytes[0] ^= 1;
   await expect(stageDecryptedFile(new Blob([bytes]), encrypted.encryption, "name", "text/plain")).rejects.toThrow();
@@ -71,11 +69,6 @@ it("discards staging on failed authentication, without returning partial plainte
 it("cancellation cleans up a partially written transfer", async () => {
   const controller = new AbortController();
   afterWrite = () => controller.abort();
-  await expect(stageEncryptedFile(new File([new Uint8Array(1024 * 1024 + 1)], "large"), controller.signal)).rejects.toThrow();
+  await expect(stageEncryptedFile(new File([new Uint8Array(1024 * 1024 + 1)], "large"), directory, controller.signal)).rejects.toThrow();
   expect(entries.size).toBe(0);
-});
-
-it("fails explicitly instead of buffering unbounded files without storage support", async () => {
-  vi.stubGlobal("navigator", { storage: {} });
-  await expect(stageEncryptedFile(new File(["x"], "name"))).rejects.toThrow("browser storage support");
 });
