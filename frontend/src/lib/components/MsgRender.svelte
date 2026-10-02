@@ -1,8 +1,14 @@
 <script module lang="ts">
+  import { MediaQuery } from "svelte/reactivity";
+
   /** infoHashes auto-download already asked for, across every message
    *  component - one request per file per session, however often rows
    *  re-render or the same file appears in several rooms. */
   const _autoRequested = new Set<string>();
+
+  /** One media query for every message on screen, not a listener each. */
+  const narrowScreen =
+    typeof window === "undefined" ? null : new MediaQuery("max-width: 639px");
 </script>
 
 <script lang="ts">
@@ -181,7 +187,7 @@
   // takes down the whole message list until reload - so coerce once, here.
   const content = $derived(typeof msg.content === "string" ? msg.content : "");
 
-  let isMobile = $state(false);
+  const isMobile = $derived(narrowScreen?.current ?? false);
   let ogPreview = $state<OgPreview | null>(null);
   let gifSaved = $state(false);
   /**
@@ -380,6 +386,22 @@
     formatsOpen = false;
     resetZoom();
   }
+
+  // Escape closes the viewer. On the window, not the dialog: opening the
+  // viewer leaves focus on the thumbnail that was clicked, which is outside
+  // it, so a handler on the dialog itself never heard the key. And only
+  // while it is open: a window listener per message on screen ran on every
+  // key typed anywhere in the app.
+  $effect(() => {
+    if (!lightbox) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      closeLightbox();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   async function downloadOriginal() {
     if (!lightbox) return;
@@ -605,17 +627,6 @@
       return `aspect-ratio: ${ogPreview.videoWidth} / ${ogPreview.videoHeight};`;
     }
     return "aspect-ratio: 16 / 9;";
-  });
-
-  $effect(() => {
-    if (typeof window === "undefined") return;
-    const media = window.matchMedia("(max-width: 639px)");
-    const update = () => {
-      isMobile = media.matches;
-    };
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
   });
 
   $effect(() => {
@@ -1283,21 +1294,6 @@
     </LazyTip>
   {/if}
 </div>
-
-<!--
-  On the window, not the dialog: opening the viewer leaves focus on the
-  thumbnail that was clicked, which is outside it, so a handler on the dialog
-  itself never heard Escape. One of these per message, each closing only its
-  own open viewer.
--->
-<svelte:window
-  onkeydown={(e) => {
-    if (lightbox && e.key === "Escape") {
-      e.preventDefault();
-      closeLightbox();
-    }
-  }}
-/>
 
 {#if lightbox && canLoadMedia(lightbox.url)}
   <div
