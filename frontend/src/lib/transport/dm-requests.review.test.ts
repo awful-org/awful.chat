@@ -119,7 +119,7 @@ vi.mock("./mailbox.svelte", () => ({
 
 import { _peerIdToDid, transportState } from "./transport.svelte";
 import { ensureDmRoomForPeer } from "./dm.svelte";
-import { getMessage, getRoom, wipeLocalDatabase } from "$lib/storage";
+import { getMessage, getRoom, putRoom, wipeLocalDatabase } from "$lib/storage";
 import { encode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
@@ -220,4 +220,23 @@ describe("a first-contact live batch is held to the batch row cap", () => {
     expect(await getRoom(room)).toMatchObject({ request: true });
     expect(s.verifyTimes.length).toBe(rows.length + 1);
   });
+});
+
+// An empty DM an older build stored is joined the same bounded way as a new
+// one (at most 32, oldest out). The bound used to hold only while the DM was
+// not joined: a second introduction found it joined, went the ordinary way,
+// and the join became permanent.
+describe("an empty DM an older build stored stays in the bounded join", () => {
+  it("however many times its identity introduces itself", async () => {
+    const minted = Array.from({ length: 100 }, () => identity().did);
+    for (const did of minted) {
+      await putRoom({ roomCode: await code(did), type: "dm", name: "", lastSeenLamport: 0, createdAt: 1,
+        participants: [did], participantLastSeen: {}, participantDid: did, request: false } as never);
+    }
+    for (const [i, did] of minted.entries()) {
+      await introduce(`12D3-m-${i}`, did);
+      await introduce(`12D3-m-${i}`, did);
+    }
+    expect(s.bound.size).toBeLessThanOrEqual(32);
+  }, 60_000);
 });

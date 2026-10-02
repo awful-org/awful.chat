@@ -609,6 +609,22 @@ describe("an introduction alone makes no DM (S08.1)", () => {
     expect(s.bound.has(await code(contact))).toBe(true);
   });
 
+  it("keeps an empty DM an older build stored in the bound through a post-quantum upgrade", async () => {
+    const minted = Array.from({ length: 40 }, () => identity());
+    for (const peer of minted) {
+      await putRoom({ roomCode: await code(peer.did), type: "dm", name: "", lastSeenLamport: 0, createdAt: 1,
+        participants: [peer.did], participantLastSeen: {}, participantDid: peer.did, request: false } as DMRoom);
+    }
+    for (const [i, peer] of minted.entries()) {
+      await introduce(`12D3-minted-${i}`, peer.did);
+      const state = pqStateWith(peer);
+      await s.hooks.upgraded!(`12D3-minted-${i}`, peer.did, state);
+      // The record follows the key the two devices agreed, joined or not.
+      expect(await getRoom(await code(peer.did))).toMatchObject({ pq: state });
+    }
+    expect(s.bound.size).toBeLessThanOrEqual(32);
+  });
+
   it("takes only so many new conversations a session from people it does not know for sure", async () => {
     const minted = Array.from({ length: MAX_UNSOLICITED_DMS + 1 }, () => identity().did);
     await sharedRoom(minted);

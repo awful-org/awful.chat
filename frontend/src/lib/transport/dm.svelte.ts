@@ -1282,14 +1282,17 @@ export async function ensureDmRoomForPeer(
   if (!existing && opts.provisional) {
     return _joinProvisionally(session, roomCode, peerDid, pqState);
   }
-  // An empty DM nobody joined this session - one an older build stored for
-  // an introduction alone - is joined the same bounded way, or introducing
-  // themselves as each of those identities again took the bindings back.
-  // Its record still takes a key the introduction agreed.
+  // An empty DM - one an older build stored for an introduction alone - is
+  // joined the same bounded way, or introducing themselves as each of those
+  // identities again took the bindings back. And it stays in the bound
+  // however often they introduce themselves: a second introduction, or a
+  // post-quantum upgrade, used to make the join permanent. One the user
+  // opened is left as it is. Its record still takes a key the introduction
+  // agreed.
   if (
     existing &&
     opts.provisional &&
-    !_transport.rooms().includes(roomCode) &&
+    (_provisional.has(roomCode) || !_transport.rooms().includes(roomCode)) &&
     !(await _holdsMessages(roomCode))
   ) {
     guard();
