@@ -30,13 +30,18 @@ any host on the internet through the volunteer's machine, so DDoS reflection,
 spam and scanning are attributed to their IP address, not yours. Browsers never
 use TCP relaying, so `--no-tcp-relay` is set and only UDP is exposed. The relay
 hands one address at most seven live credentials (25 per IPv6 /48) and
-`--user-quota` caps each one, so one address holds at most seven times
-`--user-quota` allocations at once - 84 by default - and `--total-quota` (900)
-is the pool for everyone. That makes filling it take about eleven addresses,
-not one; it does not make it impossible, and a server holding the same secret
-can be filled the same way. Size both for a machine you do not own, keeping
-the pool ten times what one address can hold. None of this is specific to a
-satellite: the main instance has exactly the same shape.
+`--user-quota` caps each one, and `--total-quota` (900) is the pool for
+everyone. coturn checks a credential's expiry only when an allocation is made,
+and an allocation kept refreshed outlives it, so that limits a rate, not a
+total: one address can add at most seven times `--user-quota` allocations
+every two hours - 84 by default. Filling the pool takes about eleven addresses
+at once, or one address about a day, instead of one address a minute: harder,
+not impossible, and a server holding the same secret can be filled the same
+way. People sharing an address share the limit too: once it is busy, every
+browser behind it is handed the same newest credential, so together they have
+one `--user-quota` for new connections. Size both for a machine you do not
+own, keeping the pool ten times what one address can add in two hours. None of
+this is specific to a satellite: the main instance has exactly the same shape.
 
 They also hold `TURN_SECRET`, which is the entire authentication system: with
 it they can mint valid credentials for **every** TURN server on the instance,

@@ -33,9 +33,21 @@ const (
 	// default pool - relayed calls and transfers failed for everybody who
 	// needs TURN, on every server sharing TURN_SECRET, for as long as it
 	// kept re-minting. Past this count the client is handed the newest of
-	// the ones it holds again. A browser holds two at a time (its current
-	// credential and the previous one, still valid for its last hour), so
-	// six is three browsers behind one address before any of them share.
+	// the ones it holds again.
+	//
+	// That bounds a rate, not a total. coturn checks a credential's expiry
+	// only when an allocation is made, and an allocation its client keeps
+	// refreshing outlives the credential, so one address can add at most
+	// turnMaxLivePerClient+1 credentials' worth of allocations every
+	// turnCredTTL - 84 at the compose defaults - and needs about a day to
+	// hold the default pool (a /48 about six hours), not a minute.
+	//
+	// The browsers behind one address are one client too. A browser holds
+	// two at a time (its current credential and the previous one, still
+	// valid for its last hour), so three steady ones each keep their own;
+	// past that every ask is handed the newest, and the browsers behind a
+	// busy address end up sharing that one credential's --user-quota for
+	// new connections rather than spreading over six.
 	turnMaxLivePerClient = 6
 	// A credential handed out again still has at least this long to run;
 	// when the newest has less, a fresh one is minted, so a client holds at

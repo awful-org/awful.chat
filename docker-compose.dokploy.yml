@@ -299,9 +299,11 @@ services:
   # the pool for everybody. A credential costs nothing to ask for, so the
   # relay hands one address at most seven live ones (25 per IPv6 /48; see
   # turnMaxLivePerClient in relay/turn.go): with these defaults one address
-  # holds at most 84 of 900 allocations, and filling the pool takes about
-  # eleven. Keep the pool inside the relay port range, one port per
-  # allocation, and keep it ten times what one address can hold.
+  # can add at most 84 of 900 allocations every two hours. coturn keeps an
+  # allocation that is refreshed past its credential's expiry, so filling the
+  # pool takes about eleven addresses at once, or one address about a day.
+  # Keep the pool inside the relay port range, one port per allocation, and
+  # keep it ten times what one address can add in two hours.
   #
   # Loopback and link-local are denied because host networking puts coturn on
   # the host's stack: without them a relay peer reaches services bound to
