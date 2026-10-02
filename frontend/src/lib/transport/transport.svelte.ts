@@ -103,7 +103,7 @@ import { LiveUpdateAdmission } from "../room-security/live-updates";
 
 const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
-import { WORKLET_URL } from "../audio/worklet-url";
+import { warmWorkletWhenIdle } from "../audio/worklet-warmup";
 import { requireSession, onIdentityLock } from "../identity/identity";
 import { pqKeyCertificate, type PqKeyCertificate } from "../identity/pq-identity";
 import {
@@ -721,15 +721,10 @@ function _setPeerDid(peerId: string, did: string): void {
 
 export const _dtln = new DtlnProcessor();
 // The 8 MB worklet is loaded lazily on first voice use (waitUntilReady kicks
-// init); at startup we only warm the service-worker cache for it, off the
-// critical path, so the first call doesn't also pay the download.
-// Consume the body too: an unread worker-served stream keeps Chromium's old
-// worker busy and can delay even skipWaiting() activation for five minutes.
-const warmWorkletCache = () => void fetch(WORKLET_URL)
-  .then((response) => response.arrayBuffer())
-  .catch(() => {});
-if (typeof requestIdleCallback === "function") requestIdleCallback(warmWorkletCache);
-else setTimeout(warmWorkletCache, 3000);
+// init). An unlocked session warms the service-worker cache for it from
+// connect(), so the first call doesn't also pay the download - and only a
+// session does: this used to run here, as the module loaded, which put the
+// download on the landing page and the setup and unlock screens too.
 export const _transport = new LibP2PTransport();
 function currentIdentitySession() {
   try { return requireSession(); } catch { return null; }
@@ -4334,6 +4329,9 @@ export async function connect() {
   // Fetch fresh short-lived TURN credentials for this session (best-effort;
   // falls back to bundled ICE servers if the relay doesn't issue them).
   refreshTurnCredentials().catch(() => {});
+  // And the noise-suppression worklet for its first call, in idle time. A
+  // page restored from the back-forward cache reconnects while locked too.
+  if (identityStore.isUnlocked) warmWorkletWhenIdle();
   if (_connectPromise) {
     await _connectPromise;
     return;
