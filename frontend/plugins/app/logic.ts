@@ -3,6 +3,7 @@
  * people using it are tracked. Separate from the components so tests run the
  * real reducer. The protocol an app speaks is docs/awful-contract.md.
  */
+import { cleanActivity } from "$lib/plugins/activity-label";
 import type { CardCtx, UpdateCtx } from "$lib/plugins/api";
 
 /** What the starter may pass after the URL (`/app {url} {args}`). */
@@ -12,6 +13,8 @@ export const MAX_URL = 2048;
 export const PRESENCE_TTL_MS = 45_000;
 /** How often a player who has the app open says so. */
 export const HEARTBEAT_MS = 15_000;
+/** The longest game name an app can advertise ("Playing ..."). */
+export const MAX_GAME = 32;
 
 /** What a card carries: everything an app needs, nothing it may not have. */
 export interface AppCardData {
@@ -36,7 +39,8 @@ export interface AppState extends AppCardData {
    * replayed, so reading the clock here costs no client its agreement with
    * another.
    */
-  present: Record<string, { name: string; seenAt: number }>;
+  /** Who has it open, and the game their app says they are in. */
+  present: Record<string, { name: string; seenAt: number; game?: string }>;
 }
 
 /**
@@ -113,7 +117,8 @@ export function reduce(state: AppState, update: { data: unknown }, ctx: UpdateCt
   if (!ctx.ephemeral || state.ended) return state;
   if (t === "join" || t === "here") {
     const name = (ctx.senderName || "").trim().slice(0, 64) || "Someone";
-    return { ...state, present: { ...state.present, [ctx.senderDid]: { name, seenAt: Date.now() } } };
+    const game = cleanActivity((data as { g?: unknown }).g, MAX_GAME) ?? undefined;
+    return { ...state, present: { ...state.present, [ctx.senderDid]: { name, seenAt: Date.now(), game } } };
   }
   if (t === "leave") {
     if (!(ctx.senderDid in state.present)) return state;
@@ -125,11 +130,19 @@ export function reduce(state: AppState, update: { data: unknown }, ctx: UpdateCt
 }
 
 /** The people heard from recently, oldest first. */
-export function presentPlayers(state: AppState, now = Date.now()): Array<{ did: string; name: string }> {
+export function presentPlayers(
+  state: AppState,
+  now = Date.now(),
+): Array<{ did: string; name: string; game?: string }> {
   return Object.entries(state.present)
     .filter(([, p]) => now - p.seenAt < PRESENCE_TTL_MS)
     .sort((a, b) => a[1].seenAt - b[1].seenAt)
-    .map(([did, p]) => ({ did, name: p.name }));
+    .map(([did, p]) => ({ did, name: p.name, game: p.game }));
+}
+
+/** "Playing Jeopardy", for the user list. */
+export function playing(game: string): string {
+  return `Playing ${game}`;
 }
 
 /**

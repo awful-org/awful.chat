@@ -3,7 +3,7 @@ import { manifest } from "./manifest";
 import AppCard from "./AppCard.svelte";
 import AppTile from "./AppTile.svelte";
 import { forget, hasAgreed } from "./consent";
-import { initialState, parseAppCommand, presentPlayers, randomToken, reduce, type AppState } from "./logic";
+import { initialState, parseAppCommand, playing, presentPlayers, randomToken, reduce, type AppState } from "./logic";
 
 export default definePlugin<AppState>({
   manifest,
@@ -13,6 +13,8 @@ export default definePlugin<AppState>({
   reduce,
   callTileActive: (s) => !s.ended && !!s.url,
   callTileViewers: (s) => presentPlayers(s).map((p) => p.name),
+  callTileActivities: (s) =>
+    Object.fromEntries(presentPlayers(s).flatMap((p) => (p.game ? [[p.did, playing(p.game)]] : []))),
   callTileMenu: ({ card, cardState, host }) => [
     // The way back from "Don't show again": the notice shows next time.
     ...(cardState.origin && hasAgreed(cardState.origin)

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_ARGS,
+  MAX_GAME,
   PRESENCE_TTL_MS,
   initialState,
   parseAppCommand,
@@ -76,6 +77,17 @@ describe("reduce", () => {
     expect(presentPlayers(s)).toEqual([]);
   });
 
+  it("keeps the game a player's app advertised, as one clean line", () => {
+    let s = reduce(start(), { data: { t: "join", g: "Jeopardy\n\u202Eround 2" } }, ctx(BO, true, "Bo"));
+    expect(presentPlayers(s)[0].game).toBe("Jeopardy round 2");
+    s = reduce(s, { data: { t: "here", g: "x".repeat(MAX_GAME + 10) } }, ctx(BO, true, "Bo"));
+    expect(presentPlayers(s)[0].game).toHaveLength(MAX_GAME);
+    s = reduce(s, { data: { t: "here" } }, ctx(BO, true, "Bo"));
+    expect(presentPlayers(s)[0].game).toBeUndefined();
+    s = reduce(s, { data: { t: "here", g: { evil: true } } }, ctx(BO, true, "Bo"));
+    expect(presentPlayers(s)[0].game).toBeUndefined();
+  });
+
   it("forgets someone not heard from in a while", () => {
     const s = reduce(start(), { data: { t: "here" } }, ctx(BO, true, "Bo"));
     expect(presentPlayers(s, Date.now() + PRESENCE_TTL_MS + 1)).toEqual([]);
@@ -122,6 +134,13 @@ describe("the bridge", () => {
     expect(msg({ awful: 1, type: "attest" })).toBeNull();
     expect(msg("ready")).toBeNull();
     expect(msg({ awful: 1, type: "ready", pad: "x".repeat(MAX_MESSAGE_BYTES) })).toBeNull();
+  });
+
+  it("reads an advertised game, cleaned, and null to clear it", () => {
+    expect(msg({ awful: 1, type: "activity", name: "  Jeopardy  " })).toEqual({ awful: 1, type: "activity", name: "Jeopardy" });
+    expect(msg({ awful: 1, type: "activity", name: null })).toEqual({ awful: 1, type: "activity", name: null });
+    expect(msg({ awful: 1, type: "activity", name: 42 })).toEqual({ awful: 1, type: "activity", name: null });
+    expect(msg({ awful: 1, type: "activity", name: "\u0000\u200B" })).toEqual({ awful: 1, type: "activity", name: null });
   });
 
   it("holds an app to its rate", () => {

@@ -14,7 +14,7 @@
   import { Switch } from "$lib/components/ui/switch";
   import { Maximize2, Minimize2 } from "@lucide/svelte";
   import type { CallTileProps } from "$lib/plugins/api";
-  import { HEARTBEAT_MS, playerId, presentPlayers, type AppState } from "./logic";
+  import { HEARTBEAT_MS, playerId, playing, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
   import { agree, hasAgreed } from "./consent";
 
@@ -78,8 +78,30 @@
     frame?.contentWindow?.postMessage(message, app.origin);
   }
 
+  /**
+   * The game the app says this player is in. Plain, not $state: presence()
+   * reads it inside the open effect, and a dependency there would re-run
+   * the effect - rejoining and re-listening - on every change.
+   */
+  let game: string | null = null;
+  let gameTimer: ReturnType<typeof setTimeout> | undefined;
+
   function presence(t: "join" | "here" | "leave"): void {
-    void host.sendUpdate(card.id, { t }, { ephemeral: true }).catch(() => {});
+    const data = t !== "leave" && game ? { t, g: game } : { t };
+    void host.sendUpdate(card.id, data, { ephemeral: true }).catch(() => {});
+  }
+
+  /** The app advertised a game: our own row now, everyone else's soon. */
+  function setGame(name: string | null): void {
+    if (name === game) return;
+    game = name;
+    // Guarded, not `requires`d: an older host just shows no activity.
+    if (typeof host.setActivity === "function") host.setActivity(name ? playing(name) : null);
+    // At most one extra presence a second, however chatty the app.
+    gameTimer ??= setTimeout(() => {
+      gameTimer = undefined;
+      if (phase === "open") presence("here");
+    }, 1_000);
   }
 
   function agreeAndOpen(): void {
@@ -91,6 +113,7 @@
     if (phase === "open") presence("leave");
     phase = "closed";
     ready = 0;
+    setGame(null);
   }
 
   // Open: say so, keep saying so, and listen to the app.
@@ -106,8 +129,14 @@
       if (!frame?.contentWindow || event.source !== frame.contentWindow || !allow()) return;
       const message = readAppMessage(event, frame.contentWindow, app.origin);
       if (!message) return;
-      if (message.type === "ready") ready += 1;
+      // A new page starts with no game: the one the last page advertised
+      // may not be what this one is.
+      if (message.type === "ready") {
+        ready += 1;
+        setGame(null);
+      }
       else if (message.type === "close") close();
+      else if (message.type === "activity") setGame(message.name);
     };
     window.addEventListener("message", onMessage);
     // The page's theme can change while the app is open.
@@ -167,6 +196,7 @@
   }
 
   onDestroy(() => {
+    clearTimeout(gameTimer);
     if (phase === "open") presence("leave");
   });
 </script>
@@ -177,9 +207,12 @@
      menu - none of which reaches the host from inside a cross-origin iframe. -->
 <div class="flex h-full w-full flex-col overflow-hidden bg-black font-mono text-white">
   <!-- The site's address, always, outside anything the site draws: an app
-       must never pass for the host. Left room for the host's Leave button,
-       right room for its audience chip. -->
-  <div class="flex h-10 shrink-0 items-center gap-2 border-b border-white/10 pl-12 pr-14 text-[11px]">
+       must never pass for the host. Left room for the host's Leave button
+       (further right when focused, past the grid menu), right room for its
+       audience chip. -->
+  <div class="flex h-10 shrink-0 items-center gap-2 border-b border-white/10 {focused
+      ? 'pl-26'
+      : 'pl-12'} pr-14 text-[11px]">
     <span class="truncate text-white/90" title={app.url}>{site}</span>
     <!-- Said out loud: the app's own page takes every click inside it, so
          "click the tile to focus it" only works on this header. -->

@@ -13,6 +13,7 @@ import { MessageType } from "$lib/types/message";
 import { getPlugin } from "./registry";
 import { getCardState } from "./state.svelte";
 import { isPluginEnabled } from "./prefs.svelte";
+import { cleanActivity } from "./activity-label";
 
 export interface PluginCallTile {
   pluginId: string;
@@ -22,6 +23,8 @@ export interface PluginCallTile {
   viewers: string[];
   /** The plugin's `callTileFocusOnJoin`; absent means true. */
   focusOnJoin?: boolean;
+  /** What people are doing in the tile, by DID (`callTileActivities`). */
+  activities?: Record<string, string>;
 }
 
 export const callTilesState = $state({
@@ -75,12 +78,22 @@ async function _scan(roomCode: string): Promise<void> {
         } catch {
           // A viewers hook must never take the tile down with it.
         }
+        const activities: Record<string, string> = {};
+        try {
+          for (const [did, label] of Object.entries(plugin.callTileActivities?.(state) ?? {})) {
+            const clean = cleanActivity(label);
+            if (clean) activities[did] = clean;
+          }
+        } catch {
+          // Same as viewers: a broken hook costs the labels, not the tile.
+        }
         byPlugin.set(pluginId, {
           pluginId,
           cardId: msg.id,
           roomCode,
           viewers,
           focusOnJoin: plugin.callTileFocusOnJoin !== false,
+          activities,
         });
       } else {
         // The newest card decides for its plugin even when inactive -

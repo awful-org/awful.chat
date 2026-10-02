@@ -147,6 +147,24 @@ within about 45 seconds.
 { awful: 1, type: "theme", theme: "light" }
 ```
 
+### `activity` (app → host)
+
+Advertise what this player is doing, shown under their name in the room's
+user list while they are in the call with the app open:
+
+```js
+{ awful: 1, type: "activity", name: "Jeopardy" }   // "Playing Jeopardy"
+{ awful: 1, type: "activity", name: null }         // clears it
+```
+
+- `name` is plain text: the host makes it one line, turns control and
+  formatting characters into spaces and keeps the first 32 characters. Keep it to the
+  game's name; the host adds "Playing".
+- It is per player and per page: every `ready` starts with none, so a page
+  that loads into a game says so again.
+- Everyone in the room sees it, so it reaches people who have not opened the
+  app. Only the game, then - never a player's score, hand or answer.
+
 ### `close` (app → host)
 
 The app can close itself for this person, for example when the game is over:

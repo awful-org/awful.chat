@@ -78,6 +78,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "call-tile-menu",
   "palette-commands",
   "self-name",
+  "activity",
 ]);
 
 export interface UpdateCtx {
@@ -129,6 +130,13 @@ export interface HostApi {
   selfDid(): string;
   /** This user's display name, the same value `ctx.senderName` carries for their own updates. */
   selfName(): string;
+  /**
+   * What this user is doing in your call tile, under their name in their
+   * own user list ("Playing Jeopardy"); null clears it. Local: everyone
+   * else's row comes from `callTileActivities(cardState)`. The host clears
+   * it when your tile unmounts.
+   */
+  setActivity(label: string | null): void;
   /** Peers connected right now, with the display names the host knows. */
   peers(): Array<{ did: string; name: string }>;
   /** A peer left. Returns unsubscribe; call it when your surface unmounts. */
@@ -490,6 +498,14 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
    * meant to sit in the grid beside the cameras (a scoreboard, a timer).
    */
   callTileFocusOnJoin?: boolean;
+  /**
+   * What each person is doing in your tile, by DID, shown under their name
+   * in the call's user list: `{ "did:key:...": "Playing Jeopardy" }`.
+   * PURE, like `callTileViewers`. The host keeps one plain line of up to 48
+   * characters. Your own row is `host.setActivity`: your own live updates
+   * never fold back to you, so your state never lists you.
+   */
+  callTileActivities?(cardState: State): Record<string, string>;
   /**
    * Extra rows for the tile's right-click menu, built on demand when the
    * user opens it - so this one is NOT pure: read whatever the controls need

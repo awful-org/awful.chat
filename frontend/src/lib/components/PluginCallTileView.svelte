@@ -3,6 +3,8 @@
   import { getPlugin } from "$lib/plugins/registry";
   import { getCardState, onCardStateChange } from "$lib/plugins/state.svelte";
   import { makeHostApi } from "$lib/plugins/host";
+  import { setSelfActivity } from "$lib/plugins/activity.svelte";
+  import { onDestroy } from "svelte";
   import { getMessage } from "$lib/storage";
   import type { Message } from "$lib/transport/transport.svelte";
 
@@ -33,6 +35,9 @@
   // One host per (plugin, room): a fresh host per render meant a fresh
   // now-playing token per card-state tick, churning the OS media surface.
   const hostApi = $derived(makeHostApi(pluginId, roomCode));
+
+  // Whatever the tile said you were doing ends with the tile.
+  onDestroy(() => setSelfActivity(pluginId, null));
 
   // Same tick bridge as MsgRender/PluginWidgetBox: repaint when updates fold.
   let tick = $state(0);

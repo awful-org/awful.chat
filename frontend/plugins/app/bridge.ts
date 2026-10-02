@@ -4,6 +4,9 @@
  * tested; AppTile wires them to the iframe.
  */
 
+import { cleanActivity } from "$lib/plugins/activity-label";
+import { MAX_GAME } from "./logic";
+
 export const PROTOCOL = 1;
 /** Per app, per second, and per message: the contract's limits. */
 export const MAX_MESSAGES_PER_SECOND = 20;
@@ -15,7 +18,11 @@ export interface Player {
   color: string | null;
 }
 
-export type AppMessage = { awful: 1; type: "ready" } | { awful: 1; type: "close" };
+export type AppMessage =
+  | { awful: 1; type: "ready" }
+  | { awful: 1; type: "close" }
+  /** The game this player is in, shown as "Playing <name>"; null clears it. */
+  | { awful: 1; type: "activity"; name: string | null };
 
 /**
  * An app's message, when it is one this host answers: from the iframe it
@@ -43,6 +50,9 @@ export function readAppMessage(
   const { awful, type } = data as { awful?: unknown; type?: unknown };
   if (awful !== PROTOCOL) return null;
   if (type === "ready" || type === "close") return { awful: PROTOCOL, type };
+  if (type === "activity") {
+    return { awful: PROTOCOL, type, name: cleanActivity((data as { name?: unknown }).name, MAX_GAME) };
+  }
   return null;
 }
 

@@ -125,6 +125,8 @@ the sections below or right here when one line covers it:
 | `cards()` | This plugin's existing cards in the host's room |
 | `onCardStateChange(cb)` | Fires after a persisted update folds; returns unsubscribe |
 | `roomCode()` / `selfDid()` | The room this host is bound to; the user's own DID |
+| `selfName()` | The user's own display name, as their updates carry it |
+| `setActivity(label \| null)` | "Playing Jeopardy" under the user's own name in the call's user list |
 | `peers()` | Connected peers as `{ did, name }` |
 | `onPeerDisconnect(cb)` / `onBeforeDisconnect(cb)` | A peer left / this page is going away; both return unsubscribe |
 | `showLocalCard(data?)` / `closeLocalCard(id)` | Open (returns its id) / close the private floating surface |
@@ -342,7 +344,15 @@ host }`); `localCard` has its own (below):
   your control overlays on it so all chrome moves together. They also get
   `focused` (the tile is on the big stage) and `setFocused(on)`: clicking
   a tile focuses it, but an iframe or a canvas that takes the pointer
-  swallows that click, so give such a tile a visible Focus button.
+  swallows that click, so give such a tile a visible Focus button. The
+  host's Leave button sits in the tile's top-left corner, 3rem in when
+  unfocused and 6.5rem in when focused (the stage's grid menu takes the
+  corner): keep that clear. `callTileActivities(cardState)`, also PURE,
+  returns what each person is doing in the tile by DID (`{ [did]: "Playing
+  Jeopardy" }`), shown under their name in the call's user list as one
+  plain line of up to 48 characters. Your own updates never fold back to
+  you, so your own row is `host.setActivity(label)` instead; the host
+  clears it when your tile unmounts.
 
 - `callTileMenu` - extra rows for your call tile's RIGHT-CLICK menu, so a
   viewer finds the controls of a stream where they expect them. The host
@@ -415,7 +425,7 @@ of mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
 `call-audio`, `call-capture`, `clock-sample`, `local-card`,
 `now-playing`, `plugin-stream`, `picture-in-picture`, `call-tile-menu`,
-`palette-commands`.
+`palette-commands`, `self-name`, `activity`.
 Declare only what you truly cannot function without. A feature that only adds a button is
 better guarded at the call site (`typeof host.pictureInPicture ===
 "function"`) so the plugin still loads on an older app and just hides the
