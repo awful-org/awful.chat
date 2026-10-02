@@ -1080,10 +1080,16 @@ async function _admissionView(): Promise<AdmissionView> {
 
 /** In the phonebook, or reached out to by us. */
 function _isTrustedDmPeer(peerDid: string, view: AdmissionView): boolean {
+  if (_reachedOutTo(peerDid)) return true;
+  return view.contacts.some((e) => e.did === peerDid || dmPeerDid(e.peerId) === peerDid);
+}
+
+/** Whether this session reached out to them: opened their DM, or wrote in it. */
+function _reachedOutTo(peerDid: string): boolean {
   for (const id of _solicited) {
     if (id === peerDid || dmPeerDid(id) === peerDid) return true;
   }
-  return view.contacts.some((e) => e.did === peerDid || dmPeerDid(e.peerId) === peerDid);
+  return false;
 }
 
 /**
@@ -1206,7 +1212,8 @@ function _joinProvisionally(
 /**
  * Join the saved DMs at connect, on the other side's account (see
  * MAX_DMS_JOINED_FOR_THEM): the ones somebody wrote in, those the user read
- * last first, at most SAVED_DMS_JOINED_AT_CONNECT. Joining every stored DM
+ * last first, at most SAVED_DMS_JOINED_AT_CONNECT - and, on the user's,
+ * any the user opened or wrote in this session. Joining every stored DM
  * gave whoever could get DMs stored with us the conversation bindings, at
  * every start: the empty ones an older build made for introductions alone,
  * and the ones a room member's minted identities pile up session after
@@ -1236,18 +1243,23 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
   const theirs = _joinedForThem(session);
   let joined = 0;
   for (const [i, room] of saved.entries()) {
-    if (joined >= SAVED_DMS_JOINED_AT_CONNECT) break;
     if (!written[i]) continue;
     const roomCode = room.roomCode;
-    // Opened by the user in the meantime: joined on their account already.
-    if (
-      _transport.rooms().includes(roomCode) &&
-      !theirs.has(roomCode) &&
-      !_provisional.has(roomCode)
-    ) {
-      continue;
+    // One the user opened or wrote in this session is theirs, and comes back
+    // joined whatever others hold - after another tab held the node, say.
+    const mine = _reachedOutTo(room.participantDid);
+    if (!mine) {
+      if (joined >= SAVED_DMS_JOINED_AT_CONNECT) continue;
+      // Joined on the user's account already.
+      if (
+        _transport.rooms().includes(roomCode) &&
+        !theirs.has(roomCode) &&
+        !_provisional.has(roomCode)
+      ) {
+        continue;
+      }
+      if (!theirs.has(roomCode) && theirs.size >= MAX_DMS_JOINED_FOR_THEM) continue;
     }
-    if (!theirs.has(roomCode) && theirs.size >= MAX_DMS_JOINED_FOR_THEM) break;
     try {
       joinStoredRoom(_transport, roomCode, room);
     } catch {
@@ -1256,6 +1268,10 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
       continue;
     }
     _provisional.delete(roomCode);
+    if (mine) {
+      theirs.delete(roomCode);
+      continue;
+    }
     theirs.add(roomCode);
     joined += 1;
   }

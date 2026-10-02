@@ -733,6 +733,24 @@ describe("an introduction alone makes no DM (S08.1)", () => {
     expect(await getMessage(card.id)).toBeDefined();
   });
 
+  it("joins a DM the user opened again after another tab held the node, whatever others hold", async () => {
+    for (let i = 0; i < MAX_DMS_JOINED_FOR_THEM; i++) {
+      const did = identity().did;
+      await savedDm(did);
+      await introduce(`12D3-saved-${i}`, did);
+    }
+    const mine = identity().did;
+    const room = await savedDm(mine);
+    expect(await openDmConversation(mine)).toBe(true);
+    // Another tab takes the node: every conversation is left, the session
+    // goes on, and the node comes back.
+    s.joined.clear();
+    transportState.relayConnected = false;
+    await connect();
+    await vi.waitFor(() => expect(s.joined.has(room)).toBe(true));
+    disconnectTransport();
+  });
+
   it("lets go of every conversation it joined for others when it locks", async () => {
     const friend = identity().did;
     await ensureDmRoomForPeer(friend);
