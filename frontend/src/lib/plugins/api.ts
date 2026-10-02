@@ -157,8 +157,8 @@ export interface HostApi {
   sendUpdateImmediately(cardId: string, payload: unknown): void;
   /**
    * This plugin's existing cards in the host's room, newest last. Cheap: it
-   * reads card rows only, and `state` is the folded state when the host has
-   * it in memory.
+   * reads card rows only. `state` is the folded state of the cards this
+   * user sent, and of anyone else's when the host already has it in memory.
    */
   cards(): Promise<Array<{ id: string; senderDid: string; state?: unknown }>>;
   /** Notify card surfaces after a persisted plugin state fold. */

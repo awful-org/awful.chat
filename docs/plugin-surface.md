@@ -70,6 +70,13 @@ this file and the README disagree, the README wins. What has grown since:
   keyed by that same `name`) - the same eager-manifest / lazy-handler split
   slash commands already use. Gated behind the `palette-commands` host
   feature.
+- Card state (section 3) no longer reads the room per card or clears on a
+  room switch. A room's plugin rows are read once and kept (storage keeps
+  them current, and checks them against the room's row count), a card folds
+  only its own rows, and states survive a room switch - disconnect, lock and
+  removing the room clear them. `host.cards()` folds only the caller's own
+  cards. Call tiles read storage only when a card is stored. The old way let
+  one member's pile of cards stall every member's room open.
 
 ## Goals
 

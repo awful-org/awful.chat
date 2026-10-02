@@ -4492,9 +4492,10 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
     // for THIS room during the awaits, but without this reset it also kept
     // the room just left, so switching rooms never changed the member list.
     transportState.roomUsers = [];
-    // Only the entered room's cache: wiping everything dropped in-flight
-    // ephemerals for pinned widgets and call tiles following OTHER rooms.
-    clearCardStates(roomCode);
+    // The room's card states are NOT cleared here: every fold keeps them
+    // current, and rebuilding each card on screen per entry is what let one
+    // member's pile of cards stall everyone's room open. Removing the room
+    // (removeRoomCompletely) drops them.
     await _loadHistory(roomCode, stillCurrent);
     // Background, one decrypt pass for blob URLs AND re-seeding: awaiting
     // this froze every room open for as long as its images take to decrypt
@@ -4587,6 +4588,8 @@ export async function removeRoomCompletely(roomCode: string): Promise<void> {
     transportState.connected = false;
   }
   await removeRoom(roomCode);
+  // Its cards' states go with it: joined again, it starts from what is stored.
+  clearCardStates(roomCode);
   const scoped = new Map(transportState.peerRoomProfiles);
   scoped.delete(roomCode);
   transportState.peerRoomProfiles = scoped;

@@ -243,7 +243,8 @@ The argument is optional, so a plugin that only needs the payload keeps
 its one-argument `initialState` unchanged.
 
 Two related host calls: `host.cards()` lists the plugin's existing cards
-in the host's room (cheap - it reads only card rows), and
+in the host's room (cheap - it reads only card rows; each carries its folded
+`state` when it is your own card, or when the host already holds it), and
 `host.sendUpdateImmediately(cardId, data)` is the page-teardown variant
 of sendUpdate for `host.onBeforeDisconnect` departure beacons - no async
 work, same room binding as sendUpdate.

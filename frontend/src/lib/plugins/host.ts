@@ -34,7 +34,12 @@ import {
 import { requestJumpToMessage } from "$lib/ui-state.svelte";
 import type { Message } from "$lib/types/message";
 import { requestElementPip, setNowPlayingFor } from "./media-session";
-import { getCardState, onCardStateChange as onPluginCardStateChange } from "./state.svelte";
+import {
+  cardStates,
+  getCardState,
+  onCardStateChange as onPluginCardStateChange,
+  rowRoute,
+} from "./state.svelte";
 import { MessageType } from "$lib/types/message";
 import { closeLocalCard, upsertLocalCard } from "./local-cards.svelte";
 import { showPluginError } from "./plugin-errors.svelte";
@@ -232,30 +237,27 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       // Card rows only - getAllMessages decrypted the ENTIRE room history
       // for this, which froze the UI on every plugin join.
       const messages = await getPluginCardMessages(roomCode);
-      const cards = messages.flatMap((message) => {
-        if (message.type !== MessageType.PluginCard) return [];
-        try {
-          const payload = JSON.parse(message.content);
-          return payload.pluginId === pluginId
-            ? [
-                {
-                  id: message.id,
-                  senderDid: message.senderDid || message.senderId,
-                },
-              ]
-            : [];
-        } catch {
-          return [];
-        }
-      });
+      const cards = messages.flatMap((message) =>
+        message.type === MessageType.PluginCard &&
+        rowRoute(message)?.pluginId === pluginId
+          ? [{ id: message.id, senderDid: message.senderDid || message.senderId }]
+          : []
+      );
+      // `state` is what the host already holds, plus this user's own cards -
+      // the ones a plugin acts on (a new /app ends its sender's earlier
+      // apps). Folding EVERY card on every call is what let one member's
+      // pile of cards stall the room: each fold installed a state, each
+      // install woke every card, and every card asked again.
+      const self = identityStore.did || "";
       const { getPlugin } = await import("./registry");
       const definition = await getPlugin(pluginId);
-      if (!definition) return cards;
       return Promise.all(
-        cards.map(async (card) => ({
-          ...card,
-          state: await getCardState(card.id, roomCode, definition),
-        }))
+        cards.map(async (card) => {
+          const held = cardStates.get(card.id);
+          if (held && held.roomCode === roomCode) return { ...card, state: held.state };
+          if (!definition || !self || card.senderDid !== self) return card;
+          return { ...card, state: await getCardState(card.id, roomCode, definition) };
+        })
       );
     },
     ping: (did, opts) => measureRtt(did, opts?.timeoutMs),
