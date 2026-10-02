@@ -210,6 +210,21 @@ describe("inline markdown", () => {
     }
   });
 
+  it("stays linear on a line of links that touch", () => {
+    // Every link is read with its word: each word is read once, not once
+    // for every link in it.
+    const started = performance.now();
+    for (const hostile of [
+      "[a](https://x.yz)".repeat(960),
+      "[a.](https://x.yz)[bc](https://x.yz)".repeat(450),
+      "@[did:key:zAna]".repeat(1000) + "[a](https://x.yz)",
+    ]) {
+      renderMessageMarkdown(hostile, (d) => d);
+      stripMarkdown(hostile);
+    }
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
   it("still masks a link beside punctuation, or beside an address a space away", () => {
     const fine = [
       "[the docs](https://a.bc/x).",
