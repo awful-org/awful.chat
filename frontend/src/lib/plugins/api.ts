@@ -77,6 +77,7 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "picture-in-picture",
   "call-tile-menu",
   "palette-commands",
+  "self-name",
 ]);
 
 export interface UpdateCtx {
@@ -126,6 +127,8 @@ export interface HostApi {
   roomCode(): string;
   /** This user's DID, the same value `ctx.senderDid` carries for their own updates. */
   selfDid(): string;
+  /** This user's display name, the same value `ctx.senderName` carries for their own updates. */
+  selfName(): string;
   /** Peers connected right now, with the display names the host knows. */
   peers(): Array<{ did: string; name: string }>;
   /** A peer left. Returns unsubscribe; call it when your surface unmounts. */

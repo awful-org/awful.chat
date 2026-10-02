@@ -1,0 +1,80 @@
+<script lang="ts">
+  /**
+   * The chat card for an app: which site, what it was started with, who has
+   * it open, and - for the person who started it - a way to end it. The app
+   * itself only opens as a call tile.
+   */
+  import { Button } from "$lib/components/ui/button";
+  import type { CardProps } from "$lib/plugins/api";
+  import { presentPlayers, type AppState } from "./logic";
+
+  let { card, cardState, host }: CardProps<AppState> = $props();
+
+  // $derived: a const would capture the prop once and miss every update.
+  const app = $derived(cardState);
+  const site = $derived(app.url ? new URL(app.url).host : "");
+  const mine = $derived(host.selfDid() === app.starter);
+  // The clock, ticking while the app runs: someone whose tab closed sends no
+  // "leave", and only time passing takes them off the list.
+  let now = $state(Date.now());
+  $effect(() => {
+    if (app.ended) return;
+    const tick = setInterval(() => (now = Date.now()), 5_000);
+    return () => clearInterval(tick);
+  });
+  const using = $derived(presentPlayers(app, now));
+  let ending = $state(false);
+
+  async function end(): Promise<void> {
+    if (ending) return;
+    ending = true;
+    try {
+      await host.sendUpdate(card.id, { t: "end" });
+    } catch (err) {
+      console.error("[app] could not end:", err);
+    } finally {
+      ending = false;
+    }
+  }
+</script>
+
+<div class="flex w-full flex-col gap-2 font-mono">
+  {#if !app.url}
+    <p class="text-xs text-muted-foreground">This app can't be opened: its address is missing or not https.</p>
+  {:else}
+    <div class="flex items-center gap-2">
+      <span class="grid size-8 shrink-0 place-items-center rounded-md bg-primary/15 text-sm font-semibold text-primary"
+        >{site.charAt(0).toUpperCase()}</span
+      >
+      <div class="min-w-0">
+        <p class="truncate text-sm font-semibold text-foreground">{site}</p>
+        <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>
+      </div>
+    </div>
+    {#if app.args}
+      <p class="text-xs text-muted-foreground">
+        Started with <code class="rounded bg-muted px-1 py-0.5 text-foreground">{app.args}</code>
+      </p>
+    {/if}
+    {#if app.ended}
+      <p class="text-xs text-muted-foreground">Ended.</p>
+    {:else}
+      <p class="text-xs text-muted-foreground">
+        {#if using.length}
+          {using.map((p) => p.name).join(", ")}
+          {using.length === 1 ? "has" : "have"} it open.
+        {/if}
+        It runs in the call, as a tile.
+      </p>
+      {#if mine}
+        <Button
+          variant="outline"
+          size="sm"
+          class="self-start font-mono text-xs cursor-pointer"
+          disabled={ending}
+          onclick={end}>{ending ? "Ending..." : "End for everyone"}</Button
+        >
+      {/if}
+    {/if}
+  {/if}
+</div>
