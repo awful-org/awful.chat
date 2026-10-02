@@ -52,7 +52,6 @@ import {
   removeRoomParticipant,
   updateParticipantLastSeen,
   cleanupInactiveParticipants,
-  setDmRequest,
   getDeletedFloor,
   addRoomParticipants,
   MAX_ROOM_PARTICIPANTS,
@@ -174,7 +173,9 @@ import {
   parseDmEnvelope,
 } from "./dm-codec";
 import {
+  acceptIfDmRequest,
   depositDmReceipt,
+  dmRequestPending,
   sendDmReadAcks,
   dmConversationCodeAsync,
   dmPeerDid,
@@ -3882,6 +3883,24 @@ function _handleDmChatAsync(
     };
 
     observeLamport(roomCode, lamport);
+    // A message request is told nothing back until it is accepted: no
+    // delivered tick and no read receipt (sendDmReadAcks holds the rest).
+    // The ack gave a stranger who knew only our DID the times this device
+    // was running, and answered every replay of the same message again.
+    const request = await dmRequestPending(roomCode);
+    guard();
+    // No stream to reply on when the DM came out of the mailbox. Calling
+    // send() with a DID makes peerIdFromString throw inside libp2p, and
+    // that surfaces as a `stream-open-failed` toast the user reads as a
+    // real error - up to two per collected DM. So the receipt goes back
+    // through the mailbox instead of being dropped: waiting for the two
+    // of you to be online together is exactly what the mailbox exists to
+    // avoid, and the ticks stayed at "sent" forever meanwhile.
+    const answer = (receipt: Uint8Array) => {
+      if (request) return;
+      if (viaMailbox) _depositDmReceipt(senderDid, receipt);
+      else _transport.sendRoom(peerId, roomCode, receipt).catch(() => {});
+    };
     // Against storage, not the on-screen list: that list holds whichever
     // conversation is open, so a redelivered message was only recognised
     // as a duplicate when you happened to be looking at that DM.
@@ -3942,23 +3961,7 @@ function _handleDmChatAsync(
         await refreshDmRooms();
         guard();
         transportState.dmVersion += 1;
-        // No stream to reply on when the DM came out of the mailbox. Calling
-        // send() with a DID makes peerIdFromString throw inside libp2p, and
-        // that surfaces as a `stream-open-failed` toast the user reads as a
-        // real error - up to two per collected DM. So the receipt goes back
-        // through the mailbox instead of being dropped: waiting for the two
-        // of you to be online together is exactly what the mailbox exists to
-        // avoid, and the ticks stayed at "sent" forever meanwhile.
-        if (viaMailbox) {
-          _depositDmReceipt(
-            senderDid,
-            encodeDmReadEnvelope([envelope.payload.id])
-          );
-        } else {
-          _transport
-            .sendRoom(peerId, roomCode, encodeDmReadEnvelope([envelope.payload.id]))
-            .catch(() => {});
-        }
+        answer(encodeDmReadEnvelope([envelope.payload.id]));
       }
     }
 
@@ -3966,13 +3969,7 @@ function _handleDmChatAsync(
     // out the ack would only cost a second mailbox deposit.
     guard();
     if (readSent) return;
-    if (viaMailbox) {
-      _depositDmReceipt(senderDid, encodeDmAckEnvelope(envelope.payload.id));
-    } else {
-      _transport
-        .sendRoom(peerId, roomCode, encodeDmAckEnvelope(envelope.payload.id))
-        .catch(() => {});
-    }
+    answer(encodeDmAckEnvelope(envelope.payload.id));
   })();
 }
 
@@ -5018,7 +5015,7 @@ export async function sendFiles(
     const did = await dmPeerDidForRoom(roomCode);
     if (!did || await ensureDmRoomForPeer(did) !== roomCode) throw new Error("DM identity unavailable");
     // Answering a message request accepts it, files included.
-    if (await setDmRequest(roomCode, false)) void refreshDmRooms();
+    await acceptIfDmRequest(roomCode, did);
   }
   if (!_transport.rooms().includes(roomCode)) throw new Error("Not in a room");
   assertCurrent();

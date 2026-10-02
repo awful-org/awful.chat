@@ -33,6 +33,7 @@ import {
   appendToDmPanel,
   defaultPanelPosition,
   dmPanel,
+  dmPanelIsShowing,
 } from "$lib/dm-panel.svelte";
 import { MessageType, type Message, type WireTyping } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
@@ -65,6 +66,7 @@ import {
   encodeDmChatEnvelope,
   encodeDmReadEnvelope,
   hashDmRoomCode,
+  MAX_DM_READ_IDS,
 } from "./dm-codec";
 import type { MailboxDepositResult } from "./mailbox.svelte";
 import {
@@ -497,7 +499,7 @@ export async function sendDirectMessage(
   const roomCode = await ensureDmRoomForPeer(peerId);
   if (requireSession() !== session) throw new Error("Identity changed");
   // Answering a message request accepts it.
-  if (roomCode && (await setDmRequest(roomCode, false))) await refreshDmRooms();
+  if (roomCode) await acceptIfDmRequest(roomCode, peerId);
   if (requireSession() !== session) throw new Error("Identity changed");
   if (!roomCode) {
     // Sending into a peerId-derived room would file the message in a thread
@@ -664,21 +666,25 @@ function _connectedDmPeerId(peerIdOrDid: string): string | null {
  * Fire-and-forget: if the peer is offline the acks are simply dropped -
  * they'll be re-sent the next time the conversation is opened while
  * both peers are online (idempotent on the receiving side).
+ *
+ * Never into a message request. Opening one is how it gets judged, and a
+ * stranger the user has not accepted learned from the receipt that, and
+ * when, their message was looked at. The receipt it held back goes out
+ * when the request is accepted (acceptIfDmRequest).
  */
 export function sendDmReadAcks(peerId: string, messageIds: string[]): void {
   if (!messageIds.length) return;
-  const envelope = encodeDmReadEnvelope(messageIds);
-  const resolved = _connectedDmPeerId(peerId);
-  if (resolved) {
-    void sendDmFrame(resolved, envelope).then((sent) => {
-      if (!sent) return depositDmReceipt(peerId, envelope);
-    }).catch(() => {});
-    return;
-  }
-  // Offline: leave the receipt in their mailbox instead of dropping it. The
-  // sender's ticks were stuck at "sent" until the two of you next happened
-  // to be online together, which for an offline-delivered DM could be never.
-  void depositDmReceipt(peerId, envelope);
+  void (async () => {
+    const roomCode = await dmConversationCodeAsync(peerId);
+    if (!roomCode || (await dmRequestPending(roomCode))) return;
+    const envelope = encodeDmReadEnvelope(messageIds);
+    const resolved = _connectedDmPeerId(peerId);
+    if (resolved && (await sendDmFrame(resolved, envelope))) return;
+    // Offline: leave the receipt in their mailbox instead of dropping it. The
+    // sender's ticks were stuck at "sent" until the two of you next happened
+    // to be online together, which for an offline-delivered DM could be never.
+    await depositDmReceipt(peerId, envelope);
+  })().catch(() => {});
 }
 
 /**
@@ -941,14 +947,63 @@ export function isDmRequestRoom(roomCode: string): boolean {
   );
 }
 
+/**
+ * The same question for what has to wait until a request is accepted
+ * (receipts): the stored record, and the sidebar's copy, which can only be
+ * the more cautious of the two - an acceptance it has not caught up with.
+ * A record that cannot be read counts as a request.
+ */
+export async function dmRequestPending(roomCode: string): Promise<boolean> {
+  if (isDmRequestRoom(roomCode)) return true;
+  try {
+    return ((await getRoom(roomCode)) as DMRoom | undefined)?.request === true;
+  } catch {
+    return true;
+  }
+}
+
 /** The user accepted a message request: an ordinary DM from now on. */
 export async function acceptDmRequest(peerIdOrDid: string): Promise<void> {
   const roomCode = await ensureDmRoomForPeer(peerIdOrDid);
   if (!roomCode) return;
-  if (await setDmRequest(roomCode, false)) {
-    await refreshDmRooms();
+  if (await acceptIfDmRequest(roomCode, peerIdOrDid)) {
     transportState.dmVersion += 1;
   }
+}
+
+/**
+ * Accept the request in this conversation, if it is one; resolves whether
+ * it was. The Accept button, answering it (text or files) and saving the
+ * person as a contact all come here.
+ */
+export async function acceptIfDmRequest(
+  roomCode: string,
+  peerIdOrDid: string
+): Promise<boolean> {
+  if (!(await setDmRequest(roomCode, false))) return false;
+  await refreshDmRooms();
+  _sendHeldReadReceipt(roomCode, peerIdOrDid);
+  return true;
+}
+
+/**
+ * The read receipt a request held back, now that it is accepted: for
+ * whatever of theirs is on screen, in the pane or the panel. Nothing on
+ * screen, nothing to say - opening it later sends one, as for any DM.
+ */
+function _sendHeldReadReceipt(roomCode: string, peerIdOrDid: string): void {
+  if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+  const selfDid = identityStore.did ?? _transport.selfId();
+  const shown =
+    transportState.chatMode === "dm" && transportState.roomCode === roomCode
+      ? transportState.messages
+      : dmPanelIsShowing(roomCode)
+        ? dmPanel.messages
+        : [];
+  const theirs = shown
+    .filter((m) => m.roomCode === roomCode && m.senderId !== selfDid)
+    .map((m) => m.id);
+  sendDmReadAcks(peerIdOrDid, theirs.slice(-MAX_DM_READ_IDS));
 }
 
 export interface EnsureDmOptions {
@@ -1107,7 +1162,7 @@ export async function addToPhonebook(peerIdOrDid: string): Promise<void> {
   const roomCode = await ensureDmRoomForPeer(did);
   if (!roomCode) return;
   // A contact is never a request.
-  await setDmRequest(roomCode, false);
+  await acceptIfDmRequest(roomCode, did);
   const profile = await getPeerProfile(did);
   // The store is keyed by whatever form `peerId` held at add time, so the
   // same human can exist under a DID-keyed row and a peerId-keyed row.

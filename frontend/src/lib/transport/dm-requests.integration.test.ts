@@ -100,14 +100,22 @@ vi.mock("./mailbox.svelte", () => ({
   },
 }));
 
-import { deliverMailboxDm, transportState, _peerIdToDid } from "./transport.svelte";
-import { openDmConversation, ensureDmRoomForPeer, isDmRequestRoom } from "./dm.svelte";
+import { deliverMailboxDm, transportState, _peerIdToDid, markSeen } from "./transport.svelte";
+import {
+  acceptDmRequest,
+  ensureDmRoomForPeer,
+  isDmRequestRoom,
+  openDmConversation,
+  openDmPanel,
+  closeDmPanel,
+  sendDirectMessage,
+} from "./dm.svelte";
 import { getRoom, wipeLocalDatabase, getLastMessage, getRoomParticipants, getMessage } from "$lib/storage";
 import { encode, decode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
 import { roomsStore } from "$lib/rooms.svelte";
-import { hashDmRoomCode, type DmPayload } from "./dm-codec";
+import { encodeDmChatEnvelope, hashDmRoomCode, parseDmEnvelope, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
 
 function identity(): UnlockedSession {
@@ -164,6 +172,22 @@ async function dmPeer(device = "12D3-peer") {
   const code = await hashDmRoomCode(s.session!.did, who.did);
   s.roomPeers.set(code, new Set([device]));
   return { who, device, code };
+}
+
+/** Every receipt that left: deposited in a mailbox or sent over a channel. */
+function receipts() {
+  const out: { to: string; type: string; ids: string[] }[] = [];
+  for (const d of s.deposits) {
+    const e = parseDmEnvelope(d.envelope);
+    if (e?.type === "ack") out.push({ to: d.to, type: "ack", ids: [e.messageId] });
+    if (e?.type === "read") out.push({ to: d.to, type: "read", ids: e.messageIds });
+  }
+  for (const f of s.sent) {
+    const e = parseDmEnvelope(f.data);
+    if (e?.type === "ack") out.push({ to: f.peer, type: "ack", ids: [e.messageId] });
+    if (e?.type === "read") out.push({ to: f.peer, type: "read", ids: e.messageIds });
+  }
+  return out;
 }
 
 const rosters = () =>
@@ -308,5 +332,63 @@ describe("a message request makes no sound until accepted (S08.2)", () => {
     receive(device, signedWire(who, code, { senderName: "Your Bank" }), code);
     await vi.waitFor(() => expect(s.announce).toHaveBeenCalledOnce());
     expect(s.announce.mock.calls[0][0]).toMatchObject({ senderName: "Bob", senderId: who.did });
+  });
+});
+
+describe("a message request sends no receipts until accepted (S08.5)", () => {
+  beforeEach(() => closeDmPanel());
+
+  it("acks no mailbox DM that files a request", async () => {
+    const stranger = identity().did;
+    await deliverMailboxDm(stranger, chat(stranger));
+    await settled();
+    expect(receipts()).toEqual([]);
+  });
+
+  it("acks no live DM in a request, and still acks an accepted DM's", async () => {
+    const stranger = await dmPeer("12D3-stranger");
+    receive(stranger.device, encodeDmChatEnvelope(chat(stranger.who.did)), stranger.code);
+    await vi.waitFor(async () => expect(await getLastMessage(stranger.code)).toBeDefined());
+    await settled();
+    expect(receipts()).toEqual([]);
+
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    const payload = chat(friend.who.did);
+    receive(friend.device, encodeDmChatEnvelope(payload), friend.code);
+    await vi.waitFor(() => expect(receipts()).toEqual([{ to: "12D3-friend", type: "ack", ids: [payload.id] }]));
+  });
+
+  it("sends no read receipt for a request opened in the pane or the panel", async () => {
+    const stranger = identity().did;
+    await deliverMailboxDm(stranger, chat(stranger));
+    expect(await openDmConversation(stranger)).toBe(true);
+    await markSeen();
+    expect(await openDmPanel(stranger)).toBe(true);
+    await deliverMailboxDm(stranger, chat(stranger, "still there?", { lamport: 2 }));
+    await settled();
+    expect(receipts()).toEqual([]);
+  });
+
+  it("sends the held read receipt for what is on screen once accepted", async () => {
+    const stranger = identity().did;
+    const first = chat(stranger);
+    await deliverMailboxDm(stranger, first);
+    await openDmConversation(stranger);
+    await settled();
+    expect(receipts()).toEqual([]);
+    await acceptDmRequest(stranger);
+    await vi.waitFor(() => expect(receipts()).toEqual([{ to: stranger, type: "read", ids: [first.id] }]));
+  });
+
+  it("answering a request sends the read receipt it held", async () => {
+    const stranger = identity().did;
+    const first = chat(stranger);
+    await deliverMailboxDm(stranger, first);
+    await openDmConversation(stranger);
+    await sendDirectMessage("hi back", { peerId: stranger });
+    await vi.waitFor(() =>
+      expect(receipts().filter((r) => r.type === "read")).toEqual([{ to: stranger, type: "read", ids: [first.id] }])
+    );
   });
 });

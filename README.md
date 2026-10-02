@@ -32,7 +32,8 @@ group video.
   it never expires and lets in whoever it reaches.
 - **Direct messages** with an offline queue, delivery and read receipts, a
   phonebook of saved contacts, and message requests: a DM from a stranger
-  waits under Requests, without notifying, until you accept it.
+  waits under Requests, without notifying and without telling them it
+  arrived or was read, until you accept it.
 - **@Mentions** with autocomplete: tamper-proof (they ride inside the signed
   message), rename-proof (always show the current name), and the mentioned
   person gets a highlighted message and a notification.
