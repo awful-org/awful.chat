@@ -126,6 +126,7 @@ import {
   type TileRects,
 } from "$lib/call-tile-rects";
 import { stageCameraHidden, stageCameraShown } from "$lib/call-cameras.svelte";
+import { remoteCameraTileId } from "$lib/call-tiles";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
 import type { PeerVoiceQuality } from "$lib/call-quality";
@@ -470,7 +471,8 @@ import {
       const avatarUrl = getPeerAvatar(peerId);
       const remoteCallState = callPeerStates.get(peerId);
       result.push({
-        id: `remote-camera-${peerId}`,
+        // The one format wantedCameras reads popped-out windows back by.
+        id: remoteCameraTileId(peerId),
         label,
         avatarUrl,
         isLocal: false,

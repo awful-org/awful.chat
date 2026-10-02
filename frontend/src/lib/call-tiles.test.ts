@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { buildCallTiles, wantedCameras, type CallState } from "./call-tiles";
+import {
+  buildCallTiles,
+  remoteCameraTileId,
+  wantedCameras,
+  type CallState,
+} from "./call-tiles";
 
 describe("buildCallTiles", () => {
   let state: CallState;
@@ -304,6 +309,8 @@ describe("wantedCameras", () => {
       trackStartTimes: new Map(),
     });
     const popped = tiles.find((t) => t.peerId === "peer-c")!.id;
+    // The stage names its tiles with the same helper.
+    expect(popped).toBe(remoteCameraTileId("peer-c"));
 
     expect(
       wantedCameras([], null, [popped, "remote-screen-peer-d", "local-camera"])

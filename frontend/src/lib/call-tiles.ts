@@ -7,8 +7,16 @@
 
 import type { SpotlightTile } from "./spotlight";
 
-/** A remote camera tile's id is this and the peerId, here and on the stage. */
 const REMOTE_CAMERA = "remote-camera-";
+
+/**
+ * A remote camera tile's id, here and on the stage. wantedCameras reads
+ * popped-out windows back by it, so a stage tile named any other way would
+ * have its window's camera parked and the picture freeze.
+ */
+export function remoteCameraTileId(peerId: string): string {
+  return `${REMOTE_CAMERA}${peerId}`;
+}
 
 export interface CallState {
   /** Map of peerId to participant state with media tracks */
@@ -68,7 +76,7 @@ export function buildCallTiles(state: CallState): SpotlightTile[] {
   // Remote camera tiles - one per peer, regardless of track state.
   for (const [peerId, p] of state.participants) {
     result.push({
-      id: `${REMOTE_CAMERA}${peerId}`,
+      id: remoteCameraTileId(peerId),
       kind: "camera",
       isLocal: false,
       peerId,
