@@ -227,7 +227,7 @@ describe("a first-contact live batch is held to the batch row cap", () => {
     expect(await getRoom(room)).toBeUndefined();
   }, 60_000);
 
-  it("an honest first contact costs one check more than its rows, not twice as many", async () => {
+  it("an honest first contact costs at most one check more than its rows, not twice as many", async () => {
     const stranger = identity();
     const room = await code(stranger.did);
     await introduce("12D3-stranger", stranger.did);
@@ -237,7 +237,11 @@ describe("a first-contact live batch is held to the batch row cap", () => {
     receive("12D3-stranger", batchOf(room, rows), room);
     await vi.waitFor(async () => expect(await getMessage(rows[2].id)).toBeDefined());
     expect(await getRoom(room)).toMatchObject({ request: true });
-    expect(s.verifyTimes.length).toBe(rows.length + 1);
+    // The first-contact check verifies one row, and the batch handler the
+    // rest; a signature that already verified this session is not checked
+    // again, so that row may cost nothing the second time.
+    expect(s.verifyTimes.length).toBeGreaterThanOrEqual(rows.length);
+    expect(s.verifyTimes.length).toBeLessThanOrEqual(rows.length + 1);
   });
 });
 

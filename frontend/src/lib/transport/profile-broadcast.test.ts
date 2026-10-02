@@ -77,7 +77,11 @@ function profilesTo(peer?: string) {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 let clock = 1_000_000;
 
-beforeEach(() => {
+beforeEach(async () => {
+  // A broadcast is fire-and-forget and yields between copies: under a loaded
+  // machine the previous case's tail can still be running. Let it land before
+  // the counters are cleared, or its copies are counted here.
+  await settle();
   // Date only: the broadcast's own pauses are real timers.
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(clock += 60_000);

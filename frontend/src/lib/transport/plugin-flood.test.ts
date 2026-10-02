@@ -47,6 +47,11 @@ vi.mock("$lib/storage", () => ({
   bulkPutMessages: async (rows: any[], guard: () => void) => { guard(); rows.forEach(m => s.rows.set(m.id, m)); },
   getAttachmentsByMessage: async () => [],
   getDeletedFloor: async () => 0, addRoomParticipants: async () => {}, MAX_ROOM_PARTICIPANTS: 512,
+  // A repair batch goes through the push tracker, which holds watermarks
+  // until the push completes.
+  PAGE_SIZE: 50, commitWatermark: async () => {}, holdWatermarks: () => {},
+  releaseWatermarks: async () => {}, heldWatermarks: () => new Map(),
+  senderMaxLamports: async () => new Map(),
 }));
 vi.mock("$lib/messaging", () => ({ signMessage: (m: any) => m, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true }));
 vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, refreshDmRooms: async () => {}, roomsStore: { rooms: [], dmRooms: [] } }));

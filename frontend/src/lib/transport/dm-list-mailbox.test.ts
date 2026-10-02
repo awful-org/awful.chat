@@ -73,6 +73,8 @@ vi.mock("./dm.svelte", () => ({
   dmPeerDid: () => "did:peer",
   dmConversationCodeAsync: async () => "dm-peer",
   dmRoomExists: async () => true,
+  dmJoinableForThem: () => true,
+  dropDmIfEmpty: async () => {},
   ensureDmRoomForPeer: async () => "dm-peer",
 }));
 vi.mock("./verify-incoming", async (original) => ({
