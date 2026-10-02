@@ -442,9 +442,19 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   private localFileLookup: ((infoHash: string) => Promise<File | null>) | null =
     null;
 
-  /** Storage lives a layer up; this is how it offers files we have not seeded. */
-  setLocalFileLookup(fn: (infoHash: string) => Promise<File | null>): void {
+  private localRestore: ((infoHash: string) => Promise<boolean>) | null = null;
+  /** Files being looked for on this device before anything is fetched. */
+  private checkingLocal = new Set<string>();
+
+  /** Storage lives a layer up; this is how it offers files we have not
+   *  seeded - and, with `restore`, shows a protected file it holds when a
+   *  download is asked for one (true when it did). */
+  setLocalFileLookup(
+    fn: (infoHash: string) => Promise<File | null>,
+    restore?: (infoHash: string) => Promise<boolean>,
+  ): void {
     this.localFileLookup = fn;
+    this.localRestore = restore ?? null;
   }
 
   constructor(private readonly selfId: () => string) {
@@ -709,13 +719,35 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
   ensureDownload(file: FileDescriptor, opts?: { retry?: boolean }): void {
     try { encryptedFileSize(file); } catch { return; }
-    const signal = this.lifecycle.signal;
     if (!isValidInfoHash(file.infoHash)) {
       console.warn(`Rejecting download with invalid infoHash: ${file.infoHash}`);
       return;
     }
 
     this.knownFiles.set(file.infoHash, file);
+    const existing = this.transfers.get(file.infoHash);
+    if (existing?.status === "complete" || existing?.status === "seeding") {
+      return;
+    }
+    // A protected file this device already holds - one a room open left for
+    // its Download button - is shown from that copy, not fetched again.
+    const restore = this.localRestore;
+    if ((file as FileEntry).encryption && restore && existing?.status !== "downloading") {
+      if (this.checkingLocal.has(file.infoHash)) return;
+      this.checkingLocal.add(file.infoHash);
+      const signal = this.lifecycle.signal;
+      void restore(file.infoHash).catch(() => false).then((shown) => {
+        this.checkingLocal.delete(file.infoHash);
+        if (!shown && !signal.aborted) this.fetchFile(file, opts);
+      });
+      return;
+    }
+    this.fetchFile(file, opts);
+  }
+
+  /** ensureDownload, from the swarm. */
+  private fetchFile(file: FileDescriptor, opts?: { retry?: boolean }): void {
+    const signal = this.lifecycle.signal;
     const existing = this.transfers.get(file.infoHash);
     if (existing?.status === "complete" || existing?.status === "seeding") {
       return;
@@ -958,6 +990,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.plaintext.clear();
     this.publishing.clear();
     this.storedSeeds.clear();
+    this.checkingLocal.clear();
     // A lock/reset must also stop torrents serving ciphertext and free stores.
     const client = this.clientP;
     this.clientP = null;

@@ -145,6 +145,14 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
       type: stored.mimeType,
       lastModified: stored.createdAt,
     });
+  }, async (infoHash) => {
+    // A download asked for a protected file this device holds: shown from
+    // here, never fetched again (see EAGER_RESTORE_MAX_BYTES).
+    const epoch = _fileEpoch;
+    const stored = (await getAttachmentsByInfoHash(infoHash, { skipBytes: true }))
+      .find((attachment) => attachment.encryption);
+    if (epoch !== _fileEpoch || !stored) return false;
+    return _restoreStoredFile(stored);
   });
 
   _fileTransport.on("signal", (peerId, envelope) => {
@@ -494,6 +502,16 @@ export async function _announceStoredFilesTo(peerId: string): Promise<void> {
   }
 }
 
+/**
+ * The largest held file a room open decrypts by itself: the ceiling a fetch
+ * nobody asked for already has. A decrypted file lives in memory (see
+ * stageDecryptedFile), and a room with a 2 GB video somewhere in its history
+ * must not cost 2 GB of it on every visit. A held file over this shows its
+ * Download button, and asking for it shows it from this device's own copy
+ * (the restore handed to setLocalFileLookup), not from the swarm.
+ */
+const EAGER_RESTORE_MAX_BYTES = AUTO_DOWNLOAD_MAX_BYTES;
+
 export async function _hydrateFileTransfersFromStorage(
   roomCode: string
 ): Promise<Attachment[]> {
@@ -521,6 +539,15 @@ export async function _hydrateFileTransfersFromStorage(
     if (attachment.encryption) {
       // Already on screen this session: sent, downloaded or opened before.
       if (transportState.fileTransfers.get(attachment.infoHash)?.blobURL) continue;
+      if (attachment.size > EAGER_RESTORE_MAX_BYTES) {
+        withFileTransfer({
+          infoHash: attachment.infoHash, filename: attachment.filename,
+          mimeType: attachment.mimeType, size: attachment.size,
+          encryption: attachment.encryption, width: attachment.width, height: attachment.height,
+          status: "pending", progress: 0, done: false, seeding: false, peers: 0, seeders: 1,
+        });
+        continue;
+      }
       // One file that will not open must not keep the rest of the room's
       // from showing.
       await _restoreStoredFile(attachment).catch(() => {});
@@ -553,20 +580,18 @@ export async function _hydrateFileTransfersFromStorage(
 }
 
 /** Show one stored protected file: from this device's durable ciphertext
- *  when it holds it, else from the attachment row's own copy. */
-async function _restoreStoredFile(attachment: Attachment): Promise<void> {
+ *  when it holds it, else from the attachment row's own copy. False when
+ *  neither is here. */
+async function _restoreStoredFile(attachment: Attachment): Promise<boolean> {
   const epoch = _fileEpoch;
   const transport = getFileTransport();
-  if (attachment.data) {
-    await transport.restoreEncryptedFile(attachment, attachment.data);
-    return;
-  }
+  if (attachment.data) return transport.restoreEncryptedFile(attachment, attachment.data);
   // A durable copy that will not open (damaged on disk) falls back to the
   // row's, as one that is missing does.
-  if (await transport.restoreEncryptedFile(attachment).catch(() => false)) return;
+  if (await transport.restoreEncryptedFile(attachment).catch(() => false)) return true;
   const full = await getAttachment(attachment.id);
-  if (epoch !== _fileEpoch || !full?.data) return;
-  await transport.restoreEncryptedFile(full, full.data);
+  if (epoch !== _fileEpoch || !full?.data) return false;
+  return transport.restoreEncryptedFile(full, full.data);
 }
 
 export async function _resumeAttachmentSeeding(

@@ -40,8 +40,12 @@ const broken = new Set<string>();
 const files = {
   handlers: {} as Record<string, (...args: unknown[]) => void>,
   lookup: null as ((infoHash: string) => Promise<File | null>) | null,
+  restore: null as ((infoHash: string) => Promise<boolean>) | null,
   on(event: string, handler: (...args: unknown[]) => void) { this.handlers[event] = handler; },
-  setLocalFileLookup(fn: (infoHash: string) => Promise<File | null>) { this.lookup = fn; },
+  setLocalFileLookup(
+    fn: (infoHash: string) => Promise<File | null>,
+    restore: (infoHash: string) => Promise<boolean>,
+  ) { this.lookup = fn; this.restore = restore; },
   seedFiles: async () => [],
   getTransfer: () => undefined,
   persistableCiphertext: vi.fn(async () => undefined),
@@ -116,4 +120,17 @@ it("serves a peer's request from the ciphertext, never decrypting it", async () 
     "by-hash:meta", "serve:mid:store", "row-bytes:mid", "serve:mid:row",
   ]);
   expect(files.restoreEncryptedFile).not.toHaveBeenCalled();
+});
+
+it("leaves a held file over the auto-download ceiling for its Download button, then shows it from here", async () => {
+  rows = [{ ...row("video", 4), mimeType: "video/mp4", size: 2 * 1024 ** 3 }, row("new", 3)];
+  durable = new Set(["h-video", "h-new"]);
+  await _hydrateAndSeedAttachments("rd2_room");
+  expect(calls).toEqual(["room:meta", "show:new:store"]);
+  expect(transportState.fileTransfers.get("h-video")).toMatchObject({ status: "pending", seeders: 1 });
+  // Asked for (its button, or the auto-download of a video on screen): shown
+  // from this device's copy - and a file this device does not hold is not.
+  expect(await files.restore!("h-video")).toBe(true);
+  expect(calls.at(-1)).toBe("show:video:store");
+  expect(await files.restore!("h-unknown")).toBe(false);
 });

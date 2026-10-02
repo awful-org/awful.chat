@@ -694,6 +694,9 @@ room open (first time in a session), newest first:
   file IN MEMORY from room-v2-ciphertext, or from the row's data when this
   device has no durable copy (which is then written, once) → blobURL.
   Nothing is seeded, re-hashed or rewritten, and the rows are not touched.
+  A file over the auto-download ceiling (64MB) is left "pending" with its
+  Download button; a download asked for a file this device holds is shown
+  from it (webtorrent.ts ensureDownload), never fetched again.
 
 serving (a peer's link connects for a file with no torrent here):
   seed room-v2-ciphertext/<infoHash> as it is - the original opaque name

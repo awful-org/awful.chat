@@ -453,6 +453,36 @@ describe("WebTorrentFileTransport", () => {
     expect(t.getTransfer(HASH)?.status).toBe("downloading");
   });
 
+  it("shows a protected file this device holds instead of fetching it again", async () => {
+    // A hash of its own: other tests' fake adds land in the shared map late.
+    const hash = "e".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    const held = new Set([hash]);
+    const restore = vi.fn(async (infoHash: string) => held.has(infoHash));
+    t.setLocalFileLookup(async () => null, restore);
+    t.onPeerConnect("alice");
+    t.registerSeeder(encrypted, "alice");
+    t.ensureDownload(encrypted, { retry: true });
+    t.ensureDownload(encrypted); // asked twice while looking: one look
+    await tick();
+    await tick();
+    expect(restore).toHaveBeenCalledOnce();
+    expect(addCalls).toEqual([]);
+    expect(livePeers.length).toBe(0);
+
+    // Not here after all: fetched, as before.
+    held.clear();
+    t.ensureDownload(encrypted, { retry: true });
+    await vi.waitFor(() => expect(addCalls).toEqual([hash]));
+    expect(livePeers.length).toBe(1);
+    expect(t.getTransfer(hash)?.status).toBe("downloading");
+  });
+
   it("seeds a stored file on demand when a peer dials for it", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     t.setLocalFileLookup(async () =>
