@@ -102,9 +102,9 @@ const SPAN_RE = new RegExp(
  *    a character that could pass for an ASCII one, so "paypal.cοm" and
  *    "paypa∣.com" are addresses. Not Chinese or Japanese, whose sentences
  *    run on after a full stop with no space between.
- * A label that reorders itself (a bidi override, embedding or isolate) is
- * never masked: an override draws "t.co" from text that spells "oc.t". One
- * typed around the link cannot reach its text: see anchor.
+ * Text that can lay itself out in another order than it is spelled is
+ * never masked: an override draws "t.co" from text that spells "oc.t", and
+ * between two right-to-left marks "w.3org" draws as "w3.org".
  */
 const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
 /**
@@ -128,10 +128,16 @@ const MARK_RE = /\p{M}/gu;
  */
 const LOOKALIKE_RE =
   /[^\p{ASCII}\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/gu;
+/** Bidi overrides, embeddings and isolates. */
 const REORDERS_RE = /[\u202A-\u202E\u2066-\u2069]/;
 const REORDERS_ALL_RE = new RegExp(REORDERS_RE.source, "g");
+/**
+ * The right-to-left marks: invisible, and enough to turn the digits and
+ * punctuation between two of them around.
+ */
+const RTL_MARK_RE = /[\u061C\u200F]/;
 function looksLikeUrl(label: string): boolean {
-  if (REORDERS_RE.test(label)) return true;
+  if (REORDERS_RE.test(label) || RTL_MARK_RE.test(label)) return true;
   const drawn = label
     .replace(UNSEEN_RE, "")
     .normalize("NFKD")
@@ -176,19 +182,86 @@ export function trimUrl(url: string): { url: string; rest: string } {
 }
 
 /**
- * A link, its text a bidi isolate laid out left to right, and with no bidi
- * control of its own. An override typed before the link and closed after
- * it reversed the text inside, so a masked "oc.t" drew as "t.co", and a
- * bare url as another host's; one inside a url reversed the rest of it, and
+ * A link, with no bidi control in its text or its title (the href keeps
+ * them: the browser encodes them).
+ *
+ * A url shown as itself is a bidi isolate laid out left to right. An
+ * override typed before it and closed after it reversed it, so a bare url
+ * drew as another host's; one inside it reversed the rest of it, and
  * "https://" with "moc.lapyap@evil.example" after an override drew as a
  * link to paypal.com. Not dir="auto" nor <bdi>: an invisible right-to-left
- * mark at the start of a label then makes the label right to left, and
- * "co.t" draws as "t.co" again.
+ * mark at its start then turns it around again.
+ *
+ * A masked link is no isolate. An isolate is laid out as one piece, and
+ * right-to-left text puts the pieces in its own order, so
+ * "[.com](…)[paypal](…)" drew as one link to paypal.com between two Hebrew
+ * words, or between two invisible right-to-left marks. As text of the line,
+ * a left-to-right letter never moves, and no override reaches it: a line
+ * holding one masks no link (see linksShowingUrls).
  */
-function anchor(href: string, html: string, title?: string): string {
-  const t = title ? ` title="${escapeHtml(title.replace(REORDERS_ALL_RE, ""))}"` : "";
+function anchor(href: string, html: string, masked = false): string {
+  const title = masked ? ` title="${escapeHtml(href.replace(REORDERS_ALL_RE, ""))}"` : "";
+  const dir = masked ? "" : ' dir="ltr"';
   const text = html.replace(REORDERS_ALL_RE, "");
-  return `<a href="${escapeHtml(href)}"${t} target="_blank" rel="noopener noreferrer" dir="ltr" class="${LINK_CLASS}">${text}</a>`;
+  return `<a href="${escapeHtml(href)}"${title} target="_blank" rel="noopener noreferrer"${dir} class="${LINK_CLASS}">${text}</a>`;
+}
+
+/**
+ * A word, as an address is one: what lies between two spaces the address
+ * test reads as spaces. Not the spaces narrower than a word space, which it
+ * drops, nor an ogham space mark or a line separator, which it reads as a
+ * letter.
+ */
+const SPACELESS_RE = /[^\t-\r \u00A0\u2000-\u2005\u2007\u205F\u3000]+/g;
+
+/**
+ * Which of a line's spans are masked links that show their url instead of
+ * their label, read off the line as it draws: a masked link as its label,
+ * a mention as its name.
+ *  - Every link in a word that reads as an address. Labels that touch draw
+ *    as one word: "[paypal](…)[.com](…)" was two links, neither label an
+ *    address alone, that drew as one link to paypal.com, and
+ *    "[paypal](…).com" drew the same in two colours.
+ *  - Every link in a line holding a bidi override, embedding or isolate,
+ *    which can lay the line out in any order.
+ * Each word is read once, so a line of touching links stays linear.
+ */
+function linksShowingUrls(src: string, spans: RegExpExecArray[], named: (text: string) => string): boolean[] {
+  const shown = spans.map(() => false);
+  const links: { k: number; start: number; end: number }[] = [];
+  let line = "";
+  let last = 0;
+  spans.forEach((m, k) => {
+    const [whole, , , , label, href, bare, mention] = m;
+    line += src.slice(last, m.index);
+    last = m.index + whole.length;
+    if (label !== undefined && href !== undefined) {
+      const text = named(label);
+      links.push({ k, start: line.length, end: line.length + text.length });
+      line += text;
+    } else if (bare !== undefined) {
+      // As anchor draws it.
+      line += whole.replace(REORDERS_ALL_RE, "");
+    } else {
+      line += mention !== undefined ? named(whole) : whole;
+    }
+  });
+  line += src.slice(last);
+
+  if (REORDERS_RE.test(line)) {
+    for (const { k } of links) shown[k] = true;
+    return shown;
+  }
+  let i = 0;
+  for (const word of line.matchAll(SPACELESS_RE)) {
+    const start = word.index;
+    const end = start + word[0].length;
+    while (i < links.length && links[i].end <= start) i++;
+    if (i === links.length) break;
+    if (links[i].start >= end || !looksLikeUrl(word[0])) continue;
+    for (let j = i; j < links.length && links[j].start < end; j++) shown[links[j].k] = true;
+  }
+  return shown;
 }
 
 /** Code shows mentions by name, as text, and nothing else is interpreted. */
@@ -336,9 +409,11 @@ function inline(src: string, resolveName: ResolveName, links = true, plain = fal
   const parked: string[] = [];
   const park = (html: string) => `<${parked.push(html) - 1}>`;
 
+  const spans = [...src.matchAll(SPAN_RE)];
+  const showsUrl = linksShowingUrls(src, spans, named);
   let text = "";
   let last = 0;
-  for (const m of src.matchAll(SPAN_RE)) {
+  for (const [k, m] of spans.entries()) {
     const [whole, escaped, fenced, tick, label, href, bare, mention] = m;
     text += escapeHtml(src.slice(last, m.index));
     last = m.index + whole.length;
@@ -351,12 +426,12 @@ function inline(src: string, resolveName: ResolveName, links = true, plain = fal
       if (plain) {
         // Not clickable here, but a notification that reads "paypal.com"
         // for a link to somewhere else still lies: keep the look-alike whole.
-        text += park(looksLikeUrl(named(label)) ? escapeHtml(whole) : inline(label, resolveName, false, true));
+        text += park(showsUrl[k] ? escapeHtml(whole) : inline(label, resolveName, false, true));
       } else {
         text +=
-          !links || looksLikeUrl(named(label))
+          !links || showsUrl[k]
             ? park(`${escapeHtml(`[${label}](`)}${links ? anchor(href, escapeHtml(href)) : escapeHtml(href)})`)
-            : park(anchor(href, inline(label, resolveName, false), href));
+            : park(anchor(href, inline(label, resolveName, false), true));
       }
     } else if (bare !== undefined) {
       const { url, rest } = trimUrl(bare);

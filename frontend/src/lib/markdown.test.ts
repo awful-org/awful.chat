@@ -91,13 +91,13 @@ describe("inline markdown", () => {
 
   it("takes the innermost brackets as a link's label", () => {
     expect(plain("[a [b](https://x.yz)")).toBe(
-      '[a <a href="https://x.yz" title="https://x.yz" target="_blank" rel="noopener noreferrer" dir="ltr">b</a>',
+      '[a <a href="https://x.yz" title="https://x.yz" target="_blank" rel="noopener noreferrer">b</a>',
     );
   });
 
   it("masks a link, http(s) only, showing where it goes on hover", () => {
     expect(plain("[the docs](https://example.com/a)")).toBe(
-      '<a href="https://example.com/a" title="https://example.com/a" target="_blank" rel="noopener noreferrer" dir="ltr">the docs</a>',
+      '<a href="https://example.com/a" title="https://example.com/a" target="_blank" rel="noopener noreferrer">the docs</a>',
     );
     expect(plain("[**bold** label](https://a.bc)")).toContain("><strong>bold</strong> label</a>");
     expect(plain("[x](javascript:alert(1))")).not.toContain("<a");
@@ -173,6 +173,75 @@ describe("inline markdown", () => {
     }
   });
 
+  it("reads a link with the text it touches, so labels that touch cannot spell an address", () => {
+    // Neither "paypal" nor ".com" is an address, but two links that touch
+    // drew as one link to paypal.com, and one with the rest typed after it
+    // drew the same in two colours. Every link in such a word shows its url.
+    const evil = "https://evil.example/login";
+    const r = (did: string) => (did === "did:key:zPay" ? "paypal" : did);
+    const spelled = [
+      `[paypal](${evil})[.com](${evil})`,
+      `[paypal.](${evil})[com](${evil})`,
+      `[pay](${evil})[pal](${evil})[.com](${evil})`,
+      `[https://paypal](${evil})[.com/login](${evil})`,
+      `[paypal](${evil}).com`,
+      `paypal[.com](${evil})`,
+      `**[paypal](${evil})**[.com](${evil})`,
+      // A thin space draws as almost nothing, so it ends no word.
+      `[paypal](${evil})\u2009[.com](${evil})`,
+      // A mention draws as its name, in the colour of a link.
+      `@[did:key:zPay][.com](${evil})`,
+    ];
+    for (const s of spelled) {
+      expect(renderMessageMarkdown(s, r), s).not.toContain(" title=");
+      expect(stripMarkdown(s, r), s).toContain(evil);
+    }
+  });
+
+  it("still masks a link beside punctuation, or beside an address a space away", () => {
+    const fine = [
+      "[the docs](https://a.bc/x).",
+      "([the docs](https://a.bc/x))",
+      '"[the docs](https://a.bc/x)", then',
+      "[the docs](https://a.bc/x)'s index",
+      "[EN](https://a.bc/en)/[FR](https://a.bc/fr)",
+      "[v1](https://a.bc/1).[2](https://a.bc/2)",
+      "see example.com or [the docs](https://a.bc/x)",
+      "[the docs](https://a.bc/x)\u00a0example.com",
+      // A right-to-left mark a space away moves nothing in the link's word.
+      "\u05e9\u05dc\u05d5\u05dd\u200f [the docs](https://a.bc/x)",
+    ];
+    for (const s of fine) {
+      expect(plain(s), s).not.toContain("](");
+    }
+  });
+
+  it("keeps a masked link in the line's own text, where right-to-left text cannot move it", () => {
+    // An isolate is laid out as one piece, and between two Hebrew words, or
+    // two invisible right-to-left marks, "[.com](…)[paypal](…)" drew as one
+    // link to paypal.com. A masked link is text of the line, whose letters
+    // stay where they are typed.
+    const evil = "https://evil.example/login";
+    const html = md(`\u05e9\u05dc\u05d5\u05dd [.com](${evil})[paypal](${evil}) \u05e2\u05d5\u05dc\u05dd`);
+    expect(html.match(/<a [^>]*>/g)).toHaveLength(2);
+    expect(html).not.toContain("dir=");
+    // What can still move what is typed shows every url: a right-to-left
+    // mark in the word (between two, "w.3org" draws as "w3.org"), or an
+    // override, embedding or isolate anywhere in the line, code included.
+    const moved = [
+      `\u200f[.com](${evil})[paypal](${evil})\u200f`,
+      `\u061c.[paypal](${evil})\u061ccom`,
+      `[w\u200f.3\u200forg](${evil})`,
+      `[w](${evil})\u200f.3\u200forg`,
+      `\u202e x [.com](${evil})[paypal](${evil})`,
+      `\u2067x\u2069 [the docs](${evil})`,
+      `\`\u202e\` [the docs](${evil})`,
+    ];
+    for (const s of moved) {
+      expect(md(s), s).not.toContain(" title=");
+    }
+  });
+
   it("still masks a label in any language that is not an address", () => {
     const labels = [
       "Instala\u00e7\u00e3o do servidor",
@@ -199,8 +268,9 @@ describe("inline markdown", () => {
   it("keeps a link's text in its own order, whatever is typed around or inside it", () => {
     // An override typed before a link and closed after it reversed the text
     // inside: a masked "oc.t" drew as "t.co", and a bare url as another
-    // host's. Each link is an isolate, left to right, which nothing outside
-    // reaches and a right-to-left mark inside cannot turn around.
+    // host's. A url shown is an isolate, left to right, which nothing
+    // outside reaches and a right-to-left mark inside cannot turn around,
+    // and a line holding an override, embedding or isolate masks no link.
     const outside = [
       "\u202e[oc.t](https://evil.example/login)\u202c",
       "\u202e see https://evil.example/moc.lapyap//:sptth \u202c",
@@ -211,6 +281,7 @@ describe("inline markdown", () => {
       const tags = [...md(s).matchAll(/<a [^>]*>/g)].map((m) => m[0]);
       expect(tags, s).toHaveLength(1);
       expect(tags[0], s).toContain(' dir="ltr"');
+      expect(tags[0], s).not.toContain(" title=");
     }
     // One inside a url, where the url is shown: "https://" then an override
     // then "moc.lapyap@evil.example" drew as a link to paypal.com.
@@ -303,7 +374,7 @@ describe("block markdown", () => {
     expect(html).toBe(
       "<strong>bold</strong>\n<em>italic</em>\n<s>strikethrough</s>\n<code>inline code</code>" +
         "<h1>Heading</h1><ul><li>list item</li></ul>" +
-        '<a href="https://example.com" title="https://example.com" target="_blank" rel="noopener noreferrer" dir="ltr">link</a>',
+        '<a href="https://example.com" title="https://example.com" target="_blank" rel="noopener noreferrer">link</a>',
     );
   });
 });
