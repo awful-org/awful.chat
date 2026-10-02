@@ -969,8 +969,9 @@ const _provisional = new Map<string, DmPqState | undefined>();
  */
 export const MAX_DMS_JOINED_FOR_THEM = 128;
 /**
- * How many saved DMs connecting joins, the ones the user read last first.
- * The rest of the bound is left for whoever turns up during the session.
+ * How many saved DMs connecting joins, the ones the user read or wrote in
+ * last first (Room.seenAt). The rest of the bound is left for whoever turns
+ * up during the session.
  */
 export const SAVED_DMS_JOINED_AT_CONNECT = 64;
 let _forThem: { session: UnlockedSession; rooms: Set<string> } | null = null;
@@ -1231,20 +1232,27 @@ function _joinProvisionally(
  * Join the saved DMs at connect, on the other side's account (see
  * MAX_DMS_JOINED_FOR_THEM): the ones somebody wrote in, those the user read
  * last first, at most SAVED_DMS_JOINED_AT_CONNECT - and, on the user's,
- * any the user opened or wrote in this session, whatever it holds. Joining
- * every stored DM gave whoever could get DMs stored with us the
- * conversation bindings, at every start: the empty ones an older build made
- * for introductions alone, and the ones a room member's minted identities
- * pile up session after session. One left out is joined when the user opens
- * it, or when the other side writes or introduces themselves while there is
- * room. Contacts are joined by joinPhonebookDmRooms whatever they hold,
- * requests not at all.
+ * any the user pinned, or opened or wrote in this session, whatever it
+ * holds. Joining every stored DM gave whoever could get DMs stored with us
+ * the conversation bindings, at every start: the empty ones an older build
+ * made for introductions alone, and the ones a room member's minted
+ * identities pile up session after session. One left out is joined when
+ * the user opens it, or when the other side writes or introduces themselves
+ * while there is room. Contacts are joined by joinPhonebookDmRooms whatever
+ * they hold, requests not at all.
  */
 export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
   const session = requireSession();
   const contacts = new Set(
     (await getPhonebookEntries()).map((e) => dmPeerDid(e.did ?? e.peerId))
   );
+  // Read last first, by when (Room.seenAt), which only the user moves. Ones
+  // last read before that was recorded come next, the newest conversation
+  // first, and the ones the user never opened last: nothing but the user's
+  // reading raises lastSeenLamport from 0. Ranking by lastSeenLamport itself
+  // compared counters kept per conversation (epoch timestamps on DMs from
+  // before the logical clock), which put long and old conversations first.
+  const opened = (r: DMRoom) => ((r.lastSeenLamport ?? 0) > 0 ? 1 : 0);
   const saved = rooms
     .filter(
       (r): r is DMRoom =>
@@ -1254,7 +1262,8 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
     )
     .sort(
       (a, b) =>
-        (b.lastSeenLamport ?? 0) - (a.lastSeenLamport ?? 0) ||
+        (b.seenAt ?? 0) - (a.seenAt ?? 0) ||
+        opened(b) - opened(a) ||
         (b.createdAt ?? 0) - (a.createdAt ?? 0)
     );
   const written = await Promise.all(saved.map((r) => _holdsMessages(r.roomCode)));
@@ -1263,12 +1272,12 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
   let joined = 0;
   for (const [i, room] of saved.entries()) {
     const roomCode = room.roomCode;
-    // One the user opened or wrote in this session is theirs, and comes back
-    // joined whatever others hold - after another tab held the node, say -
-    // empty or not. Left out while empty, it was joined again only through
-    // the bounded way an introduction takes, where later ones could evict
-    // it while the user had it open.
-    const mine = _reachedOutTo(room.participantDid);
+    // One the user pinned, or opened or wrote in this session, is theirs,
+    // and comes back joined whatever others hold - after another tab held
+    // the node, say - empty or not. Left out while empty, it was joined
+    // again only through the bounded way an introduction takes, where later
+    // ones could evict it while the user had it open.
+    const mine = _reachedOutTo(room.participantDid) || typeof room.pinnedAt === "number";
     if (!mine) {
       if (!written[i]) continue;
       if (joined >= SAVED_DMS_JOINED_AT_CONNECT) continue;

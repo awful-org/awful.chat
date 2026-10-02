@@ -118,6 +118,7 @@ import {
 import {
   MAX_DMS_JOINED_FOR_THEM,
   MAX_UNSOLICITED_DMS,
+  SAVED_DMS_JOINED_AT_CONNECT,
   ensureDmRoomForPeer,
   openDmConversation,
 } from "./dm.svelte";
@@ -370,4 +371,81 @@ describe("a DM the user opened comes back joined after another tab held the node
     expect(s.joined.has(room)).toBe(true);
     disconnectTransport();
   }, 30_000);
+});
+
+// joinSavedDms ranked by lastSeenLamport, described as "the ones the user
+// read last first". lastSeenLamport is a per-conversation logical counter
+// (and an epoch-millisecond value on DMs from before the logical clock), so
+// across conversations it measured history length, not when anything was
+// read.
+describe("connecting joins the saved DMs the user read last", () => {
+  async function savedDm(did: string, lastSeenLamport: number, at: number, extra: Partial<DMRoom> = {}): Promise<string> {
+    const roomCode = await code(did);
+    await putRoom({ roomCode, type: "dm", name: "", lastSeenLamport, createdAt: at, participants: [did],
+      participantLastSeen: {}, participantDid: did, request: false, ...extra } as DMRoom);
+    await putMessage({ id: newMessageId(did), roomCode, senderId: did, senderName: "", timestamp: at,
+      lamport: lastSeenLamport, type: MessageType.Text, content: "earlier", attachments: [], status: "read" });
+    return roomCode;
+  }
+
+  async function joinedAtConnect(expected = SAVED_DMS_JOINED_AT_CONNECT): Promise<void> {
+    s.bound.clear(); s.joined.clear();
+    await connect();
+    await vi.waitFor(() => expect(s.bound.size).toBe(expected), { timeout: 20_000 });
+    await settled();
+    expect(s.bound.size).toBe(expected);
+  }
+
+  const DAY = 24 * 3600_000;
+
+  it("a conversation read a minute ago is joined ahead of ones last read a year ago", async () => {
+    const yearAgo = Date.now() - 365 * DAY;
+    // Long or pre-logical-clock histories, untouched for a year.
+    for (let i = 0; i < SAVED_DMS_JOINED_AT_CONNECT; i++) {
+      await savedDm(identity().did, 1_700_000_000_000 + i, yearAgo + i);
+    }
+    // Started last week, three messages, read a minute ago.
+    const recent = await savedDm(identity().did, 3, Date.now() - 7 * DAY);
+    await joinedAtConnect();
+    expect(s.bound.has(recent)).toBe(true);
+    disconnectTransport();
+  }, 60_000);
+
+  it("by when it was read, whatever the counters or the creation dates say", async () => {
+    const yearAgo = Date.now() - 365 * DAY;
+    for (let i = 0; i < SAVED_DMS_JOINED_AT_CONNECT; i++) {
+      await savedDm(identity().did, 1_700_000_000_000 + i, yearAgo - 30 * DAY + i, { seenAt: yearAgo + i });
+    }
+    // Older than all of them, three messages long, read a minute ago.
+    const recent = await savedDm(identity().did, 3, yearAgo - 365 * DAY, { seenAt: Date.now() - 60_000 });
+    await joinedAtConnect();
+    expect(s.bound.has(recent)).toBe(true);
+    disconnectTransport();
+  }, 60_000);
+
+  it("never one the user has not opened ahead of one they have", async () => {
+    const yearAgo = Date.now() - 365 * DAY;
+    for (let i = 0; i < SAVED_DMS_JOINED_AT_CONNECT; i++) {
+      await savedDm(identity().did, 5, yearAgo + i, { seenAt: yearAgo + i });
+    }
+    // Somebody else's, started a minute ago: newest of all, never opened.
+    const unopened = await savedDm(identity().did, 0, Date.now() - 60_000);
+    await joinedAtConnect();
+    expect(s.bound.has(unopened)).toBe(false);
+    disconnectTransport();
+  }, 60_000);
+
+  it("and a pinned one on the user's account, whatever it holds", async () => {
+    for (let i = 0; i < SAVED_DMS_JOINED_AT_CONNECT; i++) {
+      await savedDm(identity().did, 5, Date.now() - DAY + i, { seenAt: Date.now() - 60_000 + i });
+    }
+    // Pinned long ago, never opened since, nothing said in it.
+    const did = identity().did;
+    const pinned = await code(did);
+    await putRoom({ roomCode: pinned, type: "dm", name: "", lastSeenLamport: 0, createdAt: 1, participants: [did],
+      participantLastSeen: {}, participantDid: did, request: false, pinnedAt: 1 } as DMRoom);
+    await joinedAtConnect(SAVED_DMS_JOINED_AT_CONNECT + 1);
+    expect(s.bound.has(pinned)).toBe(true);
+    disconnectTransport();
+  }, 60_000);
 });

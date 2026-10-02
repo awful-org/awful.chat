@@ -291,6 +291,22 @@ describe("unread counts and seen tracking", () => {
     await markRoomSeen("room-a", 7);
     expect((await getRoom("room-a"))?.lastSeenLamport).toBe(42);
   });
+
+  it("markRoomSeen records when the user last read the room, each time", async () => {
+    await putRoom(room);
+    expect((await getRoom("room-a"))?.seenAt).toBeUndefined();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      await markRoomSeen("room-a", 42);
+      expect((await getRoom("room-a"))?.seenAt).toBe(1_000);
+      // Read again with nothing new: still a read, later.
+      now.mockReturnValue(2_000);
+      await markRoomSeen("room-a", 7);
+      expect((await getRoom("room-a"))?.seenAt).toBe(2_000);
+    } finally {
+      now.mockRestore();
+    }
+  });
 });
 
 describe("sidebar pin and position live on the room record", () => {

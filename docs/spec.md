@@ -230,6 +230,7 @@ interface Room {
   type: RoomType
   name: string
   lastSeenLamport: number  // unread count derived from this
+  seenAt?: number          // when the user last read or wrote here (ms, this device)
   createdAt: number
   pfpData?: ArrayBuffer    // local upload - blobURL generated at runtime
   pfpURL?: string          // external URL (tenor, giphy, etc) - stored as-is

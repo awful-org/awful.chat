@@ -89,6 +89,14 @@ export interface Room {
   type: RoomType;
   name: string;
   lastSeenLamport: number; // unread count = messages with lamport > this
+  /**
+   * When the user last read or wrote here, by this device's clock (ms):
+   * markRoomSeen sets it. lastSeenLamport is a count kept per conversation
+   * and says nothing about when; this does, and only the user moves it,
+   * unlike the time of the last message. Absent until the room is next
+   * read. Private: never sent.
+   */
+  seenAt?: number;
   createdAt: number;
   pfpData?: ArrayBuffer; // local upload - blobURL generated at runtime, never stored
   pfpURL?: string; // external URL (tenor, giphy, etc) - stored as-is
@@ -2364,6 +2372,9 @@ export async function cleanupInactiveParticipants(
  * incoming-message handler vs the open-conversation path working from an
  * older snapshot), and a late write with a lower lamport would resurrect
  * already-read messages as unread.
+ *
+ * Every caller is the user reading the room or writing in it, so this also
+ * records when (Room.seenAt).
  */
 export async function markRoomSeen(
   roomCode: string,
@@ -2373,6 +2384,7 @@ export async function markRoomSeen(
   await _patchRoom(roomCode, (room) => ({
     ...room,
     lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, lamport),
+    seenAt: Date.now(),
   }), guard);
 }
 
