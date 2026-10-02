@@ -123,7 +123,7 @@ async function nativeDetector(): Promise<QrDetector | null> {
 type JsQR = typeof import("jsqr").default;
 
 /** What a scan says when its decoder could not be downloaded. */
-export const SCANNER_NOT_LOADED = "Couldn't load the scanner. Check your connection and try again.";
+export const SCANNER_NOT_LOADED = "Couldn't load the scanner. Check your connection and reload the page.";
 
 /**
  * jsQR, the decoder for a platform without a detector of its own, loaded by
@@ -135,11 +135,13 @@ function loadJsQR(): Promise<JsQR> {
   jsQRLoad ??= import("jsqr").then(
     (m) => m.default,
     (err) => {
-      // Not kept, so the next scan tries again (offline, or a deploy that
-      // replaced the chunk). The first failure in a minute reloads the page
-      // before it gets here - main.ts takes a chunk that will not load for a
-      // stale deploy - so this is what a second one says: plainly, and not
-      // as a camera problem, which is how the browser's own text came out.
+      // Not kept, but the next scan fetches nothing either: browsers keep a
+      // failed import for the life of the page, and only a reload asks the
+      // network again (offline, or a deploy that replaced the chunk). The
+      // first failure in a minute is that reload - main.ts takes a chunk that
+      // will not load for a stale deploy - so this is what a second one says:
+      // plainly, and not as a camera problem, which is how the browser's own
+      // text came out.
       jsQRLoad = null;
       throw new Error(SCANNER_NOT_LOADED, { cause: err });
     }

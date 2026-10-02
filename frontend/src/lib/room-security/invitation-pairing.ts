@@ -20,13 +20,14 @@ function loadOpaque(): Promise<typeof Opaque> {
     await opaque.ready;
     return opaque;
   })().catch((err) => {
-    // Not kept: offline, or a deploy that replaced the chunk, and the next
-    // pairing should try again rather than fail the same way forever. The
-    // first failure in a minute reloads the page before it gets here (main.ts
-    // takes a chunk that will not load for a stale deploy); a second one is
-    // said plainly, where a code being redeemed shows its error.
+    // Not kept, but the next pairing fetches nothing either: browsers keep a
+    // failed import for the life of the page, and only a reload asks the
+    // network again (offline, or a deploy that replaced the chunk). The first
+    // failure in a minute is that reload (main.ts takes a chunk that will not
+    // load for a stale deploy); a second one is said plainly, where a code
+    // being redeemed shows its error.
     opaqueLoad = null;
-    throw new Error("Couldn't load short codes. Check your connection and try again.", { cause: err });
+    throw new Error("Couldn't load short codes. Check your connection and reload the page.", { cause: err });
   });
   return opaqueLoad;
 }

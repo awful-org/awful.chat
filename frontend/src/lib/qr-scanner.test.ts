@@ -121,7 +121,7 @@ describe("jsQR", () => {
 
   // The browser's own text names the chunk's https URL, so the dialogs - which
   // show a message only when it is about https - showed it as a camera problem.
-  it("says plainly when it could not be downloaded, and tries again on the next scan", async () => {
+  it("says plainly when it could not be downloaded, and does not keep the failure itself", async () => {
     vi.resetModules();
     let loads = 0;
     vi.doMock("jsqr", async (importOriginal) => {

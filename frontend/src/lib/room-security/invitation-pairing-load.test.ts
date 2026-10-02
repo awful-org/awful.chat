@@ -48,7 +48,7 @@ it("loads OPAQUE once, on the first pairing, and pairs with it", async () => {
 
 // A code being redeemed shows its error as it is, and the browser's text for a
 // chunk that did not download means nothing to the person holding the code.
-it("says plainly when OPAQUE could not be downloaded, and tries again next time", async () => {
+it("says plainly when OPAQUE could not be downloaded, and does not keep the failure itself", async () => {
   vi.resetModules();
   let loads = 0;
   vi.doMock("@serenity-kit/opaque", async (importOriginal) => {
@@ -57,7 +57,7 @@ it("says plainly when OPAQUE could not be downloaded, and tries again next time"
   });
   const pairing = await import("./invitation-pairing");
   await expect(pairing.startPairingJoin("k5t-8r5")).rejects.toThrow(
-    "Couldn't load short codes. Check your connection and try again."
+    "Couldn't load short codes. Check your connection and reload the page."
   );
   const host = await pairing.InvitationPairingHost.create(newRoomSecret());
   expect(host.locator).toHaveLength(2);
