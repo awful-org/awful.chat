@@ -76,7 +76,7 @@ export function firstPage(route: Route): LazyPage | null {
   return route === "app" ? "gate" : route;
 }
 
-const preloaded = new Set<LazyPage>();
+const linked = new Set<LazyPage>();
 
 /**
  * Start downloading a page without running it: its chunks as modulepreload
@@ -91,7 +91,32 @@ const preloaded = new Set<LazyPage>();
  * which runs first in the entry and watches for exactly these links.
  */
 export function preloadPage(page: LazyPage | null): void {
-  if (!page || preloaded.has(page)) return;
+  if (page) linkPage(page, "preload");
+}
+
+/**
+ * Download the page that is likely next - the app, behind the setup and
+ * unlock screens - once the current one has painted and the browser is
+ * idle, so it never competes with what is on screen. Under Save-Data too:
+ * the service worker's precache downloads the same chunks on a first visit
+ * anyway, and with them in hand the unlock needs no network, where a chunk
+ * that does not load reloads the page and drops the invitation the gate
+ * holds.
+ *
+ * Its stylesheets as prefetches: a preload is for the page on screen, and
+ * one still unused a few seconds after the load - the app's, while a
+ * password is typed - is a console warning. A prefetch fills the HTTP cache,
+ * where the stylesheet vite's loader adds at the unlock finds it.
+ */
+export function prefetchPage(page: LazyPage): void {
+  const later = () => linkPage(page, "prefetch");
+  if (typeof requestIdleCallback === "function") requestIdleCallback(later, { timeout: 2000 });
+  else setTimeout(later, 200);
+}
+
+/** The page's links in the head: the two above differ only in its stylesheets'. */
+function linkPage(page: LazyPage, styles: "preload" | "prefetch"): void {
+  if (linked.has(page)) return;
   let lists: Partial<Record<LazyPage, unknown>>;
   try {
     lists = JSON.parse(document.getElementById("page-chunks")?.textContent || "{}");
@@ -100,35 +125,23 @@ export function preloadPage(page: LazyPage | null): void {
   }
   const hrefs = lists[page];
   if (!Array.isArray(hrefs)) return;
-  preloaded.add(page);
+  linked.add(page);
   for (const href of hrefs) {
     if (typeof href !== "string") continue;
     const link = document.createElement("link");
-    if (href.endsWith(".css")) {
+    if (!href.endsWith(".css")) {
+      link.rel = "modulepreload";
+    } else if (styles === "preload") {
       // Not a stylesheet yet: vite's loader adds that when the page is
       // imported, and waits for it, so the page never shows unstyled.
       link.rel = "preload";
       link.as = "style";
     } else {
-      link.rel = "modulepreload";
+      link.rel = "prefetch";
     }
     // As vite's own loader asks for them, or the preload is not reused.
     link.crossOrigin = "";
     link.href = href;
     document.head.appendChild(link);
   }
-}
-
-/**
- * Download the page that is likely next - the app, behind the setup and
- * unlock screens - once the current one has painted and the browser is
- * idle, so it never competes with what is on screen. Not when the browser
- * asks to save data: the page then downloads when it is opened.
- */
-export function prefetchPage(page: LazyPage): void {
-  const connection = (navigator as { connection?: { saveData?: boolean } }).connection;
-  if (connection?.saveData === true) return;
-  const later = () => preloadPage(page);
-  if (typeof requestIdleCallback === "function") requestIdleCallback(later, { timeout: 2000 });
-  else setTimeout(later, 200);
 }

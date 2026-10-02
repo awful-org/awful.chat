@@ -205,7 +205,6 @@ describe("prefetchPage", () => {
     const head = page(JSON.stringify({ app: ["/assets/AppView-x.js"] }));
     let idle: (() => void) | undefined;
     vi.stubGlobal("requestIdleCallback", (fn: () => void) => void (idle = fn));
-    vi.stubGlobal("navigator", {});
     const { prefetchPage } = await import("./pages");
     prefetchPage("app");
     expect(head).toEqual([]);
@@ -213,12 +212,27 @@ describe("prefetchPage", () => {
     expect(head).toHaveLength(1);
   });
 
-  it("leaves it alone when the browser asks to save data", async () => {
+  // A preload still unused a few seconds after the load is a console
+  // warning, and the app's stylesheets wait for the password.
+  it("fetches the stylesheets into the cache rather than preloading them", async () => {
+    const head = page(JSON.stringify({ app: ["/assets/AppView-x.js", "/assets/app-y.css"] }));
+    const { prefetchPage } = await import("./pages");
+    prefetchPage("app");
+    await vi.runAllTimersAsync();
+    expect(head).toEqual([
+      { rel: "modulepreload", crossOrigin: "", href: "/assets/AppView-x.js" },
+      { rel: "prefetch", crossOrigin: "", href: "/assets/app-y.css" },
+    ]);
+  });
+
+  // The service worker's precache downloads the same chunks regardless, so
+  // holding back saved nothing; it only left the unlock needing the network.
+  it("fetches it when the browser asks to save data too", async () => {
     const head = page(JSON.stringify({ app: ["/assets/AppView-x.js"] }));
     vi.stubGlobal("navigator", { connection: { saveData: true } });
     const { prefetchPage } = await import("./pages");
     prefetchPage("app");
     await vi.runAllTimersAsync();
-    expect(head).toEqual([]);
+    expect(head).toEqual([{ rel: "modulepreload", crossOrigin: "", href: "/assets/AppView-x.js" }]);
   });
 });
