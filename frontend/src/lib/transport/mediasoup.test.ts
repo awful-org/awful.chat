@@ -755,6 +755,82 @@ describe("cameras nothing on screen shows are not received (G05.1)", () => {
     expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
   });
 
+  it("an unpark whose camera closes while its consumer is being built adds no dead track", async () => {
+    const { video, internals, built, consume, closes } = session();
+    const added = vi.fn();
+    const removed = vi.fn();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    video.on("trackAdded", added);
+    video.on("trackRemoved", removed);
+    // The SFU answered the consume, then the producer closed while
+    // recvTransport.consume() (local SDP work) was still running.
+    const transport = internals.recvTransport as { consume: (o: unknown) => Promise<unknown> };
+    const build = transport.consume;
+    let release!: () => void;
+    transport.consume = async (o: unknown) => {
+      await new Promise<void>((r) => (release = r));
+      return build(o);
+    };
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    (internals.handleSignal as (msg: unknown) => void).call(video, {
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await settle();
+
+    // Told the camera is off, and never handed a track that will not play.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(added).not.toHaveBeenCalled();
+    expect(built[1].close).toHaveBeenCalled();
+    expect(closes()).toEqual(["cam-a", "cam-a"]);
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    expect((internals.closedWhileConsuming as Set<string>).size).toBe(0);
+  });
+
+  it("a first consume whose camera closes while its consumer is being built adds no dead track", async () => {
+    // The same race on the announce path: it froze a tile until the stall
+    // sweep turned it into "That stream has ended".
+    const { video, internals, built, consume, closes } = session();
+    const added = vi.fn();
+    const errors = vi.fn();
+    video.on("trackAdded", added);
+    video.on("error", errors);
+    const transport = internals.recvTransport as { consume: (o: unknown) => Promise<unknown> };
+    const build = transport.consume;
+    let release!: () => void;
+    transport.consume = async (o: unknown) => {
+      await new Promise<void>((r) => (release = r));
+      return build(o);
+    };
+
+    const consuming = consume("peer-a", "cam-a", "camera");
+    await settle();
+    (internals.handleSignal as (msg: unknown) => void).call(video, {
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await consuming;
+
+    expect(added).not.toHaveBeenCalled();
+    expect(errors).not.toHaveBeenCalled();
+    expect(built[0].close).toHaveBeenCalled();
+    expect(closes()).toEqual(["cam-a"]);
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    expect((internals.closedWhileConsuming as Set<string>).size).toBe(0);
+  });
+
   it("a rejoin retracts parked cameras; the replay brings back the ones still on", async () => {
     const { video, internals, consume } = session();
     const removed = vi.fn();

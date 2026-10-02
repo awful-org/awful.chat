@@ -756,6 +756,9 @@ Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
   - while parked the app keeps the last track (no trackRemoved), so "has
     video" stays true for the spotlight and the grid filters; a parked
     camera's ms:producer-closed, peer-left or a rejoin removes it
+  - a producer that closes while its consume is in flight (after the SFU
+    answered it): the late consumer is closed with ms:close-consumer and
+    never reaches the app as a track, for any consume, first or not
   - screen shares are never parked; no opinion yet (or no call) = every
     camera received
 

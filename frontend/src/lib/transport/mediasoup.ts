@@ -335,6 +335,9 @@ export class MediasoupVideo implements VideoTransport {
 
   // Consumes in flight, keyed by producer id. See consumeProducer.
   private inflightConsumes: Map<string, Promise<void>> = new Map();
+  // Producers whose ms:producer-closed came while a consume for them was in
+  // flight. See consumeProducerInner.
+  private closedWhileConsuming: Set<string> = new Set();
 
   // The remote cameras something on screen shows, by peerId, or null for no
   // opinion (every camera received). See setWantedCameras.
@@ -459,6 +462,7 @@ export class MediasoupVideo implements VideoTransport {
     this.producers.clear();
     this.consumers.clear();
     this.inflightConsumes.clear();
+    this.closedWhileConsuming.clear();
     this.active.clear();
     this.pendingTransmissions.clear();
     this.pendingScreenProducerIds.clear();
@@ -932,6 +936,7 @@ export class MediasoupVideo implements VideoTransport {
     this.consumers.clear();
     this.consumerStats.clear();
     this.inflightConsumes.clear();
+    this.closedWhileConsuming.clear();
     this.producers.forEach((ps) => ps.forEach((p) => p.producer.close()));
     this.producers.clear();
     this.active.clear();
@@ -1488,6 +1493,11 @@ export class MediasoupVideo implements VideoTransport {
             this.consumers.delete(peerId);
           }
         });
+        // A consume still out for it has no consumer to close yet: it drops
+        // the one it gets (consumeProducerInner).
+        if (this.inflightConsumes.has(msg.producerId)) {
+          this.closedWhileConsuming.add(msg.producerId);
+        }
         this.clearParkTimer(msg.producerId);
         // A parked camera has no consumer left to close, but the app still
         // holds its last track as "camera on": the camera is off now.
@@ -1581,6 +1591,7 @@ export class MediasoupVideo implements VideoTransport {
         // with a consume against the fresh transport.
         if (this.inflightConsumes.get(producerId) === p) {
           this.inflightConsumes.delete(producerId);
+          this.closedWhileConsuming.delete(producerId);
         }
       }
     );
@@ -1643,6 +1654,17 @@ export class MediasoupVideo implements VideoTransport {
     if (generation !== this.joinGeneration || (watching && !this.watchingTransmissionPeers.has(peerId))) {
       consumer.close();
       if (generation === this.joinGeneration) this.signal({ type: "ms:close-consumer", producerId });
+      return;
+    }
+    // The producer closed after the SFU answered this consume, while the
+    // consumer was still being built here. Its ms:producer-closed found
+    // nothing to close and has already told the app the stream is gone, so
+    // this track would never carry a frame: a frozen tile until the stall
+    // sweep re-consumed it into "That stream has ended". The close-consumer
+    // is a courtesy: the SFU dropped its consumer along with the producer.
+    if (this.closedWhileConsuming.has(producerId)) {
+      consumer.close();
+      this.signal({ type: "ms:close-consumer", producerId });
       return;
     }
     // The server creates every consumer paused (see handleConsume) so no RTP
