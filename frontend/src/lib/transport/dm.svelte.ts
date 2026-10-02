@@ -918,9 +918,28 @@ export const MAX_DM_REQUESTS = 20;
  * conversation is held back like a full request: dropped live, left in the
  * mailbox for the next session. What such DMs can keep joined is bounded
  * apart, across sessions too: MAX_DMS_JOINED_FOR_THEM.
+ *
+ * Only a conversation that keeps something is charged. Admitting one takes
+ * its unit at once, so a burst cannot slip past, and one undone because
+ * nothing it brought was stored, or never made at all, gives it back. The
+ * unit used to stay spent: sixty-four junk batches from anyone who knew our
+ * DID, each with one signed row the batch handler then refused, left
+ * nothing behind and held back every first contact - room-mates' too - for
+ * the rest of the session.
+ *
+ * What is left: a member of a room we share can still spend it all with as
+ * many DMs from identities it mints, a message in each. Those are listed
+ * and can be deleted, but until the next session every other new
+ * conversation from someone we do not know for sure is held back.
  */
 export const MAX_UNSOLICITED_DMS = 64;
-let _unsolicitedSpent: { session: UnlockedSession; count: number } | null = null;
+let _unsolicited: { session: UnlockedSession; rooms: Set<string> } | null = null;
+
+/** This session's new conversations charged to MAX_UNSOLICITED_DMS. */
+function _unsolicitedCharged(session: UnlockedSession): Set<string> {
+  if (_unsolicited?.session !== session) _unsolicited = { session, rooms: new Set() };
+  return _unsolicited.rooms;
+}
 
 /**
  * Conversations joined for an introduction alone, with nothing stored. The
@@ -1047,7 +1066,7 @@ function _admissionChanged(): void {
 onIdentityLock(() => {
   _admission = null;
   _admissionChanged();
-  _unsolicitedSpent = null;
+  _unsolicited = null;
   // Their bindings too: kept across a lock, they piled up unlock after
   // unlock in a page that was never reloaded.
   for (const roomCode of [..._provisional.keys(), ...(_forThem?.rooms ?? [])]) {
@@ -1149,20 +1168,19 @@ function _admitUntrusted(
   reserve: boolean,
   view: AdmissionView
 ): "known" | "request" | "full" {
-  if (_unsolicitedSpent?.session !== view.session) {
-    _unsolicitedSpent = { session: view.session, count: 0 };
-  }
-  const spent = _unsolicitedSpent;
-  if (spent.count >= MAX_UNSOLICITED_DMS) return "full";
+  const charged = _unsolicitedCharged(view.session);
+  // Once a session per conversation: one deleted since and written in again
+  // is the same conversation.
+  if (!charged.has(roomCode) && charged.size >= MAX_UNSOLICITED_DMS) return "full";
   if (view.roomMates.has(peerDid)) {
-    if (reserve) spent.count += 1;
+    if (reserve) charged.add(roomCode);
     return "known";
   }
   if (_requestsInFlight.has(roomCode)) return "request";
   if (view.held + _requestsInFlight.size >= MAX_DM_REQUESTS) return "full";
   if (reserve) {
     _requestsInFlight.add(roomCode);
-    spent.count += 1;
+    charged.add(roomCode);
   }
   return "request";
 }
@@ -1279,8 +1297,9 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
 
 /**
  * Undo a conversation made for a first contact that brought nothing in: a
- * batch whose every row was refused. Left, it was an empty request that
- * nothing listed and nothing could delete.
+ * batch whose every row was refused, or that could not be joined. Left, it
+ * was an empty request that nothing listed and nothing could delete; and
+ * what admitting it charged is given back (MAX_UNSOLICITED_DMS).
  */
 export async function dropDmIfEmpty(roomCode: string): Promise<void> {
   const guard = captureDmOwnership();
@@ -1288,6 +1307,7 @@ export async function dropDmIfEmpty(roomCode: string): Promise<void> {
   guard();
   _forgetJoin(roomCode);
   await deleteRoom(roomCode);
+  _unsolicited?.rooms.delete(roomCode);
   _admissionChanged();
   await refreshDmRooms();
   guard();
@@ -1311,6 +1331,7 @@ export async function pruneEmptyDmRequests(rooms: (Room | DMRoom)[]): Promise<vo
     guard();
     _forgetJoin(room.roomCode);
     await deleteRoom(room.roomCode);
+    _unsolicited?.rooms.delete(room.roomCode);
     _admissionChanged();
     pruned = true;
   }
@@ -1435,6 +1456,8 @@ export async function ensureDmRoomForPeer(
   // Joined for an introduction until now: stored under the key it agreed.
   if (!existing) pqState ??= _provisional.get(roomCode);
   let request = false;
+  const charged = _unsolicitedCharged(session);
+  const chargedBefore = charged.has(roomCode);
   // Another introduction for one an introduction already joined is joined
   // again as it is (an upgrade may have moved its key), and charged nothing.
   if (!existing && unsolicited && !(opts.provisional && _provisional.has(roomCode))) {
@@ -1478,6 +1501,11 @@ export async function ensureDmRoomForPeer(
   }
   try {
     return await _joinDm(session, guard, peerIdOrDid, peerDid, roomCode, existing, pqState, request, !!unsolicited);
+  } catch (error) {
+    // Never made (the transport's bindings were full, say): a first contact
+    // that could not be joined costs this session nothing.
+    if (!existing && !chargedBefore) charged.delete(roomCode);
+    throw error;
   } finally {
     if (request) _requestsInFlight.delete(roomCode);
   }

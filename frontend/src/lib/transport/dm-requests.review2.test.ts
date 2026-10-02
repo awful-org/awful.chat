@@ -1,0 +1,259 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { publicKeyToDid, type UnlockedSession } from "$lib/identity/identity";
+
+// Second review round: cases the fixes still left open. Same harness as
+// dm-requests.review.test.ts (real transport, DM and storage modules on
+// fake-indexeddb; only the libp2p class and the media stack are stand-ins).
+const s = vi.hoisted(() => ({
+  session: null as UnlockedSession | null,
+  identity: { did: null as string | null, isUnlocked: true },
+  handlers: new Map<string, Function>(),
+  hooks: {} as { verified?: Function; upgraded?: Function },
+  joined: new Set<string>(),
+  bound: new Set<string>(),
+  joins: 0,
+  roomPeers: new Map<string, Set<string>>(),
+  connected: [] as string[],
+  sent: [] as { peer: string; room: string; data: Uint8Array }[],
+  deposits: [] as { to: string; envelope: Uint8Array; kind?: string }[],
+  announce: vi.fn(),
+  introduce: vi.fn(async (_peer: string, _did?: string) => true),
+}));
+
+vi.mock("$lib/identity/identity", async (original) => ({
+  ...(await original<typeof import("$lib/identity/identity")>()),
+  requireSession: () => {
+    if (!s.session) throw new Error("Locked");
+    return s.session;
+  },
+  isUnlocked: () => !!s.session,
+}));
+vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: s.identity }));
+vi.mock("./libp2p/transport", () => ({
+  LibP2PTransport: class {
+    on(event: string, fn: Function) { s.handlers.set(event, fn); }
+    setDmIntroduction(_identity: unknown, verified: Function, upgraded?: Function) {
+      s.hooks.verified = verified;
+      s.hooks.upgraded = upgraded;
+    }
+    selfId() { return "12D3-self"; }
+    rooms() { return [...s.joined]; }
+    peers() { return [...s.connected]; }
+    peersInRoom(room: string) { return [...(s.roomPeers.get(room) ?? [])]; }
+    isRoomPeer(room: string, peer: string) { return !!s.roomPeers.get(room)?.has(peer); }
+    isSecureRoom(room: string) { return room.startsWith("rd2_") || room.startsWith("dm-"); }
+    joinSecureConversation(localId: string) {
+      if (!s.bound.has(localId) && s.bound.size >= 512) throw new Error("Conversation binding limit");
+      s.joins += 1;
+      s.bound.add(localId);
+      s.joined.add(localId);
+      return "rd2_disc";
+    }
+    joinSecureRoom() { return "rd2_disc"; }
+    joinRoom(room: string) { s.joined.add(room); }
+    holdDmLobby() {}
+    forgetConversation(localId: string) {
+      s.bound.delete(localId);
+      s.joined.delete(localId);
+    }
+    leaveRoom(room: string) { s.joined.delete(room); }
+    introduceDm(peer: string, did?: string) { return s.introduce(peer, did); }
+    async sendRoom(peer: string, room: string, data: Uint8Array) {
+      s.sent.push({ peer, room, data });
+      return true;
+    }
+    async send() { return true; }
+    async broadcast() {}
+    async disconnect() {}
+    async connect() {}
+    dialNow() {}
+  },
+}));
+vi.mock("./ice-server-list", () => ({ refreshTurnCredentials: async () => {} }));
+vi.mock("./libp2p/voice", () => ({ LibP2PVoice: class { setCallPeers() {} activePeers() { return []; } } }));
+vi.mock("./mediasoup", () => ({
+  MediasoupVideo: class {
+    setRoomAdmission() {} setJoinSigner() {} setCallPeerAdmission() {} retryDeferredProducers() {}
+  },
+}));
+vi.mock("../audio/dtln-processor", () => ({ DtlnProcessor: class {} }));
+vi.mock("./voice.svelte", () => ({ initVoice() {} }));
+vi.mock("./transmission.svelte", () => ({ initTransmission() {}, _sendWatchPresence() {} }));
+vi.mock("./call.svelte", () => ({ leaveCall: vi.fn(), _sendCallPresence() {}, _sendCallState() {} }));
+vi.mock("./file/webtorrent", () => ({
+  WebTorrentFileTransport: class {
+    on() {} setLocalFileLookup() {} setSignalSender() {} resetTransfers() {} onPeerDisconnect() {}
+    onPeerConnect() {} registerSeeder() {} ensureDownload() {}
+  },
+}));
+vi.mock("../telemetry/taps", () => ({ stopTelemetryTaps: vi.fn(), installTelemetryTaps: vi.fn() }));
+vi.mock("./node-lock", () => ({ releaseNodeLock: vi.fn(), acquireNodeLock: async () => {} }));
+vi.mock("../plugins/registry", () => ({ getPlugin: async () => null, getManifest: () => undefined }));
+vi.mock("$lib/room-security/invitation-release", () => ({ ROOM_SECURITY_V2_RELEASED: true }));
+vi.mock("../announce", () => ({ announceMessage: s.announce }));
+vi.mock("$lib/sounds", () => ({ playPeerJoinSound() {}, playPeerLeaveSound() {} }));
+vi.mock("./mailbox.svelte", () => ({
+  mailboxPrefs: { enabled: true },
+  collectMailbox: async () => {},
+  depositDmToMailbox: async (to: string, envelope: Uint8Array, kind?: string) => {
+    s.deposits.push({ to, envelope, kind });
+    return "sent";
+  },
+}));
+
+import {
+  _peerIdToDid,
+  deliverMailboxBatch,
+  deliverMailboxDm,
+  transportState,
+} from "./transport.svelte";
+import { MAX_UNSOLICITED_DMS } from "./dm.svelte";
+import { getDMRooms, getLastMessage, putRoom, wipeLocalDatabase } from "$lib/storage";
+import { encode } from "$lib/utils";
+import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
+import { canonicalContentV3 } from "$lib/messaging";
+import { roomsStore } from "$lib/rooms.svelte";
+import { hashDmRoomCode, type DmPayload } from "./dm-codec";
+import { newMessageId } from "$lib/message-id";
+import { notifyIdentityLock } from "$lib/identity/lock-events";
+
+function identity(): UnlockedSession {
+  const privateKey = crypto.getRandomValues(new Uint8Array(32));
+  const publicKey = new Uint8Array(ed25519.getPublicKey(privateKey));
+  return { privateKey, publicKey, did: publicKeyToDid(publicKey) };
+}
+
+const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+function signedWire(as: UnlockedSession, room: string, extra: Partial<Message> = {}): WireChatMessage {
+  const msg: Message = {
+    id: newMessageId(as.did), roomCode: room, senderId: as.did, senderName: "Them",
+    timestamp: Date.now(), lamport: 1, type: MessageType.Text, content: "hi", attachments: [],
+    ...extra,
+  };
+  const sig = ed25519.sign(new TextEncoder().encode(canonicalContentV3(msg)), as.privateKey);
+  return messageToWire({ ...msg, senderDid: as.did, sig: hex(sig), sigV: 3 });
+}
+
+function chat(from: string, text = "hello", extra: Partial<DmPayload> = {}): DmPayload {
+  return { id: newMessageId(from), text, ts: Date.now(), lamport: 1, ...extra };
+}
+
+const code = (did: string) => hashDmRoomCode(s.session!.did, did);
+
+beforeEach(async () => {
+  notifyIdentityLock();
+  await wipeLocalDatabase();
+  vi.clearAllMocks();
+  s.session = identity();
+  s.identity.did = s.session.did;
+  s.joined.clear(); s.bound.clear(); s.roomPeers.clear();
+  s.joins = 0;
+  s.connected = []; s.sent = []; s.deposits = [];
+  roomsStore.dmRooms = [];
+  _peerIdToDid.clear();
+  Object.assign(transportState, {
+    roomCode: null, chatMode: "room", activeDmPeerId: null, roomUsers: [], messages: [],
+    relayConnected: false,
+  });
+});
+
+// A first contact is admitted (and charged to MAX_UNSOLICITED_DMS) before
+// its rows are stored. When every row is then refused, dropDmIfEmpty takes
+// the conversation away again - but the charge stayed. A stranger who knows
+// only our DID could therefore spend the whole session's budget with junk
+// that leaves nothing behind, and from then on every first contact from
+// anyone who is not a contact (strangers AND room-mates) was held back.
+describe("a dropped first contact still spends the session's budget", () => {
+  /** A mailbox batch from `as`, one row it signed: a plugin card whose payload is not JSON. */
+  async function junkBatch(as: UnlockedSession): Promise<Uint8Array> {
+    const room = await code(as.did);
+    const row = signedWire(as, room, { type: MessageType.PluginCard, content: "not json" });
+    return encode({ type: MessageType.SyncBatch, roomCode: room, messages: [row], batchIndex: 0, totalBatches: 1 });
+  }
+
+  it("control: one junk batch fewer than the budget leaves the honest stranger's DM through", async () => {
+    const attacker = identity();
+    for (let i = 0; i < MAX_UNSOLICITED_DMS - 1; i++) {
+      await deliverMailboxBatch(attacker.did, await junkBatch(attacker));
+    }
+    expect(await getDMRooms()).toEqual([]);
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }, 60_000);
+
+  it("a DID-only stranger's refused batches leave nothing, yet lock every later first contact out", async () => {
+    const attacker = identity();
+    for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+      // Acked away like any junk (resolves), and leaves no conversation.
+      await deliverMailboxBatch(attacker.did, await junkBatch(attacker));
+    }
+    expect(await getDMRooms()).toEqual([]);
+
+    // An honest stranger's first DM, through the mailbox.
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }, 60_000);
+
+  it("same for a member of a room we share", async () => {
+    const attacker = identity();
+    for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+      await deliverMailboxBatch(attacker.did, await junkBatch(attacker));
+    }
+    const mate = identity().did;
+    await putRoom({ roomCode: "SHAREDROOM1", type: "text", name: "shared", lastSeenLamport: 0,
+      createdAt: Date.now(), participants: [mate], participantLastSeen: {} });
+    await deliverMailboxDm(mate, chat(mate, "hey, from the room"));
+    expect((await getLastMessage(await code(mate)))?.content).toBe("hey, from the room");
+  }, 60_000);
+
+  // One identity's batches are one conversation, which the budget counts
+  // once; the attack mints an identity per batch.
+  it("however many identities the junk comes from", async () => {
+    for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+      const attacker = identity();
+      await deliverMailboxBatch(attacker.did, await junkBatch(attacker));
+    }
+    expect(await getDMRooms()).toEqual([]);
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }, 60_000);
+
+  // The batch handler throws on a row that is not an object: with a good
+  // row beside it, the conversation was made for the good one and then kept
+  // empty - charged, and its blob kept in the mailbox for every collect.
+  it("nor with batches whose one good row comes with one the handler cannot look at", async () => {
+    for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+      const attacker = identity();
+      const room = await code(attacker.did);
+      const blob = encode({ type: MessageType.SyncBatch, roomCode: room,
+        messages: [signedWire(attacker, room), null], batchIndex: 0, totalBatches: 1 });
+      // Junk, answered as junk: acked away, nothing made or joined for it.
+      await expect(deliverMailboxBatch(attacker.did, blob)).resolves.toBeUndefined();
+    }
+    expect(await getDMRooms()).toEqual([]);
+    expect(s.joins).toBe(0);
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }, 60_000);
+
+  it("nor with first contacts that could not be joined at all", async () => {
+    // Every conversation binding the transport has is taken.
+    for (let i = 0; i < 512; i++) s.bound.add(`dm-taken-${i}`);
+    for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+      const stranger = identity().did;
+      // Kept in the mailbox for a later collect, nothing made.
+      await expect(deliverMailboxDm(stranger, chat(stranger))).rejects.toThrow();
+    }
+    expect(await getDMRooms()).toEqual([]);
+    s.bound.clear();
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }, 60_000);
+});

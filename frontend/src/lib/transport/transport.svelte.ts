@@ -3761,15 +3761,17 @@ export async function deliverMailboxBatch(
   if (!(await _ensureDmForBatch(senderDid, guard))) {
     throw new Error("No room for a new conversation");
   }
-  // Stored but not joined: past what others can keep joined (dm.svelte.ts,
-  // MAX_DMS_JOINED_FOR_THEM). The batch handler takes nothing for a room
-  // not joined, so the blob waits in the mailbox until it is.
-  if (!_transport.rooms().includes(roomCode)) {
+  try {
+    // Stored but not joined: past what others can keep joined (dm.svelte.ts,
+    // MAX_DMS_JOINED_FOR_THEM). The batch handler takes nothing for a room
+    // not joined, so the blob waits in the mailbox until it is.
+    if (!_transport.rooms().includes(roomCode)) throw new Error("Conversation not joined");
+    await _handleSyncBatch(roomCode, messages, senderDid, live);
+  } finally {
+    // One made for this batch that kept nothing is undone, however the
+    // handler came out of it, and costs nothing (MAX_UNSOLICITED_DMS).
     if (!existed) await dropDmIfEmpty(roomCode);
-    throw new Error("Conversation not joined");
   }
-  await _handleSyncBatch(roomCode, messages, senderDid, live);
-  if (!existed) await dropDmIfEmpty(roomCode);
 }
 
 /**
@@ -3802,11 +3804,14 @@ async function _handleDmBatch(
     if (!(await _ensureDmForBatch(senderDid, guard))) return;
     created = true;
   }
-  await _handleSyncBatch(room, msg.messages, peerId, live, {
-    batchIndex: msg.batchIndex,
-    totalBatches: msg.totalBatches,
-  });
-  if (created) await dropDmIfEmpty(room);
+  try {
+    await _handleSyncBatch(room, msg.messages, peerId, live, {
+      batchIndex: msg.batchIndex,
+      totalBatches: msg.totalBatches,
+    });
+  } finally {
+    if (created) await dropDmIfEmpty(room);
+  }
   // The DM list orders and shows conversations by their last row, and only
   // the text path refreshed it: a card into a DM that was not on screen
   // left the list unaware of it. Live sends only: a history repair arrives
@@ -3831,6 +3836,12 @@ async function _handleDmBatch(
  * at a time - as often as they sent it, since a refused batch makes no
  * conversation and leaves the channel open. One row that passes is enough,
  * so the check stops there.
+ *
+ * A row the batch handler cannot even look at - not an object, or one
+ * whose signed form cannot be built - refuses the whole batch here, as
+ * nothing honest sends one: the handler throws on it, after the
+ * conversation was made, and a mailbox batch it throws on is kept and comes
+ * back on every collect.
  */
 async function _anyRowTakable(
   roomCode: string,
@@ -3839,6 +3850,7 @@ async function _anyRowTakable(
   live: boolean
 ): Promise<boolean> {
   if (!Array.isArray(rows) || rows.length > BATCH_SIZE * 4) return false;
+  if (!rows.every((m) => _rowReadable(m, roomCode))) return false;
   for (const m of rows) {
     try {
       const allowUnsigned = allowsUnsignedDmHistory(m, senderDid, live);
@@ -3848,6 +3860,17 @@ async function _anyRowTakable(
     }
   }
   return false;
+}
+
+/** Whether the batch handler can check this row without throwing. */
+function _rowReadable(row: unknown, roomCode: string): boolean {
+  if (row === null || typeof row !== "object") return false;
+  try {
+    canonicalContentV3({ ...(row as WireChatMessage), roomCode });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
