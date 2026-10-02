@@ -68,13 +68,17 @@ const PARKED_RE = /<(\d+)>/g;
 /**
  * Spans taken whole, leftmost first: a backslash escape, ```code```, `code`,
  * a masked link, a bare url, a mention token.
+ *
+ * A masked link's label holds no "[", so "[a [b](…)" links "b", as in
+ * CommonMark. A label that ran on across "[" made every "[" of a peer's run
+ * of them rescan the rest of the line for a "]": quadratic, on every render.
  */
 const SPAN_RE = new RegExp(
   [
     String.raw`\\([\\\x60*~_|>\[\]()#-])`,
     String.raw`\x60\x60\x60([^\n]+?)\x60\x60\x60`,
     String.raw`\x60([^\x60\n]+)\x60`,
-    String.raw`\[([^\]\n]+)\]\((https?:\/\/[^\s()<>"]+)\)`,
+    String.raw`\[([^[\]\n]+)\]\((https?:\/\/[^\s()<>"]+)\)`,
     String.raw`(https?:\/\/[^\s<>"]+)`,
     String.raw`(@\[[^[\]]+\])`,
   ].join("|"),

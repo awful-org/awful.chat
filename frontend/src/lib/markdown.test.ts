@@ -76,6 +76,25 @@ describe("inline markdown", () => {
     expect(plain("`C:\\Users\\_x`")).toBe("<code>C:\\Users\\_x</code>");
   });
 
+  it("stays linear on a run of brackets that never close", () => {
+    // A label once ran on across "[", so each "[" of a peer's run of them
+    // rescanned the rest of the line for a "]".
+    const started = performance.now();
+    for (const hostile of ["[".repeat(16384), "@[".repeat(8192), "[a".repeat(8192)]) {
+      renderMessageMarkdown(hostile, (d) => d);
+      stripMarkdown(hostile);
+      firstLinkedUrl(hostile);
+      linkTargets(hostile);
+    }
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  it("takes the innermost brackets as a link's label", () => {
+    expect(plain("[a [b](https://x.yz)")).toBe(
+      '[a <a href="https://x.yz" title="https://x.yz" target="_blank" rel="noopener noreferrer">b</a>',
+    );
+  });
+
   it("masks a link, http(s) only, showing where it goes on hover", () => {
     expect(plain("[the docs](https://example.com/a)")).toBe(
       '<a href="https://example.com/a" title="https://example.com/a" target="_blank" rel="noopener noreferrer">the docs</a>',
