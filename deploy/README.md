@@ -75,6 +75,13 @@ unsubscribing deletes the endpoint, and `PUSH_ENABLED=0` removes the surface
 entirely, at the cost of offline DMs never reaching a closed phone until the
 user opens it.
 
+The relay holds subscriptions for at most 65,536 identities. dids are free to
+make, so one address (an IPv4 address or IPv6 /56, and four times that per
+/48) may hold a sixty-fourth of them, and a full store drops the identity whose
+devices subscribed longest ago rather than refusing new ones. Every unlock of
+the app subscribes again, so that is the identity least in use, and it is back
+the next time one of its devices opens the app.
+
 ## Add a TURN server
 
 Best value per unit of effort, and the one a friend can host: a stock

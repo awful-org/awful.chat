@@ -24,6 +24,10 @@ package main
 // stays sealed in the mailbox blob the device collects once it is awake.
 
 import (
+	"container/list"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -31,6 +35,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -99,8 +104,20 @@ const (
 	// Boxes holding subscriptions. Subscribing needs a did signature, but
 	// dids are free to mint, so without a ceiling this is an unbounded
 	// on-disk sink for anyone with curl - the same reasoning as
-	// mailboxGlobalMaxBoxes.
+	// mailboxGlobalMaxBoxes. A full store sheds the box subscribed to
+	// longest ago rather than refusing (pushShedOldest).
 	pushMaxBoxes = 65536
+	// The part of pushMaxBoxes one source may hold: an IPv4 address or an
+	// IPv6 /56 (shareKey), and ipv6AggregateFactor times that for the /48
+	// around it, so one allocation's 256 /56s are not 256 shares. The
+	// ceiling used to be the only limit: one address minting dids filled the
+	// store in a day and a half, after which every identity that subscribed
+	// for the first time got 507 and no wake-ups, for good - a restart
+	// counted the same files back in. A sixty-fourth is a thousand
+	// identities behind one address, far past a household or an office, and
+	// it means shedding by age cannot be turned into a way to push real
+	// users out: a source over its share is refused before anything is shed.
+	pushMaxBoxesPerSource = pushMaxBoxes / 64
 )
 
 // pushPayload is the entire message. Byte-for-byte what the frontend's
@@ -145,6 +162,24 @@ var (
 	// keeps the ceiling check race-free.
 	pushMu    sync.Mutex
 	pushBoxes int
+
+	// pushOrder is every stored box, the one subscribed to longest ago at
+	// the front, and pushOrderAt finds a box in it. A device subscribes again
+	// on every unlock, so the front is the box whose devices have gone
+	// longest without opening the app - an abandoned identity, or a minted
+	// one - and that is what a full store sheds. Rebuilt from file times at
+	// boot. Guarded by pushMu.
+	pushOrder   = list.New()
+	pushOrderAt = map[string]*list.Element{}
+	// pushHeld is how many boxes each source created and still holds, for
+	// pushMaxBoxesPerSource. Memory only, keyed by a hash under the
+	// mailbox's per-process key, never an address: a restart forgets it,
+	// which only means boxes from before the restart count against nobody.
+	// Guarded by pushMu.
+	pushHeld = map[string]int{}
+	// When a full store last said so, so shedding writes a line an hour at
+	// most. Guarded by pushMu.
+	pushFullLogged time.Time
 
 	pushVapidMu     sync.Mutex
 	pushVapidCached *vapidKeys
@@ -415,8 +450,11 @@ func readPushBox(box string) (map[string]pushSubscription, bool) {
 // unsubscribed identity leaves nothing behind. Caller holds pushMu.
 func writePushBox(box string, devices map[string]pushSubscription, existed bool) error {
 	if len(devices) == 0 {
-		if existed && os.Remove(pushBoxPath(box)) == nil && pushBoxes > 0 {
-			pushBoxes--
+		if existed && os.Remove(pushBoxPath(box)) == nil {
+			if pushBoxes > 0 {
+				pushBoxes--
+			}
+			pushUntrack(box)
 		}
 		return nil
 	}
@@ -437,17 +475,146 @@ func writePushBox(box string, devices map[string]pushSubscription, existed bool)
 }
 
 // pushInitCount counts the boxes already on disk, so the ceiling survives a
-// restart. Runs once at boot, like mailboxInitUsedBytes.
+// restart, and lines them up oldest file first, so shedding does too. Runs
+// once at boot, like mailboxInitUsedBytes. The shares start empty.
 func pushInitCount() {
 	pushMu.Lock()
 	defer pushMu.Unlock()
 	pushBoxes = 0
+	pushOrder.Init()
+	pushOrderAt = map[string]*list.Element{}
+	pushHeld = map[string]int{}
+	type stored struct {
+		box string
+		mod time.Time
+	}
+	var boxes []stored
 	entries, _ := os.ReadDir(pushDir)
 	for _, e := range entries {
-		if !e.IsDir() {
-			pushBoxes++
+		box, ok := strings.CutSuffix(e.Name(), ".json")
+		if e.IsDir() || !ok || !mailboxBoxRe.MatchString(box) {
+			continue
+		}
+		s := stored{box: box}
+		if info, err := e.Info(); err == nil {
+			s.mod = info.ModTime()
+		}
+		boxes = append(boxes, s)
+	}
+	sort.Slice(boxes, func(i, j int) bool {
+		if boxes[i].mod.Equal(boxes[j].mod) {
+			return boxes[i].box < boxes[j].box
+		}
+		return boxes[i].mod.Before(boxes[j].mod)
+	})
+	for _, s := range boxes {
+		pushOrderAt[s.box] = pushOrder.PushBack(&pushStoredBox{box: s.box})
+	}
+	pushBoxes = len(boxes)
+}
+
+// pushStoredBox is one entry of pushOrder: the box and the share tags its
+// creation was charged to, empty for a box no share holds.
+type pushStoredBox struct {
+	box     string
+	sources []string
+}
+
+// pushSourceTags names the shares a subscribe from r is charged to: the
+// source's own (an IPv4 address or IPv6 /56) and, for IPv6, its /48. None
+// for a proxy-class address, which is everybody behind it (exemptFromShares).
+// Keyed hashes, like mailboxSourceTag, so the store's bookkeeping never
+// holds an address.
+func pushSourceTags(r *http.Request) []string {
+	addr := clientAddr(r)
+	own := shareKey(addr)
+	if own == "" {
+		return nil
+	}
+	keys := []string{own}
+	if _, agg := clientBuckets(addr); agg != "" {
+		keys = append(keys, agg)
+	}
+	tags := make([]string, len(keys))
+	for i, k := range keys {
+		m := hmac.New(sha256.New, mailboxSourceKey)
+		m.Write([]byte("push:" + k))
+		tags[i] = hex.EncodeToString(m.Sum(nil)[:12])
+	}
+	return tags
+}
+
+// pushShareFull reports whether a source already holds its share of boxes:
+// pushMaxBoxesPerSource for its own tag, ipv6AggregateFactor times that for
+// its /48's. Caller holds pushMu.
+func pushShareFull(sources []string) bool {
+	for i, s := range sources {
+		limit := pushMaxBoxesPerSource
+		if i > 0 {
+			limit *= ipv6AggregateFactor
+		}
+		if pushHeld[s] >= limit {
+			return true
 		}
 	}
+	return false
+}
+
+// pushTrack records a subscribe to box: it moves to the back of pushOrder,
+// and a box being created is charged to sources. Caller holds pushMu.
+func pushTrack(box string, sources []string, created bool) {
+	if el, ok := pushOrderAt[box]; ok {
+		pushOrder.MoveToBack(el)
+		return
+	}
+	entry := &pushStoredBox{box: box}
+	if created {
+		entry.sources = sources
+		for _, s := range sources {
+			pushHeld[s]++
+		}
+	}
+	pushOrderAt[box] = pushOrder.PushBack(entry)
+}
+
+// pushUntrack forgets a box whose file is gone and returns its share.
+// Caller holds pushMu.
+func pushUntrack(box string) {
+	el, ok := pushOrderAt[box]
+	if !ok {
+		return
+	}
+	delete(pushOrderAt, box)
+	entry := pushOrder.Remove(el).(*pushStoredBox)
+	for _, s := range entry.sources {
+		if pushHeld[s]--; pushHeld[s] <= 0 {
+			delete(pushHeld, s)
+		}
+	}
+}
+
+// pushShedOldest makes room in a full store by deleting the box subscribed
+// to longest ago, and reports whether it freed one. That box's devices stop
+// being woken until one of them opens the app again, which subscribes
+// afresh. Caller holds pushMu.
+func pushShedOldest() bool {
+	el := pushOrder.Front()
+	if el == nil {
+		return false
+	}
+	box := el.Value.(*pushStoredBox).box
+	if err := os.Remove(pushBoxPath(box)); err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	pushUntrack(box)
+	if pushBoxes > 0 {
+		pushBoxes--
+	}
+	if now := time.Now(); now.Sub(pushFullLogged) >= time.Hour {
+		pushFullLogged = now
+		log.Printf("[push] the subscription store is full (%d boxes): each new one replaces the box subscribed to longest ago", pushMaxBoxes)
+	}
+	return true
 }
 
 // pushRemoveDevices drops subscriptions a push service has told us are dead.
@@ -723,12 +890,23 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sources := pushSourceTags(r)
 	pushMu.Lock()
 	subs, existed := readPushBox(box)
-	if !existed && pushBoxes >= pushMaxBoxes {
-		pushMu.Unlock()
-		http.Error(w, "push full", http.StatusInsufficientStorage)
-		return
+	if !existed {
+		// A new box costs its source a slot of its share, checked before
+		// anything is shed: a source past its share must not be able to
+		// push somebody else's box out by asking for one more.
+		if pushShareFull(sources) {
+			pushMu.Unlock()
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		if pushBoxes >= pushMaxBoxes && !pushShedOldest() {
+			pushMu.Unlock()
+			http.Error(w, "push full", http.StatusInsufficientStorage)
+			return
+		}
 	}
 	if _, replacing := subs[req.Device]; !replacing && len(subs) >= pushMaxDevices {
 		// Oldest out first, so a user cycling through devices keeps the ones
@@ -748,6 +926,9 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		Ts:       time.Now().Unix(),
 	}
 	err = writePushBox(box, subs, existed)
+	if err == nil {
+		pushTrack(box, sources, !existed)
+	}
 	pushMu.Unlock()
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)

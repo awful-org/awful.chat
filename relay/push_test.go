@@ -19,7 +19,8 @@ import (
 
 // pushTestSetup points the whole surface at temp directories and empties the
 // process-wide state these tests would otherwise inherit from each other:
-// the queue, the coalescing map, the box counter and the cached VAPID pair.
+// the queue, the coalescing map, the box counter, the shedding order and
+// shares, and the cached VAPID pair.
 func pushTestSetup(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -31,9 +32,9 @@ func pushTestSetup(t *testing.T) {
 	pushVapidMu.Lock()
 	pushVapidCached = nil
 	pushVapidMu.Unlock()
-	pushMu.Lock()
-	pushBoxes = 0
-	pushMu.Unlock()
+	// The directory does not exist yet, so this empties the counter, the
+	// shedding order and the shares.
+	pushInitCount()
 	pushSentMu.Lock()
 	pushLastSent = map[string]time.Time{}
 	pushLastSwep = time.Time{}
