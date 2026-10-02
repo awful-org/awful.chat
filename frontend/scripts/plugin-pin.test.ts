@@ -2,53 +2,10 @@ import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 // @ts-expect-error - plain .mjs, no types
 import { refKind, tarballCommit } from "./plugin-pin.mjs";
+import { header, padded, record, tarball } from "./tar-fixture";
 
 const SHA = "b8d8061f4b28fbe374dadfbacce7ae6b47a45d87";
 const OTHER = "9e806dc5" + "0".repeat(32);
-
-/** One ustar header block, as git archive writes them. */
-function header(name: string, typeflag: string, size: number): Buffer {
-  const block = Buffer.alloc(512);
-  block.write(name, 0, "latin1");
-  block.write("0000666\0", 100, "latin1");
-  block.write("0000000\0", 108, "latin1");
-  block.write("0000000\0", 116, "latin1");
-  block.write(size.toString(8).padStart(11, "0") + "\0", 124, "latin1");
-  block.write("00000000000\0", 136, "latin1");
-  block.write("        ", 148, "latin1");
-  block.write(typeflag, 156, "latin1");
-  block.write("ustar\0" + "00", 257, "latin1");
-  let sum = 0;
-  for (const b of block) sum += b;
-  block.write(sum.toString(8).padStart(6, "0") + "\0 ", 148, "latin1");
-  return block;
-}
-
-function padded(body: Buffer): Buffer {
-  return Buffer.concat([body, Buffer.alloc((512 - (body.length % 512)) % 512)]);
-}
-
-/** A pax record: its length counts itself, in bytes. */
-function record(key: string, value: string): string {
-  const rest = ` ${key}=${value}\n`;
-  const bytes = Buffer.byteLength(rest);
-  let length = bytes + 1;
-  while (String(length).length + bytes !== length) length += 1;
-  return `${length}${rest}`;
-}
-
-/** A codeload-shaped tarball: pax global header (unless null), one file. */
-function tarball(paxRecords: string | null): Buffer {
-  const file = Buffer.from('export const manifest = { id: "dice" };\n');
-  const parts: Buffer[] = [];
-  if (paxRecords !== null) {
-    const body = Buffer.from(paxRecords);
-    parts.push(header("pax_global_header", "g", body.length), padded(body));
-  }
-  parts.push(header("dice-ref/manifest.ts", "0", file.length), padded(file));
-  parts.push(Buffer.alloc(1024));
-  return gzipSync(Buffer.concat(parts));
-}
 
 describe("what a ref pins", () => {
   it("takes only a whole commit sha as a pin", () => {
@@ -61,11 +18,15 @@ describe("what a ref pins", () => {
   it("does not take an abbreviated sha for one", () => {
     expect(refKind("d00d9db", true)).toBe("short-sha");
     expect(refKind(SHA.slice(0, 39), true)).toBe("short-sha");
+    // git resolves an abbreviation from 4 characters, so the rule starts there.
+    expect(refKind("d00d", true)).toBe("short-sha");
+    expect(refKind("2024", true)).toBe("short-sha");
   });
 
   it("tells tags, branches and a missing ref apart", () => {
     expect(refKind("v1.2", true)).toBe("name");
     expect(refKind("main", true)).toBe("name");
+    expect(refKind("d00d9dbz", true)).toBe("name");
     // Too short to be anyone's abbreviation: just a name.
     expect(refKind("abc", true)).toBe("name");
     expect(refKind("HEAD", false)).toBe("none");

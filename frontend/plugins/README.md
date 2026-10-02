@@ -846,9 +846,11 @@ PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
   (`user/repo@<commit-sha>`): the build then checks that the tarball GitHub
   sends is that commit, and refuses it otherwise. An abbreviated sha fails
   the build too, because it pins nothing - git resolves a branch or tag of
-  the same name first. Set `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to opt in to
-  either anyway. Every fetched source logs the commit its tarball names and
-  the tarball's sha256, so you can confirm two fetches pulled the same bytes.
+  the same name first. So does a tag or branch named in hex alone, 4 to 39
+  characters (`2024`), which cannot be told from an abbreviation. Set
+  `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to build any of these anyway. Every
+  fetched source logs the commit its tarball names and the tarball's
+  sha256, so you can confirm two fetches pulled the same bytes.
 - Trust: a fetched plugin runs with the same trust as the app itself, in
   every user's browser, unsandboxed. Only list sources you trust like your
   own code.

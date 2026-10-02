@@ -6,15 +6,19 @@ import { constants, gunzipSync } from "node:zlib";
 
 /** A whole commit sha: the only ref git always reads as an object name. */
 const FULL_SHA = /^[0-9a-f]{40}$/i;
-/** Hex short of a whole sha: what an abbreviated commit looks like. */
-const SHORT_SHA = /^[0-9a-f]{7,39}$/i;
+/**
+ * Hex short of a whole sha: what an abbreviated commit looks like. From 4
+ * characters, the shortest abbreviation git resolves.
+ */
+const SHORT_SHA = /^[0-9a-f]{4,39}$/i;
 
 /**
  * "sha" for a whole commit sha - the only pin. "short-sha" for an
  * abbreviation, which is not one: git resolves a branch or tag of the same
  * name before it, and a repo recreated under the same name can grow a new
- * commit sharing the prefix in seconds. "name" for a tag or branch, "none"
- * when the source names no ref at all.
+ * commit sharing the prefix in seconds. A tag or branch named in hex alone
+ * ("2024") is taken for one too: from the name, nothing tells them apart.
+ * "name" for any other tag or branch, "none" when the source names no ref.
  *
  * @param {string} ref
  * @param {boolean} hasRef

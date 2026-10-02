@@ -219,9 +219,9 @@ async function materialize(source, tmp) {
   }
   if (kind === "short-sha") {
     console.error(
-      `[fetch-plugins] WARNING: ${spec}@${ref} is an abbreviated commit sha, ` +
-        `which pins nothing: a branch or tag of that name, or a new commit ` +
-        `sharing the prefix, is fetched in its place.`
+      `[fetch-plugins] WARNING: ${spec}@${ref} reads as an abbreviated commit ` +
+        `sha, which pins nothing: a branch or tag of that name, or a new ` +
+        `commit sharing the prefix, is fetched in its place.`
     );
     if (process.env.PLUGIN_SOURCES_ALLOW_UNPINNED !== "1") {
       fail(

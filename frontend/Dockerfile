@@ -27,7 +27,8 @@ COPY frontend/ .
 # Comma/space separated plugin sources (github urls, user/repo[@ref]) fetched
 # into plugins/ before the build - see plugins/README.md. Empty = built-ins only.
 ARG PLUGIN_SOURCES
-# Set to 1 to let an unpinned source (no #ref) through fetch-plugins.
+# Set to 1 to let an unpinned source (no ref, or an abbreviated sha rather
+# than the whole 40-character one) through fetch-plugins.
 ARG PLUGIN_SOURCES_ALLOW_UNPINNED
 
 ENV PLUGIN_SOURCES=$PLUGIN_SOURCES
