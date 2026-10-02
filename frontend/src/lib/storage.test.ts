@@ -14,6 +14,7 @@ import {
   senderMaxLamports,
   getMessagesAboveWatermarks,
   commitWatermark,
+  heldWatermarks,
   holdWatermarks,
   releaseWatermarks,
   watermarksHeld,
@@ -239,15 +240,26 @@ describe("watermarks", () => {
     await setWatermark("room-a", "alice", 7);
     await setWatermark("room-a", "alice", 5);
     await setWatermark("room-b", "bob", 3);
-    expect(await getWatermark("room-a", "alice")).toBe(0);
+    // Not written, so no digest advertises it yet.
+    expect(await getWatermarksForRoom("room-a")).toEqual({});
     expect(await getWatermark("room-b", "bob")).toBe(3);
     // A completed push's own claim is proved, so it does not wait.
     await commitWatermark("room-a", "carol", 4);
-    expect(await getWatermark("room-a", "carol")).toBe(4);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ carol: 4 });
     await releaseWatermarks("room-a");
     expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 7, carol: 4 });
     await setWatermark("room-a", "alice", 9);
     expect(await getWatermark("room-a", "alice")).toBe(9);
+  });
+
+  it("reads how far a sender reached, an advance still waiting on a hold included", async () => {
+    await setWatermark("room-a", "alice", 5);
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    // The row behind 7 is stored: a deleted DM's floor must cover it.
+    expect(await getWatermark("room-a", "alice")).toBe(7);
+    expect(heldWatermarks("room-a")).toEqual(new Map([["alice", 7]]));
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 5 });
   });
 
   it("forgets what waited when the room's history is deleted", async () => {

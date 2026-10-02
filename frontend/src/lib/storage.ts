@@ -2814,10 +2814,21 @@ export function getDeletedFloor(roomCode: string, senderId: string): Promise<num
   return getWatermark(DELETED_FLOOR + roomCode, senderId);
 }
 
+/**
+ * How far this sender's side of the room reached: the saved watermark, or an
+ * advance a held room is still waiting to write, whichever is higher - that
+ * row is stored all the same. A deleted DM's floor is read through this, and
+ * read from the saved row alone it left out every message that arrived while
+ * the conversation was held, which a relay replaying acked blobs could then
+ * bring back. Digests advertise getWatermarksForRoom, which leaves those
+ * advances out until the hold ends.
+ */
 export async function getWatermark(
   roomCode: string,
   senderId: string
 ): Promise<number> {
+  // Before the read: a release meanwhile writes this value, never loses it.
+  const held = _watermarkHolds.get(roomCode)?.get(senderId) ?? 0;
   const database = await getDB();
   const id = watermarkId(roomCode, senderId);
   const blindedId = await blindValue(id);
@@ -2829,7 +2840,7 @@ export async function getWatermark(
     // be looked up. This is intentional and safe.
     record = await database.get("watermarks", id as Blinded);
   }
-  return record?.maxLamport ?? 0;
+  return Math.max(record?.maxLamport ?? 0, held);
 }
 
 /**
