@@ -2,9 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { publicKeyToDid, type UnlockedSession } from "$lib/identity/identity";
 
-// What the transport only does in a browser, like the repair tick. A
-// stand-in window makes the module set it up, and only setInterval is faked,
-// so storage still runs on its own timers.
+// What the transport only does in a browser: the repair tick and the resync
+// on coming back online. A stand-in window makes the module set both up, and
+// only setInterval is faked, so storage still runs on its own timers.
 const s = vi.hoisted(() => {
   (globalThis as { window?: unknown }).window = new EventTarget();
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
@@ -76,8 +76,9 @@ vi.mock("./mailbox.svelte", () => ({
 }));
 
 import { transportState } from "./transport.svelte";
-import { encode } from "$lib/utils";
+import { decode, encode } from "$lib/utils";
 import { MessageType } from "$lib/types/message";
+import { hashDmRoomCode } from "./dm-codec";
 
 function identity(): UnlockedSession {
   const privateKey = crypto.getRandomValues(new Uint8Array(32));
@@ -121,5 +122,21 @@ describe("a call member whose presence lapses leaves its audience (G01.2)", () =
     }
     expect(transportState.callPeerRooms.has("12D3-member")).toBe(false);
     expect(viewersOf(SELF)).toEqual([]);
+  });
+});
+
+describe("coming back to the app sends no join over a DM (G01.1)", () => {
+  const joins = () =>
+    s.broadcasts.filter((b) => (decode(b.data) as { type?: string })?.type === MessageType.JoinRoom);
+
+  it("with a DM open, and still for a room", async () => {
+    const dm = await hashDmRoomCode(s.session!.did, identity().did);
+    Object.assign(transportState, { roomCode: dm, chatMode: "dm" });
+    window.dispatchEvent(new Event("online"));
+    expect(joins()).toEqual([]);
+
+    Object.assign(transportState, { roomCode: "rd2_room", chatMode: "room" });
+    window.dispatchEvent(new Event("online"));
+    expect(joins().map((b) => b.room)).toEqual(["rd2_room"]);
   });
 });

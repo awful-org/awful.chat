@@ -3165,6 +3165,10 @@ function _broadcastJoinRoom(): void {
   const selfDid = identityStore.did ?? _transport.selfId();
   const roomCode = transportState.roomCode;
   if (!selfDid || !roomCode) return;
+  // A DM has no roster to join (see _handleJoinRoom), and coming back to the
+  // app with one open still sent this over it: an older build answers a join
+  // with whatever roster it has on screen.
+  if (roomCode.startsWith("dm-")) return;
   _transport.broadcast(
     encode({ type: MessageType.JoinRoom, peerId: selfDid }),
     roomCode
