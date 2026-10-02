@@ -1231,13 +1231,14 @@ function _joinProvisionally(
  * Join the saved DMs at connect, on the other side's account (see
  * MAX_DMS_JOINED_FOR_THEM): the ones somebody wrote in, those the user read
  * last first, at most SAVED_DMS_JOINED_AT_CONNECT - and, on the user's,
- * any the user opened or wrote in this session. Joining every stored DM
- * gave whoever could get DMs stored with us the conversation bindings, at
- * every start: the empty ones an older build made for introductions alone,
- * and the ones a room member's minted identities pile up session after
- * session. One left out is joined when the user opens it, or when the other
- * side writes or introduces themselves while there is room. Contacts are
- * joined by joinPhonebookDmRooms whatever they hold, requests not at all.
+ * any the user opened or wrote in this session, whatever it holds. Joining
+ * every stored DM gave whoever could get DMs stored with us the
+ * conversation bindings, at every start: the empty ones an older build made
+ * for introductions alone, and the ones a room member's minted identities
+ * pile up session after session. One left out is joined when the user opens
+ * it, or when the other side writes or introduces themselves while there is
+ * room. Contacts are joined by joinPhonebookDmRooms whatever they hold,
+ * requests not at all.
  */
 export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
   const session = requireSession();
@@ -1261,12 +1262,15 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
   const theirs = _joinedForThem(session);
   let joined = 0;
   for (const [i, room] of saved.entries()) {
-    if (!written[i]) continue;
     const roomCode = room.roomCode;
     // One the user opened or wrote in this session is theirs, and comes back
-    // joined whatever others hold - after another tab held the node, say.
+    // joined whatever others hold - after another tab held the node, say -
+    // empty or not. Left out while empty, it was joined again only through
+    // the bounded way an introduction takes, where later ones could evict
+    // it while the user had it open.
     const mine = _reachedOutTo(room.participantDid);
     if (!mine) {
+      if (!written[i]) continue;
       if (joined >= SAVED_DMS_JOINED_AT_CONNECT) continue;
       // Joined on the user's account already.
       if (

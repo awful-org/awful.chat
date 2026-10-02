@@ -654,9 +654,11 @@ describe("an introduction alone makes no DM (S08.1)", () => {
 
   it("joins at connect only the saved DMs somebody wrote in", async () => {
     const spoken = identity().did, silent = identity().did;
-    await ensureDmRoomForPeer(spoken);
-    await deliverMailboxDm(spoken, chat(spoken));
-    await ensureDmRoomForPeer(silent);
+    // Both stored by an earlier session, neither opened in this one: one the
+    // user opens is joined at connect whatever it holds.
+    await savedDm(spoken);
+    await putRoom({ roomCode: await code(silent), type: "dm", name: "", lastSeenLamport: 0, createdAt: 1,
+      participants: [silent], participantLastSeen: {}, participantDid: silent, request: false } as DMRoom);
     s.bound.clear(); s.joined.clear();
     await connect();
     await vi.waitFor(async () => expect(s.bound.has(await code(spoken))).toBe(true));

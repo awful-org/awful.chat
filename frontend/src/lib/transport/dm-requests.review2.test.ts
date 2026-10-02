@@ -109,11 +109,18 @@ vi.mock("$lib/rooms.svelte", async (original) => {
 
 import {
   _peerIdToDid,
+  connect,
   deliverMailboxBatch,
   deliverMailboxDm,
+  disconnectTransport,
   transportState,
 } from "./transport.svelte";
-import { MAX_DMS_JOINED_FOR_THEM, MAX_UNSOLICITED_DMS, ensureDmRoomForPeer } from "./dm.svelte";
+import {
+  MAX_DMS_JOINED_FOR_THEM,
+  MAX_UNSOLICITED_DMS,
+  ensureDmRoomForPeer,
+  openDmConversation,
+} from "./dm.svelte";
 import {
   getDMRooms,
   getLastMessage,
@@ -155,6 +162,7 @@ function chat(from: string, text = "hello", extra: Partial<DmPayload> = {}): DmP
 }
 
 const code = (did: string) => hashDmRoomCode(s.session!.did, did);
+const settled = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 beforeEach(async () => {
   notifyIdentityLock();
@@ -341,4 +349,25 @@ describe("a mailbox batch for a DM that cannot be joined", () => {
     expect(await getMessage(card.id)).toBeDefined();
     expect(refreshDmRooms).not.toHaveBeenCalled();
   });
+});
+
+// 6034075: "Connecting now joins any DM the user opened or wrote in this
+// session on the user's account". joinSavedDms skipped every DM with nothing
+// in it before it looked at whether the user opened it.
+describe("a DM the user opened comes back joined after another tab held the node", () => {
+  it("also when nothing has been said in it yet", async () => {
+    const friend = identity().did;
+    const room = await code(friend);
+    expect(await openDmConversation(friend)).toBe(true);
+    expect(s.joined.has(room)).toBe(true);
+    // Another tab takes the node and hands it back: every conversation is left.
+    s.joined.clear();
+    transportState.relayConnected = false;
+    await connect();
+    await settled();
+    await settled();
+    expect(await getRoom(room)).toBeDefined();
+    expect(s.joined.has(room)).toBe(true);
+    disconnectTransport();
+  }, 30_000);
 });
