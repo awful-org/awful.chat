@@ -158,6 +158,12 @@ describe("inline markdown", () => {
       "paypal\ua4f8com",
       "paypal\ufe52com",
       "paypal\u0660com",
+      "paypal\uabeccom",
+      "paypal\u{1ecae}com",
+      // An Arabic-Indic zero beside just one digit that passes for a letter.
+      "paypa\u0661\u0660com",
+      "paypa\u06f1\u06f0com",
+      "wikipedia\u0660\u0665rg",
       "\uff50\uff41\uff59\uff50\uff41\uff4c\uff0e\uff43\uff4f\uff4d",
       "\u{1D429}\u{1D41A}\u{1D432}\u{1D429}\u{1D41A}\u{1D425}.\u{1D41C}\u{1D428}\u{1D426}",
       // A whole url, split where it cannot be seen.
@@ -256,6 +262,9 @@ describe("inline markdown", () => {
       // A year in Arabic-Indic digits, whose zero is drawn as a dot.
       "\u062a\u0642\u0631\u064a\u0631 \u0662\u0660\u0662\u0664",
       "\u06af\u0632\u0627\u0631\u0634 \u06f2\u06f0\u06f2\u06f4",
+      "\u0633\u0646\u0629 \u0662\u0660\u0662\u0660",
+      // Meetei Mayek's heavy tone mark, on a Meetei syllable.
+      "\uabc3\uabe4\uabc7\uabe9\uabec\uabc2\uabe3\uabdf",
       "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 photos",
       "e.g. this one",
       "v1.2 notes",

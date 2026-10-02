@@ -115,12 +115,15 @@ const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
  */
 const UNSEEN_RE = /[\p{Default_Ignorable_Code_Point}\u2006\u2008-\u200A\u202F*~_|\x60\\]/gu;
 /**
- * A full stop, or what Unicode's confusables list says draws as one. The
- * Arabic-Indic zeros only on their own: beside another such digit they are
- * part of a number, and a label holding the year 2024 is no address.
+ * A full stop, or what Unicode's confusables list says draws as one. An
+ * Arabic-Indic zero only outside a number: between two such digits it is
+ * part of one, and a label holding the year 2024 is no address, but beside
+ * just one it is a dot, since one of them passes for an l and five for an
+ * o. The Meetei Mayek heavy tone mark only where it marks no Meetei
+ * syllable.
  */
 const DOT_LIKE_RE =
-  /[\u0701\u0702\u3002\uA4F8\uA60E\u{10A50}\u{1D16D}]|(?<![\u0660-\u0669\u06F0-\u06F9])[\u0660\u06F0](?![\u0660-\u0669\u06F0-\u06F9])/gu;
+  /[\u0701\u0702\u3002\uA4F8\uA60E\u{10A50}\u{1D16D}\u{1ECAE}]|(?<!\p{Script=Meetei_Mayek})\uABEC|(?<![\u0660-\u0669\u06F0-\u06F9])[\u0660\u06F0]|[\u0660\u06F0](?![\u0660-\u0669\u06F0-\u06F9])/gu;
 const MARK_RE = /\p{M}/gu;
 /**
  * By script extension, so the marks Japanese shares between its scripts
