@@ -186,6 +186,7 @@ import {
   ensureDmRoomForPeer,
   isDmRequestRoom,
   joinSavedDms,
+  knownDmName,
   offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
@@ -3237,8 +3238,9 @@ function _announceMessage(
       if (room?.type !== "dm" || (room as DMRoom).request === true) return;
       // Titled as the conversation is: by the name their proven profile
       // gave, never the frame's senderName, which is unsigned and theirs to
-      // pick per message.
-      _announce({ ...msg, senderName: resolveDmDisplayName(msg.senderId) }, opts);
+      // pick per message. With no name known, a generic title as for an
+      // unnamed room: the stand-in was "did:key:z6Mk" for everybody.
+      _announce({ ...msg, senderName: knownDmName(msg.senderId) ?? "New message" }, opts);
     })
     .catch(() => {});
 }

@@ -378,6 +378,15 @@ describe("a message request makes no sound until accepted (S08.2)", () => {
     await vi.waitFor(() => expect(s.announce).toHaveBeenCalledOnce());
     expect(s.announce.mock.calls[0][0]).toMatchObject({ senderName: "Bob", senderId: who.did });
   });
+
+  it("titles a DM whose sender's name it does not know plainly, not by a DID's first letters", async () => {
+    const { who, device, code } = await dmPeer();
+    await ensureDmRoomForPeer(who.did);
+    transportState.peerNames = new Map();
+    receive(device, signedWire(who, code, { senderName: "Your Bank" }), code);
+    await vi.waitFor(() => expect(s.announce).toHaveBeenCalledOnce());
+    expect(s.announce.mock.calls[0][0]).toMatchObject({ senderName: "New message", senderId: who.did });
+  });
 });
 
 describe("a message request sends no receipts until accepted (S08.5)", () => {

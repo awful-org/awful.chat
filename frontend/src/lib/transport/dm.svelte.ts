@@ -835,6 +835,16 @@ async function _flushQueuedDmForPeer(peerId: string): Promise<void> {
  * fragment as the sender's name.
  */
 export function resolveDmDisplayName(peerId: string): string {
+  return knownDmName(peerId) ?? peerId.slice(0, 12);
+}
+
+/**
+ * The name we know the other side of a DM by - their proven profile's, or
+ * the nickname we saved for them - or null when we know none. A DID's first
+ * characters are "did:key:z6Mk" for everyone, so where a stand-in would be
+ * read as a name (a notification's title), the caller picks its own.
+ */
+export function knownDmName(peerId: string): string | null {
   const did = _peerIdToDid.get(peerId);
   const names = transportState.peerNames;
   const named = (did ? names.get(did) : undefined) ?? names.get(peerId);
@@ -844,8 +854,7 @@ export function resolveDmDisplayName(peerId: string): string {
   const entry = roomsStore.phonebook.find(
     (e) => e.peerId === peerId || e.did === peerId || (!!did && e.did === did)
   );
-  if (entry?.nickname) return entry.nickname;
-  return peerId.slice(0, 12);
+  return entry?.nickname || null;
 }
 
 /**
