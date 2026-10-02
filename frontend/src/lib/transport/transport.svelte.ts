@@ -104,6 +104,7 @@ import { LiveUpdateAdmission } from "../room-security/live-updates";
 const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
 import { warmWorkletWhenIdle } from "../audio/worklet-warmup";
+import { configSettled } from "../runtime-config";
 import { requireSession, onIdentityLock } from "../identity/identity";
 import { pqKeyCertificate, type PqKeyCertificate } from "../identity/pq-identity";
 import {
@@ -4345,6 +4346,10 @@ export async function connect() {
       // An ephemeral session has a peerId of its own, so it neither needs the
       // seat nor may take it from the tab running the user's account.
       if (!_ephemeralSession) await acquireNodeLock(_nodeLockEvents);
+      // A launch from the saved configuration may still be reading the
+      // served one, and the node keeps the relay it starts with: give that
+      // read a second, or a moved relay is dialled where it used to be.
+      await configSettled(1000);
       // This device's own libp2p key, NOT the identity key: two devices on the
       // same account would otherwise share a peerId and never connect.
       await _transport.connect(

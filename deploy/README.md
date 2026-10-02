@@ -176,6 +176,14 @@ a service worker update prompt, because nothing about the list is in the
 bundle. Still, change it when the instance is quiet, and leave a removed SFU
 running until you are confident every client has reloaded.
 
+The relay's address (`VITE_RELAY_MULTIADDR`, which changes when the relay
+moves or gets a new key) is read the same way, and a session keeps the relay
+it connected to. A launch gives its read of `/config.json` up to a second
+before it connects, so it normally dials the new address; on a slower link it
+dials the one in the copy it kept and moves over only if that one does not
+answer. While the old relay is still up, those sessions stay on it, apart
+from everyone else, until they reload.
+
 ### What this does and does not do
 
 It places rooms; it does not balance load. A room lives entirely on one SFU

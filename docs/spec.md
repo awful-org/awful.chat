@@ -1039,8 +1039,11 @@ Service Worker: /sw.js. Precaches the shell and hashed assets (not the
   background; /config.json is never cached by the worker or the HTTP cache.
   The app keeps the last copy it read in localStorage and a later launch
   starts from it, applying the fresh read when it lands, so only a first
-  launch waits on the network for it. registerType "prompt": a new
-  build waits until the user accepts the reload.
+  launch waits on the network for it - and a launch of /qs or /qc, which
+  exist only if the fresh read says so. The transport gives a read still
+  in flight up to a second before it connects: the relay it dials is kept
+  for the session. registerType "prompt": a new build waits until the user
+  accepts the reload.
 Startup: the entry bundle is the landing page. /app and /r/ first show the
   setup or unlock screen from a chunk of their own and fetch the app behind
   it in idle time (not under Save-Data); the app mounts at the first unlock

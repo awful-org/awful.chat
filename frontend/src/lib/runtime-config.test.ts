@@ -208,9 +208,48 @@ describe("a launch that has been configured before", () => {
     const m = await load(respond(JSON.stringify({ apiUrl: "https://fresh.example" })));
     expect((await m.loadRuntimeConfig()).apiUrl).toBe("https://fresh.example");
   });
+
+  // The node keeps the relay it starts with for the whole session, so
+  // connect() gives a read under way a moment: started from a copy older
+  // than a move of the relay, it would dial where the relay used to be.
+  it("lets a connection wait for the read under way, but only as long as asked", async () => {
+    storage();
+    const OLD = "/dns4/old.example/tcp/443/wss/p2p/12D3KooA";
+    const NEW = "/dns4/new.example/tcp/443/wss/p2p/12D3KooB";
+    const first = await load(respond(JSON.stringify({ relayMultiaddr: OLD })));
+    await first.loadRuntimeConfig();
+
+    let answer!: (r: Response) => void;
+    const m = await load((() => new Promise<Response>((r) => (answer = r))) as unknown as typeof fetch);
+    await m.loadRuntimeConfig();
+    expect(m.relayMultiaddr()).toBe(OLD);
+    const dialled = m.configSettled(5_000).then(() => m.relayMultiaddr());
+    answer(new Response(JSON.stringify({ relayMultiaddr: NEW }), {
+      headers: { "content-type": "application/json" },
+    }));
+    expect(await dialled).toBe(NEW);
+
+    // A read that never answers holds the connection up for the limit only.
+    const stuck = await load(stalled);
+    await stuck.loadRuntimeConfig();
+    const t0 = Date.now();
+    await stuck.configSettled(50);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(stuck.relayMultiaddr()).toBe(NEW);
+  });
+
+  it("does not hold a connection up when nothing is being read", async () => {
+    const m = await load(respond(JSON.stringify({ apiUrl: "https://relay.example" })));
+    await m.loadRuntimeConfig();
+    const waited = await Promise.race([
+      m.configSettled(60_000).then(() => "settled"),
+      new Promise((r) => setTimeout(() => r("held up"), 50)),
+    ]);
+    expect(waited).toBe("settled");
+  });
 });
 
-describe("a first launch whose load failed", () => {
+describe("a launch whose read of the file failed", () => {
   /** window and document as event targets, so retries can be fired. */
   function page() {
     const win = new EventTarget();
@@ -251,6 +290,28 @@ describe("a first launch whose load failed", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(calls.count).toBe(3);
     expect(m.isConfigured()).toBe(true);
+    expect(m.apiUrl()).toBe("https://back.example");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(calls.count).toBe(3);
+  });
+
+  // The saved copy can be out of date - the relay moved since - and the read
+  // meant to correct it can fail at launch; "online" may never come.
+  it("keeps trying on a timer while it runs on a saved copy it could not refresh", async () => {
+    page();
+    storage();
+    const first = await load(respond(JSON.stringify({ apiUrl: "https://old.example" })));
+    await first.loadRuntimeConfig();
+    const { calls, impl } = flaky(2);
+    const m = await load(impl);
+    await m.loadRuntimeConfig();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls.count).toBe(1);
+    expect(m.apiUrl()).toBe("https://old.example");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(calls.count).toBe(2);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls.count).toBe(3);
     expect(m.apiUrl()).toBe("https://back.example");
     await vi.advanceTimersByTimeAsync(120_000);
     expect(calls.count).toBe(3);

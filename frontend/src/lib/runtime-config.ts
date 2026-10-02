@@ -108,6 +108,11 @@ let current: RuntimeConfig = fromBuild();
 // pre-load values and never know.
 let pending: Promise<RuntimeConfig> | null = null;
 let configured = false;
+// Whether this launch has read the file itself, rather than only starting
+// from the copy the last one kept.
+let confirmed = false;
+// A read of the file under way, for configSettled.
+let reading: Promise<RuntimeConfig> | null = null;
 
 /**
  * On a first launch the app mounts after this, so it is what a new visitor
@@ -176,6 +181,25 @@ export function loadRuntimeConfig(): Promise<RuntimeConfig> {
   return pending;
 }
 
+/**
+ * Wait for a read of /config.json that is under way, but no longer than
+ * `ms`. A launch that started from the saved copy reads the file behind the
+ * app, and the copy can be out of date: what is fixed for a whole session
+ * when the transport connects - the relay's address - should come from that
+ * read when it is quick, not from the copy. Nothing to wait for otherwise.
+ */
+export function configSettled(ms: number): Promise<void> {
+  const read = reading;
+  if (!read) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    void read.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 /** The first retry's wait, doubled after every miss up to the cap. */
 const RETRY_FIRST_MS = 5_000;
 const RETRY_MAX_MS = 60_000;
@@ -211,19 +235,20 @@ function failed(why: string, transient: boolean, err?: unknown): void {
 /**
  * Load again once there is a reason to think it would work. Any failure is
  * tried again when the browser says it is back online. A blip (offline, a
- * timeout, a server error) also when the page is shown again and, while the
- * app has nothing to run on, after a wait: lie-fi and a captive portal never
- * fire "online", and an installed app has no reload button, so that event
- * alone ran a whole session with no relay. A file that is not there is the
- * operator's to fix - asking again on every glance at the tab would only
- * fill the console, `pnpm dev`'s included. One retry per failure, whichever
- * reason comes first.
+ * timeout, a server error) also when the page is shown again and, until
+ * this launch has read the file once, after a wait: lie-fi and a captive
+ * portal never fire "online", and an installed app has no reload button, so
+ * that event alone ran a whole session with no relay - or, started from a
+ * saved copy, on whatever it said, a relay that has since moved included. A
+ * file that is not there is the operator's to fix - asking again on every
+ * glance at the tab would only fill the console, `pnpm dev`'s included. One
+ * retry per failure, whichever reason comes first.
  */
 function armRetry(transient: boolean): void {
   if (retryArmed || typeof window === "undefined") return;
   retryArmed = true;
   const doc = transient && typeof document !== "undefined" ? document : null;
-  const onTimer = transient && !configured;
+  const onTimer = transient && !confirmed;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const retry = () => {
     if (!retryArmed) return;
@@ -244,7 +269,16 @@ function armRetry(transient: boolean): void {
   }
 }
 
-async function fetchConfig(): Promise<RuntimeConfig> {
+function fetchConfig(): Promise<RuntimeConfig> {
+  const read = readConfig();
+  reading = read;
+  void read.then(() => {
+    if (reading === read) reading = null;
+  });
+  return read;
+}
+
+async function readConfig(): Promise<RuntimeConfig> {
   try {
     // Relative to the app's base, not to "/": an instance published under
     // a subpath (a GitHub Pages project site, say) serves its config there.
@@ -270,6 +304,7 @@ async function fetchConfig(): Promise<RuntimeConfig> {
     }
     current = coerce(JSON.parse(body), fromBuild());
     configured = true;
+    confirmed = true;
     retryDelay = RETRY_FIRST_MS;
     saveConfig(body);
   } catch (err) {

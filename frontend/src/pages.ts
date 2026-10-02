@@ -42,15 +42,24 @@ export function loadPage(page: LazyPage): Promise<Component> {
 
 export type Route = "landing" | "app" | "qs" | "qc";
 
+/**
+ * The routes an instance can turn off: whether they exist at all is in its
+ * configuration (main.ts waits for that to be read on these two).
+ */
+export function optionalRoute(pathname: string): "qs" | "qc" | null {
+  const path = pathname.replace(/\/$/, "");
+  return path === "/qs" ? "qs" : path === "/qc" ? "qc" : null;
+}
+
 /** What an address shows: App.svelte's routing, and main.ts's preload. */
 export function routeFor(pathname: string): Route {
   if (pathname.startsWith("/r/")) return "app";
-  // The routes an instance can turn off. A disabled one falls through to the
-  // landing page rather than 404ing: the flag is an operator's choice, not a
-  // broken link, and the page it would have shown does not exist here.
-  const path = pathname.replace(/\/$/, "");
-  if (path === "/qs") return useQs() ? "qs" : "landing";
-  if (path === "/qc") return useQc() ? "qc" : "landing";
+  // A disabled optional route falls through to the landing page rather than
+  // 404ing: the flag is an operator's choice, not a broken link, and the
+  // page it would have shown does not exist here.
+  const optional = optionalRoute(pathname);
+  if (optional === "qs") return useQs() ? "qs" : "landing";
+  if (optional === "qc") return useQc() ? "qc" : "landing";
   // /share-target is normally a POST the service worker answers; a GET
   // reaches nginx only when no worker controls the page yet, and the shared
   // payload is already parked in IndexedDB for the app to claim.

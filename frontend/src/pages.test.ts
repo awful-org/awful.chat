@@ -136,6 +136,17 @@ describe("routeFor", () => {
     expect(routeFor("/qc/")).toBe("qc");
   });
 
+  // A saved copy of the configuration can be wrong about exactly these two,
+  // so main.ts waits for the served one before routing them.
+  it("tells which addresses exist only when the instance says so", async () => {
+    const { optionalRoute } = await import("./pages");
+    expect(optionalRoute("/qs")).toBe("qs");
+    expect(optionalRoute("/qc/")).toBe("qc");
+    for (const other of ["/", "/app", "/r/", "/qsx", "/q", "/r/qs"]) {
+      expect(optionalRoute(other), other).toBeNull();
+    }
+  });
+
   it("starts the app's address at the setup and unlock screens", async () => {
     const { firstPage } = await import("./pages");
     expect(firstPage("app")).toBe("gate");
