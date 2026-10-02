@@ -3374,11 +3374,12 @@ async function _handleChatMessage(
   if (receivedFromPeerId) {
     _repairBackoff.reset(receivedFromPeerId, roomCode);
     if (clock > 0 && msg.lamport > clock + 1) {
-      // Held first, so this very message cannot claim a watermark over the
-      // rows the digest is asking for. For the message's own room, not the
-      // one on screen, and past the debounce: a detected gap is the strongest
-      // signal we get, and a routine exchange must not swallow it.
-      _inboundPushes.expect(receivedFromPeerId, roomCode);
+      // The digest holds the room before this call returns, so this very
+      // message cannot claim a watermark over the rows it is asking for - and
+      // only when a digest goes out: a peer not known to be in the room gets
+      // none, and nothing would answer a hold. For the message's own room,
+      // not the one on screen, and past the debounce: a detected gap is the
+      // strongest signal we get, and a routine exchange must not swallow it.
       _sendDigestForRoom(receivedFromPeerId, roomCode).catch(() => {});
     }
   }

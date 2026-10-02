@@ -15,6 +15,8 @@ const s = vi.hoisted(() => ({
   mostInFlight: 0,
   refuse: (_frame: any): boolean => false,
   roomPeers: ["peer1"] as string[],
+  /** Who the room lists, when that is not everyone on its channel. */
+  listed: null as string[] | null,
   pushReads: 0,
 }));
 
@@ -34,7 +36,7 @@ vi.mock("./libp2p/transport", async () => {
     p2pNode = {};
     on(event: string, fn: Function) { s.handlers.set(event, fn); }
     setDmIntroduction() {} selfId() { return "self"; } rooms() { return ["rd2_room"]; }
-    peers() { return s.roomPeers; } peersInRoom() { return s.roomPeers; }
+    peers() { return s.roomPeers; } peersInRoom() { return s.listed ?? s.roomPeers; }
     isRoomPeer(_room: string, peer: string) { return s.roomPeers.includes(peer); }
     isSecureRoom() { return true; }
     async sendRoom(peer: string, _room: string, bytes: Uint8Array) {
@@ -159,6 +161,7 @@ beforeEach(() => {
   s.holds.clear();
   s.frames = [];
   s.roomPeers = ["peer1", "peer2"];
+  s.listed = null;
   _resetSyncThrottle();
   _resetSyncProgress();
   transportState.roomCode = "rd2_elsewhere";
@@ -270,5 +273,21 @@ it("keeps a gap message's claim waiting until the peer answers the gap's own dig
   // Its answer to the gap's digest is the one that ends the wait.
   noPush("peer1");
   await vi.waitFor(() => expect(s.watermarks.get(`${ROOM}|${gap.senderId}`)).toBe(gap.lamport));
+  expect(s.holds.has(ROOM)).toBe(false);
+});
+
+// A gap seen in a message from a peer the room does not list yet: no digest
+// can go to it, and nothing would answer a wait. The gap path used to hold
+// the room for one anyway, and every claim in it waited 15s for nothing.
+it("holds nothing for a gap when no digest can go out", async () => {
+  for (let l = 1; l <= 30; l++) s.rows.set(row(l).id, row(l));
+  for (const l of [30, 28, 29]) s.watermarks.set(`${ROOM}|${row(l).senderId}`, l);
+  send("peer2", { ...row(31), roomCode: undefined });
+  await vi.waitFor(() => expect(s.rows.has(row(31).id)).toBe(true));
+  s.listed = ["peer2"];
+  const gap = row(observedLamport(ROOM) + 10);
+  send("peer1", { ...gap, roomCode: undefined });
+  await vi.waitFor(() => expect(s.watermarks.get(`${ROOM}|${gap.senderId}`)).toBe(gap.lamport));
+  expect(digestsTo("peer1")).toEqual([]);
   expect(s.holds.has(ROOM)).toBe(false);
 });
