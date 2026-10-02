@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const codeToHtml = vi.fn(async (code: string, opts: { lang: string }) => {
   if (opts.lang === "nope") throw new Error(`Language \`${opts.lang}\` is not included`);
@@ -6,7 +6,7 @@ const codeToHtml = vi.fn(async (code: string, opts: { lang: string }) => {
 });
 vi.mock("shiki", () => ({ codeToHtml }));
 
-const { cachedHighlight, highlightCode, stripControlChars } = await import("./message-body");
+const { cachedHighlight, highlightCode, messageBody, stripControlChars } = await import("./message-body");
 
 beforeEach(() => {
   codeToHtml.mockClear();
@@ -61,6 +61,165 @@ describe("highlightCode", () => {
     await highlightCode(huge, "txt");
     expect(cachedHighlight(huge, "txt")).toBeUndefined();
     expect(cachedHighlight("kept", "js")).toBeDefined();
+  });
+
+  it("counts the code a block is kept by, not only its html", async () => {
+    // A key is a block's whole code: counting the html alone, 200 blocks
+    // of 16K characters held 3M more than the bound allowed.
+    const a = "a".repeat(600_000);
+    const b = "b".repeat(600_000);
+    await highlightCode(a, "txt");
+    await highlightCode(b, "txt");
+    expect(cachedHighlight(a, "txt")).toBeUndefined();
+    expect(cachedHighlight(b, "txt")).toBeDefined();
+  });
+});
+
+/** A fenced block's <pre>, as much of one as the attachment touches. */
+function block(code: string) {
+  const pre = {
+    textContent: code,
+    dataset: { lang: "js" },
+    classList: ["pr-9"],
+    isConnected: true,
+    replaceWith: vi.fn(() => {
+      pre.isConnected = false;
+    }),
+  };
+  return pre;
+}
+type Block = ReturnType<typeof block>;
+
+/** An IntersectionObserver the test tells what has come on screen. */
+class Observer {
+  static made: Observer[] = [];
+  watched = new Set<unknown>();
+  disconnected = false;
+  constructor(
+    private callback: (entries: { isIntersecting: boolean; target: unknown }[]) => void,
+    public init?: IntersectionObserverInit,
+  ) {
+    Observer.made.push(this);
+  }
+  observe(target: unknown) {
+    this.watched.add(target);
+  }
+  unobserve(target: unknown) {
+    this.watched.delete(target);
+  }
+  disconnect() {
+    this.disconnected = true;
+    this.watched.clear();
+  }
+  show(...targets: Block[]) {
+    this.callback(targets.map((target) => ({ isIntersecting: true, target })));
+  }
+}
+
+describe("messageBody", () => {
+  let idle: (() => void)[] = [];
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+  /** Idle moments, one after another, until nothing asks for another. */
+  async function idleTime() {
+    await settle();
+    while (idle.length) {
+      idle.shift()!();
+      await settle();
+    }
+  }
+  /** The attachment on a body holding these blocks, after its first look; its teardown. */
+  async function attach(...blocks: Block[]) {
+    const body = { querySelectorAll: () => blocks, addEventListener() {}, removeEventListener() {} };
+    const teardown = messageBody("")(body as unknown as HTMLElement) as () => void;
+    await settle();
+    return teardown;
+  }
+
+  beforeEach(() => {
+    idle = [];
+    Observer.made = [];
+    vi.stubGlobal("IntersectionObserver", Observer);
+    vi.stubGlobal("requestIdleCallback", (run: () => void) => idle.push(run));
+    vi.stubGlobal("document", {
+      createElement: () => ({ innerHTML: "", content: { firstElementChild: { classList: { add() {} } } } }),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("highlights a block once it comes on screen, one per idle moment", async () => {
+    const [a, b, c] = [block("on screen a"), block("on screen b"), block("scrolled past")];
+    await attach(a, b, c);
+    const [observer] = Observer.made;
+    // Ahead of the list's own scroll box, which a rootMargin never reached.
+    expect(observer.init).toEqual({ scrollMargin: "200px" });
+    expect([...observer.watched]).toEqual([a, b, c]);
+    expect(codeToHtml).not.toHaveBeenCalled();
+
+    observer.show(a, b);
+    expect([...observer.watched]).toEqual([c]);
+    expect(codeToHtml).not.toHaveBeenCalled();
+    idle.shift()!();
+    await settle();
+    expect(codeToHtml).toHaveBeenCalledTimes(1);
+    expect(a.replaceWith).toHaveBeenCalledTimes(1);
+    expect(idle).toHaveLength(1);
+    await idleTime();
+    expect(codeToHtml.mock.calls.map(([code]) => code)).toEqual(["on screen a", "on screen b"]);
+    expect(b.replaceWith).toHaveBeenCalledTimes(1);
+    expect(c.replaceWith).not.toHaveBeenCalled();
+  });
+
+  it("tokenizes a block shown in two messages once", async () => {
+    const [d, e] = [block("pasted twice"), block("pasted twice")];
+    await attach(d);
+    await attach(e);
+    Observer.made[0].show(d);
+    Observer.made[1].show(e);
+    await idleTime();
+    expect(codeToHtml).toHaveBeenCalledTimes(1);
+    expect(d.replaceWith).toHaveBeenCalledTimes(1);
+    expect(e.replaceWith).toHaveBeenCalledTimes(1);
+  });
+
+  it("swaps in a block highlighted before at once, with nothing to wait for", async () => {
+    await highlightCode("seen before", "js");
+    codeToHtml.mockClear();
+    const f = block("seen before");
+    await attach(f);
+    expect(f.replaceWith).toHaveBeenCalledTimes(1);
+    expect(Observer.made).toHaveLength(0);
+    expect(idle).toHaveLength(0);
+    expect(codeToHtml).not.toHaveBeenCalled();
+  });
+
+  it("does nothing more for a body once it is gone, and lets go of its observer", async () => {
+    const g = block("gone before its turn");
+    const teardown = await attach(g);
+    const [observer] = Observer.made;
+    observer.show(g);
+    teardown();
+    expect(observer.disconnected).toBe(true);
+    await idleTime();
+    expect(codeToHtml).not.toHaveBeenCalled();
+    expect(g.replaceWith).not.toHaveBeenCalled();
+
+    // Gone before it even looked: nothing is watched at all.
+    const body = { querySelectorAll: () => [block("never looked at")], addEventListener() {}, removeEventListener() {} };
+    (messageBody("")(body as unknown as HTMLElement) as () => void)();
+    await idleTime();
+    expect(Observer.made).toHaveLength(1);
+  });
+
+  it("skips a block no longer in the page", async () => {
+    const h = block("taken out");
+    await attach(h);
+    Observer.made[0].show(h);
+    h.isConnected = false;
+    await idleTime();
+    expect(codeToHtml).not.toHaveBeenCalled();
   });
 });
 

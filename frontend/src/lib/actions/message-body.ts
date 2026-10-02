@@ -15,9 +15,10 @@ import type { Attachment } from "svelte/attachments";
  * mount - the room reopened, scrolled back to, the message re-rendered.
  */
 const highlighted = new Map<string, string>();
+/** Characters held, keys and html both: a key is a block's whole code. */
 let highlightedChars = 0;
 const CACHE_ENTRIES = 200;
-/** About 4 MB of html at most; one block's is a few hundred KB at worst. */
+/** About 4 MB at most; one block's html is a few hundred KB at worst. */
 const CACHE_CHARS = 2_000_000;
 /** In flight, so blocks that ask at once share one tokenization. */
 const pending = new Map<string, Promise<string | null>>();
@@ -36,18 +37,18 @@ export function cachedHighlight(code: string, lang: string): string | undefined 
 }
 
 function remember(key: string, html: string): void {
-  if (html.length > CACHE_CHARS) return;
+  if (key.length + html.length > CACHE_CHARS) return;
   const before = highlighted.get(key);
   if (before !== undefined) {
     highlighted.delete(key);
-    highlightedChars -= before.length;
+    highlightedChars -= key.length + before.length;
   }
   highlighted.set(key, html);
-  highlightedChars += html.length;
+  highlightedChars += key.length + html.length;
   for (const [old, oldHtml] of highlighted) {
     if (highlighted.size <= CACHE_ENTRIES && highlightedChars <= CACHE_CHARS) break;
     highlighted.delete(old);
-    highlightedChars -= oldHtml.length;
+    highlightedChars -= old.length + oldHtml.length;
   }
 }
 
@@ -169,16 +170,20 @@ export function messageBody(html: string): Attachment<HTMLElement> {
         return;
       }
       // The rest as they come on screen: a block scrolled past is never done.
-      observer = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
-            observer?.unobserve(entry.target);
-            enqueue(entry.target as HTMLElement, isLive);
-          }
-        },
-        { rootMargin: "200px" }
-      );
+      // A little ahead of that, by scrollMargin, which widens the message
+      // list's own scroll box. A rootMargin only widens the viewport's, and
+      // the list clipped the block before it got there. Where scrollMargin
+      // is not known, a block waits until it is in view.
+      const ahead: IntersectionObserverInit & { scrollMargin?: string } = {
+        scrollMargin: "200px",
+      };
+      observer = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          observer?.unobserve(entry.target);
+          enqueue(entry.target as HTMLElement, isLive);
+        }
+      }, ahead);
       for (const pre of waiting) observer.observe(pre);
     });
 
