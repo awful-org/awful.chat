@@ -18,9 +18,11 @@
   const manifest = $derived(getManifest(entry.pluginId));
 </script>
 
+<!-- ml-11: in line with message content, past a row's padding, avatar and
+     gap (0.5 + 1.75 + 0.5rem), so it reads as part of the conversation. -->
 <div
   role="alert"
-  class="group relative my-1.5 flex max-w-xl items-start gap-2.5 overflow-hidden rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 font-mono"
+  class="group relative my-1.5 ml-11 flex max-w-xl items-start gap-2.5 overflow-hidden rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 font-mono"
 >
   <!-- The countdown: a CSS animation, so hovering pauses it for free, and
        its end is the dismissal. A note shown again is a new entry, so it

@@ -279,7 +279,10 @@ chat, with your plugin's name, and keeps their draft to fix. A
 nothing. For trouble after the command returned (a link that would not
 load, someone who left), call `host.showError(message)`: the same note.
 Plain text, a sentence or two; the host trims it to one line of 300
-characters.
+characters. A note belongs to the room the host is bound to and is
+dropped after a minute if nobody looked; a host with no room (the settings
+surface) has nowhere to show one, so there it does nothing - say it in
+your own UI instead.
 
 **Palette commands** add rows to the Ctrl+K palette. List them eagerly in
 `manifest.paletteCommands` (`name`, `title`, optional `subtitle`) so the

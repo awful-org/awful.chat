@@ -139,12 +139,18 @@ export default definePlugin({
   reduce,
   commands: {
     ping: async (args: string, host: HostApi) => {
-      const names = parsePingArgs(args);
-      if (names.length === 0) {
+      const asked = parsePingArgs(args, Infinity);
+      if (asked.length === 0) {
         throw new Error("Mention up to three people to ping: /ping @alice, @bob");
+      }
+      const names = asked.slice(0, MAX_TARGETS);
+      const notes: string[] = [];
+      if (asked.length > names.length) {
+        notes.push(`Ping takes up to ${MAX_TARGETS} people, so ${asked.slice(MAX_TARGETS).join(", ")} ${asked.length - MAX_TARGETS === 1 ? "was" : "were"} left out.`);
       }
       const online = host.peers();
       const targets: PingTarget[] = [];
+      const missing: string[] = [];
       for (const name of names) {
         const match = online.find(
           (p) => p.name.toLowerCase() === name.toLowerCase()
@@ -153,12 +159,13 @@ export default definePlugin({
         // loss and look like their connection was the problem: leave them
         // out, and say so.
         if (match) targets.push({ did: match.did, name: match.name });
+        else missing.push(name);
       }
-      const missing = names.filter((name) => !targets.some((t) => t.name.toLowerCase() === name.toLowerCase()));
       const nobody = `${missing.join(", ")} ${missing.length === 1 ? "isn't" : "aren't"} connected to this room right now`;
       if (targets.length === 0) throw new Error(`Nobody to ping: ${nobody}.`);
       await host.sendCard({ targets });
-      if (missing.length) host.showError(`Pinging the rest: ${nobody}.`);
+      if (missing.length) notes.push(`Pinging the rest: ${nobody}.`);
+      if (notes.length) host.showError(notes.join(" "));
     },
   },
 });

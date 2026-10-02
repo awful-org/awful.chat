@@ -66,8 +66,13 @@
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import MsgRender from "./MsgRender.svelte";
   import LocalPluginCard from "./LocalPluginCard.svelte";
-  import { localPluginCards } from "$lib/plugins/local-cards.svelte";
-  import { pluginErrors, showPluginError } from "$lib/plugins/plugin-errors.svelte";
+  import { closeLocalCard, localPluginCards } from "$lib/plugins/local-cards.svelte";
+  import {
+    dismissPluginErrors,
+    dismissPluginErrorsFor,
+    freshErrorsFor,
+    showPluginError,
+  } from "$lib/plugins/plugin-errors.svelte";
   import PluginErrorRow from "./PluginErrorRow.svelte";
   import GifPicker from "./GifPicker.svelte";
   import GifImage from "./GifImage.svelte";
@@ -472,9 +477,34 @@
   const visibleLocalCards = $derived(
     localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
   );
-  const visiblePluginErrors = $derived(
-    pluginErrors.entries.filter((entry) => entry.roomCode === roomCode)
-  );
+
+  // Esc closes the newest private plugin card (a soundboard), the way it
+  // closes any other panel - after anything that used the key first: the
+  // command and mention popups, staged files, an open dialog or menu.
+  // Typing in a field inside the card, the first Esc only leaves the field,
+  // so a half-typed name is not thrown away by reflex.
+  $effect(() => {
+    if (visibleLocalCards.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
+      if (document.querySelector('[role="dialog"], [role="menu"], [role="listbox"]')) return;
+      const active = document.activeElement as HTMLElement | null;
+      const inCard = active?.closest("[data-local-card]");
+      if (inCard && active?.matches("input, textarea, select, [contenteditable='true']")) {
+        e.preventDefault();
+        active.blur();
+        return;
+      }
+      const newest = visibleLocalCards[visibleLocalCards.length - 1];
+      e.preventDefault();
+      closeLocalCard(newest.id);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  // Re-derived when the room or the notes change, which is when age matters:
+  // a stale note for this room is not shown on the way in.
+  const visiblePluginErrors = $derived(freshErrorsFor(roomCode));
 
   const messageById = $derived(new Map(visibleMessages.map((m) => [m.id, m])));
 
@@ -821,10 +851,17 @@
 
         found = true;
         const handler = plugin.commands[commandName];
-        const hostApi: HostApi = makeHostApi(pluginId, roomCode);
+        const hostApi: HostApi = makeHostApi(pluginId, submittedRoom);
+        // A retry supersedes the complaint about the last attempt.
+        dismissPluginErrorsFor(pluginId, submittedRoom);
+        // What was on screen before this run: a command that works clears
+        // it, whichever plugin complained - but not what this run itself
+        // says on the way (/ping's "pinging the rest").
+        const before = freshErrorsFor(submittedRoom).map((e) => e.id);
 
         try {
           await handler(args, hostApi);
+          dismissPluginErrors(before);
           stopTyping();
           draft = "";
           replyTargetId = null;
@@ -837,9 +874,10 @@
           console.error(`[chat] command /${commandName} failed:`, err);
           // The plugin's own words, in the chat where they were asked for;
           // the draft stays for fixing.
+          // The room it was typed in, not whichever is open once it threw.
           showPluginError(
             pluginId,
-            roomCode,
+            submittedRoom,
             err instanceof Error && err.message ? err.message : `/${commandName} did not work. Your draft has been kept.`,
           );
           autoScroll = true;
@@ -2646,6 +2684,7 @@
       >
         {#each visibleLocalCards as entry (entry.id)}
           <div
+            data-local-card
             class="pointer-events-auto w-full max-w-sm overflow-y-auto rounded-lg shadow-xl"
             style="max-height: min(70vh, 100%)"
           >
