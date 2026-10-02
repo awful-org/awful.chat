@@ -2127,6 +2127,8 @@ import {
           cardId={pt.cardId!}
           roomCode={pt.pluginRoomCode!}
           chromeVisible={dockedControls ? panelMouse !== null : controlsVisible}
+          focused={callFocus.pinnedTileId === pt.id}
+          setFocused={(on) => (callFocus.pinnedTileId = on ? pt.id : null)}
         />
       </div>
     {/each}

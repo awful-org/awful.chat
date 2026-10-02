@@ -12,12 +12,13 @@
   import { onDestroy } from "svelte";
   import { Button } from "$lib/components/ui/button";
   import { Switch } from "$lib/components/ui/switch";
+  import { Maximize2, Minimize2 } from "@lucide/svelte";
   import type { CallTileProps } from "$lib/plugins/api";
   import { HEARTBEAT_MS, playerId, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
   import { agree, hasAgreed } from "./consent";
 
-  let { card, cardState, host, chromeVisible }: CallTileProps<AppState> = $props();
+  let { card, cardState, host, chromeVisible, focused, setFocused }: CallTileProps<AppState> = $props();
 
   const app = $derived(cardState);
   const site = $derived(app.url ? new URL(app.url).host : "");
@@ -180,6 +181,18 @@
        right room for its audience chip. -->
   <div class="flex h-10 shrink-0 items-center gap-2 border-b border-white/10 pl-12 pr-14 text-[11px]">
     <span class="truncate text-white/90" title={app.url}>{site}</span>
+    <!-- Said out loud: the app's own page takes every click inside it, so
+         "click the tile to focus it" only works on this header. -->
+    <button
+      type="button"
+      onclick={(event) => {
+        event.stopPropagation();
+        setFocused(!focused);
+      }}
+      class="pointer-events-auto ml-auto flex shrink-0 cursor-pointer items-center gap-1 rounded-md bg-white/10 px-2 py-0.5 text-white/90 hover:bg-white/20"
+    >
+      {#if focused}<Minimize2 class="size-3" />Unfocus{:else}<Maximize2 class="size-3" />Focus{/if}
+    </button>
     {#if mine && chromeVisible && phase !== "disclose"}
       <button
         type="button"
@@ -187,7 +200,7 @@
           event.stopPropagation();
           end();
         }}
-        class="pointer-events-auto ml-auto shrink-0 cursor-pointer rounded-md bg-white/10 px-2 py-0.5 text-red-300 hover:bg-white/20">End for everyone</button
+        class="pointer-events-auto shrink-0 cursor-pointer rounded-md bg-white/10 px-2 py-0.5 text-red-300 hover:bg-white/20">End for everyone</button
       >
     {/if}
   </div>

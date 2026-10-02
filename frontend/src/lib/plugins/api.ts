@@ -361,10 +361,18 @@ export interface WidgetProps<State = unknown> {
 
 /**
  * Props of the `callTile` surface: the card's, plus whether the call's own
- * controls are showing, so your overlays move with them.
+ * controls are showing, so your overlays move with them, and whether the
+ * tile is on the stage.
  */
 export interface CallTileProps<State = unknown> extends CardProps<State> {
   chromeVisible: boolean;
+  /** This tile is the focused one, on the big stage. */
+  focused: boolean;
+  /**
+   * Focus or unfocus this tile, as clicking it does. For a visible button:
+   * an iframe swallows the clicks that would otherwise reach the tile.
+   */
+  setFocused(focused: boolean): void;
 }
 
 /**

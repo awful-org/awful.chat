@@ -339,7 +339,10 @@ host }`); `localCard` has its own (below):
   an iframe never reloads mid-call. Call tiles receive one extra prop,
   `chromeVisible` - it mirrors the call's own controls (shown while the
   mouse moves over the call section, hidden on idle in fullscreen); gate
-  your control overlays on it so all chrome moves together.
+  your control overlays on it so all chrome moves together. They also get
+  `focused` (the tile is on the big stage) and `setFocused(on)`: clicking
+  a tile focuses it, but an iframe or a canvas that takes the pointer
+  swallows that click, so give such a tile a visible Focus button.
 
 - `callTileMenu` - extra rows for your call tile's RIGHT-CLICK menu, so a
   viewer finds the controls of a stream where they expect them. The host

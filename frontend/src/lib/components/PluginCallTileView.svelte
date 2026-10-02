@@ -11,6 +11,8 @@
     cardId,
     roomCode,
     chromeVisible = true,
+    focused = false,
+    setFocused = () => {},
   }: {
     pluginId: string;
     cardId: string;
@@ -18,6 +20,10 @@
     /** Mirrors the call's controls visibility (mouse moving over the call
      *  section) so plugin controls appear and hide WITH the call chrome. */
     chromeVisible?: boolean;
+    /** The tile is focused, and the way to change that - for the plugin's
+     *  own button, since its content may swallow the tile's clicks. */
+    focused?: boolean;
+    setFocused?: (focused: boolean) => void;
   } = $props();
 
   let card = $state<Message | null>(null);
@@ -56,6 +62,8 @@
     cardState={tileState}
     host={hostApi}
     {chromeVisible}
+    {focused}
+    {setFocused}
   />
 {:else}
   <div
