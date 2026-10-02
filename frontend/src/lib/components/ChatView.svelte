@@ -117,6 +117,7 @@
   import { REPLY_THRESHOLD, dragOffset, swipeAction } from "$lib/swipe";
   import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
+  import { tallyReactions, type ReactionTally } from "$lib/reaction-tally";
   import {
     addToPhonebook,
     dmInboxNoticeFor,
@@ -513,23 +514,19 @@
     replyTargetId ? (messageById.get(replyTargetId) ?? null) : null
   );
 
+  // Rebuilt whenever the list changes, but a message whose reactions did
+  // not change keeps the same Map (reaction-tally.ts), so its chips are left
+  // alone when a message lands somewhere else.
+  let lastReactions: ReactionTally | undefined;
   const reactionsByMessage = $derived.by(() => {
-    const byMessage = new Map<string, Map<string, Set<string>>>();
-    for (const m of messages) {
-      if (m.type !== MessageType.Reaction || !m.reactionTo || !m.reactionEmoji)
-        continue;
-      if (!byMessage.has(m.reactionTo)) byMessage.set(m.reactionTo, new Map());
-      const byEmoji = byMessage.get(m.reactionTo)!;
-      if (!byEmoji.has(m.reactionEmoji))
-        byEmoji.set(m.reactionEmoji, new Set());
-      const users = byEmoji.get(m.reactionEmoji)!;
-      // Normalize to the DID: a reaction added before the sender's binding
-      // was known (peerId form) must cancel against one added after.
-      const reactor = senderDid(m.senderId) || m.senderId;
-      if (m.reactionOp === "remove") users.delete(reactor);
-      else users.add(reactor);
-    }
-    return byMessage;
+    // Normalize to the DID: a reaction added before the sender's binding
+    // was known (peerId form) must cancel against one added after.
+    lastReactions = tallyReactions(
+      messages,
+      (senderId) => senderDid(senderId) || senderId,
+      lastReactions
+    );
+    return lastReactions;
   });
 
   // Coalesce instant scrolls to one per frame. Three independent paths ask
@@ -1225,6 +1222,15 @@
     void addFilesToStage(e.dataTransfer.files);
   }
 
+  /**
+   * How we look in this room. Resolved once, not four or five times in
+   * every message of ours: it reads the room list, which moves with every
+   * unread count anywhere.
+   */
+  const ownProfile = $derived(
+    getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null)
+  );
+
   /** The old room this one was moved from, if any (legacy-move.ts). */
   const movedFromRoom = $derived.by(() => {
     const code = roomsStore.rooms.find((r) => r.roomCode === roomCode)?.archiveOf;
@@ -1797,19 +1803,26 @@
    *  overwrites the original on peers that already hold it. Whenever we hold
    *  the quoted message ourselves, its own signed content is the truth and the
    *  snapshot is ignored. The snapshot is still the fallback for a quote whose
-   *  target we never received. */
-  function quoted(r: ReplyTo): { name: string; content: string } {
-    const held = messageById.get(r.id);
+   *  target we never received.
+   *
+   *  `held` is the quoted message, when we have it. It is looked up by the
+   *  row on its own: the lookup re-runs whenever the list changes, and the
+   *  quote - with its markdown stripping - only when what it quotes does. */
+  function quotedName(r: ReplyTo, held: Message | undefined): string {
+    return held ? displayName(held) : r.senderName;
+  }
+
+  function quotedText(r: ReplyTo, held: Message | undefined): string {
     if (held) {
       // Use quotable text for held messages so image-only messages show
       // [image] instead of empty content. Held message is the source of truth.
       // Far more than the 160-character snapshot: it is stripped of markdown
       // before it shows and the line truncates itself, so a cut through a
       // link never reaches the screen.
-      return { name: displayName(held), content: getQuotableText(held, QUOTE_SHOWN_CHARS) };
+      return getQuotableText(held, QUOTE_SHOWN_CHARS);
     }
     // Snapshot from the wire is already built with quotable text
-    return { name: r.senderName, content: r.content };
+    return r.content;
   }
 
   function reactorNames(users: Set<string>): string {
@@ -1850,7 +1863,6 @@
   function openProfileFromMessage(msg: Message): void {
     const own = isSelfSender(msg.senderId);
     const did = own ? selfId() : senderDid(msg.senderId);
-    const ownProfile = getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null);
     profileCardFor = {
       did,
       name: own ? ownProfile.nickname || "You" : displayName(msg),
@@ -2761,6 +2773,7 @@
             )}
             {@const showHeader = shouldShowHeader(msg, prev)}
             {@const isOwn = isSelfSender(msg.senderId)}
+            {@const reactions = reactionsByMessage.get(msg.id)}
             <div>
               {#if showDate}
                 <div class="flex items-center gap-3 py-3">
@@ -2807,7 +2820,9 @@
                   : ""}
               >
                 {#if msg.replyTo}
-                  {@const q = quoted(msg.replyTo)}
+                  {@const held = messageById.get(msg.replyTo.id)}
+                  {@const quoteFrom = quotedName(msg.replyTo, held)}
+                  {@const quote = stripMarkdown(quotedText(msg.replyTo, held), resolveMentionDisplayName)}
                   <button
                     type="button"
                     class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
@@ -2817,14 +2832,14 @@
                       size="16"
                       class="text-muted-foreground -ml-5 transform -scale-x-100"
                     />
-                    <span class="font-semibold">{q.name}</span>
-                    <span class="truncate"
-                      >{stripMarkdown(q.content, resolveMentionDisplayName)}</span
-                    >
+                    <span class="font-semibold">{quoteFrom}</span>
+                    <span class="truncate">{quote}</span>
                   </button>
                 {/if}
 
                 {#if showHeader}
+                  {@const avatar = isOwn ? ownProfile.avatarUrl : senderAvatar(msg.senderId)}
+                  {@const avatarColor = isOwn ? ownProfile.color : senderColor(msg.senderId)}
                   <div class="flex items-start gap-2">
                     <div
                       role="button"
@@ -2847,23 +2862,17 @@
                       {isOwn
                         ? 'bg-primary/20 text-primary'
                         : 'bg-secondary text-secondary-foreground'}"
-                      style={isOwn
-                        ? getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).color
-                          ? `color: ${getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).color}`
-                          : ""
-                        : senderColor(msg.senderId)
-                          ? `color: ${senderColor(msg.senderId)}`
-                          : ""}
+                      style={avatarColor ? `color: ${avatarColor}` : ""}
                     >
-                      {#if isOwn && getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).avatarUrl}
+                      {#if isOwn && avatar}
                         <GifImage
-                          src={getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).avatarUrl ?? ""}
+                          src={avatar}
                           alt="You"
                           class="size-full object-cover"
                         />
-                      {:else if !isOwn && senderAvatar(msg.senderId)}
+                      {:else if !isOwn && avatar}
                         <GifImage
-                          src={senderAvatar(msg.senderId) ?? ""}
+                          src={avatar}
                           alt={displayName(msg)}
                           class="size-full object-cover"
                           animate="hover"
@@ -2874,7 +2883,7 @@
                     </div>
                     <div class="flex min-w-0 items-baseline gap-2">
                       {#if isOwn}
-                        {@const own = getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null)}
+                        {@const own = ownProfile}
                         {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
                         <span
                           role="button"
@@ -2943,11 +2952,9 @@
                   onRequestFileDownload={requestFileDownload}
                 />
 
-                {#if reactionsByMessage.get(msg.id)?.size}
+                {#if reactions?.size}
                   <div class="ml-9 mt-1 flex items-center gap-1">
-                    {#each [...(reactionsByMessage
-                        .get(msg.id)
-                        ?.entries() ?? [])] as [emoji, users] (emoji)}
+                    {#each [...reactions.entries()] as [emoji, users] (emoji)}
                       {#if users.size > 0}
                         {@const reacted = users.has(selfId()) || users.has(myPeerId())}
                         <LazyTip text={reactorNames(users)}>

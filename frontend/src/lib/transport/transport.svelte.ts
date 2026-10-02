@@ -206,6 +206,7 @@ import {
 } from "./files.svelte";
 import { appendSorted, compareMessages as MSG_ORDER } from "./message-order";
 import type { MessageCursor } from "./message-order";
+import { sameFields, withEntry } from "./peer-maps";
 import { createSyncViewBuffer } from "./sync-view";
 import {
   noteSyncBatch,
@@ -2546,20 +2547,14 @@ async function _handleProfile(
   const color = hasColorField ? normalizeNicknameColor(msg.color) : undefined;
   const name = normalizeWireName(msg.name);
 
-  const names = new Map(transportState.peerNames);
-  names.set(did, name);
-  transportState.peerNames = names;
-
-  const avatars = new Map(transportState.peerAvatars);
-  if (avatarUrl) avatars.set(did, avatarUrl);
-  else avatars.delete(did);
-  transportState.peerAvatars = avatars;
+  // A frame that repeats what is known replaces none of these maps: every
+  // peer sends one on each connect and room switch, and each new map re-ran
+  // every name, avatar and tag on screen (see peer-maps.ts).
+  transportState.peerNames = withEntry(transportState.peerNames, did, name);
+  transportState.peerAvatars = withEntry(transportState.peerAvatars, did, avatarUrl || undefined);
 
   if (hasColorField) {
-    const colors = new Map(transportState.peerColors);
-    if (color) colors.set(did, color);
-    else colors.delete(did);
-    transportState.peerColors = colors;
+    transportState.peerColors = withEntry(transportState.peerColors, did, color || undefined);
   }
 
   // Their post-quantum key, verified against the DID just proved, and the
@@ -2596,15 +2591,12 @@ async function _handleProfile(
     nameGlow: msg.nameGlow,
   });
 
-  if (Object.keys(validated).length > 0) {
-    const meta = new Map(transportState.peerProfileMeta);
-    meta.set(did, validated);
-    transportState.peerProfileMeta = meta;
-  } else {
-    const meta = new Map(transportState.peerProfileMeta);
-    meta.delete(did);
-    transportState.peerProfileMeta = meta;
-  }
+  transportState.peerProfileMeta = withEntry(
+    transportState.peerProfileMeta,
+    did,
+    Object.keys(validated).length > 0 ? validated : undefined,
+    sameFields
+  );
 
   // NEVER write over our own row. Profiles are keyed by did and getOwnProfile
   // finds the one flagged isMe, so a peer profile stored under our own did
