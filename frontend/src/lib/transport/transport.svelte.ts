@@ -15,7 +15,7 @@ import {
   _withRefused,
   REFUSED_MAX_SENDERS,
 } from "./refused-lamports";
-import { allowSyncReaction } from "./sync-throttle";
+import { RepairBackoff, allowSyncReaction } from "./sync-throttle";
 import { planPush, runPush } from "./sync-push";
 import { InboundPushes, type BatchOutcome, type HeldRow } from "./sync-inbound";
 import {
@@ -23,6 +23,7 @@ import {
   commitWatermark,
   holdWatermarks,
   releaseWatermarks,
+  senderMaxLamports,
 } from "../storage";
 import { setErrorWithAutoClear } from "./call-error";
 import { blindValue } from "../storage-crypto";
@@ -36,7 +37,6 @@ import {
   getAllMessages,
   getMessagesAboveWatermarks,
   getMessagesOfTypes,
-  getSenderMaxLamports,
   getWatermarksForRoom,
   setWatermark,
   markRoomSeen,
@@ -220,7 +220,7 @@ import {
   noteSyncComplete,
   syncProgress,
 } from "./sync-progress.svelte";
-import { issueLamport, observeLamport, remoteLamportAllowed } from "./logical-clock";
+import { issueLamport, observeLamport, observedLamport, remoteLamportAllowed } from "./logical-clock";
 import { ProfileEcho, frameHash } from "./profile-echo";
 import { initVoice } from "./voice.svelte";
 import { installTelemetryTaps, stopTelemetryTaps } from "../telemetry/taps";
@@ -1272,8 +1272,6 @@ async function _broadcastProfile(): Promise<void> {
  */
 const SYNC_DEBOUNCE_MS = 10_000;
 const _lastDigestAt = new Map<string, number>();
-/** "room|senderId" -> highest lamport we have seen, for the gap hint above. */
-const _lastSeenLamport = new Map<string, number>();
 
 /** What a push of history did, and what its rows may claim. */
 const _inboundPushes = new InboundPushes({
@@ -1312,6 +1310,8 @@ function _syncAllPeers(force = false): void {
 const REPAIR_TICK_MS = 15_000;
 const APP_SILENCE_MS = 15_000;
 const PROFILE_REPAIR_MAX_MS = 5 * 60_000;
+/** The tick's digests back off while a pair stays in sync (sync-throttle.ts). */
+const _repairBackoff = new RepairBackoff();
 const _lastAppInbound = new Map<string, number>();
 const _profileRepair = new Map<string, { next: number; delay: number }>();
 /** One copy of an unchanged profile per peer per burst - see profile-echo.ts. */
@@ -1345,9 +1345,11 @@ if (typeof window !== "undefined") {
         continue;
       }
       const quietFor = Date.now() - (_lastAppInbound.get(pid) ?? 0);
-      if (quietFor > APP_SILENCE_MS) {
+      const open = transportState.roomCode;
+      if (quietFor > APP_SILENCE_MS && open && _repairBackoff.due(pid, open)) {
         // Alive (liveness pings hold the connection) but silent: verify we
         // did not miss anything. One digest, a number per sender.
+        _repairBackoff.wait(pid, open);
         _syncPeer(pid, true);
       }
     }
@@ -1418,6 +1420,8 @@ if (typeof window !== "undefined") {
       // other room we were in, background rooms included.
       for (const pid of _transport.peersInRoom(room)) {
         if (!_peerIdToDid.has(pid)) continue;
+        if (!_repairBackoff.due(pid, room)) continue;
+        _repairBackoff.wait(pid, room);
         _sendDigestForRoom(pid, room).catch(() => {});
       }
     }
@@ -1701,43 +1705,35 @@ async function _handleDigest(
 
   const mine = await getWatermarksForRoom(roomCode);
 
-  // Throttled BEFORE the work, not just before the send.
-  //
-  // Deciding what a peer is missing costs getSenderMaxLamports, which reads
-  // every row in the room off the lamport index, and the push that follows
-  // decrypts and re-uploads whatever it finds. The window used to sit on the
-  // send alone, so a member looping empty digests still bought a full-room
-  // scan per frame - throttling the reaction while leaving the amplifier
-  // running. Consuming the window on a digest that turns out to need no push
-  // is the deliberate cost: the scan is what has to be rationed, and the two
-  // cases are indistinguishable before it runs. One push hands over
-  // everything missing and the repair tick is slower than this window, so
-  // honest flows are unaffected.
+  // Senders we hold messages from, not senders we happen to have a
+  // watermark row for. A partial watermark map (one row lost, or written
+  // before a sender was known) silently excluded that sender from every
+  // push we ever made. From memory (senderMaxLamports): this read every row
+  // of the room for every digest that came in - one per visible member per
+  // repair tick in a quiet room, forever, with writes queued behind it.
   //
   // No watermarks are rebuilt from stored rows here any more. That claimed
   // each sender's highest stored row, and a push now stores rows it has not
   // yet proved contiguous: a room with history but no watermark rows simply
   // advertises none, takes one push of what it holds back as duplicates, and
   // the completed push claims them.
-  if (allowSyncReaction(`push|${peerId}|${roomCode}`)) {
-    // Senders we hold messages from, not senders we happen to have a
-    // watermark row for. A partial watermark map (one row lost, or written
-    // before a sender was known) silently excluded that sender from every
-    // push we ever made. Clear fields only: building this via getAllMessages
-    // AES-decrypted the whole room on every background digest exchange, for
-    // two fields that were never encrypted in the first place.
-    const highest = await getSenderMaxLamports(roomCode);
-    for (const [sid, lamport] of Object.entries(mine)) {
-      const at = highest.get(sid);
-      if (at === undefined || lamport > at) highest.set(sid, lamport);
-    }
-    const theyAreMissing = [...highest.keys()].filter(
-      (sid) => (theirWatermarks[sid] ?? -1) < highest.get(sid)!
-    );
+  const highest = await senderMaxLamports(roomCode);
+  for (const [sid, lamport] of Object.entries(mine)) {
+    const at = highest.get(sid);
+    if (at === undefined || lamport > at) highest.set(sid, lamport);
+  }
+  const theyAreMissing = [...highest.keys()].filter(
+    (sid) => (theirWatermarks[sid] ?? -1) < highest.get(sid)!
+  );
 
-    if (theyAreMissing.length > 0) {
-      await _pushMissingTo(peerId, roomCode, theirWatermarks);
-    }
+  // Throttled before the push, which is what costs: it reads and decrypts
+  // whatever they lack and uploads it, so a member looping digests that
+  // claim to lack everything still gets one push per window. Deciding there
+  // is nothing to push no longer reads the room, so a digest that needs none
+  // no longer uses the window up. Not awaited: a paced push of a long
+  // backlog runs for a while, and the reply below must not wait behind it.
+  if (theyAreMissing.length > 0 && allowSyncReaction(`push|${peerId}|${roomCode}`)) {
+    void _pushMissingTo(peerId, roomCode, theirWatermarks).catch(() => {});
   }
 
   // A digest only tells the SENDER what they lack, so one exchange heals one
@@ -1758,6 +1754,10 @@ async function _handleDigest(
   const weAreBehind = Object.keys(theirWatermarks).some(
     (sid) => (theirWatermarks[sid] ?? -1) > (advertised[sid] ?? -1)
   );
+  // An exchange that found nothing missing either way is what the repair
+  // tick backs off on; one that found anything starts it over.
+  if (theyAreMissing.length || weAreBehind) _repairBackoff.reset(peerId, roomCode);
+  else _repairBackoff.wait(peerId, roomCode);
   // Reply for the SAME room: routing through _syncPeer digested whatever
   // room the UI had open, so a background room only ever healed one way.
   // Throttled: this reply bypasses the _syncPeer debounce by design, and a
@@ -1909,6 +1909,7 @@ async function _handleSyncBatch(
    */
   progress?: { batchIndex: number; totalBatches: number; order?: unknown }
 ): Promise<void> {
+  if (fromPeerId) _repairBackoff.reset(fromPeerId, roomCode);
   // A repair frame is one batch of a push. A push's frames are handled one at
   // a time, in order, and what their rows claim is decided across the push.
   if (!live && progress && fromPeerId) {
@@ -3303,25 +3304,30 @@ async function _handleChatMessage(
     return;
   }
 
+  // Read before this message moves it: what the room had shown us so far.
+  const clock = observedLamport(roomCode);
   // Per room, so a DM's wall-clock lamport can no longer be absorbed into a
   // chat room's counter - which it was, unguarded, on this path.
   lamportReceive(roomCode, wire.lamport);
 
   const msg = wireToMessage(wire, roomCode);
 
-  // A sender's lamport only ever moves forward, so a jump past what we have
-  // from them means we probably missed something. It is a hint, not proof -
-  // the clock also advances on receives - but a digest is small and answering
-  // one costs nothing, so erring towards syncing is the cheap side.
+  // A message more than one past the room's clock was written after
+  // something we have not seen, so we probably missed it. It is a hint, not
+  // proof, but a digest is small and erring towards syncing is the cheap
+  // side. Measured against the ROOM's clock, not the sender's last lamport:
+  // in a conversation a sender's lamport jumps every time somebody else
+  // spoke, so nearly every message used to fire a digest at its sender, each
+  // costing them a read of the room.
   if (receivedFromPeerId) {
-    const seen = _lastSeenLamport.get(`${roomCode}|${msg.senderId}`) ?? -1;
-    // Force past the debounce: a detected gap is the strongest signal we get,
-    // and a routine profile exchange must not be allowed to consume the window
-    // and swallow it.
-    if (seen >= 0 && msg.lamport > seen + 1)
-      _syncPeer(receivedFromPeerId, true);
-    if (msg.lamport > seen) {
-      _lastSeenLamport.set(`${roomCode}|${msg.senderId}`, msg.lamport);
+    _repairBackoff.reset(receivedFromPeerId, roomCode);
+    if (clock > 0 && msg.lamport > clock + 1) {
+      // Held first, so this very message cannot claim a watermark over the
+      // rows the digest is asking for. For the message's own room, not the
+      // one on screen, and past the debounce: a detected gap is the strongest
+      // signal we get, and a routine exchange must not swallow it.
+      _inboundPushes.expect(roomCode);
+      _sendDigestForRoom(receivedFromPeerId, roomCode).catch(() => {});
     }
   }
 
@@ -3619,6 +3625,7 @@ _transport.on("disconnect", (peerId) => {
   // until the sender's DID binds, so dropping them on a disconnect would throw
   // away messages that a reconnect would otherwise replay.
   _lastDigestAt.delete(peerId);
+  _repairBackoff.forgetPeer(peerId);
   transportState.peers = _transport.peers();
   for (const listener of _peerDisconnectListeners) listener({ did });
   _fileTransport.onPeerDisconnect(peerId);

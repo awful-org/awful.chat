@@ -11,6 +11,8 @@ import {
   putRoom,
   getRoom,
   setWatermark,
+  senderMaxLamports,
+  getMessagesAboveWatermarks,
   commitWatermark,
   holdWatermarks,
   releaseWatermarks,
@@ -255,6 +257,53 @@ describe("watermarks", () => {
     expect(watermarksHeld("room-a")).toBe(false);
     await releaseWatermarks("room-a");
     expect(await getWatermark("room-a", "alice")).toBe(0);
+  });
+});
+
+describe("what a digest and a push read", () => {
+  it("reads a room once for its senders, and stays current as rows are stored", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1], ["bob", 2]]));
+    const reads = getAll.mock.calls.length;
+    expect(reads).toBeGreaterThan(0);
+    await putMessage(msg({ senderId: "alice" }));
+    await bulkPutMessages([msg({ senderId: "carol" })]);
+    for (let i = 0; i < 5; i++) {
+      expect(await senderMaxLamports("room-a")).toEqual(
+        new Map([["alice", 3], ["bob", 2], ["carol", 4]])
+      );
+    }
+    // Every digest after the first is answered from memory.
+    expect(getAll.mock.calls.length).toBe(reads);
+  });
+
+  it("forgets a room whose history is deleted", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" })]);
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1]]));
+    await deleteMessagesForRoom("room-a");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map());
+  });
+
+  it("reads a push only from the lowest watermark the peer has for anyone we hold", async () => {
+    const rows = Array.from({ length: 100 }, (_, i) =>
+      msg({ senderId: i % 2 ? "alice" : "bob" }));
+    await bulkPutMessages(rows);
+    // The room's senders are known already: any digest before this one read them.
+    await senderMaxLamports("room-a");
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 95, bob: 90 });
+    // bob wrote the odd lamports, alice the even ones.
+    expect(missing.map((m) => m.lamport)).toEqual([91, 93, 95, 96, 97, 98, 99, 100]);
+    const lowest = getAll.mock.calls.map(([range]) => (range as IDBKeyRange).lower[1]);
+    expect(Math.min(...lowest)).toBe(91);
+  });
+
+  it("still reads everything for a peer that lacks one of our senders", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 1 });
+    expect(missing.map((m) => m.senderId)).toEqual(["bob"]);
+    expect(await getMessagesAboveWatermarks("room-a", { alice: 1, bob: 2 })).toEqual([]);
   });
 });
 

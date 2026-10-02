@@ -15,6 +15,7 @@ const s = vi.hoisted(() => ({
   mostInFlight: 0,
   refuse: (_frame: any): boolean => false,
   roomPeers: ["peer1"] as string[],
+  pushReads: 0,
 }));
 
 function commit(room: string, sender: string, lamport: number): void {
@@ -73,9 +74,13 @@ vi.mock("$lib/storage", () => ({
     const m = s.rows.get(id);
     return [id, { roomCode: m.roomCode, senderId: m.senderId, lamport: m.lamport }];
   })),
-  getMessagesAboveWatermarks: async (room: string, marks: Record<string, number>) =>
-    [...s.rows.values()].filter((m) => m.roomCode === room && m.lamport > (marks[m.senderId] ?? -1)),
-  getSenderMaxLamports: async (room: string) => {
+  getMessagesAboveWatermarks: async (room: string, marks: Record<string, number>) => {
+    s.pushReads++;
+    return [...s.rows.values()].filter((m) => m.roomCode === room && m.lamport > (marks[m.senderId] ?? -1));
+  },
+  getRoom: async (room: string) => ({ roomCode: room, type: "text", createdAt: 1 }),
+  updateMessageStatus: async () => {},
+  senderMaxLamports: async (room: string) => {
     const out = new Map<string, number>();
     for (const m of s.rows.values()) {
       if (m.roomCode === room && (out.get(m.senderId) ?? -1) < m.lamport) out.set(m.senderId, m.lamport);
@@ -126,6 +131,7 @@ import { _resetSyncThrottle } from "./sync-throttle";
 import { _resetSyncProgress } from "./sync-progress.svelte";
 import { encode } from "$lib/utils";
 import { planPush } from "./sync-push";
+import { observedLamport } from "./logical-clock";
 
 const ROOM = "rd2_room";
 const SENDERS = ["did:key:a", "did:key:b", "did:key:c"];
@@ -151,6 +157,7 @@ beforeEach(() => {
   s.mostInFlight = 0;
   s.refuse = () => false;
   s.roomPeers = ["peer1"];
+  s.pushReads = 0;
   _resetSyncThrottle();
   _resetSyncProgress();
   transportState.roomCode = "rd2_elsewhere";
@@ -228,4 +235,39 @@ it("keeps a cut-off push from an older build from claiming past what it did not 
   // The live message's claim waited for the room to settle, then landed.
   await vi.advanceTimersByTimeAsync(15_000);
   expect(mark(row(201).senderId)).toBe(201);
+});
+
+it("answers a digest that lacks nothing without reading anything to push, or using up the push window", async () => {
+  for (let l = 1; l <= 30; l++) s.rows.set(row(l).id, row(l));
+  const theirs: Record<string, number> = {};
+  for (const m of s.rows.values()) theirs[m.senderId] = Math.max(theirs[m.senderId] ?? -1, m.lamport);
+  // Both sides hold, and have claimed, the same history.
+  for (const [sender, lamport] of Object.entries(theirs)) s.watermarks.set(`${ROOM}|${sender}`, lamport);
+  for (let i = 0; i < 5; i++) send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: theirs });
+  await new Promise((r) => setTimeout(r, 20));
+  expect(s.pushReads).toBe(0);
+  expect(s.frames).toEqual([]);
+  // The window is still there for a digest that does lack something.
+  const behind = { ...theirs, [SENDERS[0]]: 0 };
+  send("peer1", { type: MessageType.SyncDigest, roomCode: ROOM, watermarks: behind });
+  await vi.waitFor(() => expect(s.frames.at(-1)?.frame.type).toBe(MessageType.SyncComplete));
+  expect(s.pushReads).toBe(1);
+});
+
+it("takes a lamport jump as a gap only against the room's clock", async () => {
+  const chat = (lamport: number) => send("peer1", { ...row(lamport), roomCode: undefined });
+  const digests = () => s.frames.filter((f) => f.frame.type === MessageType.SyncDigest);
+  // The room's clock is module state, already moved by the tests above.
+  const base = Math.max(observedLamport(ROOM), 1);
+  // A conversation: each sender's lamport jumps whenever somebody else spoke,
+  // but the room's clock never does. No digest for any of it.
+  for (let l = base + 1; l <= base + 9; l++) {
+    chat(l);
+    await vi.waitFor(() => expect(s.rows.has(row(l).id)).toBe(true));
+  }
+  expect(digests()).toEqual([]);
+  // Something we never saw came before this one: ask, for this room.
+  chat(base + 15);
+  await vi.waitFor(() => expect(digests()).toHaveLength(1));
+  expect(digests()[0]).toMatchObject({ peer: "peer1", frame: { roomCode: ROOM } });
 });

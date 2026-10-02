@@ -368,9 +368,24 @@ type Watermarks = Record<string, number>
 on connect (both peers):
   → send SyncDigest { watermarks }
 
+also sent:
+  → on a gap: a live message more than one past the ROOM's lamport clock
+    (not the sender's last lamport, which jumps whenever someone else
+    spoke) - a digest to its sender, for that message's room
+  → by the 15s repair tick, to a peer silent that long, for the open room
+    and one background room per tick - backing off per peer and room
+    (15s, 30s, ... up to 5 minutes) while exchanges find nothing missing
+    either way; a message, a push or an exchange that finds a difference
+    starts it over
+
 on receive SyncDigest:
-  → compare their watermarks against mine
-  → push everything they're missing as SyncBatch[] + SyncComplete
+  → compare their watermarks against mine, and against the senders I hold
+    rows from - kept in memory per room (one read of the room the first
+    time it is asked about, then every stored row updates it), so a digest
+    that lacks nothing costs no read of the room
+  → push everything they're missing as SyncBatch[] + SyncComplete -
+    throttled per peer and room (10s), the push being what costs; it reads
+    only from the lowest watermark they have for anyone I hold rows from
     (sync-push.ts), one push at a time per peer and room:
     - order "head": the newest page first (the 50 rows a page shows, plus
       any plugin updates between them), so the page they render arrives

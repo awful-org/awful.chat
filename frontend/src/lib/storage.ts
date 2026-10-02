@@ -963,12 +963,15 @@ export async function getMessagesOfTypes(
   return opened.sort((a, b) => a.lamport - b.lamport);
 }
 
-/** Raw (still-sealed) message rows for a room - one bulk index read. */
-async function _rawRoomMessages(roomCode: string): Promise<Message[]> {
+/**
+ * Raw (still-sealed) message rows for a room - one bulk index read. `from`
+ * is the lowest lamport wanted.
+ */
+async function _rawRoomMessages(roomCode: string, from = 0): Promise<Message[]> {
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   const blindedRange = IDBKeyRange.bound(
-    [blindRoomCode, 0],
+    [blindRoomCode, from],
     [blindRoomCode, Number.MAX_SAFE_INTEGER]
   );
   const results = await database
@@ -979,7 +982,7 @@ async function _rawRoomMessages(roomCode: string): Promise<Message[]> {
   // During migration, also query the plaintext range to see unmigrated rows
   if (!isMigrationComplete()) {
     const plaintextRange = IDBKeyRange.bound(
-      [roomCode, 0],
+      [roomCode, from],
       [roomCode, Number.MAX_SAFE_INTEGER]
     );
     const plaintextResults = await database
@@ -1046,7 +1049,19 @@ export async function getMessagesAboveWatermarks(
   roomCode: string,
   watermarks: Record<string, number>
 ): Promise<Message[]> {
-  const rows = await _rawRoomMessages(roomCode);
+  // Only rows above the lowest watermark the peer has for anyone we hold
+  // rows from can be missing, so the read starts there instead of at the
+  // room's first row: a member back from a short absence lacks the last few
+  // rows, not the whole history. A peer that lacks a sender entirely still
+  // reads from the start.
+  const held = await senderMaxLamports(roomCode);
+  if (!held.size) return [];
+  let floor = Infinity;
+  for (const senderId of held.keys()) {
+    const at = watermarks[senderId];
+    floor = Math.min(floor, typeof at === "number" && Number.isSafeInteger(at) ? at : -1);
+  }
+  const rows = await _rawRoomMessages(roomCode, Math.max(0, floor + 1));
   // Build maps of watermarks for both blinded and plaintext forms to handle
   // the migration window. A legacy row has plaintext senderId and needs the
   // plaintext watermark value. Blinded rows need the blinded value. Checking
@@ -1160,6 +1175,52 @@ function _notifyMessageStored(msg: Message): void {
     }
   }
 }
+
+/**
+ * getSenderMaxLamports, kept in memory per room for the session.
+ *
+ * Every digest a peer sent us paid for that read of the room's every row -
+ * one per visible member per repair tick in a quiet room, forever, and a
+ * burst of them queued writes behind it - to answer a question whose answer
+ * only changes when a row is stored. So a room is read once, the first time
+ * it is asked about, and from then on each stored row moves its sender's
+ * entry. The map handed out is a copy, the caller's to change.
+ */
+const _senderMax = new Map<string, { map: Map<string, number>; ready: Promise<void> }>();
+
+export async function senderMaxLamports(roomCode: string): Promise<Map<string, number>> {
+  let entry = _senderMax.get(roomCode);
+  if (!entry) {
+    // In place before the read, so a row stored while it runs still counts.
+    const map = new Map<string, number>();
+    const created = { map, ready: Promise.resolve() };
+    created.ready = getSenderMaxLamports(roomCode).then(
+      (read) => {
+        for (const [senderId, lamport] of read) _raiseSenderMax(map, senderId, lamport);
+      },
+      (err) => {
+        if (_senderMax.get(roomCode) === created) _senderMax.delete(roomCode);
+        throw err;
+      }
+    );
+    _senderMax.set(roomCode, created);
+    entry = created;
+  }
+  await entry.ready;
+  return new Map(entry.map);
+}
+
+function _raiseSenderMax(map: Map<string, number>, senderId: string, lamport: number): void {
+  if (typeof senderId !== "string" || !senderId || !Number.isFinite(lamport)) return;
+  if ((map.get(senderId) ?? -Infinity) < lamport) map.set(senderId, lamport);
+}
+
+onMessageStored((msg) => {
+  const entry = _senderMax.get(msg.roomCode);
+  if (entry) _raiseSenderMax(entry.map, msg.senderId, msg.lamport);
+});
+// Rows belong to the identity that stored them.
+onIdentityLock(() => _senderMax.clear());
 
 export async function putMessage(message: Message, guard: WriteGuard = captureWriteGuard()): Promise<void> {
   const database = await getDB();
@@ -1394,6 +1455,7 @@ export async function getSearchableStats(
 
 export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
   _watermarkHolds.delete(roomCode);
+  _senderMax.delete(roomCode);
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   // The room's search index goes with its messages.
@@ -1490,6 +1552,8 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
     await writeTx.objectStore("watermarks").delete(wm.id as Blinded);
   }
   await writeTx.done;
+  // Again, now the rows are gone: a read in the meantime counted them.
+  _senderMax.delete(roomCode);
   // The Yjs snapshot lives in its own store; a leftover one would resurrect
   // the shared doc if the same room code is ever joined again. Delete both the
   // blinded key (if migrated) and the plaintext key (if legacy).
@@ -3062,6 +3126,7 @@ export async function wipeLocalDatabase(): Promise<void> {
   invalidatePeerProfilesCache();
   _readableWatermarks.clear();
   _watermarkHolds.clear();
+  _senderMax.clear();
   await deleteDB(dbName());
   await (await import("./transport/file/ciphertext-store")).wipeCiphertext();
 }
@@ -3075,6 +3140,7 @@ export function closeDatabase(): void {
     db = null;
   }
   _watermarkHolds.clear();
+  _senderMax.clear();
 }
 
 // ── at-rest migration ────────────────────────────────────────────────────────
