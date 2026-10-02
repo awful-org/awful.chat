@@ -13,6 +13,9 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
@@ -200,12 +204,15 @@ const (
 	// the rest of the window, so paying the cost of a reconnect on top buys
 	// nothing.
 	//
-	// 128/min/peer x connMgrHigh bounds the system-wide guess rate: 128 x
-	// 512 = 65,536 empty-room REGISTERs/minute at the absolute worst case
-	// (every connection the relay will hold saturating its budget). That is
-	// a ~4h sweep of the legacy 2^24 space and nothing at all against 2^65,
-	// and a peer only refills early by dropping every stream it holds and
-	// reconnecting, which costs a fresh libp2p connection.
+	// 128/min/peer x relayMaxConns bounds the system-wide guess rate: 128 x
+	// 2048 = 262,144 empty-room REGISTERs/minute at the absolute worst case
+	// (one party holding every connection the relay will accept, each
+	// saturating its budget, which also shuts everyone else out). That is
+	// about an hour's sweep of the legacy 2^24 space and nothing at all
+	// against 2^65; from public addresses the per-source budgets below hold
+	// it to a quarter of that. A peer only refills early by dropping every
+	// stream it holds and reconnecting, which costs a fresh libp2p
+	// connection.
 	//
 	// maxRoomsPerPeer is 1024, so a peer with more than 128 saved EMPTY rooms
 	// will exhaust this partway through a reconnect burst and have the rest
@@ -230,8 +237,8 @@ const (
 	// filled registry degrades everyone to their first 64 rooms instead of
 	// locking every newcomer out. The hard bound is then maxTotalRegistrations
 	// + 64 x the peers the relay can hold at once - each needs a libp2p
-	// connection, and the resource manager caps those at connMgrHigh*2 - so
-	// at most ~65k registrations (~30 MB) past the soft ceiling.
+	// connection, and the resource manager caps those at relayMaxConns - so
+	// at most ~131k registrations (~59 MB) past the soft ceiling by default.
 	guaranteedRoomsPerPeer = 64
 	// maxPeersPerRoom caps DISTINCT peers in one room. A room is a group
 	// chat whose members each hold a gossipsub mesh with the others; a
@@ -678,6 +685,12 @@ type registry struct {
 	// Said once when total first reaches the ceiling, so the line does not
 	// repeat per refused frame - which would be the disk-fill it prevents.
 	totalCapLogged bool
+	// protect, when set, tells the connection manager whether a peer holds
+	// a rendezvous stream, so it never trims an open tab (see connMgrHigh).
+	// Called under mu as a peer's first stream arrives and as its last one
+	// goes, so the two can never land out of order. Nil in tests that do not
+	// need it.
+	protect func(peerId string, on bool)
 }
 
 func newRegistry() *registry {
@@ -771,6 +784,9 @@ func (r *registry) addStreamFrom(peerId string, s rvStream, addr netip.Addr) *co
 	if streams == nil {
 		streams = make(map[*connectedClient]struct{})
 		r.clients[peerId] = streams
+		if r.protect != nil {
+			r.protect(peerId, true)
+		}
 	}
 	// A second stream joins the budget the peer already has; it never gets a
 	// fresh one.
@@ -1268,6 +1284,9 @@ func (r *registry) evict(c *connectedClient) ([]departure, []leaveLine) {
 		// connection the connection manager already bounds.
 		delete(r.emptyRegisters, c.peerId)
 		delete(r.joins, c.peerId)
+		if r.protect != nil {
+			r.protect(c.peerId, false)
+		}
 	}
 	return notifications, lines
 }
@@ -1568,12 +1587,60 @@ readLoop:
 	return reason
 }
 
-// Connection ceiling for the whole relay. The low mark is where the connection
-// manager starts trimming idle peers, the high mark is a hard stop.
+// relayMaxConns is how many libp2p connections the relay holds at once - one
+// per open tab, plus the second node device sync starts - and every other
+// connection, stream, reservation and circuit ceiling below is sized from
+// it. RELAY_MAX_CONNS sets it; past it a new connection is refused at
+// accept, which a client retries, rather than an established one being
+// dropped. Measured at about 140-180 KB of relay memory per tab and 25-33 KB
+// per live circuit, the default is roughly 550 MB with every connection and
+// circuit in use: lower it on a small box, and keep GOMEMLIMIT
+// (RELAY_GOMEMLIMIT in the compose file) above what it allows. See
+// deploy/README.md, "Relay capacity".
+var relayMaxConns = parseRelayMaxConns(os.Getenv("RELAY_MAX_CONNS"))
+
 const (
-	connMgrLow  = 256
-	connMgrHigh = 512
+	defaultRelayMaxConns = 2048
+	minRelayMaxConns     = 64
+	maxRelayMaxConns     = 1 << 16
 )
+
+func parseRelayMaxConns(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultRelayMaxConns
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("[relay] ignoring RELAY_MAX_CONNS=%q: not a number, using %d", raw, defaultRelayMaxConns)
+		return defaultRelayMaxConns
+	}
+	return min(max(n, minRelayMaxConns), maxRelayMaxConns)
+}
+
+// The connection manager's watermarks. It does not trim idle peers and it is
+// not a hard stop: every 10 s, once connMgrHigh connections are open, it closes
+// connections past their one-minute grace, lowest value first, until those
+// number connMgrLow. At the old 256/512 that evicted more than half of all
+// tabs about every 70 s as soon as 512 were connected, the same unlucky ones
+// each time, each eviction a PEER_LEFT to all their rooms and a reconnect
+// storm. Now a peer holding a rendezvous stream - every open tab - is
+// protected and never trimmed (registry.protect), the hard ceiling is the
+// resource manager's at relayMaxConns, and trimming only ever reaches
+// connections that never got as far as a rendezvous stream.
+var (
+	connMgrHigh = relayMaxConns
+	connMgrLow  = relayMaxConns * 3 / 4
+)
+
+// rendezvousProtectTag marks a peer the connection manager must not trim.
+const rendezvousProtectTag = "rendezvous"
+
+// newConnManager builds the relay's connection manager. Options are for
+// tests, which need a grace period shorter than a minute.
+func newConnManager(opts ...connmgr.Option) (*connmgr.BasicConnMgr, error) {
+	return connmgr.NewConnManager(connMgrLow, connMgrHigh, opts...)
+}
 
 // relayResources lifts the circuit-relay reservation ceilings for the same
 // reason newResourceManager lifts the connection ones: behind Traefik every
@@ -1591,12 +1658,15 @@ const (
 // a client's address and not to the proxy's.
 func relayResources() relayv2.Resources {
 	res := relayv2.DefaultResources()
-	res.MaxReservations = connMgrHigh
+	// One per connection the relay will hold: a tab past this got
+	// RESERVATION_REFUSED, which leaves a browser undialable, and rebuilt its
+	// node in a loop.
+	res.MaxReservations = relayMaxConns
 	// Per-IP and per-ASN here cannot tell the proxy from a client, and the
 	// proxy is every user at once; reservationGate does the per-address
 	// limiting that can.
-	res.MaxReservationsPerIP = connMgrHigh
-	res.MaxReservationsPerASN = connMgrHigh
+	res.MaxReservationsPerIP = relayMaxConns
+	res.MaxReservationsPerASN = relayMaxConns
 	// MaxCircuits is the fourth ceiling relayv2.DefaultResources() sets, and
 	// this function used to leave it alone at the default: 16 COMBINED
 	// circuits per peer, counting both directions (source or destination).
@@ -1610,12 +1680,9 @@ func relayResources() relayv2.Resources {
 	// accumulating.
 	//
 	// Lifted to connMgrHigh for the same reason as the three ceilings
-	// above: the resource manager's own memory budget is the real bound,
-	// not this count. Each live circuit reserves 2*BufferSize = 4 KiB from
-	// a peer's resource-manager span (circuitv2/relay/relay.go), so
-	// connMgrHigh (512) circuits cost at most 2 MiB for one peer - small
-	// next to the resource manager's own limits, and nowhere near what it
-	// takes to OOM the box.
+	// above: the resource manager's circuit limits (relayCircuitLimits) are
+	// the real bound, 128 each way per peer and relayCircuits relay-wide,
+	// not this count.
 	res.MaxCircuits = connMgrHigh
 	return res
 }
@@ -1643,10 +1710,10 @@ func relayResources() relayv2.Resources {
 // hole-punching stepping stone the "limited" flag was designed around, so
 // they must not carry a limit at all. The abuse bound is the resource
 // manager and relayResources above: per-peer and global reservation and
-// circuit counts, and the memory budget behind them. Those resource-manager
-// numbers used to be go-libp2p's generic service defaults, scaled by the
-// host's memory, which nobody had chosen for a relay; relayCircuitLimits
-// now sets them explicitly.
+// circuit counts. Those resource-manager numbers used to be go-libp2p's
+// generic service defaults, scaled by the host's memory, which nobody had
+// chosen for a relay; relayCircuitLimits and relaySystemLimits now set them
+// explicitly.
 
 // No circuit ACL. One was tried on 2026-09-02: AllowConnect required both
 // ends of a circuit to hold a live rendezvous stream, which is how an app
@@ -1700,13 +1767,24 @@ func proxyPrefixLimits() (v4, v6 []rcmgr.NetworkPrefixLimit) {
 	add(netip.MustParsePrefix("127.0.0.0/8"), math.MaxInt)
 	add(netip.MustParsePrefix("::1/128"), math.MaxInt)
 	for _, c := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"} {
-		add(netip.MustParsePrefix(c), connMgrHigh*2)
+		add(netip.MustParsePrefix(c), relayMaxConns)
 	}
 	for _, p := range trustedProxies.literalPrefixes() {
-		add(p, connMgrHigh*2)
+		add(p, relayMaxConns)
 	}
 	return v4, v6
 }
+
+// relayCircuits is how many circuits the relay carries at once: four per
+// connection at the ceiling, and never fewer than the 2048 it has always
+// allowed. A circuit is kept for the life of both tabs, one per pair of
+// online room members, so a fully online 50-member room alone is 1,225 of
+// them; each costs the relay about 30 KB.
+var relayCircuits = max(2048, 4*relayMaxConns)
+
+// Per peer, as a circuit's source and as its destination: one per online
+// contact in a busy room, twice over.
+const relayCircuitsPerPeer = 128
 
 // relayCircuitLimits pins the resource-manager limits the relay service
 // and its hop and stop protocols run under. WithInfiniteLimits has to stay
@@ -1721,6 +1799,8 @@ func proxyPrefixLimits() (v4, v6 []rcmgr.NetworkPrefixLimit) {
 // calls - but they are now chosen rather than inherited, and do not grow
 // with RAM. Each circuit is one inbound hop stream and one outbound stop
 // stream, plus 2 x BufferSize (4 KiB) of buffer charged to the service.
+// The streams themselves are what newResourceManager's System limits are
+// sized for, so these are the ones that bind.
 func relayCircuitLimits(limits *rcmgr.PartialLimitConfig) {
 	if limits.Service == nil {
 		limits.Service = map[string]rcmgr.ResourceLimits{}
@@ -1734,43 +1814,118 @@ func relayCircuitLimits(limits *rcmgr.PartialLimitConfig) {
 	if limits.ProtocolPeer == nil {
 		limits.ProtocolPeer = map[protocol.ID]rcmgr.ResourceLimits{}
 	}
-	// 2048 circuits at once relay-wide, four per connected peer at the
-	// connection ceiling; 8 MiB of their buffers, with headroom.
+	// relayCircuits at once relay-wide, and their buffers with room to
+	// spare.
 	limits.Service[relayv2.ServiceName] = rcmgr.ResourceLimits{
-		StreamsInbound:  rcmgr.LimitVal(2048),
-		StreamsOutbound: rcmgr.LimitVal(2048),
-		Streams:         rcmgr.LimitVal(4096),
-		Memory:          rcmgr.LimitVal64(64 << 20),
+		StreamsInbound:  rcmgr.LimitVal(relayCircuits),
+		StreamsOutbound: rcmgr.LimitVal(relayCircuits),
+		Streams:         rcmgr.LimitVal(2 * relayCircuits),
+		Memory:          rcmgr.LimitVal64(max(64<<20, int64(relayCircuits)*16<<10)),
 	}
-	// One peer: 128 circuits it opened and 128 it is the target of - one per
-	// online contact in a busy room, twice over.
+	// One peer: relayCircuitsPerPeer circuits it opened and as many it is
+	// the target of.
 	limits.ServicePeer[relayv2.ServiceName] = rcmgr.ResourceLimits{
-		StreamsInbound:  rcmgr.LimitVal(128),
-		StreamsOutbound: rcmgr.LimitVal(128),
-		Streams:         rcmgr.LimitVal(256),
+		StreamsInbound:  rcmgr.LimitVal(relayCircuitsPerPeer),
+		StreamsOutbound: rcmgr.LimitVal(relayCircuitsPerPeer),
+		Streams:         rcmgr.LimitVal(2 * relayCircuitsPerPeer),
 		Memory:          rcmgr.LimitVal64(16 << 20),
 	}
 	limits.Protocol[circuitproto.ProtoIDv2Hop] = rcmgr.ResourceLimits{
-		StreamsInbound: rcmgr.LimitVal(2048),
-		Streams:        rcmgr.LimitVal(4096),
+		StreamsInbound: rcmgr.LimitVal(relayCircuits),
+		Streams:        rcmgr.LimitVal(2 * relayCircuits),
 	}
 	limits.ProtocolPeer[circuitproto.ProtoIDv2Hop] = rcmgr.ResourceLimits{
-		StreamsInbound: rcmgr.LimitVal(128),
-		Streams:        rcmgr.LimitVal(256),
+		StreamsInbound: rcmgr.LimitVal(relayCircuitsPerPeer),
+		Streams:        rcmgr.LimitVal(2 * relayCircuitsPerPeer),
 	}
 	limits.Protocol[circuitproto.ProtoIDv2Stop] = rcmgr.ResourceLimits{
-		StreamsOutbound: rcmgr.LimitVal(2048),
-		Streams:         rcmgr.LimitVal(4096),
+		StreamsOutbound: rcmgr.LimitVal(relayCircuits),
+		Streams:         rcmgr.LimitVal(2 * relayCircuits),
 	}
 	limits.ProtocolPeer[circuitproto.ProtoIDv2Stop] = rcmgr.ResourceLimits{
-		StreamsOutbound: rcmgr.LimitVal(128),
-		Streams:         rcmgr.LimitVal(256),
+		StreamsOutbound: rcmgr.LimitVal(relayCircuitsPerPeer),
+		Streams:         rcmgr.LimitVal(2 * relayCircuitsPerPeer),
 	}
 }
+
+// The memory go-yamux reserves from the resource manager for every open
+// stream: its initial receive window, charged in full the moment the stream
+// opens (go-yamux session.go). A circuit is two of them, one on each end's
+// connection, and a tab's rendezvous stream is one more.
+const yamuxStreamWindow = 256 << 10
 
 // newResourceManager builds the libp2p resource manager for the relay.
 // Extracted so main_test.go can assert the ceilings it sets.
 func newResourceManager() (network.ResourceManager, error) {
+	return newResourceManagerFrom(rcmgr.DefaultLimits.AutoScale())
+}
+
+// relaySystemLimits pins what newResourceManager does not leave to the
+// host's size. The scaled defaults it replaces were sized at an eighth of the
+// host's RAM - 384 MiB of accounting on a 2 GB VPS - and go-yamux charges a
+// stream's whole 256 KiB window against them up front, though a quiet stream
+// really holds a few kilobytes. So memory accounting, not any limit chosen
+// here, capped the relay at about 580 circuits on 2 GB (980 on 4 GB), short
+// of one fully online 50-member room, and every circuit past it failed with
+// RESOURCE_LIMIT_EXCEEDED; the streams defaults were as short of a tab per
+// connection. These are counted from relayMaxConns instead: a rendezvous
+// stream per connection, relayCircuits circuits, and half a connection's
+// worth of short-lived streams (identify, ping, reservations), with memory
+// enough that every one of those streams can be open and the circuit
+// buffers still fit. What protects the host is the connection and stream
+// counts, at about 140-180 KB of real memory per tab and 25-33 KB per
+// circuit, and GOMEMLIMIT; the memory figure here only has to stay out of
+// their way.
+func relaySystemLimits(limits *rcmgr.PartialLimitConfig, scaled rcmgr.ConcreteLimitConfig) {
+	streamsIn := relayMaxConns + relayCircuits + relayMaxConns/2
+	streamsOut := relayCircuits + relayMaxConns/2
+	// The circuit buffers are reserved at network.ReservationPriorityHigh,
+	// which is refused past 204/256 of the limit, hence the scaling; 64 MiB
+	// covers what else reserves memory, such as a hop message being read.
+	circuitBuffers := int64(relayCircuits) * 2 * int64(relayv2.DefaultResources().BufferSize)
+	memory := (int64(streamsIn+streamsOut)*yamuxStreamWindow+circuitBuffers)*256/204 + 64<<20
+
+	limits.System.Conns = rcmgr.LimitVal(relayMaxConns)
+	limits.System.ConnsInbound = rcmgr.LimitVal(relayMaxConns)
+	limits.System.ConnsOutbound = rcmgr.LimitVal(relayMaxConns)
+	limits.System.StreamsInbound = rcmgr.LimitVal(streamsIn)
+	limits.System.StreamsOutbound = rcmgr.LimitVal(streamsOut)
+	limits.System.Streams = rcmgr.LimitVal(streamsIn + streamsOut)
+	limits.System.Memory = rcmgr.LimitVal64(memory)
+	// Connections and streams still being set up (noise and muxer, then
+	// protocol negotiation) sit in the transient scope, whose scaled
+	// default is a few hundred connections and a hundred-odd streams. A
+	// relay restart makes every client reconnect at once, and those arrive
+	// as one burst.
+	limits.Transient.Conns = rcmgr.LimitVal(relayMaxConns)
+	limits.Transient.ConnsInbound = rcmgr.LimitVal(relayMaxConns)
+	limits.Transient.ConnsOutbound = rcmgr.LimitVal(relayMaxConns)
+	limits.Transient.StreamsInbound = rcmgr.LimitVal(relayMaxConns / 2)
+	limits.Transient.StreamsOutbound = rcmgr.LimitVal(relayMaxConns / 2)
+	limits.Transient.Streams = rcmgr.LimitVal(relayMaxConns)
+	// One peer at its limits: maxStreamsPerPeer rendezvous streams (tabs
+	// sharing a peerId), relayCircuitsPerPeer circuits each way, and room
+	// for the short-lived ones. The scaled default is 64 MiB on a 1 GB host,
+	// short of that.
+	perPeer := int64(maxStreamsPerPeer+2*relayCircuitsPerPeer+32) * yamuxStreamWindow
+	if scaledPeer := scaled.ToPartialLimitConfig().PeerDefault.Memory; int64(scaledPeer) < perPeer {
+		limits.PeerDefault.Memory = rcmgr.LimitVal64(perPeer)
+	}
+	// Every tab holds one rendezvous stream, so the protocol's default share,
+	// a few hundred streams on a small host, refused tabs long before the
+	// connection ceiling.
+	if limits.Protocol == nil {
+		limits.Protocol = map[protocol.ID]rcmgr.ResourceLimits{}
+	}
+	limits.Protocol[RendezvousProtocol] = rcmgr.ResourceLimits{
+		StreamsInbound: rcmgr.LimitVal(2 * relayMaxConns),
+		Streams:        rcmgr.LimitVal(2 * relayMaxConns),
+	}
+}
+
+// newResourceManagerFrom is newResourceManager on the scaled defaults of a
+// given host, so a test can build the 2 GB VPS the relay runs on.
+func newResourceManagerFrom(scaled rcmgr.ConcreteLimitConfig) (network.ResourceManager, error) {
 	// EVERY browser reaches this process from a single source IP - Traefik's,
 	// on the docker network - because the compose routes relay.<domain>
 	// through it and nothing forwards the real client address.
@@ -1787,35 +1942,18 @@ func newResourceManager() (network.ResourceManager, error) {
 	//
 	// So a proxy's address (proxyPrefixLimits) is held only to the global
 	// ceilings, and a public address - a client the relay really sees - to
-	// maxConnsPerAddr and a connection rate. The connmgr (above) at 512 and
-	// the memory/stream limits from DefaultLimits stay as the protection
-	// for the host. The resource manager's System.ConnsInbound is lifted to
-	// connMgrHigh * 2 so the connection manager remains the binding limit
-	// rather than the resource manager doing hard rejections.
+	// maxConnsPerAddr and a connection rate. The global ceilings are
+	// relaySystemLimits, sized from relayMaxConns.
 	//
 	// Behind Traefik the per-address limits never apply, because libp2p
 	// sees only Traefik: they would need the client's address carried to
 	// this listener (PROXY protocol on a TCP router, which this listener
 	// does not parse) or the listener exposed directly. See deploy/README.md.
 	proxyV4, proxyV6 := proxyPrefixLimits()
-	// The memory-scaled defaults also cap TOTAL inbound connections
-	// (System.ConnsInbound is 64 + 64*(scaledMiB/1024), so a small VPS lands
-	// well under connMgrHigh * 2). Those are hard rejections, while the
-	// connection manager trims gracefully, so the system connection numbers
-	// are lifted to match the connection-manager ceiling and per-subnet cap,
-	// keeping connmgr the binding limit. Memory, streams and file descriptors
-	// keep the scaled defaults - they are the ones actually protecting the host.
-	scaled := rcmgr.DefaultLimits.AutoScale()
+	// File descriptors and the per-peer and per-protocol defaults keep the
+	// scaled values, apart from what relaySystemLimits has to raise.
 	limits := scaled.ToPartialLimitConfig()
-	limits.System.Conns = rcmgr.LimitVal(connMgrHigh * 2)
-	limits.System.ConnsInbound = rcmgr.LimitVal(connMgrHigh * 2)
-	limits.System.ConnsOutbound = rcmgr.LimitVal(connMgrHigh * 2)
-	// Connections still being upgraded (noise + muxer) sit in the transient
-	// scope, whose scaled default is a few hundred. A relay restart makes
-	// every client reconnect at once, and those arrive as one burst.
-	limits.Transient.Conns = rcmgr.LimitVal(connMgrHigh)
-	limits.Transient.ConnsInbound = rcmgr.LimitVal(connMgrHigh)
-	limits.Transient.ConnsOutbound = rcmgr.LimitVal(connMgrHigh)
+	relaySystemLimits(&limits, scaled)
 	relayCircuitLimits(&limits)
 
 	// New connections a second from one public source. A proxy prefix is
@@ -1863,7 +2001,10 @@ func main() {
 	os.MkdirAll("/app/data", 0o700)
 	priv := loadOrGenKey("/app/data/relay.key")
 
-	connMgr, _ := connmgr.NewConnManager(connMgrLow, connMgrHigh)
+	connMgr, err := newConnManager()
+	if err != nil {
+		log.Fatalf("connection manager: %v", err)
+	}
 
 	rm, err := newResourceManager()
 	if err != nil {
@@ -1873,8 +2014,12 @@ func main() {
 	// at DEBUG by go-libp2p, so when the default per-IP cap was silently
 	// refusing connections the relay logs looked perfectly healthy. Run with
 	// GOLOG_LOG_LEVEL=rcmgr=debug to see individual rejections.
-	log.Printf("[relay] connection limits: connmgr %d/%d, %d per public address (%d per IPv6 /48), proxies and private ranges held only to the global %d",
-		connMgrLow, connMgrHigh, maxConnsPerAddr, maxConnsPerAggregate, connMgrHigh*2)
+	memLimit := "unset"
+	if l := debug.SetMemoryLimit(-1); l != math.MaxInt64 {
+		memLimit = fmt.Sprintf("%d MiB", l>>20)
+	}
+	log.Printf("[relay] connection limits: %d connections and %d circuits (RELAY_MAX_CONNS), %d per public address (%d per IPv6 /48), proxies and private ranges held only to the global ceiling; connections with no rendezvous stream trimmed past %d; GOMEMLIMIT %s",
+		relayMaxConns, relayCircuits, maxConnsPerAddr, maxConnsPerAggregate, connMgrHigh, memLimit)
 
 	// Get port from env or default to 8080
 	httpPort := os.Getenv("HTTP_PORT")
@@ -1883,6 +2028,17 @@ func main() {
 	}
 
 	reg := newRegistry()
+	reg.protect = func(id string, on bool) {
+		p, err := peer.Decode(id)
+		if err != nil {
+			return
+		}
+		if on {
+			connMgr.Protect(p, rendezvousProtectTag)
+		} else {
+			connMgr.Unprotect(p, rendezvousProtectTag)
+		}
+	}
 	res := relayResources()
 	// Per-address reservation limits, for the addresses that are one client's
 	// and not the proxy's - see relaygate.go.

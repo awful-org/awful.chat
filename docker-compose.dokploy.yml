@@ -95,6 +95,16 @@ services:
       # names nothing that resolves, the relay says so at boot and every user
       # shares Traefik's one bucket until it does.
       - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-dokploy-traefik}
+      # How many libp2p connections (open tabs) the relay holds at once,
+      # default 2048. Past it new connections are refused at accept and
+      # retried; established tabs are never dropped to make room. Lower it on
+      # a small box. See deploy/README.md, "Relay capacity".
+      - RELAY_MAX_CONNS=${RELAY_MAX_CONNS:-}
+      # The Go runtime's soft memory limit: the garbage collector works harder
+      # as the relay nears it instead of letting the heap double. Keep it
+      # above what RELAY_MAX_CONNS needs at full load (about 550 MB at 2048)
+      # and below what the box can give the relay.
+      - GOMEMLIMIT=${RELAY_GOMEMLIMIT:-768MiB}
     volumes:
       - relay_data:/app/data
     networks:

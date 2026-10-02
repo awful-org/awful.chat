@@ -595,7 +595,7 @@ func TestResourceManagerAllowsManyConnsFromOneIP(t *testing.T) {
 	// is put back below the connection manager's own high-water mark - the
 	// per-subnet cap (8 by default, and meaningless behind a proxy) or the
 	// memory-scaled System.ConnsInbound, which on a small VPS lands under it.
-	const want = connMgrHigh
+	want := connMgrHigh
 	scopes := make([]network.ConnManagementScope, 0, want)
 	for i := 0; i < want; i++ {
 		scope, err := rm.OpenConnection(network.DirInbound, true, remote)

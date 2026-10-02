@@ -219,6 +219,28 @@ and a single port already in use aborts the whole container, so a range inside
 Linux's ephemeral window (32768-60999) makes the SFU fail to start at random,
 typically after a reboot.
 
+## Relay capacity
+
+There is one relay, so size it rather than multiply it. `RELAY_MAX_CONNS`
+(default 2048) is how many libp2p connections it holds at once - one per open
+tab, and a second one while device sync runs - and every other ceiling is
+counted from it: as many circuit-relay reservations, four times as many
+relayed circuits (a circuit stays up for the life of both tabs, one per pair
+of online room members, so a fully online 50-member room is 1,225 of them),
+and the libp2p resource manager's stream and memory accounting to match. Past it a new
+connection is refused at accept and the client retries; a tab that already
+holds its rendezvous stream is protected and is never dropped to make room.
+
+Real memory is what to size against: about 150 KB per connected tab and 30 KB
+per circuit, so roughly 550 MB with every connection and circuit in use at the
+default. `RELAY_GOMEMLIMIT` (default `768MiB`) is the Go runtime's soft limit
+for it: near the limit the garbage collector works harder instead of letting
+the heap grow to twice what is live, but nothing is refused, so it is a
+backstop, not a ceiling. On a small box lower `RELAY_MAX_CONNS` first, then
+`RELAY_GOMEMLIMIT` with it, keeping the limit above what the connections need;
+a container memory limit on top turns running out into a restart of the relay,
+which drops every tab at once. The relay prints both values at boot.
+
 ## What cannot be multiplied yet
 
 The **relay** is single. It holds the rendezvous registry (who is in which

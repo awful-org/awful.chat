@@ -3,7 +3,7 @@ package main
 // Per-address circuit-relay reservation limits that know about proxies.
 //
 // A reservation is how a browser becomes dialable at all - it cannot
-// listen - and there are MaxReservations (connMgrHigh) of them for the
+// listen - and there are MaxReservations (relayMaxConns) of them for the
 // whole relay. go-libp2p's own per-IP and per-ASN reservation caps cannot
 // tell a proxy from a client, so relayResources has to lift them to the
 // global ceiling: behind Traefik every browser shares one address, and a
