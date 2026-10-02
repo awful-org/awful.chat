@@ -637,7 +637,9 @@ Relay side (relay/mailbox.go):
   the blob from THAT device only; the blob leaves at TTL or quota
   eviction, so a phone and a desktop on one identity each collect it
   (the client dedups by message id against storage). A client that sends
-  no device gets the old delete-on-ack.
+  no device gets the old delete-on-ack. At the global quota, blobs some
+  device has already acked give way to new deposits, oldest first; a blob
+  no device has acked is never removed to make room.
   Kinds: the sealed plaintext carries a kind - a chat envelope, a DM
   sync batch (files, plugin cards, without inline bytes), or a delivery
   or read receipt - so receipts and attachments reach a sleeping phone
