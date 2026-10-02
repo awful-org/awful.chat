@@ -50,3 +50,17 @@ it("clears for a new session: waiters get no turn, and old turns stop counting",
   fresh!();
   expect(await next).not.toBeNull();
 });
+
+it("says it is full only with no turn free and no place in line, so a clear's null is told from a refusal", async () => {
+  const gate = new RoomOpenings(1, 1);
+  expect(gate.full).toBe(false);
+  const held = gate.tryEnter();
+  expect(gate.full).toBe(false); // a place in line is left
+  const waiting = gate.enter();
+  expect(gate.full).toBe(true);
+  expect(await gate.enter()).toBeNull();
+  held!();
+  expect(gate.full).toBe(false);
+  (await waiting)!();
+  expect(gate.active).toBe(0);
+});

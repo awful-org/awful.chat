@@ -854,14 +854,25 @@ export class LibP2PTransport implements PeerTransport {
       if (!current()) return null;
       const live = this.liveRoomChannel(room, peerId);
       if (live?.channel) return live.channel;
-      const end = this.roomOpenings.tryEnter() ?? await this.roomOpenings.enter();
+      let waited = false;
+      let end = this.roomOpenings.tryEnter();
       if (!end) {
-        this.noteRoomRefusal("queue", peerId, room);
-        return null;
+        if (this.roomOpenings.full) {
+          this.noteRoomRefusal("queue", peerId, room);
+          return null;
+        }
+        // No turn after all means the line was cleared - a lock, a logout, a
+        // new node - which refuses nothing.
+        end = await this.roomOpenings.enter();
+        if (!end) return null;
+        waited = true;
       }
       let entry: RoomStreamEntry | null = null;
       try {
         if (!current()) return null;
+        // The wait for a turn can be long enough for theirs to have arrived:
+        // joined, back at the top, rather than raced with a dial of ours.
+        if (waited && (this.liveRoomChannel(room, peerId) || this.roomHandshake(room, peerId))) continue;
         const signal = AbortSignal.timeout(30_000);
         const connection = await node.dial(peerIdFromString(peerId), { signal });
         if (!current()) return null;

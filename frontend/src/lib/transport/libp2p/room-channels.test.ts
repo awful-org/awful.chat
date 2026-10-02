@@ -10,6 +10,7 @@ vi.mock("$lib/telemetry/recorder", async (original) => ({
   rec: (event: (typeof recorded)[number]) => { recorded.push(event); },
 }));
 import { LibP2PTransport } from "./transport";
+import { RoomOpenings } from "./room-openings";
 import { newRoomSecret } from "$lib/room-security/keys";
 
 afterEach(() => {
@@ -161,4 +162,45 @@ it("does not count a member the relay says left back in over the channel their l
   await vi.waitFor(() => expect(internal.roomMembers.get(room)?.has("bob")).toBe(true));
   internal.secureStreams.delete(bounced);
   expect(t.isRoomPeer(room, "bob")).toBe(true);
+});
+
+it("reports a full line of openings as a refusal, and a line cleared for a new session as none", async () => {
+  const { t, internal, room } = transport();
+  internal.roomOpenings = new RoomOpenings(1, 1);
+  internal.node = { dial: vi.fn(() => new Promise(() => {})), peerId: { toString: () => "alice" } };
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  void t.sendSecureRoom("p1", room, new Uint8Array([1])); // the one turn
+  const queued = t.sendSecureRoom("p2", room, new Uint8Array([1])); // the one place in line
+  expect(await t.sendSecureRoom("p3", room, new Uint8Array([1]))).toBe(false);
+  expect(internal.debugStats.roomChannelRefusals).toBe(1);
+  internal.roomOpenings.clear();
+  expect(await queued).toBe(false);
+  expect(internal.debugStats.roomChannelRefusals).toBe(1);
+  expect(recorded.filter((event) => event.d?.roomChannel === "refused").map((event) => event.peer)).toEqual(["p3"]);
+});
+
+it("joins the channel the peer opened while ours waited for a turn, rather than dialling them", async () => {
+  const { t, internal, room } = transport();
+  internal.roomOpenings = new RoomOpenings(1, 10);
+  let unreachable!: () => void;
+  const dial = vi.fn((peer: { toString(): string }) => peer.toString() === "p1"
+    ? new Promise((_, reject) => { unreachable = () => reject(new Error("unreachable")); })
+    : Promise.reject(new Error("dialled")));
+  internal.node = { dial, peerId: { toString: () => "alice" } };
+  const first = t.sendSecureRoom("p1", room, new Uint8Array([1]));
+  const waiting = t.sendSecureRoom("bob", room, new Uint8Array([2]));
+  // Bob's own channel for the room starts its handshake while ours is in line.
+  let prove!: () => void;
+  const channel = { verified: false, ready: new Promise<void>((resolve) => { prove = resolve; }),
+    trySend: vi.fn(async () => "sent") };
+  const theirs = roomStream({ room, getChannel: () => channel });
+  internal.secureStreams.add(theirs);
+  unreachable();
+  expect(await first).toBe(false);
+  channel.verified = true;
+  theirs.channel = channel as any;
+  prove();
+  expect(await waiting).toBe(true);
+  expect(channel.trySend).toHaveBeenCalledWith(new Uint8Array([2]));
+  expect(dial).toHaveBeenCalledOnce();
 });

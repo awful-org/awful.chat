@@ -49,6 +49,15 @@ export class RoomOpenings {
     return this.#queue.length;
   }
 
+  /**
+   * No turn free and no place left in line: enter() would refuse. Asked
+   * first, so that a null from enter() can only mean the line was cleared -
+   * which is a session ending, not a refusal worth reporting.
+   */
+  get full(): boolean {
+    return this.#active >= this.concurrent && this.#queue.length >= this.queued;
+  }
+
   #take(): () => void {
     this.#active++;
     const generation = this.#generation;
