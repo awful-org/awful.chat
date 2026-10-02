@@ -163,9 +163,11 @@ do not forward, so a proxied hostname is a TURN server nobody can reach.
 ### Changing the list splits rooms until clients reload
 
 This is the one operational trap. Placement is computed from the list the
-client has, and a client reads that list once, at startup. So a session open
-across the change places rooms using the old list while a freshly loaded one
-uses the new list, and two people in the same room can land on different SFUs.
+client has, and a client reads that list only as it starts (a launch begins
+with the copy the last one kept and takes the served list a moment later, as
+soon as its read of `/config.json` lands). So a session open across the change
+places rooms using the old list while a freshly loaded one uses the new list,
+and two people in the same room can land on different SFUs.
 Chat and presence are unaffected (they go through the relay), so it shows up
 as "video is broken for some people", not as a deploy problem.
 

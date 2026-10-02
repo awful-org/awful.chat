@@ -1036,7 +1036,10 @@ Manifest: /manifest.webmanifest (vite-plugin-pwa), id "/", scope "/",
 Service Worker: /sw.js. Precaches the shell and hashed assets (not the
   DTLN worklet or shiki grammars, cached on first use); every in-scope
   navigation is answered from the precached index.html, revalidated in the
-  background; /config.json is never cached. registerType "prompt": a new
+  background; /config.json is never cached by the worker or the HTTP cache.
+  The app keeps the last copy it read in localStorage and a later launch
+  starts from it, applying the fresh read when it lands, so only a first
+  launch waits on the network for it. registerType "prompt": a new
   build waits until the user accepts the reload.
 Install: the deferred beforeinstallprompt is captured at boot and offered
   once the app is usable; iOS gets Share > Add to Home Screen guidance.

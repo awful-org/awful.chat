@@ -40,7 +40,9 @@ window.addEventListener("vite:preloadError", (event) => {
 // Configuration BEFORE the app mounts. Several modules read the relay and
 // api urls while they initialise, and a mount that raced this would have
 // them capture the build-time fallback instead of what the instance
-// actually serves. A missing config.json resolves immediately.
+// actually serves. A missing config.json resolves immediately, and so does
+// any launch after the first: it starts from the copy the last one kept and
+// refreshes it behind the app (runtime-config.ts).
 await loadRuntimeConfig();
 
 // Databases a crashed quick page left behind. /qc does its OWN switch, once
