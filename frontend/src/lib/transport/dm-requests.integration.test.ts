@@ -207,3 +207,52 @@ describe("a DM never hands out a room's member list (G01.1)", () => {
     expect(roster.participants).toEqual(expect.arrayContaining(members));
   });
 });
+
+describe("only someone in our call is listed as watching it (G01.2)", () => {
+  const SELF = "12D3-self";
+  const viewersOf = (sharer: string) => [...(transportState.transmissionViewers.get(sharer) ?? [])];
+  const presence = (peer: string, room: string, inCall = true) =>
+    receive(peer, { type: MessageType.CallPresence, inCall, roomCode: room }, room);
+  const watch = (peer: string, room: string, shares: string[]) =>
+    receive(peer, { type: MessageType.WatchPresence, watching: shares.at(-1) ?? null, watchingAll: shares }, room);
+
+  beforeEach(() => {
+    s.joined.add("rd2_call");
+    s.roomPeers.set("rd2_call", new Set(["12D3-member", "12D3-sharer"]));
+    Object.assign(transportState, { inCall: true, callRoomCode: "rd2_call" });
+  });
+
+  it("refuses a DM peer whose call presence names the DM", async () => {
+    const { who, device, code } = await dmPeer("12D3-stranger");
+    await ensureDmRoomForPeer(who.did);
+    presence(device, code);
+    expect(transportState.callPeerRooms.get(device)).toBe(code);
+    watch(device, code, [SELF, "12D3-sharer"]);
+    expect(viewersOf(SELF)).toEqual([]);
+    expect(viewersOf("12D3-sharer")).toEqual([]);
+  });
+
+  it("lists a member of our call, for shares in that call only", () => {
+    presence("12D3-member", "rd2_call");
+    presence("12D3-sharer", "rd2_call");
+    watch("12D3-member", "rd2_call", [SELF, "12D3-sharer", "12D3-outsider"]);
+    expect(viewersOf(SELF)).toEqual(["12D3-member"]);
+    expect(viewersOf("12D3-sharer")).toEqual(["12D3-member"]);
+    expect(viewersOf("12D3-outsider")).toEqual([]);
+  });
+
+  it("drops a viewer whose call presence ends or moves to another room", () => {
+    s.joined.add("rd2_other");
+    s.roomPeers.set("rd2_other", new Set(["12D3-member"]));
+    presence("12D3-member", "rd2_call");
+    watch("12D3-member", "rd2_call", [SELF]);
+    expect(viewersOf(SELF)).toEqual(["12D3-member"]);
+    presence("12D3-member", "rd2_call", false);
+    expect(viewersOf(SELF)).toEqual([]);
+
+    presence("12D3-member", "rd2_call");
+    watch("12D3-member", "rd2_call", [SELF]);
+    presence("12D3-member", "rd2_other");
+    expect(viewersOf(SELF)).toEqual([]);
+  });
+});

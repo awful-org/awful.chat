@@ -2687,18 +2687,37 @@ export function _handleWatchPresence(
   // map with junk keys. A viewer has to be somebody call presence already
   // places in a room the relay agrees they are in, and the value it names
   // has to look like a peerId rather than arbitrary text.
+  //
+  // And that room has to be OUR call's, with every share named in that same
+  // call: any vouched room was enough, and a DM is one - so a DM's peer, a
+  // stranger's request included, could list itself watching a share in a
+  // private room's call it had no part in.
   const theirRoom = transportState.callPeerRooms.get(viewerPeerId);
   const admitted =
-    !!theirRoom && _transport.isRoomPeer(theirRoom, viewerPeerId);
+    !!theirRoom &&
+    theirRoom === transportState.callRoomCode &&
+    _transport.isRoomPeer(theirRoom, viewerPeerId);
   if (admitted) {
+    const self = _transport.selfId();
     for (const sharer of watching) {
       if (!looksLikePeerId(sharer)) continue;
+      if (sharer !== self && transportState.callPeerRooms.get(sharer) !== theirRoom) continue;
       const set = new Set(next.get(sharer) ?? []);
       set.add(viewerPeerId);
       next.set(sharer, set);
     }
   }
   transportState.transmissionViewers = next;
+}
+
+/** Take a peer off every share's audience, if it is on one. */
+function _dropViewer(peerId: string): void {
+  for (const viewers of transportState.transmissionViewers.values()) {
+    if (viewers.has(peerId)) {
+      _handleWatchPresence(peerId, []);
+      return;
+    }
+  }
 }
 
 /**
@@ -2738,6 +2757,8 @@ function _handleCallPresence(
     // Membership-gated like the handlers above: "in a call" for a room we
     // never joined is unverifiable noise - at best meaningless, at worst a
     // fake ring sound from any connected peer.
+    // Moved to another room's call: whatever they watched was in the old one.
+    if (theirRoom && theirRoom !== roomCode) _dropViewer(peerId);
     next.add(peerId);
     roomNext.set(peerId, roomCode);
     _callPeerSeen.set(peerId, Date.now());
@@ -2757,6 +2778,9 @@ function _handleCallPresence(
     transportState.pendingTransmissions = txNext;
 
     _forgetWatched(peerId);
+    // Out of the call is out of its audience: the entry used to outlive the
+    // presence that admitted it, until a disconnect or their next frame.
+    _dropViewer(peerId);
 
     const callStateNext = new Map(transportState.callPeerStates);
     callStateNext.delete(peerId);
