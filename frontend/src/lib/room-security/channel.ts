@@ -1,4 +1,4 @@
-import { base64urlnopad } from "@scure/base";
+import { base64urlnopad } from "./base64url";
 import { DISCOVERY_ID_RE } from "./keys";
 import { openRoomEnvelope, sealRoomEnvelope, MAX_ROOM_PLAINTEXT } from "./envelope";
 import { MembershipSession, type MembershipFrame } from "./session";

@@ -5,7 +5,7 @@
  */
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { base64urlnopad as base64url } from "@scure/base";
+import { base64urlnopad as base64url } from "./base64url";
 import type { RoomKeys } from "./keys";
 
 export const MAX_ROOM_PLAINTEXT = 1024 * 1024;

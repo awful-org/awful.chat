@@ -1,4 +1,26 @@
 import { afterEach, expect, it, vi } from "vitest";
+
+// Counts what still goes through @scure/base's pure-JS base64url: the
+// handshake's 32-byte values, and never a frame's payload or ciphertext.
+const slowCodec = vi.hoisted(() => ({ chars: 0 }));
+vi.mock("@scure/base", async (original) => {
+  const real = await original<typeof import("@scure/base")>();
+  return {
+    ...real,
+    base64urlnopad: {
+      encode: (bytes: Uint8Array) => {
+        const text = real.base64urlnopad.encode(bytes);
+        slowCodec.chars += text.length;
+        return text;
+      },
+      decode: (text: string) => {
+        slowCodec.chars += text.length;
+        return real.base64urlnopad.decode(text);
+      },
+    },
+  };
+});
+
 import { MAX_ROOM_MESSAGE, SecureRoomChannel } from "./channel";
 import { deriveRoomKeys, newRoomSecret } from "./keys";
 
@@ -50,6 +72,17 @@ it("reassembles a multi-megabyte profile before dispatching it exactly once", as
   expect(received.length).toBe(data.length);
   // Avoid millions of generic matcher object comparisons for a byte buffer.
   expect(received.every((byte, index) => byte === data[index])).toBe(true);
+});
+
+it("seals and opens a frame's bytes without the pure-JS codec", async () => {
+  const { a, delivered } = await pair();
+  slowCodec.chars = 0;
+  const data = new Uint8Array(700_000);
+  for (let i = 0; i < data.length; i++) data[i] = i % 253;
+  expect(await a.send(data)).toBe(true);
+  await vi.waitFor(() => expect(delivered).toHaveBeenCalledTimes(1), { timeout: 5000 });
+  expect((delivered.mock.calls[0][0] as Uint8Array).every((byte, i) => byte === data[i])).toBe(true);
+  expect(slowCodec.chars).toBe(0);
 });
 
 it("rejects oversized application messages without closing a healthy channel", async () => {
