@@ -885,7 +885,7 @@
         <!-- No transfer entry while this room's stored files are still being
              read back means "not registered yet", not "nobody has it". -->
         {@const hydrating = !transfer && attachmentHydration.rooms.has(msg.roomCode)}
-        <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
+        <div class="relative rounded-md border border-border/70 bg-muted/30 p-2.5">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">
               <p class="truncate text-sm text-foreground">{file.filename}</p>
@@ -917,8 +917,11 @@
 
           <!-- Only while bytes are actually moving: a finished or seeding
                transfer has nothing left to report. -->
+          <!-- Over the card's bottom edge, not a row of its own: a bar that
+               took space moved everything below it twice, once when a
+               transfer started and again when it finished. -->
           {#if transfer?.status === "downloading" && !transfer.done && (transfer.progress ?? 0) < 1}
-            <div class="mt-2 h-1.5 overflow-hidden rounded bg-muted">
+            <div class="absolute inset-x-2.5 bottom-1 h-1 overflow-hidden rounded bg-muted">
               <div
                 class="h-full bg-primary transition-[width]"
                 style={`width: ${Math.max(0, Math.min(100, Math.round((transfer.progress || 0) * 100)))}%`}
