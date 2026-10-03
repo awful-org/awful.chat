@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isMacLike, shortcutKeys, shortcutLabel } from "./platform";
+import { isMacLike, isShortcutModifier, shortcutKeys, shortcutLabel } from "./platform";
 
 const MAC_SAFARI =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
@@ -104,5 +104,23 @@ describe("shortcutLabel", () => {
   it("joins with + everywhere else", () => {
     expect(shortcutLabel(["Mod", "K"], false)).toBe("Ctrl+K");
     expect(shortcutLabel(["Mod", "Shift", "F"], false)).toBe("Ctrl+Shift+F");
+  });
+});
+
+describe("isShortcutModifier", () => {
+  const key = (metaKey: boolean, ctrlKey: boolean) => ({ metaKey, ctrlKey });
+
+  it("takes Cmd on a Mac and leaves Ctrl to text editing", () => {
+    expect(isShortcutModifier(key(true, false), true)).toBe(true);
+    expect(isShortcutModifier(key(false, true), true)).toBe(false);
+    expect(isShortcutModifier(key(true, true), true)).toBe(false);
+    expect(isShortcutModifier(key(false, false), true)).toBe(false);
+  });
+
+  it("takes Ctrl elsewhere and leaves the Windows or Super key to the system", () => {
+    expect(isShortcutModifier(key(false, true), false)).toBe(true);
+    expect(isShortcutModifier(key(true, false), false)).toBe(false);
+    expect(isShortcutModifier(key(true, true), false)).toBe(false);
+    expect(isShortcutModifier(key(false, false), false)).toBe(false);
   });
 });

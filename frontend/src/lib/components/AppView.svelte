@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isShortcutModifier } from "$lib/platform";
   import { untrack } from "svelte";
   import { isLegacyArchive } from "$lib/room-security/legacy-archive";
   import LegacyArchive from "./LegacyArchive.svelte";
@@ -1438,7 +1439,8 @@
   onpopstate={handlePopState}
   onhashchange={handleHashChange}
   onkeydown={(e) => {
-    if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+    // Cmd on a Mac, Ctrl elsewhere - never both (platform.ts).
+    if (!isShortcutModifier(e) || e.altKey) return;
 
     // Cmd/Ctrl+F searches the open room (all rooms with Shift, or when no
     // room is open). It shadows the browser's find on purpose: the page

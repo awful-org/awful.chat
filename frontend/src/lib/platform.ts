@@ -1,8 +1,9 @@
 /**
  * platform.ts - what this machine calls its modifier keys.
  *
- * Every shortcut the app binds takes Cmd on a Mac where it takes Ctrl
- * elsewhere, so every label for one has to follow the same rule. Shortcuts are
+ * Every shortcut the app binds takes Cmd on a Mac and Ctrl elsewhere, the
+ * way every app on each system does, so every label for one has to follow
+ * the same rule. Shortcuts are
  * written once with "Mod" for that key and formatted here: "⌘K" on a Mac,
  * "Ctrl+K" everywhere else.
  */
@@ -65,4 +66,18 @@ export function shortcutLabel(
   mac: boolean = isMacLike()
 ): string {
   return shortcutKeys(keys, mac).join(mac ? "" : "+");
+}
+
+/**
+ * Whether a key event carries the app's shortcut key: Cmd on a Mac, Ctrl
+ * everywhere else, and never the other one. On a Mac, Ctrl+K, Ctrl+F and
+ * Ctrl+B are the system's own text editing in every text box (delete to the
+ * end of the line, forward and back a character), and Mac apps leave them
+ * alone. Elsewhere the Windows or Super key belongs to the system.
+ */
+export function isShortcutModifier(
+  e: { metaKey: boolean; ctrlKey: boolean },
+  mac: boolean = isMacLike()
+): boolean {
+  return mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
 }
