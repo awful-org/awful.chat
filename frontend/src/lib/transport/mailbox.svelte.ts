@@ -196,10 +196,10 @@ function relayHost(): string {
  */
 function signedRequest(
   action: MailboxAction,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  device: string
 ): { headers: Record<string, string>; body: string } {
   const session = requireSession();
-  const device = _transport.selfId();
   const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
   const body = JSON.stringify({ ...payload, device, nonce });
   const ts = Math.floor(Date.now() / 1000);
@@ -226,12 +226,19 @@ let _collectPausedUntil = 0;
 export async function collectMailbox(): Promise<void> {
   if (!mailboxPrefs.enabled || !API() || !isUnlocked() || _collecting) return;
   if (Date.now() < _collectPausedUntil) return;
+  // Not before this device has its id, which only a started node gives it.
+  // A collect naming no device is answered with every blob, acked or not,
+  // and its ack deletes them for all of our devices - and the first collect
+  // after every page load went out like that, re-delivering the whole box
+  // and a receipt per DM still in it. Connecting to the relay collects again.
+  const device = _transport.selfId();
+  if (!device) return;
   _collecting = true;
   try {
     const session = requireSession();
     const res = await fetch(`${API()}/mailbox/collect`, {
       method: "POST",
-      ...signedRequest("collect", {}),
+      ...signedRequest("collect", {}, device),
       // Without a deadline a request that never settles latches _collecting
       // for the rest of the session and the mailbox goes quiet for good.
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
@@ -305,7 +312,7 @@ export async function collectMailbox(): Promise<void> {
     if (done.length > 0) {
       const ack = await fetch(`${API()}/mailbox/ack`, {
         method: "POST",
-        ...signedRequest("ack", { ids: done }),
+        ...signedRequest("ack", { ids: done }, device),
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
       if (!ack.ok) {

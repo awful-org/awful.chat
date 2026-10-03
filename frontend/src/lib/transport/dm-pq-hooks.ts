@@ -16,6 +16,7 @@ export interface IntroductionHookDeps {
   boundDid(peer: string): string | undefined;
   bind(peer: string, did: string): void;
   dmExists(did: string): Promise<boolean>;
+  /** Join the DM with them: one we hold as it is, a new one without storing it. */
   ensureDm(did: string, state?: DmPqState): Promise<unknown>;
   replayPending(peer: string, did: string): void;
   /** The check after an upgrade that the other device followed; see UPGRADE_HEAL_DELAY_MS. */
@@ -66,12 +67,15 @@ export function _resetHealsForTests(): void {
 }
 
 /**
- * An introduction proved `did` owns `peer`. Bind them and make sure the DM
- * exists - except that a DM which does not exist yet, when a post-quantum
- * upgrade is about to follow, is left for the upgrade to create under the
- * hybrid key: joining it here would put it on the classical key for the
- * moments in between. If the upgrade then fails, the next ensureDm creates it
- * classically, exactly as for a peer on an older build.
+ * An introduction proved `did` owns `peer`. Bind them and join the DM, so
+ * their first message can arrive live - a new DM is only joined, and stored
+ * with that message (dm.svelte.ts, EnsureDmOptions.provisional), since an
+ * introduction alone costs its sender nothing. Except that a DM which does
+ * not exist yet, when a post-quantum upgrade is about to follow, is left for
+ * the upgrade to join under the hybrid key: joining it here would put it on
+ * the classical key for the moments in between. If the upgrade then fails,
+ * the next ensureDm joins it classically, exactly as for a peer on an older
+ * build.
  */
 export async function onIntroductionVerified(
   deps: IntroductionHookDeps,

@@ -33,6 +33,7 @@ import {
   setWatermark,
   markRoomSeen,
   markOwnMessagesReadUpTo,
+  onMessageStored,
   nextMessageLamport,
   getPeerProfile,
   putPeerProfile,
@@ -52,7 +53,6 @@ import {
   removeRoomParticipant,
   updateParticipantLastSeen,
   cleanupInactiveParticipants,
-  setDmRequest,
   getDeletedFloor,
   addRoomParticipants,
   MAX_ROOM_PARTICIPANTS,
@@ -174,20 +174,27 @@ import {
   parseDmEnvelope,
 } from "./dm-codec";
 import {
+  acceptIfDmRequest,
   depositDmReceipt,
+  dmRequestPending,
   sendDmReadAcks,
   dmConversationCodeAsync,
   dmPeerDid,
   dmPeerDidForRoom,
+  dmJoinableForThem,
   dmRoomExists,
+  dropDmIfEmpty,
   ensureDmRoomForPeer,
   isDmRequestRoom,
+  joinSavedDms,
+  knownDmName,
   offerDmUpgrade,
   sendDmFrame,
   flushQueuedDmForConnectedPeers,
   flushQueuedDmForPeer,
   joinPhonebookDmRooms,
   noteMailboxDeposit,
+  pruneEmptyDmRequests,
   queueDmMessage,
   resolveDmDisplayName,
   sendDirectMessage,
@@ -741,8 +748,9 @@ const _introductionHookDeps: IntroductionHookDeps = {
   // Arrows, not the functions themselves: dm.svelte imports this module, so
   // these bindings are only safe to read once both have finished loading.
   dmExists: (did) => dmRoomExists(did),
-  // Unsolicited: the introduction may be a stranger's. See EnsureDmOptions.
-  ensureDm: (did, state) => ensureDmRoomForPeer(did, state, { unsolicited: true }),
+  // An introduction alone, maybe a stranger's: a new DM is joined but only
+  // stored with its first message. See EnsureDmOptions.provisional.
+  ensureDm: (did, state) => ensureDmRoomForPeer(did, state, { provisional: true }),
   replayPending: (peer, did) => _replayPendingDm(peer, did),
   heal: {
     schedule: (run, ms) => { setTimeout(run, ms); },
@@ -974,6 +982,31 @@ async function _receiptsForDmWith(
 }
 
 /**
+ * How far each DM's read cascade has reached: every message of ours at or
+ * below `upTo` is read, so a receipt walks only from there up. It walked the
+ * whole conversation every time - one IndexedDB round trip per row, on every
+ * message the other side read, ahead of every write to the store. One of
+ * ours stored at or below it later (another device's, a write that lost a
+ * race) moves it back down, and a walk that saw one of ours stored while it
+ * ran does not move it on. Per session: after a reload each DM walks once.
+ */
+const _readCascade = new Map<string, { upTo: number; stores: number }>();
+let _readCascadeWatching = false;
+onIdentityLock(() => _readCascade.clear());
+
+function _watchOwnStores(): void {
+  if (_readCascadeWatching) return;
+  _readCascadeWatching = true;
+  onMessageStored((m) => {
+    const cascade = _readCascade.get(m.roomCode);
+    if (!cascade || m.status === "read" || !isSelfSender(m.senderId)) return;
+    if (!Number.isSafeInteger(m.lamport)) return;
+    cascade.upTo = Math.min(cascade.upTo, m.lamport - 1);
+    cascade.stores += 1;
+  });
+}
+
+/**
  * `who` names the other party, so the room is the DM with them: every id
  * here already passed _receiptsForDmWith for that room. The room code has to
  * be derived again rather than read off the rows, because the rows hold it
@@ -998,7 +1031,13 @@ async function _cascadeReadAcks(
     lamport = Math.max(lamport, m.lamport);
   }
   if (!lamport) return;
-  const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport);
+  _watchOwnStores();
+  let cascade = _readCascade.get(roomCode);
+  if (!cascade) _readCascade.set(roomCode, (cascade = { upTo: -1, stores: 0 }));
+  if (lamport <= cascade.upTo) return;
+  const stores = cascade.stores;
+  const changed = await markOwnMessagesReadUpTo(roomCode, self, lamport, cascade.upTo);
+  if (cascade.stores === stores) cascade.upTo = Math.max(cascade.upTo, lamport);
   if (!changed.length) return;
   const changedSet = new Set(changed);
   transportState.messages = transportState.messages.map((m) =>
@@ -1368,6 +1407,8 @@ if (typeof window !== "undefined") {
           // chime as a drop, not a silent vanishing.
           _peerCallSound(roomNext.get(pid), false, idsNext.has(pid));
           roomNext.delete(pid);
+          // Out of the call is out of its audience, as when they leave it.
+          _dropViewer(pid);
           idsNext.delete(pid);
           statesNext.delete(pid);
           _callPeerSeen.delete(pid);
@@ -2688,18 +2729,37 @@ export function _handleWatchPresence(
   // map with junk keys. A viewer has to be somebody call presence already
   // places in a room the relay agrees they are in, and the value it names
   // has to look like a peerId rather than arbitrary text.
+  //
+  // And that room has to be OUR call's, with every share named in that same
+  // call: any vouched room was enough, and a DM is one - so a DM's peer, a
+  // stranger's request included, could list itself watching a share in a
+  // private room's call it had no part in.
   const theirRoom = transportState.callPeerRooms.get(viewerPeerId);
   const admitted =
-    !!theirRoom && _transport.isRoomPeer(theirRoom, viewerPeerId);
+    !!theirRoom &&
+    theirRoom === transportState.callRoomCode &&
+    _transport.isRoomPeer(theirRoom, viewerPeerId);
   if (admitted) {
+    const self = _transport.selfId();
     for (const sharer of watching) {
       if (!looksLikePeerId(sharer)) continue;
+      if (sharer !== self && transportState.callPeerRooms.get(sharer) !== theirRoom) continue;
       const set = new Set(next.get(sharer) ?? []);
       set.add(viewerPeerId);
       next.set(sharer, set);
     }
   }
   transportState.transmissionViewers = next;
+}
+
+/** Take a peer off every share's audience, if it is on one. */
+function _dropViewer(peerId: string): void {
+  for (const viewers of transportState.transmissionViewers.values()) {
+    if (viewers.has(peerId)) {
+      _handleWatchPresence(peerId, []);
+      return;
+    }
+  }
 }
 
 /**
@@ -2739,6 +2799,8 @@ function _handleCallPresence(
     // Membership-gated like the handlers above: "in a call" for a room we
     // never joined is unverifiable noise - at best meaningless, at worst a
     // fake ring sound from any connected peer.
+    // Moved to another room's call: whatever they watched was in the old one.
+    if (theirRoom && theirRoom !== roomCode) _dropViewer(peerId);
     next.add(peerId);
     roomNext.set(peerId, roomCode);
     _callPeerSeen.set(peerId, Date.now());
@@ -2758,6 +2820,9 @@ function _handleCallPresence(
     transportState.pendingTransmissions = txNext;
 
     _forgetWatched(peerId);
+    // Out of the call is out of its audience: the entry used to outlive the
+    // presence that admitted it, until a disconnect or their next frame.
+    _dropViewer(peerId);
 
     const callStateNext = new Map(transportState.callPeerStates);
     callStateNext.delete(peerId);
@@ -2974,6 +3039,10 @@ function _handleJoinRoom(
 ): void {
   if (!room) return;
   if (!claimedDid) return;
+  // A DM has no roster to join: its members are its two parties. A join
+  // over one put whatever DID it named on the DM's member list, and was
+  // answered with the roster on screen.
+  if (room.startsWith("dm-")) return;
   // A shape check, deliberately NOT a self-announcement check.
   //
   // Demanding one (holding an unbound sender's join until their Profile
@@ -3048,6 +3117,10 @@ function _handleRoomUsersSync(
   const roomCode = room ?? msg.roomCode;
   if (!roomCode) return;
   if (room === null && !_transport.rooms().includes(roomCode)) return;
+  // Same as a join: a DM's peer has no roster to give, and one that tries
+  // is handing over somebody else's room (an older build answers a DM's
+  // join with whatever roster it had on screen).
+  if (roomCode.startsWith("dm-")) return;
   const participants = msg.participants;
   if (!Array.isArray(participants)) return;
   const selfDid = identityStore.did ?? _transport.selfId();
@@ -3095,6 +3168,10 @@ function _broadcastJoinRoom(): void {
   const selfDid = identityStore.did ?? _transport.selfId();
   const roomCode = transportState.roomCode;
   if (!selfDid || !roomCode) return;
+  // A DM has no roster to join (see _handleJoinRoom), and coming back to the
+  // app with one open still sent this over it: an older build answers a join
+  // with whatever roster it has on screen.
+  if (roomCode.startsWith("dm-")) return;
   _transport.broadcast(
     encode({ type: MessageType.JoinRoom, peerId: selfDid }),
     roomCode
@@ -3144,9 +3221,33 @@ function _announceMessage(
   msg: Message,
   opts: { viaMailbox?: boolean } = {}
 ): void {
+  if (!msg.roomCode.startsWith("dm-")) {
+    _announce(msg, opts);
+    return;
+  }
   // A message request makes no sound: a stranger minting identities would
-  // otherwise get a notification per identity.
+  // otherwise get a notification per identity. The stored record decides,
+  // not just the sidebar's copy of it, which missed a request stored a
+  // moment earlier: a stranger's bare message over the DM's channel, or a
+  // live batch, rang the phone with a text of their choosing. A DM with no
+  // record is no conversation we hold, and is as quiet.
   if (isDmRequestRoom(msg.roomCode)) return;
+  let guard: () => void;
+  try { guard = captureDmOwnership(); } catch { return; }
+  void getRoom(msg.roomCode)
+    .then((room) => {
+      guard();
+      if (room?.type !== "dm" || (room as DMRoom).request === true) return;
+      // Titled as the conversation is: by the name their proven profile
+      // gave, never the frame's senderName, which is unsigned and theirs to
+      // pick per message. With no name known, a generic title as for an
+      // unnamed room: the stand-in was "did:key:z6Mk" for everybody.
+      _announce({ ...msg, senderName: knownDmName(msg.senderId) ?? "New message" }, opts);
+    })
+    .catch(() => {});
+}
+
+function _announce(msg: Message, opts: { viaMailbox?: boolean }): void {
   announceMessage(
     msg,
     {
@@ -3250,6 +3351,11 @@ async function _handleChatMessage(
     console.warn("[chat] refused a message reusing the id of one we already hold");
     return;
   }
+  // A DM is stored with its first message, by the batch copy every bare one
+  // is followed by (_handleDmBatch, which admits it - a stranger's becomes
+  // a request). Until then there is no conversation to file this in.
+  if (isNewMessage && roomCode.startsWith("dm-") && (await getRoom(roomCode))?.type !== "dm") return;
+  guard();
 
   // Only a genuinely new message is written: re-putting a replayed one
   // would overwrite the stored row with this handler's view of it.
@@ -3492,9 +3598,15 @@ async function _sendRoomUsers(
   // peer that dials us - so it handed out the join secret AND the member
   // list to strangers.
   if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
+  // A DM's members are its two parties, and the peer asking is one of them:
+  // there is nothing to tell. Answering one handed the DM's peer - a
+  // stranger's request included - whatever roster was on screen.
+  if (roomCode.startsWith("dm-")) return;
   const selfDid = identityStore.did ?? _transport.selfId();
+  // The on-screen list only while it is this room's: during a switch it
+  // is still filling, or belongs to another conversation.
   const known =
-    roomCode === transportState.roomCode
+    roomCode === transportState.roomCode && transportState.chatMode === "room"
       ? transportState.roomUsers
       : await getRoomParticipants(roomCode);
   const participants = [...new Set([...known, selfDid])];
@@ -3640,16 +3752,31 @@ export async function deliverMailboxBatch(
     (m) => !(m?.senderId === senderDid && typeof m.lamport === "number" && m.lamport <= floor)
   );
   if (!messages.length) return;
-  // The batch handler refuses a room we have not joined, and a conversation
-  // whose first contact arrives through the mailbox has never been joined.
-  // No room means a stranger's request that did not fit: dropped.
-  if (!(await _ensureDmForBatch(senderDid, guard))) return;
-  await _handleSyncBatch(
-    roomCode,
-    messages,
-    senderDid,
-    decoded.live === true
-  );
+  const live = decoded.live === true;
+  const existed = await dmRoomExists(senderDid);
+  guard();
+  if (!existed && !(await _anyRowTakable(roomCode, messages, senderDid, live))) return;
+  // The batch handler takes nothing for a conversation we have not joined,
+  // and one past what others can keep joined (dm.svelte.ts,
+  // MAX_DMS_JOINED_FOR_THEM) is not joined for a batch: the blob waits in
+  // the mailbox until it can be. Asked before anything is made or re-read
+  // for it, as such a blob comes back on every collect.
+  if (!dmJoinableForThem(roomCode)) throw new Error("Conversation not joined");
+  // A conversation whose first contact arrives through the mailbox has
+  // never been joined. No room means a new conversation that did not fit:
+  // like a text, it stays in the mailbox for a later collect.
+  if (!(await _ensureDmForBatch(senderDid, guard, existed))) {
+    throw new Error("No room for a new conversation");
+  }
+  try {
+    // Not joined after all: the bound filled up meanwhile.
+    if (!_transport.rooms().includes(roomCode)) throw new Error("Conversation not joined");
+    await _handleSyncBatch(roomCode, messages, senderDid, live);
+  } finally {
+    // One made for this batch that kept nothing is undone, however the
+    // handler came out of it, and costs nothing (MAX_UNSOLICITED_DMS).
+    if (!existed) await dropDmIfEmpty(roomCode);
+  }
 }
 
 /**
@@ -3678,13 +3805,18 @@ async function _handleDmBatch(
     guard();
     if ((await dmConversationCodeAsync(senderDid).catch(() => null)) !== room) return;
     guard();
+    if (!(await _anyRowTakable(room, msg.messages, senderDid, live))) return;
     if (!(await _ensureDmForBatch(senderDid, guard))) return;
     created = true;
   }
-  await _handleSyncBatch(room, msg.messages, peerId, live, {
-    batchIndex: msg.batchIndex,
-    totalBatches: msg.totalBatches,
-  });
+  try {
+    await _handleSyncBatch(room, msg.messages, peerId, live, {
+      batchIndex: msg.batchIndex,
+      totalBatches: msg.totalBatches,
+    });
+  } finally {
+    if (created) await dropDmIfEmpty(room);
+  }
   // The DM list orders and shows conversations by their last row, and only
   // the text path refreshed it: a card into a DM that was not on screen
   // left the list unaware of it. Live sends only: a history repair arrives
@@ -3697,11 +3829,70 @@ async function _handleDmBatch(
 }
 
 /**
- * Create the conversation a DM batch is the first contact of, as a request.
- * False when there is no room for it (a stranger's request that did not fit).
+ * Whether a first-contact batch has a row the batch handler could take. A
+ * conversation is made for one, and for nothing less: junk is refused
+ * before it costs a request slot, and answered like junk (acked away)
+ * rather than kept in the mailbox for a slot to free up. A row that passes
+ * here and is refused later still leaves nothing: see dropDmIfEmpty.
+ *
+ * Held to the batch handler's own row cap, and checked before it: a
+ * stranger's 4 MB frame of one signed row repeated ten thousand times was
+ * verified row by row, one synchronous task, and froze the tab for seconds
+ * at a time - as often as they sent it, since a refused batch makes no
+ * conversation and leaves the channel open. One row that passes is enough,
+ * so the check stops there.
+ *
+ * A row the batch handler cannot even look at - not an object, or one
+ * whose signed form cannot be built - refuses the whole batch here, as
+ * nothing honest sends one: the handler throws on it, after the
+ * conversation was made, and a mailbox batch it throws on is kept and comes
+ * back on every collect.
  */
-async function _ensureDmForBatch(senderDid: string, guard: () => void): Promise<boolean> {
+async function _anyRowTakable(
+  roomCode: string,
+  rows: WireChatMessage[],
+  senderDid: string,
+  live: boolean
+): Promise<boolean> {
+  if (!Array.isArray(rows) || rows.length > BATCH_SIZE * 4) return false;
+  if (!rows.every((m) => _rowReadable(m, roomCode))) return false;
+  for (const m of rows) {
+    try {
+      const allowUnsigned = allowsUnsignedDmHistory(m, senderDid, live);
+      if ((await _verifyIncoming(m, { room: roomCode, allowUnsigned })).ok) return true;
+    } catch {
+      // A row that cannot even be checked is not one to take.
+    }
+  }
+  return false;
+}
+
+/** Whether the batch handler can check this row without throwing. */
+function _rowReadable(row: unknown, roomCode: string): boolean {
+  if (row === null || typeof row !== "object") return false;
+  try {
+    canonicalContentV3({ ...(row as WireChatMessage), roomCode });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Join the conversation a DM batch is for, creating it - a request, from a
+ * stranger - when the batch is its first contact. False when there is no
+ * room for a new one (a new conversation that did not fit). The DM list is
+ * re-read only for one just made: that decrypts every DM record, and a
+ * mailbox batch for a DM we already have can come back on every collect.
+ */
+async function _ensureDmForBatch(
+  senderDid: string,
+  guard: () => void,
+  existed = false
+): Promise<boolean> {
   if (!(await ensureDmRoomForPeer(senderDid, undefined, { unsolicited: true }))) return false;
+  guard();
+  if (existed) return true;
   // A request this just created must be known as one before anything in the
   // batch is announced (_announceMessage reads roomsStore).
   await refreshDmRooms();
@@ -3770,26 +3961,44 @@ function _handleDmChatAsync(
     // Same binding verifyIncoming applies to room rows: a DM peer cannot file
     // a row under an id someone else's message was bound to.
     if (!messageIdAllowedFor(envelope.payload.id, senderDid)) return;
+    const wireTs = envelope.payload.ts;
+    const wireLamport = envelope.payload.lamport;
+    // Preserve assigned logical values on every device, irrespective of its
+    // clock. Legacy envelopes without a counter use their original timestamp
+    // deterministically, never this receiver's arrival time.
+    const lamport = wireLamport ?? wireTs;
+    // Everything that can refuse this message is checked before the
+    // conversation is made. A new one (a stranger's request above all) used
+    // to be stored first, so a refused message - a lamport past what the
+    // clock takes, an id we already hold - left an empty request behind.
+    const expected = await dmConversationCodeAsync(senderDid);
+    guard();
+    if (!expected || !remoteLamportAllowed(expected, lamport)) return;
+    // A message we already hold has nothing new to store: it is answered in
+    // a conversation we have, never one made for it.
+    if (
+      (await messageClearFieldsByIds([envelope.payload.id])).size > 0 &&
+      !(await dmRoomExists(senderDid))
+    ) return;
     const roomCode = await ensureDmRoomForPeer(peerId, undefined, { unsolicited: true });
     guard();
-    if (!roomCode) return;
+    if (!roomCode) {
+      // No room for a new conversation now: the requests, or this session's
+      // new conversations, are full. The mailbox copy stays there for a
+      // later collect, instead of being acked away as if it had arrived.
+      if (viaMailbox) throw new Error("No room for a new conversation");
+      return;
+    }
 
     const reaction = envelope.payload.reaction;
     // Timestamp sanitization affects display only, never the sequence stored
     // in sync/read watermarks. Old envelopes may carry epoch-sized counters.
-    const wireTs = envelope.payload.ts;
     const ts =
       Number.isSafeInteger(wireTs) &&
       wireTs > 0 &&
       wireTs <= Date.now() + MAX_DM_LAMPORT_SKEW
         ? wireTs
         : Date.now();
-    const wireLamport = envelope.payload.lamport;
-    // Preserve assigned logical values on every device, irrespective of its
-    // clock. Legacy envelopes without a counter use their original timestamp
-    // deterministically, never this receiver's arrival time.
-    const lamport = wireLamport ?? wireTs;
-    if (!remoteLamportAllowed(roomCode, lamport)) return;
     const msg: Message = {
       id: envelope.payload.id,
       roomCode,
@@ -3822,6 +4031,24 @@ function _handleDmChatAsync(
     };
 
     observeLamport(roomCode, lamport);
+    // A message request is told nothing back until it is accepted: no
+    // delivered tick and no read receipt (sendDmReadAcks holds the rest).
+    // The ack gave a stranger who knew only our DID the times this device
+    // was running, and answered every replay of the same message again.
+    const request = await dmRequestPending(roomCode);
+    guard();
+    // No stream to reply on when the DM came out of the mailbox. Calling
+    // send() with a DID makes peerIdFromString throw inside libp2p, and
+    // that surfaces as a `stream-open-failed` toast the user reads as a
+    // real error - up to two per collected DM. So the receipt goes back
+    // through the mailbox instead of being dropped: waiting for the two
+    // of you to be online together is exactly what the mailbox exists to
+    // avoid, and the ticks stayed at "sent" forever meanwhile.
+    const answer = (receipt: Uint8Array) => {
+      if (request) return;
+      if (viaMailbox) _depositDmReceipt(senderDid, receipt);
+      else _transport.sendRoom(peerId, roomCode, receipt).catch(() => {});
+    };
     // Against storage, not the on-screen list: that list holds whichever
     // conversation is open, so a redelivered message was only recognised
     // as a duplicate when you happened to be looking at that DM.
@@ -3882,23 +4109,7 @@ function _handleDmChatAsync(
         await refreshDmRooms();
         guard();
         transportState.dmVersion += 1;
-        // No stream to reply on when the DM came out of the mailbox. Calling
-        // send() with a DID makes peerIdFromString throw inside libp2p, and
-        // that surfaces as a `stream-open-failed` toast the user reads as a
-        // real error - up to two per collected DM. So the receipt goes back
-        // through the mailbox instead of being dropped: waiting for the two
-        // of you to be online together is exactly what the mailbox exists to
-        // avoid, and the ticks stayed at "sent" forever meanwhile.
-        if (viaMailbox) {
-          _depositDmReceipt(
-            senderDid,
-            encodeDmReadEnvelope([envelope.payload.id])
-          );
-        } else {
-          _transport
-            .sendRoom(peerId, roomCode, encodeDmReadEnvelope([envelope.payload.id]))
-            .catch(() => {});
-        }
+        answer(encodeDmReadEnvelope([envelope.payload.id]));
       }
     }
 
@@ -3906,13 +4117,7 @@ function _handleDmChatAsync(
     // out the ack would only cost a second mailbox deposit.
     guard();
     if (readSent) return;
-    if (viaMailbox) {
-      _depositDmReceipt(senderDid, encodeDmAckEnvelope(envelope.payload.id));
-    } else {
-      _transport
-        .sendRoom(peerId, roomCode, encodeDmAckEnvelope(envelope.payload.id))
-        .catch(() => {});
-    }
+    answer(encodeDmAckEnvelope(envelope.payload.id));
   })();
 }
 
@@ -4395,6 +4600,8 @@ async function _joinSavedRooms(): Promise<void> {
     // A message request is joined when its sender turns up again (their
     // introduction) or the user opens it - never just for starting up.
     if ((room as DMRoom).request === true) continue;
+    // Other DMs below, and not every one of them: see joinSavedDms.
+    if (room.type === "dm") continue;
     try {
       joinStoredRoom(_transport, room.roomCode, room);
     } catch {
@@ -4403,8 +4610,13 @@ async function _joinSavedRooms(): Promise<void> {
       console.warn("[room] skipped a saved room with an invalid invitation");
     }
   }
+  await joinSavedDms(rooms).catch(() => {});
   // Not awaited in the join order any more: housekeeping, once per session.
-  void _sweepInactiveParticipants(rooms);
+  // Empty requests first: the sweep rewrites every room record, and a
+  // rewrite racing a delete puts the record back.
+  void pruneEmptyDmRequests(rooms)
+    .catch(() => {})
+    .then(() => _sweepInactiveParticipants(rooms));
 }
 
 /**
@@ -4958,7 +5170,7 @@ export async function sendFiles(
     const did = await dmPeerDidForRoom(roomCode);
     if (!did || await ensureDmRoomForPeer(did) !== roomCode) throw new Error("DM identity unavailable");
     // Answering a message request accepts it, files included.
-    if (await setDmRequest(roomCode, false)) void refreshDmRooms();
+    await acceptIfDmRequest(roomCode, did);
   }
   if (!_transport.rooms().includes(roomCode)) throw new Error("Not in a room");
   assertCurrent();

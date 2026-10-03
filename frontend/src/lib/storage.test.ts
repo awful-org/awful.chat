@@ -47,6 +47,8 @@ import {
   setRoomPositions,
   setMessagePinned,
   deleteRoom,
+  getLastMessage,
+  roomHoldsMessages,
 } from "./storage";
 import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { STORE_SPECS, inspectRow, isCurrentAad, sealRow } from "./storage-crypto";
@@ -288,6 +290,22 @@ describe("unread counts and seen tracking", () => {
     await markRoomSeen("room-a", 42);
     await markRoomSeen("room-a", 7);
     expect((await getRoom("room-a"))?.lastSeenLamport).toBe(42);
+  });
+
+  it("markRoomSeen records when the user last read the room, each time", async () => {
+    await putRoom(room);
+    expect((await getRoom("room-a"))?.seenAt).toBeUndefined();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      await markRoomSeen("room-a", 42);
+      expect((await getRoom("room-a"))?.seenAt).toBe(1_000);
+      // Read again with nothing new: still a read, later.
+      now.mockReturnValue(2_000);
+      await markRoomSeen("room-a", 7);
+      expect((await getRoom("room-a"))?.seenAt).toBe(2_000);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
 
@@ -538,6 +556,29 @@ describe("markOwnMessagesReadUpTo", () => {
     expect((await getMessage("own-3"))?.status).toBe("sent");
     expect((await getMessage("theirs"))?.status).toBe("delivered");
     expect((await getMessage("own-1"))?.status).toBe("read");
+  });
+
+  it("walks only above where an earlier cascade reached", async () => {
+    await bulkPutMessages([
+      msg({ id: "below", senderId: "me", lamport: 5, status: "sent" }),
+      msg({ id: "above", senderId: "me", lamport: 15, status: "sent" }),
+    ]);
+    expect(await markOwnMessagesReadUpTo("room-a", "me", 20, 10)).toEqual(["above"]);
+    expect((await getMessage("below"))?.status).toBe("sent");
+  });
+});
+
+describe("roomHoldsMessages", () => {
+  it("answers from the index alone, so a row that will not open still counts", async () => {
+    expect(await roomHoldsMessages("room-a")).toBe(false);
+    await putMessage(msg({ id: "only", status: "sent" }));
+    // A clear field rewritten around the seal: the row no longer opens.
+    const db = await getDB();
+    await db.put("messages", { ...(await db.get("messages", "only")), status: "read" } as never);
+    // getLastMessage drops a row it cannot open, and so read the room as empty.
+    expect(await getLastMessage("room-a")).toBeUndefined();
+    expect(await roomHoldsMessages("room-a")).toBe(true);
+    expect(await roomHoldsMessages("room-b")).toBe(false);
   });
 });
 

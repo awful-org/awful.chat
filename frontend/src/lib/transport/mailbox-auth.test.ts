@@ -5,8 +5,9 @@ import { sha256 } from "@noble/hashes/sha2.js";
 // Every authenticated mailbox call carries a v2 proof: a signature over the
 // action, the relay's host, the device, the time and the exact body. These
 // pin the wire shape the relay checks (relay/mailbox.go).
+const device = vi.hoisted(() => ({ id: "12D3KooWDevice" }));
 vi.mock("./transport.svelte", () => ({
-  _transport: { selfId: () => "12D3KooWDevice" },
+  _transport: { selfId: () => device.id },
   broadcastProfile: () => {},
   deliverMailboxBatch: async () => {},
   deliverMailboxDm: async () => {},
@@ -52,6 +53,7 @@ const sent: Sent[] = [];
 
 beforeEach(() => {
   sent.length = 0;
+  device.id = "12D3KooWDevice";
   vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
     const headers = init.headers as Record<string, string>;
     sent.push({ url, auth: headers.Authorization, body: init.body as string });
@@ -93,6 +95,29 @@ it("signs collect and ack each as themselves, with the device and a nonce in the
   expect(collect).not.toHaveProperty("sig");
   expect(ack).not.toHaveProperty("sig");
   expect(collect.nonce).not.toBe(ack.nonce);
+});
+
+// A collect that names no device is answered with every blob, acked or not,
+// and its ack deletes them for all of our devices: the first collect after a
+// page load used to go out like that, before the node had started.
+it("does not collect before this device has its id", async () => {
+  device.id = "";
+  await collectMailbox();
+  expect(sent).toEqual([]);
+});
+
+it("acks as the same device that collected", async () => {
+  vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
+    const headers = init.headers as Record<string, string>;
+    sent.push({ url, auth: headers.Authorization, body: init.body as string });
+    if (url.endsWith("/mailbox/collect")) {
+      device.id = "";
+      return new Response(JSON.stringify([{ id: "abc", blob: "AA==" }]), { status: 200 });
+    }
+    return new Response(null, { status: 204 });
+  });
+  await collectMailbox();
+  expect(verify(sent[1], "ack")).toMatchObject({ device: "12D3KooWDevice", ids: ["abc"] });
 });
 
 // The same vector relay/mailbox_auth_test.go pins, so the two sides cannot

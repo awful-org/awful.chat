@@ -89,6 +89,14 @@ export interface Room {
   type: RoomType;
   name: string;
   lastSeenLamport: number; // unread count = messages with lamport > this
+  /**
+   * When the user last read or wrote here, by this device's clock (ms):
+   * markRoomSeen sets it. lastSeenLamport is a count kept per conversation
+   * and says nothing about when; this does, and only the user moves it,
+   * unlike the time of the last message. Absent until the room is next
+   * read. Private: never sent.
+   */
+  seenAt?: number;
   createdAt: number;
   pfpData?: ArrayBuffer; // local upload - blobURL generated at runtime, never stored
   pfpURL?: string; // external URL (tenor, giphy, etc) - stored as-is
@@ -805,6 +813,31 @@ export async function getLastMessage(
   }
 
   return _open("messages", newest?.value);
+}
+
+/**
+ * Whether anything is stored in a room: one key read from the index, nothing
+ * opened or decrypted. For the checks that only ask whether a conversation is
+ * empty, which getLastMessage answered by decrypting its newest row - once per
+ * saved DM at every connect, before any of them was joined.
+ */
+export async function roomHoldsMessages(roomCode: string): Promise<boolean> {
+  const database = await getDB();
+  const blindRoomCode = await blindValue(roomCode);
+  const blinded = await database
+    .transaction("messages")
+    .store.index("byRoomLamport")
+    .getKey(
+      IDBKeyRange.bound([blindRoomCode, 0], [blindRoomCode, Number.MAX_SAFE_INTEGER])
+    );
+  if (blinded !== undefined) return true;
+  if (isMigrationComplete()) return false;
+  // During migration a row may still sit under the plaintext room code.
+  const plaintext = await database
+    .transaction("messages")
+    .store.index("byRoomLamport")
+    .getKey(IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER]));
+  return plaintext !== undefined;
 }
 
 /**
@@ -1575,12 +1608,18 @@ const MESSAGE_STATUS_RANK: Record<MessageStatus, number> = {
  * earlier in that room was read too. Acks only name the page the reader had
  * loaded, so cascade the status down the backlog. Returns the ids that
  * actually changed so callers can update in-memory copies.
+ *
+ * `after` is how far an earlier cascade in the room already reached: only
+ * rows above it are walked. Every receipt used to walk the whole room, one
+ * IndexedDB round trip per row, holding up every write to the store behind it.
  */
 export async function markOwnMessagesReadUpTo(
   roomCode: string,
   senderId: string,
-  lamport: number
+  lamport: number,
+  after = -1
 ): Promise<string[]> {
+  if (lamport <= after) return [];
   const database = await getDB();
   // status lives inside the sealed blob, so this is a three-step cascade:
   // collect candidates by clear senderId, decrypt/filter/re-seal outside any
@@ -1588,7 +1627,7 @@ export async function markOwnMessagesReadUpTo(
   const blindRoomCode = await blindValue(roomCode);
   const blindedSenderId = await blindValue(senderId);
   const blindedRange = IDBKeyRange.bound(
-    [blindRoomCode, 0],
+    [blindRoomCode, after + 1],
     [blindRoomCode, lamport]
   );
 
@@ -1616,7 +1655,7 @@ export async function markOwnMessagesReadUpTo(
   // During migration, also walk the plaintext range in a separate transaction
   if (!isMigrationComplete()) {
     const plaintextRange = IDBKeyRange.bound(
-      [roomCode, 0],
+      [roomCode, after + 1],
       [roomCode, lamport]
     );
     cursor = await database
@@ -2384,6 +2423,9 @@ export async function cleanupInactiveParticipants(
  * incoming-message handler vs the open-conversation path working from an
  * older snapshot), and a late write with a lower lamport would resurrect
  * already-read messages as unread.
+ *
+ * Every caller is the user reading the room or writing in it, so this also
+ * records when (Room.seenAt).
  */
 export async function markRoomSeen(
   roomCode: string,
@@ -2393,6 +2435,7 @@ export async function markRoomSeen(
   await _patchRoom(roomCode, (room) => ({
     ...room,
     lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, lamport),
+    seenAt: Date.now(),
   }), guard);
 }
 

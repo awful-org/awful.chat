@@ -50,7 +50,7 @@
     {
       icon: Send,
       title: "DMs are the only messages that wait for you",
-      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms. A DM from someone who is not a contact and shares no room with you arrives as a request: it does not notify you, and waits under Requests until you accept it.",
+      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms. A DM from someone who is not a contact and shares no room with you arrives as a request: it does not notify you, sends them no delivered or read ticks, and waits under Requests until you accept it.",
     },
     {
       icon: RefreshCw,

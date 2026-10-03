@@ -27,13 +27,13 @@ function deps(opts: { bound?: string; exists?: boolean } = {}) {
 const STATE = { v: 1, ct: "c", ek: "e" } as DmPqState;
 
 describe("onIntroductionVerified", () => {
-  it("binds and creates the DM, as before, when no upgrade follows", async () => {
+  it("binds and joins the DM, as before, when no upgrade follows", async () => {
     const { d, calls } = deps();
     await onIntroductionVerified(d, "peer", "did:a", false);
     expect(calls).toEqual(["bind peer did:a", "ensure did:a", "replay peer did:a"]);
   });
 
-  it("leaves a DM that does not exist yet for the upgrade to create post-quantum", async () => {
+  it("leaves a DM that does not exist yet for the upgrade to join post-quantum", async () => {
     const { d, calls } = deps({ exists: false });
     await onIntroductionVerified(d, "peer", "did:a", true);
     expect(calls).toEqual(["bind peer did:a", "replay peer did:a"]);
