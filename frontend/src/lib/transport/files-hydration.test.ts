@@ -201,6 +201,51 @@ it("shows a held file whoever sent it and whatever auto-download says, since not
   expect(shown()).toEqual(["show:old:store"]);
 });
 
+// The floating DM panel loads its conversation's messages apart from the
+// view's, and only the view's were looked through: a held picture there
+// showed only once it was clicked.
+it("shows by themselves the held files of a conversation open in the floating DM panel", async () => {
+  const { dmPanel } = await import("$lib/dm-panel.svelte");
+  const inDm = (r: Attachment): Attachment => ({ ...r, roomCode: "dm-panel" });
+  const film = { ...inDm(row("film", 4)), mimeType: "video/mp4", size: AUTO_DOWNLOAD_MAX_BYTES + 1 };
+  const late = inDm(row("late", 5));
+  rows = [inDm(row("new", 3)), inDm(row("old", 1)), film, late];
+  durable = new Set(["h-new", "h-old", "h-film", "h-late"]);
+  try {
+    // The view stays on another room.
+    dmPanel.roomCode = "dm-panel";
+    dmPanel.messages = page(rows[0], film);
+    await _hydrateAndSeedAttachments("dm-panel");
+    // Within the same ceiling as the view: the film waits for its button.
+    expect(shown()).toEqual(["show:new:store"]);
+    // An older page loaded into the panel (what initFiles' effect on the
+    // panel's messages runs; there is no DOM here to run it).
+    dmPanel.messages = page(rows[0], rows[1], film);
+    await _showLoadedHeldFiles("dm-panel", dmPanel.messages);
+    expect(shown()).toEqual(["show:new:store", "show:old:store"]);
+    // Once the panel is closed, nothing more of it is shown.
+    dmPanel.roomCode = null;
+    await _showLoadedHeldFiles("dm-panel", page(...rows));
+    expect(shown()).toEqual(["show:new:store", "show:old:store"]);
+  } finally {
+    dmPanel.roomCode = null;
+    dmPanel.messages = [];
+  }
+});
+
+// Both are runes-driven, and there is no DOM here to run them, so they are
+// read from the source, as msg-render-media.test.ts reads MsgRender.
+it("reads back a conversation's held files as the panel opens it, and watches the panel's page", async () => {
+  const { readFileSync } = await import("node:fs");
+  const dm = readFileSync("src/lib/transport/dm.svelte.ts", "utf8");
+  const open = dm.slice(dm.indexOf("export async function openDmPanel("), dm.indexOf("export function closeDmPanel("));
+  expect(open).toMatch(/dmPanel\.messages = page;[\s\S]*void _hydrateAndSeedAttachments\(roomCode\)/);
+  const source = readFileSync("src/lib/transport/files.svelte.ts", "utf8");
+  expect(source).toMatch(
+    /const roomCode = dmPanel\.roomCode;\s*const messages = dmPanel\.messages;\s*untrack\(\(\) => \{\s*if \(roomCode\) void _showLoadedHeldFiles\(roomCode, messages\)/
+  );
+});
+
 it("auto-download asks once for a rendered message's media within the ceiling, and reads nothing else", () => {
   const entry = (infoHash: string, mimeType: string, size: number) =>
     ({ infoHash, filename: infoHash, mimeType, size }) as FileEntry;

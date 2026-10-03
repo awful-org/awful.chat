@@ -457,6 +457,11 @@ export async function openDmPanel(peerIdOrDid: string): Promise<boolean> {
   if (epoch !== panelOpenEpoch || requireSession() !== session || dmPanel.roomCode !== roomCode) return false;
   dmPanel.messages = page;
   dmPanel.loading = false;
+  // Held files show by themselves here as they do in the view, read back the
+  // same way and in the background (see openDmConversation).
+  void _hydrateAndSeedAttachments(roomCode).catch((err) =>
+    console.warn("[dm] attachment hydrate/seed failed:", err)
+  );
 
   const selfDid = identityStore.did ?? _transport.selfId();
   const theirs = page

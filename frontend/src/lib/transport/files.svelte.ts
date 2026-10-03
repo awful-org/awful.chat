@@ -24,6 +24,7 @@ import type {
 } from "$lib/types/message";
 import { base64ToBytes, encode } from "$lib/utils";
 import { mediaPrefs } from "$lib/media-prefs.svelte";
+import { dmPanel } from "$lib/dm-panel.svelte";
 import { untrack } from "svelte";
 import { SvelteSet } from "svelte/reactivity";
 import type { FileTransferSnapshot, FileSignalEnvelope } from "./types";
@@ -181,6 +182,15 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     $effect(() => {
       const roomCode = transportState.roomCode;
       const messages = transportState.messages;
+      untrack(() => {
+        if (roomCode) void _showLoadedHeldFiles(roomCode, messages).catch(() => {});
+      });
+    });
+    // The floating DM panel loads its conversation's messages apart from the
+    // view's, and its held files show by themselves the same way.
+    $effect(() => {
+      const roomCode = dmPanel.roomCode;
+      const messages = dmPanel.messages;
       untrack(() => {
         if (roomCode) void _showLoadedHeldFiles(roomCode, messages).catch(() => {});
       });
@@ -626,6 +636,20 @@ let _showing: Promise<void> | null = null;
  *  button still tries. */
 const _autoShown = new Set<string>();
 
+/** Whether a conversation is on screen: open in the view, or in the floating
+ *  DM panel. */
+function _onScreen(roomCode: string): boolean {
+  return roomCode === transportState.roomCode || roomCode === dmPanel.roomCode;
+}
+
+/** The messages loaded for a conversation on screen: the view's, or the
+ *  floating DM panel's when only the panel shows it. */
+function _loadedMessages(roomCode: string): readonly Message[] {
+  return roomCode !== transportState.roomCode && roomCode === dmPanel.roomCode
+    ? dmPanel.messages
+    : transportState.messages;
+}
+
 /**
  * Show the held files of the messages `roomCode` has loaded (see
  * _showsByItself): on its first open, and whenever its page changes after.
@@ -633,7 +657,7 @@ const _autoShown = new Set<string>();
  */
 export function _showLoadedHeldFiles(
   roomCode: string,
-  messages: readonly Message[] = transportState.messages,
+  messages: readonly Message[] = _loadedMessages(roomCode),
 ): Promise<void> {
   const held = _heldFiles.get(roomCode);
   if (held?.size) {
@@ -668,7 +692,7 @@ async function _showQueued(epoch: number): Promise<void> {
     const [infoHash, row] = _showQueue.entries().next().value as [string, Attachment];
     _showQueue.delete(infoHash);
     // Left meanwhile: shown when the conversation is loaded again.
-    if (row.roomCode !== transportState.roomCode) continue;
+    if (!_onScreen(row.roomCode)) continue;
     const current = transportState.fileTransfers.get(infoHash);
     if (current?.blobURL || current?.status === "downloading") continue;
     _autoShown.add(infoHash);
