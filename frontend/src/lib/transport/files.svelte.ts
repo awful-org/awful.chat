@@ -631,6 +631,16 @@ const _heldFiles = new Map<string, Map<string, Attachment>>();
 /** Held files waiting to be shown by themselves, decrypted one at a time. */
 const _showQueue = new Map<string, Attachment>();
 let _showing: Promise<void> | null = null;
+
+/**
+ * Whether the room's pictures may still change what is on screen: its
+ * stored attachments are being read back, or held files are queued or being
+ * shown. The chat view waits for this before it shows a conversation it is
+ * opening, so the pictures are in place when it appears.
+ */
+export function attachmentsSettling(roomCode: string): boolean {
+  return attachmentHydration.rooms.has(roomCode) || _showing !== null || _showQueue.size > 0;
+}
 /** Held files this session has tried to show by itself: one that will not
  *  open is not decrypted again every time the page changes. Its Download
  *  button still tries. */

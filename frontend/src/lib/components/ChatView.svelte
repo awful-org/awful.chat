@@ -5,6 +5,7 @@
   import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
   import { roomMemberCount } from "$lib/room-members";
   import { highlightBusy } from "$lib/actions/message-body";
+  import { attachmentsSettling } from "$lib/transport/files.svelte";
   import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
@@ -788,7 +789,8 @@
    *
    * Landed is checked each frame, not guessed with a delay: the stored page
    * is in, the view sits at the newest row (or the room is empty), no code
-   * block is waiting to be highlighted, no history push into the room is
+   * block is waiting to be highlighted, the room's pictures are read back
+   * and shown (attachmentsSettling), no history push into the room is
    * running, every picture on screen has loaded, and the list's height held
    * still from one frame to the next. SETTLE_FALLBACK_MS is not a guess at
    * any of these; it is only there so something that never reports done
@@ -838,6 +840,7 @@
       transportState.historyRoom === roomCode &&
       (empty || initialScrollDone) &&
       !highlightBusy() &&
+      !attachmentsSettling(roomCode) &&
       syncing === null &&
       picturesOnScreenLoaded(el) &&
       still;
