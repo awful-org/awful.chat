@@ -68,4 +68,15 @@ describe("MsgRender's image viewer", () => {
     expect(template).toContain("This image is too large to show.");
     expect(script).toMatch(/const lightboxFormats = \$derived\([^;]*lightboxView === "shown"/);
   });
+
+  // Enter and Space handed their KeyboardEvent to the click handler, which
+  // measured the zoom point from its clientX and clientY: undefined on a
+  // key, so the pan came out NaN and the zoom did nothing.
+  it("zooms from the keyboard about the image's centre, not from a key's missing position", () => {
+    const keydown = template.match(/onkeydown=\{\(e\) => \{([\s\S]*?)\n\s*\}\}/);
+    expect(keydown).not.toBeNull();
+    expect(keydown![1]).toContain("toggleZoom({ x: 0, y: 0 })");
+    expect(keydown![1]).not.toContain("onImageClick");
+    expect(script).toMatch(/function onImageClick\(e: MouseEvent\) \{\s*toggleZoom\(fromCentre\(e\)\);\s*\}/);
+  });
 });

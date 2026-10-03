@@ -372,6 +372,11 @@
    * zoom every time you finish dragging.
    */
   function onImageClick(e: MouseEvent) {
+    toggleZoom(fromCentre(e));
+  }
+
+  /** Zoom in about `at` (relative to centre), or back out if zoomed. */
+  function toggleZoom(at: Point) {
     if (panned) {
       panned = false;
       return;
@@ -386,7 +391,7 @@
     );
     // An image that fits already has nothing to reveal at "actual size", so
     // fall back to a plain step in rather than doing nothing.
-    applyZoom(target > MIN_ZOOM ? target : 2.5, fromCentre(e));
+    applyZoom(target > MIN_ZOOM ? target : 2.5, at);
   }
 
   function onPointerDown(e: PointerEvent) {
@@ -1569,7 +1574,10 @@
           if (e.key !== "Enter" && e.key !== " ") return;
           e.preventDefault();
           // Escape must keep closing the viewer, so only these two are taken.
-          onImageClick(e as unknown as MouseEvent);
+          // A key has no position, so it zooms about the image's centre:
+          // passed as an event, its missing clientX made the pan NaN and the
+          // zoom was dropped.
+          toggleZoom({ x: 0, y: 0 });
         }}
         class="relative z-10 touch-none select-none"
         style="cursor: {dragFrom
