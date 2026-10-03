@@ -125,9 +125,12 @@ the sections below or right here when one line covers it:
 | `cards()` | This plugin's existing cards in the host's room |
 | `onCardStateChange(cb)` | Fires after a persisted update folds; returns unsubscribe |
 | `roomCode()` / `selfDid()` | The room this host is bound to; the user's own DID |
+| `selfName()` | The user's own display name, as their updates carry it |
+| `setActivity(label \| null)` | "Playing Jeopardy" under the user's own name in the call's user list |
 | `peers()` | Connected peers as `{ did, name }` |
 | `onPeerDisconnect(cb)` / `onBeforeDisconnect(cb)` | A peer left / this page is going away; both return unsubscribe |
 | `showLocalCard(data?)` / `closeLocalCard(id)` | Open (returns its id) / close the private floating surface |
+| `showError(message)` | Tell the person who caused it why something did not work, in a note only they see in this room's chat; never sent or stored |
 | `setNowPlaying(info \| null)` | OS media surface (lock screen, media keys); `pipVideo` names the auto-PiP target |
 | `pictureInPicture(video)` | The browser's own floating window for a video the plugin renders |
 | `ping(did, opts?)` / `isRelayed(did)` | One link probe / is this peer relayed |
@@ -185,7 +188,11 @@ the widget, call tile, local card and settings surfaces have `WidgetProps`,
 
 Updates attach to a card. `host.sendUpdate(cardId, data)` persists and
 replays; `{ ephemeral: true }` sends live-only (cursors, ticks) and is
-capped at about 4 per second per sender. Your `reduce(state, update, ctx)`
+capped at about 4 per second per sender. Receivers cap the rest too: 20
+persisted updates per 10 seconds from one person in a room, every plugin's
+together, and 10 cards a minute, dropping what is over. The host keeps to
+the same caps when sending, so past them `sendUpdate` and `sendCard`
+reject instead - one human action should be one update. Your `reduce(state, update, ctx)`
 folds them: history first in a deterministic order, then live. Keep it
 pure, keep it a function of its inputs, and the same state materializes
 on every client and every reload. The context carries `{ senderDid,
@@ -240,7 +247,8 @@ The argument is optional, so a plugin that only needs the payload keeps
 its one-argument `initialState` unchanged.
 
 Two related host calls: `host.cards()` lists the plugin's existing cards
-in the host's room (cheap - it reads only card rows), and
+in the host's room (cheap - it reads only card rows; each carries its folded
+`state` when it is your own card, or when the host already holds it), and
 `host.sendUpdateImmediately(cardId, data)` is the page-teardown variant
 of sendUpdate for `host.onBeforeDisconnect` departure beacons - no async
 work, same room binding as sendUpdate.
@@ -267,6 +275,19 @@ file layer, not through card payloads.
 **Slash commands** register from the `commands` map; `/wheel a, b, c`
 calls your handler with the raw argument string. Commands of disabled
 plugins do not autocomplete and do not fire.
+
+**Never fail silently.** Throw an `Error` whose message says what to type
+instead - `throw new Error("A poll needs two options: /poll Lunch? Pizza,
+Sushi")` - and the host shows it in a note only that person sees, in the
+chat, with your plugin's name, and keeps their draft to fix. A
+`console.warn` reaches nobody: to the person typing, the command did
+nothing. For trouble after the command returned (a link that would not
+load, someone who left), call `host.showError(message)`: the same note.
+Plain text, a sentence or two; the host trims it to one line of 300
+characters. A note belongs to the room the host is bound to and is
+dropped after a minute if nobody looked; a host with no room (the settings
+surface) has nowhere to show one, so there it does nothing - say it in
+your own UI instead.
 
 **Palette commands** add rows to the Ctrl+K palette. List them eagerly in
 `manifest.paletteCommands` (`name`, `title`, optional `subtitle`) so the
@@ -330,14 +351,27 @@ host }`); `localCard` has its own (below):
   tile, and optionally `callTileViewers(cardState)` returning the display
   names using it - the host shows them in the same audience chip screen
   shares get. Both must be deterministic: every client evaluates them on
-  the same folded state. The host renders the tile content inside a
+  the same folded state. Joining a tile also focuses it, like opening a
+  stream; set `callTileFocusOnJoin: false` for a tile meant to sit in the
+  grid beside the cameras (a scoreboard, a timer). The host renders the tile content inside a
   pointer-events-none layer (clicking the tile focuses it, like any
   stream) - give your interactive controls `pointer-events-auto`, and
   know the mount is PERSISTENT: it survives focus changes and filters, so
   an iframe never reloads mid-call. Call tiles receive one extra prop,
   `chromeVisible` - it mirrors the call's own controls (shown while the
   mouse moves over the call section, hidden on idle in fullscreen); gate
-  your control overlays on it so all chrome moves together.
+  your control overlays on it so all chrome moves together. They also get
+  `focused` (the tile is on the big stage) and `setFocused(on)`: clicking
+  a tile focuses it, but an iframe or a canvas that takes the pointer
+  swallows that click, so give such a tile a visible Focus button. The
+  host's Leave button sits in the tile's top-left corner, 3rem in when
+  unfocused and 6.5rem in when focused (the stage's grid menu takes the
+  corner): keep that clear. `callTileActivities(cardState)`, also PURE,
+  returns what each person is doing in the tile by DID (`{ [did]: "Playing
+  Jeopardy" }`), shown under their name in the call's user list as one
+  plain line of up to 48 characters. Your own updates never fold back to
+  you, so your own row is `host.setActivity(label)` instead; the host
+  clears it when your tile unmounts.
 
 - `callTileMenu` - extra rows for your call tile's RIGHT-CLICK menu, so a
   viewer finds the controls of a stream where they expect them. The host
@@ -410,7 +444,7 @@ of mounting code that crashes. Current feature names: `room-context`,
 `resolve-room-image`, `open-message`, `confirm`, `plugin-settings`,
 `call-audio`, `call-capture`, `clock-sample`, `local-card`,
 `now-playing`, `plugin-stream`, `picture-in-picture`, `call-tile-menu`,
-`palette-commands`.
+`palette-commands`, `self-name`, `activity`, `error-card`.
 Declare only what you truly cannot function without. A feature that only adds a button is
 better guarded at the call site (`typeof host.pictureInPicture ===
 "function"`) so the plugin still loads on an older app and just hides the
@@ -719,12 +753,16 @@ The host reads its api origin at runtime, so there is nothing to inline.
 
 The upstream host must be in the instance's `PLUGIN_PROXY_HOSTS` allowlist,
 and the url may carry `{{secret:NAME}}` placeholders that the relay fills
-from `PLUGIN_PROXY_SECRETS` server-side. Operators should bind secrets to
-their host (`STEAM@api.steampowered.com=key`): an unbound secret can be
-sent to any allowlisted host, which is a leak the moment a second host is
-allowlisted. A 204 means the instance is not configured for your plugin:
-say so in the card. Placeholders belong in QUERY STRINGS (values are
-query-escaped). GET only, https only, 2 MB response cap, responses cached
+from `PLUGIN_PROXY_SECRETS` server-side. Each secret is bound to one host
+and one query parameter (`STEAM@api.steampowered.com?key=your-key`), and
+the relay fills it only when the placeholder is the WHOLE value of that
+parameter - so a caller cannot move the key into a parameter the upstream
+echoes back. An operator may also pin a path prefix
+(`STEAM@api.steampowered.com/ISteamUser/?key=your-key`) for a host with an
+endpoint that echoes its query. Document the host and parameter your
+plugin uses, and the paths it calls. The older `NAME=value` and
+`NAME@host=value` forms are no longer filled. A 204 means the instance is
+not configured for your plugin: say so in the card. GET only, https only, 2 MB response cap, responses cached
 ~5 minutes, ~10 requests/minute per client. Document the hosts and secrets
 your plugin needs in its README.
 
@@ -778,9 +816,10 @@ consequences worth knowing before you publish one:
 - The bundle an instance serves depends on its plugin set, so your code is
   inside the bytes anyone checking that instance will hash. A change you push
   changes what every instance running you serves.
-- An instance is expected to pin you (`PLUGIN_SOURCES=owner/repo@sha`).
-  Tag releases, and do not rewrite history on a tag people pin - a pinned ref
-  that changes underneath is exactly what pinning is meant to prevent.
+- An instance is expected to pin you by a whole commit sha
+  (`PLUGIN_SOURCES=owner/repo@<40-character sha>`). Tag releases, and do not
+  rewrite history on a tag people use - a ref that changes underneath is
+  exactly what pinning is meant to prevent.
 
 ## Installing plugins from outside this repo
 
@@ -793,9 +832,9 @@ PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
 ```
 
 - Accepted forms: a github url, `user/repo`, either with `@ref` or `#ref`
-  (tag, branch or commit), or a local path in dev. Prefer `@` in an
-  environment variable: a `.env` file treats `#` as the start of a comment,
-  so `owner/repo#sha` arrives at the build as `owner/repo`.
+  (tag, branch or a commit's whole sha), or a local path in dev. Prefer `@`
+  in an environment variable: a `.env` file treats `#` as the start of a
+  comment, so `owner/repo#sha` arrives at the build as `owner/repo`.
 - A source can hold ONE plugin (manifest.ts at its root) or a PACK: plugin
   folders at the root or under `plugins/`.
 - Removing an entry removes the plugin on the next deploy. Fetched plugins
@@ -803,10 +842,15 @@ PLUGIN_SOURCES=https://github.com/you/awful-plugin-dice#v1,you/plugin-pack
   loudly rather than silently shipping without it.
 - A source with no ref fails the build: it fetches HEAD of a third-party
   repo with no integrity check, so the same env value can ship different
-  code on the next build. Pin it (`user/repo@<commit-sha>`), or set
-  `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to opt in anyway. Every fetched source
-  logs its tarball's sha256 so you can confirm two fetches pulled the same
-  bytes.
+  code on the next build. Pin it by the commit's whole 40-character sha
+  (`user/repo@<commit-sha>`): the build then checks that the tarball GitHub
+  sends is that commit, and refuses it otherwise. An abbreviated sha fails
+  the build too, because it pins nothing - git resolves a branch or tag of
+  the same name first. So does a tag or branch named in hex alone, 4 to 39
+  characters (`2024`), which cannot be told from an abbreviation. Set
+  `PLUGIN_SOURCES_ALLOW_UNPINNED=1` to build any of these anyway. Every
+  fetched source logs the commit its tarball names and the tarball's
+  sha256, so you can confirm two fetches pulled the same bytes.
 - Trust: a fetched plugin runs with the same trust as the app itself, in
   every user's browser, unsandboxed. Only list sources you trust like your
   own code.

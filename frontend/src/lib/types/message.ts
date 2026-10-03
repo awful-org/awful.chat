@@ -1,5 +1,6 @@
 import type { FileSignalEnvelope } from "$lib/transport/types";
 import { normalizeWireName, stripWireControls } from "$lib/wire-name";
+import type { PqKeyCertificate } from "$lib/identity/pq-identity";
 
 export enum MessageType {
   // chat - persisted to IDB, sent over wire
@@ -18,6 +19,7 @@ export enum MessageType {
   VoiceSignal = "voice_signal",
   RoomName = "room_name",
   PluginEphemeral = "plugin_ephemeral",
+  Typing = "typing",
   // room users - wire only, never persisted
   JoinRoom = "join_room",
   LeaveRoom = "leave_room",
@@ -26,6 +28,7 @@ export enum MessageType {
   SyncDigest = "sync_digest",
   SyncBatch = "sync_batch",
   SyncComplete = "sync_complete",
+  SyncNone = "sync_none",
   // DM delivery/read receipts do NOT use MessageType - they are tagged
   // binary envelopes over the direct stream (see dm-codec.ts)
 }
@@ -72,6 +75,8 @@ export interface Message {
 }
 
 export interface Attachment {
+  /** Private descriptor; data, when present, contains ciphertext for v2. */
+  encryption?: import("../room-security/file-crypto").EncryptedFileDescriptor;
   id: string; // UUIDv7
   roomCode: string;
   messageId: string;
@@ -115,6 +120,7 @@ export interface FileMeta {
 }
 
 export interface FileEntry {
+  encryption?: import("../room-security/file-crypto").EncryptedFileDescriptor;
   filename: string;
   mimeType: string;
   size: number;
@@ -162,6 +168,15 @@ export interface WireChatMessage {
 
 export interface WireProfile {
   type: MessageType.Profile;
+  /** Advertised on main frames by clients that understand room profiles. */
+  roomProfilesSupported?: true;
+  /** Only an explicit true makes this a room profile; the transport supplies the room. */
+  roomScoped?: true;
+  /**
+   * On a room frame only: the sender has no overrides in this room, so it
+   * carries no profile and the receiver drops any room copy it holds.
+   */
+  roomInherit?: true;
   name: string;
   did: string | null;
   avatarUrl: string | null;
@@ -199,6 +214,19 @@ export interface WireProfile {
   inboxOff?: true;
   gradient2?: string | null;
   gradient3?: string | null;
+  /**
+   * The sender's ML-KEM-768 key with their DID's signature over it
+   * (identity/pq-identity.ts). Absent from older builds, which is also how a
+   * peer without post-quantum support is recognised. Self-certifying, so it
+   * is re-verified against the proven DID rather than trusted for arriving
+   * on a bound connection.
+   */
+  pq?: PqKeyCertificate;
+}
+
+/** An old profile sent through a room is still a main profile. */
+export function isRoomScopedProfile(profile: WireProfile): boolean {
+  return profile.roomScoped === true;
 }
 
 export interface WireCallPresence {
@@ -245,6 +273,20 @@ export interface WireWatchPresence {
   watchingAll?: string[];
 }
 
+/**
+ * "I am typing in this conversation" (true), or "I stopped" (false).
+ *
+ * No name, no room, no signature: it only ever travels over a room's or a
+ * DM's authenticated channel, which already says who sent it and where, and
+ * the receiver names the typer from its own view of that peer. Senders repeat
+ * it while the draft keeps changing; receivers forget a typer that goes quiet
+ * (typing.ts has the timings).
+ */
+export interface WireTyping {
+  type: MessageType.Typing;
+  typing: boolean;
+}
+
 export interface WirePluginEphemeral {
   type: MessageType.PluginEphemeral;
   id: string;
@@ -264,6 +306,14 @@ export interface WireRoomName {
   /** Which room this name is for. Required on a direct send, where there is
    *  no pubsub topic to infer it from. */
   roomCode?: string;
+  /**
+   * The legacy room this secure room continues, when it was moved from one
+   * (room-security/legacy-move.ts). Only ever sent inside the secure room's
+   * own channel; receivers adopt it under the rules in adoptLegacyPredecessor.
+   */
+  movedFrom?: string;
+  /** When this name was chosen (ms); the newest wins (room-name.ts). */
+  nameAt?: number;
 }
 
 export interface WireJoinRoom {
@@ -289,6 +339,11 @@ export interface WireSyncDigest {
   type: MessageType.SyncDigest;
   roomCode: string; // the room this digest is for - receiver must have joined it
   watermarks: Record<string, number>; // senderId → maxLamport
+  /**
+   * Names this digest, for the SyncNone that answers it (sync-inbound.ts).
+   * Absent from older senders; older receivers ignore it.
+   */
+  nonce?: number;
 }
 
 export interface WireSyncBatch {
@@ -304,11 +359,36 @@ export interface WireSyncBatch {
    * older senders, which is why quiet is the default.
    */
   live?: boolean;
+  /**
+   * Where this batch sits in a paced push (sync-push.ts). "head": the newest
+   * page, sent first so the receiver's screen fills at once. "asc": the rest,
+   * oldest first, so whatever prefix arrives leaves no gap below it and can
+   * be claimed as it lands. Absent from older senders and from live batches;
+   * such a push is claimed only once it completes (sync-inbound.ts).
+   */
+  order?: "head" | "asc";
 }
 
 export interface WireSyncComplete {
   type: MessageType.SyncComplete;
   roomCode: string;
+}
+
+/**
+ * The answer to a digest that brings no push: nothing to send, or a push
+ * not allowed yet. The asker holds the room from its digest until the push
+ * starts (sync-inbound.ts), and this lets it stop at once. Older builds
+ * never send it, so the asker's wait for them still runs out on its own,
+ * and they ignore it as a type they do not know.
+ */
+export interface WireSyncNone {
+  type: MessageType.SyncNone;
+  roomCode: string;
+  /**
+   * The nonce of the digest this answers: only an answer to the latest
+   * digest ends the asker's wait. Absent when that digest carried none.
+   */
+  nonce?: number;
 }
 
 // File wire
@@ -345,13 +425,15 @@ export type AnyWireMessage =
   | WireWatchPresence
   | WireCallState
   | WirePluginEphemeral
+  | WireTyping
   | WireRoomName
   | WireJoinRoom
   | WireLeaveRoom
   | WireRoomUsersSync
   | WireSyncDigest
   | WireSyncBatch
-  | WireSyncComplete;
+  | WireSyncComplete
+  | WireSyncNone;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -27,7 +27,8 @@ COPY frontend/ .
 # Comma/space separated plugin sources (github urls, user/repo[@ref]) fetched
 # into plugins/ before the build - see plugins/README.md. Empty = built-ins only.
 ARG PLUGIN_SOURCES
-# Set to 1 to let an unpinned source (no #ref) through fetch-plugins.
+# Set to 1 to let an unpinned source (no ref, or an abbreviated sha rather
+# than the whole 40-character one) through fetch-plugins.
 ARG PLUGIN_SOURCES_ALLOW_UNPINNED
 
 ENV PLUGIN_SOURCES=$PLUGIN_SOURCES
@@ -47,9 +48,19 @@ COPY .git /.git
 
 RUN pnpm build
 
+# A gzip -9 copy beside each script and stylesheet, which nginx serves as is
+# (gzip_static) instead of compressing every request at level 1. Here, not in
+# `pnpm build`: the copies are for this image's nginx, and dist/ itself stays
+# what the reproducibility check hashes. See scripts/precompress.mjs for what
+# is left out (index.html, JSON) and why.
+RUN node scripts/precompress.mjs dist
+
 # Pinned minor: a floating :alpine changes what runs on every build with no
 # diff to review.
 FROM nginx:1.30-alpine AS runner
+# jq: docker-entrypoint.d/41-awful-whats-new.sh trims GitHub's answer to the
+# few fields Settings > What's new shows.
+RUN apk add --no-cache jq
 COPY --from=builder /app/dist /usr/share/nginx/html
 # frontend/ prefixes here too: the context is the repo root (see the top of
 # this file). Only the --from=builder copy above is relative to the image.

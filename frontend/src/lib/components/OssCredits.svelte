@@ -189,9 +189,9 @@
           url: "https://github.com/jakearchibald/idb",
         },
         {
-          name: "html5-qrcode / node-qrcode",
-          what: "reading and drawing device sync codes",
-          url: "https://github.com/mebjas/html5-qrcode",
+          name: "jsQR / node-qrcode",
+          what: "reading and drawing QR codes: room invites and device sync",
+          url: "https://github.com/cozmo/jsQR",
         },
       ],
     },

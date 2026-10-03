@@ -7,9 +7,13 @@
  *
  * PLUGIN_SOURCES is a comma/whitespace separated list of:
  *
- *   user/repo@<commit-sha>   pinned. The only form that can be rebuilt later.
+ *   user/repo@<commit-sha>   pinned: the whole 40-character sha, and the
+ *                            only form that can be rebuilt later. The tarball
+ *                            must say it is that commit or the build fails.
  *   user/repo@v1.2           a tag or branch. Builds, but is recorded as not
  *                            reproducible, because either can be moved.
+ *   user/repo@d00d9db        an abbreviated sha. NOT a pin, so it needs the
+ *                            same opt-in as no ref at all, see below.
  *   user/repo                the default branch. Needs opt-in, see below.
  *   https://github.com/user/repo   the same, written out in full.
  *   /abs/path or ./rel/path  a local directory, for development.
@@ -30,9 +34,10 @@
  *
  * A source with no #ref fails the build by default: it fetches HEAD of a
  * third-party repo with no integrity check, and the exact same env value can
- * ship different code on the next build. Set PLUGIN_SOURCES_ALLOW_UNPINNED=1
- * to opt into that anyway. Every fetched source prints its tarball's sha256
- * so an operator can confirm two fetches pulled the same bytes.
+ * ship different code on the next build. So does an abbreviated sha. Set
+ * PLUGIN_SOURCES_ALLOW_UNPINNED=1 to opt into either anyway. Every fetched
+ * source prints the commit its tarball names and the tarball's sha256, so an
+ * operator can confirm two fetches pulled the same bytes.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -48,6 +53,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { refKind, tarballCommit } from "./plugin-pin.mjs";
 
 const PLUGINS_DIR = resolve(import.meta.dirname, "../plugins");
 const FETCHED_MANIFEST = join(PLUGINS_DIR, ".fetched.json");
@@ -188,20 +194,42 @@ async function materialize(source, tmp) {
   // No #ref means "fetch whatever HEAD is right now" - a different build can
   // ship different code from the exact same PLUGIN_SOURCES value, with no
   // integrity check on what came back. Loud by default; opt-in to bypass.
-  // Pinned means a commit sha, and nothing else. A tag or a branch can be
-  // moved after the fact, so a build that used one cannot be reproduced from
-  // its own declaration later - which is what anyone checking the instance
-  // reads `pinned` to mean. Such a ref still builds: choosing one is
+  // Pinned means a whole commit sha, and nothing else. A tag or a branch can
+  // be moved after the fact, so a build that used one cannot be reproduced
+  // from its own declaration later - which is what anyone checking the
+  // instance reads `pinned` to mean. Such a ref still builds: choosing one is
   // deliberate in a way that fetching a default branch is not. It is
   // recorded honestly and warned about.
-  const pinned = /^[0-9a-f]{7,40}$/i.test(ref);
-  if (hasRef && !pinned) {
+  //
+  // An ABBREVIATED sha was taken as a pin too, and it is not one: git
+  // resolves a branch or tag named d00d9db before the commit it abbreviates,
+  // so whoever can push to the repo could swap the code under a "pinned"
+  // build, and a repo recreated under the same name can grow a commit with
+  // that prefix in seconds. The instance's public build declaration even
+  // says which prefix to aim for. Refused like an unpinned source.
+  const kind = refKind(ref, hasRef);
+  const pinned = kind === "sha";
+  if (kind === "name") {
     console.error(
       `[fetch-plugins] WARNING: ${spec}@${ref} is a tag or branch, not a ` +
         `commit sha. It can be moved, so this build records itself as not ` +
         `reproducible and cannot be rebuilt from its own declaration later. ` +
-        `Use a sha to pin it.`
+        `Use its whole commit sha to pin it.`
     );
+  }
+  if (kind === "short-sha") {
+    console.error(
+      `[fetch-plugins] WARNING: ${spec}@${ref} reads as an abbreviated commit ` +
+        `sha, which pins nothing: a branch or tag of that name, or a new ` +
+        `commit sharing the prefix, is fetched in its place.`
+    );
+    if (process.env.PLUGIN_SOURCES_ALLOW_UNPINNED !== "1") {
+      fail(
+        `${spec}@${ref} is not a whole commit sha. Pin it with all 40 ` +
+          `characters: ${spec}@<commit-sha>.` +
+          `\n  To build it unpinned anyway, set PLUGIN_SOURCES_ALLOW_UNPINNED=1.`
+      );
+    }
   }
   if (!hasRef) {
     console.error(
@@ -211,7 +239,7 @@ async function materialize(source, tmp) {
     );
     if (process.env.PLUGIN_SOURCES_ALLOW_UNPINNED !== "1") {
       fail(
-        `${spec} has no ref. Pin it to a commit sha: ` +
+        `${spec} has no ref. Pin it to a whole (40-character) commit sha: ` +
           `${spec}@<commit-sha>.` +
           `\n  To fetch HEAD anyway, set PLUGIN_SOURCES_ALLOW_UNPINNED=1 ` +
           `(fine for testing; such a build cannot be reproduced by anyone once ` +
@@ -224,14 +252,27 @@ async function materialize(source, tmp) {
   const res = await fetch(url);
   if (!res.ok) fail(`download failed (${res.status}) for ${url}`);
   const tarBuf = Buffer.from(await res.arrayBuffer());
+  // Which commit came back, from the tarball itself (git archive names it in
+  // the pax header), before anything is extracted. A pin is only a pin if
+  // this is checked: asking for a sha by name and building whatever answered
+  // was exactly how a branch named like the sha got built instead.
+  const commit = tarballCommit(tarBuf);
+  if (pinned && commit !== ref.toLowerCase()) {
+    fail(
+      `${spec}@${ref}: the tarball that came back ` +
+        (commit ? `is commit ${commit}` : `names no commit`) +
+        `, not the pinned one. Refusing to build it.`
+    );
+  }
   const tarPath = join(tmp, "src.tar.gz");
   writeFileSync(tarPath, tarBuf);
-  // Only a tarball by ref is downloaded here (no git clone, no GitHub API
-  // call), so there is no commit SHA to resolve for free. The tarball's own
-  // sha256 is the next best thing: it lets an operator confirm two fetches
+  // The tarball's own sha256 on top: it lets an operator confirm two fetches
   // of the same ref actually pulled the same bytes.
   const sha256 = createHash("sha256").update(tarBuf).digest("hex");
-  console.log(`[fetch-plugins] ${spec}@${ref} tarball sha256: ${sha256}`);
+  console.log(
+    `[fetch-plugins] ${spec}@${ref} is commit ${commit ?? "(not named)"}, ` +
+      `tarball sha256: ${sha256}`
+  );
   const out = join(tmp, "x");
   mkdirSync(out);
   // --strip-components=1 drops the repo-name-ref top folder codeload adds.
@@ -291,10 +332,10 @@ for (const source of sources) {
       checkNoEnvReads(dir, id);
       cpSync(dir, join(PLUGINS_DIR, id), { recursive: true });
       // Provenance, not just the name: what a deployed instance gets asked
-      // is WHICH code this plugin is. The tarball sha is the only integrity
-      // fact available here - no clone and no API call, so there is no
-      // commit sha to resolve for free - and a ref alone is not enough,
-      // because a tag or branch can be moved after the fact.
+      // is WHICH code this plugin is. `pinned` means the tarball was checked
+      // to be the whole commit sha the ref names; the tarball sha256 says
+      // which bytes, and a ref alone is not enough, because a tag or branch
+      // can be moved after the fact.
       fetched.push({ id, source: spec, ref, pinned, sha256 });
       if (!existsSync(join(dir, "README.md"))) {
         console.warn(

@@ -1,5 +1,4 @@
 <script lang="ts">
-import { tick } from "svelte";
 import {
   Dialog,
   DialogContent,
@@ -14,11 +13,6 @@ import {
     connectAsTarget,
     parsePlaintextToken,
     revealShortCode,
-    startScanning,
-    scannerState,
-    switchScanCamera,
-    nextScanCameraId,
-    toggleScanTorch,
     cancelSync,
     type SyncPayload,
   } from "$lib/transport/sync.svelte";
@@ -29,10 +23,9 @@ import {
     Check,
     CircleAlert,
     RefreshCw,
-    SwitchCamera,
-    Flashlight,
-    FlashlightOff,
   } from "@lucide/svelte";
+  import QrScanner from "./QrScanner.svelte";
+  import { SCANNER_NOT_LOADED } from "$lib/qr-scanner.svelte";
 
   interface Props {
     open: boolean;
@@ -60,12 +53,12 @@ import {
     | "error"
   >("select");
   let manualToken = $state("");
-  let scannerElementId = $state(
-    `qr-scanner-${crypto.randomUUID().slice(0, 8)}`
-  );
   let scanPermission = $state<boolean | null>(null);
+  // A code the camera read that is not a sync code. Not a camera problem:
+  // it used to flip the view to "camera access denied".
+  let scanHint = $state<string | null>(null);
+  let scanUnavailable = $state<string | null>(null);
   let syncMode = $state<"add" | "replace">("add");
-  let startScanPromise: Promise<void> | null = null;
 
   // Auto-set initial view based on flowMode
   $effect(() => {
@@ -76,9 +69,8 @@ import {
     }
   });
 
-  // The typed short code carries only the first 8 chars of the sync token, so
-  // the source stops honouring the full 128-bit one the moment it is shown -
-  // keep it behind a deliberate tap instead of printing it next to every QR.
+  // Manual pairing copies the complete capability and full token, just like
+  // scanning the QR. Showing it never weakens source authentication.
   let shortCodeShown = $state(false);
 
   function handleShowShortCode() {
@@ -117,22 +109,13 @@ import {
       // answering null aborts it with nothing written.
       settlePassword(null);
       shortCodeShown = false;
-      (async () => {
-        // Wait for any in-flight scan start to complete
-        if (startScanPromise) {
-          try {
-            await startScanPromise;
-          } catch (e) {
-            // Ignore - scan start failed
-          }
-        }
-        await cancelSync();
-      })();
+      void cancelSync();
       view = "select";
       manualToken = "";
       syncMode = "add";
       pendingPayload = null;
       scanPermission = null;
+      scanHint = null;
     }
   });
 
@@ -174,50 +157,36 @@ import {
 
   let copyFailed = $state(false);
 
-async function handleStartScanning() {
-  view = "scan";
-  await tick();
-  try {
-    startScanPromise = startScanning(
-        scannerElementId,
-        async (payload) => {
-          await handleScanSuccess(payload);
-        },
-        (error) => {
-          console.error("Scan error:", error);
-          scanPermission = false;
-        }
-      );
-    await startScanPromise;
-    // startScanning catches its own failures and reports them through
-    // onError, so it RESOLVES either way - reading the error it recorded is
-    // the only way to tell a running camera from a refused one. Setting this
-    // true unconditionally is why the "camera access denied" panel could
-    // never appear: onError set it false and the next line set it back.
-    scanPermission = !syncState.scanError;
-    } catch (err) {
-      scanPermission = false;
-      console.error("Failed to start scanner:", err);
-    } finally {
-      startScanPromise = null;
-    }
+  // The viewfinder (QrScanner) starts the camera when it mounts and stops it
+  // when it goes; this only opens the view.
+  function handleStartScanning() {
+    scanPermission = null;
+    scanHint = null;
+    view = "scan";
   }
 
-  async function handleSwitchCamera() {
-    const next = nextScanCameraId();
-    if (!next) return;
-    await switchScanCamera(
-      next,
-      scannerElementId,
-      async (payload) => {
-        await handleScanSuccess(payload);
-      },
-      (error) => {
-        console.error("Scan error:", error);
-        scanPermission = false;
-      }
-    );
-    scanPermission = !syncState.scanError;
+  function handleScannedText(text: string): boolean {
+    let payload: SyncPayload | null;
+    try {
+      // The same parser as the typed code; a full-form code carries the
+      // whole peerId, which is what the target pins the connection to
+      // (see connectAsTarget). parsePlaintextToken throws its own message
+      // for a code from before pinning existed.
+      payload = parsePlaintextToken(text);
+    } catch (err) {
+      scanHint = err instanceof Error ? err.message : "Invalid QR code";
+      return false;
+    }
+    if (payload?.peerId) {
+      void handleScanSuccess(payload);
+      return true;
+    }
+    // The JSON payload the QR carried before this build. A PWA can hold an
+    // old build for a while after a deploy.
+    scanHint = text.startsWith("{")
+      ? "This QR code is from an older version of the app - refresh the other device and generate a new code"
+      : "That QR code is not a sync code.";
+    return false;
   }
 
   function handleManualInput() {
@@ -412,7 +381,7 @@ async function handleStartScanning() {
           {#if shortCodeShown}
             <div class="w-full space-y-2">
               <p class="text-xs text-muted-foreground text-center">
-                Or enter this code manually:
+                Or copy this sync code to your other device:
               </p>
               <div class="flex gap-2">
                 <Input
@@ -436,7 +405,7 @@ async function handleStartScanning() {
               </div>
               {#if copyFailed}
                 <p class="text-xs text-muted-foreground">
-                  Could not reach the clipboard. Type the code instead.
+                  Could not reach the clipboard. Select and copy the complete code.
                 </p>
               {/if}
             </div>
@@ -447,7 +416,7 @@ async function handleStartScanning() {
               class="w-full font-mono text-xs text-muted-foreground"
             >
               <Keyboard class="w-3.5 h-3.5 mr-2" />
-              Can't scan? Show a code to type
+              Can't scan? Copy a sync code
             </Button>
           {/if}
 
@@ -473,8 +442,8 @@ async function handleStartScanning() {
             <div class="text-center space-y-2">
               <CircleAlert class="w-12 h-12 text-destructive mx-auto" />
               <p class="text-sm text-muted-foreground">
-                Camera access denied. Please allow camera access or use manual
-                entry.
+                {scanUnavailable ??
+                  "Camera access denied. Please allow camera access or use manual entry."}
               </p>
             </div>
             <Button onclick={handleManualInput} class="w-full font-mono">
@@ -482,59 +451,21 @@ async function handleStartScanning() {
               Enter code manually
             </Button>
           {:else}
-            <div class="relative w-full">
-              <div
-                id={scannerElementId}
-                class="w-full aspect-square bg-black rounded-lg overflow-hidden"
-              ></div>
-              <!-- Over the viewfinder, because that is where the user is
-                   looking while they hold two phones up to each other. -->
-              <div class="absolute right-2 top-2 flex flex-col gap-2">
-                {#if scannerState.cameras.length > 1}
-                  <button
-                    type="button"
-                    onclick={handleSwitchCamera}
-                    aria-label="Switch camera"
-                    class="inline-flex size-11 items-center justify-center rounded-lg bg-black/60 text-white backdrop-blur hover:bg-black/80"
-                  >
-                    <SwitchCamera class="size-5" />
-                  </button>
-                {/if}
-                {#if scannerState.torchAvailable}
-                  <button
-                    type="button"
-                    onclick={() => void toggleScanTorch()}
-                    aria-pressed={scannerState.torchOn}
-                    aria-label={scannerState.torchOn
-                      ? "Turn off torch"
-                      : "Turn on torch"}
-                    class="inline-flex size-11 items-center justify-center rounded-lg backdrop-blur {scannerState.torchOn
-                      ? 'bg-white text-black'
-                      : 'bg-black/60 text-white hover:bg-black/80'}"
-                  >
-                    {#if scannerState.torchOn}
-                      <Flashlight class="size-5" />
-                    {:else}
-                      <FlashlightOff class="size-5" />
-                    {/if}
-                  </button>
-                {/if}
-              </div>
-              {#if scannerState.awaitingPermission}
-                <!-- The prompt is open and unanswered. Without this the view
-                     was a black square for however long the user took to
-                     read it, which reads as a scanner that does not work. -->
-                <div
-                  class="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-lg bg-black/80 p-4 text-center"
-                >
-                  <Camera class="size-8 text-white/80" />
-                  <p class="text-xs text-white/80">
-                    Waiting for camera permission - answer your browser's
-                    prompt to start scanning.
-                  </p>
-                </div>
-              {/if}
-            </div>
+            <QrScanner
+              onText={handleScannedText}
+              onUnavailable={(message) => {
+                console.error("Scan error:", message);
+                // Plain http has no camera at all; saying "denied" sent people
+                // looking for a permission that was never asked. Nor is a
+                // scanner that did not download a camera problem.
+                scanUnavailable =
+                  /https/i.test(message) || message === SCANNER_NOT_LOADED ? message : null;
+                scanPermission = false;
+              }}
+            />
+            {#if scanHint}
+              <p role="alert" class="text-xs text-destructive text-center">{scanHint}</p>
+            {/if}
             <p class="text-xs text-muted-foreground text-center">
               Point your camera at the QR code on your other device.
             </p>
@@ -543,12 +474,11 @@ async function handleStartScanning() {
       {:else if view === "manual-input"}
         <div class="space-y-4">
           <p class="text-sm text-muted-foreground">
-            Enter the sync code shown on your other device (three groups of
-            eight characters, separated by dashes).
+            Paste the sync code copied from your other device.
           </p>
           <Input
             bind:value={manualToken}
-            placeholder="abcd1234-abcd1234-abcd1234"
+            placeholder="Sync code"
             class="font-mono text-center"
             autocapitalize="off"
             autocorrect="off"

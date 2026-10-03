@@ -41,6 +41,25 @@ describe("storage at-rest crypto", () => {
     await initStorageCrypto(KEY);
   });
 
+  it("seals room profile displays and image bytes while blinding room and identity lookups", async () => {
+    const avatar = new Uint8Array([7, 8, 9]).buffer;
+    const row = {
+      id: "own:room-secret:did:key:alice", roomCode: "room-secret",
+      did: "did:key:alice", kind: "own", fields: { nickname: "Room Alice" },
+      pfpData: avatar,
+    };
+    const sealed = await sealRow(row, STORE_SPECS.roomProfiles);
+    expect(sealed.id).toMatch(/^b1:/);
+    expect(sealed.roomCode).toMatch(/^b1:/);
+    expect(sealed.did).toMatch(/^b1:/);
+    expect(sealed.fields).toBeUndefined();
+    expect(sealed.pfpData).toBeUndefined();
+    expect(JSON.stringify(sealed)).not.toContain("Room Alice");
+    expect(JSON.stringify(sealed)).not.toContain("room-secret");
+    expect(JSON.stringify(sealed)).not.toContain("did:key:alice");
+    expect(await openRow(sealed, STORE_SPECS.roomProfiles)).toEqual(row);
+  });
+
   it("round-trips a message and leaves no plaintext content on the row", async () => {
     const msg = {
       id: "m1",

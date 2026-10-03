@@ -1069,9 +1069,22 @@ export function fmtBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(2)} MiB`;
 }
 
-/** A token reference, never a literal colour. See `app.css`. */
+/**
+ * A token reference, never a literal colour. See `app.css`.
+ *
+ * `sev` and link states come out of an uploaded bundle, which anyone with a
+ * peerId can send, and these strings go into style attributes: interpolated
+ * as they were, a crafted value closed the var() and added a url() beacon
+ * that told the sender the operator's IP and when they looked. Only the
+ * known names ever reach the style.
+ */
+const SEVERITIES: ReadonlySet<string> = new Set(["debug", "info", "warn", "error"]);
+const LINK_STATES: ReadonlySet<string> = new Set([
+  "none", "dialing", "dial-failed", "relayed", "direct", "proven", "lost", "dropped",
+]);
+
 export function sevColor(sev: DiagSeverity): string {
-  return `var(--color-sev-${sev})`;
+  return `var(--color-sev-${SEVERITIES.has(sev) ? sev : "info"})`;
 }
 
 export function severityColor(sev: Finding["severity"]): string {
@@ -1081,7 +1094,7 @@ export function severityColor(sev: Finding["severity"]): string {
 }
 
 export function linkColor(state: LinkState): string {
-  return `var(--color-ls-${state})`;
+  return `var(--color-ls-${LINK_STATES.has(state) ? state : "none"})`;
 }
 
 /** A flat `d` bag as one line. Keys stay in insertion order. */

@@ -11,15 +11,17 @@
   import { looksLikePeerId } from "$lib/identity/identity-utils";
   import {
     derivePeerOnlineState,
+    nextGraceExpiry,
     PEER_PROOF_GRACE_MS,
   } from "$lib/peer-online-status";
+  import { keepUnchanged } from "$lib/stable-rows";
   import {
     openDmPanel,
     addToPhonebook,
     isInPhonebook,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
-  import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import GifImage from "./GifImage.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
@@ -44,6 +46,7 @@
   } from "$lib/components/ui/drawer";
   import UserProfileCard from "./UserProfileCard.svelte";
   import { openSettings } from "$lib/ui-state.svelte";
+  import { activityFor } from "$lib/plugins/activity.svelte";
 
   interface Props {
     open: boolean;
@@ -75,6 +78,8 @@
     isRelayed: boolean;
     inCall: boolean;
     sharing: boolean;
+    /** What a call tile says they are doing there ("Playing Jeopardy"). */
+    activity: string | null;
   }
 
   const roomUsers = $derived(transportState.roomUsers);
@@ -83,6 +88,8 @@
   const peerAvatars = $derived(transportState.peerAvatars);
   const peerColors = $derived(transportState.peerColors);
   const peerProfileMeta = $derived(transportState.peerProfileMeta);
+  const peerRoomProfiles = $derived(transportState.peerRoomProfiles);
+  const currentRoomProfile = $derived(transportState.roomCode?.startsWith("rd2_") ? transportState.roomCode : null);
 
   const selfDid = $derived(selfId());
   const ownDid = $derived(identityStore.did);
@@ -119,23 +126,52 @@
   // "connecting" on its own once the grace window elapses, not only the
   // next time some other reactive input happens to change - so this needs
   // its own clock, not a derivation of state that only ticks on its own.
+  // One that wakes only for that: a single timer to the earliest grace
+  // window still running, and none at all while every connected peer is
+  // proven. It used to tick twice a second for as long as the list was
+  // mounted, rebuilding the roster and repainting every row each time.
   let now = $state(Date.now());
   $effect(() => {
-    const tick = setInterval(() => {
+    const at = nextGraceExpiry(
+      connectedSince,
+      transportState.provenPeers,
+      now,
+      PEER_PROOF_GRACE_MS
+    );
+    if (at === null) return;
+    const timer = setTimeout(() => {
       now = Date.now();
-    }, 500);
-    return () => clearInterval(tick);
+    }, Math.max(0, at - Date.now()));
+    return () => clearTimeout(timer);
   });
+
+  /** The order localeCompare gave, from one collator made once. */
+  const byName = new Intl.Collator();
+
+  /**
+   * The rows as last built, by DID. A rebuild hands back the old object for
+   * a row that came out the same (stable-rows.ts), so the list repaints, and
+   * redraws avatars for, only the members something actually changed for.
+   */
+  let previousRows = new Map<string, User>();
 
   const users = $derived.by(() => {
     const allUsers: User[] = [];
+    const rows = new Map<string, User>();
+
+    // One pass over the connections instead of one per member: which
+    // connected id, if any, each DID has. The first one wins, as find did.
+    const connectedByDid = new Map<string, string>();
+    for (const peerId of peers) {
+      const did = peerIdToDid(peerId);
+      if (!connectedByDid.has(did)) connectedByDid.set(did, peerId);
+    }
+    const connected = new Set(peers);
 
     for (const did of roomUsers) {
       const isSelf =
         did === selfDid || did === ownDid || did === selfPeerId();
-      const connectedPeerId = peers.find(
-        (peerId) => peerIdToDid(peerId) === did
-      );
+      const connectedPeerId = connectedByDid.get(did);
       const mappedPeerId =
         connectedPeerId ??
         didToPeerId(did) ??
@@ -145,9 +181,9 @@
       // reach them, so "connected" and "proven" are checked separately
       // (libp2p-audit finding 1).
       const onlinePeerId = connectedPeerId ??
-        (peers.includes(did)
+        (connected.has(did)
           ? did
-          : mappedPeerId && peers.includes(mappedPeerId)
+          : mappedPeerId && connected.has(mappedPeerId)
             ? mappedPeerId
             : null);
       const proven = !!onlinePeerId && transportState.provenPeers.has(onlinePeerId);
@@ -181,30 +217,36 @@
       let tagChipColor: string | null = null;
 
       if (isSelf) {
-        name = profileStore.nickname || "You";
-        avatarUrl = profileStore.avatarUrl || null;
-        color = profileStore.color || null;
-        nameEffect = profileStore.nameEffect || null;
-        nameShimmer = profileStore.nameShimmer ?? null;
-        nameGlow = profileStore.nameGlow ?? null;
-        gradient2 = profileStore.gradient2 || null;
-        gradient3 = profileStore.gradient3 || null;
-        tagText = profileStore.tagText || null;
-        tagTextColor = profileStore.tagTextColor || null;
-        tagChipColor = profileStore.tagChipColor || null;
+        const own = getScopedProfile(currentRoomProfile);
+        name = own.nickname || "You";
+        avatarUrl = own.avatarUrl || null;
+        color = own.color || null;
+        nameEffect = own.nameEffect || null;
+        nameShimmer = own.nameShimmer ?? null;
+        nameGlow = own.nameGlow ?? null;
+        gradient2 = own.gradient2 || null;
+        gradient3 = own.gradient3 || null;
+        tagText = own.tagText || null;
+        tagTextColor = own.tagTextColor || null;
+        tagChipColor = own.tagChipColor || null;
       } else {
         // roomUsers can carry a raw peerId while these maps are DID-keyed.
         const nameKey = peerIdToDid(did) || did;
-        const known = peerNames.get(nameKey) || peerNames.get(did);
+        const scoped = currentRoomProfile ? peerRoomProfiles.get(currentRoomProfile)?.get(nameKey) ?? peerRoomProfiles.get(currentRoomProfile)?.get(did) : undefined;
+        const known = scoped?.nickname || peerNames.get(nameKey) || peerNames.get(did);
         named = !!known;
         name = known || did.slice(0, 12);
-        avatarUrl = peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
+        // A room profile is the whole presentation in this room: what it
+        // lacks was cleared there, so the main profile never fills it in.
+        avatarUrl = scoped
+          ? scoped.pfpURL || null
+          : peerAvatars.get(nameKey) || peerAvatars.get(did) || null;
         color =
           displayPrefs.showPeerNicknameColors
-            ? peerColors.get(nameKey) || peerColors.get(did) || null
+            ? (scoped ? scoped.color : peerColors.get(nameKey) || peerColors.get(did)) || null
             : null;
         // Name effect: respect showPeerNicknameColors like color does
-        const meta = peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);
+        const meta = scoped ?? peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);
         if (displayPrefs.showPeerNicknameColors) {
           nameEffect = meta?.nameEffect || null;
           nameShimmer = meta?.nameShimmer ?? null;
@@ -240,7 +282,7 @@
                 transportState.watchingTransmissions.has(k))
           );
 
-      allUsers.push({
+      const row = keepUnchanged(previousRows.get(did), {
         did,
         peerId: mappedPeerId,
         name,
@@ -256,13 +298,17 @@
         isRelayed: userIsRelayed,
         inCall,
         sharing: inCall && sharing,
+        activity: inCall ? activityFor(did, isSelf, transportState.roomCode) : null,
         tagText,
         tagTextColor,
         tagChipColor,
         gradient2,
         gradient3,
       });
+      rows.set(did, row);
+      allUsers.push(row);
     }
+    previousRows = rows;
 
     return allUsers.sort((a, b) => {
       if (a.isSelf && !b.isSelf) return -1;
@@ -276,7 +322,7 @@
       // They belong under the people you can actually tell apart.
       if (a.named && !b.named) return -1;
       if (!a.named && b.named) return 1;
-      return a.name.localeCompare(b.name);
+      return byName.compare(a.name, b.name);
     });
   });
 
@@ -387,7 +433,7 @@
         openProfileCard(user);
       }
     }}
-    class="flex items-center ml-2 gap-3 px-2 py-1.5 rounded-md transition-colors {user.isSelf
+    class="flex items-center ml-2 gap-3 px-2 py-1.5 rounded-md transition-colors select-none [-webkit-touch-callout:none] {user.isSelf
       ? user.isOnline
         ? ''
         : 'opacity-60'
@@ -467,7 +513,7 @@
         {user.sharing
           ? "Sharing screen"
           : user.inCall
-            ? "In call"
+            ? (user.activity ?? "In call")
             : user.isOnline
               ? "Online"
               : user.isConnecting
@@ -575,7 +621,7 @@
   <div
     role="menu"
     tabindex="-1"
-    class="fixed z-50 min-w-40 rounded-md border border-border bg-popover py-1 shadow-xl"
+    class="fixed z-50 min-w-40 select-none rounded-md border border-border bg-popover py-1 shadow-xl"
     style="top: {userMenu.y}px; left: {userMenu.x}px"
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
@@ -623,7 +669,8 @@
     name={selectedUserForProfile.name}
     avatarUrl={selectedUserForProfile.avatarUrl ?? undefined}
     color={selectedUserForProfile.color ?? undefined}
-    onEdit={() => openSettings("profile")}
+    roomCode={currentRoomProfile}
+    onEdit={() => openSettings("profile", currentRoomProfile)}
     onMessage={() => {
       // Offline members too: their DID opens the conversation, and the DM
       // itself says if it will only land while you are both online.

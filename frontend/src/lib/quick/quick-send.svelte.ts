@@ -6,13 +6,14 @@
  * than once per person - and can close the tab as soon as somebody has it,
  * because the others can now get it from each other.
  *
- * Deliberately built on the two storage-free layers and nothing else:
+ * Deliberately built on two transport layers:
  * LibP2PTransport for introduction and signalling, WebTorrentFileTransport
  * for the bytes. It does NOT import transport.svelte.ts, which would drag in
  * the message store, the attachment store and at-rest crypto - all of which
- * exist to remember things this page must not remember. Nothing here touches
- * IndexedDB or localStorage, so "gone when the tab closes" is a property of
- * the code rather than a cleanup routine that has to run.
+ * exist to remember things this page must not remember. Descriptors and keys
+ * stay in memory. The encrypted file API stages ciphertext in OPFS and keeps
+ * plaintext in memory only; teardown aborts transfers and removes retained
+ * ciphertext.
  *
  * The same two consequences as sync.svelte.ts, for the same reason: this is a
  * SECOND libp2p node in the profile, so it connects with no key seed (a fresh
@@ -28,9 +29,11 @@
 
 import { LibP2PTransport } from "$lib/transport/libp2p/transport";
 import { WebTorrentFileTransport } from "$lib/transport/file/webtorrent";
+import { removeCiphertext } from "$lib/transport/file/ciphertext-store";
 import { refreshTurnCredentials } from "$lib/transport/ice-server-list";
 import { isConfigured } from "$lib/runtime-config";
-import { newQuickCode, normalizeQuickCode } from "$lib/room-code";
+import { newRoomSecret, parseRoomSecret, deriveRoomKeys } from "$lib/room-security/keys";
+import { encryptedFileSize, fileSignatureBinding } from "$lib/room-security/file-descriptor";
 import { quickSessionSeed } from "./session-key";
 import { decode, encode } from "$lib/utils";
 import {
@@ -77,8 +80,9 @@ type QuickWire =
   | { type: "__qs_ack"; infoHash: string };
 
 function isQuickWire(value: unknown): value is QuickWire {
-  const t = (value as { type?: unknown } | null)?.type;
-  return t === "__qs_mode" || t === "__qs_ack";
+  const v = value as Partial<QuickWire> | null;
+  return v?.type === "__qs_mode" ? v.mode === "once" || v.mode === "multi"
+    : v?.type === "__qs_ack" && typeof v.infoHash === "string" && /^[a-f0-9]{40}$/.test(v.infoHash);
 }
 
 interface QuickSendState {
@@ -126,20 +130,24 @@ export const quickSend = $state<QuickSendState>({
 
 let transport: LibP2PTransport | null = null;
 let files: WebTorrentFileTransport | null = null;
-/**
- * The bytes behind everything this device offers, by infoHash.
- *
- * WebTorrent holds a seeded file itself, but a peer that arrives later asks
- * for it through the local lookup - which in the app reads the attachment
- * store. Here the File objects are simply kept, which is why closing the tab
- * ends the transfer: there is no copy anywhere else.
- *
- * ponytail: an in-memory Map, so an offered file is bounded by the tab's
- * memory and a received one by what a Blob can hold (~2 GB, less on mobile).
- * Streaming into showSaveFilePicker() lifts the receive side on Chromium; do
- * it when somebody actually hits the ceiling.
- */
-const localFiles = new Map<string, File>();
+let room = "";
+let generation = 0;
+/** Only references: original plaintext files are never a fallback source. */
+const localFiles = new Set<string>();
+const accepted = new Set<string>();
+const completed = new Set<string>();
+const ciphertext = new Set<string>();
+
+function mayReshare(): boolean {
+  return quickSend.heardMode !== "once" && shouldReshare();
+}
+
+function announceFile(file: FileDescriptor): void {
+  for (const peer of wired) {
+    if (isRoomPeer(peer)) void transport?.sendRoom(peer, room,
+      encode({ type: "__file_signal", payload: { kind: "file-seeder", file } }));
+  }
+}
 
 /**
  * Whether to serve a file this device received.
@@ -156,8 +164,8 @@ const localFiles = new Map<string, File>();
  */
 function shouldReshare(): boolean {
   const conn = (
-    navigator as Navigator & { connection?: { saveData?: boolean } }
-  ).connection;
+    globalThis.navigator as Navigator & { connection?: { saveData?: boolean } }
+  )?.connection;
   return conn?.saveData !== true;
 }
 
@@ -165,28 +173,27 @@ function shouldReshare(): boolean {
 const wired = new Set<string>();
 
 function isRoomPeer(peerId: string): boolean {
-  return !!transport && transport.isRoomPeer(quickSend.code, peerId);
+  return !quickSend.closed && !!transport && transport.isRoomPeer(room, peerId);
 }
 
 /**
- * A peer only exists to this page once the RELAY places it in the code.
+ * A peer only exists here after the transport verifies capability membership.
  *
  * The file transport announces our whole inventory to every peer it is told
  * about, so wiring a peer that merely dialled us would hand a stranger the
- * list of what this device is offering. Same attestation the app uses to
- * decide who may be told a room exists.
+ * list of what this device is offering. A relay roster alone grants no access.
  */
 function wirePeer(peerId: string): void {
   if (!files || wired.has(peerId) || !isRoomPeer(peerId)) return;
   wired.add(peerId);
-  files.onPeerConnect(peerId);
   // Before anything is served: a receiver has to know not to serve it on.
   sendQuick(peerId, { type: "__qs_mode", mode: quickSend.mode });
+  files.onPeerConnect(peerId);
   refreshPeerCount();
 }
 
 function sendQuick(peerId: string, msg: QuickWire): void {
-  void transport?.send(peerId, encode(msg));
+  if (isRoomPeer(peerId)) void transport?.sendRoom(peerId, room, encode(msg));
 }
 
 /** Tell everyone here what this link is for. */
@@ -210,18 +217,15 @@ export function setQuickSendMode(mode: QuickSendMode): void {
 /**
  * A one-time link has done its job.
  *
- * Leaving the room is what closes it: a peer is only ever wired once the
- * relay places it here (wirePeer), so nobody new can be told what we hold.
- * Transfers already running are direct WebRTC links and finish on their own -
- * cutting somebody off mid-file to enforce a promise about NEW arrivals
- * would be pure spite. The seeded copy is deliberately left in place for
- * exactly that reason.
+ * Leaving the room closes admission and disconnecting file peers closes
+ * existing transfers. A peer that already received bytes can keep them.
  */
 function closeLink(): void {
   if (quickSend.closed) return;
   quickSend.closed = true;
   quickSend.status = "closed";
-  transport?.leaveRoom(quickSend.code);
+  transport?.leaveRoom(room);
+  for (const peer of wired) files?.onPeerDisconnect(peer);
   wired.clear();
   quickSend.peers = 0;
 }
@@ -233,7 +237,7 @@ function unwirePeer(peerId: string): void {
 }
 
 function refreshPeerCount(): void {
-  quickSend.peers = transport?.peersInRoom(quickSend.code).length ?? 0;
+  quickSend.peers = transport?.peersInRoom(room).length ?? 0;
 }
 
 function putTransfer(snapshot: FileTransferSnapshot): void {
@@ -244,16 +248,21 @@ function putTransfer(snapshot: FileTransferSnapshot): void {
   quickSend.transfers = next;
 }
 
-function noteIncoming(file: FileDescriptor): void {
-  if (localFiles.has(file.infoHash)) return; // our own, echoed back
-  if (quickSend.incoming.some((f) => f.infoHash === file.infoHash)) return;
+function noteIncoming(file: FileDescriptor): boolean {
+  const known = [...quickSend.offered, ...quickSend.incoming].find(f => f.infoHash === file.infoHash);
+  if (known) return fileSignatureBinding(known) === fileSignatureBinding(file);
+  if (quickSend.incoming.length >= 256) return false;
   quickSend.incoming = [...quickSend.incoming, file];
+  return true;
 }
 
 function handleQuickWire(msg: QuickWire): void {
   if (msg.type === "__qs_mode") {
     // Strictest wins and never relaxes - see heardMode.
-    if (msg.mode === "once") quickSend.heardMode = "once";
+    if (msg.mode === "once") {
+      quickSend.heardMode = "once";
+      if (completed.size) for (const peer of wired) files?.onPeerDisconnect(peer);
+    }
     return;
   }
   // An ack for something WE offered, on a one-time link: delivered, so the
@@ -268,14 +277,20 @@ function handleQuickWire(msg: QuickWire): void {
  * revisit does not build a second node.
  */
 export async function startQuickSend(joinCode?: string): Promise<void> {
-  const code = joinCode ? normalizeQuickCode(joinCode) : newQuickCode();
-  if (!code) {
+  let code;
+  try {
+    code = joinCode === undefined ? newRoomSecret() : parseRoomSecret(joinCode);
+  } catch {
+    stopQuickSend();
     quickSend.status = "failed";
     quickSend.error = "That does not look like a quick send code.";
     return;
   }
-  if (transport && quickSend.code === code) return;
+  if (transport && quickSend.code === code && quickSend.status !== "failed") return;
   if (transport) stopQuickSend();
+  const attempt = ++generation;
+  room = deriveRoomKeys(code).discoveryId;
+  const scope = room;
 
   quickSend.code = code;
   quickSend.isHost = !joinCode;
@@ -298,49 +313,58 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
   transport = t;
   files = f;
 
-  f.setLocalFileLookup(async (infoHash) => localFiles.get(infoHash) ?? null);
+  // The torrent layer retains ciphertext. Never offer plaintext via fallback lookup.
+  f.setLocalFileLookup(async () => null);
+  const current = () => generation === attempt && transport === t;
 
   f.on("signal", (peerId, envelope) => {
-    void t.send(
+    if (!current() || !isRoomPeer(peerId)) return;
+    const hash = envelope.kind === "file-seeder" ? envelope.file.infoHash : envelope.infoHash;
+    if (envelope.kind === "file-seeder" && !localFiles.has(hash) && !mayReshare()) return;
+    if (completed.has(hash) && !localFiles.has(hash) && !mayReshare()) return;
+    void t.sendRoom(
       peerId,
+      scope,
       encode({
         type: "__file_signal",
         payload: envelope,
       } satisfies FileSignalWireMessage)
     );
   });
-  f.on("transfer", (snapshot) => putTransfer(snapshot));
-  f.on("downloaded", (infoHash, blob) => {
+  f.on("transfer", (snapshot) => {
+    if (!current()) return;
+    if (snapshot.encryption && snapshot.seeding) ciphertext.add(snapshot.infoHash);
+    putTransfer(snapshot);
+  });
+  f.on("downloaded", (infoHash) => {
+    if (!current() || !accepted.has(infoHash)) return;
     const desc = quickSend.incoming.find((f) => f.infoHash === infoHash);
     if (!desc) return;
+    ciphertext.add(infoHash);
+    completed.add(infoHash);
     // Say so first, and whatever the mode: it is what lets a one-time link
     // know it is done, and it costs one small frame.
     for (const peerId of wired) {
       sendQuick(peerId, { type: "__qs_ack", infoHash });
     }
-    // A one-time link is ONE delivery, so this copy goes no further. In
-    // multi-peer this is what makes the swarm a swarm: seedFiles announces to
-    // every peer we are wired to, so the next person to ask has two places to
-    // pull from - and localFiles is what serves it, exactly as it serves the
-    // sender's own.
-    if (quickSend.heardMode === "once" || !shouldReshare()) return;
-    const file = new File([blob], desc.filename, { type: desc.mimeType });
-    localFiles.set(infoHash, file);
-    void f.seedFiles([file]);
+    // Already retained as authenticated ciphertext by the torrent layer.
+    // Never pass the published plaintext Blob back into a seeding API.
+    if (mayReshare()) announceFile(desc);
+    else for (const peer of wired) f.onPeerDisconnect(peer);
   });
 
-  t.on("connect", wirePeer);
-  t.on("disconnect", unwirePeer);
-  // The relay's membership reply is what makes a peer real here, and it can
-  // land either side of the connection - a peer already connected fires no
-  // second connect event.
+  t.on("connect", (peer) => { if (current()) wirePeer(peer); });
+  t.on("disconnect", (peer) => { if (current()) unwirePeer(peer); });
+  // Secure membership can complete after connect. Reconcile removals too:
+  // discovery rosters are only hints, transport.isRoomPeer is authoritative.
   t.on("roomPeers", (room, peerIds) => {
-    if (room !== quickSend.code) return;
+    if (!current() || room !== scope) return;
+    for (const peer of wired) if (!isRoomPeer(peer)) unwirePeer(peer);
     for (const peerId of peerIds) wirePeer(peerId);
     refreshPeerCount();
   });
-  t.on("message", (peerId, data) => {
-    if (!isRoomPeer(peerId)) return;
+  t.on("message", (peerId, data, authenticatedRoom) => {
+    if (!current() || authenticatedRoom !== scope || !isRoomPeer(peerId)) return;
     let decoded: unknown;
     try {
       decoded = decode(data);
@@ -353,8 +377,16 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
     }
     if (!isFileSignalWireMessage(decoded)) return;
     if (decoded.payload.kind === "file-seeder") {
-      noteIncoming(decoded.payload.file);
-    }
+      const file = decoded.payload.file;
+      if (!file?.encryption || !/^[a-f0-9]{40}$/.test(file.infoHash) ||
+        typeof file.filename !== "string" || file.filename.length > 1024 ||
+        typeof file.mimeType !== "string" || file.mimeType.length > 256) return;
+      try { encryptedFileSize(file); if (!noteIncoming(file)) return; } catch { return; }
+    } else if (decoded.payload.kind === "file-wt-signal") {
+      const hash = decoded.payload.infoHash;
+      if (!localFiles.has(hash) && (!accepted.has(hash) || (completed.has(hash) && !mayReshare()))) return;
+      if (!decoded.payload.signal || typeof decoded.payload.signal !== "object") return;
+    } else return;
     f.handleSignal(peerId, decoded.payload);
   });
 
@@ -362,10 +394,13 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
     // A per-page key, never the device key - and the SAME one on every
     // reconnect, so a relay bounce does not turn us into a stranger.
     await t.connect(quickSessionSeed());
-    t.joinRoom(code);
+    if (!current()) { void t.disconnect(); return; }
+    t.joinSecureRoom(code);
     quickSend.status = "ready";
     refreshPeerCount();
   } catch (err) {
+    if (!current()) return;
+    stopQuickSend();
     quickSend.status = "failed";
     quickSend.error = err instanceof Error ? err.message : String(err);
   }
@@ -373,17 +408,34 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
 
 /** Seed files and announce them to whoever is already here. */
 export async function offerFiles(picked: File[]): Promise<void> {
-  if (!files || !picked.length) return;
-  const descriptors = await files.seedFiles(picked);
-  descriptors.forEach((desc, i) => {
-    const file = picked[i];
-    if (file) localFiles.set(desc.infoHash, file);
-  });
+  if (!files || !picked.length || quickSend.status !== "ready") return;
+  const owner = files;
+  if (picked.length > 1) {
+    for (const file of picked) {
+      if (files !== owner || quickSend.status !== "ready") break;
+      await offerFiles([file]);
+    }
+    return;
+  }
+  let descriptors: FileDescriptor[];
+  // One file per operation lets partial success remain visible and ensures
+  // every persisted ciphertext reference is owned even if the next file fails.
+  try { descriptors = await owner.seedEncryptedFiles(picked); }
+  catch (err) {
+    if (files === owner) quickSend.error = err instanceof Error ? err.message : "Could not encrypt files.";
+    return;
+  }
+  if (files !== owner || quickSend.status !== "ready") {
+    for (const desc of descriptors) void removeCiphertext(desc.infoHash).catch(() => {});
+    return;
+  }
+  descriptors.forEach(desc => { localFiles.add(desc.infoHash); ciphertext.add(desc.infoHash); });
   const known = new Set(quickSend.offered.map((f) => f.infoHash));
   quickSend.offered = [
     ...quickSend.offered,
     ...descriptors.filter((d) => !known.has(d.infoHash)),
   ];
+  for (const desc of descriptors) announceFile(desc);
 }
 
 /**
@@ -394,10 +446,16 @@ export async function offerFiles(picked: File[]): Promise<void> {
  */
 export function acceptFile(infoHash: string, retry = false): void {
   const file = quickSend.incoming.find((f) => f.infoHash === infoHash);
-  if (file) files?.ensureDownload(file, { retry });
+  if (file && quickSend.status === "ready") {
+    accepted.add(infoHash);
+    ciphertext.add(infoHash);
+    files?.ensureDownload(file, { retry });
+  }
 }
 
 export function stopQuickSend(): void {
+  ++generation;
+  room = "";
   for (const snapshot of quickSend.transfers.values()) {
     if (snapshot.blobURL) URL.revokeObjectURL(snapshot.blobURL);
   }
@@ -406,6 +464,10 @@ export function stopQuickSend(): void {
   transport = null;
   files = null;
   localFiles.clear();
+  accepted.clear();
+  completed.clear();
+  for (const hash of ciphertext) void removeCiphertext(hash).catch(() => {});
+  ciphertext.clear();
   wired.clear();
   quickSend.status = "idle";
   quickSend.code = "";

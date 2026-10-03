@@ -89,10 +89,17 @@ const VOICE_MEDIA_STALL_MS = 8_000;
 // echo whenever anyone talked, which read as "DTLN is processing inbound
 // audio too" (it never touches the inbound path). AEC runs at capture,
 // before the track reaches the worklet, so the two compose.
+//
+// AGC ON here too. With it off, speech reached the worklet at whatever level
+// the hardware produced, and its noise gate has a fixed threshold: a quiet
+// mic (a HyperX Cloud III sat right on it) had its gate closing inside
+// words, which everyone heard as a spotty voice that only a threshold of 0
+// fixed. AGC brings every mic to roughly the same level, well clear of the
+// gate - the same leveling the non-DTLN path has always had.
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: false,
-  autoGainControl: false,
+  autoGainControl: true,
 };
 
 const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {
@@ -290,7 +297,10 @@ export class LibP2PVoice implements VoiceTransport {
     });
   }
 
+  private securityRoom: string | null = null;
+
   async join(_roomCode: string): Promise<void> {
+    this.securityRoom = _roomCode;
     this.node = this.transport.p2pNode;
     if (!this.node) throw new Error("Transport not connected");
 
@@ -565,8 +575,7 @@ export class LibP2PVoice implements VoiceTransport {
     this.lastRedialAsk.set(peerId, now);
     this.debugStats.redialsAsked++;
     rec(ev("voice.redial.ask", { peer: peerId }));
-    void this.transport
-      .send(peerId, encode({ type: MessageType.VoiceRedial }))
+    void this.sendVoiceFrame(peerId, encode({ type: MessageType.VoiceRedial }))
       .catch(() => {});
   }
 
@@ -1281,9 +1290,14 @@ export class LibP2PVoice implements VoiceTransport {
    * handleWireSignal for why this replaced the dedicated /voice/ stream.
    */
   private sendSignal(peerId: string, signal: VoiceSignal): Promise<boolean> {
-    return this.transport
-      .send(peerId, encode({ type: MessageType.VoiceSignal, signal }))
+    return this.sendVoiceFrame(peerId, encode({ type: MessageType.VoiceSignal, signal }))
       .catch(() => false);
+  }
+
+  private sendVoiceFrame(peerId: string, data: Uint8Array): Promise<boolean> {
+    return this.securityRoom && (this.securityRoom.startsWith("rd2_") || this.securityRoom.startsWith("dm-"))
+      ? this.transport.sendRoom(peerId, this.securityRoom, data)
+      : this.transport.send(peerId, data);
   }
 
   private ensureRemotePeer(peerId: string): RemotePeer {

@@ -6,3 +6,4 @@ tmp/
 relay/relay
 .specs/
 .opencode/
+.pnpm-store/

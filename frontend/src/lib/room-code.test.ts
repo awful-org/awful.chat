@@ -10,9 +10,11 @@ import {
 } from "./room-code";
 
 describe("room codes", () => {
-  it("is 13 Crockford base32 characters (65 bits)", () => {
+  it("is a canonical 256-bit v2 capability", () => {
     for (let i = 0; i < 50; i++) {
-      expect(newRoomCode()).toMatch(/^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{13}$/);
+      // 256 bits in 52 base32 characters: the last one carries a single
+      // bit and four zero bits, so it is only ever "a" or "q".
+      expect(newRoomCode()).toMatch(/^r2_[a-z2-7]{51}[aq]$/);
     }
   });
 

@@ -4,10 +4,12 @@ import {
   boundReactionEmoji,
   boundReplyTo,
   isChatMessage,
+  isRoomScopedProfile,
   messageToWire,
   wireToMessage,
   type Message,
   type WireChatMessage,
+  type WireProfile,
 } from "./message";
 import { MAX_WIRE_NAME_LENGTH } from "$lib/wire-name";
 
@@ -43,6 +45,19 @@ const full: Message = {
 };
 
 describe("wire codec", () => {
+  it("treats legacy profiles as main even when a room transported them", () => {
+    const old = JSON.parse(JSON.stringify({ type: MessageType.Profile, name: "Main", did: "did:key:zAlice", avatarUrl: null })) as WireProfile;
+    expect(isRoomScopedProfile(old)).toBe(false);
+    expect(old.roomProfilesSupported).toBeUndefined();
+  });
+
+  it("preserves explicit room capability and scope through the wire shape", () => {
+    const main: WireProfile = { type: MessageType.Profile, name: "Main", did: "did:key:zAlice", avatarUrl: null, roomProfilesSupported: true };
+    const room: WireProfile = { ...main, name: "Room", roomScoped: true };
+    expect(isRoomScopedProfile(JSON.parse(JSON.stringify(main)))).toBe(false);
+    expect(JSON.parse(JSON.stringify(room))).toMatchObject({ roomProfilesSupported: true, roomScoped: true, name: "Room" });
+    expect(isRoomScopedProfile(JSON.parse(JSON.stringify(room)))).toBe(true);
+  });
   it("messageToWire strips storage-only fields", () => {
     const wire = messageToWire(full);
     expect(wire).not.toHaveProperty("roomCode");

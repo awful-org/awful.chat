@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { CornerUpLeft, Minus, Send, X } from "@lucide/svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { draggable } from "$lib/actions/draggable";
@@ -13,8 +13,12 @@
   import {
     closeDmPanel,
     dmInboxNoticeFor,
+    isDmRequestRoom,
     sendDirectMessage,
+    sendDmTyping,
   } from "$lib/transport/dm.svelte";
+  import { TypingAnnouncer } from "$lib/typing";
+  import { typersIn, typingPrefs } from "$lib/typing.svelte";
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import { resolveChatFontStack } from "$lib/chat-font";
@@ -159,6 +163,27 @@
     list.scrollTop = list.scrollHeight;
   });
 
+  // Typing indicator, both ways. The "stop" goes to the peer the burst was
+  // announced to, even once the panel has moved on to someone else.
+  const typing = new TypingAnnouncer<string>(sendDmTyping);
+  const peerTyping = $derived(!!dmPanel.roomCode && typersIn(dmPanel.roomCode).length > 0);
+
+  /** A message request stays silent until accepted, as it does in the view. */
+  function noteDraftTyping(): void {
+    const hasText = typingPrefs.sendTyping && !!dmPanel.peerId &&
+      !(dmPanel.roomCode && isDmRequestRoom(dmPanel.roomCode)) && draft.trim().length > 0;
+    typing.input(hasText, Date.now(), () => dmPanel.peerId);
+  }
+
+  function stopTyping(): void {
+    typing.stop();
+  }
+
+  $effect(() => {
+    void dmPanel.peerId;
+    return () => untrack(stopTyping);
+  });
+
   async function send(): Promise<void> {
     const body = draft.trim();
     const peerId = dmPanel.peerId;
@@ -170,7 +195,10 @@
       // Explicit peer: the panel is not the conversation the view is on, which
       // is the entire point of it.
       await sendDirectMessage(body, { peerId });
-      if (dmPanel.peerId === peerId && draft === submittedDraft) draft = "";
+      if (dmPanel.peerId === peerId && draft === submittedDraft) {
+        stopTyping();
+        draft = "";
+      }
     } catch (err) {
       sendError = err instanceof Error ? err.message : "Could not send; your draft has been kept.";
     } finally {
@@ -234,8 +262,13 @@
       }}
       class="flex h-13 shrink-0 cursor-grab touch-none items-center gap-1 border-b border-border bg-muted/40 px-2 active:cursor-grabbing"
     >
-      <span class="min-w-0 flex-1 truncate text-xs font-medium">
-        {dmPanel.peerName || "Direct message"}
+      <span class="flex min-w-0 flex-1 flex-col">
+        <span class="truncate text-xs font-medium">
+          {dmPanel.peerName || "Direct message"}
+        </span>
+        {#if peerTyping}
+          <span class="truncate text-[10px] text-muted-foreground">typing…</span>
+        {/if}
       </span>
 
       <Tip text="Open in the DMs tab">
@@ -305,7 +338,11 @@
                     ? 'text-primary'
                     : 'text-foreground'}"
                 >
-                  {own ? "You" : dmPanel.peerName || msg.senderName}
+                  {own
+                    ? "You"
+                    : dmPanel.peerName ||
+                      transportState.peerNames.get(msg.senderDid || msg.senderId) ||
+                      msg.senderName}
                 </span>
                 <span class="shrink-0 text-[10px] text-muted-foreground">
                   {formatTime(msg.timestamp)}
@@ -349,7 +386,7 @@
             bind:this={inputEl}
             bind:value={draft}
             onkeydown={onKeydown}
-            oninput={syncCaret}
+            oninput={() => { syncCaret(); noteDraftTyping(); }}
             onkeyup={syncCaret}
             onclick={syncCaret}
             onselect={syncCaret}

@@ -1,25 +1,201 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { applyBackup } from "./backup-restore";
+import { applyBackup, importDatabase } from "./backup-restore";
 import { BACKUP_FORMAT, BACKUP_VERSION, type BackupFile } from "./backup";
 import {
   getAllMessages,
   getAllRooms,
   getDB,
   getKeypairRecord,
+  getMessage,
+  putMessage,
   getMnemonicRecord,
+  getPeerProfile,
   getWatermark,
   migrateAtRest,
+  putPeerProfile,
   setAtRestOwner,
   wipeLocalDatabase,
+  putRoom,
+  getRoom,
+  putOwnRoomProfile,
+  getOwnRoomProfile,
+  deleteRoomProfilesForRoom,
+  getRoomDeletionMarker,
+  putIdentityRecord,
+  deleteRoom,
 } from "../storage";
+import { initStorageCrypto } from "../storage-crypto";
+import { deriveRoomKeys, newRoomSecret } from "../room-security/keys";
 import {
   createIdentity,
   isUnlocked,
   lockIdentity,
+  publicKeyToDid,
   unlockIdentity,
 } from "../identity/identity";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { pqKeyCertificate } from "../identity/pq-identity";
 
 const PASSWORD = "the password that was in use at backup time";
+
+describe("room profile import", () => {
+  const secret = newRoomSecret();
+  const code = deriveRoomKeys(secret).discoveryId;
+  const room = (generation: number) => ({ roomCode: code, roomSecret: secret, type: "text" as const,
+    name: "Sync", createdAt: generation, lastSeenLamport: 0, participants: [] });
+  const data = (overrides: Record<string, unknown> = {}) => ({
+    messages: [], attachments: [], pending: [], watermarks: [], yjsDocs: [],
+    rooms: [], profiles: [], savedGifs: [], roomProfiles: [], roomDeletions: [],
+    ...overrides,
+  }) as unknown as import("./backup").DatabaseExport;
+
+  beforeEach(async () => {
+    await wipeLocalDatabase();
+    await initStorageCrypto(new Uint8Array(32).fill(24));
+    // Imports keep only this identity's own overrides.
+    await putIdentityRecord({ id: "keypair", did: "did:alice", publicKey: new Uint8Array(32) } as never);
+  });
+
+  it("drops another identity's overrides and sanitizes the values it keeps", async () => {
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [
+      { roomCode: code, did: "did:mallory", generation: 100, fields: { nickname: "Not me" } },
+      { roomCode: code, did: "did:alice", generation: 100, fields: {
+        color: "red;background:url(https://x/beacon);position:fixed",
+        tagChipColor: "#12345g", nickname: "  Alice  ", bio: null,
+        pfpData: btoa("x".repeat(600 * 1024)),
+      } },
+    ] }), "add");
+    expect(await getOwnRoomProfile(code, "did:mallory")).toBeUndefined();
+    const fields = (await getOwnRoomProfile(code, "did:alice"))?.fields;
+    expect(fields?.color).toBeUndefined();
+    expect(fields?.tagChipColor).toBeUndefined();
+    expect(fields?.pfpData).toBeUndefined();
+    expect(fields?.nickname).toBe("Alice");
+    expect(fields?.bio).toBeNull();
+  });
+
+  it("refuses a leave marker dated far in the future", async () => {
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 9e15, deletedAt: 9e15 }] }), "add");
+    expect(await getRoomDeletionMarker(code)).toBeUndefined();
+    await putRoom(room(100));
+    expect((await getRoom(code))?.createdAt).toBe(100);
+  });
+
+  it("restores a room override on a second device and merges independent field edits", async () => {
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Room Alice" },
+      fieldEdits: { nickname: { at: 110, id: "device-a" } },
+    }] }), "add");
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Room Alice");
+    await importDatabase(data({ roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { bio: "Hello" }, fieldEdits: { bio: { at: 120, id: "device-b" } },
+    }] }), "add");
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ nickname: "Room Alice", bio: "Hello" });
+  });
+
+  it("applies later reset tombstones and keeps a newer rejoin generation", async () => {
+    await putRoom(room(200));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 200,
+      fields: { nickname: "Old", bio: "Local" },
+      fieldEdits: { nickname: { at: 201, id: "a" }, bio: { at: 202, id: "a" } } });
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 200,
+      fields: { bio: null }, fieldEdits: { nickname: { at: 203, id: "b", reset: true },
+        bio: { at: 204, id: "b" } },
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(200);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ bio: null });
+  });
+
+  it("never removes a room or its history for a leave on another device", async () => {
+    await putRoom(room(100));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Kept" } });
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 150, deletedAt: 151 }] }), "add");
+    // Still in the generation the marker names: nothing changes here.
+    expect((await getRoom(code))?.createdAt).toBe(100);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Kept");
+    expect(await getRoomDeletionMarker(code)).toBeUndefined();
+  });
+
+  it("keeps a left generation's overrides out when an old snapshot brings the room back", async () => {
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 150, deletedAt: 151 }] }), "add");
+    expect((await getRoomDeletionMarker(code))?.generation).toBe(150);
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Stale" },
+    }] }), "add");
+    // The room is back - as a new generation above the marker, so its
+    // profiles can be written - but the left generation's override is not.
+    expect((await getRoom(code))?.createdAt).toBe(152);
+    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+  });
+
+  it("normalizes independent joins, then applies a later leave without refreshing its timestamp", async () => {
+    await putRoom(room(200));
+    await importDatabase(data({ rooms: [room(100)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Joined on A", pfpData: btoa("image") },
+      fieldEdits: { nickname: { at: 110, id: "a" } },
+    }] }), "add");
+    const imported = await getOwnRoomProfile(code, "did:alice");
+    expect(imported?.generation).toBe(200);
+    expect(imported?.fields.nickname).toBe("Joined on A");
+    expect([...new Uint8Array(imported?.fields.pfpData as ArrayBuffer)]).toEqual([...new TextEncoder().encode("image")]);
+    await importDatabase(data({ rooms: [room(100)], roomDeletions: [{
+      roomCode: code, generation: 100, deletedAt: 300,
+    }] }), "add");
+    // A leave elsewhere: this device is still in the room, so it stays.
+    expect((await getRoom(code))?.createdAt).toBe(200);
+    expect(await getRoomDeletionMarker(code)).toBeUndefined();
+    await deleteRoomProfilesForRoom(code, 100, 300);
+    await deleteRoom(code);
+    await putRoom(room(400));
+    await importDatabase(data({ roomDeletions: [{
+      roomCode: code, generation: 100, deletedAt: 300,
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(400);
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+  });
+
+  it("keeps a remote marker alongside a later rejoin and rejects a subsequent old snapshot", async () => {
+    await putRoom(room(400));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 400,
+      fields: { nickname: "Rejoined" } });
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] }), "add");
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Rejoined");
+    await importDatabase(data({ rooms: [room(200)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 200, fields: { nickname: "Stale" },
+    }] }), "add");
+    expect((await getRoom(code))?.createdAt).toBe(400);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields.nickname).toBe("Rejoined");
+  });
+
+  it("retains a local override when another device contributes a newer join generation", async () => {
+    await putRoom(room(100));
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 100,
+      fields: { nickname: "Local" }, fieldEdits: { nickname: { at: 110, id: "a" } } });
+    await importDatabase(data({ rooms: [room(200)], roomProfiles: [{
+      roomCode: code, did: "did:alice", generation: 200,
+      fields: { bio: "Remote" }, fieldEdits: { bio: { at: 210, id: "b" } },
+    }] }), "add");
+    expect((await getOwnRoomProfile(code, "did:alice"))?.generation).toBe(200);
+    expect((await getOwnRoomProfile(code, "did:alice"))?.fields).toEqual({ nickname: "Local", bio: "Remote" });
+  });
+
+  it("clears profile rows on a local leave even if a newer marker already exists", async () => {
+    await putRoom(room(400));
+    await importDatabase(data({ roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] }), "add");
+    await putOwnRoomProfile({ roomCode: code, did: "did:alice", generation: 400,
+      fields: { nickname: "Later" } });
+    await deleteRoomProfilesForRoom(code, 100, 200);
+    expect(await getOwnRoomProfile(code, "did:alice")).toBeUndefined();
+    expect((await getRoomDeletionMarker(code))?.deletedAt).toBe(300);
+  });
+});
 
 /** A backup taken by an identity that no longer exists on this device. */
 async function backupFromAnIdentity(): Promise<BackupFile> {
@@ -84,6 +260,23 @@ describe("restoring a backup onto a device with no identity", () => {
 
     const restored = await getKeypairRecord();
     expect(restored?.did).toBe(backup.identity?.keypair.did);
+  });
+
+  it("checks cancellation after password derivation before activating or writing an identity", async () => {
+    let checked = false;
+    await expect(applyBackup(backup, "replace", {
+      requestPassword: async () => PASSWORD,
+      beforeCommit: () => {
+        checked = true;
+        expect(isUnlocked()).toBe(false);
+        throw new Error("Cancelled session");
+      },
+    })).rejects.toThrow("Cancelled session");
+    expect(checked).toBe(true);
+    expect(isUnlocked()).toBe(false);
+    expect(await getKeypairRecord()).toBeUndefined();
+    expect(await getMnemonicRecord()).toBeUndefined();
+    expect(await getAllRooms()).toEqual([]);
   });
 
   it("restores the data, which a recovery phrase alone cannot", async () => {
@@ -280,6 +473,79 @@ describe("a merge never adopts the incoming identity", () => {
     expect((await getAllRooms()).map((r) => r.roomCode)).toContain(
       "restoredroom0001"
     );
+  });
+});
+
+// The identity section is part of a file someone may have handed over
+// (security audit L3).
+describe("a backup's identity section is checked before it is trusted", () => {
+  it("refuses an iteration count no build ever wrote, which made unlocking spin", async () => {
+    const backup = await backupFromAnIdentity();
+    backup.identity!.mnemonic.iterations = 4_000_000_000;
+    await wipeLocalDatabase();
+    await expect(applyBackup(backup, "replace")).rejects.toThrow("Invalid backup");
+    expect(await getKeypairRecord()).toBeUndefined();
+  });
+
+  it("refuses a keypair whose public key is not its DID's", async () => {
+    const backup = await backupFromAnIdentity();
+    backup.identity!.keypair.did = publicKeyToDid(ed25519.getPublicKey(new Uint8Array(32).fill(7)));
+    await wipeLocalDatabase();
+    await expect(applyBackup(backup, "replace")).rejects.toThrow("does not match its DID");
+    expect(await getKeypairRecord()).toBeUndefined();
+  });
+});
+
+// A merged-in file could reuse a real message's id to replace it with forged
+// content under anyone's name (security audit M4).
+describe("a merge never overwrites or forges messages", () => {
+  it("keeps a message already held, drops a bad signature, adds genuinely new rows", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    const row = (id: string, content: string, extra: Record<string, unknown> = {}) => ({
+      id, roomCode: "restoredroom0001", senderId: "did:key:zBob", senderName: "Bob",
+      timestamp: 1, lamport: 1, type: "text", content, attachments: [], ...extra,
+    });
+    await putMessage(row("m-1", "the real message") as never);
+
+    await applyBackup({
+      ...incoming,
+      messages: [
+        row("m-1", "forged"),
+        row("m-2", "new and unsigned"),
+        row("m-3", "forged with a bad signature", { senderDid: "did:key:zBob", sig: "00".repeat(64), sigV: 3 }),
+      ],
+    } as unknown as BackupFile, "add");
+
+    expect((await getMessage("m-1"))?.content).toBe("the real message");
+    expect((await getMessage("m-2"))?.content).toBe("new and unsigned");
+    expect(await getMessage("m-3")).toBeUndefined();
+  });
+});
+
+// A peer's PQ key certificate is what lets this device seal for them
+// post-quantum while they are offline. A merged-in profile row from a device
+// that never heard it is usually NEWER (it saw their name change later), and
+// taking it wholesale quietly downgraded every message sealed to them.
+describe("a merge keeps a peer's post-quantum key", () => {
+  it("keeps the local certificate when a newer imported row has none", async () => {
+    const incoming = await backupFromAnIdentity();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    const peerSeed = crypto.getRandomValues(new Uint8Array(32));
+    const peerDid = publicKeyToDid(ed25519.getPublicKey(peerSeed));
+    const cert = pqKeyCertificate({ did: peerDid, privateKey: peerSeed });
+    await putPeerProfile({ did: peerDid, isMe: false, nickname: "old", updatedAt: 1, pqKey: cert });
+
+    await applyBackup({
+      ...incoming,
+      profiles: [{ did: peerDid, isMe: false, nickname: "new", updatedAt: 2 }],
+    } as unknown as BackupFile, "add");
+
+    const merged = await getPeerProfile(peerDid);
+    expect(merged?.nickname).toBe("new");
+    expect(merged?.pqKey).toEqual(cert);
   });
 });
 

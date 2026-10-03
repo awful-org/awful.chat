@@ -14,18 +14,19 @@ import {
   Trash2,
   Users,
 } from "@lucide/svelte";
-import { roomsStore, renameRoom, toggleRoomPin } from "$lib/rooms.svelte";
-import { createInvite, formatShortCode } from "$lib/invite";
+import { roomsStore, toggleRoomPin } from "$lib/rooms.svelte";
+import { uiState } from "$lib/ui-state.svelte";
+import { savedRoomInvitationLink } from "$lib/room-security/invitations";
 import {
   getRoomNotifyMode,
   setRoomNotifyMode,
   type RoomNotifyMode,
 } from "$lib/notify-prefs.svelte";
 import { hashRef } from "$lib/storage-crypto";
-import { setRoomName } from "$lib/transport/transport.svelte";
+import { renameRoomEverywhere } from "$lib/transport/transport.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
-import { parseRoomCode } from "../query";
+import { parseJoinInput } from "$lib/invite";
 
 const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
   all: "All messages",
@@ -34,10 +35,38 @@ const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
 };
 
 /**
+ * Command ids for rooms and contacts, worked out once each.
+ *
+ * hashRef is a pure-JS SHA-256, and a catalog build used to pay one per room
+ * and one per contact, every build. A room code or a peer id never changes,
+ * so neither does its ref. The palette forgets them all when it unmounts,
+ * which a lock does, so no room code outlives the session in here.
+ */
+const refs = new Map<string, string>();
+/** Far above the rooms and contacts one device holds: a guard, not a budget. */
+const REFS_MAX = 4096;
+
+function ref(value: string): string {
+  let out = refs.get(value);
+  if (out === undefined) {
+    if (refs.size >= REFS_MAX) refs.clear();
+    out = hashRef(value);
+    refs.set(value, out);
+  }
+  return out;
+}
+
+/** Drop the remembered refs. The palette calls this when it unmounts. */
+export function forgetRoomRefs(): void {
+  refs.clear();
+}
+
+/**
  * Room navigation, joining, and the destructive room-management actions.
  *
  * Rebuilt on every catalog refresh, so every row below reads `roomsStore`
- * and `host` directly rather than caching anything module-scoped.
+ * and `host` directly rather than caching anything module-scoped - the one
+ * exception being the id refs above, which depend on nothing that changes.
  */
 export const roomCommands: CmdSource = (host) => {
   const cmds: Cmd[] = [];
@@ -62,7 +91,7 @@ export const roomCommands: CmdSource = (host) => {
       // room code - the room's whole membership secret - into web storage,
       // where it survives every lock and outlives the room. The real code
       // stays in the closure below, which is the only place that needs it.
-      id: `room.open:${hashRef(room.roomCode)}`,
+      id: `room.open:${ref(room.roomCode)}`,
       title: room.name || room.roomCode,
       // The room code is shown unconditionally: two rooms can share a name,
       // and the code is the only thing that still tells them apart.
@@ -78,7 +107,7 @@ export const roomCommands: CmdSource = (host) => {
     cmds.push({
       // Hashed for the same reason as room.open above: the peer id is the
       // social graph, and the MRU would persist it verbatim.
-      id: `room.dm:${hashRef(entry.peerId)}`,
+      id: `room.dm:${ref(entry.peerId)}`,
       title: entry.nickname,
       group: "People",
       icon: Users,
@@ -97,14 +126,14 @@ export const roomCommands: CmdSource = (host) => {
         kind: "prompt",
         id: "room.join",
         title: "Join room by code",
-        placeholder: "Room code or invite link…",
+        placeholder: "Invite link or short code…",
         validate: (value) =>
-          parseRoomCode(value) === null
-            ? "Not a room code, invite link, or web+awfl:// link"
+          parseJoinInput(value).kind === "invalid"
+            ? "Not an invite link or short code"
             : null,
         submit: (value) => {
-          const code = parseRoomCode(value);
-          if (code) host.joinRoomByCode(code);
+          const parsed = parseJoinInput(value);
+          if (parsed.kind !== "invalid") host.joinRoomByCode(parsed.code);
         },
         submitLabel: "Join",
       }),
@@ -122,17 +151,19 @@ export const roomCommands: CmdSource = (host) => {
   if (activeCode) {
     cmds.push({
       id: "room.copyLink",
-      title: "Copy room link",
+      title: "Copy permanent room link",
+      subtitle: "Never expires; anyone it reaches can join. A short code has limits",
+      keywords: ["invite", "link", "permanent"],
       group: "Rooms",
       icon: Link,
       action: {
         kind: "act",
         perform: () => {
-          // Fragment form - see RoomCreateJoin's handleCopy.
-          const url = `${window.location.origin}/r/#${activeCode}`;
-          navigator.clipboard
-            .writeText(url)
-            .catch((err) => console.warn("copy room link failed", err));
+          // The saved invitation link, fragment form (see RoomCreateJoin's createdLink).
+          // On failure the invite dialog shows the link, or why there is none.
+          savedRoomInvitationLink(window.location.origin, activeCode)
+            .then((url) => navigator.clipboard.writeText(url))
+            .catch(() => { uiState.invitationRoomRequested = activeCode; });
         },
       },
     });
@@ -152,13 +183,12 @@ export const roomCommands: CmdSource = (host) => {
           title: "Rename room",
           initial: currentTitle,
           // Without this an empty submit would blank the room name for every
-          // participant, since `setRoomName` broadcasts whatever it is given.
+          // participant, since the rename is broadcast to the room.
           validate: (value) =>
             value.trim().length === 0 ? "Room name cannot be empty" : null,
           submit: async (value) => {
             try {
-              await renameRoom(activeCode, value);
-              setRoomName(value);
+              await renameRoomEverywhere(activeCode, value);
             } catch (err) {
               console.warn("rename room failed", err);
             }
@@ -168,40 +198,33 @@ export const roomCommands: CmdSource = (host) => {
       },
     });
 
-    // The header's invite menu, minus nothing: the 5-minute short code for
-    // typing on a phone, and the OS share sheet where the browser has one.
+    // The header's Invite: the invite dialog, short code first, then the
+    // permanent link; and the OS share sheet where the browser has one.
     cmds.push({
       id: "room.copyShortCode",
-      title: "Copy short invite code",
-      subtitle: "Works for 5 minutes",
-      keywords: ["invite", "code", "share"],
+      title: "Invite people with a short code",
+      keywords: ["invite", "qr", "short code", "share", "people"],
       group: "Rooms",
       icon: KeyRound,
       action: {
         kind: "act",
-        perform: async () => {
-          try {
-            const { code } = await createInvite(activeCode);
-            await navigator.clipboard.writeText(formatShortCode(code));
-          } catch (err) {
-            console.warn("copy short invite code failed", err);
-          }
-        },
+        perform: () => { uiState.invitationRoomRequested = activeCode; },
       },
     });
     if (typeof navigator !== "undefined" && typeof navigator.share === "function") {
       cmds.push({
         id: "room.shareLink",
-        title: "Share room link",
+        title: "Share permanent room link",
         keywords: ["invite", "send"],
         group: "Rooms",
         icon: Share2,
         action: {
           kind: "act",
-          perform: () => {
-            navigator
-              .share({ url: `${window.location.origin}/r/#${activeCode}` })
-              .catch(() => {});
+          perform: async () => {
+            try {
+              const url = await savedRoomInvitationLink(window.location.origin, activeCode);
+              await navigator.share({ url });
+            } catch { /* Cancelled or capability unavailable. */ }
           },
         },
       });

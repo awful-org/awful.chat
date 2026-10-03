@@ -1,14 +1,16 @@
 <script module lang="ts">
-  /** infoHashes auto-download already asked for, across every message
-   *  component - one request per file per session, however often rows
-   *  re-render or the same file appears in several rooms. */
-  const _autoRequested = new Set<string>();
+  import { MediaQuery } from "svelte/reactivity";
+
+  /** One media query for every message on screen, not a listener each. */
+  const narrowScreen =
+    typeof window === "undefined" ? null : new MediaQuery("max-width: 639px");
 </script>
 
 <script lang="ts">
   import { apiUrl } from "$lib/runtime-config";
   import { isGifUrl } from "$lib/media-url";
-  import { Tip } from "$lib/components/ui/tooltip";
+  import { remotePreviewUrl } from "$lib/preview-url";
+  import { LazyTip, Tip } from "$lib/components/ui/tooltip";
   import {
     ChevronDown,
     Download,
@@ -22,6 +24,7 @@
     Check,
     CheckCheck,
     Clock,
+    ImageOff,
     Pin as PinIcon,
     PinOff,
   } from "@lucide/svelte";
@@ -38,10 +41,16 @@
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
-  import { linkify } from "$lib/mentions";
+  import { messageBody } from "$lib/actions/message-body";
+  import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
   import { formatSize } from "$lib/utils";
-  import { mediaBoxStyle } from "$lib/image-size";
-  import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
+  import { animatedView, mediaBoxStyle } from "$lib/image-size";
+  import {
+    INLINE_FILE_MAX_BYTES,
+    attachmentHydration,
+    autoDownloadOnRender,
+  } from "$lib/transport/files.svelte";
+  import type { Attachment } from "svelte/attachments";
 
   import {
     convertImage,
@@ -80,6 +89,7 @@
     unpinWidget,
   } from "$lib/plugins/prefs.svelte";
   import type { PluginComponent } from "$lib/plugins/api";
+  import { canOpenAsPage } from "$lib/safe-mime";
 
   interface Props {
     msg: Message;
@@ -129,6 +139,18 @@
       : "Queued - will send when the recipient is reachable";
   });
 
+  // Opt-in auto-download: ask for another member's media as its message
+  // renders, as its Download button would, within the ceiling every ask
+  // nobody made has (autoDownloadOnRender).
+  $effect(() => {
+    if (isOwn) return;
+    autoDownloadOnRender(
+      msg.meta?.files ?? [],
+      (infoHash) => fileTransfers.get(infoHash),
+      (file) => onRequestFileDownload(file, msg.senderId)
+    );
+  });
+
   /**
    * Whether a not-yet-loaded media file deserves its skeleton. An active
    * download obviously does. A PENDING one does too when it is small enough
@@ -139,22 +161,6 @@
    * pending file ABOVE the inline cap needs a manual Download click, and a
    * skeleton there would pulse forever next to its own Download button.
    */
-  // Opt-in auto-download: fetch media attachments as soon as their message
-  // renders, exactly what clicking Download would do. Media only - a stray
-  // zip stays a manual click - and never retried after a failure, so a dead
-  // seeder does not turn into a request loop.
-  $effect(() => {
-    if (!mediaPrefs.autoDownloadMedia || isOwn) return;
-    for (const file of msg.meta?.files ?? []) {
-      if (!/^(image|video|audio)\//.test(file.mimeType)) continue;
-      const transfer = fileTransfers.get(file.infoHash);
-      if (transfer && transfer.status !== "pending") continue;
-      if (_autoRequested.has(file.infoHash)) continue;
-      _autoRequested.add(file.infoHash);
-      onRequestFileDownload(file, msg.senderId);
-    }
-  });
-
   function expectsBytesSoon(
     status: string | undefined,
     size: number
@@ -177,8 +183,7 @@
   // takes down the whole message list until reload - so coerce once, here.
   const content = $derived(typeof msg.content === "string" ? msg.content : "");
 
-  let isMobile = $state(false);
-  let highlightedCode = $state<string | null>(null);
+  const isMobile = $derived(narrowScreen?.current ?? false);
   let ogPreview = $state<OgPreview | null>(null);
   let gifSaved = $state(false);
   /**
@@ -192,6 +197,9 @@
     mimeType: string;
     /** Absent for a remote GIF, whose bytes we do not hold. */
     size?: number;
+    /** As the GifImage it was opened from takes it: an animated image is
+     *  measured before the viewer decodes it (see lightboxView). */
+    animated?: boolean;
   };
   let lightbox = $state<Lightbox | null>(null);
   let formatsOpen = $state(false);
@@ -213,12 +221,48 @@
   );
 
   /**
+   * The open animated image's copy, loaded out of the page, and the url it
+   * is a copy of. Its img is null if it did not load.
+   */
+  let lightboxCopy = $state.raw<{ url: string; img: HTMLImageElement | null }>();
+  const lightboxLoaded = $derived(
+    lightbox?.animated && lightboxCopy?.url === lightbox.url
+      ? lightboxCopy.img
+      : undefined
+  );
+  /**
+   * What the viewer shows of an animated image, by GifImage's rule: its size
+   * is read from a copy loaded out of the page, before anything decodes it,
+   * and past image-size.ts's bound it is "too-large" and never decoded. A
+   * message shows such an image as a placeholder, and a click on that used
+   * to open its url here in a plain img, decoding at full size the very
+   * image the placeholder had refused. What is shown within the bound is
+   * that copy itself (see showCopy).
+   *
+   * A still image is shown at once, as its message showed it: a plain img
+   * the message had already decoded. The bound is GifImage's, for what it
+   * animates, and a photo from a 24 MP camera is past it.
+   */
+  const lightboxView = $derived(
+    lightbox?.animated
+      ? animatedView(
+          lightboxLoaded && {
+            width: lightboxLoaded.naturalWidth,
+            height: lightboxLoaded.naturalHeight,
+          }
+        )
+      : "shown"
+  );
+
+  /**
    * Conversion needs the bytes on this origin: a canvas fed a cross-origin
    * image is tainted and toBlob throws. A remote GIF has no size recorded
    * either, which is the same signal, so both cases fall back to Original.
+   * Nor is an image the viewer will not show converted: a conversion draws
+   * the whole picture on a canvas, the cost the bound is there to refuse.
    */
   const lightboxFormats = $derived(
-    lightbox && lightbox.size !== undefined
+    lightbox && lightbox.size !== undefined && lightboxView === "shown"
       ? convertTargets(lightbox.mimeType)
       : []
   );
@@ -238,6 +282,39 @@
    * ends over the backdrop would otherwise close it every time.
    */
   let panned = false;
+
+  const viewerImageClass = "max-h-[90vh] max-w-[90vw] rounded-md object-contain";
+  /** The zoom and pan, as the viewer's image wears them. */
+  const zoomStyle = $derived(
+    `transform: translate(${pan.x}px, ${pan.y}px) scale(${zoom}); transition: ${
+      dragFrom || pinchStart ? "none" : "transform 120ms ease-out"
+    }`
+  );
+
+  /**
+   * An animated image's copy, put in the viewer: the one that was measured.
+   * An img of the same url fetched it again (Chromium does, for an image
+   * the server says not to store), and the server could then answer with
+   * another image than the one checked - the reason GifImage plays its copy.
+   * The zoom is applied by an effect of its own, so it restyles the copy
+   * rather than putting it back in the page each time.
+   */
+  function showCopy(img: HTMLImageElement): Attachment<HTMLElement> {
+    return (slot) => {
+      img.alt = "Preview";
+      img.draggable = false;
+      img.className = viewerImageClass;
+      slot.append(img);
+      imgEl = img;
+      $effect(() => {
+        img.style.cssText = zoomStyle;
+      });
+      return () => {
+        img.remove();
+        if (imgEl === img) imgEl = null;
+      };
+    };
+  }
 
   const viewport = () => ({
     width: typeof window === "undefined" ? 0 : window.innerWidth,
@@ -295,6 +372,11 @@
    * zoom every time you finish dragging.
    */
   function onImageClick(e: MouseEvent) {
+    toggleZoom(fromCentre(e));
+  }
+
+  /** Zoom in about `at` (relative to centre), or back out if zoomed. */
+  function toggleZoom(at: Point) {
     if (panned) {
       panned = false;
       return;
@@ -309,7 +391,7 @@
     );
     // An image that fits already has nothing to reveal at "actual size", so
     // fall back to a plain step in rather than doing nothing.
-    applyZoom(target > MIN_ZOOM ? target : 2.5, fromCentre(e));
+    applyZoom(target > MIN_ZOOM ? target : 2.5, at);
   }
 
   function onPointerDown(e: PointerEvent) {
@@ -363,6 +445,7 @@
   function openLightbox(next: Lightbox) {
     resetZoom();
     lightbox = next;
+    lightboxCopy = undefined;
     formatsOpen = false;
     convertError = null;
     previewText = null;
@@ -374,9 +457,49 @@
 
   function closeLightbox() {
     lightbox = null;
+    // Let go with the viewer: a copy it showed holds the decoded image.
+    lightboxCopy = undefined;
     formatsOpen = false;
     resetZoom();
   }
+
+  // Escape closes the viewer. On the window, not the dialog: opening the
+  // viewer leaves focus on the thumbnail that was clicked, which is outside
+  // it, so a handler on the dialog itself never heard the key. And only
+  // while it is open: a window listener per message on screen ran on every
+  // key typed anywhere in the app.
+  $effect(() => {
+    if (!lightbox) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      closeLightbox();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // An animated image is measured before the viewer shows it, as GifImage
+  // measures it (see lightboxView): its size is known once its copy loads.
+  // Not for a remote image while external media is off - the viewer does
+  // not open then either.
+  $effect(() => {
+    const open = lightbox;
+    if (!open?.animated || !canLoadMedia(open.url)) return;
+    const url = open.url;
+    const img = new Image();
+    let cancelled = false;
+    img.onload = () => {
+      if (!cancelled) lightboxCopy = { url, img };
+    };
+    img.onerror = () => {
+      if (!cancelled) lightboxCopy = { url, img: null };
+    };
+    img.src = url;
+    return () => {
+      cancelled = true;
+    };
+  });
 
   async function downloadOriginal() {
     if (!lightbox) return;
@@ -459,7 +582,6 @@
       cancelled = true;
     };
   });
-  let copiedCode = $state(false);
   let videoPlaying = $state(false);
   let videoEl = $state<HTMLVideoElement | null>(null);
   let videoNaturalWidth = $state(0);
@@ -565,42 +687,15 @@
     })();
   });
 
-  function firstUrl(text: string): string | null {
-    // Stops at a quote or angle bracket too, so a URL quoted inside other
-    // text does not drag the closing quote and what follows along.
-    const match = text.match(/https?:\/\/[^\s"'<>]+/i);
-    return match ? match[0] : null;
-  }
-
   function transferKey(file: FileEntry, index: number): string {
     return `${msg.id}:${file.infoHash}:${index}`;
   }
 
   const isFileMessage = $derived(msg.type === MessageType.File);
-  const asCodeBlock = $derived.by(() => {
-    const match = content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
-    if (!match) return null;
-    return { lang: match[1] || "text", code: match[2] };
-  });
-  const codeSegments = $derived.by(() => {
-    const match = content.match(/```([\w-]+)?\n([\s\S]*?)```/m);
-    if (!match) return null;
-    const fullMatch = match[0];
-    const startIdx = content.indexOf(fullMatch);
-    const endIdx = startIdx + fullMatch.length;
-
-    const before = content.slice(0, startIdx).trim();
-    const code = match[2];
-    const after = content.slice(endIdx).trim();
-
-    return {
-      before,
-      lang: match[1] || "text",
-      code,
-      after,
-    };
-  });
-  const linkedUrl = $derived(firstUrl(content));
+  // The first url the body renders as a link, trimmed the same way, so
+  // "(see https://a.b)" or [label](https://a.b) previews https://a.b, and a
+  // url written as code gets no preview.
+  const linkedUrl = $derived(firstLinkedUrl(content));
   const isGifMessage = $derived(isGifUrl(content));
   // Plugin cards and updates carry JSON, and a poster URL inside it is not
   // a link the person posted: the preview fetch was firing for every party
@@ -633,46 +728,17 @@
   });
 
   $effect(() => {
-    if (typeof window === "undefined") return;
-    const media = window.matchMedia("(max-width: 639px)");
-    const update = () => {
-      isMobile = media.matches;
-    };
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  });
-
-  $effect(() => {
-    highlightedCode = null;
-    if (!asCodeBlock) return;
-    // Loaded on demand: the highlighter engine plus its wasm is well over
-    // half a megabyte, and most sessions never see a code block.
-    import("shiki")
-      .then(({ codeToHtml }) =>
-        codeToHtml(asCodeBlock.code, {
-          lang: asCodeBlock.lang,
-          theme: "github-dark",
-        })
-      )
-      .then((html) => {
-        highlightedCode = html;
-      })
-      .catch(() => {
-        highlightedCode = `<pre><code>${escapeHtml(asCodeBlock.code)}</code></pre>`;
-      });
-  });
-
-  $effect(() => {
     ogPreview = null;
     if (!mediaPrefs.externalMedia || !shouldShowOg || !linkedUrl) return;
+    const previewUrl = remotePreviewUrl(linkedUrl);
+    if (!previewUrl) return;
     const ctrl = new AbortController();
     fetch(
       // No hardcoded origin: an unset apiUrl means this instance never said
       // where its relay is, and defaulting to awful.frav.in would hand every
       // link its users open to a stranger's server. Empty resolves
       // same-origin and 404s, so previews are simply off.
-      `${apiUrl()}/og/preview?url=${encodeURIComponent(linkedUrl)}`,
+      `${apiUrl()}/og/preview?url=${encodeURIComponent(previewUrl)}`,
       { signal: ctrl.signal }
     )
       .then((r) => r.json())
@@ -782,49 +848,10 @@
     }
   }
 
-  /**
-   * Drop the C0 controls, keeping only newline and tab (and DEL, which behaves
-   * like one).
-   *
-   * A fenced block is peer text on its way to a terminal, and the bytes that
-   * do not show on screen are the dangerous ones: a `\r` rewrites the line the
-   * reader thinks they pasted, and an escape byte can drive the terminal
-   * itself. What was copied has to be what was displayed.
-   */
-  function stripControlChars(text: string): string {
-    // eslint-disable-next-line no-control-regex
-    return text.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "");
+  /** Every message body goes through here: markdown, links, mentions, emoji. */
+  function renderBody(text: string): string {
+    return renderMessageMarkdown(text, resolveMentionDisplayName);
   }
-
-  async function copyCodeBlock() {
-    if (!asCodeBlock) return;
-    await navigator.clipboard.writeText(stripControlChars(asCodeBlock.code));
-    copiedCode = true;
-    setTimeout(() => {
-      copiedCode = false;
-    }, 1200);
-  }
-
-  // The shiki-failure fallback: escaping only "<" blocked tag injection but
-  // visibly mangled code containing "&"; full escaping matches escapeHtml.
-  function escapeForCodeFallback(code: string): string {
-    return escapeHtml(code);
-  }
-
-  function escapeHtml(text: string): string {
-    return text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/\"/g, "&quot;")
-      .replace(/'/g, "&#039;");
-  }
-
-  function linkifyText(text: string): string {
-    return linkify(text, resolveMentionDisplayName);
-  }
-
-
 
   function onVideoMeta() {
     if (!videoEl) return;
@@ -844,9 +871,11 @@
 >
   {#if isFileMessage}
     {#if content}
-      <!-- Through linkifyText like every other body: rendered raw, a caption
-           showed mention tokens as @[did:key:...] instead of the name. -->
-      <p class="whitespace-pre-wrap mb-2">{@html linkifyText(content)}</p>
+      <!-- Through renderBody like every other body: rendered raw, a caption
+           showed mention tokens as @[did:key:...] instead of the name. A div,
+           not a p: markdown can put a heading or a list in it. -->
+      {@const body = renderBody(content)}
+      <div class="whitespace-pre-wrap mb-2" {@attach messageBody(body)}>{@html body}</div>
     {/if}
 
     <div class="space-y-2">
@@ -856,7 +885,7 @@
         <!-- No transfer entry while this room's stored files are still being
              read back means "not registered yet", not "nobody has it". -->
         {@const hydrating = !transfer && attachmentHydration.rooms.has(msg.roomCode)}
-        <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
+        <div class="relative rounded-md border border-border/70 bg-muted/30 p-2.5">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">
               <p class="truncate text-sm text-foreground">{file.filename}</p>
@@ -870,7 +899,7 @@
                  gone from this device after a reload, and the only way back
                  is pulling it from a peer who still holds it. -->
             {#if !transfer || transfer.status === "pending" || transfer.status === "failed"}
-              <Tip text="Download">
+              <LazyTip text="Download">
                 {#snippet children(props)}
               <button
                 {...props}
@@ -882,14 +911,17 @@
                 <Download class="size-3.5" />
               </button>
                 {/snippet}
-              </Tip>
+              </LazyTip>
             {/if}
           </div>
 
           <!-- Only while bytes are actually moving: a finished or seeding
                transfer has nothing left to report. -->
+          <!-- Over the card's bottom edge, not a row of its own: a bar that
+               took space moved everything below it twice, once when a
+               transfer started and again when it finished. -->
           {#if transfer?.status === "downloading" && !transfer.done && (transfer.progress ?? 0) < 1}
-            <div class="mt-2 h-1.5 overflow-hidden rounded bg-muted">
+            <div class="absolute inset-x-2.5 bottom-1 h-1 overflow-hidden rounded bg-muted">
               <div
                 class="h-full bg-primary transition-[width]"
                 style={`width: ${Math.max(0, Math.min(100, Math.round((transfer.progress || 0) * 100)))}%`}
@@ -899,6 +931,9 @@
 
           {#if file.mimeType.startsWith("image/")}
             {@const box = mediaBoxStyle(file.width, file.height)}
+            <!-- One answer for the message and the viewer it opens: what is
+                 animated is measured before either decodes it. -->
+            {@const animated = file.mimeType === "image/gif"}
             {#if !transfer?.blobURL}
               <!-- The picture's own shape, held open before a single byte of
                    it has arrived. This is what stops the chat jumping as
@@ -952,6 +987,7 @@
                     filename: file.filename,
                     mimeType: file.mimeType,
                     size: file.size,
+                    animated,
                   })}
               >
                 <GifImage
@@ -961,7 +997,7 @@
                     ? 'h-full w-full'
                     : 'max-w-xs max-h-56'} rounded-md object-contain"
                   loading="lazy"
-                  animated={file.mimeType === "image/gif"}
+                  {animated}
                   animate={mediaPrefs.gifAutoplay ? true : "hover"}
                 />
               </button>
@@ -1063,31 +1099,6 @@
         </div>
       {/each}
     </div>
-  {:else if codeSegments}
-    {#if codeSegments.before}
-      <p class="whitespace-pre-wrap mb-2">{@html linkifyText(codeSegments.before)}</p>
-    {/if}
-    <div
-      class="relative overflow-x-auto rounded-md border border-border/70 bg-muted/30 p-2 [&_.shiki]:bg-transparent! {codeSegments.after ? 'mb-2' : ''}"
-    >
-      <button
-        type="button"
-        class="absolute right-2 top-2 z-10 inline-flex size-7 items-center justify-center rounded border border-border/70 bg-card text-muted-foreground hover:text-foreground"
-        onclick={copyCodeBlock}
-        aria-label={copiedCode ? "Copied" : "Copy code"}
-      >
-        {#if copiedCode}
-          <Check class="size-3.5" />
-        {:else}
-          <Copy class="size-3.5" />
-        {/if}
-      </button>
-      {@html highlightedCode ??
-        `<pre><code>${escapeHtml(codeSegments.code)}</code></pre>`}
-    </div>
-    {#if codeSegments.after}
-      <p class="whitespace-pre-wrap">{@html linkifyText(codeSegments.after)}</p>
-    {/if}
   {:else if isGifMessage}
     <div class="group relative inline-block">
       <button
@@ -1097,6 +1108,7 @@
             url: content,
             filename: "gif.gif",
             mimeType: "image/gif",
+            animated: true,
           })}
       >
         <GifImage
@@ -1173,7 +1185,7 @@
             </span>
           {/if}
           {#if pluginHasWidget}
-            <Tip
+            <LazyTip
               text={pluginIsPinned
                 ? "Unpin from the sidebar"
                 : "Pin this plugin to the sidebar"}
@@ -1200,7 +1212,7 @@
                   {pluginIsPinned ? "pinned" : "pin"}
                 </button>
               {/snippet}
-            </Tip>
+            </LazyTip>
           {/if}
         </div>
         {#if pluginHostApi}
@@ -1213,7 +1225,8 @@
       </div>
     {/if}
   {:else}
-    <p class="whitespace-pre-wrap">{@html linkifyText(content)}</p>
+    {@const body = renderBody(content)}
+    <div class="whitespace-pre-wrap" {@attach messageBody(body)}>{@html body}</div>
 
     {#if mediaPrefs.externalMedia && linkedUrl && ogPreview}
       <div
@@ -1359,7 +1372,7 @@
        One tick: the relay holds it. Two: their device has it. Green: they
        opened it. -->
   {#if isOwn && isDmMessage && msg.status}
-    <Tip text={statusTip}>
+    <LazyTip text={statusTip}>
       {#snippet children(props)}
         <span
           {...props}
@@ -1384,24 +1397,9 @@
           {/if}
         </span>
       {/snippet}
-    </Tip>
+    </LazyTip>
   {/if}
 </div>
-
-<!--
-  On the window, not the dialog: opening the viewer leaves focus on the
-  thumbnail that was clicked, which is outside it, so a handler on the dialog
-  itself never heard Escape. One of these per message, each closing only its
-  own open viewer.
--->
-<svelte:window
-  onkeydown={(e) => {
-    if (lightbox && e.key === "Escape") {
-      e.preventDefault();
-      closeLightbox();
-    }
-  }}
-/>
 
 {#if lightbox && canLoadMedia(lightbox.url)}
   <div
@@ -1439,20 +1437,25 @@
         </Tip>
       {/if}
 
-      <Tip text="Open in a new tab">
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            class="size-9 rounded-full bg-black/60 text-white inline-flex items-center justify-center hover:bg-black/80 cursor-pointer"
-            onclick={() =>
-              window.open(lightbox!.url, "_blank", "noopener,noreferrer")}
-            aria-label="Open in a new tab"
-          >
-            <ExternalLink class="size-4" />
-          </button>
-        {/snippet}
-      </Tip>
+      <!-- A blob URL is on the app's own origin: a peer's file opened as a
+           page runs as the app, so only types that cannot run anything open
+           (safe-mime.ts). A remote URL (a GIF service) is another origin. -->
+      {#if !lightbox!.url.startsWith("blob:") || canOpenAsPage(lightbox!.mimeType)}
+        <Tip text="Open in a new tab">
+          {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              class="size-9 rounded-full bg-black/60 text-white inline-flex items-center justify-center hover:bg-black/80 cursor-pointer"
+              onclick={() =>
+                window.open(lightbox!.url, "_blank", "noopener,noreferrer")}
+              aria-label="Open in a new tab"
+            >
+              <ExternalLink class="size-4" />
+            </button>
+          {/snippet}
+        </Tip>
+      {/if}
       <Tip text="Download original">
         {#snippet children(props)}
           <button
@@ -1542,7 +1545,26 @@
       </p>
     {/if}
 
-    {#if lightboxKind === "image"}
+    {#if lightboxKind === "image" && lightboxView !== "shown"}
+      <!-- An animated image past the bound, or one that did not load, said
+           plainly where the picture would be (see lightboxView). Nothing
+           while its copy is still loading. -->
+      {#if lightboxView !== "loading"}
+        <div
+          class="relative z-10 flex max-w-xs flex-col items-center gap-2 rounded-md border border-border bg-background px-6 py-5 text-center"
+        >
+          <ImageOff class="size-6 text-muted-foreground" />
+          {#if lightboxView === "too-large" && lightboxLoaded}
+            <p class="text-sm text-foreground">This image is too large to show.</p>
+            <p class="font-mono text-xs text-muted-foreground">
+              {lightboxLoaded.naturalWidth} x {lightboxLoaded.naturalHeight} pixels
+            </p>
+          {:else}
+            <p class="text-sm text-foreground">This image did not load.</p>
+          {/if}
+        </div>
+      {/if}
+    {:else if lightboxKind === "image"}
       <!-- A div, not a button: it carries drag handlers, and a draggable
            button is neither. It still has to be operable from a keyboard,
            so it takes focus and answers Enter and Space the way the click
@@ -1555,7 +1577,10 @@
           if (e.key !== "Enter" && e.key !== " ") return;
           e.preventDefault();
           // Escape must keep closing the viewer, so only these two are taken.
-          onImageClick(e as unknown as MouseEvent);
+          // A key has no position, so it zooms about the image's centre:
+          // passed as an event, its missing clientX made the pan NaN and the
+          // zoom was dropped.
+          toggleZoom({ x: 0, y: 0 });
         }}
         class="relative z-10 touch-none select-none"
         style="cursor: {dragFrom
@@ -1570,17 +1595,20 @@
         onpointerup={onPointerUp}
         onpointercancel={onPointerUp}
       >
-        <img
-          bind:this={imgEl}
-          src={lightbox.url}
-          alt="Preview"
-          draggable="false"
-          class="max-h-[90vh] max-w-[90vw] rounded-md object-contain"
-          style="transform: translate({pan.x}px, {pan.y}px) scale({zoom}); transition: {dragFrom ||
-          pinchStart
-            ? 'none'
-            : 'transform 120ms ease-out'}"
-        />
+        {#if !lightbox.animated}
+          <img
+            bind:this={imgEl}
+            src={lightbox.url}
+            alt="Preview"
+            draggable="false"
+            class={viewerImageClass}
+            style={zoomStyle}
+          />
+        {:else if lightboxLoaded}
+          <!-- An animated image is only ever its measured copy: never its
+               url in an img of its own (see showCopy). -->
+          <span style="display:contents" {@attach showCopy(lightboxLoaded)}></span>
+        {/if}
       </div>
     {:else}
       <div

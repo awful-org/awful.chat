@@ -25,7 +25,9 @@ import {
   setCallPip,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
+  setShowRoomProfileInSidebar,
 } from "$lib/display-prefs.svelte";
+import { typingPrefs, setSendTyping } from "$lib/typing.svelte";
 import { Slider } from "$lib/components/ui/slider";
 import { Input } from "$lib/components/ui/input";
 import { Button } from "$lib/components/ui/button";
@@ -270,12 +272,40 @@ async function loadLocalFonts(): Promise<void> {
   </div>
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Show room profile in the sidebar</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        When you are viewing a chat room, the bottom-left profile card shows
+        that room's profile. Direct messages continue to use your main profile.
+      </span>
+    </div>
+    <Switch
+      aria-label="Show room profile in the sidebar"
+      checked={displayPrefs.showRoomProfileInSidebar}
+      onCheckedChange={(checked) => setShowRoomProfileInSidebar(checked)}
+    />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
       <span class="text-xs font-mono">External previews and media</span>
       <span class="text-xs font-mono text-muted-foreground leading-relaxed">
         On by default. Sends message links to the relay for previews and loads images, GIFs and avatars from their hosts, disclosing your IP address. Turn off to block these requests; local attachments still work.
       </span>
     </div>
     <Switch aria-label="External previews and media" checked={mediaPrefs.externalMedia} onCheckedChange={setExternalMedia} />
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Show when I'm typing</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Rooms and direct messages see "is typing…" while you write. Off stops
+        telling them; you still see when others are typing.
+      </span>
+    </div>
+    <Switch
+      aria-label="Show when I'm typing"
+      checked={typingPrefs.sendTyping}
+      onCheckedChange={(checked) => setSendTyping(checked)}
+    />
   </div>
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">

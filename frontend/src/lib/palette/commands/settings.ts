@@ -7,6 +7,7 @@ import {
   Puzzle,
   RefreshCw,
   SlidersHorizontal,
+  Sparkles,
   User,
   Volume2,
 } from "@lucide/svelte";
@@ -32,6 +33,7 @@ import {
   setNotificationsEnabled,
 } from "$lib/notify.svelte";
 import { pushPrefs, setPushEnabled } from "$lib/push.svelte";
+import { setSendTyping, typingPrefs } from "$lib/typing.svelte";
 import { mailboxPrefs, setMailboxEnabled } from "$lib/transport/mailbox.svelte";
 import {
   getVoiceActiveInputDevice,
@@ -71,6 +73,7 @@ const SETTINGS_TABS = [
   { id: "plugins", label: "Plugins", icon: Puzzle },
   { id: "quirks", label: "Quirks", icon: Info },
   { id: "oss", label: "OSS", icon: Heart },
+  { id: "whatsnew", label: "What's new", icon: Sparkles },
 ] as const;
 
 // Fills are exclusive - they all claim background-clip: text - so only these
@@ -183,6 +186,20 @@ export const settingsCommands: CmdSource = () => {
       kind: "act",
       keepOpen: true,
       perform: () => setExternalMedia(!mediaPrefs.externalMedia),
+    },
+  });
+
+  cmds.push({
+    id: "settings.toggle:sendTyping",
+    title: "Show when I'm typing",
+    subtitle: "Let rooms and DMs see \"is typing…\" while you write",
+    keywords: ["toggle", "enable", "disable", "privacy", "typing", "indicator"],
+    group: "Settings",
+    badge: typingPrefs.sendTyping ? "On" : "Off",
+    action: {
+      kind: "act",
+      keepOpen: true,
+      perform: () => setSendTyping(!typingPrefs.sendTyping),
     },
   });
 

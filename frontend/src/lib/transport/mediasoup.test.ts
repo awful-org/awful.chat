@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { MediasoupVideo, PRODUCER_GONE } from "./mediasoup";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CAMERA_PARK_GRACE_MS, MediasoupVideo, PRODUCER_GONE } from "./mediasoup";
 import type * as mediasoupClient from "mediasoup-client";
 
 // White-box: reach past the public VideoTransport surface to drive the
@@ -494,5 +494,690 @@ describe("overlapping consumes for one producer", () => {
     // Released once settled, so a later re-consume (a stall, a rebuild) is
     // not answered with a stale promise.
     expect((internals.inflightConsumes as Map<string, unknown>).size).toBe(0);
+  });
+});
+
+describe("cameras nothing on screen shows are not received (G05.1)", () => {
+  interface Sent {
+    type: string;
+    producerId?: string;
+  }
+
+  /**
+   * A joined session whose SFU answers every consume, recording each frame
+   * sent and each consumer built. Consumers are fakes with their own track,
+   * so a test can tell the original from the one a fresh consume brought.
+   */
+  function session() {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    const sent: Sent[] = [];
+    const built: Array<{ producerId: string; close: ReturnType<typeof vi.fn>; track: { id: string } }> = [];
+    internals.device = { recvRtpCapabilities: {} };
+    internals.ensureRecvTransport = async () => {};
+    internals.signal = (msg: Sent) => sent.push(msg);
+    internals.request = async (msg: Sent) => {
+      sent.push(msg);
+      return { type: "ms:consumer-options", options: { producerId: msg.producerId } };
+    };
+    let held: Promise<void> | null = null;
+    internals.recvTransport = {
+      ...fakeTransport(),
+      consume: async (options: { producerId: string }) => {
+        if (held) await held;
+        const state = { closed: false };
+        const consumer = {
+          id: `c${built.length + 1}`,
+          producerId: options.producerId,
+          kind: "video",
+          track: { id: `t${built.length + 1}` },
+          get closed() {
+            return state.closed;
+          },
+          close: vi.fn(() => {
+            state.closed = true;
+          }),
+          on: vi.fn(),
+        };
+        built.push(consumer);
+        return consumer;
+      },
+    };
+    const consume = (peerId: string, producerId: string, source: "camera" | "screen") =>
+      (internals.consumeProducer as (p: string, id: string, s: string) => Promise<void>).call(
+        video,
+        peerId,
+        producerId,
+        source
+      );
+    const closes = () => sent.filter((m) => m.type === "ms:close-consumer").map((m) => m.producerId);
+    const consumes = () => sent.filter((m) => m.type === "ms:consume").map((m) => m.producerId);
+    /**
+     * Hold every consumer build from now on - the SFU has answered, the local
+     * SDP work has not finished - until the returned release is called.
+     */
+    const holdBuilds = () => {
+      let release!: () => void;
+      held = new Promise<void>((r) => (release = r));
+      return () => {
+        held = null;
+        release();
+      };
+    };
+    const signalIn = (msg: unknown) =>
+      (internals.handleSignal as (m: unknown) => void).call(video, msg);
+    return { video, internals, sent, built, consume, closes, consumes, holdBuilds, signalIn };
+  }
+
+  /** Let a consume started in the background (an unpark) run to the end. */
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("receives every camera while nothing has said what is on screen", async () => {
+    const { consume, closes } = session();
+    await consume("peer-a", "cam-a", "camera");
+
+    vi.advanceTimersByTime(10 * CAMERA_PARK_GRACE_MS);
+
+    // No opinion is the old behaviour exactly: a shell that never feeds
+    // setWantedCameras keeps every camera, as before.
+    expect(closes()).toEqual([]);
+  });
+
+  it("stops receiving a camera nothing shows once the grace period runs out", async () => {
+    const { video, internals, built, consume, closes } = session();
+    const removed = vi.fn();
+    video.on("trackRemoved", removed);
+    await consume("peer-a", "cam-a", "camera");
+
+    // Another room opened: the stage is gone and the spotlight is a share.
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS - 1);
+    expect(closes()).toEqual([]);
+    vi.advanceTimersByTime(1);
+
+    // Closed on the SFU, which stops forwarding it, and here.
+    expect(closes()).toEqual(["cam-a"]);
+    expect(built[0].close).toHaveBeenCalled();
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    // The camera is still on, only not received: the app keeps the last
+    // track, so the spotlight, the grid filter and the tile itself still
+    // know this person has video.
+    expect(removed).not.toHaveBeenCalled();
+  });
+
+  it("a glance away and back costs nothing", async () => {
+    const { video, consume, closes } = session();
+    await consume("peer-a", "cam-a", "camera");
+
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS / 2);
+    video.setWantedCameras(new Set(["peer-a"]));
+    vi.advanceTimersByTime(10 * CAMERA_PARK_GRACE_MS);
+
+    expect(closes()).toEqual([]);
+  });
+
+  it("receives it afresh the moment something shows it again", async () => {
+    const { video, consume, consumes, sent } = session();
+    const added = vi.fn();
+    video.on("trackAdded", added);
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    added.mockClear();
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+
+    expect(consumes()).toEqual(["cam-a", "cam-a"]);
+    // Resumed like every consume: the SFU asks for a keyframe on resume.
+    expect(sent.at(-1)).toEqual({ type: "ms:resume-consumer", producerId: "cam-a" });
+    // A new track replaces the one the app kept.
+    expect(added).toHaveBeenCalledWith("peer-a", { id: "t2" }, "camera");
+  });
+
+  it("parks a camera that arrives while nothing shows it, after the same grace", async () => {
+    const { video, consume, closes } = session();
+    video.setWantedCameras(new Set(["someone-else"]));
+
+    await consume("peer-a", "cam-a", "camera");
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+
+    expect(closes()).toEqual(["cam-a"]);
+  });
+
+  it("never touches a screen share being watched", async () => {
+    const { video, internals, consume, closes } = session();
+    (internals.watchingTransmissionPeers as Set<string>).add("peer-b");
+    await consume("peer-b", "share-b", "screen");
+
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(10 * CAMERA_PARK_GRACE_MS);
+
+    // Watching is the user's own choice, and the sharer's "who is watching"
+    // list is announced from these consumers.
+    expect(closes()).toEqual([]);
+  });
+
+  it("a camera turned off while parked leaves the app's tile", async () => {
+    const { video, internals, consume } = session();
+    const removed = vi.fn();
+    video.on("trackRemoved", removed);
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+
+    (internals.handleSignal as (msg: unknown) => void).call(video, {
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+
+    // No consumer was left to close, but the app still held the last track.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    // And it is not consumed again when shown: there is nothing to show.
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+  });
+
+  it("a camera turned off just as it is shown again drops out quietly", async () => {
+    const { video, internals, consume } = session();
+    const removed = vi.fn();
+    const errors = vi.fn();
+    video.on("trackRemoved", removed);
+    video.on("error", errors);
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    internals.request = async () => ({ type: "ms:consume-failed", producerId: "cam-a" });
+
+    // What is on screen can change twice while one consume is out.
+    video.setWantedCameras(new Set(["peer-a"]));
+    video.setWantedCameras(new Set(["peer-a", "peer-b"]));
+    await settle();
+
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    // Not an error anyone needs to see: the camera is simply off.
+    expect(errors).not.toHaveBeenCalled();
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+  });
+
+  it("an unpark that fails is tried once more three seconds later", async () => {
+    const { video, internals, consume } = session();
+    const added = vi.fn();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    video.on("trackAdded", added);
+    const answer = internals.request as (msg: Sent) => Promise<unknown>;
+    let calls = 0;
+    internals.request = async (msg: Sent) => {
+      if (++calls === 1) throw new Error("mediasoup request timeout: ms:consumer-options");
+      return answer(msg);
+    };
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    expect(added).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(3_000);
+    await settle();
+
+    expect(calls).toBe(2);
+    expect(added).toHaveBeenCalledWith("peer-a", { id: "t2" }, "camera");
+  });
+
+  it("an unpark that fails twice drops the frozen picture, and is tried again once shown afresh", async () => {
+    const { video, internals, consume } = session();
+    const removed = vi.fn();
+    video.on("trackRemoved", removed);
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    const answer = internals.request as (msg: Sent) => Promise<unknown>;
+    let calls = 0;
+    internals.request = async (msg: Sent) => {
+      if (++calls <= 2) throw new Error("mediasoup request timeout: ms:consumer-options");
+      return answer(msg);
+    };
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await settle();
+
+    // A tile showing the person beats one frozen on a stale frame.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    // Not while it stays shown, whatever else changes: someone starting to
+    // talk is no reason to ask a failing SFU again.
+    video.setWantedCameras(new Set(["peer-a", "peer-b"]));
+    await settle();
+    expect(calls).toBe(2);
+    // Off the screen and back again tries afresh.
+    video.setWantedCameras(new Set(["peer-b"]));
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    expect(calls).toBe(3);
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+  });
+
+  it("after two failed unparks, the app pushing the same cameras again does not start the tries over", async () => {
+    const { video, internals, consume } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    let attempts = 0;
+    internals.request = async () => {
+      attempts++;
+      throw new Error("mediasoup request timeout: ms:consumer-options");
+    };
+    // What the app does on any roster change, and the double failure's own
+    // trackRemoved is one: AppView hands the spotlight a new tile object and
+    // call-cameras pushes an equal set.
+    video.on("trackRemoved", () => video.setWantedCameras(new Set(["peer-a"])));
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await settle();
+    // A minute in which nothing on screen changes.
+    for (let i = 0; i < 60; i++) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await settle();
+    }
+
+    // Was 3 by the end of the ladder and 46 a minute later: every push
+    // retried a camera that had been shown all along.
+    expect(attempts).toBe(2);
+  });
+
+  it("leaving while a second try waits leaves no timer, and nothing tries after a rejoin", async () => {
+    const { video, internals, consume, consumes } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    const answer = internals.request as (msg: Sent) => Promise<unknown>;
+    const transport = internals.recvTransport;
+    internals.request = async () => {
+      throw new Error("mediasoup request timeout: ms:consumer-options");
+    };
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+
+    video.leave();
+    expect(vi.getTimerCount()).toBe(0);
+
+    // The same room again inside the three seconds, cam-a still parked
+    // there: only that call's own screen may bring it back.
+    internals.device = { recvRtpCapabilities: {} };
+    internals.recvTransport = transport;
+    internals.request = answer;
+    (internals.parkedCameras as Map<string, string>).set("cam-a", "peer-a");
+    await vi.advanceTimersByTimeAsync(3_000);
+    await settle();
+    expect(consumes()).toEqual(["cam-a"]);
+  });
+
+  it("a set changed in place after it was handed over still counts as a change", async () => {
+    const { video, consume, closes } = session();
+    await consume("peer-a", "cam-a", "camera");
+    const shown = new Set(["peer-a"]);
+    video.setWantedCameras(shown);
+
+    shown.delete("peer-a");
+    video.setWantedCameras(shown);
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+
+    expect(closes()).toEqual(["cam-a"]);
+  });
+
+  it("an unpark whose camera closes while its consumer is being built adds no dead track", async () => {
+    const { video, internals, built, consume, closes } = session();
+    const added = vi.fn();
+    const removed = vi.fn();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    video.on("trackAdded", added);
+    video.on("trackRemoved", removed);
+    // The SFU answered the consume, then the producer closed while
+    // recvTransport.consume() (local SDP work) was still running.
+    const transport = internals.recvTransport as { consume: (o: unknown) => Promise<unknown> };
+    const build = transport.consume;
+    let release!: () => void;
+    transport.consume = async (o: unknown) => {
+      await new Promise<void>((r) => (release = r));
+      return build(o);
+    };
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    (internals.handleSignal as (msg: unknown) => void).call(video, {
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await settle();
+
+    // Told the camera is off, and never handed a track that will not play.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(added).not.toHaveBeenCalled();
+    expect(built[1].close).toHaveBeenCalled();
+    expect(closes()).toEqual(["cam-a", "cam-a"]);
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    expect((internals.closedWhileConsuming as Set<string>).size).toBe(0);
+  });
+
+  it("a first consume whose camera closes while its consumer is being built adds no dead track", async () => {
+    // The same race on the announce path: it froze a tile until the stall
+    // sweep turned it into "That stream has ended".
+    const { video, internals, built, consume, closes } = session();
+    const added = vi.fn();
+    const errors = vi.fn();
+    video.on("trackAdded", added);
+    video.on("error", errors);
+    const transport = internals.recvTransport as { consume: (o: unknown) => Promise<unknown> };
+    const build = transport.consume;
+    let release!: () => void;
+    transport.consume = async (o: unknown) => {
+      await new Promise<void>((r) => (release = r));
+      return build(o);
+    };
+
+    const consuming = consume("peer-a", "cam-a", "camera");
+    await settle();
+    (internals.handleSignal as (msg: unknown) => void).call(video, {
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await consuming;
+
+    expect(added).not.toHaveBeenCalled();
+    expect(errors).not.toHaveBeenCalled();
+    expect(built[0].close).toHaveBeenCalled();
+    expect(closes()).toEqual(["cam-a"]);
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    expect((internals.closedWhileConsuming as Set<string>).size).toBe(0);
+  });
+
+  it("a peer leaving while their camera is parked takes the kept track with peerLeft", async () => {
+    const { video, internals, consume } = session();
+    const left = vi.fn();
+    const removed = vi.fn();
+    video.on("peerLeft", left);
+    video.on("trackRemoved", removed);
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(1);
+
+    (internals.handleSignal as (msg: unknown) => void).call(video, {
+      type: "ms:peer-left",
+      peerId: "peer-a",
+    });
+
+    expect(left).toHaveBeenCalledTimes(1);
+    expect(left).toHaveBeenCalledWith("peer-a");
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+    expect(removed).not.toHaveBeenCalled();
+  });
+
+  it("a rejoin retracts parked cameras; the replay brings back the ones still on", async () => {
+    const { video, internals, consume } = session();
+    const removed = vi.fn();
+    video.on("trackRemoved", removed);
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    internals.currentRoomCode = "room";
+    internals.currentPeerId = "me";
+    internals.sessionIsLive = () => false;
+    internals.join = vi.fn(async () => {});
+
+    await (internals.attemptRejoin as (g: number) => Promise<void>)(
+      internals.joinGeneration as number
+    );
+
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+    // What is on screen is not session state.
+    expect(internals.wantedCameras).toEqual(new Set());
+  });
+
+  it("leaving forgets parked cameras and goes back to receiving everything", async () => {
+    const { video, internals, consume } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+
+    video.leave();
+
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+    expect(internals.wantedCameras).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("the stall detector does not mistake a parked camera for a frozen one", async () => {
+    const { video, internals, consume, consumes } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+
+    // A parked camera sends nothing, which is what a stall looks like - but
+    // it is no longer among the consumers the sweep reads.
+    (internals.sweepConsumerStats as () => void).call(video);
+    (internals.sweepConsumerStats as () => void).call(video);
+    await settle();
+
+    expect(consumes()).toEqual(["cam-a"]);
+  });
+
+  it("an unpark in flight when its owner leaves the call does not bring them back", async () => {
+    const { video, internals, built, consume, closes, holdBuilds, signalIn } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    const events: string[] = [];
+    video.on("peerJoined", (p) => events.push(`peerJoined:${p}`));
+    video.on("peerLeft", (p) => events.push(`peerLeft:${p}`));
+    video.on("trackAdded", (p) => events.push(`trackAdded:${p}`));
+
+    // They start to talk, or their tile scrolls into view; the SFU answers
+    // the consume, and they leave while the consumer is built here - a
+    // goodbye said while clicking Leave. The SFU closes a leaver's producers
+    // and sends ms:peer-left alone, never ms:producer-closed.
+    const release = holdBuilds();
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    signalIn({ type: "ms:peer-left", peerId: "peer-a" });
+    release();
+    await settle();
+
+    // Was peerLeft, then peerJoined and trackAdded with a track that never
+    // plays.
+    expect(events).toEqual(["peerLeft:peer-a"]);
+    expect(built[1].close).toHaveBeenCalled();
+    expect(closes()).toEqual(["cam-a", "cam-a"]);
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+    expect((internals.inflightConsumes as Map<string, unknown>).size).toBe(0);
+    expect((internals.closedWhileConsuming as Set<string>).size).toBe(0);
+  });
+
+  it("a first consume in flight when its owner leaves does not bring them in", async () => {
+    // The same race on the announce path: answered, then the owner gone
+    // before the consumer is built here.
+    const { video, internals, built, closes, consumes, holdBuilds, signalIn } = session();
+    const events: string[] = [];
+    const errors = vi.fn();
+    video.on("peerJoined", (p) => events.push(`peerJoined:${p}`));
+    video.on("peerLeft", (p) => events.push(`peerLeft:${p}`));
+    video.on("trackAdded", (p) => events.push(`trackAdded:${p}`));
+    video.on("error", errors);
+
+    const release = holdBuilds();
+    signalIn({ type: "ms:new-producer", peerId: "peer-a", producerId: "cam-a", source: "camera" });
+    await settle();
+    signalIn({ type: "ms:peer-left", peerId: "peer-a" });
+    release();
+    await settle();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await settle();
+
+    // Never joined here, so nothing to take back, and nothing tried again.
+    expect(events).toEqual([]);
+    expect(errors).not.toHaveBeenCalled();
+    expect(built[0].close).toHaveBeenCalled();
+    expect(consumes()).toEqual(["cam-a"]);
+    expect(closes()).toEqual(["cam-a"]);
+    expect((internals.consumers as Map<string, unknown>).has("peer-a")).toBe(false);
+    expect((internals.closedWhileConsuming as Set<string>).size).toBe(0);
+  });
+
+  it("a leaver who comes back keeps their new camera when shown", async () => {
+    const { video, internals, consume, holdBuilds, signalIn } = session();
+    await consume("peer-a", "cam-old", "camera");
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+    // The race above, and then nothing shows them for the grace period.
+    const release = holdBuilds();
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+    signalIn({ type: "ms:peer-left", peerId: "peer-a" });
+    release();
+    await settle();
+    video.setWantedCameras(new Set());
+    vi.advanceTimersByTime(CAMERA_PARK_GRACE_MS);
+
+    // They come back with a new camera; the old one is gone on the SFU.
+    const answer = internals.request as (msg: Sent) => Promise<unknown>;
+    internals.request = async (msg: Sent) =>
+      msg.producerId === "cam-old"
+        ? { type: "ms:consume-failed", producerId: "cam-old" }
+        : answer(msg);
+    const seen: string[] = [];
+    video.on("trackAdded", (p, t) => seen.push(`added:${p}:${(t as unknown as { id: string }).id}`));
+    video.on("trackRemoved", (p, s) => seen.push(`removed:${p}:${s}`));
+    await consume("peer-a", "cam-new", "camera");
+    // They talk, or their tile scrolls into view: shown afresh.
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+
+    // Was added, then removed: the late consumer, parked, left an entry for
+    // the dead camera, and its failed return blanked the live one.
+    expect(seen).toEqual(["added:peer-a:t3"]);
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+  });
+
+  it("a camera that is gone never blanks the one that took its place", async () => {
+    // trackRemoved names a peer and a source, never a producer. However a
+    // parked entry for a dead camera came to outlive it, its failed return
+    // must leave the peer's live camera alone.
+    const { video, internals, consume } = session();
+    await consume("peer-a", "cam-new", "camera");
+    video.setWantedCameras(new Set());
+    (internals.parkedCameras as Map<string, string>).set("cam-old", "peer-a");
+    const answer = internals.request as (msg: Sent) => Promise<unknown>;
+    internals.request = async (msg: Sent) =>
+      msg.producerId === "cam-old"
+        ? { type: "ms:consume-failed", producerId: "cam-old" }
+        : answer(msg);
+    const removed = vi.fn();
+    video.on("trackRemoved", removed);
+
+    video.setWantedCameras(new Set(["peer-a"]));
+    await settle();
+
+    expect(removed).not.toHaveBeenCalled();
+    expect((internals.parkedCameras as Map<string, string>).size).toBe(0);
+  });
+
+  it("a stalled camera turned off while it is consumed again is reported off", async () => {
+    const { video, internals, built, consume, holdBuilds, signalIn } = session();
+    await consume("peer-a", "cam-a", "camera");
+    // Not a byte comes in: the sweep's two misses in a row.
+    (built[0] as unknown as { getStats: () => Promise<Map<string, unknown>> }).getStats =
+      async () => new Map([["in", { type: "inbound-rtp", bytesReceived: 100 }]]);
+    const added = vi.fn();
+    const removed = vi.fn();
+    video.on("trackAdded", added);
+    video.on("trackRemoved", removed);
+
+    const release = holdBuilds();
+    for (let i = 0; i < 3; i++) {
+      (internals.sweepConsumerStats as () => void).call(video);
+      await settle();
+    }
+    expect((internals.inflightConsumes as Map<string, unknown>).has("cam-a")).toBe(true);
+    // The stalled consumer is already off the list, so closing the camera
+    // finds nothing to close.
+    signalIn({
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await settle();
+
+    // The app held the stalled track as "camera on", for good.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    expect(added).not.toHaveBeenCalled();
+    expect((internals.inflightConsumes as Map<string, unknown>).size).toBe(0);
+  });
+
+  it("a camera turned off while a rebuilt recv transport consumes it again is reported off", async () => {
+    const { video, internals, consume, holdBuilds, signalIn } = session();
+    await consume("peer-a", "cam-a", "camera");
+    const transport = internals.recvTransport;
+    const added = vi.fn();
+    const removed = vi.fn();
+    video.on("trackAdded", added);
+    video.on("trackRemoved", removed);
+
+    const release = holdBuilds();
+    (internals.rebuildRecvTransport as () => void).call(video);
+    // The fresh transport, which ensureRecvTransport would have built.
+    internals.recvTransport = transport;
+    await settle();
+    expect((internals.inflightConsumes as Map<string, unknown>).has("cam-a")).toBe(true);
+    signalIn({
+      type: "ms:producer-closed",
+      peerId: "peer-a",
+      producerId: "cam-a",
+      source: "camera",
+      kind: "video",
+    });
+    release();
+    await settle();
+
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed).toHaveBeenCalledWith("peer-a", "camera", "video");
+    expect(added).not.toHaveBeenCalled();
   });
 });

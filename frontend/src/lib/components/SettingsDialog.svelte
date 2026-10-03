@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { uiState } from "$lib/ui-state.svelte";
+  import { openPalette, uiState } from "$lib/ui-state.svelte";
   import {
     Dialog,
     DialogContent,
@@ -65,6 +65,7 @@
     Activity,
     Info,
     Heart,
+    Sparkles,
     Puzzle,
     Github,
     Check,
@@ -80,8 +81,11 @@
   import DiagnosticsSettings from "./settings/DiagnosticsSettings.svelte";
   import PluginSettings from "./settings/PluginSettings.svelte";
   import AvatarPickerDialog from "./AvatarPickerDialog.svelte";
+  import { getScopedProfile, saveAvatar, saveScopedFields } from "$lib/profile.svelte";
   import QuirksNotice from "./QuirksNotice.svelte";
   import OssCredits from "./OssCredits.svelte";
+  import WhatsNewSettings from "./settings/WhatsNewSettings.svelte";
+  import { whatsNew } from "$lib/whats-new.svelte";
 
   type SettingsTab =
     | "profile"
@@ -91,6 +95,7 @@
     | "data"
     | "diagnostics"
     | "plugins"
+    | "whatsnew"
     | "quirks"
     | "oss";
 
@@ -109,10 +114,17 @@
   $effect(() => {
     if (open && uiState.settingsTab) {
       activeTab = uiState.settingsTab as SettingsTab;
+      selectedProfileRoom = uiState.settingsProfileRoom;
       uiState.settingsTab = null;
+      uiState.settingsProfileRoom = null;
     }
   });
   let avatarDialogOpen = $state(false);
+  let selectedProfileRoom = $state<string | null>(null);
+  let avatarPickerRoom = $state<string | null>(null);
+  $effect(() => {
+    if (!open) selectedProfileRoom = null;
+  });
   let isMobile = $state(false);
 
   const tabs = $state([
@@ -129,6 +141,9 @@
     { id: "plugins" as SettingsTab, label: "Plugins", icon: Puzzle },
     { id: "quirks" as SettingsTab, label: "Quirks", icon: Info },
     { id: "oss" as SettingsTab, label: "OSS", icon: Heart },
+    // Always last: news, not a setting. On desktop it also sits at the foot
+    // of the column, apart from the tabs that change something.
+    { id: "whatsnew" as SettingsTab, label: "What's new", icon: Sparkles },
   ]);
 
   $effect(() => {
@@ -149,6 +164,16 @@
   const closeHandler = (v: boolean) => {
     if (!v) onClose();
   };
+
+  /** What the palette's own shortcut is called on this machine. */
+  const modKey =
+    typeof navigator !== "undefined" && /Mac|iPhone|iPad/i.test(navigator.userAgent) ? "⌘" : "Ctrl";
+
+  /** Settings' tip: close this and open the palette on settings only. */
+  function searchInPalette(): void {
+    onClose();
+    openPalette(">");
+  }
 </script>
 
 {#snippet TabBar()}
@@ -166,7 +191,10 @@
         type="button"
         onclick={() => (activeTab = tab.id)}
         aria-pressed={activeTab === tab.id}
-        class="flex shrink-0 items-center gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {activeTab ===
+        class="flex shrink-0 items-center gap-2 px-3 py-2 rounded-md text-xs font-mono transition-colors whitespace-nowrap {!isMobile &&
+        tab.id === 'whatsnew'
+          ? 'mt-auto'
+          : ''} {activeTab ===
         tab.id
           ? isMobile
             ? 'bg-muted text-foreground'
@@ -178,6 +206,9 @@
              at the same x and the column looks ragged. -->
         <tab.icon class="w-4 h-4 shrink-0" />
         <span class="truncate">{tab.label}</span>
+        {#if tab.id === "whatsnew" && whatsNew.unseen}
+          <span class="ml-auto size-2 shrink-0 rounded-full bg-primary" role="img" aria-label="New"></span>
+        {/if}
       </button>
     {/each}
   </div>
@@ -311,7 +342,9 @@
         <ProfileSettings
           {isMobile}
           {avatarDialogOpen}
-          onAvatarClick={() => (avatarDialogOpen = true)}
+          roomCode={selectedProfileRoom}
+          onRoomChange={(room) => (selectedProfileRoom = room)}
+          onAvatarClick={() => { avatarPickerRoom = selectedProfileRoom; avatarDialogOpen = true; }}
         />
       {:else if activeTab === "audio"}
         <AudioSettings />
@@ -325,6 +358,8 @@
         <DiagnosticsSettings {activeTab} />
       {:else if activeTab === "plugins"}
         <PluginSettings />
+      {:else if activeTab === "whatsnew"}
+        <WhatsNewSettings />
       {:else if activeTab === "quirks"}
         {@render QuirksTab()}
       {:else if activeTab === "oss"}
@@ -349,7 +384,9 @@
             <ProfileSettings
               {isMobile}
               {avatarDialogOpen}
-              onAvatarClick={() => (avatarDialogOpen = true)}
+              roomCode={selectedProfileRoom}
+              onRoomChange={(room) => (selectedProfileRoom = room)}
+              onAvatarClick={() => { avatarPickerRoom = selectedProfileRoom; avatarDialogOpen = true; }}
             />
           {:else if activeTab === "audio"}
             <AudioSettings />
@@ -363,6 +400,8 @@
             <DiagnosticsSettings {activeTab} />
           {:else if activeTab === "plugins"}
             <PluginSettings />
+          {:else if activeTab === "whatsnew"}
+            <WhatsNewSettings />
           {:else if activeTab === "quirks"}
             {@render QuirksTab()}
           {:else if activeTab === "oss"}
@@ -378,10 +417,24 @@
       class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-0 sm:h-178.75 lg:h-195 flex flex-col overflow-hidden p-0"
       style="max-height: {Math.max(0, visibleHeight - 32)}px; top: {viewportTop + visibleHeight / 2}px;"
     >
-      <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
+      <!-- pr-12 clears the dialog's own close button, absolute at the right. -->
+      <DialogHeader class="flex-row items-center justify-between gap-4 px-6 py-4 pr-12 border-b border-border shrink-0">
         <DialogTitle class="font-mono text-base font-semibold"
           >Settings</DialogTitle
         >
+        <!-- Every setting is a row in the palette, under ">": a hint, not a
+             second search box. Clicking it takes you there. -->
+        <button
+          type="button"
+          onclick={searchInPalette}
+          class="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <span>Tip:</span>
+          <kbd class="rounded border border-border px-1">{modKey}</kbd><kbd class="rounded border border-border px-1">K</kbd>
+          <span>then</span>
+          <kbd class="rounded border border-border px-1">&gt;</kbd>
+          <span>finds any setting</span>
+        </button>
       </DialogHeader>
       <div class="min-h-0 flex-1 overflow-hidden px-4 pb-4">
         {@render DesktopContent()}
@@ -392,6 +445,9 @@
 
 <AvatarPickerDialog
   open={avatarDialogOpen}
+  scopeKey={avatarPickerRoom}
+  value={getScopedProfile(avatarPickerRoom).avatarUrl}
+  onSave={(url) => avatarPickerRoom ? saveScopedFields(avatarPickerRoom, { pfpURL: url ?? null }) : saveAvatar(url)}
   onClose={() => {
     avatarDialogOpen = false;
   }}

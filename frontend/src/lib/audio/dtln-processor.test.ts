@@ -46,6 +46,10 @@ class FakeCtx {
     await Promise.resolve();
     this.state = "suspended";
   }
+  async close() {
+    await Promise.resolve();
+    this.state = "closed";
+  }
   createMediaStreamSource(_s: MediaStream) {
     const n = new FakeNode();
     this.sources.push(n);
@@ -315,6 +319,49 @@ describe("DtlnProcessor fatal callback (finding 1)", () => {
 
     expect(fatalCalls).toBe(1);
     expect(d.isReady()).toBe(false);
+  });
+
+  it("rebuilds on a fresh context after a crash, closing the old one", async () => {
+    // Every node in a context shares one WASM instance, which can only ever
+    // create two denoisers - a rebuild in the same context would get a
+    // broken one or hang. So a crash must retire the context.
+    const d = await makeProcessor();
+    const first = ctx;
+    await d.processStream(micStream);
+    (d.node as unknown as CrashableWorklet).onprocessorerror();
+    await Promise.resolve();
+    expect(first.state).toBe("closed");
+
+    ctx = new FakeCtx();
+    await d.processStream(micStream);
+    expect(d.ctx).toBe(ctx);
+    expect(d.ctx).not.toBe(first);
+  });
+
+  it("a failed init closes its context, so the retry gets a new one", async () => {
+    const contexts: FakeCtx[] = [];
+    (globalThis as any).AudioContext = function () {
+      const c = new FakeCtx();
+      if (contexts.length === 0) {
+        c.audioWorklet = {
+          addModule: async () => {
+            throw new Error("offline");
+          },
+        };
+      }
+      contexts.push(c);
+      return c;
+    };
+    (globalThis as any).AudioWorkletNode = FakeWorkletNode;
+    const d = new DtlnProcessor();
+
+    await expect(d.waitUntilReady()).rejects.toThrow("offline");
+    await Promise.resolve();
+    expect(contexts[0].state).toBe("closed");
+
+    await d.waitUntilReady();
+    expect(contexts).toHaveLength(2);
+    expect(d.ctx).toBe(contexts[1]);
   });
 
   it("onFatal(null) clears a previously registered handler", async () => {

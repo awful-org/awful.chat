@@ -23,6 +23,7 @@ const CHAT_FONT_SIZE_KEY = "awful:chat-font-size:v1";
 const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
 const CALL_STAGE_HEIGHT_KEY = "awful:call-stage-height:v1";
 const CALL_CHAT_WIDTH_KEY = "awful:call-chat-width:v1";
+const ROOM_PROFILE_SIDEBAR_KEY = "awful:room-profile-sidebar:v1";
 
 function readFraction(key: string): number | null {
   if (typeof localStorage === "undefined") return null;
@@ -98,7 +99,18 @@ export const displayPrefs = $state({
       ? null
       : localStorage.getItem(CHAT_FONT_FAMILY_KEY),
   ),
+  /** Show the current chat room's profile in the bottom-left identity card. */
+  showRoomProfileInSidebar: readStored(ROOM_PROFILE_SIDEBAR_KEY, false),
 });
+
+export function setShowRoomProfileInSidebar(on: boolean): void {
+  displayPrefs.showRoomProfileInSidebar = on;
+  try {
+    localStorage.setItem(ROOM_PROFILE_SIDEBAR_KEY, on ? "1" : "0");
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
 
 export function setCallPip(on: boolean): void {
   displayPrefs.callPip = on;
@@ -218,6 +230,8 @@ if (typeof window !== "undefined") {
     // CALL_PIP_KEY was missing from this list, so flipping picture-in-picture
     // in one tab left every other tab on the stale value until a reload.
     if (e.key === CALL_PIP_KEY) displayPrefs.callPip = e.newValue === "1";
+    if (e.key === ROOM_PROFILE_SIDEBAR_KEY)
+      displayPrefs.showRoomProfileInSidebar = e.newValue === "1";
     if (e.key === AVATAR_TINT_KEY)
       displayPrefs.avatarTint = e.newValue === "1";
     if (e.key === CHAT_FONT_SIZE_KEY)

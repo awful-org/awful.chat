@@ -9,7 +9,6 @@
   import { Check, Copy, Download, Upload, Users } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import * as Card from "$lib/components/ui/card/index.js";
-  import { formatQuickCode } from "$lib/room-code";
   import { formatSize } from "$lib/utils";
   import {
     acceptFile,
@@ -35,8 +34,13 @@
     void start();
     // A pasted link arrives as a hash change on an already-open page.
     const onHash = () => void start();
+    const onHide = () => stopQuickSend();
     window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      window.removeEventListener("hashchange", onHash);
+      window.removeEventListener("pagehide", onHide);
+    };
   });
 
   onDestroy(stopQuickSend);
@@ -134,11 +138,14 @@
       </Card.Content>
     {:else if quickSend.status === "ready"}
       <Card.Content class="space-y-4">
+        {#if quickSend.error}
+          <p class="text-xs text-destructive font-mono" role="alert">{quickSend.error}</p>
+        {/if}
         <div class="space-y-1.5">
           <div class="flex items-center justify-between gap-2">
-            <code class="text-base font-mono tracking-wide text-foreground">
-              {formatQuickCode(quickSend.code)}
-            </code>
+            <span class="text-sm font-mono text-foreground">
+              File link
+            </span>
             <Button
               variant="ghost"
               size="sm"
@@ -161,8 +168,7 @@
             {:else if quickSend.peers === 1}
               One person is here
             {:else if quickSend.heardMode === "once"}
-              {quickSend.peers} people are here · only the first to finish
-              gets it
+              {quickSend.peers} people are here · closes after the first delivery
             {:else}
               {quickSend.peers} people are here · they share with each other
             {/if}
@@ -188,8 +194,7 @@
           </label>
         {:else if quickSend.heardMode === "once"}
           <p class="text-xs text-muted-foreground font-mono leading-relaxed">
-            One-time link · you are the only recipient, and this page will not
-            share the file on to anyone else.
+            One-time link · this page will not share the completed file on.
           </p>
         {/if}
 

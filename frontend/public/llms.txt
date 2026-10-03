@@ -25,7 +25,18 @@ them (USE_QS / USE_QC):
 
 Key properties:
 - No sign-up: create an identity locally, back it up with 12 words
-- End-to-end encrypted messaging (noise protocol between peers)
+- End-to-end encrypted messaging (noise protocol between peers, and an
+  authenticated, encrypted channel per room)
+- Rooms are a 256-bit secret; the relay and media server only ever see a
+  derived public ID that cannot join. Invite by short code - six characters,
+  limited to the people (up to 25) and minutes (up to 10) the inviter
+  chooses, handed over with OPAQUE - or by a permanent link that carries the
+  secret after the "#", so it never reaches a server
+- Post-quantum: DM keys, the offline mailbox and short-code handovers add
+  ML-KEM-768 to the elliptic-curve exchange
+- Discord-style markdown (bold, italic, underline, strikethrough, spoilers,
+  quotes, lists, code blocks), typing indicators, a separate profile per room,
+  and message requests for DMs from strangers
 - Signed messages (ed25519) to prevent impersonation
 - Delivery and read receipts for direct messages
 - Offline DMs: an encrypted 48-hour relay mailbox (sealed to the recipient,
@@ -38,13 +49,17 @@ Key properties:
   for calls and screen shares
 - Instance plugins: watch-together, polls, and more, bundled at build time
   and compiled into the app, so they are part of what a build hash covers
+- Apps: /app <url> opens any website as a sandboxed tile in a call; sites
+  that speak the awful contract get the session and per-session player ids,
+  never anyone's identity
 - Device sync via QR code between your own devices; encrypted backup files
   for restoring elsewhere
 - Verifiable builds: every instance publishes the commit it runs, and
   awful-verify (https://github.com/awful-org/awful-verify) checks that the
   served code matches the published source
 - No analytics, no trackers, no third-party scripts beyond an optional
-  YouTube embed inside the watch-together plugin
+  YouTube embed inside the watch-together plugin, and websites someone opens
+  in a call with /app, each sandboxed and behind a notice
 - Self-hostable: Docker Compose with a Go relay, mediasoup SFU, coturn
 
 ## Links
@@ -53,4 +68,5 @@ Key properties:
 - [Source code](https://github.com/awful-org/awful.chat): open source, self-hosting instructions in the README
 - [Protocol and storage spec](https://github.com/awful-org/awful.chat/blob/main/docs/spec.md): how identity, messages, the mailbox and at-rest encryption work
 - [Plugins](https://github.com/awful-org/awful.chat/blob/main/frontend/plugins/README.md): writing and installing plugins
+- [The awful contract](https://github.com/awful-org/awful.chat/blob/main/docs/awful-contract.md): how a website runs as an app in a call
 - [Curated plugins](https://github.com/awful-org/awfully-awesome)

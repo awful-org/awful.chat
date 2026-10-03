@@ -1,4 +1,42 @@
 import { deleteDB, openDB, type IDBPDatabase } from "idb";
+import { validateStoredCapability } from "./room-security/keys";
+import { sanitizePeerProfile } from "./profile-sanitize";
+import { onIdentityLock } from "./identity/lock-events";
+import type { RoomProfileFields, RoomProfileField } from "./room-profile";
+import type { PqKeyCertificate } from "./identity/pq-identity";
+import type { DmPqState } from "./room-security/pq-dm";
+
+type WriteGuard = () => void;
+let writeEpoch = 0;
+onIdentityLock(() => { writeEpoch++; });
+function captureWriteGuard(): WriteGuard {
+  const epoch = writeEpoch;
+  return () => {
+    if (epoch !== writeEpoch) throw new Error("Identity changed during storage write");
+  };
+}
+
+/** Abort pending IDB requests on lock; check ownership at the commit boundary. */
+async function guardedCommit(
+  database: AppDB, store: "messages" | "rooms" | "watermarks" | "attachments" | "roomProfiles",
+  guard: WriteGuard, write: (tx: any) => Promise<void>,
+): Promise<void> {
+  guard();
+  const tx = database.transaction(store, "readwrite");
+  const done = tx.done;
+  // Observe rejection immediately, including when lock aborts during a request.
+  void done.catch(() => {});
+  const release = onIdentityLock(() => { try { tx.abort(); } catch {} });
+  try {
+    await write(tx);
+    guard();
+    await done;
+    guard();
+  } catch (error) {
+    try { tx.abort(); } catch {}
+    throw error;
+  } finally { release(); }
+}
 
 import { dbName } from "./quick/quick-storage";
 
@@ -46,9 +84,19 @@ export type RoomType = "text" | "dm";
 
 export interface Room {
   roomCode: string;
+  /** Local encrypted capability. Never serialize into room rosters or plugin APIs. */
+  roomSecret?: string;
   type: RoomType;
   name: string;
   lastSeenLamport: number; // unread count = messages with lamport > this
+  /**
+   * When the user last read or wrote here, by this device's clock (ms):
+   * markRoomSeen sets it. lastSeenLamport is a count kept per conversation
+   * and says nothing about when; this does, and only the user moves it,
+   * unlike the time of the last message. Absent until the room is next
+   * read. Private: never sent.
+   */
+  seenAt?: number;
   createdAt: number;
   pfpData?: ArrayBuffer; // local upload - blobURL generated at runtime, never stored
   pfpURL?: string; // external URL (tenor, giphy, etc) - stored as-is
@@ -60,6 +108,19 @@ export interface Room {
   position?: number;
   /** Messages this user pinned here, oldest pin first. Private: never sent. */
   pinnedMessages?: string[];
+  /**
+   * Secure room only: the legacy room whose history this one continues
+   * (room-security/legacy-move.ts). Its messages stay under their own code
+   * and are shown on top of this room, on this device only.
+   */
+  archiveOf?: string;
+  /** Legacy room only: the secure room it moved to. Hidden from the sidebar. */
+  movedTo?: string;
+  /**
+   * When the name was chosen (ms): the newest name wins between members
+   * (room-name.ts). 0 for the placeholder a bare invite link stores.
+   */
+  nameAt?: number;
 }
 
 const PARTICIPANT_INACTIVE_DAYS = 30;
@@ -68,6 +129,22 @@ const PARTICIPANT_INACTIVE_MS = PARTICIPANT_INACTIVE_DAYS * 24 * 60 * 60 * 1000;
 export interface DMRoom extends Room {
   type: "dm";
   participantDid: string;
+  /**
+   * Set once the conversation is post-quantum (room-security/pq-dm.ts): the
+   * ML-KEM ciphertext its hybrid key is derived from. From then on the DM
+   * joins only under that key. Never removed by a write that lacks it - see
+   * putRoom.
+   */
+  pq?: DmPqState;
+  /**
+   * A message request: the conversation was started by somebody who is not
+   * in the phonebook, shares no room with us and was never messaged by us
+   * (an introduction they made, or a mailbox delivery). Held apart, capped
+   * (dm.svelte.ts MAX_DM_REQUESTS), not joined at startup and not announced,
+   * until the user accepts it. Absent on every DM from before requests
+   * existed, which are all accepted.
+   */
+  request?: boolean;
 }
 
 export interface OwnProfile {
@@ -120,7 +197,57 @@ export interface PeerProfile {
   /** Their offline inbox is off (from their profile). Kept so it is known
    *  while they are offline, which is exactly when it matters. */
   inboxOff?: boolean;
+  /**
+   * Their ML-KEM-768 key certificate, from a profile they sent. Kept so a
+   * message sealed for them while they are offline can still be sealed
+   * post-quantum; re-verified against the DID on every use.
+   */
+  pqKey?: PqKeyCertificate;
   updatedAt: number;
+}
+
+export interface RoomProfileFieldEdit {
+  at: number;
+  id: string;
+  /** A reset inherits main and must win over older sync data. */
+  reset?: boolean;
+}
+
+export interface OwnRoomProfileRecord {
+  roomCode: string;
+  did: string;
+  generation: number;
+  fields: RoomProfileFields;
+  fieldEdits?: Partial<Record<RoomProfileField, RoomProfileFieldEdit>>;
+}
+
+export interface RoomDeletionMarker {
+  roomCode: string;
+  generation: number;
+  deletedAt: number;
+}
+
+export function roomDeletionCutoff(marker: RoomDeletionMarker): number {
+  return Math.max(marker.generation, marker.deletedAt);
+}
+
+function deletionMarkerIsNewer(incoming: RoomDeletionMarker, existing?: RoomDeletionMarker): boolean {
+  return !existing || roomDeletionCutoff(incoming) > roomDeletionCutoff(existing) ||
+    (roomDeletionCutoff(incoming) === roomDeletionCutoff(existing) && incoming.generation > existing.generation);
+}
+
+interface RoomProfileRow {
+  id: string;
+  roomCode: string;
+  did: string;
+  kind: "own" | "peer" | "deletion";
+  generation: number;
+  fields?: RoomProfileFields;
+  fieldEdits?: OwnRoomProfileRecord["fieldEdits"];
+  profile?: PeerProfile;
+  pfpData?: ArrayBuffer;
+  bannerData?: ArrayBuffer;
+  deletedAt?: number;
 }
 
 export interface WatermarkRecord {
@@ -172,6 +299,7 @@ type AppDB = IDBPDatabase<{
       byMessage: Blinded;
       byInfoHash: Blinded;
       byStatus: string;
+      byRoom: Blinded;
     };
   };
   pending: {
@@ -207,6 +335,11 @@ type AppDB = IDBPDatabase<{
     key: Blinded;
     value: OwnProfile | PeerProfile;
   };
+  roomProfiles: {
+    key: Blinded;
+    value: RoomProfileRow;
+    indexes: { byRoom: Blinded; byKind: RoomProfileRow["kind"] };
+  };
   savedGifs: {
     key: string;
     value: SavedGif;
@@ -229,11 +362,22 @@ type AppDB = IDBPDatabase<{
 /** Sealed per-room search index: entries serialized as encrypted bytes. */
 export interface SearchIndexRecord {
   roomCode: string;
-  /** Highest lamport of any message folded into `data`. Clear on disk so
-   *  staleness is checkable without a decrypt. */
+  /** Highest lamport of any message folded into `data`. Clear on disk, where
+   *  older builds read it (see STORE_SPECS.searchIndex). */
   lastLamport: number;
   /** JSON bytes of SearchEntry[]; sealed via the `bytes` spec. */
   data: ArrayBuffer;
+  /**
+   * How many of the room's message rows (of every type) sat below
+   * lastLamport when the index was written, all of them folded into `data`
+   * as far as they are searchable. Sealed with the row's other fields.
+   * Absent on rows older builds wrote, which never read it, and on rows
+   * written by a session that could not vouch for every row below - another
+   * tab stored some it never saw: such a row is checked the old way. A count
+   * that still matches means nothing landed underneath the index since, so
+   * only the rows from lastLamport up need reading to bring it current.
+   */
+  rowsBelow?: number;
 }
 
 /**
@@ -279,7 +423,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 6, {
+  db = (await openDB(dbName(), 9, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -367,6 +511,28 @@ async function openDatabase(): Promise<AppDB> {
         // Diagnostic event chunks, sealed (see STORE_SPECS). Never synced.
         const s = database.createObjectStore("diagnostics", { keyPath: "id" });
         s.createIndex("bySession", "sessionId", { unique: false });
+      }
+      if (oldVersion < 8) {
+        // v7 only ever existed in pre-release builds of room profiles, which
+        // sealed `kind` and had no byKind index; their rows cannot be found
+        // by kind, so the store starts over rather than half-working.
+        if (database.objectStoreNames.contains("roomProfiles")) {
+          database.deleteObjectStore("roomProfiles");
+        }
+        const store = database.createObjectStore("roomProfiles", { keyPath: "id" });
+        store.createIndex("byRoom", "roomCode", { unique: false });
+        store.createIndex("byKind", "kind", { unique: false });
+      }
+      if (oldVersion < 9) {
+        // Opening a room picked its files out of the whole store: every row
+        // of every room, file bytes and all, read to keep a handful. The
+        // index is over the stored roomCode - blinded on sealed rows, the
+        // plaintext on rows the blinding sweep has not reached - exactly
+        // like messages.byRoom; existing rows are indexed as it is built,
+        // and nothing about a row changes.
+        transaction
+          .objectStore("attachments")
+          .createIndex("byRoom", "roomCode", { unique: false });
       }
     },
     blocking() {
@@ -661,6 +827,31 @@ export async function getLastMessage(
 }
 
 /**
+ * Whether anything is stored in a room: one key read from the index, nothing
+ * opened or decrypted. For the checks that only ask whether a conversation is
+ * empty, which getLastMessage answered by decrypting its newest row - once per
+ * saved DM at every connect, before any of them was joined.
+ */
+export async function roomHoldsMessages(roomCode: string): Promise<boolean> {
+  const database = await getDB();
+  const blindRoomCode = await blindValue(roomCode);
+  const blinded = await database
+    .transaction("messages")
+    .store.index("byRoomLamport")
+    .getKey(
+      IDBKeyRange.bound([blindRoomCode, 0], [blindRoomCode, Number.MAX_SAFE_INTEGER])
+    );
+  if (blinded !== undefined) return true;
+  if (isMigrationComplete()) return false;
+  // During migration a row may still sit under the plaintext room code.
+  const plaintext = await database
+    .transaction("messages")
+    .store.index("byRoomLamport")
+    .getKey(IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER]));
+  return plaintext !== undefined;
+}
+
+/**
  * Logical allocation for ALL conversations, including legacy epoch-sized DM
  * counters. Stored rows and durable sync watermarks establish a floor even
  * after reload or history pruning. No wall-clock reading participates.
@@ -799,41 +990,288 @@ export async function getAllMessages(roomCode: string): Promise<Message[]> {
  * room history and froze the UI for seconds on every rescan.
  */
 export async function getPluginCardMessages(
-  roomCode: string
+  roomCode: string,
+  snapshot?: { version?: number }
 ): Promise<Message[]> {
-  return getMessagesOfTypes(roomCode, [MessageType.PluginCard]);
+  return getMessagesOfTypes(roomCode, [MessageType.PluginCard], snapshot);
 }
 
 /**
- * Only the room's messages of the given clear types, decrypted. Same cursor
- * trick as getPluginCardMessages: rows that fail the clear-field filter
- * never pay for crypto.
+ * Only the room's messages of the given clear types, decrypted, in lamport
+ * order (id breaks ties, as the index does). Answered from the room's typed
+ * rows (below), so only the first read pays for the room. `snapshot.version`
+ * names the rows this answer came from: the same version is the same rows,
+ * which lets a caller keep what it built from them. The array is the
+ * caller's; the messages in it are shared - read them, never change them.
  */
 export async function getMessagesOfTypes(
   roomCode: string,
-  types: ChatMessageType[]
+  types: ChatMessageType[],
+  snapshot?: { version?: number }
 ): Promise<Message[]> {
-  // One bulk read, then filter on clear fields, then decrypt survivors.
-  // NOT a cursor: an await per row is an IDB round-trip per message, and
-  // walking a big room that way (recurring, per digest) jammed the
-  // database enough to delay live attachment writes and sends. Sealed
-  // message rows are small; materializing them raw is the cheap part -
-  // the decrypt is what must stay scoped.
-  const rows = await _rawRoomMessages(roomCode);
   const wanted = new Set<ChatMessageType>(types);
-  const opened = await _openAll(
-    "messages",
-    rows.filter((r) => wanted.has(r.type))
-  );
-  return opened.sort((a, b) => a.lamport - b.lamport);
+  const held = await _typedRowsFor(roomCode, wanted);
+  if (snapshot) snapshot.version = held.version;
+  const key = [...wanted].sort().join(",");
+  let sorted = held.sorted.get(key);
+  if (!sorted) {
+    sorted = [...held.rows.values()]
+      .filter((m) => wanted.has(m.type))
+      .sort(_typedOrder);
+    held.sorted.set(key, sorted);
+  }
+  return sorted.slice();
 }
 
-/** Raw (still-sealed) message rows for a room - one bulk index read. */
-async function _rawRoomMessages(roomCode: string): Promise<Message[]> {
+// ── typed rows, kept decrypted ───────────────────────────────────────────────
+//
+// Plugin cards, plugin updates and reactions, per room, decrypted once and
+// kept. Each of these reads was a getAll over EVERY row of the room plus a
+// decrypt of the matching ones, and they come in crowds: a room open builds
+// every plugin card on screen, a call keeps asking which cards are tiles,
+// every reaction click asks for the reaction rows - and one member's pile of
+// cards made a room open cost one such read per card, on every member's
+// client.
+//
+// Kept current by the stored-message hook, which every write path fires, and
+// checked before each use against the room's row count, which costs the
+// database a walk over keys and the page nothing: a change the hook cannot
+// see (a deleted room, another tab) moves the count, and a moved count is a
+// fresh read, never a stale answer. Locking drops it with everything else
+// decrypted.
+
+interface TypedRows {
+  /** The handle it was read through: a reopened database is another one. */
+  database: AppDB;
+  /** Rows of EVERY type in the room that this copy accounts for. */
+  count: number;
+  /** The types `rows` holds in full. */
+  types: Set<ChatMessageType>;
+  rows: Map<string, Message>;
+  /** Moves whenever `rows` does. */
+  version: number;
+  /** Sorted answers by type set, until `rows` moves. */
+  sorted: Map<string, Message[]>;
+  /** Roughly what `rows` weighs, for TYPED_ROWS_BYTES. */
+  bytes: number;
+}
+
+/** By room, least recently used first. */
+const _typedRows = new Map<string, TypedRows>();
+const _typedLoads = new Map<string, Promise<TypedRows>>();
+/** Rows stored while a room's read is in flight, merged when it lands. */
+const _typedPending = new Map<string, Message[]>();
+let _typedVersion = 0;
+let _typedHooked = false;
+/**
+ * How many rooms stay decrypted, and roughly how much of them. The bytes are
+ * the real bound; the room count is generous because a pinned plugin widget
+ * looks at every saved room every few seconds, and a small count would push
+ * the open room and the call's out each time. The room just read always
+ * stays, whatever its size: a room heavy with rows is exactly the one that
+ * must not be read again on every card.
+ */
+const TYPED_ROWS_ROOMS = 32;
+const TYPED_ROWS_BYTES = 24 * 1024 * 1024;
+
+function _typedOrder(a: Message, b: Message): number {
+  return a.lamport - b.lamport || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function _typedRowBytes(m: Message): number {
+  return 256 + (m.content?.length ?? 0) * 2;
+}
+
+function _hookTypedRows(): void {
+  if (_typedHooked) return;
+  _typedHooked = true;
+  onMessageStored(_noteTypedRow);
+  onIdentityLock(() => {
+    _typedRows.clear();
+    _typedPending.clear();
+  });
+}
+
+function _noteTypedRow(msg: Message): void {
+  _typedPending.get(msg.roomCode)?.push(msg);
+  const held = _typedRows.get(msg.roomCode);
+  if (!held) return;
+  if (!held.types.has(msg.type)) {
+    // Taken as new. If it was a rewrite of a row we hold no copy of, the
+    // count disagrees on the next read and that read starts over.
+    held.count += 1;
+    return;
+  }
+  const before = held.rows.get(msg.id);
+  if (before) held.bytes -= _typedRowBytes(before);
+  else held.count += 1;
+  const row = { ...msg };
+  held.rows.set(msg.id, row);
+  held.bytes += _typedRowBytes(row);
+  held.version = ++_typedVersion;
+  held.sorted.clear();
+}
+
+/** Every row of the room, in both ranges while the blinding sweep runs. */
+async function _roomRowCount(database: AppDB, roomCode: string): Promise<number> {
+  const blindRoomCode = await blindValue(roomCode);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const blinded = index.count(
+    IDBKeyRange.bound([blindRoomCode, 0], [blindRoomCode, Number.MAX_SAFE_INTEGER])
+  );
+  if (isMigrationComplete()) return blinded;
+  const plaintext = index.count(
+    IDBKeyRange.bound([roomCode, 0], [roomCode, Number.MAX_SAFE_INTEGER])
+  );
+  return (await blinded) + (await plaintext);
+}
+
+function _coversTypes(held: TypedRows, wanted: Set<ChatMessageType>): boolean {
+  for (const t of wanted) if (!held.types.has(t)) return false;
+  return true;
+}
+
+async function _typedRowsFor(
+  roomCode: string,
+  wanted: Set<ChatMessageType>
+): Promise<TypedRows> {
+  _hookTypedRows();
+  const database = await getDB();
+  const held = _typedRows.get(roomCode);
+  if (held && held.database === database && _coversTypes(held, wanted)) {
+    const count = await _roomRowCount(database, roomCode);
+    if (_typedRows.get(roomCode) === held && count === held.count) {
+      _typedRows.delete(roomCode);
+      _typedRows.set(roomCode, held);
+      return held;
+    }
+  }
+  return _loadTypedRows(roomCode, database, wanted);
+}
+
+/** One read per room at a time; everyone asking meanwhile shares it. */
+function _loadTypedRows(
+  roomCode: string,
+  database: AppDB,
+  wanted: Set<ChatMessageType>
+): Promise<TypedRows> {
+  const inflight = _typedLoads.get(roomCode);
+  if (inflight) {
+    return inflight.then((loaded) =>
+      loaded.database === database && _coversTypes(loaded, wanted)
+        ? loaded
+        : _loadTypedRows(roomCode, database, wanted)
+    );
+  }
+  const load = _readTypedRows(roomCode, database, wanted);
+  _typedLoads.set(roomCode, load);
+  void load
+    .finally(() => {
+      if (_typedLoads.get(roomCode) === load) _typedLoads.delete(roomCode);
+    })
+    .catch(() => {});
+  return load;
+}
+
+async function _readTypedRows(
+  roomCode: string,
+  database: AppDB,
+  wanted: Set<ChatMessageType>
+): Promise<TypedRows> {
+  const epoch = writeEpoch;
+  const prev = _typedRows.get(roomCode);
+  const reuse = prev?.database === database ? prev : undefined;
+  const types = new Set<ChatMessageType>([...(reuse?.types ?? []), ...wanted]);
+  const pending: Message[] = [];
+  _typedPending.set(roomCode, pending);
+  try {
+    // One bulk read, then filter on clear fields, then decrypt survivors.
+    // NOT a cursor: an await per row is an IDB round-trip per message, and
+    // walking a big room that way (recurring, per digest) jammed the
+    // database enough to delay live attachment writes and sends. Sealed
+    // message rows are small; materializing them raw is the cheap part -
+    // the decrypt is what must stay scoped.
+    const raw = await _rawRoomMessages(roomCode);
+    // A row already held decrypted is not decrypted again: a type joining
+    // the set, or a count that moved, costs only the rows that are new.
+    const rows = new Map<string, Message>();
+    const toOpen: Message[] = [];
+    for (const r of raw) {
+      if (!types.has(r.type)) continue;
+      const kept = reuse?.rows.get(r.id);
+      if (kept && kept.type === r.type && kept.lamport === r.lamport) {
+        rows.set(r.id, kept);
+      } else {
+        toOpen.push(r);
+      }
+    }
+    for (const m of await _openAll<Message>("messages", toOpen)) rows.set(m.id, m);
+    // Rows stored while this read ran are in its snapshot or after it; either
+    // way they belong here, and only the ones after it change the count.
+    const ids = new Set(raw.map((r) => r.id));
+    let count = raw.length;
+    for (const m of pending) {
+      if (!ids.has(m.id)) {
+        ids.add(m.id);
+        count += 1;
+      }
+      if (types.has(m.type)) rows.set(m.id, { ...m });
+    }
+    let bytes = 0;
+    for (const m of rows.values()) bytes += _typedRowBytes(m);
+    const loaded: TypedRows = {
+      database,
+      count,
+      types,
+      rows,
+      version: ++_typedVersion,
+      sorted: new Map(),
+      bytes,
+    };
+    // Not past a lock, a closed database or the room's deletion (which drops
+    // `pending`): a read that straddled one still answers its caller, but
+    // keeps nothing.
+    if (epoch === writeEpoch && db === database && _typedPending.get(roomCode) === pending) {
+      _typedRows.delete(roomCode);
+      _typedRows.set(roomCode, loaded);
+      _trimTypedRows(roomCode);
+    }
+    return loaded;
+  } finally {
+    if (_typedPending.get(roomCode) === pending) _typedPending.delete(roomCode);
+  }
+}
+
+/**
+ * A deleted room's rows go from memory with it, now rather than whenever the
+ * room is read again or pushed out. Whoever asks next reads afresh.
+ */
+function _dropTypedRows(roomCode: string): void {
+  _typedRows.delete(roomCode);
+  _typedPending.delete(roomCode);
+  _typedLoads.delete(roomCode);
+}
+
+function _trimTypedRows(keep: string): void {
+  let bytes = 0;
+  for (const held of _typedRows.values()) bytes += held.bytes;
+  for (const [roomCode, held] of _typedRows) {
+    if (_typedRows.size <= TYPED_ROWS_ROOMS && bytes <= TYPED_ROWS_BYTES) break;
+    if (roomCode === keep) continue;
+    _typedRows.delete(roomCode);
+    bytes -= held.bytes;
+  }
+}
+
+/**
+ * Raw (still-sealed) message rows for a room - one bulk index read. `from`
+ * is the lowest lamport wanted.
+ */
+async function _rawRoomMessages(roomCode: string, from = 0): Promise<Message[]> {
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   const blindedRange = IDBKeyRange.bound(
-    [blindRoomCode, 0],
+    [blindRoomCode, from],
     [blindRoomCode, Number.MAX_SAFE_INTEGER]
   );
   const results = await database
@@ -844,7 +1282,7 @@ async function _rawRoomMessages(roomCode: string): Promise<Message[]> {
   // During migration, also query the plaintext range to see unmigrated rows
   if (!isMigrationComplete()) {
     const plaintextRange = IDBKeyRange.bound(
-      [roomCode, 0],
+      [roomCode, from],
       [roomCode, Number.MAX_SAFE_INTEGER]
     );
     const plaintextResults = await database
@@ -911,7 +1349,22 @@ export async function getMessagesAboveWatermarks(
   roomCode: string,
   watermarks: Record<string, number>
 ): Promise<Message[]> {
-  const rows = await _rawRoomMessages(roomCode);
+  // Only rows above the peer's watermark for a sender it is behind on can be
+  // missing, so the read starts at the lowest of those instead of at the
+  // room's first row: a member back from a short absence lacks the last few
+  // rows, not the whole history. Not the lowest over every sender: one who
+  // posted once, long ago, kept the peer's mark for them at that old row and
+  // dragged nearly every read back to the start of the room. A peer that
+  // lacks a sender entirely still reads from the start.
+  const held = await senderMaxLamports(roomCode);
+  let floor = Infinity;
+  for (const [senderId, max] of held) {
+    const at = watermarks[senderId];
+    const theirs = typeof at === "number" && Number.isSafeInteger(at) ? at : -1;
+    if (theirs < max) floor = Math.min(floor, theirs);
+  }
+  if (floor === Infinity) return [];
+  const rows = await _rawRoomMessages(roomCode, Math.max(0, floor + 1));
   // Build maps of watermarks for both blinded and plaintext forms to handle
   // the migration window. A legacy row has plaintext senderId and needs the
   // plaintext watermark value. Blinded rows need the blinded value. Checking
@@ -932,6 +1385,13 @@ export async function getMessagesAboveWatermarks(
       return r.lamport > maxLamport;
     })
   );
+}
+
+/** Whether `did` wrote anything in the room: clear fields only, no decrypt. */
+export async function roomHasMessageFrom(roomCode: string, did: string): Promise<boolean> {
+  const rows = await _rawRoomMessages(roomCode);
+  const blinded = await blindValue(did);
+  return rows.some((r) => r.senderId === blinded || r.senderId === did);
 }
 
 export async function getMessage(id: string): Promise<Message | undefined> {
@@ -1019,17 +1479,87 @@ function _notifyMessageStored(msg: Message): void {
   }
 }
 
-export async function putMessage(message: Message): Promise<void> {
+/**
+ * getSenderMaxLamports, kept in memory per room for the session.
+ *
+ * Every digest a peer sent us paid for that read of the room's every row -
+ * one per visible member per repair tick in a quiet room, forever, and a
+ * burst of them queued writes behind it - to answer a question whose answer
+ * only changes when a row is stored. So a room is read once, the first time
+ * it is asked about, and from then on each stored row moves its sender's
+ * entry. The map handed out is a copy, the caller's to change.
+ */
+const _senderMax = new Map<string, { map: Map<string, number>; ready: Promise<void> }>();
+
+export async function senderMaxLamports(roomCode: string): Promise<Map<string, number>> {
+  let entry = _senderMax.get(roomCode);
+  if (!entry) {
+    // In place before the read, so a row stored while it runs still counts.
+    const map = new Map<string, number>();
+    const created = { map, ready: Promise.resolve() };
+    created.ready = getSenderMaxLamports(roomCode).then(
+      (read) => {
+        for (const [senderId, lamport] of read) _raiseSenderMax(map, senderId, lamport);
+      },
+      (err) => {
+        if (_senderMax.get(roomCode) === created) _senderMax.delete(roomCode);
+        throw err;
+      }
+    );
+    _senderMax.set(roomCode, created);
+    entry = created;
+  }
+  await entry.ready;
+  return new Map(entry.map);
+}
+
+function _raiseSenderMax(map: Map<string, number>, senderId: string, lamport: number): void {
+  if (typeof senderId !== "string" || !senderId || !Number.isFinite(lamport)) return;
+  if ((map.get(senderId) ?? -Infinity) < lamport) map.set(senderId, lamport);
+}
+
+onMessageStored((msg) => {
+  const entry = _senderMax.get(msg.roomCode);
+  if (entry) _raiseSenderMax(entry.map, msg.senderId, msg.lamport);
+});
+// Rows belong to the identity that stored them.
+onIdentityLock(() => _senderMax.clear());
+
+export async function putMessage(message: Message, guard: WriteGuard = captureWriteGuard()): Promise<void> {
   const database = await getDB();
-  await database.put("messages", await _seal("messages", message));
+  guard();
+  const sealed = await _seal("messages", message);
+  await guardedCommit(database, "messages", guard, async tx => { await tx.store.put(sealed); });
   _notifyMessageStored(message);
 }
 
-export async function bulkPutMessages(messages: Message[]): Promise<void> {
+/**
+ * The messages a MERGE import brings in: never a row already held. A backup
+ * is a file, possibly someone else's, and reusing a real message's id was how
+ * one replaced a genuine signed row with forged content under any sender.
+ * Resolves the number actually added.
+ */
+export async function bulkAddNewMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<number> {
   const database = await getDB();
+  guard();
   const sealed = await Promise.all(messages.map((m) => _seal("messages", m)));
-  const tx = database.transaction("messages", "readwrite");
-  await Promise.all([...sealed.map((m) => tx.store.put(m)), tx.done]);
+  const added: Message[] = [];
+  await guardedCommit(database, "messages", guard, async tx => {
+    for (let i = 0; i < sealed.length; i++) {
+      if ((await tx.store.getKey(messages[i].id)) !== undefined) continue;
+      await tx.store.put(sealed[i]);
+      added.push(messages[i]);
+    }
+  });
+  for (const m of added) _notifyMessageStored(m);
+  return added.length;
+}
+
+export async function bulkPutMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<void> {
+  const database = await getDB();
+  guard();
+  const sealed = await Promise.all(messages.map((m) => _seal("messages", m)));
+  await guardedCommit(database, "messages", guard, async tx => { await Promise.all(sealed.map(m => tx.store.put(m))); });
   for (const m of messages) _notifyMessageStored(m);
 }
 
@@ -1052,9 +1582,66 @@ export async function getSearchIndex(
   }
 }
 
-export async function putSearchIndex(record: SearchIndexRecord): Promise<void> {
+/**
+ * Write a room's sealed search index, unless the room is gone or the row
+ * would not be sealed under the key its entries were read with. Returns
+ * whether it was written.
+ *
+ * An index row exists only while the rows its entries were read from are
+ * stored. They are checked in one transaction with the write, and
+ * deleteMessagesForRoom drops the row in the transaction that drops the
+ * messages, so whichever of the two runs second, no index outlives its
+ * room. That holds across tabs too: a tab that kept its search corpus after
+ * another tab took the node never hears of a deletion there, and its next
+ * write would bring back the text of every message in the deleted room -
+ * even once the room fills again over there, with as many rows as before,
+ * none of them these.
+ */
+export async function putSearchIndex(
+  record: SearchIndexRecord,
+  options: {
+    /**
+     * The row's key as the entries were read: the room code blinded under
+     * the storage key of the time (corpus.svelte.ts). A row that seals to
+     * another key is not written: the storage key changed since, which a
+     * restore does without a lock event, and this session's message text
+     * would be sealed into the database that replaces it.
+     */
+    rowKey?: Blinded;
+    /** The room's rows when the entries were checked against them. Fewer
+     *  by the time of the write means rows were deleted meanwhile. */
+    minRows?: number;
+    /** The ids of the messages the entries were read from. Each must still
+     *  be one of the room's rows: a count alone is met again by a room
+     *  deleted elsewhere and filled again. */
+    ids?: readonly string[];
+    /** Asked once the row is sealed, and again right before the write: a
+     *  room deleted in this tab meanwhile must not get the index back. */
+    stillWanted?: () => boolean;
+  } = {}
+): Promise<boolean> {
+  const { rowKey, minRows = 1, ids = [], stillWanted } = options;
   const database = await getDB();
-  await database.put("searchIndex", await _seal("searchIndex", record));
+  const sealed = await _seal("searchIndex", record);
+  // The index is message text: never on disk unsealed, which an import's
+  // plaintext window (no key armed) would otherwise allow.
+  if (!isSealed(sealed)) return false;
+  if (rowKey !== undefined && sealed.roomCode !== rowKey) return false;
+  const ranges = await _roomLamportRanges(record.roomCode, 0, Number.MAX_SAFE_INTEGER, false);
+  if (stillWanted && !stillWanted()) return false;
+  const tx = database.transaction(["messages", "searchIndex"], "readwrite");
+  const index = tx.objectStore("messages").index("byRoomLamport");
+  // The room's rows by id: keys only, nothing read, let alone opened.
+  const held = new Set(
+    (await Promise.all(ranges.map((range) => index.getAllKeys(range)))).flat()
+  );
+  const write =
+    held.size >= Math.max(1, minRows) &&
+    ids.every((id) => held.has(id)) &&
+    (!stillWanted || stillWanted());
+  if (write) await tx.objectStore("searchIndex").put(sealed);
+  await tx.done;
+  return write;
 }
 
 export async function deleteSearchIndex(roomCode: string): Promise<void> {
@@ -1190,43 +1777,121 @@ export async function deleteDiagnostics(): Promise<void> {
 }
 
 /**
- * Newest lamport AND row count among a room's rows of the given types, read
- * from CLEAR fields only - the search index staleness check, at no decrypt
- * cost. The count is the half that matters: a repair sync backfills OLDER
- * messages, which move no lamport high-water mark at all, so "lastLamport
- * is current" alone would bless an index that silently lost them.
+ * How many of a room's rows of the given types sit below `below`, read from
+ * CLEAR fields only, at no decrypt cost: the coverage check for a search
+ * index row written without rowsBelow - by an older build, or by a session
+ * that could not vouch for every row (corpus.svelte.ts). The count is what
+ * matters: a repair sync backfills OLDER messages, which move no lamport
+ * high-water mark at all, so "lastLamport is current" alone would bless an
+ * index that silently lost them.
+ *
+ * Every row of the room is read, so such an index row comes here once, and
+ * is written back with its count; countRowsBelow is the check after that.
+ * One bulk read, not a cursor: an await per row held the store for the
+ * whole walk, and a send issued meanwhile waited the better part of a
+ * second.
  */
 export async function getSearchableStats(
   roomCode: string,
-  types: readonly ChatMessageType[]
-): Promise<{ newestLamport: number; count: number }> {
-  const database = await getDB();
+  types: readonly ChatMessageType[],
+  below: number
+): Promise<{ countBelow: number }> {
   const wanted = new Set<ChatMessageType>(types);
-  const blindRoomCode = await blindValue(roomCode);
-  const ranges: Blinded[] = [blindRoomCode];
-  if (!isMigrationComplete()) ranges.push(roomCode as Blinded);
-  let newest = 0;
-  let count = 0;
-  for (const code of ranges) {
-    let cursor = await database
-      .transaction("messages")
-      .store.index("byRoomLamport")
-      .openCursor(
-        IDBKeyRange.bound([code, 0], [code, Number.MAX_SAFE_INTEGER]),
-        "prev"
-      );
-    while (cursor) {
-      if (wanted.has(cursor.value.type)) {
-        newest = Math.max(newest, cursor.value.lamport);
-        count += 1;
-      }
-      cursor = await cursor.continue();
+  let countBelow = 0;
+  for (const row of await _rawRoomMessages(roomCode)) {
+    if (wanted.has(row.type) && row.lamport < below) countBelow += 1;
+  }
+  return { countBelow };
+}
+
+/** The room's index ranges: the blinded one, and during the migration window
+ *  the plaintext one as well. */
+async function _roomLamportRanges(
+  roomCode: string,
+  from: number,
+  to: number,
+  openTop: boolean
+): Promise<IDBKeyRange[]> {
+  const codes: Blinded[] = [await blindValue(roomCode)];
+  if (!isMigrationComplete()) codes.push(roomCode as Blinded);
+  return codes.map((code) => IDBKeyRange.bound([code, from], [code, to], false, openTop));
+}
+
+/**
+ * How many of the room's rows, of any type, sit below `lamport`. The index
+ * counts them in the database itself - no row is read, let alone opened -
+ * which is what makes the search index's coverage check cheap enough to run
+ * every time a room is first searched.
+ */
+export async function countRowsBelow(roomCode: string, lamport: number): Promise<number> {
+  if (lamport <= 0) return 0;
+  const database = await getDB();
+  const ranges = await _roomLamportRanges(roomCode, 0, lamport, true);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const counts = await Promise.all(ranges.map((range) => index.count(range)));
+  return counts.reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * The room's rows of any type, counted by the index like countRowsBelow:
+ * how many there are, how many of them sit below `lamport`, and the newest
+ * lamport among them. One transaction, so the three agree with each other
+ * and with the writes around them: a row stored meanwhile is in all of them
+ * or in none.
+ */
+export async function countRoomRows(
+  roomCode: string,
+  lamport = 0
+): Promise<{ rows: number; below: number; newest: number }> {
+  const database = await getDB();
+  const all = await _roomLamportRanges(roomCode, 0, Number.MAX_SAFE_INTEGER, false);
+  const under =
+    lamport > 0
+      ? all.map((range) => IDBKeyRange.bound(range.lower, [range.lower[0], lamport], false, true))
+      : [];
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const [rows, below, tops] = await Promise.all([
+    Promise.all(all.map((range) => index.count(range))),
+    Promise.all(under.map((range) => index.count(range))),
+    Promise.all(all.map((range) => index.openKeyCursor(range, "prev"))),
+  ]);
+  const sum = (counts: number[]) => counts.reduce((total, n) => total + n, 0);
+  return {
+    rows: sum(rows),
+    below: sum(below),
+    newest: Math.max(0, ...tops.map((cursor) => (cursor ? cursor.key[1] : 0))),
+  };
+}
+
+/**
+ * The room's rows of the given types from `lamport` up, decrypted, oldest
+ * first: what a search index that ends at `lamport` is missing. type and id
+ * are clear fields, so rows of other types, and rows the index already
+ * holds (`known`), never pay for a decrypt.
+ */
+export async function getSearchableSince(
+  roomCode: string,
+  lamport: number,
+  types: readonly ChatMessageType[],
+  known?: ReadonlySet<string>
+): Promise<Message[]> {
+  const database = await getDB();
+  const ranges = await _roomLamportRanges(roomCode, lamport, Number.MAX_SAFE_INTEGER, false);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const wanted = new Set<ChatMessageType>(types);
+  const byId = new Map<string, Message>();
+  for (const rows of await Promise.all(ranges.map((range) => index.getAll(range)))) {
+    for (const row of rows) {
+      if (wanted.has(row.type) && !known?.has(row.id)) byId.set(row.id, row);
     }
   }
-  return { newestLamport: newest, count };
+  const opened = await _openAll<Message>("messages", [...byId.values()]);
+  return opened.sort(compareMessages);
 }
 
 export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
+  _watermarkHolds.delete(roomCode);
+  _senderMax.delete(roomCode);
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   // The room's search index goes with its messages.
@@ -1302,9 +1967,13 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
 
   // Delete in a separate transaction
   const writeTx = database.transaction(
-    ["messages", "attachments", "watermarks"],
+    ["messages", "attachments", "watermarks", "searchIndex"],
     "readwrite"
   );
+  // The index row again, with the rows: another tab may have written it
+  // since the delete above. putSearchIndex counts the rows in its own
+  // transaction, so none is written once they are gone.
+  await writeTx.objectStore("searchIndex").delete(blindRoomCode);
   for (const attId of attachmentIds) {
     await writeTx.objectStore("attachments").delete(attId);
     _attachmentEpoch += 1;
@@ -1323,6 +1992,10 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
     await writeTx.objectStore("watermarks").delete(wm.id as Blinded);
   }
   await writeTx.done;
+  // Its plugin and reaction rows, held decrypted, go with it.
+  _dropTypedRows(roomCode);
+  // Again, now the rows are gone: a read in the meantime counted them.
+  _senderMax.delete(roomCode);
   // The Yjs snapshot lives in its own store; a leftover one would resurrect
   // the shared doc if the same room code is ever joined again. Delete both the
   // blinded key (if migrated) and the plaintext key (if legacy).
@@ -1397,12 +2070,18 @@ const MESSAGE_STATUS_RANK: Record<MessageStatus, number> = {
  * earlier in that room was read too. Acks only name the page the reader had
  * loaded, so cascade the status down the backlog. Returns the ids that
  * actually changed so callers can update in-memory copies.
+ *
+ * `after` is how far an earlier cascade in the room already reached: only
+ * rows above it are walked. Every receipt used to walk the whole room, one
+ * IndexedDB round trip per row, holding up every write to the store behind it.
  */
 export async function markOwnMessagesReadUpTo(
   roomCode: string,
   senderId: string,
-  lamport: number
+  lamport: number,
+  after = -1
 ): Promise<string[]> {
+  if (lamport <= after) return [];
   const database = await getDB();
   // status lives inside the sealed blob, so this is a three-step cascade:
   // collect candidates by clear senderId, decrypt/filter/re-seal outside any
@@ -1410,7 +2089,7 @@ export async function markOwnMessagesReadUpTo(
   const blindRoomCode = await blindValue(roomCode);
   const blindedSenderId = await blindValue(senderId);
   const blindedRange = IDBKeyRange.bound(
-    [blindRoomCode, 0],
+    [blindRoomCode, after + 1],
     [blindRoomCode, lamport]
   );
 
@@ -1438,7 +2117,7 @@ export async function markOwnMessagesReadUpTo(
   // During migration, also walk the plaintext range in a separate transaction
   if (!isMigrationComplete()) {
     const plaintextRange = IDBKeyRange.bound(
-      [roomCode, 0],
+      [roomCode, after + 1],
       [roomCode, lamport]
     );
     cursor = await database
@@ -1551,14 +2230,21 @@ export async function getAttachmentsByMessage(
 }
 
 export async function getAttachmentsByInfoHash(
-  infoHash: string
+  infoHash: string,
+  /** Metadata only, the file bytes left sealed: for the callers that want
+   *  a row's room, status or descriptor and would otherwise decrypt the
+   *  whole file to learn it - several of them once per block served.
+   *  `withBytes` is filled with the ids of the rows that carry their bytes,
+   *  as getAttachmentsWithData does. */
+  opts?: { skipBytes?: boolean; withBytes?: Set<string> }
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedInfoHash = await blindValue(infoHash);
-  return _openAllHealing(
-    "attachments",
-    await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash)
-  );
+  const rows = await database.getAllFromIndex("attachments", "byInfoHash", blindedInfoHash);
+  for (const row of rows) {
+    if (rowHasBytes(row, "data")) opts?.withBytes?.add(row.id);
+  }
+  return _openAllHealing("attachments", rows, opts);
 }
 
 /**
@@ -1572,31 +2258,59 @@ export async function getAttachmentsByInfoHash(
  * usable while the sweep runs.
  */
 export async function getAttachmentsWithData(
-  roomCode: string
+  roomCode: string,
+  /** Metadata only: the file bytes stay sealed and are let go as each row
+   *  is read, for callers that fetch one row's bytes if they need them.
+   *  `withBytes` is filled with the ids of the rows that carry their bytes,
+   *  which a row read that way can no longer tell by itself. */
+  opts?: { skipBytes?: boolean; withBytes?: Set<string> }
 ): Promise<Attachment[]> {
   const database = await getDB();
   const blindedRoomCode = await blindValue(roomCode);
+  const keys = [blindedRoomCode];
+  if (!isMigrationComplete() && roomCode !== blindedRoomCode) {
+    keys.push(roomCode as Blinded);
+  }
   // Select by the bytes, not the status: rows written before the status
   // rank guards could be stuck at "downloading"/"failed" WITH data present,
   // and filtering on status made those images unrenderable forever.
-  // rowHasBytes sees the bytes whether the row is sealed or legacy, and the
-  // filter runs BEFORE decryption so no-data rows never cost a decrypt.
-  // A cursor, not getAll: every room's multi-MB sealed blobs materialized
-  // at once just to pick this room's - a real memory spike on phones for
-  // every single room open.
+  // rowHasBytes sees the bytes whether the row is sealed or legacy.
+  // The room's own rows only, through byRoom: this used to walk the whole
+  // store, every room's multi-MB sealed blobs, on every room's first open -
+  // and as one long read transaction that the room's own writes queued
+  // behind. A cursor still, so skipBytes can drop each row's blob as it goes.
+  const index = database.transaction("attachments").store.index("byRoom");
   const matches: Attachment[] = [];
-  let cursor = await database.transaction("attachments").store.openCursor();
-  while (cursor) {
-    const a = cursor.value;
-    if (
-      rowHasBytes(a, "data") &&
-      (a.roomCode === blindedRoomCode || a.roomCode === roomCode)
-    ) {
-      matches.push(a);
+  const seen = new Set<string>();
+  const withBytes = new Set<string>();
+  for (const key of keys) {
+    let cursor = await index.openCursor(key);
+    while (cursor) {
+      const row = cursor.value;
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        if (rowHasBytes(row, "data")) {
+          withBytes.add(row.id);
+          opts?.withBytes?.add(row.id);
+        }
+        if (opts?.skipBytes) {
+          const { data: _d, ...meta } = row as Attachment & { _encBytes?: unknown };
+          delete (meta as { _encBytes?: unknown })._encBytes;
+          matches.push(meta as Attachment);
+        } else {
+          matches.push(row);
+        }
+      }
+      cursor = await cursor.continue();
     }
-    cursor = await cursor.continue();
   }
-  return _openAllHealing("attachments", matches);
+  const opened = await _openAllHealing<Attachment>("attachments", matches, opts);
+  const { readCiphertext } = await import("./transport/file/ciphertext-store");
+  const available: Attachment[] = [];
+  for (const a of opened) {
+    if (withBytes.has(a.id) || (a.encryption && await readCiphertext(a.infoHash).catch(() => null))) available.push(a);
+  }
+  return available;
 }
 
 /**
@@ -1627,10 +2341,12 @@ export async function getSeedableFiles(): Promise<
   // infoHash is blinded for migrated rows and plaintext for legacy rows, so
   // the same file could appear twice without plaintext-based deduplication.
   const rows: Attachment[] = [];
+  const rowsWithBytes = new Set<string>();
   let cursor = await database.transaction("attachments").store.openCursor();
   while (cursor) {
     const row = cursor.value;
-    if (rowHasBytes(row, "data")) {
+    if (rowHasBytes(row, "data")) rowsWithBytes.add(row.id);
+    {
       const { data: _d, ...meta } = row as Attachment & {
         _encBytes?: unknown;
       };
@@ -1648,6 +2364,11 @@ export async function getSeedableFiles(): Promise<
     skipBytes: true,
   });
   for (const a of opened) {
+    if (!rowsWithBytes.has(a.id) && !a.encryption) continue;
+    if (a.encryption && !rowsWithBytes.has(a.id)) {
+      const { readCiphertext } = await import("./transport/file/ciphertext-store");
+      if (!await readCiphertext(a.infoHash).catch(() => null)) continue;
+    }
     if (!seen.has(a.infoHash)) {
       seen.add(a.infoHash);
       out.push({
@@ -1657,6 +2378,7 @@ export async function getSeedableFiles(): Promise<
           filename: a.filename,
           mimeType: a.mimeType,
           size: a.size,
+          encryption: a.encryption,
         },
       });
     }
@@ -1664,10 +2386,18 @@ export async function getSeedableFiles(): Promise<
   return out;
 }
 
-export async function putAttachment(attachment: Attachment): Promise<void> {
+export async function putAttachment(attachment: Attachment, guard: WriteGuard = captureWriteGuard()): Promise<void> {
+  guard();
+  if (attachment.encryption) {
+    const { encryptedFileSize } = await import("./room-security/file-descriptor");
+    const expected = encryptedFileSize(attachment);
+    if (attachment.data && attachment.data.byteLength !== expected) throw new Error("Encrypted attachment data must be ciphertext");
+  }
   const database = await getDB();
+  guard();
   const { blobURL: _, ...record } = attachment;
-  await database.put("attachments", await _seal("attachments", record));
+  const sealed = await _seal("attachments", record);
+  await guardedCommit(database, "attachments", guard, async tx => { await tx.store.put(sealed); });
   _attachmentEpoch += 1;
 }
 
@@ -1691,13 +2421,25 @@ const ATTACHMENT_STATUS_RANK: Record<AttachmentStatus, number> = {
  */
 export async function updateAttachmentStatus(
   id: string,
-  status: AttachmentStatus
+  status: AttachmentStatus,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
+  guard();
   const database = await getDB();
-  const attachment = await _openHealing<Attachment>(
-    "attachments",
-    await database.get("attachments", id)
-  );
+  const stored = await database.get("attachments", id);
+  guard();
+  // The status is clear on the stored row, so whether this changes anything
+  // is known before opening it - and opening it means decrypting the file
+  // bytes it carries, which the seeding path used to do for nothing on
+  // every block it served.
+  if (
+    !stored ||
+    ATTACHMENT_STATUS_RANK[stored.status] >= ATTACHMENT_STATUS_RANK[status]
+  ) {
+    return;
+  }
+  const attachment = await _openHealing<Attachment>("attachments", stored);
+  guard();
   if (!attachment) return;
   if (
     ATTACHMENT_STATUS_RANK[attachment.status] >= ATTACHMENT_STATUS_RANK[status]
@@ -1707,17 +2449,14 @@ export async function updateAttachmentStatus(
   const sealed = await _seal("attachments", { ...attachment, status });
   // The seal ran outside any transaction: re-check against the freshest row
   // so a later status is never regressed and a deleted row never returns.
-  const tx = database.transaction("attachments", "readwrite");
-  const fresh = await tx.store.get(id);
-  if (
-    !fresh ||
-    ATTACHMENT_STATUS_RANK[fresh.status] >= ATTACHMENT_STATUS_RANK[status]
-  ) {
-    await tx.done;
-    return;
-  }
-  await tx.store.put(sealed);
-  await tx.done;
+  await guardedCommit(database, "attachments", guard, async tx => {
+    const fresh = await tx.store.get(id) as { status: AttachmentStatus } | undefined;
+    if (
+      !fresh ||
+      ATTACHMENT_STATUS_RANK[fresh.status] >= ATTACHMENT_STATUS_RANK[status]
+    ) return;
+    await tx.store.put(sealed);
+  });
   _attachmentEpoch += 1;
 }
 
@@ -1728,13 +2467,16 @@ export async function updateAttachmentStatus(
  */
 export async function updateAttachmentData(
   id: string,
-  data: ArrayBuffer
+  data: ArrayBuffer,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
+  guard();
   const database = await getDB();
   const attachment = await _openHealing<Attachment>(
     "attachments",
     await database.get("attachments", id)
   );
+  guard();
   if (!attachment) return;
   const status =
     ATTACHMENT_STATUS_RANK[attachment.status] >=
@@ -1745,21 +2487,22 @@ export async function updateAttachmentData(
   // The seal ran outside any transaction; status is a CLEAR field, so the
   // regression guard re-checks against the freshest row at write time - the
   // seeding path may have advanced it while we were encrypting the blob.
-  const tx = database.transaction("attachments", "readwrite");
-  const fresh = await tx.store.get(id);
-  if (!fresh) {
-    // Deleted (room wipe) while the blob was encrypting: re-inserting it
-    // would leave an undeletable orphan.
-    await tx.done;
-    return;
-  }
-  if (
-    ATTACHMENT_STATUS_RANK[fresh.status] > ATTACHMENT_STATUS_RANK[sealed.status]
-  ) {
-    sealed.status = fresh.status;
-  }
-  await tx.store.put(sealed);
-  await tx.done;
+  let retry = false;
+  await guardedCommit(database, "attachments", guard, async tx => {
+    const fresh = await tx.store.get(id) as { status: AttachmentStatus } | undefined;
+    if (!fresh) {
+      // Deleted (room wipe) while encrypting: do not resurrect the row.
+      return;
+    }
+    if (ATTACHMENT_STATUS_RANK[fresh.status] > ATTACHMENT_STATUS_RANK[sealed.status]) {
+      // Status is authenticated metadata. Re-seal the newer row rather than
+      // mutating authenticated fields on an already encrypted record.
+      retry = true;
+      return;
+    }
+    await tx.store.put(sealed);
+  });
+  if (retry) return updateAttachmentData(id, data, guard);
   _attachmentEpoch += 1;
 }
 
@@ -1813,23 +2556,77 @@ export async function getDMRooms(): Promise<DMRoom[]> {
   );
 }
 
-export async function putRoom(room: Room | DMRoom): Promise<void> {
+export async function putRoom(room: Room | DMRoom, guard: WriteGuard = captureWriteGuard()): Promise<void> {
+  validateStoredCapability(room);
+  // A DM's post-quantum state only ever arrives, it never leaves. Writers
+  // that rebuild a record from an older read (a rename, an import of a row
+  // from a device that had not upgraded yet) would otherwise drop it, and the
+  // next start would join the conversation under the classical key again -
+  // a downgrade nobody asked for. Deleting the room is the way to lose it.
+  // The carry is read and written on the room's patch queue, so no
+  // setDmPqState (or another DM write) can land between the two.
+  if (room.roomCode.startsWith("dm-")) {
+    return _onRoomQueue(room.roomCode, () => _putRoomNow(room, guard));
+  }
+  if (room.type === "text") {
+    return _onRoomQueue(room.roomCode, async () =>
+      _putRoomNow(await _withLiveGeneration(room), guard));
+  }
+  return _putRoomNow(room, guard);
+}
+
+/**
+ * A room's createdAt is also its membership generation (room-profile.ts):
+ * room profiles are bound to it, and a leave marker refuses every generation
+ * at or below its cutoff. So a text room that is being CREATED here - by
+ * saveRoom, an invitation, a quick call or an import - must land above any
+ * marker, whichever path creates it and whatever clock wrote the marker, or
+ * every room-profile write for it would fail from then on. An existing row is
+ * left alone: its generation is already the one its profiles carry.
+ */
+async function _withLiveGeneration<T extends Room>(room: T): Promise<T> {
+  if (await getRoom(room.roomCode).catch(() => undefined)) return room;
+  const marker = await getRoomDeletionMarker(room.roomCode).catch(() => undefined);
+  if (!marker) return room;
+  const floor = roomDeletionCutoff(marker) + 1;
+  return (room.createdAt ?? 0) >= floor ? room : { ...room, createdAt: floor };
+}
+
+async function _putRoomNow(room: Room | DMRoom, guard: WriteGuard): Promise<void> {
+  let carriedPq: DmPqState | undefined;
+  let carriedRequest: boolean | undefined;
+  if (
+    room.roomCode.startsWith("dm-") &&
+    (!(room as DMRoom).pq || (room as DMRoom).request === undefined)
+  ) {
+    // An unreadable row has no state left to carry.
+    const stored = (await getRoom(room.roomCode).catch(() => undefined)) as DMRoom | undefined;
+    if (!(room as DMRoom).pq) carriedPq = stored?.pq;
+    // Same carry for a request: a writer rebuilding the row without the flag
+    // must not accept the request behind the user's back. Accepting writes
+    // `request: false` explicitly (setDmRequest).
+    if ((room as DMRoom).request === undefined) carriedRequest = stored?.request;
+  }
   const database = await getDB();
   const roomWithParticipants = {
     ...room,
     participants: room.participants ?? [],
+    ...(carriedPq ? { pq: carriedPq } : {}),
+    ...(carriedRequest !== undefined ? { request: carriedRequest } : {}),
   };
+  guard();
   const sealed = await _seal("rooms", roomWithParticipants);
   const blindedRoomCode = await blindValue(room.roomCode);
   // The primary key changed (roomCode is now blinded), so we must delete the
   // old plaintext key if it exists, then put the new blinded one. Otherwise
   // we end up with both versions in the store.
-  const tx = database.transaction("rooms", "readwrite");
+  await guardedCommit(database, "rooms", guard, async tx => {
   // Cast to Blinded: during migration, legacy plaintext keys exist and must
   // be deleted. This is intentional and safe.
   await tx.store.delete(room.roomCode as Blinded);
+  guard();
   await tx.store.put(sealed);
-  await tx.done;
+  });
 }
 
 /** Shared read-decrypt-modify-seal-write cycle for room records. The old
@@ -1846,11 +2643,15 @@ const _roomPatchQueue = new Map<string, Promise<void>>();
 
 function _patchRoom(
   roomCode: string,
-  patch: (room: Room | DMRoom) => Room | DMRoom | null
+  patch: (room: Room | DMRoom) => Room | DMRoom | null,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
-  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(() =>
-    _patchRoomNow(roomCode, patch)
-  );
+  return _onRoomQueue(roomCode, () => _patchRoomNow(roomCode, patch, guard));
+}
+
+/** Run one write to this room after every earlier queued one settled. */
+function _onRoomQueue(roomCode: string, write: () => Promise<void>): Promise<void> {
+  const run = (_roomPatchQueue.get(roomCode) ?? Promise.resolve()).then(write);
   const settled = run.catch(() => {});
   _roomPatchQueue.set(roomCode, settled);
   void settled.then(() => {
@@ -1861,7 +2662,8 @@ function _patchRoom(
 
 async function _patchRoomNow(
   roomCode: string,
-  patch: (room: Room | DMRoom) => Room | DMRoom | null
+  patch: (room: Room | DMRoom) => Room | DMRoom | null,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   const database = await getDB();
   const blindedRoomCode = await blindValue(roomCode);
@@ -1877,15 +2679,53 @@ async function _patchRoomNow(
   if (!room) return;
   const updated = patch(room);
   if (!updated) return;
+  guard();
   const sealed = await _seal("rooms", updated);
   // The primary key is blinded, so delete the old plaintext key before
   // putting the updated version under the blinded key. For new rooms this
   // is a no-op; for migrated ones it cleans up the plaintext record.
-  const tx = database.transaction("rooms", "readwrite");
+  await guardedCommit(database, "rooms", guard, async tx => {
   // Cast to Blinded: we are intentionally deleting the legacy plaintext key.
   await tx.store.delete(roomCode as Blinded);
+  guard();
   await tx.store.put(sealed);
-  await tx.done;
+  });
+}
+
+/**
+ * Record that a DM is now post-quantum. Through the per-room patch queue so
+ * it cannot interleave with another patch and be written over; replacing an
+ * existing state is allowed (a later introduction may repair a bad one), and
+ * resolves false when there was nothing to change or no such DM.
+ */
+export async function setDmPqState(
+  roomCode: string,
+  state: DmPqState
+): Promise<boolean> {
+  let changed = false;
+  await _patchRoom(roomCode, (room) => {
+    if (room.type !== "dm") return null;
+    const current = (room as DMRoom).pq;
+    if (current?.ct === state.ct && current?.ek === state.ek) return null;
+    changed = true;
+    return { ...room, pq: state } as DMRoom;
+  });
+  return changed;
+}
+
+/** Mark a DM as a message request, or accept one (false). */
+export async function setDmRequest(
+  roomCode: string,
+  request: boolean
+): Promise<boolean> {
+  let changed = false;
+  await _patchRoom(roomCode, (room) => {
+    if (room.type !== "dm") return null;
+    if (((room as DMRoom).request === true) === request) return null;
+    changed = true;
+    return { ...room, request } as DMRoom;
+  });
+  return changed;
 }
 
 /** Pin a room to the top of the sidebar, or unpin it (null). */
@@ -1934,18 +2774,48 @@ export async function getRoomParticipants(roomCode: string): Promise<string[]> {
   return room?.participants ?? [];
 }
 
+/**
+ * Members one room's record holds. Every add rewrites and reseals the whole
+ * record, so an uncapped list was a cost a peer could grow at will.
+ */
+export const MAX_ROOM_PARTICIPANTS = 512;
+
 export async function addRoomParticipant(
   roomCode: string,
   peerId: string
 ): Promise<void> {
+  await addRoomParticipants(roomCode, [[peerId, Date.now()]]);
+}
+
+/**
+ * Add members, or refresh when they were last seen, in ONE rewrite of the
+ * room record. A last-seen time only ever moves forward. New members past
+ * MAX_ROOM_PARTICIPANTS are not added.
+ */
+export async function addRoomParticipants(
+  roomCode: string,
+  seen: Iterable<readonly [did: string, at: number]>
+): Promise<void> {
   // participants are documented as DIDs; a raw peerId written here is never
   // matched by a leave (keyed by DID) and ghosts the member list for 7 days.
-  if (!peerId.startsWith("did:")) return;
+  const entries = [...seen].filter(([did]) => did.startsWith("did:"));
+  if (!entries.length) return;
   await _patchRoom(roomCode, (room) => {
     const participants = new Set(room.participants ?? []);
-    participants.add(peerId);
-    const participantLastSeen = room.participantLastSeen ?? {};
-    participantLastSeen[peerId] = Date.now();
+    const participantLastSeen = { ...(room.participantLastSeen ?? {}) };
+    let changed = false;
+    for (const [did, at] of entries) {
+      if (!participants.has(did)) {
+        if (participants.size >= MAX_ROOM_PARTICIPANTS) continue;
+        participants.add(did);
+        changed = true;
+      }
+      if (!((participantLastSeen[did] ?? 0) >= at)) {
+        participantLastSeen[did] = at;
+        changed = true;
+      }
+    }
+    if (!changed) return null;
     return { ...room, participants: [...participants], participantLastSeen };
   });
 }
@@ -2015,15 +2885,20 @@ export async function cleanupInactiveParticipants(
  * incoming-message handler vs the open-conversation path working from an
  * older snapshot), and a late write with a lower lamport would resurrect
  * already-read messages as unread.
+ *
+ * Every caller is the user reading the room or writing in it, so this also
+ * records when (Room.seenAt).
  */
 export async function markRoomSeen(
   roomCode: string,
-  lamport: number
+  lamport: number,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   await _patchRoom(roomCode, (room) => ({
     ...room,
     lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, lamport),
-  }));
+    seenAt: Date.now(),
+  }), guard);
 }
 
 export async function deleteRoom(roomCode: string): Promise<void> {
@@ -2036,6 +2911,183 @@ export async function deleteRoom(roomCode: string): Promise<void> {
   await tx.store.delete(roomCode as Blinded);
   await tx.store.delete(blindedRoomCode);
   await tx.done;
+}
+
+function roomProfileId(kind: RoomProfileRow["kind"], roomCode: string, did = ""): string {
+  return `${kind}\0${roomCode}\0${did}`;
+}
+
+async function getRoomProfileRow(
+  kind: RoomProfileRow["kind"], roomCode: string, did = "",
+): Promise<RoomProfileRow | undefined> {
+  const database = await getDB();
+  const row = await database.get("roomProfiles", await blindValue(roomProfileId(kind, roomCode, did)));
+  return _open("roomProfiles", row);
+}
+
+export async function getRoomDeletionMarker(roomCode: string): Promise<RoomDeletionMarker | undefined> {
+  const row = await getRoomProfileRow("deletion", roomCode);
+  return row ? { roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt! } : undefined;
+}
+
+/** Rows of one kind, opening only those: peers' rows carry avatar bytes. */
+async function _roomProfileRowsOfKind(kind: RoomProfileRow["kind"]): Promise<RoomProfileRow[]> {
+  const database = await getDB();
+  const rows = await database.getAllFromIndex("roomProfiles", "byKind", kind);
+  return (await _openAll<RoomProfileRow>("roomProfiles", rows)).filter(row => row.kind === kind);
+}
+
+export async function getAllRoomDeletionMarkers(): Promise<RoomDeletionMarker[]> {
+  const rows = await _roomProfileRowsOfKind("deletion");
+  return rows.map(row => ({
+    roomCode: row.roomCode, generation: row.generation, deletedAt: row.deletedAt!,
+  }));
+}
+
+function ownRoomRecord(row: RoomProfileRow): OwnRoomProfileRecord {
+  return {
+    roomCode: row.roomCode, did: row.did, generation: row.generation,
+    fields: {
+      ...row.fields,
+      ...(row.pfpData ? { pfpData: row.pfpData } : {}),
+      ...(row.bannerData ? { bannerData: row.bannerData } : {}),
+    },
+    fieldEdits: row.fieldEdits,
+  };
+}
+
+export async function getOwnRoomProfile(roomCode: string, did: string): Promise<OwnRoomProfileRecord | undefined> {
+  const row = await getRoomProfileRow("own", roomCode, did);
+  return row?.kind === "own" ? ownRoomRecord(row) : undefined;
+}
+
+export async function getAllOwnRoomProfiles(): Promise<OwnRoomProfileRecord[]> {
+  return (await _roomProfileRowsOfKind("own")).map(ownRoomRecord);
+}
+
+export async function putOwnRoomProfile(
+  record: OwnRoomProfileRecord, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const room = await getRoom(record.roomCode);
+  if (room?.type !== "text" || room.createdAt !== record.generation) {
+    throw new Error("room generation is not joined");
+  }
+  const database = await getDB();
+  const markerKey = await blindValue(roomProfileId("deletion", record.roomCode));
+  const markerBefore = await database.get("roomProfiles", markerKey);
+  const marker = await _open("roomProfiles", markerBefore);
+  if (marker && record.generation <= roomDeletionCutoff(marker as RoomDeletionMarker)) throw new Error("room generation was deleted");
+  const fields = { ...record.fields };
+  const pfpData = fields.pfpData instanceof ArrayBuffer ? fields.pfpData : undefined;
+  const bannerData = fields.bannerData instanceof ArrayBuffer ? fields.bannerData : undefined;
+  if (pfpData) delete fields.pfpData;
+  if (bannerData) delete fields.bannerData;
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("own", record.roomCode, record.did),
+    roomCode: record.roomCode, did: record.did, kind: "own" as const,
+    generation: record.generation, fields, fieldEdits: record.fieldEdits,
+    pfpData, bannerData,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const current = await tx.store.get(markerKey);
+    if (_sealFingerprint(current) !== _sealFingerprint(markerBefore)) throw new Error("room generation was deleted");
+    await tx.store.put(sealed);
+  });
+}
+
+export async function getPeerRoomProfile(roomCode: string, did: string): Promise<PeerProfile | undefined> {
+  const row = await getRoomProfileRow("peer", roomCode, did);
+  return row?.kind === "peer" && row.profile
+    ? sanitizePeerProfile({ ...row.profile, pfpData: row.pfpData, bannerData: row.bannerData })
+    : undefined;
+}
+
+export async function getAllPeerRoomProfiles(roomCode: string): Promise<PeerProfile[]> {
+  const database = await getDB();
+  const keys = await database.transaction("roomProfiles").store.index("byRoom").getAllKeys(await blindValue(roomCode));
+  const rows = await Promise.all(keys.map(async key => _open("roomProfiles", await database.get("roomProfiles", key))));
+  return rows.filter((row): row is RoomProfileRow => row?.kind === "peer" && !!row.profile)
+    .map(row => sanitizePeerProfile({ ...row.profile!, pfpData: row.pfpData, bannerData: row.bannerData }));
+}
+
+/** A peer went back to its main profile in this room (WireProfile.roomInherit). */
+export async function deletePeerRoomProfile(
+  roomCode: string, did: string, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const database = await getDB();
+  const key = await blindValue(roomProfileId("peer", roomCode, did));
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    await tx.store.delete(key);
+  });
+}
+
+export async function putPeerRoomProfile(
+  roomCode: string, generation: number, profile: PeerProfile,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const room = await getRoom(roomCode);
+  if (room?.type !== "text" || room.createdAt !== generation) {
+    throw new Error("room generation is not joined");
+  }
+  const database = await getDB();
+  const markerKey = await blindValue(roomProfileId("deletion", roomCode));
+  const markerBefore = await database.get("roomProfiles", markerKey);
+  const marker = await _open("roomProfiles", markerBefore);
+  if (marker && generation <= roomDeletionCutoff(marker as RoomDeletionMarker)) throw new Error("room generation was deleted");
+  const { pfpData, bannerData, ...display } = profile;
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("peer", roomCode, profile.did), roomCode,
+    did: profile.did, kind: "peer" as const, generation,
+    profile: display, pfpData, bannerData,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const current = await tx.store.get(markerKey);
+    if (_sealFingerprint(current) !== _sealFingerprint(markerBefore)) throw new Error("room generation was deleted");
+    await tx.store.put(sealed);
+  });
+}
+
+/** Remove both profile kinds but keep the non-profile marker for later device sync. */
+export async function deleteRoomProfilesForRoom(
+  roomCode: string, generation: number, deletedAt = Date.now(),
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const existing = await getRoomDeletionMarker(roomCode);
+  const incoming = { roomCode, generation, deletedAt };
+  const replaceMarker = deletionMarkerIsNewer(incoming, existing);
+  const database = await getDB();
+  const marker = replaceMarker ? await _seal("roomProfiles", {
+    id: roomProfileId("deletion", roomCode), roomCode, did: "",
+    kind: "deletion" as const, generation,
+    deletedAt,
+  }) : undefined;
+  const blindedRoom = await blindValue(roomCode);
+  const deletionKey = await blindValue(roomProfileId("deletion", roomCode));
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    const keys = await tx.store.index("byRoom").getAllKeys(blindedRoom);
+    for (const key of keys) {
+      if (!replaceMarker && key === deletionKey) continue;
+      await tx.store.delete(key);
+    }
+    if (marker) await tx.store.put(marker);
+  });
+}
+
+/** Preserve a remote leave event even if this device already rejoined later. */
+export async function putRoomDeletionMarker(
+  marker: RoomDeletionMarker, guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const existing = await getRoomDeletionMarker(marker.roomCode);
+  if (!deletionMarkerIsNewer(marker, existing)) return;
+  const database = await getDB();
+  const sealed = await _seal("roomProfiles", {
+    id: roomProfileId("deletion", marker.roomCode), roomCode: marker.roomCode,
+    did: "", kind: "deletion" as const, generation: marker.generation,
+    deletedAt: marker.deletedAt,
+  });
+  await guardedCommit(database, "roomProfiles", guard, async tx => {
+    await tx.store.put(sealed);
+  });
 }
 
 export async function getOwnProfile(
@@ -2163,7 +3215,10 @@ export async function getPeerProfile(
     record = await database.get("profiles", did as Blinded);
   }
   if (!record || record.isMe) return undefined;
-  return _open("profiles", record as PeerProfile);
+  // Checked on the way out, like a live profile: a stored row may have come
+  // from a backup or an older build (profile-sanitize.ts).
+  const opened = await _open("profiles", record as PeerProfile);
+  return opened && sanitizePeerProfile(opened);
 }
 
 export async function putPeerProfile(profile: PeerProfile): Promise<void> {
@@ -2200,10 +3255,10 @@ export async function getAllPeerProfiles(): Promise<PeerProfile[]> {
   if (_peerProfilesCache) return _peerProfilesCache;
   const database = await getDB();
   const all = await database.getAll("profiles");
-  const opened = await _openAll(
+  const opened = (await _openAll(
     "profiles",
     all.filter((p): p is PeerProfile => p.isMe === false)
-  );
+  )).map(sanitizePeerProfile);
   _peerProfilesCache = opened;
   return opened;
 }
@@ -2229,10 +3284,42 @@ function watermarkId(roomCode: string, senderId: string): string {
   return `${roomCode}:${senderId}`;
 }
 
+/**
+ * A deleted DM's floor: the sender's messages up to this lamport were in the
+ * conversation when it was deleted. The mailbox signature has no freshness,
+ * and a relay that kept blobs we had acked could otherwise hand them back
+ * later and rebuild the conversation. Kept in the watermarks store under a
+ * room key of its own, which deleting the room's rows does not touch.
+ */
+const DELETED_FLOOR = "deleted:";
+
+export function setDeletedFloor(
+  roomCode: string,
+  senderId: string,
+  lamport: number
+): Promise<void> {
+  return setWatermark(DELETED_FLOOR + roomCode, senderId, lamport);
+}
+
+export function getDeletedFloor(roomCode: string, senderId: string): Promise<number> {
+  return getWatermark(DELETED_FLOOR + roomCode, senderId);
+}
+
+/**
+ * How far this sender's side of the room reached: the saved watermark, or an
+ * advance a held room is still waiting to write, whichever is higher - that
+ * row is stored all the same. A deleted DM's floor is read through this, and
+ * read from the saved row alone it left out every message that arrived while
+ * the conversation was held, which a relay replaying acked blobs could then
+ * bring back. Digests advertise getWatermarksForRoom, which leaves those
+ * advances out until the hold ends.
+ */
 export async function getWatermark(
   roomCode: string,
   senderId: string
 ): Promise<number> {
+  // Before the read: a release meanwhile writes this value, never loses it.
+  const held = _watermarkHolds.get(roomCode)?.get(senderId) ?? 0;
   const database = await getDB();
   const id = watermarkId(roomCode, senderId);
   const blindedId = await blindValue(id);
@@ -2244,17 +3331,85 @@ export async function getWatermark(
     // be looked up. This is intentional and safe.
     record = await database.get("watermarks", id as Blinded);
   }
-  return record?.maxLamport ?? 0;
+  return Math.max(record?.maxLamport ?? 0, held);
 }
 
+/**
+ * Rooms with a history push in them that has not completed, and the
+ * watermark advances waiting on it.
+ *
+ * A watermark says "I hold everything this sender wrote up to here", and
+ * nobody offers what is below it again. While a push is unfinished, the rows
+ * it stored can sit above rows it has not delivered yet - and a live message
+ * from the same sender would claim straight over that gap, for good. So
+ * while a room is held, setWatermark keeps the advance here, and it is
+ * written when a push into the room completes (sync-inbound.ts decides).
+ * If the session ends first it is simply lost: the next digest asks for
+ * those rows again, and they come back as duplicates a completed push
+ * claims.
+ */
+const _watermarkHolds = new Map<string, Map<string, number>>();
+/** Senders kept per held room; past it an advance is dropped, never grown. */
+const MAX_HELD_SENDERS = 4096;
+// A push belongs to the session that received it.
+onIdentityLock(() => _watermarkHolds.clear());
+
+export function holdWatermarks(roomCode: string): void {
+  if (!_watermarkHolds.has(roomCode)) _watermarkHolds.set(roomCode, new Map());
+}
+
+/**
+ * The advances a held room is waiting to write, by sender. Rows we already
+ * hold: a digest must not advertise them yet (that is the hold), but nor is
+ * a peer that has them ahead of us.
+ */
+export function heldWatermarks(roomCode: string): ReadonlyMap<string, number> {
+  return _watermarkHolds.get(roomCode) ?? new Map();
+}
+
+/** Stop holding the room and write what waited. */
+export async function releaseWatermarks(
+  roomCode: string,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const waiting = _watermarkHolds.get(roomCode);
+  if (!waiting) return;
+  _watermarkHolds.delete(roomCode);
+  for (const [senderId, maxLamport] of waiting) {
+    await commitWatermark(roomCode, senderId, maxLamport, guard);
+  }
+}
+
+/** Advance a watermark - or, while a push into the room is open, wait. */
 export async function setWatermark(
   roomCode: string,
   senderId: string,
-  maxLamport: number
+  maxLamport: number,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const waiting = _watermarkHolds.get(roomCode);
+  if (!waiting) return commitWatermark(roomCode, senderId, maxLamport, guard);
+  guard();
+  if (!Number.isSafeInteger(maxLamport) || maxLamport < 0) return;
+  const at = waiting.get(senderId);
+  if (at === undefined && waiting.size >= MAX_HELD_SENDERS) return;
+  if (at === undefined || at < maxLamport) waiting.set(senderId, maxLamport);
+}
+
+/**
+ * Write a watermark now, holds or not. For a claim already known to skip
+ * nothing: a completed push's rows, or what waited on one.
+ */
+export async function commitWatermark(
+  roomCode: string,
+  senderId: string,
+  maxLamport: number,
+  guard: WriteGuard = captureWriteGuard(),
 ): Promise<void> {
   const database = await getDB();
   const id = watermarkId(roomCode, senderId);
   const blindedId = await blindValue(id);
+  guard();
   // Seal OUTSIDE the transaction to avoid timeout issues with async ops.
   const sealed = await _seal("watermarks", {
     id,
@@ -2265,8 +3420,9 @@ export async function setWatermark(
   // Read+write in ONE transaction so concurrent fire-and-forget callers can't
   // interleave and regress the watermark (a late lower value clobbering a
   // higher one written between our get and put).
-  const tx = database.transaction("watermarks", "readwrite");
+  await guardedCommit(database, "watermarks", guard, async tx => {
   const existing = await tx.store.get(blindedId);
+  guard();
   // Never regress - only advance the watermark
   if (!existing || existing.maxLamport < maxLamport) {
     await tx.store.put(sealed);
@@ -2285,8 +3441,14 @@ export async function setWatermark(
     return;
   }
   // The dead row is gone (_openHealing); this write is the first readable one.
-  await database.put("watermarks", sealed);
+  guard();
+  await guardedCommit(database, "watermarks", guard, async repair => {
+    const current = await repair.store.get(blindedId);
+    guard();
+    if (!current || current.maxLamport < maxLamport) await repair.store.put(sealed);
+  });
   _readableWatermarks.add(blindedId);
+  });
 }
 
 /** Watermark rows known to decrypt, so setWatermark checks each only once. */
@@ -2470,7 +3632,10 @@ export async function wipeLocalDatabase(): Promise<void> {
   }
   invalidatePeerProfilesCache();
   _readableWatermarks.clear();
+  _watermarkHolds.clear();
+  _senderMax.clear();
   await deleteDB(dbName());
+  await (await import("./transport/file/ciphertext-store")).wipeCiphertext();
 }
 
 /** Close the cached connection without deleting anything - a
@@ -2481,6 +3646,8 @@ export function closeDatabase(): void {
     db.close();
     db = null;
   }
+  _watermarkHolds.clear();
+  _senderMax.clear();
 }
 
 // ── at-rest migration ────────────────────────────────────────────────────────

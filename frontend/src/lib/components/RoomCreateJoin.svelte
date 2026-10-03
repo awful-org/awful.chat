@@ -1,14 +1,23 @@
 <script lang="ts">
+  import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import GifImage from "./GifImage.svelte";
   import { mediaPrefs } from "$lib/media-prefs.svelte";
-  import { formatRoomCode, newRoomCode } from "$lib/room-code";
+  import { newRoomCode } from "$lib/room-code";
+  import { parseJoinInput } from "$lib/invite";
+  import { joinInvitationPairing } from "$lib/invite-pairing";
+  import { parseSecureInvitation } from "$lib/room-security/invitations";
+  import { onDestroy, tick } from "svelte";
+  import { Clipboard, LogIn, Menu, Plus, ScanLine } from "@lucide/svelte";
+  import InviteOptions from "./InviteOptions.svelte";
+  import QrScanner from "./QrScanner.svelte";
+  import { SCANNER_NOT_LOADED } from "$lib/qr-scanner.svelte";
   import {
-    createInvite,
-    formatShortCode,
-    parseJoinInput,
-    resolveInvite,
-  } from "$lib/invite";
-  import { Check, Clipboard, Copy, LogIn, Menu, Plus, Share2 } from "@lucide/svelte";
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogHeader,
+    DialogTitle,
+  } from "$lib/components/ui/dialog";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
@@ -28,30 +37,37 @@
     onJoin: (roomCode: string, displayName: string, roomName?: string) => void | Promise<void>;
     error?: string | null;
     toggleSidebar?: () => void;
+    /** Inside AppView's modal: no full-page wrapper, the modal scrolls. */
+    inDialog?: boolean;
   }
 
-  let { onJoin, error = null, toggleSidebar }: Props = $props();
+  let { onJoin, error = null, toggleSidebar, inDialog = false }: Props = $props();
 
   let roomName = $state("");
   let joinCode = $state("");
   let createdCode = $state<string | null>(null);
-  let copied = $state(false);
-  // The 5-minute alias of createdCode, once asked for. See $lib/invite.
-  let shortCode = $state<string | null>(null);
-  let shortCodeExpiresAt = $state(0);
-  let now = $state(Date.now());
-  $effect(() => {
-    if (!shortCode) return;
-    now = Date.now();
-    const timer = setInterval(() => now = Date.now(), 1000);
-    return () => clearInterval(timer);
-  });
-  let shortCodeError = $state<string | null>(null);
-  let shortCopied = $state(false);
-  let copyMenuOpen = $state(false);
+  // `/r/#<code>`, not `/r/<code>`: a fragment never reaches the server, so
+  // the membership secret stays out of access logs and out of the Referer
+  // of every link the room page later opens.
+  const createdLink = $derived(
+    createdCode ? `${window.location.origin}/r/#${createdCode}` : ""
+  );
+  // The camera opens in a dialog of its own, over this card.
+  let scanning = $state(false);
+  let scanHint = $state<string | null>(null);
+  let scanError = $state<string | null>(null);
+  const qrSize = $derived(inDialog ? "size-50" : "size-60");
+  let joinController: AbortController | undefined;
+  let alive = true;
+  onDestroy(() => { alive = false; joinController?.abort(); });
+  const createdSecret = $derived(createdCode ? parseSecureInvitation(createdCode) : null);
+  // Joining the room just created can fail; the invite itself is
+  // InviteOptions', and its short code outlives this card.
+  let createdError = $state<string | null>(null);
   let joinError = $state<string | null>(null);
-  let legacyFallback = $state<string | null>(null);
-  $effect(() => { joinCode; legacyFallback = null; joinError = null; });
+  // Only a short-code join waits on the inviter, so only it can be cancelled.
+  let pairingJoin = $state(false);
+  $effect(() => { joinCode; joinController?.abort(); joinError = null; });
   let avatarDialogOpen = $state(false);
 
   let { relayConnected } = $derived(transportState);
@@ -62,18 +78,20 @@
 
   let creating = $state(false);
   let joining = $state(false);
+  let joinCreatedButton = $state<HTMLElement | null>(null);
 
   async function handleCreate() {
     if (creating) return;
     creating = true;
     try {
       await saveName(profileStore.nickname);
+      requireRoomSecurityRelease();
       const code = newRoomCode();
       createdCode = code;
-      copied = false;
-      shortCode = null;
-      shortCodeExpiresAt = 0;
-      shortCodeError = null;
+      scanning = false;
+      createdError = null;
+      // The focused Create button is gone; joining is the next step.
+      void tick().then(() => joinCreatedButton?.focus());
     } catch (err) {
       joinError = err instanceof Error ? err.message : "Could not create the room";
     } finally {
@@ -93,7 +111,7 @@
       );
       createdCode = null;
     } catch (err) {
-      shortCodeError = err instanceof Error ? err.message : "Could not open the room";
+      createdError = err instanceof Error ? err.message : "Could not open the room";
     } finally {
       joining = false;
     }
@@ -103,100 +121,51 @@
     if (!joinCode.trim() || joining) return;
     joining = true;
     joinError = null;
-    legacyFallback = null;
+    const controller = new AbortController();
+    joinController = controller;
+    const input = joinCode;
     try {
+      requireRoomSecurityRelease();
       await saveName(profileStore.nickname);
-      const parsed = parseJoinInput(joinCode);
+      if (!alive || controller.signal.aborted) return;
+      const parsed = parseJoinInput(input);
       if (parsed.kind === "invalid") {
         joinError = "Enter a valid room link or code";
         return;
       }
       let code = parsed.code;
-      if (parsed.kind === "short") {
-        try {
-          const resolved = await resolveInvite(code);
-          if (!resolved) {
-            if (parsed.legacySixHex) legacyFallback = code.toLowerCase();
-            joinError = parsed.legacySixHex
-              ? "That short invite is unknown or expired. If this is an old six-character room code, confirm below."
-              : "That short invite is unknown or expired. Ask for a new code.";
-            return;
-          }
-          code = resolved;
-        } catch (err) {
-          joinError = err instanceof Error ? err.message : "Could not reach the relay to look up that code";
-          return;
-        }
+      if (parsed.kind === "pairing") {
+        pairingJoin = true;
+        code = await joinInvitationPairing(code, controller.signal);
       }
+      if (!alive || controller.signal.aborted) return;
       await onJoin(code, profileStore.nickname || "Anonymous");
     } catch (err) {
-      joinError = err instanceof Error ? err.message : "Could not join the room";
-    } finally {
-      joining = false;
-    }
-  }
-
-  async function joinLegacy() {
-    if (!legacyFallback || joining) return;
-    joining = true;
-    try { await onJoin(legacyFallback, profileStore.nickname || "Anonymous"); }
-    catch (err) { joinError = err instanceof Error ? err.message : "Could not join the legacy room"; }
-    finally { joining = false; }
-  }
-
-  async function handleCopyLink() {
-    copyMenuOpen = false;
-    await handleCopy(createdCode!);
-  }
-
-  // Mint on first use, then copy. The code stays on screen afterwards so it
-  // can be read aloud, which is the point of it.
-  async function handleCopyShort() {
-    copyMenuOpen = false;
-    shortCodeError = null;
-    try {
-      if (!shortCode || Date.now() >= shortCodeExpiresAt) {
-        const made = await createInvite(createdCode!);
-        shortCode = made.code;
-        shortCodeExpiresAt = made.expiresAt;
+      if (alive && !controller.signal.aborted && joinController === controller) {
+        joinError = err instanceof Error ? err.message : "Could not join the room";
       }
-    } catch {
-      shortCodeError = "The relay is not reachable right now";
-      return;
-    }
-    try { await navigator.clipboard.writeText(formatShortCode(shortCode)); shortCopied = true; }
-    catch { shortCodeError = "Clipboard unavailable. Select and copy the code below."; }
-    setTimeout(() => (shortCopied = false), 2000);
-  }
-
-  // The OS share sheet, where there is one. Only offered when the browser
-  // actually has it, or the menu would carry two entries that do the same
-  // thing; the catch still falls back to the clipboard.
-  const canShare = $derived(
-    typeof navigator !== "undefined" && typeof navigator.share === "function"
-  );
-
-  async function handleShareLink() {
-    copyMenuOpen = false;
-    try {
-      await navigator.share({
-        url: `${window.location.origin}/r/#${createdCode!}`,
-      });
-    } catch (err) {
-      // Dismissing the sheet is not a failure and must not silently copy
-      // something the user decided not to send.
-      if ((err as Error)?.name === "AbortError") return;
-      await handleCopy(createdCode!);
+    } finally {
+      if (joinController === controller) {
+        joining = false;
+        pairingJoin = false;
+      }
     }
   }
 
-  async function handleCopy(code: string) {
-    // `/r/#<code>`, not `/r/<code>`: a fragment never reaches the server, so
-    // the membership secret stays out of access logs and out of the Referer
-    // of every link the room page later opens.
-    await navigator.clipboard.writeText(`${window.location.origin}/r/#${code}`);
-    copied = true;
-    setTimeout(() => (copied = false), 2000);
+  // A room's QR carries its invite link (or a short link); any other QR is
+  // not ours and the camera keeps looking.
+  function handleScannedText(text: string): boolean {
+    if (parseJoinInput(text).kind === "invalid") {
+      scanHint = "That QR code isn't a room invite.";
+      return false;
+    }
+    scanning = false;
+    scanHint = null;
+    joinCode = text.trim();
+    // After the field's effect: it aborts the join in flight whenever the
+    // text changes, which would be this one if it started first.
+    void tick().then(handleJoin);
+    return true;
   }
 
   async function handlePaste() {
@@ -213,27 +182,9 @@
   );
 </script>
 
-{#if !createdCode}
-  <!-- viewportHeight, not just a dvh class: every one of these screens centres a
-       card with a text field in it, and dvh does not shrink when the software
-       keyboard opens - so on a phone the field being typed into ended up under
-       the keyboard. overflow-y-auto because the box is now exactly the visible
-       height and a tall card has to be able to scroll inside it. -->
-  <div
-    use:viewportHeight
-    class="flex min-h-dvh h-full overflow-y-auto items-center justify-center p-4 bg-background"
-  >
-    {#if toggleSidebar != null}
-      <Button
-        onclick={toggleSidebar}
-        variant="outline"
-        class="absolute top-4 left-4 sm:hidden"
-        aria-label="Open sidebar"
-      >
-        <Menu />
-      </Button>
-    {/if}
-    <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
+{#snippet card()}
+  {#if !createdCode}
+    <Card class="m-auto w-full max-w-sm bg-card border-border text-card-foreground">
       <CardHeader>
         <div class="flex items-center justify-between">
           <div>
@@ -310,6 +261,11 @@
             oninput={(e) => {
               profileStore.nickname = (e.target as HTMLInputElement).value;
             }}
+            onchange={(e) => {
+              void saveName((e.target as HTMLInputElement).value).catch((err) => {
+                joinError = err instanceof Error ? err.message : "Could not save your display name";
+              });
+            }}
             placeholder="Your display name"
             class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono text-center focus-visible:ring-ring"
           />
@@ -348,18 +304,61 @@
             <Input
               id="join-code" autocomplete="off" aria-describedby={joinError ? "room-join-error" : undefined} aria-invalid={joinError ? "true" : undefined}
               bind:value={joinCode}
-              placeholder="Room code, short code or link"
-              class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-10 focus-visible:ring-ring"
+              placeholder="Link or short code"
+              class="bg-background border-input text-foreground placeholder:text-muted-foreground font-mono pr-16 focus-visible:ring-ring"
             />
-            <button
-              type="button"
-              onclick={handlePaste}
-              class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground cursor-pointer"
-              aria-label="Paste room code"
-            >
-              <Clipboard class="size-4" />
-            </button>
+            <div class="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-2">
+              <button
+                type="button"
+                onclick={() => { scanHint = null; scanError = null; scanning = true; }}
+                class="text-muted-foreground hover:text-foreground cursor-pointer"
+                aria-label="Scan a QR code"
+                title="Scan a QR code"
+              >
+                <ScanLine class="size-4" />
+              </button>
+              <button
+                type="button"
+                onclick={handlePaste}
+                class="text-muted-foreground hover:text-foreground cursor-pointer"
+                aria-label="Paste room code"
+              >
+                <Clipboard class="size-4" />
+              </button>
+            </div>
           </div>
+          <!-- Content only while open, so the camera stops when it closes. -->
+          <Dialog bind:open={scanning}>
+            <DialogContent
+              class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-sm flex flex-col gap-0 p-0 max-h-[calc(100dvh-2rem)] overflow-hidden"
+            >
+              <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
+                <DialogTitle class="font-mono text-base font-semibold">Scan a QR code</DialogTitle>
+                <DialogDescription class="text-xs">
+                  Point the camera at a room's QR code.
+                </DialogDescription>
+              </DialogHeader>
+              <div class="flex min-h-0 flex-col gap-3 overflow-y-auto p-4">
+                {#if scanError}
+                  <p role="alert" class="rounded-lg bg-destructive/10 border border-destructive/30 px-3 py-2 text-sm text-destructive">
+                    {scanError}
+                  </p>
+                {:else}
+                  <QrScanner
+                    onText={handleScannedText}
+                    onUnavailable={(message) => {
+                      scanError = /https/i.test(message) || message === SCANNER_NOT_LOADED
+                        ? message
+                        : "Couldn't open the camera. Allow camera access in your browser, or paste the link instead.";
+                    }}
+                  />
+                  {#if scanHint}
+                    <p role="alert" class="text-center text-xs text-destructive">{scanHint}</p>
+                  {/if}
+                {/if}
+              </div>
+            </DialogContent>
+          </Dialog>
           <Button
             variant="outline"
             onclick={handleJoin}
@@ -369,100 +368,35 @@
             <LogIn class="size-4 mr-1" />
             {joining ? "Joining..." : "Join room"}
           </Button>
-          {#if legacyFallback}
-            <Button variant="ghost" disabled={joining} onclick={joinLegacy}>Join legacy room {legacyFallback}</Button>
+          {#if pairingJoin}
+            <Button
+              variant="ghost"
+              onclick={() => joinController?.abort()}
+              class="font-mono text-muted-foreground hover:text-foreground cursor-pointer"
+            >
+              Cancel
+            </Button>
           {/if}
         </div>
       </CardContent>
     </Card>
-  </div>
-{:else}
-  <div
-    use:viewportHeight
-    class="flex min-h-dvh h-full overflow-y-auto items-center justify-center p-4 bg-background"
-  >
-    <Card class="w-full max-w-sm bg-card border-border text-card-foreground">
+  {:else}
+    <Card class="m-auto w-full max-w-sm bg-card border-border text-card-foreground">
       <CardHeader>
         <CardTitle class="font-mono text-foreground">Room created</CardTitle>
         <CardDescription class="text-muted-foreground">
-          Share this code with others so they can join.
+          Invite people with a short code, or share the permanent link.
         </CardDescription>
       </CardHeader>
-      <CardContent class="grid gap-4">
-        <div class="relative rounded-lg bg-muted px-3 py-2">
-          <div
-            class="text-center font-mono text-sm tracking-widest text-muted-foreground truncate overflow-hidden pr-8"
-          >
-            {formatRoomCode(createdCode!)}
-          </div>
-          <div class="absolute right-2 top-1/2 -translate-y-1/2" data-copy-menu>
-            <button
-              type="button"
-              onclick={() => (copyMenuOpen = !copyMenuOpen)}
-              class="text-muted-foreground hover:text-foreground cursor-pointer"
-              aria-label="Copy"
-              aria-haspopup="menu"
-              aria-expanded={copyMenuOpen}
-            >
-              {#if copied || shortCopied}
-                <Check class="size-4 text-primary" />
-              {:else}
-                <Copy class="size-4" />
-              {/if}
-            </button>
-            {#if copyMenuOpen}
-              <div
-                role="menu"
-                class="absolute right-0 top-full mt-2 z-10 w-56 rounded-lg border border-border bg-popover text-popover-foreground shadow-md p-1"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={handleCopyLink}
-                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
-                >
-                  Copy link
-                </button>
-                {#if canShare}
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onclick={handleShareLink}
-                    class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted cursor-pointer"
-                  >
-                    <Share2 class="size-3.5" />
-                    Share link
-                  </button>
-                {/if}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={handleCopyShort}
-                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
-                >
-                  Copy short code
-                  <span class="block text-xs text-muted-foreground">Works for 5 minutes</span>
-                </button>
-              </div>
-            {/if}
-          </div>
-        </div>
-
-        {#if shortCode}
-          <div class="rounded-lg bg-muted px-3 py-2">
-            <div class="text-center font-mono text-lg tracking-widest text-foreground">
-              {formatShortCode(shortCode)}
-            </div>
-            <div class="mt-1 text-center text-xs text-muted-foreground">
-              {now >= shortCodeExpiresAt ? "Expired — copy a short code again to refresh" : `Expires in ${Math.ceil((shortCodeExpiresAt - now) / 1000)} seconds`}
-            </div>
-          </div>
-        {/if}
-        {#if shortCodeError}
-          <div class="text-center text-xs text-destructive">{shortCodeError}</div>
+      <!-- grid-cols-1 (minmax(0, 1fr)) so the long link cannot widen the card. -->
+      <CardContent class="grid grid-cols-1 gap-4">
+        <InviteOptions secret={createdSecret} link={createdLink} {qrSize} />
+        {#if createdError}
+          <div role="alert" class="text-center text-xs text-destructive">{createdError}</div>
         {/if}
 
         <Button
+          bind:ref={joinCreatedButton}
           onclick={handleJoinCreated}
           disabled={joining}
           class="bg-primary hover:bg-primary/90 text-primary-foreground font-mono cursor-pointer w-full"
@@ -472,18 +406,36 @@
         </Button>
       </CardContent>
     </Card>
+  {/if}
+{/snippet}
+
+{#if inDialog}
+  {@render card()}
+{:else}
+  <!-- viewportHeight, not just a dvh class: every one of these screens centres a
+       card with a text field in it, and dvh does not shrink when the software
+       keyboard opens - so on a phone the field being typed into ended up under
+       the keyboard. overflow-y-auto because the box is now exactly the visible
+       height and a tall card has to be able to scroll inside it. The card
+       centres itself with m-auto: unlike items-center, auto margins collapse
+       when it is taller than the box, so its top stays reachable. -->
+  <div
+    use:viewportHeight
+    class="flex min-h-dvh h-full overflow-y-auto p-4 bg-background"
+  >
+    {#if toggleSidebar != null && !createdCode}
+      <Button
+        onclick={toggleSidebar}
+        variant="outline"
+        class="absolute top-4 left-4 sm:hidden"
+        aria-label="Open sidebar"
+      >
+        <Menu />
+      </Button>
+    {/if}
+    {@render card()}
   </div>
 {/if}
-
-<svelte:window
-  onclick={(e) => {
-    if (copyMenuOpen && !(e.target as HTMLElement).closest("[data-copy-menu]"))
-      copyMenuOpen = false;
-  }}
-  onkeydown={(e) => {
-    if (e.key === "Escape") copyMenuOpen = false;
-  }}
-/>
 
 <AvatarPickerDialog
   open={avatarDialogOpen}

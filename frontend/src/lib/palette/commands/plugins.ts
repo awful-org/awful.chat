@@ -2,6 +2,7 @@ import { Puzzle } from "@lucide/svelte";
 import { getPlugin, getRegistry } from "$lib/plugins/registry";
 import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
 import { makeHostApi } from "$lib/plugins/host";
+import { showPluginError } from "$lib/plugins/plugin-errors.svelte";
 import type { Cmd } from "../types";
 import type { CmdSource } from "../host";
 
@@ -39,7 +40,19 @@ export const pluginCommands: CmdSource = (host) => {
               return;
             }
             // "" with no room open, same binding the settings surface gets.
-            await handler(makeHostApi(pluginId, host.activeRoomCode ?? ""));
+            const room = host.activeRoomCode ?? "";
+            try {
+              await handler(makeHostApi(pluginId, room));
+            } catch (err) {
+              // The palette has closed by now: the same note a thrown slash
+              // command gets, so the failure is not silent.
+              showPluginError(
+                pluginId,
+                room,
+                err instanceof Error && err.message ? err.message : `${entry.title} did not work.`,
+              );
+              throw err;
+            }
           },
         },
       });

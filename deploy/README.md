@@ -28,10 +28,22 @@ deliberately allowed, so a plain `curl` gets one), and those credentials work
 on every TURN server in `TURN_URLS`. Anyone who wants one can relay traffic to
 any host on the internet through the volunteer's machine, so DDoS reflection,
 spam and scanning are attributed to their IP address, not yours. Browsers never
-use TCP relaying, so `--no-tcp-relay` is set and only UDP is exposed, and
-`--total-quota` and `--user-quota` bound how much of it one party can use at
-once - size them for a machine you do not own. None of this is specific to a
-satellite: the main instance has exactly the same shape.
+use TCP relaying, so `--no-tcp-relay` is set and only UDP is exposed. The relay
+hands one address at most seven live credentials (25 per IPv6 /48), all of them
+carrying one of the same seven ids (25 for a /48); `--user-quota` caps the
+allocations under each id whatever the credential's expiry, and
+`--total-quota` (900) is the pool for everyone. coturn checks a credential's
+expiry only when an allocation is made, and keeps an allocation that is
+refreshed past it, which is why the ids are fixed: one address holds at most
+seven times `--user-quota` allocations - 84 by default, and an IPv6 /48 300 -
+however long it keeps at it. Filling the pool takes about eleven addresses at
+once instead of one address a minute: harder, not impossible, and a server
+holding the same secret can be filled the same way. People sharing an address
+share the limit too: once it is busy, every browser behind it is handed the
+same newest credential, so together they have one `--user-quota` for new
+connections. Size both for a machine you do not own, keeping the pool ten
+times what one address can hold. None of this is specific to a satellite: the
+main instance has exactly the same shape.
 
 They also hold `TURN_SECRET`, which is the entire authentication system: with
 it they can mint valid credentials for **every** TURN server on the instance,
@@ -69,11 +81,21 @@ identifier held by the vendor: while the subscription lives it links the device
 to the identity, and the vendor sees the timing of every wake-up. What the
 relay sends through it is the whole disclosure - `{"t":"mail"}`, meaning "check
 your box", with no sender, no room, no count and no content, at most one per
-mailbox per minute - and everything real stays sealed in the blob the device
-collects once it is awake. Subscribing is per device and opt-in in the app,
+mailbox per minute and one per device until that device has collected (or an
+hour has passed) - and everything real stays sealed in the blob the device
+collects once it is awake. Deposits are anonymous, so the relay cannot tell a
+contact's DM from a stranger's message request or junk: any of them can still
+make a closed app ring once, but no longer every minute. Subscribing is per device and opt-in in the app,
 unsubscribing deletes the endpoint, and `PUSH_ENABLED=0` removes the surface
 entirely, at the cost of offline DMs never reaching a closed phone until the
 user opens it.
+
+The relay holds subscriptions for at most 65,536 identities. dids are free to
+make, so one address (an IPv4 address or IPv6 /56, and four times that per
+/48) may hold a sixty-fourth of them, and a full store drops the identity whose
+devices subscribed longest ago rather than refusing new ones. Every unlock of
+the app subscribes again, so that is the identity least in use, and it is back
+the next time one of its devices opens the app.
 
 ## Add a TURN server
 
@@ -136,8 +158,9 @@ do not forward, so a proxied hostname is a TURN server nobody can reach.
    ```sh
    cd deploy/sfu-satellite
    cp .env.example .env
-   # PUBLIC_IP     this server's public address
-   # SFU_HOSTNAME  a DNS name pointing at it
+   # PUBLIC_IP            this server's public address
+   # SFU_HOSTNAME         a DNS name pointing at it
+   # SFU_ALLOWED_ORIGINS  the main instance's app origin, https://<DOMAIN>
    docker compose up -d
    ```
 
@@ -162,9 +185,11 @@ do not forward, so a proxied hostname is a TURN server nobody can reach.
 ### Changing the list splits rooms until clients reload
 
 This is the one operational trap. Placement is computed from the list the
-client has, and a client reads that list once, at startup. So a session open
-across the change places rooms using the old list while a freshly loaded one
-uses the new list, and two people in the same room can land on different SFUs.
+client has, and a client reads that list only as it starts (a launch begins
+with the copy the last one kept and takes the served list a moment later, as
+soon as its read of `/config.json` lands). So a session open across the change
+places rooms using the old list while a freshly loaded one uses the new list,
+and two people in the same room can land on different SFUs.
 Chat and presence are unaffected (they go through the relay), so it shows up
 as "video is broken for some people", not as a deploy problem.
 
@@ -172,6 +197,14 @@ A plain page reload is enough to pick up the new list - it no longer waits on
 a service worker update prompt, because nothing about the list is in the
 bundle. Still, change it when the instance is quiet, and leave a removed SFU
 running until you are confident every client has reloaded.
+
+The relay's address (`VITE_RELAY_MULTIADDR`, which changes when the relay
+moves or gets a new key) is read the same way, and a session keeps the relay
+it connected to. A launch gives its read of `/config.json` up to a second
+before it connects, so it normally dials the new address; on a slower link it
+dials the one in the copy it kept and moves over only if that one does not
+answer. While the old relay is still up, those sessions stay on it, apart
+from everyone else, until they reload.
 
 ### What this does and does not do
 
@@ -203,6 +236,34 @@ and a single port already in use aborts the whole container, so a range inside
 Linux's ephemeral window (32768-60999) makes the SFU fail to start at random,
 typically after a reboot.
 
+## Relay capacity
+
+There is one relay, so size it rather than multiply it. `RELAY_MAX_CONNS`
+(default 2048) is how many libp2p connections it holds at once - one per open
+tab, and a second one while device sync runs - and every other ceiling is
+counted from it: as many circuit-relay reservations, four times as many
+relayed circuits (a circuit stays up for the life of both tabs, one per pair
+of online room members, so a fully online 50-member room is 1,225 of them),
+and the libp2p resource manager's stream and memory accounting to match. Past it a new
+connection is refused at accept and the client retries; a tab that already
+holds its rendezvous stream is protected and is never dropped to make room.
+
+Real memory is what to size against: about 150 KB per connected tab and 30 KB
+per circuit, so roughly 550 MB with every connection and circuit in use at the
+default. `RELAY_GOMEMLIMIT` (default `768MiB`) is the Go runtime's soft limit
+for it: near the limit the garbage collector works harder instead of letting
+the heap grow to twice what is live, but nothing is refused, so it is a
+backstop, not a ceiling. On a small box lower `RELAY_MAX_CONNS` first, then
+`RELAY_GOMEMLIMIT` with it, keeping the limit above what the connections need;
+a container memory limit on top turns running out into a restart of the relay,
+which drops every tab at once. The relay prints both values at boot.
+
+`RELAY_GOMEMLIMIT` goes to the Go runtime as it is, and the runtime takes only
+its own units: a whole number of `MiB` or `GiB`, such as `768MiB` or `1GiB`
+(or plain bytes). `1G`, `768MB`, `512m` or `1.5GiB` do not mean roughly the
+same - they stop the relay at boot with "malformed GOMEMLIMIT", and it does not
+come back until the value is fixed.
+
 ## What cannot be multiplied yet
 
 The **relay** is single. It holds the rendezvous registry (who is in which
@@ -223,15 +284,44 @@ half on the other, and each half would never see the other half in its
 next to its PeerID, but there is no code check that refuses a second
 replica outright.
 
-**`TRUSTED_PROXY_CIDRS` is optional hardening.** The relay's API port is
-reachable by every container on `dokploy-network`, not only Traefik, and the
-default trusted range (see `.env.example`) is the whole private address
-space - so on this compose shape, another container on the same box can
-forge `X-Forwarded-For` and pick its own bucket for every per-IP rate limit
-the relay has (`/turn-credentials`, `/invite`, `/mailbox`, `/plugin-proxy`,
-`/plugin-stream`). That neighbour is something you deployed yourself, so the
-default stays convenient. To close it, set the variable to Traefik's own
-address on your `dokploy-network` as a single `/32` (`docker network inspect
-dokploy-network` lists it), and re-check it whenever Traefik is recreated:
-a stale value makes the relay treat Traefik as the client, and every user
-then shares one rate-limit bucket.
+**`TRUSTED_PROXY_CIDRS` names the proxy.** The relay believes
+`X-Forwarded-For` only from what this lists, and trusts nothing when it is
+empty. It used to trust the whole private address space by default, which on
+this compose shape let any other container on `dokploy-network` forge the
+header and pick its own bucket for every per-IP limit the relay has
+(`/turn-credentials`, `/invite`, `/mailbox`, `/push`, `/og`, `/plugin-proxy`,
+`/plugin-stream`, `/telemetry`). The compose now defaults it to
+`dokploy-traefik`, the name of Dokploy's Traefik container, which the relay
+re-resolves every 30 seconds so a recreated Traefik is followed rather than
+turned into "the client". If your proxy has another name, set it; the relay
+logs what the name resolved to at boot, and says so loudly when it resolves
+to nothing, because every user then shares one rate-limit bucket.
+
+**The libp2p side cannot see client addresses.** Traefik routes
+`relay.<domain>` as HTTP, so the WebSocket that carries every browser's
+libp2p connection reaches the relay from Traefik's address, and libp2p reads
+no `X-Forwarded-For`. The relay's per-address limits there - 64 connections
+and 32 circuit-relay reservations per IPv4 address or IPv6 /64 (four times
+that per /48), a connection rate, and the per-source rendezvous budgets -
+therefore apply only to connections that arrive from a public address. A
+proxy's address (anything private, loopback or CGNAT, or a CIDR listed in
+`TRUSTED_PROXY_CIDRS`) is held to the global ceilings alone, because a
+per-address cap on it would be a cap on every user at once. On this compose
+shape that means those per-address limits are inactive: bringing them into
+effect needs the client's address carried to the relay's libp2p listener,
+which takes PROXY protocol on a Traefik TCP router plus PROXY protocol
+support in the relay's listener (it has none today), or the listener
+exposed directly without Traefik in front.
+
+**Plugin secrets are bound, one binding per name.** A
+`PLUGIN_PROXY_SECRETS` entry is `NAME@host?param=value`, for example
+`STEAM@api.steampowered.com?key=your-steam-api-key`: the relay substitutes
+`{{secret:NAME}}` only as the whole value of that query parameter, and only
+on that host. A path prefix is optional hardening -
+`NAME@host/path/prefix?param=value` - for a host that also serves an endpoint
+which echoes its query back. A NAME holds a single binding - a later entry
+with the same NAME replaces the earlier one - so a plugin that calls several
+path prefixes on its host with the same key should leave the path out. The
+older `NAME@host=value` and `NAME=value` forms are no longer substituted; the
+relay names any it finds at boot, and the plugins using them report "not
+configured" until they are rewritten.

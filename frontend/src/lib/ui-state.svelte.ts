@@ -6,6 +6,8 @@
 export const uiState = $state({
   settingsOpenRequested: false,
   settingsTab: null as string | null,
+  /** Room scope requested by an in-room profile card; null means Main. */
+  settingsProfileRoom: null as string | null,
   /**
    * Somebody asked to be taken back to the call they are in. Only AppView knows
    * how to get there - it owns the active conversation - and the button lives
@@ -17,12 +19,20 @@ export const uiState = $state({
    * Cmd/Ctrl+K, so anything outside that tree travels through here too.
    */
   paletteOpenRequested: false,
+  /** What the palette opens with typed, e.g. ">" for settings only. */
+  paletteQuery: null as string | null,
+  /** Open the active room's capability/PAKE invitation dialog. */
+  invitationRoomRequested: null as string | null,
   /**
    * Somebody asked to navigate to one message - a pinned widget jumping to
    * its card. Two owners consume it in sequence: AppView opens the room,
    * ChatView scrolls to the row once the history is on screen and clears it.
+   * `revealed`: the history up to it has been read (revealMessage), so a
+   * row ChatView does not hold even then is not looked for in storage again.
    */
-  jumpToMessage: null as { roomCode: string; messageId: string } | null,
+  jumpToMessage: null as
+    | { roomCode: string; messageId: string; revealed?: boolean }
+    | null,
   /**
    * The screen-share quality picker (ShareScreenDialog, owned by
    * SidebarControls). Three buttons open it - sidebar, call view, palette -
@@ -63,8 +73,12 @@ export function openCameraPicker(): void {
   uiState.cameraPickerOpen = true;
 }
 
-export function openSettings(tab: string | null = null): void {
+export function openSettings(
+  tab: string | null = null,
+  profileRoom: string | null = null
+): void {
   uiState.settingsTab = tab;
+  uiState.settingsProfileRoom = profileRoom;
   uiState.settingsOpenRequested = true;
 }
 
@@ -76,13 +90,15 @@ export function requestReturnToCall(): void {
  * Ask for the command palette. The palette is owned by AppView, which also binds
  * Cmd/Ctrl+K, so anything outside that tree requests it here.
  */
-export function openPalette(): void {
+export function openPalette(query: string | null = null): void {
+  uiState.paletteQuery = query;
   uiState.paletteOpenRequested = true;
 }
 
 export function requestJumpToMessage(
   roomCode: string,
-  messageId: string
+  messageId: string,
+  revealed = false
 ): void {
-  uiState.jumpToMessage = { roomCode, messageId };
+  uiState.jumpToMessage = { roomCode, messageId, revealed };
 }

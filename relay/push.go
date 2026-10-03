@@ -18,12 +18,18 @@ package main
 // /push/unsubscribe deletes it.
 //
 // WHAT THE RELAY SENDS. The whole message is {"t":"mail"} - "check your
-// box". No sender, no room, no count, no content, and at most one per box
-// per minute, so the wake-up stream is not a finer traffic-analysis channel
-// than the deposit stream a push service would already see. Everything real
-// stays sealed in the mailbox blob the device collects once it is awake.
+// box". No sender, no room, no count, no content, at most one per box per
+// minute, and to one device only once until that device has collected its
+// box (pushRearmAfter), so the wake-up stream is not a finer traffic-analysis
+// channel than the deposit stream a push service would already see.
+// Everything real stays sealed in the mailbox blob the device collects once
+// it is awake.
 
 import (
+	"container/list"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -31,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,18 +63,74 @@ const (
 	// wakes, so a second push would cost battery and tell the push vendor
 	// more about this box's traffic than it needs to know.
 	pushCoalesceWindow = time.Minute
-	// One worker drains this. A burst that outruns delivery drops wake-ups
+	// After a wake-up reaches a device, that device is not woken again until
+	// it has collected its box - or subscribed again, which every unlock
+	// does - or this long has passed. A deposit is anonymous and names no
+	// sender, and the service worker shows every push as "New message", so
+	// with the minute above as the only limit anyone who knew a did could
+	// make a closed phone ring every minute, junk and message requests
+	// alike, and blocking somebody did nothing. One push already says
+	// everything waiting: until the device has looked, a second one says
+	// nothing new. What remains is one ring per hour that the app stays
+	// closed; real mail still wakes it at once after every collect.
+	pushRearmAfter = time.Hour
+	// pushWorkers drain this. A burst that outruns delivery drops wake-ups
 	// rather than growing without bound - the mailbox still holds the
 	// message, and the next deposit or foreground collect finds it.
 	pushQueueDepth = 1024
+	// Delivery used to be ONE worker sending to a box's devices one at a
+	// time with a 15 s timeout each. Sixteen subscribed devices whose
+	// endpoints accepted TLS and never answered held that worker for four
+	// minutes per wake-up, and every real wake-up on the instance queued
+	// behind it until the queue overflowed and dropped them. Now: a pool of
+	// workers, a short timeout per send, a cap on sends in flight to any one
+	// push service, and a service or box that keeps failing is suspended
+	// with backoff instead of retried at full cost on every deposit. The
+	// allowlist below is what makes "never answers" rare in the first place:
+	// an endpoint has to be at a real push service.
+	pushWorkers = 8
+	// A push service answers in well under a second; five is generous for
+	// a slow mobile-network day and short enough that a hung send costs a
+	// worker five seconds, not fifteen.
+	pushSendTimeout = 5 * time.Second
+	// Sends in flight to one push service at once. Four workers' worth, so
+	// one service that has gone slow can occupy at most half the pool.
+	pushPerHostConcurrency = 4
+	// How long a send waits for a free slot at its push service before the
+	// wake-up is skipped for that device. The mailbox keeps the message;
+	// the next deposit tries again.
+	pushHostWait = 2 * time.Second
+	// A push service that fails this many sends in a row is suspended for a
+	// backoff that doubles, from pushHostBackoffMin to pushHostBackoffMax,
+	// and resets on the first success.
+	pushHostFailThreshold = 5
+	pushHostBackoffMin    = 30 * time.Second
+	pushHostBackoffMax    = 10 * time.Minute
+	// The same for one box whose every device failed this many deliveries
+	// in a row: its wake-ups are skipped for a doubling backoff.
+	pushBoxFailThreshold = 3
+	pushBoxBackoffMin    = time.Minute
+	pushBoxBackoffMax    = time.Hour
 	// Seconds a push service should hold an undelivered wake-up. A day, so a
 	// phone that was off overnight still gets told once it is back.
 	pushTTL = 86400
 	// Boxes holding subscriptions. Subscribing needs a did signature, but
 	// dids are free to mint, so without a ceiling this is an unbounded
 	// on-disk sink for anyone with curl - the same reasoning as
-	// mailboxGlobalMaxBoxes.
+	// mailboxGlobalMaxBoxes. A full store sheds the box subscribed to
+	// longest ago rather than refusing (pushShedOldest).
 	pushMaxBoxes = 65536
+	// The part of pushMaxBoxes one source may hold: an IPv4 address or an
+	// IPv6 /56 (shareKey), and ipv6AggregateFactor times that for the /48
+	// around it, so one allocation's 256 /56s are not 256 shares. The
+	// ceiling used to be the only limit: one address minting dids filled the
+	// store in a day and a half, after which every identity that subscribed
+	// for the first time got 507 and no wake-ups, for good - a restart
+	// counted the same files back in. A sixty-fourth is a thousand
+	// identities behind one address, far past a household or an office, and
+	// it means shedding by age cannot be turned into a way to push real
+	// users out: a source over its share is refused before anything is shed.
+	pushMaxBoxesPerSource = pushMaxBoxes / 64
 )
 
 // pushPayload is the entire message. Byte-for-byte what the frontend's
@@ -113,20 +176,207 @@ var (
 	pushMu    sync.Mutex
 	pushBoxes int
 
+	// pushOrder is every stored box, the one subscribed to longest ago at
+	// the front, and pushOrderAt finds a box in it. A device subscribes again
+	// on every unlock, so the front is the box whose devices have gone
+	// longest without opening the app - an abandoned identity, or a minted
+	// one - and that is what a full store sheds. Rebuilt from file times at
+	// boot. Guarded by pushMu.
+	pushOrder   = list.New()
+	pushOrderAt = map[string]*list.Element{}
+	// pushHeld is how many boxes each source created and still holds, for
+	// pushMaxBoxesPerSource. Memory only, keyed by a hash under the
+	// mailbox's per-process key, never an address: a restart forgets it,
+	// which only means boxes from before the restart count against nobody.
+	// Guarded by pushMu.
+	pushHeld = map[string]int{}
+	// When a full store last said so, so shedding writes a line an hour at
+	// most. Guarded by pushMu.
+	pushFullLogged time.Time
+
 	pushVapidMu     sync.Mutex
 	pushVapidCached *vapidKeys
 
 	pushSentMu   sync.Mutex
 	pushLastSent = map[string]time.Time{}
 	pushLastSwep time.Time
+
+	// pushTold is when each device of a box was last woken, for
+	// pushRearmAfter. An entry goes when that device collects or subscribes,
+	// or once it is older than pushRearmAfter, so the map only ever holds
+	// devices woken within the last hour or so.
+	pushToldMu    sync.Mutex
+	pushTold      = map[string]map[string]time.Time{}
+	pushToldSwept time.Time
 )
 
 var pushQueue = make(chan string, pushQueueDepth)
 
-// One client for every push send, over the SSRF-safe transport the proxies
-// share (see pluginProxyTransport): a subscription endpoint is attacker
-// input, and a push service that hangs must not hold the worker forever.
-var pushHTTPClient = &http.Client{Timeout: 15 * time.Second, Transport: pluginProxyTransport}
+// One client for every push send, over the SSRF-safe dialer the proxies use
+// (see pluginProxySafeDial): a subscription endpoint is attacker input, and
+// a push service that hangs must not hold a worker for longer than one
+// pushSendTimeout.
+var pushHTTPClient = &http.Client{Timeout: pushSendTimeout, Transport: &http.Transport{
+	DialContext:         pluginProxySafeDial,
+	IdleConnTimeout:     90 * time.Second,
+	MaxIdleConns:        32,
+	MaxIdleConnsPerHost: pushPerHostConcurrency,
+}}
+
+// ── Push services ─────────────────────────────────────────────────────────
+
+// defaultPushHosts are the push services browsers actually hand out
+// endpoints at: Chrome, Edge-on-Android, Samsung Internet, Opera and Brave
+// use Firebase Cloud Messaging; Firefox uses Mozilla's autopush; Safari
+// (macOS 13+, iOS 16.4+) uses Apple's; Edge on Windows uses WNS. A "*."
+// entry matches any subdomain. PUSH_ALLOWED_HOSTS replaces this list for an
+// operator whose users need another service; "*" allows any https host,
+// which is how the relay behaved before and lets a subscriber aim the relay
+// at any server on the internet.
+var defaultPushHosts = []string{
+	"fcm.googleapis.com",
+	"updates.push.services.mozilla.com",
+	"web.push.apple.com",
+	"*.push.apple.com",
+	"*.notify.windows.com",
+}
+
+var pushAllowedHosts = parsePushHosts(os.Getenv("PUSH_ALLOWED_HOSTS"))
+
+func parsePushHosts(raw string) []string {
+	var out []string
+	for _, h := range strings.Split(raw, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	if len(out) == 0 {
+		return defaultPushHosts
+	}
+	return out
+}
+
+// pushHostKey returns the allowlist entry an endpoint host falls under,
+// which is also the key its concurrency slots and backoff are kept under -
+// one per push SERVICE, not per hostname, so a service that spreads its
+// endpoints over many subdomains is still one service to be gentle with.
+// Empty when no entry allows the host.
+func pushHostKey(host string) string {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, h := range pushAllowedHosts {
+		switch {
+		case h == "*":
+			return host
+		case strings.HasPrefix(h, "*."):
+			if strings.HasSuffix(host, h[1:]) && len(host) > len(h)-1 {
+				return h
+			}
+		case host == h:
+			return h
+		}
+	}
+	return ""
+}
+
+type pushHostState struct {
+	slots          chan struct{}
+	fails          int
+	backoff        time.Duration
+	suspendedUntil time.Time
+}
+
+var (
+	pushHostsMu sync.Mutex
+	pushHosts   = map[string]*pushHostState{}
+)
+
+func pushHost(key string) *pushHostState {
+	pushHostsMu.Lock()
+	defer pushHostsMu.Unlock()
+	st := pushHosts[key]
+	if st == nil {
+		st = &pushHostState{slots: make(chan struct{}, pushPerHostConcurrency)}
+		pushHosts[key] = st
+	}
+	return st
+}
+
+// pushHostSuspended reports whether a push service is sitting out a backoff.
+func pushHostSuspended(st *pushHostState, now time.Time) bool {
+	pushHostsMu.Lock()
+	defer pushHostsMu.Unlock()
+	return now.Before(st.suspendedUntil)
+}
+
+// pushHostResult records one send's outcome at a push service. ok is any
+// answer at all from the service, including 404/410: those are about the
+// subscription, not about the service being unwell.
+func pushHostResult(st *pushHostState, ok bool, now time.Time) {
+	pushHostsMu.Lock()
+	defer pushHostsMu.Unlock()
+	if ok {
+		st.fails, st.backoff = 0, 0
+		return
+	}
+	st.fails++
+	if st.fails < pushHostFailThreshold {
+		return
+	}
+	st.backoff = nextBackoff(st.backoff, pushHostBackoffMin, pushHostBackoffMax)
+	st.suspendedUntil = now.Add(st.backoff)
+	st.fails = 0
+}
+
+func nextBackoff(cur, lo, hi time.Duration) time.Duration {
+	if cur < lo {
+		return lo
+	}
+	if cur*2 > hi {
+		return hi
+	}
+	return cur * 2
+}
+
+// Per-box failure state, see pushBoxFailThreshold. Only boxes that have
+// failed are here and a success deletes the entry, so it is bounded by the
+// subscribed boxes.
+type pushBoxState struct {
+	fails          int
+	backoff        time.Duration
+	suspendedUntil time.Time
+}
+
+var (
+	pushBoxFailMu sync.Mutex
+	pushBoxFail   = map[string]*pushBoxState{}
+)
+
+func pushBoxSuspended(box string, now time.Time) bool {
+	pushBoxFailMu.Lock()
+	defer pushBoxFailMu.Unlock()
+	st := pushBoxFail[box]
+	return st != nil && now.Before(st.suspendedUntil)
+}
+
+func pushBoxResult(box string, ok bool, now time.Time) {
+	pushBoxFailMu.Lock()
+	defer pushBoxFailMu.Unlock()
+	if ok {
+		delete(pushBoxFail, box)
+		return
+	}
+	st := pushBoxFail[box]
+	if st == nil {
+		st = &pushBoxState{}
+		pushBoxFail[box] = st
+	}
+	st.fails++
+	if st.fails >= pushBoxFailThreshold {
+		st.backoff = nextBackoff(st.backoff, pushBoxBackoffMin, pushBoxBackoffMax)
+		st.suspendedUntil = now.Add(st.backoff)
+		st.fails = 0
+	}
+}
 
 // pushSend is the one outbound call to a push service, behind a package-level
 // seam so a test can see what would go over the wire without one. It returns
@@ -221,8 +471,11 @@ func readPushBox(box string) (map[string]pushSubscription, bool) {
 // unsubscribed identity leaves nothing behind. Caller holds pushMu.
 func writePushBox(box string, devices map[string]pushSubscription, existed bool) error {
 	if len(devices) == 0 {
-		if existed && os.Remove(pushBoxPath(box)) == nil && pushBoxes > 0 {
-			pushBoxes--
+		if existed && os.Remove(pushBoxPath(box)) == nil {
+			if pushBoxes > 0 {
+				pushBoxes--
+			}
+			pushUntrack(box)
 		}
 		return nil
 	}
@@ -243,17 +496,146 @@ func writePushBox(box string, devices map[string]pushSubscription, existed bool)
 }
 
 // pushInitCount counts the boxes already on disk, so the ceiling survives a
-// restart. Runs once at boot, like mailboxInitUsedBytes.
+// restart, and lines them up oldest file first, so shedding does too. Runs
+// once at boot, like mailboxInitUsedBytes. The shares start empty.
 func pushInitCount() {
 	pushMu.Lock()
 	defer pushMu.Unlock()
 	pushBoxes = 0
+	pushOrder.Init()
+	pushOrderAt = map[string]*list.Element{}
+	pushHeld = map[string]int{}
+	type stored struct {
+		box string
+		mod time.Time
+	}
+	var boxes []stored
 	entries, _ := os.ReadDir(pushDir)
 	for _, e := range entries {
-		if !e.IsDir() {
-			pushBoxes++
+		box, ok := strings.CutSuffix(e.Name(), ".json")
+		if e.IsDir() || !ok || !mailboxBoxRe.MatchString(box) {
+			continue
+		}
+		s := stored{box: box}
+		if info, err := e.Info(); err == nil {
+			s.mod = info.ModTime()
+		}
+		boxes = append(boxes, s)
+	}
+	sort.Slice(boxes, func(i, j int) bool {
+		if boxes[i].mod.Equal(boxes[j].mod) {
+			return boxes[i].box < boxes[j].box
+		}
+		return boxes[i].mod.Before(boxes[j].mod)
+	})
+	for _, s := range boxes {
+		pushOrderAt[s.box] = pushOrder.PushBack(&pushStoredBox{box: s.box})
+	}
+	pushBoxes = len(boxes)
+}
+
+// pushStoredBox is one entry of pushOrder: the box and the share tags its
+// creation was charged to, empty for a box no share holds.
+type pushStoredBox struct {
+	box     string
+	sources []string
+}
+
+// pushSourceTags names the shares a subscribe from r is charged to: the
+// source's own (an IPv4 address or IPv6 /56) and, for IPv6, its /48. None
+// for a proxy-class address, which is everybody behind it (exemptFromShares).
+// Keyed hashes, like mailboxSourceTag, so the store's bookkeeping never
+// holds an address.
+func pushSourceTags(r *http.Request) []string {
+	addr := clientAddr(r)
+	own := shareKey(addr)
+	if own == "" {
+		return nil
+	}
+	keys := []string{own}
+	if _, agg := clientBuckets(addr); agg != "" {
+		keys = append(keys, agg)
+	}
+	tags := make([]string, len(keys))
+	for i, k := range keys {
+		m := hmac.New(sha256.New, mailboxSourceKey)
+		m.Write([]byte("push:" + k))
+		tags[i] = hex.EncodeToString(m.Sum(nil)[:12])
+	}
+	return tags
+}
+
+// pushShareFull reports whether a source already holds its share of boxes:
+// pushMaxBoxesPerSource for its own tag, ipv6AggregateFactor times that for
+// its /48's. Caller holds pushMu.
+func pushShareFull(sources []string) bool {
+	for i, s := range sources {
+		limit := pushMaxBoxesPerSource
+		if i > 0 {
+			limit *= ipv6AggregateFactor
+		}
+		if pushHeld[s] >= limit {
+			return true
 		}
 	}
+	return false
+}
+
+// pushTrack records a subscribe to box: it moves to the back of pushOrder,
+// and a box being created is charged to sources. Caller holds pushMu.
+func pushTrack(box string, sources []string, created bool) {
+	if el, ok := pushOrderAt[box]; ok {
+		pushOrder.MoveToBack(el)
+		return
+	}
+	entry := &pushStoredBox{box: box}
+	if created {
+		entry.sources = sources
+		for _, s := range sources {
+			pushHeld[s]++
+		}
+	}
+	pushOrderAt[box] = pushOrder.PushBack(entry)
+}
+
+// pushUntrack forgets a box whose file is gone and returns its share.
+// Caller holds pushMu.
+func pushUntrack(box string) {
+	el, ok := pushOrderAt[box]
+	if !ok {
+		return
+	}
+	delete(pushOrderAt, box)
+	entry := pushOrder.Remove(el).(*pushStoredBox)
+	for _, s := range entry.sources {
+		if pushHeld[s]--; pushHeld[s] <= 0 {
+			delete(pushHeld, s)
+		}
+	}
+}
+
+// pushShedOldest makes room in a full store by deleting the box subscribed
+// to longest ago, and reports whether it freed one. That box's devices stop
+// being woken until one of them opens the app again, which subscribes
+// afresh. Caller holds pushMu.
+func pushShedOldest() bool {
+	el := pushOrder.Front()
+	if el == nil {
+		return false
+	}
+	box := el.Value.(*pushStoredBox).box
+	if err := os.Remove(pushBoxPath(box)); err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	pushUntrack(box)
+	if pushBoxes > 0 {
+		pushBoxes--
+	}
+	if now := time.Now(); now.Sub(pushFullLogged) >= time.Hour {
+		pushFullLogged = now
+		log.Printf("[push] the subscription store is full (%d boxes): each new one replaces the box subscribed to longest ago", pushMaxBoxes)
+	}
+	return true
 }
 
 // pushRemoveDevices drops subscriptions a push service has told us are dead.
@@ -305,9 +687,77 @@ func pushNotifyBox(box string) {
 	}
 }
 
+// pushWaiting reports whether a wake-up reached device within pushRearmAfter
+// and the device has not collected its box since.
+func pushWaiting(box, device string, now time.Time) bool {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	told, ok := pushTold[box][device]
+	return ok && now.Sub(told) < pushRearmAfter
+}
+
+// pushSweepTold drops the entries past pushRearmAfter, which hold nothing
+// back any more, at most once a pushRearmAfter: the same opportunistic
+// sweep as pushNotifyBox's. It used to run only when a wake-up was sent, so
+// while every deposit found its devices already told, or every send failed,
+// nothing was swept. pushDeliver runs it now, for every wake-up a deposit
+// queues.
+func pushSweepTold(now time.Time) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	if now.Sub(pushToldSwept) <= pushRearmAfter {
+		return
+	}
+	pushToldSwept = now
+	for b, devices := range pushTold {
+		for d, told := range devices {
+			if now.Sub(told) >= pushRearmAfter {
+				delete(devices, d)
+			}
+		}
+		if len(devices) == 0 {
+			delete(pushTold, b)
+		}
+	}
+}
+
+// pushMarkTold records that a wake-up reached device.
+func pushMarkTold(box, device string, now time.Time) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	devices := pushTold[box]
+	if devices == nil {
+		devices = map[string]time.Time{}
+		pushTold[box] = devices
+	}
+	devices[device] = now
+}
+
+// pushCollected re-arms wake-ups for a device that has just looked at its
+// box: collected it, or subscribed again on unlock. An empty device - a
+// client that does not name itself - re-arms every device of the box, which
+// errs towards waking one once too often rather than never.
+func pushCollected(box, device string) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	if device == "" {
+		delete(pushTold, box)
+		return
+	}
+	if devices := pushTold[box]; devices != nil {
+		delete(devices, device)
+		if len(devices) == 0 {
+			delete(pushTold, box)
+		}
+	}
+}
+
 // pushDeliver sends the wake-up to every device subscribed to one box. Worker
 // goroutine only - never a deposit's request path.
 func pushDeliver(box string) {
+	// Here rather than in pushNotifyBox, which runs under the deposit's
+	// mailbox lock.
+	pushSweepTold(time.Now())
 	// readPushBox hands back a map of its own, so the sends below happen off
 	// the lock and a slow push service never blocks a subscribe.
 	pushMu.Lock()
@@ -334,9 +784,40 @@ func pushDeliver(box string) {
 		VAPIDPublicKey:  keys.PublicKey,
 		VAPIDPrivateKey: keys.PrivateKey,
 	}
-	sent, expired, failed := 0, 0, 0
+	now := time.Now()
+	if pushBoxSuspended(box, now) {
+		return
+	}
+	sent, expired, failed, skipped, waiting := 0, 0, 0, 0, 0
 	var dead []string
 	for device, s := range subs {
+		if pushWaiting(box, device, now) {
+			// Already told, and has not looked yet: see pushRearmAfter.
+			waiting++
+			continue
+		}
+		key := pushEndpointKey(s.Endpoint)
+		if key == "" {
+			// Stored before the allowlist, or an operator has narrowed it
+			// since. Skipped, not deleted: a PUSH_ALLOWED_HOSTS set by
+			// mistake must be undoable by setting it back, and a deleted
+			// subscription only returns when its device next re-subscribes.
+			// The device's own unsubscribe, or a 404/410 once it is allowed
+			// again, still removes it.
+			skipped++
+			continue
+		}
+		host := pushHost(key)
+		if pushHostSuspended(host, time.Now()) {
+			skipped++
+			continue
+		}
+		select {
+		case host.slots <- struct{}{}:
+		case <-time.After(pushHostWait):
+			skipped++
+			continue
+		}
 		status, err := pushSend(
 			&webpush.Subscription{
 				Endpoint: s.Endpoint,
@@ -345,6 +826,8 @@ func pushDeliver(box string) {
 			pushPayload,
 			opts,
 		)
+		<-host.slots
+		pushHostResult(host, err == nil && status < 500, time.Now())
 		switch {
 		case err != nil:
 			failed++
@@ -355,6 +838,7 @@ func pushDeliver(box string) {
 			dead = append(dead, device)
 		case status >= 200 && status < 300:
 			sent++
+			pushMarkTold(box, device, time.Now())
 		default:
 			failed++
 		}
@@ -362,36 +846,63 @@ func pushDeliver(box string) {
 	if len(dead) > 0 {
 		pushRemoveDevices(box, dead)
 	}
+	if sent+failed > 0 {
+		pushBoxResult(box, sent > 0, time.Now())
+	}
+	if sent+expired+failed+skipped == 0 {
+		// Every device was already told. Saying so for each deposit would be
+		// a line a minute per box somebody keeps depositing into.
+		return
+	}
 	// Counts only. An endpoint is a per-device identifier at a vendor and
 	// must never reach a log line.
-	log.Printf("[push] wake-up: %d sent, %d expired, %d failed", sent, expired, failed)
+	log.Printf("[push] wake-up: %d sent, %d expired, %d failed, %d skipped, %d already told", sent, expired, failed, skipped, waiting)
 }
 
-// startPushWorker drains the queue on exactly one goroutine, so however many
-// deposits land at once the relay opens one push request at a time.
+// pushEndpointKey is the push service an endpoint belongs to, or empty when
+// it is not one this relay sends to.
+func pushEndpointKey(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "https" || u.User != nil {
+		return ""
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return ""
+	}
+	return pushHostKey(u.Hostname())
+}
+
+// startPushWorker drains the queue on pushWorkers goroutines, so however
+// many deposits land at once the relay has at most that many push requests
+// open, and one slow push service cannot hold all of them (see
+// pushPerHostConcurrency).
 func startPushWorker() {
 	if !pushEnabled {
 		return
 	}
 	pushInitCount()
-	go func() {
-		for box := range pushQueue {
-			pushDeliver(box)
-		}
-	}()
+	log.Printf("[push] sending to %s", strings.Join(pushAllowedHosts, ", "))
+	for range pushWorkers {
+		go func() {
+			for box := range pushQueue {
+				pushDeliver(box)
+			}
+		}()
+	}
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
 
-// validPushEndpoint accepts only an https URL small enough to store. The push
-// service is chosen by the browser, not by us, so there is no host allowlist
-// to apply - what bounds abuse is that subscribing needs a did signature.
+// validPushEndpoint accepts only an https URL small enough to store, on
+// port 443, at a push service the relay sends to (defaultPushHosts). The
+// browser picks the service, but browsers only pick from a handful; without
+// the allowlist a subscriber - dids are free - could point the relay at any
+// server on the internet and have it POST there on every deposit.
 func validPushEndpoint(raw string) bool {
 	if raw == "" || len(raw) > pushMaxEndpoint {
 		return false
 	}
-	u, err := url.Parse(raw)
-	return err == nil && u.Scheme == "https" && u.Host != ""
+	return pushEndpointKey(raw) != ""
 }
 
 // handlePushConfig tells the client whether to offer push at all, and hands
@@ -401,7 +912,7 @@ func handlePushConfig(w http.ResponseWriter, r *http.Request) {
 		apiError(w, r, "Origin not allowed", http.StatusForbidden)
 		return
 	}
-	if !rateAllow("push:"+clientIP(r), pushRateLimit) {
+	if !rateAllowClient(r, "push:", pushRateLimit) {
 		apiError(w, r, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -433,14 +944,11 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("push:"+clientIP(r), pushRateLimit) {
+	if !rateAllowClient(r, "push:", pushRateLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	var req struct {
-		Did          string `json:"did"`
-		Ts           int64  `json:"ts"`
-		Sig          string `json:"sig"`
 		Device       string `json:"device"`
 		Subscription struct {
 			Endpoint string `json:"endpoint"`
@@ -450,7 +958,11 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 			} `json:"keys"`
 		} `json:"subscription"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 8*1024)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -467,21 +979,34 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad keys", http.StatusBadRequest)
 		return
 	}
-	// The same auth the mailbox uses, verbatim: same signed string, same
-	// helper, same skew, and the same box derivation - so a subscription can
-	// only ever be filed under the box its holder can also collect from.
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	// The mailbox's auth, for this action: the same key, skew and box
+	// derivation - so a subscription can only ever be filed under the box
+	// its holder can also collect from - and a proof that signs this
+	// endpoint and this device, so a captured one cannot subscribe anybody
+	// else's.
+	box, err := authenticateMailbox(r, pushActionSubscribe, body, req.Device, "", 0, "")
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
+	sources := pushSourceTags(r)
 	pushMu.Lock()
 	subs, existed := readPushBox(box)
-	if !existed && pushBoxes >= pushMaxBoxes {
-		pushMu.Unlock()
-		http.Error(w, "push full", http.StatusInsufficientStorage)
-		return
+	if !existed {
+		// A new box costs its source a slot of its share, checked before
+		// anything is shed: a source past its share must not be able to
+		// push somebody else's box out by asking for one more.
+		if pushShareFull(sources) {
+			pushMu.Unlock()
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		if pushBoxes >= pushMaxBoxes && !pushShedOldest() {
+			pushMu.Unlock()
+			http.Error(w, "push full", http.StatusInsufficientStorage)
+			return
+		}
 	}
 	if _, replacing := subs[req.Device]; !replacing && len(subs) >= pushMaxDevices {
 		// Oldest out first, so a user cycling through devices keeps the ones
@@ -501,11 +1026,17 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		Ts:       time.Now().Unix(),
 	}
 	err = writePushBox(box, subs, existed)
+	if err == nil {
+		pushTrack(box, sources, !existed)
+	}
 	pushMu.Unlock()
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
+	// A device subscribes on every unlock, so it is awake and about to
+	// collect: its next wake-up can go out.
+	pushCollected(box, req.Device)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -518,17 +1049,18 @@ func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	if !mailboxCORS(w, r) {
 		return
 	}
-	if !rateAllow("push:"+clientIP(r), pushRateLimit) {
+	if !rateAllowClient(r, "push:", pushRateLimit) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	var req struct {
-		Did    string `json:"did"`
-		Ts     int64  `json:"ts"`
-		Sig    string `json:"sig"`
 		Device string `json:"device"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+	body, ok := readMailboxBody(w, r, 4096)
+	if !ok {
+		return
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -536,7 +1068,7 @@ func handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad device", http.StatusBadRequest)
 		return
 	}
-	box, err := verifyMailboxAuth(req.Did, req.Ts, req.Sig)
+	box, err := authenticateMailbox(r, pushActionUnsubscribe, body, req.Device, "", 0, "")
 	if err != nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

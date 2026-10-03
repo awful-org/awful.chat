@@ -151,6 +151,25 @@ body {
   overscroll-behavior-y: none;
 }
 
+/* Emoji a size above the text they sit in. They are drawn by the system emoji
+   font at the surrounding font-size, which reads small next to a word; the
+   message body wraps each one (markdown.ts, via mentions.ts wrapEmoji), and the reaction chips
+   use the same class. line-height 1 so a line holding one is not taller than
+   the lines around it. */
+.emoji {
+  font-size: 1.3em;
+  line-height: 1;
+}
+
+/* A fullscreen call whose controls have faded (VoiceVideoCallView): the
+   pointer goes with them, like a video player. The class was set there all
+   along with no rule behind it, so the cursor never hid. The descendants too,
+   and !important: every tile is a button with its own cursor-pointer. */
+.cursor-hidden,
+.cursor-hidden * {
+  cursor: none !important;
+}
+
 .chat-messages {
   overscroll-behavior: contain;
 }

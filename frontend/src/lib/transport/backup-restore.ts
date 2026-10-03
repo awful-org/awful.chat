@@ -10,7 +10,9 @@ import {
   wipeLocalDatabase,
   putIdentityRecord,
   bulkPutMessages,
+  bulkAddNewMessages,
   putAttachment,
+  getAttachment,
   putRoom,
   putPeerProfile,
   putOwnProfile,
@@ -19,6 +21,14 @@ import {
   setWatermark,
   getOwnProfile,
   getPeerProfile,
+  getOwnRoomProfile,
+  getAllOwnRoomProfiles,
+  putOwnRoomProfile,
+  getAllRoomDeletionMarkers,
+  deleteRoomProfilesForRoom,
+  putRoomDeletionMarker,
+  roomDeletionCutoff,
+  getKeypairRecord,
   markAtRestSweepNeeded,
 } from "../storage";
 import type { Message, Attachment, PendingMessage } from "../types/message";
@@ -36,6 +46,8 @@ import type {
   OwnProfile,
   SavedGif,
   WatermarkRecord,
+  RoomDeletionMarker,
+  OwnRoomProfileRecord,
 } from "../storage";
 import {
   bytesFromExport,
@@ -48,8 +60,81 @@ import {
   type DatabaseExport,
   EXPORT_SECTIONS,
   type ParsedBackupFile,
+  type RoomProfileExport,
+  isValidRoomDeletionMarker,
 } from "./backup";
-import { unlockWithImportedMnemonic } from "../identity/identity";
+import { sanitizeRoomProfileFields, type RoomProfileField } from "../room-profile";
+
+/**
+ * How far ahead of our clock a leave marker may be dated. A marker refuses
+ * every room generation at or below it, so one dated in the far future - in
+ * a backup file, or from a paired device with a broken clock - would refuse
+ * this room's profiles until then.
+ */
+export const MAX_MARKER_SKEW_MS = 5 * 60_000;
+
+/**
+ * Leave markers from another device or a backup. They govern ROOM PROFILES
+ * only: the overrides of a room generation that was left elsewhere are
+ * dropped, and never come back. They never remove a room or its history -
+ * leaving a room on one device is not a decision about this one, and a merge
+ * keeps what is already here (bulkAddNewMessages). A room this device still
+ * holds in the generation the marker names is left entirely alone.
+ */
+export async function applyRoomDeletionMarkers(markers: unknown[]): Promise<void> {
+  const latest = Date.now() + MAX_MARKER_SKEW_MS;
+  const local = new Map((await getAllRoomDeletionMarkers()).map(m => [m.roomCode, m]));
+  for (const value of markers) {
+    if (!isValidRoomDeletionMarker(value)) continue;
+    const marker = value as RoomDeletionMarker;
+    if (marker.generation > latest || marker.deletedAt > latest) continue;
+    const held = local.get(marker.roomCode);
+    if (held && roomDeletionCutoff(held) >= roomDeletionCutoff(marker)) continue;
+    const room = await getRoom(marker.roomCode);
+    if (room?.type === "text") {
+      if (room.createdAt <= roomDeletionCutoff(marker)) continue;
+      // Rejoined here since: the overrides are the new generation's. Keep the
+      // marker, so an older snapshot cannot bring the old ones back.
+      await putRoomDeletionMarker(marker);
+    } else {
+      await deleteRoomProfilesForRoom(marker.roomCode, marker.generation, marker.deletedAt);
+    }
+    local.set(marker.roomCode, marker);
+  }
+}
+
+function roomProfileFromExport(raw: RoomProfileExport): OwnRoomProfileRecord {
+  const fields = { ...raw.fields } as OwnRoomProfileRecord["fields"];
+  for (const key of ["pfpData", "bannerData"] as const) {
+    const value = raw.fields[key];
+    if (typeof value === "string") {
+      const bytes = bytesFromExport(value);
+      if (bytes) fields[key] = bytes;
+      else delete fields[key];
+    }
+  }
+  // A file someone handed you: every value is checked like one off the wire.
+  return { ...raw, fields: sanitizeRoomProfileFields(fields) };
+}
+
+function mergeOwnRoomProfile(local: OwnRoomProfileRecord, remote: OwnRoomProfileRecord): OwnRoomProfileRecord {
+  const fields = { ...local.fields };
+  const fieldEdits = { ...local.fieldEdits };
+  const keys = new Set([...Object.keys(local.fields), ...Object.keys(remote.fields),
+    ...Object.keys(local.fieldEdits ?? {}), ...Object.keys(remote.fieldEdits ?? {})]) as Set<RoomProfileField>;
+  for (const key of keys) {
+    const before = local.fieldEdits?.[key] ?? { at: 0, id: "" };
+    const after = remote.fieldEdits?.[key] ?? { at: 0, id: "" };
+    if (after.at < before.at || (after.at === before.at && after.id < before.id)) continue;
+    if (after.at === before.at && after.id === before.id &&
+        Object.hasOwn(local.fields, key)) continue;
+    if (remote.fieldEdits?.[key]) fieldEdits[key] = remote.fieldEdits[key];
+    if (remote.fieldEdits?.[key]?.reset || !Object.hasOwn(remote.fields, key)) delete fields[key];
+    else (fields as Record<string, unknown>)[key] = remote.fields[key];
+  }
+  return { ...local, fields, fieldEdits };
+}
+import { publicKeyToDid, unlockWithImportedMnemonic, validPbkdf2Iterations } from "../identity/identity";
 import type { MnemonicRecord } from "../identity/identity";
 
 export interface ImportResult {
@@ -61,6 +146,11 @@ export interface ImportResult {
 }
 
 export interface ImportOptions {
+  /** Synchronous cancellation check immediately before irreversible identity
+   * activation/database mutation. Throw to abort with no import writes. Once
+   * accepted, callers must serialize replacement operations until settlement;
+   * the multi-transaction import cannot be rolled back after this boundary. */
+  beforeCommit?: () => void;
   /**
    * Asked for the imported identity's password BEFORE anything is wiped or
    * written, so the at-rest key is armed and sealRow seals every imported row
@@ -93,10 +183,26 @@ function mnemonicRecordFromExport(
     encrypted: new Uint8Array(identity.mnemonic.encrypted).buffer,
     // Absent = written before per-record counts existed = legacy 100k,
     // which is exactly what unlockIdentity assumes when it is undefined.
-    ...(typeof identity.mnemonic.iterations === "number"
-      ? { iterations: identity.mnemonic.iterations }
+    // Anything else must be a count this app could have written: a file
+    // claiming billions made every unlock spin.
+    ...(identity.mnemonic.iterations !== undefined
+      ? { iterations: checkedIterations(identity.mnemonic.iterations) }
       : {}),
   };
+}
+
+function checkedIterations(value: unknown): number {
+  if (!validPbkdf2Iterations(value)) throw new Error("Invalid backup: bad identity record");
+  return value;
+}
+
+/** The keypair section must at least be one key's own DID. */
+function checkedKeypair(identity: NonNullable<DatabaseExport["identity"]>): { did: string; publicKey: Uint8Array<ArrayBuffer> } {
+  const publicKey = new Uint8Array(identity.keypair.publicKey) as Uint8Array<ArrayBuffer>;
+  if (publicKey.length !== 32 || publicKeyToDid(publicKey) !== identity.keypair.did) {
+    throw new Error("Invalid backup: the identity's key does not match its DID");
+  }
+  return { did: identity.keypair.did, publicKey };
 }
 
 export async function importDatabase(
@@ -130,6 +236,8 @@ export async function importDatabase(
     yjsDocs,
     rooms,
     profiles,
+    roomProfiles,
+    roomDeletions,
     savedGifs,
     dropped: droppedRecords,
   } = sanitizeCollections({
@@ -140,6 +248,8 @@ export async function importDatabase(
     yjsDocs: data.yjsDocs,
     rooms: data.rooms,
     profiles: data.profiles,
+    roomProfiles: data.roomProfiles,
+    roomDeletions: data.roomDeletions,
     savedGifs: data.savedGifs,
   });
   if (droppedRecords > 0) {
@@ -157,6 +267,8 @@ export async function importDatabase(
     yjsDocs,
     rooms,
     profiles,
+    roomProfiles,
+    roomDeletions,
     savedGifs,
   };
 
@@ -167,6 +279,12 @@ export async function importDatabase(
   // plaintext originals recoverable, which is exactly what the at-rest design
   // and the duress wipe assume never happens.
   let armed = false;
+  let committed = false;
+  const beforeCommit = () => {
+    if (committed) return;
+    options.beforeCommit?.();
+    committed = true;
+  };
   if (identity && options.requestPassword) {
     const record = mnemonicRecordFromExport(identity);
     for (let retry = false; ; retry = true) {
@@ -176,7 +294,8 @@ export async function importDatabase(
         throw new Error("Import cancelled - nothing on this device changed");
       }
       try {
-        await unlockWithImportedMnemonic(record, password);
+        // Unlocking checks the phrase really is the DID the backup names.
+        await unlockWithImportedMnemonic(record, password, beforeCommit, checkedKeypair(identity).did);
         armed = true;
         break;
       } catch (err) {
@@ -189,6 +308,7 @@ export async function importDatabase(
     }
   }
 
+  beforeCommit();
   if (mode === "replace") {
     // Clear existing data first
     console.log("[Sync] Wiping local database (replace mode)");
@@ -223,12 +343,25 @@ export async function importDatabase(
 /** Messages per import transaction; see the loop in importDatabaseInner. */
 const IMPORT_CHUNK = 200;
 
+/** Drop rows whose signature is present but does not verify. */
+async function withoutForgedSignatures(messages: Message[]): Promise<Message[]> {
+  const { verifyMessage } = await import("../messaging");
+  const keep = await Promise.all(messages.map(async (m) => !m.sig || (await verifyMessage(m))));
+  return messages.filter((_, i) => keep[i]);
+}
+
 async function importDatabaseInner(
   data: DatabaseExport,
   mode: "add" | "replace",
   onProgress?: (done: number, total: number) => void
 ): Promise<void> {
-  const total = EXPORT_SECTIONS.reduce((n, k) => n + data[k].length, 0);
+  // Markers lead the import, so an override from a generation that was left
+  // is never written back (applyRoomDeletionMarkers: profiles only).
+  await applyRoomDeletionMarkers(data.roomDeletions ?? []);
+  const markers = new Map((await getAllRoomDeletionMarkers()).map(m => [m.roomCode, roomDeletionCutoff(m)]));
+  const survives = (roomCode: string, generation: number): boolean =>
+    generation > (markers.get(roomCode) ?? -1);
+  const total = EXPORT_SECTIONS.reduce((n, k) => n + (data[k]?.length ?? 0), 0);
   let done = 0;
   const tick = (n = 1): void => {
     done += n;
@@ -242,11 +375,7 @@ async function importDatabaseInner(
     console.log("[Sync] Importing identity");
     const mnemonicRecord = mnemonicRecordFromExport(data.identity);
 
-    const keypairRecord = {
-      id: "keypair" as const,
-      did: data.identity.keypair.did,
-      publicKey: new Uint8Array(data.identity.keypair.publicKey),
-    };
+    const keypairRecord = { id: "keypair" as const, ...checkedKeypair(data.identity) };
 
     await putIdentityRecord(mnemonicRecord);
     await putIdentityRecord(keypairRecord);
@@ -265,16 +394,25 @@ async function importDatabaseInner(
   // real history that silence outlasted the source's ack clock.
   for (let i = 0; i < data.messages.length; i += IMPORT_CHUNK) {
     const chunk = data.messages.slice(i, i + IMPORT_CHUNK);
-    await bulkPutMessages(chunk);
+    if (mode === "add") {
+      // A merge keeps what is already here: see bulkAddNewMessages. And a
+      // row that carries a signature which does not verify is a forgery -
+      // every version a real row was ever signed with still verifies.
+      await bulkAddNewMessages(await withoutForgedSignatures(chunk));
+    } else {
+      await bulkPutMessages(chunk);
+    }
     tick(chunk.length);
   }
   const writes: Promise<unknown>[] = [
-    ...data.attachments.map((a) =>
-      putAttachment({
+    ...data.attachments.map(async (a) => {
+      // Likewise: a merge never replaces the bytes of a file already held.
+      if (mode === "add" && (await getAttachment(a.id))) return;
+      await putAttachment({
         ...a,
         data: bytesFromExport(a.data),
-      } as Attachment)
-    ),
+      } as Attachment);
+    }),
     ...data.rooms.map((r) => {
       const importedRoom = pfpFromJson(r);
       if (mode === "add") {
@@ -306,7 +444,16 @@ async function importDatabaseInner(
             const importedUpdatedAt = (importedProfile as PeerProfile).updatedAt ?? 0;
             const localUpdatedAt = (localProfile as PeerProfile | undefined)?.updatedAt ?? 0;
             if (importedUpdatedAt >= localUpdatedAt) {
-              await putPeerProfile(importedProfile as PeerProfile);
+              // A newer row from a device that never heard their PQ key must
+              // not erase the one this device holds: losing it quietly drops
+              // sealing for them back to X25519 only. Every use re-verifies
+              // the certificate, so keeping either copy trusts nothing new.
+              const pqKey =
+                (importedProfile as PeerProfile).pqKey ?? localProfile?.pqKey;
+              await putPeerProfile({
+                ...(importedProfile as PeerProfile),
+                ...(pqKey ? { pqKey } : {}),
+              });
             }
           }
         })();
@@ -374,6 +521,31 @@ async function importDatabaseInner(
     }),
   ];
   await Promise.all(writes.map((w) => w.then(() => tick())));
+  for (const local of await getAllOwnRoomProfiles()) {
+    const room = await getRoom(local.roomCode);
+    if (room?.type === "text" && room.createdAt !== local.generation &&
+        survives(local.roomCode, local.generation)) {
+      await putOwnRoomProfile({ ...local, generation: room.createdAt });
+    }
+  }
+  // Our own overrides only: a row under another DID would be shown as ours.
+  const selfDid = (await getKeypairRecord())?.did;
+  for (const raw of data.roomProfiles ?? []) {
+    if (selfDid && raw.did === selfDid && survives(raw.roomCode, raw.generation)) {
+      const room = await getRoom(raw.roomCode);
+      if (room?.type === "text") {
+        // Separate devices can first join the same room at different times.
+        // The marker check above prevents an older, pre-leave override from
+        // being promoted into a deliberate rejoin.
+        const imported = { ...roomProfileFromExport(raw), generation: room.createdAt };
+        const local = mode === "add" ? await getOwnRoomProfile(raw.roomCode, raw.did) : undefined;
+        await putOwnRoomProfile(local && local.generation === imported.generation
+          ? mergeOwnRoomProfile(local, imported) : imported);
+      }
+    }
+    tick();
+  }
+  tick((data.roomDeletions ?? []).length);
 }
 
 // ── File backup (QR-less alternative to device sync) ─────────────────────────

@@ -7,6 +7,10 @@
  * be re-scrolled once the images finished, and why a loading skeleton could
  * not be drawn at the right size. They are measured once by the sender, who
  * already holds the file, and travel with the announce.
+ *
+ * Also the size a peer's inline avatar or banner claims in its header, read
+ * without decoding it, and the size a GIF's still frame is drawn at: both
+ * keep an image from costing what its own dimensions would.
  */
 
 /**
@@ -193,4 +197,277 @@ async function measureVideo(
     releaseOnTimeout.delete(release);
     release();
   }
+}
+
+type Size = { width: number; height: number };
+/** A file's byte at `i`, or -1 past its end. */
+type ByteAt = (i: number) => number;
+
+/**
+ * The pixel size an image declares in its header, read without decoding
+ * it: GIF, PNG, WebP and JPEG. Null for any other format, or for a header
+ * cut short.
+ */
+export function declaredImageSize(byteAt: ByteAt): Size | null {
+  return (
+    gifSize(byteAt) ?? pngSize(byteAt) ?? webpSize(byteAt) ?? jpegSize(byteAt)
+  );
+}
+
+/** `n` bytes from `at`, or null when the file ends first. */
+function bytesAt(byteAt: ByteAt, at: number, n: number): number[] | null {
+  const out: number[] = [];
+  for (let k = 0; k < n; k++) {
+    const b = byteAt(at + k);
+    if (b < 0) return null;
+    out.push(b);
+  }
+  return out;
+}
+
+const ascii = (b: number[], at: number, n: number) =>
+  String.fromCharCode(...b.slice(at, at + n));
+
+/**
+ * The logical screen, grown to fit the first frame: Chromium and Firefox
+ * both grow it, so a 1x1 screen around a 16383x16383 frame decodes at the
+ * frame's size.
+ */
+function gifSize(byteAt: ByteAt): Size | null {
+  const head = bytesAt(byteAt, 0, 13);
+  if (!head || ascii(head, 0, 3) !== "GIF") return null;
+  let width = head[6] | (head[7] << 8);
+  let height = head[8] | (head[9] << 8);
+  // Past the global colour table, then past any extensions: each is a run
+  // of sub-blocks that an empty one ends.
+  let at = 13 + (head[10] & 0x80 ? 3 << ((head[10] & 7) + 1) : 0);
+  while (byteAt(at) === 0x21) {
+    at += 2;
+    for (let len = byteAt(at); len > 0; len = byteAt(at)) at += len + 1;
+    at++;
+  }
+  const frame = byteAt(at) === 0x2c ? bytesAt(byteAt, at + 1, 8) : null;
+  if (frame) {
+    const [left, top, w, h] = [0, 2, 4, 6].map((k) => frame[k] | (frame[k + 1] << 8));
+    width = Math.max(width, left + w);
+    height = Math.max(height, top + h);
+  }
+  return { width, height };
+}
+
+const u32 = (b: number[], at: number) =>
+  b[at] * 0x1000000 + ((b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]);
+
+/** The IHDR chunk, which must come first. */
+function pngSize(byteAt: ByteAt): Size | null {
+  const head = bytesAt(byteAt, 0, 24);
+  if (!head || head[0] !== 0x89 || ascii(head, 1, 3) !== "PNG") return null;
+  if (ascii(head, 12, 4) !== "IHDR") return null;
+  return { width: u32(head, 16), height: u32(head, 20) };
+}
+
+/** An extended WebP's canvas (an animated one is extended), or its one bitstream's size. */
+function webpSize(byteAt: ByteAt): Size | null {
+  const head = bytesAt(byteAt, 0, 30);
+  if (!head || ascii(head, 0, 4) !== "RIFF" || ascii(head, 8, 4) !== "WEBP") return null;
+  switch (ascii(head, 12, 4)) {
+    case "VP8X":
+      return {
+        width: 1 + (head[24] | (head[25] << 8) | (head[26] << 16)),
+        height: 1 + (head[27] | (head[28] << 8) | (head[29] << 16)),
+      };
+    case "VP8 ":
+      // After the frame tag and the start code: 14 bits a side.
+      return {
+        width: (head[26] | (head[27] << 8)) & 0x3fff,
+        height: (head[28] | (head[29] << 8)) & 0x3fff,
+      };
+    case "VP8L": {
+      // After the signature byte: 14 bits of width - 1, then of height - 1.
+      const bits = head[21] | (head[22] << 8) | (head[23] << 16) | (head[24] << 24);
+      return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >>> 14) & 0x3fff) };
+    }
+  }
+  return null;
+}
+
+/**
+ * The frame header, walking the segments before it by their lengths, so a
+ * padded EXIF block cannot push it out of reach and an embedded thumbnail
+ * is never mistaken for it.
+ */
+function jpegSize(byteAt: ByteAt): Size | null {
+  if (byteAt(0) !== 0xff || byteAt(1) !== 0xd8) return null;
+  let at = 2;
+  for (;;) {
+    if (byteAt(at) !== 0xff) return null;
+    while (byteAt(at + 1) === 0xff) at++;
+    const marker = byteAt(at + 1);
+    at += 2;
+    // TEM, RST0-7 and SOI carry no length.
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
+    const length = bytesAt(byteAt, at, 2);
+    // The end of the image, or the scan begins, with no frame header yet.
+    if (!length || marker === 0xd9 || marker === 0xda) return null;
+    // SOF0-15, except DHT, JPG and DAC, which share the range.
+    const sofn = marker >= 0xc0 && marker <= 0xcf;
+    if (sofn && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      const sof = bytesAt(byteAt, at + 2, 5);
+      return sof && { width: (sof[3] << 8) | sof[4], height: (sof[1] << 8) | sof[2] };
+    }
+    const len = (length[0] << 8) | length[1];
+    if (len < 2) return null;
+    at += len;
+  }
+}
+
+/**
+ * The size a base64 data: URL's image declares, decoding only the parts of
+ * it the header walk reads, 3 KiB at a time: never the whole picture, which
+ * is what the check is there to avoid.
+ */
+export function dataUrlImageSize(url: string): Size | null {
+  const b64 = url.slice(url.indexOf(",") + 1);
+  const WINDOW = 3072;
+  let start = -1;
+  let chunk = "";
+  return declaredImageSize((i) => {
+    const at = i - (i % WINDOW);
+    if (at !== start) {
+      start = at;
+      const chars = b64.slice((at / 3) * 4, ((at + WINDOW) / 3) * 4);
+      try {
+        chunk = atob(chars.padEnd(Math.ceil(chars.length / 4) * 4, "="));
+      } catch {
+        chunk = "";
+      }
+    }
+    return i - at < chunk.length ? chunk.charCodeAt(i - at) : -1;
+  });
+}
+
+/**
+ * The most an avatar or banner sent inline may claim to be, a side. The
+ * picker sends 256 and 840. A peer's hand-made 16383x16383 GIF is a few
+ * dozen bytes that decode to a gigabyte, in every place it is drawn, and
+ * it is stored and drawn again on every launch.
+ */
+const MAX_PROFILE_IMAGE_SIDE = 4096;
+
+/**
+ * Whether an inline avatar or banner claims a size worth drawing. A format
+ * not read here (AVIF) or a header cut short passes, as before: GifImage
+ * bounds every still frame it draws, whatever arrives.
+ */
+export function profileImageFits(dataUrl: string): boolean {
+  const size = dataUrlImageSize(dataUrl);
+  return (
+    !size ||
+    (size.width <= MAX_PROFILE_IMAGE_SIDE &&
+      size.height <= MAX_PROFILE_IMAGE_SIDE)
+  );
+}
+
+/**
+ * A still frame's longest side, in canvas pixels: far more than an avatar
+ * or a GIF in a message is ever shown at.
+ */
+const MAX_FRAME_SIDE = 1024;
+
+/**
+ * Past this an animated image is not decoded at all, for a still frame or
+ * to play: 4096x4096 is 64 MB decoded.
+ */
+const MAX_FRAME_PIXELS = 4096 * 4096;
+
+export function canDecodeStillFrame(width: number, height: number): boolean {
+  return width > 0 && height > 0 && width * height <= MAX_FRAME_PIXELS;
+}
+
+/**
+ * What GifImage shows of an animated image, by the size a copy of it
+ * loaded out of the page turned out to be: undefined while that loads,
+ * null if it failed. Only "shown" draws a still frame or mounts the img
+ * that plays it. The browser decodes that img at full size, once per url,
+ * so an image past MAX_FRAME_PIXELS, or one whose size is not known, never
+ * gets one: each of a peer's GIF links could cost a gigabyte.
+ */
+export function animatedView(
+  size: Size | null | undefined
+): "loading" | "shown" | "too-large" | "failed" {
+  if (size === undefined) return "loading";
+  if (size === null) return "failed";
+  return size.width * size.height > MAX_FRAME_PIXELS ? "too-large" : "shown";
+}
+
+/**
+ * The canvas for a still frame of a `naturalWidth` x `naturalHeight`
+ * image shown in a `shownWidth` x `shownHeight` box (CSS pixels, 0 when
+ * unknown): the image's own shape, with the pixels to cover the box at
+ * `pixelRatio`, never more than the image has, nor MAX_FRAME_SIDE a side.
+ * Null for an image too large to decode for one.
+ *
+ * Every canvas is a backing store of its own, so drawing each at the
+ * image's size put a peer's 16383x16383 avatar at a gigabyte in every
+ * place it appeared: the user list, each of their message groups, a
+ * profile card, a call tile.
+ */
+export function stillFrameSize(
+  naturalWidth: number,
+  naturalHeight: number,
+  shownWidth: number,
+  shownHeight: number,
+  pixelRatio: number
+): Size | null {
+  if (!canDecodeStillFrame(naturalWidth, naturalHeight)) return null;
+  let scale = Math.min(
+    1,
+    MAX_FRAME_SIDE / Math.max(naturalWidth, naturalHeight)
+  );
+  if (shownWidth > 0 && shownHeight > 0) {
+    const ratio = Math.max(1, pixelRatio || 1);
+    // Enough to cover the box: an avatar crops the frame to fill it.
+    const cover = Math.max(
+      (shownWidth * ratio) / naturalWidth,
+      (shownHeight * ratio) / naturalHeight
+    );
+    scale = Math.min(scale, cover);
+  }
+  return {
+    width: Math.max(1, Math.round(naturalWidth * scale)),
+    height: Math.max(1, Math.round(naturalHeight * scale)),
+  };
+}
+
+/**
+ * Whether a still frame drawn at `drawn` (undefined before the first) is
+ * drawn again for a box that now needs `needed`: only to grow. A box that
+ * grows after the first frame, past a breakpoint or with a zoom, gets a
+ * sharp one; one that shrinks keeps the sharper frame it has; and a redraw,
+ * which can move the box, cannot set off redraws without end, each being
+ * larger than the last, up to stillFrameSize's bound.
+ */
+export function stillFrameGrows(drawn: Size | undefined, needed: Size): boolean {
+  return !drawn || needed.width > drawn.width || needed.height > drawn.height;
+}
+
+/**
+ * The still frame to draw now for a box of `shownWidth` x `shownHeight`
+ * CSS pixels, or null to keep the one at `drawn`. A box of nothing past the
+ * first frame keeps it: a canvas hidden with display:none is measured at
+ * 0x0, which stillFrameSize reads as no box at all and answers with the
+ * image's own size, and every avatar hidden that way would have grown to
+ * MAX_FRAME_SIDE a side and kept it once shown again.
+ */
+export function stillFrameRedraw(
+  drawn: Size | undefined,
+  naturalWidth: number,
+  naturalHeight: number,
+  shownWidth: number,
+  shownHeight: number,
+  pixelRatio: number
+): Size | null {
+  if (drawn && !(shownWidth > 0 && shownHeight > 0)) return null;
+  const size = stillFrameSize(naturalWidth, naturalHeight, shownWidth, shownHeight, pixelRatio);
+  return size && stillFrameGrows(drawn, size) ? size : null;
 }
