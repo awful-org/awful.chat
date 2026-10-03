@@ -9,7 +9,7 @@
   import AudioSettings from "./settings/AudioSettings.svelte";
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
-  import { RELAY_TIP } from "$lib/copy";
+  import { RELAY_TIP, TURN_TIP } from "$lib/copy";
   import {
     addToPhonebook,
     isInPhonebook,
@@ -128,7 +128,7 @@ import {
 import { stageCameraHidden, stageCameraShown } from "$lib/call-cameras.svelte";
 import { remoteCameraTileId } from "$lib/call-tiles";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
-import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
+import { peerQualityState, voiceLinkState, voiceRouteState } from "$lib/call-peer-quality.svelte";
 import type { PeerVoiceQuality } from "$lib/call-quality";
 import {
   ambientStyle,
@@ -2027,6 +2027,22 @@ import {
                 class="pointer-events-auto ml-1 inline-flex cursor-help"
               >
                 <Workflow class="size-3 text-blue-400" />
+              </button>
+            {/snippet}
+          </Tip>
+        {/if}
+        <!-- This person's voice route, not the chat connection above: their
+             audio goes through a TURN server (voiceRouteState). -->
+        {#if !tile.isLocal && voiceRouteState.turn.has(tile.peerId)}
+          <Tip text={TURN_TIP} side="top">
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                aria-label="Voice via TURN"
+                class="pointer-events-auto ml-1 inline-flex cursor-help"
+              >
+                <Radio class="size-3 text-yellow-400" />
               </button>
             {/snippet}
           </Tip>

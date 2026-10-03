@@ -13,6 +13,7 @@ import {
   applyPeerQualityEvent,
   notePeerQualityTrack,
   setVoiceLink,
+  setVoiceTurn,
 } from "$lib/call-peer-quality.svelte";
 import type { CallQualityStatusEvent } from "$lib/call-quality";
 
@@ -115,6 +116,9 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
     ) {
       applyPeerQualityEvent(status as CallQualityStatusEvent);
     }
+    // The route, kept apart from the quality verdict (call-peer-quality).
+    if (status.type === "voice-ice-connected") setVoiceTurn(status.peerId, status.relayed === true);
+    else if (status.type === "voice-peer-left") setVoiceTurn(status.peerId, false);
   });
 
   restoreVoicePrefs();

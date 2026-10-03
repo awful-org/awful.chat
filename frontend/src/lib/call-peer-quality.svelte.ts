@@ -48,8 +48,27 @@ export function setVoiceLink(peerId: string, up: boolean): void {
   voiceLinkState.connected = next;
 }
 
+/**
+ * Peers whose voice currently goes through a TURN relay, from the pair the
+ * browser actually selected (voice.ts reads it from getStats). Its own set,
+ * not a quality: a degraded or failed verdict says nothing about the route,
+ * and a route on TURN is not a fault. Tiles badge these people.
+ */
+export const voiceRouteState = $state({
+  turn: new Set<string>() as ReadonlySet<string>,
+});
+
+export function setVoiceTurn(peerId: string, onTurn: boolean): void {
+  if (voiceRouteState.turn.has(peerId) === onTurn) return;
+  const next = new Set(voiceRouteState.turn);
+  if (onTurn) next.add(peerId);
+  else next.delete(peerId);
+  voiceRouteState.turn = next;
+}
+
 /** Call teardown: verdicts are about links that no longer exist. */
 export function resetPeerQuality(): void {
   if (peerQualityState.peers.size > 0) peerQualityState.peers = new Map();
   if (voiceLinkState.connected.size > 0) voiceLinkState.connected = new Set();
+  if (voiceRouteState.turn.size > 0) voiceRouteState.turn = new Set();
 }
