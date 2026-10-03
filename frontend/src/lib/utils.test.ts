@@ -76,6 +76,17 @@ describe("normalizeAvatarUrl", () => {
     expect(normalizeAvatarUrl("data:image/png,notbase64")).toBeUndefined();
     expect(normalizeAvatarUrl("data:image/png;base64,ab cd")).toBeUndefined();
   });
+
+  // 35 bytes declaring a 16383x16383 screen: a gigabyte decoded, in every
+  // place a peer's avatar is drawn, on every launch.
+  it("rejects a data: image that claims more than 4096 px a side", () => {
+    const bomb = "data:image/gif;base64,R0lGODlh/z//P4AAAAAAAP///ywAAAAA/z//PwACAkwBADs=";
+    const hidden = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAA/z//PwACAkwBADs=";
+    expect(normalizeAvatarUrl(bomb)).toBeUndefined();
+    expect(normalizeAvatarUrl(hidden)).toBeUndefined();
+    const avatar = "data:image/gif;base64,R0lGODlhAAEAAYAAAAAAAP///ywAAAAAAAEAAQACAkwBADs=";
+    expect(normalizeAvatarUrl(avatar)).toBe(avatar);
+  });
 });
 
 describe("normalizeNicknameColor", () => {

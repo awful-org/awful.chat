@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { profileImageFits } from "./image-size";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -124,9 +125,11 @@ export function normalizeAvatarUrl(url: unknown): string | undefined {
   if (typeof url !== "string") return undefined;
   // An avatar picked from the device is sent inline as a data: URL - rejecting
   // those meant uploaded pictures never propagated to anyone, only linked ones.
+  // Its bytes are capped, and so is the size its header claims: a few dozen
+  // bytes can claim 16383x16383.
   if (url.startsWith("data:")) {
     if (url.length > MAX_DATA_AVATAR_LEN) return undefined;
-    return DATA_AVATAR_RE.test(url) ? url : undefined;
+    return DATA_AVATAR_RE.test(url) && profileImageFits(url) ? url : undefined;
   }
   try {
     const parsed = new URL(url);
