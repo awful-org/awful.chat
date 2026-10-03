@@ -282,12 +282,6 @@
   let commandSelectedIndex = $state(0);
   let commandHint = $state<string | null>(null);
   let submitting = $state(false);
-  /**
-   * The "Saving and sending" line is for attachments only. A text message
-   * settles in a blink, and the line flashed (and nudged the composer) on
-   * every one; images and files take long enough to be worth saying so.
-   */
-  let submittingFiles = $state(false);
   let sendError = $state<string | null>(null);
   let commandHintTimer: ReturnType<typeof setTimeout> | undefined;
   let mentionPopupOpen = $state(false);
@@ -1003,7 +997,6 @@
     const submittedRoom = roomCode;
     const submittedFiles = [...stagedFiles];
     submitting = true;
-    submittingFiles = submittedFiles.length > 0;
     sendError = null;
     try {
 
@@ -1070,18 +1063,45 @@
 
     if (stagedFiles.length > 0) {
       const sendToken = beginSendingPreview(stagedFiles, wireText);
-      await sendFiles(submittedFiles, wireText, {
-        replyTo: replyTarget
-          ? {
-              id: replyTarget.id,
-              senderName: displayName(replyTarget),
-              content: getQuotableText(replyTarget),
-            }
-          : undefined,
-      }).finally(() => {
+      const replyTo = replyTarget
+        ? {
+            id: replyTarget.id,
+            senderName: displayName(replyTarget),
+            content: getQuotableText(replyTarget),
+          }
+        : undefined;
+      // The message is on screen already, where it will land (the sending
+      // row), so the composer empties now, as in any chat app. It used to
+      // hold the draft, the staged picture and a "Saving and sending" line
+      // until the send finished - a second copy of the message, off to the
+      // side. A send that fails hands everything back.
+      const submittedReplyId = replyTargetId;
+      const submittedMentions = new Map(draftMentionMap);
+      clearStagedFiles();
+      stopTyping();
+      draft = "";
+      replyTargetId = null;
+      draftMentionMap.clear();
+      mentionPopupOpen = false;
+      autoScroll = true;
+      requestAnimationFrame(() => autoResize());
+      try {
+        await sendFiles(submittedFiles, wireText, { replyTo });
+      } catch (err) {
+        // Back into the composer, unless something new was started there.
+        if (roomCode === submittedRoom && !draft && stagedFiles.length === 0) {
+          draft = submittedDraft;
+          for (const [name, did] of submittedMentions) draftMentionMap.set(name, did);
+          replyTargetId = submittedReplyId;
+          stagedFiles = submittedFiles;
+          requestAnimationFrame(() => autoResize());
+        }
+        throw err;
+      } finally {
         clearSendingPreview(sendToken);
-      });
-      if (roomCode === submittedRoom && stagedFiles.length === submittedFiles.length && stagedFiles.every((f, i) => f === submittedFiles[i])) clearStagedFiles();
+      }
+      requestAnimationFrame(() => textareaEl?.focus());
+      return;
     } else if (replyTarget) {
       await sendReply(wireText, replyTarget);
     } else {
@@ -1105,7 +1125,6 @@
       sendError = err instanceof Error ? err.message : "Could not send. Your draft and files have been kept.";
     } finally {
       submitting = false;
-      submittingFiles = false;
     }
   }
 
@@ -3070,6 +3089,11 @@
                           class="size-full object-cover"
                           animate="hover"
                         />
+                      {:else if isOwn}
+                        <!-- Our own initial from our nickname, as the
+                             sidebar shows it: the message's stored name can
+                             be a placeholder ("You"). -->
+                        {(ownProfile.nickname || "You").charAt(0).toUpperCase()}
                       {:else}
                         {initials(msg)}
                       {/if}
@@ -3268,55 +3292,83 @@
           {/each}
 
           {#if sendingPreviews.length > 0}
-            <!-- The message before it exists. It sits where it will land and
-                 pulses until the real one replaces it, which is the whole
-                 point: a line of text above the input described the send
-                 happening somewhere else, and left the place it was going
-                 empty. -->
-            <div class="mb-3 flex flex-col items-end gap-1">
-              <div
-                class="flex max-w-[85%] animate-pulse flex-col gap-1.5 rounded-lg bg-primary/10 p-2"
-                aria-live="polite"
-                aria-label="Sending"
-              >
-                {#each sendingPreviews as p, i (i)}
-                  {#if p.url && p.type.startsWith("image/")}
-                    <img
-                      src={p.url}
-                      alt={p.name}
-                      class="max-h-56 max-w-xs rounded-md object-contain"
-                    />
-                  {:else if p.url && p.type.startsWith("video/")}
-                    <!-- svelte-ignore a11y_media_has_caption -->
-                    <video
-                      src={p.url}
-                      class="max-h-56 max-w-xs rounded-md"
-                      muted
-                      playsinline
-                    ></video>
-                  {:else}
-                    <div
-                      class="flex items-center gap-2 rounded bg-muted/60 px-2 py-1.5"
+            <!-- The message before it exists, drawn as the message it will
+                 be: our own row, in the place it will land, with the picture
+                 or file at its real size and dimmed until the real one
+                 replaces it. A bubble on the right read as something else
+                 entirely in a chat whose messages all sit on the left. -->
+            {@const lastShown = renderedMessages[renderedMessages.length - 1]}
+            {@const sendingHeader =
+              !lastShown ||
+              !isSelfSender(lastShown.senderId) ||
+              Date.now() - lastShown.timestamp > 2 * 60 * 1000}
+            <div
+              class="rounded-md px-2 py-0.5 {sendingHeader ? 'mt-3 pt-1' : ''}"
+              aria-live="polite"
+              aria-label="Sending"
+            >
+              {#if sendingHeader}
+                {@const own = ownProfile}
+                {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
+                <div class="flex items-start gap-2">
+                  <div
+                    class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden bg-primary/20 text-xs font-semibold font-mono text-primary"
+                    style={own.color ? `color: ${own.color}` : ""}
+                  >
+                    {#if own.avatarUrl}
+                      <GifImage src={own.avatarUrl} alt="You" class="size-full object-cover" />
+                    {:else}
+                      {(own.nickname || "You").charAt(0).toUpperCase()}
+                    {/if}
+                  </div>
+                  <div class="flex min-w-0 items-baseline gap-2">
+                    <span
+                      class="max-w-72 truncate text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
+                        ? 'italic'
+                        : ''} {effectStyle.class}"
+                      style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
                     >
-                      <FileText class="size-4 shrink-0 text-muted-foreground" />
-                      <div class="min-w-0">
-                        <p class="truncate text-xs text-foreground">{p.name}</p>
-                        <p class="text-[10px] text-muted-foreground">
-                          {formatSize(p.size)}
-                        </p>
-                      </div>
-                    </div>
-                  {/if}
-                {/each}
+                      {own.nickname || "You"}
+                    </span>
+                    <span class="text-xs text-muted-foreground">Sending…</span>
+                  </div>
+                </div>
+              {/if}
+              <div class="ml-9 flex flex-col items-start opacity-50">
                 {#if sendingCaption}
-                  <p class="whitespace-pre-wrap break-words text-sm">
+                  <p class="mb-2 whitespace-pre-wrap break-words text-(length:--chat-font-size) leading-normal text-foreground">
                     {stripMarkdown(sendingCaption, resolveMentionDisplayName)}
                   </p>
                 {/if}
+                <!-- The same card the sent message shows, so nothing moves
+                     when it replaces this. -->
+                <div class="w-full space-y-2">
+                  {#each sendingPreviews as p, i (i)}
+                    <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
+                      <p class="truncate text-sm text-foreground">{p.name}</p>
+                      <p class="text-xs text-muted-foreground">{formatSize(p.size)} • sending…</p>
+                      {#if p.url && p.type.startsWith("image/")}
+                        <img
+                          src={p.url}
+                          alt={p.name}
+                          class="mt-2 max-h-56 max-w-xs rounded-md object-contain"
+                        />
+                      {:else if p.url && p.type.startsWith("video/")}
+                        <!-- svelte-ignore a11y_media_has_caption -->
+                        <video
+                          src={p.url}
+                          class="mt-2 max-h-56 max-w-xs rounded-md"
+                          muted
+                          playsinline
+                        ></video>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
               </div>
-              <span class="font-mono text-[10px] text-muted-foreground">
-                Sending...
-              </span>
+              {#if !sendingHeader}
+                <span class="ml-9 text-xs text-muted-foreground">Sending…</span>
+              {/if}
             </div>
           {/if}
         </div>
@@ -3556,8 +3608,6 @@
         />
         {#if sendError}
           <p role="alert" class="mb-1 rounded border border-destructive/30 bg-background px-2 py-1 text-xs text-destructive">{sendError}</p>
-        {:else if submittingFiles}
-          <p role="status" class="px-2 py-1 text-xs text-muted-foreground">Saving and sending…</p>
         {:else if serialize(draft, draftMentionMap).length > MAX_CHAT_CONTENT_LENGTH}
           <p role="status" class="px-2 py-1 text-xs text-muted-foreground">This long message will be sent as message.txt.</p>
         {/if}
