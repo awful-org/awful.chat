@@ -4,6 +4,7 @@
   import type { Message } from "$lib/transport/transport.svelte";
   import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
   import { roomMemberCount } from "$lib/room-members";
+  import { highlightBusy } from "$lib/actions/message-body";
   import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
@@ -779,64 +780,76 @@
 
   /**
    * Opening a conversation lands in several steps: the stored page renders,
-   * the view jumps to its newest row, code blocks and markdown settle to
+   * the view jumps to its newest row, code blocks and pictures settle to
    * their final height, then the history peers push in arrives and the view
-   * jumps again. Each step moved what was on screen, and together they read
-   * as the chat flickering. So the rows render hidden behind a skeleton until
-   * they have landed - the view anchored and nothing changing for a moment -
-   * and are shown once, in place. Never for long: a slow sync or a slow
-   * device gets the real rows after SETTLE_MAX_MS whatever is still moving.
+   * moves again. Each step moved what was on screen, and together they read
+   * as the chat flickering. So the rows render under a skeleton until they
+   * have landed, and are shown once, in place.
+   *
+   * Landed is checked each frame, not guessed with a delay: the stored page
+   * is in, the view sits at the newest row (or the room is empty), no code
+   * block is waiting to be highlighted, no history push into the room is
+   * running, every picture on screen has loaded, and the list's height held
+   * still from one frame to the next. SETTLE_FALLBACK_MS is not a guess at
+   * any of these; it is only there so something that never reports done
+   * cannot keep the conversation covered.
    */
-  const SETTLE_QUIET_MS = 300;
-  /** An empty room has no rows to wait for: this long with none, and it is. */
-  const SETTLE_EMPTY_MS = 700;
-  const SETTLE_MAX_MS = 2500;
+  const SETTLE_FALLBACK_MS = 5000;
   let settling = $state(true);
-  let settleQuiet: ReturnType<typeof setTimeout> | undefined;
-  let settleCap: ReturnType<typeof setTimeout> | undefined;
+  let settleFrame = 0;
+  let settleStarted = 0;
+  let lastHeight = -1;
 
   function beginSettling() {
-    clearTimeout(settleQuiet);
-    clearTimeout(settleCap);
     settling = true;
-    settleCap = setTimeout(endSettling, SETTLE_MAX_MS);
-    noteSettleActivity();
+    settleStarted = performance.now();
+    lastHeight = -1;
+    if (!settleFrame) settleFrame = requestAnimationFrame(checkSettled);
   }
 
   function endSettling() {
-    clearTimeout(settleQuiet);
-    clearTimeout(settleCap);
+    if (settleFrame) cancelAnimationFrame(settleFrame);
+    settleFrame = 0;
     if (!settling) return;
     if (autoScroll) scrollToBottom();
     settling = false;
   }
 
-  /** Something moved: the quiet period starts over. */
-  function noteSettleActivity() {
+  function picturesOnScreenLoaded(el: HTMLElement): boolean {
+    const box = el.getBoundingClientRect();
+    for (const img of el.querySelectorAll("img")) {
+      if (img.complete) continue;
+      const r = img.getBoundingClientRect();
+      if (r.bottom > box.top && r.top < box.bottom) return false;
+    }
+    return true;
+  }
+
+  function checkSettled() {
+    settleFrame = 0;
     if (!settling) return;
-    clearTimeout(settleQuiet);
-    settleQuiet = setTimeout(
-      () => {
-        // A sync into this room is still running: its rows are part of the
-        // landing, so only the cap ends it early.
-        if (untrack(() => syncing) !== null) return;
-        if (initialScrollDone || untrack(() => visibleMessages.length) === 0) endSettling();
-      },
-      untrack(() => visibleMessages.length) === 0 ? SETTLE_EMPTY_MS : SETTLE_QUIET_MS
-    );
+    const el = messagesEl;
+    const height = el?.scrollHeight ?? -1;
+    const still = height === lastHeight;
+    lastHeight = height;
+    const empty = visibleMessages.length === 0;
+    const landed =
+      !!el &&
+      transportState.historyRoom === roomCode &&
+      (empty || initialScrollDone) &&
+      !highlightBusy() &&
+      syncing === null &&
+      picturesOnScreenLoaded(el) &&
+      still;
+    if (landed || performance.now() - settleStarted > SETTLE_FALLBACK_MS) {
+      endSettling();
+      return;
+    }
+    settleFrame = requestAnimationFrame(checkSettled);
   }
 
   onDestroy(() => {
-    clearTimeout(settleQuiet);
-    clearTimeout(settleCap);
-  });
-
-  $effect(() => {
-    visibleMessages.length;
-    renderedMessages.length;
-    initialScrollDone;
-    syncing;
-    untrack(noteSettleActivity);
+    if (settleFrame) cancelAnimationFrame(settleFrame);
   });
 
   // Scroll on new messages if autoScroll is enabled
@@ -868,7 +881,6 @@
   $effect(() => {
     if (!messagesEl || typeof MutationObserver === "undefined") return;
     const observer = new MutationObserver(() => {
-      noteSettleActivity();
       if (autoScroll) {
         requestAnimationFrame(() => scrollToBottom());
       }
