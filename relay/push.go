@@ -18,12 +18,18 @@ package main
 // /push/unsubscribe deletes it.
 //
 // WHAT THE RELAY SENDS. The whole message is {"t":"mail"} - "check your
-// box". No sender, no room, no count, no content, and at most one per box
-// per minute, so the wake-up stream is not a finer traffic-analysis channel
-// than the deposit stream a push service would already see. Everything real
-// stays sealed in the mailbox blob the device collects once it is awake.
+// box". No sender, no room, no count, no content, at most one per box per
+// minute, and to one device only once until that device has collected its
+// box (pushRearmAfter), so the wake-up stream is not a finer traffic-analysis
+// channel than the deposit stream a push service would already see.
+// Everything real stays sealed in the mailbox blob the device collects once
+// it is awake.
 
 import (
+	"container/list"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -31,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +63,17 @@ const (
 	// wakes, so a second push would cost battery and tell the push vendor
 	// more about this box's traffic than it needs to know.
 	pushCoalesceWindow = time.Minute
+	// After a wake-up reaches a device, that device is not woken again until
+	// it has collected its box - or subscribed again, which every unlock
+	// does - or this long has passed. A deposit is anonymous and names no
+	// sender, and the service worker shows every push as "New message", so
+	// with the minute above as the only limit anyone who knew a did could
+	// make a closed phone ring every minute, junk and message requests
+	// alike, and blocking somebody did nothing. One push already says
+	// everything waiting: until the device has looked, a second one says
+	// nothing new. What remains is one ring per hour that the app stays
+	// closed; real mail still wakes it at once after every collect.
+	pushRearmAfter = time.Hour
 	// pushWorkers drain this. A burst that outruns delivery drops wake-ups
 	// rather than growing without bound - the mailbox still holds the
 	// message, and the next deposit or foreground collect finds it.
@@ -99,8 +117,20 @@ const (
 	// Boxes holding subscriptions. Subscribing needs a did signature, but
 	// dids are free to mint, so without a ceiling this is an unbounded
 	// on-disk sink for anyone with curl - the same reasoning as
-	// mailboxGlobalMaxBoxes.
+	// mailboxGlobalMaxBoxes. A full store sheds the box subscribed to
+	// longest ago rather than refusing (pushShedOldest).
 	pushMaxBoxes = 65536
+	// The part of pushMaxBoxes one source may hold: an IPv4 address or an
+	// IPv6 /56 (shareKey), and ipv6AggregateFactor times that for the /48
+	// around it, so one allocation's 256 /56s are not 256 shares. The
+	// ceiling used to be the only limit: one address minting dids filled the
+	// store in a day and a half, after which every identity that subscribed
+	// for the first time got 507 and no wake-ups, for good - a restart
+	// counted the same files back in. A sixty-fourth is a thousand
+	// identities behind one address, far past a household or an office, and
+	// it means shedding by age cannot be turned into a way to push real
+	// users out: a source over its share is refused before anything is shed.
+	pushMaxBoxesPerSource = pushMaxBoxes / 64
 )
 
 // pushPayload is the entire message. Byte-for-byte what the frontend's
@@ -146,12 +176,38 @@ var (
 	pushMu    sync.Mutex
 	pushBoxes int
 
+	// pushOrder is every stored box, the one subscribed to longest ago at
+	// the front, and pushOrderAt finds a box in it. A device subscribes again
+	// on every unlock, so the front is the box whose devices have gone
+	// longest without opening the app - an abandoned identity, or a minted
+	// one - and that is what a full store sheds. Rebuilt from file times at
+	// boot. Guarded by pushMu.
+	pushOrder   = list.New()
+	pushOrderAt = map[string]*list.Element{}
+	// pushHeld is how many boxes each source created and still holds, for
+	// pushMaxBoxesPerSource. Memory only, keyed by a hash under the
+	// mailbox's per-process key, never an address: a restart forgets it,
+	// which only means boxes from before the restart count against nobody.
+	// Guarded by pushMu.
+	pushHeld = map[string]int{}
+	// When a full store last said so, so shedding writes a line an hour at
+	// most. Guarded by pushMu.
+	pushFullLogged time.Time
+
 	pushVapidMu     sync.Mutex
 	pushVapidCached *vapidKeys
 
 	pushSentMu   sync.Mutex
 	pushLastSent = map[string]time.Time{}
 	pushLastSwep time.Time
+
+	// pushTold is when each device of a box was last woken, for
+	// pushRearmAfter. An entry goes when that device collects or subscribes,
+	// or once it is older than pushRearmAfter, so the map only ever holds
+	// devices woken within the last hour or so.
+	pushToldMu    sync.Mutex
+	pushTold      = map[string]map[string]time.Time{}
+	pushToldSwept time.Time
 )
 
 var pushQueue = make(chan string, pushQueueDepth)
@@ -415,8 +471,11 @@ func readPushBox(box string) (map[string]pushSubscription, bool) {
 // unsubscribed identity leaves nothing behind. Caller holds pushMu.
 func writePushBox(box string, devices map[string]pushSubscription, existed bool) error {
 	if len(devices) == 0 {
-		if existed && os.Remove(pushBoxPath(box)) == nil && pushBoxes > 0 {
-			pushBoxes--
+		if existed && os.Remove(pushBoxPath(box)) == nil {
+			if pushBoxes > 0 {
+				pushBoxes--
+			}
+			pushUntrack(box)
 		}
 		return nil
 	}
@@ -437,17 +496,146 @@ func writePushBox(box string, devices map[string]pushSubscription, existed bool)
 }
 
 // pushInitCount counts the boxes already on disk, so the ceiling survives a
-// restart. Runs once at boot, like mailboxInitUsedBytes.
+// restart, and lines them up oldest file first, so shedding does too. Runs
+// once at boot, like mailboxInitUsedBytes. The shares start empty.
 func pushInitCount() {
 	pushMu.Lock()
 	defer pushMu.Unlock()
 	pushBoxes = 0
+	pushOrder.Init()
+	pushOrderAt = map[string]*list.Element{}
+	pushHeld = map[string]int{}
+	type stored struct {
+		box string
+		mod time.Time
+	}
+	var boxes []stored
 	entries, _ := os.ReadDir(pushDir)
 	for _, e := range entries {
-		if !e.IsDir() {
-			pushBoxes++
+		box, ok := strings.CutSuffix(e.Name(), ".json")
+		if e.IsDir() || !ok || !mailboxBoxRe.MatchString(box) {
+			continue
+		}
+		s := stored{box: box}
+		if info, err := e.Info(); err == nil {
+			s.mod = info.ModTime()
+		}
+		boxes = append(boxes, s)
+	}
+	sort.Slice(boxes, func(i, j int) bool {
+		if boxes[i].mod.Equal(boxes[j].mod) {
+			return boxes[i].box < boxes[j].box
+		}
+		return boxes[i].mod.Before(boxes[j].mod)
+	})
+	for _, s := range boxes {
+		pushOrderAt[s.box] = pushOrder.PushBack(&pushStoredBox{box: s.box})
+	}
+	pushBoxes = len(boxes)
+}
+
+// pushStoredBox is one entry of pushOrder: the box and the share tags its
+// creation was charged to, empty for a box no share holds.
+type pushStoredBox struct {
+	box     string
+	sources []string
+}
+
+// pushSourceTags names the shares a subscribe from r is charged to: the
+// source's own (an IPv4 address or IPv6 /56) and, for IPv6, its /48. None
+// for a proxy-class address, which is everybody behind it (exemptFromShares).
+// Keyed hashes, like mailboxSourceTag, so the store's bookkeeping never
+// holds an address.
+func pushSourceTags(r *http.Request) []string {
+	addr := clientAddr(r)
+	own := shareKey(addr)
+	if own == "" {
+		return nil
+	}
+	keys := []string{own}
+	if _, agg := clientBuckets(addr); agg != "" {
+		keys = append(keys, agg)
+	}
+	tags := make([]string, len(keys))
+	for i, k := range keys {
+		m := hmac.New(sha256.New, mailboxSourceKey)
+		m.Write([]byte("push:" + k))
+		tags[i] = hex.EncodeToString(m.Sum(nil)[:12])
+	}
+	return tags
+}
+
+// pushShareFull reports whether a source already holds its share of boxes:
+// pushMaxBoxesPerSource for its own tag, ipv6AggregateFactor times that for
+// its /48's. Caller holds pushMu.
+func pushShareFull(sources []string) bool {
+	for i, s := range sources {
+		limit := pushMaxBoxesPerSource
+		if i > 0 {
+			limit *= ipv6AggregateFactor
+		}
+		if pushHeld[s] >= limit {
+			return true
 		}
 	}
+	return false
+}
+
+// pushTrack records a subscribe to box: it moves to the back of pushOrder,
+// and a box being created is charged to sources. Caller holds pushMu.
+func pushTrack(box string, sources []string, created bool) {
+	if el, ok := pushOrderAt[box]; ok {
+		pushOrder.MoveToBack(el)
+		return
+	}
+	entry := &pushStoredBox{box: box}
+	if created {
+		entry.sources = sources
+		for _, s := range sources {
+			pushHeld[s]++
+		}
+	}
+	pushOrderAt[box] = pushOrder.PushBack(entry)
+}
+
+// pushUntrack forgets a box whose file is gone and returns its share.
+// Caller holds pushMu.
+func pushUntrack(box string) {
+	el, ok := pushOrderAt[box]
+	if !ok {
+		return
+	}
+	delete(pushOrderAt, box)
+	entry := pushOrder.Remove(el).(*pushStoredBox)
+	for _, s := range entry.sources {
+		if pushHeld[s]--; pushHeld[s] <= 0 {
+			delete(pushHeld, s)
+		}
+	}
+}
+
+// pushShedOldest makes room in a full store by deleting the box subscribed
+// to longest ago, and reports whether it freed one. That box's devices stop
+// being woken until one of them opens the app again, which subscribes
+// afresh. Caller holds pushMu.
+func pushShedOldest() bool {
+	el := pushOrder.Front()
+	if el == nil {
+		return false
+	}
+	box := el.Value.(*pushStoredBox).box
+	if err := os.Remove(pushBoxPath(box)); err != nil && !os.IsNotExist(err) {
+		return false
+	}
+	pushUntrack(box)
+	if pushBoxes > 0 {
+		pushBoxes--
+	}
+	if now := time.Now(); now.Sub(pushFullLogged) >= time.Hour {
+		pushFullLogged = now
+		log.Printf("[push] the subscription store is full (%d boxes): each new one replaces the box subscribed to longest ago", pushMaxBoxes)
+	}
+	return true
 }
 
 // pushRemoveDevices drops subscriptions a push service has told us are dead.
@@ -499,9 +687,77 @@ func pushNotifyBox(box string) {
 	}
 }
 
+// pushWaiting reports whether a wake-up reached device within pushRearmAfter
+// and the device has not collected its box since.
+func pushWaiting(box, device string, now time.Time) bool {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	told, ok := pushTold[box][device]
+	return ok && now.Sub(told) < pushRearmAfter
+}
+
+// pushSweepTold drops the entries past pushRearmAfter, which hold nothing
+// back any more, at most once a pushRearmAfter: the same opportunistic
+// sweep as pushNotifyBox's. It used to run only when a wake-up was sent, so
+// while every deposit found its devices already told, or every send failed,
+// nothing was swept. pushDeliver runs it now, for every wake-up a deposit
+// queues.
+func pushSweepTold(now time.Time) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	if now.Sub(pushToldSwept) <= pushRearmAfter {
+		return
+	}
+	pushToldSwept = now
+	for b, devices := range pushTold {
+		for d, told := range devices {
+			if now.Sub(told) >= pushRearmAfter {
+				delete(devices, d)
+			}
+		}
+		if len(devices) == 0 {
+			delete(pushTold, b)
+		}
+	}
+}
+
+// pushMarkTold records that a wake-up reached device.
+func pushMarkTold(box, device string, now time.Time) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	devices := pushTold[box]
+	if devices == nil {
+		devices = map[string]time.Time{}
+		pushTold[box] = devices
+	}
+	devices[device] = now
+}
+
+// pushCollected re-arms wake-ups for a device that has just looked at its
+// box: collected it, or subscribed again on unlock. An empty device - a
+// client that does not name itself - re-arms every device of the box, which
+// errs towards waking one once too often rather than never.
+func pushCollected(box, device string) {
+	pushToldMu.Lock()
+	defer pushToldMu.Unlock()
+	if device == "" {
+		delete(pushTold, box)
+		return
+	}
+	if devices := pushTold[box]; devices != nil {
+		delete(devices, device)
+		if len(devices) == 0 {
+			delete(pushTold, box)
+		}
+	}
+}
+
 // pushDeliver sends the wake-up to every device subscribed to one box. Worker
 // goroutine only - never a deposit's request path.
 func pushDeliver(box string) {
+	// Here rather than in pushNotifyBox, which runs under the deposit's
+	// mailbox lock.
+	pushSweepTold(time.Now())
 	// readPushBox hands back a map of its own, so the sends below happen off
 	// the lock and a slow push service never blocks a subscribe.
 	pushMu.Lock()
@@ -532,9 +788,14 @@ func pushDeliver(box string) {
 	if pushBoxSuspended(box, now) {
 		return
 	}
-	sent, expired, failed, skipped := 0, 0, 0, 0
+	sent, expired, failed, skipped, waiting := 0, 0, 0, 0, 0
 	var dead []string
 	for device, s := range subs {
+		if pushWaiting(box, device, now) {
+			// Already told, and has not looked yet: see pushRearmAfter.
+			waiting++
+			continue
+		}
 		key := pushEndpointKey(s.Endpoint)
 		if key == "" {
 			// Stored before the allowlist, or an operator has narrowed it
@@ -577,6 +838,7 @@ func pushDeliver(box string) {
 			dead = append(dead, device)
 		case status >= 200 && status < 300:
 			sent++
+			pushMarkTold(box, device, time.Now())
 		default:
 			failed++
 		}
@@ -587,9 +849,14 @@ func pushDeliver(box string) {
 	if sent+failed > 0 {
 		pushBoxResult(box, sent > 0, time.Now())
 	}
+	if sent+expired+failed+skipped == 0 {
+		// Every device was already told. Saying so for each deposit would be
+		// a line a minute per box somebody keeps depositing into.
+		return
+	}
 	// Counts only. An endpoint is a per-device identifier at a vendor and
 	// must never reach a log line.
-	log.Printf("[push] wake-up: %d sent, %d expired, %d failed, %d skipped", sent, expired, failed, skipped)
+	log.Printf("[push] wake-up: %d sent, %d expired, %d failed, %d skipped, %d already told", sent, expired, failed, skipped, waiting)
 }
 
 // pushEndpointKey is the push service an endpoint belongs to, or empty when
@@ -723,12 +990,23 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sources := pushSourceTags(r)
 	pushMu.Lock()
 	subs, existed := readPushBox(box)
-	if !existed && pushBoxes >= pushMaxBoxes {
-		pushMu.Unlock()
-		http.Error(w, "push full", http.StatusInsufficientStorage)
-		return
+	if !existed {
+		// A new box costs its source a slot of its share, checked before
+		// anything is shed: a source past its share must not be able to
+		// push somebody else's box out by asking for one more.
+		if pushShareFull(sources) {
+			pushMu.Unlock()
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		if pushBoxes >= pushMaxBoxes && !pushShedOldest() {
+			pushMu.Unlock()
+			http.Error(w, "push full", http.StatusInsufficientStorage)
+			return
+		}
 	}
 	if _, replacing := subs[req.Device]; !replacing && len(subs) >= pushMaxDevices {
 		// Oldest out first, so a user cycling through devices keeps the ones
@@ -748,11 +1026,17 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		Ts:       time.Now().Unix(),
 	}
 	err = writePushBox(box, subs, existed)
+	if err == nil {
+		pushTrack(box, sources, !existed)
+	}
 	pushMu.Unlock()
 	if err != nil {
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
+	// A device subscribes on every unlock, so it is awake and about to
+	// collect: its next wake-up can go out.
+	pushCollected(box, req.Device)
 	w.WriteHeader(http.StatusNoContent)
 }
 

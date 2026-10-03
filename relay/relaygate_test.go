@@ -184,27 +184,40 @@ func TestResourceManagerTrustsANamedPublicProxy(t *testing.T) {
 
 // The circuit limits are chosen, not inherited from memory-scaled service
 // defaults, and none of them is tighter than what those defaults gave a
-// small VPS.
+// small VPS. Neither are the System ceilings, which are sized so that the
+// relay's own connection and circuit limits are what bind.
 func TestRelayCircuitLimitsArePinned(t *testing.T) {
 	scaled := rcmgr.DefaultLimits.Scale(1<<30, 1024)
 	limits := scaled.ToPartialLimitConfig()
+	relaySystemLimits(&limits, scaled)
 	relayCircuitLimits(&limits)
 	built := limits.Build(scaled).ToPartialLimitConfig()
 	svc := built.Service[relayv2.ServiceName]
-	if svc.StreamsInbound != rcmgr.LimitVal(2048) || svc.StreamsOutbound != rcmgr.LimitVal(2048) {
-		t.Fatalf("relay service streams = %v/%v", svc.StreamsInbound, svc.StreamsOutbound)
+	if svc.StreamsInbound != rcmgr.LimitVal(relayCircuits) || svc.StreamsOutbound != rcmgr.LimitVal(relayCircuits) {
+		t.Fatalf("relay service streams = %v/%v, want %d", svc.StreamsInbound, svc.StreamsOutbound, relayCircuits)
 	}
 	hop := built.ProtocolPeer[circuitproto.ProtoIDv2Hop]
-	if hop.StreamsInbound != rcmgr.LimitVal(128) {
+	if hop.StreamsInbound != rcmgr.LimitVal(relayCircuitsPerPeer) {
 		t.Fatalf("per-peer hop streams = %v", hop.StreamsInbound)
 	}
 	// Not tighter than the generic protocol defaults this replaced, at the
 	// same scale: a tighter number fails calls, not attackers.
 	def := scaled.ToPartialLimitConfig()
-	if old := def.ProtocolDefault.StreamsInbound; int(old) > 2048 {
-		t.Fatalf("pinned hop limit (2048) is below the old scaled default %v", old)
+	if old := def.ProtocolDefault.StreamsInbound; int(old) > relayCircuits {
+		t.Fatalf("pinned hop limit (%d) is below the old scaled default %v", relayCircuits, old)
 	}
-	if old := def.ProtocolPeerDefault.StreamsInbound; int(old) > 128 {
-		t.Fatalf("pinned per-peer hop limit (128) is below the old scaled default %v", old)
+	if old := def.ProtocolPeerDefault.StreamsInbound; int(old) > relayCircuitsPerPeer {
+		t.Fatalf("pinned per-peer hop limit (%d) is below the old scaled default %v", relayCircuitsPerPeer, old)
+	}
+
+	sys := built.System
+	if sys.ConnsInbound != rcmgr.LimitVal(relayMaxConns) {
+		t.Fatalf("System.ConnsInbound = %v, want relayMaxConns (%d)", sys.ConnsInbound, relayMaxConns)
+	}
+	if need := relayMaxConns + relayCircuits; int(sys.StreamsInbound) < need {
+		t.Fatalf("System.StreamsInbound = %v, under a rendezvous stream per connection plus a hop per circuit (%d)", sys.StreamsInbound, need)
+	}
+	if need := int64(sys.Streams) * yamuxStreamWindow; int64(sys.Memory) < need {
+		t.Fatalf("System.Memory = %v, under a yamux window for every stream allowed (%d)", sys.Memory, need)
 	}
 }

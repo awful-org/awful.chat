@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -158,12 +159,13 @@ func TestPluginProxyCacheBounded(t *testing.T) {
 	}
 	pluginProxyCacheMu.Lock()
 	entries, order, size := len(pluginProxyCache), len(pluginProxyCacheOrder), pluginProxyCacheBytes
+	held := pluginProxyCacheHeldLocked()
 	pluginProxyCacheMu.Unlock()
 	if entries > pluginProxyCacheMaxEntries || order != entries {
 		t.Fatalf("cache held %d entries (order %d), cap is %d", entries, order, pluginProxyCacheMaxEntries)
 	}
-	if size != entries*len(body) {
-		t.Fatalf("byte accounting drifted: %d bytes for %d entries", size, entries)
+	if size != held {
+		t.Fatalf("byte accounting drifted: %d bytes counted, %d held by %d entries", size, held, entries)
 	}
 	// Oldest-first: the first key is gone, the last one is still served.
 	if _, ok := pluginProxyCached("pp:https://h/?i=0"); ok {
@@ -181,6 +183,117 @@ func TestPluginProxyCacheBounded(t *testing.T) {
 	pluginProxyCacheMu.Unlock()
 	if after != before {
 		t.Fatalf("refresh double-counted: %d -> %d", before, after)
+	}
+}
+
+// resetPluginProxyCache empties the response cache, so a test starts cold.
+func resetPluginProxyCache(t *testing.T) {
+	t.Helper()
+	pluginProxyCacheMu.Lock()
+	defer pluginProxyCacheMu.Unlock()
+	pluginProxyCache = map[string]pluginProxyCacheEntry{}
+	pluginProxyCacheOrder = nil
+	pluginProxyCacheBytes = 0
+}
+
+// pluginProxyCacheHeldLocked is what the cache really holds: every key and
+// every body. Caller holds pluginProxyCacheMu.
+func pluginProxyCacheHeldLocked() int {
+	held := 0
+	for k, e := range pluginProxyCache {
+		held += len(k) + len(e.body)
+	}
+	return held
+}
+
+// The key is the whole url, the caller's choice up to the megabyte request
+// line the relay reads, and only bodies counted against the 64 MiB: urls
+// with small answers filled every entry while the cache said it held a few
+// kilobytes. Keys count now, and one longer than its even share is not kept.
+func TestPluginProxyCacheCountsItsKeys(t *testing.T) {
+	resetPluginProxyCache(t)
+	t.Cleanup(func() { resetPluginProxyCache(t) })
+
+	// Distinct keys of exactly the longest kept length, as windows over one
+	// string so the test does not hold 64 MiB of its own.
+	r := rand.New(rand.NewPCG(1, 2))
+	letters := make([]byte, pluginProxyCacheMaxKeyBytes+pluginProxyCacheMaxEntries+100)
+	for i := range letters {
+		letters[i] = byte('a' + r.IntN(26))
+	}
+	all := string(letters)
+	body := []byte("{}")
+	for i := 0; i < pluginProxyCacheMaxEntries+100; i++ {
+		pluginProxyStore(all[i:i+pluginProxyCacheMaxKeyBytes], body, "application/json")
+
+		pluginProxyCacheMu.Lock()
+		held, counted, entries := pluginProxyCacheHeldLocked(), pluginProxyCacheBytes, len(pluginProxyCache)
+		pluginProxyCacheMu.Unlock()
+		if held != counted {
+			t.Fatalf("store %d: the cache holds %d bytes of keys and bodies but counts %d", i, held, counted)
+		}
+		if held > pluginProxyCacheMaxBytes {
+			t.Fatalf("store %d: %d entries hold %d bytes, cap %d", i, entries, held, pluginProxyCacheMaxBytes)
+		}
+	}
+	pluginProxyCacheMu.Lock()
+	entries := len(pluginProxyCache)
+	pluginProxyCacheMu.Unlock()
+	if entries >= pluginProxyCacheMaxEntries {
+		t.Fatalf("%d urls of %d bytes each with two-byte answers fit, so their keys were not counted", entries, pluginProxyCacheMaxKeyBytes)
+	}
+
+	// A url past its share is not kept at all, and costs the cache nothing.
+	pluginProxyCacheMu.Lock()
+	before := pluginProxyCacheBytes
+	pluginProxyCacheMu.Unlock()
+	long := "pp:https://h/?" + strings.Repeat("k", pluginProxyCacheMaxKeyBytes)
+	pluginProxyStore(long, body, "application/json")
+	if _, ok := pluginProxyCached(long); ok {
+		t.Fatalf("a %d-byte url was kept, longest kept is %d", len(long), pluginProxyCacheMaxKeyBytes)
+	}
+	pluginProxyCacheMu.Lock()
+	after := pluginProxyCacheBytes
+	pluginProxyCacheMu.Unlock()
+	if after != before {
+		t.Fatalf("an unkept url changed the count: %d -> %d", before, after)
+	}
+}
+
+// Through the handler: a url longer than its share is fetched for every ask,
+// and a normal one is still answered from the cache.
+func TestPluginProxyLongURLsAreNotKept(t *testing.T) {
+	resetRateLimiter(t)
+	resetPluginProxyCache(t)
+	t.Cleanup(func() { resetPluginProxyCache(t) })
+	var fetches atomic.Int64
+	srv := proxyUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	})
+	ask := func(raw string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/plugin-proxy?url="+url.QueryEscape(raw), nil)
+		rec := httptest.NewRecorder()
+		handlePluginProxy(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	long := srv.URL + "/card?pad=" + strings.Repeat("a", pluginProxyCacheMaxKeyBytes)
+	ask(long)
+	ask(long)
+	if n := fetches.Load(); n != 2 {
+		t.Fatalf("two asks for a url past its share cost %d fetches, want one each", n)
+	}
+
+	short := srv.URL + "/card?id=" + t.Name()
+	ask(short)
+	ask(short)
+	if n := fetches.Load(); n != 3 {
+		t.Fatalf("two asks for a short url cost %d fetches, want one", n-2)
 	}
 }
 

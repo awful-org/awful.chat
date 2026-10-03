@@ -28,10 +28,22 @@ deliberately allowed, so a plain `curl` gets one), and those credentials work
 on every TURN server in `TURN_URLS`. Anyone who wants one can relay traffic to
 any host on the internet through the volunteer's machine, so DDoS reflection,
 spam and scanning are attributed to their IP address, not yours. Browsers never
-use TCP relaying, so `--no-tcp-relay` is set and only UDP is exposed, and
-`--total-quota` and `--user-quota` bound how much of it one party can use at
-once - size them for a machine you do not own. None of this is specific to a
-satellite: the main instance has exactly the same shape.
+use TCP relaying, so `--no-tcp-relay` is set and only UDP is exposed. The relay
+hands one address at most seven live credentials (25 per IPv6 /48), all of them
+carrying one of the same seven ids (25 for a /48); `--user-quota` caps the
+allocations under each id whatever the credential's expiry, and
+`--total-quota` (900) is the pool for everyone. coturn checks a credential's
+expiry only when an allocation is made, and keeps an allocation that is
+refreshed past it, which is why the ids are fixed: one address holds at most
+seven times `--user-quota` allocations - 84 by default, and an IPv6 /48 300 -
+however long it keeps at it. Filling the pool takes about eleven addresses at
+once instead of one address a minute: harder, not impossible, and a server
+holding the same secret can be filled the same way. People sharing an address
+share the limit too: once it is busy, every browser behind it is handed the
+same newest credential, so together they have one `--user-quota` for new
+connections. Size both for a machine you do not own, keeping the pool ten
+times what one address can hold. None of this is specific to a satellite: the
+main instance has exactly the same shape.
 
 They also hold `TURN_SECRET`, which is the entire authentication system: with
 it they can mint valid credentials for **every** TURN server on the instance,
@@ -69,11 +81,21 @@ identifier held by the vendor: while the subscription lives it links the device
 to the identity, and the vendor sees the timing of every wake-up. What the
 relay sends through it is the whole disclosure - `{"t":"mail"}`, meaning "check
 your box", with no sender, no room, no count and no content, at most one per
-mailbox per minute - and everything real stays sealed in the blob the device
-collects once it is awake. Subscribing is per device and opt-in in the app,
+mailbox per minute and one per device until that device has collected (or an
+hour has passed) - and everything real stays sealed in the blob the device
+collects once it is awake. Deposits are anonymous, so the relay cannot tell a
+contact's DM from a stranger's message request or junk: any of them can still
+make a closed app ring once, but no longer every minute. Subscribing is per device and opt-in in the app,
 unsubscribing deletes the endpoint, and `PUSH_ENABLED=0` removes the surface
 entirely, at the cost of offline DMs never reaching a closed phone until the
 user opens it.
+
+The relay holds subscriptions for at most 65,536 identities. dids are free to
+make, so one address (an IPv4 address or IPv6 /56, and four times that per
+/48) may hold a sixty-fourth of them, and a full store drops the identity whose
+devices subscribed longest ago rather than refusing new ones. Every unlock of
+the app subscribes again, so that is the identity least in use, and it is back
+the next time one of its devices opens the app.
 
 ## Add a TURN server
 
@@ -203,6 +225,34 @@ Keep the range above 60999. Docker binds every port in it at container start
 and a single port already in use aborts the whole container, so a range inside
 Linux's ephemeral window (32768-60999) makes the SFU fail to start at random,
 typically after a reboot.
+
+## Relay capacity
+
+There is one relay, so size it rather than multiply it. `RELAY_MAX_CONNS`
+(default 2048) is how many libp2p connections it holds at once - one per open
+tab, and a second one while device sync runs - and every other ceiling is
+counted from it: as many circuit-relay reservations, four times as many
+relayed circuits (a circuit stays up for the life of both tabs, one per pair
+of online room members, so a fully online 50-member room is 1,225 of them),
+and the libp2p resource manager's stream and memory accounting to match. Past it a new
+connection is refused at accept and the client retries; a tab that already
+holds its rendezvous stream is protected and is never dropped to make room.
+
+Real memory is what to size against: about 150 KB per connected tab and 30 KB
+per circuit, so roughly 550 MB with every connection and circuit in use at the
+default. `RELAY_GOMEMLIMIT` (default `768MiB`) is the Go runtime's soft limit
+for it: near the limit the garbage collector works harder instead of letting
+the heap grow to twice what is live, but nothing is refused, so it is a
+backstop, not a ceiling. On a small box lower `RELAY_MAX_CONNS` first, then
+`RELAY_GOMEMLIMIT` with it, keeping the limit above what the connections need;
+a container memory limit on top turns running out into a restart of the relay,
+which drops every tab at once. The relay prints both values at boot.
+
+`RELAY_GOMEMLIMIT` goes to the Go runtime as it is, and the runtime takes only
+its own units: a whole number of `MiB` or `GiB`, such as `768MiB` or `1GiB`
+(or plain bytes). `1G`, `768MB`, `512m` or `1.5GiB` do not mean roughly the
+same - they stop the relay at boot with "malformed GOMEMLIMIT", and it does not
+come back until the value is fixed.
 
 ## What cannot be multiplied yet
 

@@ -121,10 +121,16 @@ hash the app already has.
   each. The compose already runs several stacks on one box with the `STACK`
   prefix and moved port ranges. A 4 vCPU box hosts a couple dozen small
   tenants that are mostly idle, and idle really is idle because voice never
-  touches the server.
+  touches the server. Each tenant's relay is sized with `RELAY_MAX_CONNS`
+  and `RELAY_GOMEMLIMIT` (deploy/README.md, "Relay capacity"); the defaults
+  are for an instance with a box to itself.
 - coturn is one per host by design (host network), shared by every stack on
   that machine. Credentials are HMAC-minted per instance already; only the
-  quotas are per server. Big tenants get their own.
+  quotas are per server. The credentials each relay hands one address carry
+  at most seven ids between them, and coturn counts `--user-quota` per id, so
+  on a shared coturn one address holds at most seven times `--user-quota`
+  allocations per tenant (an IPv6 /48 25 times): size `--total-quota` for the
+  tenants on the host. Big tenants get their own.
 - An SFU pool, per region, a few well-connected boxes. A tenant that outgrows
   its host gets `VITE_SFU_URLS` pointed at the pool. Rooms land on one server
   by rendezvous hashing of the room code, everyone in a room computes the same

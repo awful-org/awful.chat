@@ -95,6 +95,17 @@ services:
       # names nothing that resolves, the relay says so at boot and every user
       # shares Traefik's one bucket until it does.
       - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-dokploy-traefik}
+      # How many libp2p connections (open tabs) the relay holds at once,
+      # default 2048. Past it new connections are refused at accept and
+      # retried; established tabs are never dropped to make room. Lower it on
+      # a small box. See deploy/README.md, "Relay capacity".
+      - RELAY_MAX_CONNS=${RELAY_MAX_CONNS:-}
+      # The Go runtime's soft memory limit: the garbage collector works harder
+      # as the relay nears it instead of letting the heap double. Keep it
+      # above what RELAY_MAX_CONNS needs at full load (about 550 MB at 2048)
+      # and below what the box can give the relay. Go's units only (768MiB,
+      # 1GiB): 1G or 768MB stop the relay at boot.
+      - GOMEMLIMIT=${RELAY_GOMEMLIMIT:-768MiB}
     volumes:
       - relay_data:/app/data
     networks:
@@ -282,7 +293,18 @@ services:
   # pool size gone and the dead urls removed that is ~2 per connection, and 51
   # is comfortable for the current handful of users. Bumped to 100 for
   # headroom anyway - with network_mode: host nothing is published per port,
-  # so the range size costs nothing at deploy time.
+  # so the range size costs nothing at deploy time. It is 1000 now
+  # (TURN_MIN_PORT/TURN_MAX_PORT).
+  #
+  # --user-quota caps the allocations under one credential id and
+  # --total-quota is the pool for everybody. A credential costs nothing to ask
+  # for, so the relay hands one address at most seven live ones, carrying at
+  # most seven ids between them (25 for an IPv6 /48; see turnMaxLivePerClient
+  # in relay/turn.go), and coturn counts the quota per id whatever a
+  # credential's expiry: with these defaults one address holds at most 84 of
+  # 900 allocations, and filling the pool takes about eleven addresses at
+  # once. Keep the pool inside the relay port range, one port per allocation,
+  # and keep it ten times what one address can hold.
   #
   # Loopback and link-local are denied because host networking puts coturn on
   # the host's stack: without them a relay peer reaches services bound to
@@ -357,7 +379,7 @@ services:
       --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       --min-port=${TURN_MIN_PORT:-49152}
       --max-port=${TURN_MAX_PORT:-50151}
-      --total-quota=${TURN_TOTAL_QUOTA:-300}
+      --total-quota=${TURN_TOTAL_QUOTA:-900}
       --user-quota=${TURN_USER_QUOTA:-12}
       ${TURN_TLS_ARGS:-}
     network_mode: host

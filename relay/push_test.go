@@ -19,7 +19,8 @@ import (
 
 // pushTestSetup points the whole surface at temp directories and empties the
 // process-wide state these tests would otherwise inherit from each other:
-// the queue, the coalescing map, the box counter and the cached VAPID pair.
+// the queue, the coalescing map, the box counter, the shedding order and
+// shares, and the cached VAPID pair.
 func pushTestSetup(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -31,13 +32,17 @@ func pushTestSetup(t *testing.T) {
 	pushVapidMu.Lock()
 	pushVapidCached = nil
 	pushVapidMu.Unlock()
-	pushMu.Lock()
-	pushBoxes = 0
-	pushMu.Unlock()
+	// The directory does not exist yet, so this empties the counter, the
+	// shedding order and the shares.
+	pushInitCount()
 	pushSentMu.Lock()
 	pushLastSent = map[string]time.Time{}
 	pushLastSwep = time.Time{}
 	pushSentMu.Unlock()
+	pushToldMu.Lock()
+	pushTold = map[string]map[string]time.Time{}
+	pushToldSwept = time.Time{}
+	pushToldMu.Unlock()
 	t.Cleanup(func() {
 		pushDir, pushVapidPath, pushSend, pushEnabled = savedDir, savedVapid, savedSend, savedEnabled
 		drainPushQueue()
@@ -376,5 +381,152 @@ func TestPushSubjectAlwaysHasAScheme(t *testing.T) {
 	t.Setenv("PUSH_CONTACT", "")
 	if got := pushSubject(); got != "mailto:admin@example.invalid" && got != "mailto:admin@"+domain {
 		t.Fatalf("pushSubject() = %q with no contact set", got)
+	}
+}
+
+// A deposit is anonymous, so anyone who knows a did could make a closed
+// phone ring "New message" every minute, junk or not. A device is now woken
+// once, and not again until it has looked at its box or an hour has passed;
+// one device collecting does not re-arm another.
+func TestPushWakesADeviceOnceUntilItCollects(t *testing.T) {
+	pushTestSetup(t)
+	resetPushDelivery(t)
+	mailboxDir = t.TempDir()
+	fake := &fakePushService{status: 201}
+	fake.install()
+
+	did, priv := testDid(t)
+	box := mailboxIDForDid(did)
+	phone, desktop := deviceID(70), deviceID(71)
+	endpoint := map[string]string{
+		phone:   "https://fcm.googleapis.com/fcm/send/phone",
+		desktop: "https://updates.push.services.mozilla.com/wpush/v2/desktop",
+	}
+	for _, d := range []string{phone, desktop} {
+		if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, d, endpoint[d]), handlePushSubscribe); w.Code != 204 {
+			t.Fatalf("subscribe: got %d %s", w.Code, w.Body.String())
+		}
+	}
+
+	m := &mailboxClient{t: t, did: did, priv: priv}
+	// One anonymous deposit a minute, the most the per-box window allows,
+	// each delivered as a worker would.
+	deposit := func() []string {
+		t.Helper()
+		pushSentMu.Lock()
+		delete(pushLastSent, box)
+		pushSentMu.Unlock()
+		before := fake.calls()
+		m.deposit(box, []byte{0})
+		drainPushQueue()
+		pushDeliver(box)
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		var woke []string
+		for _, s := range fake.subs[before:] {
+			woke = append(woke, s.Endpoint)
+		}
+		return woke
+	}
+
+	if woke := deposit(); len(woke) != 2 {
+		t.Fatalf("the first deposit woke %d devices, want both", len(woke))
+	}
+	for i := 0; i < 5; i++ {
+		if woke := deposit(); len(woke) != 0 {
+			t.Fatalf("deposit %d rang %v again before either device looked", i+2, woke)
+		}
+	}
+
+	// The desktop collects. Its next deposit wakes it; the phone, still in a
+	// pocket, stays told.
+	m.collect(desktop)
+	if woke := deposit(); len(woke) != 1 || woke[0] != endpoint[desktop] {
+		t.Fatalf("after the desktop collected, a deposit woke %v, want the desktop alone", woke)
+	}
+
+	// An hour on, the phone is told again even though it never looked.
+	pushToldMu.Lock()
+	pushTold[box][phone] = time.Now().Add(-pushRearmAfter - time.Second)
+	pushToldMu.Unlock()
+	if woke := deposit(); len(woke) != 1 || woke[0] != endpoint[phone] {
+		t.Fatalf("an hour later a deposit woke %v, want the phone alone", woke)
+	}
+
+	// A collect that names no device re-arms the whole box.
+	m.collect("")
+	if woke := deposit(); len(woke) != 2 {
+		t.Fatalf("after an unnamed collect a deposit woke %d devices, want both", len(woke))
+	}
+
+	// Unlocking subscribes again, which re-arms that device too.
+	if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, phone, endpoint[phone]), handlePushSubscribe); w.Code != 204 {
+		t.Fatalf("re-subscribe: got %d", w.Code)
+	}
+	if woke := deposit(); len(woke) != 1 || woke[0] != endpoint[phone] {
+		t.Fatalf("after the phone unlocked a deposit woke %v, want the phone alone", woke)
+	}
+}
+
+// Told devices were swept only when a wake-up was sent. While every deposit
+// found its devices already told - the state the told gate exists to make -
+// or every send failed, an entry long past pushRearmAfter stayed. Every
+// queued wake-up sweeps now, sent or not, and a device told within the hour
+// stays told.
+func TestPushToldIsSweptWhileNothingIsSent(t *testing.T) {
+	pushTestSetup(t)
+	resetPushDelivery(t)
+	mailboxDir = t.TempDir()
+	fake := &fakePushService{status: 201}
+	fake.install()
+
+	m := &mailboxClient{t: t}
+	wake := func(box string) {
+		t.Helper()
+		pushSentMu.Lock()
+		delete(pushLastSent, box)
+		pushSentMu.Unlock()
+		m.deposit(box, []byte{0})
+		drainPushQueue()
+		pushDeliver(box)
+	}
+	subscribe := func(seed byte) (box, device string) {
+		t.Helper()
+		did, priv := testDid(t)
+		device = deviceID(seed)
+		if w := pushRequest(t, "/push/subscribe", subscribeBody(did, priv, device, "https://fcm.googleapis.com/fcm/send/"+device), handlePushSubscribe); w.Code != 204 {
+			t.Fatalf("subscribe: got %d %s", w.Code, w.Body.String())
+		}
+		return mailboxIDForDid(did), device
+	}
+	quiet, quietDevice := subscribe(80)
+	busy, busyDevice := subscribe(81)
+	wake(quiet)
+	wake(busy)
+	if n := fake.calls(); n != 2 {
+		t.Fatalf("two first deposits sent %d wake-ups, want 2", n)
+	}
+
+	// The first device was told over an hour ago and has not looked since,
+	// and the last sweep was as long ago.
+	pushToldMu.Lock()
+	pushTold[quiet][quietDevice] = time.Now().Add(-pushRearmAfter - time.Minute)
+	pushToldSwept = time.Now().Add(-pushRearmAfter - time.Minute)
+	pushToldMu.Unlock()
+
+	// Mail for the second box, whose device is still told: nothing is sent.
+	wake(busy)
+	if n := fake.calls(); n != 2 {
+		t.Fatalf("a deposit for a device already told sent a wake-up (%d sends)", n)
+	}
+	pushToldMu.Lock()
+	_, kept := pushTold[quiet]
+	_, told := pushTold[busy][busyDevice]
+	pushToldMu.Unlock()
+	if kept {
+		t.Error("an entry past pushRearmAfter outlived a sweep because no wake-up was sent")
+	}
+	if !told {
+		t.Error("the sweep dropped a device told within the hour, so it would ring again")
 	}
 }

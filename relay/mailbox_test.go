@@ -683,9 +683,10 @@ func TestMailboxBoxCeilingTracksBytesAndEvictsStaleBoxes(t *testing.T) {
 		os.Chtimes(dir, when, when)
 	}
 
+	// What a boot finds on disk: the counters and the order boxes go in.
+	mailboxInitUsedBytes()
 	mailboxMu.Lock()
 	mailboxBoxes = mailboxGlobalMaxBoxes
-	mailboxFiles, mailboxUsedBytes = 2, 2*mailboxBlockSize
 	mailboxMu.Unlock()
 
 	n := 0
@@ -978,5 +979,175 @@ func TestAckIndexIsNotEvictedAsABlob(t *testing.T) {
 	idx := readAckIndex(box)
 	if _, still := idx[first[0].ID]; still {
 		t.Fatal("an evicted blob left its device list behind in the ack index")
+	}
+}
+
+// At the box ceiling every deposit for a new recipient used to list and stat
+// every box under mailboxMu - over a tenth of a second at 32,768 boxes - and,
+// with nothing stale, find nothing and leave the next deposit to do it all
+// again, so a few sources stalled every deposit, collect and ack on the
+// instance. It now looks at the one box deposited into longest ago.
+func TestNewBoxAtTheCeilingDoesNotWalkTheMailbox(t *testing.T) {
+	freshMailbox(t)
+	var boxes []string
+	for i := 0; i < 300; i++ {
+		box := fmt.Sprintf("%064x", i+1)
+		boxes = append(boxes, box)
+		if code := depositFrom(t, fmt.Sprintf("203.0.%d.%d", i/250, i%250+1), box, []byte("x")); code != http.StatusNoContent {
+			t.Fatalf("deposit %d: %d", i, code)
+		}
+	}
+	// A deposit into a box moves it to the back of the line.
+	if code := depositFrom(t, "203.0.9.9", boxes[0], []byte("y")); code != http.StatusNoContent {
+		t.Fatalf("deposit into an existing box: %d", code)
+	}
+	mailboxMu.Lock()
+	front := mailboxBoxOrder.Front().Value.(*mailboxBoxAge).box
+	mailboxBoxes = mailboxGlobalMaxBoxes
+	mailboxMu.Unlock()
+	if front != boxes[1] {
+		t.Fatalf("the box deposited into longest ago is %s.., want %s..", front[:8], boxes[1][:8])
+	}
+
+	walks := 0
+	saved := mailboxListBoxes
+	mailboxListBoxes = func() ([]os.DirEntry, error) {
+		walks++
+		return saved()
+	}
+	t.Cleanup(func() { mailboxListBoxes = saved })
+	// And the directory cannot be listed at all from here on (unless the
+	// tests run as root), so a deposit that still needed a walk to find a
+	// stale box would find none.
+	dir := mailboxDir
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	for i := 0; i < 50; i++ {
+		box := fmt.Sprintf("%064x", 1000+i)
+		if code := depositFrom(t, fmt.Sprintf("198.51.100.%d", i+1), box, []byte("x")); code != http.StatusInsufficientStorage {
+			t.Fatalf("new box %d at the ceiling with nothing stale: %d, want 507", i, code)
+		}
+	}
+	// An existing box still takes mail at the ceiling.
+	if code := depositFrom(t, "198.51.100.200", boxes[5], []byte("x")); code != http.StatusNoContent {
+		t.Fatalf("an existing box at the box ceiling: %d", code)
+	}
+
+	// Once the front box is past the TTL, it is the one reclaimed.
+	mailboxMu.Lock()
+	mailboxBoxOrder.Front().Value.(*mailboxBoxAge).lastDeposit = time.Now().Add(-mailboxTTL - time.Hour)
+	mailboxMu.Unlock()
+	if code := depositFrom(t, "198.51.100.201", fmt.Sprintf("%064x", 5000), []byte("x")); code != http.StatusNoContent {
+		t.Fatalf("a new box with a stale one to reclaim: %d", code)
+	}
+	if _, err := os.Stat(boxPath(boxes[1])); !os.IsNotExist(err) {
+		t.Fatal("the stale box was not the one reclaimed")
+	}
+	if walks != 0 {
+		t.Fatalf("deposits at the box ceiling walked the whole mailbox %d times", walks)
+	}
+}
+
+// A device ack keeps the blob for the identity's other devices until the TTL,
+// so a busy instance filled the global ceiling with mail already collected
+// and then refused every deposit. At the ceiling that mail now gives way,
+// oldest first; mail nobody has collected never does, and a deposit that
+// cannot be made room for is refused without removing anything.
+func TestCollectedMailGivesWayAtTheGlobalCeiling(t *testing.T) {
+	freshMailbox(t)
+	phone := deviceID(80)
+	recipient := func() (*mailboxClient, string) {
+		did, priv := testDid(t)
+		return &mailboxClient{t: t, did: did, priv: priv}, mailboxIDForDid(did)
+	}
+	exists := func(box, id string) bool {
+		_, err := os.Stat(filepath.Join(boxPath(box), id))
+		return err == nil
+	}
+
+	// a has collected two of three DMs, b's one DM is still waiting for
+	// everybody, and c's only DM has been collected.
+	a, boxA := recipient()
+	for _, m := range []string{"a1", "a2", "a3"} {
+		a.deposit(boxA, []byte(m))
+	}
+	gotA := a.collect(phone)
+	if len(gotA) != 3 {
+		t.Fatalf("a collected %d, want 3", len(gotA))
+	}
+	a.ack(phone, []string{gotA[0].ID, gotA[1].ID})
+	b, boxB := recipient()
+	b.deposit(boxB, []byte("b1"))
+	gotB := b.collect("")
+	c, boxC := recipient()
+	c.deposit(boxC, []byte("c1"))
+	gotC := c.collect(phone)
+	c.ack(phone, []string{gotC[0].ID})
+
+	d, boxD := recipient()
+	depositAtCeiling := func() int {
+		t.Helper()
+		mailboxMu.Lock()
+		mailboxFiles = mailboxGlobalMaxFiles
+		mailboxMu.Unlock()
+		w := d.request("/mailbox/deposit", map[string]string{"box": boxD, "blob": base64.StdEncoding.EncodeToString([]byte("new"))}, handleMailboxDeposit)
+		return w.Code
+	}
+
+	if code := depositAtCeiling(); code != http.StatusNoContent {
+		t.Fatalf("a deposit at the ceiling with collected mail to spare got %d", code)
+	}
+	if exists(boxA, gotA[0].ID) || !exists(boxA, gotA[1].ID) {
+		t.Fatal("the oldest collected blob was not the one that gave way")
+	}
+	if code := depositAtCeiling(); code != http.StatusNoContent {
+		t.Fatalf("second deposit: %d", code)
+	}
+	if exists(boxA, gotA[1].ID) {
+		t.Fatal("the next collected blob did not give way")
+	}
+	if _, err := os.Stat(filepath.Join(boxPath(boxA), ackIndexName)); !os.IsNotExist(err) {
+		t.Fatal("the ack index outlived every blob it described")
+	}
+	if code := depositAtCeiling(); code != http.StatusNoContent {
+		t.Fatalf("third deposit: %d", code)
+	}
+	if _, err := os.Stat(boxPath(boxC)); !os.IsNotExist(err) {
+		t.Fatal("a box left with nothing in it was not removed")
+	}
+
+	// Nothing collected is left: refused, and nothing waiting was touched.
+	if code := depositAtCeiling(); code != http.StatusInsufficientStorage {
+		t.Fatalf("with no collected mail left the ceiling returned %d, want 507", code)
+	}
+	if !exists(boxA, gotA[2].ID) || !exists(boxB, gotB[0].ID) {
+		t.Fatal("mail no device has collected was removed")
+	}
+
+	// The same after a restart: the ack indexes on disk say what was
+	// collected.
+	a.ack(phone, []string{gotA[2].ID})
+	mailboxInitUsedBytes()
+	if code := depositAtCeiling(); code != http.StatusNoContent {
+		t.Fatalf("after a restart, a deposit at the ceiling got %d", code)
+	}
+	if exists(boxA, gotA[2].ID) {
+		t.Fatal("after a restart the collected blob did not give way")
+	}
+
+	// The byte ceiling the same way.
+	b.ack(phone, []string{gotB[0].ID})
+	mailboxMu.Lock()
+	mailboxFiles = 0
+	mailboxUsedBytes = mailboxGlobalMaxBytes
+	mailboxMu.Unlock()
+	if w := d.request("/mailbox/deposit", map[string]string{"box": boxD, "blob": base64.StdEncoding.EncodeToString([]byte("new"))}, handleMailboxDeposit); w.Code != http.StatusNoContent {
+		t.Fatalf("at the byte ceiling with collected mail to spare: %d", w.Code)
+	}
+	if exists(boxB, gotB[0].ID) {
+		t.Fatal("at the byte ceiling the collected blob did not give way")
 	}
 }

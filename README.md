@@ -227,13 +227,14 @@ whose context holds no repository declares no commit.
 | `TURN_URLS` | no | the TURN URL list served to clients, comma-separated (below) |
 | `SFU_RTC_MIN_PORT` / `SFU_RTC_MAX_PORT` | no | SFU media range, published and allocated from (default 61000-61499) |
 | `TURN_MIN_PORT` / `TURN_MAX_PORT` | no | coturn relay range, one port per allocation (default 49152-50151) |
-| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide and per credential |
+| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide (default 900) and per credential id (default 12). The credentials the relay hands one address carry at most seven ids between them, so one address holds at most seven times the per-id quota (below) |
 | `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` and `/plugin-stream` (the streaming variant, for media a CDN will not serve cross-origin) |
 | `PLUGIN_PROXY_SECRETS` | no | `NAME@host?param=value` list (e.g. `STEAM@api.steampowered.com?key=...`); plugins put `{{secret:NAME}}` as the whole value of that query parameter, and the relay substitutes it server-side only on that host. `NAME@host/path/prefix?param=value` also restricts the path. The older `NAME@host=value` form is no longer substituted |
+| `RELAY_MAX_CONNS` / `RELAY_GOMEMLIMIT` | no | how many connections (open tabs) the relay holds at once, default 2048, with four times as many relayed circuits, and the relay's soft memory limit, default 768MiB. Past the first, new connections are refused and retried rather than open tabs dropped. See [deploy/README.md](deploy/README.md), "Relay capacity" |
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
 | `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |
-| `PUSH_ENABLED` | no | Web Push, **on by default**. The relay wakes a subscribed device when its mailbox receives a DM, with a push carrying no content (`{"t":"mail"}`, at most one per box per minute). `0` turns it off: `/push/config` answers `enabled: false` and the subscribe routes 404. What it discloses is in [deploy/README.md](deploy/README.md) |
+| `PUSH_ENABLED` | no | Web Push, **on by default**. The relay wakes a subscribed device when its mailbox receives a DM, with a push carrying no content (`{"t":"mail"}`, at most one per box per minute, and one per device until that device collects or an hour passes). `0` turns it off: `/push/config` answers `enabled: false` and the subscribe routes 404. What it discloses is in [deploy/README.md](deploy/README.md) |
 | `PUSH_ALLOWED_HOSTS` | no | push services the relay will send wake-ups to, comma-separated, `*.` for subdomains. Unset means `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `web.push.apple.com`, `*.push.apple.com`, `*.notify.windows.com`; setting it replaces that list, and `*` allows any https host |
 | `PUSH_CONTACT` | no | `mailto:` contact in the VAPID header, which is how a push vendor reaches you about your instance. Defaults to `mailto:admin@<DOMAIN>` |
 | `SFU_MAX_ROOMS` | no | concurrent rooms one SFU will hold, default 250. Past it a join is refused rather than degrading every call already running |
@@ -301,6 +302,23 @@ ones who need TURN at all. Mobile and CGNAT users cannot connect directly, so
 they are the ones who end up relayed, and the relay port range is finite: a
 stranger exhausting it does not slow them down, it locks them out.
 
+Minted credentials alone do not stop that, because anyone can ask for one. So
+the relay hands one address at most seven live credentials (25 per IPv6 /48)
+and gives its newest out again past that, and every credential it hands one
+address carries one of the same seven ids (25 for a /48). coturn's
+`--user-quota` caps the allocations under each id at 12, whatever the
+credential's expiry, and `--total-quota` (900 by default, inside the 1000-port
+range) is the pool. The ids are what make that a cap: coturn checks a
+credential's expiry only when an allocation is made, and an allocation kept
+refreshed outlives it, so while every credential had an id of its own one
+address could gather the whole pool in a day. Now one address holds at most
+84 allocations however long it keeps at it, and one IPv6 /48 300, so filling
+the pool takes about eleven addresses (or three /48s) at once, where it used
+to take one address a minute. The browsers behind one busy address share the
+limit too: all of them are handed its newest credential, and share its 12
+allocations for new connections. Raise `TURN_TOTAL_QUOTA` with the port range,
+and keep it ten times what one address can hold.
+
 **When TURN times out.** The credential fetch succeeding proves nothing: it
 comes from the relay, and the allocation goes to coturn. If a bundle shows
 `ice.turn.fail` with `branch: "allocate"` and `outcome: "timeout"` while
@@ -358,8 +376,10 @@ so. To read one:
 4. Optional, on your own instance: set `TELEMETRY_ENABLED=1` on the relay, and
    the user turns **Allow upload to this instance** on. The relay then staples
    its OWN view of that peer to the bundle - registration outcomes and the real
-   reason a rendezvous stream closed, which the client cannot know. Read
-   `docs/spec.md` "Server Privacy" first: this is a real disclosure change.
+   reason a rendezvous stream closed, which the client cannot know. It keeps a
+   peer's events for half an hour after the last one, so upload soon after the
+   problem. Read `docs/spec.md` "Server Privacy" first: this is a real
+   disclosure change.
 5. Set `SFU_TELEMETRY=1` for the third vantage, and capture the container logs
    with timestamps: `docker logs -t <sfu>` and `docker logs -t <relay>`.
 

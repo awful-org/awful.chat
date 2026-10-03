@@ -637,7 +637,9 @@ Relay side (relay/mailbox.go):
   the blob from THAT device only; the blob leaves at TTL or quota
   eviction, so a phone and a desktop on one identity each collect it
   (the client dedups by message id against storage). A client that sends
-  no device gets the old delete-on-ack.
+  no device gets the old delete-on-ack. At the global quota, blobs some
+  device has already acked give way to new deposits, oldest first; a blob
+  no device has acked is never removed to make room.
   Kinds: the sealed plaintext carries a kind - a chat envelope, a DM
   sync batch (files, plugin cards, without inline bytes), or a delivery
   or read receipt - so receipts and attachments reach a sleeping phone
@@ -876,8 +878,9 @@ EXITS (each gated, all off by default)
 THREE VANTAGES ON ONE SESSION
   client:    the bundle above
   relay:     stapled at ingest - registry counts, per-stream open/close with
-             the REAL close reason, and a per-peer event ring.
-             relay/telemetry.go
+             the REAL close reason, and a per-peer event ring (up to 256
+             events, dropped once nothing has been recorded for that peer
+             for 30 minutes). relay/telemetry.go
   sfu:       ms:diag returns a live snapshot (transports, producers,
              consumers, room siblings); SFU_TELEMETRY=1 also prints one
              [sfu-telemetry] JSON line per room per 10s sweep.
@@ -951,10 +954,13 @@ relay knows:   libp2p peerId + which roomCodes it registered (rendezvous);
                one push endpoint per device - a stable identifier issued by
                the phone's push vendor (Apple, Google, Mozilla) - and it
                sends that vendor a content-free "check your box" at most
-               once a minute per identity when mail arrives. The vendor
-               learns the timing of those wake-ups, never what they are
-               about; the relay learns how many devices an identity has
-               subscribed;
+               once a minute per identity when mail arrives, and to a
+               device once until that device collects (or an hour
+               passes). The vendor learns the timing of those wake-ups,
+               never what they are about; the relay learns how many
+               devices an identity has subscribed. A deposit names no
+               sender, so anyone who knows a DID - a message request
+               included - can still make a closed app ring once;
                where traffic is relayed, the rhythm of typing indicators:
                a small frame every few seconds to the room's peers while
                someone writes (never their content; off with "Show when
@@ -1100,7 +1106,14 @@ Privacy: App Settings > External previews and media is on by default.
 Endpoint: /og/preview?url=<encoded_url> on the Go relay's API port
          (/og is an alias; /klipy/* proxies GIF search the same way)
 Response: JSON { title, description, image, siteName, url, video, mediaType }
-Caching: Server-side caching with TTL
+Caching: the relay keeps each answer in memory for an hour (a failure for
+         five minutes), concurrent asks for one URL share a single fetch, and
+         only a real fetch spends the per-address rate budget. Answers carry
+         Cache-Control: private, max-age=3600 (300 for a failure) so the
+         browser does not ask again on every redraw. The relay holds the
+         URLs it was asked about for that long, within 1024 entries and
+         8 MiB counting URLs and answers alike; a URL over 8 KiB is fetched
+         for each ask and never kept.
 Security: URL allowlist/blocklist, size limits, timeout protection
 ```
 

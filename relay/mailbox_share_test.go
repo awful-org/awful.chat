@@ -28,9 +28,16 @@ func depositFrom(t *testing.T, addr, box string, blob []byte) int {
 
 func freshMailbox(t *testing.T) {
 	t.Helper()
+	empty := t.TempDir()
 	mailboxDir = t.TempDir()
 	mailboxInitUsedBytes()
 	resetRateLimiter(t)
+	// The counters and indexes are process-wide, and a test that pushed them
+	// to a ceiling must not hand that ceiling to whichever test runs next.
+	t.Cleanup(func() {
+		mailboxDir = empty
+		mailboxInitUsedBytes()
+	})
 }
 
 // One IPv6 /56 is 256 separate /64 buckets. Each of them keeps its own
