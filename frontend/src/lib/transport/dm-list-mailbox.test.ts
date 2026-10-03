@@ -61,10 +61,11 @@ vi.mock("$lib/storage", () => ({
 }));
 vi.mock("./attachment-ownership", () => ({ ensureMessageAttachmentOwnership: async () => {} }));
 vi.mock("$lib/messaging", () => ({}));
+const mirror = vi.hoisted(() => ({ dmRooms: [{ roomCode: "dm-peer", participantDid: "did:peer", lastSeenLamport: 0 }] as any[] }));
 vi.mock("$lib/rooms.svelte", () => ({
   noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(),
   refreshDmRooms: async () => { s.events.push("refreshDmRooms"); },
-  roomsStore: { rooms: [], dmRooms: [{ roomCode: "dm-peer", participantDid: "did:peer", lastSeenLamport: 0 }] },
+  roomsStore: { rooms: [], get dmRooms() { return mirror.dmRooms; } },
 }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
 vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));
@@ -125,4 +126,17 @@ it("a DM batch collected from the mailbox tells the DM list once its row is stor
   expect(s.rows.has("mail-1")).toBe(true);
   // Not only the refresh before the row existed: a signal after it.
   expect({ events: s.events, told: toldAfterStore(before) }).toMatchObject({ told: true });
+});
+
+it("a DM the list's mirror never had is listed once a mailbox batch lands in it", async () => {
+  const saved = mirror.dmRooms;
+  mirror.dmRooms = [];
+  try {
+    await deliverMailboxBatch("did:peer", encode({ type: MessageType.SyncBatch, roomCode: "dm-peer",
+      live: true, batchIndex: 0, totalBatches: 1, messages: [card("mail-2", 9)] }));
+    expect(s.rows.has("mail-2")).toBe(true);
+    expect(s.events.lastIndexOf("refreshDmRooms")).toBeGreaterThan(s.events.indexOf("stored"));
+  } finally {
+    mirror.dmRooms = saved;
+  }
 });

@@ -3959,6 +3959,14 @@ export async function deliverMailboxBatch(
   // listed at all. The rooms that refresh read are still current: storing a
   // row changes none of them.
   guard();
+  // Except a conversation the list's mirror never had: a DM record can be
+  // stored without being listed (a phonebook contact's DM made again at
+  // connect while the list loaded), and bumping the version re-reads only
+  // what the mirror holds.
+  if (!roomsStore.dmRooms.some((r) => r.roomCode === roomCode)) {
+    await refreshDmRooms();
+    guard();
+  }
   transportState.dmVersion += 1;
 }
 

@@ -344,7 +344,11 @@ describe("a mailbox batch for a DM that cannot be joined", () => {
 
   it("and taken into one that can be, still without re-reading the DM list", async () => {
     const peer = identity();
-    const { card, blob } = batchFrom(peer, await savedDm(peer.did), 2);
+    const room = await savedDm(peer.did);
+    // Listed, as a saved DM is once the list has loaded: one the list does
+    // not have yet is re-read once to put it there (dm-list-mailbox.test.ts).
+    roomsStore.dmRooms = [{ roomCode: room, participantDid: peer.did } as (typeof roomsStore.dmRooms)[number]];
+    const { card, blob } = batchFrom(peer, room, 2);
     vi.mocked(refreshDmRooms).mockClear();
     await deliverMailboxBatch(peer.did, blob);
     expect(await getMessage(card.id)).toBeDefined();
