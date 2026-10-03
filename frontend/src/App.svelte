@@ -1,6 +1,5 @@
 <script lang="ts">
   import { identityStore, init } from "$lib/identity/identity.svelte";
-  import AppView from "$lib/components/AppView.svelte";
   import Landing from "./Landing.svelte";
   import InstallPrompt from "$lib/components/InstallPrompt.svelte";
   import NotifyPrompt from "$lib/components/NotifyPrompt.svelte";
@@ -8,24 +7,49 @@
   import { notifyState } from "$lib/notify.svelte";
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
-  import { useQc, useQs } from "$lib/runtime-config";
   import { applyRouteMeta } from "$lib/page-meta";
-  import QuickSend from "$lib/components/QuickSend.svelte";
-  import QuickCall from "$lib/components/QuickCall.svelte";
+  // The app, its setup and unlock screens, /qs and /qc are chunks of their
+  // own, so the landing page paints from a small entry; and the routes are
+  // pages.ts's, which main.ts preloads from before this mounts.
+  import {
+    loadPage,
+    prefetchPage,
+    routeFor,
+    type LazyPage,
+    type Route,
+  } from "./pages";
 
-  let currentRoute = $state<"landing" | "app" | "qs" | "qc">("landing");
+  let currentRoute = $state<Route>("landing");
 
   /**
-   * The routes an instance can turn off. A disabled one falls through to the
-   * landing page rather than 404ing: the flag is an operator's choice, not a
-   * broken link, and the page it would have shown does not exist here.
+   * Whether the app keeps the screen while locked. Until the first unlock of
+   * this page the app's address shows the gate, the setup and unlock screens
+   * in a chunk of their own (IdentityGate), and AppView loads only after it:
+   * it is about 2 MB, and an invite link's first visit waited for all of it
+   * before showing a form that needs none of it. From the first unlock on,
+   * AppView keeps the screen and shows its own lock screen, as it always
+   * did: locking must not close the room that was open.
    */
-  function optionalRoute(pathname: string): "qs" | "qc" | null {
-    const path = pathname.replace(/\/$/, "");
-    if (path === "/qs") return useQs() ? "qs" : null;
-    if (path === "/qc") return useQc() ? "qc" : null;
-    return null;
-  }
+  let appOpened = $state(false);
+  $effect(() => {
+    if (currentRoute === "app" && identityStore.isUnlocked) appOpened = true;
+  });
+  const gateShown = $derived(
+    currentRoute === "app" &&
+      !identityStore.initializing &&
+      !identityStore.isUnlocked &&
+      !appOpened
+  );
+
+  // While the gate waits for a password, fetch the app behind it - once the
+  // gate is in, so its own download never shares the line with the app's.
+  $effect(() => {
+    if (!gateShown) return;
+    loadPage("gate").then(
+      () => prefetchPage("app"),
+      () => {}
+    );
+  });
 
   /** A percent-encoded URL piece, or the piece itself when it is malformed. */
   function decode(part: string): string {
@@ -37,30 +61,16 @@
   }
 
   /**
-   * The room code out of the address bar, fragment form first.
+   * Move an old path-form invite into the fragment before anything else runs.
+   * The request that carried it is already in the server's log, but every
+   * later Referer and share of window.location.href would carry it too.
    *
    * The code IS the membership secret, and a path carries it everywhere a
    * fragment does not: the server's access log, the Referer of every outbound
    * link, and nginx's own og:url rewrite. Invite links are `/r/#<code>` now.
-   * `/r/<code>` still parses, because links already handed out do not change.
-   *
    * The palette's parser rather than a local one: it is the only parser that
-   * knows every shape a code has ever had AND strips the `web+awfl://` scheme.
-   * The manifest registers that protocol as `/r/%s`, so a tapped `web+awfl://`
-   * link arrives as an ENCODED url inside the path - which the local parser
-   * handed to normalizeRoomCode whole, and every such link opened the landing
-   * page instead of the room.
-   */
-  function urlRoomCode(): string | null {
-    const { pathname, hash } = window.location;
-    if (!pathname.startsWith("/r/")) return null;
-    return parseRoomCode(decode(pathname) + decode(hash));
-  }
-
-  /**
-   * Move an old path-form invite into the fragment before anything else runs.
-   * The request that carried it is already in the server's log, but every
-   * later Referer and share of window.location.href would carry it too.
+   * knows every shape a code has ever had AND strips the `web+awfl://` scheme,
+   * which the manifest registers as `/r/#%s`.
    */
   function upgradeLegacyPath(): void {
     const { pathname, hash, search } = window.location;
@@ -95,22 +105,7 @@
     if (identityStore.initializing) return;
 
     upgradeLegacyPath();
-    const pathname = window.location.pathname;
-    const roomCode = urlRoomCode();
-    const optional = optionalRoute(pathname);
-
-    if (roomCode) {
-      currentRoute = "app";
-    } else if (optional) {
-      currentRoute = optional;
-    } else if (pathname === "/app" || pathname === "/share-target") {
-      // /share-target is normally a POST the service worker answers; a GET
-      // reaches nginx only when no worker controls the page yet, and the
-      // shared payload is already parked in IndexedDB for the app to claim.
-      currentRoute = "app";
-    } else {
-      currentRoute = "landing";
-    }
+    currentRoute = routeFor(window.location.pathname);
     // /qs and /qc are the only routes worth finding from a search, so they
     // say who they are instead of canonicalising to the root - see page-meta.
     applyRouteMeta(currentRoute);
@@ -119,20 +114,7 @@
   function handlePopState() {
     if (identityStore.initializing) return;
 
-    const pathname = window.location.pathname;
-
-    const optional = optionalRoute(pathname);
-    if (optional) {
-      currentRoute = optional;
-    } else if (
-      urlRoomCode() ||
-      pathname === "/app" ||
-      pathname === "/share-target"
-    ) {
-      currentRoute = "app";
-    } else {
-      currentRoute = "landing";
-    }
+    currentRoute = routeFor(window.location.pathname);
     applyRouteMeta(currentRoute);
   }
 </script>
@@ -151,6 +133,37 @@
 <InstallPrompt />
 <NotifyPrompt />
 
+{#snippet waiting()}
+  <div class="min-h-screen bg-background flex items-center justify-center">
+    <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
+  </div>
+{/snippet}
+
+<!--
+  A page that is not in the startup bundle: the same pulse while its chunk
+  arrives, and a way out if it never does (offline on a first visit, say).
+-->
+{#snippet lazyPage(page: LazyPage)}
+  {#await loadPage(page)}
+    {@render waiting()}
+  {:then Page}
+    <Page />
+  {:catch}
+    <div
+      class="min-h-screen bg-background flex flex-col items-center justify-center gap-3 p-4 text-center"
+    >
+      <p class="font-mono text-xs text-muted-foreground">
+        Awful.chat could not load. Check your connection and try again.
+      </p>
+      <button
+        type="button"
+        class="font-mono text-xs text-foreground underline"
+        onclick={() => window.location.reload()}>Try again</button
+      >
+    </div>
+  {/await}
+{/snippet}
+
 <!--
   /qc before the spinner: its "use my account" unlock can auto-login with a
   remembered password, and that raises `initializing` too. Swapping the page
@@ -159,15 +172,15 @@
   route is only ever "qc" once boot has finished, so this skips nothing.
 -->
 {#if currentRoute === "qc"}
-  <QuickCall />
+  {@render lazyPage("qc")}
 {:else if identityStore.initializing}
-  <div class="min-h-screen bg-background flex items-center justify-center">
-    <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
-  </div>
+  {@render waiting()}
 {:else if currentRoute === "qs"}
-  <QuickSend />
+  {@render lazyPage("qs")}
 {:else if currentRoute === "landing"}
   <Landing />
+{:else if gateShown}
+  {@render lazyPage("gate")}
 {:else}
-  <AppView />
+  {@render lazyPage("app")}
 {/if}

@@ -1,57 +1,58 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  formatShortCode,
-  looksLikeShortCode,
-  normalizeShortCode,
-  parseJoinInput,
-  createInvite,
-  resolveInvite,
-} from "./invite";
+import { expect, it, vi } from "vitest";
+import { createInvite, parseJoinInput } from "./invite";
+import { newRoomSecret, deriveRoomKeys } from "./room-security/keys";
+import { requireRoomSecurityRelease, ROOM_SECURITY_V2_RELEASED } from "./room-security/invitation-release";
 
-describe("short invite codes", () => {
-  it("normalizes case, separators and look-alikes", () => {
-    expect(normalizeShortCode(" 7qk3-m9 ")).toBe("7QK3M9");
-    expect(normalizeShortCode("7QK3 M9")).toBe("7QK3M9");
-    expect(normalizeShortCode("OIlo")).toBe("0110");
-  });
-
-  it("recognizes a short code, including a legacy 6-char hex room code", () => {
-    expect(looksLikeShortCode("7qk3-m9")).toBe(true);
-    expect(looksLikeShortCode("a1b2c3")).toBe(true);
-    expect(looksLikeShortCode("3f9a1c2b4d5e6f70")).toBe(false);
-    expect(looksLikeShortCode("7QK3M")).toBe(false);
-    expect(looksLikeShortCode("7QK3MU")).toBe(false); // U is not in the alphabet
-  });
-
-  it("formats for reading aloud", () => {
-    expect(formatShortCode("7QK3M9")).toBe("7QK3-M9");
-  });
+it("accepts complete capabilities and fragment/protocol handoffs without case folding", () => {
+  const secret = newRoomSecret();
+  for (const input of [secret, `/r/#${secret}`, `https://chat.example/r/#${secret}`, `web+awfl://${secret}`, `/r/#${encodeURIComponent(`web+awfl://r/#${secret}`)}`]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "room", code: secret });
+  }
 });
-
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
-describe("room join input", () => {
-  it("treats full links identically regardless of how they were pasted", () => {
-    for (const input of ["https://chat.example/r/#6BMB3GST2JRJZ", "/r/#6BMB3GST2JRJZ", "web+awfl://6BMB3GST2JRJZ", "6bmb-3gst-2jrj-z"]) {
-      expect(parseJoinInput(input)).toEqual({ kind: "room", code: "6BMB3GST2JRJZ" });
-    }
-    expect(parseJoinInput("https://chat.example/r/a1b2c3?ref=x#unrelated")).toEqual({ kind: "room", code: "a1b2c3" });
-  });
-  it("keeps ambiguous bare legacy codes distinct from explicit legacy links", () => {
-    expect(parseJoinInput("a1b2c3")).toEqual({ kind: "short", code: "A1B2C3", legacySixHex: true });
-    expect(parseJoinInput("7qk3-m9")).toEqual({ kind: "short", code: "7QK3M9", legacySixHex: false });
-    for (const input of ["", "hello", "https://example.com/", "6BMB3GST2JRJZ/junk"]) expect(parseJoinInput(input)).toEqual({ kind: "invalid" });
-  });
-  it("starts invite expiry before the request, not after its round trip", async () => {
-    const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      clock.mockReturnValue(4000);
-      return new Response(JSON.stringify({ code: "7QK3M9", ttl: 300 }));
-    }));
-    expect((await createInvite("6BMB3GST2JRJZ")).expiresAt).toBe(301000);
-  });
-  it("distinguishes unknown/expired aliases from rate-limited requests", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response("{}", { status: 404 })).mockResolvedValueOnce(new Response("{}", { status: 429 })));
-    expect(await resolveInvite("7QK3M9")).toBeNull();
-    await expect(resolveInvite("7QK3M9")).rejects.toThrow("Wait a minute");
-  });
+it("accepts a capability in any case and hands back the lowercase form", () => {
+  const secret = newRoomSecret();
+  expect(secret).toBe(secret.toLowerCase());
+  for (const input of [secret.toUpperCase(), `https://chat.example/r/#${secret.toUpperCase()}`]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "room", code: secret });
+  }
+});
+it("accepts six-character online pairing codes, lowercase, folding human lookalikes", () => {
+  expect(parseJoinInput("k5t-8r5")).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  expect(parseJoinInput(" K5T 8R5 ")).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  expect(parseJoinInput("k5t8r5")).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  expect(parseJoinInput("ooo-lll")).toEqual({ kind: "pairing", code: "000-111" });
+  for (const wrong of ["k5t-8r", "k5t-8r5a", "k5u-8r5"]) {
+    expect(parseJoinInput(wrong)).toEqual({ kind: "invalid" });
+  }
+});
+it("accepts a short link, in the fragment only", () => {
+  for (const input of ["https://awful.chat/r/#k5t-8r5", "awful.chat/r/#K5T8R5", "/r/#k5t-8r5", " http://127.0.0.1:5173/r/#k5t-8r5 "]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "pairing", code: "k5t-8r5" });
+  }
+  for (const input of ["https://awful.chat/r/k5t-8r5", "https://awful.chat/r/#k5t-8r5/x", "https://awful.chat/r/?c=k5t-8r5", "https://awful.chat/#k5t-8r5"]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "invalid" });
+  }
+});
+it("rejects public IDs, old room codes and malformed or path/query capabilities", () => {
+  const secret = newRoomSecret();
+  // Six-character inputs are pairing-code shaped now; a retired short alias
+  // such as "7QK3M9" is tried as a pairing and fails at the relay - never
+  // looked up as a plaintext alias, which is what this guards.
+  for (const input of ["", "6BMB3GST2JRJZ", deriveRoomKeys(secret).discoveryId, `/r/${secret}`, `/r/?secret=${secret}`, "https://example.org/", `${secret}/junk`]) {
+    expect(parseJoinInput(input)).toEqual({ kind: "invalid" });
+  }
+});
+it("retires every plaintext alias request without contacting the network", async () => {
+  const fetchSpy = vi.spyOn(globalThis, "fetch");
+  try {
+    for (const input of ["legacy", newRoomSecret()]) await expect(createInvite(input)).rejects.toThrow("plaintext aliases are retired");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  } finally { fetchSpy.mockRestore(); }
+});
+it("honors the compiled release decision for ordinary invitations", () => {
+  if (ROOM_SECURITY_V2_RELEASED) {
+    expect(requireRoomSecurityRelease).not.toThrow();
+  } else {
+    expect(requireRoomSecurityRelease).toThrow("awaiting");
+  }
 });

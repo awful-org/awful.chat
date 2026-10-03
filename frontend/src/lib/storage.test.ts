@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bulkPutMessages,
   getMessage,
@@ -11,6 +11,15 @@ import {
   putRoom,
   getRoom,
   setWatermark,
+  senderMaxLamports,
+  getMessagesAboveWatermarks,
+  commitWatermark,
+  heldWatermarks,
+  holdWatermarks,
+  releaseWatermarks,
+  setDeletedFloor,
+  deleteMessagesForRoom,
+  getDeletedFloor,
   updateMessageStatus,
   wipeLocalDatabase,
   type Room,
@@ -30,9 +39,12 @@ import {
   putAttachment,
   getAttachmentsByInfoHash,
   updateAttachmentStatus,
+  updateAttachmentData,
   getDB,
   migrateAtRest,
   addRoomParticipant,
+  addRoomParticipants,
+  MAX_ROOM_PARTICIPANTS,
   updateParticipantLastSeen,
   removeRoomParticipant,
   cleanupInactiveParticipants,
@@ -41,11 +53,14 @@ import {
   setRoomPositions,
   setMessagePinned,
   deleteRoom,
+  getLastMessage,
+  roomHoldsMessages,
 } from "./storage";
 import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { STORE_SPECS, inspectRow, isCurrentAad, sealRow } from "./storage-crypto";
 import { getAllRooms as allRooms, putRoom as saveRoomRow, getRoom as roomByCode } from "./storage";
 import { MessageType, type Message } from "./types/message";
+import { lockIdentity } from "./identity/identity";
 
 const TEST_KEY = new Uint8Array(32).fill(42);
 
@@ -74,10 +89,132 @@ beforeEach(async () => {
 
 // Clean up after all tests to avoid affecting other test suites
 afterEach(() => {
+  vi.restoreAllMocks();
   clearStorageCrypto();
 });
 
+describe("identity-owned writes", () => {
+  it.each(["message", "room", "watermark"])("default %s guard rejects lock during pre-transaction encryption", async kind => {
+    let release!: () => void;
+    let entered!: () => void;
+    const pause = new Promise<void>(r => { release = r; });
+    const encrypting = new Promise<void>(r => { entered = r; });
+    const encrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "encrypt").mockImplementationOnce(async (...args) => {
+      entered(); await pause; return encrypt(...args);
+    });
+    const writing = kind === "message" ? putMessage(msg({ id: "stale" }))
+      : kind === "room" ? putRoom({ roomCode: "room-a", type: "text", name: "Private", createdAt: 1, lastSeenLamport: 0, participants: [] })
+      : setWatermark("room-a", "alice", 99);
+    const rejected = expect(writing).rejects.toThrow();
+    await encrypting;
+    lockIdentity();
+    await initStorageCrypto(TEST_KEY); // same key, new unlock
+    release();
+    await rejected;
+    expect(await getMessage("stale")).toBeUndefined();
+    expect(await getRoom("room-a")).toBeUndefined();
+    expect(await getWatermark("room-a", "alice")).toBe(0);
+  });
+  const attachment = { id: "attachment-owned", messageId: "m", roomCode: "room-a",
+    infoHash: "hash-owned", filename: "file", mimeType: "text/plain", size: 1,
+    createdAt: 1, status: "pending" as const };
+
+  it.each(["insert", "status", "data"])("revokes an attachment %s while encryption is pending", async operation => {
+    if (operation !== "insert") await putAttachment(attachment);
+    let release!: () => void;
+    let entered!: () => void;
+    const paused = new Promise<void>(r => { release = r; });
+    const encrypting = new Promise<void>(r => { entered = r; });
+    const encrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "encrypt").mockImplementationOnce(async (...args) => {
+      entered(); await paused; return encrypt(...args);
+    });
+    let active = true;
+    const guard = () => { if (!active) throw new Error("Identity changed"); };
+    const writing = operation === "insert" ? putAttachment(attachment, guard)
+      : operation === "status" ? updateAttachmentStatus(attachment.id, "seeding", guard)
+      : updateAttachmentData(attachment.id, new ArrayBuffer(1), guard);
+    const rejected = expect(writing).rejects.toThrow("Identity changed");
+    await encrypting;
+    active = false;
+    release();
+    await rejected;
+    const rows = await getAttachmentsByInfoHash(attachment.infoHash);
+    if (operation === "insert") expect(rows).toEqual([]);
+    else { expect(rows[0].status).toBe("pending"); expect(rows[0].data).toBeUndefined(); }
+  });
+
+  it("re-seals downloaded bytes when seeding advances during encryption", async () => {
+    await putAttachment(attachment);
+    let release!: () => void;
+    let entered!: () => void;
+    const paused = new Promise<void>(r => { release = r; });
+    const encrypting = new Promise<void>(r => { entered = r; });
+    const encrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "encrypt").mockImplementationOnce(async (...args) => {
+      entered(); await paused; return encrypt(...args);
+    });
+    const bytes = new Uint8Array([42]).buffer;
+    const writing = updateAttachmentData(attachment.id, bytes);
+    await encrypting;
+    await updateAttachmentStatus(attachment.id, "seeding");
+    release();
+    await writing;
+    const rows = await getAttachmentsByInfoHash(attachment.infoHash);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("seeding");
+    expect(rows[0].data).toEqual(bytes);
+  });
+
+  it("does not commit a message when ownership is revoked while encryption is pending", async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const encrypting = new Promise<void>(resolve => { entered = resolve; });
+    const encrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    vi.spyOn(crypto.subtle, "encrypt").mockImplementationOnce(async (...args) => {
+      entered();
+      await pending;
+      return encrypt(...args);
+    });
+    let ownsIdentity = true;
+    const message = msg();
+    const writing = putMessage(message, () => {
+      if (!ownsIdentity) throw new Error("Identity changed");
+    });
+    const rejected = expect(writing).rejects.toThrow("Identity changed");
+    await encrypting;
+    ownsIdentity = false;
+    release();
+    await rejected;
+    expect(await getMessage(message.id)).toBeUndefined();
+  });
+
+  it("rejects revoked history, room and watermark writes without changing storage", async () => {
+    const revoked = () => { throw new Error("Identity changed"); };
+    const message = msg();
+    await expect(bulkPutMessages([message], revoked)).rejects.toThrow("Identity changed");
+    await expect(putRoom({ roomCode: "room-a", type: "text", name: "old identity",
+      createdAt: 1, lastSeenLamport: 0, participants: [] }, revoked))
+      .rejects.toThrow("Identity changed");
+    await expect(setWatermark("room-a", "alice", 10, revoked)).rejects.toThrow("Identity changed");
+    expect(await getMessage(message.id)).toBeUndefined();
+    expect(await getRoom("room-a")).toBeUndefined();
+    expect(await getWatermark("room-a", "alice")).toBe(0);
+  });
+});
+
 describe("watermarks", () => {
+  it("keeps a deleted conversation's floor through the room's deletion", async () => {
+    await setWatermark("dm-x", "did:key:zPeer", 42);
+    await setDeletedFloor("dm-x", "did:key:zPeer", 42);
+    await deleteMessagesForRoom("dm-x");
+    expect(await getWatermark("dm-x", "did:key:zPeer")).toBe(0);
+    expect(await getDeletedFloor("dm-x", "did:key:zPeer")).toBe(42);
+    expect(await getWatermarksForRoom("dm-x")).toEqual({});
+  });
+
   it("stores and reads per-sender max lamport", async () => {
     await setWatermark("room-a", "alice", 5);
     expect(await getWatermark("room-a", "alice")).toBe(5);
@@ -97,6 +234,92 @@ describe("watermarks", () => {
       alice: 4,
       bob: 9,
     });
+  });
+
+  it("waits while a push holds the room, and writes what waited on release", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await setWatermark("room-a", "alice", 5);
+    await setWatermark("room-b", "bob", 3);
+    // Not written, so no digest advertises it yet.
+    expect(await getWatermarksForRoom("room-a")).toEqual({});
+    expect(await getWatermark("room-b", "bob")).toBe(3);
+    // A completed push's own claim is proved, so it does not wait.
+    await commitWatermark("room-a", "carol", 4);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ carol: 4 });
+    await releaseWatermarks("room-a");
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 7, carol: 4 });
+    await setWatermark("room-a", "alice", 9);
+    expect(await getWatermark("room-a", "alice")).toBe(9);
+  });
+
+  it("reads how far a sender reached, an advance still waiting on a hold included", async () => {
+    await setWatermark("room-a", "alice", 5);
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    // The row behind 7 is stored: a deleted DM's floor must cover it.
+    expect(await getWatermark("room-a", "alice")).toBe(7);
+    expect(heldWatermarks("room-a")).toEqual(new Map([["alice", 7]]));
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 5 });
+  });
+
+  it("forgets what waited when the room's history is deleted", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await deleteMessagesForRoom("room-a");
+    expect(heldWatermarks("room-a")).toEqual(new Map());
+    await releaseWatermarks("room-a");
+    expect(await getWatermark("room-a", "alice")).toBe(0);
+    // No longer held: an advance is written at once.
+    await setWatermark("room-a", "bob", 3);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ bob: 3 });
+  });
+});
+
+describe("what a digest and a push read", () => {
+  it("reads a room once for its senders, and stays current as rows are stored", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1], ["bob", 2]]));
+    const reads = getAll.mock.calls.length;
+    expect(reads).toBeGreaterThan(0);
+    await putMessage(msg({ senderId: "alice" }));
+    await bulkPutMessages([msg({ senderId: "carol" })]);
+    for (let i = 0; i < 5; i++) {
+      expect(await senderMaxLamports("room-a")).toEqual(
+        new Map([["alice", 3], ["bob", 2], ["carol", 4]])
+      );
+    }
+    // Every digest after the first is answered from memory.
+    expect(getAll.mock.calls.length).toBe(reads);
+  });
+
+  it("forgets a room whose history is deleted", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" })]);
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1]]));
+    await deleteMessagesForRoom("room-a");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map());
+  });
+
+  it("reads a push only from the lowest watermark the peer has for anyone we hold", async () => {
+    const rows = Array.from({ length: 100 }, (_, i) =>
+      msg({ senderId: i % 2 ? "alice" : "bob" }));
+    await bulkPutMessages(rows);
+    // The room's senders are known already: any digest before this one read them.
+    await senderMaxLamports("room-a");
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 95, bob: 90 });
+    // bob wrote the odd lamports, alice the even ones.
+    expect(missing.map((m) => m.lamport)).toEqual([91, 93, 95, 96, 97, 98, 99, 100]);
+    const lowest = getAll.mock.calls.map(([range]) => (range as IDBKeyRange).lower[1]);
+    expect(Math.min(...lowest)).toBe(91);
+  });
+
+  it("still reads everything for a peer that lacks one of our senders", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 1 });
+    expect(missing.map((m) => m.senderId)).toEqual(["bob"]);
+    expect(await getMessagesAboveWatermarks("room-a", { alice: 1, bob: 2 })).toEqual([]);
   });
 });
 
@@ -159,6 +382,22 @@ describe("unread counts and seen tracking", () => {
     await markRoomSeen("room-a", 42);
     await markRoomSeen("room-a", 7);
     expect((await getRoom("room-a"))?.lastSeenLamport).toBe(42);
+  });
+
+  it("markRoomSeen records when the user last read the room, each time", async () => {
+    await putRoom(room);
+    expect((await getRoom("room-a"))?.seenAt).toBeUndefined();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      await markRoomSeen("room-a", 42);
+      expect((await getRoom("room-a"))?.seenAt).toBe(1_000);
+      // Read again with nothing new: still a read, later.
+      now.mockReturnValue(2_000);
+      await markRoomSeen("room-a", 7);
+      expect((await getRoom("room-a"))?.seenAt).toBe(2_000);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
 
@@ -409,6 +648,29 @@ describe("markOwnMessagesReadUpTo", () => {
     expect((await getMessage("own-3"))?.status).toBe("sent");
     expect((await getMessage("theirs"))?.status).toBe("delivered");
     expect((await getMessage("own-1"))?.status).toBe("read");
+  });
+
+  it("walks only above where an earlier cascade reached", async () => {
+    await bulkPutMessages([
+      msg({ id: "below", senderId: "me", lamport: 5, status: "sent" }),
+      msg({ id: "above", senderId: "me", lamport: 15, status: "sent" }),
+    ]);
+    expect(await markOwnMessagesReadUpTo("room-a", "me", 20, 10)).toEqual(["above"]);
+    expect((await getMessage("below"))?.status).toBe("sent");
+  });
+});
+
+describe("roomHoldsMessages", () => {
+  it("answers from the index alone, so a row that will not open still counts", async () => {
+    expect(await roomHoldsMessages("room-a")).toBe(false);
+    await putMessage(msg({ id: "only", status: "sent" }));
+    // A clear field rewritten around the seal: the row no longer opens.
+    const db = await getDB();
+    await db.put("messages", { ...(await db.get("messages", "only")), status: "read" } as never);
+    // getLastMessage drops a row it cannot open, and so read the room as empty.
+    expect(await getLastMessage("room-a")).toBeUndefined();
+    expect(await roomHoldsMessages("room-a")).toBe(true);
+    expect(await roomHoldsMessages("room-b")).toBe(false);
   });
 });
 
@@ -730,6 +992,21 @@ describe("room participants and persistence", () => {
       "did:key:zBob"
     ];
     expect(secondTimestamp).toBeGreaterThanOrEqual(after);
+  });
+
+  it("adds many in one go, never past the cap, never moving last-seen back", async () => {
+    await putRoom(baseRoom);
+    await addRoomParticipant("room-persist", "did:key:zKept");
+    const kept = (await getRoom("room-persist"))!.participantLastSeen!["did:key:zKept"];
+    const flood = Array.from(
+      { length: MAX_ROOM_PARTICIPANTS + 50 },
+      (_, i) => [`did:key:zJunk${i}`, 1] as const
+    );
+    await addRoomParticipants("room-persist", [["did:key:zKept", 1], ...flood]);
+    const room = await getRoom("room-persist");
+    expect(room?.participants).toHaveLength(MAX_ROOM_PARTICIPANTS);
+    expect(room?.participants).toContain("did:key:zKept");
+    expect(room?.participantLastSeen?.["did:key:zKept"]).toBe(kept);
   });
 
   it("removes a participant and its timestamp", async () => {

@@ -80,6 +80,8 @@ const videoMock = {
 };
 
 const transportMock = {
+  isSecureRoom: (room: string) => room.startsWith("rd2_") || room.startsWith("dm-"),
+  sendRoom: vi.fn(),
   reconcileNow: vi.fn(),
   selfId: () => "self-id",
   send: vi.fn(),
@@ -107,7 +109,19 @@ vi.mock("./transport.svelte", () => ({
 // vi.mock calls above must resolve before call.svelte.ts's own top-level
 // `import { ... } from "./transport.svelte"` runs, and only a module loaded
 // after those mocks land observes the mocked version.
-const { joinCall, leaveCall, setDeafened, startScreenShare } = await import("./call.svelte");
+const { joinCall, leaveCall, setDeafened, startScreenShare, _sendCallState } = await import("./call.svelte");
+
+it.each(["rd2_" + "A".repeat(43), "dm-" + "a".repeat(40)])(
+  "routes call state through the protected call scope %s when another room is displayed",
+  (room) => {
+    transportState.callRoomCode = room;
+    transportMock.send.mockClear();
+    transportMock.sendRoom.mockClear();
+    _sendCallState("member");
+    expect(transportMock.sendRoom).toHaveBeenCalledWith("member", room, expect.any(Uint8Array));
+    expect(transportMock.send).not.toHaveBeenCalled();
+  },
+);
 
 beforeEach(() => {
   transportState.roomCode = "room1";

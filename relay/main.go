@@ -8,9 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,17 +24,23 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/muxer/yamux"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	circuitproto "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	"github.com/libp2p/go-libp2p/x/rate"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
-const RendezvousProtocol = "/awful/rendezvous/1.0.0"
+// Coordinated v2 cutover: no v1 handler or protocol fallback. Legacy clients
+// must update before they can register room discovery on this relay.
+const RendezvousProtocol = "/awful/rendezvous/2.0.0"
 
 type clientMsg struct {
 	Type string `json:"type"` // REGISTER | UNREGISTER | PING
@@ -52,15 +63,32 @@ type rvStream interface {
 }
 
 const (
-	// How long a single frame may take to reach one peer before its stream is
+	// How long one write may take to reach one peer before its stream is
 	// treated as dead. Only that peer's own writer goroutine ever waits this
 	// long, so nobody else's work is queued behind it.
 	streamWriteTimeout = 5 * time.Second
-	// Outbox depth per peer. A reconnecting peer re-REGISTERs every room it is
-	// in at once, so the queue has to absorb a burst of PEERS/PEER_JOINED
-	// frames; a peer still behind after this many is not reading its stream at
-	// all and gets dropped.
-	sendQueueDepth = 256
+	// Outbox bounds per stream, in frames and in bytes, whichever comes
+	// first. A reconnecting peer re-REGISTERs every room it is in at once,
+	// and everyone else's reconnect lands PEER_JOINED frames on it in the
+	// same instant, so the queue has to absorb a burst; a peer still this
+	// far behind is not reading its stream at all and gets dropped. It was a
+	// 256-frame channel, which a peer's own reconnect with a few hundred
+	// rooms could fill before its writer goroutine was even scheduled - on a
+	// one-core box every time - and the dropped tab's PEER_LEFT and
+	// PEER_JOINED two seconds later filled other tabs' outboxes in turn,
+	// which is how a relay restart became a minute of tabs evicting each
+	// other. A stream that really stops reading is caught by the write
+	// deadline above anyway; these bound the memory it holds meanwhile.
+	sendQueueDepth = 4096
+	sendQueueBytes = 512 << 10
+	// The writer sends everything queued in writes of up to this many bytes,
+	// with the frames back to back exactly as they would have been sent one
+	// at a time (the client reads any number of frames from one chunk). One
+	// write per frame was one yamux frame and one syscall per frame, most of
+	// the relay's CPU during a reconnect burst. Twice the largest frame, so
+	// a full PEERS frame always fits with others; small enough that the
+	// client's per-chunk buffer copies stay cheap.
+	writeBatchBytes = 2 * maxMsgLen
 	// maxMsgLen bounds one rendezvous frame, in both directions. readLoop
 	// resets the stream when a peer's declared length goes over it. sendTo
 	// refuses to build an outbound frame that goes over it too. The client
@@ -176,12 +204,15 @@ const (
 	// the rest of the window, so paying the cost of a reconnect on top buys
 	// nothing.
 	//
-	// 128/min/peer x connMgrHigh bounds the system-wide guess rate: 128 x
-	// 512 = 65,536 empty-room REGISTERs/minute at the absolute worst case
-	// (every connection the relay will hold saturating its budget). That is
-	// a ~4h sweep of the legacy 2^24 space and nothing at all against 2^65,
-	// and a peer only refills early by dropping every stream it holds and
-	// reconnecting, which costs a fresh libp2p connection.
+	// 128/min/peer x relayMaxConns bounds the system-wide guess rate: 128 x
+	// 2048 = 262,144 empty-room REGISTERs/minute at the absolute worst case
+	// (one party holding every connection the relay will accept, each
+	// saturating its budget, which also shuts everyone else out). That is
+	// about an hour's sweep of the legacy 2^24 space and nothing at all
+	// against 2^65; from public addresses the per-source budgets below hold
+	// it to a quarter of that. A peer only refills early by dropping every
+	// stream it holds and reconnecting, which costs a fresh libp2p
+	// connection.
 	//
 	// maxRoomsPerPeer is 1024, so a peer with more than 128 saved EMPTY rooms
 	// will exhaust this partway through a reconnect burst and have the rest
@@ -191,6 +222,51 @@ const (
 	// figures of them - never gets near it.
 	maxEmptyRegisters   = 128
 	emptyRegisterWindow = time.Minute
+
+	// Every budget above is keyed by peerId, and a peerId is free: one host
+	// minted ~200 of them, created a few junk rooms, and joined those
+	// NON-empty rooms from every identity - which cost nothing, since only
+	// an empty room was ever charged - until maxTotalRegistrations was
+	// reached and every real REGISTER on the instance came back
+	// REGISTER_FAILED. Four more bounds close that, each keeping the two
+	// legitimate bursts working: a reconnect re-registering up to
+	// maxRoomsPerPeer rooms at once, and DM lobbies (up to 64) 70 s later.
+	//
+	// guaranteedRoomsPerPeer: maxTotalRegistrations is a SOFT ceiling. Past
+	// it a peer still gets its first guaranteedRoomsPerPeer rooms, so a
+	// filled registry degrades everyone to their first 64 rooms instead of
+	// locking every newcomer out. The hard bound is then maxTotalRegistrations
+	// + 64 x the peers the relay can hold at once - each needs a libp2p
+	// connection, and the resource manager caps those at relayMaxConns - so
+	// at most ~131k registrations (~59 MB) past the soft ceiling by default.
+	guaranteedRoomsPerPeer = 64
+	// maxPeersPerRoom caps DISTINCT peers in one room. A room is a group
+	// chat whose members each hold a gossipsub mesh with the others; a
+	// browser does not sustain hundreds of those, so 512 is far past any
+	// room that works, and it stops one room absorbing an unbounded number
+	// of junk identities without costing them a single empty-room charge.
+	maxPeersPerRoom = 512
+	// maxJoinsPerPeer charges EVERY new membership, populated room or not,
+	// against one budget a peer's streams share. An empty room still costs
+	// maxEmptyRegisters on top, so it stays the dearer of the two. Twice
+	// the room cap: a whole reconnect burst plus its lobbies fits in one
+	// window with room to spare.
+	maxJoinsPerPeer = 2 * maxRoomsPerPeer
+	joinWindow      = time.Minute
+	// Per-SOURCE budgets, where the source is the connection's address: an
+	// IPv4 address or an IPv6 /64, plus an aggregate for the IPv6 /48 at
+	// ipv6AggregateFactor times each. Free peerIds from one host share
+	// these. They apply only to connections from a public address. Behind a
+	// proxy every browser arrives from the proxy's one address (see
+	// isProxyClassAddr), where a per-address budget would be a budget for
+	// the whole service, so there the per-peer budgets and the soft ceiling
+	// above are what remain. The per-source numbers are several users'
+	// worth - a household or an office behind one NAT, all reconnecting
+	// after a relay restart - and still a small slice of the registry: one
+	// address holds 4% of maxTotalRegistrations.
+	maxRoomsPerSource          = 8 * maxRoomsPerPeer
+	maxJoinsPerSource          = 8 * maxJoinsPerPeer
+	maxEmptyRegistersPerSource = 16 * maxEmptyRegisters
 )
 
 // rendezvousIdleTimeout closes a stream that has REGISTERed nothing yet and
@@ -233,11 +309,23 @@ type connectedClient struct {
 	// the sending peer's goroutine. Writing inline meant one peer that stopped
 	// reading its stream stalled every other member of its rooms for the whole
 	// write deadline, because go-yamux blocks once the receiver's window fills.
-	out           chan []byte
+	// The queue is a slice under outMu rather than a buffered channel, so it
+	// is bounded in bytes (sendQueueBytes) and costs an idle stream nothing;
+	// outReady (capacity 1) wakes the writer.
+	outMu         sync.Mutex
+	outFrames     [][]byte
+	outBytes      int
+	outReady      chan struct{}
 	done          chan struct{}
 	closeOnce     sync.Once
-	roomCapLogged bool          // guarded by registry.mu; keeps a capped peer from flooding the log
-	joinLeaveLog  membershipLog // guarded by registry.mu; caps the join/leave lines this stream can write
+	roomCapLogged bool // guarded by registry.mu; keeps a capped peer from flooding the log
+	refusalLogged bool // guarded by registry.mu; the same, for every other refusal
+	// The source buckets this stream's connection came from (see
+	// maxRoomsPerSource): source is the IPv4 address or IPv6 /64, sourceAgg
+	// the IPv6 /48. Both empty for a proxy-class or unknown address, which
+	// the per-source budgets do not apply to.
+	source, sourceAgg string
+	joinLeaveLog      membershipLog // guarded by registry.mu; caps the join/leave lines this stream can write
 
 	// Telemetry-only bookkeeping (relay/telemetry.go), guarded by
 	// registry.mu exactly like roomCapLogged and joinLeaveLog above - written
@@ -261,7 +349,7 @@ func newConnectedClient(peerId string, s rvStream) *connectedClient {
 		peerId:       peerId,
 		stream:       s,
 		rooms:        make(map[string]struct{}),
-		out:          make(chan []byte, sendQueueDepth),
+		outReady:     make(chan struct{}, 1),
 		done:         make(chan struct{}),
 		diagRef:      fmt.Sprintf("s%x", time.Now().UnixNano()),
 		diagOpenedAt: time.Now(),
@@ -270,21 +358,62 @@ func newConnectedClient(peerId string, s rvStream) *connectedClient {
 	return c
 }
 
-// writeLoop owns every write to the stream, so two frames can never interleave
-// and the deadline covers exactly one write.
+// writeLoop owns every write to the stream, so two frames can never
+// interleave, and each wake-up writes everything queued by then in as few
+// writes as writeBatchBytes allows. The deadline covers one write.
 func (c *connectedClient) writeLoop() {
 	for {
 		select {
-		case frame := <-c.out:
-			c.stream.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
-			if _, err := c.stream.Write(frame); err != nil {
-				c.shutdown()
-				return
-			}
+		case <-c.outReady:
 		case <-c.done:
 			return
 		}
+		c.outMu.Lock()
+		frames := c.outFrames
+		c.outFrames, c.outBytes = nil, 0
+		c.outMu.Unlock()
+		for len(frames) > 0 {
+			// How many of the queued frames go in this write. A lone frame is
+			// written as it is; only a run of them is copied into one buffer,
+			// so an idle stream holds no buffer of its own.
+			n, size := 1, len(frames[0])
+			for n < len(frames) && size+len(frames[n]) <= writeBatchBytes {
+				size += len(frames[n])
+				n++
+			}
+			batch := frames[0]
+			if n > 1 {
+				batch = make([]byte, 0, size)
+				for _, f := range frames[:n] {
+					batch = append(batch, f...)
+				}
+			}
+			frames = frames[n:]
+			c.stream.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+			if _, err := c.stream.Write(batch); err != nil {
+				c.shutdown()
+				return
+			}
+		}
 	}
+}
+
+// enqueue hands a frame to this client's writer, or reports false when the
+// outbox is already as far behind as sendQueueDepth and sendQueueBytes allow.
+func (c *connectedClient) enqueue(frame []byte) bool {
+	c.outMu.Lock()
+	if len(c.outFrames) >= sendQueueDepth || c.outBytes+len(frame) > sendQueueBytes {
+		c.outMu.Unlock()
+		return false
+	}
+	c.outFrames = append(c.outFrames, frame)
+	c.outBytes += len(frame)
+	c.outMu.Unlock()
+	select {
+	case c.outReady <- struct{}{}:
+	default: // already signalled; the writer takes everything queued
+	}
+	return true
 }
 
 // shutdown stops the writer goroutine and tears the stream down. Resetting the
@@ -438,15 +567,35 @@ func newOpBudget(limit int, window time.Duration) *opBudget {
 }
 
 func (o *opBudget) allow(now time.Time) bool {
+	if !o.has(now) {
+		return false
+	}
+	o.left--
+	return true
+}
+
+// has reports whether the budget can spend one more, refilling it first
+// when the window has rolled over, without spending it.
+func (o *opBudget) has(now time.Time) bool {
 	if !o.started || now.Sub(o.windowStart) >= o.window {
 		o.started = true
 		o.windowStart = now
 		o.left = o.limit
 	}
-	if o.left <= 0 {
-		return false
+	return o.left > 0
+}
+
+// allowAll spends one from every budget, or from none: a join the source
+// refuses must not still cost the peer's own budget.
+func allowAll(now time.Time, budgets ...*opBudget) bool {
+	for _, b := range budgets {
+		if !b.has(now) {
+			return false
+		}
 	}
-	o.left--
+	for _, b := range budgets {
+		b.left--
+	}
 	return true
 }
 
@@ -522,12 +671,26 @@ type registry struct {
 	// Entries live exactly as long as clients[peerId] does, so the map stays
 	// bounded by the connection ceiling and not by anything a peer chooses.
 	emptyRegisters map[string]*opBudget
+	// peerId -> the membership budget shared by every stream that peer holds,
+	// see maxJoinsPerPeer. Same lifetime as emptyRegisters.
+	joins map[string]*opBudget
+	// source bucket -> what every stream from it holds and may still spend,
+	// see maxRoomsPerSource. An entry lives while any stream from that
+	// source does, so the map is bounded by connections, not by anything a
+	// peer chooses.
+	sources map[string]*sourceState
 	// Sum of len(c.rooms) over every live stream, kept incrementally because
 	// the only alternative is walking the whole registry on every REGISTER.
 	total int
 	// Said once when total first reaches the ceiling, so the line does not
 	// repeat per refused frame - which would be the disk-fill it prevents.
 	totalCapLogged bool
+	// protect, when set, tells the connection manager whether a peer holds
+	// a rendezvous stream, so it never trims an open tab (see connMgrHigh).
+	// Called under mu as a peer's first stream arrives and as its last one
+	// goes, so the two can never land out of order. Nil in tests that do not
+	// need it.
+	protect func(peerId string, on bool)
 }
 
 func newRegistry() *registry {
@@ -535,6 +698,67 @@ func newRegistry() *registry {
 		rooms:          make(map[string]map[*connectedClient]struct{}),
 		clients:        make(map[string]map[*connectedClient]struct{}),
 		emptyRegisters: make(map[string]*opBudget),
+		joins:          make(map[string]*opBudget),
+		sources:        make(map[string]*sourceState),
+	}
+}
+
+// sourceState is one source bucket's footprint in the registry and its
+// budgets. held is the registrations its streams hold right now.
+type sourceState struct {
+	streams int
+	held    int
+	maxHeld int
+	joins   *opBudget
+	empty   *opBudget
+}
+
+// sourceKeysFor names the source buckets a connection from addr is budgeted
+// under, or none for an address the per-source budgets do not apply to.
+func sourceKeysFor(addr netip.Addr) (own, agg string) {
+	if !addr.IsValid() || isProxyClassAddr(addr) {
+		return "", ""
+	}
+	return clientBuckets(addr.String())
+}
+
+// sourceKeys returns the stream's source bucket keys that are set.
+func (c *connectedClient) sourceKeys() []string {
+	switch {
+	case c.source == "":
+		return nil
+	case c.sourceAgg == "":
+		return []string{c.source}
+	default:
+		return []string{c.source, c.sourceAgg}
+	}
+}
+
+// attachSource counts a new stream against its source bucket, creating the
+// bucket's state on its first stream. Caller holds r.mu.
+func (r *registry) attachSource(key string, factor int) {
+	st := r.sources[key]
+	if st == nil {
+		st = &sourceState{
+			maxHeld: maxRoomsPerSource * factor,
+			joins:   newOpBudget(maxJoinsPerSource*factor, joinWindow),
+			empty:   newOpBudget(maxEmptyRegistersPerSource*factor, emptyRegisterWindow),
+		}
+		r.sources[key] = st
+	}
+	st.streams++
+}
+
+// detachSource is attachSource's inverse, for a stream leaving the
+// registry. The budgets go with the last stream, like a peer's own. Caller
+// holds r.mu.
+func (r *registry) detachSource(key string) {
+	st := r.sources[key]
+	if st == nil {
+		return
+	}
+	if st.streams--; st.streams <= 0 {
+		delete(r.sources, key)
 	}
 }
 
@@ -544,6 +768,12 @@ func newRegistry() *registry {
 // than a stale session, and tearing it down made the two tabs reset each other
 // forever, wiping the loser's room membership every round.
 func (r *registry) addStream(peerId string, s rvStream) *connectedClient {
+	return r.addStreamFrom(peerId, s, netip.Addr{})
+}
+
+// addStreamFrom is addStream for a stream whose connection came from addr,
+// which decides the source buckets it is budgeted under.
+func (r *registry) addStreamFrom(peerId string, s rvStream, addr netip.Addr) *connectedClient {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -554,11 +784,24 @@ func (r *registry) addStream(peerId string, s rvStream) *connectedClient {
 	if streams == nil {
 		streams = make(map[*connectedClient]struct{})
 		r.clients[peerId] = streams
+		if r.protect != nil {
+			r.protect(peerId, true)
+		}
 	}
 	// A second stream joins the budget the peer already has; it never gets a
 	// fresh one.
 	r.emptyRegisterBudget(peerId)
+	if r.joins[peerId] == nil {
+		r.joins[peerId] = newOpBudget(maxJoinsPerPeer, joinWindow)
+	}
 	c := newConnectedClient(peerId, s)
+	c.source, c.sourceAgg = sourceKeysFor(addr)
+	if c.source != "" {
+		r.attachSource(c.source, 1)
+	}
+	if c.sourceAgg != "" {
+		r.attachSource(c.sourceAgg, ipv6AggregateFactor)
+	}
 	streams[c] = struct{}{}
 	return c
 }
@@ -622,17 +865,15 @@ func (r *registry) sendTo(c *connectedClient, msg serverMsg) {
 	frame[3] = byte(len(data))
 	copy(frame[4:], data)
 
-	select {
-	case c.out <- frame:
-		// Handed to this client's writer goroutine; the caller (some other
-		// peer's read loop) never waits on the network.
-	default:
+	// Handed to this client's writer goroutine; the caller (some other peer's
+	// read loop) never waits on the network.
+	if !c.enqueue(frame) {
 		// A full outbox means the peer is not draining its stream. Dropping it
 		// is the point: the alternative is blocking the caller on a write that
 		// will not complete, which is how one dead tab stalled a whole room.
 		// It has missed frames either way, so it has to reconnect to resync.
 		log.Printf("[rv] %s is not reading its stream, dropping it", short(c.peerId))
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseOutboxFull}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", relayCloseOutboxFull)})
 		c.shutdown()
 	}
 }
@@ -708,6 +949,37 @@ func (r *registry) sendPeers(c *connectedClient, room string, others []string) {
 	}
 }
 
+// refuseLocked answers one REGISTER with registerCapped for reason, saying
+// line once per stream at most. Called with r.mu held; returns with it
+// released, and writes the line after releasing it.
+func (r *registry) refuseLocked(c *connectedClient, room, reason, line string) registerOutcome {
+	say := !c.refusalLogged
+	c.refusalLogged = true
+	c.diagCapped++
+	r.mu.Unlock()
+	if say {
+		log.Print(line)
+	}
+	diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", reason)})
+	return registerCapped
+}
+
+// distinctPeersAtLeast reports whether members holds at least n distinct
+// peerIds, stopping as soon as it knows.
+func distinctPeersAtLeast(members map[*connectedClient]struct{}, n int) bool {
+	if len(members) < n {
+		return false
+	}
+	seen := make(map[string]struct{}, n)
+	for m := range members {
+		seen[m.peerId] = struct{}{}
+		if len(seen) >= n {
+			return true
+		}
+	}
+	return false
+}
+
 // register admits c into room. readLoop answers registerCapped with an
 // explicit REGISTER_FAILED; registerOracleSilenced stays silent (see
 // maxEmptyRegisters); every other path either really succeeded or is
@@ -741,18 +1013,21 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room)})
 		return registerJoined
 	}
-	if r.total >= maxTotalRegistrations {
+	held := r.roomsHeldByPeer(c.peerId)
+	// Past the soft ceiling only a peer still inside its guaranteed rooms
+	// gets in - see guaranteedRoomsPerPeer.
+	if r.total >= maxTotalRegistrations && held >= guaranteedRoomsPerPeer {
 		sayCapped := !r.totalCapLogged
 		r.totalCapLogged = true
 		c.diagCapped++
 		r.mu.Unlock()
 		if sayCapped {
-			log.Printf("[rv] registry is at its %d-registration ceiling, ignoring further REGISTERs", maxTotalRegistrations)
+			log.Printf("[rv] registry is at its %d-registration ceiling, only peers under %d rooms may join more", maxTotalRegistrations, guaranteedRoomsPerPeer)
 		}
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", "capped")})
 		return registerCapped
 	}
-	if r.roomsHeldByPeer(c.peerId) >= maxRoomsPerPeer {
+	if held >= maxRoomsPerPeer {
 		sayCapped := !c.roomCapLogged
 		c.roomCapLogged = true
 		c.diagCapped++
@@ -765,21 +1040,55 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 		if sayCapped {
 			log.Printf("[rv] %s hit the %d-room cap, ignoring further REGISTERs", short(c.peerId), maxRoomsPerPeer)
 		}
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "capped"}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", "capped")})
 		return registerCapped
+	}
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil && st.held >= st.maxHeld {
+			return r.refuseLocked(c, room, "source-capped",
+				fmt.Sprintf("[rv] %s's network holds its %d-registration share, ignoring further REGISTERs", short(c.peerId), st.maxHeld))
+		}
 	}
 
 	members := r.rooms[room]
+	if !peerInRoom(members, c.peerId) && distinctPeersAtLeast(members, maxPeersPerRoom) {
+		return r.refuseLocked(c, room, "room-full",
+			fmt.Sprintf("[rv] room [%s] is at its %d-peer cap, refusing %s", logSafe(room), maxPeersPerRoom, short(c.peerId)))
+	}
+	// Every new membership is charged, to the peer and to its source, before
+	// anything about the room's population is consulted: this refusal must
+	// come out the same for an empty room and a populated one, or it would
+	// be the oracle the empty-register budget below exists to deny.
+	now := time.Now()
+	joinBudgets := []*opBudget{r.joins[c.peerId]}
+	emptyBudgets := []*opBudget{r.emptyRegisterBudget(c.peerId)}
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil {
+			joinBudgets = append(joinBudgets, st.joins)
+			emptyBudgets = append(emptyBudgets, st.empty)
+		}
+	}
+	if joinBudgets[0] == nil {
+		// Cannot happen for a live stream - addStreamFrom creates the budget
+		// and evict drops it with the peer's last stream - but a nil here
+		// would panic the whole relay, so it gets a fresh one instead.
+		joinBudgets[0] = newOpBudget(maxJoinsPerPeer, joinWindow)
+		r.joins[c.peerId] = joinBudgets[0]
+	}
+	if !allowAll(now, joinBudgets...) {
+		return r.refuseLocked(c, room, "join-rate",
+			fmt.Sprintf("[rv] %s is joining rooms faster than its budget allows, ignoring", short(c.peerId)))
+	}
 	// Whether the room has an OTHER member has to be read right here, under
 	// the same lock that is about to add c to it - a second lookup after
 	// unlocking could race a concurrent register into the same room and
 	// charge (or spare) the wrong REGISTER. An empty room is the oracle a
-	// code guesser is fishing for, so only THAT case spends the budget; a
-	// REGISTER into a room that already has somebody else in it is free.
-	if len(members) == 0 && !r.emptyRegisterBudget(c.peerId).allow(time.Now()) {
+	// code guesser is fishing for, so THAT case also spends the empty-room
+	// budget, per peer and per source.
+	if len(members) == 0 && !allowAll(now, emptyBudgets...) {
 		c.diagOracleSilenced++
 		r.mu.Unlock()
-		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: map[string]any{"refused": "oracle"}})
+		diagRecord(c.peerId, relayDiagEvent{Kind: "rv.register", Room: diagRoomRef(room), D: diagReason("refused", "oracle")})
 		return registerOracleSilenced
 	}
 	if members == nil {
@@ -793,6 +1102,11 @@ func (r *registry) register(c *connectedClient, room string) registerOutcome {
 	members[c] = struct{}{}
 	c.rooms[room] = struct{}{}
 	r.total++
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil {
+			st.held++
+		}
+	}
 
 	// Snapshot under the lock: who to notify (every stream except this peer's
 	// own) and the peer list the joiner gets (one entry per distinct peerId,
@@ -885,6 +1199,11 @@ func (r *registry) doUnregister(c *connectedClient, room string) ([]*connectedCl
 	delete(members, c)
 	delete(c.rooms, room)
 	r.total--
+	for _, k := range c.sourceKeys() {
+		if st := r.sources[k]; st != nil {
+			st.held--
+		}
+	}
 	// A transient spike past the ceiling logs one line and sets
 	// totalCapLogged, then falls silent for the rest of the process even
 	// after total drops back down. Clear the flag here so the NEXT spike
@@ -955,12 +1274,19 @@ func (r *registry) evict(c *connectedClient) ([]departure, []leaveLine) {
 	}
 	streams := r.clients[c.peerId]
 	delete(streams, c)
+	for _, k := range c.sourceKeys() {
+		r.detachSource(k)
+	}
 	if len(streams) == 0 {
 		delete(r.clients, c.peerId)
 		// The budget outlives every stream but the last, so cycling streams
 		// buys no refill; only a full reconnect does, and that costs a libp2p
 		// connection the connection manager already bounds.
 		delete(r.emptyRegisters, c.peerId)
+		delete(r.joins, c.peerId)
+		if r.protect != nil {
+			r.protect(c.peerId, false)
+		}
 	}
 	return notifications, lines
 }
@@ -1036,7 +1362,7 @@ func (r *registry) disconnectPeer(peerId string) {
 	// rooms are torn down before its own readLoop had a chance to notice
 	// and record its own close reason - "evicted" names exactly that.
 	for range doomed {
-		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseEvicted}})
+		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", relayCloseEvicted)})
 	}
 	diagRecord(peerId, relayDiagEvent{Kind: "peer.disconnect"})
 
@@ -1081,10 +1407,17 @@ func (r *registry) handleStream(s network.Stream) {
 	// reset it back - a permanent flap that wiped the loser's rooms every round.
 	// A stream that registers after the registry has let it go is what RELAY-02
 	// was really about, and register/unregister guard that directly.
-	c := r.addStream(peerId, s)
+	// The connection's address decides which source buckets this stream is
+	// budgeted under - see maxRoomsPerSource.
+	var addr netip.Addr
+	if ip, err := manet.ToIP(s.Conn().RemoteMultiaddr()); err == nil {
+		addr, _ = netip.AddrFromSlice(ip)
+		addr = addr.Unmap()
+	}
+	c := r.addStreamFrom(peerId, s, addr)
 	if c == nil {
 		lifecycleLogf("[rv] %s already holds %d rendezvous streams, refusing another", short(peerId), maxStreamsPerPeer)
-		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": relayCloseStreamCap}})
+		diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", relayCloseStreamCap)})
 		s.Reset()
 		return
 	}
@@ -1110,17 +1443,21 @@ func (r *registry) readLoop(s rvReadStream, peerId string, c *connectedClient) s
 
 	// Every complaint this stream can provoke comes out of one small budget:
 	// maxMsgLen has no lower bound, so a peer can stream tiny junk frames at
-	// line rate and would otherwise get a log line for each one.
+	// line rate and would otherwise get a log line for each one. The
+	// rv.send.fail event that goes with a complaint is recorded only when the
+	// line is: unbudgeted, a peer sending junk filled its telemetry ring with
+	// them, and the relay held every such ring until it restarted.
 	budget := &logBudget{left: maxStreamLogLines}
 	membershipOps := newOpBudget(maxMembershipOps, membershipOpWindow)
-	warn := func(format string, args ...any) {
+	warn := func(format string, args ...any) bool {
 		if !budget.allow() {
-			return
+			return false
 		}
 		log.Printf(format, args...)
 		if budget.spent() {
 			log.Printf("[rv] %s used up its log budget, further complaints about this stream are dropped", short(peerId))
 		}
+		return true
 	}
 
 	// Set once the stream has registered a room; from then on it gets
@@ -1169,15 +1506,17 @@ readLoop:
 
 			var msg clientMsg
 			if err := json.Unmarshal(payload, &msg); err != nil {
-				warn("[rv] bad message from %s: %v", short(peerId), err)
-				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "malformed"}})
+				if warn("[rv] bad message from %s: %v", short(peerId), err) {
+					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: diagReason("reason", "malformed")})
+				}
 				continue
 			}
 
 			if msg.Type == "REGISTER" || msg.Type == "UNREGISTER" {
 				if !validRoom(msg.Room) {
-					warn("[rv] %s sent an unusable room id (%d bytes), ignoring", short(peerId), len(msg.Room))
-					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "bad-room"}})
+					if warn("[rv] %s sent an unusable room id (%d bytes), ignoring", short(peerId), len(msg.Room)) {
+						diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: diagReason("reason", "bad-room")})
+					}
 					if msg.Type == "REGISTER" {
 						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
 					}
@@ -1189,14 +1528,15 @@ readLoop:
 			case "REGISTER", "UNREGISTER":
 				// Refuse the OPERATION, not just its log line. Each membership
 				// change fans a frame out to every other stream in the room,
-				// and a peer flapping one shared room fills another member's
-				// outbox in ~130 messages - at which point sendTo drops that
+				// and a peer flapping one shared room could fill another
+				// member's outbox - at which point sendTo drops that
 				// member, and dropping it evicts it from every room it holds,
 				// including rooms the flapper was never in. A real client
 				// registers each room once per connection.
 				if !membershipOps.allow(time.Now()) {
-					warn("[rv] %s is changing rooms faster than %d/%s, ignoring", short(peerId), maxMembershipOps, membershipOpWindow)
-					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", Room: diagRoomRef(msg.Room), D: map[string]any{"reason": "rate-limited"}})
+					if warn("[rv] %s is changing rooms faster than %d/%s, ignoring", short(peerId), maxMembershipOps, membershipOpWindow) {
+						diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", Room: diagRoomRef(msg.Room), D: diagReason("reason", "rate-limited")})
+					}
 					if msg.Type == "REGISTER" {
 						r.sendTo(c, serverMsg{Type: "REGISTER_FAILED", Room: msg.Room})
 					}
@@ -1236,22 +1576,71 @@ readLoop:
 				// this loop. Old clients ignore unknown frame types.
 				r.sendTo(c, serverMsg{Type: "PONG"})
 			default:
-				warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type))
-				diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: map[string]any{"reason": "unknown-type"}})
+				if warn("[rv] unknown type from %s: %s", short(peerId), logSafe(msg.Type)) {
+					diagRecord(peerId, relayDiagEvent{Kind: "rv.send.fail", D: diagReason("reason", "unknown-type")})
+				}
 			}
 		}
 	}
 
-	diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: map[string]any{"reason": reason}})
+	diagRecord(peerId, relayDiagEvent{Kind: "rv.close", D: diagReason("reason", reason)})
 	return reason
 }
 
-// Connection ceiling for the whole relay. The low mark is where the connection
-// manager starts trimming idle peers, the high mark is a hard stop.
+// relayMaxConns is how many libp2p connections the relay holds at once - one
+// per open tab, plus the second node device sync starts - and every other
+// connection, stream, reservation and circuit ceiling below is sized from
+// it. RELAY_MAX_CONNS sets it; past it a new connection is refused at
+// accept, which a client retries, rather than an established one being
+// dropped. Measured at about 140-180 KB of relay memory per tab and 25-33 KB
+// per live circuit, the default is roughly 550 MB with every connection and
+// circuit in use: lower it on a small box, and keep GOMEMLIMIT
+// (RELAY_GOMEMLIMIT in the compose file) above what it allows. See
+// deploy/README.md, "Relay capacity".
+var relayMaxConns = parseRelayMaxConns(os.Getenv("RELAY_MAX_CONNS"))
+
 const (
-	connMgrLow  = 256
-	connMgrHigh = 512
+	defaultRelayMaxConns = 2048
+	minRelayMaxConns     = 64
+	maxRelayMaxConns     = 1 << 16
 )
+
+func parseRelayMaxConns(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultRelayMaxConns
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Printf("[relay] ignoring RELAY_MAX_CONNS=%q: not a number, using %d", raw, defaultRelayMaxConns)
+		return defaultRelayMaxConns
+	}
+	return min(max(n, minRelayMaxConns), maxRelayMaxConns)
+}
+
+// The connection manager's watermarks. It does not trim idle peers and it is
+// not a hard stop: every 10 s, once connMgrHigh connections are open, it closes
+// connections past their one-minute grace, lowest value first, until those
+// number connMgrLow. At the old 256/512 that evicted more than half of all
+// tabs about every 70 s as soon as 512 were connected, the same unlucky ones
+// each time, each eviction a PEER_LEFT to all their rooms and a reconnect
+// storm. Now a peer holding a rendezvous stream - every open tab - is
+// protected and never trimmed (registry.protect), the hard ceiling is the
+// resource manager's at relayMaxConns, and trimming only ever reaches
+// connections that never got as far as a rendezvous stream.
+var (
+	connMgrHigh = relayMaxConns
+	connMgrLow  = relayMaxConns * 3 / 4
+)
+
+// rendezvousProtectTag marks a peer the connection manager must not trim.
+const rendezvousProtectTag = "rendezvous"
+
+// newConnManager builds the relay's connection manager. Options are for
+// tests, which need a grace period shorter than a minute.
+func newConnManager(opts ...connmgr.Option) (*connmgr.BasicConnMgr, error) {
+	return connmgr.NewConnManager(connMgrLow, connMgrHigh, opts...)
+}
 
 // relayResources lifts the circuit-relay reservation ceilings for the same
 // reason newResourceManager lifts the connection ones: behind Traefik every
@@ -1263,13 +1652,21 @@ const (
 // inbound connection to a peer runs through its relay reservation: past the
 // ninth user, peers simply could not reach each other, and the app reported
 // it as a reservation timeout.
+//
+// The per-address cap those lifts gave up lives in reservationGate
+// (relaygate.go) instead, which applies it only where the relay really sees
+// a client's address and not to the proxy's.
 func relayResources() relayv2.Resources {
 	res := relayv2.DefaultResources()
-	res.MaxReservations = connMgrHigh
-	// Per-IP and per-ASN are meaningless while the proxy is the only peer we
-	// see; the global ceiling above is the one that counts.
-	res.MaxReservationsPerIP = connMgrHigh
-	res.MaxReservationsPerASN = connMgrHigh
+	// One per connection the relay will hold: a tab past this got
+	// RESERVATION_REFUSED, which leaves a browser undialable, and rebuilt its
+	// node in a loop.
+	res.MaxReservations = relayMaxConns
+	// Per-IP and per-ASN here cannot tell the proxy from a client, and the
+	// proxy is every user at once; reservationGate does the per-address
+	// limiting that can.
+	res.MaxReservationsPerIP = relayMaxConns
+	res.MaxReservationsPerASN = relayMaxConns
 	// MaxCircuits is the fourth ceiling relayv2.DefaultResources() sets, and
 	// this function used to leave it alone at the default: 16 COMBINED
 	// circuits per peer, counting both directions (source or destination).
@@ -1283,12 +1680,9 @@ func relayResources() relayv2.Resources {
 	// accumulating.
 	//
 	// Lifted to connMgrHigh for the same reason as the three ceilings
-	// above: the resource manager's own memory budget is the real bound,
-	// not this count. Each live circuit reserves 2*BufferSize = 4 KiB from
-	// a peer's resource-manager span (circuitv2/relay/relay.go), so
-	// connMgrHigh (512) circuits cost at most 2 MiB for one peer - small
-	// next to the resource manager's own limits, and nowhere near what it
-	// takes to OOM the box.
+	// above: the resource manager's circuit limits (relayCircuitLimits) are
+	// the real bound, 128 each way per peer and relayCircuits relay-wide,
+	// not this count.
 	res.MaxCircuits = connMgrHigh
 	return res
 }
@@ -1316,7 +1710,10 @@ func relayResources() relayv2.Resources {
 // hole-punching stepping stone the "limited" flag was designed around, so
 // they must not carry a limit at all. The abuse bound is the resource
 // manager and relayResources above: per-peer and global reservation and
-// circuit counts, and the memory budget behind them.
+// circuit counts. Those resource-manager numbers used to be go-libp2p's
+// generic service defaults, scaled by the host's memory, which nobody had
+// chosen for a relay; relayCircuitLimits and relaySystemLimits now set them
+// explicitly.
 
 // No circuit ACL. One was tried on 2026-09-02: AllowConnect required both
 // ends of a circuit to hold a live rendezvous stream, which is how an app
@@ -1332,9 +1729,203 @@ func relayResources() relayv2.Resources {
 // keyed by peerId, not by stream, and that is a different design; the
 // abuse bound is the resource manager, see the note on unlimited circuits.
 
+// Connection limits for a PUBLIC source address - a connection the relay
+// really sees a client's address on. go-libp2p's defaults (8 per address,
+// 0.2 new a second) were lifted wholesale when every browser was found to
+// arrive from Traefik's one address, and with them went any bound on one
+// host: a single machine could open 1024 connections and hold every
+// reservation on the relay. These are the realistic numbers again, applied
+// only where they mean one client's network, never to a proxy (see
+// proxyPrefixLimits).
+//
+// 64 connections is a household or office behind one NAT, each person with
+// a tab or two and a device-sync node, all reconnecting at once after a
+// relay restart - which the burst of the same size covers. IPv6 is held per
+// /64 with an aggregate for the /48, like every other per-client budget.
+const (
+	maxConnsPerAddr      = 64
+	maxConnsPerAggregate = maxConnsPerAddr * ipv6AggregateFactor
+	newConnsPerAddrRPS   = 1.0
+)
+
+// proxyPrefixLimits are the source prefixes held only to the global
+// ceilings: loopback, the private and CGNAT ranges - where a proxy lives and
+// no internet client can connect from - and the literal entries of
+// TRUSTED_PROXY_CIDRS, for a proxy on a public address. A matching prefix
+// replaces the per-subnet limits, so none of them is ever a per-user cap on
+// what is really the whole service. Most specific first, as the resource
+// manager requires.
+func proxyPrefixLimits() (v4, v6 []rcmgr.NetworkPrefixLimit) {
+	add := func(p netip.Prefix, n int) {
+		l := rcmgr.NetworkPrefixLimit{Network: p.Masked(), ConnCount: n}
+		if p.Addr().Is4() {
+			v4 = append(v4, l)
+		} else {
+			v6 = append(v6, l)
+		}
+	}
+	add(netip.MustParsePrefix("127.0.0.0/8"), math.MaxInt)
+	add(netip.MustParsePrefix("::1/128"), math.MaxInt)
+	for _, c := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"} {
+		add(netip.MustParsePrefix(c), relayMaxConns)
+	}
+	for _, p := range trustedProxies.literalPrefixes() {
+		add(p, relayMaxConns)
+	}
+	return v4, v6
+}
+
+// relayCircuits is how many circuits the relay carries at once: four per
+// connection at the ceiling, and never fewer than the 2048 it has always
+// allowed. A circuit is kept for the life of both tabs, one per pair of
+// online room members, so a fully online 50-member room alone is 1,225 of
+// them; each costs the relay about 30 KB.
+var relayCircuits = max(2048, 4*relayMaxConns)
+
+// Per peer, as a circuit's source and as its destination: one per online
+// contact in a busy room, twice over.
+const relayCircuitsPerPeer = 128
+
+// relayCircuitLimits pins the resource-manager limits the relay service
+// and its hop and stop protocols run under. WithInfiniteLimits has to stay
+// (see the note on unlimited circuits), so these are what bound circuits:
+// how many are open at once relay-wide, and how many one peer holds.
+//
+// They were go-libp2p's generic service and protocol defaults before,
+// scaled by an eighth of the host's memory: on a small VPS about 700
+// concurrent circuits relay-wide and 64 per peer as a source. The numbers
+// here are no tighter than that on any box the relay runs on today - a
+// circuit carries a call's signalling, and a tighter number would fail
+// calls - but they are now chosen rather than inherited, and do not grow
+// with RAM. Each circuit is one inbound hop stream and one outbound stop
+// stream, plus 2 x BufferSize (4 KiB) of buffer charged to the service.
+// The streams themselves are what newResourceManager's System limits are
+// sized for, so these are the ones that bind.
+func relayCircuitLimits(limits *rcmgr.PartialLimitConfig) {
+	if limits.Service == nil {
+		limits.Service = map[string]rcmgr.ResourceLimits{}
+	}
+	if limits.ServicePeer == nil {
+		limits.ServicePeer = map[string]rcmgr.ResourceLimits{}
+	}
+	if limits.Protocol == nil {
+		limits.Protocol = map[protocol.ID]rcmgr.ResourceLimits{}
+	}
+	if limits.ProtocolPeer == nil {
+		limits.ProtocolPeer = map[protocol.ID]rcmgr.ResourceLimits{}
+	}
+	// relayCircuits at once relay-wide, and their buffers with room to
+	// spare.
+	limits.Service[relayv2.ServiceName] = rcmgr.ResourceLimits{
+		StreamsInbound:  rcmgr.LimitVal(relayCircuits),
+		StreamsOutbound: rcmgr.LimitVal(relayCircuits),
+		Streams:         rcmgr.LimitVal(2 * relayCircuits),
+		Memory:          rcmgr.LimitVal64(max(64<<20, int64(relayCircuits)*16<<10)),
+	}
+	// One peer: relayCircuitsPerPeer circuits it opened and as many it is
+	// the target of.
+	limits.ServicePeer[relayv2.ServiceName] = rcmgr.ResourceLimits{
+		StreamsInbound:  rcmgr.LimitVal(relayCircuitsPerPeer),
+		StreamsOutbound: rcmgr.LimitVal(relayCircuitsPerPeer),
+		Streams:         rcmgr.LimitVal(2 * relayCircuitsPerPeer),
+		Memory:          rcmgr.LimitVal64(16 << 20),
+	}
+	limits.Protocol[circuitproto.ProtoIDv2Hop] = rcmgr.ResourceLimits{
+		StreamsInbound: rcmgr.LimitVal(relayCircuits),
+		Streams:        rcmgr.LimitVal(2 * relayCircuits),
+	}
+	limits.ProtocolPeer[circuitproto.ProtoIDv2Hop] = rcmgr.ResourceLimits{
+		StreamsInbound: rcmgr.LimitVal(relayCircuitsPerPeer),
+		Streams:        rcmgr.LimitVal(2 * relayCircuitsPerPeer),
+	}
+	limits.Protocol[circuitproto.ProtoIDv2Stop] = rcmgr.ResourceLimits{
+		StreamsOutbound: rcmgr.LimitVal(relayCircuits),
+		Streams:         rcmgr.LimitVal(2 * relayCircuits),
+	}
+	limits.ProtocolPeer[circuitproto.ProtoIDv2Stop] = rcmgr.ResourceLimits{
+		StreamsOutbound: rcmgr.LimitVal(relayCircuitsPerPeer),
+		Streams:         rcmgr.LimitVal(2 * relayCircuitsPerPeer),
+	}
+}
+
+// The memory go-yamux reserves from the resource manager for every open
+// stream: its initial receive window, charged in full the moment the stream
+// opens (go-yamux session.go). A circuit is two of them, one on each end's
+// connection, and a tab's rendezvous stream is one more.
+const yamuxStreamWindow = 256 << 10
+
 // newResourceManager builds the libp2p resource manager for the relay.
-// Extracted so main_test.go can assert the ceiling it lifts.
+// Extracted so main_test.go can assert the ceilings it sets.
 func newResourceManager() (network.ResourceManager, error) {
+	return newResourceManagerFrom(rcmgr.DefaultLimits.AutoScale())
+}
+
+// relaySystemLimits pins what newResourceManager does not leave to the
+// host's size. The scaled defaults it replaces were sized at an eighth of the
+// host's RAM - 384 MiB of accounting on a 2 GB VPS - and go-yamux charges a
+// stream's whole 256 KiB window against them up front, though a quiet stream
+// really holds a few kilobytes. So memory accounting, not any limit chosen
+// here, capped the relay at about 580 circuits on 2 GB (980 on 4 GB), short
+// of one fully online 50-member room, and every circuit past it failed with
+// RESOURCE_LIMIT_EXCEEDED; the streams defaults were as short of a tab per
+// connection. These are counted from relayMaxConns instead: a rendezvous
+// stream per connection, relayCircuits circuits, and half a connection's
+// worth of short-lived streams (identify, ping, reservations), with memory
+// enough that every one of those streams can be open and the circuit
+// buffers still fit. What protects the host is the connection and stream
+// counts, at about 140-180 KB of real memory per tab and 25-33 KB per
+// circuit, and GOMEMLIMIT; the memory figure here only has to stay out of
+// their way.
+func relaySystemLimits(limits *rcmgr.PartialLimitConfig, scaled rcmgr.ConcreteLimitConfig) {
+	streamsIn := relayMaxConns + relayCircuits + relayMaxConns/2
+	streamsOut := relayCircuits + relayMaxConns/2
+	// The circuit buffers are reserved at network.ReservationPriorityHigh,
+	// which is refused past 204/256 of the limit, hence the scaling; 64 MiB
+	// covers what else reserves memory, such as a hop message being read.
+	circuitBuffers := int64(relayCircuits) * 2 * int64(relayv2.DefaultResources().BufferSize)
+	memory := (int64(streamsIn+streamsOut)*yamuxStreamWindow+circuitBuffers)*256/204 + 64<<20
+
+	limits.System.Conns = rcmgr.LimitVal(relayMaxConns)
+	limits.System.ConnsInbound = rcmgr.LimitVal(relayMaxConns)
+	limits.System.ConnsOutbound = rcmgr.LimitVal(relayMaxConns)
+	limits.System.StreamsInbound = rcmgr.LimitVal(streamsIn)
+	limits.System.StreamsOutbound = rcmgr.LimitVal(streamsOut)
+	limits.System.Streams = rcmgr.LimitVal(streamsIn + streamsOut)
+	limits.System.Memory = rcmgr.LimitVal64(memory)
+	// Connections and streams still being set up (noise and muxer, then
+	// protocol negotiation) sit in the transient scope, whose scaled
+	// default is a few hundred connections and a hundred-odd streams. A
+	// relay restart makes every client reconnect at once, and those arrive
+	// as one burst.
+	limits.Transient.Conns = rcmgr.LimitVal(relayMaxConns)
+	limits.Transient.ConnsInbound = rcmgr.LimitVal(relayMaxConns)
+	limits.Transient.ConnsOutbound = rcmgr.LimitVal(relayMaxConns)
+	limits.Transient.StreamsInbound = rcmgr.LimitVal(relayMaxConns / 2)
+	limits.Transient.StreamsOutbound = rcmgr.LimitVal(relayMaxConns / 2)
+	limits.Transient.Streams = rcmgr.LimitVal(relayMaxConns)
+	// One peer at its limits: maxStreamsPerPeer rendezvous streams (tabs
+	// sharing a peerId), relayCircuitsPerPeer circuits each way, and room
+	// for the short-lived ones. The scaled default is 64 MiB on a 1 GB host,
+	// short of that.
+	perPeer := int64(maxStreamsPerPeer+2*relayCircuitsPerPeer+32) * yamuxStreamWindow
+	if scaledPeer := scaled.ToPartialLimitConfig().PeerDefault.Memory; int64(scaledPeer) < perPeer {
+		limits.PeerDefault.Memory = rcmgr.LimitVal64(perPeer)
+	}
+	// Every tab holds one rendezvous stream, so the protocol's default share,
+	// a few hundred streams on a small host, refused tabs long before the
+	// connection ceiling.
+	if limits.Protocol == nil {
+		limits.Protocol = map[protocol.ID]rcmgr.ResourceLimits{}
+	}
+	limits.Protocol[RendezvousProtocol] = rcmgr.ResourceLimits{
+		StreamsInbound: rcmgr.LimitVal(2 * relayMaxConns),
+		Streams:        rcmgr.LimitVal(2 * relayMaxConns),
+	}
+}
+
+// newResourceManagerFrom is newResourceManager on the scaled defaults of a
+// given host, so a test can build the 2 GB VPS the relay runs on.
+func newResourceManagerFrom(scaled rcmgr.ConcreteLimitConfig) (network.ResourceManager, error) {
 	// EVERY browser reaches this process from a single source IP - Traefik's,
 	// on the docker network - because the compose routes relay.<domain>
 	// through it and nothing forwards the real client address.
@@ -1349,46 +1940,53 @@ func newResourceManager() (network.ResourceManager, error) {
 	// device sync (the one feature that opens a SECOND libp2p node per
 	// device, doubling the count) tripped it first.
 	//
-	// So the per-subnet caps are raised to double the connection-manager
-	// ceiling (connMgrHigh * 2 = 1024) and the connection rate limiter is
-	// disabled: the connmgr (above) at 512 and the memory/stream limits from
-	// DefaultLimits stay as the real protection. The resource manager's
-	// System.ConnsInbound is also lifted to the same value so the connection
-	// manager remains the binding limit rather than the resource manager
-	// doing hard rejections.
-	// Per-IP limits only become meaningful again if the client address ever
-	// reaches us (PROXY protocol on the entrypoint, or a directly exposed
-	// listener) - see docs/spec.md.
-	subnetLimit := func(prefix int) rcmgr.ConnLimitPerSubnet {
-		return rcmgr.ConnLimitPerSubnet{ConnCount: connMgrHigh * 2, PrefixLength: prefix}
-	}
-	// The memory-scaled defaults also cap TOTAL inbound connections
-	// (System.ConnsInbound is 64 + 64*(scaledMiB/1024), so a small VPS lands
-	// well under connMgrHigh * 2). Those are hard rejections, while the
-	// connection manager trims gracefully, so the system connection numbers
-	// are lifted to match the connection-manager ceiling and per-subnet cap,
-	// keeping connmgr the binding limit. Memory, streams and file descriptors
-	// keep the scaled defaults - they are the ones actually protecting the host.
-	scaled := rcmgr.DefaultLimits.AutoScale()
+	// So a proxy's address (proxyPrefixLimits) is held only to the global
+	// ceilings, and a public address - a client the relay really sees - to
+	// maxConnsPerAddr and a connection rate. The global ceilings are
+	// relaySystemLimits, sized from relayMaxConns.
+	//
+	// Behind Traefik the per-address limits never apply, because libp2p
+	// sees only Traefik: they would need the client's address carried to
+	// this listener (PROXY protocol on a TCP router, which this listener
+	// does not parse) or the listener exposed directly. See deploy/README.md.
+	proxyV4, proxyV6 := proxyPrefixLimits()
+	// File descriptors and the per-peer and per-protocol defaults keep the
+	// scaled values, apart from what relaySystemLimits has to raise.
 	limits := scaled.ToPartialLimitConfig()
-	limits.System.Conns = rcmgr.LimitVal(connMgrHigh * 2)
-	limits.System.ConnsInbound = rcmgr.LimitVal(connMgrHigh * 2)
-	limits.System.ConnsOutbound = rcmgr.LimitVal(connMgrHigh * 2)
-	// Connections still being upgraded (noise + muxer) sit in the transient
-	// scope, whose scaled default is a few hundred. A relay restart makes
-	// every client reconnect at once, and those arrive as one burst.
-	limits.Transient.Conns = rcmgr.LimitVal(connMgrHigh)
-	limits.Transient.ConnsInbound = rcmgr.LimitVal(connMgrHigh)
-	limits.Transient.ConnsOutbound = rcmgr.LimitVal(connMgrHigh)
+	relaySystemLimits(&limits, scaled)
+	relayCircuitLimits(&limits)
+
+	// New connections a second from one public source. A proxy prefix is
+	// listed with the zero Limit, which is no rate limit at all.
+	proxyRates := make([]rate.PrefixLimit, 0, len(proxyV4)+len(proxyV6))
+	for _, l := range append(append([]rcmgr.NetworkPrefixLimit{}, proxyV4...), proxyV6...) {
+		proxyRates = append(proxyRates, rate.PrefixLimit{Prefix: l.Network})
+	}
+	connRate := &rate.Limiter{
+		NetworkPrefixLimits: proxyRates,
+		SubnetRateLimiter: rate.SubnetLimiter{
+			IPv4SubnetLimits: []rate.SubnetLimit{
+				{PrefixLength: 32, Limit: rate.Limit{RPS: newConnsPerAddrRPS, Burst: maxConnsPerAddr}},
+			},
+			IPv6SubnetLimits: []rate.SubnetLimit{
+				{PrefixLength: 64, Limit: rate.Limit{RPS: newConnsPerAddrRPS, Burst: maxConnsPerAddr}},
+				{PrefixLength: 48, Limit: rate.Limit{RPS: newConnsPerAddrRPS * ipv6AggregateFactor, Burst: maxConnsPerAggregate}},
+			},
+			GracePeriod: time.Minute,
+		},
+	}
 
 	return rcmgr.NewResourceManager(
 		rcmgr.NewFixedLimiter(limits.Build(scaled)),
+		rcmgr.WithNetworkPrefixLimit(proxyV4, proxyV6),
 		rcmgr.WithLimitPerSubnet(
-			[]rcmgr.ConnLimitPerSubnet{subnetLimit(32)},
-			[]rcmgr.ConnLimitPerSubnet{subnetLimit(56), subnetLimit(48)},
+			[]rcmgr.ConnLimitPerSubnet{{PrefixLength: 32, ConnCount: maxConnsPerAddr}},
+			[]rcmgr.ConnLimitPerSubnet{
+				{PrefixLength: 64, ConnCount: maxConnsPerAddr},
+				{PrefixLength: 48, ConnCount: maxConnsPerAggregate},
+			},
 		),
-		// Zero value = no rate limiting (see x/rate.Limiter).
-		rcmgr.WithConnRateLimiters(&rate.Limiter{}),
+		rcmgr.WithConnRateLimiters(connRate),
 	)
 }
 
@@ -1403,7 +2001,10 @@ func main() {
 	os.MkdirAll("/app/data", 0o700)
 	priv := loadOrGenKey("/app/data/relay.key")
 
-	connMgr, _ := connmgr.NewConnManager(connMgrLow, connMgrHigh)
+	connMgr, err := newConnManager()
+	if err != nil {
+		log.Fatalf("connection manager: %v", err)
+	}
 
 	rm, err := newResourceManager()
 	if err != nil {
@@ -1413,8 +2014,12 @@ func main() {
 	// at DEBUG by go-libp2p, so when the default per-IP cap was silently
 	// refusing connections the relay logs looked perfectly healthy. Run with
 	// GOLOG_LOG_LEVEL=rcmgr=debug to see individual rejections.
-	log.Printf("[relay] connection limits: connmgr %d/%d, per-subnet cap %d",
-		connMgrLow, connMgrHigh, connMgrHigh*2)
+	memLimit := "unset"
+	if l := debug.SetMemoryLimit(-1); l != math.MaxInt64 {
+		memLimit = fmt.Sprintf("%d MiB", l>>20)
+	}
+	log.Printf("[relay] connection limits: %d connections and %d circuits (RELAY_MAX_CONNS), %d per public address (%d per IPv6 /48), proxies and private ranges held only to the global ceiling; connections with no rendezvous stream trimmed past %d; GOMEMLIMIT %s",
+		relayMaxConns, relayCircuits, maxConnsPerAddr, maxConnsPerAggregate, connMgrHigh, memLimit)
 
 	// Get port from env or default to 8080
 	httpPort := os.Getenv("HTTP_PORT")
@@ -1422,9 +2027,22 @@ func main() {
 		httpPort = "8080"
 	}
 
-	// Built before the host: the circuit-relay ACL below asks it whether a
-	// peer is one of ours.
 	reg := newRegistry()
+	reg.protect = func(id string, on bool) {
+		p, err := peer.Decode(id)
+		if err != nil {
+			return
+		}
+		if on {
+			connMgr.Protect(p, rendezvousProtectTag)
+		} else {
+			connMgr.Unprotect(p, rendezvousProtectTag)
+		}
+	}
+	res := relayResources()
+	// Per-address reservation limits, for the addresses that are one client's
+	// and not the proxy's - see relaygate.go.
+	gate := newReservationGate(res.ReservationTTL)
 
 	// libp2p WebSocket
 	h, err := libp2p.New(
@@ -1439,8 +2057,11 @@ func main() {
 		libp2p.ForceReachabilityPublic(),
 		libp2p.EnableRelay(),
 		libp2p.EnableRelayService(
-			relayv2.WithResources(relayResources()),
+			relayv2.WithResources(res),
+			// No per-circuit duration or byte limit - see the note on
+			// unlimited circuits. What bounds circuits is relayCircuitLimits.
 			relayv2.WithInfiniteLimits(),
+			relayv2.WithACL(gate),
 		),
 		libp2p.EnableHolePunching(),
 		libp2p.EnableNATService(),
@@ -1452,6 +2073,11 @@ func main() {
 	h.SetStreamHandler(RendezvousProtocol, reg.handleStream)
 	relaySelfPeerId = h.ID().String()
 
+	// Before the API answers anything: a hostname in TRUSTED_PROXY_CIDRS has
+	// to be resolved first, or the first requests after a restart are all
+	// keyed on the proxy itself.
+	startTrustedProxyResolver()
+
 	// HTTP server for OG and Klipy endpoints (run on separate internal port)
 	apiPort := "8081"
 	go func() {
@@ -1462,8 +2088,7 @@ func main() {
 		mux.HandleFunc("/klipy/search", getOnly(handleKlipySearch))
 		mux.HandleFunc("/klipy/trending", getOnly(handleKlipyTrending))
 		mux.HandleFunc("/turn-credentials", getOnly(handleTurnCredentials))
-		mux.HandleFunc("/invite", postOnly(handleInviteCreate))
-		mux.HandleFunc("/invite/", getOnly(handleInviteResolve))
+		registerInviteEndpoints(mux)
 		mux.HandleFunc("/plugin-proxy", getOnly(handlePluginProxy))
 		mux.HandleFunc("/plugin-stream", getOnly(handlePluginStream))
 		mux.HandleFunc("/mailbox/deposit", handleMailboxDeposit)
@@ -1521,6 +2146,8 @@ func main() {
 				return
 			}
 			lifecycleLogf("[peer] disconnect %s", short(peerId.String()))
+			// The relay drops the peer's reservation at this same moment.
+			gate.forget(peerId)
 			reg.disconnectPeer(peerId.String())
 		},
 	})

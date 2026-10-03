@@ -9,6 +9,7 @@ import { canonicalContentV3, canonicalContentV2 } from "../messaging";
 import { MessageType, type WireChatMessage } from "../types/message";
 import { hex, utf8 } from "../utils";
 import { publicKeyToDid } from "../identity/identity";
+import { newMessageId } from "../message-id";
 
 /** A throwaway identity: private key plus the did:key it publishes as. */
 function identity(seedByte: number) {
@@ -235,6 +236,31 @@ describe("verifyIncoming", () => {
     expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
       ok: false,
       reason: "no-did",
+    });
+  });
+
+  describe("ids bound to their sender", () => {
+    it("accepts a row under an id bound to its own sender", async () => {
+      const w = signV3(
+        wire({ id: newMessageId(alice.did), senderId: alice.did, senderDid: alice.did }),
+        alice.priv
+      );
+      expect(await verifyIncoming(w, { room: ROOM })).toEqual({ ok: true });
+    });
+
+    it("refuses an honestly signed row squatting someone else's id", async () => {
+      const aliceId = newMessageId(alice.did);
+      const squat = signV3(
+        wire({ id: aliceId, type: MessageType.Reaction, senderId: mallory.did, senderDid: mallory.did }),
+        mallory.priv
+      );
+      expect(await verifyIncoming(squat, { room: ROOM })).toEqual({ ok: false, reason: "id-sender" });
+    });
+
+    it("refuses the squat unsigned too, even where unsigned rows are allowed", async () => {
+      const squat = wire({ id: newMessageId(alice.did), senderId: mallory.did, senderDid: mallory.did });
+      expect(await verifyIncoming(squat, { room: ROOM, allowUnsigned: true }))
+        .toEqual({ ok: false, reason: "id-sender" });
     });
   });
 

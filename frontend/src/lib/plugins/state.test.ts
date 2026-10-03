@@ -219,6 +219,26 @@ describe("card ownership", () => {
     expect(built.last?.id).toBe("u1");
   });
 
+  it("takes the owner from the card row, never a non-card row under its id", async () => {
+    const ownerAware = {
+      manifest: { id: "poll" },
+      initialState: (_d: unknown, ctx: { senderDid: string }) => [ctx.senderDid],
+      reduce: (s: unknown) => s,
+    } as unknown as PluginDefinition;
+    const squat = {
+      ...row("card1", MessageType.PluginUpdate, { pluginId: "poll", cardId: "x", data: 0 }, 1),
+      senderId: "did:key:mallory",
+    } as Message;
+    const card = {
+      ...row("card1", MessageType.PluginCard, { pluginId: "poll", data: {} }, 2),
+      senderId: "did:key:alice",
+    } as Message;
+    vi.mocked(getMessagesOfTypes).mockResolvedValue([squat, card]);
+
+    const built = await buildCardState("card1", "room-1", ownerAware);
+    expect(built.state).toEqual(["did:key:alice"]);
+  });
+
   it("refuses a live fold from a plugin that does not own the card", () => {
     cardStates.set("card1", {
       state: ["good"],

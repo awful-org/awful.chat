@@ -12,6 +12,7 @@ import { base64ToBytes, bytesToBase64, utf8 } from "../utils";
 import { AESFromPassword, PBKDF2_ITERATIONS } from "../identity/identity";
 import { MessageType } from "../types/message";
 import type { Message, Attachment, PendingMessage } from "../types/message";
+import { encryptedFileSize } from "../room-security/file-descriptor";
 import type {
   Room,
   DMRoom,
@@ -19,9 +20,27 @@ import type {
   OwnProfile,
   SavedGif,
   WatermarkRecord,
+  OwnRoomProfileRecord,
+  RoomDeletionMarker,
 } from "../storage";
+import type { RoomProfileField } from "../room-profile";
+
+export type RoomProfileExport = Omit<OwnRoomProfileRecord, "fields"> & {
+  fields: Partial<Record<RoomProfileField, string | boolean | null>>;
+};
+
+/** JSON has no ArrayBuffer representation, including inside nested overrides. */
+export function roomProfileToExport(record: OwnRoomProfileRecord): RoomProfileExport {
+  const fields = { ...record.fields } as RoomProfileExport["fields"];
+  for (const key of ["pfpData", "bannerData"] as const) {
+    const bytes = record.fields[key];
+    if (bytes instanceof ArrayBuffer) fields[key] = bytesToBase64(new Uint8Array(bytes));
+  }
+  return { ...record, fields };
+}
 
 export interface AttachmentExport {
+  encryption?: Attachment["encryption"];
   id: string;
   roomCode: string;
   messageId: string;
@@ -49,6 +68,8 @@ export const EXPORT_SECTIONS = [
   "attachments",
   "rooms",
   "profiles",
+  "roomProfiles",
+  "roomDeletions",
   "watermarks",
   "yjsDocs",
   "savedGifs",
@@ -82,6 +103,8 @@ export interface DatabaseExport {
   yjsDocs: { id: string; update: number[] }[];
   rooms: (Room | DMRoom)[];
   profiles: (PeerProfile | OwnProfile)[];
+  roomProfiles?: RoomProfileExport[];
+  roomDeletions?: RoomDeletionMarker[];
   savedGifs: SavedGif[];
 }
 
@@ -89,7 +112,8 @@ export const BACKUP_FORMAT = "awful.chat/backup";
 // v2: attachment and saved-gif bytes are base64 strings, not number[]. An
 // old build restoring a v2 file would coerce the string to garbage bytes, so
 // it must refuse cleanly on the version instead.
-export const BACKUP_VERSION = 2;
+// v3 adds room overrides and leave markers. A v2 reader would discard them.
+export const BACKUP_VERSION = 3;
 
 export interface BackupFile extends DatabaseExport {
   format: typeof BACKUP_FORMAT;
@@ -145,6 +169,11 @@ export function pfpToJson<T extends { pfpData?: unknown; bannerData?: unknown }>
  * a union, and a real local name is not overwritten by the import.
  */
 export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
+  if (local.roomSecret && imported.roomSecret && local.roomSecret !== imported.roomSecret) {
+    throw new Error("Imported room capability conflicts with the local room");
+  }
+  const localPq = (local as { pq?: unknown }).pq;
+  const importedPq = (imported as { pq?: unknown }).pq;
   const participantLastSeen: Record<string, number> = {};
   for (const [did, ts] of Object.entries(local.participantLastSeen ?? {})) {
     participantLastSeen[did] = ts ?? 0;
@@ -154,14 +183,25 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   }
   return {
     ...imported,
+    ...(local.roomSecret || imported.roomSecret
+      ? { roomSecret: local.roomSecret ?? imported.roomSecret }
+      : {}),
+    // A DM's post-quantum state: this device's own wins. Ours came out of an
+    // introduction that confirmed it; an imported one only came out of a
+    // file, and on the decapsulating side a ciphertext cannot be checked
+    // without that confirmation (room-security/pq-dm.ts).
+    ...(localPq || importedPq ? { pq: localPq ?? importedPq } : {}),
     lastSeenLamport: Math.max(
       local.lastSeenLamport ?? 0,
       imported.lastSeenLamport ?? 0
     ),
-    createdAt: Math.min(
-      local.createdAt ?? Infinity,
-      imported.createdAt ?? Infinity
-    ),
+    // A text room's createdAt is its membership generation (room-profile.ts):
+    // a deliberate rejoin creates a newer one, and an older snapshot must not
+    // roll it back below a leave marker. Anything else keeps the earliest,
+    // which is what the sidebar falls back to for ordering.
+    createdAt: local.type === "text"
+      ? Math.max(local.createdAt ?? 0, imported.createdAt ?? 0)
+      : Math.min(local.createdAt ?? Infinity, imported.createdAt ?? Infinity),
     participants: [
       ...new Set([
         ...(local.participants ?? []),
@@ -275,6 +315,8 @@ function parseBackupValue(parsed: unknown): BackupFile {
     yjsDocs: arr(d.yjsDocs),
     rooms: arr(d.rooms),
     profiles: arr(d.profiles),
+    roomProfiles: arr(d.roomProfiles),
+    roomDeletions: arr(d.roomDeletions),
     savedGifs: arr(d.savedGifs),
   };
 }
@@ -477,6 +519,16 @@ export function isValidMessageRecord(m: unknown): m is Message {
 export function isValidAttachmentRecord(a: unknown): a is AttachmentExport {
   if (!a || typeof a !== "object") return false;
   const r = a as Record<string, unknown>;
+  if (r.encryption !== undefined) {
+    try {
+      const expected = encryptedFileSize(a as Attachment);
+      if (!/^[a-f0-9]{40}$/i.test(String(r.infoHash))) return false;
+      if (r.data !== undefined) {
+        const bytes = typeof r.data === "string" ? base64ToBytes(r.data) : Array.isArray(r.data) ? r.data : null;
+        if (!bytes || bytes.length !== expected) return false;
+      }
+    } catch { return false; }
+  }
   return (
     isNonEmptyString(r.id) &&
     isNonEmptyString(r.roomCode) &&
@@ -518,6 +570,41 @@ export function isValidProfileRecord(
   return (
     isNonEmptyString(r.did) && typeof r.nickname === "string"
   );
+}
+
+const ROOM_PROFILE_FIELDS = new Set([
+  "nickname", "pfpURL", "pfpData", "color", "bannerURL", "bannerData",
+  "tagText", "tagTextColor", "tagChipColor", "bio", "nameEffect",
+  "nameShimmer", "nameGlow", "gradient2", "gradient3",
+]);
+
+export function isValidRoomProfileRecord(value: unknown): value is RoomProfileExport {
+  if (!value || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  if (!isNonEmptyString(r.roomCode) || !isNonEmptyString(r.did) ||
+      !isFiniteNonNegative(r.generation) || !r.fields || typeof r.fields !== "object" ||
+      Array.isArray(r.fields)) return false;
+  const fields = r.fields as Record<string, unknown>;
+  if (Object.entries(fields).some(([key, field]) =>
+    !ROOM_PROFILE_FIELDS.has(key) ||
+    (field !== null && (key === "nameShimmer" || key === "nameGlow"
+      ? typeof field !== "boolean" : typeof field !== "string"))
+  )) return false;
+  if (r.fieldEdits === undefined) return true;
+  if (!r.fieldEdits || typeof r.fieldEdits !== "object" || Array.isArray(r.fieldEdits)) return false;
+  return Object.entries(r.fieldEdits as Record<string, unknown>).every(([key, edit]) => {
+    if (!ROOM_PROFILE_FIELDS.has(key) || !edit || typeof edit !== "object") return false;
+    const e = edit as Record<string, unknown>;
+    return isFiniteNonNegative(e.at) && isNonEmptyString(e.id) &&
+      (e.reset === undefined || typeof e.reset === "boolean");
+  });
+}
+
+export function isValidRoomDeletionMarker(value: unknown): value is RoomDeletionMarker {
+  if (!value || typeof value !== "object") return false;
+  const r = value as Record<string, unknown>;
+  return isNonEmptyString(r.roomCode) && isFiniteNonNegative(r.generation) &&
+    isFiniteNonNegative(r.deletedAt);
 }
 
 export function isValidSavedGifRecord(g: unknown): g is SavedGif {
@@ -575,6 +662,8 @@ export interface SanitizedCollections {
   yjsDocs: { id: string; update: number[] }[];
   rooms: (Room | DMRoom)[];
   profiles: (PeerProfile | OwnProfile)[];
+  roomProfiles: RoomProfileExport[];
+  roomDeletions: RoomDeletionMarker[];
   savedGifs: SavedGif[];
   /** Total records dropped across every collection above. */
   dropped: number;
@@ -596,6 +685,8 @@ export function sanitizeCollections(data: {
   yjsDocs: unknown[];
   rooms: unknown[];
   profiles: unknown[];
+  roomProfiles?: unknown[];
+  roomDeletions?: unknown[];
   savedGifs: unknown[];
 }): SanitizedCollections {
   const messages = sanitize(data.messages, isValidMessageRecord);
@@ -605,6 +696,8 @@ export function sanitizeCollections(data: {
   const yjsDocs = sanitize(data.yjsDocs, isValidYjsDocRecord);
   const rooms = sanitize(data.rooms, isValidRoomRecord);
   const profiles = sanitize(data.profiles, isValidProfileRecord);
+  const roomProfiles = sanitize(data.roomProfiles ?? [], isValidRoomProfileRecord);
+  const roomDeletions = sanitize(data.roomDeletions ?? [], isValidRoomDeletionMarker);
   const savedGifs = sanitize(data.savedGifs, isValidSavedGifRecord);
 
   return {
@@ -615,6 +708,8 @@ export function sanitizeCollections(data: {
     yjsDocs: yjsDocs.records,
     rooms: rooms.records,
     profiles: profiles.records,
+    roomProfiles: roomProfiles.records,
+    roomDeletions: roomDeletions.records,
     savedGifs: savedGifs.records,
     dropped:
       messages.dropped +
@@ -624,6 +719,8 @@ export function sanitizeCollections(data: {
       yjsDocs.dropped +
       rooms.dropped +
       profiles.dropped +
+      roomProfiles.dropped +
+      roomDeletions.dropped +
       savedGifs.dropped,
   };
 }

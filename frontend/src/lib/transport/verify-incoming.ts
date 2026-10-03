@@ -5,6 +5,7 @@
  * this lived there it could not be tested, and it is the single function
  * standing between a peer and a forged message in someone else's name.
  */
+import { messageIdAllowedFor } from "../message-id";
 import { canonicalContentV3, verifySignature } from "../messaging";
 import type { WireChatMessage } from "../types/message";
 import { remoteLamportAllowed } from "./logical-clock";
@@ -49,9 +50,38 @@ export type VerifyReason =
   | "no-did"
   | "did-mismatch"
   | "no-room"
+  | "id-sender"
   | "bad-signature";
 
 export type VerifyVerdict = { ok: true } | { ok: false; reason: VerifyReason };
+
+/**
+ * Signatures that already verified this session, keyed by everything the
+ * check reads: the signing did, the signature and the exact canonical. The
+ * same signed row reaches us more than once - a pusher per connected member
+ * on a resync, an older sender's broadcast plus its direct copy - and every
+ * copy paid a pure-JS ed25519 verify on the main thread. A hit is only ever
+ * the identical input, so it answers what verifying again would. Failures
+ * are not kept, and neither are long canonicals, which bounds the memory to
+ * a few hundred small rows.
+ */
+const VERIFIED_MAX = 512;
+const VERIFIED_KEY_MAX = 4096;
+const _verified = new Set<string>();
+
+function _rememberVerified(key: string): void {
+  if (key.length > VERIFIED_KEY_MAX) return;
+  _verified.delete(key);
+  _verified.add(key);
+  if (_verified.size > VERIFIED_MAX) {
+    _verified.delete(_verified.values().next().value as string);
+  }
+}
+
+/** Test seam: forget every remembered signature. */
+export function _resetVerifiedSignatures(): void {
+  _verified.clear();
+}
 
 export async function verifyIncoming(
   wire: WireChatMessage,
@@ -72,6 +102,12 @@ export async function verifyIncoming(
   const files = wire.meta?.files;
   if (Array.isArray(files) && files.length > MAX_MESSAGE_FILES) {
     return { ok: false, reason: "too-many-files" };
+  }
+  // Before the signature, and for unsigned rows too: a signature proves who
+  // wrote the row, never that the id it claims was theirs to use. See
+  // message-id.ts for the censorship an unbound id allowed.
+  if (!messageIdAllowedFor(wire.id, wire.senderId)) {
+    return { ok: false, reason: "id-sender" };
   }
   if (!wire.sig) {
     return opts.allowUnsigned === true
@@ -113,10 +149,10 @@ export async function verifyIncoming(
   // under - a message signed for another room (or with its type flipped in
   // transit) fails verification here.
   if (!opts.room) return { ok: false, reason: "no-room" };
-  const valid = await verifySignature(
-    wire.senderDid,
-    wire.sig,
-    canonicalContentV3({ ...wire, roomCode: opts.room })
-  );
+  const canonical = canonicalContentV3({ ...wire, roomCode: opts.room });
+  const key = JSON.stringify([wire.senderDid, wire.sig, canonical]);
+  if (_verified.has(key)) return { ok: true };
+  const valid = await verifySignature(wire.senderDid, wire.sig, canonical);
+  if (valid) _rememberVerified(key);
   return valid ? { ok: true } : { ok: false, reason: "bad-signature" };
 }

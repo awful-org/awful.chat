@@ -29,7 +29,6 @@
     watchVisibilityForCall,
   } from "$lib/call-speakers";
   import { profileStore } from "$lib/profile.svelte";
-  import { formatQuickCode } from "$lib/room-code";
   import {
     adoptAccount,
     backToChoosing,
@@ -80,7 +79,7 @@
     // session, so a refresh is a reconnect and not a fresh sign-up.
     const resume = resumableSession(fromLink || "");
     isHost = hostedHere(fromLink || "") ?? !fromLink;
-    setQuickCallCode(fromLink || undefined, isHost);
+    if (!setQuickCallCode(fromLink || undefined, isHost)) return;
     // The code IS the secret, so it lives in the fragment and never in the
     // path - same reasoning as room invites, see App.svelte.
     if (isHost) {
@@ -185,11 +184,12 @@
     <div class="min-h-dvh bg-background text-foreground font-mono flex">
       <div class="flex min-h-dvh min-w-0 flex-1 flex-col">
         <ChatView
-          roomCode={quickCall.code}
+          roomCode={quickCall.roomCode}
           roomName="Quick call"
           selfId={identityStore.did ?? ""}
           onLeave={endQuickCall}
           ephemeral
+          inviteLink={link}
         />
       </div>
     </div>
@@ -368,9 +368,9 @@
 
             <div class="w-full space-y-1.5">
               <div class="flex items-center justify-between gap-2">
-                <code class="text-sm font-mono tracking-wide text-foreground">
-                  {formatQuickCode(quickCall.code)}
-                </code>
+                <span class="text-sm font-mono text-foreground">
+                  Call link
+                </span>
                 <Button
                   variant="ghost"
                   size="sm"

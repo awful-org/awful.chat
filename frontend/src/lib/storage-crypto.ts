@@ -620,6 +620,16 @@ export const STORE_SPECS = {
     blind: ["did"],
     bytes: ["pfpData", "bannerData"],
   },
+  roomProfiles: {
+    storeName: "roomProfiles",
+    key: "id",
+    // kind is three-valued (own / peer / deletion): hashing it hides nothing,
+    // and in the clear it is an index, so listing one kind no longer opens
+    // every peer's avatar bytes to throw them away.
+    clear: ["kind"],
+    blind: ["id", "roomCode", "did"],
+    bytes: ["pfpData", "bannerData"],
+  },
   phonebook: {
     storeName: "phonebook",
     key: "peerId",
@@ -672,9 +682,12 @@ export const STORE_SPECS = {
   // One row per room: the message-search index. The entries themselves are
   // serialized plaintext message text, so they ride in `bytes` and are
   // sealed like attachment data - a readable search index would undo the
-  // sealed messages store one field over. lastLamport stays clear for the
-  // same reason watermarks' maxLamport does: the staleness check compares
-  // it against the newest message row's clear lamport, no decrypt needed.
+  // sealed messages store one field over. lastLamport is clear, as it has
+  // been since the store began, so the row reads the same in every build;
+  // nothing depends on that any more. The row is opened before it is
+  // judged: the room's rows below lastLamport are counted against
+  // rowsBelow, sealed with the rest, and the rows from lastLamport up are
+  // read to top it up (corpus.svelte.ts).
   searchIndex: {
     storeName: "searchIndex",
     key: "roomCode",

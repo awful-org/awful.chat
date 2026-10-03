@@ -3,6 +3,7 @@
   import {
     transportState,
     _transport,
+    _peerIdToDid,
   } from "$lib/transport/transport.svelte";
   import {
     CornerUpLeft,
@@ -15,7 +16,7 @@
   import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { cn } from "$lib/utils";
   import { worstQuality } from "$lib/call-quality";
-  import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
+  import { peerQualityState, voiceLinkState, voiceRouteState } from "$lib/call-peer-quality.svelte";
 
   interface Props {
     /** Icon-rail layout: one icon, the whole status in a tooltip. */
@@ -110,6 +111,20 @@
       .map(([pid]) => pid);
   });
   const expectedCount = $derived(expectedPeers.length);
+
+  /** Who in this call is heard through TURN, by name, for the badge's tip. */
+  const turnTip = $derived.by(() => {
+    const names = expectedPeers
+      .filter((pid) => voiceRouteState.turn.has(pid))
+      .map((pid) => {
+        const did = _peerIdToDid.get(pid) ?? pid;
+        return transportState.peerNames.get(did) ?? transportState.peerNames.get(pid) ?? "someone";
+      });
+    const who = names.length
+      ? `Voice with ${new Intl.ListFormat(undefined, { type: "conjunction" }).format(names)}`
+      : "Voice";
+    return `${who} is using a TURN relay. A direct path may not be available on these networks; relay use alone does not mean poor quality. The app looks for a direct path again when the network changes.`;
+  });
   const activeCount = $derived(
     expectedPeers.filter((pid) => voiceLinkState.connected.has(pid)).length
   );
@@ -229,7 +244,7 @@
 
       <div class="flex items-center gap-1 shrink-0">
         {#if quality === "relayed"}
-          <Tip text="Voice is using a TURN relay. A direct path may not be available on these networks; relay use alone does not mean poor quality.">
+          <Tip text={turnTip}>
             {#snippet children(props)}
               <div
                 {...props}

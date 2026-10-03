@@ -16,8 +16,10 @@ this file and the README disagree, the README wins. What has grown since:
   `repository` (the settings page groups plugins by repository origin and
   links it), and `icon` accepts `lucide:*` names, not just emoji.
 - External plugin sources: the frontend Dockerfile fetches extra plugin repos
-  at build time via `PLUGIN_SOURCES` (e.g. `awful-org/awfully-awesome#<sha>`; an unpinned
-  entry fails the build unless `PLUGIN_SOURCES_ALLOW_UNPINNED=1`),
+  at build time via `PLUGIN_SOURCES` (e.g. `awful-org/awfully-awesome@<sha>`,
+  the whole 40-character sha, and the fetched tarball must name that commit;
+  an unpinned entry, or one with an abbreviated sha, fails the build unless
+  `PLUGIN_SOURCES_ALLOW_UNPINNED=1`),
   deleting any fetched `.gitignore` so Tailwind scans their markup. A
   pre-commit hook keeps fetched plugins out of the app repo.
 - Host API grew: `cards()` and `sendUpdateImmediately` (host-bound, room
@@ -62,12 +64,21 @@ this file and the README disagree, the README wins. What has grown since:
   widgets - `callTile`, `callTileActive`, `callTileViewers`, `callTileMenu`
   and `widget` are all definition surfaces now, alongside `card`,
   `localCard` and `settings`.
-- Plugins can add rows to the Ctrl+K command palette: `manifest.paletteCommands`
+- Plugins can add rows to the Ctrl+K (⌘K on Mac) command palette: `manifest.paletteCommands`
   (eager `{name, title, subtitle?}`, so the catalog lists them without loading
   plugin code) plus `PluginDefinition.paletteCommands` (the lazy handlers,
   keyed by that same `name`) - the same eager-manifest / lazy-handler split
   slash commands already use. Gated behind the `palette-commands` host
   feature.
+- Card state (section 3) no longer reads the room per card or clears on a
+  room switch. A room's plugin rows are read once and kept (storage keeps
+  them current, and checks them against the room's row count), a card folds
+  only its own rows, and states survive a room switch - disconnect, lock and
+  removing the room clear them. That replaces section 3's eviction: a state
+  lives for the session, so what is held grows with the cards a user has
+  looked at. `host.cards()` folds only the caller's own cards. Call tiles
+  read storage only when a card is stored. The old way let one member's pile
+  of cards stall every member's room open.
 
 ## Goals
 

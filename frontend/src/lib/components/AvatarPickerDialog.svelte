@@ -8,6 +8,7 @@
   import Input from "$lib/components/ui/input/input.svelte";
   import { Drawer, DrawerContent } from "$lib/components/ui/drawer";
   import { saveAvatar, saveBanner, profileStore } from "$lib/profile.svelte";
+  import { untrack } from "svelte";
   import ImageCropper from "$lib/components/ImageCropper.svelte";
   import { cropImageToDataUrl, type CropView, type CropTarget } from "$lib/crop";
   import {
@@ -22,9 +23,12 @@
     onClose: () => void;
     /** What the picked image becomes. Same picker, two destinations. */
     target?: "avatar" | "banner";
+    value?: string;
+    onSave?: (value: string | undefined) => Promise<void>;
+    scopeKey?: string | null;
   }
 
-  let { open, onClose, target = "avatar" }: Props = $props();
+  let { open, onClose, target = "avatar", value, onSave, scopeKey = null }: Props = $props();
   const isBanner = $derived(target === "banner");
   const dialogTitle = $derived(isBanner ? "Set banner" : "Set profile picture");
 
@@ -72,10 +76,13 @@
     }
   }
 
+  let wasOpen = false;
+  let previousScope: string | null = null;
   $effect(() => {
-    if (open) {
-      preview = isBanner ? (profileStore.bannerUrl ?? undefined) : profileStore.avatarUrl;
-    }
+    const opened = open && (!wasOpen || scopeKey !== previousScope);
+    wasOpen = open;
+    previousScope = scopeKey;
+    if (opened) preview = untrack(() => onSave ? value : (isBanner ? profileStore.bannerUrl : profileStore.avatarUrl));
   });
 
   let urlInput = $state("");
@@ -233,9 +240,13 @@
     if (saving) return;
     saving = true;
     try {
-      if (isBanner) await saveBanner(preview);
+      if (onSave) await onSave(preview);
+      else if (isBanner) await saveBanner(preview);
       else await saveAvatar(preview);
       onClose();
+    } catch {
+      error = "Could not save profile. Try again.";
+      preview = onSave ? value : (isBanner ? profileStore.bannerUrl : profileStore.avatarUrl);
     } finally {
       saving = false;
     }

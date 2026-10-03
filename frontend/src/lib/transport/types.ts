@@ -281,6 +281,7 @@ export type FileTransferStatus =
   | "failed";
 
 export interface FileDescriptor {
+  encryption?: import('../room-security/file-crypto').EncryptedFileDescriptor;
   infoHash: string;
   filename: string;
   mimeType: string;
@@ -326,7 +327,8 @@ export type FileSignalEnvelope =
 export interface FileTransferEvents {
   signal: (peerId: string, envelope: FileSignalEnvelope) => void;
   transfer: (snapshot: FileTransferSnapshot) => void;
-  downloaded: (infoHash: string, blob: Blob) => void;
+  /** `restored`: read back from this device's own storage, not fetched. */
+  downloaded: (infoHash: string, blob: Blob, restored?: boolean) => void;
 }
 
 export interface FileTransferTransport {

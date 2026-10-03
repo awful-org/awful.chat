@@ -22,10 +22,13 @@
    * row would stop the user from typing.
    */
   import { Dialog } from "bits-ui";
+  import { onDestroy, untrack } from "svelte";
+  import { uiState } from "$lib/ui-state.svelte";
   import { ArrowLeft, CornerDownLeft, Search, TriangleAlert } from "@lucide/svelte";
   import PaletteRow from "./PaletteRow.svelte";
   import { PaletteState } from "$lib/palette/palette.svelte";
   import { buildCatalog } from "$lib/palette/commands";
+  import { forgetRoomRefs } from "$lib/palette/commands/rooms";
   import type { PaletteHost } from "$lib/palette/host";
   import { SIGILS } from "$lib/palette/types";
 
@@ -38,8 +41,14 @@
   let { open = $bindable(), host }: Props = $props();
 
   // The catalog depends on app state, never on the query, so it is NOT rebuilt
-  // per keystroke. That keeps the lowercase-field cache in `rank.ts` warm.
+  // per keystroke. That keeps the lowercase-field cache in `rank.ts` warm. Nor
+  // is it built while the palette is closed: nothing reads it then (see the
+  // scroll effect below).
   const catalog = $derived(buildCatalog(host));
+
+  // Mounted for as long as the identity is unlocked, so this runs on a lock:
+  // the remembered room and contact refs go with the session.
+  onDestroy(forgetRoomRefs);
 
   const palette = new PaletteState(
     () => catalog,
@@ -63,6 +72,12 @@
     if (open) {
       palette.reset();
       pointerMoved = false;
+      // Opened for something in particular (Settings' tip opens it on ">").
+      // Untracked: taking the query must not re-run this and reset it again.
+      untrack(() => {
+        if (uiState.paletteQuery) palette.setQuery(uiState.paletteQuery);
+        uiState.paletteQuery = null;
+      });
     }
   });
 
@@ -94,6 +109,12 @@
 
   /** Keep the active row visible without yanking the list around. */
   $effect(() => {
+    // Closed, there is no list to scroll - and reading the selection would
+    // keep the whole catalog live behind it. The catalog reads the unread
+    // counts and the recent activity, so every incoming message in any room
+    // rebuilt it, a SHA-256 per room and contact, for a palette nobody had
+    // open. With this the catalog is built when the palette opens.
+    if (!open) return;
     const id = activeId;
     if (!id || !listEl) return;
     const el = listEl.querySelector(`#${CSS.escape(id)}`);
@@ -128,7 +149,7 @@
       case "Backspace":
         // Read the live element value: on a key repeat the state write lags a
         // tick, which pops a page the user was still typing in.
-        if (palette.backspace((e.currentTarget as HTMLInputElement).value)) {
+        if (palette.backspace(inputEl?.value ?? "")) {
           e.preventDefault();
         }
         return;
@@ -170,6 +191,31 @@
         void palette.accept();
         return;
     }
+  }
+
+  /**
+   * A click anywhere in the palette must not take focus from the input.
+   *
+   * Rows, the back button and the forget button carry `tabindex="-1"` to stay
+   * out of the Tab sequence, but that still makes them focusable by a click:
+   * one click on a toggle row moved focus onto the row, and from then on
+   * Escape, the arrows and Enter reached nothing, since every key is handled
+   * on the input. Cancelling mousedown keeps focus where it is and still lets
+   * the click through.
+   */
+  function keepInputFocus(e: MouseEvent): void {
+    if (e.target !== inputEl) e.preventDefault();
+  }
+
+  /**
+   * Backstop for a key that arrives while focus is somewhere else in the
+   * palette anyway: send focus home and handle it there. Focusing during
+   * keydown also lands a typed character in the input.
+   */
+  function handleStrayKeydown(e: KeyboardEvent): void {
+    if (e.target === inputEl) return;
+    inputEl?.focus();
+    handleKeydown(e);
   }
 
   /**
@@ -215,6 +261,8 @@
              -translate-x-1/2 overflow-hidden rounded-lg border border-border
              bg-popover text-popover-foreground font-mono shadow-2xl duration-150"
       onpointermove={() => (pointerMoved = true)}
+      onmousedown={keepInputFocus}
+      onkeydown={handleStrayKeydown}
     >
       <Dialog.Title class="sr-only">Command palette</Dialog.Title>
       <Dialog.Description class="sr-only">

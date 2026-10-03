@@ -40,7 +40,7 @@
     {
       icon: HardDrive,
       title: "Every device is a server, yours included",
-      body: "Messages, files and your identity live in this browser's storage, not on a server (the one exception: offline DMs wait encrypted at the relay for up to 48 hours). Clearing site data, private browsing or uninstalling the app erases your copy. That is not always fatal: everyone in a room keeps their own copy, so with your 12 words you can restore your identity, rejoin with the room code and pull history back from peers who are online and still have it. Expect gaps in what comes back, and if everyone in a room wipes their data the conversation is gone for good. Settings > Data can ask the browser to protect this storage from being cleared automatically when space runs low.",
+      body: "Messages, files and your identity live in this browser's storage, not on a server (the one exception: offline DMs wait encrypted at the relay for up to 48 hours). Clearing site data, private browsing or uninstalling the app erases your copy. That is not always fatal: everyone in a room keeps their own copy, so with your 12 words you can restore your identity, rejoin with the room's invite link and pull history back from peers who are online and still have it. Expect gaps in what comes back, and if everyone in a room wipes their data the conversation is gone for good. Settings > Data can ask the browser to protect this storage from being cleared automatically when space runs low.",
     },
     {
       icon: KeyRound,
@@ -50,7 +50,7 @@
     {
       icon: Send,
       title: "DMs are the only messages that wait for you",
-      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms.",
+      body: "A direct message travels straight between your devices when you are both online. If the other person has the app closed, an encrypted copy waits for them at the relay for up to 48 hours - the offline inbox - and they collect it the next time they open the app. The relay only ever sees ciphertext and delivery times, never the content or who sent it. You can turn the inbox off in Settings > Session, and then DMs behave like room messages: they only move while you are both there. Delivery and read receipts exist in DMs only, not in rooms. A DM from someone who is not a contact and shares no room with you arrives as a request: it does not notify you, sends them no delivered or read ticks, and waits under Requests until you accept it.",
     },
     {
       icon: RefreshCw,
@@ -59,8 +59,8 @@
     },
     {
       icon: Hash,
-      title: "The room code is the invite and the lock",
-      body: "Anyone holding a room code can join it. There are no roles, bans or moderation tools yet, so share codes only with people you want in the room.",
+      title: "A short code invites; the permanent link is the key",
+      body: "A short code lets in the number of people you choose, for up to 10 minutes, and only while your app is open: it is the careful way to invite someone. The room's permanent link never expires - anyone holding it can join, now or later, including anyone it is forwarded to. Either way, whoever gets in holds the room like any member and can invite others too. There are no roles, bans or moderation tools yet.",
     },
     {
       icon: FileDown,
@@ -109,7 +109,7 @@
   {/each}
   {#if compact}
     <button type="button" aria-expanded={expanded} onclick={() => expanded = !expanded} class="rounded-md px-3 py-2 text-left text-sm text-primary hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring">
-      {expanded ? "Show the essentials" : "More about delivery, room codes, files and devices"}
+      {expanded ? "Show the essentials" : "More about delivery, invites, files and devices"}
     </button>
   {/if}
 </div>

@@ -7,10 +7,10 @@ import type { Cmd } from "./types";
  * listed here that does nothing is worse than one not listed.
  */
 const SHORTCUTS: ReadonlyArray<{ keys: string[]; does: string }> = [
-  { keys: ["Ctrl", "K"], does: "Open or close this palette" },
-  { keys: ["Ctrl", "F"], does: "Search this room" },
-  { keys: ["Ctrl", "Shift", "F"], does: "Search all rooms" },
-  { keys: ["Ctrl", "B"], does: "Collapse or expand the sidebar" },
+  { keys: ["Mod", "K"], does: "Open or close this palette" },
+  { keys: ["Mod", "F"], does: "Search this room" },
+  { keys: ["Mod", "Shift", "F"], does: "Search all rooms" },
+  { keys: ["Mod", "B"], does: "Collapse or expand the sidebar" },
   { keys: ["Enter"], does: "Send the message" },
   { keys: ["Shift", "Enter"], does: "New line in the message" },
   { keys: [":"], does: "Start an emoji, like :wave" },

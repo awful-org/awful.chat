@@ -409,10 +409,13 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "dm.mailbox.deposit":
     case "dm.mailbox.collect":
     case "dm.mailbox.drop":
+    case "dm.pq.heal":
     case "ice.turn.ok":
     case "ice.turn.unavailable":
     case "ice.turn.fail":
     case "ice.servers.changed":
+    // An ICE restart on a link that stays up: the graph is unchanged.
+    case "voice.heal":
     case "voice.offer.out":
     case "voice.offer.in":
     case "voice.answer.in":

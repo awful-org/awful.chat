@@ -69,6 +69,11 @@ services:
       # (roughly one port per transport, two per participant in a call), so
       # keep the two in step.
       SFU_MAX_ROOMS: ${SFU_MAX_ROOMS:-250}
+      # The main instance's app origin, which every browser's signalling
+      # socket comes from - not this server's own hostname. A page on any
+      # other site is refused at the upgrade, and with this unset in
+      # production so is everybody, so compose refuses to start without it.
+      SFU_ALLOWED_ORIGINS: ${SFU_ALLOWED_ORIGINS:?SFU_ALLOWED_ORIGINS must be the main instance origin, e.g. https://awful.example.com}
     networks:
       - sfu-net
 

@@ -21,6 +21,8 @@
  * anyone gets.
  */
 
+import { FILE_STORE_DIRS } from "./transport/file/ciphertext-store";
+
 const DURESS_KEY = "awful:duress:v1";
 // Same cost as the identity's PBKDF2 (identity.ts PBKDF2_ITERATIONS): a
 // cheaper duress check would make unlock timing reveal that a duress record
@@ -258,12 +260,29 @@ export async function isDuressPassword(password: string): Promise<boolean> {
   return constantTimeEqual(hash, rec.hash);
 }
 
+/** Everything in the origin's private file system: listed where the engine
+ *  can, ALWAYS unioned with the names the file transport uses, the same way
+ *  the databases are below. */
+async function wipeFileSystem(): Promise<void> {
+  const root = await navigator.storage?.getDirectory?.();
+  if (!root) return;
+  const names = new Set<string>(FILE_STORE_DIRS);
+  try {
+    for await (const name of root.keys()) names.add(name);
+  } catch {
+    /* fall back to the known names */
+  }
+  await Promise.allSettled(
+    [...names].map((name) => root.removeEntry(name, { recursive: true }))
+  );
+}
+
 /**
  * Destroy this device's data: every IndexedDB database (identity, messages,
- * files - all of it), web storage, and every Cache Storage bucket, then
- * reload into the fresh-install flow. Strictly local and silent: no network
- * writes, no room leaves - outbound traffic at wipe time is itself a tell.
- * Never returns.
+ * files - all of it), web storage, every Cache Storage bucket and the
+ * origin's private file system (OPFS), then reload into the fresh-install
+ * flow. Strictly local and silent: no network writes, no room leaves -
+ * outbound traffic at wipe time is itself a tell. Never returns.
  */
 export async function executeDuressWipe(): Promise<never> {
   // Web storage first: even if a database delete ends up blocked, no trace
@@ -328,6 +347,13 @@ export async function executeDuressWipe(): Promise<never> {
   } catch {
     /* no Cache Storage access */
   }
+
+  // The origin's private file system is a storage area of its own, and
+  // deleting every database leaves it standing: the ciphertext of every file
+  // this device held, the transfer directories beside it and, from older
+  // builds, decrypted attachments. The directories alone say an account was
+  // here.
+  jobs.push(wipeFileSystem());
 
   // Bounded wait: finish properly when unblocked, but never strand the
   // user on a frozen screen if another tab pins a database open.

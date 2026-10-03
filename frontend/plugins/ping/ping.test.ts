@@ -93,6 +93,8 @@ describe("parsePingArgs", () => {
 
   it("caps the target count", () => {
     expect(parsePingArgs("a, b, c, d, e")).toHaveLength(MAX_TARGETS);
+    // Uncapped, so the command can say who was left out.
+    expect(parsePingArgs("a, b, c, d, e", Infinity)).toEqual(["a", "b", "c", "d", "e"]);
   });
 
   it("is empty for empty input", () => {

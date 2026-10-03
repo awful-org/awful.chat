@@ -113,6 +113,7 @@ export type DiagKind =
   | "dm.mailbox.deposit"
   | "dm.mailbox.collect"
   | "dm.mailbox.drop"
+  | "dm.pq.heal"
   // ice / turn
   | "ice.turn.ok"
   | "ice.turn.unavailable"
@@ -132,6 +133,7 @@ export type DiagKind =
   | "voice.degraded"
   | "voice.failed"
   | "voice.restart"
+  | "voice.heal"
   | "voice.teardown"
   | "voice.redial.ask"
   | "voice.redial.serve"
@@ -177,7 +179,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 117;
+export const DIAG_KIND_COUNT = 119;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -271,6 +273,8 @@ export const KIND_SEV = {
   "dm.mailbox.deposit": "info",
   "dm.mailbox.collect": "info",
   "dm.mailbox.drop": "error",
+  // A DM upgrade where one device was left on the old key; healed in place.
+  "dm.pq.heal": "info",
   // ice / turn
   "ice.turn.ok": "info",
   "ice.turn.unavailable": "error",
@@ -290,6 +294,7 @@ export const KIND_SEV = {
   "voice.degraded": "warn",
   "voice.failed": "error",
   "voice.restart": "info",
+  "voice.heal": "info",
   "voice.teardown": "info",
   "voice.redial.ask": "info",
   "voice.redial.serve": "info",

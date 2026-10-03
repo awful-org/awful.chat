@@ -1,16 +1,42 @@
 /// <reference lib="webworker" />
 
 import { clientsClaim } from "workbox-core";
-import {
-  precacheAndRoute,
-  matchPrecache,
-} from "workbox-precaching";
+import { PrecacheController, PrecacheRoute } from "workbox-precaching";
+import { registerRoute } from "workbox-routing";
 import { storeSharedPayload } from "$lib/share-target";
 import { storeNotifyIntent } from "$lib/notify-intents";
+import { installSecurityCutover, activateSecurityCutover, navigateSecurityCutoverWindows } from "$lib/room-security/pwa-cutover";
+import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 
 declare let self: ServiceWorkerGlobalScope;
 
 clientsClaim();
+const precache = new PrecacheController();
+const matchPrecache = (url: string) => precache.matchPrecache(url);
+
+// The v2 release is deliberately incompatible with old room admission. Refresh
+// installed v1 pages once, after the new precache has installed successfully.
+// Later updates continue to use the normal prompt below.
+self.addEventListener("install", (event) => {
+  event.waitUntil((async () => {
+    await precache.install(event);
+    if (ROOM_SECURITY_V2_RELEASED) {
+      await installSecurityCutover(caches,
+        !!self.registration.active, () => self.skipWaiting());
+    }
+  })());
+});
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    await precache.activate(event);
+    if (ROOM_SECURITY_V2_RELEASED) {
+      await activateSecurityCutover(caches, async () => {
+        const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+        navigateSecurityCutoverWindows(windows as WindowClient[]);
+      });
+    }
+  })());
+});
 
 // registerType is "prompt": the new worker WAITS until the user accepts the
 // reload (updateServiceWorker() posts SKIP_WAITING). The old unconditional
@@ -115,14 +141,16 @@ self.addEventListener("push", (event) => {
   );
 });
 
-precacheAndRoute(
+precache.addToCacheList(
   (self as ServiceWorkerGlobalScope & { __WB_MANIFEST: any }).__WB_MANIFEST
 );
+registerRoute(new PrecacheRoute(precache));
 
 // Big, rarely-needed assets are kept OUT of the precache (see globIgnores in
 // vite.config.ts) and cached the first time they are actually used instead:
-//   - the DTLN wasm worklet (~8 MB), warmed once in the idle time after
-//     app start and loaded on first voice use
+//   - the DTLN wasm worklet (~8 MB), warmed in idle time once an unlocked
+//     session connects with noise suppression on (worklet-warmup.ts), and
+//     loaded on first voice use
 //   - shiki language chunks (~300 files), fetched only when a code block of
 //     that language is rendered
 // Precaching them cost every visitor ~16 MB on install and on every update.

@@ -43,6 +43,16 @@ export interface SpotlightTile {
 }
 
 /**
+ * How long a remote peer must speak without a break before rule 3 hands them
+ * the spotlight. call-tiles.ts (wantedCameras) counts on it: a talker's
+ * camera, parked while nothing showed it, is asked for at their first word,
+ * and has to be playing again before this runs out, or the floating panel
+ * and picture in picture go black at the switch. So it stays well above that
+ * round trip; call-tiles.test.ts holds it to a stated budget.
+ */
+export const SPEAKER_TAKEOVER_MS = 1500;
+
+/**
  * Apply the spotlight rule to choose which tile the panel should show.
  *
  * Rules in order:
@@ -101,7 +111,6 @@ export function spotlight(
 
   // Rule 3: the active speaker, with hysteresis so the panel does not flicker
   // every time someone says "yeah".
-  const SPEAKER_TAKEOVER_MS = 1500;
   const SPEAKER_HOLD_MS = 2000;
 
   // The incumbent keeps the spot while still speaking, and for a grace period

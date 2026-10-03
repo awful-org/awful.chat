@@ -243,6 +243,45 @@ describe("WebTorrentFileTransport", () => {
     expect(livePeers.length).toBe(0);
   });
 
+  it("a seed serving block after block has nothing new to tell the app", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    await t.seedFiles([new File([new Uint8Array(10)], "cat.png", { type: "image/png" })]);
+    const torrent = torrents.get(HASH)!;
+    torrent.progress = 1;
+    const snapshots: unknown[] = [];
+    t.on("transfer", (s) => snapshots.push(s));
+    // A request in, a header and a block out: three reports per 16 KiB.
+    for (let i = 0; i < 300; i++) torrent.emit(i % 3 ? "upload" : "download");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(snapshots).toHaveLength(0);
+    expect(t.getTransfer(HASH)?.status).toBe("seeding");
+  });
+
+  it("a download's progress becomes a snapshot at most every quarter second", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.ensureDownload(file);
+    await tick();
+    await tick();
+    const torrent = torrents.get(HASH)!;
+    const snapshots: Array<{ progress: number }> = [];
+    t.on("transfer", (s) => snapshots.push(s));
+    vi.useFakeTimers();
+    try {
+      for (let i = 1; i <= 300; i++) {
+        torrent.progress = i / 300;
+        torrent.emit("download");
+      }
+      expect(snapshots).toHaveLength(1);
+      vi.advanceTimersByTime(250);
+      // The latest progress, not the second report's.
+      expect(snapshots.map((s) => s.progress)).toEqual([1 / 300, 1]);
+      vi.advanceTimersByTime(1_000);
+      expect(snapshots).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a real disconnect starts the count over", async () => {
     vi.useFakeTimers();
     try {
@@ -270,9 +309,8 @@ describe("WebTorrentFileTransport", () => {
     }
   });
 
-  it("caps the WebRTC links a roomful of files can open at once", async () => {
+  it("dials two holders of one file at a time, not all of them", async () => {
     const t = new WebTorrentFileTransport(() => "me");
-    // One file, more seeders for it than the cap allows.
     for (let i = 0; i < 50; i++) {
       const peerId = `peer${i}`;
       t.onPeerConnect(peerId);
@@ -280,8 +318,29 @@ describe("WebTorrentFileTransport", () => {
     }
     t.ensureDownload(file);
     await tick();
-    expect(livePeers.length).toBeLessThanOrEqual(32);
-    expect(livePeers.length).toBe(32);
+    const links = (t as never as { wtPeers: Map<string, EventEmitter> }).wtPeers;
+    // The author (learned first) and one spare.
+    expect([...links.keys()]).toEqual([`${HASH}:peer0`, `${HASH}:peer1`]);
+
+    // A holder that does not answer makes room for the next one.
+    links.get(`${HASH}:peer0`)!.emit("error", new Error("ice failed"));
+    (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+    expect([...links.keys()]).toEqual([`${HASH}:peer1`, `${HASH}:peer2`]);
+    t.destroy();
+  });
+
+  it("caps the links it dials, however many files a room holds", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    // Four holders so the per-peer ceiling is not what stops it.
+    for (const peerId of ["a", "b", "c", "d"]) t.onPeerConnect(peerId);
+    for (let i = 0; i < 40; i++) {
+      const desc = { ...file, infoHash: (i + 1).toString(16).padStart(40, "0") };
+      for (const peerId of ["a", "b", "c", "d"]) t.registerSeeder(desc, peerId);
+      t.ensureDownload(desc);
+    }
+    await tick();
+    expect(livePeers.length).toBe(24);
+    t.destroy();
   });
 
   it("adds a torrent once when the same file is requested twice at once", async () => {
@@ -392,6 +451,119 @@ describe("WebTorrentFileTransport", () => {
     t.onPeerConnect("alice");
     t.registerSeeder(file, "alice");
     expect(t.getTransfer(HASH)?.status).toBe("downloading");
+  });
+
+  it("shows a protected file this device holds instead of fetching it again", async () => {
+    // A hash of its own: other tests' fake adds land in the shared map late.
+    const hash = "e".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    const held = new Set([hash]);
+    const restore = vi.fn(async (infoHash: string) => held.has(infoHash));
+    t.setLocalFileLookup(async () => null, restore);
+    t.onPeerConnect("alice");
+    t.registerSeeder(encrypted, "alice");
+    t.ensureDownload(encrypted, { retry: true });
+    t.ensureDownload(encrypted); // asked twice while looking: one look
+    await tick();
+    await tick();
+    expect(restore).toHaveBeenCalledOnce();
+    expect(addCalls).toEqual([]);
+    expect(livePeers.length).toBe(0);
+
+    // Not here after all: fetched, as before.
+    held.clear();
+    t.ensureDownload(encrypted, { retry: true });
+    await vi.waitFor(() => expect(addCalls).toEqual([hash]));
+    expect(livePeers.length).toBe(1);
+    expect(t.getTransfer(hash)?.status).toBe("downloading");
+  });
+
+  it("a click while an automatic ask is still looking on this device counts as a click", async () => {
+    const hash = "f".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    let answer!: (held: boolean) => void;
+    const restore = vi.fn(() => new Promise<boolean>((resolve) => (answer = resolve)));
+    t.setLocalFileLookup(async () => null, restore);
+    t.onPeerConnect("alice");
+    t.registerSeeder(encrypted, "alice");
+    // Given up on: every dial at alice spent, and the transfer failed.
+    const internals = t as never as {
+      wtAttempts: Map<string, number>;
+      transfers: Map<string, object>;
+    };
+    internals.wtAttempts.set(`${hash}:alice`, 6);
+    internals.transfers.set(hash, { ...t.getTransfer(hash), status: "failed" });
+    // Alice announcing it again asks for it by itself...
+    t.registerSeeder(encrypted, "alice");
+    // ...and the user clicks Download while that looks on this device.
+    t.ensureDownload(encrypted, { retry: true });
+    expect(restore).toHaveBeenCalledOnce();
+    // Not here: the click is what the fetch gets, so it starts over.
+    answer(false);
+    await vi.waitFor(() => expect(addCalls).toEqual([hash]));
+    expect(livePeers.length).toBe(1);
+    expect(t.getTransfer(hash)?.status).toBe("downloading");
+  });
+
+  it("an ask nobody made leaves a protected file this device holds where it is: not shown, not fetched", async () => {
+    const hash = "c".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    const restore = vi.fn(async (_infoHash: string, _asked: boolean) => true);
+    t.setLocalFileLookup(async () => null, restore);
+    t.onPeerConnect("alice");
+    // A seeder announcing it, or its message arriving again.
+    t.registerSeeder(encrypted, "alice");
+    t.ensureDownload(encrypted);
+    await tick();
+    await tick();
+    expect(restore.mock.calls).toEqual([[hash, false]]);
+    expect(addCalls).toEqual([]);
+    expect(livePeers.length).toBe(0);
+    expect(t.getTransfer(hash)?.status).toBe("pending");
+    // Asked for, it is shown.
+    t.ensureDownload(encrypted, { retry: true });
+    await tick();
+    expect(restore.mock.calls.at(-1)).toEqual([hash, true]);
+    expect(addCalls).toEqual([]);
+  });
+
+  it("a click on a held file while an automatic ask is still looking shows it", async () => {
+    const hash = "d".repeat(40);
+    const encrypted = {
+      ...file,
+      infoHash: hash,
+      encryption: { version: 2, key: "A".repeat(43), id: "A".repeat(22), size: 10, chunkSize: 1024 * 1024 },
+    } as never;
+    const t = new WebTorrentFileTransport(() => "me");
+    const answers: Array<(here: boolean) => void> = [];
+    const restore = vi.fn((_infoHash: string, _asked: boolean) => new Promise<boolean>((resolve) => answers.push(resolve)));
+    t.setLocalFileLookup(async () => null, restore);
+    t.ensureDownload(encrypted);
+    // The user clicks Download while the automatic ask looks...
+    t.ensureDownload(encrypted, { retry: true });
+    expect(restore).toHaveBeenCalledOnce();
+    // ...which finds it held and leaves it: the click still shows it.
+    answers[0](true);
+    await vi.waitFor(() => expect(restore).toHaveBeenCalledTimes(2));
+    expect(restore.mock.calls[1]).toEqual([hash, true]);
+    answers[1](true);
+    await tick();
+    expect(addCalls).toEqual([]);
   });
 
   it("seeds a stored file on demand when a peer dials for it", async () => {
@@ -596,6 +768,131 @@ describe("WebTorrentFileTransport", () => {
       t.handleSignal("alice", sig({ type: "offer" }));
       expect(first.destroyed).toBe(true);
       expect(linksOf(t).get(key)).not.toBe(first);
+      t.destroy();
+    });
+  });
+
+  describe("a busy room", () => {
+    type Link = EventEmitter & { destroyed: boolean; signals: unknown[]; destroy(): void };
+    const linksOf = (t: unknown) => (t as { wtPeers: Map<string, Link> }).wtPeers;
+    const hashOf = (i: number) => (i + 1).toString(16).padStart(40, "0");
+
+    /** Fill our dialling budget: 24 downloads across three holders. */
+    function fillDials(t: InstanceType<typeof WebTorrentFileTransport>) {
+      for (const peerId of ["a", "b", "c"]) t.onPeerConnect(peerId);
+      for (let i = 0; i < 24; i++) {
+        const desc = { ...file, infoHash: hashOf(i) };
+        const holder = ["a", "b", "c"][i % 3];
+        t.registerSeeder(desc, holder);
+        t.ensureDownload(desc);
+      }
+      expect(linksOf(t).size).toBe(24);
+    }
+
+    it("still serves while its own downloads fill their budget", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      fillDials(t);
+      t.onPeerConnect("bob");
+      t.handleSignal("bob", {
+        kind: "file-wt-signal",
+        infoHash: HASH,
+        signal: { type: "offer" },
+        session: "s1",
+      } as never);
+      // The image we just sent reaches bob although we are busy catching up.
+      expect(linksOf(t).has(`${HASH}:bob`)).toBe(true);
+      t.destroy();
+    });
+
+    it("answers busy instead of dropping an offer it has no room for", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      const sent: Array<{ peer: string; envelope: { signal: unknown; session?: string } }> = [];
+      t.on("signal", (peer, envelope) => sent.push({ peer, envelope: envelope as never }));
+      for (let i = 0; i < 24; i++) {
+        const peer = `p${i}`;
+        t.onPeerConnect(peer);
+        t.handleSignal(peer, {
+          kind: "file-wt-signal",
+          infoHash: HASH,
+          signal: { type: "offer" },
+          session: `s${i}`,
+        } as never);
+      }
+      expect(linksOf(t).size).toBe(24);
+
+      t.onPeerConnect("late");
+      t.handleSignal("late", {
+        kind: "file-wt-signal",
+        infoHash: HASH,
+        signal: { type: "offer" },
+        session: "late-session",
+      } as never);
+      expect(linksOf(t).has(`${HASH}:late`)).toBe(false);
+      expect(sent.at(-1)).toEqual({
+        peer: "late",
+        envelope: {
+          kind: "file-wt-signal",
+          infoHash: HASH,
+          signal: { type: "busy" },
+          session: "late-session",
+        },
+      });
+      t.destroy();
+    });
+
+    it("hears busy as a wait, not a failed attempt", async () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      const sent: Array<{ session?: string }> = [];
+      t.on("signal", (_peer, envelope) => sent.push(envelope as never));
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      await tick();
+      const key = `${HASH}:alice`;
+      const link = linksOf(t).get(key)!;
+      link.emit("signal", { type: "offer" });
+      const session = sent.at(-1)?.session;
+
+      t.handleSignal("alice", {
+        kind: "file-wt-signal",
+        infoHash: HASH,
+        signal: { type: "busy" },
+        session,
+      } as never);
+      expect(link.destroyed).toBe(true);
+      const internals = t as never as {
+        wtAttempts: Map<string, number>;
+        wtNextTry: Map<string, number>;
+      };
+      expect(internals.wtAttempts.get(key)).toBe(0);
+      expect(internals.wtNextTry.get(key)!).toBeGreaterThan(Date.now() + 5_000);
+      expect(t.getTransfer(HASH)?.status).toBe("downloading");
+      t.destroy();
+    });
+
+    it("gives a free slot to the newest download first", () => {
+      const t = new WebTorrentFileTransport(() => "me");
+      t.onPeerConnect("alice");
+      // Eight downloads from alice: her share of our table.
+      for (let i = 0; i < 8; i++) {
+        const desc = { ...file, infoHash: hashOf(i) };
+        t.registerSeeder(desc, "alice");
+        t.ensureDownload(desc);
+      }
+      // Two more wait for a slot: an old one, then the image just sent.
+      const older = { ...file, infoHash: hashOf(100) };
+      const newest = { ...file, infoHash: hashOf(101) };
+      for (const desc of [older, newest]) {
+        t.registerSeeder(desc, "alice");
+        t.ensureDownload(desc);
+      }
+      const links = linksOf(t);
+      expect(links.has(`${newest.infoHash}:alice`)).toBe(false);
+
+      links.get(`${hashOf(0)}:alice`)!.destroy();
+      (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+      expect(links.has(`${newest.infoHash}:alice`)).toBe(true);
+      expect(links.has(`${older.infoHash}:alice`)).toBe(false);
       t.destroy();
     });
   });

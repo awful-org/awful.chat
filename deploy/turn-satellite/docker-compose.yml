@@ -52,6 +52,15 @@ services:
     # (an admin UI, an exporter, a stray database), straight through the
     # provider's ingress firewall.
     #
+    # --user-quota caps the allocations under one credential id and
+    # --total-quota is the pool for everybody. The credentials the main
+    # instance's relay hands one address carry at most seven ids between them
+    # (25 for an IPv6 /48), and coturn counts the quota per id whatever a
+    # credential's expiry, so with these defaults one address holds at most 84
+    # of 900 allocations and filling the pool takes about eleven addresses at
+    # once. The pool stays inside the 1000-port relay range, one port per
+    # allocation; widen the range before raising it.
+    #
     # Keep every argument below a real flag: this is a folded block, so a "#"
     # line inside it becomes a literal argument rather than a comment.
     command: >
@@ -78,6 +87,6 @@ services:
       --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       --min-port=${TURN_MIN_PORT:-49152}
       --max-port=${TURN_MAX_PORT:-50151}
-      --total-quota=${TURN_TOTAL_QUOTA:-300}
+      --total-quota=${TURN_TOTAL_QUOTA:-900}
       --user-quota=${TURN_USER_QUOTA:-12}
       ${TURN_TLS_ARGS:-}

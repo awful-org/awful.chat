@@ -23,6 +23,8 @@ import (
 type fakeStream struct {
 	mu           sync.Mutex
 	frames       [][]byte
+	writes       int
+	wire         []byte // written bytes that do not make a whole frame yet
 	reset        bool
 	readDeadline time.Time
 }
@@ -33,9 +35,18 @@ func (f *fakeStream) Write(p []byte) (int, error) {
 	if f.reset {
 		return 0, errors.New("stream reset")
 	}
-	buf := make([]byte, len(p))
-	copy(buf, p)
-	f.frames = append(f.frames, buf)
+	f.writes++
+	// One write can carry several frames back to back; split them on their
+	// length prefixes the way the client does, so each frame is one entry.
+	f.wire = append(f.wire, p...)
+	for len(f.wire) >= 4 {
+		n := int(f.wire[0])<<24 | int(f.wire[1])<<16 | int(f.wire[2])<<8 | int(f.wire[3])
+		if len(f.wire) < 4+n {
+			break
+		}
+		f.frames = append(f.frames, append([]byte(nil), f.wire[:4+n]...))
+		f.wire = f.wire[4+n:]
+	}
 	return len(p), nil
 }
 
@@ -367,13 +378,17 @@ func TestSlowPeerDoesNotStallOtherPeers(t *testing.T) {
 	b := addClient(r, "peer-b", &blockingStream{release: release})
 	r.register(b, "room1")
 
-	a, _ := newClient(r, "peer-a")
+	// Two churning peers: one alone runs out of join budget (maxJoinsPerPeer)
+	// a few frames short of filling b's outbox.
 	churn := make(chan struct{})
 	go func() {
 		defer close(churn)
-		for i := 0; i < sendQueueDepth+4; i++ {
-			r.register(a, "room1")
-			r.unregister(a, "room1")
+		for _, id := range []string{"peer-a", "peer-c"} {
+			c, _ := newClient(r, id)
+			for i := 0; i < sendQueueDepth/2+4; i++ {
+				r.register(c, "room1")
+				r.unregister(c, "room1")
+			}
 		}
 	}()
 	select {
@@ -580,7 +595,7 @@ func TestResourceManagerAllowsManyConnsFromOneIP(t *testing.T) {
 	// is put back below the connection manager's own high-water mark - the
 	// per-subnet cap (8 by default, and meaningless behind a proxy) or the
 	// memory-scaled System.ConnsInbound, which on a small VPS lands under it.
-	const want = connMgrHigh
+	want := connMgrHigh
 	scopes := make([]network.ConnManagementScope, 0, want)
 	for i := 0; i < want; i++ {
 		scope, err := rm.OpenConnection(network.DirInbound, true, remote)
@@ -818,6 +833,12 @@ func TestRoomCapIsSharedAcrossAPeersStreams(t *testing.T) {
 func TestTotalCapLoggedResetsWhenTotalFalls(t *testing.T) {
 	r := newRegistry()
 	a, _ := newClient(r, "peer-a")
+	// Past the soft ceiling a peer still gets its guaranteed rooms, so the
+	// refusal this test is about only starts once a has used them.
+	liftEmptyRegisterBudget(r, "peer-a")
+	for i := range guaranteedRoomsPerPeer {
+		r.register(a, fmt.Sprintf("held-%d", i))
+	}
 	r.mu.Lock()
 	r.total = maxTotalRegistrations
 	r.totalCapLogged = true
@@ -1189,4 +1210,64 @@ func TestPingIsAnsweredWithPong(t *testing.T) {
 		t.Fatal("readLoop did not return once the idle window elapsed")
 	}
 	r.removeClient(c)
+}
+
+// gatedStream holds its first write until the gate opens, the way a writer
+// goroutine that has not been scheduled yet holds everything behind it.
+type gatedStream struct {
+	fakeStream
+	gate chan struct{}
+}
+
+func (g *gatedStream) Write(p []byte) (int, error) {
+	<-g.gate
+	return g.fakeStream.Write(p)
+}
+
+// Every frame used to be its own write - its own yamux frame and syscall - and
+// the outbox was 256 frames, so a burst that arrived before the writer ran
+// (a reconnect re-registering a few hundred rooms, or everyone's PEER_JOINED
+// after a relay restart) dropped a tab that was reading fine. A burst now
+// waits in a queue bounded by bytes and goes out in a few writes, frame for
+// frame as before.
+func TestQueuedFramesGoOutInFewWrites(t *testing.T) {
+	r := newRegistry()
+	s := &gatedStream{gate: make(chan struct{})}
+	a := addClient(r, "peer-a", s)
+	liftEmptyRegisterBudget(r, "peer-a")
+	const rooms = 300
+	for i := range rooms {
+		r.register(a, fmt.Sprintf("room-%d", i))
+	}
+	select {
+	case <-a.done:
+		t.Fatal("a burst the writer had not reached yet dropped the stream")
+	default:
+	}
+	close(s.gate)
+	s.waitFrames(t, rooms)
+	for i := range rooms {
+		if msg := s.decode(t, i); msg.Type != "PEERS" || msg.Room != fmt.Sprintf("room-%d", i) {
+			t.Fatalf("frame %d is %s %q, want PEERS for room-%d in order", i, msg.Type, msg.Room, i)
+		}
+	}
+	s.mu.Lock()
+	writes, leftover := s.writes, len(s.wire)
+	s.mu.Unlock()
+	if writes > 5 {
+		t.Fatalf("%d frames took %d writes, want a handful", rooms, writes)
+	}
+	if leftover != 0 {
+		t.Fatalf("%d bytes of a partial frame were written", leftover)
+	}
+
+	// No write is larger than a batch, except a single frame that is.
+	big := make([]string, maxPeersPerFrame)
+	for i := range big {
+		big[i] = strings.Repeat("Q", 52)
+	}
+	frame, _ := json.Marshal(serverMsg{Type: "PEERS", Room: "r", Peers: big})
+	if 4+len(frame) > writeBatchBytes {
+		t.Fatalf("a full PEERS frame (%d bytes) does not fit in one batch (%d)", 4+len(frame), writeBatchBytes)
+	}
 }

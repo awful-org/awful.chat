@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"net"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -98,5 +101,85 @@ func TestIsDisallowedIP(t *testing.T) {
 
 	if !isDisallowedIP(nil) {
 		t.Error("a nil IP must be disallowed")
+	}
+}
+
+// An IPv6 transition address is only as public as the IPv4 address inside
+// it: through the host's NAT64, 64:ff9b::a9fe:a9fe is the metadata service.
+func TestIsDisallowedIPLooksInsideTransitionAddresses(t *testing.T) {
+	blocked := []string{
+		"64:ff9b::a9fe:a9fe",  // NAT64 of 169.254.169.254
+		"64:ff9b::7f00:1",     // NAT64 of 127.0.0.1
+		"64:ff9b::a00:1",      // NAT64 of 10.0.0.1
+		"2002:a9fe:a9fe::1",   // 6to4 of 169.254.169.254
+		"2002:c0a8:101::",     // 6to4 of 192.168.1.1
+		"::7f00:1",            // IPv4-compatible 127.0.0.1
+		"::a00:1",             // IPv4-compatible 10.0.0.1
+		"64:ff9b:1::a00:1",    // local-use NAT64: refused outright
+		"64:ff9b:1:ffff::808", // however the IPv4 is laid out in it
+		"2001:0:4136:e378::1", // Teredo: refused outright
+	}
+	for _, s := range blocked {
+		if !isDisallowedIP(net.ParseIP(s)) {
+			t.Errorf("%s should be disallowed", s)
+		}
+	}
+	allowed := []string{
+		"64:ff9b::808:808", // NAT64 of 8.8.8.8
+		"2002:808:808::1",  // 6to4 of 8.8.8.8
+		"2001:db8::1",      // not Teredo: 2001:db8::/32 is next door
+		"2001:4860::8888",  // Google, a real 2001:: address outside 2001::/32
+	}
+	for _, s := range allowed {
+		if isDisallowedIP(net.ParseIP(s)) {
+			t.Errorf("%s should be allowed", s)
+		}
+	}
+}
+
+// Only the web's ports, on every outbound fetch path.
+func TestSafeDialsRefuseOtherPorts(t *testing.T) {
+	for _, dial := range []func(context.Context, string, string) (net.Conn, error){ogSafeDial, pluginProxySafeDial} {
+		for _, addr := range []string{"example.com:22", "example.com:6379", "example.com:8080"} {
+			if c, err := dial(context.Background(), "tcp", addr); err == nil {
+				c.Close()
+				t.Errorf("dialled %s", addr)
+			} else if !strings.Contains(err.Error(), "disallowed port") {
+				t.Errorf("%s: refused for the wrong reason: %v", addr, err)
+			}
+		}
+	}
+	req := httptest.NewRequest("GET", "/og/preview?url="+url.QueryEscape("http://example.com:6379/"), nil)
+	rec := httptest.NewRecorder()
+	handleOgPreview(rec, req)
+	if rec.Code != 400 {
+		t.Errorf("a preview of port 6379 got %d, want 400", rec.Code)
+	}
+}
+
+// A preview hands its urls to an img src and a video element in every client
+// that shows it, so only absolute http(s) urls may come back.
+func TestAbsolutizeUrlOnlyReturnsWebURLs(t *testing.T) {
+	base := "https://example.com/post/1"
+	cases := map[string]string{
+		"/img.png":                      "https://example.com/img.png",
+		"https://cdn.example.com/a.jpg": "https://cdn.example.com/a.jpg",
+		"//cdn.example.com/a.jpg":       "https://cdn.example.com/a.jpg",
+		"javascript:alert(1)":           "",
+		"JavaScript:alert(1)":           "",
+		"data:image/svg+xml,<svg/>":     "",
+		"file:///etc/passwd":            "",
+		"blob:https://example.com/uuid": "",
+		"ftp://example.com/a.png":       "",
+		"https://user:pw@example.com/a": "",
+	}
+	for raw, want := range cases {
+		got := absolutizeUrl(raw, base)
+		switch {
+		case want == "" && got != nil:
+			t.Errorf("%q: returned %q, want nothing", raw, *got)
+		case want != "" && (got == nil || *got != want):
+			t.Errorf("%q: got %v, want %q", raw, got, want)
+		}
 	}
 }

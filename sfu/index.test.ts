@@ -190,6 +190,7 @@ async function connectAndJoin(
   label: string,
   port: number = PORT,
 ): Promise<WebSocket> {
+  roomCode = testRoom(roomCode).room;
   const ws = new WebSocket(wsUrl(port));
   const challenge = nextMessage(ws, (m) => m.type === "auth:challenge");
   await new Promise<void>((resolve, reject) => {
@@ -200,12 +201,27 @@ async function connectAndJoin(
   const peerId = testPeer(label).peerId;
   const signature = sign(null, Buffer.from(joinPayload(nonce, roomCode, peerId)), testPeer(label).privateKey).toString("base64");
   const joined = nextMessage(ws, (m) => m.type === "auth:joined");
-  ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature }));
+  ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature,
+    capability: roomProof(nonce, roomCode, peerId) }));
   await joined;
   return ws;
 }
 
 const identities = new Map<string, ReturnType<typeof makeTestPeer>>();
+const rooms = new Map<string, { room: string; privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"] }>();
+function testRoom(label: string) {
+  if (!rooms.has(label)) {
+    const key = generateKeyPairSync("ed25519");
+    const entry = { room: `rs2_${key.publicKey.export({ format: "jwk" }).x}`, privateKey: key.privateKey };
+    rooms.set(label, entry);
+    rooms.set(entry.room, entry);
+  }
+  return rooms.get(label)!;
+}
+function roomProof(nonce: string, room: string, peer: string) {
+  return sign(null, Buffer.from(JSON.stringify(["awful:sfu:room:v2", nonce, room, peer])),
+    testRoom(room).privateKey).toString("base64url");
+}
 function makeTestPeer() {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const raw = Buffer.from(publicKey.export({ format: "jwk" }).x!, "base64url");
@@ -227,18 +243,50 @@ test("join signature binds nonce, room and peer identity", () => {
 });
 
 test("SFU rejects unsigned joins, forged identities and cross-socket replay", async () => {
+  const room = testRoom("auth-room").room;
   const a = testPeer("auth-wire-a"), b = testPeer("auth-wire-b");
   let captured = "";
   for (const mode of ["unsigned", "forged", "capture", "replay"]) {
     const ws = new WebSocket(wsUrl());
     try {
       const { nonce } = await nextMessage(ws, m => m.type === "auth:challenge");
-      const signature = mode === "replay" ? captured : sign(null, Buffer.from(joinPayload(nonce, "auth-room", a.peerId)), mode === "forged" ? b.privateKey : a.privateKey).toString("base64");
+      const signature = mode === "replay" ? captured : sign(null, Buffer.from(joinPayload(nonce, room, a.peerId)), mode === "forged" ? b.privateKey : a.privateKey).toString("base64");
       if (mode === "capture") captured = signature;
       const reply = nextMessage(ws, m => m.type === "auth:joined" || m.type === "ms:error");
-      ws.send(JSON.stringify({ type: "join", roomCode: "auth-room", peerId: a.peerId, signature: mode === "unsigned" ? undefined : signature }));
+      ws.send(JSON.stringify({ type: "join", roomCode: room, peerId: a.peerId, signature: mode === "unsigned" ? undefined : signature,
+        capability: roomProof(nonce, room, a.peerId) }));
       assert.equal((await reply).type, mode === "capture" ? "auth:joined" : "ms:error");
     } finally { ws.close(); }
+  }
+});
+
+test("v2 admission requires a fresh room capability as well as peer identity", async () => {
+  const roomKey = generateKeyPairSync("ed25519");
+  const otherKey = generateKeyPairSync("ed25519");
+  const room = `rs2_${roomKey.publicKey.export({ format: "jwk" }).x}`;
+  const peer = testPeer("v2-admission");
+  let captured = "";
+  for (const mode of ["missing", "wrong-key", "capture", "replay", "wrong-peer", "root", "discovery", "legacy"]) {
+    const ws = new WebSocket(wsUrl());
+    try {
+      const { nonce } = await nextMessage(ws, m => m.type === "auth:challenge");
+      const roomCode = mode === "legacy" ? "legacy-room" : mode === "root" ? `r2_${"a".repeat(43)}` : mode === "discovery" ? `rd2_${"a".repeat(43)}` : room;
+      let capability = sign(null, Buffer.from(JSON.stringify([
+        "awful:sfu:room:v2", nonce, roomCode,
+        mode === "wrong-peer" ? testPeer("other-member").peerId : peer.peerId,
+      ])), mode === "wrong-key" ? otherKey.privateKey : roomKey.privateKey).toString("base64url");
+      if (mode === "capture") captured = capability;
+      if (mode === "replay") capability = captured;
+      const signature = sign(null, Buffer.from(joinPayload(nonce, roomCode, peer.peerId)), peer.privateKey).toString("base64");
+      const reply = nextMessage(ws, m => m.type === "auth:joined" || m.type === "ms:error");
+      ws.send(JSON.stringify({ type: "join", roomCode, peerId: peer.peerId, signature,
+        capability: mode === "missing" ? undefined : capability }));
+      assert.equal((await reply).type, mode === "capture" ? "auth:joined" : "ms:error", mode);
+    } finally {
+      const closed = new Promise<void>(resolve => ws.once("close", () => resolve()));
+      ws.close();
+      await closed;
+    }
   }
 });
 
@@ -250,8 +298,10 @@ test("authenticated identity reconnects after disconnect and cannot evict its li
     const { nonce } = await nextMessage(duplicate, m => m.type === "auth:challenge");
     const { peerId, privateKey } = testPeer(label);
     const reply = nextMessage(duplicate, m => m.type === "ms:error");
-    const signature = sign(null, Buffer.from(joinPayload(nonce, "auth-reconnect-room", peerId)), privateKey).toString("base64");
-    duplicate.send(JSON.stringify({ type: "join", roomCode: "auth-reconnect-room", peerId, signature }));
+    const roomCode = testRoom("auth-reconnect-room").room;
+    const signature = sign(null, Buffer.from(joinPayload(nonce, roomCode, peerId)), privateKey).toString("base64");
+    duplicate.send(JSON.stringify({ type: "join", roomCode, peerId, signature,
+      capability: roomProof(nonce, roomCode, peerId) }));
     assert.equal((await reply).reason, "peer-id-in-use");
     assert.equal(first.readyState, WebSocket.OPEN);
   } finally {
@@ -663,5 +713,108 @@ describe("ms:diag with SFU_TELEMETRY unset", () => {
     } finally {
       ws.close();
     }
+  });
+});
+
+// The upgrade's Origin check and the cap on sockets that have not joined
+// yet (sfu/admission.ts). Its own process: both are read once at boot.
+describe("admission: origin allowlist and unjoined-socket cap", () => {
+  let ADMIT_PORT = 0;
+  let admitSfu: SpawnedSfu;
+
+  before(async () => {
+    ADMIT_PORT = await freePort([PORT]);
+    admitSfu = spawnSfu(ADMIT_PORT, {
+      DOMAIN: "chat.example",
+      SFU_MAX_PENDING_PER_PROXY: "3",
+      SFU_MAX_PENDING_PER_IP: "2",
+    });
+    await waitForServer(ADMIT_PORT);
+  });
+
+  after(async () => {
+    await admitSfu.stop();
+  });
+
+  type Attempt = { ws: WebSocket; status?: number; closeCode?: number; opened: boolean };
+
+  // Opens a socket and reports how it ended up: refused at the upgrade
+  // (status), accepted and then closed by the server (closeCode), or open.
+  function attempt(opts: { origin?: string; forwardedFor?: string } = {}): Promise<Attempt> {
+    const headers: Record<string, string> = {};
+    if (opts.forwardedFor) headers["X-Forwarded-For"] = opts.forwardedFor;
+    const ws = new WebSocket(wsUrl(ADMIT_PORT), { origin: opts.origin, headers });
+    return new Promise((resolve) => {
+      const a: Attempt = { ws, opened: false };
+      ws.once("unexpected-response", (req, res) => {
+        a.status = res.statusCode;
+        req.destroy();
+        resolve(a);
+      });
+      ws.once("error", () => resolve(a));
+      ws.once("open", () => {
+        a.opened = true;
+        // A refused-for-capacity socket is closed straight after opening;
+        // one that is admitted hears its join challenge first.
+        ws.once("close", (code) => {
+          a.closeCode = code;
+          resolve(a);
+        });
+        ws.once("message", () => resolve(a));
+      });
+    });
+  }
+
+  async function closeAll(list: Attempt[]): Promise<void> {
+    await Promise.all(
+      list.map(
+        (a) =>
+          new Promise<void>((resolve) => {
+            if (a.ws.readyState === WebSocket.CLOSED) return resolve();
+            a.ws.once("close", () => resolve());
+            a.ws.close();
+          }),
+      ),
+    );
+    // The server releases a slot on ITS close event, which can land just
+    // after the client's.
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  test("a browser on another site is refused at the upgrade; the app's own origin is not", async () => {
+    const evil = await attempt({ origin: "https://evil.example" });
+    assert.equal(evil.status, 403);
+    assert.equal(evil.opened, false);
+    const app = await attempt({ origin: "https://chat.example" });
+    assert.equal(app.opened, true);
+    assert.equal(app.closeCode, undefined);
+    const noOrigin = await attempt();
+    assert.equal(noOrigin.opened, true);
+    await closeAll([app, noOrigin]);
+  });
+
+  test("unjoined sockets are capped per client and per proxy", async () => {
+    // From 127.0.0.1 with no X-Forwarded-For: a trusted proxy naming nobody.
+    const viaProxy: Attempt[] = [];
+    for (let i = 0; i < 3; i++) viaProxy.push(await attempt());
+    assert.ok(viaProxy.every((a) => a.opened && a.closeCode === undefined));
+    const overProxy = await attempt();
+    assert.equal(overProxy.closeCode, 1013);
+    await closeAll(viaProxy);
+
+    // Named clients each get their own, smaller, allowance.
+    const client: Attempt[] = [];
+    for (let i = 0; i < 2; i++) client.push(await attempt({ forwardedFor: "203.0.113.5" }));
+    assert.ok(client.every((a) => a.opened && a.closeCode === undefined));
+    const over = await attempt({ forwardedFor: "203.0.113.5" });
+    assert.equal(over.closeCode, 1013);
+    const other = await attempt({ forwardedFor: "203.0.113.6" });
+    assert.equal(other.closeCode, undefined);
+    await closeAll([...client, other]);
+
+    // And the slots come back once those sockets are gone.
+    const again = await attempt({ forwardedFor: "203.0.113.5" });
+    assert.equal(again.closeCode, undefined);
+    await closeAll([again]);
   });
 });

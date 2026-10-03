@@ -3,6 +3,12 @@
  * Used at the trust boundary (receiving wire profiles) and by ProfileSettings.
  */
 
+import { profileImageFits } from "./image-size";
+import { normalizeAvatarUrl } from "./utils";
+
+// Same raster allowlist as avatars, with the banner's larger inline budget.
+const DATA_BANNER_RE = /^data:image\/(png|jpeg|jpg|gif|webp|avif);base64,[A-Za-z0-9+/]+=*$/;
+
 export interface ValidatedProfileMeta {
   tagText?: string;
   tagTextColor?: string;
@@ -15,16 +21,6 @@ export interface ValidatedProfileMeta {
   nameGlow?: boolean;
   bannerUrl?: string;
 }
-
-/**
- * Base64 raster image only, the same allowlist normalizeAvatarUrl applies to
- * avatars. A bare `data:image/` prefix test also let `data:image/svg+xml`
- * through, and SVG can carry script and external references - harmless while
- * both banner call sites are <img>, which neuters it, but the policy must not
- * depend on every future call site remembering that.
- */
-const DATA_BANNER_RE =
-  /^data:image\/(png|jpeg|jpg|gif|webp|avif);base64,[A-Za-z0-9+/]+=*$/;
 
 /**
  * Validate and sanitize profile metadata from wire or settings.
@@ -89,15 +85,14 @@ export function validateProfileMeta(meta: Partial<ValidatedProfileMeta>): Valida
     result.nameGlow = meta.nameGlow;
   }
 
-  // Banner URL: base64 raster data: image only, max 1.5 MB string length.
-  // The length test runs first so a 1.5 MB string is never handed to the regex.
-  if (typeof meta.bannerUrl === "string") {
-    if (
-      meta.bannerUrl.length <= 1_500_000 &&
-      DATA_BANNER_RE.test(meta.bannerUrl)
-    ) {
-      result.bannerUrl = meta.bannerUrl;
-    }
+  // The shared picker supports uploads AND linked images/GIFs. Match avatar
+  // normalization so banners visible to their owner also survive transmission,
+  // the size an inline one's header claims included.
+  if (typeof meta.bannerUrl === "string" && meta.bannerUrl.length <= 1_500_000) {
+    const bannerUrl = meta.bannerUrl.startsWith("data:")
+      ? (DATA_BANNER_RE.test(meta.bannerUrl) && profileImageFits(meta.bannerUrl) ? meta.bannerUrl : undefined)
+      : normalizeAvatarUrl(meta.bannerUrl);
+    if (bannerUrl) result.bannerUrl = bannerUrl;
   }
 
   return result;

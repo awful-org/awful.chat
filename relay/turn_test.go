@@ -1,13 +1,13 @@
 package main
 
 import (
-	"reflect"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -187,6 +187,7 @@ type turnResponse struct {
 func turnBody(t *testing.T) turnResponse {
 	t.Helper()
 	resetRateLimiter(t)
+	resetTurnCredentials(t)
 	req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
 	rec := httptest.NewRecorder()
 	handleTurnCredentials(rec, req)
@@ -200,9 +201,11 @@ func turnBody(t *testing.T) turnResponse {
 	return body
 }
 
-// coturn keys --user-quota on the WHOLE username, so a bare expiry put every
-// client that minted in the same wall-clock second into one shared allocation
-// bucket. The id half has to be there, and it has to differ per request.
+// coturn keys --user-quota on the id half of the username, and on the WHOLE
+// username when there is none, so a bare expiry put every client that minted
+// in the same wall-clock second into one shared allocation bucket. The id half
+// has to be there, and for a proxy's address - everybody behind it, so no one
+// client - it has to differ per request.
 func TestTurnCredentialsUsernameCarriesAPerClientID(t *testing.T) {
 	resetRateLimiter(t)
 	const secret = "test-secret-123"

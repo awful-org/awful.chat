@@ -49,9 +49,11 @@ services:
       - TURN_PORT=${TURN_PORT:-}
       - TURN_URLS=${TURN_URLS:-}
       # Generic plugin proxy: allowlisted upstream hosts and named secrets
-      # substituted server-side ({{secret:NAME}}). Bind secrets to their
-      # host - NAME@host=value - so no other allowlisted upstream can ever
-      # receive them. What keeps API-using plugins "env + redeploy".
+      # substituted server-side ({{secret:NAME}}). Each secret is bound to a
+      # host and the one query parameter it fills - NAME@host?param=value,
+      # optionally NAME@host/path/prefix?param=value - so it can reach
+      # nothing else.
+      # What keeps API-using plugins "env + redeploy".
       - PLUGIN_PROXY_HOSTS=${PLUGIN_PROXY_HOSTS:-}
       - PLUGIN_PROXY_SECRETS=${PLUGIN_PROXY_SECRETS:-}
       # Optional diagnostic collector. Unset means the /telemetry route
@@ -75,20 +77,35 @@ services:
       # reaches an operator whose instance misbehaves. Defaults to
       # admin@${DOMAIN}.
       - PUSH_CONTACT=${PUSH_CONTACT:-}
-      # Whose X-Forwarded-For the relay believes, for rate limiting and the
-      # plugin proxy. Read by relay/pluginproxy.go and documented in
-      # .env.example, but never passed in until recently: an operator who added
-      # a CDN's ranges here got no error and no effect, which on a control that
-      # decides which client ip is believed is the worst way to fail.
+      # Push services the relay sends to. Unset is the services browsers use
+      # (FCM, Mozilla, Apple, WNS); setting it replaces that list. See
+      # .env.example.
+      - PUSH_ALLOWED_HOSTS=${PUSH_ALLOWED_HOSTS:-}
+      # Whose X-Forwarded-For the relay believes, for every per-client limit
+      # it has. The relay itself trusts NOTHING when this is empty: every
+      # container on dokploy-network holds a private address, so the old
+      # "trust every private range" default let any neighbour forge the header
+      # and pick its own rate-limit bucket.
       #
-      # Optional. Unset, the relay trusts private ranges plus loopback, which
-      # is right behind Traefik alone. On this compose's shared dokploy-network
-      # every container holds a private address, so another container on the
-      # box could forge X-Forwarded-For and pick its own per-IP rate-limit
-      # bucket; an operator who wants that closed sets Traefik's /32 here (see
-      # .env.example). It is a rate-limit bypass for a neighbour you deployed
-      # yourself, so the default stays convenient rather than strict.
-      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-}
+      # The default below is the NAME of Dokploy's Traefik container, which
+      # docker's DNS answers on dokploy-network. The relay re-resolves it every
+      # 30s, so it follows Traefik across a recreate instead of going stale
+      # the way a hand-copied /32 does. If your Traefik runs under another
+      # name, or a CDN sits in front of it, set this (see .env.example). If it
+      # names nothing that resolves, the relay says so at boot and every user
+      # shares Traefik's one bucket until it does.
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-dokploy-traefik}
+      # How many libp2p connections (open tabs) the relay holds at once,
+      # default 2048. Past it new connections are refused at accept and
+      # retried; established tabs are never dropped to make room. Lower it on
+      # a small box. See deploy/README.md, "Relay capacity".
+      - RELAY_MAX_CONNS=${RELAY_MAX_CONNS:-}
+      # The Go runtime's soft memory limit: the garbage collector works harder
+      # as the relay nears it instead of letting the heap double. Keep it
+      # above what RELAY_MAX_CONNS needs at full load (about 550 MB at 2048)
+      # and below what the box can give the relay. Go's units only (768MiB,
+      # 1GiB): 1G or 768MB stop the relay at boot.
+      - GOMEMLIMIT=${RELAY_GOMEMLIMIT:-768MiB}
     volumes:
       - relay_data:/app/data
     networks:
@@ -242,6 +259,12 @@ services:
       # Same omission SFU_MAX_ROOMS had: read by sfu/index.ts, documented in
       # .env.example, never passed in - so setting it did nothing at all.
       SFU_REJOIN_PROBE_MS: ${SFU_REJOIN_PROBE_MS:-3000}
+      # The Origin a browser's signalling socket must come from: the app's
+      # own, https://DOMAIN, the same variable the relay's CORS reads. A
+      # page on any other site is refused at the upgrade. SFU_ALLOWED_ORIGINS
+      # adds more, comma-separated, for a second app origin.
+      DOMAIN: ${DOMAIN}
+      SFU_ALLOWED_ORIGINS: ${SFU_ALLOWED_ORIGINS:-}
     # NOT dokploy-network. Nothing routes to this service by hostname from
     # outside - it has no traefik labels, and its media ports are published
     # straight to the host - so the only thing the shared network bought was
@@ -270,7 +293,18 @@ services:
   # pool size gone and the dead urls removed that is ~2 per connection, and 51
   # is comfortable for the current handful of users. Bumped to 100 for
   # headroom anyway - with network_mode: host nothing is published per port,
-  # so the range size costs nothing at deploy time.
+  # so the range size costs nothing at deploy time. It is 1000 now
+  # (TURN_MIN_PORT/TURN_MAX_PORT).
+  #
+  # --user-quota caps the allocations under one credential id and
+  # --total-quota is the pool for everybody. A credential costs nothing to ask
+  # for, so the relay hands one address at most seven live ones, carrying at
+  # most seven ids between them (25 for an IPv6 /48; see turnMaxLivePerClient
+  # in relay/turn.go), and coturn counts the quota per id whatever a
+  # credential's expiry: with these defaults one address holds at most 84 of
+  # 900 allocations, and filling the pool takes about eleven addresses at
+  # once. Keep the pool inside the relay port range, one port per allocation,
+  # and keep it ten times what one address can hold.
   #
   # Loopback and link-local are denied because host networking puts coturn on
   # the host's stack: without them a relay peer reaches services bound to
@@ -345,7 +379,7 @@ services:
       --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       --min-port=${TURN_MIN_PORT:-49152}
       --max-port=${TURN_MAX_PORT:-50151}
-      --total-quota=${TURN_TOTAL_QUOTA:-300}
+      --total-quota=${TURN_TOTAL_QUOTA:-900}
       --user-quota=${TURN_USER_QUOTA:-12}
       ${TURN_TLS_ARGS:-}
     network_mode: host
@@ -359,10 +393,12 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         # External plugins fetched at build time; see frontend/plugins/README.md.
-        # Pin each to a commit sha (owner/repo@sha) - an instance built from a
-        # moving ref cannot be rebuilt by anyone later, including you.
+        # Pin each to a commit's whole 40-character sha (owner/repo@<sha>) - an
+        # instance built from a moving ref cannot be rebuilt by anyone later,
+        # including you.
         - PLUGIN_SOURCES=${PLUGIN_SOURCES:-}
-        # Unpinned sources fail the build unless this is 1 (ships HEAD).
+        # Unpinned sources - no ref, or an abbreviated sha - fail the build
+        # unless this is 1.
         - PLUGIN_SOURCES_ALLOW_UNPINNED=${PLUGIN_SOURCES_ALLOW_UNPINNED:-}
     # Instance configuration, read at START and served as /config.json rather
     # than compiled into the bundle, so two instances of the same commit and
@@ -381,6 +417,9 @@ services:
       # no account, /qc is a call with no room.
       - APP_USE_QS=${USE_QS:-}
       - APP_USE_QC=${USE_QC:-}
+      # Settings > What's new, fetched from GitHub by this container at start
+      # (frontend/docker-entrypoint.d/41-awful-whats-new.sh). 0 turns it off.
+      - APP_WHATS_NEW=${WHATS_NEW:-}
     restart: unless-stopped
     # Drops every capability except what the stock nginx image needs: the
     # master starts as root and setuid/setgids its workers to the nginx user

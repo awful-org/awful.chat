@@ -18,6 +18,16 @@ export const MAX_PEER_VOLUME = 2.5;
 /** How often the roster and the actual voice links are compared. */
 const VOICE_RECONCILE_MS = 4_000;
 /**
+ * A link that settled on TURN is offered one look for a direct path this
+ * long after it did. The other triggers are events (the network changing
+ * or coming back); this is the one timer, for a link that lost the race to
+ * TURN at join on a network that then never changes. A guess, so it runs
+ * once per link and is not a schedule.
+ */
+const TURN_HEAL_RETRY_MS = 20_000;
+/** Looks for a direct path per link, whatever triggered them. */
+const TURN_HEAL_MAX_ATTEMPTS = 3;
+/**
  * Per-peer redial backoff: a flat step up to a low ceiling, not doubling.
  * It exists only to stop a hot loop (an RTCPeerConnection with no working ICE
  * fails instantly, tears itself down and redials, at ~20 dials a second) - and
@@ -89,10 +99,17 @@ const VOICE_MEDIA_STALL_MS = 8_000;
 // echo whenever anyone talked, which read as "DTLN is processing inbound
 // audio too" (it never touches the inbound path). AEC runs at capture,
 // before the track reaches the worklet, so the two compose.
+//
+// AGC ON here too. With it off, speech reached the worklet at whatever level
+// the hardware produced, and its noise gate has a fixed threshold: a quiet
+// mic (a HyperX Cloud III sat right on it) had its gate closing inside
+// words, which everyone heard as a spotty voice that only a threshold of 0
+// fixed. AGC brings every mic to roughly the same level, well clear of the
+// gate - the same leveling the non-DTLN path has always had.
 const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: false,
-  autoGainControl: false,
+  autoGainControl: true,
 };
 
 const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {
@@ -175,6 +192,10 @@ interface RemotePeer {
   recoveryPending?: boolean;
   /** Polls taken; only every third one is recorded. */
   sampleTick?: number;
+  /** Looks for a direct path taken while this link was on TURN. */
+  healAttempts?: number;
+  /** The one settled-on-TURN retry, while it is pending. */
+  healTimer?: ReturnType<typeof setTimeout>;
 }
 
 export class LibP2PVoice implements VoiceTransport {
@@ -290,7 +311,10 @@ export class LibP2PVoice implements VoiceTransport {
     });
   }
 
+  private securityRoom: string | null = null;
+
   async join(_roomCode: string): Promise<void> {
+    this.securityRoom = _roomCode;
     this.node = this.transport.p2pNode;
     if (!this.node) throw new Error("Transport not connected");
 
@@ -339,6 +363,10 @@ export class LibP2PVoice implements VoiceTransport {
 
     this.transport.on("connect", this.onTransportConnect);
     this.transport.on("disconnect", this.onTransportDisconnect);
+    if (typeof window !== "undefined") {
+      window.addEventListener("online", this.onNetworkChange);
+      (navigator as Navigator & { connection?: EventTarget }).connection?.addEventListener("change", this.onNetworkChange);
+    }
 
     this.reconcileTimer ??= setInterval(
       () => this.reconcileLinks(),
@@ -565,8 +593,7 @@ export class LibP2PVoice implements VoiceTransport {
     this.lastRedialAsk.set(peerId, now);
     this.debugStats.redialsAsked++;
     rec(ev("voice.redial.ask", { peer: peerId }));
-    void this.transport
-      .send(peerId, encode({ type: MessageType.VoiceRedial }))
+    void this.sendVoiceFrame(peerId, encode({ type: MessageType.VoiceRedial }))
       .catch(() => {});
   }
 
@@ -800,6 +827,16 @@ export class LibP2PVoice implements VoiceTransport {
           : "Voice connected directly (P2P)",
       });
     }
+    // Settled on TURN: one later look for a direct path. Asked by one side
+    // only, the lower id, so the two do not offer at once (glare resolves
+    // it anyway, at the cost of a wasted round).
+    if (
+      pair?.relayed && remote.pc.connectionState === "connected" && mediaHealthy &&
+      remote.healTimer === undefined && !remote.healAttempts &&
+      this.transport.selfId() < remote.peerId
+    ) {
+      remote.healTimer = setTimeout(() => this.tryDirectPath(remote, "settled"), TURN_HEAL_RETRY_MS);
+    }
     if (!inbound) return;
 
     // The watchdog above turns all of this into one verdict after 8s of
@@ -830,7 +867,48 @@ export class LibP2PVoice implements VoiceTransport {
     );
   }
 
+  /**
+   * Look for a direct path for a voice link that is on TURN: an ICE restart
+   * while it is connected. Media keeps flowing on the current pair while the
+   * new checks run, and the browser moves only if a better pair succeeds; the
+   * next stats probe reports the route either way. A browser never does this
+   * by itself - the first working pair is kept for the life of the link - so
+   * without it a call that landed on TURN stayed there.
+   */
+  private tryDirectPath(remote: RemotePeer, reason: "network" | "settled"): void {
+    if (this.remotePeers.get(remote.peerId) !== remote) return;
+    if (!remote.relayed) return;
+    if (remote.pc.connectionState !== "connected" || remote.pc.signalingState !== "stable") return;
+    if ((remote.healAttempts ?? 0) >= TURN_HEAL_MAX_ATTEMPTS) return;
+    remote.healAttempts = (remote.healAttempts ?? 0) + 1;
+    const peerId = remote.peerId;
+    rec(ev("voice.heal", { peer: peerId, d: { reason, attempt: remote.healAttempts } }));
+    remote.pc.restartIce();
+    remote.pc
+      .createOffer({ iceRestart: true })
+      .then((offer) =>
+        remote.pc.setLocalDescription(offer).then(() =>
+          this.sendSignal(peerId, { type: "offer", sdp: offer.sdp! })
+        )
+      )
+      .catch((err) => {
+        // A lost look costs nothing: the link is still up on TURN.
+        if (this.remotePeers.get(peerId) === remote) {
+          console.warn(`[Voice] direct-path look for ${peerId.slice(-8)} failed:`, err);
+        }
+      });
+  }
+
+  /** The network changed or came back: every link on TURN looks again. */
+  private onNetworkChange = (): void => {
+    for (const remote of this.remotePeers.values()) this.tryDirectPath(remote, "network");
+  };
+
   leave(): void {
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", this.onNetworkChange);
+      (navigator as Navigator & { connection?: EventTarget }).connection?.removeEventListener("change", this.onNetworkChange);
+    }
     if (this.onTransportConnect) {
       this.transport.off("connect", this.onTransportConnect);
       this.onTransportConnect = null;
@@ -1281,9 +1359,14 @@ export class LibP2PVoice implements VoiceTransport {
    * handleWireSignal for why this replaced the dedicated /voice/ stream.
    */
   private sendSignal(peerId: string, signal: VoiceSignal): Promise<boolean> {
-    return this.transport
-      .send(peerId, encode({ type: MessageType.VoiceSignal, signal }))
+    return this.sendVoiceFrame(peerId, encode({ type: MessageType.VoiceSignal, signal }))
       .catch(() => false);
+  }
+
+  private sendVoiceFrame(peerId: string, data: Uint8Array): Promise<boolean> {
+    return this.securityRoom && (this.securityRoom.startsWith("rd2_") || this.securityRoom.startsWith("dm-"))
+      ? this.transport.sendRoom(peerId, this.securityRoom, data)
+      : this.transport.send(peerId, data);
   }
 
   private ensureRemotePeer(peerId: string): RemotePeer {
@@ -1499,6 +1582,7 @@ export class LibP2PVoice implements VoiceTransport {
     remote.audio.srcObject = null;
     remote.stream?.getTracks().forEach((t) => t.stop());
     remote.pc.close();
+    clearTimeout(remote.healTimer);
 
     this.remotePeers.delete(peerId);
     this.active.delete(peerId);

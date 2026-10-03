@@ -77,6 +77,9 @@ export const HOST_FEATURES: ReadonlySet<string> = new Set([
   "picture-in-picture",
   "call-tile-menu",
   "palette-commands",
+  "self-name",
+  "activity",
+  "error-card",
 ]);
 
 export interface UpdateCtx {
@@ -108,14 +111,19 @@ export interface HostApi {
    * Post a card to the host's room. `payload` is what `initialState`
    * receives on every client, so seed options and questions from it; it is
    * JSON, capped at 16 KB. Resolves to the card's id, which updates name.
+   * Receivers take at most 10 cards a minute from one person in a room,
+   * all plugins together; past that this rejects ("Too many cards at
+   * once...") rather than send what they would drop.
    */
   sendCard(payload: unknown): Promise<string>;
   /**
    * Attach an update to a card. Persisted and replayed in fold order
    * (lamport, senderId, updateId) on every client, into your `reduce`.
    * `{ ephemeral: true }` sends live only, never stored or replayed
-   * (cursors, ticks), capped at about four a second per sender. JSON,
-   * 4 KB; anything larger is refused.
+   * (cursors, ticks), capped at about four a second per sender; persisted
+   * ones at 20 per 10 s from one person in a room, all plugins together,
+   * and past that this rejects rather than send what receivers would drop.
+   * JSON, 4 KB; anything larger is refused.
    */
   sendUpdate(
     cardId: string,
@@ -126,6 +134,15 @@ export interface HostApi {
   roomCode(): string;
   /** This user's DID, the same value `ctx.senderDid` carries for their own updates. */
   selfDid(): string;
+  /** This user's display name, the same value `ctx.senderName` carries for their own updates. */
+  selfName(): string;
+  /**
+   * What this user is doing in your call tile, under their name in their
+   * own user list ("Playing Jeopardy"); null clears it. Local: everyone
+   * else's row comes from `callTileActivities(cardState)`. The host clears
+   * it when your tile unmounts.
+   */
+  setActivity(label: string | null): void;
   /** Peers connected right now, with the display names the host knows. */
   peers(): Array<{ did: string; name: string }>;
   /** A peer left. Returns unsubscribe; call it when your surface unmounts. */
@@ -139,14 +156,15 @@ export interface HostApi {
    */
   onBeforeDisconnect(listener: () => void): () => void;
   /**
-   * The teardown-safe `sendUpdate`: no async work, same room binding, for
-   * the `onBeforeDisconnect` beacon. Fire and forget.
+   * The teardown-safe `sendUpdate`: no async work, same room binding, same
+   * cap (past it, nothing is sent), for the `onBeforeDisconnect` beacon.
+   * Fire and forget.
    */
   sendUpdateImmediately(cardId: string, payload: unknown): void;
   /**
    * This plugin's existing cards in the host's room, newest last. Cheap: it
-   * reads card rows only, and `state` is the folded state when the host has
-   * it in memory.
+   * reads card rows only. `state` is the folded state of the cards this
+   * user sent, and of anyone else's when the host already has it in memory.
    */
   cards(): Promise<Array<{ id: string; senderDid: string; state?: unknown }>>;
   /** Notify card surfaces after a persisted plugin state fold. */
@@ -278,6 +296,15 @@ export interface HostApi {
   showLocalCard(data?: unknown): string;
   /** Close a local card by the id `showLocalCard` returned. */
   closeLocalCard(id: string): void;
+  /**
+   * Tell the person who caused it why this did not work - "Mention someone
+   * to ping: /ping @alice" - in a note only they see, in this room's chat.
+   * Never sent or stored. A command that throws gets the same note with its
+   * error's message, so use this for what goes wrong after a command
+   * returned, or where throwing is not an option. Plain text, one or two
+   * sentences.
+   */
+  showError(message: string): void;
   /** Play a local audio blob through this user's outgoing call track.
    *  Sounds are scoped to the calling plugin: several of this plugin's clips
    *  can layer (the host caps concurrency and evicts the oldest), and stop()
@@ -358,10 +385,18 @@ export interface WidgetProps<State = unknown> {
 
 /**
  * Props of the `callTile` surface: the card's, plus whether the call's own
- * controls are showing, so your overlays move with them.
+ * controls are showing, so your overlays move with them, and whether the
+ * tile is on the stage.
  */
 export interface CallTileProps<State = unknown> extends CardProps<State> {
   chromeVisible: boolean;
+  /** This tile is the focused one, on the big stage. */
+  focused: boolean;
+  /**
+   * Focus or unfocus this tile, as clicking it does. For a visible button:
+   * an iframe swallows the clicks that would otherwise reach the tile.
+   */
+  setFocused(focused: boolean): void;
 }
 
 /**
@@ -472,6 +507,21 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
    * same audience chip screen-share transmissions get.
    */
   callTileViewers?(cardState: State): string[];
+  /**
+   * Whether joining your tile also focuses it, the way opening a stream
+   * puts it on the big stage. Default true: someone who just chose to join
+   * a game or a watch party wants it in front of them. Set false for a tile
+   * meant to sit in the grid beside the cameras (a scoreboard, a timer).
+   */
+  callTileFocusOnJoin?: boolean;
+  /**
+   * What each person is doing in your tile, by DID, shown under their name
+   * in the call's user list: `{ "did:key:...": "Playing Jeopardy" }`.
+   * PURE, like `callTileViewers`. The host keeps one plain line of up to 48
+   * characters. Your own row is `host.setActivity`: your own live updates
+   * never fold back to you, so your state never lists you.
+   */
+  callTileActivities?(cardState: State): Record<string, string>;
   /**
    * Extra rows for the tile's right-click menu, built on demand when the
    * user opens it - so this one is NOT pure: read whatever the controls need

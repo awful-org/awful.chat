@@ -3,6 +3,9 @@
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
   import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
+  import { roomMemberCount } from "$lib/room-members";
+  import { highlightBusy } from "$lib/actions/message-body";
+  import { attachmentsSettling } from "$lib/transport/files.svelte";
   import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
@@ -55,7 +58,7 @@
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
-  import { Tip } from "$lib/components/ui/tooltip";
+  import { LazyTip, Tip } from "$lib/components/ui/tooltip";
   import { Separator } from "$lib/components/ui/separator";
   import {
     Drawer,
@@ -66,13 +69,20 @@
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import MsgRender from "./MsgRender.svelte";
   import LocalPluginCard from "./LocalPluginCard.svelte";
-  import { localPluginCards } from "$lib/plugins/local-cards.svelte";
+  import { closeLocalCard, localPluginCards } from "$lib/plugins/local-cards.svelte";
+  import {
+    dismissPluginErrors,
+    dismissPluginErrorsFor,
+    freshErrorsFor,
+    showPluginError,
+  } from "$lib/plugins/plugin-errors.svelte";
+  import PluginErrorRow from "./PluginErrorRow.svelte";
   import GifPicker from "./GifPicker.svelte";
   import GifImage from "./GifImage.svelte";
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
   import MentionInput from "./MentionInput.svelte";
   import UserListSidebar from "./UserListSidebar.svelte";
-  import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs, setCallChatWidth } from "$lib/display-prefs.svelte";
   import { resolveSplit } from "$lib/call-split";
   import SplitHandle from "./SplitHandle.svelte";
@@ -88,15 +98,18 @@
     didToPeerId,
     peerIdToDid,
     sendReply,
+    sendRoomTyping,
     sendFiles,
     toggleReaction,
     loadMoreMessages,
     markSeen,
     requestFileDownload,
     resolveMentionDisplayName,
+    trimMessageView,
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
-  import { humanizeMentions } from "$lib/mentions";
+  import { compareMessages } from "$lib/transport/message-order";
+  import { stripMarkdown } from "$lib/markdown";
   import {
     pinnedMessagesOf,
     refreshPhonebook,
@@ -104,17 +117,31 @@
   } from "$lib/rooms.svelte";
   import { getMessage } from "$lib/storage";
   import { openSearch } from "$lib/search/ui.svelte";
-  import { revealMessage } from "$lib/reveal-message";
+  import { revealInFlight, revealMessage, revealStored } from "$lib/reveal-message";
+  import {
+    around,
+    hold,
+    planJump,
+    showNewer,
+    showOlder,
+    trimPoint,
+    windowRange,
+    type ChatWindow,
+  } from "$lib/chat-window";
   import { REPLY_THRESHOLD, dragOffset, swipeAction } from "$lib/swipe";
   import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
+  import { tallyReactions, type ReactionTally } from "$lib/reaction-tally";
   import {
     addToPhonebook,
     dmInboxNoticeFor,
     openDmPanel,
     removeFromPhonebook,
     isInPhonebook,
+    sendDmTyping,
   } from "$lib/transport/dm.svelte";
+  import { TypingAnnouncer, typingLine } from "$lib/typing";
+  import { typersIn, typingPrefs } from "$lib/typing.svelte";
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
   import {
@@ -137,8 +164,10 @@
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
   import { formatSize, seededRandom } from "$lib/utils";
-  import { getQuotableText } from "$lib/quote-helper";
-  import { createInvite, formatShortCode } from "$lib/invite";
+  import { QUOTE_SHOWN_CHARS, getQuotableText } from "$lib/quote-helper";
+  import InvitationDialog from "./InvitationDialog.svelte";
+  import ArchivedHistory from "./ArchivedHistory.svelte";
+  import { roomsStore } from "$lib/rooms.svelte";
   import {
     getRoomNotifyMode,
     setRoomNotifyMode,
@@ -146,6 +175,7 @@
   } from "$lib/notify-prefs.svelte";
   import { takeDroppedReplyDraft } from "$lib/notify-intents";
   import { formatRoomCode } from "$lib/room-code";
+  import type { PeerProfile } from "$lib/storage";
 
   $effect(() => {
     loadProfile();
@@ -180,11 +210,19 @@
      *    about a person who exists for as long as their tab does.
      */
     ephemeral?: boolean;
+    /**
+     * The link the invite menu hands out, when it is not the saved room's
+     * `/r/#` link. A quick call's guests arrive through `/qc#`.
+     */
+    inviteLink?: string;
     onOpenSidebar?: () => void;
     onOpenDm?: (peerId: string) => Promise<void> | void;
     incomingSharedFiles?: File[];
     incomingSharedText?: string;
     onConsumeIncomingShared?: () => void;
+    /** This DM is a message request (storage.ts DMRoom.request). */
+    dmRequest?: boolean;
+    onAcceptDmRequest?: () => void;
   }
 
   let {
@@ -192,18 +230,23 @@
     roomName,
     onLeave,
     ephemeral = false,
+    inviteLink,
     onOpenSidebar,
     onOpenDm,
     incomingSharedFiles = [],
     incomingSharedText = "",
     onConsumeIncomingShared,
+    dmRequest = false,
+    onAcceptDmRequest,
   }: Props = $props();
 
   // Reset scroll state when room changes
   $effect(() => {
     roomCode;
     initialScrollDone = false;
+    untrack(beginSettling);
     autoScroll = true;
+    chatWindow = null;
     // hasMoreHistory too. This component is not keyed by room, so switching
     // rooms does not remount it: paging to the top of one room set this false
     // and every other room then opened with no way to page back for the rest
@@ -223,6 +266,7 @@
     peerAvatars,
     peerColors,
     peerProfileMeta,
+    peerRoomProfiles,
     fileTransfers,
     connecting,
   } = $derived(transportState);
@@ -241,12 +285,6 @@
   let commandSelectedIndex = $state(0);
   let commandHint = $state<string | null>(null);
   let submitting = $state(false);
-  /**
-   * The "Saving and sending" line is for attachments only. A text message
-   * settles in a blink, and the line flashed (and nudged the composer) on
-   * every one; images and files take long enough to be worth saying so.
-   */
-  let submittingFiles = $state(false);
   let sendError = $state<string | null>(null);
   let commandHintTimer: ReturnType<typeof setTimeout> | undefined;
   let mentionPopupOpen = $state(false);
@@ -448,9 +486,60 @@
       (m) => RENDERABLE_TYPES.has(m.type) && m.roomCode === roomCode
     )
   );
+
+  /**
+   * Which of them are mounted (chat-window.ts): null follows the newest; a
+   * window held still keeps the reader's place while they are up in
+   * history. Every row is a whole component tree, and mounting every message
+   * held was a frozen frame of seconds when a catch-up landed hundreds.
+   */
+  let chatWindow = $state<ChatWindow>(null);
+  const range = $derived(windowRange(visibleMessages, chatWindow));
+  const renderedMessages = $derived(visibleMessages.slice(range.from, range.to));
+  /** The room's people, counted as the member list draws them (room-members.ts). */
+  const memberCount = $derived(
+    roomMemberCount(roomUsers, [identityStore.did ?? "", selfId(), myPeerId()], senderDid)
+  );
+  /** The newest message held is mounted. */
+  const atNewest = $derived(range.to >= visibleMessages.length);
+  /**
+   * Following the newest at the bottom. The list is pinned to the bottom
+   * then, so the browser's own scroll anchoring is switched off: as rows
+   * left the top of the window it moved the view to keep them in place,
+   * and the scroll that made read as the reader scrolling away.
+   */
+  const following = $derived(chatWindow === null && autoScroll);
   const visibleLocalCards = $derived(
     localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
   );
+
+  // Esc closes the newest private plugin card (a soundboard), the way it
+  // closes any other panel - after anything that used the key first: the
+  // command and mention popups, staged files, an open dialog or menu.
+  // Typing in a field inside the card, the first Esc only leaves the field,
+  // so a half-typed name is not thrown away by reflex.
+  $effect(() => {
+    if (visibleLocalCards.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || e.isComposing) return;
+      if (document.querySelector('[role="dialog"], [role="menu"], [role="listbox"]')) return;
+      const active = document.activeElement as HTMLElement | null;
+      const inCard = active?.closest("[data-local-card]");
+      if (inCard && active?.matches("input, textarea, select, [contenteditable='true']")) {
+        e.preventDefault();
+        active.blur();
+        return;
+      }
+      const newest = visibleLocalCards[visibleLocalCards.length - 1];
+      e.preventDefault();
+      closeLocalCard(newest.id);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  // Re-derived when the room or the notes change, which is when age matters:
+  // a stale note for this room is not shown on the way in.
+  const visiblePluginErrors = $derived(freshErrorsFor(roomCode));
 
   const messageById = $derived(new Map(visibleMessages.map((m) => [m.id, m])));
 
@@ -458,23 +547,19 @@
     replyTargetId ? (messageById.get(replyTargetId) ?? null) : null
   );
 
+  // Rebuilt whenever the list changes, but a message whose reactions did
+  // not change keeps the same Map (reaction-tally.ts), so its chips are left
+  // alone when a message lands somewhere else.
+  let lastReactions: ReactionTally | undefined;
   const reactionsByMessage = $derived.by(() => {
-    const byMessage = new Map<string, Map<string, Set<string>>>();
-    for (const m of messages) {
-      if (m.type !== MessageType.Reaction || !m.reactionTo || !m.reactionEmoji)
-        continue;
-      if (!byMessage.has(m.reactionTo)) byMessage.set(m.reactionTo, new Map());
-      const byEmoji = byMessage.get(m.reactionTo)!;
-      if (!byEmoji.has(m.reactionEmoji))
-        byEmoji.set(m.reactionEmoji, new Set());
-      const users = byEmoji.get(m.reactionEmoji)!;
-      // Normalize to the DID: a reaction added before the sender's binding
-      // was known (peerId form) must cancel against one added after.
-      const reactor = senderDid(m.senderId) || m.senderId;
-      if (m.reactionOp === "remove") users.delete(reactor);
-      else users.add(reactor);
-    }
-    return byMessage;
+    // Normalize to the DID: a reaction added before the sender's binding
+    // was known (peerId form) must cancel against one added after.
+    lastReactions = tallyReactions(
+      messages,
+      (senderId) => senderDid(senderId) || senderId,
+      lastReactions
+    );
+    return lastReactions;
   });
 
   // Coalesce instant scrolls to one per frame. Three independent paths ask
@@ -490,7 +575,9 @@
       _scrollQueued = true;
       requestAnimationFrame(() => {
         _scrollQueued = false;
-        if (!messagesEl) return;
+        // Asked for while following; the reader may have been taken
+        // elsewhere since (a jump to a message), and that wins.
+        if (!messagesEl || !autoScroll) return;
         messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: "instant" });
       });
       return;
@@ -503,42 +590,269 @@
     messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior });
   }
 
+  /** A window move is being anchored: the scrolling it causes is not the
+   *  reader's. */
+  let shifting = false;
+
+  /** Where the last scroll event left the view, to tell up from growth. */
+  let lastScrollTop = 0;
+
   function handleScroll() {
     if (!messagesEl) return;
     const { scrollHeight, scrollTop, clientHeight } = messagesEl;
+    const fromBottom = scrollHeight - scrollTop - clientHeight;
     // "At the bottom" within 120px: the old 40px meant stopping half a
     // message short of the end - one flick of momentum scroll on mobile -
-    // silently stopped the view from following new arrivals.
-    autoScroll = scrollHeight - scrollTop - clientHeight < 120;
+    // silently stopped the view from following new arrivals. The bottom of
+    // a window short of the newest messages is not the end.
+    const atBottom = fromBottom < 120;
+    const movedUp = scrollTop < lastScrollTop - 1;
+    lastScrollTop = scrollTop;
+    // Only the reader scrolling up leaves the bottom. The list growing under
+    // a view that follows it is not that: a code block highlighting, a
+    // picture loading or a synced page landing between our own scroll to
+    // the bottom and that scroll's event made the event read as "left the
+    // bottom", and the view stopped following - a conversation opened
+    // mid-history, under "New messages below". It follows on instead.
+    if (autoScroll && atNewest && !atBottom && !movedUp) {
+      scrollToBottom();
+      return;
+    }
+    autoScroll = atBottom && atNewest;
+    if (!initialScrollDone || shifting) return;
+    if (chatWindow === null && !atBottom) {
+      // The reader left the bottom: hold the window, so what arrives below
+      // does not push the rows being read off its top.
+      chatWindow = hold(visibleMessages, range);
+    } else if (chatWindow !== null && autoScroll) {
+      // Back at the newest: follow it again, with only its rows mounted.
+      void anchored(() => (chatWindow = null)).then(trimHeld);
+      return;
+    }
     // Reaching the top fetches the next page - the button alone was gated on
     // 50+ VISIBLE messages, and a page full of invisible rows (reactions,
     // plugin updates) kept the count below that forever: two weeks of
     // history with no way to scroll to it.
-    if (scrollTop < 80 && initialScrollDone && canLoadOlder && !loadingMore) {
-      void loadOlderPreservingScroll();
+    if (scrollTop < 80) void showOlderRows();
+    else if (!atNewest && fromBottom < 400) void showNewerRows();
+  }
+
+  /** The next older rows: those already held first, then a page from
+   *  storage. */
+  async function showOlderRows() {
+    if (shifting || loadingMore) return;
+    if (range.from === 0) {
+      if (!canLoadOlder) return;
+      // Hold the window first, so the page lands above it unmounted until
+      // the anchored move below shows it.
+      if (chatWindow === null) chatWindow = hold(visibleMessages, range);
+      await handleLoadMore();
+      if (range.from === 0) return;
+    }
+    await anchored(() => (chatWindow = showOlder(visibleMessages, range)));
+  }
+
+  async function showNewerRows() {
+    if (shifting || atNewest) return;
+    await anchored(() => (chatWindow = showNewer(visibleMessages, range)));
+  }
+
+  /**
+   * Change what is mounted without moving what is on screen: the row at the
+   * top of the view stays where it was, whatever went in or came out above
+   * it. Browsers that anchor scrolling would do this for rows added; Safari
+   * does not, and rows taken away need it everywhere.
+   */
+  async function anchored(change: () => void): Promise<void> {
+    const el = messagesEl;
+    if (!el) {
+      change();
+      return;
+    }
+    shifting = true;
+    try {
+      const anchor = topRow(el);
+      const before = anchor?.getBoundingClientRect().top ?? 0;
+      change();
+      await tick();
+      if (anchor?.isConnected) {
+        el.scrollTop += anchor.getBoundingClientRect().top - before;
+      }
+    } finally {
+      shifting = false;
     }
   }
 
-  /** Prepending grows the container upward; without compensation the view
-   *  jumps to the oldest loaded message and re-triggers the top fetch. */
-  async function loadOlderPreservingScroll() {
-    if (!messagesEl) return;
-    const prevHeight = messagesEl.scrollHeight;
-    const prevTop = messagesEl.scrollTop;
-    await handleLoadMore();
-    await tick();
-    if (messagesEl) {
-      messagesEl.scrollTop = prevTop + (messagesEl.scrollHeight - prevHeight);
+  /** The first message row at least partly in view. */
+  function topRow(el: HTMLElement): HTMLElement | null {
+    const top = el.getBoundingClientRect().top;
+    for (const row of el.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+      if (row.getBoundingClientRect().bottom > top) return row;
     }
+    return null;
+  }
+
+  /**
+   * Drop held rows the window no longer needs, while it follows the newest
+   * at the bottom: the view held every message it was ever given for as long
+   * as the room was open. They are in storage; scrolling back reads them.
+   * Never while a jump is filling in the history it is about to show, and
+   * never the message being replied to: the reply is built from it.
+   */
+  function trimHeld(): void {
+    if (chatWindow !== null || !autoScroll || loadingMore) return;
+    if (revealInFlight() || uiState.jumpToMessage?.roomCode === roomCode) return;
+    const keepFrom = trimPoint(visibleMessages, replyTarget);
+    if (!keepFrom) return;
+    // Pins on their way out stay where the pinned panel looks for what is
+    // not held, rather than showing as gone until storage is read again.
+    const leaving = pinnedIds.flatMap((id) => {
+      const msg = messageById.get(id);
+      return msg && compareMessages(msg, keepFrom) < 0 ? [msg] : [];
+    });
+    if (leaving.length > 0) {
+      const next = new Map(pinnedFromStore);
+      for (const msg of leaving) next.set(msg.id, msg);
+      pinnedFromStore = next;
+    }
+    trimMessageView(roomCode, keepFrom);
+    hasMoreHistory = true;
+  }
+
+  // The list emptied while the same conversation stays open: it is being
+  // opened again - selecting the room on screen re-joins it, which reloads
+  // its newest page - and it lands on its newest rows like any opening. A
+  // window held back in history would mount nothing of that page.
+  $effect(() => {
+    if (visibleMessages.length > 0) return;
+    chatWindow = null;
+    autoScroll = true;
+    initialScrollDone = false;
+    hasMoreHistory = true;
+    untrack(beginSettling);
+  });
+
+  // New rows at the newest end are what grows the held list while it is
+  // followed; rows loaded at the old end are there to be read.
+  let newestSeen: string | undefined;
+  $effect(() => {
+    const newest = visibleMessages.at(-1)?.id;
+    if (newest === newestSeen) return;
+    newestSeen = newest;
+    untrack(trimHeld);
+  });
+
+  // Sending - or anything else that asks the view to follow - while the
+  // window sits back in history brings the newest rows back, or what was
+  // just sent would land out of sight. Scrolling never asks this: it
+  // follows only once the newest rows are on.
+  $effect(() => {
+    if (autoScroll && chatWindow !== null && !atNewest) untrack(toNewest);
+  });
+
+  /** "New messages below": the newest rows, mounted if they are not. */
+  function toNewest() {
+    if (atNewest) {
+      scrollToBottom("smooth");
+      autoScroll = true;
+      return;
+    }
+    // A smooth scroll through a list being swapped under it goes nowhere:
+    // put the newest rows up, then go to them at once.
+    chatWindow = null;
+    autoScroll = true;
+    void tick().then(() => {
+      scrollToBottom();
+      trimHeld();
+    });
   }
 
   $effect(() => {
     if (initialScrollDone || !messagesEl || visibleMessages.length === 0)
       return;
     requestAnimationFrame(() => {
+      // Opening a conversation lands on its newest message, whatever a
+      // scroll event said while it was being laid out.
+      autoScroll = true;
       scrollToBottom();
       initialScrollDone = true;
     });
+  });
+
+  /**
+   * Opening a conversation lands in several steps: the stored page renders,
+   * the view jumps to its newest row, code blocks and pictures settle to
+   * their final height, then the history peers push in arrives and the view
+   * moves again. Each step moved what was on screen, and together they read
+   * as the chat flickering. So the rows render under a skeleton until they
+   * have landed, and are shown once, in place.
+   *
+   * Landed is checked each frame, not guessed with a delay: the stored page
+   * is in, the view sits at the newest row (or the room is empty), no code
+   * block is waiting to be highlighted, the room's pictures are read back
+   * and shown (attachmentsSettling), no history push into the room is
+   * running, every picture on screen has loaded, and the list's height held
+   * still from one frame to the next. SETTLE_FALLBACK_MS is not a guess at
+   * any of these; it is only there so something that never reports done
+   * cannot keep the conversation covered.
+   */
+  const SETTLE_FALLBACK_MS = 5000;
+  let settling = $state(true);
+  let settleFrame = 0;
+  let settleStarted = 0;
+  let lastHeight = -1;
+
+  function beginSettling() {
+    settling = true;
+    settleStarted = performance.now();
+    lastHeight = -1;
+    if (!settleFrame) settleFrame = requestAnimationFrame(checkSettled);
+  }
+
+  function endSettling() {
+    if (settleFrame) cancelAnimationFrame(settleFrame);
+    settleFrame = 0;
+    if (!settling) return;
+    if (autoScroll) scrollToBottom();
+    settling = false;
+  }
+
+  function picturesOnScreenLoaded(el: HTMLElement): boolean {
+    const box = el.getBoundingClientRect();
+    for (const img of el.querySelectorAll("img")) {
+      if (img.complete) continue;
+      const r = img.getBoundingClientRect();
+      if (r.bottom > box.top && r.top < box.bottom) return false;
+    }
+    return true;
+  }
+
+  function checkSettled() {
+    settleFrame = 0;
+    if (!settling) return;
+    const el = messagesEl;
+    const height = el?.scrollHeight ?? -1;
+    const still = height === lastHeight;
+    lastHeight = height;
+    const empty = visibleMessages.length === 0;
+    const landed =
+      !!el &&
+      transportState.historyRoom === roomCode &&
+      (empty || initialScrollDone) &&
+      !highlightBusy() &&
+      !attachmentsSettling(roomCode) &&
+      syncing === null &&
+      picturesOnScreenLoaded(el) &&
+      still;
+    if (landed || performance.now() - settleStarted > SETTLE_FALLBACK_MS) {
+      endSettling();
+      return;
+    }
+    settleFrame = requestAnimationFrame(checkSettled);
+  }
+
+  onDestroy(() => {
+    if (settleFrame) cancelAnimationFrame(settleFrame);
   });
 
   // Scroll on new messages if autoScroll is enabled
@@ -547,6 +861,8 @@
     // The in-flight message too: it is not in visibleMessages, so without
     // this it appears below the fold and the send looks like it did nothing.
     sendingPreviews.length;
+    // A plugin's "only you" note lands at the bottom too.
+    visiblePluginErrors.length;
     if (!initialScrollDone) return;
     if (autoScroll && messagesEl) {
       setTimeout(() => scrollToBottom(), 0);
@@ -776,7 +1092,6 @@
     const submittedRoom = roomCode;
     const submittedFiles = [...stagedFiles];
     submitting = true;
-    submittingFiles = submittedFiles.length > 0;
     sendError = null;
     try {
 
@@ -795,10 +1110,18 @@
 
         found = true;
         const handler = plugin.commands[commandName];
-        const hostApi: HostApi = makeHostApi(pluginId, roomCode);
+        const hostApi: HostApi = makeHostApi(pluginId, submittedRoom);
+        // A retry supersedes the complaint about the last attempt.
+        dismissPluginErrorsFor(pluginId, submittedRoom);
+        // What was on screen before this run: a command that works clears
+        // it, whichever plugin complained - but not what this run itself
+        // says on the way (/ping's "pinging the rest").
+        const before = freshErrorsFor(submittedRoom).map((e) => e.id);
 
         try {
           await handler(args, hostApi);
+          dismissPluginErrors(before);
+          stopTyping();
           draft = "";
           replyTargetId = null;
           autoScroll = true;
@@ -808,7 +1131,15 @@
           });
         } catch (err) {
           console.error(`[chat] command /${commandName} failed:`, err);
-          sendError = err instanceof Error ? err.message : "Command failed; your draft has been kept.";
+          // The plugin's own words, in the chat where they were asked for;
+          // the draft stays for fixing.
+          // The room it was typed in, not whichever is open once it threw.
+          showPluginError(
+            pluginId,
+            submittedRoom,
+            err instanceof Error && err.message ? err.message : `/${commandName} did not work. Your draft has been kept.`,
+          );
+          autoScroll = true;
         }
         return;
       }
@@ -827,18 +1158,45 @@
 
     if (stagedFiles.length > 0) {
       const sendToken = beginSendingPreview(stagedFiles, wireText);
-      await sendFiles(submittedFiles, wireText, {
-        replyTo: replyTarget
-          ? {
-              id: replyTarget.id,
-              senderName: displayName(replyTarget),
-              content: getQuotableText(replyTarget),
-            }
-          : undefined,
-      }).finally(() => {
+      const replyTo = replyTarget
+        ? {
+            id: replyTarget.id,
+            senderName: displayName(replyTarget),
+            content: getQuotableText(replyTarget),
+          }
+        : undefined;
+      // The message is on screen already, where it will land (the sending
+      // row), so the composer empties now, as in any chat app. It used to
+      // hold the draft, the staged picture and a "Saving and sending" line
+      // until the send finished - a second copy of the message, off to the
+      // side. A send that fails hands everything back.
+      const submittedReplyId = replyTargetId;
+      const submittedMentions = new Map(draftMentionMap);
+      clearStagedFiles();
+      stopTyping();
+      draft = "";
+      replyTargetId = null;
+      draftMentionMap.clear();
+      mentionPopupOpen = false;
+      autoScroll = true;
+      requestAnimationFrame(() => autoResize());
+      try {
+        await sendFiles(submittedFiles, wireText, { replyTo });
+      } catch (err) {
+        // Back into the composer, unless something new was started there.
+        if (roomCode === submittedRoom && !draft && stagedFiles.length === 0) {
+          draft = submittedDraft;
+          for (const [name, did] of submittedMentions) draftMentionMap.set(name, did);
+          replyTargetId = submittedReplyId;
+          stagedFiles = submittedFiles;
+          requestAnimationFrame(() => autoResize());
+        }
+        throw err;
+      } finally {
         clearSendingPreview(sendToken);
-      });
-      if (roomCode === submittedRoom && stagedFiles.length === submittedFiles.length && stagedFiles.every((f, i) => f === submittedFiles[i])) clearStagedFiles();
+      }
+      requestAnimationFrame(() => textareaEl?.focus());
+      return;
     } else if (replyTarget) {
       await sendReply(wireText, replyTarget);
     } else {
@@ -846,6 +1204,7 @@
     }
 
     if (roomCode !== submittedRoom || draft !== submittedDraft) return;
+    stopTyping();
     draft = "";
     replyTargetId = null;
     draftMentionMap.clear();
@@ -861,7 +1220,6 @@
       sendError = err instanceof Error ? err.message : "Could not send. Your draft and files have been kept.";
     } finally {
       submitting = false;
-      submittingFiles = false;
     }
   }
 
@@ -902,17 +1260,33 @@
     const jump = uiState.jumpToMessage;
     if (!jump || jump.roomCode !== roomCode || !initialScrollDone) return;
     uiState.jumpToMessage = null;
-    requestAnimationFrame(() => jumpToMessage(jump.messageId));
+    untrack(() => jumpToMessage(jump.messageId, jump.revealed));
   });
 
-  function jumpToMessage(messageId: string) {
-    const el = document.getElementById(`msg-${messageId}`);
-    if (!el || !messagesEl) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
-    setTimeout(() => {
-      el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
-    }, 900);
+  /** Scroll to a message and flash it - one this view does not hold, from
+   *  storage (chat-window.ts, planJump). */
+  function jumpToMessage(messageId: string, revealed = false) {
+    const plan = planJump(visibleMessages, range, messageId, revealed);
+    if (plan.kind === "reveal") void revealStored(roomCode, messageId);
+    if (plan.kind !== "show" || !messagesEl) return;
+    // Held but not mounted: a window around it first, held still so the
+    // rows around it stay while it is read.
+    const moved = !plan.mounted;
+    if (moved) {
+      autoScroll = false;
+      chatWindow = around(visibleMessages, plan.index);
+    }
+    void tick().then(() =>
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`msg-${messageId}`);
+        if (!el || !messagesEl) return;
+        el.scrollIntoView({ behavior: moved ? "instant" : "smooth", block: "center" });
+        el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
+        setTimeout(() => {
+          el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
+        }, 900);
+      })
+    );
   }
 
   // Pinned messages: private to this user, stored on the room record.
@@ -969,14 +1343,14 @@
   /** The words beside the pictures: the caption and any non-image files. */
   function pinnedPreview(msg: Message): string {
     if (msg.type === MessageType.File) {
-      const caption = humanizeMentions(msg.content ?? "", resolveMentionDisplayName);
+      const caption = stripMarkdown(msg.content ?? "", resolveMentionDisplayName);
       const others = (msg.meta?.files ?? [])
         .filter((f) => !f.mimeType?.startsWith("image/"))
         .map((f) => f.filename);
       return [caption, ...others].filter(Boolean).join(" · ");
     }
     if (isGifUrl(msg.content ?? "")) return "";
-    return humanizeMentions(msg.content ?? "", resolveMentionDisplayName);
+    return stripMarkdown(msg.content ?? "", resolveMentionDisplayName);
   }
 
   function openPinned(msg: Message): void {
@@ -1151,6 +1525,21 @@
     void addFilesToStage(e.dataTransfer.files);
   }
 
+  /**
+   * How we look in this room. Resolved once, not four or five times in
+   * every message of ours: it reads the room list, which moves with every
+   * unread count anywhere.
+   */
+  const ownProfile = $derived(
+    getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null)
+  );
+
+  /** The old room this one was moved from, if any (legacy-move.ts). */
+  const movedFromRoom = $derived.by(() => {
+    const code = roomsStore.rooms.find((r) => r.roomCode === roomCode)?.archiveOf;
+    return code ? (roomsStore.rooms.find((r) => r.roomCode === code) ?? null) : null;
+  });
+
   let copyMenuOpen = $state(false);
   /** The phone header's overflow sheet: what the header has no room for. */
   let moreOpen = $state(false);
@@ -1166,15 +1555,23 @@
     moreOpen = false;
     onLeave();
   }
-  // Header short code: minted for THIS room on first use and dropped on a
-  // room switch, since it aliases one room code.
-  let shortCode = $state<string | null>(null);
-  let shortCodeFor = $state<string | null>(null);
-  let shortCodeError = $state<string | null>(null);
-
+  let invitationOpen = $state(false);
+  $effect(() => {
+    if (uiState.invitationRoomRequested === roomCode) {
+      uiState.invitationRoomRequested = null;
+      invitationOpen = true;
+    }
+  });
+  // Copy and share are a quick call's: a room's Invite opens the invite
+  // dialog instead (short code first), so only `inviteLink` is ever sent.
   async function copyCode() {
     copyMenuOpen = false;
-    await navigator.clipboard.writeText(window.location.href);
+    if (!inviteLink) return;
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+    } catch {
+      return;
+    }
     copied = true;
     setTimeout(() => (copied = false), 2000);
   }
@@ -1189,30 +1586,15 @@
 
   async function shareLink() {
     copyMenuOpen = false;
+    if (!inviteLink) return;
     try {
-      await navigator.share({ url: window.location.href });
+      await navigator.share({ url: inviteLink });
     } catch (err) {
       // Dismissing the sheet is not a failure and must not silently copy
       // something the user decided not to send.
       if ((err as Error)?.name === "AbortError") return;
       await copyCode();
     }
-  }
-
-  async function copyShortCode() {
-    copyMenuOpen = false;
-    shortCodeError = null;
-    if (shortCodeFor !== roomCode) shortCode = null;
-    try {
-      shortCode ??= (await createInvite(roomCode)).code;
-      shortCodeFor = roomCode;
-    } catch {
-      shortCodeError = "Relay not reachable";
-      return;
-    }
-    await navigator.clipboard.writeText(formatShortCode(shortCode));
-    copied = true;
-    setTimeout(() => (copied = false), 2000);
   }
 
   /**
@@ -1595,23 +1977,42 @@
     return (displayName(msg) || msg.senderId).charAt(0).toUpperCase();
   }
 
+  /**
+   * The sender's profile for this room, when they have one (room-profile.ts).
+   * It is the WHOLE presentation in this room: the sender resolved it against
+   * their main profile before sending, so a field it lacks was cleared on
+   * purpose and must not be filled in from the main profile.
+   */
+  function roomProfileOf(senderId: string): PeerProfile | undefined {
+    return roomCode.startsWith("rd2_")
+      ? peerRoomProfiles.get(roomCode)?.get(senderDid(senderId))
+      : undefined;
+  }
+
   function senderAvatar(senderId: string): string | undefined {
-    return (
-      peerAvatars.get(senderDid(senderId)) ?? peerAvatars.get(senderId)
-    );
+    const scoped = roomProfileOf(senderId);
+    if (scoped) return scoped.pfpURL;
+    return peerAvatars.get(senderDid(senderId)) ?? peerAvatars.get(senderId);
   }
 
   /** User-picked nickname color, keyed like names (by DID, peerId fallback). */
   function senderColor(senderId: string): string | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
+    const scoped = roomProfileOf(senderId);
+    if (scoped) return scoped.color;
     return peerColors.get(senderDid(senderId)) ?? peerColors.get(senderId);
+  }
+
+  /** The name-effect fields, from the room profile or else the main one. */
+  function senderMeta(senderId: string) {
+    const did = senderDid(senderId);
+    return roomProfileOf(senderId) ?? peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
   }
 
   /** Name effect, keyed like names (by DID, peerId fallback). Respects showPeerNicknameColors. */
   function senderEffect(senderId: string): string | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    return peerProfileMeta.get(did)?.nameEffect ?? peerProfileMeta.get(senderId)?.nameEffect;
+    return senderMeta(senderId)?.nameEffect;
   }
 
   /** Gradient stops for the gradient effect, keyed like names. */
@@ -1619,23 +2020,20 @@
     g2?: string;
     g3?: string;
   } {
-    const did = senderDid(senderId);
-    const meta = peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
-    return { g2: meta?.gradient2, g3: meta?.gradient3 };
+    const meta = senderMeta(senderId);
+    return { g2: meta?.gradient2 ?? undefined, g3: meta?.gradient3 ?? undefined };
   }
 
   /** Shimmer state for the name effect, keyed like names. Respects showPeerNicknameColors. */
   function senderShimmer(senderId: string): boolean | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    return peerProfileMeta.get(did)?.nameShimmer ?? peerProfileMeta.get(senderId)?.nameShimmer;
+    return senderMeta(senderId)?.nameShimmer;
   }
 
   /** Glow state for the name effect, keyed like names. Respects showPeerNicknameColors. */
   function senderGlow(senderId: string): boolean | undefined {
     if (!displayPrefs.showPeerNicknameColors) return undefined;
-    const did = senderDid(senderId);
-    return peerProfileMeta.get(did)?.nameGlow ?? peerProfileMeta.get(senderId)?.nameGlow;
+    return senderMeta(senderId)?.nameGlow;
   }
 
   /** Tag chip, keyed like names. Deliberately NOT behind
@@ -1644,8 +2042,7 @@
   function senderTag(
     senderId: string
   ): { text: string; textColor: string; chipColor: string } | null {
-    const did = senderDid(senderId);
-    const meta = peerProfileMeta.get(did) ?? peerProfileMeta.get(senderId);
+    const meta = senderMeta(senderId);
     if (!meta?.tagText) return null;
     return {
       text: meta.tagText,
@@ -1658,7 +2055,7 @@
    *  on everything that person ever said, not just what they say next. */
   function displayNameFor(senderId: string, stored?: string): string {
     return (
-      peerNames.get(senderDid(senderId)) ||
+      roomProfileOf(senderId)?.nickname || peerNames.get(senderDid(senderId)) ||
       peerNames.get(senderId) ||
       stored ||
       senderId.slice(0, 8)
@@ -1669,6 +2066,37 @@
     return displayNameFor(msg.senderId, msg.senderName);
   }
 
+  // ── Typing indicator ──────────────────────────────────────────────────
+  const typing = new TypingAnnouncer<{ roomCode: string; dmPeerId: string | null }>(
+    (to, on) => {
+      if (to.dmPeerId) sendDmTyping(to.dmPeerId, on);
+      else sendRoomTyping(to.roomCode, on);
+    }
+  );
+
+  /** On every keystroke. A message request stays silent until accepted. */
+  function noteDraftTyping() {
+    const hasText = typingPrefs.sendTyping && !dmRequest && draft.trim().length > 0;
+    typing.input(hasText, Date.now(), () => {
+      if (!roomCode.startsWith("dm-")) return { roomCode, dmPeerId: null };
+      const dmPeerId = transportState.activeDmPeerId;
+      return dmPeerId ? { roomCode, dmPeerId } : null;
+    });
+  }
+
+  function stopTyping() {
+    typing.stop();
+  }
+
+  $effect(() => {
+    void roomCode;
+    return () => untrack(stopTyping);
+  });
+
+  const typingText = $derived(
+    typingLine(typersIn(roomCode).map((did) => displayNameFor(did)))
+  );
+
   /** What a reply should QUOTE.
    *
    *  The reply snapshot travels unsigned: no canonical version covers
@@ -1678,16 +2106,26 @@
    *  overwrites the original on peers that already hold it. Whenever we hold
    *  the quoted message ourselves, its own signed content is the truth and the
    *  snapshot is ignored. The snapshot is still the fallback for a quote whose
-   *  target we never received. */
-  function quoted(r: ReplyTo): { name: string; content: string } {
-    const held = messageById.get(r.id);
+   *  target we never received.
+   *
+   *  `held` is the quoted message, when we have it. It is looked up by the
+   *  row on its own: the lookup re-runs whenever the list changes, and the
+   *  quote - with its markdown stripping - only when what it quotes does. */
+  function quotedName(r: ReplyTo, held: Message | undefined): string {
+    return held ? displayName(held) : r.senderName;
+  }
+
+  function quotedText(r: ReplyTo, held: Message | undefined): string {
     if (held) {
       // Use quotable text for held messages so image-only messages show
       // [image] instead of empty content. Held message is the source of truth.
-      return { name: displayName(held), content: getQuotableText(held) };
+      // Far more than the 160-character snapshot: it is stripped of markdown
+      // before it shows and the line truncates itself, so a cut through a
+      // link never reaches the screen.
+      return getQuotableText(held, QUOTE_SHOWN_CHARS);
     }
     // Snapshot from the wire is already built with quotable text
-    return { name: r.senderName, content: r.content };
+    return r.content;
   }
 
   function reactorNames(users: Set<string>): string {
@@ -1730,12 +2168,12 @@
     const did = own ? selfId() : senderDid(msg.senderId);
     profileCardFor = {
       did,
-      name: own ? profileStore.nickname || "You" : displayName(msg),
+      name: own ? ownProfile.nickname || "You" : displayName(msg),
       avatarUrl: own
-        ? (profileStore.avatarUrl ?? undefined)
+        ? (ownProfile.avatarUrl ?? undefined)
         : (senderAvatar(msg.senderId) ?? undefined),
       color: own
-        ? (profileStore.color ?? undefined)
+        ? (ownProfile.color ?? undefined)
         : senderColor(msg.senderId),
     };
   }
@@ -1920,6 +2358,10 @@
   }
 </script>
 
+{#key roomCode}
+  <InvitationDialog {roomCode} bind:open={invitationOpen} />
+{/key}
+
 <svelte:window
   onclick={(e) => {
     closeUserMenu();
@@ -2100,26 +2542,34 @@
             class="gap-1 text-xs shrink-0 border-border text-muted-foreground"
           >
             <Users class="size-3" />
-            {peers.length + 1}
+            {memberCount}
           </Badge>
         {/if}
       </div>
       <div class="flex items-center gap-2 shrink-0">
         {#if !isDmChat}
+          <!-- Desktop only: the phone header has no room for it next to the
+               room name; its overflow sheet carries the same actions. -->
           <div class="relative hidden sm:block" data-copy-menu>
-            <Tip text={copied ? "Copied" : "Copy invite"}>
+            <!-- A room's Invite opens the invite dialog, short code first: the
+                 permanent link is the least private invite there is, so it is
+                 no longer the one-click default. A quick call's link is the
+                 call itself and has no short code: that keeps its menu. -->
+            <Tip text={inviteLink ? (copied ? "Copied" : "Copy invite") : "Invite people"}>
               {#snippet children(props)}
             <button
               {...props}
               type="button"
-              onclick={() => (copyMenuOpen = !copyMenuOpen)}
-              aria-label="Copy invite"
-              aria-haspopup="menu"
-              aria-expanded={copyMenuOpen}
+              onclick={() => (inviteLink ? (copyMenuOpen = !copyMenuOpen) : (invitationOpen = true))}
+              aria-label={inviteLink ? "Copy invite" : "Invite people"}
+              aria-haspopup={inviteLink ? "menu" : "dialog"}
+              aria-expanded={inviteLink ? copyMenuOpen : undefined}
               class="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
             >
-              <code>{formatRoomCode(roomCode)}</code>
-              {#if copied}
+              <span>Invite</span>
+              {#if !inviteLink}
+                <UserPlus class="size-3 mb-0.5" />
+              {:else if copied}
                 <Check class="size-3 text-primary" />
               {:else}
                 <Copy class="size-3 mb-0.5" />
@@ -2151,23 +2601,6 @@
                     Share link
                   </button>
                 {/if}
-                <button
-                  type="button"
-                  role="menuitem"
-                  onclick={copyShortCode}
-                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
-                >
-                  Copy short code
-                  <span class="block text-xs text-muted-foreground">
-                    {#if shortCode && shortCodeFor === roomCode}
-                      {formatShortCode(shortCode)} - works for 5 minutes
-                    {:else if shortCodeError}
-                      {shortCodeError}
-                    {:else}
-                      Works for 5 minutes
-                    {/if}
-                  </span>
-                </button>
               </div>
             {/if}
           </div>
@@ -2422,50 +2855,42 @@
               <Users class="size-4 text-muted-foreground" />
               {showUserList ? "Hide users" : "Show users"}
             </button>
-            <button
-              type="button"
-              onclick={() => {
-                moreOpen = false;
-                void copyCode();
-              }}
-              class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
-            >
-              <Copy class="size-4 text-muted-foreground" />
-              Copy invite link
-            </button>
-            {#if canShare}
+            {#if inviteLink}
               <button
                 type="button"
                 onclick={() => {
                   moreOpen = false;
-                  void shareLink();
+                  void copyCode();
                 }}
                 class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
               >
-                <Share2 class="size-4 text-muted-foreground" />
-                Share invite link
+                <Copy class="size-4 text-muted-foreground" />
+                Copy invite link
+              </button>
+              {#if canShare}
+                <button
+                  type="button"
+                  onclick={() => {
+                    moreOpen = false;
+                    void shareLink();
+                  }}
+                  class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+                >
+                  <Share2 class="size-4 text-muted-foreground" />
+                  Share invite link
+                </button>
+              {/if}
+            {:else}
+              <!-- Short code first, as on desktop (the invite dialog). -->
+              <button
+                type="button"
+                onclick={() => { moreOpen = false; invitationOpen = true; }}
+                class="flex items-center gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
+              >
+                <UserPlus class="size-4 text-muted-foreground" />
+                Invite people
               </button>
             {/if}
-            <!-- Stays open: the code it mints is shown here to read out. -->
-            <button
-              type="button"
-              onclick={() => void copyShortCode()}
-              class="flex items-start gap-3 rounded-md px-3 py-3 text-left text-sm hover:bg-muted cursor-pointer"
-            >
-              <Copy class="size-4 mt-0.5 text-muted-foreground" />
-              <span>
-                Copy short code
-                <span class="block text-xs text-muted-foreground">
-                  {#if shortCode && shortCodeFor === roomCode}
-                    {formatShortCode(shortCode)} - works for 5 minutes
-                  {:else if shortCodeError}
-                    {shortCodeError}
-                  {:else}
-                    Works for 5 minutes
-                  {/if}
-                </span>
-              </span>
-            </button>
           {:else}
             <button
               type="button"
@@ -2575,6 +3000,7 @@
       >
         {#each visibleLocalCards as entry (entry.id)}
           <div
+            data-local-card
             class="pointer-events-auto w-full max-w-sm overflow-y-auto rounded-lg shadow-xl"
             style="max-height: min(70vh, 100%)"
           >
@@ -2599,415 +3025,472 @@
         </div>
       </div>
     {/if}
-    <!-- The touch handlers are the swipe-right-for-sidebar gesture; the
-         header button is its accessible equivalent. -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div
-      bind:this={messagesEl}
-      onscroll={handleScroll}
-      ontouchstart={isMobile && onOpenSidebar ? regionTouchStart : undefined}
-      ontouchmove={isMobile && onOpenSidebar ? regionTouchMove : undefined}
-      ontouchend={isMobile ? () => (regionSwipe = null) : undefined}
-      ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
-      style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
-        ? ' touch-action: pan-y;'
-        : ''}"
-      class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
-    >
-      {#if canLoadOlder && visibleMessages.length > 0}
-        <div class="flex justify-center py-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onclick={loadOlderPreservingScroll}
-            disabled={loadingMore}
-            class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
-          >
-            <ChevronUp class="size-3.5" />
-            {loadingMore ? "Loading..." : "Load older messages"}
-          </Button>
-        </div>
-      {/if}
+    <!-- The list and, while it lands, a skeleton over it (see beginSettling).
+         Covered, not hidden or unmounted: the rows lay out and the view
+         anchors and follows behind it exactly as it does in plain sight, so
+         what is revealed is already in place. -->
+    <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
+      <!-- The touch handlers are the swipe-right-for-sidebar gesture; the
+           header button is its accessible equivalent. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        bind:this={messagesEl}
+        onscroll={handleScroll}
+        ontouchstart={isMobile && onOpenSidebar ? regionTouchStart : undefined}
+        ontouchmove={isMobile && onOpenSidebar ? regionTouchMove : undefined}
+        ontouchend={isMobile ? () => (regionSwipe = null) : undefined}
+        ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
+        style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
+          ? ' touch-action: pan-y;'
+          : ''}{following ? ' overflow-anchor: none;' : ''}"
+        class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
+      >
+        <!-- A room moved from an old one carries that room's history on top,
+             once the new room's own history has run out above. -->
+        {#if movedFromRoom && !canLoadOlder && range.from === 0}
+          <ArchivedHistory roomCode={movedFromRoom.roomCode} roomName={movedFromRoom.name} />
+        {/if}
+        {#if (canLoadOlder || range.from > 0) && visibleMessages.length > 0}
+          <div class="flex justify-center py-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onclick={showOlderRows}
+              disabled={loadingMore}
+              class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
+            >
+              <ChevronUp class="size-3.5" />
+              {loadingMore ? "Loading..." : "Load older messages"}
+            </Button>
+          </div>
+        {/if}
 
-      {#if visibleMessages.length === 0}
-        <div class="flex h-full items-center justify-center py-20">
-          <p class="select-none text-sm text-muted-foreground italic">
-            No messages yet. Say something!
-          </p>
-        </div>
-      {:else}
-        <div class="space-y-0.5">
-          {#each visibleMessages as msg, i (msg.id)}
-            {@const prev = visibleMessages[i - 1]}
-            {@const showDate = shouldShowDateSep(
-              msg.timestamp,
-              prev?.timestamp
-            )}
-            {@const showHeader = shouldShowHeader(msg, prev)}
-            {@const isOwn = isSelfSender(msg.senderId)}
-            <div>
-              {#if showDate}
-                <div class="flex items-center gap-3 py-3">
-                  <Separator class="flex-1 bg-border" />
-                  <span class="text-xs text-muted-foreground"
-                    title="Reported message dates; conversation order uses logical sequence, not device clocks."
-                    >{formatDate(msg.timestamp)}</span
-                  >
-                  <Separator class="flex-1 bg-border" />
-                </div>
-              {/if}
-              <div
-                id={`msg-${msg.id}`}
-                class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
-                  ? 'mt-3 pt-1'
-                  : ''} {messageIsMentioningMe(msg)
-                  ? 'bg-primary/5 border-l-2 border-l-primary pl-1.5'
-                  : ''} {pinnedSet.has(msg.id) ? 'pr-6' : ''}"
-                role="button"
-                tabindex={isMobile ? 0 : -1}
-                onclick={() => isMobile && handleMessageClick(msg.id)}
-                onkeydown={isMobile
-                  ? (e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        handleMessageClick(msg.id);
-                      }
-                    }
-                  : undefined}
-                ontouchstart={isMobile
-                  ? (e) => handleTouchStart(msg.id, e)
-                  : undefined}
-                ontouchmove={isMobile
-                  ? (e) => handleTouchMove(msg.id, e)
-                  : undefined}
-                ontouchend={isMobile
-                  ? () => handleTouchEnd(msg.id)
-                  : undefined}
-                ontouchcancel={isMobile
-                  ? () => handleTouchEnd(msg.id)
-                  : undefined}
-                style={isMobile
-                  ? `touch-action: pan-y;${swipeMessageId === msg.id ? ` transform: translateX(${dragOffset(swipeDelta)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}` : ""}`
-                  : ""}
-              >
-                {#if msg.replyTo}
-                  {@const q = quoted(msg.replyTo)}
-                  <button
-                    type="button"
-                    class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
-                    onclick={() => jumpToMessage(msg.replyTo!.id)}
-                  >
-                    <Reply
-                      size="16"
-                      class="text-muted-foreground -ml-5 transform -scale-x-100"
-                    />
-                    <span class="font-semibold">{q.name}</span>
-                    <span class="truncate"
-                      >{humanizeMentions(
-                        q.content,
-                        resolveMentionDisplayName
-                      )}</span
+        {#if visibleMessages.length === 0}
+          <div class="flex h-full items-center justify-center py-20">
+            <p class="select-none text-sm text-muted-foreground italic">
+              No messages yet. Say something!
+            </p>
+          </div>
+        {:else}
+          <div class="space-y-0.5">
+            {#each renderedMessages as msg, i (msg.id)}
+              <!-- The first row mounted reads as first, date and name shown,
+                   whatever is held above it: rows landing above the window
+                   change nothing on screen until the window takes them in,
+                   which it does without moving the view (anchored). -->
+              {@const prev = renderedMessages[i - 1]}
+              {@const showDate = shouldShowDateSep(
+                msg.timestamp,
+                prev?.timestamp
+              )}
+              {@const showHeader = shouldShowHeader(msg, prev)}
+              {@const isOwn = isSelfSender(msg.senderId)}
+              {@const reactions = reactionsByMessage.get(msg.id)}
+              <div>
+                {#if showDate}
+                  <div class="flex items-center gap-3 py-3">
+                    <Separator class="flex-1 bg-border" />
+                    <span class="text-xs text-muted-foreground"
+                      title="Reported message dates; conversation order uses logical sequence, not device clocks."
+                      >{formatDate(msg.timestamp)}</span
                     >
-                  </button>
+                    <Separator class="flex-1 bg-border" />
+                  </div>
                 {/if}
-
-                {#if showHeader}
-                  <div class="flex items-start gap-2">
-                    <div
-                      role="button"
-                      tabindex="0"
-                      onclick={(e) => {
-                        e.stopPropagation();
-                        openProfileFromMessage(msg);
-                      }}
-                      oncontextmenu={(e) => {
-                        e.preventDefault();
-                        openUserMenuFromMessage(msg, e);
-                      }}
-                      onkeydown={(e) => {
+                <div
+                  id={`msg-${msg.id}`}
+                  class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
+                    ? 'mt-3 pt-1'
+                    : ''} {messageIsMentioningMe(msg)
+                    ? 'bg-primary/5 border-l-2 border-l-primary pl-1.5'
+                    : ''} {pinnedSet.has(msg.id) ? 'pr-6' : ''}"
+                  role="button"
+                  tabindex={isMobile ? 0 : -1}
+                  onclick={() => isMobile && handleMessageClick(msg.id)}
+                  onkeydown={isMobile
+                    ? (e) => {
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          openProfileFromMessage(msg);
+                          handleMessageClick(msg.id);
                         }
-                      }}
-                      class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold font-mono
-                      {isOwn
-                        ? 'bg-primary/20 text-primary'
-                        : 'bg-secondary text-secondary-foreground'}"
-                      style={isOwn
-                        ? profileStore.color
-                          ? `color: ${profileStore.color}`
-                          : ""
-                        : senderColor(msg.senderId)
-                          ? `color: ${senderColor(msg.senderId)}`
-                          : ""}
-                    >
-                      {#if isOwn && profileStore.avatarUrl}
-                        <GifImage
-                          src={profileStore.avatarUrl}
-                          alt="You"
-                          class="size-full object-cover"
-                        />
-                      {:else if !isOwn && senderAvatar(msg.senderId)}
-                        <GifImage
-                          src={senderAvatar(msg.senderId) ?? ""}
-                          alt={displayName(msg)}
-                          class="size-full object-cover"
-                          animate="hover"
-                        />
-                      {:else}
-                        {initials(msg)}
-                      {/if}
-                    </div>
-                    <div class="flex min-w-0 items-baseline gap-2">
-                      {#if isOwn}
-                        {@const effectStyle = nameEffectStyle(profileStore.nameEffect, profileStore.color, profileStore.gradient2 ?? undefined, profileStore.gradient3 ?? undefined, profileStore.nameShimmer, profileStore.nameGlow)}
-                        <span
-                          role="button"
-                          tabindex="0"
-                          onclick={() => openProfileFromMessage(msg)}
-                          onkeydown={(e) => {
-                            if (e.key === "Enter") openProfileFromMessage(msg);
-                          }}
-                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
-                            ? 'italic'
-                            : ''} {effectStyle.class}"
-                          style={effectStyle.style || (profileStore.color ? `color: ${profileStore.color}` : "")}
-                        >
-                          {profileStore.nickname || "You"}
-                        </span>
-                        {#if profileStore.tagText}
-                          <span
-                            class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
-                            style={`background-color: ${profileStore.tagChipColor ?? "#e5e7eb"}; color: ${profileStore.tagTextColor ?? "#000000"}`}
-                            >{profileStore.tagText}</span
-                          >
-                        {/if}
-                      {:else}
-                        {@const color = senderColor(msg.senderId)}
-                        {@const effect = senderEffect(msg.senderId)}
-                        {@const grads = senderGradients(msg.senderId)}
-                        {@const shimmer = senderShimmer(msg.senderId)}
-                        {@const glow = senderGlow(msg.senderId)}
-                        {@const effectStyle = nameEffectStyle(effect, color, grads.g2, grads.g3, shimmer, glow)}
-                        <span
-                          role="button"
-                          tabindex="0"
-                          onclick={() => openProfileFromMessage(msg)}
-                          oncontextmenu={(e) => {
-                            e.preventDefault();
-                            openUserMenuFromMessage(msg, e);
-                          }}
-                          onkeydown={(e) => {
-                            if (e.key === "Enter") openProfileFromMessage(msg);
-                          }}
-                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
-                          style={effectStyle.style || (color ? `color: ${color}` : "")}
-                        >
-                          {displayName(msg)}
-                        </span>
-                        {@const tag = senderTag(msg.senderId)}
-                        {#if tag}
-                          <span
-                            class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
-                            style={`background-color: ${tag.chipColor}; color: ${tag.textColor}`}
-                            >{tag.text}</span
-                          >
-                        {/if}
-                      {/if}
-                      <span class="text-xs text-muted-foreground"
-                        >{formatTime(msg.timestamp)}</span
-                      >
-                    </div>
-                  </div>
-                {/if}
-
-                <MsgRender
-                  {msg}
-                  {isOwn}
-                  {fileTransfers}
-                  onRequestFileDownload={requestFileDownload}
-                />
-
-                {#if reactionsByMessage.get(msg.id)?.size}
-                  <div class="ml-9 mt-1 flex items-center gap-1">
-                    {#each [...(reactionsByMessage
-                        .get(msg.id)
-                        ?.entries() ?? [])] as [emoji, users] (emoji)}
-                      {#if users.size > 0}
-                        {@const reacted = users.has(selfId()) || users.has(myPeerId())}
-                        <Tip text={reactorNames(users)}>
-                          {#snippet children(props)}
-                            <button
-                              {...props}
-                              type="button"
-                              class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
-                                ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
-                                : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
-                              onclick={(e) => {
-                                e.stopPropagation();
-                                toggleReaction?.(msg.id, emoji);
-                                activeMessageId = null;
-                              }}
-                            >
-                              <span>{emoji}</span>
-                              <span>{users.size}</span>
-                            </button>
-                          {/snippet}
-                        </Tip>
-                      {/if}
-                    {/each}
-                  </div>
-                {/if}
-
-                {#if isMobile && swipeMessageId === msg.id && swipeDelta < 0}
-                  {@const progress = Math.min(1, -swipeDelta / REPLY_THRESHOLD)}
-                  <div
-                    class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
-                    style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
-                  >
-                    <Reply class="size-5" />
-                  </div>
-                {/if}
-
-                <div
-                  class="absolute right-0 sm:right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 {activeMessageId ===
-                  msg.id
-                    ? 'opacity-100'
-                    : ''} transition-opacity flex items-center gap-1 pr-1"
-                >
-                  <Tip text="React">
-                    {#snippet children(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
-                    aria-label="React"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      if (reactionPickerFor === msg.id) {
-                        reactionPickerFor = null;
-                      } else {
-                        openReactionPicker(msg.id, e.currentTarget);
                       }
-                      activeMessageId = null;
-                    }}
+                    : undefined}
+                  ontouchstart={isMobile
+                    ? (e) => handleTouchStart(msg.id, e)
+                    : undefined}
+                  ontouchmove={isMobile
+                    ? (e) => handleTouchMove(msg.id, e)
+                    : undefined}
+                  ontouchend={isMobile
+                    ? () => handleTouchEnd(msg.id)
+                    : undefined}
+                  ontouchcancel={isMobile
+                    ? () => handleTouchEnd(msg.id)
+                    : undefined}
+                  style={isMobile
+                    ? `touch-action: pan-y;${swipeMessageId === msg.id ? ` transform: translateX(${dragOffset(swipeDelta)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}` : ""}`
+                    : ""}
+                >
+                  {#if msg.replyTo}
+                    {@const held = messageById.get(msg.replyTo.id)}
+                    {@const quoteFrom = quotedName(msg.replyTo, held)}
+                    {@const quote = stripMarkdown(quotedText(msg.replyTo, held), resolveMentionDisplayName)}
+                    <button
+                      type="button"
+                      class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
+                      onclick={() => jumpToMessage(msg.replyTo!.id)}
+                    >
+                      <Reply
+                        size="16"
+                        class="text-muted-foreground -ml-5 transform -scale-x-100"
+                      />
+                      <span class="font-semibold">{quoteFrom}</span>
+                      <span class="truncate">{quote}</span>
+                    </button>
+                  {/if}
+
+                  {#if showHeader}
+                    {@const avatar = isOwn ? ownProfile.avatarUrl : senderAvatar(msg.senderId)}
+                    {@const avatarColor = isOwn ? ownProfile.color : senderColor(msg.senderId)}
+                    <div class="flex items-start gap-2">
+                      <div
+                        role="button"
+                        tabindex="0"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          openProfileFromMessage(msg);
+                        }}
+                        oncontextmenu={(e) => {
+                          e.preventDefault();
+                          openUserMenuFromMessage(msg, e);
+                        }}
+                        onkeydown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            openProfileFromMessage(msg);
+                          }
+                        }}
+                        class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold font-mono
+                        {isOwn
+                          ? 'bg-primary/20 text-primary'
+                          : 'bg-secondary text-secondary-foreground'}"
+                        style={avatarColor ? `color: ${avatarColor}` : ""}
+                      >
+                        {#if isOwn && avatar}
+                          <GifImage
+                            src={avatar}
+                            alt="You"
+                            class="size-full object-cover"
+                          />
+                        {:else if !isOwn && avatar}
+                          <GifImage
+                            src={avatar}
+                            alt={displayName(msg)}
+                            class="size-full object-cover"
+                            animate="hover"
+                          />
+                        {:else if isOwn}
+                          <!-- Our own initial from our nickname, as the
+                               sidebar shows it: the message's stored name can
+                               be a placeholder ("You"). -->
+                          {(ownProfile.nickname || "You").charAt(0).toUpperCase()}
+                        {:else}
+                          {initials(msg)}
+                        {/if}
+                      </div>
+                      <div class="flex min-w-0 items-baseline gap-2">
+                        {#if isOwn}
+                          {@const own = ownProfile}
+                          {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
+                          <span
+                            role="button"
+                            tabindex="0"
+                            onclick={() => openProfileFromMessage(msg)}
+                            onkeydown={(e) => {
+                              if (e.key === "Enter") openProfileFromMessage(msg);
+                            }}
+                            class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
+                              ? 'italic'
+                              : ''} {effectStyle.class}"
+                            style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
+                          >
+                            {own.nickname || "You"}
+                          </span>
+                          {#if own.tagText}
+                            <span
+                              class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
+                              style={`background-color: ${own.tagChipColor ?? "#e5e7eb"}; color: ${own.tagTextColor ?? "#000000"}`}
+                              >{own.tagText}</span
+                            >
+                          {/if}
+                        {:else}
+                          {@const color = senderColor(msg.senderId)}
+                          {@const effect = senderEffect(msg.senderId)}
+                          {@const grads = senderGradients(msg.senderId)}
+                          {@const shimmer = senderShimmer(msg.senderId)}
+                          {@const glow = senderGlow(msg.senderId)}
+                          {@const effectStyle = nameEffectStyle(effect, color, grads.g2, grads.g3, shimmer, glow)}
+                          <span
+                            role="button"
+                            tabindex="0"
+                            onclick={() => openProfileFromMessage(msg)}
+                            oncontextmenu={(e) => {
+                              e.preventDefault();
+                              openUserMenuFromMessage(msg, e);
+                            }}
+                            onkeydown={(e) => {
+                              if (e.key === "Enter") openProfileFromMessage(msg);
+                            }}
+                            class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
+                            style={effectStyle.style || (color ? `color: ${color}` : "")}
+                          >
+                            {displayName(msg)}
+                          </span>
+                          {@const tag = senderTag(msg.senderId)}
+                          {#if tag}
+                            <span
+                              class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
+                              style={`background-color: ${tag.chipColor}; color: ${tag.textColor}`}
+                              >{tag.text}</span
+                            >
+                          {/if}
+                        {/if}
+                        <span class="text-xs text-muted-foreground"
+                          >{formatTime(msg.timestamp)}</span
+                        >
+                      </div>
+                    </div>
+                  {/if}
+
+                  <MsgRender
+                    {msg}
+                    {isOwn}
+                    {fileTransfers}
+                    onRequestFileDownload={requestFileDownload}
+                  />
+
+                  {#if reactions?.size}
+                    <div class="ml-9 mt-1 flex items-center gap-1">
+                      {#each [...reactions.entries()] as [emoji, users] (emoji)}
+                        {#if users.size > 0}
+                          {@const reacted = users.has(selfId()) || users.has(myPeerId())}
+                          <LazyTip text={reactorNames(users)}>
+                            {#snippet children(props)}
+                              <button
+                                {...props}
+                                type="button"
+                                class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
+                                  ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
+                                  : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
+                                onclick={(e) => {
+                                  e.stopPropagation();
+                                  toggleReaction?.(msg.id, emoji);
+                                  activeMessageId = null;
+                                }}
+                              >
+                                <span class="emoji">{emoji}</span>
+                                <span>{users.size}</span>
+                              </button>
+                            {/snippet}
+                          </LazyTip>
+                        {/if}
+                      {/each}
+                    </div>
+                  {/if}
+
+                  {#if isMobile && swipeMessageId === msg.id && swipeDelta < 0}
+                    {@const progress = Math.min(1, -swipeDelta / REPLY_THRESHOLD)}
+                    <div
+                      class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
+                      style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
+                    >
+                      <Reply class="size-5" />
+                    </div>
+                  {/if}
+
+                  <div
+                    class="absolute right-0 sm:right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 {activeMessageId ===
+                    msg.id
+                      ? 'opacity-100'
+                      : ''} transition-opacity flex items-center gap-1 pr-1"
                   >
-                    <Smile class="size-3.5" />
-                  </button>
-                    {/snippet}
-                  </Tip>
-                  <Tip text="Reply">
-                    {#snippet children(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
-                    aria-label="Reply"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      startReply(msg);
-                      activeMessageId = null;
-                    }}
-                  >
-                    <Reply class="size-3.5" />
-                  </button>
-                    {/snippet}
-                  </Tip>
-                  {#if !ephemeral}
-                    <Tip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                    <LazyTip text="React">
                       {#snippet children(props)}
                     <button
                       {...props}
                       type="button"
-                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 hover:text-foreground cursor-pointer {pinnedSet.has(msg.id)
-                        ? 'text-primary'
-                        : 'text-muted-foreground'}"
-                      aria-label={pinnedSet.has(msg.id) ? "Unpin message" : "Pin message"}
-                      aria-pressed={pinnedSet.has(msg.id)}
+                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                      aria-label="React"
                       onclick={(e) => {
                         e.stopPropagation();
-                        void toggleMessagePin(roomCode, msg.id);
+                        if (reactionPickerFor === msg.id) {
+                          reactionPickerFor = null;
+                        } else {
+                          openReactionPicker(msg.id, e.currentTarget);
+                        }
                         activeMessageId = null;
                       }}
                     >
-                      {#if pinnedSet.has(msg.id)}
-                        <PinOff class="size-3.5" />
-                      {:else}
-                        <Pin class="size-3.5" />
-                      {/if}
+                      <Smile class="size-3.5" />
                     </button>
                       {/snippet}
-                    </Tip>
+                    </LazyTip>
+                    <LazyTip text="Reply">
+                      {#snippet children(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                      aria-label="Reply"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        startReply(msg);
+                        activeMessageId = null;
+                      }}
+                    >
+                      <Reply class="size-3.5" />
+                    </button>
+                      {/snippet}
+                    </LazyTip>
+                    {#if !ephemeral}
+                      <LazyTip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                        {#snippet children(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 hover:text-foreground cursor-pointer {pinnedSet.has(msg.id)
+                          ? 'text-primary'
+                          : 'text-muted-foreground'}"
+                        aria-label={pinnedSet.has(msg.id) ? "Unpin message" : "Pin message"}
+                        aria-pressed={pinnedSet.has(msg.id)}
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          void toggleMessagePin(roomCode, msg.id);
+                          activeMessageId = null;
+                        }}
+                      >
+                        {#if pinnedSet.has(msg.id)}
+                          <PinOff class="size-3.5" />
+                        {:else}
+                          <Pin class="size-3.5" />
+                        {/if}
+                      </button>
+                        {/snippet}
+                      </LazyTip>
+                    {/if}
+                  </div>
+                  {#if pinnedSet.has(msg.id)}
+                    <!-- Marks a pinned message at rest; the toolbar above
+                         covers it on hover, where the same pin unpins. -->
+                    <Pin
+                      class="pointer-events-none absolute right-2 top-1.5 size-3 rotate-45 text-primary/70 transition-opacity group-hover:opacity-0"
+                      aria-label="Pinned"
+                    />
                   {/if}
                 </div>
-                {#if pinnedSet.has(msg.id)}
-                  <!-- Marks a pinned message at rest; the toolbar above
-                       covers it on hover, where the same pin unpins. -->
-                  <Pin
-                    class="pointer-events-none absolute right-2 top-1.5 size-3 rotate-45 text-primary/70 transition-opacity group-hover:opacity-0"
-                    aria-label="Pinned"
-                  />
-                {/if}
               </div>
-            </div>
-          {/each}
+            {/each}
 
-          {#if sendingPreviews.length > 0}
-            <!-- The message before it exists. It sits where it will land and
-                 pulses until the real one replaces it, which is the whole
-                 point: a line of text above the input described the send
-                 happening somewhere else, and left the place it was going
-                 empty. -->
-            <div class="mb-3 flex flex-col items-end gap-1">
+            {#if sendingPreviews.length > 0}
+              <!-- The message before it exists, drawn as the message it will
+                   be: our own row, in the place it will land, with the picture
+                   or file at its real size and dimmed until the real one
+                   replaces it. A bubble on the right read as something else
+                   entirely in a chat whose messages all sit on the left. -->
+              {@const lastShown = renderedMessages[renderedMessages.length - 1]}
+              {@const sendingHeader =
+                !lastShown ||
+                !isSelfSender(lastShown.senderId) ||
+                Date.now() - lastShown.timestamp > 2 * 60 * 1000}
               <div
-                class="flex max-w-[85%] animate-pulse flex-col gap-1.5 rounded-lg bg-primary/10 p-2"
+                class="rounded-md px-2 py-0.5 {sendingHeader ? 'mt-3 pt-1' : ''}"
                 aria-live="polite"
                 aria-label="Sending"
               >
-                {#each sendingPreviews as p, i (i)}
-                  {#if p.url && p.type.startsWith("image/")}
-                    <img
-                      src={p.url}
-                      alt={p.name}
-                      class="max-h-56 max-w-xs rounded-md object-contain"
-                    />
-                  {:else if p.url && p.type.startsWith("video/")}
-                    <!-- svelte-ignore a11y_media_has_caption -->
-                    <video
-                      src={p.url}
-                      class="max-h-56 max-w-xs rounded-md"
-                      muted
-                      playsinline
-                    ></video>
-                  {:else}
+                {#if sendingHeader}
+                  {@const own = ownProfile}
+                  {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
+                  <div class="flex items-start gap-2">
                     <div
-                      class="flex items-center gap-2 rounded bg-muted/60 px-2 py-1.5"
+                      class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden bg-primary/20 text-xs font-semibold font-mono text-primary"
+                      style={own.color ? `color: ${own.color}` : ""}
                     >
-                      <FileText class="size-4 shrink-0 text-muted-foreground" />
-                      <div class="min-w-0">
-                        <p class="truncate text-xs text-foreground">{p.name}</p>
-                        <p class="text-[10px] text-muted-foreground">
-                          {formatSize(p.size)}
-                        </p>
-                      </div>
+                      {#if own.avatarUrl}
+                        <GifImage src={own.avatarUrl} alt="You" class="size-full object-cover" />
+                      {:else}
+                        {(own.nickname || "You").charAt(0).toUpperCase()}
+                      {/if}
                     </div>
+                    <div class="flex min-w-0 items-baseline gap-2">
+                      <span
+                        class="max-w-72 truncate text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
+                          ? 'italic'
+                          : ''} {effectStyle.class}"
+                        style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
+                      >
+                        {own.nickname || "You"}
+                      </span>
+                      <span class="text-xs text-muted-foreground">Sending…</span>
+                    </div>
+                  </div>
+                {/if}
+                <div class="ml-9 flex flex-col items-start opacity-50">
+                  {#if sendingCaption}
+                    <p class="mb-2 whitespace-pre-wrap break-words text-(length:--chat-font-size) leading-normal text-foreground">
+                      {stripMarkdown(sendingCaption, resolveMentionDisplayName)}
+                    </p>
                   {/if}
-                {/each}
-                {#if sendingCaption}
-                  <p class="whitespace-pre-wrap break-words text-sm">
-                    {humanizeMentions(
-                      sendingCaption,
-                      resolveMentionDisplayName
-                    )}
-                  </p>
+                  <!-- The same card the sent message shows, so nothing moves
+                       when it replaces this. -->
+                  <div class="w-full space-y-2">
+                    {#each sendingPreviews as p, i (i)}
+                      <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
+                        <p class="truncate text-sm text-foreground">{p.name}</p>
+                        <p class="text-xs text-muted-foreground">{formatSize(p.size)} • sending…</p>
+                        {#if p.url && p.type.startsWith("image/")}
+                          <img
+                            src={p.url}
+                            alt={p.name}
+                            class="mt-2 max-h-56 max-w-xs rounded-md object-contain"
+                          />
+                        {:else if p.url && p.type.startsWith("video/")}
+                          <!-- svelte-ignore a11y_media_has_caption -->
+                          <video
+                            src={p.url}
+                            class="mt-2 max-h-56 max-w-xs rounded-md"
+                            muted
+                            playsinline
+                          ></video>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+                {#if !sendingHeader}
+                  <span class="ml-9 text-xs text-muted-foreground">Sending…</span>
                 {/if}
               </div>
-              <span class="font-mono text-[10px] text-muted-foreground">
-                Sending...
-              </span>
+            {/if}
+          </div>
+        {/if}
+        {#each visiblePluginErrors as entry (entry.id)}
+          <PluginErrorRow {entry} />
+        {/each}
+      </div>
+      {#if settling}
+        <div
+          class="absolute inset-0 z-20 flex flex-col justify-end gap-5 overflow-hidden bg-background px-6 pb-4"
+          aria-hidden="true"
+        >
+          {#each [0.55, 0.8, 0.4, 0.7, 0.35, 0.6] as width, i (i)}
+            <div class="flex items-start gap-2">
+              <div class="size-7 shrink-0 animate-pulse rounded-full bg-muted/60"></div>
+              <div class="flex min-w-0 flex-1 flex-col gap-2 pt-1">
+                <div class="h-3 w-24 animate-pulse rounded bg-muted/60"></div>
+                <div class="h-3 animate-pulse rounded bg-muted/40" style="width: {Math.round(width * 100)}%"></div>
+              </div>
             </div>
-          {/if}
+          {/each}
         </div>
       {/if}
     </div>
@@ -3027,14 +3510,29 @@
         variant="secondary"
         size="sm"
         class="rounded-full shadow-md font-mono text-xs"
-        onclick={() => {
-          scrollToBottom("smooth");
-          autoScroll = true;
-        }}
+        onclick={toNewest}
       >
         <ArrowDown class="size-3" /> New messages below <ArrowDown
           class="size-3"
         />
+      </Button>
+    </div>
+  {/if}
+
+  {#if dmRequest}
+    <!-- Answering accepts too (sendDirectMessage); Delete is the same act as
+         deleting any conversation. -->
+    <div
+      role="status"
+      class="flex flex-wrap items-center gap-2 border-t border-border bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground"
+    >
+      <UserPlus class="size-3.5 shrink-0" />
+      <span class="min-w-0 flex-1">
+        Message request. They are not a contact and share no room with you.
+      </span>
+      <Button variant="ghost" size="sm" onclick={() => onLeave()}>Delete</Button>
+      <Button variant="secondary" size="sm" onclick={() => onAcceptDmRequest?.()}>
+        Accept
       </Button>
     </div>
   {/if}
@@ -3066,7 +3564,7 @@
           >
           <span class="mx-1">•</span>
           <span class="truncate"
-            >{humanizeMentions(getQuotableText(replyTarget), resolveMentionDisplayName)}</span
+            >{stripMarkdown(getQuotableText(replyTarget, QUOTE_SHOWN_CHARS), resolveMentionDisplayName)}</span
           >
         </div>
         <Tip text="Cancel reply (Esc)">
@@ -3159,8 +3657,24 @@
   {/if}
 
   <div
-    class="border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))] min-h-18.75 bg-background"
+    class="relative border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))] min-h-18.75 bg-background"
   >
+    {#if typingText}
+      <!-- In the composer's top padding, so it never moves the chat. -->
+      <p
+        class="pointer-events-none absolute inset-x-4 top-0 flex h-4 items-center gap-1.5 font-mono text-[11px] text-muted-foreground"
+      >
+        <span class="inline-flex shrink-0 gap-0.5" aria-hidden="true">
+          {#each [0, 1, 2] as i (i)}
+            <span
+              class="size-1 rounded-full bg-current motion-safe:animate-pulse"
+              style="animation-delay: {i * 200}ms"
+            ></span>
+          {/each}
+        </span>
+        <span class="truncate">{typingText}</span>
+      </p>
+    {/if}
     <form
       onsubmit={(e) => {
         e.preventDefault();
@@ -3175,7 +3689,13 @@
         class="hidden"
         onchange={(e) => {
           const target = e.currentTarget as HTMLInputElement;
-          if (target.files?.length) void addFilesToStage(target.files);
+          // Focus goes to the message box once the files are staged: left
+          // on the attach button, the Enter meant to send pressed it again
+          // and opened the picker a second time. After staging, so an Enter
+          // that quick does not find the composer still empty.
+          if (target.files?.length) {
+            void addFilesToStage(target.files).then(() => textareaEl?.focus());
+          }
           target.value = "";
         }}
       />
@@ -3206,12 +3726,11 @@
             autoResize();
             updateMentionState();
             updateCommandState();
+            noteDraftTyping();
           }}
         />
         {#if sendError}
           <p role="alert" class="mb-1 rounded border border-destructive/30 bg-background px-2 py-1 text-xs text-destructive">{sendError}</p>
-        {:else if submittingFiles}
-          <p role="status" class="px-2 py-1 text-xs text-muted-foreground">Saving and sending…</p>
         {:else if serialize(draft, draftMentionMap).length > MAX_CHAT_CONTENT_LENGTH}
           <p role="status" class="px-2 py-1 text-xs text-muted-foreground">This long message will be sent as message.txt.</p>
         {/if}
@@ -3355,7 +3874,8 @@
     name={profileCardFor.name}
     avatarUrl={profileCardFor.avatarUrl}
     color={profileCardFor.color}
-    onEdit={() => openSettings("profile")}
+    roomCode={roomCode.startsWith("rd2_") ? roomCode : null}
+    onEdit={() => openSettings("profile", roomCode.startsWith("rd2_") ? roomCode : null)}
     onMessage={dmTargetFor(profileCardFor.did)
       ? () => {
           const target = dmTargetFor(profileCardFor!.did)!;

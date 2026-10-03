@@ -21,7 +21,13 @@
     shareScreenPressed,
     leaveCall,
   } from "$lib/transport/call.svelte";
-  import { profileStore, loadProfile } from "$lib/profile.svelte";
+  import {
+    profileStore,
+    getScopedProfile,
+    saveScopedFields,
+    saveAvatar,
+    loadProfile,
+  } from "$lib/profile.svelte";
   import { nameEffectStyle } from "$lib/name-effect";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import AvatarPickerDialog from "$lib/components/AvatarPickerDialog.svelte";
@@ -31,6 +37,10 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import { toggleDeafen } from "$lib/transport/call.svelte";
+  import { loadWhatsNew, whatsNew } from "$lib/whats-new.svelte";
+
+  // Once per page: the list is small, and the dot on Settings needs it.
+  void loadWhatsNew();
 
   interface Props {
     /** Icon-rail layout: no name, no status text, controls stacked. */
@@ -79,8 +89,15 @@
     );
   });
 
-  const initial = $derived(
-    (profileStore.nickname || "?").charAt(0).toUpperCase()
+  const sidebarRoomCode = $derived(
+    displayPrefs.showRoomProfileInSidebar &&
+      transportState.roomCode?.startsWith("rd2_")
+      ? transportState.roomCode
+      : null
+  );
+  const sidebarProfile = $derived(getScopedProfile(sidebarRoomCode));
+  const sidebarInitial = $derived(
+    (sidebarProfile.nickname || "?").charAt(0).toUpperCase()
   );
 </script>
 
@@ -181,9 +198,9 @@
           aria-label="Change profile picture"
           class="relative flex size-9 items-center justify-center rounded-full overflow-hidden bg-primary/20 hover:ring-2 hover:ring-primary/50 transition-all cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary"
         >
-          {#if profileStore.avatarUrl}
+          {#if sidebarProfile.avatarUrl}
             <GifImage
-              src={profileStore.avatarUrl}
+              src={sidebarProfile.avatarUrl}
               alt="Avatar"
               class="size-full object-cover"
               animate={mediaPrefs.gifAutoplay ? true : "hover"}
@@ -191,7 +208,7 @@
           {:else}
             <span
               class="text-sm font-semibold text-primary font-mono select-none"
-              >{initial}</span
+              >{sidebarInitial}</span
             >
           {/if}
         </button>
@@ -206,20 +223,20 @@
       <!-- Name + status -->
       {#if !collapsed}
         {@const effectStyle = nameEffectStyle(
-          profileStore.nameEffect,
-          profileStore.color ?? undefined,
-          profileStore.gradient2 ?? undefined,
-          profileStore.gradient3 ?? undefined,
-          profileStore.nameShimmer ?? undefined,
-          profileStore.nameGlow ?? undefined
+          sidebarProfile.nameEffect,
+          sidebarProfile.color ?? undefined,
+          sidebarProfile.gradient2 ?? undefined,
+          sidebarProfile.gradient3 ?? undefined,
+          sidebarProfile.nameShimmer ?? undefined,
+          sidebarProfile.nameGlow ?? undefined
         )}
         <div class="flex flex-col gap-1.5 mt-1 w-full min-w-0">
           <div class="flex items-baseline w-full min-w-0">
             <span
               class="truncate max-w-26 text-xs font-semibold text-foreground font-mono leading-tight {effectStyle.class}"
               style={effectStyle.style ||
-                (profileStore.color ? `color: ${profileStore.color}` : "")}
-              >{profileStore.nickname}</span
+                (sidebarProfile.color ? `color: ${sidebarProfile.color}` : "")}
+              >{sidebarProfile.nickname}</span
             >
           </div>
           <!-- Connection status text: always shown, not gated on showConnectionInfo.
@@ -289,10 +306,14 @@
         {...props}
         type="button"
         onclick={() => (audioSettingsOpen = true)}
-        aria-label="Settings"
-        class="flex items-center justify-center rounded-md size-8 cursor-pointer transition-colors text-muted-foreground hover:text-foreground hover:bg-muted"
+        aria-label={whatsNew.unseen ? "Settings, new release" : "Settings"}
+        class="relative flex items-center justify-center rounded-md size-8 cursor-pointer transition-colors text-muted-foreground hover:text-foreground hover:bg-muted"
       >
         <Settings class="size-4" />
+        {#if whatsNew.unseen}
+          <!-- A release this device has not opened: Settings > What's new. -->
+          <span class="absolute right-1 top-1 size-2 rounded-full bg-primary ring-2 ring-background"></span>
+        {/if}
       </button>
         {/snippet}
       </Tip>
@@ -302,6 +323,12 @@
 
 <AvatarPickerDialog
   open={avatarDialogOpen}
+  scopeKey={sidebarRoomCode}
+  value={sidebarProfile.avatarUrl}
+  onSave={(url) =>
+    sidebarRoomCode
+      ? saveScopedFields(sidebarRoomCode, { pfpURL: url ?? null })
+      : saveAvatar(url)}
   onClose={() => {
     avatarDialogOpen = false;
   }}

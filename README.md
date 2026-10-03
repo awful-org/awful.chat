@@ -22,11 +22,18 @@ group video.
 
 ## Features
 
-- **Rooms** with shareable invite links, message history that syncs
-  peer-to-peer, replies, emoji reactions, code blocks with syntax
-  highlighting, and link previews.
-- **Direct messages** with an offline queue, delivery and read receipts, and
-  a phonebook of saved contacts.
+- **Rooms** with message history that syncs peer-to-peer, replies, emoji
+  reactions, Discord-style markdown (bold, italic, underline, strikethrough,
+  spoilers, quotes, lists, code blocks with syntax highlighting), typing
+  indicators, and link previews.
+- **Invites by short code**: six characters you read out, send or show as a
+  QR, letting in only the people (up to 25) and minutes (up to 10) you
+  choose. Each room also has a permanent link, folded away behind a warning:
+  it never expires and lets in whoever it reaches.
+- **Direct messages** with an offline queue, delivery and read receipts, a
+  phonebook of saved contacts, and message requests: a DM from a stranger
+  waits under Requests, without notifying and without telling them it
+  arrived or was read, until you accept it.
 - **@Mentions** with autocomplete: tamper-proof (they ride inside the signed
   message), rename-proof (always show the current name), and the mentioned
   person gets a highlighted message and a notification.
@@ -43,12 +50,17 @@ group video.
   images, video, audio and GIFs, a GIF picker with saved favorites, and
   small files delivered inside the message itself so they load instantly.
 - **Profiles**: avatar, banner (image or GIF), a colored tag chip, bio, and
-  name effects (gradient, shimmer, glow, rainbow).
+  name effects (gradient, shimmer, glow, rainbow), and optionally a separate
+  profile per room, which messages, member lists and call tiles follow there.
 - **Plugins**: instance-level, Minecraft-mods style. Drop a folder or point
   `PLUGIN_SOURCES` at GitHub repos and redeploy; ships with `/wheel`,
-  `/poll` and `/ping`, with more at
+  `/poll`, `/ping` and `/app`, with more at
   [awful-org/awfully-awesome](https://github.com/awful-org/awfully-awesome).
   See [frontend/plugins/README.md](frontend/plugins/README.md).
+- **Apps**: `/app <url> [anything]` opens any website as a tile in the call,
+  in a sandbox, after a notice that it sees your IP. Sites that speak
+  [the awful contract](docs/awful-contract.md) learn the session and who is
+  playing - never who anyone is.
 - **Multi-device**: several devices on one identity, QR device sync,
   encrypted backups, and optional biometric unlock (fingerprint or security
   key via WebAuthn PRF).
@@ -106,7 +118,8 @@ coturn      TURN server for voice fallback (compose only, stock image)
 
 Full data model, sync protocol, wire formats and crypto details:
 [docs/spec.md](docs/spec.md). Plugin surface design:
-[docs/plugin-surface.md](docs/plugin-surface.md).
+[docs/plugin-surface.md](docs/plugin-surface.md). What a website does to run
+as an app: [docs/awful-contract.md](docs/awful-contract.md).
 
 ## Development
 
@@ -178,9 +191,10 @@ iptables DNAT instead, which costs nothing.
 `VITE_API_URL`, `VITE_RELAY_MULTIADDR` and the two SFU variables are the
 instance's own addresses. They are NOT compiled into the app: the frontend
 container writes them to `/config.json` when it starts and the app reads that
-before it mounts, so changing one takes a restart rather than a rebuild. The
-two optional pages, `USE_QS` and `USE_QC`, ride the same file and behave the
-same way: `docker compose up -d frontend` is enough, and `curl
+as it starts (from the copy it kept last time, if it has one, until the fresh
+read lands a moment later), so changing one takes a restart rather than a
+rebuild. The two optional pages, `USE_QS` and `USE_QC`, ride the same file and
+behave the same way: `docker compose up -d frontend` is enough, and `curl
 https://<domain>/config.json` says which of them an instance is serving.
 
 That is also what makes a build checkable. Two instances running the *same
@@ -215,23 +229,27 @@ whose context holds no repository declares no commit.
 | `TURN_URLS` | no | the TURN URL list served to clients, comma-separated (below) |
 | `SFU_RTC_MIN_PORT` / `SFU_RTC_MAX_PORT` | no | SFU media range, published and allocated from (default 61000-61499) |
 | `TURN_MIN_PORT` / `TURN_MAX_PORT` | no | coturn relay range, one port per allocation (default 49152-50151) |
-| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide and per credential |
+| `TURN_TOTAL_QUOTA` / `TURN_USER_QUOTA` | no | concurrent TURN allocations, server-wide (default 900) and per credential id (default 12). The credentials the relay hands one address carry at most seven ids between them, so one address holds at most seven times the per-id quota (below) |
 | `PLUGIN_PROXY_HOSTS` | no | hostnames plugins may reach through the relay's `/plugin-proxy` and `/plugin-stream` (the streaming variant, for media a CDN will not serve cross-origin) |
-| `PLUGIN_PROXY_SECRETS` | no | `NAME@host=value` list; plugins reference `{{secret:NAME}}`, substituted server-side only for that host |
+| `PLUGIN_PROXY_SECRETS` | no | `NAME@host?param=value` list (e.g. `STEAM@api.steampowered.com?key=...`); plugins put `{{secret:NAME}}` as the whole value of that query parameter, and the relay substitutes it server-side only on that host. `NAME@host/path/prefix?param=value` also restricts the path. The older `NAME@host=value` form is no longer substituted |
+| `RELAY_MAX_CONNS` / `RELAY_GOMEMLIMIT` | no | how many connections (open tabs) the relay holds at once, default 2048, with four times as many relayed circuits, and the relay's soft memory limit, default 768MiB. Past the first, new connections are refused and retried rather than open tabs dropped. See [deploy/README.md](deploy/README.md), "Relay capacity" |
 | `TELEMETRY_ENABLED` | no | `1` makes the relay accept a diagnostic bundle at `POST /telemetry` and staple its own view of the uploader. Unset answers 204, stores nothing, and the app hides its Upload button |
 | `TELEMETRY_ADMIN_TOKEN` | no | bearer token for `GET /telemetry/list` and `/telemetry/get`, which the [dashboard](dashboard/README.md) reads. Unset makes both answer 404 |
 | `TELEMETRY_DIR` | no | where bundles are stored, default `/app/data/telemetry` inside the relay's data volume |
-| `PUSH_ENABLED` | no | Web Push, **on by default**. The relay wakes a subscribed device when its mailbox receives a DM, with a push carrying no content (`{"t":"mail"}`, at most one per box per minute). `0` turns it off: `/push/config` answers `enabled: false` and the subscribe routes 404. What it discloses is in [deploy/README.md](deploy/README.md) |
+| `PUSH_ENABLED` | no | Web Push, **on by default**. The relay wakes a subscribed device when its mailbox receives a DM, with a push carrying no content (`{"t":"mail"}`, at most one per box per minute, and one per device until that device collects or an hour passes). `0` turns it off: `/push/config` answers `enabled: false` and the subscribe routes 404. What it discloses is in [deploy/README.md](deploy/README.md) |
+| `PUSH_ALLOWED_HOSTS` | no | push services the relay will send wake-ups to, comma-separated, `*.` for subdomains. Unset means `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `web.push.apple.com`, `*.push.apple.com`, `*.notify.windows.com`; setting it replaces that list, and `*` allows any https host |
 | `PUSH_CONTACT` | no | `mailto:` contact in the VAPID header, which is how a push vendor reaches you about your instance. Defaults to `mailto:admin@<DOMAIN>` |
 | `SFU_MAX_ROOMS` | no | concurrent rooms one SFU will hold, default 250. Past it a join is refused rather than degrading every call already running |
 | `SFU_REJOIN_PROBE_MS` | no | how often a client is probed to confirm its SFU session is still live, default 3000 |
 | `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
 | `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
-| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs whose `X-Forwarded-For` the relay believes. Unset means private ranges plus loopback, correct behind traefik alone. Opt-in hardening: set it to Traefik's own `/32` on `dokploy-network` so a neighbouring container on the same box cannot forge the header and dodge the relay's per-IP limits; add a CDN's ranges when one sits in front |
-| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
+| `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs, addresses or hostnames whose `X-Forwarded-For` the relay believes. Empty trusts nothing (every request is keyed on its socket peer). The dokploy compose defaults it to `dokploy-traefik`, re-resolved every 30s so it survives Traefik being recreated; name your own proxy if it differs, and add a CDN's ranges when one sits in front. `private` restores the old trust-every-private-range behaviour |
+| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit, or only an abbreviated sha (a pin is the whole 40-character sha). Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
+| `SFU_ALLOWED_ORIGINS` | no | extra origins the SFU accepts a signalling socket from, besides `https://<DOMAIN>` (the compose passes `DOMAIN` to the SFU for this). Required on an SFU satellite, where it is the main instance's origin |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |
 | `USE_QS` | no | `1` serves `/qs`, which hands a file to one person or several with no account: the bytes go peer to peer and are never uploaded anywhere, everyone holding the link serves what they have finished, and a one-time switch closes the link as soon as it has delivered. Unset answers that path with the landing page, and the app never mentions the feature |
+| `WHATS_NEW` | no | On by default. At start the frontend container asks GitHub's API for the last five pull requests merged into `main` of the repository the build came from, and serves them as `/whats-new.json` for Settings > What's new. Users' browsers never contact GitHub: they read the instance's own copy. `0` stops the server asking; the tab then shows nothing |
 | `USE_QC` | no | `1` serves `/qc`, a call with no room and no account: camera, screen share and text chat under a throwaway identity in a database deleted when the tab closes. An identity already on the device can be used instead, and the call stays just as disposable. Unset answers that path with the landing page |
 
 Firewall: open 80/443 (web), 3478 tcp+udp (TURN), 5349 tcp+udp (TURN TLS,
@@ -285,6 +303,23 @@ open relay for the whole internet - and the people that hurts first are the
 ones who need TURN at all. Mobile and CGNAT users cannot connect directly, so
 they are the ones who end up relayed, and the relay port range is finite: a
 stranger exhausting it does not slow them down, it locks them out.
+
+Minted credentials alone do not stop that, because anyone can ask for one. So
+the relay hands one address at most seven live credentials (25 per IPv6 /48)
+and gives its newest out again past that, and every credential it hands one
+address carries one of the same seven ids (25 for a /48). coturn's
+`--user-quota` caps the allocations under each id at 12, whatever the
+credential's expiry, and `--total-quota` (900 by default, inside the 1000-port
+range) is the pool. The ids are what make that a cap: coturn checks a
+credential's expiry only when an allocation is made, and an allocation kept
+refreshed outlives it, so while every credential had an id of its own one
+address could gather the whole pool in a day. Now one address holds at most
+84 allocations however long it keeps at it, and one IPv6 /48 300, so filling
+the pool takes about eleven addresses (or three /48s) at once, where it used
+to take one address a minute. The browsers behind one busy address share the
+limit too: all of them are handed its newest credential, and share its 12
+allocations for new connections. Raise `TURN_TOTAL_QUOTA` with the port range,
+and keep it ten times what one address can hold.
 
 **When TURN times out.** The credential fetch succeeding proves nothing: it
 comes from the relay, and the allocation goes to coturn. If a bundle shows
@@ -343,8 +378,10 @@ so. To read one:
 4. Optional, on your own instance: set `TELEMETRY_ENABLED=1` on the relay, and
    the user turns **Allow upload to this instance** on. The relay then staples
    its OWN view of that peer to the bundle - registration outcomes and the real
-   reason a rendezvous stream closed, which the client cannot know. Read
-   `docs/spec.md` "Server Privacy" first: this is a real disclosure change.
+   reason a rendezvous stream closed, which the client cannot know. It keeps a
+   peer's events for half an hour after the last one, so upload soon after the
+   problem. Read `docs/spec.md` "Server Privacy" first: this is a real
+   disclosure change.
 5. Set `SFU_TELEMETRY=1` for the third vantage, and capture the container logs
    with timestamps: `docker logs -t <sfu>` and `docker logs -t <relay>`.
 

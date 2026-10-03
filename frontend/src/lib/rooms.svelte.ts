@@ -4,6 +4,8 @@ import {
   getDMRooms,
   putRoom,
   deleteRoom,
+  deleteRoomProfilesForRoom,
+  getRoomDeletionMarker,
   getUnreadCount,
   getLastMessage,
   getRoom,
@@ -19,6 +21,7 @@ import {
 } from "./storage";
 import { identityStore } from "./identity/identity.svelte";
 import { dropRoomCorpus } from "./search/corpus.svelte";
+import { MessageType } from "./types/message";
 
 /**
  * Your own messages must never count as unread - they arrive back through
@@ -101,7 +104,82 @@ export async function refreshDmRooms(): Promise<void> {
   roomsStore.dmRooms = await getDMRooms();
 }
 
-export async function refreshUnreadCount(roomCode: string): Promise<void> {
+/**
+ * Rooms whose count is a base new rows can be added to: recounted from
+ * storage since the user last read them. Reading a room drops it, so the
+ * next arrival counts from storage again - a row that arrived while the room
+ * was open but never reached the screen is still unread.
+ */
+const _counted = new Set<string>();
+/** Recounts in flight, and whether another was asked for meanwhile. */
+const _recounts = new Map<string, { again: boolean; done: Promise<void> }>();
+/**
+ * Rows already counted, by id: the live frame and its direct copy, or two
+ * pushers, can store the same row at once, and it is one unread message.
+ */
+const COUNTED_IDS_MAX = 2048;
+const _countedIds = new Set<string>();
+
+function _firstSighting(id: string): boolean {
+  if (_countedIds.has(id)) return false;
+  _countedIds.add(id);
+  if (_countedIds.size > COUNTED_IDS_MAX) {
+    _countedIds.delete(_countedIds.values().next().value as string);
+  }
+  return true;
+}
+
+/**
+ * Rows just stored for a room: add the ones that count to its unread total.
+ *
+ * Every incoming message used to recount its room from storage, reading the
+ * whole unread backlog off IndexedDB - a room left unread for a week cost a
+ * read of thousands of rows per message, and a 20-row sync batch its own read
+ * each. Rows that count are new messages from someone else above the read
+ * mark; the stored count only grows by them. Where there is no base to add
+ * to, the room is counted from storage, which already holds these rows.
+ */
+export function noteUnreadArrivals(
+  roomCode: string,
+  rows: ReadonlyArray<{ id: string; senderId: string; lamport: number; type: string }>
+): void {
+  if (roomCode.startsWith("dm-")) return;
+  const self = selfSenderId();
+  const fresh = rows.filter(
+    (m) =>
+      m.type !== MessageType.Reaction &&
+      m.type !== MessageType.PluginUpdate &&
+      (!self || m.senderId !== self) &&
+      _firstSighting(m.id)
+  );
+  if (!fresh.length) return;
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  if (!room || !_counted.has(roomCode) || _recounts.has(roomCode)) {
+    void refreshUnreadCount(roomCode).catch(() => {});
+    return;
+  }
+  const added = fresh.filter((m) => m.lamport > room.lastSeenLamport).length;
+  if (!added) return;
+  const next = new Map(roomsStore.unreadCounts);
+  next.set(roomCode, (next.get(roomCode) ?? 0) + added);
+  roomsStore.unreadCounts = next;
+}
+
+/** The user read the room up to what is on screen. */
+export function noteRoomRead(roomCode: string): void {
+  _counted.delete(roomCode);
+  if (roomsStore.unreadCounts.get(roomCode) === 0) return;
+  const next = new Map(roomsStore.unreadCounts);
+  next.set(roomCode, 0);
+  roomsStore.unreadCounts = next;
+}
+
+/**
+ * Count a room's unread rows from storage. One at a time per room: a call
+ * while one is in flight asks it for another pass instead, and settles with
+ * it.
+ */
+export function refreshUnreadCount(roomCode: string): Promise<void> {
   // unreadCounts is the ROOM counter. DM conversations are counted separately,
   // against roomsStore.dmRooms, and anything filed here is also added to that
   // total - so a dm- code landing in this map is counted twice by every
@@ -111,7 +189,28 @@ export async function refreshUnreadCount(roomCode: string): Promise<void> {
   // same storage as rooms, so the getRoom fallback below happily resolves one.
   // The callers cannot help: a DM file, a DM plugin card and a DM history
   // repair all arrive through the room paths carrying a dm- roomCode.
-  if (roomCode.startsWith("dm-")) return;
+  if (roomCode.startsWith("dm-")) return Promise.resolve();
+  const running = _recounts.get(roomCode);
+  if (running) {
+    running.again = true;
+    return running.done;
+  }
+  const run = { again: false, done: Promise.resolve() };
+  _recounts.set(roomCode, run);
+  run.done = (async () => {
+    try {
+      do {
+        run.again = false;
+        await _recountUnread(roomCode);
+      } while (run.again);
+    } finally {
+      _recounts.delete(roomCode);
+    }
+  })();
+  return run.done;
+}
+
+async function _recountUnread(roomCode: string): Promise<void> {
   // Fall back to the database when the mirror has not caught up: a message can
   // arrive for a room whose record exists but whose sidebar entry is still in
   // flight (a deep-link join), and dropping the count there left the badge
@@ -131,6 +230,10 @@ export async function refreshUnreadCount(roomCode: string): Promise<void> {
   // the mirror cannot have been read through it, so it keeps its count.
   const now = roomsStore.rooms.find((r) => r.roomCode === roomCode);
   if (now && now.lastSeenLamport !== room.lastSeenLamport) return;
+  _counted.add(roomCode);
+  // Only when it changed: every consumer of the map - the sidebar, the tab
+  // title, the app badge - recomputes on a new one.
+  if (roomsStore.unreadCounts.get(roomCode) === count) return;
   const next = new Map(roomsStore.unreadCounts);
   next.set(roomCode, count);
   roomsStore.unreadCounts = next;
@@ -156,31 +259,20 @@ async function _refreshAllActivity(): Promise<void> {
  * Recount every room. Authoritative, not seed-only: it counts from each room's
  * persisted watermark, which is the same source markSeen writes, so a room the
  * user has just read counts zero anyway. Skipping rooms already in the map
- * meant a second sweep silently kept stale counts.
+ * meant a second sweep silently kept stale counts. Room by room through
+ * refreshUnreadCount, so a recount already running for one is asked for
+ * another pass rather than raced, with the same staleness rule.
  */
 async function _refreshAllUnread(): Promise<void> {
-  const before = roomsStore.rooms.map((r) => r.lastSeenLamport);
-  const counts = await Promise.all(
-    roomsStore.rooms.map((r) =>
-      getUnreadCount(r.roomCode, r.lastSeenLamport, selfSenderId())
-    )
-  );
-  const merged = new Map(roomsStore.unreadCounts);
-  roomsStore.rooms.forEach((room, i) => {
-    // Same staleness rule as refreshUnreadCount: if markSeen moved the
-    // watermark while the sweep was in flight, this count would relight the
-    // badge on a room being read.
-    if (room.lastSeenLamport !== before[i]) return;
-    merged.set(room.roomCode, counts[i]);
-  });
-  roomsStore.unreadCounts = merged;
+  await Promise.all(roomsStore.rooms.map((r) => refreshUnreadCount(r.roomCode)));
 }
 
-export async function saveRoom(roomCode: string, name: string): Promise<void> {
+export async function saveRoom(roomCode: string, name: string, guard?: () => void): Promise<void> {
   // Check the DATABASE, not the in-memory mirror: on a deep-link join the
   // mirror can still be empty while loadRooms() is in flight, and recreating
   // the record here wiped its name, watermark and member list.
   const stored = await getRoom(roomCode);
+  guard?.();
   if (stored) {
     if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
       roomsStore.rooms = [...roomsStore.rooms, stored];
@@ -188,43 +280,53 @@ export async function saveRoom(roomCode: string, name: string): Promise<void> {
     return;
   }
 
+  const marker = await getRoomDeletionMarker(roomCode);
+  guard?.();
+
   const room: Room = {
     roomCode,
     name,
     type: "text",
     lastSeenLamport: 0,
-    createdAt: Date.now(),
+    // createdAt also identifies this membership generation. An intentional
+    // rejoin must outrank the leave marker even within the same millisecond.
+    createdAt: Math.max(Date.now(), (marker ? Math.max(marker.generation, marker.deletedAt) : 0) + 1),
     participants: [],
     participantLastSeen: {},
   };
 
-  await putRoom(room);
+  await putRoom(room, guard);
+  guard?.();
   if (!roomsStore.rooms.some((r) => r.roomCode === roomCode)) {
     roomsStore.rooms = [...roomsStore.rooms, room];
   }
 }
 
 /**
- * Persist a room name learned from a peer (or set locally).
- * Without this a name broadcast only lived in transportState, so the sidebar
- * and the next join still showed the raw room code.
+ * Persist a room name learned from a peer (or set locally), with when it
+ * was chosen (room-name.ts). Without this a name broadcast only lived in
+ * transportState, so the sidebar and the next join still showed the raw
+ * room code.
  */
 export async function renameRoom(
   roomCode: string,
-  name: string
+  name: string,
+  nameAt: number
 ): Promise<void> {
   const trimmed = name.trim().slice(0, 64);
   if (!trimmed || trimmed === roomCode) return;
-  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
-  if (idx === -1) return;
-  if (roomsStore.rooms[idx].name === trimmed) return;
+  // Not in the mirror yet (a room still being opened): the stored record
+  // still takes it, and the mirror picks it up from there.
+  const current = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  if (current && current.name === trimmed && current.nameAt === nameAt) return;
   // Patch the STORED record: the mirror is refreshed rarely, and writing a
   // whole room from it rolled back participants and the seen watermark that
   // other writers had advanced since page load (evicting members days early).
   const stored = await getRoom(roomCode);
   if (!stored) return;
-  const updated = { ...stored, name: trimmed };
-  roomsStore.rooms[idx] = updated;
+  const updated = { ...stored, name: trimmed, nameAt };
+  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
+  if (idx !== -1) roomsStore.rooms[idx] = updated;
   await putRoom(updated);
 }
 
@@ -317,9 +419,18 @@ export async function removeRoom(roomCode: string): Promise<void> {
   // Before the storage delete: an in-flight search sweep must see the drop
   // and abandon its final index write for this room.
   dropRoomCorpus(roomCode);
+  const room = await getRoom(roomCode);
+  if (room?.type === "text") {
+    const marker = await getRoomDeletionMarker(roomCode);
+    await deleteRoomProfilesForRoom(
+      roomCode,
+      Math.max(Date.now(), room.createdAt, marker?.generation ?? 0) + 1,
+    );
+  }
   await deleteMessagesForRoom(roomCode);
   await deleteRoom(roomCode);
   roomsStore.rooms = roomsStore.rooms.filter((r) => r.roomCode !== roomCode);
+  _counted.delete(roomCode);
   const unread = new Map(roomsStore.unreadCounts);
   unread.delete(roomCode);
   roomsStore.unreadCounts = unread;

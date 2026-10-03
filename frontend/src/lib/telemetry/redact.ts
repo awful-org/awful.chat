@@ -127,6 +127,10 @@ export class RefTable {
   scrub(text: string): string {
     try {
       let out = text.replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>");
+      // Capabilities are not registered as room refs: only their public rd2_
+      // discovery IDs are. Scrub even truncated secrets and copied sync bundles.
+      out = out.replace(/web\+awfl:[^\s"'<>]+/gi, "<invitation>")
+        .replace(/r2_[A-Za-z0-9_-]+(?::[^\s"'<>]+)?/g, "<capability>");
       for (const [code, entry] of this.#rooms) {
         out = out.split(code).join(entry.ref);
       }

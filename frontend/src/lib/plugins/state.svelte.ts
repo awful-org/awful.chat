@@ -84,10 +84,92 @@ export function foldComparator(
   return a.id.localeCompare(b.id);
 }
 
+/** A plugin row's routing fields, read from its payload. */
+interface RowRoute {
+  pluginId?: unknown;
+  cardId?: unknown;
+}
+
+/** Parsed once per row, however many builds and scans look at it. */
+const _routes = new WeakMap<Message, RowRoute | null>();
+
+/** The pluginId and cardId a plugin row's payload names, or null. */
+export function rowRoute(msg: Message): RowRoute | null {
+  let route = _routes.get(msg);
+  if (route === undefined) {
+    try {
+      const payload = JSON.parse(msg.content) as RowRoute | null;
+      route =
+        payload && typeof payload === "object"
+          ? { pluginId: payload.pluginId, cardId: payload.cardId }
+          : null;
+    } catch {
+      route = null;
+    }
+    _routes.set(msg, route);
+  }
+  return route;
+}
+
+/** One card's rows: the card itself and every update naming it. */
+interface CardRows {
+  card?: Message;
+  updates: Message[];
+}
+
+/**
+ * A room's plugin rows grouped by card, once per version of the stored rows
+ * (getMessagesOfTypes' snapshot) rather than once per card: a room open
+ * builds every card on screen, and each build walked and parsed every
+ * update in the room to find its own. A few rooms only - a room open is a
+ * burst, and the rows themselves are storage's to keep.
+ */
+const _roomCardRows = new Map<
+  string,
+  { version: number | undefined; byCard: Map<string, CardRows> }
+>();
+const ROOM_CARD_ROWS_KEPT = 4;
+
+async function cardRows(roomCode: string, cardId: string): Promise<CardRows> {
+  const snapshot: { version?: number } = {};
+  const rows = await getMessagesOfTypes(
+    roomCode,
+    [MessageType.PluginCard, MessageType.PluginUpdate],
+    snapshot
+  );
+  let held = _roomCardRows.get(roomCode);
+  if (!held || held.version === undefined || held.version !== snapshot.version) {
+    const byCard = new Map<string, CardRows>();
+    const rowsOf = (id: string) => {
+      let own = byCard.get(id);
+      if (!own) byCard.set(id, (own = { updates: [] }));
+      return own;
+    };
+    for (const msg of rows) {
+      // The CARD row is the PluginCard under that id: an update, or any
+      // other row, that happens to carry the card's id must not become the
+      // card - its sender would become the owner.
+      if (msg.type === MessageType.PluginCard) rowsOf(msg.id).card = msg;
+      else if (msg.type === MessageType.PluginUpdate) {
+        const cardOf = rowRoute(msg)?.cardId;
+        if (typeof cardOf === "string") rowsOf(cardOf).updates.push(msg);
+      }
+    }
+    held = { version: snapshot.version, byCard };
+  }
+  _roomCardRows.delete(roomCode);
+  _roomCardRows.set(roomCode, held);
+  for (const room of _roomCardRows.keys()) {
+    if (_roomCardRows.size <= ROOM_CARD_ROWS_KEPT) break;
+    _roomCardRows.delete(room);
+  }
+  return held.byCard.get(cardId) ?? { updates: [] };
+}
+
 /**
  * Rebuild state for a plugin card from stored updates.
- * Called on first render of a card, queries storage for all PluginUpdate
- * messages referencing the cardId, folds through the reducer.
+ * Called on first render of a card: reads the card's own rows (its card row
+ * and the updates naming it) and folds them through the reducer.
  */
 export async function buildCardState(
   cardId: string,
@@ -98,10 +180,7 @@ export async function buildCardState(
   // live there); updates only ever mutate it. Plugin rows ONLY: pulling
   // this via getAllMessages decrypted the room's entire history - every
   // text and file message - to rebuild one card, on every cache miss.
-  const allMessages = await getMessagesOfTypes(roomCode, [
-    MessageType.PluginCard,
-    MessageType.PluginUpdate,
-  ]);
+  const own = await cardRows(roomCode, cardId);
   let cardData: unknown = undefined;
   // Who actually posted the card, from the signed row - never from its
   // payload. A plugin that decides ownership needs this and cannot get it
@@ -112,7 +191,7 @@ export async function buildCardState(
   // the definition when the row is missing or malformed keeps a card that is
   // rendering (from an in-memory row) foldable rather than inert.
   let ownerPluginId = definition.manifest.id;
-  const cardMsg = allMessages.find((m) => m.id === cardId);
+  const cardMsg = own.card;
   if (cardMsg) {
     cardCtx = { senderDid: cardMsg.senderDid || cardMsg.senderId };
     try {
@@ -138,20 +217,14 @@ export async function buildCardState(
 
   let state = definition.initialState(cardData, cardCtx);
 
-  // Filter for PluginUpdate messages for this cardId. The pluginId has to
+  // This card's updates, from the plugin that owns it. The pluginId has to
   // match the card's too: the live path picks the reducer from the update's
   // own pluginId, so replaying on cardId alone made storage and the live
   // fold disagree about which plugin owns the card - and let a foreign
   // plugin's payload through this card's reducer on every rebuild.
-  const updates = allMessages.filter((msg) => {
-    if (msg.type !== MessageType.PluginUpdate) return false;
-    try {
-      const payload = JSON.parse(msg.content);
-      return payload.cardId === cardId && payload.pluginId === ownerPluginId;
-    } catch {
-      return false;
-    }
-  });
+  const updates = own.updates.filter(
+    (msg) => rowRoute(msg)?.pluginId === ownerPluginId
+  );
 
   // Sort by fold order (lamport, senderId, id)
   updates.sort(foldComparator);
@@ -350,16 +423,20 @@ export async function getCardState(
 }
 
 /**
- * Clear cached card states. With a roomCode, only that room's entries go -
- * a room SWITCH must not wipe the state of pinned widgets and call tiles
- * following cards in other rooms (their ephemerals dropped unrecoverably in
- * the gap). Without one (disconnect), everything goes.
+ * Clear cached card states. With a roomCode, only that room's entries go:
+ * the room was removed, and must not get its old states back if it is
+ * joined again. Entering a room clears nothing - the states are kept current
+ * by every fold, and rebuilding each card on screen per entry is what made
+ * one member's pile of cards stall everyone's room open. Without a roomCode
+ * (disconnect, lock), everything goes.
  */
 export function clearCardStates(roomCode?: string): void {
   if (roomCode === undefined) {
     cardStates.clear();
+    _roomCardRows.clear();
     return;
   }
+  _roomCardRows.delete(roomCode);
   for (const [cardId, entry] of cardStates) {
     if (entry.roomCode === roomCode) cardStates.delete(cardId);
   }

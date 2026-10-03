@@ -6,7 +6,8 @@ const { state, transport } = vi.hoisted(() => ({
     pendingTransmissions: new Map<string, string>(),
     roomCode: "room", callRoomCode: "room",
   },
-  transport: { peers: () => [], broadcast: vi.fn(), send: vi.fn() },
+  transport: { peers: () => [], broadcast: vi.fn(), send: vi.fn(),
+    isSecureRoom: () => false, sendRoom: vi.fn() },
 }));
 vi.mock("./transport.svelte", () => ({
   transportState: state,

@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { buildCallTiles, type CallState } from "./call-tiles";
+import {
+  buildCallTiles,
+  remoteCameraTileId,
+  wantedCameras,
+  type CallState,
+  type CameraSurfaces,
+} from "./call-tiles";
+import { SPEAKER_TAKEOVER_MS, spotlight } from "./spotlight";
 
 describe("buildCallTiles", () => {
   let state: CallState;
@@ -262,5 +269,151 @@ describe("buildCallTiles", () => {
     expect(screenTile?.startedAt).toBeDefined();
     expect(typeof screenTile?.startedAt).toBe("number");
     expect(screenTile?.startedAt).toBeGreaterThan(0);
+  });
+});
+
+describe("wantedCameras", () => {
+  const camera = (peerId: string, isLocal = false) => ({
+    id: isLocal ? "local-camera" : remoteCameraTileId(peerId),
+    kind: "camera" as const,
+    isLocal,
+    peerId,
+  });
+  const share = (peerId: string) => ({
+    id: `remote-screen-${peerId}`,
+    kind: "screen" as const,
+    isLocal: false,
+    peerId,
+  });
+  const shown = (surfaces: Partial<CameraSurfaces>): CameraSurfaces => ({
+    stage: [],
+    spotlight: null,
+    pinnedTileId: null,
+    poppedOut: [],
+    speaking: [],
+    selfId: "self",
+    ...surfaces,
+  });
+
+  it("is what the stage has on screen when nothing else shows a camera", () => {
+    expect(wantedCameras(shown({ stage: ["a", "b"] }))).toEqual(new Set(["a", "b"]));
+  });
+
+  it("is nothing at all when no surface shows a camera", () => {
+    // Another room open, the panel showing a share: no camera is worth
+    // receiving, where every one used to be decoded at full size.
+    expect(wantedCameras(shown({ spotlight: share("a") }))).toEqual(new Set());
+  });
+
+  it("adds the spotlight's camera: the floating panel and picture in picture show it", () => {
+    expect(
+      wantedCameras(shown({ stage: ["a"], spotlight: camera("b") }))
+    ).toEqual(new Set(["a", "b"]));
+  });
+
+  it("never asks for our own camera, which is not received", () => {
+    expect(
+      wantedCameras(shown({ spotlight: camera("self", true), speaking: ["self"] }))
+    ).toEqual(new Set());
+  });
+
+  it("adds whoever is talking, before the spotlight can move to them", () => {
+    // Rule 3 hands the spotlight over after 1.5 s of speech. Asked for only
+    // at the switch, a parked camera put a black picture in the floating
+    // panel and picture in picture for the round trip it takes to return.
+    expect(
+      wantedCameras(shown({ spotlight: camera("a"), speaking: ["b", "self"] }))
+    ).toEqual(new Set(["a", "b"]));
+  });
+
+  it("adds no one for talking where there is no spotlight to take", () => {
+    // A quick call (/qc) has no AppView, so no floating panel and no picture
+    // in picture: a talker the stage does not show was received for nothing.
+    expect(wantedCameras(shown({ speaking: ["b"] }))).toEqual(new Set());
+    expect(wantedCameras(shown({ stage: ["b"], speaking: ["b"] }))).toEqual(new Set(["b"]));
+  });
+
+  it("asks for a talker at least an unpark's time before the spotlight can move to them", () => {
+    // Bringing a parked camera back is a consume round trip to the SFU, the
+    // local SDP work and a keyframe from the sender: a few hundred
+    // milliseconds on an ordinary call, so a second is a generous ceiling.
+    // The warm-up only beats the black picture while rule 3's takeover stays
+    // above it.
+    const UNPARK_BUDGET_MS = 1_000;
+    expect(SPEAKER_TAKEOVER_MS).toBeGreaterThanOrEqual(UNPARK_BUDGET_MS);
+
+    const track = {} as MediaStreamTrack;
+    const tiles = [
+      { ...camera("self", true), videoTrack: null },
+      { ...camera("a"), videoTrack: track },
+      { ...camera("b"), videoTrack: track },
+    ];
+    const firstWord = 60_000;
+    const speakers = {
+      speaking: new Set(["b"]),
+      speakingSince: new Map([["b", firstWord]]),
+      lastSpokeAt: new Map([
+        ["a", 0],
+        ["b", firstWord],
+      ]),
+    };
+    const incumbent = remoteCameraTileId("a");
+
+    // From b's first word, b's camera is asked for...
+    expect(
+      wantedCameras(shown({ spotlight: camera("a"), speaking: speakers.speaking }))
+    ).toEqual(new Set(["a", "b"]));
+    // ...and the spotlight is still a's when it is back.
+    expect(
+      spotlight(tiles, null, null, speakers, incumbent, firstWord + UNPARK_BUDGET_MS)
+    ).toBe(incumbent);
+    expect(
+      spotlight(tiles, null, null, speakers, incumbent, firstWord + SPEAKER_TAKEOVER_MS)
+    ).toBe(remoteCameraTileId("b"));
+  });
+
+  it("adds no one for talking while a pin holds the spotlight", () => {
+    const pinned = camera("a");
+    expect(
+      wantedCameras(shown({ spotlight: pinned, pinnedTileId: pinned.id, speaking: ["b"] }))
+    ).toEqual(new Set(["a"]));
+  });
+
+  it("adds no one for talking while a watched share holds the spotlight", () => {
+    expect(
+      wantedCameras(shown({ spotlight: share("a"), speaking: ["b"] }))
+    ).toEqual(new Set());
+  });
+
+  it("a pin on a tile that is gone holds nothing", () => {
+    // Rule 1 skips a pin whose tile left; the speakers rule decides again.
+    expect(
+      wantedCameras(
+        shown({ spotlight: camera("a"), pinnedTileId: remoteCameraTileId("gone"), speaking: ["b"] })
+      )
+    ).toEqual(new Set(["a", "b"]));
+  });
+
+  it("adds a camera popped out into its own window, by the stage's tile id", () => {
+    const tiles = buildCallTiles({
+      participants: new Map([
+        ["peer-c", { videoTrack: null, screenTrack: null }],
+      ]),
+      localCameraStream: null,
+      localScreenStream: null,
+      cameraOff: true,
+      watchingTransmissions: new Map(),
+      selfId: "self",
+      trackStartTimes: new Map(),
+    });
+    const popped = tiles.find((t) => t.peerId === "peer-c")!.id;
+    // The stage names its tiles with the same helper.
+    expect(popped).toBe(remoteCameraTileId("peer-c"));
+
+    expect(
+      wantedCameras(
+        shown({ poppedOut: [popped, "remote-screen-peer-d", "local-camera"] })
+      )
+    ).toEqual(new Set(["peer-c"]));
   });
 });
