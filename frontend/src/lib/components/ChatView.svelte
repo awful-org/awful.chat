@@ -592,6 +592,9 @@
    *  reader's. */
   let shifting = false;
 
+  /** Where the last scroll event left the view, to tell up from growth. */
+  let lastScrollTop = 0;
+
   function handleScroll() {
     if (!messagesEl) return;
     const { scrollHeight, scrollTop, clientHeight } = messagesEl;
@@ -601,6 +604,18 @@
     // silently stopped the view from following new arrivals. The bottom of
     // a window short of the newest messages is not the end.
     const atBottom = fromBottom < 120;
+    const movedUp = scrollTop < lastScrollTop - 1;
+    lastScrollTop = scrollTop;
+    // Only the reader scrolling up leaves the bottom. The list growing under
+    // a view that follows it is not that: a code block highlighting, a
+    // picture loading or a synced page landing between our own scroll to
+    // the bottom and that scroll's event made the event read as "left the
+    // bottom", and the view stopped following - a conversation opened
+    // mid-history, under "New messages below". It follows on instead.
+    if (autoScroll && atNewest && !atBottom && !movedUp) {
+      scrollToBottom();
+      return;
+    }
     autoScroll = atBottom && atNewest;
     if (!initialScrollDone || shifting) return;
     if (chatWindow === null && !atBottom) {
