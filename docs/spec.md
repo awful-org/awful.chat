@@ -818,8 +818,9 @@ session, so a held file is decrypted only
     picture, video or sound of 64MB or less - whoever sent it, whatever
     the auto-download setting, since nothing is fetched; newest first, one
     at a time;
-  - or when someone asks for it, whatever its size: its Download button, a
-    plugin, or auto-download as another member's media comes on screen.
+  - or when someone asks for it: its Download button or a plugin, whatever
+    its size, or auto-download as another member's picture, video or sound
+    of 64MB or less comes on screen (files.svelte.ts autoDownloadOnRender).
   Decrypted IN MEMORY from room-v2-ciphertext, or from the row's data when
   this device has no durable copy (which is then written, once) → blobURL.
   Anything else waits for its Download button. An ask nobody made - a

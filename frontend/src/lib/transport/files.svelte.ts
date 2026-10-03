@@ -445,6 +445,47 @@ export function shouldAutoDownload(mimeType: string, size?: number): boolean {
   );
 }
 
+/** infoHashes auto-download asked for as their messages rendered, across
+ *  every message on screen - one ask per file per session, however often
+ *  rows re-render or the same file appears in several rooms. */
+const _askedOnRender = new Set<string>();
+
+/**
+ * Auto-download as a message renders: ask for each of its files that
+ * shouldAutoDownload allows, and that is neither here nor on its way, exactly
+ * as its Download button would. Never asked again after a failure, so a dead
+ * seeder does not turn into a request loop. A stray zip stays a click.
+ *
+ * The ask is a click to the transport (requestFileDownload): a protected
+ * file this device holds is decrypted into memory to be shown, and one it
+ * does not hold is fetched. So the ceiling every other ask nobody made has
+ * holds here too. Without it, another member's held 2 GB video on the loaded
+ * page was decrypted into memory each session, and one not held was fetched,
+ * though nobody had clicked anything. Past the ceiling a file waits for its
+ * Download button; held files of the loaded page within it show by
+ * themselves, whoever sent them (see _showsByItself).
+ *
+ * `transferOf` is a getter, not the map: the transfers are read only for a
+ * file that may be asked for, so a message with nothing to ask for - or
+ * any message, with auto-download off - does not run this again for every
+ * transfer that moves.
+ */
+export function autoDownloadOnRender(
+  files: readonly FileEntry[],
+  transferOf: (infoHash: string) => FileTransferSnapshot | undefined,
+  ask: (file: FileEntry) => void,
+): void {
+  if (!mediaPrefs.autoDownloadMedia) return;
+  for (const file of files) {
+    if (!shouldAutoDownload(file.mimeType, file.size)) continue;
+    const transfer = transferOf(file.infoHash);
+    if (transfer && transfer.status !== "pending") continue;
+    if (_askedOnRender.has(file.infoHash)) continue;
+    _askedOnRender.add(file.infoHash);
+    ask(file);
+  }
+}
+
 export async function fileFingerprint(file: File): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",

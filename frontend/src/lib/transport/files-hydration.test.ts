@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import type { Attachment, Message } from "$lib/types/message";
+import type { Attachment, FileEntry, Message } from "$lib/types/message";
 
 const calls: string[] = [];
 let rows: Attachment[] = [];
@@ -70,8 +70,10 @@ const files = {
     return !!data || durable.has(row.infoHash);
   }),
 };
-const { initFiles, _hydrateAndSeedAttachments, _resetAttachmentHydration, _showLoadedHeldFiles } =
-  await import("./files.svelte");
+const {
+  initFiles, _hydrateAndSeedAttachments, _resetAttachmentHydration, _showLoadedHeldFiles,
+  autoDownloadOnRender, AUTO_DOWNLOAD_MAX_BYTES,
+} = await import("./files.svelte");
 const { mediaPrefs } = await import("$lib/media-prefs.svelte");
 initFiles(files as never);
 
@@ -197,6 +199,69 @@ it("shows a held file whoever sent it and whatever auto-download says, since not
   const own = page(row("old", 1)).map((m) => ({ ...m, senderId: "did:me" }));
   await _showLoadedHeldFiles("rd2_room", own);
   expect(shown()).toEqual(["show:old:store"]);
+});
+
+it("auto-download asks once for a rendered message's media within the ceiling, and reads nothing else", () => {
+  const entry = (infoHash: string, mimeType: string, size: number) =>
+    ({ infoHash, filename: infoHash, mimeType, size }) as FileEntry;
+  const entries = [
+    entry("r-clip", "video/mp4", AUTO_DOWNLOAD_MAX_BYTES),
+    entry("r-film", "video/mp4", AUTO_DOWNLOAD_MAX_BYTES + 1),
+    entry("r-zip", "application/zip", 8),
+    entry("r-shown", "image/png", 8),
+    entry("r-held", "audio/ogg", 8),
+  ];
+  const transfers = new Map([["r-shown", { status: "seeding" }], ["r-held", { status: "pending" }]]);
+  const read: string[] = [];
+  const transferOf = (infoHash: string) => {
+    read.push(infoHash);
+    return transfers.get(infoHash) as never;
+  };
+  const asked: string[] = [];
+  const render = () => autoDownloadOnRender(entries, transferOf, (file) => asked.push(file.infoHash));
+
+  mediaPrefs.autoDownloadMedia = false;
+  render();
+  expect([asked, read]).toEqual([[], []]);
+  mediaPrefs.autoDownloadMedia = true;
+  render();
+  // The row renders again: one ask per file.
+  render();
+  // Past the ceiling it waits for its Download button, like a zip.
+  expect(asked).toEqual(["r-clip", "r-held"]);
+  // Nor are their transfers read, so their rows do not render again with
+  // every transfer that moves.
+  expect(new Set(read)).toEqual(new Set(["r-clip", "r-shown", "r-held"]));
+});
+
+it("as another member's page renders, a held file past the ceiling is left for its button, not decrypted", async () => {
+  const film = { ...row("film", 4), mimeType: "video/mp4", size: AUTO_DOWNLOAD_MAX_BYTES + 1 };
+  rows = [film, row("new", 3)];
+  durable = new Set(["h-film", "h-new"]);
+  // And a picture this device does not hold yet, in a message just arrived.
+  transportState.messages = [...page(...rows), ...page({ ...row("pic", 5), size: 2 * 1024 * 1024 })];
+  await _hydrateAndSeedAttachments("rd2_room");
+  // Auto-download asks as each message renders. Its ask is a click to the
+  // transport (requestFileDownload), which shows a held file from here.
+  const asked: string[] = [];
+  for (const message of transportState.messages) {
+    autoDownloadOnRender(
+      message.meta?.files ?? [],
+      (infoHash) => transportState.fileTransfers.get(infoHash) as never,
+      (file) => {
+        asked.push(file.infoHash);
+        void files.restore!(file.infoHash, true);
+      },
+    );
+  }
+  await settle();
+  // The picture it does not hold is asked for; the film is not.
+  expect(asked).toEqual(["h-pic"]);
+  expect(shown()).toEqual(["show:new:store"]);
+  expect(transportState.fileTransfers.get("h-film")).toMatchObject({ status: "pending", seeders: 1 });
+  // Its Download button shows it from this device's copy.
+  expect(await files.restore!("h-film", true)).toBe(true);
+  expect(shown()).toEqual(["show:new:store", "show:film:store"]);
 });
 
 it("tries a held file that will not open once, not every time the page changes", async () => {

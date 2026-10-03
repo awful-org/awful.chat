@@ -1,11 +1,6 @@
 <script module lang="ts">
   import { MediaQuery } from "svelte/reactivity";
 
-  /** infoHashes auto-download already asked for, across every message
-   *  component - one request per file per session, however often rows
-   *  re-render or the same file appears in several rooms. */
-  const _autoRequested = new Set<string>();
-
   /** One media query for every message on screen, not a listener each. */
   const narrowScreen =
     typeof window === "undefined" ? null : new MediaQuery("max-width: 639px");
@@ -49,7 +44,11 @@
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
   import { formatSize } from "$lib/utils";
   import { mediaBoxStyle } from "$lib/image-size";
-  import { INLINE_FILE_MAX_BYTES, attachmentHydration } from "$lib/transport/files.svelte";
+  import {
+    INLINE_FILE_MAX_BYTES,
+    attachmentHydration,
+    autoDownloadOnRender,
+  } from "$lib/transport/files.svelte";
 
   import {
     convertImage,
@@ -138,6 +137,18 @@
       : "Queued - will send when the recipient is reachable";
   });
 
+  // Opt-in auto-download: ask for another member's media as its message
+  // renders, as its Download button would, within the ceiling every ask
+  // nobody made has (autoDownloadOnRender).
+  $effect(() => {
+    if (isOwn) return;
+    autoDownloadOnRender(
+      msg.meta?.files ?? [],
+      (infoHash) => fileTransfers.get(infoHash),
+      (file) => onRequestFileDownload(file, msg.senderId)
+    );
+  });
+
   /**
    * Whether a not-yet-loaded media file deserves its skeleton. An active
    * download obviously does. A PENDING one does too when it is small enough
@@ -148,22 +159,6 @@
    * pending file ABOVE the inline cap needs a manual Download click, and a
    * skeleton there would pulse forever next to its own Download button.
    */
-  // Opt-in auto-download: fetch media attachments as soon as their message
-  // renders, exactly what clicking Download would do. Media only - a stray
-  // zip stays a manual click - and never retried after a failure, so a dead
-  // seeder does not turn into a request loop.
-  $effect(() => {
-    if (!mediaPrefs.autoDownloadMedia || isOwn) return;
-    for (const file of msg.meta?.files ?? []) {
-      if (!/^(image|video|audio)\//.test(file.mimeType)) continue;
-      const transfer = fileTransfers.get(file.infoHash);
-      if (transfer && transfer.status !== "pending") continue;
-      if (_autoRequested.has(file.infoHash)) continue;
-      _autoRequested.add(file.infoHash);
-      onRequestFileDownload(file, msg.senderId);
-    }
-  });
-
   function expectsBytesSoon(
     status: string | undefined,
     size: number
