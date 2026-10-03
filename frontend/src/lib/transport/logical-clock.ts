@@ -18,6 +18,11 @@ export function validLamport(value: unknown): value is number {
     value >= 0 && value < Number.MAX_SAFE_INTEGER;
 }
 
+/** The highest lamport this conversation has issued or seen; 0 for none yet. */
+export function observedLamport(room: string): number {
+  return clocks.get(room) ?? 0;
+}
+
 export function observeLamport(room: string, value: number): void {
   if (validLamport(value)) clocks.set(room, Math.max(clocks.get(room) ?? 0, value));
 }

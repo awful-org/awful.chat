@@ -159,6 +159,7 @@ enum MessageType {
   SyncDigest      = "sync_digest",
   SyncBatch       = "sync_batch",
   SyncComplete    = "sync_complete",
+  SyncNone        = "sync_none",        // a digest's answer when no push follows
 }
 
 // NOTE: DM delivery/read receipts are implemented, but NOT via these wire
@@ -363,13 +364,17 @@ interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
 interface WireRoomName     { type: MessageType.RoomName;     name: string }
 
 // sync - wire only
-interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
-interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number }
+interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number>;
+                             nonce?: number }          // echoed by its SyncNone; absent from older senders
+interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number;
+                             live?: boolean            // one send's direct copy, not history repair
+                             order?: "head" | "asc" }  // place in a paced push; absent from older senders
 interface WireSyncComplete { type: MessageType.SyncComplete }
+interface WireSyncNone     { type: MessageType.SyncNone;     nonce?: number }  // the digest it answers; absent from older senders
 
 type AnyWireMessage =
   | WireChatMessage | WireProfile | WireCallPresence | WireRoomName
-  | WireSyncDigest | WireSyncBatch | WireSyncComplete
+  | WireSyncDigest | WireSyncBatch | WireSyncComplete | WireSyncNone
 
 // helpers
 function wireToMessage(wire: WireChatMessage, roomCode: string): Message  // adds roomCode + attachments: []
@@ -391,17 +396,92 @@ type Watermarks = Record<string, number>
 on connect (both peers):
   → send SyncDigest { watermarks }
 
+also sent:
+  → on a gap: a live message more than one past the ROOM's lamport clock
+    (not the sender's last lamport, which jumps whenever someone else
+    spoke) - a digest to its sender, for that message's room. A row missed
+    from one sender while others kept the clock moving is no gap: a
+    reconnect's digests find it, but a frame lost on a channel that stayed
+    up is found only by a digest exchanged before that sender's next
+    message arrives
+  → by the 15s repair tick, to a peer silent that long, for the open room
+    and one background room per tick - backing off per peer and room
+    (15s, 30s, ... up to 5 minutes) while exchanges find nothing missing
+    either way; a message, a push or an exchange that finds a difference
+    starts it over
+
 on receive SyncDigest:
-  → compare their watermarks against mine
-  → push everything they're missing as SyncBatch[] + SyncComplete,
-    NEWEST FIRST: the receiver keeps one page on screen (the newest) and
-    parks the rest in storage, so batch 0 is the page they will render
+  → compare their watermarks against mine, and against the senders I hold
+    rows from - kept in memory per room (one read of the room the first
+    time it is asked about, then every stored row updates it), so a digest
+    that lacks nothing costs no read of the room
+  → push everything they're missing as SyncBatch[] + SyncComplete -
+    throttled per peer and room (10s), the push being what costs; it reads
+    only from the lowest of their watermarks for a sender they are behind
+    on (sync-push.ts), one push at a time per peer and room:
+    - order "head": the newest page first (the 50 rows a page shows, plus
+      any plugin updates between them), so the page they render arrives
+      first; a push that fits on one page has no head
+    - order "asc": everything older, OLDEST first, so whatever part of the
+      push arrives leaves no gap below it
+    - each frame goes out once the room channel accepted the one before
+      (it refuses past 32 frames / 4 MB in flight); 4 back to back, then
+      one per 150ms, which an older receiver on a slow phone - verifying
+      each batch before it reads the next frame - keeps ahead of
+    - a refused frame is retried (250ms, 1s), then the push stops; the
+      SyncComplete goes out only once every batch was accepted
+  → a digest that brings no push - nothing they lack, the push window not
+    open yet, or a read that found nothing - is answered with SyncNone,
+    echoing the digest's nonce, so the asker stops holding its room for it
+    (below). A push already running to that peer answers instead. Older
+    builds never send SyncNone, and ignore it as a type they do not know
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
+  → drop ids already held BEFORE verifying (clear fields, no decrypt): a
+    held row is never overwritten, so its copy needs no verdict, and a held
+    id from another room or sender is refused. Only the rest are verified;
+    a signature that already verified this session is not checked again
   → bulkPut to IDB (idempotent - put by id)
-  → update watermarks (max semantics)
-  → live batch (one send's direct copy): merge into the view now
+  → claim watermarks (max semantics, never regress) - but a watermark says
+    "I hold everything this sender wrote up to here", and nobody offers what
+    is below it again, so a push only claims what cannot skip a row
+    (sync-inbound.ts). A push's batches are handled one at a time, in the
+    order they arrived - a DM's frames, which look the conversation up on
+    the way in, wait in line per peer and conversation so none overtakes
+    the one before it, its SyncComplete included:
+    - "asc" batches claim as each is stored, while every earlier batch of the
+      push was stored too (a missing or refused batch stops the claims)
+    - "head" batches, and an older build's unmarked batches, claim only once
+      the push completes: every batch it announced (totalBatches) arrived,
+      in order - which also tells a cut-off push from a whole one, so it
+      does not wait on SyncComplete either
+    - rows already held count: their stored lamport, not the copy's
+    - while a push into the room is open, or one stopped short and none has
+      completed since, or a digest we sent is unanswered, every other
+      advance there (live messages, our own sends) waits in memory and is
+      written when that ends. A digest is answered by its peer's push (which
+      holds the room itself from its first frame), SyncComplete or a
+      SyncNone carrying that digest's nonce - with two digests out to one
+      peer, the answer to the first does not end the wait the second set;
+      an older build never sends SyncNone, so when it has nothing to push
+      the wait runs out after 15s
+    - those waiting advances count as held when a peer's digest is weighed:
+      a row we stored but have not claimed yet is not one to ask them for.
+      The cost: such a row can sit above rows of its sender we never got,
+      and once it is claimed nobody offers those again - the gap every live
+      message claimed over at once before rooms were held. Asking instead
+      had peers push the held rows back on nearly every exchange in a room
+      with an older build, whose silence holds the room 15s per digest
+    - an older build whose push stops short (it lost batches past the
+      channel's window, newest first) would re-send the same newest rows on
+      every digest: what it delivered is advertised to that peer alone, for
+      the session; every other peer is still asked for everything
+  → live batch (one send's direct copy): claims row by row, like any live
+    message - waiting while the room is held as above - and merges into the
+    view now. In a protected room the sender gives this copy only to roster
+    members its broadcast did not reach - the broadcast already went down
+    the same verified channel to everyone else
   → repair batch: park rows for the view (sync-view.ts), flushed ONCE per
     burst - 250ms quiet, 1s at most, or on SyncComplete. At the flush, rows
     at/above the loaded window's floor are appended; anything below it (or
@@ -412,6 +492,7 @@ on receive SyncBatch:
     after 20s without a frame
 
 on receive SyncComplete:
+  → once the push's batches are all in and handled (or it stalls):
   → flush the room's parked rows; re-sort in-memory list if out of order
   → send SyncDigest to all OTHER connected peers (gossip propagation)
     so data spreads through partial meshes without requiring direct connections

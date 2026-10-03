@@ -66,12 +66,14 @@
     getMessages,
     getLastMessage,
     getUnreadCount,
-    getPeerProfile,
+    getAllPeerProfiles,
+    onMessageStored,
     markRoomSeen,
     putPhonebookEntry,
     requestPersistentStorage,
     type PhonebookEntry,
   } from "$lib/storage";
+  import { DmInboxReads } from "$lib/dm-inbox-reads";
   import { MessageType } from "$lib/types/message";
   import { loadProfile } from "$lib/profile.svelte";
   import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
@@ -362,6 +364,15 @@
   );
   let dmUnread = $state(new Map<string, number>());
   let dmBuildRun = 0;
+  /** Moves once rows were stored into a conversation (dm-inbox-reads.ts). */
+  let dmStored = $state(0);
+  /** The DM list's storage reads, per conversation (dm-inbox-reads.ts). */
+  const dmReads = new DmInboxReads({
+    lastMessage: (roomCode) => getLastMessage(roomCode),
+    unreadCount: (roomCode, lastSeenLamport) =>
+      getUnreadCount(roomCode, lastSeenLamport, selfId()),
+    rebuild: () => (dmStored += 1),
+  });
   // Message requests keep their own badge in the list but stay out of the
   // total: a stranger does not get to light up the app icon.
   const dmUnreadTotal = $derived(
@@ -1332,17 +1343,57 @@
     refreshDmRooms().catch(() => {});
   });
 
+  // A conversation's reads go stale when a row is stored into it, and the
+  // list is built again soon after, whatever path stored it.
+  $effect(() => {
+    const off = onMessageStored((m) => dmReads.noteStored(m.roomCode));
+    return () => {
+      off();
+      dmReads.dispose();
+    };
+  });
+
   $effect(() => {
     roomsStore.dmRooms.length;
     // dmVersion bumps once per DM change; depending on messages.length would
-    // re-run this storage sweep for every message in every room. The maps are
-    // replaced wholesale on update, so identity also catches renames that
-    // .size missed.
+    // re-run this for every message in every room. Not the peer name and
+    // avatar maps: they are replaced on every profile frame and every room
+    // open, and each replacement rebuilt the whole list from storage. Every
+    // place that shows a name or an avatar reads those maps first; what this
+    // list keeps is the fallback for a peer they lack, which only the stored
+    // profile - read here - can supply. dmStored moves soon after rows are
+    // stored into a conversation, for the paths that tell the list nothing
+    // themselves (dm-inbox-reads.ts).
     transportState.dmVersion;
-    transportState.peerNames;
-    transportState.peerAvatars;
+    dmStored;
     (async () => {
       const run = ++dmBuildRun;
+      const alive = () => run === dmBuildRun;
+      // Stored profiles only for a peer the live maps do not name yet - and
+      // then every peer's, in one read that storage keeps until a profile is
+      // written, not two decrypting reads per conversation. Untracked: the
+      // maps must not become what this effect runs on.
+      const unnamed = untrack(() =>
+        roomsStore.dmRooms.some((room) => {
+          const peer = room.participantDid;
+          return !!peer && !transportState.peerNames.has(peerIdToDid(peer)) &&
+            !transportState.peerNames.has(peer);
+        })
+      );
+      const profiles = new Map(
+        unnamed
+          ? (await getAllPeerProfiles().catch(() => [])).map((p) => [p.did, p])
+          : []
+      );
+      if (!alive()) return;
+      // The preview only needs the newest message; loading a full page per
+      // room made every keystroke in any conversation a storage sweep. Read
+      // only for the conversations that changed (dm-inbox-reads.ts).
+      const reads = await dmReads.read(
+        roomsStore.dmRooms.filter((room) => room.participantDid),
+        alive
+      );
+      if (!reads || !alive()) return;
       const next = new Map<string, { text: string; ts: number }>();
       const nextInbox = new Map<
         string,
@@ -1363,9 +1414,8 @@
         if (!peerId) continue;
 
         const did = peerIdToDid(peerId);
-        // The preview only needs the newest message; loading a full page per
-        // room made every keystroke in any conversation a storage sweep.
-        let last = await getLastMessage(room.roomCode);
+        const read = reads.get(room.roomCode);
+        let last = read?.last;
 
         const activeDid = peerIdToDid(transportState.activeDmPeerId ?? "");
         const roomDid = peerIdToDid(peerId);
@@ -1376,16 +1426,14 @@
           last = live[live.length - 1] ?? last;
         }
 
-        const profile = await getPeerProfile(did).catch(() => undefined);
+        const profile = profiles.get(did);
         // In a DM the only remote sender is the peer, so the newest message
         // carries their DID whenever they spoke last.
         const messageDid =
           last && last.senderId !== selfId() && last.senderName !== "You"
             ? last.senderId
             : undefined;
-        const messageProfile = messageDid
-          ? await getPeerProfile(messageDid).catch(() => undefined)
-          : undefined;
+        const messageProfile = messageDid ? profiles.get(messageDid) : undefined;
 
         const nickname =
           messageProfile?.nickname ||
@@ -1423,16 +1471,10 @@
           });
         }
 
-        const self = selfId();
-        const unread = await getUnreadCount(
-          room.roomCode,
-          room.lastSeenLamport,
-          self
-        );
-        unreadNext.set(room.roomCode, unread);
+        unreadNext.set(room.roomCode, read?.unread ?? 0);
       }
 
-      if (run !== dmBuildRun) return;
+      if (!alive()) return;
       dmPreviews = next;
       dmInbox = nextInbox;
       dmUnread = unreadNext;

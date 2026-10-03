@@ -11,6 +11,12 @@ import {
   putRoom,
   getRoom,
   setWatermark,
+  senderMaxLamports,
+  getMessagesAboveWatermarks,
+  commitWatermark,
+  heldWatermarks,
+  holdWatermarks,
+  releaseWatermarks,
   setDeletedFloor,
   deleteMessagesForRoom,
   getDeletedFloor,
@@ -228,6 +234,92 @@ describe("watermarks", () => {
       alice: 4,
       bob: 9,
     });
+  });
+
+  it("waits while a push holds the room, and writes what waited on release", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await setWatermark("room-a", "alice", 5);
+    await setWatermark("room-b", "bob", 3);
+    // Not written, so no digest advertises it yet.
+    expect(await getWatermarksForRoom("room-a")).toEqual({});
+    expect(await getWatermark("room-b", "bob")).toBe(3);
+    // A completed push's own claim is proved, so it does not wait.
+    await commitWatermark("room-a", "carol", 4);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ carol: 4 });
+    await releaseWatermarks("room-a");
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 7, carol: 4 });
+    await setWatermark("room-a", "alice", 9);
+    expect(await getWatermark("room-a", "alice")).toBe(9);
+  });
+
+  it("reads how far a sender reached, an advance still waiting on a hold included", async () => {
+    await setWatermark("room-a", "alice", 5);
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    // The row behind 7 is stored: a deleted DM's floor must cover it.
+    expect(await getWatermark("room-a", "alice")).toBe(7);
+    expect(heldWatermarks("room-a")).toEqual(new Map([["alice", 7]]));
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 5 });
+  });
+
+  it("forgets what waited when the room's history is deleted", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await deleteMessagesForRoom("room-a");
+    expect(heldWatermarks("room-a")).toEqual(new Map());
+    await releaseWatermarks("room-a");
+    expect(await getWatermark("room-a", "alice")).toBe(0);
+    // No longer held: an advance is written at once.
+    await setWatermark("room-a", "bob", 3);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ bob: 3 });
+  });
+});
+
+describe("what a digest and a push read", () => {
+  it("reads a room once for its senders, and stays current as rows are stored", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1], ["bob", 2]]));
+    const reads = getAll.mock.calls.length;
+    expect(reads).toBeGreaterThan(0);
+    await putMessage(msg({ senderId: "alice" }));
+    await bulkPutMessages([msg({ senderId: "carol" })]);
+    for (let i = 0; i < 5; i++) {
+      expect(await senderMaxLamports("room-a")).toEqual(
+        new Map([["alice", 3], ["bob", 2], ["carol", 4]])
+      );
+    }
+    // Every digest after the first is answered from memory.
+    expect(getAll.mock.calls.length).toBe(reads);
+  });
+
+  it("forgets a room whose history is deleted", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" })]);
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1]]));
+    await deleteMessagesForRoom("room-a");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map());
+  });
+
+  it("reads a push only from the lowest watermark the peer has for anyone we hold", async () => {
+    const rows = Array.from({ length: 100 }, (_, i) =>
+      msg({ senderId: i % 2 ? "alice" : "bob" }));
+    await bulkPutMessages(rows);
+    // The room's senders are known already: any digest before this one read them.
+    await senderMaxLamports("room-a");
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 95, bob: 90 });
+    // bob wrote the odd lamports, alice the even ones.
+    expect(missing.map((m) => m.lamport)).toEqual([91, 93, 95, 96, 97, 98, 99, 100]);
+    const lowest = getAll.mock.calls.map(([range]) => (range as IDBKeyRange).lower[1]);
+    expect(Math.min(...lowest)).toBe(91);
+  });
+
+  it("still reads everything for a peer that lacks one of our senders", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 1 });
+    expect(missing.map((m) => m.senderId)).toEqual(["bob"]);
+    expect(await getMessagesAboveWatermarks("room-a", { alice: 1, bob: 2 })).toEqual([]);
   });
 });
 

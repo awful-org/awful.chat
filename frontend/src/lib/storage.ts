@@ -362,11 +362,22 @@ type AppDB = IDBPDatabase<{
 /** Sealed per-room search index: entries serialized as encrypted bytes. */
 export interface SearchIndexRecord {
   roomCode: string;
-  /** Highest lamport of any message folded into `data`. Clear on disk so
-   *  staleness is checkable without a decrypt. */
+  /** Highest lamport of any message folded into `data`. Clear on disk, where
+   *  older builds read it (see STORE_SPECS.searchIndex). */
   lastLamport: number;
   /** JSON bytes of SearchEntry[]; sealed via the `bytes` spec. */
   data: ArrayBuffer;
+  /**
+   * How many of the room's message rows (of every type) sat below
+   * lastLamport when the index was written, all of them folded into `data`
+   * as far as they are searchable. Sealed with the row's other fields.
+   * Absent on rows older builds wrote, which never read it, and on rows
+   * written by a session that could not vouch for every row below - another
+   * tab stored some it never saw: such a row is checked the old way. A count
+   * that still matches means nothing landed underneath the index since, so
+   * only the rows from lastLamport up need reading to bring it current.
+   */
+  rowsBelow?: number;
 }
 
 /**
@@ -1252,12 +1263,15 @@ function _trimTypedRows(keep: string): void {
   }
 }
 
-/** Raw (still-sealed) message rows for a room - one bulk index read. */
-async function _rawRoomMessages(roomCode: string): Promise<Message[]> {
+/**
+ * Raw (still-sealed) message rows for a room - one bulk index read. `from`
+ * is the lowest lamport wanted.
+ */
+async function _rawRoomMessages(roomCode: string, from = 0): Promise<Message[]> {
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   const blindedRange = IDBKeyRange.bound(
-    [blindRoomCode, 0],
+    [blindRoomCode, from],
     [blindRoomCode, Number.MAX_SAFE_INTEGER]
   );
   const results = await database
@@ -1268,7 +1282,7 @@ async function _rawRoomMessages(roomCode: string): Promise<Message[]> {
   // During migration, also query the plaintext range to see unmigrated rows
   if (!isMigrationComplete()) {
     const plaintextRange = IDBKeyRange.bound(
-      [roomCode, 0],
+      [roomCode, from],
       [roomCode, Number.MAX_SAFE_INTEGER]
     );
     const plaintextResults = await database
@@ -1335,7 +1349,22 @@ export async function getMessagesAboveWatermarks(
   roomCode: string,
   watermarks: Record<string, number>
 ): Promise<Message[]> {
-  const rows = await _rawRoomMessages(roomCode);
+  // Only rows above the peer's watermark for a sender it is behind on can be
+  // missing, so the read starts at the lowest of those instead of at the
+  // room's first row: a member back from a short absence lacks the last few
+  // rows, not the whole history. Not the lowest over every sender: one who
+  // posted once, long ago, kept the peer's mark for them at that old row and
+  // dragged nearly every read back to the start of the room. A peer that
+  // lacks a sender entirely still reads from the start.
+  const held = await senderMaxLamports(roomCode);
+  let floor = Infinity;
+  for (const [senderId, max] of held) {
+    const at = watermarks[senderId];
+    const theirs = typeof at === "number" && Number.isSafeInteger(at) ? at : -1;
+    if (theirs < max) floor = Math.min(floor, theirs);
+  }
+  if (floor === Infinity) return [];
+  const rows = await _rawRoomMessages(roomCode, Math.max(0, floor + 1));
   // Build maps of watermarks for both blinded and plaintext forms to handle
   // the migration window. A legacy row has plaintext senderId and needs the
   // plaintext watermark value. Blinded rows need the blinded value. Checking
@@ -1450,6 +1479,52 @@ function _notifyMessageStored(msg: Message): void {
   }
 }
 
+/**
+ * getSenderMaxLamports, kept in memory per room for the session.
+ *
+ * Every digest a peer sent us paid for that read of the room's every row -
+ * one per visible member per repair tick in a quiet room, forever, and a
+ * burst of them queued writes behind it - to answer a question whose answer
+ * only changes when a row is stored. So a room is read once, the first time
+ * it is asked about, and from then on each stored row moves its sender's
+ * entry. The map handed out is a copy, the caller's to change.
+ */
+const _senderMax = new Map<string, { map: Map<string, number>; ready: Promise<void> }>();
+
+export async function senderMaxLamports(roomCode: string): Promise<Map<string, number>> {
+  let entry = _senderMax.get(roomCode);
+  if (!entry) {
+    // In place before the read, so a row stored while it runs still counts.
+    const map = new Map<string, number>();
+    const created = { map, ready: Promise.resolve() };
+    created.ready = getSenderMaxLamports(roomCode).then(
+      (read) => {
+        for (const [senderId, lamport] of read) _raiseSenderMax(map, senderId, lamport);
+      },
+      (err) => {
+        if (_senderMax.get(roomCode) === created) _senderMax.delete(roomCode);
+        throw err;
+      }
+    );
+    _senderMax.set(roomCode, created);
+    entry = created;
+  }
+  await entry.ready;
+  return new Map(entry.map);
+}
+
+function _raiseSenderMax(map: Map<string, number>, senderId: string, lamport: number): void {
+  if (typeof senderId !== "string" || !senderId || !Number.isFinite(lamport)) return;
+  if ((map.get(senderId) ?? -Infinity) < lamport) map.set(senderId, lamport);
+}
+
+onMessageStored((msg) => {
+  const entry = _senderMax.get(msg.roomCode);
+  if (entry) _raiseSenderMax(entry.map, msg.senderId, msg.lamport);
+});
+// Rows belong to the identity that stored them.
+onIdentityLock(() => _senderMax.clear());
+
 export async function putMessage(message: Message, guard: WriteGuard = captureWriteGuard()): Promise<void> {
   const database = await getDB();
   guard();
@@ -1507,9 +1582,55 @@ export async function getSearchIndex(
   }
 }
 
-export async function putSearchIndex(record: SearchIndexRecord): Promise<void> {
+/**
+ * Write a room's sealed search index, unless the room is gone or the row
+ * would not be sealed under the key its entries were read with. Returns
+ * whether it was written.
+ *
+ * An index row exists only while its room has rows. The rows are counted
+ * in one transaction with the write, and deleteMessagesForRoom drops the
+ * row in the transaction that drops the messages, so whichever of the two
+ * runs second, no index outlives its room. That holds across tabs too: a
+ * tab that kept its search corpus after another tab took the node never
+ * hears of a deletion there, and its next write would bring back the text
+ * of every message in the deleted room.
+ */
+export async function putSearchIndex(
+  record: SearchIndexRecord,
+  options: {
+    /**
+     * The row's key as the entries were read: the room code blinded under
+     * the storage key of the time (corpus.svelte.ts). A row that seals to
+     * another key is not written: the storage key changed since, which a
+     * restore does without a lock event, and this session's message text
+     * would be sealed into the database that replaces it.
+     */
+    rowKey?: Blinded;
+    /** The room's rows when the entries were checked against them. Fewer
+     *  by the time of the write means rows were deleted meanwhile. */
+    minRows?: number;
+    /** Asked once the row is sealed, and again right before the write: a
+     *  room deleted in this tab meanwhile must not get the index back. */
+    stillWanted?: () => boolean;
+  } = {}
+): Promise<boolean> {
+  const { rowKey, minRows = 1, stillWanted } = options;
   const database = await getDB();
-  await database.put("searchIndex", await _seal("searchIndex", record));
+  const sealed = await _seal("searchIndex", record);
+  // The index is message text: never on disk unsealed, which an import's
+  // plaintext window (no key armed) would otherwise allow.
+  if (!isSealed(sealed)) return false;
+  if (rowKey !== undefined && sealed.roomCode !== rowKey) return false;
+  const ranges = await _roomLamportRanges(record.roomCode, 0, Number.MAX_SAFE_INTEGER, false);
+  if (stillWanted && !stillWanted()) return false;
+  const tx = database.transaction(["messages", "searchIndex"], "readwrite");
+  const index = tx.objectStore("messages").index("byRoomLamport");
+  const counts = await Promise.all(ranges.map((range) => index.count(range)));
+  const rows = counts.reduce((sum, n) => sum + n, 0);
+  const write = rows >= Math.max(1, minRows) && (!stillWanted || stillWanted());
+  if (write) await tx.objectStore("searchIndex").put(sealed);
+  await tx.done;
+  return write;
 }
 
 export async function deleteSearchIndex(roomCode: string): Promise<void> {
@@ -1645,43 +1766,121 @@ export async function deleteDiagnostics(): Promise<void> {
 }
 
 /**
- * Newest lamport AND row count among a room's rows of the given types, read
- * from CLEAR fields only - the search index staleness check, at no decrypt
- * cost. The count is the half that matters: a repair sync backfills OLDER
- * messages, which move no lamport high-water mark at all, so "lastLamport
- * is current" alone would bless an index that silently lost them.
+ * How many of a room's rows of the given types sit below `below`, read from
+ * CLEAR fields only, at no decrypt cost: the coverage check for a search
+ * index row written without rowsBelow - by an older build, or by a session
+ * that could not vouch for every row (corpus.svelte.ts). The count is what
+ * matters: a repair sync backfills OLDER messages, which move no lamport
+ * high-water mark at all, so "lastLamport is current" alone would bless an
+ * index that silently lost them.
+ *
+ * Every row of the room is read, so such an index row comes here once, and
+ * is written back with its count; countRowsBelow is the check after that.
+ * One bulk read, not a cursor: an await per row held the store for the
+ * whole walk, and a send issued meanwhile waited the better part of a
+ * second.
  */
 export async function getSearchableStats(
   roomCode: string,
-  types: readonly ChatMessageType[]
-): Promise<{ newestLamport: number; count: number }> {
-  const database = await getDB();
+  types: readonly ChatMessageType[],
+  below: number
+): Promise<{ countBelow: number }> {
   const wanted = new Set<ChatMessageType>(types);
-  const blindRoomCode = await blindValue(roomCode);
-  const ranges: Blinded[] = [blindRoomCode];
-  if (!isMigrationComplete()) ranges.push(roomCode as Blinded);
-  let newest = 0;
-  let count = 0;
-  for (const code of ranges) {
-    let cursor = await database
-      .transaction("messages")
-      .store.index("byRoomLamport")
-      .openCursor(
-        IDBKeyRange.bound([code, 0], [code, Number.MAX_SAFE_INTEGER]),
-        "prev"
-      );
-    while (cursor) {
-      if (wanted.has(cursor.value.type)) {
-        newest = Math.max(newest, cursor.value.lamport);
-        count += 1;
-      }
-      cursor = await cursor.continue();
+  let countBelow = 0;
+  for (const row of await _rawRoomMessages(roomCode)) {
+    if (wanted.has(row.type) && row.lamport < below) countBelow += 1;
+  }
+  return { countBelow };
+}
+
+/** The room's index ranges: the blinded one, and during the migration window
+ *  the plaintext one as well. */
+async function _roomLamportRanges(
+  roomCode: string,
+  from: number,
+  to: number,
+  openTop: boolean
+): Promise<IDBKeyRange[]> {
+  const codes: Blinded[] = [await blindValue(roomCode)];
+  if (!isMigrationComplete()) codes.push(roomCode as Blinded);
+  return codes.map((code) => IDBKeyRange.bound([code, from], [code, to], false, openTop));
+}
+
+/**
+ * How many of the room's rows, of any type, sit below `lamport`. The index
+ * counts them in the database itself - no row is read, let alone opened -
+ * which is what makes the search index's coverage check cheap enough to run
+ * every time a room is first searched.
+ */
+export async function countRowsBelow(roomCode: string, lamport: number): Promise<number> {
+  if (lamport <= 0) return 0;
+  const database = await getDB();
+  const ranges = await _roomLamportRanges(roomCode, 0, lamport, true);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const counts = await Promise.all(ranges.map((range) => index.count(range)));
+  return counts.reduce((sum, n) => sum + n, 0);
+}
+
+/**
+ * The room's rows of any type, counted by the index like countRowsBelow:
+ * how many there are, how many of them sit below `lamport`, and the newest
+ * lamport among them. One transaction, so the three agree with each other
+ * and with the writes around them: a row stored meanwhile is in all of them
+ * or in none.
+ */
+export async function countRoomRows(
+  roomCode: string,
+  lamport = 0
+): Promise<{ rows: number; below: number; newest: number }> {
+  const database = await getDB();
+  const all = await _roomLamportRanges(roomCode, 0, Number.MAX_SAFE_INTEGER, false);
+  const under =
+    lamport > 0
+      ? all.map((range) => IDBKeyRange.bound(range.lower, [range.lower[0], lamport], false, true))
+      : [];
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const [rows, below, tops] = await Promise.all([
+    Promise.all(all.map((range) => index.count(range))),
+    Promise.all(under.map((range) => index.count(range))),
+    Promise.all(all.map((range) => index.openKeyCursor(range, "prev"))),
+  ]);
+  const sum = (counts: number[]) => counts.reduce((total, n) => total + n, 0);
+  return {
+    rows: sum(rows),
+    below: sum(below),
+    newest: Math.max(0, ...tops.map((cursor) => (cursor ? cursor.key[1] : 0))),
+  };
+}
+
+/**
+ * The room's rows of the given types from `lamport` up, decrypted, oldest
+ * first: what a search index that ends at `lamport` is missing. type and id
+ * are clear fields, so rows of other types, and rows the index already
+ * holds (`known`), never pay for a decrypt.
+ */
+export async function getSearchableSince(
+  roomCode: string,
+  lamport: number,
+  types: readonly ChatMessageType[],
+  known?: ReadonlySet<string>
+): Promise<Message[]> {
+  const database = await getDB();
+  const ranges = await _roomLamportRanges(roomCode, lamport, Number.MAX_SAFE_INTEGER, false);
+  const index = database.transaction("messages").store.index("byRoomLamport");
+  const wanted = new Set<ChatMessageType>(types);
+  const byId = new Map<string, Message>();
+  for (const rows of await Promise.all(ranges.map((range) => index.getAll(range)))) {
+    for (const row of rows) {
+      if (wanted.has(row.type) && !known?.has(row.id)) byId.set(row.id, row);
     }
   }
-  return { newestLamport: newest, count };
+  const opened = await _openAll<Message>("messages", [...byId.values()]);
+  return opened.sort(compareMessages);
 }
 
 export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
+  _watermarkHolds.delete(roomCode);
+  _senderMax.delete(roomCode);
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   // The room's search index goes with its messages.
@@ -1757,9 +1956,13 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
 
   // Delete in a separate transaction
   const writeTx = database.transaction(
-    ["messages", "attachments", "watermarks"],
+    ["messages", "attachments", "watermarks", "searchIndex"],
     "readwrite"
   );
+  // The index row again, with the rows: another tab may have written it
+  // since the delete above. putSearchIndex counts the rows in its own
+  // transaction, so none is written once they are gone.
+  await writeTx.objectStore("searchIndex").delete(blindRoomCode);
   for (const attId of attachmentIds) {
     await writeTx.objectStore("attachments").delete(attId);
     _attachmentEpoch += 1;
@@ -1780,6 +1983,8 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
   await writeTx.done;
   // Its plugin and reaction rows, held decrypted, go with it.
   _dropTypedRows(roomCode);
+  // Again, now the rows are gone: a read in the meantime counted them.
+  _senderMax.delete(roomCode);
   // The Yjs snapshot lives in its own store; a leftover one would resurrect
   // the shared doc if the same room code is ever joined again. Delete both the
   // blinded key (if migrated) and the plaintext key (if legacy).
@@ -3089,10 +3294,21 @@ export function getDeletedFloor(roomCode: string, senderId: string): Promise<num
   return getWatermark(DELETED_FLOOR + roomCode, senderId);
 }
 
+/**
+ * How far this sender's side of the room reached: the saved watermark, or an
+ * advance a held room is still waiting to write, whichever is higher - that
+ * row is stored all the same. A deleted DM's floor is read through this, and
+ * read from the saved row alone it left out every message that arrived while
+ * the conversation was held, which a relay replaying acked blobs could then
+ * bring back. Digests advertise getWatermarksForRoom, which leaves those
+ * advances out until the hold ends.
+ */
 export async function getWatermark(
   roomCode: string,
   senderId: string
 ): Promise<number> {
+  // Before the read: a release meanwhile writes this value, never loses it.
+  const held = _watermarkHolds.get(roomCode)?.get(senderId) ?? 0;
   const database = await getDB();
   const id = watermarkId(roomCode, senderId);
   const blindedId = await blindValue(id);
@@ -3104,10 +3320,76 @@ export async function getWatermark(
     // be looked up. This is intentional and safe.
     record = await database.get("watermarks", id as Blinded);
   }
-  return record?.maxLamport ?? 0;
+  return Math.max(record?.maxLamport ?? 0, held);
 }
 
+/**
+ * Rooms with a history push in them that has not completed, and the
+ * watermark advances waiting on it.
+ *
+ * A watermark says "I hold everything this sender wrote up to here", and
+ * nobody offers what is below it again. While a push is unfinished, the rows
+ * it stored can sit above rows it has not delivered yet - and a live message
+ * from the same sender would claim straight over that gap, for good. So
+ * while a room is held, setWatermark keeps the advance here, and it is
+ * written when a push into the room completes (sync-inbound.ts decides).
+ * If the session ends first it is simply lost: the next digest asks for
+ * those rows again, and they come back as duplicates a completed push
+ * claims.
+ */
+const _watermarkHolds = new Map<string, Map<string, number>>();
+/** Senders kept per held room; past it an advance is dropped, never grown. */
+const MAX_HELD_SENDERS = 4096;
+// A push belongs to the session that received it.
+onIdentityLock(() => _watermarkHolds.clear());
+
+export function holdWatermarks(roomCode: string): void {
+  if (!_watermarkHolds.has(roomCode)) _watermarkHolds.set(roomCode, new Map());
+}
+
+/**
+ * The advances a held room is waiting to write, by sender. Rows we already
+ * hold: a digest must not advertise them yet (that is the hold), but nor is
+ * a peer that has them ahead of us.
+ */
+export function heldWatermarks(roomCode: string): ReadonlyMap<string, number> {
+  return _watermarkHolds.get(roomCode) ?? new Map();
+}
+
+/** Stop holding the room and write what waited. */
+export async function releaseWatermarks(
+  roomCode: string,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const waiting = _watermarkHolds.get(roomCode);
+  if (!waiting) return;
+  _watermarkHolds.delete(roomCode);
+  for (const [senderId, maxLamport] of waiting) {
+    await commitWatermark(roomCode, senderId, maxLamport, guard);
+  }
+}
+
+/** Advance a watermark - or, while a push into the room is open, wait. */
 export async function setWatermark(
+  roomCode: string,
+  senderId: string,
+  maxLamport: number,
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<void> {
+  const waiting = _watermarkHolds.get(roomCode);
+  if (!waiting) return commitWatermark(roomCode, senderId, maxLamport, guard);
+  guard();
+  if (!Number.isSafeInteger(maxLamport) || maxLamport < 0) return;
+  const at = waiting.get(senderId);
+  if (at === undefined && waiting.size >= MAX_HELD_SENDERS) return;
+  if (at === undefined || at < maxLamport) waiting.set(senderId, maxLamport);
+}
+
+/**
+ * Write a watermark now, holds or not. For a claim already known to skip
+ * nothing: a completed push's rows, or what waited on one.
+ */
+export async function commitWatermark(
   roomCode: string,
   senderId: string,
   maxLamport: number,
@@ -3339,6 +3621,8 @@ export async function wipeLocalDatabase(): Promise<void> {
   }
   invalidatePeerProfilesCache();
   _readableWatermarks.clear();
+  _watermarkHolds.clear();
+  _senderMax.clear();
   await deleteDB(dbName());
   await (await import("./transport/file/ciphertext-store")).wipeCiphertext();
 }
@@ -3351,6 +3635,8 @@ export function closeDatabase(): void {
     db.close();
     db = null;
   }
+  _watermarkHolds.clear();
+  _senderMax.clear();
 }
 
 // ── at-rest migration ────────────────────────────────────────────────────────
