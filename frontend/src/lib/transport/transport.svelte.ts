@@ -421,6 +421,12 @@ interface TransportState {
    */
   historyCapped: boolean;
   /**
+   * The conversation whose stored page transportState.messages holds, once
+   * _loadHistory has put it there; null while one is being read. The chat
+   * view waits for it before it shows a conversation it is opening.
+   */
+  historyRoom: string | null;
+  /**
    * Peers currently reached through a relay circuit rather than directly.
    *
    * A reactive mirror of the transport's own set. The badge reads this, not
@@ -517,6 +523,7 @@ export const transportState = $state<TransportState>({
   peerColors: new Map(),
   peerRoomProfiles: new Map(),
   historyCapped: false,
+  historyRoom: null,
   relayedPeers: new Set(),
   provenPeers: new Set(),
   peerInboxOff: new Set(),
@@ -1641,6 +1648,7 @@ export async function _loadHistory(
   stillCurrent: () => boolean = () => true
 ): Promise<void> {
   const page = { capped: false };
+  transportState.historyRoom = null;
   const [msgs, profiles, roomProfiles] = await Promise.all([
     getMessages(roomCode, undefined, page),
     getAllPeerProfiles(),
@@ -1652,6 +1660,7 @@ export async function _loadHistory(
   // Whether a first read filled a page is the only honest answer to "is
   // there more?", and it is known here and nowhere else.
   transportState.historyCapped = page.capped;
+  transportState.historyRoom = roomCode;
   // Counters are per conversation, including legacy epoch-sized DM counters.
   if (msgs.length > 0) {
     const seen = Math.max(...msgs.map((m) => m.lamport));

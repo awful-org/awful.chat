@@ -102,6 +102,17 @@ function swapIn(pre: HTMLElement, html: string): void {
  */
 const queue: { pre: HTMLElement; live: () => boolean }[] = [];
 let draining = false;
+/** Blocks observed whose first on-screen report has not come in yet. */
+let unreported = 0;
+
+/**
+ * Whether highlighting may still change the height of what is on screen: a
+ * block not yet reported on or off screen, or one queued or being done. The
+ * chat view waits for this before it shows a conversation it is opening.
+ */
+export function highlightBusy(): boolean {
+  return unreported > 0 || draining || queue.length > 0;
+}
 
 function whenIdle(run: () => void): void {
   if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 1000 });
@@ -151,6 +162,7 @@ export function messageBody(html: string): Attachment<HTMLElement> {
     let live = true;
     const isLive = () => live;
     let observer: IntersectionObserver | undefined;
+    let dropUnreported = () => {};
 
     // After this flush: the body's {@html} may not be in the DOM yet when an
     // attachment on its parent runs.
@@ -177,14 +189,26 @@ export function messageBody(html: string): Attachment<HTMLElement> {
       const ahead: IntersectionObserverInit & { scrollMargin?: string } = {
         scrollMargin: "200px",
       };
+      const reported = new WeakSet<Element>();
+      const report = (target: Element) => {
+        if (reported.has(target)) return;
+        reported.add(target);
+        unreported--;
+      };
       observer = new IntersectionObserver((entries) => {
         for (const entry of entries) {
+          report(entry.target);
           if (!entry.isIntersecting) continue;
           observer?.unobserve(entry.target);
           enqueue(entry.target as HTMLElement, isLive);
         }
       }, ahead);
       for (const pre of waiting) observer.observe(pre);
+      unreported += waiting.length;
+      // A body taken down before the observer spoke never will.
+      dropUnreported = () => {
+        for (const pre of waiting) report(pre);
+      };
     });
 
     const reveal = (e: Event): boolean => {
@@ -233,6 +257,7 @@ export function messageBody(html: string): Attachment<HTMLElement> {
     return () => {
       live = false;
       observer?.disconnect();
+      dropUnreported();
       node.removeEventListener("click", onClick);
       node.removeEventListener("keydown", onKeydown);
     };
