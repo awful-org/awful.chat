@@ -1610,8 +1610,12 @@ async function _joinDm(
       // rather than fail a send over a race it already won.
       if (pqState || existing?.pq) throw error;
       const fresh = (await getRoom(roomCode)) as DMRoom | undefined;
-      if (requireSession() !== session || !fresh?.pq) throw error;
-      joinDmConversation(_transport, session, roomCode, peerDid, fresh.pq);
+      if (requireSession() !== session) throw error;
+      // Or the upgrade is still only provisional: our own introduction's
+      // agreement, not stored yet.
+      const pq = fresh?.pq ?? _provisional.get(roomCode);
+      if (!pq) throw error;
+      joinDmConversation(_transport, session, roomCode, peerDid, pq);
     }
     _noteJoin(session, roomCode, account);
     const device = looksLikePeerId(peerIdOrDid) ? peerIdOrDid : didToPeerId(peerDid, _peerIdToDid);
@@ -1623,6 +1627,12 @@ async function _joinDm(
     }
   }
   if (existing) return roomCode;
+  // Our own introduction can finish while the await above runs, and its
+  // agreement comes back through the stranger's hook as a provisional join:
+  // the transport is bound to the hybrid key by then. Stored without it,
+  // the record says classical and every send is refused as a conflicting
+  // capability until a reload.
+  if (!pqState && account === "user") pqState = _provisional.get(roomCode);
   const room: DMRoom = {
     roomCode,
     type: "dm",
