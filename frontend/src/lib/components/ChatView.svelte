@@ -3,6 +3,7 @@
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
   import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
+  import { roomMemberCount } from "$lib/room-members";
   import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
@@ -498,6 +499,10 @@
   let chatWindow = $state<ChatWindow>(null);
   const range = $derived(windowRange(visibleMessages, chatWindow));
   const renderedMessages = $derived(visibleMessages.slice(range.from, range.to));
+  /** The room's people, counted as the member list draws them (room-members.ts). */
+  const memberCount = $derived(
+    roomMemberCount(roomUsers, [identityStore.did ?? "", selfId(), myPeerId()], senderDid)
+  );
   /** The newest message held is mounted. */
   const atNewest = $derived(range.to >= visibleMessages.length);
   /**
@@ -2423,7 +2428,7 @@
             class="gap-1 text-xs shrink-0 border-border text-muted-foreground"
           >
             <Users class="size-3" />
-            {peers.length + 1}
+            {memberCount}
           </Badge>
         {/if}
       </div>
