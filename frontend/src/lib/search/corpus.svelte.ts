@@ -272,6 +272,10 @@ async function saveIndex(roomCode: string, c: RoomCorpus): Promise<void> {
     lastLamport,
     data: encodeIndex(c.entries),
   };
+  // The messages the entries were read from, taken with them. A room
+  // deleted in another tab and filled again there can hold as many rows as
+  // the corpus took in, none of them these: the write checks them by id.
+  const ids = c.entries.map((entry) => entry.id);
   // rowsBelow says the entries hold every searchable row below lastLamport,
   // and the next session trusts it to read only from there up. That holds
   // only while storage has no row this corpus has not seen. Another tab of
@@ -289,6 +293,7 @@ async function saveIndex(roomCode: string, c: RoomCorpus): Promise<void> {
       // Rows deleted while the index is sealed: the write counts them again,
       // in one transaction with it.
       minRows: counts.rows,
+      ids,
       // The room may be deleted in this tab meanwhile - its corpus object
       // is dropped then.
       stillWanted: () => _rooms.get(roomCode) === c,

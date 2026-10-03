@@ -1587,13 +1587,15 @@ export async function getSearchIndex(
  * would not be sealed under the key its entries were read with. Returns
  * whether it was written.
  *
- * An index row exists only while its room has rows. The rows are counted
- * in one transaction with the write, and deleteMessagesForRoom drops the
- * row in the transaction that drops the messages, so whichever of the two
- * runs second, no index outlives its room. That holds across tabs too: a
- * tab that kept its search corpus after another tab took the node never
- * hears of a deletion there, and its next write would bring back the text
- * of every message in the deleted room.
+ * An index row exists only while the rows its entries were read from are
+ * stored. They are checked in one transaction with the write, and
+ * deleteMessagesForRoom drops the row in the transaction that drops the
+ * messages, so whichever of the two runs second, no index outlives its
+ * room. That holds across tabs too: a tab that kept its search corpus after
+ * another tab took the node never hears of a deletion there, and its next
+ * write would bring back the text of every message in the deleted room -
+ * even once the room fills again over there, with as many rows as before,
+ * none of them these.
  */
 export async function putSearchIndex(
   record: SearchIndexRecord,
@@ -1609,12 +1611,16 @@ export async function putSearchIndex(
     /** The room's rows when the entries were checked against them. Fewer
      *  by the time of the write means rows were deleted meanwhile. */
     minRows?: number;
+    /** The ids of the messages the entries were read from. Each must still
+     *  be one of the room's rows: a count alone is met again by a room
+     *  deleted elsewhere and filled again. */
+    ids?: readonly string[];
     /** Asked once the row is sealed, and again right before the write: a
      *  room deleted in this tab meanwhile must not get the index back. */
     stillWanted?: () => boolean;
   } = {}
 ): Promise<boolean> {
-  const { rowKey, minRows = 1, stillWanted } = options;
+  const { rowKey, minRows = 1, ids = [], stillWanted } = options;
   const database = await getDB();
   const sealed = await _seal("searchIndex", record);
   // The index is message text: never on disk unsealed, which an import's
@@ -1625,9 +1631,14 @@ export async function putSearchIndex(
   if (stillWanted && !stillWanted()) return false;
   const tx = database.transaction(["messages", "searchIndex"], "readwrite");
   const index = tx.objectStore("messages").index("byRoomLamport");
-  const counts = await Promise.all(ranges.map((range) => index.count(range)));
-  const rows = counts.reduce((sum, n) => sum + n, 0);
-  const write = rows >= Math.max(1, minRows) && (!stillWanted || stillWanted());
+  // The room's rows by id: keys only, nothing read, let alone opened.
+  const held = new Set(
+    (await Promise.all(ranges.map((range) => index.getAllKeys(range)))).flat()
+  );
+  const write =
+    held.size >= Math.max(1, minRows) &&
+    ids.every((id) => held.has(id)) &&
+    (!stillWanted || stillWanted());
   if (write) await tx.objectStore("searchIndex").put(sealed);
   await tx.done;
   return write;

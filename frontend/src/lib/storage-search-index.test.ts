@@ -19,10 +19,10 @@ import { MessageType, type Message } from "./types/message";
 
 /**
  * A room's sealed search index is the text of every searchable message in
- * it. It is written only while the room has its rows, counted in the
- * transaction that writes it, and only sealed under the key its entries
- * were read with; a room's deletion takes it along in the transaction that
- * takes the rows.
+ * it. It is written only while the room has the rows its entries were read
+ * from, checked in the transaction that writes it, and only sealed under the
+ * key its entries were read with; a room's deletion takes it along in the
+ * transaction that takes the rows.
  */
 
 const KEY = new Uint8Array(32).fill(7);
@@ -73,6 +73,15 @@ it("writes no index for a room that lost rows since they were counted", async ()
   await bulkPutMessages(rows);
   expect(await putSearchIndex(record(), { minRows: 4 })).toBe(false);
   expect(await getSearchIndex("room-a")).toBeUndefined();
+});
+
+// Deleted in another tab and filled again there: as many rows as when the
+// entries were read, but not the messages they were read from.
+it("writes no index whose messages are not all among the room's rows", async () => {
+  await bulkPutMessages(rows);
+  expect(await putSearchIndex(record(), { minRows: 3, ids: ["msg-1", "msg-9"] })).toBe(false);
+  expect(await getSearchIndex("room-a")).toBeUndefined();
+  expect(await putSearchIndex(record(), { minRows: 3, ids: ["msg-1", "msg-2", "msg-3"] })).toBe(true);
 });
 
 // A restore that takes the device over arms the backup's identity with no

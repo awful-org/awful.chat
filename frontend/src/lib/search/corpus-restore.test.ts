@@ -36,8 +36,9 @@ function msg(overrides: Partial<Message> = {}): Message {
 /**
  * The imported account's rows, this room's among them. Stored from a
  * second copy of the storage module, so this one's hook does not take them
- * in: the room then holds as many rows as the corpus has seen, and only the
- * key is left to tell the two accounts apart.
+ * in. Both accounts are members of the room, so the imported account holds
+ * the very messages the corpus was read from, and more: only the key is
+ * left to tell the two accounts apart.
  */
 async function importRestoredRows(rows: Message[]): Promise<void> {
   vi.resetModules();
@@ -67,9 +68,13 @@ it("seals no index of the session a restore replaced under the restored key", as
 
   await initStorageCrypto(RESTORED_KEY);
   await wipeLocalDatabase();
-  await importRestoredRows(
-    Array.from({ length: 40 }, () => msg({ content: "the restored account's" }))
+  const shared = Array.from({ length: 31 }, (_, i) =>
+    msg({ id: `msg-${i + 1}`, lamport: i + 1, content: "the restored account's copy" })
   );
+  await importRestoredRows([
+    ...shared,
+    ...Array.from({ length: 9 }, () => msg({ content: "the restored account's" })),
+  ]);
 
   await vi.advanceTimersByTimeAsync(6 * 60_000);
   await vi.runOnlyPendingTimersAsync();

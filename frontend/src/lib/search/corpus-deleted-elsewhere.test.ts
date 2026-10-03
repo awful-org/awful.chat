@@ -11,7 +11,7 @@ import { clearSearchCorpus, ensureRoomCorpus, saveSearchIndexes } from "./corpus
 // corpus and its pending index write, and never hears of a deletion over
 // there. The write is from memory, so nothing in this tab stops it; the
 // room's rows do. An index is written only while they are all still there
-// (saveIndex), counted again in one transaction with the write
+// (saveIndex), checked again by id in one transaction with the write
 // (putSearchIndex).
 //
 // The other tab is this module graph loaded a second time (vi.resetModules),
@@ -106,6 +106,31 @@ it("does not write the index of a room another tab deleted back once it fills ag
 
   expect(await getSearchIndex("room-a")).toBeUndefined();
 });
+
+// A busy room, or a DM whose sender keeps writing: the rows that arrive
+// over there match, or pass, what this tab took in. A count alone let the
+// write through, and at a tie the next session showed the deleted messages
+// in search, from an index that vouched for every row below it.
+for (const refill of [31, 40]) {
+  it(`does not write the index of a room another tab deleted back once ${refill} rows fill it again`, async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    await bulkPutMessages(Array.from({ length: 30 }, () => msg()));
+    await ensureRoomCorpus("room-a");
+    await putMessage(msg({ content: "said just before the room was deleted" }));
+
+    await deleteRoomFromOtherTab("room-a");
+    await (await otherTab()).bulkPutMessages(
+      Array.from({ length: refill }, () => msg({ content: "said after it was joined again" }))
+    );
+
+    await vi.advanceTimersByTimeAsync(6 * 60_000);
+    await vi.runOnlyPendingTimersAsync();
+    vi.useRealTimers();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    expect(await getSearchIndex("room-a")).toBeUndefined();
+  });
+}
 
 it("does not write the index of a room another tab deletes while it is sealed", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
