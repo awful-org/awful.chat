@@ -163,9 +163,11 @@ do not forward, so a proxied hostname is a TURN server nobody can reach.
 ### Changing the list splits rooms until clients reload
 
 This is the one operational trap. Placement is computed from the list the
-client has, and a client reads that list once, at startup. So a session open
-across the change places rooms using the old list while a freshly loaded one
-uses the new list, and two people in the same room can land on different SFUs.
+client has, and a client reads that list only as it starts (a launch begins
+with the copy the last one kept and takes the served list a moment later, as
+soon as its read of `/config.json` lands). So a session open across the change
+places rooms using the old list while a freshly loaded one uses the new list,
+and two people in the same room can land on different SFUs.
 Chat and presence are unaffected (they go through the relay), so it shows up
 as "video is broken for some people", not as a deploy problem.
 
@@ -173,6 +175,14 @@ A plain page reload is enough to pick up the new list - it no longer waits on
 a service worker update prompt, because nothing about the list is in the
 bundle. Still, change it when the instance is quiet, and leave a removed SFU
 running until you are confident every client has reloaded.
+
+The relay's address (`VITE_RELAY_MULTIADDR`, which changes when the relay
+moves or gets a new key) is read the same way, and a session keeps the relay
+it connected to. A launch gives its read of `/config.json` up to a second
+before it connects, so it normally dials the new address; on a slower link it
+dials the one in the copy it kept and moves over only if that one does not
+answer. While the old relay is still up, those sessions stay on it, apart
+from everyone else, until they reload.
 
 ### What this does and does not do
 

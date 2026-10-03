@@ -13,8 +13,23 @@ import {
 } from "$lib/storage";
 import { roomsStore } from "$lib/rooms.svelte";
 import { hasRoomOverrides, resolveRoomProfile, type RoomProfileFields } from "$lib/room-profile";
-import { broadcastProfile } from "$lib/transport/transport.svelte";
 import { bytesToBase64, sniffImageMime } from "$lib/utils";
+
+/**
+ * Tell the peers about a change. Only an unlocked session has any: the
+ * transport connects after the unlock, disconnects at a lock, and announces
+ * the profile itself to each peer it connects to. The setup screen saves the
+ * name and the avatar through here before the unlock, on a screen that shows
+ * before the app - libp2p, the call stack - has even downloaded
+ * (IdentityGate.svelte), so the transport is imported once there is someone
+ * to tell, not with this module.
+ */
+function broadcastProfile(): void {
+  if (!identityStore.isUnlocked) return;
+  void import("$lib/transport/transport.svelte")
+    .then((transport) => transport.broadcastProfile())
+    .catch(() => {});
+}
 
 interface ProfileStore {
   nickname: string;

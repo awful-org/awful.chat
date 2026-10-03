@@ -1266,8 +1266,21 @@ Manifest: /manifest.webmanifest (vite-plugin-pwa), id "/", scope "/",
 Service Worker: /sw.js. Precaches the shell and hashed assets (not the
   DTLN worklet or shiki grammars, cached on first use); every in-scope
   navigation is answered from the precached index.html, revalidated in the
-  background; /config.json is never cached. registerType "prompt": a new
-  build waits until the user accepts the reload.
+  background; /config.json is never cached by the worker or the HTTP cache.
+  The app keeps the last copy it read in localStorage and a later launch
+  starts from it, applying the fresh read when it lands, so only a first
+  launch waits on the network for it - and a launch of /qs or /qc, which
+  exist only if the fresh read says so. The transport gives a read still
+  in flight up to a second before it connects: the relay it dials is kept
+  for the session. registerType "prompt": a new build waits until the user
+  accepts the reload.
+Startup: the entry bundle is the landing page. /app and /r/ first show the
+  setup or unlock screen from a chunk of their own and fetch the app behind
+  it in idle time, under Save-Data too, since the worker precaches the same
+  chunks; the app mounts at the first unlock and keeps the screen after, its
+  own lock screen included. /qs and /qc are chunks of their own. index.html
+  carries each page's chunk list, which main.ts preloads while /config.json
+  is read.
 Install: the deferred beforeinstallprompt is captured at boot and offered
   once the app is usable; iOS gets Share > Add to Home Screen guidance.
 Share Target: POST /share-target (multipart: title, text, url, files),

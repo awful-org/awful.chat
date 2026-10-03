@@ -191,9 +191,10 @@ iptables DNAT instead, which costs nothing.
 `VITE_API_URL`, `VITE_RELAY_MULTIADDR` and the two SFU variables are the
 instance's own addresses. They are NOT compiled into the app: the frontend
 container writes them to `/config.json` when it starts and the app reads that
-before it mounts, so changing one takes a restart rather than a rebuild. The
-two optional pages, `USE_QS` and `USE_QC`, ride the same file and behave the
-same way: `docker compose up -d frontend` is enough, and `curl
+as it starts (from the copy it kept last time, if it has one, until the fresh
+read lands a moment later), so changing one takes a restart rather than a
+rebuild. The two optional pages, `USE_QS` and `USE_QC`, ride the same file and
+behave the same way: `docker compose up -d frontend` is enough, and `curl
 https://<domain>/config.json` says which of them an instance is serving.
 
 That is also what makes a build checkable. Two instances running the *same

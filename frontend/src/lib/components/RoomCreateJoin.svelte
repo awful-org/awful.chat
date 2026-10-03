@@ -10,6 +10,7 @@
   import { Clipboard, LogIn, Menu, Plus, ScanLine } from "@lucide/svelte";
   import InviteOptions from "./InviteOptions.svelte";
   import QrScanner from "./QrScanner.svelte";
+  import { SCANNER_NOT_LOADED } from "$lib/qr-scanner.svelte";
   import {
     Dialog,
     DialogContent,
@@ -346,7 +347,7 @@
                   <QrScanner
                     onText={handleScannedText}
                     onUnavailable={(message) => {
-                      scanError = /https/i.test(message)
+                      scanError = /https/i.test(message) || message === SCANNER_NOT_LOADED
                         ? message
                         : "Couldn't open the camera. Allow camera access in your browser, or paste the link instead.";
                     }}

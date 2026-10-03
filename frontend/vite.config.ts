@@ -1,5 +1,5 @@
 import tailwindcss from "@tailwindcss/vite";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin, type Rollup } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import path from "path";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
@@ -7,6 +7,74 @@ import { VitePWA } from "vite-plugin-pwa";
 import pkg from "./package.json";
 // @ts-expect-error - plain .mjs, no types, and this file is not type-checked
 import { resolveCommit } from "./scripts/git-commit.mjs";
+
+/**
+ * The chunks (and their CSS) each page outside the startup bundle needs
+ * (src/pages.ts), written into index.html for main.ts, which starts
+ * downloading the current page's while /config.json is still being read.
+ * Only what the entry does not already load, and as inert JSON: the CSP
+ * allows no inline script, and nothing of the page may run before the
+ * configuration is in.
+ */
+function pageChunks(pages: Record<string, string>): Plugin {
+  let base = "/";
+  return {
+    name: "awful:page-chunks",
+    apply: "build",
+    configResolved(config) {
+      base = config.base;
+    },
+    transformIndexHtml: {
+      order: "post",
+      handler(_html, { bundle }) {
+        if (!bundle) return;
+        const chunks = Object.values(bundle).filter(
+          (output): output is Rollup.OutputChunk => output.type === "chunk"
+        );
+        const closure = (roots: Rollup.OutputChunk[]) => {
+          const seen = new Set<string>();
+          const visit = (chunk: Rollup.OutputChunk) => {
+            if (seen.has(chunk.fileName)) return;
+            seen.add(chunk.fileName);
+            for (const file of chunk.imports) {
+              const next = bundle[file];
+              if (next?.type === "chunk") visit(next);
+            }
+          };
+          roots.forEach(visit);
+          return seen;
+        };
+        const withCss = (files: Set<string>) => {
+          const all = new Set(files);
+          for (const file of files) {
+            const output = bundle[file];
+            if (output?.type !== "chunk") continue;
+            for (const css of output.viteMetadata?.importedCss ?? []) all.add(css);
+          }
+          return all;
+        };
+        const startup = withCss(closure(chunks.filter((chunk) => chunk.isEntry)));
+        const lists: Record<string, string[]> = {};
+        for (const [page, source] of Object.entries(pages)) {
+          const chunk = chunks.find((c) => c.facadeModuleId?.endsWith(source));
+          // A renamed page would quietly lose its preload; say so instead.
+          if (!chunk) throw new Error(`[page-chunks] no chunk for ${source}`);
+          lists[page] = [...withCss(closure([chunk]))]
+            .filter((file) => !startup.has(file))
+            .map((file) => base + file);
+        }
+        return [
+          {
+            tag: "script",
+            attrs: { type: "application/json", id: "page-chunks" },
+            children: JSON.stringify(lists),
+            injectTo: "head",
+          },
+        ];
+      },
+    },
+  };
+}
 
 export default defineConfig(({ mode }) => ({
   // Read VITE_* vars from the repo-root .env so bare `pnpm dev` works
@@ -28,6 +96,12 @@ export default defineConfig(({ mode }) => ({
     tailwindcss(),
     svelte(),
     nodePolyfills(),
+    pageChunks({
+      app: "/src/lib/components/AppView.svelte",
+      gate: "/src/lib/components/IdentityGate.svelte",
+      qs: "/src/lib/components/QuickSend.svelte",
+      qc: "/src/lib/components/QuickCall.svelte",
+    }),
     VitePWA({
       registerType: "prompt",
       strategies: "injectManifest",

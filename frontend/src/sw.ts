@@ -148,8 +148,9 @@ registerRoute(new PrecacheRoute(precache));
 
 // Big, rarely-needed assets are kept OUT of the precache (see globIgnores in
 // vite.config.ts) and cached the first time they are actually used instead:
-//   - the DTLN wasm worklet (~8 MB), warmed once in the idle time after
-//     app start and loaded on first voice use
+//   - the DTLN wasm worklet (~8 MB), warmed in idle time once an unlocked
+//     session connects with noise suppression on (worklet-warmup.ts), and
+//     loaded on first voice use
 //   - shiki language chunks (~300 files), fetched only when a code block of
 //     that language is rendered
 // Precaching them cost every visitor ~16 MB on install and on every update.

@@ -1,5 +1,7 @@
 import { parseSecureInvitation } from "./room-security/invitation-format";
-import { parsePairingCode, formatPairingCode } from "./room-security/invitation-pairing";
+// Not invitation-pairing.ts: reading a code must not load the pairing's
+// cryptography, and an invite link is read before this device has an identity.
+import { parsePairingCode, formatPairingCode } from "./room-security/pairing-code";
 
 export type JoinInput =
   | { kind: "pairing"; code: string }
