@@ -139,6 +139,9 @@ function translateTransport(event: string, args: unknown[]): Body | null {
     case "roomPeers": {
       const room = asString(args[0]);
       const list = Array.isArray(args[1]) ? args[1] : [];
+      // count is the members this event names, which is the room's size only
+      // for a rendezvous reply. A protected room's channel proving itself
+      // names just the one member it brought in: one, not the room.
       return ev("rv.peers", {
         room: room ? refs().roomRef(room) : null,
         d: { count: list.length },

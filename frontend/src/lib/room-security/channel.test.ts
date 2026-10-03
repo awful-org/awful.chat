@@ -1,4 +1,26 @@
 import { afterEach, expect, it, vi } from "vitest";
+
+// Counts what still goes through @scure/base's pure-JS base64url: the
+// handshake's 32-byte values, and never a frame's payload or ciphertext.
+const slowCodec = vi.hoisted(() => ({ chars: 0 }));
+vi.mock("@scure/base", async (original) => {
+  const real = await original<typeof import("@scure/base")>();
+  return {
+    ...real,
+    base64urlnopad: {
+      encode: (bytes: Uint8Array) => {
+        const text = real.base64urlnopad.encode(bytes);
+        slowCodec.chars += text.length;
+        return text;
+      },
+      decode: (text: string) => {
+        slowCodec.chars += text.length;
+        return real.base64urlnopad.decode(text);
+      },
+    },
+  };
+});
+
 import { MAX_ROOM_MESSAGE, SecureRoomChannel } from "./channel";
 import { deriveRoomKeys, newRoomSecret } from "./keys";
 
@@ -52,6 +74,17 @@ it("reassembles a multi-megabyte profile before dispatching it exactly once", as
   expect(received.every((byte, index) => byte === data[index])).toBe(true);
 });
 
+it("seals and opens a frame's bytes without the pure-JS codec", async () => {
+  const { a, delivered } = await pair();
+  slowCodec.chars = 0;
+  const data = new Uint8Array(700_000);
+  for (let i = 0; i < data.length; i++) data[i] = i % 253;
+  expect(await a.send(data)).toBe(true);
+  await vi.waitFor(() => expect(delivered).toHaveBeenCalledTimes(1), { timeout: 5000 });
+  expect((delivered.mock.calls[0][0] as Uint8Array).every((byte, i) => byte === data[i])).toBe(true);
+  expect(slowCodec.chars).toBe(0);
+});
+
 it("rejects oversized application messages without closing a healthy channel", async () => {
   const { a, delivered } = await pair();
   expect(await a.send(new Uint8Array(MAX_ROOM_MESSAGE + 1))).toBe(false);
@@ -78,4 +111,30 @@ it("does not send data on an unverified or closed connection", async () => {
   c.close();
   expect(await c.send(new Uint8Array([1]))).toBe(false);
   expect(write).not.toHaveBeenCalled();
+});
+
+it("tells a message that never left apart from one refused or broken on the way", async () => {
+  const { a, b } = await pair();
+  // Refused here: the channel stays up, and a resend elsewhere would bypass the cap.
+  expect(await a.trySend(new Uint8Array(MAX_ROOM_MESSAGE + 1))).toBe("failed");
+  expect(a.verified).toBe(true);
+  expect(await a.trySend(new Uint8Array([1]))).toBe("sent");
+  // Closed before anything was written: safe to send again on a fresh channel.
+  a.close();
+  expect(await a.trySend(new Uint8Array([2]))).toBe("unsent");
+  // Broken part way: some of it may have arrived, so it is not resent.
+  const writes: unknown[] = [];
+  const keys = deriveRoomKeys(newRoomSecret());
+  let peer!: SecureRoomChannel;
+  const c = new SecureRoomChannel(keys, "carol", "dave", "initiator", async (f) => {
+    writes.push(f);
+    if (writes.length > 2) { c.close(); throw new Error("stream gone"); }
+    queueMicrotask(() => peer.receive(f, JSON.stringify(f).length));
+  }, () => {}, () => {});
+  peer = new SecureRoomChannel(keys, "dave", "carol", "responder", async (f) => {
+    queueMicrotask(() => c.receive(f, JSON.stringify(f).length));
+  }, () => {}, () => {});
+  channels.push(c, peer, b);
+  await c.ready;
+  expect(await c.trySend(new Uint8Array(300_000))).toBe("failed");
 });

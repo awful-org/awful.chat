@@ -5,7 +5,6 @@ import { webSockets } from "@libp2p/websockets";
 import { noise } from "@libp2p/noise";
 import { yamux } from "@libp2p/yamux";
 import { LibP2PTransport } from "./transport";
-import { ROOM_PROTOCOL } from "$lib/room-security/stream";
 import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
 import { pairwiseRoomSecret } from "$lib/room-security/pairwise";
 import { hybridPairwiseRoomSecret, type DmPqState } from "$lib/room-security/pq-dm";
@@ -26,9 +25,7 @@ async function peer() {
   const internal = transport as any;
   internal.node = node;
   internal.rendezvousSend = () => {};
-  await node.handle(ROOM_PROTOCOL, (stream, connection) => {
-    internal.attachSecureStream(stream, connection);
-  });
+  await internal.handleRoomStreams(node);
   await node.handle(DM_INTRODUCTION_PROTOCOL, (stream, connection) => {
     internal.attachIntroduction(stream, connection);
   });
@@ -153,3 +150,175 @@ it("uses a protected wire room while delivering local DM scopes in both directio
   await vi.waitFor(() => expect(atAlice).toHaveBeenCalledWith(bob.node.peerId.toString(), new Uint8Array([8]), local));
   expect(alice.transport.rooms()).toEqual([local]);
 }, 15_000);
+
+/** Proven channels one side holds, per room. */
+function channelsPerRoom(transport: LibP2PTransport): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const entry of (transport as any).secureStreams) {
+    if (entry.channel?.verified) counts.set(entry.room, (counts.get(entry.room) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/** Two devices with one real connection between them, sharing `count` rooms. */
+async function sharedRooms(count: number) {
+  const [alice, bob] = await Promise.all([peer(), peer()]);
+  const secrets = Array.from({ length: count }, () => newRoomSecret());
+  const rooms = secrets.map((secret) => alice.transport.joinSecureRoom(secret));
+  for (const secret of secrets) bob.transport.joinSecureRoom(secret);
+  await alice.node.peerStore.merge(bob.node.peerId, { multiaddrs: bob.node.getMultiaddrs() });
+  await alice.node.dial(bob.node.getMultiaddrs());
+  // Both ends hold the connection before rooms are opened over it, as they
+  // do in production, where each side dials (dialPeer) before opening any.
+  await vi.waitFor(() => expect(bob.node.getConnections(alice.node.peerId)).toHaveLength(1));
+  const a = alice.node.peerId.toString(), b = bob.node.peerId.toString();
+  for (const [side, other] of [[alice, b], [bob, a]] as const) {
+    const internal = side.transport as any;
+    // Production dials through the relay first; these two are already connected.
+    internal.dialPeer = async () => {};
+    // identify does this on a real node; the harness starts no listener for it.
+    internal.connectedPeers.add(other);
+  }
+  // Every room from both ends at once, the way a rendezvous reply on one side
+  // and PEER_JOINED on the other set them off.
+  const discover = () => {
+    for (const room of rooms) {
+      (alice.transport as any).verifyDiscoveredRoomPeer(room, b);
+      (bob.transport as any).verifyDiscoveredRoomPeer(room, a);
+    }
+  };
+  return { alice, bob, rooms, a, b, discover };
+}
+
+/**
+ * One frame per room each way, every one sent and arrived in its room - all
+ * at once, or `oneAtATime`, each arriving before the next goes.
+ */
+async function deliversEverywhere({ alice, bob, rooms, a, b }: Awaited<ReturnType<typeof sharedRooms>>, oneAtATime = false) {
+  const atBob = vi.fn(), atAlice = vi.fn();
+  bob.transport.on("message", atBob);
+  alice.transport.on("message", atAlice);
+  const sends = rooms.flatMap((room, i) => [
+    () => alice.transport.sendRoom(b, room, new Uint8Array([i])),
+    () => bob.transport.sendRoom(a, room, new Uint8Array([100 + i])),
+  ]);
+  if (oneAtATime) {
+    for (const [n, send] of sends.entries()) {
+      expect(await send()).toBe(true);
+      await vi.waitFor(() => expect(atBob.mock.calls.length + atAlice.mock.calls.length).toBe(n + 1));
+    }
+  } else {
+    expect((await Promise.all(sends.map((send) => send()))).every(Boolean)).toBe(true);
+  }
+  await vi.waitFor(() => {
+    expect(atBob).toHaveBeenCalledTimes(rooms.length);
+    expect(atAlice).toHaveBeenCalledTimes(rooms.length);
+  }, { timeout: 20_000 });
+  rooms.forEach((room, i) => {
+    expect(atBob).toHaveBeenCalledWith(a, new Uint8Array([i]), room);
+    expect(atAlice).toHaveBeenCalledWith(b, new Uint8Array([100 + i]), room);
+  });
+}
+
+it("gives two devices sharing 40 rooms one channel per room, all delivering both ways", async () => {
+  const pair = await sharedRooms(40);
+  pair.discover();
+  // Past libp2p's old 32 streams per protocol and our old 32 per connection,
+  // with no room left out and no pair holding two.
+  await vi.waitFor(() => {
+    for (const side of [pair.alice, pair.bob]) {
+      const counts = channelsPerRoom(side.transport);
+      expect(pair.rooms.filter((room) => counts.get(room) === 1)).toHaveLength(40);
+      expect(counts.size).toBe(40);
+    }
+  }, { timeout: 30_000 });
+  for (const room of pair.rooms) {
+    expect(pair.alice.transport.isRoomPeer(room, pair.b)).toBe(true);
+    expect(pair.bob.transport.isRoomPeer(room, pair.a)).toBe(true);
+  }
+  await deliversEverywhere(pair);
+}, 60_000);
+
+it("closes the least recently used idle channels past the limit, and reopens them on the next send", async () => {
+  const pair = await sharedRooms(6);
+  const { alice, bob, rooms, a, b } = pair;
+  const roster = vi.fn();
+  alice.transport.on("roomPeers", roster);
+  pair.discover();
+  await vi.waitFor(() => {
+    expect(roster).toHaveBeenCalledTimes(6);
+    for (const room of rooms) expect(bob.transport.isRoomPeer(room, a)).toBe(true);
+  }, { timeout: 20_000 });
+  // Three at most, and no quiet period first, so the next pass - the
+  // reconcile tick's - closes three at once. Set only now: the quiet period
+  // is also what lets the other end finish a handshake before its channel
+  // can close, and at zero a channel could go before Bob had proven it.
+  (alice.transport as any).roomChannelLimits = { total: 3, perConnection: 3, idleMs: 0 };
+  const held = () => [...channelsPerRoom(alice.transport).values()].reduce((sum, n) => sum + n, 0);
+  (alice.transport as any).trimRoomChannels();
+  expect(held()).toBe(3);
+  expect((alice.transport as any).debugStats.roomChannelsClosedIdle).toBe(3);
+  // Closed is not gone: both ends still count the other in, in every room.
+  for (const room of rooms) {
+    expect(alice.transport.isRoomPeer(room, b)).toBe(true);
+    expect(bob.transport.isRoomPeer(room, a)).toBe(true);
+  }
+  // A send from either end opens what the other closed. One at a time: with
+  // no quiet period a channel can close under a frame the other end is
+  // sending that instant, the race ROOM_CHANNEL_QUIET_MS makes rare.
+  await deliversEverywhere(pair, true);
+  // ...without announcing anybody again: a reopened channel is not news.
+  expect(roster).toHaveBeenCalledTimes(6);
+  await vi.waitFor(() => expect(held()).toBeLessThanOrEqual(3));
+}, 60_000);
+
+it("keeps channels used lately open past the limit, and closes the quiet ones first", async () => {
+  const pair = await sharedRooms(4);
+  const { alice, rooms } = pair;
+  (alice.transport as any).roomChannelLimits = { total: 2, perConnection: 2, idleMs: 60_000 };
+  pair.discover();
+  await vi.waitFor(() => expect(channelsPerRoom(alice.transport).size).toBe(4), { timeout: 20_000 });
+  // All four carried their handshake moments ago: the limit bends.
+  expect((alice.transport as any).trimRoomChannels()).toBe(true);
+  expect(channelsPerRoom(alice.transport).size).toBe(4);
+  for (const entry of (alice.transport as any).secureStreams) {
+    if (entry.room === rooms[0]) entry.usedAt -= 180_000;
+    if (entry.room === rooms[1]) entry.usedAt -= 120_000;
+  }
+  expect((alice.transport as any).trimRoomChannels()).toBe(false);
+  expect([...channelsPerRoom(alice.transport).keys()].sort()).toEqual([rooms[2], rooms[3]].sort());
+}, 30_000);
+
+it("stops counting a member once a fresh channel to them is refused", async () => {
+  const pair = await sharedRooms(2);
+  const { alice, bob, rooms, b } = pair;
+  pair.discover();
+  await vi.waitFor(() => expect(channelsPerRoom(alice.transport).size).toBe(2), { timeout: 20_000 });
+  // Bob leaves the first room, and the relay's word of it never reaches Alice.
+  bob.transport.leaveRoom(rooms[0]);
+  await vi.waitFor(() => expect(channelsPerRoom(alice.transport).has(rooms[0])).toBe(false));
+  // A closed channel alone is not a departure...
+  expect(alice.transport.isRoomPeer(rooms[0], b)).toBe(true);
+  // ...but a refused one is.
+  expect(await alice.transport.sendRoom(b, rooms[0], new Uint8Array([1]))).toBe(false);
+  expect(alice.transport.isRoomPeer(rooms[0], b)).toBe(false);
+  expect(alice.transport.isRoomPeer(rooms[1], b)).toBe(true);
+  expect((alice.transport as any).debugStats.roomChannelRefusals).toBeGreaterThan(0);
+}, 30_000);
+
+it("takes the relay's word that a member left, and announces them again when they return", async () => {
+  const pair = await sharedRooms(1);
+  const { alice, rooms: [room], a, b } = pair;
+  const internal = alice.transport as any;
+  pair.discover();
+  await vi.waitFor(() => expect(channelsPerRoom(alice.transport).get(room)).toBe(1), { timeout: 20_000 });
+  for (const entry of [...internal.secureStreams]) entry.close();
+  expect(alice.transport.isRoomPeer(room, b)).toBe(true);
+  internal.handleRendezvousMsg(a, { type: "PEER_LEFT", room, peer: b });
+  expect(alice.transport.isRoomPeer(room, b)).toBe(false);
+  expect(alice.transport.peersInRoom(room)).toEqual([]);
+  const roster = vi.fn();
+  alice.transport.on("roomPeers", roster);
+  expect(await alice.transport.sendRoom(b, room, new Uint8Array([1]))).toBe(true);
+  expect(roster).toHaveBeenCalledWith(room, [b]);
+}, 30_000);

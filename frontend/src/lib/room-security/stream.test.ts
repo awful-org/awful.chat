@@ -27,7 +27,7 @@ class Wire extends EventTarget {
 const handles: ReturnType<typeof attachRoomStream>[] = [];
 afterEach(() => { for (const h of handles) h.close(); handles.length = 0; });
 
-function setup(backpressure = false) {
+function setup(backpressure = false, admit?: (room: string) => boolean) {
   const keys = deriveRoomKeys(newRoomSecret());
   const rooms = new Map([[keys.discoveryId, keys]]);
   const a = new Wire(), b = new Wire();
@@ -35,7 +35,7 @@ function setup(backpressure = false) {
   const onData = vi.fn(), ready = vi.fn(), closed = vi.fn();
   const connection = (peer: string) => ({ status: "open", remotePeer: { toString: () => peer } }) as Connection;
   const inbound = attachRoomStream({ stream: b as unknown as Stream, connection: connection("alice"),
-    local: "bob", rooms, onData, onReady: ready, onClose: closed });
+    local: "bob", rooms, admit, onData, onReady: ready, onClose: closed });
   const outbound = attachRoomStream({ stream: a as unknown as Stream, connection: connection("bob"),
     local: "alice", rooms, initiate: keys, onData: () => {}, onReady: () => {}, onClose: () => {} });
   handles.push(inbound, outbound);
@@ -79,4 +79,15 @@ it("rejects an oversized declared frame before buffering its payload", async () 
   p.b.dispatchEvent(Object.assign(new Event("message"), { data: bytes }));
   expect(p.b.aborted).toBe(true);
   expect(p.onData).not.toHaveBeenCalled();
+});
+
+it("asks before answering a hello, and closes a stream it is told to refuse", async () => {
+  const admit = vi.fn(() => false);
+  const p = setup(false, admit);
+  await expect(p.outbound.getChannel()!.ready).rejects.toThrow();
+  expect(admit).toHaveBeenCalledExactlyOnceWith(p.keys.discoveryId);
+  expect(p.inbound.getChannel()).toBeNull();
+  expect(p.b.aborted).toBe(true);
+  expect(p.ready).not.toHaveBeenCalled();
+  expect(p.closed).toHaveBeenCalledOnce();
 });

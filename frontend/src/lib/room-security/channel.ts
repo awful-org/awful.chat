@@ -1,4 +1,4 @@
-import { base64urlnopad } from "@scure/base";
+import { base64urlnopad } from "./base64url";
 import { DISCOVERY_ID_RE } from "./keys";
 import { openRoomEnvelope, sealRoomEnvelope, MAX_ROOM_PLAINTEXT } from "./envelope";
 import { MembershipSession, type MembershipFrame } from "./session";
@@ -52,6 +52,11 @@ export class SecureRoomChannel {
   }
 
   get verified(): boolean { return !this.closed && this.established; }
+
+  /** Verified with nothing in flight either way, part-received messages included: closing it loses nothing. */
+  get idle(): boolean {
+    return this.verified && this.outgoingFrames === 0 && this.pendingFrames === 0 && !this.assembly;
+  }
 
   receive(frame: unknown, bytes: number): void {
     if (this.closed) return;
@@ -121,14 +126,27 @@ export class SecureRoomChannel {
   private get binding(): string { return this.session.binding; }
 
   async send(data: Uint8Array): Promise<boolean> {
+    return (await this.trySend(data)) === "sent";
+  }
+
+  /**
+   * send, telling a message that never left apart from one that failed on
+   * the way. "unsent": the channel was closed before any of this message was
+   * handed to the stream, so it can go again on a fresh channel without
+   * arriving twice. "failed": refused here (too large, too much queued) or
+   * broken part way through.
+   */
+  async trySend(data: Uint8Array): Promise<"sent" | "unsent" | "failed"> {
+    if (!this.verified) return "unsent";
     const fragments = Math.max(1, Math.ceil(data.length / CHUNK_BYTES));
-    if (!this.verified || data.length > MAX_ROOM_MESSAGE || this.sequence > Number.MAX_SAFE_INTEGER - fragments ||
-        this.outgoingFrames >= 32 || this.outgoingBytes + data.length > 4 * MAX_ROOM_PLAINTEXT) return false;
+    if (data.length > MAX_ROOM_MESSAGE || this.sequence > Number.MAX_SAFE_INTEGER - fragments ||
+        this.outgoingFrames >= 32 || this.outgoingBytes + data.length > 4 * MAX_ROOM_PLAINTEXT) return "failed";
     this.outgoingFrames++;
     this.outgoingBytes += data.length;
     const message = this.sequence;
     this.sequence += fragments;
     const copy = new Uint8Array(data);
+    let handedOver = false;
     const job = this.outgoing.then(async () => {
       if (!this.verified) throw new Error("Room channel closed");
       for (let index = 0; index < fragments; index++) {
@@ -140,11 +158,12 @@ export class SecureRoomChannel {
           data: base64urlnopad.encode(copy.subarray(offset, offset + CHUNK_BYTES)),
         })));
         if (!this.verified) throw new Error("Room channel closed");
+        handedOver = true;
         await this.write(frame);
       }
     });
     this.outgoing = job.catch(() => this.close());
-    try { await job; return true; } catch { return false; }
+    try { await job; return "sent"; } catch { return handedOver ? "failed" : "unsent"; }
     finally { this.outgoingFrames--; this.outgoingBytes -= copy.length; }
   }
 

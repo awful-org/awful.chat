@@ -360,6 +360,9 @@ interface WireChatMessage {
 interface WireProfile      { type: MessageType.Profile;      name: string; did: string | null; avatarUrl: string | null
                              // proof that `did` owns the sending peerId, see Peer Identity Binding
                              peerId?: string; bindingSig?: string }
+// A profile goes to each connected peer once, over one room the two share,
+// and again only when it changes: a room click, a resume or a network change
+// sends it only to peers that were never delivered the current one.
 interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
 interface WireRoomName     { type: MessageType.RoomName;     name: string }
 
@@ -578,7 +581,9 @@ ordering does not make relay reservations independent of UTC.
 
 ```txt
 peer joins room → rendezvous on the Go relay (/awful/rendezvous/2.0.0,
-length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT)
+length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT;
+a stream that fails or drops is reopened after 2 s, doubling to 60 s,
+jittered, and back to 2 s once the relay answers on one)
 → dials peers via libp2p (WebRTC direct, circuit-relay fallback, 3 dial
 attempts with backoff) → gossipsub topic app:room:{roomCode} per room
 
@@ -856,6 +861,30 @@ max per message:   64 KB
 SyncBatch:         max 20 messages per batch
 direct streams:    4-byte big-endian length-prefixed frames
                    (chat DM envelopes, file signaling, rendezvous)
+room channels:     one /awful/room/2.0.0 stream per protected room and peer,
+                   opened by either side; when both open one at once, the
+                   stream the smaller peerId started is kept (as for DM
+                   introductions), even when the larger peer's hello lands
+                   after it proved: for 10 s after, a stream the larger peer
+                   opens for the room is let in beside it and replaces it
+                   only once it proves too. Until it proves or fails, the
+                   smaller peer's sends to them in that room wait for it,
+                   since the larger peer's end of the old one may be gone
+                   up to 256 proven per connection plus 64 handshakes, and
+                   1024 proven in all; past that the least recently used one
+                   quiet for 30 s is closed, and the next send reopens it.
+                   A client from before reopening counts members by open
+                   channels and never reopens one, so one of these closed to
+                   it leaves it silent to us in that room until the relay
+                   lists us to it again or we send there first
+                   a member stays a member while connected, channel open or
+                   not, until the room is left, the relay sends PEER_LEFT, or
+                   a fresh channel is refused twice. No PEER_LEFT comes for a
+                   member who left while our rendezvous was down: the first
+                   send to them, refused, is how we learn it, and until then
+                   they count
+                   openings: 64 at once, the rest queued; a pair the relay
+                   lists that has no channel is retried, 5 s doubling to 5 min
 ```
 
 ---
