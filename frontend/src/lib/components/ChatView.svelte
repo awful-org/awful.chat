@@ -3572,7 +3572,13 @@
         class="hidden"
         onchange={(e) => {
           const target = e.currentTarget as HTMLInputElement;
-          if (target.files?.length) void addFilesToStage(target.files);
+          // Focus goes to the message box once the files are staged: left
+          // on the attach button, the Enter meant to send pressed it again
+          // and opened the picker a second time. After staging, so an Enter
+          // that quick does not find the composer still empty.
+          if (target.files?.length) {
+            void addFilesToStage(target.files).then(() => textareaEl?.focus());
+          }
           target.value = "";
         }}
       />
