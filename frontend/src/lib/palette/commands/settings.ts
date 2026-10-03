@@ -127,7 +127,7 @@ export const settingsCommands: CmdSource = () => {
     title: "Collapsed sidebar",
     keywords: ["toggle", "enable", "disable", "icon rail"],
     group: "Settings",
-    shortcut: ["⌘", "B"],
+    shortcut: ["Mod", "B"],
     badge: displayPrefs.sidebarCollapsed ? "On" : "Off",
     action: {
       kind: "act",

@@ -10,6 +10,7 @@
   import { ChevronRight, CornerDownLeft, X } from "@lucide/svelte";
   import HighlightedText from "./HighlightedText.svelte";
   import type { RankedCmd } from "$lib/palette/types";
+  import { shortcutKeys } from "$lib/platform";
 
   interface Props {
     row: RankedCmd;
@@ -34,6 +35,7 @@
   }: Props = $props();
 
   const opensPage = $derived(row.cmd.action.kind === "page");
+  const shortcut = $derived(row.cmd.shortcut ? shortcutKeys(row.cmd.shortcut) : null);
 </script>
 
 <!--
@@ -89,9 +91,9 @@
     </span>
   {/if}
 
-  {#if row.cmd.shortcut}
+  {#if shortcut}
     <span class="shrink-0 flex items-center gap-0.5">
-      {#each row.cmd.shortcut as key (key)}
+      {#each shortcut as key (key)}
         <kbd
           class="rounded border border-border bg-background px-1 text-[10px] leading-4
                  text-muted-foreground"

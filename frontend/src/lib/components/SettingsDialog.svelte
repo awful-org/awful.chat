@@ -1,5 +1,6 @@
 <script lang="ts">
   import { openPalette, uiState } from "$lib/ui-state.svelte";
+  import { shortcutKeys } from "$lib/platform";
   import {
     Dialog,
     DialogContent,
@@ -165,9 +166,8 @@
     if (!v) onClose();
   };
 
-  /** What the palette's own shortcut is called on this machine. */
-  const modKey =
-    typeof navigator !== "undefined" && /Mac|iPhone|iPad/i.test(navigator.userAgent) ? "⌘" : "Ctrl";
+  /** The palette's own shortcut, as this machine labels it. */
+  const paletteKeys = shortcutKeys(["Mod", "K"]);
 
   /** Settings' tip: close this and open the palette on settings only. */
   function searchInPalette(): void {
@@ -430,7 +430,7 @@
           class="flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
         >
           <span>Tip:</span>
-          <kbd class="rounded border border-border px-1">{modKey}</kbd><kbd class="rounded border border-border px-1">K</kbd>
+          {#each paletteKeys as key (key)}<kbd class="rounded border border-border px-1">{key}</kbd>{/each}
           <span>then</span>
           <kbd class="rounded border border-border px-1">&gt;</kbd>
           <span>finds any setting</span>

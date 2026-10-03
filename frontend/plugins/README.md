@@ -289,7 +289,7 @@ dropped after a minute if nobody looked; a host with no room (the settings
 surface) has nowhere to show one, so there it does nothing - say it in
 your own UI instead.
 
-**Palette commands** add rows to the Ctrl+K palette. List them eagerly in
+**Palette commands** add rows to the Ctrl+K (⌘K on Mac) palette. List them eagerly in
 `manifest.paletteCommands` (`name`, `title`, optional `subtitle`) so the
 palette can draw the row without loading your plugin code; the handler
 that actually runs lives on `paletteCommands` in your definition, keyed by

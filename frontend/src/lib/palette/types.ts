@@ -60,7 +60,11 @@ export interface Cmd {
   icon?: PaletteIcon;
   /** Current value, shown right-aligned. For example "On" for a toggle. */
   badge?: string;
-  /** Keys that trigger this command outside the palette, rendered as `<kbd>`. */
+  /**
+   * Keys that trigger this command outside the palette, rendered as `<kbd>`.
+   * "Mod" is the app's shortcut key, shown as ⌘ on a Mac and Ctrl elsewhere
+   * (see `$lib/platform`).
+   */
   shortcut?: string[];
   /**
    * Destructive. Styled as such, and MUST be paired with a `confirm` page
