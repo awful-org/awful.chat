@@ -4194,10 +4194,10 @@ function _handleDmChatAsync(
     if (!expected || !remoteLamportAllowed(expected, lamport)) return;
     // A message we already hold has nothing new to store: it is answered in
     // a conversation we have, never one made for it.
-    if (
-      (await messageClearFieldsByIds([envelope.payload.id])).size > 0 &&
-      !(await dmRoomExists(senderDid))
-    ) return;
+    const held = (await messageClearFieldsByIds([envelope.payload.id])).size > 0;
+    const existed = await dmRoomExists(senderDid);
+    guard();
+    if (held && !existed) return;
     const roomCode = await ensureDmRoomForPeer(peerId, undefined, { unsolicited: true });
     guard();
     if (!roomCode) {
@@ -4329,6 +4329,15 @@ function _handleDmChatAsync(
         transportState.dmVersion += 1;
         answer(encodeDmReadEnvelope([envelope.payload.id]));
       }
+    } else if (!existed) {
+      // Held after all: another conversation's copy of the same id was
+      // stored while this one was being made (texts carrying one legacy id
+      // at once, from as many minted identities). The conversation made
+      // for this copy keeps nothing, so it is undone and costs this session
+      // nothing (MAX_UNSOLICITED_DMS). Left, it was an empty request that
+      // nothing listed, still charged.
+      await dropDmIfEmpty(roomCode);
+      guard();
     }
 
     // A read outranks an ack on the sender's side, so when one just went

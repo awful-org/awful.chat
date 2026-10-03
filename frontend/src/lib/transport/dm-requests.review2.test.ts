@@ -136,7 +136,7 @@ import { encode } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV3 } from "$lib/messaging";
 import { refreshDmRooms, roomsStore } from "$lib/rooms.svelte";
-import { hashDmRoomCode, type DmPayload } from "./dm-codec";
+import { encodeDmChatEnvelope, hashDmRoomCode, type DmPayload } from "./dm-codec";
 import { newMessageId } from "$lib/message-id";
 import { notifyIdentityLock } from "$lib/identity/lock-events";
 
@@ -470,4 +470,88 @@ describe("whom the user reached out to is forgotten when the identity locks", ()
     expect(s.joined.has(room)).toBe(false);
     disconnectTransport();
   }, 30_000);
+});
+
+// A first contact's text makes its conversation, then stores the message
+// unless getMessage already holds its id. The check made before the
+// conversation (messageClearFieldsByIds) skips the empty id, which
+// getMessage reads like any other; and two copies of one legacy (unbound)
+// id at once both pass it. Either way the conversation kept nothing, was
+// never undone, and stayed charged to MAX_UNSOLICITED_DMS.
+describe("a first-contact text that stores nothing spends nothing", () => {
+  /** A clock that moves past REQUEST_SETTLE_MS between steps: empty requests stop holding a slot. */
+  function steppedClock() {
+    let now = Date.now();
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    return { step: () => { now += 61_000; }, restore: () => spy.mockRestore() };
+  }
+
+  async function honestStrangerGetsThrough(): Promise<void> {
+    const honest = identity().did;
+    await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
+    expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
+  }
+
+  it("however many DID-only strangers send a text under the empty id", async () => {
+    const clock = steppedClock();
+    try {
+      for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+        clock.step();
+        const stranger = identity().did;
+        await deliverMailboxDm(stranger, chat(stranger, "hi", { id: "" }));
+      }
+      clock.step();
+      await honestStrangerGetsThrough();
+    } finally {
+      clock.restore();
+    }
+  }, 60_000);
+
+  it("nor batches under the empty id, whose one row moved from conversation to conversation", async () => {
+    const clock = steppedClock();
+    try {
+      for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
+        clock.step();
+        const stranger = identity();
+        const room = await code(stranger.did);
+        await deliverMailboxBatch(stranger.did, encode({ type: MessageType.SyncBatch, roomCode: room,
+          messages: [signedWire(stranger, room, { id: "" })], batchIndex: 0, totalBatches: 1 }));
+      }
+      // No conversation was left holding nothing.
+      for (const room of await getDMRooms()) expect(await getLastMessage(room.roomCode)).toBeDefined();
+      clock.step();
+      await honestStrangerGetsThrough();
+    } finally {
+      clock.restore();
+    }
+  }, 60_000);
+
+  it("nor introduced strangers sending one legacy id at once", async () => {
+    const introduce = (device: string, did: string) => s.hooks.verified!(device, did, "r2_unused", false);
+    const clock = steppedClock();
+    try {
+      // Sixteen a minute: as many introductions as strangers may join.
+      for (let burst = 0; burst < 4; burst++) {
+        clock.step();
+        const shared = crypto.randomUUID();
+        const strangers = [];
+        for (let i = 0; i < 16; i++) {
+          const who = identity();
+          const device = `12D3-burst${burst}-${i}`;
+          await introduce(device, who.did);
+          const room = await code(who.did);
+          s.roomPeers.set(room, new Set([device]));
+          strangers.push({ who, device, room });
+        }
+        for (const { who, device, room } of strangers) {
+          s.handlers.get("message")!(device, encodeDmChatEnvelope(chat(who.did, "hi", { id: shared })), room);
+        }
+        for (let k = 0; k < 20; k++) await settled();
+      }
+      clock.step();
+      await honestStrangerGetsThrough();
+    } finally {
+      clock.restore();
+    }
+  }, 60_000);
 });
