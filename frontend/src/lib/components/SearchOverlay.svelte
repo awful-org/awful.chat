@@ -18,6 +18,13 @@
   }: { openRoom: (roomCode: string) => void | Promise<void> } = $props();
 
   let query = $state("");
+  /**
+   * What the results are for: the query once typing pauses. Searching every
+   * room on each keystroke stalled the input on the first letter or two,
+   * which match nearly everything, and the next letters queued up behind it.
+   */
+  let settledQuery = $state("");
+  const SETTLE_MS = 150;
   // Selection is tracked by entry id, not index - the palette's own rule:
   // results reorder as sweeps stream in, and an index silently comes to
   // point at a different message than the one highlighted.
@@ -25,7 +32,18 @@
   let inputEl = $state<HTMLInputElement | null>(null);
   let jumping = $state(false);
 
-  const parsed = $derived(parseSearchQuery(query));
+  $effect(() => {
+    const typed = query;
+    // Clearing the box clears the results at once: there is nothing to run.
+    if (!typed.trim()) {
+      settledQuery = typed;
+      return;
+    }
+    const timer = setTimeout(() => (settledQuery = typed), SETTLE_MS);
+    return () => clearTimeout(timer);
+  });
+
+  const parsed = $derived(parseSearchQuery(settledQuery));
 
   /** Room name lookup for row badges and the in: filter. */
   const roomName = $derived.by(() => {
@@ -37,24 +55,44 @@
     return names;
   });
 
+  /**
+   * The previous scope, handed back while the rooms in it are the same. The
+   * room lists are replaced whenever an unread count moves, and a new array
+   * here re-ran the whole search - and restarted the sweeps - for every
+   * message that arrived anywhere while the overlay was open.
+   */
+  let lastScope: string[] = [];
+
   /** The rooms this search covers: the scope room, or active-first all. */
   const scopedRooms = $derived.by(() => {
-    if (searchUi.scope) return [searchUi.scope];
-    const codes: string[] = [];
-    const seen = new Set<string>();
-    const push = (code: string | null) => {
-      if (code && !seen.has(code)) {
-        seen.add(code);
-        codes.push(code);
+    let codes: string[] = [];
+    if (searchUi.scope) {
+      codes = [searchUi.scope];
+    } else {
+      const seen = new Set<string>();
+      const push = (code: string | null) => {
+        if (code && !seen.has(code)) {
+          seen.add(code);
+          codes.push(code);
+        }
+      };
+      push(transportState.roomCode);
+      for (const room of roomsStore.rooms) push(room.roomCode);
+      for (const room of roomsStore.dmRooms) push(room.roomCode);
+      if (parsed.inRoom !== null) {
+        codes = codes.filter((code) =>
+          match((roomName.get(code) ?? code).toLowerCase(), parsed.inRoom!)
+        );
       }
-    };
-    push(transportState.roomCode);
-    for (const room of roomsStore.rooms) push(room.roomCode);
-    for (const room of roomsStore.dmRooms) push(room.roomCode);
-    if (parsed.inRoom === null) return codes;
-    return codes.filter((code) =>
-      match((roomName.get(code) ?? code).toLowerCase(), parsed.inRoom!)
-    );
+    }
+    if (
+      codes.length === lastScope.length &&
+      codes.every((code, i) => code === lastScope[i])
+    ) {
+      return lastScope;
+    }
+    lastScope = codes;
+    return codes;
   });
 
   // Opening (or widening) the search starts the sweeps, active room first.
@@ -156,6 +194,9 @@
       selectedId = results[next].entry.id;
     } else if (e.key === "Enter") {
       e.preventDefault();
+      // Enter means what is in the box, even typed faster than the results
+      // settle.
+      if (settledQuery !== query) settledQuery = query;
       const hit = results[selectedIndex];
       if (hit) void jumpTo(hit);
     }

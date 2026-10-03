@@ -27,8 +27,12 @@ export const uiState = $state({
    * Somebody asked to navigate to one message - a pinned widget jumping to
    * its card. Two owners consume it in sequence: AppView opens the room,
    * ChatView scrolls to the row once the history is on screen and clears it.
+   * `revealed`: the history up to it has been read (revealMessage), so a
+   * row ChatView does not hold even then is not looked for in storage again.
    */
-  jumpToMessage: null as { roomCode: string; messageId: string } | null,
+  jumpToMessage: null as
+    | { roomCode: string; messageId: string; revealed?: boolean }
+    | null,
   /**
    * The screen-share quality picker (ShareScreenDialog, owned by
    * SidebarControls). Three buttons open it - sidebar, call view, palette -
@@ -93,7 +97,8 @@ export function openPalette(query: string | null = null): void {
 
 export function requestJumpToMessage(
   roomCode: string,
-  messageId: string
+  messageId: string,
+  revealed = false
 ): void {
-  uiState.jumpToMessage = { roomCode, messageId };
+  uiState.jumpToMessage = { roomCode, messageId, revealed };
 }

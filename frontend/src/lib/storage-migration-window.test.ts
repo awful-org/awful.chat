@@ -12,6 +12,8 @@ import {
   getAttachmentsByMessage,
   putAttachment,
   getSeedableFiles,
+  countRowsBelow,
+  getSearchableSince,
 } from "./storage";
 import { initStorageCrypto, sealRow, openRow, STORE_SPECS } from "./storage-crypto";
 import type { Message, Attachment } from "./types/message";
@@ -81,6 +83,28 @@ describe("reads during the blind migration window", () => {
       "legacy-2",
       "migrated-1",
     ]);
+  });
+
+  it("counts and tops up BOTH halves for the search index", async () => {
+    const db = await getDB();
+    await db.put("messages", legacyMessage("legacy-1", 1));
+    await db.put("messages", legacyMessage("legacy-2", 2));
+    await putMessage({
+      id: "migrated-1",
+      roomCode: "room-legacy",
+      senderId: "did:key:zAlice",
+      senderName: "Alice",
+      lamport: 3,
+      timestamp: 3,
+      type: "text",
+      content: "after the sweep reached it",
+      attachments: [],
+    } as never);
+
+    expect(await countRowsBelow("room-legacy", 3)).toBe(2);
+    expect(await countRowsBelow("room-legacy", 4)).toBe(3);
+    const since = await getSearchableSince("room-legacy", 2, ["text"] as never);
+    expect(since.map((m) => m.id)).toEqual(["legacy-2", "migrated-1"]);
   });
 
   it("finds a room written before the migration", async () => {
