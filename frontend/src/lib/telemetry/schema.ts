@@ -133,6 +133,7 @@ export type DiagKind =
   | "voice.degraded"
   | "voice.failed"
   | "voice.restart"
+  | "voice.heal"
   | "voice.teardown"
   | "voice.redial.ask"
   | "voice.redial.serve"
@@ -178,7 +179,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 118;
+export const DIAG_KIND_COUNT = 119;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -293,6 +294,7 @@ export const KIND_SEV = {
   "voice.degraded": "warn",
   "voice.failed": "error",
   "voice.restart": "info",
+  "voice.heal": "info",
   "voice.teardown": "info",
   "voice.redial.ask": "info",
   "voice.redial.serve": "info",
