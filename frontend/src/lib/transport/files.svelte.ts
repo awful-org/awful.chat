@@ -776,6 +776,11 @@ async function _keepRowCopies(rows: Attachment[]): Promise<void> {
   const byFile = new Map<string, Attachment[]>();
   for (const row of rows) byFile.set(row.infoHash, [...(byFile.get(row.infoHash) ?? []), row]);
   for (const [infoHash, fileRows] of byFile) {
+    // Whole, or not at all: a write cut short - the tab closed while a
+    // finished download was being kept - leaves an empty file behind, and a
+    // row given that as its copy counted as holding the file.
+    if (!(await getFileTransport().holdsCiphertext(fileRows[0]))) continue;
+    guard();
     const ciphertext = await getFileTransport().persistableCiphertext(infoHash, MAX_PERSISTED_ATTACHMENT_BYTES);
     guard();
     if (!ciphertext) continue;
