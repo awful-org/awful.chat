@@ -3,7 +3,7 @@ import { manifest } from "./manifest";
 import AppCard from "./AppCard.svelte";
 import AppTile from "./AppTile.svelte";
 import { forget, hasAgreed } from "./consent";
-import { initialState, parseAppCommand, playing, presentPlayers, randomToken, reduce, type AppState } from "./logic";
+import { appUrlProblem, initialState, parseAppCommand, playing, presentPlayers, randomToken, reduce, type AppState } from "./logic";
 
 export default definePlugin<AppState>({
   manifest,
@@ -43,7 +43,10 @@ export default definePlugin<AppState>({
     app: async (args: string, host: HostApi) => {
       const parsed = parseAppCommand(args);
       if (!parsed) {
-        throw new Error("Use /app https://example.com, then anything the app should get (up to 256 characters).");
+        throw new Error(
+          appUrlProblem(args.trim().split(/\s/)[0] ?? "") ??
+            "Use /app https://example.com, then anything the app should get (up to 256 characters).",
+        );
       }
       const before = await host.cards().catch(() => []);
       await host.sendCard({

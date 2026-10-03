@@ -242,7 +242,7 @@ whose context holds no repository declares no commit.
 | `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
 | `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
 | `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs, addresses or hostnames whose `X-Forwarded-For` the relay believes. Empty trusts nothing (every request is keyed on its socket peer). The dokploy compose defaults it to `dokploy-traefik`, re-resolved every 30s so it survives Traefik being recreated; name your own proxy if it differs, and add a CDN's ranges when one sits in front. `private` restores the old trust-every-private-range behaviour |
-| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
+| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit, or only an abbreviated sha (a pin is the whole 40-character sha). Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_ALLOWED_ORIGINS` | no | extra origins the SFU accepts a signalling socket from, besides `https://<DOMAIN>` (the compose passes `DOMAIN` to the SFU for this). Required on an SFU satellite, where it is the main instance's origin |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |

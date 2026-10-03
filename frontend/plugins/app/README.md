@@ -66,3 +66,13 @@ is the site's own origin, which it needs for its own storage and cookies; it
 can never be ours, because the site is cross-origin by definition. The
 site's address stays on the tile for as long as it is open, so an app cannot
 pass for the host.
+
+That address is read from the right: in `awful.chat.<padding>.attacker.net`
+the site is `attacker.net`. So wherever it does not fit - the tile, the
+disclosure, the card - it loses its start, never its end, and the path after
+it gives way first. A host longer than 64 characters is refused, and so is
+one that starts with the instance's own name, `www.` or not, which reads as
+the instance itself (and an app on the instance's own address would be the
+app framing itself). Each client judges that against the address it is on,
+so on an instance served under two names, a card can open under one and
+show as unusable under the other.

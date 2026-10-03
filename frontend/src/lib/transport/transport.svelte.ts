@@ -229,75 +229,15 @@ import { noteIdentity, rec, recorderSnapshot, refs } from "../telemetry/recorder
 import { apiUrl, isConfigured, relayMultiaddr, sfuUrls } from "../runtime-config";
 import { faultStats, faultsActive } from "./faults";
 import { initTransmission } from "./transmission.svelte";
+import { createPluginFloodCaps } from "../plugins/flood-cap";
 
 
 /**
- * Check if a plugin message can pass without exceeding its flood cap.
- * Returns true if under limit, false if rate-limited (drop excess).
- *
- * `kind` keeps ephemerals and persisted updates in separate windows: they
- * share this mechanism and its sweep, not their budgets - an ephemeral is a
- * cursor tick, a persisted update is a human pressing a button.
+ * Flood caps for plugin traffic coming in (plugins/flood-cap.ts). True if
+ * the message is within its sender's window, false to drop it.
  */
-function _checkFloodCap(
-  kind: "e" | "u",
-  pluginId: string,
-  senderId: string,
-  limit: number,
-  window: number
-): boolean {
-  const key = `${kind}|${pluginId}|${senderId}`;
-  const now = Date.now();
-  const entry = _ephemeralFloodTrack.get(key);
-
-  // Expired windows were never removed, only overwritten if the same key came
-  // back. A peer varying the key (the receive side keys on a wire-supplied
-  // pluginId) therefore grew this map without bound for the life of the tab -
-  // and every varied key took the "first message" branch, so the cap itself
-  // constrained nothing. Callers now validate the pluginId; sweep anyway, so
-  // an idle map does not keep a window per peer per plugin forever.
-  // Throttled to once per window. Unthrottled, this walked the whole map on
-  // EVERY ephemeral once it passed the threshold - and when the entries are
-  // all still live it deletes nothing, so a busy room paid an O(size) scan
-  // per frame to free zero bytes. Ephemerals are the highest-rate message
-  // type there is (cursors, ticks), which is exactly the wrong place for
-  // that.
-  if (
-    _ephemeralFloodTrack.size > EPHEMERAL_FLOOD_MAX_KEYS &&
-    now >= _ephemeralSweepAt
-  ) {
-    _ephemeralSweepAt = now + EPHEMERAL_FLOOD_WINDOW;
-    for (const [k, v] of _ephemeralFloodTrack) {
-      if (now >= v.resetAt) _ephemeralFloodTrack.delete(k);
-    }
-  }
-
-  if (!entry || now >= entry.resetAt) {
-    // Window expired or first message, start new window
-    _ephemeralFloodTrack.set(key, {
-      count: 1,
-      resetAt: now + window,
-    });
-    return true;
-  }
-
-  if (entry.count < limit) {
-    entry.count += 1;
-    return true;
-  }
-
-  // Exceeded limit, drop this message
-  return false;
-}
-
 function _checkEphemeralFloodCap(pluginId: string, senderId: string): boolean {
-  return _checkFloodCap(
-    "e",
-    pluginId,
-    senderId,
-    EPHEMERAL_FLOOD_LIMIT,
-    EPHEMERAL_FLOOD_WINDOW
-  );
+  return _pluginFlood.ephemeral(pluginId, senderId);
 }
 
 /**
@@ -305,16 +245,20 @@ function _checkEphemeralFloodCap(pluginId: string, senderId: string): boolean {
  * were ever rate-limited, so a peer could push PluginUpdate rows at line rate
  * and each one is a signature verify, an IDB write, a watermark write and a
  * reducer fold. Looser than the ephemeral window because these are human
- * actions - a vote, a spin, a card move - not per-frame ticks.
+ * actions - a vote, a spin, a card move - not per-frame ticks. Per room and
+ * sender: keyed on the pluginId too, a made-up plugin per update was a fresh
+ * window per update.
  */
-function _checkUpdateFloodCap(pluginId: string, senderId: string): boolean {
-  return _checkFloodCap(
-    "u",
-    pluginId,
-    senderId,
-    UPDATE_FLOOD_LIMIT,
-    UPDATE_FLOOD_WINDOW
-  );
+function _checkUpdateFloodCap(roomCode: string, senderId: string, id: string): boolean {
+  return _pluginFlood.update(roomCode, senderId, id);
+}
+
+/**
+ * Cards had no cap at all, and each is stored for good and rendered for
+ * everyone in the room - a member could post them by the thousand.
+ */
+function _checkCardFloodCap(roomCode: string, senderId: string, id: string): boolean {
+  return _pluginFlood.card(roomCode, senderId, id);
 }
 
 /**
@@ -584,22 +528,8 @@ export const transportState = $state<TransportState>({
 
 let _connectPromise: Promise<void> | null = null;
 
-// Ephemeral message flood cap: ~4 per second per plugin per sender.
-// Key: "{pluginId}|{senderId}", value: { count, resetAt }
-const _ephemeralFloodTrack = new Map<
-  string,
-  { count: number; resetAt: number }
->();
-/** Next time the flood map is worth walking; see _checkEphemeralFloodCap. */
-let _ephemeralSweepAt = 0;
-const EPHEMERAL_FLOOD_LIMIT = 4;
-const EPHEMERAL_FLOOD_WINDOW = 1000; // milliseconds
-// Persisted updates: 20 per 10s per plugin per sender. A human clicking as
-// fast as they can stays well inside it; a flooder does not.
-const UPDATE_FLOOD_LIMIT = 20;
-const UPDATE_FLOOD_WINDOW = 10_000; // milliseconds
-// Above this many live windows, sweep the expired ones on the next check.
-const EPHEMERAL_FLOOD_MAX_KEYS = 256;
+// Plugin flood caps; the limits and why live in plugins/flood-cap.ts.
+const _pluginFlood = createPluginFloodCaps();
 
 const BATCH_SIZE = 20;
 export const MAX_PERSISTED_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -2095,15 +2025,20 @@ async function _handleSyncBatch(
       ? _parsePluginPayload(w.type, w.content)
       : null;
     // A LIVE batch is the direct copy of a single live send, so it rides the
-    // same per-sender cap as the gossip copy - otherwise wrapping updates in
-    // live batches routes straight around it. A repair batch is exempt: a
-    // legitimate backfill hands over a room's whole update history at once,
-    // and dropping rows there would lose history rather than delay it.
+    // same per-sender caps as the gossip copy (a message counts once, by id)
+    // - otherwise wrapping updates or cards in live batches routes straight
+    // around them. A repair batch is exempt: a legitimate backfill hands over
+    // a room's whole plugin history at once, and dropping rows there would
+    // lose history rather than delay it. So a member who marks live rows as
+    // repair is not capped here either; what keeps a pile of cards from
+    // stalling a room is that its rows are read once, not this cap.
     if (
       live &&
-      w.type === MessageType.PluginUpdate &&
       pluginPayload &&
-      !_checkUpdateFloodCap(pluginPayload.pluginId, w.senderId)
+      ((w.type === MessageType.PluginUpdate &&
+        !_checkUpdateFloodCap(roomCode, w.senderId, w.id)) ||
+        (w.type === MessageType.PluginCard &&
+          !_checkCardFloodCap(roomCode, w.senderId, w.id)))
     ) {
       continue;
     }
@@ -3297,13 +3232,20 @@ async function _handleChatMessage(
     return;
   }
   // The flood cap covered ephemerals only, so persisted updates - which cost
-  // strictly more (a store, a watermark, a fold) - were unlimited. Dropped
-  // rather than stored: nothing here claims a watermark for it, so a row
-  // wrongly caught by the window is still recoverable through history repair.
+  // strictly more (a store, a watermark, a fold) - were unlimited, and cards,
+  // stored for good and rendered for everyone, still were. Dropped rather
+  // than stored, and nothing here claims a watermark for it - but watermarks
+  // only move forward, so once a later row from the same sender is stored
+  // this one is behind it: it comes back only if the gap that row shows sets
+  // off a sync that wins the race to its watermark, or when the room is
+  // synced from nothing. Hence the sending side keeps to the same caps, with
+  // slack for arrivals that bunch up (plugins/host.ts).
   if (
-    wire.type === MessageType.PluginUpdate &&
     pluginPayload &&
-    !_checkUpdateFloodCap(pluginPayload.pluginId, wire.senderId)
+    ((wire.type === MessageType.PluginUpdate &&
+      !_checkUpdateFloodCap(roomCode, wire.senderId, wire.id)) ||
+      (wire.type === MessageType.PluginCard &&
+        !_checkCardFloodCap(roomCode, wire.senderId, wire.id)))
   ) {
     return;
   }
@@ -4705,9 +4647,10 @@ export async function joinRoom(roomCode: string): Promise<boolean> {
     // for THIS room during the awaits, but without this reset it also kept
     // the room just left, so switching rooms never changed the member list.
     transportState.roomUsers = [];
-    // Only the entered room's cache: wiping everything dropped in-flight
-    // ephemerals for pinned widgets and call tiles following OTHER rooms.
-    clearCardStates(roomCode);
+    // The room's card states are NOT cleared here: every fold keeps them
+    // current, and rebuilding each card on screen per entry is what let one
+    // member's pile of cards stall everyone's room open. Removing the room
+    // (removeRoomCompletely) drops them.
     await _loadHistory(roomCode, stillCurrent);
     // Background, one decrypt pass for blob URLs AND re-seeding: awaiting
     // this froze every room open for as long as its images take to decrypt
@@ -4800,6 +4743,8 @@ export async function removeRoomCompletely(roomCode: string): Promise<void> {
     transportState.connected = false;
   }
   await removeRoom(roomCode);
+  // Its cards' states go with it: joined again, it starts from what is stored.
+  clearCardStates(roomCode);
   const scoped = new Map(transportState.peerRoomProfiles);
   scoped.delete(roomCode);
   transportState.peerRoomProfiles = scoped;

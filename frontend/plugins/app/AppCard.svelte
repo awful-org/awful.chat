@@ -6,14 +6,16 @@
    */
   import { Button } from "$lib/components/ui/button";
   import type { CardProps } from "$lib/plugins/api";
+  import { newestCardOf, watchRoomCards } from "$lib/plugins/call-tiles.svelte";
   import { presentPlayers, type AppState } from "./logic";
+  import { manifest } from "./manifest";
+  import SiteAddress from "./SiteAddress.svelte";
   import SiteIcon from "./SiteIcon.svelte";
 
   let { card, cardState, host }: CardProps<AppState> = $props();
 
   // $derived: a const would capture the prop once and miss every update.
   const app = $derived(cardState);
-  const site = $derived(app.url ? new URL(app.url).host : "");
   const mine = $derived(host.selfDid() === app.starter);
   // The clock, ticking while the app runs: someone whose tab closed sends no
   // "leave", and only time passing takes them off the list.
@@ -28,26 +30,22 @@
 
   // A newer app in this room took the call's tile (the host shows only the
   // newest card per plugin), so this one is over even if its starter never
-  // said so - someone else's /app cannot end it for them.
-  let replaced = $state(false);
+  // said so - someone else's /app cannot end it for them. Which card is the
+  // newest comes from the call tiles' own answer, which moves only when a
+  // card is stored: asking host.cards() on every card-state change re-read
+  // the room's cards for every vote and every heartbeat, from every app
+  // card on screen. Watched on the flag and the room, not on the objects
+  // carrying them: every heartbeat is a new state, every status change
+  // (sent, delivered) a new message, and a watch rebuilt for each let a
+  // replaced card pass for running until the room was read again.
+  const ended = $derived(app.ended);
+  const roomCode = $derived(card.roomCode);
   $effect(() => {
-    // Replaced stays replaced: stop asking once it is.
-    if (app.ended || replaced) return;
-    let alive = true;
-    const check = () =>
-      void host
-        .cards()
-        .then((cards) => {
-          if (alive) replaced = cards.length > 0 && cards[cards.length - 1].id !== card.id;
-        })
-        .catch(() => {});
-    check();
-    const off = host.onCardStateChange(check);
-    return () => {
-      alive = false;
-      off();
-    };
+    if (ended) return;
+    return watchRoomCards(roomCode);
   });
+  const newest = $derived(newestCardOf(roomCode, manifest.id));
+  const replaced = $derived(!!newest && newest !== card.id);
 
   async function end(): Promise<void> {
     if (ending) return;
@@ -64,13 +62,14 @@
 
 <div class="flex w-full flex-col gap-2 font-mono">
   {#if !app.url}
-    <p class="text-xs text-muted-foreground">This app can't be opened: its address is missing or not https.</p>
+    <p class="text-xs text-muted-foreground">This app can't be opened: its address is missing, not https, or not one an app may use.</p>
   {:else}
     <div class="flex items-center gap-2">
       <SiteIcon url={app.url} class="size-8 text-sm" />
+      <!-- Never cut at the end: that is where the site's real name is. -->
       <div class="min-w-0">
-        <p class="truncate text-sm font-semibold text-foreground">{site}</p>
-        <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>
+        <SiteAddress url={app.url} class="text-sm font-semibold text-foreground" />
+        <SiteAddress url={app.url} path class="text-[11px] text-muted-foreground" />
       </div>
     </div>
     {#if app.args}

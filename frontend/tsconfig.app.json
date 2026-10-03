@@ -36,6 +36,8 @@
     "src/**/*.ts",
     "src/**/*.js",
     "src/**/*.svelte",
+    "plugins/app/**/*.ts",
+    "plugins/app/**/*.svelte",
     "plugins/ping/**/*.ts",
     "plugins/ping/**/*.svelte",
     "plugins/poll/**/*.ts",
