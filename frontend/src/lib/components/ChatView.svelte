@@ -242,6 +242,7 @@
   $effect(() => {
     roomCode;
     initialScrollDone = false;
+    untrack(beginSettling);
     autoScroll = true;
     chatWindow = null;
     // hasMoreHistory too. This component is not keyed by room, so switching
@@ -711,6 +712,7 @@
     autoScroll = true;
     initialScrollDone = false;
     hasMoreHistory = true;
+    untrack(beginSettling);
   });
 
   // New rows at the newest end are what grows the held list while it is
@@ -760,6 +762,68 @@
     });
   });
 
+  /**
+   * Opening a conversation lands in several steps: the stored page renders,
+   * the view jumps to its newest row, code blocks and markdown settle to
+   * their final height, then the history peers push in arrives and the view
+   * jumps again. Each step moved what was on screen, and together they read
+   * as the chat flickering. So the rows render hidden behind a skeleton until
+   * they have landed - the view anchored and nothing changing for a moment -
+   * and are shown once, in place. Never for long: a slow sync or a slow
+   * device gets the real rows after SETTLE_MAX_MS whatever is still moving.
+   */
+  const SETTLE_QUIET_MS = 300;
+  /** An empty room has no rows to wait for: this long with none, and it is. */
+  const SETTLE_EMPTY_MS = 700;
+  const SETTLE_MAX_MS = 2500;
+  let settling = $state(true);
+  let settleQuiet: ReturnType<typeof setTimeout> | undefined;
+  let settleCap: ReturnType<typeof setTimeout> | undefined;
+
+  function beginSettling() {
+    clearTimeout(settleQuiet);
+    clearTimeout(settleCap);
+    settling = true;
+    settleCap = setTimeout(endSettling, SETTLE_MAX_MS);
+    noteSettleActivity();
+  }
+
+  function endSettling() {
+    clearTimeout(settleQuiet);
+    clearTimeout(settleCap);
+    if (!settling) return;
+    if (autoScroll) scrollToBottom();
+    settling = false;
+  }
+
+  /** Something moved: the quiet period starts over. */
+  function noteSettleActivity() {
+    if (!settling) return;
+    clearTimeout(settleQuiet);
+    settleQuiet = setTimeout(
+      () => {
+        // A sync into this room is still running: its rows are part of the
+        // landing, so only the cap ends it early.
+        if (untrack(() => syncing) !== null) return;
+        if (initialScrollDone || untrack(() => visibleMessages.length) === 0) endSettling();
+      },
+      untrack(() => visibleMessages.length) === 0 ? SETTLE_EMPTY_MS : SETTLE_QUIET_MS
+    );
+  }
+
+  onDestroy(() => {
+    clearTimeout(settleQuiet);
+    clearTimeout(settleCap);
+  });
+
+  $effect(() => {
+    visibleMessages.length;
+    renderedMessages.length;
+    initialScrollDone;
+    syncing;
+    untrack(noteSettleActivity);
+  });
+
   // Scroll on new messages if autoScroll is enabled
   $effect(() => {
     visibleMessages.length;
@@ -789,6 +853,7 @@
   $effect(() => {
     if (!messagesEl || typeof MutationObserver === "undefined") return;
     const observer = new MutationObserver(() => {
+      noteSettleActivity();
       if (autoScroll) {
         requestAnimationFrame(() => scrollToBottom());
       }
@@ -2930,452 +2995,474 @@
         </div>
       </div>
     {/if}
-    <!-- The touch handlers are the swipe-right-for-sidebar gesture; the
-         header button is its accessible equivalent. -->
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div
-      bind:this={messagesEl}
-      onscroll={handleScroll}
-      ontouchstart={isMobile && onOpenSidebar ? regionTouchStart : undefined}
-      ontouchmove={isMobile && onOpenSidebar ? regionTouchMove : undefined}
-      ontouchend={isMobile ? () => (regionSwipe = null) : undefined}
-      ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
-      style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
-        ? ' touch-action: pan-y;'
-        : ''}{following ? ' overflow-anchor: none;' : ''}"
-      class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
-    >
-      <!-- A room moved from an old one carries that room's history on top,
-           once the new room's own history has run out above. -->
-      {#if movedFromRoom && !canLoadOlder && range.from === 0}
-        <ArchivedHistory roomCode={movedFromRoom.roomCode} roomName={movedFromRoom.name} />
-      {/if}
-      {#if (canLoadOlder || range.from > 0) && visibleMessages.length > 0}
-        <div class="flex justify-center py-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onclick={showOlderRows}
-            disabled={loadingMore}
-            class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
-          >
-            <ChevronUp class="size-3.5" />
-            {loadingMore ? "Loading..." : "Load older messages"}
-          </Button>
-        </div>
-      {/if}
+    <!-- The list and, while it lands, a skeleton over it (see beginSettling).
+         Covered, not hidden or unmounted: the rows lay out and the view
+         anchors and follows behind it exactly as it does in plain sight, so
+         what is revealed is already in place. -->
+    <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
+      <!-- The touch handlers are the swipe-right-for-sidebar gesture; the
+           header button is its accessible equivalent. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        bind:this={messagesEl}
+        onscroll={handleScroll}
+        ontouchstart={isMobile && onOpenSidebar ? regionTouchStart : undefined}
+        ontouchmove={isMobile && onOpenSidebar ? regionTouchMove : undefined}
+        ontouchend={isMobile ? () => (regionSwipe = null) : undefined}
+        ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
+        style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
+          ? ' touch-action: pan-y;'
+          : ''}{following ? ' overflow-anchor: none;' : ''}"
+        class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
+      >
+        <!-- A room moved from an old one carries that room's history on top,
+             once the new room's own history has run out above. -->
+        {#if movedFromRoom && !canLoadOlder && range.from === 0}
+          <ArchivedHistory roomCode={movedFromRoom.roomCode} roomName={movedFromRoom.name} />
+        {/if}
+        {#if (canLoadOlder || range.from > 0) && visibleMessages.length > 0}
+          <div class="flex justify-center py-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onclick={showOlderRows}
+              disabled={loadingMore}
+              class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
+            >
+              <ChevronUp class="size-3.5" />
+              {loadingMore ? "Loading..." : "Load older messages"}
+            </Button>
+          </div>
+        {/if}
 
-      {#if visibleMessages.length === 0}
-        <div class="flex h-full items-center justify-center py-20">
-          <p class="select-none text-sm text-muted-foreground italic">
-            No messages yet. Say something!
-          </p>
-        </div>
-      {:else}
-        <div class="space-y-0.5">
-          {#each renderedMessages as msg, i (msg.id)}
-            <!-- The first row mounted reads as first, date and name shown,
-                 whatever is held above it: rows landing above the window
-                 change nothing on screen until the window takes them in,
-                 which it does without moving the view (anchored). -->
-            {@const prev = renderedMessages[i - 1]}
-            {@const showDate = shouldShowDateSep(
-              msg.timestamp,
-              prev?.timestamp
-            )}
-            {@const showHeader = shouldShowHeader(msg, prev)}
-            {@const isOwn = isSelfSender(msg.senderId)}
-            {@const reactions = reactionsByMessage.get(msg.id)}
-            <div>
-              {#if showDate}
-                <div class="flex items-center gap-3 py-3">
-                  <Separator class="flex-1 bg-border" />
-                  <span class="text-xs text-muted-foreground"
-                    title="Reported message dates; conversation order uses logical sequence, not device clocks."
-                    >{formatDate(msg.timestamp)}</span
-                  >
-                  <Separator class="flex-1 bg-border" />
-                </div>
-              {/if}
-              <div
-                id={`msg-${msg.id}`}
-                class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
-                  ? 'mt-3 pt-1'
-                  : ''} {messageIsMentioningMe(msg)
-                  ? 'bg-primary/5 border-l-2 border-l-primary pl-1.5'
-                  : ''} {pinnedSet.has(msg.id) ? 'pr-6' : ''}"
-                role="button"
-                tabindex={isMobile ? 0 : -1}
-                onclick={() => isMobile && handleMessageClick(msg.id)}
-                onkeydown={isMobile
-                  ? (e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        handleMessageClick(msg.id);
-                      }
-                    }
-                  : undefined}
-                ontouchstart={isMobile
-                  ? (e) => handleTouchStart(msg.id, e)
-                  : undefined}
-                ontouchmove={isMobile
-                  ? (e) => handleTouchMove(msg.id, e)
-                  : undefined}
-                ontouchend={isMobile
-                  ? () => handleTouchEnd(msg.id)
-                  : undefined}
-                ontouchcancel={isMobile
-                  ? () => handleTouchEnd(msg.id)
-                  : undefined}
-                style={isMobile
-                  ? `touch-action: pan-y;${swipeMessageId === msg.id ? ` transform: translateX(${dragOffset(swipeDelta)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}` : ""}`
-                  : ""}
-              >
-                {#if msg.replyTo}
-                  {@const held = messageById.get(msg.replyTo.id)}
-                  {@const quoteFrom = quotedName(msg.replyTo, held)}
-                  {@const quote = stripMarkdown(quotedText(msg.replyTo, held), resolveMentionDisplayName)}
-                  <button
-                    type="button"
-                    class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
-                    onclick={() => jumpToMessage(msg.replyTo!.id)}
-                  >
-                    <Reply
-                      size="16"
-                      class="text-muted-foreground -ml-5 transform -scale-x-100"
-                    />
-                    <span class="font-semibold">{quoteFrom}</span>
-                    <span class="truncate">{quote}</span>
-                  </button>
+        {#if visibleMessages.length === 0}
+          <div class="flex h-full items-center justify-center py-20">
+            <p class="select-none text-sm text-muted-foreground italic">
+              No messages yet. Say something!
+            </p>
+          </div>
+        {:else}
+          <div class="space-y-0.5">
+            {#each renderedMessages as msg, i (msg.id)}
+              <!-- The first row mounted reads as first, date and name shown,
+                   whatever is held above it: rows landing above the window
+                   change nothing on screen until the window takes them in,
+                   which it does without moving the view (anchored). -->
+              {@const prev = renderedMessages[i - 1]}
+              {@const showDate = shouldShowDateSep(
+                msg.timestamp,
+                prev?.timestamp
+              )}
+              {@const showHeader = shouldShowHeader(msg, prev)}
+              {@const isOwn = isSelfSender(msg.senderId)}
+              {@const reactions = reactionsByMessage.get(msg.id)}
+              <div>
+                {#if showDate}
+                  <div class="flex items-center gap-3 py-3">
+                    <Separator class="flex-1 bg-border" />
+                    <span class="text-xs text-muted-foreground"
+                      title="Reported message dates; conversation order uses logical sequence, not device clocks."
+                      >{formatDate(msg.timestamp)}</span
+                    >
+                    <Separator class="flex-1 bg-border" />
+                  </div>
                 {/if}
-
-                {#if showHeader}
-                  {@const avatar = isOwn ? ownProfile.avatarUrl : senderAvatar(msg.senderId)}
-                  {@const avatarColor = isOwn ? ownProfile.color : senderColor(msg.senderId)}
-                  <div class="flex items-start gap-2">
-                    <div
-                      role="button"
-                      tabindex="0"
-                      onclick={(e) => {
-                        e.stopPropagation();
-                        openProfileFromMessage(msg);
-                      }}
-                      oncontextmenu={(e) => {
-                        e.preventDefault();
-                        openUserMenuFromMessage(msg, e);
-                      }}
-                      onkeydown={(e) => {
+                <div
+                  id={`msg-${msg.id}`}
+                  class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
+                    ? 'mt-3 pt-1'
+                    : ''} {messageIsMentioningMe(msg)
+                    ? 'bg-primary/5 border-l-2 border-l-primary pl-1.5'
+                    : ''} {pinnedSet.has(msg.id) ? 'pr-6' : ''}"
+                  role="button"
+                  tabindex={isMobile ? 0 : -1}
+                  onclick={() => isMobile && handleMessageClick(msg.id)}
+                  onkeydown={isMobile
+                    ? (e) => {
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
-                          openProfileFromMessage(msg);
+                          handleMessageClick(msg.id);
                         }
-                      }}
-                      class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold font-mono
-                      {isOwn
-                        ? 'bg-primary/20 text-primary'
-                        : 'bg-secondary text-secondary-foreground'}"
-                      style={avatarColor ? `color: ${avatarColor}` : ""}
-                    >
-                      {#if isOwn && avatar}
-                        <GifImage
-                          src={avatar}
-                          alt="You"
-                          class="size-full object-cover"
-                        />
-                      {:else if !isOwn && avatar}
-                        <GifImage
-                          src={avatar}
-                          alt={displayName(msg)}
-                          class="size-full object-cover"
-                          animate="hover"
-                        />
-                      {:else if isOwn}
-                        <!-- Our own initial from our nickname, as the
-                             sidebar shows it: the message's stored name can
-                             be a placeholder ("You"). -->
-                        {(ownProfile.nickname || "You").charAt(0).toUpperCase()}
-                      {:else}
-                        {initials(msg)}
-                      {/if}
-                    </div>
-                    <div class="flex min-w-0 items-baseline gap-2">
-                      {#if isOwn}
-                        {@const own = ownProfile}
-                        {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
-                        <span
-                          role="button"
-                          tabindex="0"
-                          onclick={() => openProfileFromMessage(msg)}
-                          onkeydown={(e) => {
-                            if (e.key === "Enter") openProfileFromMessage(msg);
-                          }}
-                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
-                            ? 'italic'
-                            : ''} {effectStyle.class}"
-                          style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
-                        >
-                          {own.nickname || "You"}
-                        </span>
-                        {#if own.tagText}
-                          <span
-                            class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
-                            style={`background-color: ${own.tagChipColor ?? "#e5e7eb"}; color: ${own.tagTextColor ?? "#000000"}`}
-                            >{own.tagText}</span
-                          >
-                        {/if}
-                      {:else}
-                        {@const color = senderColor(msg.senderId)}
-                        {@const effect = senderEffect(msg.senderId)}
-                        {@const grads = senderGradients(msg.senderId)}
-                        {@const shimmer = senderShimmer(msg.senderId)}
-                        {@const glow = senderGlow(msg.senderId)}
-                        {@const effectStyle = nameEffectStyle(effect, color, grads.g2, grads.g3, shimmer, glow)}
-                        <span
-                          role="button"
-                          tabindex="0"
-                          onclick={() => openProfileFromMessage(msg)}
-                          oncontextmenu={(e) => {
-                            e.preventDefault();
-                            openUserMenuFromMessage(msg, e);
-                          }}
-                          onkeydown={(e) => {
-                            if (e.key === "Enter") openProfileFromMessage(msg);
-                          }}
-                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
-                          style={effectStyle.style || (color ? `color: ${color}` : "")}
-                        >
-                          {displayName(msg)}
-                        </span>
-                        {@const tag = senderTag(msg.senderId)}
-                        {#if tag}
-                          <span
-                            class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
-                            style={`background-color: ${tag.chipColor}; color: ${tag.textColor}`}
-                            >{tag.text}</span
-                          >
-                        {/if}
-                      {/if}
-                      <span class="text-xs text-muted-foreground"
-                        >{formatTime(msg.timestamp)}</span
-                      >
-                    </div>
-                  </div>
-                {/if}
-
-                <MsgRender
-                  {msg}
-                  {isOwn}
-                  {fileTransfers}
-                  onRequestFileDownload={requestFileDownload}
-                />
-
-                {#if reactions?.size}
-                  <div class="ml-9 mt-1 flex items-center gap-1">
-                    {#each [...reactions.entries()] as [emoji, users] (emoji)}
-                      {#if users.size > 0}
-                        {@const reacted = users.has(selfId()) || users.has(myPeerId())}
-                        <LazyTip text={reactorNames(users)}>
-                          {#snippet children(props)}
-                            <button
-                              {...props}
-                              type="button"
-                              class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
-                                ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
-                                : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
-                              onclick={(e) => {
-                                e.stopPropagation();
-                                toggleReaction?.(msg.id, emoji);
-                                activeMessageId = null;
-                              }}
-                            >
-                              <span class="emoji">{emoji}</span>
-                              <span>{users.size}</span>
-                            </button>
-                          {/snippet}
-                        </LazyTip>
-                      {/if}
-                    {/each}
-                  </div>
-                {/if}
-
-                {#if isMobile && swipeMessageId === msg.id && swipeDelta < 0}
-                  {@const progress = Math.min(1, -swipeDelta / REPLY_THRESHOLD)}
-                  <div
-                    class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
-                    style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
-                  >
-                    <Reply class="size-5" />
-                  </div>
-                {/if}
-
-                <div
-                  class="absolute right-0 sm:right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 {activeMessageId ===
-                  msg.id
-                    ? 'opacity-100'
-                    : ''} transition-opacity flex items-center gap-1 pr-1"
-                >
-                  <LazyTip text="React">
-                    {#snippet children(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
-                    aria-label="React"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      if (reactionPickerFor === msg.id) {
-                        reactionPickerFor = null;
-                      } else {
-                        openReactionPicker(msg.id, e.currentTarget);
                       }
-                      activeMessageId = null;
-                    }}
+                    : undefined}
+                  ontouchstart={isMobile
+                    ? (e) => handleTouchStart(msg.id, e)
+                    : undefined}
+                  ontouchmove={isMobile
+                    ? (e) => handleTouchMove(msg.id, e)
+                    : undefined}
+                  ontouchend={isMobile
+                    ? () => handleTouchEnd(msg.id)
+                    : undefined}
+                  ontouchcancel={isMobile
+                    ? () => handleTouchEnd(msg.id)
+                    : undefined}
+                  style={isMobile
+                    ? `touch-action: pan-y;${swipeMessageId === msg.id ? ` transform: translateX(${dragOffset(swipeDelta)}px); transition: ${isSwiping ? "none" : "transform 0.2s ease-out"}` : ""}`
+                    : ""}
+                >
+                  {#if msg.replyTo}
+                    {@const held = messageById.get(msg.replyTo.id)}
+                    {@const quoteFrom = quotedName(msg.replyTo, held)}
+                    {@const quote = stripMarkdown(quotedText(msg.replyTo, held), resolveMentionDisplayName)}
+                    <button
+                      type="button"
+                      class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
+                      onclick={() => jumpToMessage(msg.replyTo!.id)}
+                    >
+                      <Reply
+                        size="16"
+                        class="text-muted-foreground -ml-5 transform -scale-x-100"
+                      />
+                      <span class="font-semibold">{quoteFrom}</span>
+                      <span class="truncate">{quote}</span>
+                    </button>
+                  {/if}
+
+                  {#if showHeader}
+                    {@const avatar = isOwn ? ownProfile.avatarUrl : senderAvatar(msg.senderId)}
+                    {@const avatarColor = isOwn ? ownProfile.color : senderColor(msg.senderId)}
+                    <div class="flex items-start gap-2">
+                      <div
+                        role="button"
+                        tabindex="0"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          openProfileFromMessage(msg);
+                        }}
+                        oncontextmenu={(e) => {
+                          e.preventDefault();
+                          openUserMenuFromMessage(msg, e);
+                        }}
+                        onkeydown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            openProfileFromMessage(msg);
+                          }
+                        }}
+                        class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden text-xs font-semibold font-mono
+                        {isOwn
+                          ? 'bg-primary/20 text-primary'
+                          : 'bg-secondary text-secondary-foreground'}"
+                        style={avatarColor ? `color: ${avatarColor}` : ""}
+                      >
+                        {#if isOwn && avatar}
+                          <GifImage
+                            src={avatar}
+                            alt="You"
+                            class="size-full object-cover"
+                          />
+                        {:else if !isOwn && avatar}
+                          <GifImage
+                            src={avatar}
+                            alt={displayName(msg)}
+                            class="size-full object-cover"
+                            animate="hover"
+                          />
+                        {:else if isOwn}
+                          <!-- Our own initial from our nickname, as the
+                               sidebar shows it: the message's stored name can
+                               be a placeholder ("You"). -->
+                          {(ownProfile.nickname || "You").charAt(0).toUpperCase()}
+                        {:else}
+                          {initials(msg)}
+                        {/if}
+                      </div>
+                      <div class="flex min-w-0 items-baseline gap-2">
+                        {#if isOwn}
+                          {@const own = ownProfile}
+                          {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
+                          <span
+                            role="button"
+                            tabindex="0"
+                            onclick={() => openProfileFromMessage(msg)}
+                            onkeydown={(e) => {
+                              if (e.key === "Enter") openProfileFromMessage(msg);
+                            }}
+                            class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
+                              ? 'italic'
+                              : ''} {effectStyle.class}"
+                            style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
+                          >
+                            {own.nickname || "You"}
+                          </span>
+                          {#if own.tagText}
+                            <span
+                              class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
+                              style={`background-color: ${own.tagChipColor ?? "#e5e7eb"}; color: ${own.tagTextColor ?? "#000000"}`}
+                              >{own.tagText}</span
+                            >
+                          {/if}
+                        {:else}
+                          {@const color = senderColor(msg.senderId)}
+                          {@const effect = senderEffect(msg.senderId)}
+                          {@const grads = senderGradients(msg.senderId)}
+                          {@const shimmer = senderShimmer(msg.senderId)}
+                          {@const glow = senderGlow(msg.senderId)}
+                          {@const effectStyle = nameEffectStyle(effect, color, grads.g2, grads.g3, shimmer, glow)}
+                          <span
+                            role="button"
+                            tabindex="0"
+                            onclick={() => openProfileFromMessage(msg)}
+                            oncontextmenu={(e) => {
+                              e.preventDefault();
+                              openUserMenuFromMessage(msg, e);
+                            }}
+                            onkeydown={(e) => {
+                              if (e.key === "Enter") openProfileFromMessage(msg);
+                            }}
+                            class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
+                            style={effectStyle.style || (color ? `color: ${color}` : "")}
+                          >
+                            {displayName(msg)}
+                          </span>
+                          {@const tag = senderTag(msg.senderId)}
+                          {#if tag}
+                            <span
+                              class="rounded px-1 py-px font-mono text-[10px] font-semibold uppercase leading-4"
+                              style={`background-color: ${tag.chipColor}; color: ${tag.textColor}`}
+                              >{tag.text}</span
+                            >
+                          {/if}
+                        {/if}
+                        <span class="text-xs text-muted-foreground"
+                          >{formatTime(msg.timestamp)}</span
+                        >
+                      </div>
+                    </div>
+                  {/if}
+
+                  <MsgRender
+                    {msg}
+                    {isOwn}
+                    {fileTransfers}
+                    onRequestFileDownload={requestFileDownload}
+                  />
+
+                  {#if reactions?.size}
+                    <div class="ml-9 mt-1 flex items-center gap-1">
+                      {#each [...reactions.entries()] as [emoji, users] (emoji)}
+                        {#if users.size > 0}
+                          {@const reacted = users.has(selfId()) || users.has(myPeerId())}
+                          <LazyTip text={reactorNames(users)}>
+                            {#snippet children(props)}
+                              <button
+                                {...props}
+                                type="button"
+                                class="inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs cursor-pointer transition-colors {reacted
+                                  ? 'border-blue-400/70 bg-blue-500/20 text-blue-200'
+                                  : 'border-border/80 bg-muted/40 text-muted-foreground hover:text-foreground'}"
+                                onclick={(e) => {
+                                  e.stopPropagation();
+                                  toggleReaction?.(msg.id, emoji);
+                                  activeMessageId = null;
+                                }}
+                              >
+                                <span class="emoji">{emoji}</span>
+                                <span>{users.size}</span>
+                              </button>
+                            {/snippet}
+                          </LazyTip>
+                        {/if}
+                      {/each}
+                    </div>
+                  {/if}
+
+                  {#if isMobile && swipeMessageId === msg.id && swipeDelta < 0}
+                    {@const progress = Math.min(1, -swipeDelta / REPLY_THRESHOLD)}
+                    <div
+                      class="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground"
+                      style={`opacity: ${progress}; transform: translateY(-50%) scale(${0.8 + progress * 0.25});`}
+                    >
+                      <Reply class="size-5" />
+                    </div>
+                  {/if}
+
+                  <div
+                    class="absolute right-0 sm:right-8 top-0 -translate-y-1/2 opacity-0 group-hover:opacity-100 {activeMessageId ===
+                    msg.id
+                      ? 'opacity-100'
+                      : ''} transition-opacity flex items-center gap-1 pr-1"
                   >
-                    <Smile class="size-3.5" />
-                  </button>
-                    {/snippet}
-                  </LazyTip>
-                  <LazyTip text="Reply">
-                    {#snippet children(props)}
-                  <button
-                    {...props}
-                    type="button"
-                    class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
-                    aria-label="Reply"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      startReply(msg);
-                      activeMessageId = null;
-                    }}
-                  >
-                    <Reply class="size-3.5" />
-                  </button>
-                    {/snippet}
-                  </LazyTip>
-                  {#if !ephemeral}
-                    <LazyTip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                    <LazyTip text="React">
                       {#snippet children(props)}
                     <button
                       {...props}
                       type="button"
-                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 hover:text-foreground cursor-pointer {pinnedSet.has(msg.id)
-                        ? 'text-primary'
-                        : 'text-muted-foreground'}"
-                      aria-label={pinnedSet.has(msg.id) ? "Unpin message" : "Pin message"}
-                      aria-pressed={pinnedSet.has(msg.id)}
+                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                      aria-label="React"
                       onclick={(e) => {
                         e.stopPropagation();
-                        void toggleMessagePin(roomCode, msg.id);
+                        if (reactionPickerFor === msg.id) {
+                          reactionPickerFor = null;
+                        } else {
+                          openReactionPicker(msg.id, e.currentTarget);
+                        }
                         activeMessageId = null;
                       }}
                     >
-                      {#if pinnedSet.has(msg.id)}
-                        <PinOff class="size-3.5" />
-                      {:else}
-                        <Pin class="size-3.5" />
-                      {/if}
+                      <Smile class="size-3.5" />
                     </button>
                       {/snippet}
                     </LazyTip>
+                    <LazyTip text="Reply">
+                      {#snippet children(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 text-muted-foreground hover:text-foreground cursor-pointer"
+                      aria-label="Reply"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        startReply(msg);
+                        activeMessageId = null;
+                      }}
+                    >
+                      <Reply class="size-3.5" />
+                    </button>
+                      {/snippet}
+                    </LazyTip>
+                    {#if !ephemeral}
+                      <LazyTip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                        {#snippet children(props)}
+                      <button
+                        {...props}
+                        type="button"
+                        class="size-9 sm:size-7 inline-flex items-center justify-center rounded bg-card border border-border/70 hover:text-foreground cursor-pointer {pinnedSet.has(msg.id)
+                          ? 'text-primary'
+                          : 'text-muted-foreground'}"
+                        aria-label={pinnedSet.has(msg.id) ? "Unpin message" : "Pin message"}
+                        aria-pressed={pinnedSet.has(msg.id)}
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          void toggleMessagePin(roomCode, msg.id);
+                          activeMessageId = null;
+                        }}
+                      >
+                        {#if pinnedSet.has(msg.id)}
+                          <PinOff class="size-3.5" />
+                        {:else}
+                          <Pin class="size-3.5" />
+                        {/if}
+                      </button>
+                        {/snippet}
+                      </LazyTip>
+                    {/if}
+                  </div>
+                  {#if pinnedSet.has(msg.id)}
+                    <!-- Marks a pinned message at rest; the toolbar above
+                         covers it on hover, where the same pin unpins. -->
+                    <Pin
+                      class="pointer-events-none absolute right-2 top-1.5 size-3 rotate-45 text-primary/70 transition-opacity group-hover:opacity-0"
+                      aria-label="Pinned"
+                    />
                   {/if}
                 </div>
-                {#if pinnedSet.has(msg.id)}
-                  <!-- Marks a pinned message at rest; the toolbar above
-                       covers it on hover, where the same pin unpins. -->
-                  <Pin
-                    class="pointer-events-none absolute right-2 top-1.5 size-3 rotate-45 text-primary/70 transition-opacity group-hover:opacity-0"
-                    aria-label="Pinned"
-                  />
+              </div>
+            {/each}
+
+            {#if sendingPreviews.length > 0}
+              <!-- The message before it exists, drawn as the message it will
+                   be: our own row, in the place it will land, with the picture
+                   or file at its real size and dimmed until the real one
+                   replaces it. A bubble on the right read as something else
+                   entirely in a chat whose messages all sit on the left. -->
+              {@const lastShown = renderedMessages[renderedMessages.length - 1]}
+              {@const sendingHeader =
+                !lastShown ||
+                !isSelfSender(lastShown.senderId) ||
+                Date.now() - lastShown.timestamp > 2 * 60 * 1000}
+              <div
+                class="rounded-md px-2 py-0.5 {sendingHeader ? 'mt-3 pt-1' : ''}"
+                aria-live="polite"
+                aria-label="Sending"
+              >
+                {#if sendingHeader}
+                  {@const own = ownProfile}
+                  {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
+                  <div class="flex items-start gap-2">
+                    <div
+                      class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden bg-primary/20 text-xs font-semibold font-mono text-primary"
+                      style={own.color ? `color: ${own.color}` : ""}
+                    >
+                      {#if own.avatarUrl}
+                        <GifImage src={own.avatarUrl} alt="You" class="size-full object-cover" />
+                      {:else}
+                        {(own.nickname || "You").charAt(0).toUpperCase()}
+                      {/if}
+                    </div>
+                    <div class="flex min-w-0 items-baseline gap-2">
+                      <span
+                        class="max-w-72 truncate text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
+                          ? 'italic'
+                          : ''} {effectStyle.class}"
+                        style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
+                      >
+                        {own.nickname || "You"}
+                      </span>
+                      <span class="text-xs text-muted-foreground">Sending…</span>
+                    </div>
+                  </div>
                 {/if}
+                <div class="ml-9 flex flex-col items-start opacity-50">
+                  {#if sendingCaption}
+                    <p class="mb-2 whitespace-pre-wrap break-words text-(length:--chat-font-size) leading-normal text-foreground">
+                      {stripMarkdown(sendingCaption, resolveMentionDisplayName)}
+                    </p>
+                  {/if}
+                  <!-- The same card the sent message shows, so nothing moves
+                       when it replaces this. -->
+                  <div class="w-full space-y-2">
+                    {#each sendingPreviews as p, i (i)}
+                      <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
+                        <p class="truncate text-sm text-foreground">{p.name}</p>
+                        <p class="text-xs text-muted-foreground">{formatSize(p.size)} • sending…</p>
+                        {#if p.url && p.type.startsWith("image/")}
+                          <img
+                            src={p.url}
+                            alt={p.name}
+                            class="mt-2 max-h-56 max-w-xs rounded-md object-contain"
+                          />
+                        {:else if p.url && p.type.startsWith("video/")}
+                          <!-- svelte-ignore a11y_media_has_caption -->
+                          <video
+                            src={p.url}
+                            class="mt-2 max-h-56 max-w-xs rounded-md"
+                            muted
+                            playsinline
+                          ></video>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+                {#if !sendingHeader}
+                  <span class="ml-9 text-xs text-muted-foreground">Sending…</span>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+        {#each visiblePluginErrors as entry (entry.id)}
+          <PluginErrorRow {entry} />
+        {/each}
+      </div>
+      {#if settling}
+        <div
+          class="absolute inset-0 z-20 flex flex-col justify-end gap-5 overflow-hidden bg-background px-6 pb-4"
+          aria-hidden="true"
+        >
+          {#each [0.55, 0.8, 0.4, 0.7, 0.35, 0.6] as width, i (i)}
+            <div class="flex items-start gap-2">
+              <div class="size-7 shrink-0 animate-pulse rounded-full bg-muted/60"></div>
+              <div class="flex min-w-0 flex-1 flex-col gap-2 pt-1">
+                <div class="h-3 w-24 animate-pulse rounded bg-muted/60"></div>
+                <div class="h-3 animate-pulse rounded bg-muted/40" style="width: {Math.round(width * 100)}%"></div>
               </div>
             </div>
           {/each}
-
-          {#if sendingPreviews.length > 0}
-            <!-- The message before it exists, drawn as the message it will
-                 be: our own row, in the place it will land, with the picture
-                 or file at its real size and dimmed until the real one
-                 replaces it. A bubble on the right read as something else
-                 entirely in a chat whose messages all sit on the left. -->
-            {@const lastShown = renderedMessages[renderedMessages.length - 1]}
-            {@const sendingHeader =
-              !lastShown ||
-              !isSelfSender(lastShown.senderId) ||
-              Date.now() - lastShown.timestamp > 2 * 60 * 1000}
-            <div
-              class="rounded-md px-2 py-0.5 {sendingHeader ? 'mt-3 pt-1' : ''}"
-              aria-live="polite"
-              aria-label="Sending"
-            >
-              {#if sendingHeader}
-                {@const own = ownProfile}
-                {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
-                <div class="flex items-start gap-2">
-                  <div
-                    class="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full overflow-hidden bg-primary/20 text-xs font-semibold font-mono text-primary"
-                    style={own.color ? `color: ${own.color}` : ""}
-                  >
-                    {#if own.avatarUrl}
-                      <GifImage src={own.avatarUrl} alt="You" class="size-full object-cover" />
-                    {:else}
-                      {(own.nickname || "You").charAt(0).toUpperCase()}
-                    {/if}
-                  </div>
-                  <div class="flex min-w-0 items-baseline gap-2">
-                    <span
-                      class="max-w-72 truncate text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
-                        ? 'italic'
-                        : ''} {effectStyle.class}"
-                      style={effectStyle.style || (own.color ? `color: ${own.color}` : "")}
-                    >
-                      {own.nickname || "You"}
-                    </span>
-                    <span class="text-xs text-muted-foreground">Sending…</span>
-                  </div>
-                </div>
-              {/if}
-              <div class="ml-9 flex flex-col items-start opacity-50">
-                {#if sendingCaption}
-                  <p class="mb-2 whitespace-pre-wrap break-words text-(length:--chat-font-size) leading-normal text-foreground">
-                    {stripMarkdown(sendingCaption, resolveMentionDisplayName)}
-                  </p>
-                {/if}
-                <!-- The same card the sent message shows, so nothing moves
-                     when it replaces this. -->
-                <div class="w-full space-y-2">
-                  {#each sendingPreviews as p, i (i)}
-                    <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
-                      <p class="truncate text-sm text-foreground">{p.name}</p>
-                      <p class="text-xs text-muted-foreground">{formatSize(p.size)} • sending…</p>
-                      {#if p.url && p.type.startsWith("image/")}
-                        <img
-                          src={p.url}
-                          alt={p.name}
-                          class="mt-2 max-h-56 max-w-xs rounded-md object-contain"
-                        />
-                      {:else if p.url && p.type.startsWith("video/")}
-                        <!-- svelte-ignore a11y_media_has_caption -->
-                        <video
-                          src={p.url}
-                          class="mt-2 max-h-56 max-w-xs rounded-md"
-                          muted
-                          playsinline
-                        ></video>
-                      {/if}
-                    </div>
-                  {/each}
-                </div>
-              </div>
-              {#if !sendingHeader}
-                <span class="ml-9 text-xs text-muted-foreground">Sending…</span>
-              {/if}
-            </div>
-          {/if}
         </div>
       {/if}
-      {#each visiblePluginErrors as entry (entry.id)}
-        <PluginErrorRow {entry} />
-      {/each}
     </div>
 
     {#if !isDmChat}
