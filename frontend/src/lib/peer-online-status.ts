@@ -42,3 +42,29 @@ export function derivePeerOnlineState(
     connectedSinceMs !== undefined && nowMs - connectedSinceMs < graceMs;
   return { isOnline: withinGrace, isConnecting: !withinGrace };
 }
+
+/**
+ * When some connected peer's state next changes on its own: the earliest end
+ * of a grace window still running at `nowMs`. Null when there is none - every
+ * connected peer is proven or already past its window - so a list showing
+ * these states has nothing to wake up for until something else changes.
+ *
+ * @param connectedSince When each connected peer was first seen connected.
+ * @param proven Peers whose stream is confirmed to carry traffic.
+ * @param nowMs The time the states on screen were derived at.
+ * @param graceMs As for derivePeerOnlineState.
+ */
+export function nextGraceExpiry(
+  connectedSince: ReadonlyMap<string, number>,
+  proven: ReadonlySet<string>,
+  nowMs: number,
+  graceMs: number
+): number | null {
+  let next: number | null = null;
+  for (const [peerId, since] of connectedSince) {
+    if (proven.has(peerId)) continue;
+    const end = since + graceMs;
+    if (end > nowMs && (next === null || end < next)) next = end;
+  }
+  return next;
+}

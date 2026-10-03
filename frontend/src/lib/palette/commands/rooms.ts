@@ -35,10 +35,38 @@ const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
 };
 
 /**
+ * Command ids for rooms and contacts, worked out once each.
+ *
+ * hashRef is a pure-JS SHA-256, and a catalog build used to pay one per room
+ * and one per contact, every build. A room code or a peer id never changes,
+ * so neither does its ref. The palette forgets them all when it unmounts,
+ * which a lock does, so no room code outlives the session in here.
+ */
+const refs = new Map<string, string>();
+/** Far above the rooms and contacts one device holds: a guard, not a budget. */
+const REFS_MAX = 4096;
+
+function ref(value: string): string {
+  let out = refs.get(value);
+  if (out === undefined) {
+    if (refs.size >= REFS_MAX) refs.clear();
+    out = hashRef(value);
+    refs.set(value, out);
+  }
+  return out;
+}
+
+/** Drop the remembered refs. The palette calls this when it unmounts. */
+export function forgetRoomRefs(): void {
+  refs.clear();
+}
+
+/**
  * Room navigation, joining, and the destructive room-management actions.
  *
  * Rebuilt on every catalog refresh, so every row below reads `roomsStore`
- * and `host` directly rather than caching anything module-scoped.
+ * and `host` directly rather than caching anything module-scoped - the one
+ * exception being the id refs above, which depend on nothing that changes.
  */
 export const roomCommands: CmdSource = (host) => {
   const cmds: Cmd[] = [];
@@ -63,7 +91,7 @@ export const roomCommands: CmdSource = (host) => {
       // room code - the room's whole membership secret - into web storage,
       // where it survives every lock and outlives the room. The real code
       // stays in the closure below, which is the only place that needs it.
-      id: `room.open:${hashRef(room.roomCode)}`,
+      id: `room.open:${ref(room.roomCode)}`,
       title: room.name || room.roomCode,
       // The room code is shown unconditionally: two rooms can share a name,
       // and the code is the only thing that still tells them apart.
@@ -79,7 +107,7 @@ export const roomCommands: CmdSource = (host) => {
     cmds.push({
       // Hashed for the same reason as room.open above: the peer id is the
       // social graph, and the MRU would persist it verbatim.
-      id: `room.dm:${hashRef(entry.peerId)}`,
+      id: `room.dm:${ref(entry.peerId)}`,
       title: entry.nickname,
       group: "People",
       icon: Users,

@@ -944,6 +944,37 @@ Screen share audio (share-audio.ts):
     mid-call (own-audio suppression leaving nothing to send, or an
     output-device change) is reported instead of silently dead
 
+Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
+  - every remote camera producer is consumed when announced, as before
+  - it stays received only while something shows it: a camera tile the
+    stage has on screen (IntersectionObserver), the spotlight (floating
+    panel, picture in picture), or a popped-out window
+  - and while its owner is speaking, unless a pin or a watched share holds
+    the spotlight, or there is none (a quick call has no floating panel or
+    picture in picture): a speaker takes the spotlight after 1.5 s of
+    speech (SPEAKER_TAKEOVER_MS), and a camera asked for at the first word
+    is playing by then rather than black for the round trip
+  - unshown for 5 s → ms:close-consumer and a local close; newly shown →
+    a fresh ms:consume + ms:resume-consumer (the SFU asks for a keyframe on
+    resume). No new wire message
+  - a failed return is tried once more after 3 s; failing twice drops the
+    kept track (the tile shows the person), and the camera is tried again
+    only once it goes unshown and is shown again, or by a rejoin's replay.
+    An equal set of shown cameras changes nothing
+  - while parked the app keeps the last track (no trackRemoved), so "has
+    video" stays true for the spotlight and the grid filters; a parked
+    camera's ms:producer-closed, peer-left or a rejoin removes it
+  - a producer that closes while its consume is in flight (after the SFU
+    answered it), by ms:producer-closed or with its owner's ms:peer-left
+    (which the SFU sends alone): the late consumer is closed with
+    ms:close-consumer and never reaches the app as a track, for any
+    consume, first or not
+  - when that consume stands in for a track the app still holds (a stall's
+    re-consume, a rebuilt recv transport), ms:producer-closed tells the app
+    the track is gone (trackRemoved), as it does for a live consumer
+  - screen shares are never parked; no opinion yet (or no call) = every
+    camera received
+
 Screen share transmissions:
   - remote screen producers emit transmissionAvailable(peerId, producerId)
   - UI shows pending "Click to watch" tile (not auto-consumed)
