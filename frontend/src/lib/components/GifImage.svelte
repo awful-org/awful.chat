@@ -4,8 +4,7 @@
   import {
     animatedView,
     canDecodeStillFrame,
-    stillFrameGrows,
-    stillFrameSize,
+    stillFrameRedraw,
   } from "$lib/image-size";
   /**
    * An image that can hold an animated GIF still. Browsers cannot pause a
@@ -145,14 +144,15 @@
         canvas.height = h;
         let drawn: { width: number; height: number } | undefined;
         observer = new ResizeObserver(([entry]) => {
-          const size = stillFrameSize(
+          const size = stillFrameRedraw(
+            drawn,
             w,
             h,
             entry.contentRect.width,
             entry.contentRect.height,
             devicePixelRatio
           );
-          if (!size || !stillFrameGrows(drawn, size)) return;
+          if (!size) return;
           drawn = size;
           canvas.width = size.width;
           canvas.height = size.height;

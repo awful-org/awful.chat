@@ -450,3 +450,24 @@ export function stillFrameSize(
 export function stillFrameGrows(drawn: Size | undefined, needed: Size): boolean {
   return !drawn || needed.width > drawn.width || needed.height > drawn.height;
 }
+
+/**
+ * The still frame to draw now for a box of `shownWidth` x `shownHeight`
+ * CSS pixels, or null to keep the one at `drawn`. A box of nothing past the
+ * first frame keeps it: a canvas hidden with display:none is measured at
+ * 0x0, which stillFrameSize reads as no box at all and answers with the
+ * image's own size, and every avatar hidden that way would have grown to
+ * MAX_FRAME_SIDE a side and kept it once shown again.
+ */
+export function stillFrameRedraw(
+  drawn: Size | undefined,
+  naturalWidth: number,
+  naturalHeight: number,
+  shownWidth: number,
+  shownHeight: number,
+  pixelRatio: number
+): Size | null {
+  if (drawn && !(shownWidth > 0 && shownHeight > 0)) return null;
+  const size = stillFrameSize(naturalWidth, naturalHeight, shownWidth, shownHeight, pixelRatio);
+  return size && stillFrameGrows(drawn, size) ? size : null;
+}

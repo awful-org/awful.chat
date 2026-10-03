@@ -8,6 +8,7 @@ import {
   mediaBoxStyle,
   profileImageFits,
   stillFrameGrows,
+  stillFrameRedraw,
   stillFrameSize,
 } from "./image-size";
 import { bytesToBase64 } from "./utils";
@@ -290,5 +291,24 @@ describe("animatedView", () => {
     expect(animatedView({ width: 16383, height: 16383 })).toBe("too-large");
     expect(animatedView({ width: 4097, height: 4096 })).toBe("too-large");
     expect(animatedView({ width: 1, height: 16_777_217 })).toBe("too-large");
+  });
+});
+
+describe("stillFrameRedraw", () => {
+  it("keeps the frame it has while its canvas is hidden", () => {
+    // A 4096x4096 avatar in a 40px box at ratio 2: an 80x80 frame.
+    const first = stillFrameRedraw(undefined, 4096, 4096, 40, 40, 2);
+    expect(first).toEqual({ width: 80, height: 80 });
+    // display:none measures the canvas at 0x0. Read as no box, that drew
+    // the image at 1024x1024, 4 MB, and kept it once shown again.
+    expect(stillFrameRedraw(first!, 4096, 4096, 0, 0, 2)).toBeNull();
+    expect(stillFrameRedraw(first!, 4096, 4096, 0, 40, 2)).toBeNull();
+    expect(stillFrameRedraw(first!, 4096, 4096, 40, 40, 2)).toBeNull();
+    // A box that grows still gets more pixels.
+    expect(stillFrameRedraw(first!, 4096, 4096, 80, 80, 2)).toEqual({ width: 160, height: 160 });
+  });
+
+  it("draws a first frame for a canvas not laid out yet, as before", () => {
+    expect(stillFrameRedraw(undefined, 4096, 4096, 0, 0, 2)).toEqual({ width: 1024, height: 1024 });
   });
 });
