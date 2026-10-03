@@ -94,8 +94,9 @@ const SPAN_RE = new RegExp(
  * space after the dot, or a Greek ο in "com", passed for plain text.
  *  - The markup goes ("**paypal.com**", "`paypal.com`"), and so does what
  *    draws as nothing: zero-width characters, soft hyphens, joiners,
- *    variation selectors, tag characters, combining marks, and the spaces
- *    narrower than a word space ("paypal .com" with a thin one).
+ *    variation selectors, tag characters, combining marks, control
+ *    characters, and the spaces narrower than a word space ("paypal .com"
+ *    with a thin one).
  *  - Compatibility forms fold ("ｐａｙｐａｌ．ｃｏｍ"), and what draws as a dot
  *    reads as one ("paypal․com", "paypalꓸcom"). Not the middle dot, drawn
  *    raised, which passes for a full stop only at a glance: French and
@@ -117,8 +118,16 @@ const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
  * than a word space (six-per-em, punctuation, thin, hair, narrow no-break)
  * go before NFKD would make them an ordinary space. An ordinary space stays,
  * so "e.g. this" is no address.
+ *
+ * The control characters but a tab and the line breaks go too: the HTML
+ * parser drops a NUL, Firefox draws the others as nothing, and so does
+ * Chromium in a monospace font, the chat's default. Each read as a
+ * character that ends an address, and "paypal", a NUL, ".com" drew as
+ * paypal.com. So does the medium mathematical space, which WebKit draws
+ * with no width.
  */
-const UNSEEN_RE = /[\p{Default_Ignorable_Code_Point}\u2006\u2008-\u200A\u202F*~_|\x60\\]/gu;
+const UNSEEN_RE =
+  /[\p{Default_Ignorable_Code_Point}\x00-\x08\x0B\x0C\x0E-\x1F\x7F\u2006\u2008-\u200A\u202F\u205F*~_|\x60\\]/gu;
 /**
  * A full stop, or what Unicode's confusables list says draws as one. An
  * Arabic-Indic zero only outside a number: between two such digits it is
@@ -221,9 +230,12 @@ function anchor(href: string, html: string, masked = false): string {
  * A word, as an address is one: what lies between two spaces the address
  * test reads as spaces. Not the spaces narrower than a word space, which it
  * drops, nor an ogham space mark or a line separator, which it reads as a
- * letter.
+ * letter, nor what can draw as nothing (see UNSEEN_RE): a vertical tab, a
+ * form feed or a medium mathematical space between "[paypal](…)" and
+ * "[.com](…)" drew as paypal.com. A carriage return still ends one: the
+ * parser makes it a line break.
  */
-const SPACELESS_RE = /[^\t-\r \u00A0\u2000-\u2005\u2007\u205F\u3000]+/g;
+const SPACELESS_RE = /[^\t\n\r \u00A0\u2000-\u2005\u2007\u3000]+/g;
 
 /**
  * Which of a line's spans are masked links that show their url instead of
@@ -233,9 +245,13 @@ const SPACELESS_RE = /[^\t-\r \u00A0\u2000-\u2005\u2007\u205F\u3000]+/g;
  *    as one word: "[paypal](…)[.com](…)" was two links, neither label an
  *    address alone, that drew as one link to paypal.com, and
  *    "[paypal](…).com" drew the same in two colours.
+ *  - Every link whose label reads as an address on its own, whatever its
+ *    word does: "[paypal.com](…)9" is no address as a word, since an
+ *    address ends before a digit, but its link still reads paypal.com.
  *  - Every link in a line holding a bidi override, embedding or isolate,
  *    which can lay the line out in any order.
- * Each word is read once, so a line of touching links stays linear.
+ * Each word is read once, and each label, so a line of touching links stays
+ * linear.
  */
 function linksShowingUrls(src: string, spans: RegExpExecArray[], named: (text: string) => string): boolean[] {
   const shown = spans.map(() => false);
@@ -248,6 +264,7 @@ function linksShowingUrls(src: string, spans: RegExpExecArray[], named: (text: s
     last = m.index + whole.length;
     if (label !== undefined && href !== undefined) {
       const text = named(label);
+      shown[k] = looksLikeUrl(text);
       links.push({ k, start: line.length, end: line.length + text.length });
       line += text;
     } else if (bare !== undefined) {

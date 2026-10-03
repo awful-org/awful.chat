@@ -203,10 +203,52 @@ describe("inline markdown", () => {
       `[paypal](${evil})\u2009[.com](${evil})`,
       // A mention draws as its name, in the colour of a link.
       `@[did:key:zPay][.com](${evil})`,
+      // An address ends before a digit, so the word is none, but the link
+      // alone still reads paypal.com.
+      `[paypal.com](${evil})9`,
+      `[paypal.com](${evil})**2**`,
+      `[paypal.com](${evil})\u00B9`,
     ];
     for (const s of spelled) {
       expect(renderMessageMarkdown(s, r), s).not.toContain(" title=");
       expect(stripMarkdown(s, r), s).toContain(evil);
+    }
+    // A label that touches a link of its own after it: the address shows
+    // its url, the "2" alone is no address and stays masked.
+    expect(plain(`[paypal.com](${evil})[2](https://a.bc/x)`)).toBe(
+      `[paypal.com](<a href="${evil}" target="_blank" rel="noopener noreferrer" dir="ltr">${evil}</a>)` +
+        `<a href="https://a.bc/x" title="https://a.bc/x" target="_blank" rel="noopener noreferrer">2</a>`,
+    );
+  });
+
+  it("reads a control character as the nothing it draws, in a label or between two links", () => {
+    // An HTML parser drops a NUL, Firefox draws every other C0 control as
+    // nothing, Chromium too in a monospace font (the chat's default) and a
+    // form feed or a delete in any, and WebKit a medium mathematical space.
+    // Each read as a character that ends an address, or as a space between
+    // words, so "paypal", a NUL, ".com" was masked and drew as paypal.com,
+    // as one label or split across two links.
+    const evil = "https://evil.example/login";
+    for (let n = 0; n <= 0x7f; n++) {
+      if ((n > 0x1f && n < 0x7f) || n === 0x09 || n === 0x0a || n === 0x0d) continue;
+      const c = String.fromCharCode(n);
+      for (const s of [
+        `[paypal${c}.com](${evil})`,
+        `[paypal.${c}com](${evil})`,
+        `[paypal](${evil})${c}[.com](${evil})`,
+        `[https:/${c}/paypal${c}.com/login](${evil})`,
+      ]) {
+        expect(md(s), JSON.stringify(s)).not.toContain(" title=");
+        expect(stripMarkdown(s), JSON.stringify(s)).toContain(evil);
+      }
+    }
+    for (const s of [`[paypal](${evil})\u205F[.com](${evil})`, `[paypal\u205F.com](${evil})`]) {
+      expect(md(s), JSON.stringify(s)).not.toContain(" title=");
+    }
+    // A tab, and a carriage return, which the parser makes a line break,
+    // still end a word: what they separate draws apart.
+    for (const gap of ["\t", "\r"]) {
+      expect(plain(`[the docs](https://a.bc/x)${gap}notes.txt`), JSON.stringify(gap)).not.toContain("](");
     }
   });
 
