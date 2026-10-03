@@ -24,6 +24,7 @@
     Check,
     CheckCheck,
     Clock,
+    ImageOff,
     Pin as PinIcon,
     PinOff,
   } from "@lucide/svelte";
@@ -43,12 +44,13 @@
   import { messageBody } from "$lib/actions/message-body";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
   import { formatSize } from "$lib/utils";
-  import { mediaBoxStyle } from "$lib/image-size";
+  import { animatedView, mediaBoxStyle } from "$lib/image-size";
   import {
     INLINE_FILE_MAX_BYTES,
     attachmentHydration,
     autoDownloadOnRender,
   } from "$lib/transport/files.svelte";
+  import type { Attachment } from "svelte/attachments";
 
   import {
     convertImage,
@@ -195,6 +197,9 @@
     mimeType: string;
     /** Absent for a remote GIF, whose bytes we do not hold. */
     size?: number;
+    /** As the GifImage it was opened from takes it: an animated image is
+     *  measured before the viewer decodes it (see lightboxView). */
+    animated?: boolean;
   };
   let lightbox = $state<Lightbox | null>(null);
   let formatsOpen = $state(false);
@@ -216,12 +221,48 @@
   );
 
   /**
+   * The open animated image's copy, loaded out of the page, and the url it
+   * is a copy of. Its img is null if it did not load.
+   */
+  let lightboxCopy = $state.raw<{ url: string; img: HTMLImageElement | null }>();
+  const lightboxLoaded = $derived(
+    lightbox?.animated && lightboxCopy?.url === lightbox.url
+      ? lightboxCopy.img
+      : undefined
+  );
+  /**
+   * What the viewer shows of an animated image, by GifImage's rule: its size
+   * is read from a copy loaded out of the page, before anything decodes it,
+   * and past image-size.ts's bound it is "too-large" and never decoded. A
+   * message shows such an image as a placeholder, and a click on that used
+   * to open its url here in a plain img, decoding at full size the very
+   * image the placeholder had refused. What is shown within the bound is
+   * that copy itself (see showCopy).
+   *
+   * A still image is shown at once, as its message showed it: a plain img
+   * the message had already decoded. The bound is GifImage's, for what it
+   * animates, and a photo from a 24 MP camera is past it.
+   */
+  const lightboxView = $derived(
+    lightbox?.animated
+      ? animatedView(
+          lightboxLoaded && {
+            width: lightboxLoaded.naturalWidth,
+            height: lightboxLoaded.naturalHeight,
+          }
+        )
+      : "shown"
+  );
+
+  /**
    * Conversion needs the bytes on this origin: a canvas fed a cross-origin
    * image is tainted and toBlob throws. A remote GIF has no size recorded
    * either, which is the same signal, so both cases fall back to Original.
+   * Nor is an image the viewer will not show converted: a conversion draws
+   * the whole picture on a canvas, the cost the bound is there to refuse.
    */
   const lightboxFormats = $derived(
-    lightbox && lightbox.size !== undefined
+    lightbox && lightbox.size !== undefined && lightboxView === "shown"
       ? convertTargets(lightbox.mimeType)
       : []
   );
@@ -241,6 +282,39 @@
    * ends over the backdrop would otherwise close it every time.
    */
   let panned = false;
+
+  const viewerImageClass = "max-h-[90vh] max-w-[90vw] rounded-md object-contain";
+  /** The zoom and pan, as the viewer's image wears them. */
+  const zoomStyle = $derived(
+    `transform: translate(${pan.x}px, ${pan.y}px) scale(${zoom}); transition: ${
+      dragFrom || pinchStart ? "none" : "transform 120ms ease-out"
+    }`
+  );
+
+  /**
+   * An animated image's copy, put in the viewer: the one that was measured.
+   * An img of the same url fetched it again (Chromium does, for an image
+   * the server says not to store), and the server could then answer with
+   * another image than the one checked - the reason GifImage plays its copy.
+   * The zoom is applied by an effect of its own, so it restyles the copy
+   * rather than putting it back in the page each time.
+   */
+  function showCopy(img: HTMLImageElement): Attachment<HTMLElement> {
+    return (slot) => {
+      img.alt = "Preview";
+      img.draggable = false;
+      img.className = viewerImageClass;
+      slot.append(img);
+      imgEl = img;
+      $effect(() => {
+        img.style.cssText = zoomStyle;
+      });
+      return () => {
+        img.remove();
+        if (imgEl === img) imgEl = null;
+      };
+    };
+  }
 
   const viewport = () => ({
     width: typeof window === "undefined" ? 0 : window.innerWidth,
@@ -366,6 +440,7 @@
   function openLightbox(next: Lightbox) {
     resetZoom();
     lightbox = next;
+    lightboxCopy = undefined;
     formatsOpen = false;
     convertError = null;
     previewText = null;
@@ -377,6 +452,8 @@
 
   function closeLightbox() {
     lightbox = null;
+    // Let go with the viewer: a copy it showed holds the decoded image.
+    lightboxCopy = undefined;
     formatsOpen = false;
     resetZoom();
   }
@@ -395,6 +472,28 @@
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // An animated image is measured before the viewer shows it, as GifImage
+  // measures it (see lightboxView): its size is known once its copy loads.
+  // Not for a remote image while external media is off - the viewer does
+  // not open then either.
+  $effect(() => {
+    const open = lightbox;
+    if (!open?.animated || !canLoadMedia(open.url)) return;
+    const url = open.url;
+    const img = new Image();
+    let cancelled = false;
+    img.onload = () => {
+      if (!cancelled) lightboxCopy = { url, img };
+    };
+    img.onerror = () => {
+      if (!cancelled) lightboxCopy = { url, img: null };
+    };
+    img.src = url;
+    return () => {
+      cancelled = true;
+    };
   });
 
   async function downloadOriginal() {
@@ -824,6 +923,9 @@
 
           {#if file.mimeType.startsWith("image/")}
             {@const box = mediaBoxStyle(file.width, file.height)}
+            <!-- One answer for the message and the viewer it opens: what is
+                 animated is measured before either decodes it. -->
+            {@const animated = file.mimeType === "image/gif"}
             {#if !transfer?.blobURL}
               <!-- The picture's own shape, held open before a single byte of
                    it has arrived. This is what stops the chat jumping as
@@ -877,6 +979,7 @@
                     filename: file.filename,
                     mimeType: file.mimeType,
                     size: file.size,
+                    animated,
                   })}
               >
                 <GifImage
@@ -886,7 +989,7 @@
                     ? 'h-full w-full'
                     : 'max-w-xs max-h-56'} rounded-md object-contain"
                   loading="lazy"
-                  animated={file.mimeType === "image/gif"}
+                  {animated}
                   animate={mediaPrefs.gifAutoplay ? true : "hover"}
                 />
               </button>
@@ -997,6 +1100,7 @@
             url: content,
             filename: "gif.gif",
             mimeType: "image/gif",
+            animated: true,
           })}
       >
         <GifImage
@@ -1433,7 +1537,26 @@
       </p>
     {/if}
 
-    {#if lightboxKind === "image"}
+    {#if lightboxKind === "image" && lightboxView !== "shown"}
+      <!-- An animated image past the bound, or one that did not load, said
+           plainly where the picture would be (see lightboxView). Nothing
+           while its copy is still loading. -->
+      {#if lightboxView !== "loading"}
+        <div
+          class="relative z-10 flex max-w-xs flex-col items-center gap-2 rounded-md border border-border bg-background px-6 py-5 text-center"
+        >
+          <ImageOff class="size-6 text-muted-foreground" />
+          {#if lightboxView === "too-large" && lightboxLoaded}
+            <p class="text-sm text-foreground">This image is too large to show.</p>
+            <p class="font-mono text-xs text-muted-foreground">
+              {lightboxLoaded.naturalWidth} x {lightboxLoaded.naturalHeight} pixels
+            </p>
+          {:else}
+            <p class="text-sm text-foreground">This image did not load.</p>
+          {/if}
+        </div>
+      {/if}
+    {:else if lightboxKind === "image"}
       <!-- A div, not a button: it carries drag handlers, and a draggable
            button is neither. It still has to be operable from a keyboard,
            so it takes focus and answers Enter and Space the way the click
@@ -1461,17 +1584,20 @@
         onpointerup={onPointerUp}
         onpointercancel={onPointerUp}
       >
-        <img
-          bind:this={imgEl}
-          src={lightbox.url}
-          alt="Preview"
-          draggable="false"
-          class="max-h-[90vh] max-w-[90vw] rounded-md object-contain"
-          style="transform: translate({pan.x}px, {pan.y}px) scale({zoom}); transition: {dragFrom ||
-          pinchStart
-            ? 'none'
-            : 'transform 120ms ease-out'}"
-        />
+        {#if !lightbox.animated}
+          <img
+            bind:this={imgEl}
+            src={lightbox.url}
+            alt="Preview"
+            draggable="false"
+            class={viewerImageClass}
+            style={zoomStyle}
+          />
+        {:else if lightboxLoaded}
+          <!-- An animated image is only ever its measured copy: never its
+               url in an img of its own (see showCopy). -->
+          <span style="display:contents" {@attach showCopy(lightboxLoaded)}></span>
+        {/if}
       </div>
     {:else}
       <div

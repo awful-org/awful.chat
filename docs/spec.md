@@ -289,9 +289,13 @@ interface PeerProfile {
 // 4096x4096 pixels it is a placeholder, never decoded. Its still frame is
 // drawn at the size it is shown (1024 px a side at most, drawn again when
 // that box grows), and what plays is that same copy, not the url fetched
-// again. Any other image is a plain img that the browser decodes at full
-// size, once per url however many places show it: a linked avatar whose url
-// names no animated format, a link preview's image, the lightbox's image.
+// again. The viewer a message's image opens in takes it the same way: a copy
+// of its own, measured before anything decodes it and shown itself; past
+// the bound it says the image is too large to show, and offers no
+// conversion (one draws the whole picture on a canvas). Any other image is
+// a plain img that the browser decodes at full size, once per url however
+// many places show it: a linked avatar whose url names no animated format,
+// a link preview's image, a still picture in a message and in its viewer.
 ```
 
 ### Identity struct

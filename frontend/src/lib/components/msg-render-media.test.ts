@@ -2,9 +2,10 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 /**
- * What a message asks for by itself. The rule is tested where it lives -
- * autoDownloadOnRender in files-hydration.test.ts - and these check that
- * MsgRender hands its files to it, reading the component the way
+ * What a message asks for and decodes by itself. The rules are tested where
+ * they live - autoDownloadOnRender in files-hydration.test.ts, animatedView
+ * in image-size.test.ts - and these check that MsgRender hands its files
+ * and images to them, reading the component the way
  * msg-render-listeners.test.ts does: there is no DOM in these tests.
  */
 const source = readFileSync("src/lib/components/MsgRender.svelte", "utf8");
@@ -38,5 +39,33 @@ describe("MsgRender's auto-download", () => {
     );
     expect(files).toMatch(/onclick=\{\(\) => onRequestFileDownload\(file, msg\.senderId\)\}/);
     expect(files).not.toContain("isOwn");
+  });
+});
+
+describe("MsgRender's image viewer", () => {
+  // A message shows a GIF past the bound as a placeholder, and a click on
+  // it opened the url here in a plain img, decoding at full size the very
+  // image the placeholder had refused.
+  it("is told an image is animated exactly when the message's GifImage is", () => {
+    expect(template).toMatch(/\{@const animated = file\.mimeType === "image\/gif"\}/);
+    expect(template).toMatch(/openLightbox\(\{[^}]*size: file\.size,\s*animated,\s*\}\)/);
+    expect(template).toMatch(/<GifImage\s+src=\{transfer\.blobURL\}[^>]*\{animated\}/);
+    expect(template).toMatch(/openLightbox\(\{[^}]*mimeType: "image\/gif",\s*animated: true,\s*\}\)/);
+    expect(template).toMatch(/<GifImage\s+src=\{content\}[^>]*animated=\{true\}/);
+  });
+
+  it("measures an animated image by GifImage's rule, and shows only the copy it measured", () => {
+    expect(script).toMatch(/const lightboxView = \$derived\(\s*lightbox\?\.animated\s*\?\s*animatedView\(/);
+    // The url goes into an img of its own for a still image alone.
+    expect(template.match(/src=\{lightbox\.url\}/g)).toHaveLength(1);
+    expect(template).toMatch(/\{#if !lightbox\.animated\}\s*<img\s+bind:this=\{imgEl\}\s+src=\{lightbox\.url\}/);
+    expect(template).toMatch(/\{:else if lightboxLoaded\}[\s\S]*?\{@attach showCopy\(lightboxLoaded\)\}/);
+    // Only once it is known to be within the bound.
+    expect(template).toMatch(/\{#if lightboxKind === "image" && lightboxView !== "shown"\}/);
+  });
+
+  it("says an image past the bound is too large to show, and converts nothing it will not show", () => {
+    expect(template).toContain("This image is too large to show.");
+    expect(script).toMatch(/const lightboxFormats = \$derived\([^;]*lightboxView === "shown"/);
   });
 });
