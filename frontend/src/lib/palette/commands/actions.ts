@@ -94,7 +94,7 @@ export const actionCommands: CmdSource = () => {
       keywords: ["find", "history", "grep", "messages"],
       group: "Actions",
       icon: Search,
-      shortcut: ["Ctrl", "F"],
+      shortcut: ["Mod", "F"],
       action: { kind: "act", perform: () => openSearch(here) },
     });
   }
@@ -104,7 +104,7 @@ export const actionCommands: CmdSource = () => {
     keywords: ["find", "history", "grep", "messages", "everywhere"],
     group: "Actions",
     icon: Search,
-    shortcut: ["Ctrl", "Shift", "F"],
+    shortcut: ["Mod", "Shift", "F"],
     action: { kind: "act", perform: () => openSearch(null) },
   });
 

@@ -1,5 +1,6 @@
 <script lang="ts">
 import { Label } from "$lib/components/ui/label";
+import { shortcutLabel } from "$lib/platform";
 import { Switch } from "$lib/components/ui/switch";
 import {
   notifyState,
@@ -353,7 +354,7 @@ async function loadLocalFonts(): Promise<void> {
     <div class="flex flex-col gap-1 min-w-0">
       <span class="text-xs font-mono">Collapse the sidebar</span>
       <span class="text-xs font-mono text-muted-foreground leading-relaxed">
-        Shrinks the room list to an icon rail. Cmd or Ctrl + B toggles it too.
+        Shrinks the room list to an icon rail. {shortcutLabel(["Mod", "B"])} toggles it too.
         Pinned plugin widgets hide while it is collapsed. No effect on a phone.
       </span>
     </div>
