@@ -16,9 +16,11 @@ with reactionTo/reactionEmoji/reactionOp), resolved at render time.
 ## IndexedDB Schema (idb)
 
 ```typescript
-// Current schema is v6 - v2 added savedGifs, v3 re-keyed profiles by did,
+// Current schema is v9 - v2 added savedGifs, v3 re-keyed profiles by did,
 // v4 added phonebook, v5 and v6 added the searchIndex and diagnostics stores
-// and the blinded indexes below. This listing is the v1 shape for
+// and the blinded indexes below, v8 rebuilt roomProfiles, and v9 added
+// attachments.byRoom (the blinded roomCode, so a room's files are read
+// without walking every room's). This listing is the v1 shape for
 // orientation; storage.ts is the authoritative upgrade path.
 export async function getDB(): Promise<AppDB> {
   // singleton - one connection for app lifetime
@@ -99,6 +101,13 @@ Query doctrine: bulk index getAll of raw sealed rows, filter on clear
         with multi-MB byte rows (attachments); openRow supports skipBytes
         to leave large buffers sealed when the caller only needs metadata.
         (see frontend/src/lib/storage-crypto.ts)
+Files:  outside IndexedDB, OPFS holds file ciphertext only (see File
+        Transfer); a decrypted attachment exists only in memory, as a Blob,
+        so no lock or wipe has to chase it. A browser short of memory may
+        page a large Blob to its own temporary storage (Chromium does, and
+        its in-memory share is small on a phone), cleared only when it next
+        starts - one more reason a stored file is decrypted only when its
+        message is loaded or someone asks for it.
 ```
 
 ---
@@ -662,24 +671,79 @@ What the relay learns: THAT a DID has mail and roughly when - never
 ## File Transfer
 
 ```txt
+Secure rooms (rd2_) and DMs. Every file is encrypted before it leaves the
+device (room-security/file-crypto.ts: a fresh key per file, 1 MiB AES-GCM
+chunks bound to the file id, size and chunk index). The descriptor holding
+the key travels only inside the signed, end-to-end encrypted message;
+WebTorrent sees an opaque name and ciphertext.
+
 send:
-  1. wtClient.seed(file, { announce: [] }) → infoHash
-  2. store Attachment { infoHash, status: "seeding" }
-  3. if size < 5MB: store data: ArrayBuffer
-  4. broadcast WireMessage with FileMeta
+  1. encrypt into OPFS staging (ciphertext) → seed it, pieces read from the
+     file itself → infoHash
+  2. keep the ciphertext in room-v2-ciphertext/<infoHash>; the seed reads
+     from there on
+  3. store Attachment { infoHash, encryption, status: "seeding" },
+     data: the ciphertext when it is 5MB or less
+  4. broadcast the message with the file descriptors
 
 receive:
   1. store Attachment { status: "pending" }
   2. wtClient.add(infoHash) → status: "downloading"
-  3. torrent.on("done") → blobURL → status: "complete"
-  4. if size < 5MB: store ArrayBuffer
+  3. torrent done → ciphertext to room-v2-ciphertext/<infoHash> → decrypted
+     IN MEMORY, no File until every chunk authenticates → blobURL
+     → status: "seeding" (data: the ciphertext when 5MB or less)
 
-startup:
-  re-seed all complete attachments that have data
+room open (first time in a session):
+  read the room's rows (attachments.byRoom, metadata only). Every file this
+  device holds (room-v2-ciphertext/<infoHash>, or the row's data) is held:
+  "pending", this device counted as a seeder, never fetched again. Nothing
+  is seeded, re-hashed or rewritten; a row of 5MB or less that never got
+  its copy of the file gets it, once, copied from room-v2-ciphertext.
+
+held files (files.svelte.ts): a decrypted file stays in memory for the
+session, so a held file is decrypted only
+  - when its message is loaded in the open conversation (the room open's
+    page, an older page scrolled back to, a message arriving), if it is a
+    picture, video or sound of 64MB or less - whoever sent it, whatever
+    the auto-download setting, since nothing is fetched; newest first, one
+    at a time;
+  - or when someone asks for it, whatever its size: its Download button, a
+    plugin, or auto-download as another member's media comes on screen.
+  Decrypted IN MEMORY from room-v2-ciphertext, or from the row's data when
+  this device has no durable copy (which is then written, once) → blobURL.
+  Anything else waits for its Download button. An ask nobody made - a
+  message arriving, a peer announcing what it holds - leaves a held file
+  held (webtorrent.ts ensureDownload). One restore per file at a time,
+  whoever asks (files.svelte.ts restoreStoredFile).
+
+serving (a peer's link connects for a file with no torrent here):
+  seed room-v2-ciphertext/<infoHash> as it is - the original opaque name
+  and 256 KiB pieces, so the infoHash is the signed one - with the pieces
+  read from the file itself (CiphertextChunkStore). Never decrypted, and so
+  not on screen: the file stays held here (see held files). The
+  first serve in a session hashes the ciphertext (webtorrent builds the
+  torrent before seeding it) - seconds for hundreds of MB on a phone - and
+  a link that times out meanwhile is dialled again and finds the seed.
+
+status: written to the rows when it changes, read without the file bytes.
+A torrent's progress becomes a snapshot at most every 250 ms.
+
+OPFS (the origin's private file system) holds ciphertext only, never a
+decrypted file:
+  room-v2-ciphertext/<infoHash>   durable, until a wipe
+  room-v2-pieces/<lease>/...      a download's piece store, for one session
+  room-v2-transfers/<lease>/...   a send's ciphertext until it is kept
+  <lease>: each file transport (transport/file/opfs-lease.ts) holds the Web
+  Lock "awful:opfs:<lease>" for its session. A page starting, and a lock,
+  remove every lease directory whose lock is free (its page closed or
+  crashed) - nothing can on the way out of a closed tab - and entries from
+  before leases existed once no other page holds or waits for awful:node or
+  a quick call's storage lock. The duress wipe removes all of OPFS.
 
 blobURL:
-  created: torrent done
-  revoked: message scrolls out of virtual list OR beforeunload
+  created: download done, or a held file shown (see held files); always
+           from an in-memory File
+  revoked: session reset (lock, identity switch) or page unload
 ```
 
 ---

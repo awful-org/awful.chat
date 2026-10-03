@@ -199,6 +199,7 @@ import {
   INLINE_FILE_MAX_BYTES,
   stripAndAdoptInlineFiles,
   initFiles,
+  restoreStoredFile,
   maybePeerIdFromSenderId,
   shouldAutoDownload,
   fileRoomForPeer,
@@ -4036,7 +4037,7 @@ _transport.on("message", (peerId, data, room) => {
         fileRoomForPeer(peerId, file.infoHash, room)
           .then(async (shared) => {
             if (!shared) return;
-            const stored = (await getAttachmentsByInfoHash(file.infoHash)).find(a => a.roomCode === shared);
+            const stored = (await getAttachmentsByInfoHash(file.infoHash, { skipBytes: true })).find(a => a.roomCode === shared);
             if (!stored || !acceptsFileDescriptors(shared, [stored])) return;
             // The signed stored message owns the descriptor, not a seeder's
             // unsigned inventory announcement (which may substitute its key).
@@ -4712,11 +4713,11 @@ function _disconnectWithoutBroadcasting(): void {
 
 onIdentityLock(_disconnectWithoutBroadcasting);
 
-/** Restore ciphertext locally before asking peers, using the authenticated
- * transfer publication path shared by attachment hydration. */
+/** Restore ciphertext locally before asking peers, through the same restore
+ * as attachment hydration - one decrypt per file however many ask at once. */
 export async function restoreFileAttachment(attachment: Attachment): Promise<boolean> {
   const guard = captureSessionGuard();
-  const restored = await _fileTransport.restoreEncryptedFile(attachment, attachment.data);
+  const restored = await restoreStoredFile(attachment);
   guard();
   return restored;
 }
