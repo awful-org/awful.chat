@@ -9,7 +9,7 @@
    * after the URL, display names, per-session player ids. Never a DID, the
    * room, its secret or its name.
    */
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { Button } from "$lib/components/ui/button";
   import { Switch } from "$lib/components/ui/switch";
   import { Check, Maximize2, Minimize2, TriangleAlert, X } from "@lucide/svelte";
@@ -17,19 +17,22 @@
   import { HEARTBEAT_MS, playerId, playing, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
   import { agree, hasAgreed } from "./consent";
+  import SiteAddress from "./SiteAddress.svelte";
   import SiteIcon from "./SiteIcon.svelte";
 
   let { card, cardState, host, chromeVisible, focused, setFocused }: CallTileProps<AppState> = $props();
 
   const app = $derived(cardState);
   const site = $derived(app.url ? new URL(app.url).host : "");
-  const selfDid = host.selfDid();
+  const selfDid = $derived(host.selfDid());
   const mine = $derived(selfDid === app.starter);
 
   // Mounted = joined. "closed" is the app having closed itself; leaving the
   // tile is the host's own Leave, which unmounts this.
+  // The card's origin as it was when the tile mounted: a later change of
+  // site is a new card, never a reason to skip the disclosure.
   let phase = $state<"disclose" | "open" | "closed">(
-    cardState.origin && hasAgreed(cardState.origin) ? "open" : "disclose",
+    untrack(() => (cardState.origin && hasAgreed(cardState.origin) ? "open" : "disclose")),
   );
   let frame = $state<HTMLIFrameElement | null>(null);
   /** "Don't show again for this site" - off unless the person turns it on. */
@@ -208,13 +211,14 @@
      menu - none of which reaches the host from inside a cross-origin iframe. -->
 <div class="flex h-full w-full flex-col overflow-hidden bg-black font-mono text-white">
   <!-- The site's address, always, outside anything the site draws: an app
-       must never pass for the host. Left room for the host's Leave button
-       (further right when focused, past the grid menu), right room for its
-       audience chip. -->
+       must never pass for the host, so a host too long for the tile loses
+       its start, never the end that names the site (SiteAddress). Left room
+       for the host's Leave button (further right when focused, past the grid
+       menu), right room for its audience chip. -->
   <div class="flex h-10 shrink-0 items-center gap-2 border-b border-white/10 {focused
       ? 'pl-26'
       : 'pl-12'} pr-14 text-[11px]">
-    <span class="truncate text-white/90" title={app.url}>{site}</span>
+    <SiteAddress url={app.url} class="text-white/90" />
     <div class="ml-auto flex shrink-0 items-center gap-1.5">
       {#if mine && chromeVisible && phase !== "disclose"}
         <button
@@ -262,8 +266,10 @@
           <div class="flex items-center gap-2">
             <SiteIcon url={app.url} class="size-8 text-sm" />
             <div class="min-w-0">
-              <p class="truncate text-sm font-semibold">Open {site}?</p>
-              <p class="truncate text-[11px] text-muted-foreground">{app.url}</p>
+              <p class="flex min-w-0 text-sm font-semibold">
+                <span class="shrink-0">Open&nbsp;</span><SiteAddress url={app.url} /><span class="shrink-0">?</span>
+              </p>
+              <SiteAddress url={app.url} path class="text-[11px] text-muted-foreground" />
             </div>
           </div>
           <ul class="space-y-1.5">
@@ -282,7 +288,7 @@
           </ul>
           <label class="flex cursor-pointer items-center gap-2 border-t border-border pt-3 text-muted-foreground">
             <Switch aria-label="Don't show again for {site}" bind:checked={remember} />
-            <span>Don't show again for {site}</span>
+            <span class="min-w-0 break-all">Don't show again for {site}</span>
           </label>
           <Button size="sm" class="w-full font-mono text-xs cursor-pointer" onclick={agreeAndOpen}>Open app</Button>
         </div>

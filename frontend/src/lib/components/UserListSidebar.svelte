@@ -11,8 +11,10 @@
   import { looksLikePeerId } from "$lib/identity/identity-utils";
   import {
     derivePeerOnlineState,
+    nextGraceExpiry,
     PEER_PROOF_GRACE_MS,
   } from "$lib/peer-online-status";
+  import { keepUnchanged } from "$lib/stable-rows";
   import {
     openDmPanel,
     addToPhonebook,
@@ -124,23 +126,52 @@
   // "connecting" on its own once the grace window elapses, not only the
   // next time some other reactive input happens to change - so this needs
   // its own clock, not a derivation of state that only ticks on its own.
+  // One that wakes only for that: a single timer to the earliest grace
+  // window still running, and none at all while every connected peer is
+  // proven. It used to tick twice a second for as long as the list was
+  // mounted, rebuilding the roster and repainting every row each time.
   let now = $state(Date.now());
   $effect(() => {
-    const tick = setInterval(() => {
+    const at = nextGraceExpiry(
+      connectedSince,
+      transportState.provenPeers,
+      now,
+      PEER_PROOF_GRACE_MS
+    );
+    if (at === null) return;
+    const timer = setTimeout(() => {
       now = Date.now();
-    }, 500);
-    return () => clearInterval(tick);
+    }, Math.max(0, at - Date.now()));
+    return () => clearTimeout(timer);
   });
+
+  /** The order localeCompare gave, from one collator made once. */
+  const byName = new Intl.Collator();
+
+  /**
+   * The rows as last built, by DID. A rebuild hands back the old object for
+   * a row that came out the same (stable-rows.ts), so the list repaints, and
+   * redraws avatars for, only the members something actually changed for.
+   */
+  let previousRows = new Map<string, User>();
 
   const users = $derived.by(() => {
     const allUsers: User[] = [];
+    const rows = new Map<string, User>();
+
+    // One pass over the connections instead of one per member: which
+    // connected id, if any, each DID has. The first one wins, as find did.
+    const connectedByDid = new Map<string, string>();
+    for (const peerId of peers) {
+      const did = peerIdToDid(peerId);
+      if (!connectedByDid.has(did)) connectedByDid.set(did, peerId);
+    }
+    const connected = new Set(peers);
 
     for (const did of roomUsers) {
       const isSelf =
         did === selfDid || did === ownDid || did === selfPeerId();
-      const connectedPeerId = peers.find(
-        (peerId) => peerIdToDid(peerId) === did
-      );
+      const connectedPeerId = connectedByDid.get(did);
       const mappedPeerId =
         connectedPeerId ??
         didToPeerId(did) ??
@@ -150,9 +181,9 @@
       // reach them, so "connected" and "proven" are checked separately
       // (libp2p-audit finding 1).
       const onlinePeerId = connectedPeerId ??
-        (peers.includes(did)
+        (connected.has(did)
           ? did
-          : mappedPeerId && peers.includes(mappedPeerId)
+          : mappedPeerId && connected.has(mappedPeerId)
             ? mappedPeerId
             : null);
       const proven = !!onlinePeerId && transportState.provenPeers.has(onlinePeerId);
@@ -251,7 +282,7 @@
                 transportState.watchingTransmissions.has(k))
           );
 
-      allUsers.push({
+      const row = keepUnchanged(previousRows.get(did), {
         did,
         peerId: mappedPeerId,
         name,
@@ -274,7 +305,10 @@
         gradient2,
         gradient3,
       });
+      rows.set(did, row);
+      allUsers.push(row);
     }
+    previousRows = rows;
 
     return allUsers.sort((a, b) => {
       if (a.isSelf && !b.isSelf) return -1;
@@ -288,7 +322,7 @@
       // They belong under the people you can actually tell apart.
       if (a.named && !b.named) return -1;
       if (!a.named && b.named) return 1;
-      return a.name.localeCompare(b.name);
+      return byName.compare(a.name, b.name);
     });
   });
 

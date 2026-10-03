@@ -62,8 +62,17 @@ const analysers = new Map<
 /** Shared AudioContext, one for all peers. Multiple contexts would hit browser caps. */
 let sharedCtx: AudioContext | null = null;
 
-/** Animation frame handle for the polling loop. */
-let rafId: number | null = null;
+/**
+ * Timer handle for the polling loop.
+ *
+ * A timer at the poll rate, not requestAnimationFrame. The loop used to
+ * re-request a frame on every vsync and skip five in six of them, and each
+ * pending frame made the browser run a rendering frame for the whole call -
+ * 60 to 120 a second in a voice call where nothing on screen moves. What rAF
+ * gave for free was stopping in a hidden tab; the visibility listener below
+ * keeps that.
+ */
+let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 /** Reusable buffer for FFT data (allocated once per session, not per frame). */
 const speakerBuf = new Uint8Array(512);
@@ -77,13 +86,10 @@ const speakerBuf = new Uint8Array(512);
 const SPEAKING_HOLD_MS = 500; // How long to hold after the last loud frame
 const SPEAKING_ON = 3; // Threshold to turn speaking on
 const SPEAKING_OFF = 1; // Threshold to keep speaking on (lower = hysteresis)
-const SPEAKER_POLL_MS = 100; // Poll FFT every 100ms (10Hz), not every frame (60Hz)
+export const SPEAKER_POLL_MS = 100; // Poll FFT every 100ms (10Hz), not every frame (60Hz)
 
 /** When each peer last had audio above the threshold. */
 const lastLoudAt = new Map<string, number>();
-
-/** Next time to poll speakers (throttles the FFT reads). */
-let nextSpeakerPollAt = 0;
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -151,26 +157,47 @@ function stopSpeakerDetection(peerId: string): void {
   speakers.lastSpokeAt.delete(peerId);
 }
 
+function tabHidden(): boolean {
+  return typeof document !== "undefined" && document.hidden;
+}
+
+let visibilityHooked = false;
+
 /**
- * The RAF-driven FFT polling loop.
+ * Stop the loop while the tab is hidden and start it again when it comes
+ * back, as requestAnimationFrame did on its own: no speaking state changes
+ * while backgrounded, and no FFT reads nobody sees. One listener for the
+ * life of the page.
+ */
+function hookVisibility(): void {
+  if (visibilityHooked || typeof document === "undefined") return;
+  visibilityHooked = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopPolling();
+    else if (analysers.size > 0) startPolling();
+  });
+}
+
+function startPolling(): void {
+  hookVisibility();
+  if (pollTimer !== null || tabHidden()) return;
+  pollTimer = setInterval(pollSpeakers, SPEAKER_POLL_MS);
+}
+
+function stopPolling(): void {
+  if (pollTimer === null) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+/**
+ * The FFT polling loop, every SPEAKER_POLL_MS.
  *
- * Reads frequency data every SPEAKER_POLL_MS, checks if each peer is audibly
- * speaking, and updates the speakers state. Only publishes when the set
- * actually changes to avoid re-rendering every consumer.
+ * Reads frequency data, checks if each peer is audibly speaking, and updates
+ * the speakers state. Only publishes when the set actually changes to avoid
+ * re-rendering every consumer.
  */
 function pollSpeakers(): void {
-  const pollNow = performance.now();
-
-  // Throttle FFT reads to SPEAKER_POLL_MS. The rAF loop pauses in hidden
-  // tabs (by design - no speaking state changes while backgrounded), but
-  // the FFT is expensive, so we skip it until it is time.
-  if (pollNow < nextSpeakerPollAt) {
-    rafId = requestAnimationFrame(pollSpeakers);
-    return;
-  }
-
-  nextSpeakerPollAt = pollNow + SPEAKER_POLL_MS;
-
   // Resume the context if it was suspended while the tab was hidden.
   if (sharedCtx?.state === "suspended") {
     sharedCtx.resume().catch(() => {});
@@ -229,8 +256,6 @@ function pollSpeakers(): void {
   if (changed) {
     speakers.speaking = next;
   }
-
-  rafId = requestAnimationFrame(pollSpeakers);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -294,17 +319,9 @@ export function updateSpeakerTracks(
     }
   }
 
-  // Start the RAF loop if needed.
-  if (!rafId && desiredPeers.size > 0) {
-    rafId = requestAnimationFrame(pollSpeakers);
-  }
-
-  // Stop the RAF loop if we have no one to monitor.
-  if (rafId && desiredPeers.size === 0) {
-    cancelAnimationFrame(rafId);
-    rafId = null;
-    nextSpeakerPollAt = 0;
-  }
+  // Poll while there is someone to listen to, and only then.
+  if (analysers.size > 0) startPolling();
+  else stopPolling();
 }
 
 /**
@@ -329,10 +346,7 @@ export function _trackedSpeakers(): string[] {
 }
 
 export function stopAllSpeakers(): void {
-  if (rafId) {
-    cancelAnimationFrame(rafId);
-    rafId = null;
-  }
+  stopPolling();
 
   for (const peerId of [...analysers.keys()]) {
     stopSpeakerDetection(peerId);
@@ -340,7 +354,6 @@ export function stopAllSpeakers(): void {
 
   sharedCtx?.close().catch(() => {});
   sharedCtx = null;
-  nextSpeakerPollAt = 0;
   speakers.speaking = new Set();
   speakers.speakingSince.clear();
   speakers.lastSpokeAt.clear();

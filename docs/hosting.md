@@ -186,7 +186,8 @@ to a tagged release in stages: the service's own instance first, then a tenth
 of the fleet, then the rest, with automatic rollback on a failed health
 check. Plugins compile into the bundle, so build one image per plugin-set hash
 and cache it; most tenants share the default set. Pin plugin sources to a
-commit, show the tenant the hash, keep the plugin README's warning.
+commit's whole 40-character sha, show the tenant the hash, keep the plugin
+README's warning.
 
 Health that means something. A tenant is up when its config endpoint answers,
 the relay mints a TURN credential, the SFU accepts a websocket, and, nightly,

@@ -44,10 +44,13 @@ export async function removeCiphertext(hash: string): Promise<void> {
     if (!(e instanceof DOMException && e.name === "NotFoundError")) throw e;
   });
 }
+/** Every directory the file transport keeps in the origin's private file
+ * system: this durable store, and the temporary areas of opfs-lease.ts. */
+export const FILE_STORE_DIRS = ["room-v2-ciphertext", "room-v2-transfers", "room-v2-pieces"] as const;
 export async function wipeCiphertext(): Promise<void> {
   if (!globalThis.navigator?.storage?.getDirectory) return;
   const root = await navigator.storage.getDirectory();
-  for (const name of ["room-v2-ciphertext", "room-v2-transfers", "room-v2-pieces"]) {
+  for (const name of FILE_STORE_DIRS) {
     await root.removeEntry(name, { recursive: true }).catch(e => {
       if (!(e instanceof DOMException && e.name === "NotFoundError")) throw e;
     });

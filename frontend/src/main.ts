@@ -1,9 +1,10 @@
 import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
-import { loadRuntimeConfig } from "$lib/runtime-config";
+import { configSettled, loadRuntimeConfig } from "$lib/runtime-config";
 import { sweepOrphanQuickStorage } from "$lib/quick/quick-storage";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
+import { firstPage, optionalRoute, preloadPage, routeFor } from "./pages";
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
 // ReloadPrompt.svelte. A second registerSW() here used to race it - each
@@ -40,8 +41,26 @@ window.addEventListener("vite:preloadError", (event) => {
 // Configuration BEFORE the app mounts. Several modules read the relay and
 // api urls while they initialise, and a mount that raced this would have
 // them capture the build-time fallback instead of what the instance
-// actually serves. A missing config.json resolves immediately.
-await loadRuntimeConfig();
+// actually serves. A missing config.json resolves immediately, and so does
+// any launch after the first: it starts from the copy the last one kept and
+// refreshes it behind the app (runtime-config.ts).
+const config = loadRuntimeConfig();
+
+// The pages are not in this bundle (pages.ts). An invite link or /app starts
+// downloading its first screen - the setup or unlock form, with the app to
+// follow once that is up - now, alongside the configuration, rather than
+// once App has mounted and read the identity; it runs when App shows it.
+// After loadRuntimeConfig, which has already applied a saved copy: whether
+// /qs and /qc exist is part of the configuration.
+preloadPage(firstPage(routeFor(window.location.pathname)));
+
+await config;
+
+// Whether /qs and /qc exist at all is part of the configuration, and the
+// copy a launch starts from can be out of date on exactly that: on those two
+// addresses, wait for the served one as a first launch does, or a link to a
+// page the instance has just turned on would open the landing page instead.
+if (optionalRoute(window.location.pathname)) await configSettled(4000);
 
 // Databases a crashed quick page left behind. /qc does its OWN switch, once
 // the person has said whether they are a guest or their account - it has to

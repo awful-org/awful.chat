@@ -8,7 +8,7 @@ const peerIdToDid = new Map<string, string>();
 
 vi.mock("$lib/storage", () => ({
   attachmentEpoch: () => epoch,
-  getSeedableFiles: async () => pendingRead ? pendingRead : seedable,
+  getSeedableFiles: async () => { reads++; return pendingRead ? pendingRead : seedable; },
   getRoomParticipants: async (roomCode: string) => participants[roomCode] ?? [],
   getAttachmentsByInfoHash: async () => [],
   getAttachmentsWithData: async () => [],
@@ -36,6 +36,7 @@ vi.mock("$lib/utils", () => ({
 }));
 
 let epoch = 1;
+let reads = 0;
 let seedable: Array<{ roomCode: string; file: { infoHash: string } }> = [];
 let pendingRead: Promise<typeof seedable> | null = null;
 let participants: Record<string, string[]> = {};
@@ -95,5 +96,24 @@ describe("_announceStoredFilesTo", () => {
     expect(sent).toEqual([]);
     await _announceStoredFilesTo("p1");
     expect(sent.map(s => s.infoHash)).toEqual(["new-identity-file"]);
+  });
+
+  it("peers binding at once share one walk of the store", async () => {
+    const peers = ["p1", "p2", "p3", "p4", "p5"];
+    for (const peer of peers) peerIdToDid.set(peer, "did:key:alice");
+    participants = { "rd2_a": ["did:key:alice"] };
+    seedable = [entry("rd2_a", "a")];
+    let finish!: (rows: typeof seedable) => void;
+    pendingRead = new Promise(resolve => { finish = resolve; });
+    reads = 0;
+    const binds = peers.map(peer => _announceStoredFilesTo(peer));
+    finish(seedable);
+    await Promise.all(binds);
+    expect(reads).toBe(1);
+    expect(sent.map(s => s.peerId).sort()).toEqual(peers);
+    // And the walk that finished is the cache the next bind uses.
+    pendingRead = null;
+    await _announceStoredFilesTo("p1");
+    expect(reads).toBe(1);
   });
 });

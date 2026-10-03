@@ -2,17 +2,12 @@
  * Message search engine: corpus entries, filter matching, ranking.
  *
  * Pure module - no storage, no UI, no $state - so the whole pipeline is
- * unit-testable. Terms match at word starts (matchWordPrefix), quoted
+ * unit-testable. Terms match at word starts (wordStartAt), quoted
  * phrases anywhere; only the short sender name in from: stays fuzzy.
  */
 import { MessageType, type ChatMessageType } from "$lib/types/message";
-import {
-  match,
-  matchExact,
-  mergeRanges,
-  type MatchRange,
-} from "$lib/palette/scorer";
-import type { SearchQuery } from "./query";
+import { match, mergeRanges, type MatchRange } from "$lib/palette/scorer";
+import type { SearchQuery, SearchTerm } from "./query";
 import { linkTargets, stripMarkdown } from "$lib/markdown";
 
 // Kind flags, matched by the has: filter.
@@ -137,79 +132,222 @@ const WORD_CHAR = /[\p{L}\p{N}_]/u;
 /** Scripts written without spaces: there is no word start to anchor on. */
 const UNSPACED = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u;
 
+// A match scores the way the palette's matchExact scores a run of characters:
+// RUN_SCORE each, plus START_BONUS when the run opens the text. Spelled out
+// here so the ranking pass can score without building the positions array
+// matchExact returns - on a one-letter query that array was built for most
+// of the corpus and thrown away for all but the best 80.
+const RUN_SCORE = 16;
+const START_BONUS = 20;
+/** Per character, on top, for a term that is a whole word. */
+const WHOLE_WORD_SCORE = 8;
+
 /**
- * An unquoted term matches where a WORD begins with it: "dep" finds
- * "deploy", "ploy" does not, and neither do letters that merely occur in
- * order somewhere. This used the palette's fuzzy scorer, which is right for
- * a few dozen short titles and wrong for message text - a paragraph contains
- * almost any handful of letters in order, so most of a room matched.
- * Scored like matchExact, plus a bonus for matching the whole word.
+ * Where an unquoted term matches: the first WORD that begins with it. "dep"
+ * finds "deploy", "ploy" does not, and neither do letters that merely occur
+ * in order somewhere. This used the palette's fuzzy scorer, which is right
+ * for a few dozen short titles and wrong for message text - a paragraph
+ * contains almost any handful of letters in order, so most of a room
+ * matched. Scored like matchExact, plus a bonus for the whole word
+ * (termScoreAt).
  */
-export function matchWordPrefix(lowText: string, lowTerm: string) {
-  if (lowTerm.length === 0) return null;
-  if (UNSPACED.test(lowTerm[0])) return matchExact(lowText, lowTerm);
+function wordStartAt(lowText: string, lowTerm: string): number {
+  if (lowTerm.length === 0) return -1;
+  if (UNSPACED.test(lowTerm[0])) return lowText.indexOf(lowTerm);
   for (let at = lowText.indexOf(lowTerm); at >= 0; at = lowText.indexOf(lowTerm, at + 1)) {
     if (at > 0 && WORD_CHAR.test(lowText[at - 1])) continue;
-    const hit = matchExact(lowText.slice(at), lowTerm)!;
-    const end = at + lowTerm.length;
-    const wholeWord = end === lowText.length || !WORD_CHAR.test(lowText[end]);
-    return {
-      score: hit.score + (wholeWord ? lowTerm.length * 8 : 0),
-      positions: hit.positions.map((p) => p + at),
-    };
+    return at;
   }
-  return null;
+  return -1;
+}
+
+function termAt(lowText: string, term: SearchTerm): number {
+  if (!term.exact) return wordStartAt(lowText, term.text);
+  return term.text.length === 0 ? -1 : lowText.indexOf(term.text);
+}
+
+function termScoreAt(lowText: string, term: SearchTerm, at: number): number {
+  const lowTerm = term.text;
+  const run = RUN_SCORE * lowTerm.length;
+  if (term.exact || UNSPACED.test(lowTerm[0])) {
+    return run + (at === 0 ? START_BONUS : 0);
+  }
+  // A word start counts as the start of a run: it was scored on the text
+  // from that word on.
+  const end = at + lowTerm.length;
+  const wholeWord = end === lowText.length || !WORD_CHAR.test(lowText[end]);
+  return run + START_BONUS + (wholeWord ? lowTerm.length * WHOLE_WORD_SCORE : 0);
 }
 
 /** Recency half-life: a hit ages to half its score every 30 days. */
 const HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
 
+/** Whether an entry passes a from: filter. */
+type FromFilter = (entry: SearchEntry, from: string) => boolean;
+
+function fromMatches(entry: SearchEntry, from: string): boolean {
+  return (
+    match(entry.senderName.toLowerCase(), from) !== null ||
+    entry.senderDid.toLowerCase().startsWith(from)
+  );
+}
+
+/**
+ * The from: filter for one search, remembered per name and per DID: a room
+ * holds thousands of messages from a handful of people, and the fuzzy name
+ * match lowercased and scored the same name once per message.
+ */
+function rememberingFromFilter(): FromFilter {
+  const byName = new Map<string, boolean>();
+  const byDid = new Map<string, boolean>();
+  return (entry, from) => {
+    let name = byName.get(entry.senderName);
+    if (name === undefined) {
+      name = match(entry.senderName.toLowerCase(), from) !== null;
+      byName.set(entry.senderName, name);
+    }
+    if (name) return true;
+    let did = byDid.get(entry.senderDid);
+    if (did === undefined) {
+      did = entry.senderDid.toLowerCase().startsWith(from);
+      byDid.set(entry.senderDid, did);
+    }
+    return did;
+  };
+}
+
+/**
+ * The rank score of one entry, or -1 when any filter or term fails. Builds
+ * nothing: ranking a corpus calls this once per entry, and only the hits
+ * that make the cut are turned into SearchHits (searchEntries).
+ */
+export function scoreEntry(
+  entry: SearchEntry,
+  q: SearchQuery,
+  nowMs: number,
+  passesFrom: FromFilter = fromMatches
+): number {
+  if ((entry.flags & q.has) !== q.has) return -1;
+  if (q.before !== null && entry.timestamp >= q.before) return -1;
+  if (q.after !== null && entry.timestamp < q.after) return -1;
+  if (q.from !== null && !passesFrom(entry, q.from)) return -1;
+
+  let termScore = 0;
+  for (const term of q.terms) {
+    const at = termAt(entry.low, term);
+    if (at < 0) return -1;
+    termScore += termScoreAt(entry.low, term, at);
+  }
+
+  // A timestamp that is not a number (it comes from the sender) ages to
+  // nothing rather than to NaN, which no ranking can order.
+  const age = Math.max(0, nowMs - entry.timestamp) || 0;
+  return (1 + termScore) * Math.pow(2, -age / HALF_LIFE_MS);
+}
+
+/** Highlight ranges for an entry the query matches. */
+function rangesFor(entry: SearchEntry, q: SearchQuery): MatchRange[] {
+  const ranges: MatchRange[] = [];
+  for (const term of q.terms) {
+    const at = termAt(entry.low, term);
+    if (at >= 0) ranges.push({ start: at, end: at + term.text.length });
+  }
+  return mergeRanges(ranges);
+}
+
 /**
  * Match one entry against a parsed query. Null when any filter or term
  * fails. Zero terms with a filter is valid ("has:image") and ranks purely
  * by recency.
+ *
+ * Searching does not go through here: searchEntries scores every entry and
+ * builds a hit only for those that make the cut. This is the one-entry
+ * form the tests hold searchEntries to.
  */
 export function matchEntry(
   entry: SearchEntry,
   q: SearchQuery,
   nowMs: number
 ): SearchHit | null {
-  if ((entry.flags & q.has) !== q.has) return null;
-  if (q.before !== null && entry.timestamp >= q.before) return null;
-  if (q.after !== null && entry.timestamp < q.after) return null;
-  if (q.from !== null) {
-    const nameHit = match(entry.senderName.toLowerCase(), q.from);
-    if (!nameHit && !entry.senderDid.toLowerCase().startsWith(q.from))
-      return null;
-  }
-
-  let termScore = 0;
-  const allRanges: MatchRange[] = [];
-  for (const term of q.terms) {
-    const hit = term.exact
-      ? matchExact(entry.low, term.text)
-      : matchWordPrefix(entry.low, term.text);
-    if (!hit) return null;
-    termScore += hit.score;
-    for (const p of hit.positions)
-      allRanges.push({ start: p, end: p + 1 });
-  }
-
-  const age = Math.max(0, nowMs - entry.timestamp);
-  const decay = Math.pow(2, -age / HALF_LIFE_MS);
-  return {
-    entry,
-    score: (1 + termScore) * decay,
-    ranges: mergeRanges(allRanges),
-  };
+  const score = scoreEntry(entry, q, nowMs);
+  if (score < 0) return null;
+  return { entry, score, ranges: rangesFor(entry, q) };
 }
 
-/** Sort best-first; recency (lamport) breaks ties. Truncates to `limit`. */
-export function rankHits(hits: SearchHit[], limit: number): SearchHit[] {
-  hits.sort(
-    (a, b) => b.score - a.score || b.entry.lamport - a.entry.lamport
-  );
-  return hits.length > limit ? hits.slice(0, limit) : hits;
+interface Ranked {
+  entry: SearchEntry;
+  score: number;
+  /** Scan order: what a stable sort would keep first among exact ties. */
+  seq: number;
+}
+
+/** Whether `a` ranks below `b`: by score, then the newer (higher lamport)
+ *  first, then scan order. */
+function ranksBelow(a: Ranked, b: Ranked): boolean {
+  if (a.score !== b.score) return a.score < b.score;
+  if (a.entry.lamport !== b.entry.lamport) return a.entry.lamport < b.entry.lamport;
+  return a.seq > b.seq;
+}
+
+/**
+ * The best `limit` hits across the given entry lists, best first - the same
+ * list and order as matching every entry (matchEntry) and stable-sorting
+ * all the hits by score, recency breaking ties.
+ *
+ * It keeps a heap of the best `limit` instead: a one-letter query matches
+ * most of every room, and sorting all of those hits, each with its own
+ * ranges array, to show 80 of them was most of the cost of a keystroke.
+ */
+export function searchEntries(
+  lists: Iterable<readonly SearchEntry[]>,
+  q: SearchQuery,
+  limit: number,
+  nowMs: number
+): SearchHit[] {
+  if (limit <= 0) return [];
+  const passesFrom = rememberingFromFilter();
+  // A min-heap on rank: the root is the weakest hit kept so far.
+  const heap: Ranked[] = [];
+  let seq = 0;
+  for (const entries of lists) {
+    for (const entry of entries) {
+      const score = scoreEntry(entry, q, nowMs, passesFrom);
+      const at = seq++;
+      if (score < 0) continue;
+      const item = { entry, score, seq: at };
+      if (heap.length < limit) {
+        heap.push(item);
+        siftUp(heap, heap.length - 1);
+      } else if (ranksBelow(heap[0], item)) {
+        heap[0] = item;
+        siftDown(heap, 0);
+      }
+    }
+  }
+  heap.sort((a, b) => (ranksBelow(a, b) ? 1 : ranksBelow(b, a) ? -1 : 0));
+  return heap.map((r) => ({ entry: r.entry, score: r.score, ranges: rangesFor(r.entry, q) }));
+}
+
+function siftUp(heap: Ranked[], i: number): void {
+  while (i > 0) {
+    const parent = (i - 1) >> 1;
+    if (!ranksBelow(heap[i], heap[parent])) return;
+    [heap[i], heap[parent]] = [heap[parent], heap[i]];
+    i = parent;
+  }
+}
+
+function siftDown(heap: Ranked[], i: number): void {
+  for (;;) {
+    const left = 2 * i + 1;
+    const right = left + 1;
+    let weakest = i;
+    if (left < heap.length && ranksBelow(heap[left], heap[weakest])) weakest = left;
+    if (right < heap.length && ranksBelow(heap[right], heap[weakest])) weakest = right;
+    if (weakest === i) return;
+    [heap[i], heap[weakest]] = [heap[weakest], heap[i]];
+    i = weakest;
+  }
 }
 
 export interface Snippet {

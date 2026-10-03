@@ -1,6 +1,6 @@
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: { did: "did:test:me" } }));
+vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: { did: "did:test:me", isUnlocked: true } }));
 vi.mock("$lib/transport/transport.svelte", () => ({ broadcastProfile: vi.fn() }));
 vi.mock("$lib/storage", () => ({
   getOwnProfile: vi.fn(), putOwnProfile: vi.fn(), updateOwnProfile: vi.fn(),
@@ -19,6 +19,9 @@ import { broadcastProfile } from "$lib/transport/transport.svelte";
 import { validateProfileMeta } from "./profile-meta";
 
 beforeEach(() => vi.clearAllMocks());
+// The broadcast imports the transport when it runs (profile.svelte.ts): let
+// one still on its way land in the test that caused it, not the next.
+afterEach(() => vi.dynamicImportSettled());
 
 it("keeps edits in their selected room and inherits later main edits", async () => {
   roomProfileStore.records = new Map();
@@ -59,6 +62,7 @@ it("does not display or announce a failed room write", async () => {
   vi.mocked(putOwnRoomProfile).mockRejectedValueOnce(new Error("disk failed"));
   await expect(saveScopedFields("room-a", { nickname: "Lost" })).rejects.toThrow("disk failed");
   expect(getScopedProfile("room-a").nickname).toBe("Main");
+  await vi.dynamicImportSettled();
   expect(broadcastProfile).not.toHaveBeenCalled();
 });
 
@@ -90,9 +94,11 @@ it("broadcasts a changed name only after the profile write completes", async () 
   const saving = saveName("New name");
   expect(profileStore.nickname).toBe("New name");
   await vi.waitFor(() => expect(updateOwnProfile).toHaveBeenCalledWith({ nickname: "New name" }));
+  await vi.dynamicImportSettled();
   expect(broadcastProfile).not.toHaveBeenCalled();
   finishWrite();
   await saving;
+  await vi.dynamicImportSettled();
   expect(broadcastProfile).toHaveBeenCalledOnce();
 });
 
@@ -102,8 +108,10 @@ it("does not announce a failed name write and allows a subsequent save", async (
   });
   vi.mocked(updateOwnProfile).mockRejectedValueOnce(new Error("Storage unavailable"));
   await expect(saveName("New name")).rejects.toThrow("Storage unavailable");
+  await vi.dynamicImportSettled();
   expect(broadcastProfile).not.toHaveBeenCalled();
   await saveName("New name");
+  await vi.dynamicImportSettled();
   expect(broadcastProfile).toHaveBeenCalledOnce();
 });
 

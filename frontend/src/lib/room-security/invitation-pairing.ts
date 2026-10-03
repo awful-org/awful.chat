@@ -1,10 +1,36 @@
-import * as opaque from "@serenity-kit/opaque";
+import type * as Opaque from "@serenity-kit/opaque";
 import { base64urlnopad as base64url } from "@scure/base";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { ml_kem768 } from "@noble/post-quantum/ml-kem.js";
 import { parseRoomSecret, type RoomSecret } from "./keys";
+import { PAIRING_LOCATOR_LENGTH, PAIRING_PASSWORD_LENGTH, parsePairingCode } from "./pairing-code";
+
+/**
+ * OPAQUE, loaded the first time a code is made or redeemed. The library
+ * decodes and compiles its wasm while it loads, and a static import made
+ * every page pay for that: this module is imported wherever a code is read
+ * or shown, which is far more often than a pairing runs.
+ */
+let opaqueLoad: Promise<typeof Opaque> | null = null;
+function loadOpaque(): Promise<typeof Opaque> {
+  opaqueLoad ??= (async () => {
+    const opaque = await import("@serenity-kit/opaque");
+    await opaque.ready;
+    return opaque;
+  })().catch((err) => {
+    // Not kept, but the next pairing fetches nothing either: browsers keep a
+    // failed import for the life of the page, and only a reload asks the
+    // network again (offline, or a deploy that replaced the chunk). The first
+    // failure in a minute is that reload (main.ts takes a chunk that will not
+    // load for a stale deploy); a second one is said plainly, where a code
+    // being redeemed shows its error.
+    opaqueLoad = null;
+    throw new Error("Couldn't load short codes. Check your connection and reload the page.", { cause: err });
+  });
+  return opaqueLoad;
+}
 
 export const PAIRING_TTL = 300_000;
 /** A code's lifetime, chosen by the inviter within these bounds (the relay holds the same). */
@@ -48,25 +74,14 @@ export const PAIRING_ATTEMPTS = 1 + PAIRING_SPARE_ATTEMPTS;
  * fresh one (invite-pairing.ts).
  *
  * Lowercase Crockford base32: no i, l, o or u to confuse, and typed input
- * folds those to 1 and 0, in any case.
+ * folds those to 1 and 0, in any case. Reading and writing a code live in
+ * pairing-code.ts, which needs none of the cryptography below.
  */
-export const PAIRING_LOCATOR_LENGTH = 2;
-export const PAIRING_PASSWORD_LENGTH = 4;
+export { PAIRING_LOCATOR_LENGTH, PAIRING_PASSWORD_LENGTH, parsePairingCode, formatPairingCode } from "./pairing-code";
 const alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
 const enc = new TextEncoder();
 export function pairingRandom(length: number): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(length)), b => alphabet[b & 31]).join("");
-}
-export function parsePairingCode(input: string): { locator: string; password: string } | null {
-  const raw = input.trim().toLowerCase().replace(/[-\s]/g, "").replace(/o/g, "0").replace(/[il]/g, "1");
-  const length = PAIRING_LOCATOR_LENGTH + PAIRING_PASSWORD_LENGTH;
-  if (raw.length !== length || !/^[0-9a-hjkmnp-tv-z]+$/.test(raw)) return null;
-  return { locator: raw.slice(0, PAIRING_LOCATOR_LENGTH), password: raw.slice(PAIRING_LOCATOR_LENGTH) };
-}
-/** Shown as two groups of three - "k5t-8r5" - whatever the split. */
-export function formatPairingCode(locator: string, password: string): string {
-  const code = locator + password;
-  return `${code.slice(0, 3)}-${code.slice(3)}`;
 }
 const identifiers = (locator: string) => ({ client: `awful/pairing/v2/joiner/${locator}`, server: `awful/pairing/v2/inviter/${locator}` });
 function message(value: string): string {
@@ -177,15 +192,15 @@ export class InvitationPairingHost {
   /** Per attempt: the OPAQUE login state and its one-off ML-KEM keypair. */
   private pending = new Map<string, { login: string; kem: { publicKey: Uint8Array; secretKey: Uint8Array } }>();
   private closed = false;
-  private constructor(secret: RoomSecret, private clock: () => number, limits: PairingLimits) {
+  private constructor(secret: RoomSecret, private clock: () => number, limits: PairingLimits, private opaque: typeof Opaque) {
     this.secret = parseRoomSecret(secret);
     const { uses, ttlMs } = pairingLimits(limits);
     this.uses = uses;
     this.expiresAt = clock() + ttlMs;
   }
   static async create(secret: RoomSecret, clock = Date.now, limits: PairingLimits = {}): Promise<InvitationPairingHost> {
-    await opaque.ready;
-    const host = new InvitationPairingHost(secret, clock, limits);
+    const opaque = await loadOpaque();
+    const host = new InvitationPairingHost(secret, clock, limits, opaque);
     host.setup = opaque.server.createSetup();
     const registration = opaque.client.startRegistration({ password: host.password });
     const response = opaque.server.createRegistrationResponse({ serverSetup: host.setup, userIdentifier: host.locator, registrationRequest: registration.registrationRequest });
@@ -204,7 +219,7 @@ export class InvitationPairingHost {
     if (!this.active || this.attempts >= this.uses + PAIRING_SPARE_ATTEMPTS) throw new Error("Pairing expired or attempt limit reached");
     message(attempt);
     if (this.pending.has(attempt)) throw new Error("Repeated pairing attempt");
-    const result = opaque.server.startLogin({ serverSetup: this.setup, registrationRecord: this.record, userIdentifier: this.locator, startLoginRequest: message(request), identifiers: identifiers(this.locator) });
+    const result = this.opaque.server.startLogin({ serverSetup: this.setup, registrationRecord: this.record, userIdentifier: this.locator, startLoginRequest: message(request), identifiers: identifiers(this.locator) });
     // Counted only once the request parsed: anyone who can reach the relay
     // could otherwise burn a live code with five pieces of junk. Each counted
     // start is still the one password guess it buys.
@@ -227,7 +242,7 @@ export class InvitationPairingHost {
       if (parts.length !== 3) throw new Error("Pairing needs an up-to-date app on both sides");
       const ct = exactB64(parts[1], KEM_CT_BYTES);
       exactB64(parts[2], TAG_BYTES);
-      const { sessionKey } = opaque.server.finishLogin({ serverLoginState: state.login, finishLoginRequest: message(parts[0]) });
+      const { sessionKey } = this.opaque.server.finishLogin({ serverLoginState: state.login, finishLoginRequest: message(parts[0]) });
       if (!sameTag(confirmation(sessionKey, this.locator, attempt, state.kem.publicKey, ct), parts[2])) {
         throw new Error("Pairing key mismatch");
       }
@@ -252,7 +267,7 @@ export class InvitationPairingHost {
 export async function startPairingJoin(code: string) {
   const parsed = parsePairingCode(code);
   if (!parsed) throw new Error("Enter the complete pairing code");
-  await opaque.ready;
+  const opaque = await loadOpaque();
   const { locator, password } = parsed;
   const attempt = pairingRandom(32);
   const login = opaque.client.startLogin({ password });

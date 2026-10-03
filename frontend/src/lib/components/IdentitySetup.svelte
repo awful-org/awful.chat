@@ -19,19 +19,22 @@
   import type { KeypairRecord } from "$lib/identity/identity";
   import { enroll } from "$lib/identity/identity.svelte";
   import { ArrowLeft, Smartphone, Info, Upload } from "@lucide/svelte";
+  // From the backup's own modules: sync.svelte.ts re-exports them, but brings
+  // the whole transport with it, and this screen is the first an invite link
+  // shows - before the app is even downloaded (IdentityGate.svelte).
+  import { readBackupFile, applyBackup } from "$lib/transport/backup-restore";
   import {
-    readBackupFile,
-    applyBackup,
     summarizeBackup,
     decryptBackup,
     type BackupFile,
     type BackupSummary,
     type EncryptedBackupFile,
-  } from "$lib/transport/sync.svelte";
+  } from "$lib/transport/backup";
   import { saveRememberedPassword } from "$lib/identity/remembered-password";
   import { requestPersistentStorage } from "$lib/storage";
-  import DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
+  import type DeviceSyncDialog from "$lib/components/DeviceSyncDialog.svelte";
   import QuirksNotice from "$lib/components/QuirksNotice.svelte";
+  import { untrack } from "svelte";
   import {
     Dialog,
     DialogContent,
@@ -74,6 +77,33 @@
   let restorePasswordConfirm = $state("");
 
   let syncDialogOpen = $state(false);
+  // Loaded the first time it opens, not with the screen: it brings the
+  // transport with it (the identity arrives over the relay).
+  let SyncDialog = $state.raw<typeof DeviceSyncDialog | null>(null);
+  let syncLoadFailed = $state(false);
+  $effect(() => {
+    if (!syncDialogOpen || untrack(() => SyncDialog)) return;
+    syncLoadFailed = false;
+    import("$lib/components/DeviceSyncDialog.svelte").then(
+      (module) => (SyncDialog = module.default),
+      (err) => {
+        // Closed again. The first failure in a minute reloads the page before
+        // it gets here (main.ts takes a chunk that will not load for a stale
+        // deploy); a second one is said under what was clicked, which
+        // otherwise did nothing anyone could see. As a reload, not a retry:
+        // the browser keeps a failed import for the life of the page, and
+        // asks the network for it again only after a reload.
+        console.error("[setup] device sync could not load", err);
+        syncLoadFailed = true;
+        syncDialogOpen = false;
+      }
+    );
+  });
+  // Said on the screen it was asked from, and gone with it.
+  $effect(() => {
+    void step;
+    syncLoadFailed = false;
+  });
 
   // Restore from a backup FILE, which the setup screen never offered before:
   // import lived only in Settings, and Settings needs an unlocked identity -
@@ -340,6 +370,14 @@
   });
 </script>
 
+{#snippet syncLoadError()}
+  {#if syncLoadFailed}
+    <p role="alert" class="text-xs text-destructive font-mono">
+      Couldn't load device sync. Check your connection and reload the page.
+    </p>
+  {/if}
+{/snippet}
+
 <!-- viewportHeight, not just a dvh class: every one of these screens centres a
      card with a text field in it, and dvh does not shrink when the software
      keyboard opens - so on a phone the field being typed into ended up under
@@ -403,6 +441,7 @@
           <Smartphone class="w-4 h-4 mr-2" />
           Sync from another device
         </Button>
+        {@render syncLoadError()}
         <button
           type="button"
           onclick={openQuirks}
@@ -818,6 +857,7 @@
             >sync from another device</button
           > on the device that has your history.
         </p>
+        {@render syncLoadError()}
       </CardHeader>
       <CardContent class="flex flex-col gap-3">
         <label for="recovery-phrase" class="text-xs font-medium">Recovery phrase</label>
@@ -928,15 +968,17 @@
     </DialogContent>
   </Dialog>
 
-  <DeviceSyncDialog
-    bind:open={syncDialogOpen}
-    onClose={() => {
-      syncDialogOpen = false;
-    }}
-    onComplete={() => {
-      // Reload to unlock the synced identity
-      window.location.reload();
-    }}
-    flowMode="receive"
-  />
+  {#if SyncDialog}
+    <SyncDialog
+      bind:open={syncDialogOpen}
+      onClose={() => {
+        syncDialogOpen = false;
+      }}
+      onComplete={() => {
+        // Reload to unlock the synced identity
+        window.location.reload();
+      }}
+      flowMode="receive"
+    />
+  {/if}
 </div>

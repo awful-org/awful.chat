@@ -62,11 +62,13 @@ vi.mock("$lib/storage", () => ({
   getDeletedFloor: async () => 0, addRoomParticipants: async () => {}, MAX_ROOM_PARTICIPANTS: 512,
   deletePeerRoomProfile: async () => {},
 }));
-vi.mock("$lib/messaging", () => ({ signMessage: s.sign, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true }));
-vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), refreshUnreadCount: async () => {}, refreshDmRooms: async () => {}, roomsStore: { rooms: [], dmRooms: [] } }));
+// A DM batch drops each row whose signed form cannot be built before
+// anything else; these rows are all readable.
+vi.mock("$lib/messaging", () => ({ signMessage: s.sign, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true, canonicalContentV3: () => "" }));
+vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(), refreshDmRooms: async () => {}, roomsStore: { rooms: [], dmRooms: [] } }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
 vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));
-vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer", flushQueuedDmForPeer: async () => {}, isDmRequestRoom: () => false, offerDmUpgrade: () => {} }));
+vi.mock("./dm.svelte", () => ({ dmConversationCodeAsync: async () => "dm-peer", ensureDmRoomForPeer: async () => "dm-peer", dmPeerDid: () => "did:peer", flushQueuedDmForPeer: async () => {}, isDmRequestRoom: () => false, offerDmUpgrade: () => {}, dmRoomExists: async () => true, dmJoinableForThem: () => true, dropDmIfEmpty: async () => {} }));
 vi.mock("./verify-incoming", async original => ({ ...await original<typeof import("./verify-incoming")>(), verifyIncoming: async () => ({ ok: true }) }));
 vi.mock("../storage-crypto", () => ({ blindValue: async (v: string) => v }));
 vi.mock("../telemetry/taps", () => ({ stopTelemetryTaps: vi.fn(), installTelemetryTaps: vi.fn() }));

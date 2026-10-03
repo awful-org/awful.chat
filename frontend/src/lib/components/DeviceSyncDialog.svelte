@@ -25,6 +25,7 @@ import {
     RefreshCw,
   } from "@lucide/svelte";
   import QrScanner from "./QrScanner.svelte";
+  import { SCANNER_NOT_LOADED } from "$lib/qr-scanner.svelte";
 
   interface Props {
     open: boolean;
@@ -455,8 +456,10 @@ import {
               onUnavailable={(message) => {
                 console.error("Scan error:", message);
                 // Plain http has no camera at all; saying "denied" sent people
-                // looking for a permission that was never asked.
-                scanUnavailable = /https/i.test(message) ? message : null;
+                // looking for a permission that was never asked. Nor is a
+                // scanner that did not download a camera problem.
+                scanUnavailable =
+                  /https/i.test(message) || message === SCANNER_NOT_LOADED ? message : null;
                 scanPermission = false;
               }}
             />

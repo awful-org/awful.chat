@@ -9,6 +9,11 @@ import type { CardCtx, UpdateCtx } from "$lib/plugins/api";
 /** What the starter may pass after the URL (`/app {url} {args}`). */
 export const MAX_ARGS = 256;
 export const MAX_URL = 2048;
+/**
+ * The longest host an app may have. Real ones are short; a long one is
+ * mostly padding, there to push the part that names the site out of view.
+ */
+export const MAX_HOST = 64;
 /** A player not heard from in this long has left (a closed tab sends nothing). */
 export const PRESENCE_TTL_MS = 45_000;
 /** How often a player who has the app open says so. */
@@ -43,11 +48,13 @@ export interface AppState extends AppCardData {
   present: Record<string, { name: string; seenAt: number; game?: string }>;
 }
 
-/**
- * The URL an app is opened at: https only, no credentials, bounded. A bare
- * host ("je.frav.in") means https. Null for anything else.
- */
-export function parseAppUrl(input: string): URL | null {
+/** The page's own host name, which no app may start with. */
+function ownHost(): string | undefined {
+  return globalThis.location?.hostname || undefined;
+}
+
+/** https, no credentials, bounded: the address before the host rules. */
+function readUrl(input: string): URL | null {
   const raw = input.trim();
   if (!raw || raw.length > MAX_URL) return null;
   let url: URL;
@@ -58,6 +65,47 @@ export function parseAppUrl(input: string): URL | null {
   }
   if (url.protocol !== "https:" || url.username || url.password || !url.hostname.includes(".")) return null;
   return url;
+}
+
+/**
+ * Why a host is refused, or null. One that starts with this instance's own
+ * name (awful.chat.<anything>.attacker.net) is that name to anyone reading
+ * it from the left, and the instance itself would be framing its own pages.
+ * "www." in front of either name counts the same: www.awful.chat.<anything>
+ * reads as the instance too. Judged against the address this client is on:
+ * each person is kept from their own instance's name, so on an instance
+ * served under two names a card can open under one and not the other.
+ */
+function hostProblem(hostname: string, instance: string | undefined): string | null {
+  if (hostname.length > MAX_HOST) {
+    return `An app's site name can be at most ${MAX_HOST} characters.`;
+  }
+  const own = instance?.toLowerCase().replace(/\.$/, "");
+  if (own) {
+    const bare = hostname.replace(/^www\./, "");
+    for (const name of new Set([own, own.replace(/^www\./, "")])) {
+      if (bare === name || bare.startsWith(`${name}.`)) {
+        return `An app's address can't start with ${name}, this site's own name.`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The URL an app is opened at: https only, no credentials, bounded, and a
+ * host that cannot pass for this instance (hostProblem). A bare host
+ * ("je.frav.in") means https. Null for anything else.
+ */
+export function parseAppUrl(input: string, instance = ownHost()): URL | null {
+  const url = readUrl(input);
+  return url && !hostProblem(url.hostname, instance) ? url : null;
+}
+
+/** What to tell someone whose `/app` address was refused for its host. */
+export function appUrlProblem(input: string, instance = ownHost()): string | null {
+  const url = readUrl(input);
+  return url ? hostProblem(url.hostname, instance) : null;
 }
 
 /** `/app {url} {args}`: the first word is the address, the rest is for the app. */

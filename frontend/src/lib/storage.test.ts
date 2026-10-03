@@ -11,6 +11,12 @@ import {
   putRoom,
   getRoom,
   setWatermark,
+  senderMaxLamports,
+  getMessagesAboveWatermarks,
+  commitWatermark,
+  heldWatermarks,
+  holdWatermarks,
+  releaseWatermarks,
   setDeletedFloor,
   deleteMessagesForRoom,
   getDeletedFloor,
@@ -47,6 +53,8 @@ import {
   setRoomPositions,
   setMessagePinned,
   deleteRoom,
+  getLastMessage,
+  roomHoldsMessages,
 } from "./storage";
 import { initStorageCrypto, clearStorageCrypto } from "./storage-crypto";
 import { STORE_SPECS, inspectRow, isCurrentAad, sealRow } from "./storage-crypto";
@@ -227,6 +235,92 @@ describe("watermarks", () => {
       bob: 9,
     });
   });
+
+  it("waits while a push holds the room, and writes what waited on release", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await setWatermark("room-a", "alice", 5);
+    await setWatermark("room-b", "bob", 3);
+    // Not written, so no digest advertises it yet.
+    expect(await getWatermarksForRoom("room-a")).toEqual({});
+    expect(await getWatermark("room-b", "bob")).toBe(3);
+    // A completed push's own claim is proved, so it does not wait.
+    await commitWatermark("room-a", "carol", 4);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ carol: 4 });
+    await releaseWatermarks("room-a");
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 7, carol: 4 });
+    await setWatermark("room-a", "alice", 9);
+    expect(await getWatermark("room-a", "alice")).toBe(9);
+  });
+
+  it("reads how far a sender reached, an advance still waiting on a hold included", async () => {
+    await setWatermark("room-a", "alice", 5);
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    // The row behind 7 is stored: a deleted DM's floor must cover it.
+    expect(await getWatermark("room-a", "alice")).toBe(7);
+    expect(heldWatermarks("room-a")).toEqual(new Map([["alice", 7]]));
+    expect(await getWatermarksForRoom("room-a")).toEqual({ alice: 5 });
+  });
+
+  it("forgets what waited when the room's history is deleted", async () => {
+    holdWatermarks("room-a");
+    await setWatermark("room-a", "alice", 7);
+    await deleteMessagesForRoom("room-a");
+    expect(heldWatermarks("room-a")).toEqual(new Map());
+    await releaseWatermarks("room-a");
+    expect(await getWatermark("room-a", "alice")).toBe(0);
+    // No longer held: an advance is written at once.
+    await setWatermark("room-a", "bob", 3);
+    expect(await getWatermarksForRoom("room-a")).toEqual({ bob: 3 });
+  });
+});
+
+describe("what a digest and a push read", () => {
+  it("reads a room once for its senders, and stays current as rows are stored", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1], ["bob", 2]]));
+    const reads = getAll.mock.calls.length;
+    expect(reads).toBeGreaterThan(0);
+    await putMessage(msg({ senderId: "alice" }));
+    await bulkPutMessages([msg({ senderId: "carol" })]);
+    for (let i = 0; i < 5; i++) {
+      expect(await senderMaxLamports("room-a")).toEqual(
+        new Map([["alice", 3], ["bob", 2], ["carol", 4]])
+      );
+    }
+    // Every digest after the first is answered from memory.
+    expect(getAll.mock.calls.length).toBe(reads);
+  });
+
+  it("forgets a room whose history is deleted", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" })]);
+    expect(await senderMaxLamports("room-a")).toEqual(new Map([["alice", 1]]));
+    await deleteMessagesForRoom("room-a");
+    expect(await senderMaxLamports("room-a")).toEqual(new Map());
+  });
+
+  it("reads a push only from the lowest watermark the peer has for anyone we hold", async () => {
+    const rows = Array.from({ length: 100 }, (_, i) =>
+      msg({ senderId: i % 2 ? "alice" : "bob" }));
+    await bulkPutMessages(rows);
+    // The room's senders are known already: any digest before this one read them.
+    await senderMaxLamports("room-a");
+    const getAll = vi.spyOn(IDBIndex.prototype, "getAll");
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 95, bob: 90 });
+    // bob wrote the odd lamports, alice the even ones.
+    expect(missing.map((m) => m.lamport)).toEqual([91, 93, 95, 96, 97, 98, 99, 100]);
+    const lowest = getAll.mock.calls.map(([range]) => (range as IDBKeyRange).lower[1]);
+    expect(Math.min(...lowest)).toBe(91);
+  });
+
+  it("still reads everything for a peer that lacks one of our senders", async () => {
+    await bulkPutMessages([msg({ senderId: "alice" }), msg({ senderId: "bob" })]);
+    const missing = await getMessagesAboveWatermarks("room-a", { alice: 1 });
+    expect(missing.map((m) => m.senderId)).toEqual(["bob"]);
+    expect(await getMessagesAboveWatermarks("room-a", { alice: 1, bob: 2 })).toEqual([]);
+  });
 });
 
 describe("message status", () => {
@@ -288,6 +382,22 @@ describe("unread counts and seen tracking", () => {
     await markRoomSeen("room-a", 42);
     await markRoomSeen("room-a", 7);
     expect((await getRoom("room-a"))?.lastSeenLamport).toBe(42);
+  });
+
+  it("markRoomSeen records when the user last read the room, each time", async () => {
+    await putRoom(room);
+    expect((await getRoom("room-a"))?.seenAt).toBeUndefined();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      await markRoomSeen("room-a", 42);
+      expect((await getRoom("room-a"))?.seenAt).toBe(1_000);
+      // Read again with nothing new: still a read, later.
+      now.mockReturnValue(2_000);
+      await markRoomSeen("room-a", 7);
+      expect((await getRoom("room-a"))?.seenAt).toBe(2_000);
+    } finally {
+      now.mockRestore();
+    }
   });
 });
 
@@ -538,6 +648,29 @@ describe("markOwnMessagesReadUpTo", () => {
     expect((await getMessage("own-3"))?.status).toBe("sent");
     expect((await getMessage("theirs"))?.status).toBe("delivered");
     expect((await getMessage("own-1"))?.status).toBe("read");
+  });
+
+  it("walks only above where an earlier cascade reached", async () => {
+    await bulkPutMessages([
+      msg({ id: "below", senderId: "me", lamport: 5, status: "sent" }),
+      msg({ id: "above", senderId: "me", lamport: 15, status: "sent" }),
+    ]);
+    expect(await markOwnMessagesReadUpTo("room-a", "me", 20, 10)).toEqual(["above"]);
+    expect((await getMessage("below"))?.status).toBe("sent");
+  });
+});
+
+describe("roomHoldsMessages", () => {
+  it("answers from the index alone, so a row that will not open still counts", async () => {
+    expect(await roomHoldsMessages("room-a")).toBe(false);
+    await putMessage(msg({ id: "only", status: "sent" }));
+    // A clear field rewritten around the seal: the row no longer opens.
+    const db = await getDB();
+    await db.put("messages", { ...(await db.get("messages", "only")), status: "read" } as never);
+    // getLastMessage drops a row it cannot open, and so read the room as empty.
+    expect(await getLastMessage("room-a")).toBeUndefined();
+    expect(await roomHoldsMessages("room-a")).toBe(true);
+    expect(await roomHoldsMessages("room-b")).toBe(false);
   });
 });
 

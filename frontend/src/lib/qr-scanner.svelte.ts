@@ -1,5 +1,3 @@
-import jsQR from "jsqr";
-
 /**
  * The camera QR scanner: device sync and joining a room both use it.
  *
@@ -122,6 +120,35 @@ async function nativeDetector(): Promise<QrDetector | null> {
   }
 }
 
+type JsQR = typeof import("jsqr").default;
+
+/** What a scan says when its decoder could not be downloaded. */
+export const SCANNER_NOT_LOADED = "Couldn't load the scanner. Check your connection and reload the page.";
+
+/**
+ * jsQR, the decoder for a platform without a detector of its own, loaded by
+ * the first scan that needs it. Imported statically it was downloaded and
+ * parsed with every page, and on Chrome for Android it is never run at all.
+ */
+let jsQRLoad: Promise<JsQR> | null = null;
+function loadJsQR(): Promise<JsQR> {
+  jsQRLoad ??= import("jsqr").then(
+    (m) => m.default,
+    (err) => {
+      // Not kept, but the next scan fetches nothing either: browsers keep a
+      // failed import for the life of the page, and only a reload asks the
+      // network again (offline, or a deploy that replaced the chunk). The
+      // first failure in a minute is that reload - main.ts takes a chunk that
+      // will not load for a stale deploy - so this is what a second one says:
+      // plainly, and not as a camera problem, which is how the browser's own
+      // text came out.
+      jsQRLoad = null;
+      throw new Error(SCANNER_NOT_LOADED, { cause: err });
+    }
+  );
+  return jsQRLoad;
+}
+
 /** The running scan: one at a time, there is one camera to hold. */
 interface Session {
   element: string;
@@ -241,6 +268,15 @@ export async function startQrScan(
   scannerState.torchOn = false;
 
   const detector = await nativeDetector();
+  let jsQR: JsQR | null = null;
+  if (!detector) {
+    try {
+      jsQR = await loadJsQR();
+    } catch (err) {
+      if (_session === session) await stopQrScan();
+      throw err;
+    }
+  }
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d", { willReadFrequently: true });
 
@@ -251,7 +287,7 @@ export async function startQrScan(
       if (video.readyState >= 2 && video.videoWidth > 0) {
         if (detector) {
           text = (await detector.detect(video))[0]?.rawValue ?? null;
-        } else if (context) {
+        } else if (context && jsQR) {
           const scale = Math.min(1, MAX_DECODE_SIDE / Math.max(video.videoWidth, video.videoHeight));
           canvas.width = Math.round(video.videoWidth * scale);
           canvas.height = Math.round(video.videoHeight * scale);

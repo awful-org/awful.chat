@@ -28,6 +28,7 @@ export enum MessageType {
   SyncDigest = "sync_digest",
   SyncBatch = "sync_batch",
   SyncComplete = "sync_complete",
+  SyncNone = "sync_none",
   // DM delivery/read receipts do NOT use MessageType - they are tagged
   // binary envelopes over the direct stream (see dm-codec.ts)
 }
@@ -338,6 +339,11 @@ export interface WireSyncDigest {
   type: MessageType.SyncDigest;
   roomCode: string; // the room this digest is for - receiver must have joined it
   watermarks: Record<string, number>; // senderId → maxLamport
+  /**
+   * Names this digest, for the SyncNone that answers it (sync-inbound.ts).
+   * Absent from older senders; older receivers ignore it.
+   */
+  nonce?: number;
 }
 
 export interface WireSyncBatch {
@@ -353,11 +359,36 @@ export interface WireSyncBatch {
    * older senders, which is why quiet is the default.
    */
   live?: boolean;
+  /**
+   * Where this batch sits in a paced push (sync-push.ts). "head": the newest
+   * page, sent first so the receiver's screen fills at once. "asc": the rest,
+   * oldest first, so whatever prefix arrives leaves no gap below it and can
+   * be claimed as it lands. Absent from older senders and from live batches;
+   * such a push is claimed only once it completes (sync-inbound.ts).
+   */
+  order?: "head" | "asc";
 }
 
 export interface WireSyncComplete {
   type: MessageType.SyncComplete;
   roomCode: string;
+}
+
+/**
+ * The answer to a digest that brings no push: nothing to send, or a push
+ * not allowed yet. The asker holds the room from its digest until the push
+ * starts (sync-inbound.ts), and this lets it stop at once. Older builds
+ * never send it, so the asker's wait for them still runs out on its own,
+ * and they ignore it as a type they do not know.
+ */
+export interface WireSyncNone {
+  type: MessageType.SyncNone;
+  roomCode: string;
+  /**
+   * The nonce of the digest this answers: only an answer to the latest
+   * digest ends the asker's wait. Absent when that digest carried none.
+   */
+  nonce?: number;
 }
 
 // File wire
@@ -401,7 +432,8 @@ export type AnyWireMessage =
   | WireRoomUsersSync
   | WireSyncDigest
   | WireSyncBatch
-  | WireSyncComplete;
+  | WireSyncComplete
+  | WireSyncNone;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

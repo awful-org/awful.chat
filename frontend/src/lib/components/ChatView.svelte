@@ -55,7 +55,7 @@
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
-  import { Tip } from "$lib/components/ui/tooltip";
+  import { LazyTip, Tip } from "$lib/components/ui/tooltip";
   import { Separator } from "$lib/components/ui/separator";
   import {
     Drawer,
@@ -102,8 +102,10 @@
     markSeen,
     requestFileDownload,
     resolveMentionDisplayName,
+    trimMessageView,
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
+  import { compareMessages } from "$lib/transport/message-order";
   import { stripMarkdown } from "$lib/markdown";
   import {
     pinnedMessagesOf,
@@ -112,10 +114,21 @@
   } from "$lib/rooms.svelte";
   import { getMessage } from "$lib/storage";
   import { openSearch } from "$lib/search/ui.svelte";
-  import { revealMessage } from "$lib/reveal-message";
+  import { revealInFlight, revealMessage, revealStored } from "$lib/reveal-message";
+  import {
+    around,
+    hold,
+    planJump,
+    showNewer,
+    showOlder,
+    trimPoint,
+    windowRange,
+    type ChatWindow,
+  } from "$lib/chat-window";
   import { REPLY_THRESHOLD, dragOffset, swipeAction } from "$lib/swipe";
   import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
+  import { tallyReactions, type ReactionTally } from "$lib/reaction-tally";
   import {
     addToPhonebook,
     dmInboxNoticeFor,
@@ -229,6 +242,7 @@
     roomCode;
     initialScrollDone = false;
     autoScroll = true;
+    chatWindow = null;
     // hasMoreHistory too. This component is not keyed by room, so switching
     // rooms does not remount it: paging to the top of one room set this false
     // and every other room then opened with no way to page back for the rest
@@ -474,6 +488,25 @@
       (m) => RENDERABLE_TYPES.has(m.type) && m.roomCode === roomCode
     )
   );
+
+  /**
+   * Which of them are mounted (chat-window.ts): null follows the newest; a
+   * window held still keeps the reader's place while they are up in
+   * history. Every row is a whole component tree, and mounting every message
+   * held was a frozen frame of seconds when a catch-up landed hundreds.
+   */
+  let chatWindow = $state<ChatWindow>(null);
+  const range = $derived(windowRange(visibleMessages, chatWindow));
+  const renderedMessages = $derived(visibleMessages.slice(range.from, range.to));
+  /** The newest message held is mounted. */
+  const atNewest = $derived(range.to >= visibleMessages.length);
+  /**
+   * Following the newest at the bottom. The list is pinned to the bottom
+   * then, so the browser's own scroll anchoring is switched off: as rows
+   * left the top of the window it moved the view to keep them in place,
+   * and the scroll that made read as the reader scrolling away.
+   */
+  const following = $derived(chatWindow === null && autoScroll);
   const visibleLocalCards = $derived(
     localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
   );
@@ -512,23 +545,19 @@
     replyTargetId ? (messageById.get(replyTargetId) ?? null) : null
   );
 
+  // Rebuilt whenever the list changes, but a message whose reactions did
+  // not change keeps the same Map (reaction-tally.ts), so its chips are left
+  // alone when a message lands somewhere else.
+  let lastReactions: ReactionTally | undefined;
   const reactionsByMessage = $derived.by(() => {
-    const byMessage = new Map<string, Map<string, Set<string>>>();
-    for (const m of messages) {
-      if (m.type !== MessageType.Reaction || !m.reactionTo || !m.reactionEmoji)
-        continue;
-      if (!byMessage.has(m.reactionTo)) byMessage.set(m.reactionTo, new Map());
-      const byEmoji = byMessage.get(m.reactionTo)!;
-      if (!byEmoji.has(m.reactionEmoji))
-        byEmoji.set(m.reactionEmoji, new Set());
-      const users = byEmoji.get(m.reactionEmoji)!;
-      // Normalize to the DID: a reaction added before the sender's binding
-      // was known (peerId form) must cancel against one added after.
-      const reactor = senderDid(m.senderId) || m.senderId;
-      if (m.reactionOp === "remove") users.delete(reactor);
-      else users.add(reactor);
-    }
-    return byMessage;
+    // Normalize to the DID: a reaction added before the sender's binding
+    // was known (peerId form) must cancel against one added after.
+    lastReactions = tallyReactions(
+      messages,
+      (senderId) => senderDid(senderId) || senderId,
+      lastReactions
+    );
+    return lastReactions;
   });
 
   // Coalesce instant scrolls to one per frame. Three independent paths ask
@@ -544,7 +573,9 @@
       _scrollQueued = true;
       requestAnimationFrame(() => {
         _scrollQueued = false;
-        if (!messagesEl) return;
+        // Asked for while following; the reader may have been taken
+        // elsewhere since (a jump to a message), and that wins.
+        if (!messagesEl || !autoScroll) return;
         messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: "instant" });
       });
       return;
@@ -557,39 +588,174 @@
     messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior });
   }
 
+  /** A window move is being anchored: the scrolling it causes is not the
+   *  reader's. */
+  let shifting = false;
+
   function handleScroll() {
     if (!messagesEl) return;
     const { scrollHeight, scrollTop, clientHeight } = messagesEl;
+    const fromBottom = scrollHeight - scrollTop - clientHeight;
     // "At the bottom" within 120px: the old 40px meant stopping half a
     // message short of the end - one flick of momentum scroll on mobile -
-    // silently stopped the view from following new arrivals.
-    autoScroll = scrollHeight - scrollTop - clientHeight < 120;
+    // silently stopped the view from following new arrivals. The bottom of
+    // a window short of the newest messages is not the end.
+    const atBottom = fromBottom < 120;
+    autoScroll = atBottom && atNewest;
+    if (!initialScrollDone || shifting) return;
+    if (chatWindow === null && !atBottom) {
+      // The reader left the bottom: hold the window, so what arrives below
+      // does not push the rows being read off its top.
+      chatWindow = hold(visibleMessages, range);
+    } else if (chatWindow !== null && autoScroll) {
+      // Back at the newest: follow it again, with only its rows mounted.
+      void anchored(() => (chatWindow = null)).then(trimHeld);
+      return;
+    }
     // Reaching the top fetches the next page - the button alone was gated on
     // 50+ VISIBLE messages, and a page full of invisible rows (reactions,
     // plugin updates) kept the count below that forever: two weeks of
     // history with no way to scroll to it.
-    if (scrollTop < 80 && initialScrollDone && canLoadOlder && !loadingMore) {
-      void loadOlderPreservingScroll();
+    if (scrollTop < 80) void showOlderRows();
+    else if (!atNewest && fromBottom < 400) void showNewerRows();
+  }
+
+  /** The next older rows: those already held first, then a page from
+   *  storage. */
+  async function showOlderRows() {
+    if (shifting || loadingMore) return;
+    if (range.from === 0) {
+      if (!canLoadOlder) return;
+      // Hold the window first, so the page lands above it unmounted until
+      // the anchored move below shows it.
+      if (chatWindow === null) chatWindow = hold(visibleMessages, range);
+      await handleLoadMore();
+      if (range.from === 0) return;
+    }
+    await anchored(() => (chatWindow = showOlder(visibleMessages, range)));
+  }
+
+  async function showNewerRows() {
+    if (shifting || atNewest) return;
+    await anchored(() => (chatWindow = showNewer(visibleMessages, range)));
+  }
+
+  /**
+   * Change what is mounted without moving what is on screen: the row at the
+   * top of the view stays where it was, whatever went in or came out above
+   * it. Browsers that anchor scrolling would do this for rows added; Safari
+   * does not, and rows taken away need it everywhere.
+   */
+  async function anchored(change: () => void): Promise<void> {
+    const el = messagesEl;
+    if (!el) {
+      change();
+      return;
+    }
+    shifting = true;
+    try {
+      const anchor = topRow(el);
+      const before = anchor?.getBoundingClientRect().top ?? 0;
+      change();
+      await tick();
+      if (anchor?.isConnected) {
+        el.scrollTop += anchor.getBoundingClientRect().top - before;
+      }
+    } finally {
+      shifting = false;
     }
   }
 
-  /** Prepending grows the container upward; without compensation the view
-   *  jumps to the oldest loaded message and re-triggers the top fetch. */
-  async function loadOlderPreservingScroll() {
-    if (!messagesEl) return;
-    const prevHeight = messagesEl.scrollHeight;
-    const prevTop = messagesEl.scrollTop;
-    await handleLoadMore();
-    await tick();
-    if (messagesEl) {
-      messagesEl.scrollTop = prevTop + (messagesEl.scrollHeight - prevHeight);
+  /** The first message row at least partly in view. */
+  function topRow(el: HTMLElement): HTMLElement | null {
+    const top = el.getBoundingClientRect().top;
+    for (const row of el.querySelectorAll<HTMLElement>('[id^="msg-"]')) {
+      if (row.getBoundingClientRect().bottom > top) return row;
     }
+    return null;
+  }
+
+  /**
+   * Drop held rows the window no longer needs, while it follows the newest
+   * at the bottom: the view held every message it was ever given for as long
+   * as the room was open. They are in storage; scrolling back reads them.
+   * Never while a jump is filling in the history it is about to show, and
+   * never the message being replied to: the reply is built from it.
+   */
+  function trimHeld(): void {
+    if (chatWindow !== null || !autoScroll || loadingMore) return;
+    if (revealInFlight() || uiState.jumpToMessage?.roomCode === roomCode) return;
+    const keepFrom = trimPoint(visibleMessages, replyTarget);
+    if (!keepFrom) return;
+    // Pins on their way out stay where the pinned panel looks for what is
+    // not held, rather than showing as gone until storage is read again.
+    const leaving = pinnedIds.flatMap((id) => {
+      const msg = messageById.get(id);
+      return msg && compareMessages(msg, keepFrom) < 0 ? [msg] : [];
+    });
+    if (leaving.length > 0) {
+      const next = new Map(pinnedFromStore);
+      for (const msg of leaving) next.set(msg.id, msg);
+      pinnedFromStore = next;
+    }
+    trimMessageView(roomCode, keepFrom);
+    hasMoreHistory = true;
+  }
+
+  // The list emptied while the same conversation stays open: it is being
+  // opened again - selecting the room on screen re-joins it, which reloads
+  // its newest page - and it lands on its newest rows like any opening. A
+  // window held back in history would mount nothing of that page.
+  $effect(() => {
+    if (visibleMessages.length > 0) return;
+    chatWindow = null;
+    autoScroll = true;
+    initialScrollDone = false;
+    hasMoreHistory = true;
+  });
+
+  // New rows at the newest end are what grows the held list while it is
+  // followed; rows loaded at the old end are there to be read.
+  let newestSeen: string | undefined;
+  $effect(() => {
+    const newest = visibleMessages.at(-1)?.id;
+    if (newest === newestSeen) return;
+    newestSeen = newest;
+    untrack(trimHeld);
+  });
+
+  // Sending - or anything else that asks the view to follow - while the
+  // window sits back in history brings the newest rows back, or what was
+  // just sent would land out of sight. Scrolling never asks this: it
+  // follows only once the newest rows are on.
+  $effect(() => {
+    if (autoScroll && chatWindow !== null && !atNewest) untrack(toNewest);
+  });
+
+  /** "New messages below": the newest rows, mounted if they are not. */
+  function toNewest() {
+    if (atNewest) {
+      scrollToBottom("smooth");
+      autoScroll = true;
+      return;
+    }
+    // A smooth scroll through a list being swapped under it goes nowhere:
+    // put the newest rows up, then go to them at once.
+    chatWindow = null;
+    autoScroll = true;
+    void tick().then(() => {
+      scrollToBottom();
+      trimHeld();
+    });
   }
 
   $effect(() => {
     if (initialScrollDone || !messagesEl || visibleMessages.length === 0)
       return;
     requestAnimationFrame(() => {
+      // Opening a conversation lands on its newest message, whatever a
+      // scroll event said while it was being laid out.
+      autoScroll = true;
       scrollToBottom();
       initialScrollDone = true;
     });
@@ -975,17 +1141,33 @@
     const jump = uiState.jumpToMessage;
     if (!jump || jump.roomCode !== roomCode || !initialScrollDone) return;
     uiState.jumpToMessage = null;
-    requestAnimationFrame(() => jumpToMessage(jump.messageId));
+    untrack(() => jumpToMessage(jump.messageId, jump.revealed));
   });
 
-  function jumpToMessage(messageId: string) {
-    const el = document.getElementById(`msg-${messageId}`);
-    if (!el || !messagesEl) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-    el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
-    setTimeout(() => {
-      el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
-    }, 900);
+  /** Scroll to a message and flash it - one this view does not hold, from
+   *  storage (chat-window.ts, planJump). */
+  function jumpToMessage(messageId: string, revealed = false) {
+    const plan = planJump(visibleMessages, range, messageId, revealed);
+    if (plan.kind === "reveal") void revealStored(roomCode, messageId);
+    if (plan.kind !== "show" || !messagesEl) return;
+    // Held but not mounted: a window around it first, held still so the
+    // rows around it stay while it is read.
+    const moved = !plan.mounted;
+    if (moved) {
+      autoScroll = false;
+      chatWindow = around(visibleMessages, plan.index);
+    }
+    void tick().then(() =>
+      requestAnimationFrame(() => {
+        const el = document.getElementById(`msg-${messageId}`);
+        if (!el || !messagesEl) return;
+        el.scrollIntoView({ behavior: moved ? "instant" : "smooth", block: "center" });
+        el.classList.add("ring-1", "ring-primary/60", "bg-primary/5");
+        setTimeout(() => {
+          el.classList.remove("ring-1", "ring-primary/60", "bg-primary/5");
+        }, 900);
+      })
+    );
   }
 
   // Pinned messages: private to this user, stored on the room record.
@@ -1223,6 +1405,15 @@
     if (!e.dataTransfer?.files?.length) return;
     void addFilesToStage(e.dataTransfer.files);
   }
+
+  /**
+   * How we look in this room. Resolved once, not four or five times in
+   * every message of ours: it reads the room list, which moves with every
+   * unread count anywhere.
+   */
+  const ownProfile = $derived(
+    getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null)
+  );
 
   /** The old room this one was moved from, if any (legacy-move.ts). */
   const movedFromRoom = $derived.by(() => {
@@ -1796,19 +1987,26 @@
    *  overwrites the original on peers that already hold it. Whenever we hold
    *  the quoted message ourselves, its own signed content is the truth and the
    *  snapshot is ignored. The snapshot is still the fallback for a quote whose
-   *  target we never received. */
-  function quoted(r: ReplyTo): { name: string; content: string } {
-    const held = messageById.get(r.id);
+   *  target we never received.
+   *
+   *  `held` is the quoted message, when we have it. It is looked up by the
+   *  row on its own: the lookup re-runs whenever the list changes, and the
+   *  quote - with its markdown stripping - only when what it quotes does. */
+  function quotedName(r: ReplyTo, held: Message | undefined): string {
+    return held ? displayName(held) : r.senderName;
+  }
+
+  function quotedText(r: ReplyTo, held: Message | undefined): string {
     if (held) {
       // Use quotable text for held messages so image-only messages show
       // [image] instead of empty content. Held message is the source of truth.
       // Far more than the 160-character snapshot: it is stripped of markdown
       // before it shows and the line truncates itself, so a cut through a
       // link never reaches the screen.
-      return { name: displayName(held), content: getQuotableText(held, QUOTE_SHOWN_CHARS) };
+      return getQuotableText(held, QUOTE_SHOWN_CHARS);
     }
     // Snapshot from the wire is already built with quotable text
-    return { name: r.senderName, content: r.content };
+    return r.content;
   }
 
   function reactorNames(users: Set<string>): string {
@@ -1849,7 +2047,6 @@
   function openProfileFromMessage(msg: Message): void {
     const own = isSelfSender(msg.senderId);
     const did = own ? selfId() : senderDid(msg.senderId);
-    const ownProfile = getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null);
     profileCardFor = {
       did,
       name: own ? ownProfile.nickname || "You" : displayName(msg),
@@ -2721,20 +2918,20 @@
       ontouchcancel={isMobile ? () => (regionSwipe = null) : undefined}
       style="--chat-font-size: {displayPrefs.chatFontSize}px;{isMobile
         ? ' touch-action: pan-y;'
-        : ''}"
+        : ''}{following ? ' overflow-anchor: none;' : ''}"
       class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
     >
       <!-- A room moved from an old one carries that room's history on top,
            once the new room's own history has run out above. -->
-      {#if movedFromRoom && !canLoadOlder}
+      {#if movedFromRoom && !canLoadOlder && range.from === 0}
         <ArchivedHistory roomCode={movedFromRoom.roomCode} roomName={movedFromRoom.name} />
       {/if}
-      {#if canLoadOlder && visibleMessages.length > 0}
+      {#if (canLoadOlder || range.from > 0) && visibleMessages.length > 0}
         <div class="flex justify-center py-2">
           <Button
             variant="ghost"
             size="sm"
-            onclick={loadOlderPreservingScroll}
+            onclick={showOlderRows}
             disabled={loadingMore}
             class="gap-1.5 text-xs text-muted-foreground font-mono cursor-pointer"
           >
@@ -2752,14 +2949,19 @@
         </div>
       {:else}
         <div class="space-y-0.5">
-          {#each visibleMessages as msg, i (msg.id)}
-            {@const prev = visibleMessages[i - 1]}
+          {#each renderedMessages as msg, i (msg.id)}
+            <!-- The first row mounted reads as first, date and name shown,
+                 whatever is held above it: rows landing above the window
+                 change nothing on screen until the window takes them in,
+                 which it does without moving the view (anchored). -->
+            {@const prev = renderedMessages[i - 1]}
             {@const showDate = shouldShowDateSep(
               msg.timestamp,
               prev?.timestamp
             )}
             {@const showHeader = shouldShowHeader(msg, prev)}
             {@const isOwn = isSelfSender(msg.senderId)}
+            {@const reactions = reactionsByMessage.get(msg.id)}
             <div>
               {#if showDate}
                 <div class="flex items-center gap-3 py-3">
@@ -2806,7 +3008,9 @@
                   : ""}
               >
                 {#if msg.replyTo}
-                  {@const q = quoted(msg.replyTo)}
+                  {@const held = messageById.get(msg.replyTo.id)}
+                  {@const quoteFrom = quotedName(msg.replyTo, held)}
+                  {@const quote = stripMarkdown(quotedText(msg.replyTo, held), resolveMentionDisplayName)}
                   <button
                     type="button"
                     class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
@@ -2816,14 +3020,14 @@
                       size="16"
                       class="text-muted-foreground -ml-5 transform -scale-x-100"
                     />
-                    <span class="font-semibold">{q.name}</span>
-                    <span class="truncate"
-                      >{stripMarkdown(q.content, resolveMentionDisplayName)}</span
-                    >
+                    <span class="font-semibold">{quoteFrom}</span>
+                    <span class="truncate">{quote}</span>
                   </button>
                 {/if}
 
                 {#if showHeader}
+                  {@const avatar = isOwn ? ownProfile.avatarUrl : senderAvatar(msg.senderId)}
+                  {@const avatarColor = isOwn ? ownProfile.color : senderColor(msg.senderId)}
                   <div class="flex items-start gap-2">
                     <div
                       role="button"
@@ -2846,23 +3050,17 @@
                       {isOwn
                         ? 'bg-primary/20 text-primary'
                         : 'bg-secondary text-secondary-foreground'}"
-                      style={isOwn
-                        ? getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).color
-                          ? `color: ${getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).color}`
-                          : ""
-                        : senderColor(msg.senderId)
-                          ? `color: ${senderColor(msg.senderId)}`
-                          : ""}
+                      style={avatarColor ? `color: ${avatarColor}` : ""}
                     >
-                      {#if isOwn && getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).avatarUrl}
+                      {#if isOwn && avatar}
                         <GifImage
-                          src={getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null).avatarUrl ?? ""}
+                          src={avatar}
                           alt="You"
                           class="size-full object-cover"
                         />
-                      {:else if !isOwn && senderAvatar(msg.senderId)}
+                      {:else if !isOwn && avatar}
                         <GifImage
-                          src={senderAvatar(msg.senderId) ?? ""}
+                          src={avatar}
                           alt={displayName(msg)}
                           class="size-full object-cover"
                           animate="hover"
@@ -2873,7 +3071,7 @@
                     </div>
                     <div class="flex min-w-0 items-baseline gap-2">
                       {#if isOwn}
-                        {@const own = getScopedProfile(roomCode.startsWith("rd2_") ? roomCode : null)}
+                        {@const own = ownProfile}
                         {@const effectStyle = nameEffectStyle(own.nameEffect, own.color, own.gradient2 ?? undefined, own.gradient3 ?? undefined, own.nameShimmer, own.nameGlow)}
                         <span
                           role="button"
@@ -2942,14 +3140,12 @@
                   onRequestFileDownload={requestFileDownload}
                 />
 
-                {#if reactionsByMessage.get(msg.id)?.size}
+                {#if reactions?.size}
                   <div class="ml-9 mt-1 flex items-center gap-1">
-                    {#each [...(reactionsByMessage
-                        .get(msg.id)
-                        ?.entries() ?? [])] as [emoji, users] (emoji)}
+                    {#each [...reactions.entries()] as [emoji, users] (emoji)}
                       {#if users.size > 0}
                         {@const reacted = users.has(selfId()) || users.has(myPeerId())}
-                        <Tip text={reactorNames(users)}>
+                        <LazyTip text={reactorNames(users)}>
                           {#snippet children(props)}
                             <button
                               {...props}
@@ -2967,7 +3163,7 @@
                               <span>{users.size}</span>
                             </button>
                           {/snippet}
-                        </Tip>
+                        </LazyTip>
                       {/if}
                     {/each}
                   </div>
@@ -2989,7 +3185,7 @@
                     ? 'opacity-100'
                     : ''} transition-opacity flex items-center gap-1 pr-1"
                 >
-                  <Tip text="React">
+                  <LazyTip text="React">
                     {#snippet children(props)}
                   <button
                     {...props}
@@ -3009,8 +3205,8 @@
                     <Smile class="size-3.5" />
                   </button>
                     {/snippet}
-                  </Tip>
-                  <Tip text="Reply">
+                  </LazyTip>
+                  <LazyTip text="Reply">
                     {#snippet children(props)}
                   <button
                     {...props}
@@ -3026,9 +3222,9 @@
                     <Reply class="size-3.5" />
                   </button>
                     {/snippet}
-                  </Tip>
+                  </LazyTip>
                   {#if !ephemeral}
-                    <Tip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
+                    <LazyTip text={pinnedSet.has(msg.id) ? "Unpin" : "Pin for yourself"}>
                       {#snippet children(props)}
                     <button
                       {...props}
@@ -3051,7 +3247,7 @@
                       {/if}
                     </button>
                       {/snippet}
-                    </Tip>
+                    </LazyTip>
                   {/if}
                 </div>
                 {#if pinnedSet.has(msg.id)}
@@ -3140,10 +3336,7 @@
         variant="secondary"
         size="sm"
         class="rounded-full shadow-md font-mono text-xs"
-        onclick={() => {
-          scrollToBottom("smooth");
-          autoScroll = true;
-        }}
+        onclick={toNewest}
       >
         <ArrowDown class="size-3" /> New messages below <ArrowDown
           class="size-3"

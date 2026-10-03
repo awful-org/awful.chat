@@ -393,10 +393,12 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         # External plugins fetched at build time; see frontend/plugins/README.md.
-        # Pin each to a commit sha (owner/repo@sha) - an instance built from a
-        # moving ref cannot be rebuilt by anyone later, including you.
+        # Pin each to a commit's whole 40-character sha (owner/repo@<sha>) - an
+        # instance built from a moving ref cannot be rebuilt by anyone later,
+        # including you.
         - PLUGIN_SOURCES=${PLUGIN_SOURCES:-}
-        # Unpinned sources fail the build unless this is 1 (ships HEAD).
+        # Unpinned sources - no ref, or an abbreviated sha - fail the build
+        # unless this is 1.
         - PLUGIN_SOURCES_ALLOW_UNPINNED=${PLUGIN_SOURCES_ALLOW_UNPINNED:-}
     # Instance configuration, read at START and served as /config.json rather
     # than compiled into the bundle, so two instances of the same commit and

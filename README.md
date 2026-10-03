@@ -32,7 +32,8 @@ group video.
   it never expires and lets in whoever it reaches.
 - **Direct messages** with an offline queue, delivery and read receipts, a
   phonebook of saved contacts, and message requests: a DM from a stranger
-  waits under Requests, without notifying, until you accept it.
+  waits under Requests, without notifying and without telling them it
+  arrived or was read, until you accept it.
 - **@Mentions** with autocomplete: tamper-proof (they ride inside the signed
   message), rename-proof (always show the current name), and the mentioned
   person gets a highlighted message and a notification.
@@ -190,9 +191,10 @@ iptables DNAT instead, which costs nothing.
 `VITE_API_URL`, `VITE_RELAY_MULTIADDR` and the two SFU variables are the
 instance's own addresses. They are NOT compiled into the app: the frontend
 container writes them to `/config.json` when it starts and the app reads that
-before it mounts, so changing one takes a restart rather than a rebuild. The
-two optional pages, `USE_QS` and `USE_QC`, ride the same file and behave the
-same way: `docker compose up -d frontend` is enough, and `curl
+as it starts (from the copy it kept last time, if it has one, until the fresh
+read lands a moment later), so changing one takes a restart rather than a
+rebuild. The two optional pages, `USE_QS` and `USE_QC`, ride the same file and
+behave the same way: `docker compose up -d frontend` is enough, and `curl
 https://<domain>/config.json` says which of them an instance is serving.
 
 That is also what makes a build checkable. Two instances running the *same
@@ -242,7 +244,7 @@ whose context holds no repository declares no commit.
 | `TURN_REALM` | no | coturn realm, defaults to `DOMAIN` |
 | `TURN_ALT_PORT` | no | coturn's alternate listening port, default 5349. Host-wide like `TURN_PORT`, so a second stack on one box must move it too |
 | `TRUSTED_PROXY_CIDRS` | no | comma-separated CIDRs, addresses or hostnames whose `X-Forwarded-For` the relay believes. Empty trusts nothing (every request is keyed on its socket peer). The dokploy compose defaults it to `dokploy-traefik`, re-resolved every 30s so it survives Traefik being recreated; name your own proxy if it differs, and add a CDN's ranges when one sits in front. `private` restores the old trust-every-private-range behaviour |
-| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit. Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
+| `PLUGIN_SOURCES_ALLOW_UNPINNED` | no | `1` allows a plugin source that names no commit, or only an abbreviated sha (a pin is the whole 40-character sha). Leave it off: plugins compile into the bundle, so an unpinned source can ship different code on the next build with no diff to review |
 | `SFU_TELEMETRY` | no | `1` answers a client's `ms:diag` with a live snapshot and prints one `[sfu-telemetry]` line per room per sweep to the SFU log |
 | `SFU_ALLOWED_ORIGINS` | no | extra origins the SFU accepts a signalling socket from, besides `https://<DOMAIN>` (the compose passes `DOMAIN` to the SFU for this). Required on an SFU satellite, where it is the main instance's origin |
 | `SFU_DIAG_MIN_INTERVAL_MS` | no | floor between one peer's `ms:diag` requests, default 10000 |

@@ -111,14 +111,19 @@ export interface HostApi {
    * Post a card to the host's room. `payload` is what `initialState`
    * receives on every client, so seed options and questions from it; it is
    * JSON, capped at 16 KB. Resolves to the card's id, which updates name.
+   * Receivers take at most 10 cards a minute from one person in a room,
+   * all plugins together; past that this rejects ("Too many cards at
+   * once...") rather than send what they would drop.
    */
   sendCard(payload: unknown): Promise<string>;
   /**
    * Attach an update to a card. Persisted and replayed in fold order
    * (lamport, senderId, updateId) on every client, into your `reduce`.
    * `{ ephemeral: true }` sends live only, never stored or replayed
-   * (cursors, ticks), capped at about four a second per sender. JSON,
-   * 4 KB; anything larger is refused.
+   * (cursors, ticks), capped at about four a second per sender; persisted
+   * ones at 20 per 10 s from one person in a room, all plugins together,
+   * and past that this rejects rather than send what receivers would drop.
+   * JSON, 4 KB; anything larger is refused.
    */
   sendUpdate(
     cardId: string,
@@ -151,14 +156,15 @@ export interface HostApi {
    */
   onBeforeDisconnect(listener: () => void): () => void;
   /**
-   * The teardown-safe `sendUpdate`: no async work, same room binding, for
-   * the `onBeforeDisconnect` beacon. Fire and forget.
+   * The teardown-safe `sendUpdate`: no async work, same room binding, same
+   * cap (past it, nothing is sent), for the `onBeforeDisconnect` beacon.
+   * Fire and forget.
    */
   sendUpdateImmediately(cardId: string, payload: unknown): void;
   /**
    * This plugin's existing cards in the host's room, newest last. Cheap: it
-   * reads card rows only, and `state` is the folded state when the host has
-   * it in memory.
+   * reads card rows only. `state` is the folded state of the cards this
+   * user sent, and of anyone else's when the host already has it in memory.
    */
   cards(): Promise<Array<{ id: string; senderDid: string; state?: unknown }>>;
   /** Notify card surfaces after a persisted plugin state fold. */

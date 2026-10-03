@@ -22,12 +22,13 @@
    * row would stop the user from typing.
    */
   import { Dialog } from "bits-ui";
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import { ArrowLeft, CornerDownLeft, Search, TriangleAlert } from "@lucide/svelte";
   import PaletteRow from "./PaletteRow.svelte";
   import { PaletteState } from "$lib/palette/palette.svelte";
   import { buildCatalog } from "$lib/palette/commands";
+  import { forgetRoomRefs } from "$lib/palette/commands/rooms";
   import type { PaletteHost } from "$lib/palette/host";
   import { SIGILS } from "$lib/palette/types";
 
@@ -40,8 +41,14 @@
   let { open = $bindable(), host }: Props = $props();
 
   // The catalog depends on app state, never on the query, so it is NOT rebuilt
-  // per keystroke. That keeps the lowercase-field cache in `rank.ts` warm.
+  // per keystroke. That keeps the lowercase-field cache in `rank.ts` warm. Nor
+  // is it built while the palette is closed: nothing reads it then (see the
+  // scroll effect below).
   const catalog = $derived(buildCatalog(host));
+
+  // Mounted for as long as the identity is unlocked, so this runs on a lock:
+  // the remembered room and contact refs go with the session.
+  onDestroy(forgetRoomRefs);
 
   const palette = new PaletteState(
     () => catalog,
@@ -102,6 +109,12 @@
 
   /** Keep the active row visible without yanking the list around. */
   $effect(() => {
+    // Closed, there is no list to scroll - and reading the selection would
+    // keep the whole catalog live behind it. The catalog reads the unread
+    // counts and the recent activity, so every incoming message in any room
+    // rebuilt it, a SHA-256 per room and contact, for a palette nobody had
+    // open. With this the catalog is built when the palette opens.
+    if (!open) return;
     const id = activeId;
     if (!id || !listEl) return;
     const el = listEl.querySelector(`#${CSS.escape(id)}`);

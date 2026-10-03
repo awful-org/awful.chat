@@ -16,9 +16,11 @@ with reactionTo/reactionEmoji/reactionOp), resolved at render time.
 ## IndexedDB Schema (idb)
 
 ```typescript
-// Current schema is v6 - v2 added savedGifs, v3 re-keyed profiles by did,
+// Current schema is v9 - v2 added savedGifs, v3 re-keyed profiles by did,
 // v4 added phonebook, v5 and v6 added the searchIndex and diagnostics stores
-// and the blinded indexes below. This listing is the v1 shape for
+// and the blinded indexes below, v8 rebuilt roomProfiles, and v9 added
+// attachments.byRoom (the blinded roomCode, so a room's files are read
+// without walking every room's). This listing is the v1 shape for
 // orientation; storage.ts is the authoritative upgrade path.
 export async function getDB(): Promise<AppDB> {
   // singleton - one connection for app lifetime
@@ -99,6 +101,13 @@ Query doctrine: bulk index getAll of raw sealed rows, filter on clear
         with multi-MB byte rows (attachments); openRow supports skipBytes
         to leave large buffers sealed when the caller only needs metadata.
         (see frontend/src/lib/storage-crypto.ts)
+Files:  outside IndexedDB, OPFS holds file ciphertext only (see File
+        Transfer); a decrypted attachment exists only in memory, as a Blob,
+        so no lock or wipe has to chase it. A browser short of memory may
+        page a large Blob to its own temporary storage (Chromium does, and
+        its in-memory share is small on a phone), cleared only when it next
+        starts - one more reason a stored file is decrypted only when its
+        message is loaded or someone asks for it.
 ```
 
 ---
@@ -150,6 +159,7 @@ enum MessageType {
   SyncDigest      = "sync_digest",
   SyncBatch       = "sync_batch",
   SyncComplete    = "sync_complete",
+  SyncNone        = "sync_none",        // a digest's answer when no push follows
 }
 
 // NOTE: DM delivery/read receipts are implemented, but NOT via these wire
@@ -230,6 +240,7 @@ interface Room {
   type: RoomType
   name: string
   lastSeenLamport: number  // unread count derived from this
+  seenAt?: number          // when the user last read or wrote here (ms, this device)
   createdAt: number
   pfpData?: ArrayBuffer    // local upload - blobURL generated at runtime
   pfpURL?: string          // external URL (tenor, giphy, etc) - stored as-is
@@ -266,6 +277,25 @@ interface PeerProfile {
 //   pfpData present → URL.createObjectURL(new Blob([pfpData])) at runtime
 //   pfpURL present  → use directly as <img src>
 //   setting one clears the other
+//
+// A peer's avatar or banner URL is kept only if it is http(s), or a base64
+// raster data: URL (no SVG; ~1.4 MB, a banner ~1.5 MB) whose header claims
+// at most 4096 px a side. GIF, PNG, WebP and JPEG headers are read, others
+// pass. Checked on receipt and again on every load from storage.
+//
+// An image GifImage takes for animated (a data:image/gif or data:image/webp,
+// a .gif or .webp url, or one its caller marks animated, as a GIF in a
+// message) shows once a copy of it has loaded and its size is known: past
+// 4096x4096 pixels it is a placeholder, never decoded. Its still frame is
+// drawn at the size it is shown (1024 px a side at most, drawn again when
+// that box grows), and what plays is that same copy, not the url fetched
+// again. The viewer a message's image opens in takes it the same way: a copy
+// of its own, measured before anything decodes it and shown itself; past
+// the bound it says the image is too large to show, and offers no
+// conversion (one draws the whole picture on a canvas). Any other image is
+// a plain img that the browser decodes at full size, once per url however
+// many places show it: a linked avatar whose url names no animated format,
+// a link preview's image, a still picture in a message and in its viewer.
 ```
 
 ### Identity struct
@@ -334,17 +364,24 @@ interface WireChatMessage {
 interface WireProfile      { type: MessageType.Profile;      name: string; did: string | null; avatarUrl: string | null
                              // proof that `did` owns the sending peerId, see Peer Identity Binding
                              peerId?: string; bindingSig?: string }
+// A profile goes to each connected peer once, over one room the two share,
+// and again only when it changes: a room click, a resume or a network change
+// sends it only to peers that were never delivered the current one.
 interface WireCallPresence { type: MessageType.CallPresence; inCall: boolean }
 interface WireRoomName     { type: MessageType.RoomName;     name: string }
 
 // sync - wire only
-interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number> }
-interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number }
+interface WireSyncDigest   { type: MessageType.SyncDigest;   watermarks: Record<string, number>;
+                             nonce?: number }          // echoed by its SyncNone; absent from older senders
+interface WireSyncBatch    { type: MessageType.SyncBatch;    messages: WireChatMessage[]; batchIndex: number; totalBatches: number;
+                             live?: boolean            // one send's direct copy, not history repair
+                             order?: "head" | "asc" }  // place in a paced push; absent from older senders
 interface WireSyncComplete { type: MessageType.SyncComplete }
+interface WireSyncNone     { type: MessageType.SyncNone;     nonce?: number }  // the digest it answers; absent from older senders
 
 type AnyWireMessage =
   | WireChatMessage | WireProfile | WireCallPresence | WireRoomName
-  | WireSyncDigest | WireSyncBatch | WireSyncComplete
+  | WireSyncDigest | WireSyncBatch | WireSyncComplete | WireSyncNone
 
 // helpers
 function wireToMessage(wire: WireChatMessage, roomCode: string): Message  // adds roomCode + attachments: []
@@ -366,27 +403,108 @@ type Watermarks = Record<string, number>
 on connect (both peers):
   → send SyncDigest { watermarks }
 
+also sent:
+  → on a gap: a live message more than one past the ROOM's lamport clock
+    (not the sender's last lamport, which jumps whenever someone else
+    spoke) - a digest to its sender, for that message's room. A row missed
+    from one sender while others kept the clock moving is no gap: a
+    reconnect's digests find it, but a frame lost on a channel that stayed
+    up is found only by a digest exchanged before that sender's next
+    message arrives
+  → by the 15s repair tick, to a peer silent that long, for the open room
+    and one background room per tick - backing off per peer and room
+    (15s, 30s, ... up to 5 minutes) while exchanges find nothing missing
+    either way; a message, a push or an exchange that finds a difference
+    starts it over
+
 on receive SyncDigest:
-  → compare their watermarks against mine
-  → push everything they're missing as SyncBatch[] + SyncComplete,
-    NEWEST FIRST: the receiver keeps one page on screen (the newest) and
-    parks the rest in storage, so batch 0 is the page they will render
+  → compare their watermarks against mine, and against the senders I hold
+    rows from - kept in memory per room (one read of the room the first
+    time it is asked about, then every stored row updates it), so a digest
+    that lacks nothing costs no read of the room
+  → push everything they're missing as SyncBatch[] + SyncComplete -
+    throttled per peer and room (10s), the push being what costs; it reads
+    only from the lowest of their watermarks for a sender they are behind
+    on (sync-push.ts), one push at a time per peer and room:
+    - order "head": the newest page first (the 50 rows a page shows, plus
+      any plugin updates between them), so the page they render arrives
+      first; a push that fits on one page has no head
+    - order "asc": everything older, OLDEST first, so whatever part of the
+      push arrives leaves no gap below it
+    - each frame goes out once the room channel accepted the one before
+      (it refuses past 32 frames / 4 MB in flight); 4 back to back, then
+      one per 150ms, which an older receiver on a slow phone - verifying
+      each batch before it reads the next frame - keeps ahead of
+    - a refused frame is retried (250ms, 1s), then the push stops; the
+      SyncComplete goes out only once every batch was accepted
+  → a digest that brings no push - nothing they lack, the push window not
+    open yet, or a read that found nothing - is answered with SyncNone,
+    echoing the digest's nonce, so the asker stops holding its room for it
+    (below). A push already running to that peer answers instead. Older
+    builds never send SyncNone, and ignore it as a type they do not know
   → they do the same - one round trip, bidirectional, no host election
 
 on receive SyncBatch:
+  → drop ids already held BEFORE verifying (clear fields, no decrypt): a
+    held row is never overwritten, so its copy needs no verdict, and a held
+    id from another room or sender is refused. Only the rest are verified;
+    a signature that already verified this session is not checked again
   → bulkPut to IDB (idempotent - put by id)
-  → update watermarks (max semantics)
-  → live batch (one send's direct copy): merge into the view now
+  → claim watermarks (max semantics, never regress) - but a watermark says
+    "I hold everything this sender wrote up to here", and nobody offers what
+    is below it again, so a push only claims what cannot skip a row
+    (sync-inbound.ts). A push's batches are handled one at a time, in the
+    order they arrived - a DM's frames, which look the conversation up on
+    the way in, wait in line per peer and conversation so none overtakes
+    the one before it, its SyncComplete included:
+    - "asc" batches claim as each is stored, while every earlier batch of the
+      push was stored too (a missing or refused batch stops the claims)
+    - "head" batches, and an older build's unmarked batches, claim only once
+      the push completes: every batch it announced (totalBatches) arrived,
+      in order - which also tells a cut-off push from a whole one, so it
+      does not wait on SyncComplete either
+    - rows already held count: their stored lamport, not the copy's
+    - while a push into the room is open, or one stopped short and none has
+      completed since, or a digest we sent is unanswered, every other
+      advance there (live messages, our own sends) waits in memory and is
+      written when that ends. A digest is answered by its peer's push (which
+      holds the room itself from its first frame), SyncComplete or a
+      SyncNone carrying that digest's nonce - with two digests out to one
+      peer, the answer to the first does not end the wait the second set;
+      an older build never sends SyncNone, so when it has nothing to push
+      the wait runs out after 15s
+    - those waiting advances count as held when a peer's digest is weighed:
+      a row we stored but have not claimed yet is not one to ask them for.
+      The cost: such a row can sit above rows of its sender we never got,
+      and once it is claimed nobody offers those again - the gap every live
+      message claimed over at once before rooms were held. Asking instead
+      had peers push the held rows back on nearly every exchange in a room
+      with an older build, whose silence holds the room 15s per digest
+    - an older build whose push stops short (it lost batches past the
+      channel's window, newest first) would re-send the same newest rows on
+      every digest: what it delivered is advertised to that peer alone, for
+      the session; every other peer is still asked for everything
+  → live batch (one send's direct copy): claims row by row, like any live
+    message - waiting while the room is held as above - and merges into the
+    view now. In a protected room the sender gives this copy only to roster
+    members its broadcast did not reach - the broadcast already went down
+    the same verified channel to everyone else
   → repair batch: park rows for the view (sync-view.ts), flushed ONCE per
     burst - 250ms quiet, 1s at most, or on SyncComplete. At the flush, rows
     at/above the loaded window's floor are appended; anything below it (or
     everything, for an empty view) triggers ONE re-read of the newest page,
     identity-preserving, and stays in storage behind "load older"
+  → the view mounts a window of what it holds - the newest 100 rows while it
+    follows the bottom, 200 at most (chat-window.ts). While it follows, a
+    view holding over 400 rows lets go of all but the newest 200, keeping a
+    message being replied to and what follows it (storage keeps them), which
+    moves the floor up
   → count the frame for the room's syncing pill (sync-progress.svelte.ts):
     batchIndex/totalBatches across every pusher, cleared on SyncComplete or
     after 20s without a frame
 
 on receive SyncComplete:
+  → once the push's batches are all in and handled (or it stalls):
   → flush the room's parked rows; re-sort in-memory list if out of order
   → send SyncDigest to all OTHER connected peers (gossip propagation)
     so data spreads through partial meshes without requiring direct connections
@@ -472,7 +590,9 @@ ordering does not make relay reservations independent of UTC.
 
 ```txt
 peer joins room → rendezvous on the Go relay (/awful/rendezvous/2.0.0,
-length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT)
+length-prefixed JSON: REGISTER/UNREGISTER → PEERS/PEER_JOINED/PEER_LEFT;
+a stream that fails or drops is reopened after 2 s, doubling to 60 s,
+jittered, and back to 2 s once the relay answers on one)
 → dials peers via libp2p (WebRTC direct, circuit-relay fallback, 3 dial
 attempts with backoff) → gossipsub topic app:room:{roomCode} per room
 
@@ -645,10 +765,14 @@ Relay side (relay/mailbox.go):
   or read receipt - so receipts and attachments reach a sleeping phone
   too, not only text. Blobs without a kind are chat.
 
-Client collect: on unlock/startup, fetch + unseal + ack. Undecryptable
-  blobs are poison-acked (deleted) so they cannot wedge the box; transient
-  failures keep the blob for the next poll. Message-id dedup against
-  storage stops replays.
+Client collect: on unlock/startup, fetch + unseal + ack, and never before
+  this device's node has started: collect and ack always name the device.
+  Undecryptable blobs are poison-acked (deleted) so they cannot wedge the
+  box; transient failures keep the blob for the next poll, and so does a
+  stranger's DM that the full message requests cannot take yet, and a DM
+  batch (files, cards) for a conversation left unjoined because others
+  already hold all the joins they may (dm.svelte.ts, MAX_DMS_JOINED_FOR_THEM).
+  Message-id dedup against storage stops replays.
 
 What the relay learns: THAT a DID has mail and roughly when - never
   content, never which identity sent it (ephemeral key, no sender field
@@ -664,24 +788,80 @@ What the relay learns: THAT a DID has mail and roughly when - never
 ## File Transfer
 
 ```txt
+Secure rooms (rd2_) and DMs. Every file is encrypted before it leaves the
+device (room-security/file-crypto.ts: a fresh key per file, 1 MiB AES-GCM
+chunks bound to the file id, size and chunk index). The descriptor holding
+the key travels only inside the signed, end-to-end encrypted message;
+WebTorrent sees an opaque name and ciphertext.
+
 send:
-  1. wtClient.seed(file, { announce: [] }) → infoHash
-  2. store Attachment { infoHash, status: "seeding" }
-  3. if size < 5MB: store data: ArrayBuffer
-  4. broadcast WireMessage with FileMeta
+  1. encrypt into OPFS staging (ciphertext) → seed it, pieces read from the
+     file itself → infoHash
+  2. keep the ciphertext in room-v2-ciphertext/<infoHash>; the seed reads
+     from there on
+  3. store Attachment { infoHash, encryption, status: "seeding" },
+     data: the ciphertext when it is 5MB or less
+  4. broadcast the message with the file descriptors
 
 receive:
   1. store Attachment { status: "pending" }
   2. wtClient.add(infoHash) → status: "downloading"
-  3. torrent.on("done") → blobURL → status: "complete"
-  4. if size < 5MB: store ArrayBuffer
+  3. torrent done → ciphertext to room-v2-ciphertext/<infoHash> → decrypted
+     IN MEMORY, no File until every chunk authenticates → blobURL
+     → status: "seeding" (data: the ciphertext when 5MB or less)
 
-startup:
-  re-seed all complete attachments that have data
+room open (first time in a session):
+  read the room's rows (attachments.byRoom, metadata only). Every file this
+  device holds (room-v2-ciphertext/<infoHash>, or the row's data) is held:
+  "pending", this device counted as a seeder, never fetched again. Nothing
+  is seeded, re-hashed or rewritten; a row of 5MB or less that never got
+  its copy of the file gets it, once, copied from room-v2-ciphertext.
+
+held files (files.svelte.ts): a decrypted file stays in memory for the
+session, so a held file is decrypted only
+  - when its message is loaded in the open conversation (the room open's
+    page, an older page scrolled back to, a message arriving), if it is a
+    picture, video or sound of 64MB or less - whoever sent it, whatever
+    the auto-download setting, since nothing is fetched; newest first, one
+    at a time;
+  - or when someone asks for it: its Download button or a plugin, whatever
+    its size, or auto-download as another member's picture, video or sound
+    of 64MB or less comes on screen (files.svelte.ts autoDownloadOnRender).
+  Decrypted IN MEMORY from room-v2-ciphertext, or from the row's data when
+  this device has no durable copy (which is then written, once) → blobURL.
+  Anything else waits for its Download button. An ask nobody made - a
+  message arriving, a peer announcing what it holds - leaves a held file
+  held (webtorrent.ts ensureDownload). One restore per file at a time,
+  whoever asks (files.svelte.ts restoreStoredFile).
+
+serving (a peer's link connects for a file with no torrent here):
+  seed room-v2-ciphertext/<infoHash> as it is - the original opaque name
+  and 256 KiB pieces, so the infoHash is the signed one - with the pieces
+  read from the file itself (CiphertextChunkStore). Never decrypted, and so
+  not on screen: the file stays held here (see held files). The
+  first serve in a session hashes the ciphertext (webtorrent builds the
+  torrent before seeding it) - seconds for hundreds of MB on a phone - and
+  a link that times out meanwhile is dialled again and finds the seed.
+
+status: written to the rows when it changes, read without the file bytes.
+A torrent's progress becomes a snapshot at most every 250 ms.
+
+OPFS (the origin's private file system) holds ciphertext only, never a
+decrypted file:
+  room-v2-ciphertext/<infoHash>   durable, until a wipe
+  room-v2-pieces/<lease>/...      a download's piece store, for one session
+  room-v2-transfers/<lease>/...   a send's ciphertext until it is kept
+  <lease>: each file transport (transport/file/opfs-lease.ts) holds the Web
+  Lock "awful:opfs:<lease>" for its session. A page starting, and a lock,
+  remove every lease directory whose lock is free (its page closed or
+  crashed) - nothing can on the way out of a closed tab - and entries from
+  before leases existed once no other page holds or waits for awful:node or
+  a quick call's storage lock. The duress wipe removes all of OPFS.
 
 blobURL:
-  created: torrent done
-  revoked: message scrolls out of virtual list OR beforeunload
+  created: download done, or a held file shown (see held files); always
+           from an in-memory File
+  revoked: session reset (lock, identity switch) or page unload
 ```
 
 ---
@@ -693,6 +873,30 @@ max per message:   64 KB
 SyncBatch:         max 20 messages per batch
 direct streams:    4-byte big-endian length-prefixed frames
                    (chat DM envelopes, file signaling, rendezvous)
+room channels:     one /awful/room/2.0.0 stream per protected room and peer,
+                   opened by either side; when both open one at once, the
+                   stream the smaller peerId started is kept (as for DM
+                   introductions), even when the larger peer's hello lands
+                   after it proved: for 10 s after, a stream the larger peer
+                   opens for the room is let in beside it and replaces it
+                   only once it proves too. Until it proves or fails, the
+                   smaller peer's sends to them in that room wait for it,
+                   since the larger peer's end of the old one may be gone
+                   up to 256 proven per connection plus 64 handshakes, and
+                   1024 proven in all; past that the least recently used one
+                   quiet for 30 s is closed, and the next send reopens it.
+                   A client from before reopening counts members by open
+                   channels and never reopens one, so one of these closed to
+                   it leaves it silent to us in that room until the relay
+                   lists us to it again or we send there first
+                   a member stays a member while connected, channel open or
+                   not, until the room is left, the relay sends PEER_LEFT, or
+                   a fresh channel is refused twice. No PEER_LEFT comes for a
+                   member who left while our rendezvous was down: the first
+                   send to them, refused, is how we learn it, and until then
+                   they count
+                   openings: 64 at once, the rest queued; a pair the relay
+                   lists that has no channel is retried, 5 s doubling to 5 min
 ```
 
 ---
@@ -746,6 +950,37 @@ Screen share audio (share-audio.ts):
   - audioTrack.onmute/onunmute are wired so a share whose audio goes silent
     mid-call (own-audio suppression leaving nothing to send, or an
     output-device change) is reported instead of silently dead
+
+Remote cameras (mediasoup.ts setWantedCameras, call-cameras.svelte.ts):
+  - every remote camera producer is consumed when announced, as before
+  - it stays received only while something shows it: a camera tile the
+    stage has on screen (IntersectionObserver), the spotlight (floating
+    panel, picture in picture), or a popped-out window
+  - and while its owner is speaking, unless a pin or a watched share holds
+    the spotlight, or there is none (a quick call has no floating panel or
+    picture in picture): a speaker takes the spotlight after 1.5 s of
+    speech (SPEAKER_TAKEOVER_MS), and a camera asked for at the first word
+    is playing by then rather than black for the round trip
+  - unshown for 5 s → ms:close-consumer and a local close; newly shown →
+    a fresh ms:consume + ms:resume-consumer (the SFU asks for a keyframe on
+    resume). No new wire message
+  - a failed return is tried once more after 3 s; failing twice drops the
+    kept track (the tile shows the person), and the camera is tried again
+    only once it goes unshown and is shown again, or by a rejoin's replay.
+    An equal set of shown cameras changes nothing
+  - while parked the app keeps the last track (no trackRemoved), so "has
+    video" stays true for the spotlight and the grid filters; a parked
+    camera's ms:producer-closed, peer-left or a rejoin removes it
+  - a producer that closes while its consume is in flight (after the SFU
+    answered it), by ms:producer-closed or with its owner's ms:peer-left
+    (which the SFU sends alone): the late consumer is closed with
+    ms:close-consumer and never reaches the app as a track, for any
+    consume, first or not
+  - when that consume stands in for a track the app still holds (a stall's
+    re-consume, a rebuilt recv transport), ms:producer-closed tells the app
+    the track is gone (trackRemoved), as it does for a live consumer
+  - screen shares are never parked; no opinion yet (or no call) = every
+    camera received
 
 Screen share transmissions:
   - remote screen producers emit transmissionAvailable(peerId, producerId)
@@ -1042,8 +1277,21 @@ Manifest: /manifest.webmanifest (vite-plugin-pwa), id "/", scope "/",
 Service Worker: /sw.js. Precaches the shell and hashed assets (not the
   DTLN worklet or shiki grammars, cached on first use); every in-scope
   navigation is answered from the precached index.html, revalidated in the
-  background; /config.json is never cached. registerType "prompt": a new
-  build waits until the user accepts the reload.
+  background; /config.json is never cached by the worker or the HTTP cache.
+  The app keeps the last copy it read in localStorage and a later launch
+  starts from it, applying the fresh read when it lands, so only a first
+  launch waits on the network for it - and a launch of /qs or /qc, which
+  exist only if the fresh read says so. The transport gives a read still
+  in flight up to a second before it connects: the relay it dials is kept
+  for the session. registerType "prompt": a new build waits until the user
+  accepts the reload.
+Startup: the entry bundle is the landing page. /app and /r/ first show the
+  setup or unlock screen from a chunk of their own and fetch the app behind
+  it in idle time, under Save-Data too, since the worker precaches the same
+  chunks; the app mounts at the first unlock and keeps the screen after, its
+  own lock screen included. /qs and /qc are chunks of their own. index.html
+  carries each page's chunk list, which main.ts preloads while /config.json
+  is read.
 Install: the deferred beforeinstallprompt is captured at boot and offered
   once the app is usable; iOS gets Share > Add to Home Screen guidance.
 Share Target: POST /share-target (multipart: title, text, url, files),

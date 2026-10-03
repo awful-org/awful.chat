@@ -1,15 +1,3 @@
-<script module lang="ts">
-  /**
-   * The room this tab was opened for, once read out of the address bar and
-   * until its join has run. Module-level, not component state: a remembered
-   * password unlocks by raising identityStore.initializing, which swaps this
-   * view for the spinner and back - a fresh instance - and the address bar
-   * was already cleared, so the invitation was simply gone: the tab showed
-   * the room list, "Connecting...", and never joined or took the node.
-   */
-  let parkedRoomCode: string | null = null;
-</script>
-
 <script lang="ts">
   import { untrack } from "svelte";
   import { isLegacyArchive } from "$lib/room-security/legacy-archive";
@@ -17,8 +5,7 @@
   import { storeSecureInvitation } from "$lib/room-security/invitations";
   import { captureSessionGuard } from "$lib/identity/session-guard";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
-  import { parseSecureInvitation } from "$lib/room-security/invitation-format";
-  import { DISCOVERY_ID_RE, deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
+  import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
   import { secureInvitationLink } from "$lib/room-security/invitation-format";
   import { legacyMoveInviteText, linkLegacyMove } from "$lib/room-security/legacy-move";
   import MoveLegacyRoomDialog from "./MoveLegacyRoomDialog.svelte";
@@ -66,12 +53,14 @@
     getMessages,
     getLastMessage,
     getUnreadCount,
-    getPeerProfile,
+    getAllPeerProfiles,
+    onMessageStored,
     markRoomSeen,
     putPhonebookEntry,
     requestPersistentStorage,
     type PhonebookEntry,
   } from "$lib/storage";
+  import { DmInboxReads } from "$lib/dm-inbox-reads";
   import { MessageType } from "$lib/types/message";
   import { loadProfile } from "$lib/profile.svelte";
   import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
@@ -101,7 +90,9 @@
   } from "$lib/transport/dm.svelte";
   import FloatingDmPanel from "$lib/components/FloatingDmPanel.svelte";
   import CallPipPanel from "$lib/components/CallPipPanel.svelte";
-  import { normalizeRoomCode } from "$lib/room-code";
+  // Shared with the setup and unlock screens, which read the address bar
+  // before this view exists (room-location.ts).
+  import { consumeRoomLocation, parkedRoom } from "$lib/room-location";
   import {
     syncSpeakersFromCall,
     watchVisibilityForCall,
@@ -128,30 +119,6 @@
   const queryClient = new QueryClient();
 
   /**
-   * The room code out of the address bar, fragment form first.
-   *
-   * The code IS the membership secret, so it lives in `/r/#<code>` - a
-   * fragment is never sent to the server, never lands in an access log and
-   * never rides a Referer. `/r/<code>` still parses: links already handed out
-   * do not change, and App.svelte rewrites one to the fragment on load.
-   */
-  function parseRoomCode(pathname: string, hash: string): string | null {
-    if (!pathname.startsWith("/r/")) return null;
-    const raw =
-      hash.length > 1 ? hash.slice(1) : pathname.slice(3).split("/")[0];
-    if (!raw) return null;
-    try {
-      try { return parseSecureInvitation(pathname + hash); } catch { /* Stored room navigation. */ }
-      // A short link, `/r/#k5t-8r5`: handleJoin redeems it like a typed code.
-      const pairing = parseJoinInput(decodeURIComponent(raw));
-      if (pairing.kind === "pairing") return pairing.code;
-      return normalizeRoomCode(decodeURIComponent(raw));
-    } catch {
-      return normalizeRoomCode(raw);
-    }
-  }
-
-  /**
    * Generate preview text for a message in room/DM list.
    * Maps message types to renderable previews, mapping plugin cards to their
    * names and skipping plugin updates (non-renderable data messages).
@@ -170,22 +137,9 @@
     return stripMarkdown(msg.content, resolveMentionDisplayName) || "(message)";
   }
 
-
-
-  function consumeRoomLocation(): string | null {
-    const code = parseRoomCode(window.location.pathname, window.location.hash);
-    // Keep incoming capabilities only in memory, even while identity is locked.
-    // Public saved-room IDs are safe to retain for reload/navigation. Strip
-    // malformed inputs too: they can contain a truncated or wrapped secret.
-    if (code && !DISCOVERY_ID_RE.test(code)) {
-      history.replaceState(history.state, "", "/r/");
-    }
-    return code;
-  }
-
   /** What the address bar held when this tab opened. */
-  const openedWith = consumeRoomLocation() ?? parkedRoomCode;
-  parkedRoomCode = openedWith;
+  const openedWith = consumeRoomLocation() ?? parkedRoom.code;
+  parkedRoom.code = openedWith;
   let pendingRoomCode = $state<string | null>(openedWith);
   let alive = true;
   $effect(() => () => {
@@ -321,7 +275,7 @@
           joiningRoom = false;
           // Done with it - unless this instance was replaced mid-join, and
           // the one that replaced it still has to open the room on screen.
-          if (alive && parkedRoomCode === code) parkedRoomCode = null;
+          if (alive && parkedRoom.code === code) parkedRoom.code = null;
         });
     }
   });
@@ -362,6 +316,15 @@
   );
   let dmUnread = $state(new Map<string, number>());
   let dmBuildRun = 0;
+  /** Moves once rows were stored into a conversation (dm-inbox-reads.ts). */
+  let dmStored = $state(0);
+  /** The DM list's storage reads, per conversation (dm-inbox-reads.ts). */
+  const dmReads = new DmInboxReads({
+    lastMessage: (roomCode) => getLastMessage(roomCode),
+    unreadCount: (roomCode, lastSeenLamport) =>
+      getUnreadCount(roomCode, lastSeenLamport, selfId()),
+    rebuild: () => (dmStored += 1),
+  });
   // Message requests keep their own badge in the list but stay out of the
   // total: a stranger does not get to light up the app icon.
   const dmUnreadTotal = $derived(
@@ -1191,7 +1154,7 @@
     const code = consumeRoomLocation();
     if (!identityStore.isUnlocked) {
       pendingRoomCode = code;
-      parkedRoomCode = code;
+      parkedRoom.code = code;
       return;
     }
     // The URL is the truth: even if the view already names this room, the
@@ -1332,17 +1295,57 @@
     refreshDmRooms().catch(() => {});
   });
 
+  // A conversation's reads go stale when a row is stored into it, and the
+  // list is built again soon after, whatever path stored it.
+  $effect(() => {
+    const off = onMessageStored((m) => dmReads.noteStored(m.roomCode));
+    return () => {
+      off();
+      dmReads.dispose();
+    };
+  });
+
   $effect(() => {
     roomsStore.dmRooms.length;
     // dmVersion bumps once per DM change; depending on messages.length would
-    // re-run this storage sweep for every message in every room. The maps are
-    // replaced wholesale on update, so identity also catches renames that
-    // .size missed.
+    // re-run this for every message in every room. Not the peer name and
+    // avatar maps: they are replaced on every profile frame and every room
+    // open, and each replacement rebuilt the whole list from storage. Every
+    // place that shows a name or an avatar reads those maps first; what this
+    // list keeps is the fallback for a peer they lack, which only the stored
+    // profile - read here - can supply. dmStored moves soon after rows are
+    // stored into a conversation, for the paths that tell the list nothing
+    // themselves (dm-inbox-reads.ts).
     transportState.dmVersion;
-    transportState.peerNames;
-    transportState.peerAvatars;
+    dmStored;
     (async () => {
       const run = ++dmBuildRun;
+      const alive = () => run === dmBuildRun;
+      // Stored profiles only for a peer the live maps do not name yet - and
+      // then every peer's, in one read that storage keeps until a profile is
+      // written, not two decrypting reads per conversation. Untracked: the
+      // maps must not become what this effect runs on.
+      const unnamed = untrack(() =>
+        roomsStore.dmRooms.some((room) => {
+          const peer = room.participantDid;
+          return !!peer && !transportState.peerNames.has(peerIdToDid(peer)) &&
+            !transportState.peerNames.has(peer);
+        })
+      );
+      const profiles = new Map(
+        unnamed
+          ? (await getAllPeerProfiles().catch(() => [])).map((p) => [p.did, p])
+          : []
+      );
+      if (!alive()) return;
+      // The preview only needs the newest message; loading a full page per
+      // room made every keystroke in any conversation a storage sweep. Read
+      // only for the conversations that changed (dm-inbox-reads.ts).
+      const reads = await dmReads.read(
+        roomsStore.dmRooms.filter((room) => room.participantDid),
+        alive
+      );
+      if (!reads || !alive()) return;
       const next = new Map<string, { text: string; ts: number }>();
       const nextInbox = new Map<
         string,
@@ -1363,9 +1366,8 @@
         if (!peerId) continue;
 
         const did = peerIdToDid(peerId);
-        // The preview only needs the newest message; loading a full page per
-        // room made every keystroke in any conversation a storage sweep.
-        let last = await getLastMessage(room.roomCode);
+        const read = reads.get(room.roomCode);
+        let last = read?.last;
 
         const activeDid = peerIdToDid(transportState.activeDmPeerId ?? "");
         const roomDid = peerIdToDid(peerId);
@@ -1376,16 +1378,14 @@
           last = live[live.length - 1] ?? last;
         }
 
-        const profile = await getPeerProfile(did).catch(() => undefined);
+        const profile = profiles.get(did);
         // In a DM the only remote sender is the peer, so the newest message
         // carries their DID whenever they spoke last.
         const messageDid =
           last && last.senderId !== selfId() && last.senderName !== "You"
             ? last.senderId
             : undefined;
-        const messageProfile = messageDid
-          ? await getPeerProfile(messageDid).catch(() => undefined)
-          : undefined;
+        const messageProfile = messageDid ? profiles.get(messageDid) : undefined;
 
         const nickname =
           messageProfile?.nickname ||
@@ -1423,16 +1423,10 @@
           });
         }
 
-        const self = selfId();
-        const unread = await getUnreadCount(
-          room.roomCode,
-          room.lastSeenLamport,
-          self
-        );
-        unreadNext.set(room.roomCode, unread);
+        unreadNext.set(room.roomCode, read?.unread ?? 0);
       }
 
-      if (run !== dmBuildRun) return;
+      if (!alive()) return;
       dmPreviews = next;
       dmInbox = nextInbox;
       dmUnread = unreadNext;

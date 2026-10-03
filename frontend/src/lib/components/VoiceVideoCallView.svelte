@@ -120,6 +120,13 @@ import {
 import PluginCallTileView from "./PluginCallTileView.svelte";
 import SplitHandle from "./SplitHandle.svelte";
 import { resolveSplit } from "$lib/call-split";
+import {
+  SettlingMeasure,
+  sameTileRects,
+  type TileRects,
+} from "$lib/call-tile-rects";
+import { stageCameraHidden, stageCameraShown } from "$lib/call-cameras.svelte";
+import { remoteCameraTileId } from "$lib/call-tiles";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 import { peerQualityState, voiceLinkState } from "$lib/call-peer-quality.svelte";
 import type { PeerVoiceQuality } from "$lib/call-quality";
@@ -325,6 +332,61 @@ import {
   // poll loop for the rest of the session. This component only READS
   // speakers.speaking for its rings.
 
+  // ── Which cameras are on screen ───────────────────────────────────────────
+  //
+  // A remote camera is received only while something shows it (see
+  // call-cameras.svelte.ts). The stage's part is every remote camera tile
+  // actually on screen: not filtered away by the grid menu, not hidden
+  // behind a focused share, not scrolled out of the thumbnail strip. One
+  // IntersectionObserver answers all of those, and a tile the layout does
+  // not render at all is simply not observed. Tiles, not <video>s: an avatar
+  // tile on screen wants the camera too, the moment one is turned on.
+  let cameraTileObserver: IntersectionObserver | null = null;
+  const observedCameraTiles = new Map<Element, string>();
+
+  function cameraOnScreen(node: HTMLElement, peerId: string | null) {
+    let current: string | null = null;
+    const start = (id: string | null) => {
+      current = id;
+      if (id === null) return;
+      observedCameraTiles.set(node, id);
+      if (typeof IntersectionObserver === "undefined") {
+        stageCameraShown(node, id);
+        return;
+      }
+      cameraTileObserver ??= new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const tilePeer = observedCameraTiles.get(entry.target);
+          if (tilePeer === undefined) continue;
+          if (entry.isIntersecting) stageCameraShown(entry.target, tilePeer);
+          else stageCameraHidden(entry.target);
+        }
+      });
+      cameraTileObserver.observe(node);
+    };
+    const end = () => {
+      if (current === null) return;
+      observedCameraTiles.delete(node);
+      cameraTileObserver?.unobserve(node);
+      stageCameraHidden(node);
+      current = null;
+    };
+    start(peerId);
+    return {
+      update(id: string | null) {
+        if (id === current) return;
+        end();
+        start(id);
+      },
+      destroy: end,
+    };
+  }
+
+  $effect(() => () => {
+    cameraTileObserver?.disconnect();
+    cameraTileObserver = null;
+  });
+
   // ── Video / Audio actions ─────────────────────────────────────────────────
 
   // Both actions skip update when the track is unchanged. Svelte calls an
@@ -409,7 +471,8 @@ import {
       const avatarUrl = getPeerAvatar(peerId);
       const remoteCallState = callPeerStates.get(peerId);
       result.push({
-        id: `remote-camera-${peerId}`,
+        // The one format wantedCameras reads popped-out windows back by.
+        id: remoteCameraTileId(peerId),
         label,
         avatarUrl,
         isLocal: false,
@@ -508,70 +571,87 @@ import {
   // placeholder (click-to-primary), except on the plugin's own controls,
   // which re-enable pointer events themselves.
   const _pluginAnchors = new Map<string, HTMLElement>();
-  let pluginRects = $state<
-    Record<string, { x: number; y: number; w: number; h: number } | null>
-  >({});
+  let pluginRects = $state<TileRects>({});
+  /**
+   * Set while a plugin tile is joined: what re-measures the layer, and what
+   * watches the placeholders' sizes. Plain, not state - the effects below
+   * only poke it, and must not re-run because it was replaced.
+   */
+  let pluginLayout: {
+    settle: SettlingMeasure;
+    resize: ResizeObserver | null;
+  } | null = null;
 
   function pluginTileAnchor(node: HTMLElement, id: string) {
     _pluginAnchors.set(id, node);
+    pluginLayout?.resize?.observe(node);
+    pluginLayout?.settle.poke();
     return {
       destroy() {
         if (_pluginAnchors.get(id) === node) _pluginAnchors.delete(id);
+        pluginLayout?.resize?.unobserve(node);
+        pluginLayout?.settle.poke();
       },
     };
   }
 
+  // Follow the placeholders - measured when something can have moved them,
+  // and for a few frames after (call-tile-rects.ts), never every frame. This
+  // used to run getBoundingClientRect per tile on every animation frame for
+  // as long as a plugin tile was joined. What moves a placeholder: a resize
+  // of the panel or of the placeholder itself (a ResizeObserver, which also
+  // fires through the panel's height transition), a scroll of the thumbnail
+  // strip, and a layout change that shifts tiles without resizing them
+  // (tileLayout, further down, where the layout is worked out).
   $effect(() => {
     if (joinedPluginTiles.size === 0 || !panelEl) {
       pluginRects = {};
       return;
     }
-    let raf = 0;
-    const measure = () => {
-      const panel = panelEl?.getBoundingClientRect();
-      if (panel) {
-        const next: typeof pluginRects = {};
-        for (const id of joinedPluginTiles) {
-          const el = _pluginAnchors.get(id);
-          if (el && el.isConnected) {
-            const r = el.getBoundingClientRect();
-            next[id] = {
-              x: r.left - panel.left,
-              y: r.top - panel.top,
-              w: r.width,
-              h: r.height,
-            };
-          } else {
-            // Placeholder filtered out of the grid: hide the content but
-            // keep it MOUNTED - the party's audio keeps playing.
-            next[id] = null;
-          }
+    const panelNode = panelEl;
+    const measure = (): boolean => {
+      const panel = panelNode.getBoundingClientRect();
+      const next: TileRects = {};
+      for (const id of joinedPluginTiles) {
+        const el = _pluginAnchors.get(id);
+        if (el && el.isConnected) {
+          const r = el.getBoundingClientRect();
+          next[id] = {
+            x: r.left - panel.left,
+            y: r.top - panel.top,
+            w: r.width,
+            h: r.height,
+          };
+        } else {
+          // Placeholder filtered out of the grid: hide the content but
+          // keep it MOUNTED - the party's audio keeps playing.
+          next[id] = null;
         }
-        // Shallow compare, not JSON.stringify: this runs every frame for
-        // the whole call, and serializing two objects per frame is real
-        // steady-state cost for a check that four number compares settle.
-        const prev = pluginRects;
-        const prevKeys = Object.keys(prev);
-        const changed =
-          prevKeys.length !== Object.keys(next).length ||
-          prevKeys.some((k) => {
-            const a = prev[k];
-            const b = next[k];
-            if (a === null || b === null) return a !== b;
-            return (
-              b === undefined ||
-              a.x !== b.x ||
-              a.y !== b.y ||
-              a.w !== b.w ||
-              a.h !== b.h
-            );
-          });
-        if (changed) pluginRects = next;
       }
-      raf = requestAnimationFrame(measure);
+      if (sameTileRects(pluginRects, next)) return false;
+      pluginRects = next;
+      return true;
     };
-    raf = requestAnimationFrame(measure);
-    return () => cancelAnimationFrame(raf);
+    const settle = new SettlingMeasure(measure);
+    const resize =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(() => settle.poke())
+        : null;
+    resize?.observe(panelNode);
+    for (const el of _pluginAnchors.values()) resize?.observe(el);
+    const poke = () => settle.poke();
+    // Capture: scroll does not bubble, and the strip is a descendant.
+    panelNode.addEventListener("scroll", poke, { capture: true, passive: true });
+    window.addEventListener("resize", poke);
+    pluginLayout = { settle, resize };
+    settle.poke();
+    return () => {
+      settle.stop();
+      resize?.disconnect();
+      panelNode.removeEventListener("scroll", poke, { capture: true });
+      window.removeEventListener("resize", poke);
+      pluginLayout = null;
+    };
   });
 
   const joinedPluginTileData = $derived(
@@ -579,8 +659,8 @@ import {
   );
 
   // Joined ids whose card vanished (party closed, card replaced) would
-  // otherwise accumulate for the life of the call and be measured every
-  // frame above.
+  // otherwise accumulate for the life of the call and be measured on every
+  // layout change above.
   $effect(() => {
     const live = new Set(
       tiles.filter((t) => t.kind === "plugin").map((t) => t.id)
@@ -663,10 +743,11 @@ import {
   }
 
   $effect(() => {
-    // Rescan when the call room changes, when card state folds (votes,
-    // queue changes), and when new cards land in the open room's view.
+    // Recompute when the call room changes and when card state folds (votes,
+    // queue changes). A card stored in the call room is call-tiles' own to
+    // hear: the open room's message list, which this used to follow, moves
+    // with every chat line - and each move re-read the call room's history.
     void cardStateTickForPlugins;
-    void transportState.messages.length;
     void refreshCallTiles(transportState.callRoomCode ?? null);
   });
   let cardStateTickForPlugins = $state(0);
@@ -1327,6 +1408,28 @@ import {
   // the controls docked - see watchingFocused.
   const dockedControls = $derived(!isFullscreen && !watchingFocused);
 
+  // A tile can move without anything changing size: a tile joining or
+  // leaving ahead of it in the grid, a focus moving it to the main slot or
+  // into the strip, the controls docking. Each of those is state, so the
+  // plugin layer is re-measured whenever it changes (see the persistent
+  // plugin layer above). Keyed on the layout itself, as a string, not on
+  // the tile objects: those are rebuilt on any mute or quality verdict,
+  // which moves nothing.
+  const tileLayout = $derived(
+    [
+      visibleTiles.map((t) => t.id).join(","),
+      focusedTile?.id ?? "",
+      thumbnailTiles.map((t) => t.id).join(","),
+      gridCols,
+      dockedControls,
+      isFullscreen,
+    ].join("|")
+  );
+  $effect(() => {
+    void tileLayout;
+    pluginLayout?.settle.poke();
+  });
+
   $effect(() => {
     if (typeof window === "undefined") return;
     const media = window.matchMedia("(max-width: 639px)");
@@ -1721,6 +1824,9 @@ import {
   <div
     role="none"
     oncontextmenu={(e) => openTileMenu(e, tile)}
+    use:cameraOnScreen={tile.kind === "camera" && !tile.isLocal
+      ? tile.peerId
+      : null}
     class="relative {isFocused ? 'w-full h-full' : ''} {compact
       ? 'aspect-video'
       : ''}"

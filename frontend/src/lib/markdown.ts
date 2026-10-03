@@ -68,13 +68,17 @@ const PARKED_RE = /<(\d+)>/g;
 /**
  * Spans taken whole, leftmost first: a backslash escape, ```code```, `code`,
  * a masked link, a bare url, a mention token.
+ *
+ * A masked link's label holds no "[", so "[a [b](…)" links "b", as in
+ * CommonMark. A label that ran on across "[" made every "[" of a peer's run
+ * of them rescan the rest of the line for a "]": quadratic, on every render.
  */
 const SPAN_RE = new RegExp(
   [
     String.raw`\\([\\\x60*~_|>\[\]()#-])`,
     String.raw`\x60\x60\x60([^\n]+?)\x60\x60\x60`,
     String.raw`\x60([^\x60\n]+)\x60`,
-    String.raw`\[([^\]\n]+)\]\((https?:\/\/[^\s()<>"]+)\)`,
+    String.raw`\[([^[\]\n]+)\]\((https?:\/\/[^\s()<>"]+)\)`,
     String.raw`(https?:\/\/[^\s<>"]+)`,
     String.raw`(@\[[^[\]]+\])`,
   ].join("|"),
@@ -84,19 +88,102 @@ const SPAN_RE = new RegExp(
 /**
  * Text that reads as an address. A masked link showing one is how a link
  * that says one site and opens another is made, so it is not masked: the
- * real url shows instead. Tested with the markup taken out, so
- * "**paypal.com**" or "`paypal.com`" is still read as an address, and with
- * the dots that draw like one ("paypal․com").
+ * real url shows instead.
+ *
+ * Tested as it draws, not as it is spelled: "paypal.com" with a zero-width
+ * space after the dot, or a Greek ο in "com", passed for plain text.
+ *  - The markup goes ("**paypal.com**", "`paypal.com`"), and so does what
+ *    draws as nothing: zero-width characters, soft hyphens, joiners,
+ *    variation selectors, tag characters, combining marks, control
+ *    characters, and the spaces narrower than a word space ("paypal .com"
+ *    with a thin one).
+ *  - Compatibility forms fold ("ｐａｙｐａｌ．ｃｏｍ"), and what draws as a dot
+ *    reads as one ("paypal․com", "paypalꓸcom"). Not the middle dot, drawn
+ *    raised, which passes for a full stop only at a glance: French and
+ *    Catalan write it between letters ("étudiant·es", "col·lecció").
+ *  - Anything else outside ASCII, a letter, a digit or a symbol, reads as
+ *    a character that could pass for an ASCII one, so "paypal.cοm" and
+ *    "paypa∣.com" are addresses. Not Chinese or Japanese, whose sentences
+ *    run on after a full stop with no space between, nor the letters of
+ *    scripts that write one inside a word ("จ.เชียงใหม่", "மு.கருணாநிதி"):
+ *    Unicode's confusables list has none of those letters passing for an
+ *    ASCII one, only their digits, which still count.
+ * Text that can lay itself out in another order than it is spelled is
+ * never masked: an override draws "t.co" from text that spells "oc.t", and
+ * between two right-to-left marks "w.3org" draws as "w3.org".
  */
-const LOOKS_LIKE_URL_RE = /:\/\/|\bwww[.\u2024\u3002\uFF0E\uFF61]|\w[.\u2024\u3002\uFF0E\uFF61][a-z]{2,}(?![a-z0-9])/i;
-const looksLikeUrl = (label: string) => LOOKS_LIKE_URL_RE.test(label.replace(/[*~_|\x60\\]/g, ""));
+const LOOKS_LIKE_URL_RE = /:\/\/|\bwww\.|\w\.[a-z]{2,}(?![a-z0-9])/i;
+/**
+ * Markup, and what draws as nothing or almost nothing: the spaces narrower
+ * than a word space (six-per-em, punctuation, thin, hair, narrow no-break)
+ * go before NFKD would make them an ordinary space. An ordinary space stays,
+ * so "e.g. this" is no address.
+ *
+ * The control characters but a tab and the line breaks go too: the HTML
+ * parser drops a NUL, Firefox draws the others as nothing, and so does
+ * Chromium in a monospace font, the chat's default. Each read as a
+ * character that ends an address, and "paypal", a NUL, ".com" drew as
+ * paypal.com. So does the medium mathematical space, which WebKit draws
+ * with no width.
+ */
+const UNSEEN_RE =
+  /[\p{Default_Ignorable_Code_Point}\x00-\x08\x0B\x0C\x0E-\x1F\x7F\u2006\u2008-\u200A\u202F\u205F*~_|\x60\\]/gu;
+/**
+ * A full stop, or what Unicode's confusables list says draws as one. An
+ * Arabic-Indic zero only outside a number: between two such digits it is
+ * part of one, and a label holding the year 2024 is no address, but beside
+ * just one it is a dot, since one of them passes for an l and five for an
+ * o. The Meetei Mayek heavy tone mark only where it marks no Meetei
+ * syllable.
+ */
+const DOT_LIKE_RE =
+  /[\u0701\u0702\u3002\uA4F8\uA60E\u{10A50}\u{1D16D}\u{1ECAE}]|(?<!\p{Script=Meetei_Mayek})\uABEC|(?<![\u0660-\u0669\u06F0-\u06F9])[\u0660\u06F0]|[\u0660\u06F0](?![\u0660-\u0669\u06F0-\u06F9])/gu;
+const MARK_RE = /\p{M}/gu;
+/**
+ * By script extension, so the marks Japanese shares between its scripts
+ * (the long vowel mark, the middle dot) count as Japanese too. The other
+ * scripts by script alone, and their letters only: their digits, and a
+ * Devanagari danda (which passes for an l, and which Bengali and others
+ * share), still read as look-alikes.
+ */
+const LOOKALIKE_RE =
+  /(?!(?=\p{L})[\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Devanagari}\p{Script=Bengali}\p{Script=Gurmukhi}\p{Script=Gujarati}\p{Script=Tamil}\p{Script=Telugu}\p{Script=Kannada}\p{Script=Sinhala}])[^\p{ASCII}\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/gu;
+/** Bidi overrides, embeddings and isolates. */
+const REORDERS_RE = /[\u202A-\u202E\u2066-\u2069]/;
+const REORDERS_ALL_RE = new RegExp(REORDERS_RE.source, "g");
+/**
+ * The right-to-left marks: invisible, and enough to turn the digits and
+ * punctuation between two of them around.
+ */
+const RTL_MARK_RE = /[\u061C\u200F]/;
+function looksLikeUrl(label: string): boolean {
+  if (REORDERS_RE.test(label) || RTL_MARK_RE.test(label)) return true;
+  const drawn = label
+    .replace(UNSEEN_RE, "")
+    .normalize("NFKD")
+    .replace(DOT_LIKE_RE, ".")
+    .replace(MARK_RE, "")
+    .replace(LOOKALIKE_RE, "x");
+  return LOOKS_LIKE_URL_RE.test(drawn);
+}
 
 /**
  * A url found in running text, without the punctuation that ends the
  * sentence around it: "see https://a.b/c." links to /c, and "(https://a.b)"
  * leaves the closing parenthesis out unless the url opened one itself.
+ *
+ * The parentheses are counted once and the count kept as they are dropped:
+ * recounting the url for every ")" was quadratic, and a peer's url followed
+ * by 16k of them held every render of the message for seconds. Only ")" and
+ * punctuation are ever dropped, so the count of "(" never changes.
  */
 export function trimUrl(url: string): { url: string; rest: string } {
+  let opened = 0;
+  let closed = 0;
+  for (const ch of url) {
+    if (ch === "(") opened++;
+    else if (ch === ")") closed++;
+  }
   let end = url.length;
   for (;;) {
     const ch = url[end - 1];
@@ -104,21 +191,105 @@ export function trimUrl(url: string): { url: string; rest: string } {
       end--;
       continue;
     }
-    if (ch === ")") {
-      const body = url.slice(0, end);
-      if ((body.match(/\(/g)?.length ?? 0) < (body.match(/\)/g)?.length ?? 0)) {
-        end--;
-        continue;
-      }
+    if (ch === ")" && opened < closed) {
+      end--;
+      closed--;
+      continue;
     }
     break;
   }
   return { url: url.slice(0, end), rest: url.slice(end) };
 }
 
-function anchor(href: string, html: string, title?: string): string {
-  const t = title ? ` title="${escapeHtml(title)}"` : "";
-  return `<a href="${escapeHtml(href)}"${t} target="_blank" rel="noopener noreferrer" class="${LINK_CLASS}">${html}</a>`;
+/**
+ * A link, with no bidi control in its text or its title (the href keeps
+ * them: the browser encodes them).
+ *
+ * A url shown as itself is a bidi isolate laid out left to right. An
+ * override typed before it and closed after it reversed it, so a bare url
+ * drew as another host's; one inside it reversed the rest of it, and
+ * "https://" with "moc.lapyap@evil.example" after an override drew as a
+ * link to paypal.com. Not dir="auto" nor <bdi>: an invisible right-to-left
+ * mark at its start then turns it around again.
+ *
+ * A masked link is no isolate. An isolate is laid out as one piece, and
+ * right-to-left text puts the pieces in its own order, so
+ * "[.com](…)[paypal](…)" drew as one link to paypal.com between two Hebrew
+ * words, or between two invisible right-to-left marks. As text of the line,
+ * a left-to-right letter never moves, and no override reaches it: a line
+ * holding one masks no link (see linksShowingUrls).
+ */
+function anchor(href: string, html: string, masked = false): string {
+  const title = masked ? ` title="${escapeHtml(href.replace(REORDERS_ALL_RE, ""))}"` : "";
+  const dir = masked ? "" : ' dir="ltr"';
+  const text = html.replace(REORDERS_ALL_RE, "");
+  return `<a href="${escapeHtml(href)}"${title} target="_blank" rel="noopener noreferrer"${dir} class="${LINK_CLASS}">${text}</a>`;
+}
+
+/**
+ * A word, as an address is one: what lies between two spaces the address
+ * test reads as spaces. Not the spaces narrower than a word space, which it
+ * drops, nor an ogham space mark or a line separator, which it reads as a
+ * letter, nor what can draw as nothing (see UNSEEN_RE): a vertical tab, a
+ * form feed or a medium mathematical space between "[paypal](…)" and
+ * "[.com](…)" drew as paypal.com. A carriage return still ends one: the
+ * parser makes it a line break.
+ */
+const SPACELESS_RE = /[^\t\n\r \u00A0\u2000-\u2005\u2007\u3000]+/g;
+
+/**
+ * Which of a line's spans are masked links that show their url instead of
+ * their label, read off the line as it draws: a masked link as its label,
+ * a mention as its name.
+ *  - Every link in a word that reads as an address. Labels that touch draw
+ *    as one word: "[paypal](…)[.com](…)" was two links, neither label an
+ *    address alone, that drew as one link to paypal.com, and
+ *    "[paypal](…).com" drew the same in two colours.
+ *  - Every link whose label reads as an address on its own, whatever its
+ *    word does: "[paypal.com](…)9" is no address as a word, since an
+ *    address ends before a digit, but its link still reads paypal.com.
+ *  - Every link in a line holding a bidi override, embedding or isolate,
+ *    which can lay the line out in any order.
+ * Each word is read once, and each label, so a line of touching links stays
+ * linear.
+ */
+function linksShowingUrls(src: string, spans: RegExpExecArray[], named: (text: string) => string): boolean[] {
+  const shown = spans.map(() => false);
+  const links: { k: number; start: number; end: number }[] = [];
+  let line = "";
+  let last = 0;
+  spans.forEach((m, k) => {
+    const [whole, , , , label, href, bare, mention] = m;
+    line += src.slice(last, m.index);
+    last = m.index + whole.length;
+    if (label !== undefined && href !== undefined) {
+      const text = named(label);
+      shown[k] = looksLikeUrl(text);
+      links.push({ k, start: line.length, end: line.length + text.length });
+      line += text;
+    } else if (bare !== undefined) {
+      // As anchor draws it.
+      line += whole.replace(REORDERS_ALL_RE, "");
+    } else {
+      line += mention !== undefined ? named(whole) : whole;
+    }
+  });
+  line += src.slice(last);
+
+  if (REORDERS_RE.test(line)) {
+    for (const { k } of links) shown[k] = true;
+    return shown;
+  }
+  let i = 0;
+  for (const word of line.matchAll(SPACELESS_RE)) {
+    const start = word.index;
+    const end = start + word[0].length;
+    while (i < links.length && links[i].end <= start) i++;
+    if (i === links.length) break;
+    if (links[i].start >= end || !looksLikeUrl(word[0])) continue;
+    for (let j = i; j < links.length && links[j].start < end; j++) shown[links[j].k] = true;
+  }
+  return shown;
 }
 
 /** Code shows mentions by name, as text, and nothing else is interpreted. */
@@ -266,9 +437,11 @@ function inline(src: string, resolveName: ResolveName, links = true, plain = fal
   const parked: string[] = [];
   const park = (html: string) => `<${parked.push(html) - 1}>`;
 
+  const spans = [...src.matchAll(SPAN_RE)];
+  const showsUrl = linksShowingUrls(src, spans, named);
   let text = "";
   let last = 0;
-  for (const m of src.matchAll(SPAN_RE)) {
+  for (const [k, m] of spans.entries()) {
     const [whole, escaped, fenced, tick, label, href, bare, mention] = m;
     text += escapeHtml(src.slice(last, m.index));
     last = m.index + whole.length;
@@ -281,12 +454,12 @@ function inline(src: string, resolveName: ResolveName, links = true, plain = fal
       if (plain) {
         // Not clickable here, but a notification that reads "paypal.com"
         // for a link to somewhere else still lies: keep the look-alike whole.
-        text += park(looksLikeUrl(named(label)) ? escapeHtml(whole) : inline(label, resolveName, false, true));
+        text += park(showsUrl[k] ? escapeHtml(whole) : inline(label, resolveName, false, true));
       } else {
         text +=
-          !links || looksLikeUrl(named(label))
+          !links || showsUrl[k]
             ? park(`${escapeHtml(`[${label}](`)}${links ? anchor(href, escapeHtml(href)) : escapeHtml(href)})`)
-            : park(anchor(href, inline(label, resolveName, false), href));
+            : park(anchor(href, inline(label, resolveName, false), true));
       }
     } else if (bare !== undefined) {
       const { url, rest } = trimUrl(bare);
@@ -489,13 +662,19 @@ function* inlineTexts(content: string, quotes = true): Generator<string> {
  * The first url the rendered message actually links to - a masked link's
  * target, or a bare url trimmed as it is rendered - for the link preview. A
  * url written as code is not a link, so it gets no preview either.
+ *
+ * Its bidi controls come percent-encoded, as the browser sends them anyway,
+ * so where it goes is the same: MsgRender prints it under the message when
+ * no preview loads, as the text of a link, and "https://" with an override
+ * and "moc.lapyap@evil.example" after it drew there as a link to paypal.com.
  */
 export function firstLinkedUrl(content: string): string | null {
   if (typeof content !== "string") return null;
+  const shown = (url: string) => url.replace(REORDERS_ALL_RE, encodeURIComponent);
   for (const text of inlineTexts(content)) {
     for (const [, , , , , href, bare] of text.matchAll(SPAN_RE)) {
-      if (href !== undefined) return href;
-      if (bare !== undefined) return trimUrl(bare).url;
+      if (href !== undefined) return shown(href);
+      if (bare !== undefined) return shown(trimUrl(bare).url);
     }
   }
   return null;

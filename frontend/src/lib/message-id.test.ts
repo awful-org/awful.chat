@@ -25,6 +25,10 @@ describe("message ids bound to their sender", () => {
     expect(messageIdAllowedFor(legacy, MALLORY)).toBe(true);
   });
 
+  it("refuses the empty id, which the held-id checks skip", () => {
+    expect(messageIdAllowedFor("", ALICE)).toBe(false);
+  });
+
   it("refuses non-string input", () => {
     expect(messageIdAllowedFor(undefined as unknown as string, ALICE)).toBe(false);
     expect(messageIdAllowedFor(newMessageId(ALICE), 7 as unknown as string)).toBe(false);
