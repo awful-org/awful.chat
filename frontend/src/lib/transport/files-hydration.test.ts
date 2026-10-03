@@ -234,6 +234,24 @@ it("auto-download asks once for a rendered message's media within the ceiling, a
   expect(new Set(read)).toEqual(new Set(["r-clip", "r-shown", "r-held"]));
 });
 
+// A lock wipes the transfer map, so the file is neither here nor on its way
+// in the next session. Its ask was remembered across the lock, and the next
+// session (the same identity unlocked again, or another one) never asked for
+// it as it rendered.
+it("auto-download asks again for a file in the session after a lock", () => {
+  mediaPrefs.autoDownloadMedia = true;
+  const entries = [{ infoHash: "r-lock", filename: "r-lock", mimeType: "image/png", size: 8 } as FileEntry];
+  const asked: string[] = [];
+  const render = () => autoDownloadOnRender(entries, () => undefined, (file) => asked.push(file.infoHash));
+  render();
+  render();
+  expect(asked).toEqual(["r-lock"]);
+  // What the lock runs (transport's _disconnectWithoutBroadcasting).
+  _resetAttachmentHydration();
+  render();
+  expect(asked).toEqual(["r-lock", "r-lock"]);
+});
+
 it("as another member's page renders, a held file past the ceiling is left for its button, not decrypted", async () => {
   const film = { ...row("film", 4), mimeType: "video/mp4", size: AUTO_DOWNLOAD_MAX_BYTES + 1 };
   rows = [film, row("new", 3)];

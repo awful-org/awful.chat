@@ -447,7 +447,8 @@ export function shouldAutoDownload(mimeType: string, size?: number): boolean {
 
 /** infoHashes auto-download asked for as their messages rendered, across
  *  every message on screen - one ask per file per session, however often
- *  rows re-render or the same file appears in several rooms. */
+ *  rows re-render or the same file appears in several rooms. Cleared with
+ *  the transfer map on a lock, so the next session asks afresh. */
 const _askedOnRender = new Set<string>();
 
 /**
@@ -922,6 +923,7 @@ export function _resetAttachmentHydration(): void {
   _heldFiles.clear();
   _showQueue.clear();
   _autoShown.clear();
+  _askedOnRender.clear();
   _showing = null;
   _hydratedRooms.clear();
   _hydrating.clear();
