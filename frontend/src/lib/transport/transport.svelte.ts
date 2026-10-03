@@ -3919,11 +3919,13 @@ export async function deliverMailboxBatch(
   const roomCode = await dmConversationCodeAsync(senderDid).catch(() => null);
   guard();
   if (!roomCode || roomCode !== decoded.roomCode) return;
+  const readable = _readableRows(decoded.messages, roomCode);
+  if (!readable) return;
   // Same replay rule as deliverMailboxDm, per row.
   const floor = await _deletedFloorFor(senderDid);
   guard();
-  const messages = decoded.messages.filter(
-    (m) => !(m?.senderId === senderDid && typeof m.lamport === "number" && m.lamport <= floor)
+  const messages = readable.filter(
+    (m) => !(m.senderId === senderDid && typeof m.lamport === "number" && m.lamport <= floor)
   );
   if (!messages.length) return;
   const live = decoded.live === true;
@@ -3988,6 +3990,9 @@ async function _handleDmBatch(
   const guard = captureDmOwnership();
   const senderDid = _peerIdToDid.get(peerId);
   const live = msg.live === true;
+  // A frame refused whole goes on as no rows, which the batch handler
+  // refuses whole too, so a push still sees the frame arrive.
+  const rows = _readableRows(msg.messages, room) ?? [];
   let created = false;
   // Another of OUR OWN devices mirrors conversations it already holds: there
   // is no DM "with" ourselves to create, and the code derived from our own
@@ -3996,12 +4001,12 @@ async function _handleDmBatch(
     guard();
     if ((await dmConversationCodeAsync(senderDid).catch(() => null)) !== room) return;
     guard();
-    if (!(await _anyRowTakable(room, msg.messages, senderDid, live))) return;
+    if (!(await _anyRowTakable(room, rows, senderDid, live))) return;
     if (!(await _ensureDmForBatch(senderDid, guard))) return;
     created = true;
   }
   try {
-    await _handleSyncBatch(room, msg.messages, peerId, live, {
+    await _handleSyncBatch(room, rows, peerId, live, {
       batchIndex: msg.batchIndex,
       totalBatches: msg.totalBatches,
       order: msg.order,
@@ -4055,24 +4060,37 @@ function _inDmSyncOrder(
 }
 
 /**
+ * The rows of a DM batch the batch handler can look at, or null for a frame
+ * refused whole.
+ *
+ * Held to the batch handler's own row cap, and checked before anything else:
+ * a stranger's 4 MB frame of one signed row repeated ten thousand times was
+ * verified row by row, one synchronous task, and froze the tab for seconds
+ * at a time - as often as they sent it, since a refused batch makes no
+ * conversation and leaves the channel open. The cap counts the frame as it
+ * came, so a huge one is refused without reading a row of it.
+ *
+ * A row the handler cannot even look at - not an object, or one whose
+ * signed form cannot be built - is dropped, as nothing honest sends one:
+ * the handler throws on it, after a first contact's conversation was made,
+ * and a mailbox batch it throws on is kept and comes back on every collect.
+ * Refusing the whole batch for it instead threw away every good row beside
+ * it.
+ */
+function _readableRows(rows: unknown, roomCode: string): WireChatMessage[] | null {
+  if (!Array.isArray(rows) || rows.length > BATCH_SIZE * 4) return null;
+  return rows.filter((m) => _rowReadable(m, roomCode));
+}
+
+/**
  * Whether a first-contact batch has a row the batch handler could take. A
  * conversation is made for one, and for nothing less: junk is refused
  * before it costs a request slot, and answered like junk (acked away)
  * rather than kept in the mailbox for a slot to free up. A row that passes
  * here and is refused later still leaves nothing: see dropDmIfEmpty.
  *
- * Held to the batch handler's own row cap, and checked before it: a
- * stranger's 4 MB frame of one signed row repeated ten thousand times was
- * verified row by row, one synchronous task, and froze the tab for seconds
- * at a time - as often as they sent it, since a refused batch makes no
- * conversation and leaves the channel open. One row that passes is enough,
- * so the check stops there.
- *
- * A row the batch handler cannot even look at - not an object, or one
- * whose signed form cannot be built - refuses the whole batch here, as
- * nothing honest sends one: the handler throws on it, after the
- * conversation was made, and a mailbox batch it throws on is kept and comes
- * back on every collect.
+ * `rows` are _readableRows', so already within the cap. One row that passes
+ * is enough, so the check stops there.
  */
 async function _anyRowTakable(
   roomCode: string,
@@ -4080,8 +4098,6 @@ async function _anyRowTakable(
   senderDid: string,
   live: boolean
 ): Promise<boolean> {
-  if (!Array.isArray(rows) || rows.length > BATCH_SIZE * 4) return false;
-  if (!rows.every((m) => _rowReadable(m, roomCode))) return false;
   for (const m of rows) {
     try {
       const allowUnsigned = allowsUnsignedDmHistory(m, senderDid, live);

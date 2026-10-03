@@ -246,24 +246,43 @@ describe("a dropped first contact still spends the session's budget", () => {
     expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
   }, 60_000);
 
-  // The batch handler throws on a row that is not an object: with a good
-  // row beside it, the conversation was made for the good one and then kept
-  // empty - charged, and its blob kept in the mailbox for every collect.
-  it("nor with batches whose one good row comes with one the handler cannot look at", async () => {
+  // The batch handler throws on a row that is not an object: with a row
+  // beside it, the conversation was made for that one and then kept empty -
+  // charged, and its blob kept in the mailbox for every collect. Such a row
+  // is now dropped before the batch goes anywhere, so a batch is what its
+  // other rows make it: here, junk.
+  it("nor with batches whose one refused row comes with one the handler cannot look at", async () => {
     for (let i = 0; i < MAX_UNSOLICITED_DMS; i++) {
       const attacker = identity();
       const room = await code(attacker.did);
+      const card = signedWire(attacker, room, { type: MessageType.PluginCard, content: "not json" });
       const blob = encode({ type: MessageType.SyncBatch, roomCode: room,
-        messages: [signedWire(attacker, room), null], batchIndex: 0, totalBatches: 1 });
-      // Junk, answered as junk: acked away, nothing made or joined for it.
+        messages: [card, null], batchIndex: 0, totalBatches: 1 });
+      // Junk, answered as junk: acked away, nothing left for it.
       await expect(deliverMailboxBatch(attacker.did, blob)).resolves.toBeUndefined();
     }
     expect(await getDMRooms()).toEqual([]);
-    expect(s.joins).toBe(0);
     const honest = identity().did;
     await deliverMailboxDm(honest, chat(honest, "hi, we met at the meetup"));
     expect((await getLastMessage(await code(honest)))?.content).toBe("hi, we met at the meetup");
   }, 60_000);
+
+  // Refusing the whole batch for that row threw away the good one beside it.
+  it("while a first contact's good row is kept, and the one the handler cannot look at dropped", async () => {
+    const stranger = identity();
+    const room = await code(stranger.did);
+    const good = signedWire(stranger, room);
+    // Not an object, and one whose signed form cannot be built.
+    for (const unreadable of [null, { ...good, id: newMessageId(stranger.did), meta: { files: "x" } }]) {
+      await wipeLocalDatabase();
+      roomsStore.dmRooms = [];
+      const blob = encode({ type: MessageType.SyncBatch, roomCode: room,
+        messages: [unreadable, good], batchIndex: 0, totalBatches: 1 });
+      await expect(deliverMailboxBatch(stranger.did, blob)).resolves.toBeUndefined();
+      expect(await getMessage(good.id)).toMatchObject({ content: "hi" });
+      expect(await getDMRooms()).toEqual([expect.objectContaining({ roomCode: room, request: true })]);
+    }
+  });
 
   it("nor with first contacts that could not be joined at all", async () => {
     // Every conversation binding the transport has is taken.

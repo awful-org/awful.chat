@@ -60,7 +60,9 @@ vi.mock("$lib/storage", () => ({
   getRoom: async (room: string) => ({ roomCode: room, type: "dm", createdAt: 1 }),
 }));
 vi.mock("./attachment-ownership", () => ({ ensureMessageAttachmentOwnership: async () => {} }));
-vi.mock("$lib/messaging", () => ({}));
+// A DM batch drops each row whose signed form cannot be built before
+// anything else; these rows are all readable.
+vi.mock("$lib/messaging", () => ({ canonicalContentV3: () => "" }));
 const mirror = vi.hoisted(() => ({ dmRooms: [{ roomCode: "dm-peer", participantDid: "did:peer", lastSeenLamport: 0 }] as any[] }));
 vi.mock("$lib/rooms.svelte", () => ({
   noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(),

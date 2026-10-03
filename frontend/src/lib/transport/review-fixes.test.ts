@@ -62,7 +62,9 @@ vi.mock("$lib/storage", () => ({
   getDeletedFloor: async () => 0, addRoomParticipants: async () => {}, MAX_ROOM_PARTICIPANTS: 512,
   deletePeerRoomProfile: async () => {},
 }));
-vi.mock("$lib/messaging", () => ({ signMessage: s.sign, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true }));
+// A DM batch drops each row whose signed form cannot be built before
+// anything else; these rows are all readable.
+vi.mock("$lib/messaging", () => ({ signMessage: s.sign, signPeerBinding: () => ({ bindingSig: "sig" }), verifyPeerBinding: async () => true, canonicalContentV3: () => "" }));
 vi.mock("$lib/rooms.svelte", () => ({ noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(), refreshDmRooms: async () => {}, roomsStore: { rooms: [], dmRooms: [] } }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
 vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));

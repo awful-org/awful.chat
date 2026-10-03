@@ -111,7 +111,9 @@ vi.mock("$lib/storage", () => ({
   },
 }));
 vi.mock("./attachment-ownership", () => ({ ensureMessageAttachmentOwnership: async () => {} }));
-vi.mock("$lib/messaging", () => ({}));
+// A DM batch drops each row whose signed form cannot be built before
+// anything else; these rows are all readable.
+vi.mock("$lib/messaging", () => ({ canonicalContentV3: () => "" }));
 vi.mock("$lib/rooms.svelte", () => ({
   noteRoomActivity: vi.fn(), noteUnreadArrivals: vi.fn(), noteRoomRead: vi.fn(), refreshDmRooms: async () => {},
   roomsStore: { rooms: [], dmRooms: [] },
