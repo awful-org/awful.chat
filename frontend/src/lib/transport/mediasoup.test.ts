@@ -390,6 +390,8 @@ describe("a share that ended while we were away cannot leave a dead tile", () =>
     internals.device = { recvRtpCapabilities: {} };
     internals.recvTransport = fakeTransport();
     internals.ensureRecvTransport = async () => {};
+    // An open socket: request() fails at once on one that cannot carry it.
+    internals.sfuWs = { readyState: WebSocket.OPEN, send: () => {} };
 
     const consuming = (
       internals.consumeProducer as (
@@ -1233,5 +1235,96 @@ describe("a transport whose path goes quiet restarts ICE instead of waiting to f
     expect(recv.restartIce).not.toHaveBeenCalled();
     restart();
     expect(request).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("a rebuilt session does not inherit the old socket's requests (transport-options timeout)", () => {
+  type Internals = Record<string, unknown> & {
+    ensureRecvTransport: () => Promise<void>;
+    failPending: (ws: unknown, err: Error) => void;
+    handleSignal: (msg: unknown) => void;
+    request: (msg: unknown, responseType: string) => Promise<unknown>;
+  };
+
+  function fakeSocket(open = true) {
+    const sent: Array<{ type: string; requestId?: string }> = [];
+    return {
+      readyState: open ? WebSocket.OPEN : WebSocket.CLOSED,
+      send: (m: string) => sent.push(JSON.parse(m)),
+      sent,
+    };
+  }
+
+  function setup() {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video) as Internals;
+    const recv = { on: vi.fn(), close: vi.fn(), connectionState: "new" };
+    internals.device = { createRecvTransport: vi.fn(() => recv) };
+    return { internals, recv };
+  }
+
+  function answer(internals: Internals, requestId: string | undefined) {
+    internals.handleSignal({
+      type: "ms:transport-options",
+      requestId,
+      direction: "recv",
+      options: { id: "t", iceParameters: {}, iceCandidates: [], dtlsParameters: {} },
+    });
+  }
+
+  it("fails the old socket's request at once, and the new session asks afresh", async () => {
+    const { internals, recv } = setup();
+    const oldWs = fakeSocket();
+    internals.sfuWs = oldWs;
+    const first = internals.ensureRecvTransport();
+    expect(oldWs.sent.map((m) => m.type)).toEqual(["ms:create-transport"]);
+
+    // The rebuild: what the old socket owed fails now, not 10s from now.
+    internals.failPending(oldWs, new Error("SFU session rebuilt"));
+    await expect(first).rejects.toThrow("SFU session rebuilt");
+
+    const newWs = fakeSocket();
+    internals.sfuWs = newWs;
+    const second = internals.ensureRecvTransport();
+    expect(second).not.toBe(first);
+    expect(newWs.sent.map((m) => m.type)).toEqual(["ms:create-transport"]);
+    answer(internals, newWs.sent[0].requestId);
+    await expect(second).resolves.toBeUndefined();
+    expect(internals.recvTransport).toBe(recv);
+  });
+
+  it("a stale socket closing late leaves the live session's transport request alone", async () => {
+    const { internals } = setup();
+    const oldWs = fakeSocket();
+    const newWs = fakeSocket();
+    internals.sfuWs = newWs;
+    const live = internals.ensureRecvTransport();
+    internals.failPending(oldWs, new Error("SFU connection closed"));
+    // Still the same in-flight request: a second one would be refused by the
+    // SFU without an answer while the first is being built.
+    expect(internals.ensureRecvTransport()).toBe(live);
+    expect(newWs.sent).toHaveLength(1);
+    answer(internals, newWs.sent[0].requestId);
+    await expect(live).resolves.toBeUndefined();
+  });
+
+  it("an answer that lands after the session was rebuilt is not installed", async () => {
+    const { internals } = setup();
+    const oldWs = fakeSocket();
+    internals.sfuWs = oldWs;
+    const stale = internals.ensureRecvTransport();
+    internals.sfuWs = fakeSocket();
+    answer(internals, oldWs.sent[0].requestId);
+    await expect(stale).rejects.toThrow("SFU session rebuilt");
+    expect(internals.recvTransport ?? null).toBeNull();
+  });
+
+  it("a request on a socket that is not open fails at once instead of timing out", async () => {
+    const { internals } = setup();
+    internals.sfuWs = fakeSocket(false);
+    await expect(
+      internals.request({ type: "ms:create-transport", requestId: "r9", direction: "recv" }, "ms:transport-options"),
+    ).rejects.toThrow("SFU not connected");
+    expect((internals.pendingById as Map<string, unknown>).size).toBe(0);
   });
 });
