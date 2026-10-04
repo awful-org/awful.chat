@@ -315,7 +315,12 @@ export class MediasoupVideo implements VideoTransport {
   // the recv transport past the server's own connect-timeout reap.
   private pendingById: Map<
     string,
-    { resolve: (msg: MSMessage) => void; reject: (err: Error) => void }
+    {
+      resolve: (msg: MSMessage) => void;
+      reject: (err: Error) => void;
+      /** The socket the request went out on: only that socket can answer it. */
+      ws: WebSocket | null;
+    }
   > = new Map();
   private requestSeq = 0;
   // Set when the SFU refuses this session with an ms:error frame, cleared when
@@ -505,7 +510,7 @@ export class MediasoupVideo implements VideoTransport {
     this.device = null;
     this.sendTransport = null;
     this.recvTransport = null;
-    this.pendingById.clear();
+    this.failPending(null, new Error("Left the call"));
     this.currentRoomCode = null;
     this.currentPeerId = null;
   }
@@ -818,6 +823,8 @@ export class MediasoupVideo implements VideoTransport {
               },
             })
           );
+          // Its own requests only: the fresh socket's share the map.
+          this.failPending(ws, new Error("SFU connection closed"));
           return;
         }
         rec(
@@ -828,10 +835,7 @@ export class MediasoupVideo implements VideoTransport {
         const wasJoined = this.device !== null;
 
         // Reject all pending requests when connection drops
-        for (const req of this.pendingById.values()) {
-          req.reject(new Error("SFU connection closed"));
-        }
-        this.pendingById.clear();
+        this.failPending(null, new Error("SFU connection closed"));
 
         // If we were joined, emit an error and attempt automatic rejoin
         if (wasJoined && this.currentRoomCode && this.currentPeerId) {
@@ -1013,6 +1017,8 @@ export class MediasoupVideo implements VideoTransport {
     this.device = null;
     // join() assigns a fresh socket, so close this one rather than orphaning
     // it - and a half-open socket is exactly what we may be recovering from.
+    // What it still owed fails now, not ten seconds into the new session.
+    this.failPending(this.sfuWs, new Error("SFU session rebuilt"));
     this.sfuWs?.close();
     this.sfuWs = null;
 
@@ -1232,25 +1238,56 @@ export class MediasoupVideo implements VideoTransport {
   private sendTransportP: Promise<void> | null = null;
   private recvTransportP: Promise<void> | null = null;
 
+  /**
+   * Fail what is waiting on `ws` (every request when null) right away. A
+   * request only one socket can answer must not outlive it: left in the map
+   * it sat out its 10s timeout after a rebuild, and the transport promise
+   * awaiting it was shared with the NEW session - whose first consume then
+   * failed with "request timeout: ms:transport-options" for a request sent
+   * on a socket that no longer existed.
+   */
+  private failPending(ws: WebSocket | null, err: Error): void {
+    for (const [id, req] of this.pendingById) {
+      if (ws && req.ws !== ws) continue;
+      this.pendingById.delete(id);
+      req.reject(err);
+    }
+    // In-flight transport creations belong to the CURRENT session, so they
+    // go only when that is the one being dropped - a stale socket closing
+    // late must not let the live session ask for a second transport, which
+    // the SFU refuses without answering while the first is being built.
+    if (!ws || ws === this.sfuWs) {
+      this.sendTransportP = null;
+      this.recvTransportP = null;
+    }
+  }
+
   /** Create the send transport once; concurrent callers share the request. */
   private ensureSendTransport(): Promise<void> {
     if (this.sendTransport) return Promise.resolve();
-    this.sendTransportP ??= this.createSendTransport().finally(() => {
-      this.sendTransportP = null;
+    if (this.sendTransportP) return this.sendTransportP;
+    // Clears only itself: an old session's creation settling late must not
+    // wipe the one a rebuilt session has in flight.
+    const p: Promise<void> = this.createSendTransport().finally(() => {
+      if (this.sendTransportP === p) this.sendTransportP = null;
     });
-    return this.sendTransportP;
+    this.sendTransportP = p;
+    return p;
   }
 
   /** Same for the receive side. */
   private ensureRecvTransport(): Promise<void> {
     if (this.recvTransport) return Promise.resolve();
-    this.recvTransportP ??= this.createRecvTransport().finally(() => {
-      this.recvTransportP = null;
+    if (this.recvTransportP) return this.recvTransportP;
+    const p: Promise<void> = this.createRecvTransport().finally(() => {
+      if (this.recvTransportP === p) this.recvTransportP = null;
     });
-    return this.recvTransportP;
+    this.recvTransportP = p;
+    return p;
   }
 
   private async createSendTransport(): Promise<void> {
+    const ws = this.sfuWs;
     const msg = await this.request<MSTransportOptions>(
       {
         type: "ms:create-transport",
@@ -1260,7 +1297,10 @@ export class MediasoupVideo implements VideoTransport {
       "ms:transport-options"
     );
 
-    this.sendTransport = this.device!.createSendTransport({
+    // The session can be rebuilt while this waited: a transport for the old
+    // one would sit on the new session's slot pointing at nothing.
+    if (this.sfuWs !== ws || !this.device) throw new Error("SFU session rebuilt");
+    this.sendTransport = this.device.createSendTransport({
       ...(msg.options as mediasoupClient.types.TransportOptions),
       // The server never gathers relay candidates of its own (it is
       // ICE-Lite; the browser is the controlling agent), so without this a
@@ -1342,6 +1382,7 @@ export class MediasoupVideo implements VideoTransport {
   }
 
   private async createRecvTransport(): Promise<void> {
+    const ws = this.sfuWs;
     const msg = await this.request<MSTransportOptions>(
       {
         type: "ms:create-transport",
@@ -1351,7 +1392,10 @@ export class MediasoupVideo implements VideoTransport {
       "ms:transport-options"
     );
 
-    this.recvTransport = this.device!.createRecvTransport({
+    // The session can be rebuilt while this waited: a transport for the old
+    // one would sit on the new session's slot pointing at nothing.
+    if (this.sfuWs !== ws || !this.device) throw new Error("SFU session rebuilt");
+    this.recvTransport = this.device.createRecvTransport({
       ...(msg.options as mediasoupClient.types.TransportOptions),
       // See createSendTransport - the recv leg needs the same relay path
       // (finding 7).
@@ -2049,10 +2093,7 @@ export class MediasoupVideo implements VideoTransport {
   private failSession(message: string): void {
     const err = new Error(message);
     this.refusal = err;
-    for (const req of this.pendingById.values()) {
-      req.reject(err);
-    }
-    this.pendingById.clear();
+    this.failPending(null, err);
     this.emit("error", err);
   }
 
@@ -2078,6 +2119,14 @@ export class MediasoupVideo implements VideoTransport {
       }
 
       const requestId = (msg as { requestId?: string }).requestId;
+      const ws = this.sfuWs;
+      // signal() drops a frame for a socket that is not open, so waiting
+      // the full timeout would only report, ten seconds late, a request that
+      // never left.
+      if (ws?.readyState !== WebSocket.OPEN) {
+        reject(new Error(`SFU not connected: ${responseType}`));
+        return;
+      }
 
       const timeoutId = setTimeout(() => {
         if (requestId) this.pendingById.delete(requestId);
@@ -2094,6 +2143,7 @@ export class MediasoupVideo implements VideoTransport {
             clearTimeout(timeoutId);
             reject(err);
           },
+          ws,
         });
       }
 
