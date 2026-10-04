@@ -57,6 +57,20 @@ interface MSConnectTransport {
   direction: "send" | "recv";
   dtlsParameters: mediasoup.types.DtlsParameters;
 }
+// A transport whose path went quiet asks for fresh ICE credentials instead of
+// being torn down: the browser re-runs its checks on new sockets, and the
+// producers and consumers on the transport survive.
+interface MSRestartIce {
+  type: "ms:restart-ice";
+  requestId: string;
+  direction: "send" | "recv";
+}
+interface MSIceRestarted {
+  type: "ms:ice-restarted";
+  requestId: string;
+  direction: "send" | "recv";
+  iceParameters: mediasoup.types.IceParameters;
+}
 interface MSProduce {
   type: "ms:produce";
   requestId: string;
@@ -180,6 +194,7 @@ type ClientMsg =
   | MSGetCapabilities
   | MSCreateTransport
   | MSConnectTransport
+  | MSRestartIce
   | MSProduce
   | MSConsume
   | MSCloseConsumer
@@ -336,6 +351,7 @@ const WORKER_OP_PAUSE_MS = envInteger("SFU_WORKER_OP_PAUSE_MS", 1000);
 const WORKER_OP_TYPES = new Set<string>([
   "ms:create-transport",
   "ms:connect-transport",
+  "ms:restart-ice",
   "ms:produce",
   "ms:consume",
   "ms:resume-consumer",
@@ -758,6 +774,27 @@ async function handleCreateTransport(
     direction: msg.direction,
     options,
   } as MSTransportOptions);
+}
+
+async function handleRestartIce(
+  peer: PeerState,
+  msg: MSRestartIce,
+): Promise<void> {
+  if (msg.direction !== "send" && msg.direction !== "recv") return;
+  const transport =
+    msg.direction === "send" ? peer.sendTransport : peer.recvTransport;
+  // Only a transport that has connected has a path to repair. One still in
+  // its first handshake is the reaper's to judge.
+  if (!transport || transport.closed || !peer.connectedTransports.has(msg.direction)) {
+    return;
+  }
+  const iceParameters = await transport.restartIce();
+  send(peer.ws, {
+    type: "ms:ice-restarted",
+    requestId: msg.requestId,
+    direction: msg.direction,
+    iceParameters,
+  } as MSIceRestarted);
 }
 
 async function handleConnectTransport(
@@ -1846,6 +1883,9 @@ async function main(): Promise<void> {
             break;
           case "ms:connect-transport":
             await handleConnectTransport(peer, msg as MSConnectTransport);
+            break;
+          case "ms:restart-ice":
+            await handleRestartIce(peer, msg as MSRestartIce);
             break;
           case "ms:produce":
             await handleProduce(peer, msg as MSProduce);

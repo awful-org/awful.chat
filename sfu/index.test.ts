@@ -358,6 +358,40 @@ test("reaps a send transport that never completes ms:connect-transport", async (
   }
 });
 
+test("ms:restart-ice hands a connected transport fresh ICE credentials", async () => {
+  const ws = await connectAndJoin("room-restart-ice", "peer-restart-ice");
+  try {
+    // Asked before the transport has connected: nothing to repair, no answer.
+    // Frames are handled in order, so if r0 were answered its reply would
+    // arrive before r1's. (No waiting here: this file's reaper closes an
+    // unconnected transport after 300ms.)
+    ws.send(JSON.stringify({ type: "ms:create-transport", requestId: "t1", direction: "recv" }));
+    const options = await nextMessage(ws, (m) => m.type === "ms:transport-options");
+    ws.send(JSON.stringify({ type: "ms:restart-ice", requestId: "r0", direction: "recv" }));
+
+    // connect() only records the remote DTLS parameters; no handshake is
+    // needed for the restart to be answered.
+    ws.send(JSON.stringify({
+      type: "ms:connect-transport",
+      direction: "recv",
+      dtlsParameters: {
+        role: "client",
+        fingerprints: [{ algorithm: "sha-256", value: Array(32).fill("AB").join(":") }],
+      },
+    }));
+    ws.send(JSON.stringify({ type: "ms:restart-ice", requestId: "r1", direction: "recv" }));
+    const restarted = await nextMessage(ws, (m) => m.type === "ms:ice-restarted");
+    assert.equal(restarted.requestId, "r1");
+    assert.equal(restarted.direction, "recv");
+    assert.notEqual(
+      restarted.iceParameters.usernameFragment,
+      options.options.iceParameters.usernameFragment,
+    );
+  } finally {
+    ws.close();
+  }
+});
+
 test("rejects ms:produce with an invalid source", async () => {
   const ws = await connectAndJoin("room-produce", "peer-produce");
   try {
