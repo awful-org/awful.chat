@@ -1181,3 +1181,57 @@ describe("cameras nothing on screen shows are not received (G05.1)", () => {
     expect(added).not.toHaveBeenCalled();
   });
 });
+
+describe("a transport whose path goes quiet restarts ICE instead of waiting to fail", () => {
+  function setup() {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    const iceParameters = { usernameFragment: "fresh", password: "p", iceLite: true };
+    const recv = { closed: false, restartIce: vi.fn(async () => {}) };
+    internals.recvTransport = recv;
+    const request = vi.fn(async () => ({ type: "ms:ice-restarted", direction: "recv", iceParameters }));
+    internals.request = request;
+    const restart = () => (internals.restartIce as (d: "send" | "recv") => void).call(internals, "recv");
+    return { recv, request, restart, iceParameters };
+  }
+  const settle = () => new Promise((r) => setTimeout(r, 0));
+
+  it("asks the SFU for fresh credentials and hands them to the transport", async () => {
+    const { recv, request, restart, iceParameters } = setup();
+    restart();
+    await settle();
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "ms:restart-ice", direction: "recv" }),
+      "ms:ice-restarted"
+    );
+    expect(recv.restartIce).toHaveBeenCalledWith({ iceParameters });
+  });
+
+  it("asks once while a restart is in flight, and again after it lands", async () => {
+    const { request, restart } = setup();
+    restart();
+    restart();
+    expect(request).toHaveBeenCalledTimes(1);
+    await settle();
+    restart();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a transport closed while the answer travelled alone", async () => {
+    const { recv, restart } = setup();
+    restart();
+    recv.closed = true;
+    await settle();
+    expect(recv.restartIce).not.toHaveBeenCalled();
+  });
+
+  it("an unanswered ask is dropped quietly: a failed transport still rejoins", async () => {
+    const { recv, request, restart } = setup();
+    request.mockRejectedValueOnce(new Error("mediasoup request timeout: ms:ice-restarted"));
+    restart();
+    await settle();
+    expect(recv.restartIce).not.toHaveBeenCalled();
+    restart();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+});

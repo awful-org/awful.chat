@@ -429,6 +429,8 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "sfu.caps":
     case "sfu.transport.create":
     case "sfu.transport.state":
+    // Fresh ICE credentials for a transport that stays: the graph is unchanged.
+    case "sfu.ice.restart":
     case "sfu.transport.timeout":
     case "sfu.produce":
     case "sfu.consume":

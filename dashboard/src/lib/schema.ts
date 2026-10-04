@@ -149,6 +149,7 @@ export type DiagKind =
   | "sfu.caps"
   | "sfu.transport.create"
   | "sfu.transport.state"
+  | "sfu.ice.restart"
   | "sfu.transport.timeout"
   | "sfu.produce"
   | "sfu.consume"
@@ -179,7 +180,7 @@ export type DiagKind =
  * test time, so a kind added without a severity is a test failure rather than
  * an `undefined` severity on the wire.
  */
-export const DIAG_KIND_COUNT = 119;
+export const DIAG_KIND_COUNT = 120;
 
 /**
  * Default severity per kind. Classes, in the order they were decided:
@@ -310,6 +311,7 @@ export const KIND_SEV = {
   "sfu.caps": "info",
   "sfu.transport.create": "info",
   "sfu.transport.state": "info",
+  "sfu.ice.restart": "info",
   "sfu.transport.timeout": "error",
   "sfu.produce": "info",
   "sfu.consume": "info",

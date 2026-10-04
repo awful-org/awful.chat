@@ -54,6 +54,17 @@ interface MSCreateTransport {
   requestId: string;
   direction: "send" | "recv";
 }
+interface MSRestartIce {
+  type: "ms:restart-ice";
+  requestId: string;
+  direction: "send" | "recv";
+} // client -> server
+interface MSIceRestarted {
+  type: "ms:ice-restarted";
+  requestId: string;
+  direction: "send" | "recv";
+  iceParameters: mediasoupClient.types.IceParameters;
+} // server -> client
 interface MSTransportOptions {
   type: "ms:transport-options";
   requestId: string;
@@ -199,6 +210,8 @@ type MSMessage =
   | MSCapabilities
   | MSCreateTransport
   | MSTransportOptions
+  | MSRestartIce
+  | MSIceRestarted
   | MSConnectTransport
   | MSProduce
   | MSProduced
@@ -310,6 +323,8 @@ export class MediasoupVideo implements VideoTransport {
   // closing, so a request issued after it would be dropped by signal() and sit
   // out its own 10s timeout with nothing left alive to answer it.
   private refusal: Error | null = null;
+  /** Transports with an ICE restart in flight, so a flapping one asks once. */
+  private iceRestarting = new WeakSet<mediasoupClient.types.Transport>();
   // Screen-share producers that are available but not yet consumed (opt-in transmissions)
   private pendingTransmissions: Map<string, string> = new Map(); // peerId → producerId
   // All pending screen producers (video + optional audio) for a peer.
@@ -1292,11 +1307,38 @@ export class MediasoupVideo implements VideoTransport {
 
     this.sendTransport.on("connectionstatechange", (state: string) => {
       rec(ev("sfu.transport.state", { d: { direction: "send", state } }));
+      if (state === "disconnected") this.restartIce("send");
       if (state === "failed" || state === "closed") {
         this.emit("error", new Error("Send transport connection failed"));
         this.scheduleRejoin(this.joinGeneration);
       }
     });
+  }
+
+  /**
+   * A transport whose path went quiet: ask the SFU for fresh ICE credentials
+   * and re-run the checks on new sockets, keeping every producer and consumer
+   * on it. Waiting for "failed" instead cost ~10s of frozen media and a full
+   * rejoin each time a home router stopped passing one UDP flow - seen every
+   * ~3 minutes on a screen share. If the restart does not land, "failed"
+   * still rejoins as before.
+   */
+  private restartIce(direction: "send" | "recv"): void {
+    const transport = direction === "send" ? this.sendTransport : this.recvTransport;
+    if (!transport || transport.closed || this.iceRestarting.has(transport)) return;
+    this.iceRestarting.add(transport);
+    rec(ev("sfu.ice.restart", { d: { direction } }));
+    this.request<MSIceRestarted>(
+      { type: "ms:restart-ice", requestId: this.nextRequestId(), direction },
+      "ms:ice-restarted"
+    )
+      .then((msg) => {
+        // A rejoin may have replaced the transport while the answer travelled.
+        if (transport.closed) return;
+        return transport.restartIce({ iceParameters: msg.iceParameters });
+      })
+      .catch(() => {})
+      .finally(() => this.iceRestarting.delete(transport));
   }
 
   private async createRecvTransport(): Promise<void> {
@@ -1331,6 +1373,7 @@ export class MediasoupVideo implements VideoTransport {
 
     this.recvTransport.on("connectionstatechange", (state: string) => {
       rec(ev("sfu.transport.state", { d: { direction: "recv", state } }));
+      if (state === "disconnected") this.restartIce("recv");
       if (state === "failed" || state === "closed") {
         this.emit("error", new Error("Receive transport connection failed"));
         this.scheduleRejoin(this.joinGeneration);
