@@ -3,8 +3,10 @@ import { LibP2PVoice } from "./voice";
 
 // A voice link that settled on TURN looks for a direct path: once, a while
 // after it settled (the lower id asks), and whenever the network changes.
-// The peer connection is a state holder: what is checked is the ICE
-// restart and the offer that carries it.
+// The peer connection is a state holder: what is checked is the one offer
+// that carries the ICE restart. restartIce() must not be called: its
+// negotiationneeded sends a second offer, and the second answer tore the
+// call down.
 function setup(selfId: string, peerId = "mmm") {
   const transport = {
     selfId: () => selfId,
@@ -68,17 +70,17 @@ describe("a voice link on TURN looks for a direct path", () => {
     const { pc, sent, stats, poll } = setup("aaa");
     pc.getStats = async () => stats(true);
     await poll();
-    expect(pc.restartIce).not.toHaveBeenCalled();
+    expect(pc.createOffer).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(20_000);
     vi.useRealTimers();
     await flush();
-    expect(pc.restartIce).toHaveBeenCalledTimes(1);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
     expect(pc.createOffer).toHaveBeenCalledWith({ iceRestart: true });
     expect(sent).toEqual([{ type: "offer", sdp: "v=0 restart" }]);
     // Still on TURN on the next probes: the settled look is not repeated.
     await poll();
     await poll();
-    expect(pc.restartIce).toHaveBeenCalledTimes(1);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
   });
 
   it("leaves the settled look to the other side when its id is higher", async () => {
@@ -86,7 +88,7 @@ describe("a voice link on TURN looks for a direct path", () => {
     pc.getStats = async () => stats(true);
     await poll();
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(pc.restartIce).not.toHaveBeenCalled();
+    expect(pc.createOffer).not.toHaveBeenCalled();
   });
 
   it("looks on a network change, whichever side, at most three times", async () => {
@@ -99,8 +101,20 @@ describe("a voice link on TURN looks for a direct path", () => {
       onNetworkChange();
       await flush();
     }
-    expect(pc.restartIce).toHaveBeenCalledTimes(3);
+    expect(pc.createOffer).toHaveBeenCalledTimes(3);
     expect(remote.healAttempts).toBe(3);
+    expect(pc.restartIce).not.toHaveBeenCalled();
+  });
+
+  it("ignores an answer with no offer of ours outstanding", async () => {
+    const { internals, pc } = setup("aaa");
+    const setRemoteDescription = vi.fn(async () => {});
+    Object.assign(pc, { setRemoteDescription });
+    const handleSignal = internals.handleSignal as (p: string, s: unknown) => Promise<void>;
+    await expect(
+      handleSignal.call(internals, "mmm", { type: "answer", sdp: "v=0 stale" })
+    ).resolves.toBeUndefined();
+    expect(setRemoteDescription).not.toHaveBeenCalled();
   });
 
   it("does nothing for a direct link, or one not connected and stable", async () => {
@@ -110,13 +124,13 @@ describe("a voice link on TURN looks for a direct path", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     const onNetworkChange = internals.onNetworkChange as () => void;
     onNetworkChange();
-    expect(pc.restartIce).not.toHaveBeenCalled();
+    expect(pc.createOffer).not.toHaveBeenCalled();
 
     pc.getStats = async () => stats(true);
     await poll();
     pc.signalingState = "have-local-offer";
     onNetworkChange();
-    expect(pc.restartIce).not.toHaveBeenCalled();
+    expect(pc.createOffer).not.toHaveBeenCalled();
   });
 
   it("drops the pending look when the link is torn down", async () => {
@@ -125,6 +139,6 @@ describe("a voice link on TURN looks for a direct path", () => {
     await poll();
     (internals.teardownRemotePeer as (id: string) => void).call(internals, "mmm");
     await vi.advanceTimersByTimeAsync(20_000);
-    expect(pc.restartIce).not.toHaveBeenCalled();
+    expect(pc.createOffer).not.toHaveBeenCalled();
   });
 });

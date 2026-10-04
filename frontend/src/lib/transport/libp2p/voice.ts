@@ -883,7 +883,10 @@ export class LibP2PVoice implements VoiceTransport {
     remote.healAttempts = (remote.healAttempts ?? 0) + 1;
     const peerId = remote.peerId;
     rec(ev("voice.heal", { peer: peerId, d: { reason, attempt: remote.healAttempts } }));
-    remote.pc.restartIce();
+    // The restart rides this one offer. restartIce() is not called: it fires
+    // negotiationneeded, whose handler sends an offer of its own, and two
+    // offers meant a second answer on a stable connection, a throw, and a
+    // redial - every look tore the call down.
     remote.pc
       .createOffer({ iceRestart: true })
       .then((offer) =>
@@ -1473,7 +1476,8 @@ export class LibP2PVoice implements VoiceTransport {
         // queues and confirms delivery itself
         if (remote.pc.signalingState === "stable") {
           rec(ev("voice.restart", { peer: peerId }));
-          remote.pc.restartIce();
+          // No restartIce(): its negotiationneeded would send a second offer
+          // (see tryDirectPath).
           remote.pc
             .createOffer({ iceRestart: true })
             .then((offer) => {
@@ -1659,6 +1663,9 @@ export class LibP2PVoice implements VoiceTransport {
       case "answer": {
         this.debugStats.answersIn++;
         rec(ev("voice.answer.in", { peer: peerId }));
+        // An answer with no offer of ours outstanding is a stale duplicate.
+        // Applying it throws, and a throw here is read as a dead link.
+        if (remote.pc.signalingState !== "have-local-offer") return;
         await remote.pc.setRemoteDescription({
           type: "answer",
           sdp: signal.sdp,
