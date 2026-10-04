@@ -733,6 +733,28 @@ The first consumer is `anime-party` in
 fetched via `PLUGIN_SOURCES` like any other plugin - see its README for
 the full watch-party built on top of this library.
 
+## Embedding a player
+
+A plugin may render a third-party player in an iframe (waffle-party embeds
+YouTube, anime-party embeds zokoanime). Ask for the features it needs on the
+iframe itself, and nothing else is required of the instance:
+
+```svelte
+<iframe src={playerUrl} title="Player" allow="autoplay; fullscreen"></iframe>
+```
+
+The page's Permissions-Policy delegates `autoplay` and `fullscreen` to any
+frame, which leaves the iframe's own `allow` attribute as the gate: a frame
+that does not ask gets neither. Without `allow="autoplay"` the browser
+refuses every `play()` the player makes on your behalf, usually without an
+error you can see from the page, and the video sits on its first frame.
+Camera, microphone and screen capture are never delegated to frames, and
+picture-in-picture only to YouTube, so a player that needs those cannot
+have them.
+
+Do not add `sandbox` unless the player works under it; many refuse to run
+in a sandboxed frame. The page's CSP allows any `https:` frame.
+
 ## Calling external APIs
 
 Browsers cannot reach most APIs directly (CORS), and API keys must never
