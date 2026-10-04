@@ -4,7 +4,7 @@ import { IncomingMessage } from "http";
 import { envInteger } from "./config";
 import { clientKey, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
 import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin, verifyRoomAdmission } from "./auth";
-import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
+import { describeClose, sweepHeartbeatConnection, type EndedBy, type HeartbeatSocket } from "./heartbeat";
 import {
   SFU_DIAG_SCHEMA_VERSION,
   pickTransportStats,
@@ -1612,11 +1612,12 @@ async function main(): Promise<void> {
   const heartbeatInterval = setInterval(() => {
     const now = Date.now();
     wss.clients.forEach((ws: WebSocket) => {
-      sweepHeartbeatConnection(
+      const endedBy = sweepHeartbeatConnection(
         ws as unknown as HeartbeatSocket,
         now,
         BACKPRESSURE_DEADLINE_MS,
       );
+      if (endedBy) (ws as unknown as { endedBy?: EndedBy }).endedBy = endedBy;
     });
     emitSfuTelemetrySweep();
   }, HEARTBEAT_INTERVAL_MS);
@@ -1640,7 +1641,11 @@ async function main(): Promise<void> {
     ws.once("close", releasePending);
     let joinNonce: string | null = newJoinNonce();
     const joinDeadline = Date.now() + JOIN_TIMEOUT_MS;
-    const joinTimer = setTimeout(() => ws.terminate(), JOIN_TIMEOUT_MS);
+    const openedAt = Date.now();
+    const joinTimer = setTimeout(() => {
+      (ws as unknown as { endedBy?: EndedBy }).endedBy = "join-timeout";
+      ws.terminate();
+    }, JOIN_TIMEOUT_MS);
     joinTimer.unref();
     ws.once("close", () => clearTimeout(joinTimer));
     send(ws, { type: "auth:challenge", nonce: joinNonce });
@@ -1847,6 +1852,7 @@ async function main(): Promise<void> {
           oldPeer.recvTransport?.close();
           clearTransportReapTimer(oldPeer, "send");
           clearTransportReapTimer(oldPeer, "recv");
+          (oldPeer.ws as unknown as { endedBy?: EndedBy }).endedBy = "replaced";
           oldPeer.ws.terminate();
         }
         room.set(peer.peerId, peer);
@@ -1966,8 +1972,18 @@ async function main(): Promise<void> {
         });
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code: number) => {
       if (peer) {
+        // Why it ended, for every session that got as far as joining: the
+        // SFU's own cuts are terminate()s and look like any dropped
+        // connection (1006) to both ends unless they are named here.
+        console.log(
+          `[sfu] peer ${peer.peerId} socket ${describeClose(
+            code,
+            (ws as unknown as { endedBy?: EndedBy }).endedBy,
+            (Date.now() - openedAt) / 1000,
+          )}`,
+        );
         // Only clean up if THIS peer is still the room's current session for
         // its peerId. After a duplicate-join replacement the map holds the new
         // peer, so the old ws closing here must not evict it.

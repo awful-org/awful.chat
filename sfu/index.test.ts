@@ -17,7 +17,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import bs58 from "bs58";
 import { joinPayload, verifyJoin } from "./auth";
 import { envInteger } from "./config";
-import { sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
+import { describeClose, sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 
 // The SFU's port for this file, chosen in test.before by freePort().
 let PORT = 0;
@@ -851,4 +851,23 @@ describe("admission: origin allowlist and unjoined-socket cap", () => {
     assert.equal(again.closeCode, undefined);
     await closeAll([again]);
   });
+});
+
+test("describeClose: names the SFU's own cuts, and a drop the SFU did not make", () => {
+  assert.match(describeClose(1006, "heartbeat", 2640.4), /cut by the SFU: no answer to a heartbeat ping.*after 2640s/);
+  assert.match(describeClose(1006, "backpressure", 30), /send queue stayed full/);
+  assert.match(describeClose(1006, "join-timeout", 10), /never finished joining/);
+  assert.match(describeClose(1006, "replaced", 5), /joined again/);
+  assert.match(describeClose(1006, undefined, 44), /without a close frame - the network or a proxy/);
+  assert.match(describeClose(1001, undefined, 3), /closed by the client \(code 1001/);
+  assert.match(describeClose(4000, undefined, 3), /^closed \(code 4000/);
+});
+
+test("sweepHeartbeatConnection: says why it terminated", () => {
+  const w = { isAlive: false, ping() {}, terminate() {} };
+  assert.equal(sweepHeartbeatConnection(w, 0, 20_000), "heartbeat");
+  const alive = { isAlive: true, ping() {}, terminate() {} };
+  assert.equal(sweepHeartbeatConnection(alive, 0, 20_000), null);
+  const stuck = { backpressured: true, backpressuredSince: 0, ping() {}, terminate() {} };
+  assert.equal(sweepHeartbeatConnection(stuck, 30_001, 20_000), "backpressure");
 });
