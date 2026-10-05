@@ -51,7 +51,8 @@
       "bittorrent-tracker@9>ip": "-",
       "ws@^8": "^8.21.0",
       "ws@^7": "^7.5.11",
-      "ip-address@^10": "^10.3.1"
+      "ip-address@^10": "^10.7.1",
+      "devalue@^5": "^5.9.3"
     }
   },
   "dependencies": {
@@ -73,7 +74,7 @@
     "@scure/bip39": "^2.0.1",
     "@serenity-kit/opaque": "1.1.0",
     "@tanstack/svelte-query": "^6.1.12",
-    "dompurify": "^3.4.14",
+    "dompurify": "^3.4.16",
     "emoji-picker-element": "^1.29.1",
     "gifenc": "^1.0.3",
     "gifuct-js": "^2.1.2",
