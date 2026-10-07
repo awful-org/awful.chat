@@ -1,5 +1,6 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
+  import { isImageBytes } from "$lib/utils";
   import { onDestroy } from "svelte";
   import { Bookmark, Search, X, Loader } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
@@ -77,7 +78,15 @@
   let savedBlobUrls: string[] = [];
 
   async function loadSavedGifs() {
-    const gifs = await getAllSavedGifs();
+    const all = await getAllSavedGifs();
+    // A saved upload whose bytes are not an image can never draw: favoriting
+    // a GIF in a protected room once stored its ciphertext. Dropping it
+    // brings the bookmark back on the message, so it can be saved again.
+    const broken = all.filter(
+      (g) => g.data && !isImageBytes(new Uint8Array(g.data, 0, Math.min(16, g.data.byteLength)))
+    );
+    for (const g of broken) void deleteSavedGif(g.id).catch(() => {});
+    const gifs = all.filter((g) => !broken.includes(g));
     savedBlobUrls.forEach((u) => URL.revokeObjectURL(u));
     savedBlobUrls = [];
     savedGifs = gifs

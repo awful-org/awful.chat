@@ -3,6 +3,7 @@ import {
   decode,
   encode,
   hex,
+  isImageBytes,
   normalizeAvatarUrl,
   normalizeNicknameColor,
   sniffImageMime,
@@ -152,5 +153,20 @@ describe("sniffImageMime", () => {
   it("defaults to image/jpeg for unrecognized bytes", () => {
     const unknown = new Uint8Array([0x00, 0x00, 0x00, 0x00, 0x00]);
     expect(sniffImageMime(unknown)).toBe("image/jpeg");
+  });
+});
+
+describe("isImageBytes", () => {
+  const bytes = (...b: number[]) => new Uint8Array([...b, ...new Array(16).fill(0)]);
+  it("knows the image formats a GIF picker can hold", () => {
+    expect(isImageBytes(new TextEncoder().encode("GIF89a........"))).toBe(true);
+    expect(isImageBytes(bytes(0x89, 0x50, 0x4e, 0x47))).toBe(true);
+    expect(isImageBytes(bytes(0xff, 0xd8, 0xff))).toBe(true);
+    expect(isImageBytes(new TextEncoder().encode("RIFF\0\0\0\0WEBPVP8 "))).toBe(true);
+  });
+  it("is false for ciphertext, markup and nothing", () => {
+    expect(isImageBytes(crypto.getRandomValues(new Uint8Array(16)).fill(0x13, 0, 1))).toBe(false);
+    expect(isImageBytes(new TextEncoder().encode("<!doctype html>"))).toBe(false);
+    expect(isImageBytes(new Uint8Array(0))).toBe(false);
   });
 });

@@ -43,7 +43,7 @@
   import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
   import { messageBody } from "$lib/actions/message-body";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
-  import { formatSize } from "$lib/utils";
+  import { formatSize, isImageBytes } from "$lib/utils";
   import { animatedView, mediaBoxStyle } from "$lib/image-size";
   import {
     INLINE_FILE_MAX_BYTES,
@@ -784,16 +784,20 @@
       savedFileGifs = next;
       return;
     }
-    // Bytes from storage when the attachment persisted them, else from the
-    // blob already on screen - saving must not depend on seeders.
-    let data = (await getAttachmentsByInfoHash(file.infoHash)).find(
-      (a) => a.data
-    )?.data;
-    if (!data) {
-      const blobURL = fileTransfers.get(file.infoHash)?.blobURL;
-      if (!blobURL) return;
+    // The decrypted copy on screen first. A protected room stores its
+    // attachments as ciphertext, and taking that row's bytes saved a "GIF"
+    // that could never draw. A stored row is used only when it is plaintext
+    // (a legacy room) - saving must not depend on seeders.
+    let data: ArrayBuffer | undefined;
+    const blobURL = fileTransfers.get(file.infoHash)?.blobURL;
+    if (blobURL) {
       data = await (await fetch(blobURL)).arrayBuffer();
+    } else {
+      data = (await getAttachmentsByInfoHash(file.infoHash)).find(
+        (a) => a.data && !a.encryption
+      )?.data;
     }
+    if (!data || !isImageBytes(new Uint8Array(data, 0, Math.min(16, data.byteLength)))) return;
     await putSavedGif({
       id: file.infoHash,
       gifId: file.infoHash,
