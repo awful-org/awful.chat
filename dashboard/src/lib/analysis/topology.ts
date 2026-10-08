@@ -437,6 +437,7 @@ function applyEvent(state: FoldState, e: MergedEvent): boolean {
     case "sfu.consume.failed":
     case "sfu.error":
     case "sfu.rejoin":
+    case "sfu.resume":
     case "file.announce":
     case "file.request":
     case "file.progress":

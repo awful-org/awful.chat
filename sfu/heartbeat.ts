@@ -55,7 +55,7 @@ export function sweepHeartbeatConnection(
 }
 
 /** Why the SFU itself cut a socket, when it was the one to do it. */
-export type EndedBy = "heartbeat" | "backpressure" | "join-timeout" | "replaced";
+export type EndedBy = "heartbeat" | "backpressure" | "join-timeout" | "replaced" | "resumed";
 
 /**
  * One log line's worth of why a session's socket closed. Every cut the SFU
@@ -76,10 +76,26 @@ export function describeClose(code: number, endedBy: EndedBy | undefined, second
       return `cut by the SFU: never finished joining (${after})`;
     case "replaced":
       return `cut by the SFU: the same peer joined again and this session failed its liveness probe (${after})`;
+    case "resumed":
+      return `cut by the SFU: the same client resumed its session on a new socket (${after})`;
   }
   if (code === 1000 || code === 1001) return `closed by the client (code ${code}, ${after})`;
   if (code === 1006) {
     return `dropped without a close frame - the network or a proxy in between (code 1006, ${after})`;
   }
   return `closed (code ${code}, ${after})`;
+}
+
+/**
+ * Whether a joined session whose socket just closed is held for a resume
+ * rather than ended. Only a socket that went without a close frame: the
+ * network or a proxy dropping it (1006), or the SFU cutting one that stopped
+ * answering. Its media usually runs on regardless - it has its own UDP path -
+ * and the client comes back on a new socket within seconds. A client that
+ * closes its socket (leaving, closing the tab) sends a close frame and leaves
+ * at once, so a departure never lingers on anyone's screen.
+ */
+export function holdsForResume(code: number, endedBy: EndedBy | undefined): boolean {
+  if (endedBy === "heartbeat" || endedBy === "backpressure") return true;
+  return endedBy === undefined && code === 1006;
 }
