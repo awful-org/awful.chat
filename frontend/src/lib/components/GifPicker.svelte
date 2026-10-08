@@ -21,6 +21,8 @@
     putSavedGif,
     deleteSavedGif,
     isGifSaved,
+    isSavedUploadKey,
+    savedUploadKey,
     type SavedGif,
   } from "$lib/storage";
 
@@ -83,13 +85,13 @@
     // A saved upload whose bytes are not an image can never draw: favoriting
     // a GIF in a protected room once stored its ciphertext. Dropping it
     // brings the bookmark back on the message, so it can be saved again.
-    const broken = all.filter(
-      (g) => g.data && !isImageBytes(new Uint8Array(g.data, 0, Math.min(16, g.data.byteLength)))
-    );
+    const broken = all.filter((g) => g.data && !isImageBytes(g.data));
     for (const g of broken) void deleteSavedGif(g.id).catch(() => {});
+    let changed = broken.length > 0;
     // An upload saved before favorites were keyed by their picture is keyed
-    // by the upload it came from; re-key it, which also folds into one the
-    // copies a re-sent GIF let someone save twice. Once per row.
+    // by the upload it came from (or by the picture's hash in the clear);
+    // re-key it, which also folds into one the copies a re-sent GIF let
+    // someone save twice. Once per row.
     const gifs: SavedGif[] = [];
     const pictures = new Set<string>();
     const kept = all
@@ -100,29 +102,43 @@
         gifs.push(g);
         continue;
       }
-      const id = g.id.startsWith("sha256:") ? g.id : await gifContentId(g.data);
-      if (pictures.has(id)) {
-        void deleteSavedGif(g.id).catch(() => {});
+      let key = g.id;
+      let contentId = "";
+      if (!isSavedUploadKey(g.id)) {
+        contentId = await gifContentId(g.data);
+        key = await savedUploadKey(contentId);
+      }
+      if (pictures.has(key)) {
+        // A newer legacy row already moved onto this key: g.id IS the merged
+        // favorite then, and deleting it would lose the picture.
+        if (g.id !== key) {
+          void deleteSavedGif(g.id).catch(() => {});
+          changed = true;
+        }
         continue;
       }
-      pictures.add(id);
-      if (id === g.id) {
+      if (key === g.id) {
+        pictures.add(key);
         gifs.push(g);
         continue;
       }
-      const moved = { ...g, id, gifId: id };
+      const moved = { ...g, id: key, gifId: contentId };
       try {
         await putSavedGif(moved);
+        pictures.add(key);
         await deleteSavedGif(g.id);
         gifs.push(moved);
+        changed = true;
       } catch {
         gifs.push(g);
       }
     }
+    // Messages on screen re-check their bookmark against the new keys.
+    if (changed) savedGifsChanged();
     savedBlobUrls.forEach((u) => URL.revokeObjectURL(u));
     savedBlobUrls = [];
+    // Already newest first: `kept` was sorted and `gifs` follows its order.
     savedGifs = gifs
-      .sort((a, b) => b.savedAt - a.savedAt)
       .map((g) => {
         if (!g.data) {
           return {

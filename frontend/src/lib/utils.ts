@@ -68,8 +68,8 @@ export function sniffImageMime(bytes: Uint8Array): string {
  * which calls anything unknown a jpeg. Ciphertext, an HTML error page or an
  * empty buffer is false.
  */
-export function isImageBytes(bytes: Uint8Array): boolean {
-  const b = bytes;
+export function isImageBytes(bytes: Uint8Array | ArrayBuffer): boolean {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes, 0, Math.min(16, bytes.byteLength));
   return (
     (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) || // GIF8
     (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) || // PNG
@@ -84,12 +84,11 @@ export function isImageBytes(bytes: Uint8Array): boolean {
 /**
  * A saved upload's key: the picture's own hash. Every send is a new upload
  * with a new infoHash, so a GIF sent from Saved would otherwise never match
- * the favorite it came from. Computed here and kept here: nothing about it is
- * sent anywhere.
+ * the favorite it came from. Never sent anywhere, and stored only blinded
+ * (savedUploadKey in storage.ts).
  */
 export async function gifContentId(data: ArrayBuffer): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
-  return "sha256:" + Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+  return "sha256:" + hex(new Uint8Array(await crypto.subtle.digest("SHA-256", data)));
 }
 
 export function bytesToBase64(bytes: Uint8Array): string {

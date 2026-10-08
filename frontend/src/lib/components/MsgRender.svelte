@@ -1,6 +1,7 @@
 <script module lang="ts">
   import { MediaQuery } from "svelte/reactivity";
   import { gifContentId } from "$lib/utils";
+  import { savedGifKeys } from "$lib/storage";
 
   /** One media query for every message on screen, not a listener each. */
   const narrowScreen =
@@ -22,6 +23,20 @@
       gifIdByBlob.set(blobURL, p);
     }
     return p;
+  }
+
+  /**
+   * The saved GIFs' keys, read once per change to them (savedGifs.version)
+   * and shared by every message on screen, not read by each.
+   */
+  let savedKeysVersion = -1;
+  let savedKeys: Promise<Set<string>> = Promise.resolve(new Set());
+  function savedKeysAt(version: number): Promise<Set<string>> {
+    if (version !== savedKeysVersion) {
+      savedKeysVersion = version;
+      savedKeys = savedGifKeys().catch(() => new Set<string>());
+    }
+    return savedKeys;
   }
 </script>
 
@@ -59,7 +74,14 @@
   // The queued tooltip must not promise the relay is holding a copy when the
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
-  import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
+  import {
+    putSavedGif,
+    deleteSavedGif,
+    isGifSaved,
+    getAttachmentsByInfoHash,
+    hasSavedGifKey,
+    savedUploadKey,
+  } from "$lib/storage";
   import { savedGifs, savedGifsChanged } from "$lib/saved-gifs.svelte";
   import { messageBody } from "$lib/actions/message-body";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
@@ -770,15 +792,19 @@
   });
 
   $effect(() => {
-    void savedGifs.version;
+    const version = savedGifs.version;
     if (!isGifMessage || !content) {
       gifSaved = false;
       return;
     }
+    const gifId = content;
     let stale = false;
-    isGifSaved(content).then((saved) => {
-      if (!stale) gifSaved = !!saved;
-    });
+    savedKeysAt(version)
+      .then((keys) => hasSavedGifKey(keys, gifId))
+      .then((saved) => {
+        if (!stale) gifSaved = saved;
+      })
+      .catch(() => {});
     return () => {
       stale = true;
     };
@@ -807,18 +833,27 @@
     return byPicture ?? (await isGifSaved(infoHash));
   }
 
+  async function isFileGifSavedIn(keys: Set<string>, infoHash: string, blobURL: string) {
+    const byPicture = await gifIdOf(blobURL)
+      .then((id) => hasSavedGifKey(keys, id))
+      .catch(() => false);
+    return byPicture || (await hasSavedGifKey(keys, infoHash));
+  }
+
   $effect(() => {
     const gifs: [string, string][] = JSON.parse(shownFileGifs);
-    void savedGifs.version;
+    const version = savedGifs.version;
+    if (!gifs.length) return;
     let stale = false;
-    Promise.all(gifs.map(([hash, url]) => savedFileGif(hash, url))).then(
-      (results) => {
+    savedKeysAt(version)
+      .then((keys) => Promise.all(gifs.map(([hash, url]) => isFileGifSavedIn(keys, hash, url))))
+      .then((results) => {
         if (stale) return;
         savedFileGifs = new Set(
           gifs.filter((_, i) => results[i]).map(([hash]) => hash)
         );
-      }
-    );
+      })
+      .catch(() => {});
     return () => {
       stale = true;
     };
@@ -831,6 +866,10 @@
     const existing = await savedFileGif(file.infoHash, blobURL);
     if (existing) {
       await deleteSavedGif(existing.id);
+      // The same picture may still be saved under this upload's own key from
+      // before favorites were keyed by picture; the bookmark would stay on.
+      const legacy = await isGifSaved(file.infoHash);
+      if (legacy) await deleteSavedGif(legacy.id);
       const next = new Set(savedFileGifs);
       next.delete(file.infoHash);
       savedFileGifs = next;
@@ -849,12 +888,12 @@
         (a) => a.data && !a.encryption
       )?.data;
     }
-    if (!data || !isImageBytes(new Uint8Array(data, 0, Math.min(16, data.byteLength)))) return;
+    if (!data || !isImageBytes(data)) return;
     // Keyed by the picture: saving the same GIF twice upserts one favorite.
-    const id = await gifContentId(data);
+    const contentId = blobURL ? await gifIdOf(blobURL) : await gifContentId(data);
     await putSavedGif({
-      id,
-      gifId: id,
+      id: await savedUploadKey(contentId),
+      gifId: contentId,
       title: file.filename,
       url: "",
       previewUrl: "",

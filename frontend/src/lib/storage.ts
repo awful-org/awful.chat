@@ -3531,6 +3531,39 @@ export async function isGifSaved(gifId: string): Promise<SavedGif | undefined> {
   return _open("savedGifs", row);
 }
 
+/**
+ * The key an uploaded favorite is stored under: its picture's hash, blinded
+ * like every other identifier at rest, so the database does not say which
+ * known GIF someone saved.
+ */
+export async function savedUploadKey(contentId: string): Promise<string> {
+  return blindValue(contentId);
+}
+
+/** Whether a saved row's id is already an uploaded favorite's blinded key. */
+export function isSavedUploadKey(id: string): boolean {
+  return isBlinded(id);
+}
+
+/**
+ * Every saved GIF's stored keys in one read, nothing decrypted: enough for
+ * every message on screen to ask "is this saved" without a read each.
+ */
+export async function savedGifKeys(): Promise<Set<string>> {
+  const database = await getDB();
+  const keys = new Set<string>();
+  for (const g of await database.getAll("savedGifs")) {
+    keys.add(g.id);
+    keys.add(g.gifId);
+  }
+  return keys;
+}
+
+/** Whether `gifId` is among `keys`, in either its blinded or plain form. */
+export async function hasSavedGifKey(keys: Set<string>, gifId: string): Promise<boolean> {
+  return keys.has(gifId) || keys.has(await blindValue(gifId));
+}
+
 export async function getWebAuthnRecord(): Promise<WebAuthnRecord | undefined> {
   const database = await getDB();
   return database.get("identity", "webauthn") as Promise<
