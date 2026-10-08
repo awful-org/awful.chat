@@ -123,6 +123,23 @@ interface MSPeerLeft {
   type: "ms:peer-left";
   peerId: string;
 }
+/**
+ * The SFU's answer to a join that carried our resume token: the session we
+ * had is ours again, on this socket, and this is the room as it is now -
+ * whatever it sent while we were away was lost with the old socket.
+ */
+interface AuthResumed {
+  type: "auth:resumed";
+  resumeToken: string;
+  /** Everyone else in the room. */
+  peers: string[];
+  /** Everyone else's producers. */
+  producers: { peerId: string; producerId: string; source: VideoSource; kind: "audio" | "video" }[];
+  /** Our own producers, as the SFU holds them. */
+  own: string[];
+  /** The producers our session consumes, as the SFU holds them. */
+  consuming?: string[];
+}
 interface MSProducerClosed {
   type: "ms:producer-closed";
   /** Publisher session replacement: keep the viewer's watch intent. */
@@ -391,6 +408,14 @@ export class MediasoupVideo implements VideoTransport {
 
   // SFU WebSocket - opened on join(), closed on leave()
   private sfuWs: WebSocket | null = null;
+  /**
+   * Handed to us by the SFU at join (and anew at each resume): a join that
+   * offers it takes over the session we already have there - transports,
+   * producers, consumers - instead of starting over. The signalling socket
+   * can drop while the media, on its own UDP path, never stopped; rebuilding
+   * everything for that blanked every stream on screen for seconds.
+   */
+  private resumeToken: string | null = null;
   private joinSigner: ((nonce: string, room: string, peer: string) => string) | null = null;
   private roomAdmission: ((room: string, nonce: string, peer: string) => { roomCode: string; capability: string } | undefined) | null = null;
 
@@ -511,6 +536,7 @@ export class MediasoupVideo implements VideoTransport {
     this.sendTransport = null;
     this.recvTransport = null;
     this.failPending(null, new Error("Left the call"));
+    this.resumeToken = null;
     this.currentRoomCode = null;
     this.currentPeerId = null;
   }
@@ -725,7 +751,11 @@ export class MediasoupVideo implements VideoTransport {
    * Open a WebSocket to the SFU and send the join message.
    * Resolves once the connection is open and the join is sent.
    */
-  private connectSfu(roomCode: string, peerId: string): Promise<void> {
+  private connectSfu(
+    roomCode: string,
+    peerId: string,
+    resume?: string
+  ): Promise<"joined" | "resumed"> {
     return new Promise((resolve, reject) => {
       if (shouldBlockSfu()) {
         reject(new Error(SFU_UNREACHABLE));
@@ -780,11 +810,25 @@ export class MediasoupVideo implements VideoTransport {
               if (roomCode.startsWith("rd2_") && !admission) throw new Error("Room capability unavailable");
               const wireRoom = admission?.roomCode ?? roomCode;
               const signature = this.joinSigner(msg.nonce, wireRoom, peerId);
-              ws.send(JSON.stringify({ type: "join", roomCode: wireRoom, peerId, signature, capability: admission?.capability }));
+              ws.send(JSON.stringify({ type: "join", roomCode: wireRoom, peerId, signature, capability: admission?.capability, resume }));
             } else if (msg.type === "auth:joined" && proofSent) {
               authenticated = true;
               clearTimeout(authTimer);
-              resolve();
+              this.resumeToken = typeof msg.resumeToken === "string" ? msg.resumeToken : null;
+              resolve("joined");
+            } else if (msg.type === "auth:resumed" && proofSent && resume) {
+              authenticated = true;
+              clearTimeout(authTimer);
+              this.resumeToken = typeof msg.resumeToken === "string" ? msg.resumeToken : null;
+              // Here, not after the await: the frames behind this one are
+              // already the resumed session's, and must land on a client that
+              // has caught up with the room first. Settled either way: a
+              // throw here left the resume pending, and the ladder with it.
+              try {
+                this.reconcileResumed(msg as AuthResumed);
+              } finally {
+                resolve("resumed");
+              }
             } else {
               throw new Error("Video server could not verify this device. Update the app and try again.");
             }
@@ -832,20 +876,29 @@ export class MediasoupVideo implements VideoTransport {
             d: { code: closeEvent.code, reason: closeEvent.reason },
           })
         );
-        const wasJoined = this.device !== null;
+        // A socket that never authenticated is answered by whoever awaited
+        // connectSfu - a resume that could not connect, say, whose ladder
+        // backs off on its own. Treating its close as a session lost too
+        // restarted the ladder at once, every time: a busy loop for as long
+        // as the network stayed down.
+        const wasJoined = authenticated && this.device !== null;
 
         // Reject all pending requests when connection drops
         this.failPending(null, new Error("SFU connection closed"));
 
-        // If we were joined, emit an error and attempt automatic rejoin
+        // If we were joined, get the session back
         if (wasJoined && this.currentRoomCode && this.currentPeerId) {
-          const err: Error = new Error("SFU connection closed unexpectedly");
-          this.emit("error", err);
-
-          // Rejoin with backoff. The SFU destroyed all of our server-side
-          // state on disconnect, so this must be a FULL rebuild (device +
-          // transports + producers), not just a re-dial.
-          this.scheduleRejoin(this.joinGeneration);
+          // The SFU holds a session that dropped like this for a while, so
+          // the first try is a resume, at once: nothing on screen changes if
+          // it works. Without a token there is nothing to resume, and it is
+          // the full rebuild after a pause, as before.
+          if (this.canResume()) {
+            this.scheduleRejoin(this.joinGeneration, 1, 0);
+          } else {
+            const err: Error = new Error("SFU connection closed unexpectedly");
+            this.emit("error", err);
+            this.scheduleRejoin(this.joinGeneration);
+          }
         }
       };
     });
@@ -857,8 +910,11 @@ export class MediasoupVideo implements VideoTransport {
    * kept working) with no SFU session at all - no streams visible until a
    * manual leave and rejoin.
    */
-  private scheduleRejoin(expectedGeneration: number, attempt = 1): void {
-    const delay = Math.min(2000 * 2 ** (attempt - 1), 30_000);
+  private scheduleRejoin(
+    expectedGeneration: number,
+    attempt = 1,
+    delay = Math.min(2000 * 2 ** (attempt - 1), 30_000)
+  ): void {
     // ONE ladder, not one per failure. Four call sites schedule a rejoin (the
     // socket closing, either transport going failed/closed, ensureLive) and
     // every rung schedules the next one forever, so a single bad minute forked
@@ -870,7 +926,15 @@ export class MediasoupVideo implements VideoTransport {
     // Chrome caps a page at 500 live ones; that is the "Cannot create so many
     // PeerConnections" that eventually takes voice, video and libp2p's own
     // WebRTC dials down together.
-    rec(ev("sfu.rejoin", { d: { attempt, delayMs: delay } }));
+    // A rung that will try a resume is not a rejoin yet: on a flaky network
+    // every drop heals unseen that way, and counting each as sfu.rejoin had
+    // the dashboard report a rejoin loop for a call nobody saw falter. The
+    // rebuild it may still fall back to records its own sfu.rejoin then.
+    if (this.canResume()) {
+      rec(ev("sfu.resume", { d: { phase: "scheduled", attempt, delayMs: delay } }));
+    } else {
+      rec(ev("sfu.rejoin", { d: { attempt, delayMs: delay } }));
+    }
     if (this.rejoinTimer) clearTimeout(this.rejoinTimer);
     this.rejoinTimer = setTimeout(() => {
       this.rejoinTimer = null;
@@ -959,6 +1023,11 @@ export class MediasoupVideo implements VideoTransport {
     // rest of the call.
     if (this.sessionIsLive()) return;
 
+    // A transport can fail while the resume is out: its own rung lands on
+    // this same rebuild (attemptRejoin runs one at a time) and must not be
+    // answered by a resumed session that carries nothing on it.
+    if (this.canResume() && (await this.tryResume(roomCode, peerId)) && !this.transportGone()) return;
+
     const republish: Omit<Producer, "producer">[] = [];
     for (const [source, ps] of this.producers) {
       const stream = ps[0]?.stream;
@@ -1021,10 +1090,166 @@ export class MediasoupVideo implements VideoTransport {
     this.failPending(this.sfuWs, new Error("SFU session rebuilt"));
     this.sfuWs?.close();
     this.sfuWs = null;
+    this.resumeToken = null;
 
     await this.join(roomCode, peerId);
     for (const { source, stream, encoding } of republish) {
       await this.publish(stream, source, encoding);
+    }
+  }
+
+  /**
+   * Whether a dropped socket is all that is wrong, so the session can be
+   * taken back as it is. Not when the socket is up (then a transport died,
+   * and that is a rebuild), nor when a transport has failed or closed: the
+   * media is gone too, and resuming would only bring back a session that
+   * carries nothing.
+   */
+  private canResume(): boolean {
+    if (!this.resumeToken || !this.device || this.refusal) return false;
+    if (this.sfuWs?.readyState === WebSocket.OPEN) return false;
+    return !this.transportGone();
+  }
+
+  /** Whether either transport has failed or closed: its media is gone. */
+  private transportGone(): boolean {
+    return [this.sendTransport, this.recvTransport].some(
+      (t) => t != null && (t.connectionState === "failed" || t.connectionState === "closed")
+    );
+  }
+
+  /**
+   * Take the SFU session back on a new socket. True when it is ours again
+   * (the room has been reconciled by then, in connectSfu); false when the
+   * SFU no longer held it and the caller must rebuild. Throws while the SFU
+   * cannot be reached, so the ladder tries again with everything on screen
+   * left as it is - the SFU keeps the session a while for exactly that.
+   */
+  private async tryResume(roomCode: string, peerId: string): Promise<boolean> {
+    const token = this.resumeToken!;
+    rec(ev("sfu.resume", { d: { phase: "try" } }));
+    let how: "joined" | "resumed";
+    try {
+      how = await this.connectSfu(roomCode, peerId, token);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      rec(ev("sfu.resume", { d: { phase: "failed", message } }));
+      // Unreachable: try again, the session is still held. Anything else
+      // (refused, timed out after connecting) will not get better by
+      // resuming, so the next rung rebuilds.
+      if (message !== SFU_UNREACHABLE) this.resumeToken = null;
+      this.emit("error", err instanceof Error ? err : new Error(message));
+      throw err;
+    }
+    if (how === "resumed") {
+      rec(ev("sfu.resume", { d: { phase: "resumed" } }));
+      // A path that went quiet while the socket was down asked for its ICE
+      // restart then, and that request failed at once with no socket to go
+      // on. Nothing asks again before "failed" - a frozen stream and then
+      // the very rebuild this resume avoided.
+      if (this.sendTransport?.connectionState === "disconnected") this.restartIce("send");
+      if (this.recvTransport?.connectionState === "disconnected") this.restartIce("recv");
+      this.emit("healed");
+      return true;
+    }
+    // Too late: the SFU had already ended that session and started a new
+    // one on this socket. Drop it; the rebuild opens its own.
+    rec(ev("sfu.resume", { d: { phase: "expired" } }));
+    rec(ev("sfu.rejoin", { d: { attempt: 0, delayMs: 0, after: "resume-expired" } }));
+    const ws = this.sfuWs;
+    this.sfuWs = null;
+    this.failPending(ws, new Error("SFU session rebuilt"));
+    ws?.close();
+    return false;
+  }
+
+  /**
+   * Catch up with the room after a resume, from the SFU's account of it:
+   * every producer that closed and everyone who left while the socket was
+   * down goes as if its ms:producer-closed / ms:peer-left had arrived, and
+   * every producer that started is announced as ms:new-producer would have.
+   * What did not change is left exactly as it is - that is the point.
+   */
+  private reconcileResumed(state: AuthResumed): void {
+    const live = new Map(state.producers.map((p) => [p.producerId, p]));
+    const room = new Set(state.peers);
+    this.lastRoomPeerCount = state.peers.length;
+
+    const known = new Map<string, { peerId: string; source: VideoSource; kind: "audio" | "video" }>();
+    for (const [peerId, cs] of this.consumers) {
+      for (const c of cs) {
+        known.set(c.consumer.producerId, {
+          peerId,
+          source: c.source,
+          kind: c.consumer.kind as "audio" | "video",
+        });
+      }
+    }
+    for (const [producerId, peerId] of this.parkedCameras) {
+      known.set(producerId, { peerId, source: "camera", kind: "video" });
+    }
+    for (const [peerId, ids] of this.pendingScreenProducerIds) {
+      for (const producerId of ids) {
+        if (!known.has(producerId)) known.set(producerId, { peerId, source: "screen", kind: "video" });
+      }
+    }
+
+    // A producer that closed while a new one of the same peer and source
+    // started is that peer's session being replaced, as the SFU marks it
+    // live: a watched share stays watched instead of becoming a tile.
+    const started = new Set(
+      state.producers.filter((p) => !known.has(p.producerId)).map((p) => `${p.peerId}\0${p.source}`)
+    );
+    for (const [producerId, p] of known) {
+      if (live.has(producerId)) continue;
+      const replacing = started.has(`${p.peerId}\0${p.source}`);
+      this.handleSignal({ type: "ms:producer-closed", producerId, ...p, replacing });
+    }
+    // A consume still out for one that closed drops what it gets.
+    for (const producerId of this.inflightConsumes.keys()) {
+      if (!live.has(producerId)) this.closedWhileConsuming.add(producerId);
+    }
+
+    const peers = new Set([
+      ...this.active,
+      ...this.consumers.keys(),
+      ...this.pendingTransmissions.keys(),
+      ...this.pendingScreenProducerIds.keys(),
+    ]);
+    for (const peerId of peers) {
+      if (!room.has(peerId)) this.handleSignal({ type: "ms:peer-left", peerId });
+    }
+
+    this.queuedProducers = this.queuedProducers.filter((q) => live.has(q.producerId));
+    const queued = new Set(this.queuedProducers.map((q) => q.producerId));
+    for (const p of state.producers) {
+      if (known.has(p.producerId) || queued.has(p.producerId)) continue;
+      if (this.inflightConsumes.has(p.producerId)) continue;
+      this.handleSignal({
+        type: "ms:new-producer",
+        peerId: p.peerId,
+        producerId: p.producerId,
+        source: p.source,
+      });
+    }
+
+    // A consumer closed here while the socket was down (stopped watching,
+    // a parked camera) is still forwarded to on the SFU: its
+    // ms:close-consumer went nowhere. Checked after the announcements above,
+    // so a consume they started is not taken for one of those.
+    const held = new Set<string>();
+    for (const cs of this.consumers.values()) for (const c of cs) held.add(c.consumer.producerId);
+    for (const producerId of state.consuming ?? []) {
+      if (held.has(producerId) || this.inflightConsumes.has(producerId)) continue;
+      this.signal({ type: "ms:close-consumer", producerId });
+    }
+
+    // A produce whose answer was lost with the socket left a producer on
+    // the SFU that nothing here sends to or will ever close.
+    const mine = new Set<string>();
+    for (const ps of this.producers.values()) for (const p of ps) mine.add(p.producer.id);
+    for (const producerId of state.own) {
+      if (!mine.has(producerId)) this.signal({ type: "ms:close-producer", producerId });
     }
   }
 
