@@ -616,6 +616,30 @@ test("a resume takes over a socket the SFU still thinks is open", async () => {
   }
 });
 
+test("a second tab cannot take over a session its client resumed while being probed", async () => {
+  const a = await joinWith("resume-probe-race", "race-a");
+  // Half-open: the incumbent will not answer the probe a token-less join starts.
+  (a.ws as unknown as { _socket: { pause: () => void } })._socket.pause();
+  const tabJoin = joinWith("resume-probe-race", "race-a");
+  // The probe is out (it takes up to REJOIN_PROBE_MS); the real client
+  // comes back meanwhile with its token.
+  const back = await joinWith("resume-probe-race", "race-a", a.reply.resumeToken);
+  try {
+    assert.equal(back.reply.type, "auth:resumed");
+    const tab = await tabJoin;
+    // Terminating the probed socket answered the probe "dead", but the
+    // session lives on the resumed socket, so the tab is refused.
+    assert.equal(tab.reply.type, "ms:error");
+    assert.equal(tab.reply.reason, "peer-id-in-use");
+    tab.ws.close();
+    // And the resumed session still answers.
+    await settle(back.ws);
+  } finally {
+    (a.ws as unknown as { _socket: { resume: () => void } })._socket.resume();
+    back.ws.close();
+  }
+});
+
 test("a dropped session nobody resumes ends after the grace period", async () => {
   const a = await joinWith("resume-expire", "expire-a");
   const b = await joinWith("resume-expire", "expire-b");

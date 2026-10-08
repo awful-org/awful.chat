@@ -477,6 +477,27 @@ function send(ws: WebSocket, msg: object): void {
   }
 }
 
+function clearDetachTimer(peer: PeerState): void {
+  if (!peer.detachTimer) return;
+  clearTimeout(peer.detachTimer);
+  peer.detachTimer = null;
+}
+
+/** Every producer in `room` but `exceptPeerId`'s, as the join replay and a resume announce them. */
+function roomProducers(
+  room: Map<string, PeerState>,
+  exceptPeerId: string,
+): { peerId: string; producerId: string; source: "camera" | "screen"; kind: string }[] {
+  const producers: { peerId: string; producerId: string; source: "camera" | "screen"; kind: string }[] = [];
+  for (const [otherPeerId, other] of room) {
+    if (otherPeerId === exceptPeerId) continue;
+    for (const [producerId, { source, producer }] of other.producers) {
+      producers.push({ peerId: otherPeerId, producerId, source, kind: producer.kind });
+    }
+  }
+  return producers;
+}
+
 /**
  * Keep a session whose socket dropped (holdsForResume) for RESUME_GRACE_MS.
  * Nothing about it changes for the rest of the room meanwhile: its media
@@ -484,7 +505,7 @@ function send(ws: WebSocket, msg: object): void {
  * socket) - the resume hands over the room as it is instead.
  */
 function detachSession(peer: PeerState, ws: WebSocket): void {
-  if (peer.detachTimer) clearTimeout(peer.detachTimer);
+  clearDetachTimer(peer);
   console.log(
     `[sfu] peer ${peer.peerId} kept ${Math.round(RESUME_GRACE_MS / 1000)}s for a resume in room ${peer.roomCode}`,
   );
@@ -507,32 +528,33 @@ function resumeSession(
   ws: WebSocket,
   room: Map<string, PeerState>,
 ): void {
-  if (peer.detachTimer) {
-    clearTimeout(peer.detachTimer);
-    peer.detachTimer = null;
-  }
+  clearDetachTimer(peer);
   const previous = peer.ws;
   peer.ws = ws;
   peer.livenessProbe = null;
+  // A worker-op pause belongs to the socket it paused. Left armed, it kept
+  // spendWorkerOp from pausing the new socket until it fired.
+  if (peer.workerOpPauseTimer) {
+    clearTimeout(peer.workerOpPauseTimer);
+    peer.workerOpPauseTimer = null;
+  }
   if (previous !== ws && previous.readyState !== WebSocket.CLOSED) {
     (previous as unknown as { endedBy?: EndedBy }).endedBy = "resumed";
     previous.terminate();
   }
   peer.resumeToken = newResumeToken();
 
-  const producers: { peerId: string; producerId: string; source: "camera" | "screen"; kind: string }[] = [];
-  for (const [otherPeerId, other] of room) {
-    if (otherPeerId === peer.peerId) continue;
-    for (const [producerId, { source, producer }] of other.producers) {
-      producers.push({ peerId: otherPeerId, producerId, source, kind: producer.kind });
-    }
-  }
   send(ws, {
     type: "auth:resumed",
     resumeToken: peer.resumeToken,
     peers: [...room.keys()].filter((id) => id !== peer.peerId),
-    producers,
+    producers: roomProducers(room, peer.peerId),
     own: [...peer.producers.keys()],
+    // The producers this session consumes. A consumer the client closed
+    // while its socket was down (stopped watching, parked a camera) never
+    // reached us, and goes on forwarding to nobody until the client closes
+    // it against this list.
+    consuming: [...peer.consumersByProducerId.keys()],
   });
   console.log(`[sfu] peer ${peer.peerId} resumed its session in room ${peer.roomCode}`);
 }
@@ -1327,10 +1349,7 @@ function handleCloseProducer(peer: PeerState, msg: MSCloseProducer): void {
 }
 
 function handlePeerLeft(peer: PeerState): void {
-  if (peer.detachTimer) {
-    clearTimeout(peer.detachTimer);
-    peer.detachTimer = null;
-  }
+  clearDetachTimer(peer);
   const room = rooms.get(peer.roomCode);
   if (!room) return;
 
@@ -1866,6 +1885,10 @@ async function main(): Promise<void> {
           // for a heartbeat interval plus the client's backoff, up to a minute
           // and a half of dead video. Asking the socket costs one ping and
           // answers in milliseconds when the incumbent is alive.
+          // The socket asked, not the session: a resume can move the session
+          // onto a new socket while the probe is out, and terminating the
+          // old one answers the probe "dead" for a session that is live.
+          const probedWs = oldPeer.ws;
           const alive = await probeSessionAlive(oldPeer);
 
           // The joining socket can have gone away while the probe was out.
@@ -1881,10 +1904,11 @@ async function main(): Promise<void> {
           }
 
           // Another connection can have taken the slot while the probe was
-          // out - it is newer than this join, so it keeps it. Re-reading also
+          // out, or a resume moved the session onto a new socket - either is
+          // newer than this join, so it keeps it. Re-reading also
           // picks up the incumbent's own close handler having cleaned up.
           const current = rooms.get(joinMsg.roomCode)?.get(joinMsg.peerId);
-          if (current && current !== oldPeer) {
+          if (current && (current !== oldPeer || current.ws !== probedWs)) {
             console.warn(
               `[sfu] peerId ${joinMsg.peerId} in room ${joinMsg.roomCode} was claimed while probing; refusing the new connection`,
             );
@@ -1955,10 +1979,7 @@ async function main(): Promise<void> {
           oldPeer.recvTransport?.close();
           clearTransportReapTimer(oldPeer, "send");
           clearTransportReapTimer(oldPeer, "recv");
-          if (oldPeer.detachTimer) {
-            clearTimeout(oldPeer.detachTimer);
-            oldPeer.detachTimer = null;
-          }
+          clearDetachTimer(oldPeer);
           (oldPeer.ws as unknown as { endedBy?: EndedBy }).endedBy = "replaced";
           oldPeer.ws.terminate();
         }
@@ -1966,16 +1987,13 @@ async function main(): Promise<void> {
         send(ws, { type: "auth:joined", resumeToken: peer.resumeToken });
 
         // Send existing producers to the newly joined peer so it can consume them
-        for (const [existingPeerId, existingPeer] of room) {
-          if (existingPeerId === peer.peerId) continue;
-          for (const [producerId, { source }] of existingPeer.producers) {
-            send(peer.ws, {
-              type: "ms:new-producer",
-              peerId: existingPeerId,
-              producerId,
-              source,
-            } as MSNewProducer);
-          }
+        for (const { peerId: existingPeerId, producerId, source } of roomProducers(room, peer.peerId)) {
+          send(peer.ws, {
+            type: "ms:new-producer",
+            peerId: existingPeerId,
+            producerId,
+            source,
+          } as MSNewProducer);
         }
 
         console.log(`[sfu] peer ${peer.peerId} joined room ${peer.roomCode}`);

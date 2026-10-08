@@ -1476,6 +1476,66 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     expect(s.consumed).not.toHaveBeenCalled();
   });
 
+  it("closes on the SFU a consumer it let go of while the socket was down", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [{ peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" }],
+      own: ["p-mine"],
+      // p-gone: a consumer closed here whose ms:close-consumer went nowhere.
+      consuming: ["p-bob", "p-gone"],
+    });
+    await done;
+    expect(ws.sent.filter((m) => m.type === "ms:close-consumer")).toEqual([
+      { type: "ms:close-consumer", producerId: "p-gone" },
+    ]);
+  });
+
+  it("keeps watching a share whose sharer was replaced while the socket was down", async () => {
+    const s = dropped();
+    const screen = { source: "screen", consumer: { producerId: "p-share-1", kind: "video", id: "c-share-1", closed: false, close: vi.fn() } };
+    (s.internals.consumers as Map<string, unknown[]>).set("bob", [s.bob, screen]);
+    (s.internals.watchingTransmissionPeers as Set<string>).add("bob");
+    const ended = vi.fn();
+    s.video.on("transmissionEnded", ended);
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [
+        { peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" },
+        { peerId: "bob", producerId: "p-share-2", source: "screen", kind: "video" },
+      ],
+      own: ["p-mine"],
+    });
+    await done;
+    expect(screen.consumer.close).toHaveBeenCalled();
+    expect(ended).not.toHaveBeenCalled();
+    expect(s.consumed).toHaveBeenCalledWith("bob", "p-share-2", "screen");
+  });
+
+  it("rebuilds when a transport failed while the resume was out", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const { ws } = challenged();
+    (s.internals.recvTransport as { connectionState: string }).connectionState = "failed";
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [{ peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" }],
+      own: ["p-mine"],
+    });
+    await done;
+    expect(s.join).toHaveBeenCalledWith("room", "me");
+  });
+
   it("rebuilds as before when the SFU no longer holds the session", async () => {
     const s = dropped();
     const done = s.rejoin();
