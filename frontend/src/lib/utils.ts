@@ -63,6 +63,34 @@ export function sniffImageMime(bytes: Uint8Array): string {
   return "image/jpeg"; // ponytail: unknown bytes get the sniffing-tolerant default
 }
 
+/**
+ * Whether these bytes start like an image at all - unlike sniffImageMime,
+ * which calls anything unknown a jpeg. Ciphertext, an HTML error page or an
+ * empty buffer is false.
+ */
+export function isImageBytes(bytes: Uint8Array | ArrayBuffer): boolean {
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes, 0, Math.min(16, bytes.byteLength));
+  return (
+    (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) || // GIF8
+    (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) || // PNG
+    (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) || // JPEG
+    (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) || // RIFF....WEBP
+    (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70 &&
+      b[8] === 0x61 && b[9] === 0x76 && b[10] === 0x69 && b[11] === 0x66) // ....ftypavif
+  );
+}
+
+/**
+ * A saved upload's key: the picture's own hash. Every send is a new upload
+ * with a new infoHash, so a GIF sent from Saved would otherwise never match
+ * the favorite it came from. Never sent anywhere, and stored only blinded
+ * (savedUploadKey in storage.ts).
+ */
+export async function gifContentId(data: ArrayBuffer): Promise<string> {
+  return "sha256:" + hex(new Uint8Array(await crypto.subtle.digest("SHA-256", data)));
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let bin = "";
   const CHUNK = 0x8000; // String.fromCharCode blows the arg limit past ~64k

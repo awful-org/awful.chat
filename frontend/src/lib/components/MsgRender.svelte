@@ -1,9 +1,43 @@
 <script module lang="ts">
   import { MediaQuery } from "svelte/reactivity";
+  import { gifContentId } from "$lib/utils";
+  import { savedGifKeys } from "$lib/storage";
 
   /** One media query for every message on screen, not a listener each. */
   const narrowScreen =
     typeof window === "undefined" ? null : new MediaQuery("max-width: 639px");
+
+  /**
+   * An uploaded GIF's hash, computed once per blob URL: a blob URL never
+   * changes what it holds, and the same message re-renders often.
+   */
+  const gifIdByBlob = new Map<string, Promise<string>>();
+  function gifIdOf(blobURL: string): Promise<string> {
+    let p = gifIdByBlob.get(blobURL);
+    if (!p) {
+      p = fetch(blobURL)
+        .then((r) => r.arrayBuffer())
+        .then(gifContentId);
+      // A revoked URL fails; the next look tries again rather than remembering it.
+      p.catch(() => gifIdByBlob.delete(blobURL));
+      gifIdByBlob.set(blobURL, p);
+    }
+    return p;
+  }
+
+  /**
+   * The saved GIFs' keys, read once per change to them (savedGifs.version)
+   * and shared by every message on screen, not read by each.
+   */
+  let savedKeysVersion = -1;
+  let savedKeys: Promise<Set<string>> = Promise.resolve(new Set());
+  function savedKeysAt(version: number): Promise<Set<string>> {
+    if (version !== savedKeysVersion) {
+      savedKeysVersion = version;
+      savedKeys = savedGifKeys().catch(() => new Set<string>());
+    }
+    return savedKeys;
+  }
 </script>
 
 <script lang="ts">
@@ -40,10 +74,18 @@
   // The queued tooltip must not promise the relay is holding a copy when the
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
-  import { putSavedGif, deleteSavedGif, isGifSaved, getAttachmentsByInfoHash } from "$lib/storage";
+  import {
+    putSavedGif,
+    deleteSavedGif,
+    isGifSaved,
+    getAttachmentsByInfoHash,
+    hasSavedGifKey,
+    savedUploadKey,
+  } from "$lib/storage";
+  import { savedGifs, savedGifsChanged } from "$lib/saved-gifs.svelte";
   import { messageBody } from "$lib/actions/message-body";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
-  import { formatSize } from "$lib/utils";
+  import { formatSize, isImageBytes } from "$lib/utils";
   import { animatedView, mediaBoxStyle } from "$lib/image-size";
   import {
     INLINE_FILE_MAX_BYTES,
@@ -750,53 +792,108 @@
   });
 
   $effect(() => {
-    gifSaved = false;
-    if (!isGifMessage || !content) return;
-    isGifSaved(content).then((saved) => {
-      gifSaved = !!saved;
-    });
+    const version = savedGifs.version;
+    if (!isGifMessage || !content) {
+      gifSaved = false;
+      return;
+    }
+    const gifId = content;
+    let stale = false;
+    savedKeysAt(version)
+      .then((keys) => hasSavedGifKey(keys, gifId))
+      .then((saved) => {
+        if (!stale) gifSaved = saved;
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
   });
 
-  // Saved-state per uploaded gif in this message, keyed by infoHash.
+  // Saved-state per uploaded gif in this message, keyed by infoHash. Only a
+  // gif whose picture is here shows the bookmark, and it is matched by that
+  // picture's hash: the same GIF sent again is a new upload, still saved.
   let savedFileGifs = $state(new Set<string>());
 
+  // A string, so a transfer's progress (a new map each tick) re-checks nothing.
+  const shownFileGifs = $derived(
+    JSON.stringify(
+      (msg.meta?.files ?? [])
+        .filter((f) => f.mimeType === "image/gif")
+        .map((f) => [f.infoHash, fileTransfers.get(f.infoHash)?.blobURL ?? ""])
+        .filter(([, url]) => url)
+    )
+  );
+
+  /** The favorite this gif is, by its picture or (saved before that) its upload. */
+  async function savedFileGif(infoHash: string, blobURL: string | undefined) {
+    const byPicture = blobURL
+      ? await gifIdOf(blobURL).then(isGifSaved).catch(() => undefined)
+      : undefined;
+    return byPicture ?? (await isGifSaved(infoHash));
+  }
+
+  async function isFileGifSavedIn(keys: Set<string>, infoHash: string, blobURL: string) {
+    const byPicture = await gifIdOf(blobURL)
+      .then((id) => hasSavedGifKey(keys, id))
+      .catch(() => false);
+    return byPicture || (await hasSavedGifKey(keys, infoHash));
+  }
+
   $effect(() => {
-    savedFileGifs = new Set();
-    const gifs = (msg.meta?.files ?? []).filter(
-      (f) => f.mimeType === "image/gif"
-    );
+    const gifs: [string, string][] = JSON.parse(shownFileGifs);
+    const version = savedGifs.version;
     if (!gifs.length) return;
-    Promise.all(gifs.map((f) => isGifSaved(f.infoHash))).then((results) => {
-      savedFileGifs = new Set(
-        gifs.filter((_, i) => results[i]).map((f) => f.infoHash)
-      );
-    });
+    let stale = false;
+    savedKeysAt(version)
+      .then((keys) => Promise.all(gifs.map(([hash, url]) => isFileGifSavedIn(keys, hash, url))))
+      .then((results) => {
+        if (stale) return;
+        savedFileGifs = new Set(
+          gifs.filter((_, i) => results[i]).map(([hash]) => hash)
+        );
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
   });
 
   async function toggleSaveFileGif(e: MouseEvent, file: FileEntry) {
     e.preventDefault();
     e.stopPropagation();
-    const existing = await isGifSaved(file.infoHash);
+    const blobURL = fileTransfers.get(file.infoHash)?.blobURL;
+    const existing = await savedFileGif(file.infoHash, blobURL);
     if (existing) {
       await deleteSavedGif(existing.id);
+      // The same picture may still be saved under this upload's own key from
+      // before favorites were keyed by picture; the bookmark would stay on.
+      const legacy = await isGifSaved(file.infoHash);
+      if (legacy) await deleteSavedGif(legacy.id);
       const next = new Set(savedFileGifs);
       next.delete(file.infoHash);
       savedFileGifs = next;
+      savedGifsChanged();
       return;
     }
-    // Bytes from storage when the attachment persisted them, else from the
-    // blob already on screen - saving must not depend on seeders.
-    let data = (await getAttachmentsByInfoHash(file.infoHash)).find(
-      (a) => a.data
-    )?.data;
-    if (!data) {
-      const blobURL = fileTransfers.get(file.infoHash)?.blobURL;
-      if (!blobURL) return;
+    // The decrypted copy on screen first. A protected room stores its
+    // attachments as ciphertext, and taking that row's bytes saved a "GIF"
+    // that could never draw. A stored row is used only when it is plaintext
+    // (a legacy room) - saving must not depend on seeders.
+    let data: ArrayBuffer | undefined;
+    if (blobURL) {
       data = await (await fetch(blobURL)).arrayBuffer();
+    } else {
+      data = (await getAttachmentsByInfoHash(file.infoHash)).find(
+        (a) => a.data && !a.encryption
+      )?.data;
     }
+    if (!data || !isImageBytes(data)) return;
+    // Keyed by the picture: saving the same GIF twice upserts one favorite.
+    const contentId = blobURL ? await gifIdOf(blobURL) : await gifContentId(data);
     await putSavedGif({
-      id: file.infoHash,
-      gifId: file.infoHash,
+      id: await savedUploadKey(contentId),
+      gifId: contentId,
       title: file.filename,
       url: "",
       previewUrl: "",
@@ -805,6 +902,7 @@
       savedAt: Date.now(),
     });
     savedFileGifs = new Set([...savedFileGifs, file.infoHash]);
+    savedGifsChanged();
   }
 
   async function toggleSaveGif(e: MouseEvent) {
@@ -815,6 +913,7 @@
     if (existing) {
       await deleteSavedGif(existing.id);
       gifSaved = false;
+      savedGifsChanged();
       return;
     }
     await putSavedGif({
@@ -827,6 +926,7 @@
       savedAt: Date.now(),
     });
     gifSaved = true;
+    savedGifsChanged();
   }
 
   let copiedPreview = $state(false);

@@ -3,6 +3,8 @@ import {
   decode,
   encode,
   hex,
+  isImageBytes,
+  gifContentId,
   normalizeAvatarUrl,
   normalizeNicknameColor,
   sniffImageMime,
@@ -152,5 +154,34 @@ describe("sniffImageMime", () => {
   it("defaults to image/jpeg for unrecognized bytes", () => {
     const unknown = new Uint8Array([0x00, 0x00, 0x00, 0x00, 0x00]);
     expect(sniffImageMime(unknown)).toBe("image/jpeg");
+  });
+});
+
+describe("isImageBytes", () => {
+  const bytes = (...b: number[]) => new Uint8Array([...b, ...new Array(16).fill(0)]);
+  it("knows the image formats a GIF picker can hold", () => {
+    expect(isImageBytes(new TextEncoder().encode("GIF89a........"))).toBe(true);
+    expect(isImageBytes(bytes(0x89, 0x50, 0x4e, 0x47))).toBe(true);
+    expect(isImageBytes(bytes(0xff, 0xd8, 0xff))).toBe(true);
+    expect(isImageBytes(new TextEncoder().encode("RIFF\0\0\0\0WEBPVP8 "))).toBe(true);
+  });
+  it("is false for ciphertext, markup and nothing", () => {
+    expect(isImageBytes(crypto.getRandomValues(new Uint8Array(16)).fill(0x13, 0, 1))).toBe(false);
+    expect(isImageBytes(new TextEncoder().encode("<!doctype html>"))).toBe(false);
+    expect(isImageBytes(new Uint8Array(0))).toBe(false);
+  });
+});
+
+describe("gifContentId", () => {
+  it("is the picture's SHA-256, so two uploads of one GIF are one favorite", async () => {
+    const a = new TextEncoder().encode("GIF89a same picture").buffer;
+    const b = new TextEncoder().encode("GIF89a same picture").buffer;
+    const id = await gifContentId(a);
+    expect(id).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(await gifContentId(b)).toBe(id);
+    expect(await gifContentId(new TextEncoder().encode("GIF89a other").buffer)).not.toBe(id);
+    expect(await gifContentId(new ArrayBuffer(0))).toBe(
+      "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
   });
 });
