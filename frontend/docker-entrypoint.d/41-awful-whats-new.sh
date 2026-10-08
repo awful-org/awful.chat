@@ -19,7 +19,7 @@ set -eu
 HTML=/usr/share/nginx/html
 OUT=$HTML/whats-new.json
 BUILD=$HTML/.well-known/awful-build.json
-COUNT=5
+COUNT=10
 
 # WHATS_NEW=0 keeps this server from contacting GitHub at all; the tab then
 # says there is nothing to show.
