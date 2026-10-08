@@ -1,6 +1,7 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
-  import { isImageBytes } from "$lib/utils";
+  import { gifContentId, isImageBytes } from "$lib/utils";
+  import { savedGifsChanged } from "$lib/saved-gifs.svelte";
   import { onDestroy } from "svelte";
   import { Bookmark, Search, X, Loader } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
@@ -86,7 +87,38 @@
       (g) => g.data && !isImageBytes(new Uint8Array(g.data, 0, Math.min(16, g.data.byteLength)))
     );
     for (const g of broken) void deleteSavedGif(g.id).catch(() => {});
-    const gifs = all.filter((g) => !broken.includes(g));
+    // An upload saved before favorites were keyed by their picture is keyed
+    // by the upload it came from; re-key it, which also folds into one the
+    // copies a re-sent GIF let someone save twice. Once per row.
+    const gifs: SavedGif[] = [];
+    const pictures = new Set<string>();
+    const kept = all
+      .filter((g) => !broken.includes(g))
+      .sort((a, b) => b.savedAt - a.savedAt);
+    for (const g of kept) {
+      if (!g.data) {
+        gifs.push(g);
+        continue;
+      }
+      const id = g.id.startsWith("sha256:") ? g.id : await gifContentId(g.data);
+      if (pictures.has(id)) {
+        void deleteSavedGif(g.id).catch(() => {});
+        continue;
+      }
+      pictures.add(id);
+      if (id === g.id) {
+        gifs.push(g);
+        continue;
+      }
+      const moved = { ...g, id, gifId: id };
+      try {
+        await putSavedGif(moved);
+        await deleteSavedGif(g.id);
+        gifs.push(moved);
+      } catch {
+        gifs.push(g);
+      }
+    }
     savedBlobUrls.forEach((u) => URL.revokeObjectURL(u));
     savedBlobUrls = [];
     savedGifs = gifs
@@ -287,6 +319,7 @@
       if (existing) {
         await deleteSavedGif(existing.id);
         savedIds = new Set([...savedIds].filter((id) => id !== klipyGif.id));
+        savedGifsChanged();
         savedGifs = savedGifs.filter((g) => g.gifId !== klipyGif.id);
       } else {
         const saved: SavedGif = {
@@ -301,6 +334,7 @@
         };
         await putSavedGif(saved);
         savedIds = new Set([...savedIds, klipyGif.id]);
+        savedGifsChanged();
         savedGifs = [
           {
             id: saved.id,
@@ -317,6 +351,7 @@
       if (existing) {
         await deleteSavedGif(existing.id);
         savedIds = new Set([...savedIds].filter((id) => id !== gif.gifId));
+        savedGifsChanged();
         savedGifs = savedGifs.filter((g) => g.gifId !== gif.gifId);
       }
     }

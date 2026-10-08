@@ -81,6 +81,17 @@ export function isImageBytes(bytes: Uint8Array): boolean {
   );
 }
 
+/**
+ * A saved upload's key: the picture's own hash. Every send is a new upload
+ * with a new infoHash, so a GIF sent from Saved would otherwise never match
+ * the favorite it came from. Computed here and kept here: nothing about it is
+ * sent anywhere.
+ */
+export async function gifContentId(data: ArrayBuffer): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  return "sha256:" + Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let bin = "";
   const CHUNK = 0x8000; // String.fromCharCode blows the arg limit past ~64k
