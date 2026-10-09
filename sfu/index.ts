@@ -4,7 +4,8 @@ import { IncomingMessage } from "http";
 import { envInteger } from "./config";
 import { clientKey, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
 import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin, verifyRoomAdmission } from "./auth";
-import { describeClose, sweepHeartbeatConnection, type EndedBy, type HeartbeatSocket } from "./heartbeat";
+import { describeClose, holdsForResume, sweepHeartbeatConnection, type EndedBy, type HeartbeatSocket } from "./heartbeat";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
   SFU_DIAG_SCHEMA_VERSION,
   pickTransportStats,
@@ -188,7 +189,10 @@ interface MSDiagUnavailable {
 
 // Envelope sent by the client over this WebSocket connection.
 // All messages from client arrive as: { type: "join" } or { type: "ms:*", ... }
-type ClientJoin = { type: "join"; roomCode: string; peerId: string; signature: string; capability?: string };
+// `resume` is the token the SFU handed this client at its last join or
+// resume: present, and matching the session still held for this peer, the
+// join takes that session over instead of starting a new one.
+type ClientJoin = { type: "join"; roomCode: string; peerId: string; signature: string; capability?: string; resume?: string };
 type ClientMsg =
   | ClientJoin
   | MSGetCapabilities
@@ -268,6 +272,16 @@ interface PeerState {
   // poll snapshots - and the getStats() worker round-trips each one costs -
   // faster than that.
   lastDiagAt: number;
+  // Shared with this client alone (auth:joined / auth:resumed), and new at
+  // every resume. A join carrying it takes this session over - transports,
+  // producers and consumers as they are - instead of replacing it: the
+  // signalling socket can drop while the media, on its own UDP path, never
+  // stopped. The join's own identity proof cannot do this job, because two
+  // tabs share an identity and only one of them holds these transports.
+  resumeToken: string;
+  // Set while the socket is gone and the session waits RESUME_GRACE_MS for
+  // a resume; when it fires, the peer leaves as it would have at once.
+  detachTimer: NodeJS.Timeout | null;
 }
 
 // ── Resource ceilings ─────────────────────────────────────────────────────────
@@ -388,6 +402,21 @@ function getOrCreateRoom(roomCode: string): Map<string, PeerState> {
 // reconnect is not left staring at dead video.
 const REJOIN_PROBE_MS = envInteger("SFU_REJOIN_PROBE_MS", 3000);
 
+// How long a session whose socket dropped without a close frame is kept for
+// its client to resume (see holdsForResume). Long enough for a reconnect
+// through a flaky network, short enough that someone who really vanished is
+// not shown in the call for long. 0 ends such sessions at once, as before.
+const RESUME_GRACE_MS = envInteger("SFU_RESUME_GRACE_MS", 15000, 0);
+
+function newResumeToken(): string {
+  return randomBytes(24).toString("base64url");
+}
+
+function resumeTokenMatches(offered: unknown, held: string): boolean {
+  if (typeof offered !== "string" || offered.length !== held.length) return false;
+  return timingSafeEqual(Buffer.from(offered), Buffer.from(held));
+}
+
 // Whether an existing session is still there. readyState answers this only for
 // a socket that closed politely; the reconnect that actually matters - walking
 // from wifi to cellular mid-call - sends no FIN, so the corpse still reads OPEN
@@ -446,6 +475,88 @@ function send(ws: WebSocket, msg: object): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   }
+}
+
+function clearDetachTimer(peer: PeerState): void {
+  if (!peer.detachTimer) return;
+  clearTimeout(peer.detachTimer);
+  peer.detachTimer = null;
+}
+
+/** Every producer in `room` but `exceptPeerId`'s, as the join replay and a resume announce them. */
+function roomProducers(
+  room: Map<string, PeerState>,
+  exceptPeerId: string,
+): { peerId: string; producerId: string; source: "camera" | "screen"; kind: string }[] {
+  const producers: { peerId: string; producerId: string; source: "camera" | "screen"; kind: string }[] = [];
+  for (const [otherPeerId, other] of room) {
+    if (otherPeerId === exceptPeerId) continue;
+    for (const [producerId, { source, producer }] of other.producers) {
+      producers.push({ peerId: otherPeerId, producerId, source, kind: producer.kind });
+    }
+  }
+  return producers;
+}
+
+/**
+ * Keep a session whose socket dropped (holdsForResume) for RESUME_GRACE_MS.
+ * Nothing about it changes for the rest of the room meanwhile: its media
+ * keeps flowing, and what is sent to it is dropped (send() skips a closed
+ * socket) - the resume hands over the room as it is instead.
+ */
+function detachSession(peer: PeerState, ws: WebSocket): void {
+  clearDetachTimer(peer);
+  console.log(
+    `[sfu] peer ${peer.peerId} kept ${Math.round(RESUME_GRACE_MS / 1000)}s for a resume in room ${peer.roomCode}`,
+  );
+  peer.detachTimer = setTimeout(() => {
+    peer.detachTimer = null;
+    const room = rooms.get(peer.roomCode);
+    if (!room || room.get(peer.peerId) !== peer || peer.ws !== ws) return;
+    console.log(`[sfu] peer ${peer.peerId} did not resume; ending its session`);
+    handlePeerLeft(peer);
+  }, RESUME_GRACE_MS);
+}
+
+/**
+ * Move a held (or half-open) session onto the socket its client came back
+ * on, and tell the client what the room looks like now: whatever it was
+ * sent while it was away is lost, so it reconciles against this instead.
+ */
+function resumeSession(
+  peer: PeerState,
+  ws: WebSocket,
+  room: Map<string, PeerState>,
+): void {
+  clearDetachTimer(peer);
+  const previous = peer.ws;
+  peer.ws = ws;
+  peer.livenessProbe = null;
+  // A worker-op pause belongs to the socket it paused. Left armed, it kept
+  // spendWorkerOp from pausing the new socket until it fired.
+  if (peer.workerOpPauseTimer) {
+    clearTimeout(peer.workerOpPauseTimer);
+    peer.workerOpPauseTimer = null;
+  }
+  if (previous !== ws && previous.readyState !== WebSocket.CLOSED) {
+    (previous as unknown as { endedBy?: EndedBy }).endedBy = "resumed";
+    previous.terminate();
+  }
+  peer.resumeToken = newResumeToken();
+
+  send(ws, {
+    type: "auth:resumed",
+    resumeToken: peer.resumeToken,
+    peers: [...room.keys()].filter((id) => id !== peer.peerId),
+    producers: roomProducers(room, peer.peerId),
+    own: [...peer.producers.keys()],
+    // The producers this session consumes. A consumer the client closed
+    // while its socket was down (stopped watching, parked a camera) never
+    // reached us, and goes on forwarding to nobody until the client closes
+    // it against this list.
+    consuming: [...peer.consumersByProducerId.keys()],
+  });
+  console.log(`[sfu] peer ${peer.peerId} resumed its session in room ${peer.roomCode}`);
 }
 
 // ── mediasoup setup ───────────────────────────────────────────────────────────
@@ -1238,6 +1349,7 @@ function handleCloseProducer(peer: PeerState, msg: MSCloseProducer): void {
 }
 
 function handlePeerLeft(peer: PeerState): void {
+  clearDetachTimer(peer);
   const room = rooms.get(peer.roomCode);
   if (!room) return;
 
@@ -1756,6 +1868,14 @@ async function main(): Promise<void> {
         }
 
         let oldPeer = existingRoom?.get(joinMsg.peerId);
+        if (oldPeer && resumeTokenMatches(joinMsg.resume, oldPeer.resumeToken)) {
+          // The same client, back on a new socket. No liveness probe: its old
+          // socket may still read OPEN here (half-open, nothing told us), but
+          // the one client that holds the token has already given up on it.
+          peer = oldPeer;
+          resumeSession(oldPeer, ws, existingRoom!);
+          return;
+        }
         if (oldPeer) {
           // Both sockets proved ownership of the same device key. A live
           // incumbent keeps its slot to avoid duplicate-tab churn. It does not
@@ -1765,6 +1885,10 @@ async function main(): Promise<void> {
           // for a heartbeat interval plus the client's backoff, up to a minute
           // and a half of dead video. Asking the socket costs one ping and
           // answers in milliseconds when the incumbent is alive.
+          // The socket asked, not the session: a resume can move the session
+          // onto a new socket while the probe is out, and terminating the
+          // old one answers the probe "dead" for a session that is live.
+          const probedWs = oldPeer.ws;
           const alive = await probeSessionAlive(oldPeer);
 
           // The joining socket can have gone away while the probe was out.
@@ -1780,10 +1904,11 @@ async function main(): Promise<void> {
           }
 
           // Another connection can have taken the slot while the probe was
-          // out - it is newer than this join, so it keeps it. Re-reading also
+          // out, or a resume moved the session onto a new socket - either is
+          // newer than this join, so it keeps it. Re-reading also
           // picks up the incumbent's own close handler having cleaned up.
           const current = rooms.get(joinMsg.roomCode)?.get(joinMsg.peerId);
-          if (current && current !== oldPeer) {
+          if (current && (current !== oldPeer || current.ws !== probedWs)) {
             console.warn(
               `[sfu] peerId ${joinMsg.peerId} in room ${joinMsg.roomCode} was claimed while probing; refusing the new connection`,
             );
@@ -1815,6 +1940,8 @@ async function main(): Promise<void> {
           workerOpPauseTimer: null,
           livenessProbe: null,
           lastDiagAt: 0,
+          resumeToken: newResumeToken(),
+          detachTimer: null,
         };
         const room = getOrCreateRoom(joinMsg.roomCode);
         if (oldPeer) {
@@ -1852,23 +1979,21 @@ async function main(): Promise<void> {
           oldPeer.recvTransport?.close();
           clearTransportReapTimer(oldPeer, "send");
           clearTransportReapTimer(oldPeer, "recv");
+          clearDetachTimer(oldPeer);
           (oldPeer.ws as unknown as { endedBy?: EndedBy }).endedBy = "replaced";
           oldPeer.ws.terminate();
         }
         room.set(peer.peerId, peer);
-        send(ws, { type: "auth:joined" });
+        send(ws, { type: "auth:joined", resumeToken: peer.resumeToken });
 
         // Send existing producers to the newly joined peer so it can consume them
-        for (const [existingPeerId, existingPeer] of room) {
-          if (existingPeerId === peer.peerId) continue;
-          for (const [producerId, { source }] of existingPeer.producers) {
-            send(peer.ws, {
-              type: "ms:new-producer",
-              peerId: existingPeerId,
-              producerId,
-              source,
-            } as MSNewProducer);
-          }
+        for (const { peerId: existingPeerId, producerId, source } of roomProducers(room, peer.peerId)) {
+          send(peer.ws, {
+            type: "ms:new-producer",
+            peerId: existingPeerId,
+            producerId,
+            source,
+          } as MSNewProducer);
         }
 
         console.log(`[sfu] peer ${peer.peerId} joined room ${peer.roomCode}`);
@@ -1984,12 +2109,18 @@ async function main(): Promise<void> {
             (Date.now() - openedAt) / 1000,
           )}`,
         );
-        // Only clean up if THIS peer is still the room's current session for
-        // its peerId. After a duplicate-join replacement the map holds the new
-        // peer, so the old ws closing here must not evict it.
+        // Only clean up if THIS socket is still the room's current session
+        // for its peerId. After a duplicate-join replacement the map holds the
+        // new peer, and after a resume the same peer holds a new socket, so
+        // the old ws closing here must not evict either.
         const room = rooms.get(peer.roomCode);
-        if (room && room.get(peer.peerId) === peer) {
-          handlePeerLeft(peer);
+        if (room && room.get(peer.peerId) === peer && peer.ws === ws) {
+          const endedBy = (ws as unknown as { endedBy?: EndedBy }).endedBy;
+          if (RESUME_GRACE_MS > 0 && holdsForResume(code, endedBy)) {
+            detachSession(peer, ws);
+          } else {
+            handlePeerLeft(peer);
+          }
         }
         peer = null;
       }

@@ -17,7 +17,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import bs58 from "bs58";
 import { joinPayload, verifyJoin } from "./auth";
 import { envInteger } from "./config";
-import { describeClose, sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
+import { describeClose, holdsForResume, sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
 
 // The SFU's port for this file, chosen in test.before by freePort().
 let PORT = 0;
@@ -65,6 +65,10 @@ const MAX_WORKER_OPS = 40;
 // The socket pause a budget overrun applies. Kept under the (short) test
 // heartbeat interval: a paused socket answers no ping either.
 const WORKER_OP_PAUSE_MS = 20;
+// How long a dropped session waits for its client to resume. Short, so the
+// tests that wait it out do not sit around; long enough for a resume join's
+// handshake to land well inside it.
+const RESUME_GRACE_MS = 600;
 
 let child: ChildProcess;
 
@@ -119,6 +123,7 @@ function spawnSfu(port: number, extraEnv: Record<string, string>): SpawnedSfu {
         SFU_MAX_QUEUED_FRAME_BYTES: String(MAX_QUEUED_FRAME_BYTES),
         SFU_MAX_WORKER_OPS: String(MAX_WORKER_OPS),
         SFU_WORKER_OP_PAUSE_MS: String(WORKER_OP_PAUSE_MS),
+        SFU_RESUME_GRACE_MS: String(RESUME_GRACE_MS),
         ANNOUNCED_IP: "127.0.0.1",
         ...extraEnv,
       },
@@ -481,9 +486,9 @@ test("reaps a peer whose socket goes silently dead, freeing its producer", async
     );
     assert.equal(peerLeft.peerId, testPeer("peer-dead-a").peerId);
     // Reaped within roughly two heartbeat ticks (isAlive goes false on the
-    // first unanswered ping, terminated on the second), not the old 30s-tick
-    // heartbeat's up-to-60s window.
-    assert.ok(Date.now() - start < HEARTBEAT_INTERVAL_MS * 2 + 3000);
+    // first unanswered ping, terminated on the second) plus the time it is
+    // held for a resume, not the old 30s-tick heartbeat's up-to-60s window.
+    assert.ok(Date.now() - start < HEARTBEAT_INTERVAL_MS * 2 + RESUME_GRACE_MS + 3000);
 
     // A fresh joiner must not be handed the dead peer's producer: the room
     // replay only offers what is still in the room map, and the dead peer
@@ -509,6 +514,199 @@ test("reaps a peer whose socket goes silently dead, freeing its producer", async
     wsA.close();
     wsB.close();
   }
+});
+
+// Joins `label` to `roomLabel` on a new socket, offering `resume` if given,
+// and returns the socket with the SFU's answer to the join.
+async function joinWith(
+  roomLabel: string,
+  label: string,
+  resume?: string,
+): Promise<{ ws: WebSocket; reply: any }> {
+  const roomCode = testRoom(roomLabel).room;
+  const ws = new WebSocket(wsUrl());
+  const { nonce } = await nextMessage(ws, (m) => m.type === "auth:challenge");
+  const { peerId, privateKey } = testPeer(label);
+  const signature = sign(null, Buffer.from(joinPayload(nonce, roomCode, peerId)), privateKey).toString("base64");
+  const reply = nextMessage(
+    ws,
+    (m) => m.type === "auth:joined" || m.type === "auth:resumed" || m.type === "ms:error",
+  );
+  ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature,
+    capability: roomProof(nonce, roomCode, peerId), resume }));
+  return { ws, reply: await reply };
+}
+
+// Every message `ws` receives from now on, in order.
+function record(ws: WebSocket): any[] {
+  const seen: any[] = [];
+  ws.on("message", (raw) => seen.push(JSON.parse(raw.toString())));
+  return seen;
+}
+
+// A round trip on `ws`: everything the SFU queued for it before is in by then.
+async function settle(ws: WebSocket): Promise<void> {
+  ws.send(JSON.stringify({ type: "ms:get-capabilities", requestId: "settle" }));
+  await nextMessage(ws, (m) => m.type === "ms:capabilities");
+}
+
+function closed(ws: WebSocket): Promise<void> {
+  return new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) resolve();
+    else ws.once("close", () => resolve());
+  });
+}
+
+test("a session whose socket dropped resumes on a new socket with its media intact", async () => {
+  const a = await joinWith("resume-room", "resume-a");
+  assert.equal(a.reply.type, "auth:joined");
+  assert.ok(a.reply.resumeToken);
+  const b = await joinWith("resume-room", "resume-b");
+  const seenByB = record(b.ws);
+  try {
+    const producerId = await produceRealAudio(a.ws, 33333333);
+    await nextMessage(b.ws, (m) => m.type === "ms:new-producer" && m.producerId === producerId);
+
+    // No close frame: the server sees 1006, as from a dropped connection.
+    a.ws.terminate();
+    await closed(a.ws);
+
+    const back = await joinWith("resume-room", "resume-a", a.reply.resumeToken);
+    try {
+      assert.equal(back.reply.type, "auth:resumed");
+      // The session it left: its own producer is still there...
+      assert.deepEqual(back.reply.own, [producerId]);
+      // ...and the room as it is now.
+      assert.deepEqual(back.reply.peers, [testPeer("resume-b").peerId]);
+      assert.deepEqual(back.reply.producers, []);
+      // A token resumes once: the next one is new.
+      assert.ok(back.reply.resumeToken);
+      assert.notEqual(back.reply.resumeToken, a.reply.resumeToken);
+
+      // Nobody else saw it go.
+      await settle(b.ws);
+      assert.equal(seenByB.some((m) => m.type === "ms:peer-left" || m.type === "ms:producer-closed"), false);
+
+      // And the resumed socket drives that session: closing its producer
+      // reaches the room.
+      back.ws.send(JSON.stringify({ type: "ms:close-producer", producerId }));
+      await nextMessage(b.ws, (m) => m.type === "ms:producer-closed" && m.producerId === producerId);
+    } finally {
+      back.ws.close();
+    }
+  } finally {
+    b.ws.close();
+  }
+});
+
+test("a resume takes over a socket the SFU still thinks is open", async () => {
+  const a = await joinWith("resume-half-open", "half-open-a");
+  // Half-open: the client stopped reading and the server was told nothing.
+  (a.ws as unknown as { _socket: { pause: () => void } })._socket.pause();
+  const back = await joinWith("resume-half-open", "half-open-a", a.reply.resumeToken);
+  try {
+    // No liveness probe to sit out, and not refused as a duplicate.
+    assert.equal(back.reply.type, "auth:resumed");
+    // The old socket is cut, so the session has one socket again.
+    (a.ws as unknown as { _socket: { resume: () => void } })._socket.resume();
+    await closed(a.ws);
+    await settle(back.ws);
+  } finally {
+    back.ws.close();
+  }
+});
+
+test("a second tab cannot take over a session its client resumed while being probed", async () => {
+  const a = await joinWith("resume-probe-race", "race-a");
+  // Half-open: the incumbent will not answer the probe a token-less join starts.
+  (a.ws as unknown as { _socket: { pause: () => void } })._socket.pause();
+  const tabJoin = joinWith("resume-probe-race", "race-a");
+  // The probe is out (it takes up to REJOIN_PROBE_MS); the real client
+  // comes back meanwhile with its token.
+  const back = await joinWith("resume-probe-race", "race-a", a.reply.resumeToken);
+  try {
+    assert.equal(back.reply.type, "auth:resumed");
+    const tab = await tabJoin;
+    // Terminating the probed socket answered the probe "dead", but the
+    // session lives on the resumed socket, so the tab is refused.
+    assert.equal(tab.reply.type, "ms:error");
+    assert.equal(tab.reply.reason, "peer-id-in-use");
+    tab.ws.close();
+    // And the resumed session still answers.
+    await settle(back.ws);
+  } finally {
+    (a.ws as unknown as { _socket: { resume: () => void } })._socket.resume();
+    back.ws.close();
+  }
+});
+
+test("a dropped session nobody resumes ends after the grace period", async () => {
+  const a = await joinWith("resume-expire", "expire-a");
+  const b = await joinWith("resume-expire", "expire-b");
+  try {
+    const dropped = Date.now();
+    a.ws.terminate();
+    await nextMessage(
+      b.ws,
+      (m) => m.type === "ms:peer-left" && m.peerId === testPeer("expire-a").peerId,
+      RESUME_GRACE_MS + 4000,
+    );
+    assert.ok(Date.now() - dropped >= RESUME_GRACE_MS - 50);
+    // Too late now: the token names a session that is gone, so this is a
+    // new one.
+    const late = await joinWith("resume-expire", "expire-a", a.reply.resumeToken);
+    assert.equal(late.reply.type, "auth:joined");
+    late.ws.close();
+  } finally {
+    b.ws.close();
+  }
+});
+
+test("a client that closes its socket leaves at once, with nothing to resume", async () => {
+  const a = await joinWith("resume-clean", "clean-a");
+  const b = await joinWith("resume-clean", "clean-b");
+  try {
+    const left = Date.now();
+    a.ws.close();
+    await nextMessage(b.ws, (m) => m.type === "ms:peer-left" && m.peerId === testPeer("clean-a").peerId);
+    assert.ok(Date.now() - left < RESUME_GRACE_MS);
+    const again = await joinWith("resume-clean", "clean-a", a.reply.resumeToken);
+    assert.equal(again.reply.type, "auth:joined");
+    again.ws.close();
+  } finally {
+    b.ws.close();
+  }
+});
+
+test("a wrong resume token is an ordinary join", async () => {
+  const a = await joinWith("resume-wrong", "wrong-a");
+  try {
+    // A second tab of the same identity cannot take the live session over...
+    const tab = await joinWith("resume-wrong", "wrong-a", "not-the-token");
+    assert.equal(tab.reply.type, "ms:error");
+    assert.equal(tab.reply.reason, "peer-id-in-use");
+    tab.ws.close();
+    // ...nor a dropped one: it replaces it, as a join without a token does.
+    a.ws.terminate();
+    await closed(a.ws);
+    const other = await joinWith("resume-wrong", "wrong-a", "x".repeat(a.reply.resumeToken.length));
+    assert.equal(other.reply.type, "auth:joined");
+    other.ws.close();
+  } finally {
+    a.ws.close();
+  }
+});
+
+test("holdsForResume: only a socket that went without a close frame is held", () => {
+  assert.equal(holdsForResume(1006, undefined), true);
+  assert.equal(holdsForResume(1006, "heartbeat"), true);
+  assert.equal(holdsForResume(1006, "backpressure"), true);
+  assert.equal(holdsForResume(1000, undefined), false);
+  assert.equal(holdsForResume(1001, undefined), false);
+  assert.equal(holdsForResume(1005, undefined), false);
+  assert.equal(holdsForResume(1006, "replaced"), false);
+  assert.equal(holdsForResume(1006, "resumed"), false);
+  assert.equal(holdsForResume(1006, "join-timeout"), false);
 });
 
 test("sweepHeartbeatConnection: a socket stuck backpressured past the deadline is terminated", () => {

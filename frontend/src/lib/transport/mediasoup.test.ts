@@ -1328,3 +1328,262 @@ describe("a rebuilt session does not inherit the old socket's requests (transpor
     expect((internals.pendingById as Map<string, unknown>).size).toBe(0);
   });
 });
+
+describe("a dropped signalling socket resumes the session instead of rebuilding it", () => {
+  class FakeWs {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    static made: FakeWs[] = [];
+    readyState = FakeWs.CONNECTING;
+    sent: Array<Record<string, unknown>> = [];
+    onopen: (() => void) | null = null;
+    onmessage: ((e: { data: string }) => void) | null = null;
+    onclose: ((e: { code: number; reason: string }) => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor(public url: string) {
+      FakeWs.made.push(this);
+    }
+    send(m: string) {
+      this.sent.push(JSON.parse(m));
+    }
+    close() {
+      if (this.readyState === FakeWs.CLOSED) return;
+      this.readyState = FakeWs.CLOSED;
+      this.onclose?.({ code: 1005, reason: "" });
+    }
+    open() {
+      this.readyState = FakeWs.OPEN;
+      this.onopen?.();
+    }
+    receive(msg: Record<string, unknown>) {
+      this.onmessage?.({ data: JSON.stringify(msg) });
+    }
+    drop() {
+      this.readyState = FakeWs.CLOSED;
+      this.onclose?.({ code: 1006, reason: "" });
+    }
+  }
+
+  beforeEach(() => {
+    FakeWs.made = [];
+    vi.stubGlobal("WebSocket", FakeWs);
+    vi.stubGlobal("location", { origin: "https://awful.test" });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function camera(peerId: string, producerId: string) {
+    return { source: "camera", consumer: { producerId, kind: "video", id: `c-${producerId}`, closed: false, close: vi.fn() } };
+  }
+
+  /** A joined session whose socket has just gone, with bob's camera on screen. */
+  function dropped() {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    video.setJoinSigner(() => "sig");
+    internals.currentRoomCode = "room";
+    internals.currentPeerId = "me";
+    internals.device = {};
+    internals.resumeToken = "tok-1";
+    internals.sendTransport = { ...fakeTransport(), id: "send" };
+    internals.recvTransport = { ...fakeTransport(), id: "recv" };
+    const gone = new FakeWs("old");
+    gone.readyState = FakeWs.CLOSED;
+    internals.sfuWs = gone;
+    const bob = camera("bob", "p-bob");
+    internals.consumers = new Map([["bob", [bob]]]);
+    (internals.active as Set<string>).add("bob");
+    internals.producers = new Map([["camera", [{ source: "camera", producer: { id: "p-mine", close: vi.fn() } }]]]);
+    const join = vi.fn(async () => {});
+    internals.join = join;
+    const consumed = vi.fn(async () => {});
+    internals.consumeProducerWithRetry = consumed;
+    const removed = vi.fn();
+    const left = vi.fn();
+    const healed = vi.fn();
+    video.on("trackRemoved", removed);
+    video.on("peerLeft", left);
+    video.on("healed", healed);
+    const rejoin = () =>
+      (internals.attemptRejoin as (g: number) => Promise<void>)(internals.joinGeneration as number);
+    return { video, internals, bob, join, consumed, removed, left, healed, rejoin };
+  }
+
+  /** Answers the challenge on the resume socket and returns it with its join. */
+  function challenged() {
+    const ws = FakeWs.made.at(-1)!;
+    ws.open();
+    ws.receive({ type: "auth:challenge", nonce: "n1" });
+    return { ws, join: ws.sent[0] };
+  }
+
+  it("offers the token, keeps every stream, and catches up with the room", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const { ws, join } = challenged();
+    expect(join).toMatchObject({ type: "join", peerId: "me", resume: "tok-1" });
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob", "carol"],
+      producers: [
+        { peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" },
+        { peerId: "carol", producerId: "p-carol", source: "camera", kind: "video" },
+      ],
+      // p-lost: a produce whose answer went down with the old socket.
+      own: ["p-mine", "p-lost"],
+    });
+    await done;
+
+    // Nothing torn down, no rebuild.
+    expect(s.join).not.toHaveBeenCalled();
+    expect(s.bob.consumer.close).not.toHaveBeenCalled();
+    expect(s.removed).not.toHaveBeenCalled();
+    expect(s.internals.sfuWs).toBe(ws);
+    expect(s.healed).toHaveBeenCalled();
+    // What started meanwhile is picked up, what nothing here owns is closed.
+    expect(s.consumed).toHaveBeenCalledWith("carol", "p-carol", "camera");
+    expect(ws.sent.filter((m) => m.type === "ms:close-producer")).toEqual([
+      { type: "ms:close-producer", producerId: "p-lost" },
+    ]);
+    // The next drop offers the new token.
+    expect(s.internals.resumeToken).toBe("tok-2");
+    expect(s.video.roomPeerCount()).toBe(2);
+  });
+
+  it("drops what closed and who left while the socket was down", async () => {
+    const s = dropped();
+    const dave = camera("dave", "p-dave");
+    (s.internals.consumers as Map<string, unknown[]>).set("dave", [dave]);
+    (s.internals.active as Set<string>).add("dave");
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [{ peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" }],
+      own: ["p-mine"],
+    });
+    await done;
+    expect(dave.consumer.close).toHaveBeenCalled();
+    expect(s.removed).toHaveBeenCalledWith("dave", "camera", "video");
+    expect(s.left).toHaveBeenCalledWith("dave");
+    expect(s.bob.consumer.close).not.toHaveBeenCalled();
+    expect(s.consumed).not.toHaveBeenCalled();
+  });
+
+  it("closes on the SFU a consumer it let go of while the socket was down", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [{ peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" }],
+      own: ["p-mine"],
+      // p-gone: a consumer closed here whose ms:close-consumer went nowhere.
+      consuming: ["p-bob", "p-gone"],
+    });
+    await done;
+    expect(ws.sent.filter((m) => m.type === "ms:close-consumer")).toEqual([
+      { type: "ms:close-consumer", producerId: "p-gone" },
+    ]);
+  });
+
+  it("keeps watching a share whose sharer was replaced while the socket was down", async () => {
+    const s = dropped();
+    const screen = { source: "screen", consumer: { producerId: "p-share-1", kind: "video", id: "c-share-1", closed: false, close: vi.fn() } };
+    (s.internals.consumers as Map<string, unknown[]>).set("bob", [s.bob, screen]);
+    (s.internals.watchingTransmissionPeers as Set<string>).add("bob");
+    const ended = vi.fn();
+    s.video.on("transmissionEnded", ended);
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [
+        { peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" },
+        { peerId: "bob", producerId: "p-share-2", source: "screen", kind: "video" },
+      ],
+      own: ["p-mine"],
+    });
+    await done;
+    expect(screen.consumer.close).toHaveBeenCalled();
+    expect(ended).not.toHaveBeenCalled();
+    expect(s.consumed).toHaveBeenCalledWith("bob", "p-share-2", "screen");
+  });
+
+  it("rebuilds when a transport failed while the resume was out", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const { ws } = challenged();
+    (s.internals.recvTransport as { connectionState: string }).connectionState = "failed";
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [{ peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" }],
+      own: ["p-mine"],
+    });
+    await done;
+    expect(s.join).toHaveBeenCalledWith("room", "me");
+  });
+
+  it("rebuilds as before when the SFU no longer holds the session", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({ type: "auth:joined", resumeToken: "fresh" });
+    await done;
+    // The fresh session on that socket is let go; the rebuild opens its own.
+    expect(ws.readyState).toBe(FakeWs.CLOSED);
+    expect(s.bob.consumer.close).toHaveBeenCalled();
+    expect(s.join).toHaveBeenCalledWith("room", "me");
+  });
+
+  it("keeps everything and its token while the SFU cannot be reached", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const ws = FakeWs.made.at(-1)!;
+    ws.onerror?.();
+    ws.readyState = FakeWs.CLOSED;
+    ws.onclose?.({ code: 1006, reason: "" });
+    await expect(done).rejects.toThrow();
+    expect(s.bob.consumer.close).not.toHaveBeenCalled();
+    expect(s.join).not.toHaveBeenCalled();
+    expect(s.internals.resumeToken).toBe("tok-1");
+    // A socket that never authenticated does not restart the ladder itself:
+    // that was a busy loop for as long as the network stayed down.
+    expect(s.internals.rejoinTimer).toBeNull();
+  });
+
+  it("tries the resume at once when a joined socket drops", async () => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    video.setJoinSigner(() => "sig");
+    internals.currentRoomCode = "room";
+    internals.currentPeerId = "me";
+    const connected = (internals.connectSfu as (r: string, p: string) => Promise<string>).call(video, "room", "me");
+    const ws = FakeWs.made.at(-1)!;
+    ws.open();
+    ws.receive({ type: "auth:challenge", nonce: "n1" });
+    ws.receive({ type: "auth:joined", resumeToken: "tok-1" });
+    await expect(connected).resolves.toBe("joined");
+    internals.device = {};
+    const schedule = vi.fn();
+    internals.scheduleRejoin = schedule;
+    const errors = vi.fn();
+    video.on("error", errors);
+    ws.drop();
+    expect(schedule).toHaveBeenCalledWith(internals.joinGeneration, 1, 0);
+    // No "connection lost" banner for a drop that may heal unseen.
+    expect(errors).not.toHaveBeenCalled();
+  });
+});
