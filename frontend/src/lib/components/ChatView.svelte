@@ -861,6 +861,9 @@
       !highlightBusy() &&
       !attachmentsSettling(roomCode) &&
       syncing === null &&
+      // OG cards arrive after the message body: wait for their metadata too,
+      // then picturesOnScreenLoaded waits for the image those cards mount.
+      !el.querySelector('[data-og-loading="true"]') &&
       picturesOnScreenLoaded(el) &&
       still;
     if (landed || performance.now() - settleStarted > SETTLE_FALLBACK_MS) {
