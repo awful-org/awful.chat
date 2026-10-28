@@ -797,19 +797,37 @@
    * cannot keep the conversation covered.
    */
   const SETTLE_FALLBACK_MS = 5000;
+  /**
+   * Cached conversations normally settle in one or two frames. Covering them
+   * anyway made every switch flash a skeleton over images that were already
+   * ready. Give those frames a chance to paint; only a genuinely slow open
+   * gets the cover.
+   */
+  const SETTLE_COVER_DELAY_MS = 120;
   let settling = $state(true);
+  let settlingCover = $state(false);
+  let settleCoverTimer: ReturnType<typeof setTimeout> | null = null;
   let settleFrame = 0;
   let settleStarted = 0;
   let lastHeight = -1;
 
   function beginSettling() {
     settling = true;
+    settlingCover = false;
+    if (settleCoverTimer) clearTimeout(settleCoverTimer);
+    settleCoverTimer = setTimeout(() => {
+      settleCoverTimer = null;
+      if (settling) settlingCover = true;
+    }, SETTLE_COVER_DELAY_MS);
     settleStarted = performance.now();
     lastHeight = -1;
     if (!settleFrame) settleFrame = requestAnimationFrame(checkSettled);
   }
 
   function endSettling() {
+    if (settleCoverTimer) clearTimeout(settleCoverTimer);
+    settleCoverTimer = null;
+    settlingCover = false;
     if (settleFrame) cancelAnimationFrame(settleFrame);
     settleFrame = 0;
     if (!settling) return;
@@ -853,6 +871,7 @@
 
   onDestroy(() => {
     if (settleFrame) cancelAnimationFrame(settleFrame);
+    if (settleCoverTimer) clearTimeout(settleCoverTimer);
   });
 
   // Scroll on new messages if autoScroll is enabled
@@ -3477,7 +3496,7 @@
           <PluginErrorRow {entry} />
         {/each}
       </div>
-      {#if settling}
+      {#if settlingCover}
         <div
           class="absolute inset-0 z-20 flex flex-col justify-end gap-5 overflow-hidden bg-background px-6 pb-4"
           aria-hidden="true"

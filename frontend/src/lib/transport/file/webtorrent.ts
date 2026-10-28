@@ -103,6 +103,15 @@ const WT_MAX_ATTEMPTS = 6;
  * WT_MAX_ATTEMPTS and the transfer finally say "Could not reach the sender".
  */
 const WT_CONNECT_TIMEOUT_MS = 30_000;
+/**
+ * A connected link gets a timeout too. ICE reaching "connected" says nothing
+ * about the torrent still moving: a half-open data channel, or a sender that
+ * never attaches the torrent, otherwise occupies a slot forever. Activity on
+ * either the data channel or the torrent keeps the link alive. Ninety seconds
+ * is long enough for slow seed setup, after which the pair is rebuilt by the
+ * normal reconcile pass instead of poisoning the queue.
+ */
+const WT_STALL_TIMEOUT_MS = 90_000;
 
 /**
  * The table is split by direction: links we dialled to FETCH a file, and
@@ -143,10 +152,16 @@ const WT_BUSY_RETRY_MS = 10_000;
  * everyone, and the reconcile tick dials the deferred pairs as slots free.
  */
 const MAX_WT_PEERS_PER_PEER = 8;
-/** Distinct infoHashes a single peer may have registered with us at once. */
-const MAX_INFOHASHES_PER_PEER = 64;
+/**
+ * Distinct infoHashes a single peer may have registered with us at once.
+ * This is a memory/DoS ceiling, not a room-size target: 64 dropped ordinary
+ * history before its Download button was ever rendered, leaving that file
+ * with no candidate to dial. Keep it far above realistic per-sender history
+ * while retaining a hard bound and eviction under a deliberate flood.
+ */
+const MAX_INFOHASHES_PER_PEER = 4096;
 /** Distinct infoHashes tracked in total, across every peer. */
-const MAX_INFOHASHES_TOTAL = 4096;
+const MAX_INFOHASHES_TOTAL = 16_384;
 
 function wtKey(infoHash: string, peerId: string): string {
   return `${infoHash}:${peerId}`;
@@ -287,6 +302,10 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   /** Consecutive dials that never connected, per pair. See WT_MAX_ATTEMPTS. */
   private wtAttempts = new Map<string, number>();
   private wtReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  /** Last data/torrent activity on each live link, for WT_STALL_TIMEOUT_MS. */
+  private wtLastActivity = new Map<string, number>();
+  /** Coalesce close/error/done events into one immediate queue drain. */
+  private wtReconcileQueued = false;
   /**
    * When each download was asked for, as a sequence number. Free slots go
    * to the NEWEST first: the image just sent in the chat before the backlog
@@ -536,9 +555,31 @@ export class WebTorrentFileTransport implements FileTransferTransport {
    * are dialled, and each backs off on its own so an unreachable peer is not
    * retried every few seconds for the whole transfer.
    */
+  /** Drain deferred pairs as soon as a slot closes, not up to five seconds
+   * later. The interval remains as a fallback for backoff and stale links. */
+  private scheduleWtReconcile(): void {
+    if (this.wtReconcileQueued || this.lifecycle.signal.aborted) return;
+    this.wtReconcileQueued = true;
+    queueMicrotask(() => {
+      this.wtReconcileQueued = false;
+      if (!this.lifecycle.signal.aborted) this.reconcileWtPeers();
+    });
+  }
+
   private reconcileWtPeers(): void {
     if (typeof document !== "undefined" && document.hidden) return;
     const now = Date.now();
+    // A peer that connected and then went silent is just as unable to make
+    // progress as one that never connected. Drop it and let the same backoff
+    // and holder-selection logic choose a fresh link below.
+    for (const [key, peer] of [...this.wtPeers]) {
+      if (!peer.connected || now - (this.wtLastActivity.get(key) ?? 0) <= WT_STALL_TIMEOUT_MS) continue;
+      const session = this.wtLinkMeta.get(peer)?.session;
+      this.retireSession(key, session);
+      this.wtPeers.delete(key);
+      this.wtLastActivity.delete(key);
+      peer.destroy();
+    }
     // Only what we are still trying to fetch. "pending" is a file nobody
     // asked for yet; dialling those built links that attachToTorrent then
     // dropped for having no torrent, over and over, for every file in the
@@ -1039,6 +1080,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   resetTransfers(): void {
     this.lifecycle.abort();
     this.lifecycle = new AbortController();
+    this.wtReconcileQueued = false;
     this.plaintext.clear();
     this.publishing.clear();
     this.storedSeeds.clear();
@@ -1060,6 +1102,12 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.wtPeers.clear();
     this.wtRetired.clear();
     this.wtRequested.clear();
+    this.wtLastActivity.clear();
+    this.wtNextTry.clear();
+    this.wtBackoff.clear();
+    this.wtAttempts.clear();
+    this.addingTorrents.clear();
+    this.connectedPeers.clear();
 
     const blobUrls = new Set(
       [...this.transfers.values()]
@@ -1257,6 +1305,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.wtPeers.set(key, peer);
     const session = initiator ? newSession() : answering;
     this.wtLinkMeta.set(peer, { session, initiator });
+    this.wtLastActivity.set(key, Date.now());
 
     peer.on("signal", (signal: unknown) => {
       this.emit("signal", peerId, {
@@ -1283,10 +1332,17 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       peer.destroy();
     }, WT_CONNECT_TIMEOUT_MS);
 
+    peer.on("data", () => this.wtLastActivity.set(key, Date.now()));
     peer.on("connect", () => {
       clearTimeout(connectDeadline);
+      this.wtLastActivity.set(key, Date.now());
       this.forgetRetryState(key);
-      void this.attachToTorrent(infoHash, peer);
+      void this.attachToTorrent(infoHash, peer).catch(() => {
+        // A failed dynamic import/store/seed must not leave a connected but
+        // useless wire holding its slot forever. close() schedules the retry.
+        if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
+        peer.destroy();
+      });
     });
 
     // Whichever way a link ends, its session is over: a late answer or
@@ -1295,12 +1351,16 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       clearTimeout(connectDeadline);
       this.retireSession(key, session);
       if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
+      this.wtLastActivity.delete(key);
+      this.scheduleWtReconcile();
     });
 
     peer.on("close", () => {
       clearTimeout(connectDeadline);
       this.retireSession(key, session);
       if (this.wtPeers.get(key) === peer) this.wtPeers.delete(key);
+      this.wtLastActivity.delete(key);
+      this.scheduleWtReconcile();
     });
     return true;
   }
@@ -1419,6 +1479,10 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     let progressTimer: ReturnType<typeof setTimeout> | null = null;
     let progressDue = false;
     const pushProgress = () => {
+      const activeAt = Date.now();
+      for (const key of this.wtPeers.keys()) {
+        if (key.startsWith(`${infoHash}:`)) this.wtLastActivity.set(key, activeAt);
+      }
       if (progressTimer) {
         progressDue = true;
         return;

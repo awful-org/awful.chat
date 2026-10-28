@@ -16,10 +16,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Jobs default to read-only. Only the publish job below can write records or
+# mint provenance, so dependency installation in the reproducibility job gets
+# no repository credentials at all.
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: publish-build
@@ -68,6 +69,10 @@ jobs:
   publish:
     needs: reproducible
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -100,7 +105,10 @@ jobs:
           # above 1 is a usage or fetch failure and still fails the job.
           # --no-published skips the lookup that would only ever miss.
           set +e
-          npx --yes github:awful-org/awful-verify http://localhost:8123 \
+          # Pin the verifier as strictly as every action in this workflow.
+          # A moving branch here would execute with the write/OIDC permissions
+          # above and could replace the very records it is meant to verify.
+          npx --yes github:awful-org/awful-verify#1a580da41af1c8ef56e5061c4c288182750629ee http://localhost:8123 \
             --no-rebuild --no-published --json > /tmp/fingerprint.json
           code=$?
           set -e

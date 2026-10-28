@@ -272,9 +272,33 @@ async function wipeFileSystem(): Promise<void> {
   } catch {
     /* fall back to the known names */
   }
-  await Promise.allSettled(
-    [...names].map((name) => root.removeEntry(name, { recursive: true }))
+  await Promise.all(
+    [...names].map(async (name) => {
+      try {
+        await root.removeEntry(name, { recursive: true });
+      } catch (err) {
+        // Other tabs are wiping the same origin at once; already gone is
+        // success, but every other failure must stop the fresh-install flow.
+        if (!(err instanceof DOMException && err.name === "NotFoundError")) throw err;
+      }
+    })
   );
+  const remaining: string[] = [];
+  for await (const name of root.keys()) remaining.push(name);
+  if (remaining.length) throw new Error("Could not erase device files");
+}
+
+// A second tab can hold every IndexedDB deletion open. Ask every live app tab
+// to run the same wipe (without rebroadcasting) so each closes its own handle
+// before anybody enters the fresh-install flow. Older builds without this
+// listener simply leave deletion pending - safe, but never a false success.
+const DURESS_CHANNEL = "awful:duress-wipe:v1";
+let wipeStarted = false;
+if (typeof window !== "undefined" && typeof BroadcastChannel !== "undefined") {
+  const channel = new BroadcastChannel(DURESS_CHANNEL);
+  channel.addEventListener("message", (event) => {
+    if (event.data === "wipe") void executeDuressWipe({ notify: false });
+  });
 }
 
 /**
@@ -284,7 +308,19 @@ async function wipeFileSystem(): Promise<void> {
  * flow. Strictly local and silent: no network writes, no room leaves -
  * outbound traffic at wipe time is itself a tell. Never returns.
  */
-export async function executeDuressWipe(): Promise<never> {
+export async function executeDuressWipe(options: { notify?: boolean } = {}): Promise<never> {
+  if (wipeStarted) return new Promise<never>(() => {});
+  wipeStarted = true;
+  if (options.notify !== false) {
+    try {
+      const channel = new BroadcastChannel(DURESS_CHANNEL);
+      channel.postMessage("wipe");
+      channel.close();
+    } catch {
+      // Without BroadcastChannel the local wipe still runs; another tab can
+      // hold deletion open, in which case this function deliberately waits.
+    }
+  }
   // Web storage first: even if a database delete ends up blocked, no trace
   // that a duress password existed (or was typed) survives this line.
   try {
@@ -331,12 +367,12 @@ export async function executeDuressWipe(): Promise<never> {
   }
   for (const name of names) {
     jobs.push(
-      new Promise((resolve) => {
+      new Promise<void>((resolve, reject) => {
         const req = indexedDB.deleteDatabase(name);
-        req.onsuccess = req.onerror = () => resolve(null);
-        // onblocked (another tab holds a connection) is NOT success: keep
-        // waiting - the delete completes the moment the holder closes, and
-        // the timeout below stops a wedged wipe from hanging forever.
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error ?? new Error(`Could not erase database ${name}`));
+        // onblocked is NOT success: the channel above asks the other tabs to
+        // close their handles, and the delete completes once they have.
       })
     );
   }
@@ -355,12 +391,17 @@ export async function executeDuressWipe(): Promise<never> {
   // here.
   jobs.push(wipeFileSystem());
 
-  // Bounded wait: finish properly when unblocked, but never strand the
-  // user on a frozen screen if another tab pins a database open.
-  await Promise.race([
-    Promise.allSettled(jobs),
-    new Promise((r) => setTimeout(r, 5000)),
-  ]);
+  // Never turn a timeout or a rejected deletion into apparent success. A
+  // blocked tab leaves this screen up rather than exposing data behind a
+  // fresh-install facade; storage errors reject before navigation as well.
+  await Promise.all(jobs);
+  let remainingCaches: string[] = [];
+  try { remainingCaches = await caches.keys(); } catch { /* no Cache Storage access */ }
+  if (remainingCaches.length) throw new Error("Could not erase cached application data");
+  if (typeof indexedDB.databases === "function") {
+    const remaining = (await indexedDB.databases()).filter((d) => d.name && names.has(d.name));
+    if (remaining.length) throw new Error("Could not erase local databases");
+  }
   // Replace, not assign: the wiping page must not sit in history.
   location.replace("/");
   return new Promise<never>(() => {});
