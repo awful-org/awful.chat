@@ -36,7 +36,7 @@
   } from "$lib/emoji-autocomplete";
   import MsgRender from "./MsgRender.svelte";
   import { MessageType, type Message } from "$lib/types/message";
-  import { latestDmReceiptId } from "$lib/dm-receipt";
+  import { dmReceiptIds } from "$lib/dm-receipt";
 
   interface Props {
     /** Focus this conversation in the DMs tab and close the panel. */
@@ -113,8 +113,8 @@
   const visible = $derived(
     dmPanel.messages.filter((m) => m.type !== MessageType.Reaction)
   );
-  const latestReceiptId = $derived(
-    latestDmReceiptId(visible, (senderId) => senderId === selfId())
+  const receiptIds = $derived(
+    dmReceiptIds(visible, (senderId) => senderId === selfId())
   );
 
   /**
@@ -358,7 +358,7 @@
               isOwn={own}
               fileTransfers={transportState.fileTransfers}
               onRequestFileDownload={requestFileDownload}
-              showReceipt={latestReceiptId === msg.id}
+              showReceipt={receiptIds.includes(msg.id)}
             />
           {/each}
         {/if}

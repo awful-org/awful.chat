@@ -109,7 +109,7 @@
   } from "$lib/transport/transport.svelte";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
   import { compareMessages } from "$lib/transport/message-order";
-  import { latestDmReceiptId } from "$lib/dm-receipt";
+  import { dmReceiptIds } from "$lib/dm-receipt";
   import { stripMarkdown } from "$lib/markdown";
   import {
     pinnedMessagesOf,
@@ -2255,8 +2255,8 @@
   const isDmChat = $derived(
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
-  const latestReceiptId = $derived(
-    isDmChat ? latestDmReceiptId(renderedMessages, isSelfSender) : null
+  const receiptIds = $derived(
+    isDmChat ? dmReceiptIds(renderedMessages, isSelfSender) : []
   );
 
   /** What the leave control says. /qc overrides it: a quick call is not a
@@ -3290,7 +3290,7 @@
                     {isOwn}
                     {fileTransfers}
                     onRequestFileDownload={requestFileDownload}
-                    showReceipt={latestReceiptId === msg.id}
+                    showReceipt={receiptIds.includes(msg.id)}
                   />
 
                   {#if reactions?.size}

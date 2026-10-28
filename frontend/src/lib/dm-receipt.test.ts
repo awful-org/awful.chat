@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { latestDmReceiptId } from "./dm-receipt";
+import { dmReceiptIds } from "./dm-receipt";
 import type { Message } from "./types/message";
 
 function msg(id: string, senderId: string, status?: Message["status"]): Message {
@@ -7,28 +7,42 @@ function msg(id: string, senderId: string, status?: Message["status"]): Message 
 }
 const own = (id: string) => id === "me";
 
-describe("latest DM receipt", () => {
-  it("keeps only the newest own status, which summarizes earlier messages", () => {
-    expect(latestDmReceiptId([
+describe("DM receipts", () => {
+  it("keeps only the newest status in a uniform or normally progressing chain", () => {
+    expect(dmReceiptIds([
       msg("older-read", "me", "read"),
       msg("theirs", "them", "read"),
-      msg("newer-sent", "me", "sent"),
-    ], own)).toBe("newer-sent");
+      msg("newer-read", "me", "read"),
+    ], own)).toEqual(["newer-read"]);
+    expect(dmReceiptIds([
+      msg("sent", "me", "sent"),
+      msg("delivered", "me", "delivered"),
+      msg("read", "me", "read"),
+    ], own)).toEqual(["read"]);
   });
 
   it("shows a pending newest state instead of an older delivered tick", () => {
-    expect(latestDmReceiptId([
+    expect(dmReceiptIds([
       msg("delivered", "me", "delivered"),
       msg("sending", "me", "sending"),
-    ], own)).toBe("sending");
+    ], own)).toEqual(["sending"]);
+  });
+
+  it("keeps the oldest earlier status that is behind a later one", () => {
+    expect(dmReceiptIds([
+      msg("older-read", "me", "read"),
+      msg("third-last-delivered", "me", "delivered"),
+      msg("penultimate-read", "me", "read"),
+      msg("latest-read", "me", "read"),
+    ], own)).toEqual(["third-last-delivered", "latest-read"]);
   });
 
   it("skips own messages with no status and other people's statuses", () => {
-    expect(latestDmReceiptId([
+    expect(dmReceiptIds([
       msg("mine", "me", "read"),
       msg("theirs", "them", "read"),
       msg("draft", "me"),
-    ], own)).toBe("mine");
-    expect(latestDmReceiptId([msg("theirs", "them", "read")], own)).toBeNull();
+    ], own)).toEqual(["mine"]);
+    expect(dmReceiptIds([msg("theirs", "them", "read")], own)).toEqual([]);
   });
 });
