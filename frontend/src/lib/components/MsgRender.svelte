@@ -229,6 +229,10 @@
 
   const isMobile = $derived(narrowScreen?.current ?? false);
   let ogPreview = $state<OgPreview | null>(null);
+  /** A real preview request in flight. ChatView keeps its settling cover up
+   * until this and the resulting image have finished, rather than showing a
+   * bare link and then growing a card underneath it. */
+  let ogLoading = $state(false);
   let gifSaved = $state(false);
   /**
    * The open lightbox. An object rather than a bare URL because the download
@@ -773,9 +777,11 @@
 
   $effect(() => {
     ogPreview = null;
+    ogLoading = false;
     if (!mediaPrefs.externalMedia || !shouldShowOg || !linkedUrl) return;
     const previewUrl = remotePreviewUrl(linkedUrl);
     if (!previewUrl) return;
+    ogLoading = true;
     const ctrl = new AbortController();
     fetch(
       // No hardcoded origin: an unset apiUrl means this instance never said
@@ -788,8 +794,9 @@
       .then((r) => r.json())
       .then((json: OgPreview) => {
         if (!ctrl.signal.aborted && mediaPrefs.externalMedia) ogPreview = json;
+        ogLoading = false;
       })
-      .catch(() => {});
+      .catch(() => { ogLoading = false; });
     return () => ctrl.abort();
   });
 
@@ -970,6 +977,7 @@
 -->
 <div
   class="ml-9 text-(length:--chat-font-size) leading-normal text-foreground wrap-break-word"
+  data-og-loading={ogLoading ? "true" : undefined}
 >
   {#if isFileMessage}
     {#if content}
@@ -1392,6 +1400,8 @@
               src={ogPreview.image}
               alt={ogPreview.title ?? ""}
               referrerpolicy="no-referrer"
+              width={ogPreview.imageWidth}
+              height={ogPreview.imageHeight}
               class="w-full max-h-80 object-contain object-center"
             />
           </a>
