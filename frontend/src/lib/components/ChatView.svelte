@@ -285,7 +285,6 @@
   let commandPopupOpen = $state(false);
   let commandSelectedIndex = $state(0);
   let commandHint = $state<string | null>(null);
-  let submitting = $state(false);
   let sendError = $state<string | null>(null);
   let commandHintTimer: ReturnType<typeof setTimeout> | undefined;
   let mentionPopupOpen = $state(false);
@@ -1108,13 +1107,15 @@
   }
 
   async function submit() {
-    if (submitting) return;
+    // Sends may overlap. Offline DMs wait on transport and storage, and
+    // dropping every Enter until that finishes loses the user's next
+    // messages entirely. Drafts/replies are captured per invocation, and
+    // sending previews already carry their own generation tokens.
     const text = draft.trim();
     if (!text && stagedFiles.length === 0) return;
     const submittedDraft = draft;
     const submittedRoom = roomCode;
     const submittedFiles = [...stagedFiles];
-    submitting = true;
     sendError = null;
     try {
 
@@ -1241,8 +1242,6 @@
     });
     } catch (err) {
       sendError = err instanceof Error ? err.message : "Could not send. Your draft and files have been kept.";
-    } finally {
-      submitting = false;
     }
   }
 
