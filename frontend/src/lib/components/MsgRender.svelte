@@ -138,6 +138,8 @@
     isOwn: boolean;
     fileTransfers: Map<string, FileTransferSnapshot>;
     onRequestFileDownload: (file: FileEntry, senderId?: string | null) => void;
+    /** Only the newest own DM shows a receipt; older ones are covered by it. */
+    showReceipt?: boolean;
   }
 
   type OgPreview = {
@@ -155,7 +157,7 @@
     mediaType: "video" | "image" | "none";
   };
 
-  let { msg, isOwn, fileTransfers, onRequestFileDownload }: Props = $props();
+  let { msg, isOwn, fileTransfers, onRequestFileDownload, showReceipt = true }: Props = $props();
 
   /** DM conversations are keyed "dm-<...>"; see announce.ts. */
   const isDmMessage = $derived(msg.roomCode.startsWith("dm-"));
@@ -1471,7 +1473,7 @@
        nobody yet" read as one, so a room message shows no status at all.
        One tick: the relay holds it. Two: their device has it. Green: they
        opened it. -->
-  {#if isOwn && isDmMessage && msg.status}
+  {#if showReceipt && isOwn && isDmMessage && msg.status}
     <LazyTip text={statusTip}>
       {#snippet children(props)}
         <span
