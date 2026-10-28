@@ -335,12 +335,17 @@ services:
     # diff to review. 4.17.2 is the newest 4.x alpine tag as of this pin.
     image: coturn/coturn:4.17.2-alpine
     restart: unless-stopped
-    # Only no-new-privileges here, not cap_drop: this is network_mode: host
-    # binding low, non-standard ports (3478, 5349, and the relay range), and
-    # the official image runs the coturn process as root by default - it
-    # never goes through a setuid/setcap drop to a non-root user, so there is
-    # no CAP_NET_BIND_SERVICE grant to preserve or capability list to trim.
-    # Left alone rather than guessed at.
+    # The 4.17.2-alpine image sets User=nobody:nogroup. Keep that
+    # unprivileged account. The image puts CAP_NET_BIND_SERVICE=+ep on
+    # /usr/bin/turnserver, so that one capability must remain in the bounding
+    # set or exec itself fails with Operation not permitted. Everything else
+    # is dropped. Do not override User to root when adding TLS certificates;
+    # make their files readable by UID/GID 65534 instead.
+    user: "65534:65534"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
     # Nothing rotates docker's json-file driver by default, so any log path a

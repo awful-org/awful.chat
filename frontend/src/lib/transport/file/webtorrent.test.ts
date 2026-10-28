@@ -226,6 +226,39 @@ describe("WebTorrentFileTransport", () => {
     }
   });
 
+  it("rebuilds a connected link that goes quiet and frees its slot", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = new WebTorrentFileTransport(() => "me");
+      const reconcile = () =>
+        (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+      t.onPeerConnect("alice");
+      t.registerSeeder(file, "alice");
+      t.ensureDownload(file);
+      const peers = (t as never as { wtPeers: Map<string, EventEmitter & { destroyed: boolean; connected: boolean }> }).wtPeers;
+      const first = peers.get(`${HASH}:alice`)!;
+      first.emit("connect"); // clears the pre-connect deadline
+      first.connected = true;
+
+      vi.advanceTimersByTime(89_000);
+      reconcile();
+      expect(peers.get(`${HASH}:alice`)).toBe(first);
+      first.emit("data", new Uint8Array([1]));
+      vi.advanceTimersByTime(89_000);
+      reconcile();
+      expect(peers.get(`${HASH}:alice`)).toBe(first);
+
+      vi.advanceTimersByTime(2_000);
+      reconcile();
+      expect(first.destroyed).toBe(true);
+      expect(peers.get(`${HASH}:alice`)).not.toBe(first);
+      expect(livePeers.length).toBe(2);
+      t.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a seeded file stays seeding whatever the torrent's done flag says", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     await t.seedFiles([new File([new Uint8Array(10)], "cat.png", { type: "image/png" })]);
@@ -627,23 +660,40 @@ describe("WebTorrentFileTransport", () => {
     expect([...peers.values()][0]).toBe(live);
   });
 
+  it("keeps ordinary history available even after more than 64 announcements", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    t.onPeerConnect("alice");
+    const history = Array.from({ length: 100 }, (_, i) => ({
+      ...file, infoHash: (i + 1).toString(16).padStart(40, "0"),
+    }));
+    for (const desc of history) t.registerSeeder(desc, "alice");
+    // The oldest file is requested only when its row renders. It must still
+    // have a dial candidate; eviction before this point used to strand it.
+    t.ensureDownload(history[0]);
+    await tick();
+    expect(livePeers.length).toBe(1);
+    expect(t.getTransfer(history[0].infoHash)?.status).toBe("downloading");
+    t.destroy();
+  });
+
   it("caps the distinct infoHashes a single peer may register", async () => {
     const t = new WebTorrentFileTransport(() => "me");
     // None of these ever start a transfer, so every registration is inert
     // and eligible for eviction - the peer should never exceed the cap.
-    for (let i = 0; i < 70; i++) {
+    for (let i = 0; i < 4100; i++) {
       const infoHash = i.toString(16).padStart(40, "0");
       t.registerSeeder({ ...file, infoHash }, "alice");
     }
     const peerSeeded = (
       t as never as { peerSeeded: Map<string, Set<string>> }
     ).peerSeeded;
-    expect(peerSeeded.get("alice")?.size).toBe(64);
+    expect(peerSeeded.get("alice")?.size).toBe(4096);
     // The oldest registrations were evicted, the newest kept.
-    const last = (69).toString(16).padStart(40, "0");
+    const last = (4099).toString(16).padStart(40, "0");
     const first = (0).toString(16).padStart(40, "0");
     expect(peerSeeded.get("alice")?.has(last)).toBe(true);
     expect(peerSeeded.get("alice")?.has(first)).toBe(false);
+    t.destroy();
   });
 
   it("does not evict an infoHash with an active transfer under the per-peer cap", async () => {
@@ -655,7 +705,7 @@ describe("WebTorrentFileTransport", () => {
     await tick();
     expect(t.getTransfer(activeHash)?.status).toBe("downloading");
 
-    for (let i = 0; i < 70; i++) {
+    for (let i = 0; i < 4100; i++) {
       const infoHash = i.toString(16).padStart(40, "1");
       t.registerSeeder({ ...file, infoHash }, "alice");
     }
@@ -870,7 +920,7 @@ describe("WebTorrentFileTransport", () => {
       t.destroy();
     });
 
-    it("gives a free slot to the newest download first", () => {
+    it("gives a free slot to the newest download first", async () => {
       const t = new WebTorrentFileTransport(() => "me");
       t.onPeerConnect("alice");
       // Eight downloads from alice: her share of our table.
@@ -890,7 +940,8 @@ describe("WebTorrentFileTransport", () => {
       expect(links.has(`${newest.infoHash}:alice`)).toBe(false);
 
       links.get(`${hashOf(0)}:alice`)!.destroy();
-      (t as never as { reconcileWtPeers: () => void }).reconcileWtPeers();
+      // No timer or manual reconcile: a close drains the next queued pair.
+      await tick();
       expect(links.has(`${newest.infoHash}:alice`)).toBe(true);
       expect(links.has(`${older.infoHash}:alice`)).toBe(false);
       t.destroy();
