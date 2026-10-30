@@ -445,7 +445,8 @@ export async function offerFiles(picked: File[]): Promise<void> {
         continue;
       }
       if (files !== owner || quickSend.status !== "ready") {
-        for (const desc of descriptors) void removeCiphertext(desc.infoHash).catch(() => {});
+        // Closed meanwhile on this same transport: its torrent would seed on.
+        for (const desc of descriptors) void discardLocalCopy(owner, desc.infoHash, "Could not remove the cached file.");
         return;
       }
       descriptors.forEach(desc => { localFiles.add(desc.infoHash); ciphertext.add(desc.infoHash); });

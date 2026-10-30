@@ -8,10 +8,19 @@
   import { onDestroy, onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import QRCode from "qrcode";
-  import { Check, Copy, Download, Loader2, QrCode, Upload, UserPlus, Users, X } from "@lucide/svelte";
+  import { Check, Copy, Download, Hash, Loader2, QrCode, Upload, UserPlus, Users, X } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { formatSize } from "$lib/utils";
   import type { FileDescriptor } from "$lib/transport/types";
+  import type { RoomSecret } from "$lib/room-security/keys";
+  import { parsePairingCode } from "$lib/room-security/pairing-code";
+  import { joinInvitationPairing } from "$lib/invite-pairing";
+  import {
+    cancelShortCode,
+    hostShortCode,
+    liveShortCode,
+    shortCodeOutcome,
+  } from "$lib/short-codes.svelte";
   import {
     acceptFile,
     declineFile,
@@ -30,6 +39,13 @@
   let qr = $state("");
   let showHow = $state(false);
   let input = $state<HTMLInputElement | null>(null);
+  let showShort = $state(false);
+  let makingShort = $state(false);
+  let shortError = $state("");
+  let typedCode = $state("");
+  let joining = $state<AbortController | null>(null);
+  let joinError = $state("");
+  let now = $state(Date.now());
   /** Offers this page asked for, so Accept turns into progress at once. */
   const asked = new SvelteSet<string>();
 
@@ -41,12 +57,46 @@
     [...quickSend.transfers.values()].some((t) => t.status === "downloading")
   );
   const pending = $derived(quickSend.incoming.filter(isPending));
+  const secret = $derived(quickSend.code as RoomSecret);
+  const short = $derived(quickSend.code ? liveShortCode(secret) : null);
+  const shortEnded = $derived(quickSend.code ? shortCodeOutcome(secret) : null);
+  const shortLeft = $derived.by(() => {
+    const s = Math.max(0, Math.ceil(((short?.expiresAt ?? 0) - now) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  });
+  /** A page nobody has used yet: where someone arriving with a code starts. */
+  const fresh = $derived(
+    alone && !quickSend.offered.length && !quickSend.incoming.length && !quickSend.preparing.length
+  );
+
+  // A short code answers for this room only while the room is open here.
+  $effect(() => {
+    const code = quickSend.code as RoomSecret;
+    if (!code) return;
+    return () => {
+      cancelShortCode(code);
+      showShort = false;
+      shortError = "";
+    };
+  });
+
+  // A one-time link that has delivered reaches nothing; neither may its code.
+  $effect(() => {
+    if (quickSend.status === "closed" && quickSend.code) cancelShortCode(quickSend.code as RoomSecret);
+  });
+
+  $effect(() => {
+    if (!short) return;
+    now = Date.now();
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
 
   /** Download speed per file, smoothed, from how fast its progress moves. */
   const samples = new Map<string, { at: number; bytes: number; rate: number }>();
   let speeds = $state<Record<string, number>>({});
   $effect(() => {
-    const now = performance.now();
+    const at = performance.now();
     const next: Record<string, number> = {};
     // A declined or removed file leaves the map without passing through a
     // status that would have cleared its sample.
@@ -55,12 +105,12 @@
       if (t.status !== "downloading") { samples.delete(hash); continue; }
       const bytes = (t.progress ?? 0) * t.size;
       const prev = samples.get(hash);
-      if (!prev) { samples.set(hash, { at: now, bytes, rate: 0 }); continue; }
-      const seconds = (now - prev.at) / 1000;
+      if (!prev) { samples.set(hash, { at, bytes, rate: 0 }); continue; }
+      const seconds = (at - prev.at) / 1000;
       if (seconds >= 0.5) {
         const rate = Math.max(0, (bytes - prev.bytes) / seconds);
         prev.rate = prev.rate ? prev.rate * 0.7 + rate * 0.3 : rate;
-        prev.at = now;
+        prev.at = at;
         prev.bytes = bytes;
       }
       if (prev.rate) next[hash] = prev.rate;
@@ -90,17 +140,93 @@
     };
   });
 
-  onDestroy(stopQuickSend);
+  onDestroy(() => {
+    joining?.abort();
+    stopQuickSend();
+  });
+
+  /** Bumped by every start, so a superseded one does not carry on. */
+  let starts = 0;
 
   async function start() {
+    const run = ++starts;
     const fromLink = window.location.hash.slice(1);
     asked.clear();
+    // Whatever this page arrives at now wins over a code still being traded.
+    joining?.abort();
+    joining = null;
+    joinError = "";
+    // `/qs#k5t-8r5`: a short code, which has to be traded for the room first.
+    if (fromLink && parsePairingCode(fromLink)) {
+      history.replaceState(history.state, "", "/qs");
+      stopQuickSend();
+      typedCode = fromLink;
+      if ((await redeem(fromLink)) || run !== starts) return;
+      await startQuickSend();
+      if (quickSend.code) history.replaceState(history.state, "", `/qs#${quickSend.code}`);
+      return;
+    }
     await startQuickSend(fromLink || undefined);
     // The code IS the secret, so it lives in the fragment and never in the
     // path - same reasoning as room invites, see App.svelte. Writing it back
     // makes the address bar the link to share, and survives a reload.
     if (!fromLink && quickSend.code) {
       history.replaceState(history.state, "", `/qs#${quickSend.code}`);
+    }
+  }
+
+  async function showShortCode() {
+    showShort = !showShort;
+    if (!showShort || short) return;
+    await newShortCode();
+  }
+
+  async function newShortCode() {
+    if (makingShort || !quickSend.code) return;
+    const wanted = secret;
+    makingShort = true;
+    shortError = "";
+    try {
+      await hostShortCode(wanted);
+      // The room changed while the code was being made: the cleanup that
+      // cancels this room's codes ran before this one existed.
+      if (quickSend.code !== wanted || quickSend.status !== "ready") cancelShortCode(wanted);
+    } catch {
+      if (quickSend.code === wanted) shortError = "Couldn't get a short code right now. Try again, or use the link.";
+    } finally {
+      makingShort = false;
+    }
+  }
+
+  /**
+   * Trade a short code for the room it stands for, then join that room. The
+   * room secret lands in the fragment, the same as following the full link.
+   */
+  async function redeem(code: string): Promise<boolean> {
+    if (!parsePairingCode(code)) {
+      joinError = "Codes look like k5t-8r5.";
+      return false;
+    }
+    joining?.abort();
+    const controller = new AbortController();
+    joining = controller;
+    joinError = "";
+    try {
+      const room = await joinInvitationPairing(code, controller.signal);
+      if (joining !== controller) return false;
+      typedCode = "";
+      // Replace, not push: Back must not rejoin the room this page left.
+      history.replaceState(history.state, "", `/qs#${room}`);
+      void start();
+      return true;
+    } catch (err) {
+      if (joining !== controller) return false;
+      joinError = err instanceof Error && !controller.signal.aborted
+        ? err.message
+        : "That code didn't work. Ask for a new one.";
+      return false;
+    } finally {
+      if (joining === controller) joining = null;
     }
   }
 
@@ -181,7 +307,9 @@
     const others = Math.max(0, (t?.seeders ?? 0) - 1);
     if (alone) return "Offered · waiting for someone to join";
     if (others >= quickSend.peers) return "Everyone here has it";
-    const parts = [others ? `${others} of ${quickSend.peers} have it` : "Offered · nobody has it yet"];
+    // Only people who share it on announce it, so no announcement is not proof
+    // that nobody has it (Save-Data receivers never announce).
+    const parts = [others ? `${others} of ${quickSend.peers} have it` : "Offered"];
     if (t?.peers) parts.push(`${t.peers} connected`);
     return parts.join(" · ");
   }
@@ -248,14 +376,14 @@
       </div>
 
       {#if quickSend.status === "ready"}
-        <div class="flex gap-2">
+        <div class="flex flex-wrap gap-2">
           <span
-            class="flex-1 min-w-0 rounded-lg border border-border bg-background px-3 py-2.5 text-muted-foreground truncate select-all"
+            class="w-full sm:w-auto sm:flex-1 min-w-0 rounded-lg border border-border bg-background px-3 py-2.5 text-muted-foreground truncate select-all"
             title={link}>{shownLink}</span
           >
           <Button
             variant={alone ? "default" : "outline"}
-            class="h-11 shrink-0 font-mono text-xs"
+            class="h-11 flex-1 sm:flex-none font-mono text-xs"
             onclick={copyLink}
           >
             {#if copied}
@@ -263,6 +391,15 @@
             {:else}
               <Copy class="size-3.5" /> Copy link
             {/if}
+          </Button>
+          <Button
+            variant="outline"
+            class="h-11 shrink-0 font-mono text-xs"
+            aria-expanded={showShort}
+            aria-controls="qs-short"
+            onclick={() => void showShortCode()}
+          >
+            <Hash class="size-3.5" /> Short code
           </Button>
           <Button
             variant="outline"
@@ -275,6 +412,32 @@
             <QrCode class="size-4" />
           </Button>
         </div>
+        {#if showShort}
+          <div
+            id="qs-short"
+            class="rounded-lg border border-border bg-background px-4 py-4 flex flex-col items-center gap-2 text-center"
+            aria-live="polite"
+          >
+            {#if short}
+              <p class="text-3xl font-bold tracking-[0.2em] select-all">{short.code}</p>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                On the other device, open <span class="text-foreground">{window.location.host}/qs</span>
+                and type it · {shortLeft} left{short.uses === 1 ? " · one use" : ""}
+              </p>
+            {:else if makingShort}
+              <p class="text-xs text-muted-foreground flex items-center gap-2">
+                <Loader2 class="size-3.5 animate-spin" /> Getting a code…
+              </p>
+            {:else}
+              <p class="text-xs {shortError ? 'text-destructive' : 'text-muted-foreground'}">
+                {shortError || shortEnded || "This code is over."}
+              </p>
+              <Button variant="outline" size="sm" class="font-mono text-xs" onclick={() => void newShortCode()}>
+                New code
+              </Button>
+            {/if}
+          </div>
+        {/if}
         {#if showQr}
           <div class="flex flex-col items-center gap-2 py-2">
             {#if qr}
@@ -289,12 +452,55 @@
             <p class="text-xs text-muted-foreground">Scan to join from a phone</p>
           </div>
         {/if}
+        {#if fresh && !showShort}
+          <form
+            class="flex flex-wrap items-center gap-x-3 gap-y-2"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void redeem(typedCode);
+            }}
+          >
+            <label for="qs-code" class="text-xs text-muted-foreground">
+              Have a code from another device?
+            </label>
+            <div class="flex flex-1 min-w-56 gap-2">
+              <input
+                id="qs-code"
+                bind:value={typedCode}
+                placeholder="k5t-8r5"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                enterkeyhint="go"
+                maxlength="12"
+                disabled={!!joining}
+                class="flex-1 min-w-0 h-11 rounded-lg border border-input bg-background px-3 tracking-widest placeholder:text-muted-foreground/60 disabled:opacity-60"
+              />
+              <Button
+                type="submit"
+                variant="secondary"
+                class="h-11 font-mono"
+                disabled={!!joining || !typedCode.trim()}
+              >
+                {#if joining}
+                  <Loader2 class="size-3.5 animate-spin" /> Joining
+                {:else}
+                  Join
+                {/if}
+              </Button>
+            </div>
+          </form>
+        {/if}
+      {/if}
+      {#if joinError}
+        <p class="text-xs text-destructive" role="alert">{joinError}</p>
       {/if}
     </header>
 
     {#if quickSend.status === "connecting" || quickSend.status === "idle"}
       <p class="px-6 py-8 text-xs text-muted-foreground flex items-center gap-2">
-        <Loader2 class="size-3.5 animate-spin" /> Connecting…
+        <Loader2 class="size-3.5 animate-spin" />
+        {joining ? "Joining with the code… keep the other device on the page" : "Connecting…"}
       </p>
     {:else if quickSend.status === "failed"}
       <div class="px-6 py-6 space-y-3">
@@ -334,7 +540,7 @@
 
           {#if !quickSend.offered.length && !quickSend.preparing.length}
             <div
-              class="rounded-[10px] border border-dashed px-4 py-7 flex flex-col items-center gap-2.5 text-center transition-colors {dragging
+              class="flex-1 min-h-48 rounded-[10px] border border-dashed px-4 py-7 flex flex-col items-center justify-center gap-2.5 text-center transition-colors {dragging
                 ? 'border-primary bg-primary/5'
                 : 'border-input'}"
             >
@@ -419,7 +625,7 @@
           </div>
 
           {#if !quickSend.incoming.length}
-            <div class="rounded-[10px] border border-border px-4 py-7 flex flex-col items-center gap-2 text-center">
+            <div class="flex-1 min-h-48 rounded-[10px] border border-border px-4 py-7 flex flex-col items-center justify-center gap-2.5 text-center">
               <UserPlus class="size-5.5 text-muted-foreground" />
               {#if alone}
                 <span>Nobody else is here yet</span>
@@ -483,9 +689,20 @@
                   <Download class="size-4" />
                 </Button>
               {:else if transfer?.status === "failed"}
-                <Button variant="outline" size="sm" class="shrink-0 font-mono text-xs" onclick={() => accept(file, true)}>
-                  Retry
-                </Button>
+                <div class="flex items-center gap-0.5 shrink-0">
+                  <Button variant="outline" size="sm" class="font-mono text-xs" onclick={() => accept(file, true)}>
+                    Retry
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    class="text-muted-foreground"
+                    aria-label="Dismiss {file.filename}"
+                    onclick={() => decline(file)}
+                  >
+                    <X class="size-3.5" />
+                  </Button>
+                </div>
               {:else if waiting}
                 <div class="flex items-center gap-0.5 shrink-0">
                   <Button size="sm" class="font-mono text-xs" onclick={() => accept(file)}>Accept</Button>
