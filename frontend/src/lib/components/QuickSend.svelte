@@ -10,6 +10,7 @@
   import QRCode from "qrcode";
   import { Check, Copy, Download, Hash, Loader2, QrCode, Upload, UserPlus, Users, X } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
+  import ShortCodeLimits from "./ShortCodeLimits.svelte";
   import { formatSize } from "$lib/utils";
   import type { FileDescriptor } from "$lib/transport/types";
   import type { RoomSecret } from "$lib/room-security/keys";
@@ -175,19 +176,13 @@
     }
   }
 
-  async function showShortCode() {
-    showShort = !showShort;
-    if (!showShort || short) return;
-    await newShortCode();
-  }
-
-  async function newShortCode() {
+  async function newShortCode(limits: { uses: number; ttlMs: number }) {
     if (makingShort || !quickSend.code) return;
     const wanted = secret;
     makingShort = true;
     shortError = "";
     try {
-      await hostShortCode(wanted);
+      await hostShortCode(wanted, limits);
       // The room changed while the code was being made: the cleanup that
       // cancels this room's codes ran before this one existed.
       if (quickSend.code !== wanted || quickSend.status !== "ready") cancelShortCode(wanted);
@@ -397,7 +392,7 @@
             class="h-11 shrink-0 font-mono text-xs"
             aria-expanded={showShort}
             aria-controls="qs-short"
-            onclick={() => void showShortCode()}
+            onclick={() => (showShort = !showShort)}
           >
             <Hash class="size-3.5" /> Short code
           </Button>
@@ -413,28 +408,36 @@
           </Button>
         </div>
         {#if showShort}
-          <div
-            id="qs-short"
-            class="rounded-lg border border-border bg-background px-4 py-4 flex flex-col items-center gap-2 text-center"
-            aria-live="polite"
-          >
+          <div id="qs-short" class="flex flex-col gap-2" aria-live="polite">
             {#if short}
-              <p class="text-3xl font-bold tracking-[0.2em] select-all">{short.code}</p>
-              <p class="text-xs text-muted-foreground leading-relaxed">
-                On the other device, open <span class="text-foreground">{window.location.host}/qs</span>
-                and type it · {shortLeft} left{short.uses === 1 ? " · one use" : ""}
-              </p>
-            {:else if makingShort}
-              <p class="text-xs text-muted-foreground flex items-center gap-2">
-                <Loader2 class="size-3.5 animate-spin" /> Getting a code…
-              </p>
+              <div class="rounded-lg border border-border bg-background px-4 py-4 flex flex-col items-center gap-2 text-center">
+                <p class="text-3xl font-bold tracking-[0.2em] select-all">{short.code}</p>
+                <p class="text-xs text-muted-foreground leading-relaxed">
+                  On the other device, open <span class="text-foreground">{window.location.host}/qs</span>
+                  and type it
+                </p>
+                <p class="text-xs text-muted-foreground">
+                  {short.uses === 1 ? "Works once" : `${short.joined} of ${short.uses} joined`} · {shortLeft} left
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  class="font-mono text-xs text-muted-foreground"
+                  onclick={() => cancelShortCode(secret)}
+                >
+                  Cancel code
+                </Button>
+              </div>
             {:else}
-              <p class="text-xs {shortError ? 'text-destructive' : 'text-muted-foreground'}">
-                {shortError || shortEnded || "This code is over."}
+              {#if shortError || shortEnded}
+                <p class="text-xs {shortError ? 'text-destructive' : 'text-muted-foreground'}">
+                  {shortError || shortEnded}
+                </p>
+              {/if}
+              <p class="text-xs text-muted-foreground">
+                A short code lets in the people you choose, for the time you choose. Keep this page open while it's live.
               </p>
-              <Button variant="outline" size="sm" class="font-mono text-xs" onclick={() => void newShortCode()}>
-                New code
-              </Button>
+              <ShortCodeLimits busy={makingShort} onSubmit={(limits) => void newShortCode(limits)} />
             {/if}
           </div>
         {/if}
