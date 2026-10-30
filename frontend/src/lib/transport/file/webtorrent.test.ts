@@ -13,6 +13,8 @@ class FakeTorrent extends EventEmitter {
   done = false;
   numPeers = 0;
   files: unknown[] = [];
+  destroyed = false;
+  destroy(): void { this.destroyed = true; }
   addPeer(peer: { id?: string }): boolean {
     addedPeers.push(peer);
     return true;
@@ -65,6 +67,12 @@ vi.mock("webtorrent", () => {
       cb(torrent);
       return torrent;
     }
+    remove(infoHash: string, _opts: unknown, cb: () => void) {
+      const torrent = torrents.get(infoHash);
+      torrents.delete(infoHash);
+      torrent?.destroy();
+      cb();
+    }
     destroy(cb: () => void) {
       cb();
     }
@@ -115,6 +123,20 @@ describe("WebTorrentFileTransport", () => {
     addCalls.length = 0;
     recorded.length = 0;
     torrents.clear();
+  });
+
+  it("stops and forgets a removed seed without announcing it to new peers", async () => {
+    const t = new WebTorrentFileTransport(() => "me");
+    await t.seedFiles([new File(["0123456789"], "cat.png", { type: "image/png" })]);
+    expect(torrents.has(HASH)).toBe(true);
+    expect(t.getTransfer(HASH)?.seeding).toBe(true);
+    await t.stopSeeding(HASH);
+    const announced = vi.fn(); t.on("signal", announced);
+    t.onPeerConnect("alice");
+    expect(torrents.has(HASH)).toBe(false);
+    expect(t.getTransfer(HASH)).toBeUndefined();
+    expect(announced).not.toHaveBeenCalled();
+    t.destroy();
   });
 
   it("a re-announce of a file already downloading neither redials nor re-requests", async () => {

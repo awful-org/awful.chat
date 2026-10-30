@@ -29,6 +29,7 @@ class FakeFiles extends Events {
   lookup?: (hash: string) => Promise<File | null>;
   setLocalFileLookup(fn: typeof this.lookup) { this.lookup = fn; }
   seedEncryptedFiles = vi.fn(async (_files: File[]) => [FILE]);
+  stopSeeding = vi.fn(async (_hash: string) => {});
   onPeerConnect = vi.fn();
   onPeerDisconnect = vi.fn();
   handleSignal = vi.fn();
@@ -60,6 +61,65 @@ describe("protected quick send", () => {
     expect(f.seedEncryptedFiles).toHaveBeenCalledOnce();
     expect(sent()).toContainEqual({ room: ROOM, msg: offer() });
     expect(await f.lookup?.(HASH)).toBeNull();
+  });
+  it("shows selected files while their ciphertext and torrent are prepared", async () => {
+    await start(); let finish!: (files: typeof FILE[]) => void;
+    f.seedEncryptedFiles.mockImplementationOnce(() => new Promise(r => { finish = r; }));
+    const pending = qs.offerFiles([new File(["secret"], "private.txt")]);
+    expect(qs.quickSend.preparing).toEqual([
+      { id: expect.any(Number), filename: "private.txt", size: 6 },
+    ]);
+    expect(qs.quickSend.offered).toEqual([]);
+    finish([FILE]); await pending;
+    expect(qs.quickSend.preparing).toEqual([]);
+    expect(qs.quickSend.offered).toEqual([FILE]);
+  });
+  it("removes an offer, stops its torrent and deletes its cached ciphertext", async () => {
+    await start(); await qs.offerFiles([new File(["secret"], "private.txt")]);
+    await qs.removeOfferedFile(HASH);
+    const { removeCiphertext } = await import("$lib/transport/file/ciphertext-store");
+    expect(f.stopSeeding).toHaveBeenCalledWith(HASH);
+    expect(removeCiphertext).toHaveBeenCalledWith(HASH);
+    expect(qs.quickSend.offered).toEqual([]);
+    expect(qs.quickSend.transfers.size).toBe(0);
+    // A late wire from the withdrawn seed must not be served either.
+    t.message({ type: "__file_signal", payload: { kind: "file-wt-signal", infoHash: HASH, signal: {} } });
+    expect(f.handleSignal).not.toHaveBeenCalled();
+  });
+  it("declines an offer for the session, even when it is announced again", async () => {
+    await start(); t.message(offer());
+    await qs.declineFile(HASH);
+    expect(qs.quickSend.incoming).toEqual([]);
+    f.handleSignal.mockClear();
+    t.message(offer());
+    expect(qs.quickSend.incoming).toEqual([]);
+    expect(f.stopSeeding).not.toHaveBeenCalled();
+    expect(f.handleSignal).not.toHaveBeenCalled();
+  });
+  it("cancels a running download and deletes what it fetched", async () => {
+    await start(); t.message(offer()); qs.acceptFile(HASH);
+    f.emit("transfer", { ...FILE, status: "downloading", progress: 0.4 });
+    await qs.declineFile(HASH);
+    const { removeCiphertext } = await import("$lib/transport/file/ciphertext-store");
+    expect(f.stopSeeding).toHaveBeenCalledWith(HASH);
+    expect(removeCiphertext).toHaveBeenCalledWith(HASH);
+    expect(qs.quickSend.incoming).toEqual([]);
+    expect(qs.quickSend.transfers.size).toBe(0);
+    f.handleSignal.mockClear();
+    t.message({ type: "__file_signal", payload: { kind: "file-wt-signal", infoHash: HASH, signal: {} } });
+    expect(f.handleSignal).not.toHaveBeenCalled();
+  });
+  it("a withdrawn offer does not come back as somebody else's", async () => {
+    await start(); await qs.offerFiles([new File(["secret"], "private.txt")]);
+    await qs.removeOfferedFile(HASH);
+    t.message(offer());
+    expect(qs.quickSend.incoming).toEqual([]);
+  });
+  it("ignores late transfer events for a declined file", async () => {
+    await start(); t.message(offer()); qs.acceptFile(HASH);
+    await qs.declineFile(HASH);
+    f.emit("transfer", { ...FILE, status: "downloading", progress: 0.9 });
+    expect(qs.quickSend.transfers.size).toBe(0);
   });
   it("mints a high-entropy capability", async () => {
     await qs.startQuickSend(); expect(qs.quickSend.code).toMatch(/^r2_[a-z2-7]{52}$/);
