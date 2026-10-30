@@ -363,8 +363,11 @@
           Quick send
         </h1>
         {#if quickSend.status === "ready"}
-          <span class="text-xs text-muted-foreground flex items-center gap-1.5">
-            <Users class="size-3.5" />
+          <!-- Baseline, not center: centered boxes only line up the ink in
+               fonts with balanced line metrics, and the mono fallback differs
+               per platform. The nudge puts the icon's ink on the baseline. -->
+          <span class="text-xs text-muted-foreground flex items-baseline gap-1.5">
+            <Users class="size-3.5 shrink-0 relative top-0.5" />
             {peopleText}{quickSend.heardMode === "once" ? " · one-time link" : ""}
           </span>
         {/if}
