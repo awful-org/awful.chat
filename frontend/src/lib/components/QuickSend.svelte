@@ -10,6 +10,7 @@
   import QRCode from "qrcode";
   import { Check, Copy, Download, Hash, Loader2, QrCode, Upload, UserPlus, Users, X } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
+  import * as Dialog from "$lib/components/ui/dialog/index.js";
   import ShortCodeLimits from "./ShortCodeLimits.svelte";
   import { formatSize } from "$lib/utils";
   import type { FileDescriptor } from "$lib/transport/types";
@@ -324,7 +325,11 @@
   }
 </script>
 
+<!-- On the window, not the page: the dialogs render outside it. -->
 <svelte:window
+  ondragover={onDragOver}
+  ondragleave={onDragLeave}
+  ondrop={onDrop}
   onbeforeunload={(e) => {
     if (!busy) return;
     e.preventDefault();
@@ -334,10 +339,6 @@
 
 <div
   class="min-h-dvh overflow-y-auto bg-background text-foreground font-mono text-[13px] px-4 py-8 sm:py-12"
-  ondragover={onDragOver}
-  ondragleave={onDragLeave}
-  ondrop={onDrop}
-  role="presentation"
 >
   <input
     bind:this={input}
@@ -393,9 +394,8 @@
           <Button
             variant="outline"
             class="h-11 shrink-0 font-mono text-xs"
-            aria-expanded={showShort}
-            aria-controls="qs-short"
-            onclick={() => (showShort = !showShort)}
+            aria-haspopup="dialog"
+            onclick={() => (showShort = true)}
           >
             <Hash class="size-3.5" /> Short code
           </Button>
@@ -403,62 +403,14 @@
             variant="outline"
             size="icon"
             class="size-11 shrink-0"
-            aria-label={showQr ? "Hide QR code" : "Show QR code"}
-            aria-expanded={showQr}
-            onclick={() => (showQr = !showQr)}
+            aria-label="Show QR code"
+            aria-haspopup="dialog"
+            onclick={() => (showQr = true)}
           >
             <QrCode class="size-4" />
           </Button>
         </div>
-        {#if showShort}
-          <div id="qs-short" class="flex flex-col gap-2" aria-live="polite">
-            {#if short}
-              <div class="rounded-lg border border-border bg-background px-4 py-4 flex flex-col items-center gap-2 text-center">
-                <p class="text-3xl font-bold tracking-[0.2em] select-all">{short.code}</p>
-                <p class="text-xs text-muted-foreground leading-relaxed">
-                  On the other device, open <span class="text-foreground">{window.location.host}/qs</span>
-                  and type it
-                </p>
-                <p class="text-xs text-muted-foreground">
-                  {short.uses === 1 ? "Works once" : `${short.joined} of ${short.uses} joined`} · {shortLeft} left
-                </p>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  class="font-mono text-xs text-muted-foreground"
-                  onclick={() => cancelShortCode(secret)}
-                >
-                  Cancel code
-                </Button>
-              </div>
-            {:else}
-              {#if shortError || shortEnded}
-                <p class="text-xs {shortError ? 'text-destructive' : 'text-muted-foreground'}">
-                  {shortError || shortEnded}
-                </p>
-              {/if}
-              <p class="text-xs text-muted-foreground">
-                A short code lets in the people you choose, for the time you choose. Keep this page open while it's live.
-              </p>
-              <ShortCodeLimits busy={makingShort} onSubmit={(limits) => void newShortCode(limits)} />
-            {/if}
-          </div>
-        {/if}
-        {#if showQr}
-          <div class="flex flex-col items-center gap-2 py-2">
-            {#if qr}
-              <img
-                src={qr}
-                alt="QR code of the quick send link"
-                class="size-44 rounded-lg [image-rendering:pixelated]"
-              />
-            {:else}
-              <div class="size-44 rounded-lg bg-muted animate-pulse"></div>
-            {/if}
-            <p class="text-xs text-muted-foreground">Scan to join from a phone</p>
-          </div>
-        {/if}
-        {#if fresh && !showShort}
+        {#if fresh}
           <form
             class="flex flex-wrap items-center gap-x-3 gap-y-2"
             onsubmit={(e) => {
@@ -796,4 +748,67 @@
   <p class="mx-auto mt-3 max-w-[860px] text-center text-xs text-muted-foreground">
     Peer-to-peer · no account · anyone with the link can join
   </p>
+
+  <!-- Modals, so opening either moves nothing on the page. -->
+  <Dialog.Root bind:open={showShort}>
+    <Dialog.Content class="font-mono sm:max-w-md">
+      <Dialog.Header>
+        <Dialog.Title>Short code</Dialog.Title>
+        <Dialog.Description class="text-xs">
+          Lets in the people you choose, for the time you choose. Keep this page open while it's live.
+        </Dialog.Description>
+      </Dialog.Header>
+      <div id="qs-short" class="flex flex-col gap-3" aria-live="polite">
+        {#if short}
+          <div class="rounded-lg border border-border bg-background px-4 py-5 flex flex-col items-center gap-2 text-center">
+            <p class="text-3xl font-bold tracking-[0.2em] select-all">{short.code}</p>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              On the other device, open <span class="text-foreground">{window.location.host}/qs</span>
+              and type it
+            </p>
+            <p class="text-xs text-muted-foreground">
+              {short.uses === 1 ? "Works once" : `${short.joined} of ${short.uses} joined`} · {shortLeft} left
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            class="font-mono text-xs text-muted-foreground self-center"
+            onclick={() => cancelShortCode(secret)}
+          >
+            Cancel code
+          </Button>
+        {:else}
+          {#if shortError || shortEnded}
+            <p class="text-xs {shortError ? 'text-destructive' : 'text-muted-foreground'}">
+              {shortError || shortEnded}
+            </p>
+          {/if}
+          <ShortCodeLimits busy={makingShort} onSubmit={(limits) => void newShortCode(limits)} />
+        {/if}
+      </div>
+    </Dialog.Content>
+  </Dialog.Root>
+
+  <Dialog.Root bind:open={showQr}>
+    <Dialog.Content class="font-mono sm:max-w-sm">
+      <Dialog.Header>
+        <Dialog.Title>Scan to join</Dialog.Title>
+        <Dialog.Description class="text-xs">
+          Point a phone's camera at it to open this room there.
+        </Dialog.Description>
+      </Dialog.Header>
+      <div class="flex justify-center py-2">
+        {#if qr}
+          <img
+            src={qr}
+            alt="QR code of the quick send link"
+            class="size-56 rounded-lg [image-rendering:pixelated]"
+          />
+        {:else}
+          <div class="size-56 rounded-lg bg-muted animate-pulse"></div>
+        {/if}
+      </div>
+    </Dialog.Content>
+  </Dialog.Root>
 </div>
