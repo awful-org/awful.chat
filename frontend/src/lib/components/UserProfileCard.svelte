@@ -8,11 +8,15 @@
   import { Copy, Check, MessageSquare, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
   import {
     Dialog,
-    DialogClose,
     DialogContent,
     DialogHeader,
     DialogTitle,
   } from "$lib/components/ui/dialog";
+  import {
+    Drawer,
+    DrawerContent,
+    DrawerTitle,
+  } from "$lib/components/ui/drawer";
 
   interface Props {
     open: boolean;
@@ -101,6 +105,18 @@
   const tagChipColor = $derived(profileMeta?.tagChipColor ?? "#e5e7eb");
   const bio = $derived(profileMeta?.bio);
 
+  // A bottom sheet on a phone, like the GIF picker and the other pickers:
+  // a centred dialog there is a narrow card floating over the chat.
+  let isMobile = $state(false);
+  $effect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(max-width: 639px)");
+    const update = () => (isMobile = media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  });
+
   let copied = $state(false);
   async function copyDid() {
     try {
@@ -113,17 +129,7 @@
   }
 </script>
 
-<Dialog {open} onOpenChange={(newOpen) => onOpenChange(newOpen)}>
-  <!-- p-0 so the banner can own the top of the card outright. Everything
-       below it puts the padding back. -->
-  <DialogContent
-    class="sm:max-w-md gap-0 overflow-hidden p-0"
-    showCloseButton={false}
-  >
-    <DialogHeader class="sr-only">
-      <DialogTitle>Profile</DialogTitle>
-    </DialogHeader>
-
+{#snippet card()}
     <!-- Banner always renders (gradient fallback). It runs out to the
          dialog's own edges and up under the close button, and stops at the
          bottom by dissolving into the card rather than ending on a line.
@@ -157,12 +163,14 @@
     <!-- The stock close button is a bare icon in the foreground colour, which
          is a coin flip against an arbitrary photo. This one brings its own
          backdrop. -->
-    <DialogClose
+    <button
+      type="button"
+      onclick={() => onOpenChange(false)}
       class="absolute top-3 right-3 z-20 grid size-7 cursor-pointer place-items-center rounded-full bg-black/40 text-white/90 backdrop-blur-sm transition hover:bg-black/60 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:outline-hidden"
     >
       <X class="size-4" />
       <span class="sr-only">Close</span>
-    </DialogClose>
+    </button>
 
     <!-- relative, not just padding: the banner above is positioned and this
          was not, so it painted in the layer beneath it and the banner covered
@@ -259,7 +267,7 @@
       {/if}
 
       <div
-        class="flex items-center gap-2 rounded-md border border-border/50 bg-muted/30 px-2 py-1.5"
+        class="mx-1 flex items-center gap-2 rounded-md border border-border/50 bg-muted/30 px-2 py-1.5"
       >
         <span class="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
           {did}
@@ -278,5 +286,37 @@
         </button>
       </div>
     </div>
-  </DialogContent>
-</Dialog>
+{/snippet}
+
+{#if isMobile}
+  <Drawer {open} onOpenChange={(newOpen) => onOpenChange(newOpen)} direction="bottom">
+    <!-- The stock grab handle sits above the banner on a strip of
+         background; hidden here, and drawn over the banner instead. -->
+    <DrawerContent class="overflow-hidden [&>div:first-child]:hidden">
+      <DrawerTitle class="sr-only">Profile</DrawerTitle>
+      <div
+        class="pointer-events-none absolute top-2 left-1/2 z-20 h-1.5 w-12 -translate-x-1/2 rounded-full bg-white/50"
+        aria-hidden="true"
+      ></div>
+      <div class="relative min-h-0 overflow-y-auto pb-[env(safe-area-inset-bottom)]">
+        {@render card()}
+      </div>
+    </DrawerContent>
+  </Drawer>
+{:else}
+  <Dialog {open} onOpenChange={(newOpen) => onOpenChange(newOpen)}>
+    <!-- p-0 so the banner can own the top of the card outright. Everything
+         below it puts the padding back. grid-cols-1 is minmax(0, 1fr): the
+         grid's own auto column grew to the DID's full width and pushed the
+         buttons and the DID out past the card's edge. -->
+    <DialogContent
+      class="sm:max-w-md grid-cols-1 gap-0 overflow-hidden p-0"
+      showCloseButton={false}
+    >
+      <DialogHeader class="sr-only">
+        <DialogTitle>Profile</DialogTitle>
+      </DialogHeader>
+      {@render card()}
+    </DialogContent>
+  </Dialog>
+{/if}
