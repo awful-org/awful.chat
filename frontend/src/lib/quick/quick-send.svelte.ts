@@ -85,6 +85,12 @@ function isQuickWire(value: unknown): value is QuickWire {
     : v?.type === "__qs_ack" && typeof v.infoHash === "string" && /^[a-f0-9]{40}$/.test(v.infoHash);
 }
 
+interface QuickSendPreparation {
+  id: number;
+  filename: string;
+  size: number;
+}
+
 interface QuickSendState {
   status: QuickSendStatus;
   /** The room code, which IS the secret. Empty until start() runs. */
@@ -94,6 +100,8 @@ interface QuickSendState {
   error: string | null;
   /** How many other people the relay places in this code right now. */
   peers: number;
+  /** Files being encrypted, hashed and cached before they can be offered. */
+  preparing: QuickSendPreparation[];
   /** Files this device is seeding, newest last. */
   offered: FileDescriptor[];
   /** Files the other side has offered, newest last. */
@@ -120,6 +128,7 @@ export const quickSend = $state<QuickSendState>({
   isHost: false,
   error: null,
   peers: 0,
+  preparing: [],
   offered: [],
   incoming: [],
   transfers: new Map(),
@@ -137,6 +146,9 @@ const localFiles = new Set<string>();
 const accepted = new Set<string>();
 const completed = new Set<string>();
 const ciphertext = new Set<string>();
+/** Offers this person turned down: a re-announcement must not bring them back. */
+const declined = new Set<string>();
+let nextPreparationId = 0;
 
 function mayReshare(): boolean {
   return quickSend.heardMode !== "once" && shouldReshare();
@@ -249,6 +261,7 @@ function putTransfer(snapshot: FileTransferSnapshot): void {
 }
 
 function noteIncoming(file: FileDescriptor): boolean {
+  if (declined.has(file.infoHash)) return false;
   const known = [...quickSend.offered, ...quickSend.incoming].find(f => f.infoHash === file.infoHash);
   if (known) return fileSignatureBinding(known) === fileSignatureBinding(file);
   if (quickSend.incoming.length >= 256) return false;
@@ -332,7 +345,8 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
     );
   });
   f.on("transfer", (snapshot) => {
-    if (!current()) return;
+    // A late report from a torrent this page dropped must not bring it back.
+    if (!current() || declined.has(snapshot.infoHash)) return;
     if (snapshot.encryption && snapshot.seeding) ciphertext.add(snapshot.infoHash);
     putTransfer(snapshot);
   });
@@ -406,36 +420,82 @@ export async function startQuickSend(joinCode?: string): Promise<void> {
   }
 }
 
-/** Seed files and announce them to whoever is already here. */
+/**
+ * Seed files and announce them to whoever is already here. Preparation is
+ * visible from the moment of selection: encryption and torrent hashing both
+ * have to read the whole file before there is a descriptor to show.
+ */
 export async function offerFiles(picked: File[]): Promise<void> {
   if (!files || !picked.length || quickSend.status !== "ready") return;
   const owner = files;
-  if (picked.length > 1) {
-    for (const file of picked) {
+  const jobs = picked.map(file => ({
+    id: ++nextPreparationId, filename: file.name, size: file.size,
+  }));
+  const ids = new Set(jobs.map(job => job.id));
+  quickSend.preparing = [...quickSend.preparing, ...jobs];
+  try {
+    for (let index = 0; index < picked.length; index++) {
       if (files !== owner || quickSend.status !== "ready") break;
-      await offerFiles([file]);
+      let descriptors: FileDescriptor[];
+      // One file per operation lets partial success remain visible and ensures
+      // every persisted ciphertext reference is owned if the next file fails.
+      try { descriptors = await owner.seedEncryptedFiles([picked[index]]); }
+      catch (err) {
+        if (files === owner) quickSend.error = err instanceof Error ? err.message : "Could not encrypt files.";
+        continue;
+      }
+      if (files !== owner || quickSend.status !== "ready") {
+        for (const desc of descriptors) void removeCiphertext(desc.infoHash).catch(() => {});
+        return;
+      }
+      descriptors.forEach(desc => { localFiles.add(desc.infoHash); ciphertext.add(desc.infoHash); });
+      const known = new Set(quickSend.offered.map((f) => f.infoHash));
+      quickSend.offered = [
+        ...quickSend.offered,
+        ...descriptors.filter((d) => !known.has(d.infoHash)),
+      ];
+      for (const desc of descriptors) announceFile(desc);
     }
-    return;
+  } finally {
+    quickSend.preparing = quickSend.preparing.filter(job => !ids.has(job.id));
   }
-  let descriptors: FileDescriptor[];
-  // One file per operation lets partial success remain visible and ensures
-  // every persisted ciphertext reference is owned even if the next file fails.
-  try { descriptors = await owner.seedEncryptedFiles(picked); }
-  catch (err) {
-    if (files === owner) quickSend.error = err instanceof Error ? err.message : "Could not encrypt files.";
-    return;
+}
+
+/** Stop serving one of our offers and delete only its cached ciphertext.
+ * Other holders in the swarm remain available to receivers. */
+export async function removeOfferedFile(infoHash: string): Promise<void> {
+  if (!quickSend.offered.some(file => file.infoHash === infoHash)) return;
+  const owner = files;
+  // Withdraw it immediately: no fresh peer announcements while teardown runs.
+  localFiles.delete(infoHash);
+  // Somebody who already has it serves it on and announces it back to us:
+  // what this person withdrew must not come back as an offer to them.
+  declined.add(infoHash);
+  quickSend.offered = quickSend.offered.filter(file => file.infoHash !== infoHash);
+  dropTransfer(infoHash);
+  await discardLocalCopy(owner, infoHash, "Could not remove the cached file.");
+}
+
+function dropTransfer(infoHash: string): void {
+  const transfer = quickSend.transfers.get(infoHash);
+  if (!transfer) return;
+  if (transfer.blobURL) URL.revokeObjectURL(transfer.blobURL);
+  const transfers = new Map(quickSend.transfers);
+  transfers.delete(infoHash);
+  quickSend.transfers = transfers;
+}
+
+/** Stop the torrent and delete its cached ciphertext. */
+async function discardLocalCopy(
+  owner: WebTorrentFileTransport | null, infoHash: string, failure: string,
+): Promise<void> {
+  try {
+    await owner?.stopSeeding(infoHash);
+    await removeCiphertext(infoHash);
+    ciphertext.delete(infoHash);
+  } catch (err) {
+    if (files === owner) quickSend.error = err instanceof Error ? err.message : failure;
   }
-  if (files !== owner || quickSend.status !== "ready") {
-    for (const desc of descriptors) void removeCiphertext(desc.infoHash).catch(() => {});
-    return;
-  }
-  descriptors.forEach(desc => { localFiles.add(desc.infoHash); ciphertext.add(desc.infoHash); });
-  const known = new Set(quickSend.offered.map((f) => f.infoHash));
-  quickSend.offered = [
-    ...quickSend.offered,
-    ...descriptors.filter((d) => !known.has(d.infoHash)),
-  ];
-  for (const desc of descriptors) announceFile(desc);
 }
 
 /**
@@ -453,6 +513,21 @@ export function acceptFile(infoHash: string, retry = false): void {
   }
 }
 
+/**
+ * Turn down an offer, or stop a download already running. Either way the file
+ * leaves the list for this session, and whatever was fetched of it is dropped.
+ */
+export async function declineFile(infoHash: string): Promise<void> {
+  if (!quickSend.incoming.some((f) => f.infoHash === infoHash)) return;
+  const owner = files;
+  declined.add(infoHash);
+  quickSend.incoming = quickSend.incoming.filter((f) => f.infoHash !== infoHash);
+  dropTransfer(infoHash);
+  if (!accepted.delete(infoHash)) return;
+  completed.delete(infoHash);
+  await discardLocalCopy(owner, infoHash, "Could not stop the download.");
+}
+
 export function stopQuickSend(): void {
   ++generation;
   room = "";
@@ -466,12 +541,14 @@ export function stopQuickSend(): void {
   localFiles.clear();
   accepted.clear();
   completed.clear();
+  declined.clear();
   for (const hash of ciphertext) void removeCiphertext(hash).catch(() => {});
   ciphertext.clear();
   wired.clear();
   quickSend.status = "idle";
   quickSend.code = "";
   quickSend.peers = 0;
+  quickSend.preparing = [];
   quickSend.offered = [];
   quickSend.incoming = [];
   quickSend.transfers = new Map();
