@@ -249,6 +249,18 @@ describe("secure sync invitation and source authorization", () => {
     expect(instances).toHaveLength(before);
   });
 
+  it("does not carry a previous attempt's 100% into a new source session", async () => {
+    await generateSyncCode();
+    syncState.isComplete = true;
+    syncState.syncProgress = 100;
+    syncState.phase = "importing-remote";
+    await generateSyncCode();
+    expect(syncState.isComplete).toBe(false);
+    expect(syncState.syncProgress).toBe(0);
+    expect(syncState.phase).toBe("transfer");
+    expect(syncState.plaintextToken).not.toBeNull();
+  });
+
   it("generates a copyable full-capability code and parses it without publishing the secret as the room ID", async () => {
     await generateSyncCode();
     expect(syncState.syncError).toBeNull();
@@ -459,6 +471,17 @@ describe("target ExportRequest delivery", () => {
 
   const requests = (t: any) =>
     t.sent.filter((m: any) => m.type === "sync_export_request");
+
+  it("does not carry a previous attempt's completion into a new target session", async () => {
+    syncState.isComplete = true;
+    syncState.syncProgress = 100;
+    syncState.phase = "importing";
+    await connectAsTarget(payload());
+    expect(syncState.isComplete).toBe(false);
+    expect(syncState.syncProgress).toBe(0);
+    expect(syncState.phase).toBe("transfer");
+    expect(syncState.isConnecting).toBe(true);
+  });
 
   it("retries the ExportRequest when the first send never confirms", async () => {
     vi.useFakeTimers();
