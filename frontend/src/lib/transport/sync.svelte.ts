@@ -425,6 +425,10 @@ export function parseShortCode(
  * Call this when you want to sync FROM this device TO another.
  */
 export async function generateSyncCode(): Promise<void> {
+  // A previous successful attempt must not make the dialog complete this one
+  // before a byte moves. In particular, stale 100% on the source while a new
+  // target is still at identity/10% looks like a transfer that finished.
+  resetSyncState();
   // Invalidate the previous session synchronously. Its disconnect may finish
   // later, but must never publish a QR or clear this attempt's state.
   const previousCleanup = cleanup();
@@ -869,6 +873,9 @@ export async function connectAsTarget(
   }
 
   const mode = payload.mode ?? "replace";
+  // Same fresh-attempt guarantee as generateSyncCode: completion and progress
+  // belong to one pairing session, never to the dialog component's lifetime.
+  resetSyncState();
   const previousCleanup = cleanup();
   const attemptToken = generateToken();
   _syncToken = attemptToken;
