@@ -27,6 +27,7 @@
   } from "$lib/components/ui/select";
   import { cameraLabel, cameras, refreshCameras, watchCameras } from "$lib/cameras.svelte";
   import { loadAudioPrefs, saveAudioPrefs } from "$lib/transport/audio-prefs";
+  import { setVoiceInputDevice } from "$lib/transport/voice.svelte";
 
   let {
     open = false,
@@ -226,7 +227,13 @@
 
   function pickMic(id: string) {
     mic = id || null;
-    saveAudioPrefs({ inputDevice: mic });
+    // Saving alone leaves the already-initialized voice engine on its old
+    // input, so the next join can open the camera mic despite this preview
+    // using the headset. The shared setter updates both the live preference
+    // and local storage; before a call it does not open another microphone.
+    void setVoiceInputDevice(mic ?? "").catch((err) => {
+      console.warn("Could not apply microphone selection:", err);
+    });
   }
 </script>
 
