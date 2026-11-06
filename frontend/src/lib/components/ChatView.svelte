@@ -2258,7 +2258,9 @@
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
   const receiptIds = $derived(
-    isDmChat ? dmReceiptIds(renderedMessages, isSelfSender) : []
+    // Every message held, not the mounted window: scrolled up, the window's
+    // last row is not the end of its run.
+    new Set(isDmChat ? dmReceiptIds(visibleMessages, isSelfSender) : [])
   );
 
   /** What the leave control says. /qc overrides it: a quick call is not a
@@ -3292,7 +3294,7 @@
                     {isOwn}
                     {fileTransfers}
                     onRequestFileDownload={requestFileDownload}
-                    showReceipt={receiptIds.includes(msg.id)}
+                    showReceipt={receiptIds.has(msg.id)}
                   />
 
                   {#if reactions?.size}

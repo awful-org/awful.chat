@@ -78,6 +78,16 @@ export function appendToDmPanel(msg: Message): void {
   dmPanel.messages = [...dmPanel.messages, msg].sort(compareMessages);
 }
 
+/**
+ * Rewrite the panel's messages in place of its copies going stale: it owns its
+ * list, so a delivery or read ack that updates the pane behind it has to reach
+ * this one too. `change` returns the same object for a message it leaves alone.
+ */
+export function mapDmPanelMessages(change: (msg: Message) => Message): void {
+  const next = dmPanel.messages.map(change);
+  if (next.some((msg, index) => msg !== dmPanel.messages[index])) dmPanel.messages = next;
+}
+
 /** True when the panel is showing this conversation, so it counts as read. */
 export function dmPanelIsShowing(roomCode: string): boolean {
   return (

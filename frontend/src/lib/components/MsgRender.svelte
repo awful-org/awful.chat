@@ -138,7 +138,7 @@
     isOwn: boolean;
     fileTransfers: Map<string, FileTransferSnapshot>;
     onRequestFileDownload: (file: FileEntry, senderId?: string | null) => void;
-    /** Only the newest own DM shows a receipt; older ones are covered by it. */
+    /** Only the last own DM of a run with one status shows a receipt. */
     showReceipt?: boolean;
   }
 
