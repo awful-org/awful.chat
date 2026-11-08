@@ -119,6 +119,13 @@ container and a secret, with no checkout of this repository.
 2. Open `3478/udp`, `3478/tcp` and the relay range (`49152-50151/udp` by
    default). Add `5349/tcp` if you enable TLS.
 
+   Keep the TURN server's public IP out of `--denied-peer-ip`. When both
+   people need TURN, their relay candidates can share that IP: denying it
+   rejects CreatePermission with 403 even though allocations succeed, and
+   file transfers stay at 0%. Private, loopback and multicast destinations
+   remain denied. An allocation-only health check cannot detect this;
+   verify a relay-to-relay data transfer after changing the configuration.
+
 3. On the main instance, list **every** TURN server in `TURN_URLS`, including
    the instance's own, and redeploy the relay:
 
