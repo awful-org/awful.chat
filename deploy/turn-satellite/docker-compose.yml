@@ -67,6 +67,9 @@ services:
     #
     # Keep every argument below a real flag: this is a folded block, so a "#"
     # line inside it becomes a literal argument rather than a comment.
+    # Do not deny PUBLIC_IP: relay-to-relay connections between this server's
+    # own clients need permission to reach that public IP. The private and
+    # loopback ranges below remain denied.
     command: >
       --log-file=stdout
       --realm=${TURN_REALM:-${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME (or TURN_REALM) - an empty realm makes coturn reject every credential}}
@@ -77,7 +80,6 @@ services:
       --fingerprint
       --no-multicast-peers
       --no-tcp-relay
-      --denied-peer-ip=${PUBLIC_IP}
       --denied-peer-ip=100.64.0.0-100.127.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
       --denied-peer-ip=192.168.0.0-192.168.255.255
