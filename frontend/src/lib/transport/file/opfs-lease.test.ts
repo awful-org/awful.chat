@@ -107,7 +107,13 @@ it("touches nothing when it cannot tell who is running", async () => {
   expect(paths()).toHaveLength(2);
 });
 
-it("refuses outright without browser storage support", async () => {
+it("leases temporary storage when OPFS is unavailable and releases it on end", async () => {
   vi.stubGlobal("navigator", { storage: {}, locks });
-  await expect(new OPFSLease().directory(STAGING_DIR)).rejects.toThrow("browser storage support");
+  const lease = new OPFSLease();
+  const directory = await lease.directory(STAGING_DIR);
+  const writer = await (await directory.getFileHandle("opaque", { create: true })).createWritable();
+  await writer.write("ciphertext"); await writer.close();
+  expect(await (await (await directory.getFileHandle("opaque")).getFile()).text()).toBe("ciphertext");
+  await lease.end();
+  await expect(lease.directory(STAGING_DIR)).rejects.toThrow("Transfer storage released");
 });

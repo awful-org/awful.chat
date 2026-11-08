@@ -1,7 +1,9 @@
-/** Durable opaque ciphertext. No keys, names or MIME types enter OPFS paths. */
+import { fileStorageRoot } from "./file-storage";
+
+/** Opaque ciphertext; durable in OPFS, page-local when storage is unavailable.
+ * No keys, names or MIME types enter filesystem paths. */
 async function directory() {
-  if (!globalThis.navigator?.storage?.getDirectory) throw new Error("Encrypted files require browser storage support");
-  return (await navigator.storage.getDirectory()).getDirectoryHandle("room-v2-ciphertext", { create: true });
+  return (await fileStorageRoot()).getDirectoryHandle("room-v2-ciphertext", { create: true });
 }
 function check(hash: string) {
   if (!/^[a-f0-9]{40}$/i.test(hash)) throw new Error("Invalid ciphertext reference");
@@ -48,8 +50,7 @@ export async function removeCiphertext(hash: string): Promise<void> {
  * system: this durable store, and the temporary areas of opfs-lease.ts. */
 export const FILE_STORE_DIRS = ["room-v2-ciphertext", "room-v2-transfers", "room-v2-pieces"] as const;
 export async function wipeCiphertext(): Promise<void> {
-  if (!globalThis.navigator?.storage?.getDirectory) return;
-  const root = await navigator.storage.getDirectory();
+  const root = await fileStorageRoot();
   for (const name of FILE_STORE_DIRS) {
     await root.removeEntry(name, { recursive: true }).catch(e => {
       if (!(e instanceof DOMException && e.name === "NotFoundError")) throw e;
