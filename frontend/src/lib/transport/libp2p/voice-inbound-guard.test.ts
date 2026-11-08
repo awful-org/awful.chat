@@ -326,6 +326,7 @@ describe("LibP2PVoice.handleDtlnFatal (finding 1)", () => {
     (internals.handleDtlnFatal as () => void).call(internals);
 
     expect(calls).toEqual(["mic-2"]);
+    expect(internals.dtlnEnabled).toBe(false);
   });
 
   it("does nothing without an active call - no audioCtx, nothing to rebuild", () => {
