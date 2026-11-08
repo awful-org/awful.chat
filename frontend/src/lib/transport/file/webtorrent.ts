@@ -932,7 +932,14 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           }) as TorrentLike;
           this.attachTorrent(added, false, file);
         })
-        .catch(() => {})
+        .catch((error: unknown) => {
+          if (signal.aborted) return;
+          const current = this.transfers.get(file.infoHash);
+          if (current) this.upsertTransfer({
+            ...current, status: "failed",
+            error: error instanceof Error ? error.message : "Could not start file transfer",
+          });
+        })
         .finally(() => this.addingTorrents.delete(file.infoHash));
     }
 
@@ -1606,13 +1613,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           this.upsertTransfer({ ...descriptor, status: "seeding", done: true, seeding: true,
             progress: 1, peers: torrent.numPeers ?? 0, seeders: 1, blobURL: URL.createObjectURL(plain) });
           this.emit("downloaded", infoHash, plain);
-        })().catch(async () => {
+        })().catch(async (error: unknown) => {
           await removeCiphertext(infoHash).catch(() => {});
           torrent.destroy?.();
           const live = this.attachedTorrents.delete(infoHash);
           if (live && !signal.aborted) this.upsertTransfer({ ...descriptor, status: "failed", done: false,
             seeding: false, progress: 0, peers: 0, seeders: 0, blobURL: undefined,
-            error: "Encrypted file authentication failed" });
+            error: error instanceof Error ? error.message : "Encrypted file authentication failed" });
         }).finally(() => this.publishing.delete(infoHash));
         return;
       }

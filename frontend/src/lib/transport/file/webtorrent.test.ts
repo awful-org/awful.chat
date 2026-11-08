@@ -970,3 +970,15 @@ describe("WebTorrentFileTransport", () => {
     });
   });
 });
+
+it("reports torrent startup errors instead of leaving a transfer downloading forever", async () => {
+  const t = new WebTorrentFileTransport(() => "me");
+  const client = await (t as unknown as { client(): Promise<{ add(hash: string): unknown }> }).client();
+  const add = vi.spyOn(client, "add").mockImplementationOnce(() => { throw new Error("File storage unavailable"); });
+  const descriptor = { ...file, infoHash: "9".repeat(40) };
+  t.ensureDownload(descriptor);
+  await vi.waitFor(() => expect(t.getTransfer(descriptor.infoHash)?.status).toBe("failed"));
+  expect(t.getTransfer(descriptor.infoHash)?.error).toBe("File storage unavailable");
+  add.mockRestore();
+  t.destroy();
+});
