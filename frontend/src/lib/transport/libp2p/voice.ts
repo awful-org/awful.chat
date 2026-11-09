@@ -333,7 +333,7 @@ export class LibP2PVoice implements VoiceTransport {
     // silence forever - the track stays live, RTP keeps flowing, and
     // connectionState reads "connected" on both ends (finding 1). Rebuild
     // the mic once instead of leaving that peer permanently unheard.
-    this.dtln?.onFatal(() => this.handleDtlnFatal());
+    this.dtln?.onFatal((error) => this.handleDtlnFatal(error));
 
     try {
       await this.startMic(this.activeInputDevice ?? undefined);
@@ -855,6 +855,7 @@ export class LibP2PVoice implements VoiceTransport {
         d: {
           bytes,
           delta: previous === null ? 0 : bytes - previous,
+          dtlnLoad: this.dtlnEnabled ? this.dtln?.getProcessingLoad?.() ?? null : null,
           jitter: typeof inbound.jitter === "number" ? inbound.jitter : null,
           lost:
             typeof inbound.packetsLost === "number" ? inbound.packetsLost : null,
@@ -1124,6 +1125,7 @@ export class LibP2PVoice implements VoiceTransport {
   async setDtlnEnabled(enabled: boolean): Promise<void> {
     if (this.dtlnEnabled === enabled) return;
     this.dtlnEnabled = enabled;
+    this.emit("processingChanged", enabled);
     if (this.audioCtx) {
       await this.startMic(this.activeInputDevice ?? undefined);
     }
@@ -1199,6 +1201,8 @@ export class LibP2PVoice implements VoiceTransport {
           "[voice] DTLN failed, falling back to browser noise suppression:",
           err
         );
+        this.dtlnEnabled = false;
+        this.emit("processingChanged", false, err instanceof Error ? err.message : "DTLN unavailable");
         this.dtln?.releaseTransport();
         this.micStream.getTracks().forEach((t) => t.stop());
         try {
@@ -1284,11 +1288,12 @@ export class LibP2PVoice implements VoiceTransport {
    * replaces the track on every peer with native suppression, using the
    * same path as a manual device switch.
    */
-  private handleDtlnFatal(): void {
+  private handleDtlnFatal(error?: Error): void {
     if (!this.audioCtx) return;
     // A model that cannot keep up must not be restarted into the same
     // overload loop. Use native suppression until explicitly enabled again.
     this.dtlnEnabled = false;
+    this.emit("processingChanged", false, error?.message ?? "DTLN processing stopped");
     void this.startMic(this.activeInputDevice ?? undefined).catch((err) => {
       console.error("[voice] mic rebuild after DTLN crash failed:", err);
     });

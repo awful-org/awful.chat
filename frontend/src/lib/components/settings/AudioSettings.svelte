@@ -29,6 +29,7 @@
     getVoiceOutputVolume,
     setVoiceOutputVolume,
     getVoiceDtlnEnabled,
+    voiceProcessing,
     setVoiceDtlnEnabled,
     setVoiceDtlnNoiseGate,
     getVoiceDtlnNoiseGate,
@@ -71,6 +72,7 @@
   let activeOutput = $state<string | null>(null);
 
   let dtlnEnabled = $state(getVoiceDtlnEnabled());
+  $effect(() => { dtlnEnabled = voiceProcessing.dtlnEnabled; });
   // Restored from the last session, not a fresh default.
   let noiseGateThreshold = $state(getVoiceDtlnNoiseGate());
   let noiseGateSlider = $state<number[]>([getVoiceDtlnNoiseGate() * 10000]);
@@ -459,6 +461,11 @@
       </label>
     </div>
 
+    {#if voiceProcessing.fallbackReason}
+      <p class="text-xs text-muted-foreground" role="status">
+        DTLN stopped. Browser noise suppression is active to keep audio responsive.
+      </p>
+    {/if}
     {#if dtlnEnabled}
       <div class="flex flex-col gap-2 pl-3 border-l-2 border-blue-500/30">
         <div class="flex items-center justify-between">
