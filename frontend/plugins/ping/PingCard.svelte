@@ -101,6 +101,13 @@
   });
 
   const ceiling = $derived(chartCeiling(Object.values(plotted).flat()));
+  /** Viewers do not run probes, so their `running` flag stays false. Until
+   * the owner's first answer or final update arrives, say what the blank
+   * chart means instead of presenting it as an empty measurement. */
+  const awaitingFirstPoint = $derived(
+    !done && !superseded && (running || !isOwner) &&
+    !Object.values(plotted).some((list) => list.some((sample) => sample.rtt !== null))
+  );
   const liveStats = $derived.by(() => {
     const out: Record<string, Stats> = {};
     for (const t of cardState.targets) out[t.did] = summarize(samples[t.did] ?? []);
@@ -283,6 +290,16 @@
       class="pointer-events-none absolute right-1 top-0.5 font-mono text-[9px] text-muted-foreground"
       >{ceiling}ms</span
     >
+    {#if awaitingFirstPoint}
+      <div
+        role="status"
+        class="pointer-events-none absolute inset-0 flex items-center justify-center"
+      >
+        <span class="rounded bg-background/85 px-2 py-1 font-mono text-xs text-muted-foreground">
+          Running…
+        </span>
+      </div>
+    {/if}
   </div>
 
   <div class="flex flex-col gap-1">
