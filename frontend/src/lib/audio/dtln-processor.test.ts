@@ -31,6 +31,7 @@ class FakeDest extends FakeNode {
 }
 
 class FakeCtx {
+  sampleRate = 48000;
   state = "running";
   gains: FakeGain[] = [];
   dests: FakeDest[] = [];
@@ -80,6 +81,20 @@ class FakeWorkletNode extends FakeNode {
 }
 
 let ctx: FakeCtx;
+const workers: FakeWorker[] = [];
+class FakeWorker {
+  terminated = false;
+  onerror: (() => void) | null = null;
+  constructor() { workers.push(this); }
+  postMessage() {}
+  terminate() { this.terminated = true; }
+}
+
+beforeEach(() => {
+  workers.length = 0;
+  (globalThis as any).Worker = FakeWorker;
+  (globalThis as any).location = { href: "https://example.test/" };
+});
 
 async function makeProcessor(): Promise<DtlnProcessor> {
   ctx = new FakeCtx();
@@ -331,11 +346,24 @@ describe("DtlnProcessor fatal callback (finding 1)", () => {
     (d.node as unknown as CrashableWorklet).onprocessorerror();
     await Promise.resolve();
     expect(first.state).toBe("closed");
+    expect(workers[0].terminated).toBe(true);
 
     ctx = new FakeCtx();
     await d.processStream(micStream);
     expect(d.ctx).toBe(ctx);
     expect(d.ctx).not.toBe(first);
+    expect(workers).toHaveLength(2);
+  });
+
+  it("reports a worker backlog as fatal and terminates its computation", async () => {
+    const d = await makeProcessor();
+    let failures = 0;
+    d.onFatal(() => failures++);
+    const node = d.node as unknown as FakeWorkletNode;
+    node.port.onmessage?.({ data: { fatal: "DTLN worker cannot keep up with live audio" } });
+    expect(failures).toBe(1);
+    expect(d.isReady()).toBe(false);
+    expect(workers[0].terminated).toBe(true);
   });
 
   it("a failed init closes its context, so the retry gets a new one", async () => {

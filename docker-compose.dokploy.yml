@@ -358,6 +358,9 @@ services:
         max-file: "3"
     # volumes:
     #   - ${TURN_TLS_DIR}:/certs:ro
+    # The public relay IP must remain reachable as a peer: two clients using
+    # this TURN server exchange candidates at that same IP. Denying it lets
+    # allocations succeed but rejects their CreatePermission requests (403).
     command: >
       --log-file=stdout
       --realm=${TURN_REALM:-${DOMAIN}}
@@ -370,7 +373,6 @@ services:
       --no-tcp-relay
       --listening-port=${TURN_PORT:-3478}
       --alt-listening-port=${TURN_ALT_PORT:-5349}
-      --denied-peer-ip=${ANNOUNCED_IP}
       --denied-peer-ip=100.64.0.0-100.127.255.255
       --denied-peer-ip=10.0.0.0-10.255.255.255
       --denied-peer-ip=192.168.0.0-192.168.255.255

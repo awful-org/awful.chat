@@ -1281,11 +1281,14 @@ export class LibP2PVoice implements VoiceTransport {
    * The worklet crashed after init (finding 1): its context is suspended
    * and the destination node feeding every RTCRtpSender has no input, but
    * the track itself stays live so nothing else notices. Rebuilding the mic
-   * re-inits DTLN and replaces the track on every peer - same path a manual
-   * device switch takes.
+   * replaces the track on every peer with native suppression, using the
+   * same path as a manual device switch.
    */
   private handleDtlnFatal(): void {
     if (!this.audioCtx) return;
+    // A model that cannot keep up must not be restarted into the same
+    // overload loop. Use native suppression until explicitly enabled again.
+    this.dtlnEnabled = false;
     void this.startMic(this.activeInputDevice ?? undefined).catch((err) => {
       console.error("[voice] mic rebuild after DTLN crash failed:", err);
     });

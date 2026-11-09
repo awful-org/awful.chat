@@ -1025,6 +1025,10 @@
             {/if}
           </div>
 
+          {#if transfer?.status === "failed" && transfer.error}
+            <p class="mt-1 text-xs text-destructive" role="status">{transfer.error}</p>
+          {/if}
+
           <!-- Only while bytes are actually moving: a finished or seeding
                transfer has nothing left to report. -->
           <!-- Over the card's bottom edge, not a row of its own: a bar that
