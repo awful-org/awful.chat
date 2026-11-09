@@ -17,6 +17,8 @@ import {
 } from "$lib/call-peer-quality.svelte";
 import type { CallQualityStatusEvent } from "$lib/call-quality";
 
+export const voiceProcessing = $state({ dtlnEnabled: true, fallbackReason: null as string | null });
+
 let _voice: LibP2PVoice | null = null;
 let _dtln: DtlnProcessor | null = null;
 let _initialized = false;
@@ -31,6 +33,10 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
   _initialized = true;
   _voice = voice;
   _dtln = dtln;
+  _voice.on("processingChanged", (enabled, reason) => {
+    voiceProcessing.dtlnEnabled = enabled;
+    voiceProcessing.fallbackReason = reason ?? null;
+  });
 
   _voice.on("trackAdded", (peerId, track) => {
     notePeerQualityTrack(peerId);

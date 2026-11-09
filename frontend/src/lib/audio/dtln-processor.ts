@@ -12,6 +12,7 @@ export class DtlnProcessor {
   private worker: Worker | null = null;
   private channel: MessageChannel | null = null;
   private ready = false;
+  private processingLoad: number | null = null;
   private readyPromise!: Promise<void>;
   private resolveReady!: () => void;
   private rejectReady!: (err: Error) => void;
@@ -25,7 +26,7 @@ export class DtlnProcessor {
    * "connected" on both ends the whole time. LibP2PVoice uses this to
    * rebuild the mic instead of leaving that peer permanently unheard.
    */
-  private fatalHandler: (() => void) | null = null;
+  private fatalHandler: ((error: Error) => void) | null = null;
 
   /**
    * Gain after the model. The worklet is unity gain, and the model barely
@@ -141,6 +142,7 @@ export class DtlnProcessor {
         this.handleFatal(new Error("DTLN processor crashed"));
       this.worker.onerror = () => this.handleFatal(new Error("DTLN worker failed"));
       node.port.onmessage = ({ data }) => {
+        if (data?.processing) this.processingLoad = data.processing.load;
         if (data?.fatal) this.handleFatal(new Error(data.fatal));
       };
       this.workletNode = node;
@@ -177,7 +179,7 @@ export class DtlnProcessor {
     this.ready = false;
     this.initializing = false;
     this.armReadyPromise();
-    this.fatalHandler?.();
+    this.fatalHandler?.(err);
   }
 
   /**
@@ -186,6 +188,7 @@ export class DtlnProcessor {
    * that recovery gets a fresh heap instead of reusing a failed instance.
    */
   private discardContext(): void {
+    this.processingLoad = null;
     this.worker?.terminate();
     this.worker = null;
     this.channel?.port1.close();
@@ -197,7 +200,7 @@ export class DtlnProcessor {
   }
 
   /** Set (or clear with null) the fatal callback. One slot: one caller owns it. */
-  onFatal(handler: (() => void) | null): void {
+  onFatal(handler: ((error: Error) => void) | null): void {
     this.fatalHandler = handler;
   }
 
@@ -213,6 +216,10 @@ export class DtlnProcessor {
     const p = this.readyPromise;
     if (!this.ready && !this.initializing) void this.init().catch(() => {});
     return p;
+  }
+
+  getProcessingLoad(): number | null {
+    return this.processingLoad;
   }
 
   isReady(): boolean {
@@ -291,6 +298,7 @@ export class DtlnProcessor {
     this.txInputGain = inputGainNode;
     this.txOutputGain = outputGainNode;
     this.transportDest = dest;
+    this.node.port.postMessage({ processingGuard: true });
 
     // Resume last, unconditionally: releaseTransport() above queues a
     // suspend whose state change lands asynchronously, so ctx.state still
@@ -306,6 +314,8 @@ export class DtlnProcessor {
    * chewing CPU on a dead mic.
    */
   releaseTransport(): void {
+    this.processingLoad = null;
+    this.workletNode?.port.postMessage({ processingGuard: false });
     this.txSource?.disconnect();
     this.txInputGain?.disconnect();
     this.txOutputGain?.disconnect();

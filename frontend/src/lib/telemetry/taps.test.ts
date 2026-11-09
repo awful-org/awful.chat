@@ -425,3 +425,10 @@ describe("the TURN reachability probe", () => {
     }
   });
 });
+
+it("records the actual noise-suppression backend and fallback reason", () => {
+  const event = voiceEvent("processingChanged", [false, "DTLN processing budget exceeded"]);
+  expect(event?.kind).toBe("session.config");
+  expect(event?.d).toEqual({ voiceProcessing: "browser", reason: "DTLN processing budget exceeded" });
+  expect(voiceEvent("processingChanged", [true])?.d).toEqual({ voiceProcessing: "dtln", reason: "selected" });
+});

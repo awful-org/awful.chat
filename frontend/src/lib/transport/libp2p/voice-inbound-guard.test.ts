@@ -329,6 +329,17 @@ describe("LibP2PVoice.handleDtlnFatal (finding 1)", () => {
     expect(internals.dtlnEnabled).toBe(false);
   });
 
+  it("reports native fallback with its reason so settings cannot claim DTLN is active", () => {
+    const { voice, internals } = makeVoice();
+    internals.audioCtx = {};
+    internals.startMic = () => Promise.resolve();
+    const changed = vi.fn();
+    voice.on("processingChanged", changed);
+    (internals.handleDtlnFatal as (error: Error) => void).call(internals, new Error("DTLN processing budget exceeded"));
+    expect(changed).toHaveBeenCalledWith(false, "DTLN processing budget exceeded");
+    expect(voice.isDtlnEnabled()).toBe(false);
+  });
+
   it("does nothing without an active call - no audioCtx, nothing to rebuild", () => {
     const { internals } = makeVoice();
     internals.audioCtx = null;
