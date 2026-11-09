@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderMessageMarkdown } from "./markdown";
 import {
   buildMentionCandidates,
+  filterMentionCandidates,
   humanize,
   mentionsMe,
   segmentDraft,
@@ -366,6 +367,29 @@ describe("buildMentionCandidates", () => {
 
   it("returns nothing for an empty roster", () => {
     expect(build({ roomUsers: [], peers: [] })).toEqual([]);
+  });
+});
+
+describe("filterMentionCandidates", () => {
+  it("puts a prefix match before an online substring match", () => {
+    const candidates = [
+      { did: "did:jubarex", name: "jubarex", online: true },
+      { did: "did:renger", name: "renger", online: false },
+    ];
+    // Jubarex contains "re" near the end, but Renger starts with it. The
+    // default selected row must be Renger; online status only breaks ties.
+    expect(filterMentionCandidates(candidates, "re").map((c) => c.name)).toEqual([
+      "renger", "jubarex",
+    ]);
+  });
+
+  it("matches case-insensitively and keeps the original order for an empty query", () => {
+    const candidates = [
+      { did: "did:z", name: "Zed", online: true },
+      { did: "did:r", name: "Renger", online: false },
+    ];
+    expect(filterMentionCandidates(candidates, "REN").map((c) => c.name)).toEqual(["Renger"]);
+    expect(filterMentionCandidates(candidates, "")).toEqual(candidates);
   });
 });
 

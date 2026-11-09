@@ -246,6 +246,29 @@ export function buildMentionCandidates(
 }
 
 /**
+ * Filter the mention popup and put the most useful match first. A prefix is
+ * stronger evidence of intent than a substring elsewhere in the name: @re
+ * means "renger" before "jubarex", even when Jubarex is online and Renger
+ * is not. Online state and alphabetical order break ties within each tier.
+ */
+export function filterMentionCandidates(
+  candidates: readonly MentionCandidate[],
+  query: string,
+): MentionCandidate[] {
+  const lower = query.toLowerCase();
+  if (!lower) return [...candidates];
+  return candidates
+    .filter((candidate) => candidate.name.toLowerCase().includes(lower))
+    .sort((a, b) => {
+      const aPrefix = a.name.toLowerCase().startsWith(lower);
+      const bPrefix = b.name.toLowerCase().startsWith(lower);
+      return Number(bPrefix) - Number(aPrefix) ||
+        Number(b.online) - Number(a.online) ||
+        a.name.localeCompare(b.name);
+    });
+}
+
+/**
  * Escape special regex characters in a string.
  * Used to safely include user-provided names in regex patterns.
  *
