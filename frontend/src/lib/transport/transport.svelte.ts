@@ -171,7 +171,7 @@ import { clearPluginConfirms } from "../plugins/confirm.svelte";
 import { clearSearchCorpus } from "../search/corpus.svelte";
 import { announceMessage } from "../announce";
 import { mentionsMe } from "../mentions";
-import { appendToDmPanel, dmPanelIsShowing } from "../dm-panel.svelte";
+import { appendToDmPanel, dmPanelIsShowing, mapDmPanelMessages } from "../dm-panel.svelte";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
@@ -855,6 +855,11 @@ export function applyMessageStatus(
   status: keyof typeof STATUS_RANK
 ): void {
   updateMessageStatus(messageId, status).catch(() => {});
+  mapDmPanelMessages((m) =>
+    m.id === messageId && !(m.status && STATUS_RANK[m.status] >= STATUS_RANK[status])
+      ? { ...m, status }
+      : m
+  );
   const idx = transportState.messages.findIndex((m) => m.id === messageId);
   if (idx === -1) return;
   const current = transportState.messages[idx].status;
@@ -984,9 +989,10 @@ async function _cascadeReadAcks(
   if (cascade.stores === stores) cascade.upTo = Math.max(cascade.upTo, lamport);
   if (!changed.length) return;
   const changedSet = new Set(changed);
-  transportState.messages = transportState.messages.map((m) =>
-    changedSet.has(m.id) ? { ...m, status: "read" } : m
-  );
+  const markRead = (m: Message): Message =>
+    changedSet.has(m.id) ? { ...m, status: "read" } : m;
+  transportState.messages = transportState.messages.map(markRead);
+  mapDmPanelMessages(markRead);
 }
 
 function lamportSend(roomCode: string): number {

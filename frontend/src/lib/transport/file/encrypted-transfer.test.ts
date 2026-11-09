@@ -276,10 +276,18 @@ it("shows a file it serves from ciphertext when it is asked for, from here and o
   expect(restarted.getTransfer(descriptor.infoHash)?.status).toBe("seeding");
 });
 
-it("fails closed without OPFS instead of seeding plaintext", async () => {
-  vi.stubGlobal("navigator", { storage: {} });
-  await expect(transport().seedEncryptedFiles([new File(["secret"], "name")])).rejects.toThrow("storage support");
-  expect(seeds).toHaveLength(0);
+it("keeps the encrypted transfer boundary when OPFS is unavailable", async () => {
+  vi.stubGlobal("navigator", { storage: { getDirectory: async () => { throw new DOMException("Private window", "SecurityError"); } } });
+  const sender = transport();
+  const [descriptor] = await sender.seedEncryptedFiles([new File(["secret"], "name")]);
+  expect(descriptor.encryption).toBeTruthy();
+  expect(seeds).toHaveLength(1);
+  expect(seeds[0].file.name).not.toBe("name");
+  expect(await seeds[0].file.text()).not.toContain("secret");
+  const restored = transport();
+  const downloaded = vi.fn(); restored.on("downloaded", downloaded);
+  expect(await restored.restoreEncryptedFile(descriptor)).toBe(true);
+  expect(await downloaded.mock.calls[0][1].text()).toBe("secret");
 });
 
 it("cancels a delayed encrypted restore on reset while preserving durable ciphertext for the new session", async () => {

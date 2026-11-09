@@ -109,6 +109,7 @@ export interface PeerTransport {
 }
 
 export interface VoiceEvents {
+  processingChanged: (dtlnEnabled: boolean, reason?: string) => void;
   trackAdded: (peerId: string, track: MediaStreamTrack) => void;
   trackRemoved: (peerId: string) => void;
   peerJoined: (peerId: string) => void;

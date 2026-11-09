@@ -1,3 +1,5 @@
+import { fileStorageRoot } from "./file-storage";
+
 /**
  * Which session a temporary OPFS entry belongs to, so what a closed page left
  * behind can be told apart from what a running one is still using.
@@ -77,12 +79,9 @@ export class OPFSLease {
    * running in another tab.
    */
   async directory(area: Area): Promise<FileSystemDirectoryHandle> {
-    if (!globalThis.navigator?.storage?.getDirectory) {
-      throw new Error("Encrypted file transfers need browser storage support. Please update your browser.");
-    }
     await this.hold();
     if (this.ended) throw new Error("Transfer storage released");
-    const root = await navigator.storage.getDirectory();
+    const root = await fileStorageRoot();
     const parent = await root.getDirectoryHandle(area, { create: true });
     return parent.getDirectoryHandle(this.id, { create: true });
   }
@@ -95,8 +94,7 @@ export class OPFSLease {
       // Never held means nothing was ever made under it.
       if (!this.held) return;
       await this.held;
-      if (!globalThis.navigator?.storage?.getDirectory) return;
-      const root = await navigator.storage.getDirectory();
+      const root = await fileStorageRoot();
       for (const area of AREAS) {
         const parent = await root.getDirectoryHandle(area).catch(() => null);
         // A file still open for writing refuses removal; the lock goes
@@ -126,7 +124,7 @@ export class OPFSLease {
     const locks = globalThis.navigator?.locks;
     if (!locks || !globalThis.navigator?.storage?.getDirectory) return;
     const unleasedAreFree = await noOtherPage(locks);
-    const root = await navigator.storage.getDirectory();
+    const root = await fileStorageRoot();
     for (const area of AREAS) {
       const parent = await root.getDirectoryHandle(area).catch(() => null);
       if (!parent) continue;

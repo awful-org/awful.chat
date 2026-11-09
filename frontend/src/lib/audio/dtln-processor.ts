@@ -1,5 +1,6 @@
 import { AUDIO_PREF_DEFAULTS } from "$lib/transport/audio-prefs";
 import { WORKLET_URL } from "./worklet-url";
+import bridgeUrl from "./dtln-bridge-worklet.ts?worker&url";
 
 export interface DtlnMessage {
   noise_gate?: number;
@@ -8,7 +9,10 @@ export interface DtlnMessage {
 export class DtlnProcessor {
   private audioCtx: AudioContext | null = null;
   private workletNode: AudioWorkletNode | null = null;
+  private worker: Worker | null = null;
+  private channel: MessageChannel | null = null;
   private ready = false;
+  private processingLoad: number | null = null;
   private readyPromise!: Promise<void>;
   private resolveReady!: () => void;
   private rejectReady!: (err: Error) => void;
@@ -22,7 +26,7 @@ export class DtlnProcessor {
    * "connected" on both ends the whole time. LibP2PVoice uses this to
    * rebuild the mic instead of leaving that peer permanently unheard.
    */
-  private fatalHandler: (() => void) | null = null;
+  private fatalHandler: ((error: Error) => void) | null = null;
 
   /**
    * Gain after the model. The worklet is unity gain, and the model barely
@@ -33,7 +37,7 @@ export class DtlnProcessor {
    */
   static readonly OUTPUT_COMPENSATION = 1.0;
 
-  // Two independent graphs share the single DTLN worklet node:
+  // Two independent graphs share the single DTLN bridge and worker:
   //
   //   transport: mic -> txInputGain -> worklet -> txOutputGain -> dest (peers)
   //   monitor:   mic -> monGain -> worklet -> monOutGain -> dest (speakers)
@@ -72,7 +76,7 @@ export class DtlnProcessor {
     try {
       // Create context (it will start 'suspended' if no user gesture).
       //
-      // At the HARDWARE rate, never { sampleRate: 16000 }. The worklet
+      // At the HARDWARE rate, never { sampleRate: 16000 }. The model worker
       // carries its own resampler - it reads the context rate, anti-alias
       // filters, feeds the model at 16k and upsamples the result back - so a
       // 16k context turned that into dead code (ratio 1) and pushed the
@@ -84,11 +88,11 @@ export class DtlnProcessor {
       // track handed to Opus is wideband instead of a 16k narrowband one.
       this.audioCtx ??= new AudioContext();
 
-      await this.audioCtx.audioWorklet.addModule(WORKLET_URL);
+      await this.audioCtx.audioWorklet.addModule(bridgeUrl);
 
       const node = new AudioWorkletNode(
         this.audioCtx,
-        "NoiseSuppressionWorker",
+        "DtlnBridge",
         {
           numberOfInputs: 1,
           numberOfOutputs: 1,
@@ -97,9 +101,17 @@ export class DtlnProcessor {
           channelCountMode: "explicit",
         }
       );
+      this.worker = new Worker(new URL("./dtln-worker.ts", import.meta.url), { type: "module" });
+      this.channel = new MessageChannel();
+      node.port.postMessage({ workerPort: this.channel.port1 }, [this.channel.port1]);
+      this.worker.postMessage({
+        sampleRate: this.audioCtx.sampleRate,
+        moduleUrl: new URL(WORKLET_URL, location.href).href,
+        port: this.channel.port2,
+      }, [this.channel.port2]);
 
       await new Promise<void>((resolve, reject) => {
-        // The worklet posts "ready" once its WASM runtime is up and the
+        // The bridge forwards "ready" once the worker's WASM runtime is up and the
         // denoiser exists; a processor that crashes instead rejects in
         // milliseconds rather than eating the whole timeout.
         const timeout = setTimeout(
@@ -110,7 +122,15 @@ export class DtlnProcessor {
           clearTimeout(timeout);
           reject(new Error("DTLN processor crashed during init"));
         };
+        this.worker!.onerror = (event) => {
+          clearTimeout(timeout);
+          reject(new Error(`DTLN worker failed during init: ${event.message}`));
+        };
         node.port.onmessage = (event) => {
+          if (event.data?.fatal) {
+            clearTimeout(timeout);
+            reject(new Error(event.data.fatal));
+          }
           if (event.data === "ready") {
             clearTimeout(timeout);
             resolve();
@@ -120,6 +140,11 @@ export class DtlnProcessor {
 
       node.onprocessorerror = () =>
         this.handleFatal(new Error("DTLN processor crashed"));
+      this.worker.onerror = () => this.handleFatal(new Error("DTLN worker failed"));
+      node.port.onmessage = ({ data }) => {
+        if (data?.processing) this.processingLoad = data.processing.load;
+        if (data?.fatal) this.handleFatal(new Error(data.fatal));
+      };
       this.workletNode = node;
       this.ready = true;
       node.port.postMessage({
@@ -154,25 +179,28 @@ export class DtlnProcessor {
     this.ready = false;
     this.initializing = false;
     this.armReadyPromise();
-    this.fatalHandler?.();
+    this.fatalHandler?.(err);
   }
 
   /**
-   * Close the context so the next init() builds a new one. Every worklet node
-   * in a context shares one WASM instance, and that instance can create only
-   * two denoisers in its lifetime (a fixed 16 MB heap that destroy does not
-   * give back) - rebuilding in the same context after a crash got a
-   * denoiser that trapped on its first block, or a create that never
-   * returned and hung the audio thread. A new context is a new instance.
+   * Retire both the graph and the worker. The generated WASM instance has
+   * room for only two denoisers in its lifetime; a fresh worker guarantees
+   * that recovery gets a fresh heap instead of reusing a failed instance.
    */
   private discardContext(): void {
+    this.processingLoad = null;
+    this.worker?.terminate();
+    this.worker = null;
+    this.channel?.port1.close();
+    this.channel?.port2.close();
+    this.channel = null;
     const ctx = this.audioCtx;
     this.audioCtx = null;
     void ctx?.close().catch(() => {});
   }
 
   /** Set (or clear with null) the fatal callback. One slot: one caller owns it. */
-  onFatal(handler: (() => void) | null): void {
+  onFatal(handler: ((error: Error) => void) | null): void {
     this.fatalHandler = handler;
   }
 
@@ -188,6 +216,10 @@ export class DtlnProcessor {
     const p = this.readyPromise;
     if (!this.ready && !this.initializing) void this.init().catch(() => {});
     return p;
+  }
+
+  getProcessingLoad(): number | null {
+    return this.processingLoad;
   }
 
   isReady(): boolean {
@@ -266,6 +298,7 @@ export class DtlnProcessor {
     this.txInputGain = inputGainNode;
     this.txOutputGain = outputGainNode;
     this.transportDest = dest;
+    this.node.port.postMessage({ processingGuard: true });
 
     // Resume last, unconditionally: releaseTransport() above queues a
     // suspend whose state change lands asynchronously, so ctx.state still
@@ -281,6 +314,8 @@ export class DtlnProcessor {
    * chewing CPU on a dead mic.
    */
   releaseTransport(): void {
+    this.processingLoad = null;
+    this.workletNode?.port.postMessage({ processingGuard: false });
     this.txSource?.disconnect();
     this.txInputGain?.disconnect();
     this.txOutputGain?.disconnect();
@@ -379,6 +414,8 @@ export class DtlnProcessor {
    */
   private suspendIfIdle(): void {
     if (!this.txSource && !this.monSource) {
+      // Do not replay the bridge's buffered samples when a later call starts.
+      this.workletNode?.port.postMessage({ reset: true });
       void this.audioCtx?.suspend().catch(() => {});
     }
   }

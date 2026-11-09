@@ -24,7 +24,7 @@
   import { resolveChatFontStack } from "$lib/chat-font";
   import {
     requestFileDownload,
-    selfId,
+    isSelfSender,
     transportState,
   } from "$lib/transport/transport.svelte";
   import {
@@ -113,9 +113,7 @@
   const visible = $derived(
     dmPanel.messages.filter((m) => m.type !== MessageType.Reaction)
   );
-  const receiptIds = $derived(
-    dmReceiptIds(visible, (senderId) => senderId === selfId())
-  );
+  const receiptIds = $derived(new Set(dmReceiptIds(visible, isSelfSender)));
 
   /**
    * Same rule the chat pane uses: a header when the speaker changes, or after a
@@ -332,7 +330,7 @@
           </p>
         {:else}
           {#each visible as msg, i (msg.id)}
-            {@const own = msg.senderId === selfId()}
+            {@const own = isSelfSender(msg.senderId)}
             {#if startsGroup(msg, visible[i - 1])}
               <div
                 class="mt-1.5 flex items-baseline gap-1.5 text-xs first:mt-0"
@@ -358,7 +356,7 @@
               isOwn={own}
               fileTransfers={transportState.fileTransfers}
               onRequestFileDownload={requestFileDownload}
-              showReceipt={receiptIds.includes(msg.id)}
+              showReceipt={receiptIds.has(msg.id)}
             />
           {/each}
         {/if}

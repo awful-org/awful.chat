@@ -174,6 +174,17 @@ The dtln repo's own page (`npm run serve`) self-checks the worklet - worth
 running before syncing, since a broken worklet fails silently rather than
 loudly.
 
+The generated model bundle runs inside `frontend/src/lib/audio/dtln-worker.ts`,
+not on the audio rendering thread. `dtln-bridge-worklet.ts` transfers batches
+of samples to that worker and buffers its output. Model inference can exceed
+a single render quantum, so running it directly in an AudioWorklet causes
+dropouts even when its average CPU usage is acceptable. A bounded queue and
+a short output cushion absorb that variation; a worker that cannot keep up
+causes the call to switch to browser suppression until DTLN is enabled again.
+The adapter preserves the generated model and its resampler without editing
+either generated file. Buffering adds roughly 32 ms at 48 kHz, plus batching
+and the model's existing latency.
+
 ## Self-hosting
 
 `docker-compose.dokploy.yml` runs relay + sfu + coturn + frontend behind

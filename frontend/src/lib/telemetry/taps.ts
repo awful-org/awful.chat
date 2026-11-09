@@ -197,6 +197,11 @@ export function voiceEvent(event: string, args: unknown[]): Body | null {
       return ev("voice.media.resume", { peer, d: { via: "trackAdded" } });
     case "trackRemoved":
       return ev("voice.teardown", { peer, d: { via: "trackRemoved" } });
+    case "processingChanged":
+      return ev("session.config", { d: {
+        voiceProcessing: args[0] === true ? "dtln" : "browser",
+        reason: typeof args[1] === "string" ? args[1] : "selected",
+      } });
     case "deviceChanged":
       return ev("session.config", { d: { audioDevice: asString(args[0]) } });
     case "error":

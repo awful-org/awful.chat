@@ -43,4 +43,10 @@ describe("ChatView's window over the rows it holds", () => {
     expect(source).toContain("untrack(() => jumpToMessage(jump.messageId, jump.revealed));");
     expect(source).toContain("onclick={() => jumpToMessage(msg.replyTo!.id)}");
   });
+
+  // Scrolled up, the window's last row is not the end of its status run:
+  // reading the mounted rows put a false receipt on it.
+  it("works out DM receipts from every row held, not the mounted window", () => {
+    expect(source).toContain("dmReceiptIds(visibleMessages, isSelfSender)");
+  });
 });

@@ -4,6 +4,7 @@ import {
   appendToDmPanel,
   dmPanel,
   dmPanelIsShowing,
+  mapDmPanelMessages,
 } from "./dm-panel.svelte";
 
 const DM_A = "dm-aaaa";
@@ -97,5 +98,26 @@ describe("dmPanelIsShowing", () => {
   it("is false while closed", () => {
     dmPanel.roomCode = null;
     expect(dmPanelIsShowing(DM_A)).toBe(false);
+  });
+});
+
+describe("the panel's messages following acks", () => {
+  beforeEach(() => {
+    dmPanel.roomCode = DM_A;
+    dmPanel.messages = [];
+  });
+
+  it("applies a change to the matching message only", () => {
+    appendToDmPanel(msg({ id: "m1", lamport: 1, status: "sent" }));
+    appendToDmPanel(msg({ id: "m2", lamport: 2, status: "sent" }));
+    mapDmPanelMessages((m) => (m.id === "m2" ? { ...m, status: "read" } : m));
+    expect(dmPanel.messages.map((m) => m.status)).toEqual(["sent", "read"]);
+  });
+
+  it("leaves the list alone when nothing changed", () => {
+    appendToDmPanel(msg({ status: "sent" }));
+    const before = dmPanel.messages;
+    mapDmPanelMessages((m) => m);
+    expect(dmPanel.messages).toBe(before);
   });
 });

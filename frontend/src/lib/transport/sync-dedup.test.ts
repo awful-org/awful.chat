@@ -80,7 +80,7 @@ vi.mock("$lib/rooms.svelte", () => ({
   roomsStore: { rooms: [], dmRooms: [] },
 }));
 vi.mock("$lib/profile.svelte", () => ({ profileStore: {} }));
-vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn() }));
+vi.mock("$lib/dm-panel.svelte", () => ({ appendToDmPanel: vi.fn(), mapDmPanelMessages: vi.fn() }));
 vi.mock("./dm.svelte", () => ({ isDmRequestRoom: () => false, flushQueuedDmForPeer: async () => {} }));
 vi.mock("./verify-incoming", async (original) => ({
   ...await original<typeof import("./verify-incoming")>(), verifyIncoming: s.verify,

@@ -147,6 +147,7 @@
   import { joinCall } from "$lib/transport/call.svelte";
   import {
     buildMentionCandidates,
+    filterMentionCandidates,
     mentionsMe,
     segmentDraft,
     serialize,
@@ -1016,11 +1017,7 @@
 
   const filteredMembersForMention = $derived.by(() => {
     if (!mentionPopupOpen) return [];
-    const lower = mentionPrefix.toLowerCase();
-    if (!lower) return mentionCandidates;
-    return mentionCandidates.filter((m) =>
-      m.name.toLowerCase().includes(lower),
-    );
+    return filterMentionCandidates(mentionCandidates, mentionPrefix);
   });
 
   function updateMentionState() {
@@ -2258,7 +2255,9 @@
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
   const receiptIds = $derived(
-    isDmChat ? dmReceiptIds(renderedMessages, isSelfSender) : []
+    // Every message held, not the mounted window: scrolled up, the window's
+    // last row is not the end of its run.
+    new Set(isDmChat ? dmReceiptIds(visibleMessages, isSelfSender) : [])
   );
 
   /** What the leave control says. /qc overrides it: a quick call is not a
@@ -3292,7 +3291,7 @@
                     {isOwn}
                     {fileTransfers}
                     onRequestFileDownload={requestFileDownload}
-                    showReceipt={receiptIds.includes(msg.id)}
+                    showReceipt={receiptIds.has(msg.id)}
                   />
 
                   {#if reactions?.size}
