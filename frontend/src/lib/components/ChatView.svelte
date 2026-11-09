@@ -147,6 +147,7 @@
   import { joinCall } from "$lib/transport/call.svelte";
   import {
     buildMentionCandidates,
+    filterMentionCandidates,
     mentionsMe,
     segmentDraft,
     serialize,
@@ -1016,11 +1017,7 @@
 
   const filteredMembersForMention = $derived.by(() => {
     if (!mentionPopupOpen) return [];
-    const lower = mentionPrefix.toLowerCase();
-    if (!lower) return mentionCandidates;
-    return mentionCandidates.filter((m) =>
-      m.name.toLowerCase().includes(lower),
-    );
+    return filterMentionCandidates(mentionCandidates, mentionPrefix);
   });
 
   function updateMentionState() {
