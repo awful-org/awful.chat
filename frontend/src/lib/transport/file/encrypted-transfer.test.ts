@@ -30,6 +30,7 @@ class Client {
       t.done = true;
       t.files = [{ name: file.name }];
       this.torrents.set(t.infoHash, t);
+      opts.onProgress?.(file.size, file.size);
       cb(t);
     });
     return t;
@@ -95,6 +96,22 @@ it("seeds only opaque ciphertext, authenticates before publication, and restarts
   expect(seeds[1].file.name).toBe(seeds[0].file.name);
   expect(seeds[1].opts.pieceLength).toBe(seeds[0].opts.pieceLength);
   expect(await seeds[1].file.arrayBuffer()).toEqual(bytes);
+});
+
+it("reports real encryption, torrent hashing and browser-cache progress", async () => {
+  const sender = transport();
+  const events: { phase: string; progress: number }[] = [];
+  await sender.seedEncryptedFiles(
+    [new File(["private medical report"], "diagnosis.txt")],
+    (_source, phase, progress) => events.push({ phase, progress }),
+  );
+  expect(seeds[0].opts.onProgress).toBeTypeOf("function");
+  for (const phase of ["encrypting", "hashing", "caching"]) {
+    const reported = events.filter((event) => event.phase === phase);
+    expect(reported.length).toBeGreaterThan(0);
+    expect(reported[0].progress).toBe(0);
+    expect(reported.at(-1)?.progress).toBe(1);
+  }
 });
 
 it.each(["key", "tamper", "truncation"])("never publishes or reseeds plaintext after %s failure", async kind => {

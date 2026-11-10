@@ -28,7 +28,10 @@
  */
 
 import { LibP2PTransport } from "$lib/transport/libp2p/transport";
-import { WebTorrentFileTransport } from "$lib/transport/file/webtorrent";
+import {
+  WebTorrentFileTransport,
+  type FilePreparationPhase,
+} from "$lib/transport/file/webtorrent";
 import { removeCiphertext } from "$lib/transport/file/ciphertext-store";
 import { refreshTurnCredentials } from "$lib/transport/ice-server-list";
 import { isConfigured } from "$lib/runtime-config";
@@ -89,6 +92,9 @@ interface QuickSendPreparation {
   id: number;
   filename: string;
   size: number;
+  phase: FilePreparationPhase;
+  /** Overall progress through encrypting, hashing and caching, from 0 to 1. */
+  progress: number;
 }
 
 interface QuickSendState {
@@ -149,6 +155,14 @@ const ciphertext = new Set<string>();
 /** Offers this person turned down: a re-announcement must not bring them back. */
 const declined = new Set<string>();
 let nextPreparationId = 0;
+const PREPARATION_PHASE_START: Record<FilePreparationPhase, number> = {
+  encrypting: 0,
+  hashing: 1 / 3,
+  caching: 2 / 3,
+};
+function preparationProgress(phase: FilePreparationPhase, progress: number): number {
+  return PREPARATION_PHASE_START[phase] + Math.max(0, Math.min(1, progress)) / 3;
+}
 
 function mayReshare(): boolean {
   return quickSend.heardMode !== "once" && shouldReshare();
@@ -430,6 +444,7 @@ export async function offerFiles(picked: File[]): Promise<void> {
   const owner = files;
   const jobs = picked.map(file => ({
     id: ++nextPreparationId, filename: file.name, size: file.size,
+    phase: "encrypting" as const, progress: 0,
   }));
   const ids = new Set(jobs.map(job => job.id));
   quickSend.preparing = [...quickSend.preparing, ...jobs];
@@ -439,7 +454,19 @@ export async function offerFiles(picked: File[]): Promise<void> {
       let descriptors: FileDescriptor[];
       // One file per operation lets partial success remain visible and ensures
       // every persisted ciphertext reference is owned if the next file fails.
-      try { descriptors = await owner.seedEncryptedFiles([picked[index]]); }
+      const job = jobs[index];
+      try {
+        descriptors = await owner.seedEncryptedFiles(
+          [picked[index]],
+          (_source, phase, progress) => {
+            if (files !== owner) return;
+            const overall = preparationProgress(phase, progress);
+            quickSend.preparing = quickSend.preparing.map((candidate) =>
+              candidate.id === job.id ? { ...candidate, phase, progress: overall } : candidate
+            );
+          },
+        );
+      }
       catch (err) {
         if (files === owner) quickSend.error = err instanceof Error ? err.message : "Could not encrypt files.";
         continue;

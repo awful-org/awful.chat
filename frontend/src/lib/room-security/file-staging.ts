@@ -62,12 +62,13 @@ export async function stageEncryptedFile(
   source: File,
   directory: FileSystemDirectoryHandle,
   signal?: AbortSignal,
+  onProgress?: (bytesProcessed: number) => void,
 ): Promise<StagedFile & {
   encryption: EncryptedFileDescriptor;
 }> {
   let encryption!: EncryptedFileDescriptor;
   const staged = await stage(directory, `${crypto.randomUUID()}.bin`, "application/octet-stream", async output => {
-    encryption = await encryptFileTo(source, output);
+    encryption = await encryptFileTo(source, output, onProgress);
   }, signal);
   return { ...staged, file: new File([staged.file], `${encryption.id}.bin`, { type: "application/octet-stream" }), encryption };
 }
