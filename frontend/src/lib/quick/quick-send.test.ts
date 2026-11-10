@@ -8,6 +8,11 @@ const FILE = { infoHash: HASH, filename: "private.txt", mimeType: "text/plain", 
   encryption: { version: 2 as const, key: "A".repeat(43), id: "A".repeat(22), size: 6, chunkSize: 1048576 } };
 const offer = (file = FILE) => ({ type: "__file_signal", payload: { kind: "file-seeder", file } });
 const frame = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+type PreparationReport = (
+  source: File,
+  phase: "encrypting" | "hashing" | "caching",
+  progress: number,
+) => void;
 class Events {
   handlers = new Map<string, Function[]>();
   on(event: string, fn: Function) { this.handlers.set(event, [...this.handlers.get(event) ?? [], fn]); }
@@ -28,7 +33,7 @@ class FakeTransport extends Events {
 class FakeFiles extends Events {
   lookup?: (hash: string) => Promise<File | null>;
   setLocalFileLookup(fn: typeof this.lookup) { this.lookup = fn; }
-  seedEncryptedFiles = vi.fn(async (_files: File[]) => [FILE]);
+  seedEncryptedFiles = vi.fn(async (_files: File[], _onProgress?: PreparationReport) => [FILE]);
   stopSeeding = vi.fn(async (_hash: string) => {});
   onPeerConnect = vi.fn();
   onPeerDisconnect = vi.fn();
@@ -67,12 +72,31 @@ describe("protected quick send", () => {
     f.seedEncryptedFiles.mockImplementationOnce(() => new Promise(r => { finish = r; }));
     const pending = qs.offerFiles([new File(["secret"], "private.txt")]);
     expect(qs.quickSend.preparing).toEqual([
-      { id: expect.any(Number), filename: "private.txt", size: 6 },
+      { id: expect.any(Number), filename: "private.txt", size: 6, phase: "encrypting", progress: 0 },
     ]);
     expect(qs.quickSend.offered).toEqual([]);
     finish([FILE]); await pending;
     expect(qs.quickSend.preparing).toEqual([]);
     expect(qs.quickSend.offered).toEqual([FILE]);
+  });
+  it("reports overall encryption, hashing and browser-cache progress", async () => {
+    await start();
+    let finish!: (files: typeof FILE[]) => void;
+    let report!: PreparationReport;
+    f.seedEncryptedFiles.mockImplementationOnce((_files, onProgress) => new Promise((resolve) => {
+      report = onProgress!;
+      finish = resolve;
+    }));
+    const source = new File(["secret"], "private.txt");
+    const pending = qs.offerFiles([source]);
+    report(source, "encrypting", 0.5);
+    expect(qs.quickSend.preparing[0]).toMatchObject({ phase: "encrypting", progress: 1 / 6 });
+    report(source, "hashing", 0.5);
+    expect(qs.quickSend.preparing[0]).toMatchObject({ phase: "hashing", progress: 0.5 });
+    report(source, "caching", 1);
+    expect(qs.quickSend.preparing[0]).toMatchObject({ phase: "caching", progress: 1 });
+    finish([FILE]); await pending;
+    expect(qs.quickSend.preparing).toEqual([]);
   });
   it("removes an offer, stops its torrent and deletes its cached ciphertext", async () => {
     await start(); await qs.offerFiles([new File(["secret"], "private.txt")]);

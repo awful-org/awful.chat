@@ -16,6 +16,7 @@
   import type { FileDescriptor } from "$lib/transport/types";
   import type { RoomSecret } from "$lib/room-security/keys";
   import { parsePairingCode } from "$lib/room-security/pairing-code";
+  import { formatTimeLeft, formatTransferRate } from "$lib/quick/transfer-format";
   import { joinInvitationPairing } from "$lib/invite-pairing";
   import {
     cancelShortCode,
@@ -310,6 +311,15 @@
     return parts.join(" · ");
   }
 
+  function preparationStatus(file: {
+    phase: "encrypting" | "hashing" | "caching";
+    progress: number;
+  }): string {
+    const phase = file.phase === "encrypting" ? "Encrypting"
+      : file.phase === "hashing" ? "Hashing" : "Saving to browser";
+    return `${Math.round(file.progress * 100)}% · ${phase}`;
+  }
+
   function downloadStatus(file: FileDescriptor): string {
     const t = quickSend.transfers.get(file.infoHash);
     if (t?.status !== "downloading") return "Connecting…";
@@ -317,9 +327,9 @@
     const parts = [`${Math.round(progress * 100)}%`];
     const rate = speeds[file.infoHash];
     if (rate) {
-      parts.push(`${formatSize(Math.round(rate))}/s`);
+      parts.push(formatTransferRate(rate));
       const left = (file.size * (1 - progress)) / rate;
-      parts.push(left < 60 ? `~${Math.max(1, Math.round(left))} s left` : `~${Math.round(left / 60)} min left`);
+      parts.push(formatTimeLeft(left));
     }
     return parts.join(" · ");
   }
@@ -517,8 +527,21 @@
                   <span class="truncate">{file.filename}</span>
                   <span class="text-xs text-muted-foreground shrink-0">{formatSize(file.size)}</span>
                 </div>
-                <span class="text-xs text-muted-foreground">
-                  Encrypting · large files take a while
+                <div
+                  class="h-[3px] rounded-sm bg-muted overflow-hidden"
+                  role="progressbar"
+                  aria-label="Preparing {file.filename}"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(file.progress * 100)}
+                >
+                  <div
+                    class="h-full bg-primary transition-[width]"
+                    style="width: {Math.round(file.progress * 100)}%"
+                  ></div>
+                </div>
+                <span class="text-xs text-muted-foreground tabular-nums">
+                  {preparationStatus(file)}
                 </span>
               </div>
               <Loader2 class="size-4 shrink-0 animate-spin text-muted-foreground" />
