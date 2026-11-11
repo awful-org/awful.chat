@@ -113,6 +113,7 @@ import { LiveUpdateAdmission } from "../room-security/live-updates";
 
 const liveUpdateAdmission = new LiveUpdateAdmission();
 import { DtlnProcessor } from "../audio/dtln-processor";
+import { DfnProcessor } from "../audio/dfn-processor";
 import { warmWorkletWhenIdle } from "../audio/worklet-warmup";
 import { configSettled } from "../runtime-config";
 import { requireSession, onIdentityLock } from "../identity/identity";
@@ -682,6 +683,11 @@ export const _dtln = new DtlnProcessor();
 // connect(), so the first call doesn't also pay the download - and only a
 // session does: this used to run here, as the module loaded, which put the
 // download on the landing page and the setup and unlock screens too.
+//
+// DeepFilterNet3, the default model with DTLN as its fallback, is lazy too:
+// its WASM and model (~12 MB on the wire) download on first use, and nothing
+// warms them. Only its two small JS files (~25 KB) are in the precache.
+export const _dfn = new DfnProcessor();
 export const _transport = new LibP2PTransport();
 function currentIdentitySession() {
   try { return requireSession(); } catch { return null; }
@@ -713,7 +719,7 @@ _transport.setDmIntroduction(() => {
   // See dm-pq-hooks.ts for why a pending upgrade holds off creating the DM.
   onIntroductionVerified(_introductionHookDeps, peer, did, pqPending),
 (peer, did, state) => onIntroductionUpgraded(_introductionHookDeps, peer, did, state));
-export const _voice = new LibP2PVoice(_transport, _dtln);
+export const _voice = new LibP2PVoice(_transport, _dtln, _dfn);
 export const _video = new MediasoupVideo();
 _video.setRoomAdmission((room, nonce, peer) => _transport.sfuAdmission(room, nonce, peer));
 _video.setJoinSigner((nonce, room, peer) =>

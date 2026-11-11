@@ -17,6 +17,24 @@ The DTLN approach these implement was published as "Dual-Signal Transformation
 LSTM Network for Real-Time Noise Suppression":
   https://github.com/breizhn/DTLN
 
+The DeepFilterNet3 noise suppression ships as three files from the npm package
+@workadventure/noise-suppression (MIT, Copyright (c) 2026 WorkAdvetu.re; its
+license text is in the generated section below): an AudioWorklet script that
+carries the package's processor and the wasm-bindgen glue for libDF,
+df_bg.wasm (libDF, DeepFilterNet's Rust library, compiled to WebAssembly) and
+the model DeepFilterNet3_onnx.tar.gz. libDF and the model are DeepFilterNet's;
+its notice is section 4, and section 5 lists the Rust crates df_bg.wasm links.
+
+Sources:
+  https://github.com/Rikorose/DeepFilterNet            (libDF and the model)
+  https://github.com/workadventure/noise-suppression   (the package; how the
+                                                        wasm is built is in
+                                                        forks/deepfilternet/)
+
+The DeepFilterNet3 model was published as "DeepFilterNet: Perceptually
+Motivated Real-Time Speech Enhancement":
+  https://arxiv.org/abs/2305.08227
+
 
 ================================================================================
 1. dtln-rs - MIT License
@@ -307,6 +325,118 @@ winapi,https://github.com/retep998/winapi-rs,MIT OR Apache-2.0,Peter Atashian <r
 The build tooling inventory for dtln-rs-demo (development dependencies, not
 shipped in the bundle) is published upstream at:
   https://github.com/DataDog/dtln-rs-demo/blob/main/LICENSE-3rdparty.csv
+
+================================================================================
+4. DeepFilterNet (libDF and the DeepFilterNet3 model) - MIT OR Apache-2.0
+   https://github.com/Rikorose/DeepFilterNet
+================================================================================
+
+df_bg.wasm is libDF built from commit d375b2d8309e0935d165700c91da9de862a99c31,
+which the package patches to tract 0.23 and builds without the embedded
+default model. DeepFilterNet3_onnx.tar.gz is that commit's
+models/DeepFilterNet3_onnx.tar.gz, unchanged. Neither carries a license of its
+own; the repository's README says: "All code in this repository is
+dual-licensed under either: MIT License [...] Apache License, Version 2.0
+[...] at your option."
+
+--- MIT License ---
+
+The MIT License (MIT)
+Copyright (c) 2021 Hendrik Schröter
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--- Apache License 2.0 ---
+
+The Apache License 2.0 text is reproduced in full in section 2. DeepFilterNet's
+copy fills in its appendix with:
+
+Copyright 2021 Hendrik Schröter
+
+================================================================================
+5. Third party components of df_bg.wasm
+   Inventoried from the crate source paths compiled into the binary.
+================================================================================
+
+Component,Origin,License,Copyright
+anyhow,https://github.com/dtolnay/anyhow,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
+bit-set,https://github.com/contain-rs/bit-vec,Apache-2.0 OR MIT,Alexis Beingessner <a.beingessner@gmail.com>
+bit-vec,https://github.com/contain-rs/bit-vec,Apache-2.0 OR MIT,Alexis Beingessner <a.beingessner@gmail.com>
+bytes,https://github.com/tokio-rs/bytes,MIT,"Carl Lerche <me@carllerche.com>, Sean McArthur <sean@seanmonstar.com>"
+chacha20,https://github.com/RustCrypto/stream-ciphers,MIT OR Apache-2.0,RustCrypto Developers
+dlmalloc,https://github.com/alexcrichton/dlmalloc-rs,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
+dlv-list,https://github.com/sgodwincs/dlv-list-rs,MIT OR Apache-2.0,Scott Godwin <sgodwincs@gmail.com>
+erased-serde,https://github.com/dtolnay/erased-serde,MIT OR Apache-2.0,David Tolnay <dtolnay@gmail.com>
+flate2,https://github.com/rust-lang/flate2-rs,MIT OR Apache-2.0,"Alex Crichton <alex@alexcrichton.com>, Josh Triplett <josh@joshtriplett.org>"
+half,https://github.com/starkat99/half-rs,MIT OR Apache-2.0,Kathryn Long <squeeself@gmail.com>
+hashbrown,https://github.com/rust-lang/hashbrown,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
+itertools,https://github.com/rust-itertools/itertools,MIT OR Apache-2.0,bluss
+lazy_static,https://github.com/rust-lang-nursery/lazy-static.rs,MIT OR Apache-2.0,Marvin Löbel <loebel.marvin@gmail.com>
+lock_api,https://github.com/Amanieu/parking_lot,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
+log,https://github.com/rust-lang/log,MIT OR Apache-2.0,The Rust Project Developers
+miniz_oxide,https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide,MIT OR Zlib OR Apache-2.0,"Frommi <daniil.liferenko@gmail.com>, oyvindln <oyvindln@users.noreply.github.com>"
+ndarray,https://github.com/rust-ndarray/ndarray,MIT OR Apache-2.0,"bluss, Jim Turner"
+nom,https://github.com/rust-bakery/nom,MIT,Geoffroy Couprie <contact@geoffroycouprie.com>
+nom-language,https://github.com/rust-bakery/nom,MIT,Geoffroy Couprie <contact@geoffroycouprie.com>
+num-integer,https://github.com/rust-num/num-integer,MIT OR Apache-2.0,The Rust Project Developers
+num-rational,https://github.com/rust-num/num-rational,MIT OR Apache-2.0,The Rust Project Developers
+ordered-multimap,https://github.com/sgodwincs/ordered-multimap-rs,MIT,Scott Godwin <sgodwincs@gmail.com>
+parking_lot,https://github.com/Amanieu/parking_lot,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
+parking_lot_core,https://github.com/Amanieu/parking_lot,MIT OR Apache-2.0,Amanieu d'Antras <amanieu@gmail.com>
+primal-check,https://github.com/huonw/primal,MIT OR Apache-2.0,Huon Wilson <dbau.pp@gmail.com>
+rand,https://github.com/rust-random/rand,MIT OR Apache-2.0,"The Rand Project Developers, The Rust Project Developers"
+realfft,https://github.com/HEnquist/realfft,MIT,HEnquist <henrik.enquist@gmail.com>
+Rust standard library,https://github.com/rust-lang/rust,MIT OR Apache-2.0,The Rust Project Contributors
+rust-ini,https://github.com/zonyitoo/rust-ini,MIT,Y. T. Chung <zonyitoo@gmail.com>
+rustc-demangle,https://github.com/rust-lang/rustc-demangle,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
+rustfft,https://github.com/ejmahler/RustFFT,MIT OR Apache-2.0,"Allen Welkie <allen.welkie at gmail>, Elliott Mahler <join.together at gmail>"
+serde_core,https://github.com/serde-rs/serde,MIT OR Apache-2.0,"Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>"
+smallvec,https://github.com/servo/rust-smallvec,MIT OR Apache-2.0,The Servo Project Developers
+strength_reduce,http://github.com/ejmahler/strength_reduce,MIT OR Apache-2.0,Elliott Mahler <join.together@gmail.com>
+string-interner,https://github.com/robbepop/string-interner,MIT OR Apache-2.0,Robin Freyler
+tar,https://github.com/alexcrichton/tar-rs,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
+tract-core,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-data,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-hir,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-linalg,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-nnef,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-onnx,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-onnx-opl,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-pulse,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-pulse-opl,https://github.com/sonos/tract,MIT OR Apache-2.0,Mathieu Poumeyrol <kali@zoy.org>
+tract-transformers,https://github.com/sonos/tract,MIT OR Apache-2.0,"Mathieu Poumeyrol <kali@zoy.org>, Louis Chouraki <louis.chouraki@sonos.com>"
+transpose,https://github.com/ejmahler/transpose,MIT OR Apache-2.0,Elliott Mahler <join.together@gmail.com>
+wasm-bindgen,https://github.com/wasm-bindgen/wasm-bindgen,MIT OR Apache-2.0,The wasm-bindgen Developers
+
+--------------------------------------------------------------------------------
+df_bg.wasm links these statically. No upstream inventory exists for this
+build, so this list was compiled from the binary itself: every crate whose
+crates.io source path (name and version) the compiler left in it; half,
+whose type names appear in it; and the Rust standard library (rustc 1.93.1,
+per the binary's producers section) with the crates it vendors (dlmalloc,
+hashbrown, rustc-demangle). A crate linked without leaving such a trace is
+not listed: this covers the crates identifiable from the binary, which may
+not be all of them. Licenses are the ones crates.io records for the version
+found (hashbrown is there at 0.14.5 and 0.16.1, under the same license;
+half's version is not recorded, and every half 2.x release is MIT OR
+Apache-2.0). Copyright holders are the authors in each crate's Cargo.toml,
+or the holder its license file names where that is more specific. The MIT
+License and Apache License 2.0 texts are reproduced in sections 1 and 2.
 
 ================ GENERATED NPM LICENSE NOTICES BELOW - do not edit ================
 

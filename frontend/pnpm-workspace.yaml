@@ -9,3 +9,7 @@ ignoredBuiltDependencies:
   - sharp
   - utf-8-validate
   - utp-native
+  # Pulled in by @workadventure/noise-suppression's background-noise detector
+  # (via onnxruntime-web), which the app does not use; its postinstall only
+  # prints a version-range warning.
+  - protobufjs

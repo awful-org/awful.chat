@@ -18,6 +18,24 @@ export const SHARE_CONTENT_HINTS = ["", "motion", "detail"] as const;
 export type ShareContentHint = (typeof SHARE_CONTENT_HINTS)[number];
 export type ShareHeight = (typeof SHARE_HEIGHTS)[number];
 export type ShareFps = (typeof SHARE_FPS)[number];
+/** The noise-suppression models: DeepFilterNet3 and DTLN. */
+export const NOISE_ENGINES = ["dfn3", "dtln"] as const;
+export type NoiseEngine = (typeof NOISE_ENGINES)[number];
+/** What the user sees each one called, and the browser's own suppression. */
+export const NOISE_ENGINE_LABELS: Record<NoiseEngine | "browser", string> = {
+  dfn3: "DeepFilterNet",
+  dtln: "DTLN",
+  browser: "Browser",
+};
+
+/**
+ * The models to try for a preferred one, best first: DTLN backs DeepFilterNet3
+ * up, and only the browser backs DTLN up. A call (LibP2PVoice) and the mic
+ * test (mic-test-engine.ts) both walk it.
+ */
+export function noiseEngineOrder(preferred: NoiseEngine): NoiseEngine[] {
+  return preferred === "dfn3" ? ["dfn3", "dtln"] : ["dtln"];
+}
 
 export interface AudioPrefs {
   inputDevice: string | null;
@@ -30,7 +48,17 @@ export interface AudioPrefs {
   cameraDevice: string | null;
   inputGain: number;
   outputVolume: number;
+  /**
+   * Noise suppression on or off, whichever model does it. The name is from
+   * when DTLN was the only one, kept so nobody's saved choice is lost.
+   */
   dtlnEnabled: boolean;
+  /**
+   * The model to use while noise suppression is on. A failing model falls
+   * back for the rest of that call only, and never rewrites this.
+   */
+  noiseEngine: NoiseEngine;
+  /** DTLN's gate threshold; DeepFilterNet3 gates by itself. */
   noiseGate: number;
   /**
    * Screen-share audio that could not be confirmed echo-free (see
@@ -62,6 +90,7 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   inputGain: 1.0,
   outputVolume: 1.0,
   dtlnEnabled: true,
+  noiseEngine: "dfn3",
   noiseGate: 0.002,
   shareAudioDespiteEchoRisk: false,
   shareHeight: 0,
@@ -119,6 +148,7 @@ export function loadAudioPrefs(): AudioPrefs {
         typeof p.dtlnEnabled === "boolean"
           ? p.dtlnEnabled
           : AUDIO_PREF_DEFAULTS.dtlnEnabled,
+      noiseEngine: oneOf(NOISE_ENGINES, p.noiseEngine, AUDIO_PREF_DEFAULTS.noiseEngine),
       noiseGate: num(p.noiseGate, AUDIO_PREF_DEFAULTS.noiseGate, 0, 0.01),
       shareAudioDespiteEchoRisk:
         typeof p.shareAudioDespiteEchoRisk === "boolean"

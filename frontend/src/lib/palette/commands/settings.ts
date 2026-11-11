@@ -303,7 +303,7 @@ export const settingsCommands: CmdSource = () => {
   cmds.push({
     id: "settings.toggle:noiseSuppression",
     title: "Noise suppression",
-    keywords: ["toggle", "enable", "disable", "dtln"],
+    keywords: ["toggle", "enable", "disable", "dtln", "deepfilternet"],
     group: "Settings",
     badge: getVoiceDtlnEnabled() ? "On" : "Off",
     action: {

@@ -24,10 +24,13 @@ describe("precompress", () => {
   // nginx compressed every cold load's JavaScript on the fly at level 1, on
   // a box it shares with the relay and the SFU: the 8 MB worklet alone cost
   // about 200 ms of CPU per request.
-  it("writes a .gz beside each script, stylesheet and text file nginx would compress", () => {
+  // WebAssembly too: nginx never compresses it on the fly, so this copy is
+  // the only way the 14.6 MB DeepFilterNet3 module goes out compressed.
+  it("writes a .gz beside each script, stylesheet, text file and wasm module", () => {
     file("assets/index-a.js", text(50_000));
     file("assets/index-b.css", text(20_000));
     file("assets/langs/rust-c.js", text(9_000));
+    file("assets/df_bg-e.wasm", text(60_000));
     file("audio-worklet.js", text(80_000));
     file("third-party-notices.txt", text(30_000));
     file("logo.svg", text(4_000));
@@ -36,6 +39,7 @@ describe("precompress", () => {
       "assets/index-a.js",
       "assets/index-b.css",
       "assets/langs/rust-c.js",
+      "assets/df_bg-e.wasm",
       "audio-worklet.js",
       "third-party-notices.txt",
       "logo.svg",
@@ -57,15 +61,24 @@ describe("precompress", () => {
   });
 
   // config.json and whats-new.json are written when the container starts; a
-  // .gz from the build would serve stale ones. Images do not compress.
+  // .gz from the build would serve stale ones. Images do not compress. The
+  // DeepFilterNet3 model is a .tar.gz that must be served as is: its body
+  // here compresses, so only its extension keeps a .gz from being written.
   it("leaves out JSON, images, small files and anything already compressed", () => {
     file("manifest.json", text(5_000));
     file("og.png", Buffer.alloc(5_000, 7));
     file("assets/tiny-d.js", text(500));
     file("assets/index-a.js", text(50_000));
+    file("assets/model-a.tar.gz", text(50_000));
     precompress(dist);
     precompress(dist);
-    for (const path of ["manifest.json", "og.png", "assets/tiny-d.js", "assets/index-a.js.gz"]) {
+    for (const path of [
+      "manifest.json",
+      "og.png",
+      "assets/tiny-d.js",
+      "assets/index-a.js.gz",
+      "assets/model-a.tar.gz",
+    ]) {
       expect(existsSync(join(dist, `${path}.gz`)), path).toBe(false);
     }
   });

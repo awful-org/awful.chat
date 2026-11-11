@@ -10,7 +10,10 @@
     SelectTrigger,
   } from "$lib/components/ui/select";
   import { Button } from "$lib/components/ui/button";
-  import { transportState, _dtln } from "$lib/transport/transport.svelte";
+  import { transportState, _dtln, _dfn } from "$lib/transport/transport.svelte";
+  import type { MicDenoiser } from "$lib/audio/dtln-processor";
+  import { NOISE_ENGINE_LABELS, type NoiseEngine } from "$lib/transport/audio-prefs";
+  import { pickMicTestEngine } from "./mic-test-engine";
   import {
     cameraLabel,
     cameras,
@@ -33,6 +36,8 @@
     setVoiceDtlnEnabled,
     setVoiceDtlnNoiseGate,
     getVoiceDtlnNoiseGate,
+    getVoiceNoiseEngine,
+    setVoiceNoiseEngine,
   } from "$lib/transport/voice.svelte";
   import {
     setDeafened,
@@ -71,8 +76,11 @@
   let activeInput = $state<string | null>(null);
   let activeOutput = $state<string | null>(null);
 
+  // The settings. What actually runs is voiceProcessing.engine: a model that
+  // fails falls back for the call without touching either.
   let dtlnEnabled = $state(getVoiceDtlnEnabled());
-  $effect(() => { dtlnEnabled = voiceProcessing.dtlnEnabled; });
+  let noiseEngine = $state(getVoiceNoiseEngine());
+  const DENOISERS: Record<NoiseEngine, MicDenoiser> = { dfn3: _dfn, dtln: _dtln };
   // Restored from the last session, not a fresh default.
   let noiseGateThreshold = $state(getVoiceDtlnNoiseGate());
   let noiseGateSlider = $state<number[]>([getVoiceDtlnNoiseGate() * 10000]);
@@ -84,11 +92,26 @@
   // Distinct from isMicTesting: set only during async startup so a second
   // click can't stop-then-orphan a test that hasn't finished starting.
   let isMicStarting = $state(false);
+  // Closing the dialog mid-start (a cold DFN3 download takes up to 15 s) must
+  // not let the test come up afterwards with nothing left to stop it: the
+  // start path checks this after every await and bails through its catch.
+  let destroyed = false;
+  function bailIfDestroyed() {
+    if (destroyed) throw new Error("settings closed while the mic test was starting");
+  }
+  // The starting test's context, for onDestroy to close without waiting on a
+  // start that may never settle (an unanswered permission prompt).
+  let testCtx: AudioContext | null = null;
   let micTestDisconnect: (() => void) | null = null;
   let micLevel = $state(0);
   let micLevelInterval: ReturnType<typeof setInterval> | null = null;
   let micLevelAnalyser: AnalyserNode | null = null;
   let micTestAudio: HTMLAudioElement | null = null;
+  // What the test actually plays through, which a fallback can make differ
+  // from what a call uses; shown instead of it while the test runs.
+  let micTestEngine = $state<NoiseEngine | "browser">("browser");
+  let micTestNotice = $state<string | null>(null);
+  const shownEngine = $derived(isMicTesting ? micTestEngine : voiceProcessing.engine);
 
   // Shared with the per-person volume menu. The old curve here had no exact
   // position for 100%, so a restored setting came back reading 102% and the
@@ -170,6 +193,11 @@
     await setVoiceOutputDevice(deviceId);
   }
 
+  async function handleNoiseEngineChange(engine: NoiseEngine) {
+    noiseEngine = engine;
+    await setVoiceNoiseEngine(engine);
+  }
+
   async function handleMicTest() {
     if (isMicTesting) {
       micTestDisconnect?.();
@@ -196,19 +224,32 @@
     // future mic rebuild.
     let testStream: MediaStream | null = null;
     let dtlnCleanup: (() => void) | null = null;
+    let denoiser: MicDenoiser | null = null;
+    testCtx = null;
 
     try {
       // Deafen when starting test (mutes both input and output)
       setDeafened(true);
 
-      // DTLN handles its own noise suppression, so we disable native ones if enabled
+      // Plays the test. A default context, as a call's is, so its rate is
+      // the hardware's: what decides whether DeepFilterNet3 can run.
+      const ctx = (testCtx = new AudioContext());
+      // The model in use right now, or the one a call would fall back to,
+      // so the test plays what peers get.
+      const picked = await pickMicTestEngine(voiceProcessing.engine, ctx.sampleRate, DENOISERS);
+      bailIfDestroyed();
+      const model = (denoiser = picked.engine ? DENOISERS[picked.engine] : null);
+      micTestEngine = picked.engine ?? "browser";
+      micTestNotice = picked.notice;
+
+      // A model handles noise suppression, so we disable native ones if one runs
       const constraints: MediaStreamConstraints = {
         audio: activeInput
           ? {
-              ...(dtlnEnabled ? AUDIO_CONSTRAINTS : AUDIO_CONSTRAINTS_NO_DTLN),
+              ...(model ? AUDIO_CONSTRAINTS : AUDIO_CONSTRAINTS_NO_DTLN),
               deviceId: { exact: activeInput },
             }
-          : dtlnEnabled
+          : model
             ? AUDIO_CONSTRAINTS
             : AUDIO_CONSTRAINTS_NO_DTLN,
         video: false,
@@ -216,19 +257,19 @@
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       testStream = stream;
+      bailIfDestroyed();
 
-      if (dtlnEnabled) {
-        _dtln.disconnectFromTransport();
-        await _dtln.waitUntilReady();
+      if (model) {
+        model.disconnectFromTransport();
         _dtln.setNoiseGate(noiseGateThreshold);
-        const { processedStream, cleanup } = await _dtln.monitorStream(stream);
+        const { processedStream, cleanup } = await model.monitorStream(stream);
         dtlnCleanup = cleanup;
+        bailIfDestroyed();
 
-        const testCtx = new AudioContext();
-        const source = testCtx.createMediaStreamSource(processedStream);
-        source.connect(testCtx.destination); // plays processed audio
+        const source = ctx.createMediaStreamSource(processedStream);
+        source.connect(ctx.destination); // plays processed audio
 
-        const analyser = testCtx.createAnalyser();
+        const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;
         source.connect(analyser);
         micLevelAnalyser = analyser;
@@ -242,9 +283,9 @@
 
         micTestDisconnect = () => {
           dtlnCleanup?.();
-          _dtln.reconnectToTransport();
+          model.reconnectToTransport();
           source.disconnect();
-          testCtx.close?.();
+          ctx.close?.();
           stream.getTracks().forEach((t) => t.stop());
         };
       } else {
@@ -253,11 +294,11 @@
         micTestAudio.srcObject = stream;
         micTestAudio.volume = 0.8;
         await micTestAudio.play();
+        bailIfDestroyed();
 
-        const audioCtx = new AudioContext();
-        const analyser = audioCtx.createAnalyser();
+        const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;
-        const source = audioCtx.createMediaStreamSource(stream);
+        const source = ctx.createMediaStreamSource(stream);
         source.connect(analyser);
         micLevelAnalyser = analyser;
 
@@ -273,7 +314,7 @@
           micTestAudio = null;
           source.disconnect();
           analyser.disconnect();
-          audioCtx.close();
+          ctx.close();
           stream.getTracks().forEach((t) => t.stop());
         };
       }
@@ -287,10 +328,13 @@
       // live call transmits silence from here on.
       dtlnCleanup?.();
       testStream?.getTracks().forEach((t) => t.stop());
-      _dtln.reconnectToTransport();
+      denoiser?.reconnectToTransport();
       micTestDisconnect?.();
       micTestDisconnect = null;
-      setDeafened(false);
+      void testCtx?.close().catch(() => {});
+      // Once destroyed, onDestroy has already undeafened: twice would chime
+      // twice and restore the pre-deafen volume over any change since.
+      if (!destroyed) setDeafened(false);
       isMicTesting = false;
     } finally {
       isMicStarting = false;
@@ -299,6 +343,13 @@
 
   // Cleanup mic test when component is destroyed (modal closed)
   onDestroy(() => {
+    destroyed = true;
+    // Still starting: the start path tears down the rest at its next await,
+    // but the deafen and the context it took first can't wait for that.
+    if (isMicStarting) {
+      void testCtx?.close().catch(() => {});
+      setDeafened(false);
+    }
     if (isMicTesting) {
       micTestDisconnect?.();
       micTestDisconnect = null;
@@ -447,26 +498,59 @@
       </div>
       <label class="flex items-center gap-2 cursor-pointer">
         <span
-          class="text-xs font-mono {dtlnEnabled
+          class="text-xs font-mono {shownEngine !== 'browser'
             ? 'text-green-400'
             : 'text-muted-foreground'}"
         >
-          {dtlnEnabled ? "DTLN" : "Browser"}
+          {NOISE_ENGINE_LABELS[shownEngine]}
         </span>
         <Switch
-          aria-label="DTLN noise suppression"
+          aria-label="Noise suppression"
           bind:checked={dtlnEnabled}
           onCheckedChange={(checked) => setVoiceDtlnEnabled(checked)}
         />
       </label>
     </div>
 
+    {#if dtlnEnabled}
+      <Select
+        type="single"
+        value={noiseEngine}
+        onValueChange={(v) => handleNoiseEngineChange(v as NoiseEngine)}
+      >
+        <SelectTrigger
+          aria-label="Noise suppression engine"
+          class="bg-background border-input font-mono text-sm focus:ring-ring"
+        >
+          <span class="block truncate">{NOISE_ENGINE_LABELS[noiseEngine]}</span>
+        </SelectTrigger>
+        <SelectContent class="bg-popover border-border font-mono">
+          <SelectItem value="dfn3" class="font-mono text-sm">DeepFilterNet</SelectItem>
+          <SelectItem value="dtln" class="font-mono text-sm">DTLN</SelectItem>
+        </SelectContent>
+      </Select>
+    {/if}
     {#if voiceProcessing.fallbackReason}
+      <!-- Only DeepFilterNet falls back to DTLN; only DTLN falls back to the browser. -->
       <p class="text-xs text-muted-foreground" role="status">
-        DTLN stopped. Browser noise suppression is active to keep audio responsive.
+        {#if voiceProcessing.engine === "dtln" && voiceProcessing.unsupported}
+          DeepFilterNet can't run on this device ({voiceProcessing.fallbackReason}),
+          so DTLN is active.
+        {:else if voiceProcessing.engine === "dtln"}
+          DeepFilterNet isn't available right now, so DTLN is active.
+        {:else if noiseEngine === "dfn3"}
+          Neither DeepFilterNet nor DTLN could run, so browser noise suppression
+          is active.
+        {:else}
+          DTLN isn't available right now, so browser noise suppression is active.
+        {/if}
+        {#if !voiceProcessing.unsupported}
+          It is tried again when you next join a call.
+        {/if}
       </p>
     {/if}
-    {#if dtlnEnabled}
+    <!-- The gate is DTLN's; DeepFilterNet3 gates pauses by itself. -->
+    {#if shownEngine === "dtln"}
       <div class="flex flex-col gap-2 pl-3 border-l-2 border-blue-500/30">
         <div class="flex items-center justify-between">
           <span class="text-xs font-mono text-muted-foreground"
@@ -503,7 +587,7 @@
       onclick={handleMicTest}
       disabled={isMicStarting}
     >
-      {isMicTesting ? "■ Stop test" : "▶ Test mic (hear yourself)"}
+      {isMicTesting ? "■ Stop test" : isMicStarting ? "Loading…" : "▶ Test mic (hear yourself)"}
     </Button>
 
     {#if isMicTesting}
@@ -520,6 +604,9 @@
             style="width: {micLevel * 100}%"
           ></div>
         </div>
+        {#if micTestNotice}
+          <p class="text-xs text-muted-foreground" role="status">{micTestNotice}</p>
+        {/if}
       </div>
     {/if}
   </div>
