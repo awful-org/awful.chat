@@ -46,7 +46,7 @@ import {
 import { MessageType, type Message, type WireTyping } from "$lib/types/message";
 import { signMessage } from "$lib/messaging";
 import { prepareOutgoingText } from "./outgoing-text";
-import { dmInboxNotice } from "$lib/dm-inbox-notice";
+import { dmInboxNotice, relayCopyCounts } from "$lib/dm-inbox-notice";
 import { base64ToBytes, bytesToBase64, encode } from "$lib/utils";
 import { typingPrefs } from "$lib/typing.svelte";
 import { leaveCall } from "./call.svelte";
@@ -600,8 +600,11 @@ export async function sendDirectMessage(
         // One tick: the relay holds a sealed copy, so the message is out of
         // this device's hands even though nobody has it yet. It sat on the
         // clock until their ack came back, which for an offline peer could
-        // be days, and read as "never left".
-        if (result === "sent") applyMessageStatus(id, "sent");
+        // be days, and read as "never left". Unless their inbox is off: then
+        // nobody collects that copy, and the clock is the truth.
+        if (relayCopyCounts(result, transportState.peerInboxOff.has(peerDid))) {
+          applyMessageStatus(id, "sent");
+        }
       }).catch(() => {});
     }
   }

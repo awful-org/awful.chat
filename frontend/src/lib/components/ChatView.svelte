@@ -132,6 +132,7 @@
     type ChatWindow,
   } from "$lib/chat-window";
   import { REPLY_THRESHOLD, dragOffset, swipeAction } from "$lib/swipe";
+  import { isBlankMessageSpot } from "$lib/message-dblclick";
   import { isGifUrl } from "$lib/media-url";
   import { formatReactorNames } from "$lib/reaction-names";
   import { tallyReactions, type ReactionTally } from "$lib/reaction-tally";
@@ -1115,6 +1116,7 @@
     const submittedDraft = draft;
     const submittedRoom = roomCode;
     const submittedFiles = [...stagedFiles];
+    const sentReplyId = replyTargetId;
     sendError = null;
     try {
 
@@ -1146,7 +1148,7 @@
           dismissPluginErrors(before);
           stopTyping();
           draft = "";
-          replyTargetId = null;
+          clearSentReply(sentReplyId);
           autoScroll = true;
           requestAnimationFrame(() => {
             autoResize();
@@ -1229,7 +1231,7 @@
     if (roomCode !== submittedRoom || draft !== submittedDraft) return;
     stopTyping();
     draft = "";
-    replyTargetId = null;
+    clearSentReply(sentReplyId);
     draftMentionMap.clear();
     mentionPopupOpen = false;
     autoScroll = true;
@@ -1244,10 +1246,39 @@
     }
   }
 
+  /**
+   * A send that finishes clears the reply it went out with - not one started
+   * while it was on its way. Sends overlap (see submit), and clearing
+   * whatever was current dropped a reply picked during the last one's send.
+   */
+  function clearSentReply(sentReplyId: string | null) {
+    if (replyTargetId === sentReplyId) replyTargetId = null;
+  }
+
   function startReply(msg: Message) {
     replyTargetId = msg.id;
     reactionPickerFor = null;
     requestAnimationFrame(() => textareaEl?.focus());
+  }
+
+  /**
+   * Double-click a message's empty space to reply to it (desktop; phones have
+   * the swipe). Text, links, media and buttons keep their own double click.
+   */
+  function replyOnDoubleClick(msg: Message, e: MouseEvent) {
+    const row = e.currentTarget as HTMLElement;
+    if (!isBlankMessageSpot(e.target, row, e.clientX, e.clientY)) return;
+    window.getSelection()?.removeAllRanges();
+    startReply(msg);
+  }
+
+  /** The second press of a double click selects the nearest word, even from
+   *  empty space beside a line; on empty space that selection is not wanted. */
+  function blockBlankSelection(e: MouseEvent) {
+    if (e.button !== 0 || e.detail < 2) return;
+    if (isBlankMessageSpot(e.target, e.currentTarget as HTMLElement, e.clientX, e.clientY)) {
+      e.preventDefault();
+    }
   }
 
   function openReactionPicker(msgId: string, trigger: HTMLElement) {
@@ -1382,6 +1413,7 @@
   async function sendOrReplyWithMessage(content: string): Promise<void> {
     // Send a message (text or URL) with reply context if set. Mirrors the
     // reply branching logic from submit() so GIF selections preserve reply targets.
+    const sentReplyId = replyTargetId;
     try {
       if (replyTarget) await sendReply(content, replyTarget);
       else await sendMessage(content);
@@ -1390,7 +1422,7 @@
       return;
     }
     // Clear reply state exactly as submit() does.
-    replyTargetId = null;
+    clearSentReply(sentReplyId);
     autoScroll = true;
   }
 
@@ -1402,6 +1434,7 @@
     // A saved uploaded gif re-enters as a fresh file send: re-seeded, and
     // inlined into the message when small enough.
     const sendToken = beginSendingPreview([file], "");
+    const sentReplyId = replyTargetId;
     sendFiles([file], "", {
       replyTo: replyTarget
         ? {
@@ -1415,7 +1448,7 @@
       .finally(() => {
         clearSendingPreview(sendToken);
         // Clear reply state exactly as submit() does.
-        replyTargetId = null;
+        clearSentReply(sentReplyId);
         autoScroll = true;
       });
   }
@@ -3140,6 +3173,8 @@
                   role="button"
                   tabindex={isMobile ? 0 : -1}
                   onclick={() => isMobile && handleMessageClick(msg.id)}
+                  onmousedown={isMobile ? undefined : blockBlankSelection}
+                  ondblclick={isMobile ? undefined : (e) => replyOnDoubleClick(msg, e)}
                   onkeydown={isMobile
                     ? (e) => {
                         if (e.key === "Enter" || e.key === " ") {
