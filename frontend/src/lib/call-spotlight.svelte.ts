@@ -1,15 +1,15 @@
 /**
- * Shared spotlight calculation and utilities.
+ * Shared PiP tile state and browser window utilities.
  *
- * AppView manages the state (clock, previous, PiP element) and exposes it
- * here so both CallPipPanel and the PiP video can access the same spotlight.
+ * AppView manages the speaker hold and tile roster. PiP surfaces use the same
+ * layout preferences as the call stage, not just the held speaker's video.
  */
 
 import { buildCallTiles, type CallState } from "./call-tiles";
 import type { SpotlightTile } from "./spotlight";
-import type { SpeakerState } from "./spotlight";
 import { callPipPanel } from "./call-pip.svelte";
 import { requestElementPip } from "./plugins/media-session";
+import { pipLayoutVideo } from "./call-pip-layout";
 
 export interface SpotlightState {
   /** Current spotlight tile ID */
@@ -20,8 +20,8 @@ export interface SpotlightState {
   tiles: SpotlightTile[];
   /** Browser PiP video element, bound/passed by AppView */
   pipVideoElement: HTMLVideoElement | null;
-  /** In-app panel video element, bound/passed by CallPipPanel */
-  panelVideoElement: HTMLVideoElement | null;
+  /** Remote cameras actually visible in any active PiP layout. */
+  pipCameraPeers: string[];
 }
 
 // Module-level track start time tracking across rebuilds
@@ -52,113 +52,24 @@ export function buildTilesWithTracking(callState: CallState): SpotlightTile[] {
 }
 
 /**
- * Create a canvas placeholder for avatar tiles.
- *
- * Each call creates a new canvas, drawn once. The stream's frame (frame 0)
- * stays on screen without redrawing: captureStream(0) returns a live stream
- * without further frame updates.
- *
- * @param label Peer's name or initials for the avatar
- * @param initial One-character initial for the avatar circle
- * @returns MediaStream for use as srcObject on a video element
- */
-export function createCanvasPlaceholder(
-  label: string,
-  initial: string
-): MediaStream {
-  const canvas = document.createElement("canvas");
-  canvas.width = 640;
-  canvas.height = 480;
-  const ctx = canvas.getContext("2d");
-  if (ctx) {
-    // Dark background
-    ctx.fillStyle = "#1a1a1a";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    // Avatar circle in center
-    const centerX = canvas.width / 2;
-    const centerY = canvas.height / 2.2;
-    const radius = 60;
-
-    // Gradient: slate to slate (neutral, matches dark theme)
-    const gradient = ctx.createLinearGradient(
-      centerX - radius,
-      centerY - radius,
-      centerX + radius,
-      centerY + radius
-    );
-    gradient.addColorStop(0, "#475569");
-    gradient.addColorStop(1, "#334155");
-    ctx.fillStyle = gradient;
-    ctx.beginPath();
-    ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
-    ctx.fill();
-
-    // Initial letter in white
-    ctx.fillStyle = "#ffffff";
-    ctx.font = "bold 48px sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(initial.toUpperCase(), centerX, centerY);
-
-    // Peer name below the circle
-    ctx.fillStyle = "#d1d5db";
-    ctx.font = "16px sans-serif";
-    ctx.fillText(label, centerX, centerY + radius + 40);
-  }
-
-  // frameRate 0 means "only when asked": without requestFrame() the track
-  // never emits a frame, the <video> never reaches HAVE_METADATA, and both
-  // the panel body and requestPictureInPicture() stay blank.
-  const stream = canvas.captureStream(0);
-  const track = stream.getVideoTracks()[0] as
-    | (MediaStreamTrack & { requestFrame?: () => void })
-    | undefined;
-  track?.requestFrame?.();
-  return stream;
-}
-
-/**
- * Derive a speaking label for a tile.
- *
- * Returns "sharing" for screens, "speaking" for others when the peer is
- * active in the speakers state, empty string otherwise.
- */
-export function getSpeakingLabel(
-  tile: SpotlightTile,
-  speakers: SpeakerState
-): string {
-  if (tile.kind === "screen" || tile.kind === "transmission") {
-    return "sharing";
-  }
-  if (speakers.speaking.has(tile.peerId)) {
-    return "speaking";
-  }
-  return "";
-}
-
-/**
  * Public store for the full spotlight state.
  *
- * Managed by AppView (which owns the clock, previous memory, and updates tiles)
- * and CallPipPanel (which provides its video element).
- * Contains references to both video elements so AppView can update both
- * on spotlight changes.
+ * AppView owns the speaker/tiles and hidden browser video; active PiP surfaces
+ * report their visible cameras so SFU subscriptions outlive the main stage.
  */
 export const spotlightStore = $state<SpotlightState>({
   spotlightTileId: null,
   spotlightTile: null,
   tiles: [],
   pipVideoElement: null,
-  panelVideoElement: null,
+  pipCameraPeers: [],
 });
 
 // ── Browser picture-in-picture ────────────────────────────────────────────
 //
 // Document PiP first (Chromium): it is what Meet uses, so a window manager
 // rule that already floats Meet floats this too - on a tiling WM the element
-// PiP window was getting tiled like any other window - and it renders our own
-// markup (video + name) rather than a bare <video>. Element PiP on the hidden
+// PiP window was getting tiled like any other window. Element PiP on the hidden
 // app-level <video> is the fallback for Firefox and Safari.
 
 interface DocPipWindow extends Window {}
@@ -172,26 +83,6 @@ declare global {
 }
 
 let docPipWindow: DocPipWindow | null = null;
-let docPipVideo: HTMLVideoElement | null = null;
-let docPipLabel: HTMLElement | null = null;
-/** What the PiP surfaces are currently showing, set by AppView's effect. */
-let currentStream: MediaStream | null = null;
-let currentLabel = "";
-let currentFit: "cover" | "contain" = "cover";
-
-/** AppView calls this whenever the spotlight stream, label or fit changes. */
-export function setPipSource(
-  stream: MediaStream | null,
-  label: string,
-  fit: "cover" | "contain"
-): void {
-  currentStream = stream;
-  currentLabel = label;
-  currentFit = fit;
-  if (docPipVideo && docPipVideo.srcObject !== stream) docPipVideo.srcObject = stream;
-  if (docPipVideo) docPipVideo.style.objectFit = fit;
-  if (docPipLabel) docPipLabel.textContent = label;
-}
 
 export function browserPipSupported(): boolean {
   if (typeof window === "undefined") return false;
@@ -215,31 +106,27 @@ async function openDocumentPip(onReturn: () => void): Promise<void> {
   video.autoplay = true;
   video.muted = true;
   video.playsInline = true;
-  video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:" + currentFit;
-  video.srcObject = currentStream;
+  video.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:contain;cursor:pointer";
+  const surface = pipLayoutVideo(video, { width: w.innerWidth, height: w.innerHeight, active: true });
+  const resize = () => surface.update({ width: w.innerWidth, height: w.innerHeight, active: true });
+  w.addEventListener("resize", resize);
   video.title = "Back to the call";
   video.addEventListener("click", () => {
     window.focus();
     onReturn();
   });
-  const label = d.createElement("div");
-  label.style.cssText =
-    "position:absolute;left:8px;bottom:6px;padding:2px 6px;border-radius:3px;background:rgba(0,0,0,.5)";
-  label.textContent = currentLabel;
-  d.body.append(video, label);
-  docPipVideo = video;
-  docPipLabel = label;
+  d.body.append(video);
   callPipPanel.browserPip = true;
   w.addEventListener("pagehide", () => {
     docPipWindow = null;
-    docPipVideo = null;
-    docPipLabel = null;
+    w.removeEventListener("resize", resize);
+    surface.destroy();
     callPipPanel.browserPip = false;
   });
 }
 
 /**
- * Open the browser's PiP surface for the spotlight. `onReturn` runs when the
+ * Open the browser's PiP surface for the call layout. `onReturn` runs when the
  * person clicks the picture (Document PiP only; an element PiP window has no
  * click we can see).
  */

@@ -1338,7 +1338,7 @@ import {
   // means the speaker, not the PiP rule's implicit screen-share priority.
   $effect(() => {
     const tick = () => {
-      stageSpeaker = spotlight(visibleTiles.filter((t) => t.kind === "camera"), null, null, speakers, untrack(() => stageSpeaker), Date.now());
+      stageSpeaker = spotlight(visibleTiles.filter((t) => t.kind === "camera"), null, null, speakers, untrack(() => stageSpeaker), performance.now());
     };
     tick();
     const timer = setInterval(tick, 250);

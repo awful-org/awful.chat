@@ -49,7 +49,6 @@
   } from "$lib/rooms.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import { sortRooms } from "$lib/room-order";
-  import { latestWatched } from "$lib/watch-presence";
   import {
     getMessages,
     getLastMessage,
@@ -107,8 +106,6 @@
     spotlightStore,
     buildTilesWithTracking,
     trackStartTimes,
-    createCanvasPlaceholder,
-    setPipSource,
     enterBrowserPip,
     exitBrowserPip,
   } from "$lib/call-spotlight.svelte";
@@ -116,6 +113,12 @@
   import { closeAllPopouts, poppedOut, syncPopouts } from "$lib/call-popout.svelte";
   import { getScopedProfile } from "$lib/profile.svelte";
   import { setOnPictureInPictureEnter } from "$lib/plugins/media-session";
+  import { callLayoutPrefs } from "$lib/call-layout-prefs.svelte";
+  import { filterCallTiles } from "$lib/call-layout";
+  import { pipLayoutVideo, setPipLayout } from "$lib/call-pip-layout";
+  import { callTilesState, refreshCallTiles } from "$lib/plugins/call-tiles.svelte";
+  import { getManifest } from "$lib/plugins/registry";
+  import { onCardStateChange } from "$lib/plugins/state.svelte";
 
   const queryClient = new QueryClient();
 
@@ -906,8 +909,15 @@
     else uiState.paletteQuery = null;
   });
 
-  // Manage the spotlight state: build tiles, calculate spotlight, and manage video.
-  // This is the single source of truth for both the in-app panel and browser PiP.
+  // Keep app discovery live after navigating away and unmounting the stage.
+  $effect(() => {
+    const room = transportState.inCall ? transportState.callRoomCode : null;
+    refreshCallTiles(room);
+    if (room) return onCardStateChange(() => refreshCallTiles(room));
+  });
+
+  // Build the common PiP roster and held camera speaker. All three PiP paths
+  // consume this scene using the stage's shared preferences and layout helpers.
 
   // Ticking clock: updates every 250ms while in call.
   let tickingNow = $state(0);
@@ -950,10 +960,20 @@
       selfId: id,
       trackStartTimes,
     };
-    return buildTilesWithTracking(callState);
+    return [...buildTilesWithTracking(callState), ...callTilesState.tiles.map((tile) => ({
+      id: `plugin-${tile.pluginId}-${tile.cardId}`,
+      kind: "plugin" as const,
+      isLocal: false,
+      peerId: `plugin:${tile.pluginId}`,
+      videoTrack: null,
+    }))];
   });
 
   function callDisplayName(tile: SpotlightTile): string {
+    if (tile.kind === "plugin") {
+      const id = tile.peerId.slice("plugin:".length);
+      return getManifest(id)?.name ?? id;
+    }
     const room = transportState.callRoomCode;
     if (tile.isLocal) return getScopedProfile(room?.startsWith("rd2_") ? room : null).nickname || "You";
     const did = peerIdToDid(tile.peerId) || tile.peerId;
@@ -964,9 +984,9 @@
   // Calculate spotlight.
   const spotlightTileId = $derived(
     spotlight(
-      tiles,
-      callFocus.pinnedTileId,
-      latestWatched(transportState.watchingTransmissions),
+      filterCallTiles(tiles, callLayoutPrefs).filter((tile) => tile.kind === "camera"),
+      null,
+      null,
       speakers,
       spotlightPrevious,
       tickingNow
@@ -993,49 +1013,23 @@
     spotlightStore.pipVideoElement = pipVideoElement;
   });
 
-  // Update both the PiP video and the panel's video on spotlight change.
-  // The spec constraint is: "a spotlight change must swap srcObject on ONE
-  // element, never remount". We update both elements' srcObject but don't
-  // remount either. This keeps browser PiP following along and keeps the
-  // panel displaying the spotlight.
-  // Keyed on the TRACK and the tile id, not the tile object: tiles are
-  // rebuilt whenever participants change, and assigning a fresh MediaStream
-  // to a <video> restarts it (a black frame each time). The stream is kept
-  // and only replaced when what it carries actually changes.
-  const spotlightTrack = $derived(spotlightTile?.videoTrack ?? null);
-  const spotlightKey = $derived(
-    spotlightTile ? `${spotlightTile.id}:${spotlightTrack?.id ?? "avatar"}` : null
-  );
-  const spotlightFit = $derived(
-    spotlightTile?.kind === "camera" ? "cover" : "contain"
-  );
-  let spotlightStream: MediaStream | null = null;
-  let spotlightStreamKey: string | null = null;
+  const hasPipVideo = $derived(filterCallTiles(tiles, callLayoutPrefs).some((tile) => !!tile.videoTrack));
   $effect(() => {
-    if (!pipVideoElement) return;
-    const panelVideoElement = spotlightStore.panelVideoElement;
-    const tile = spotlightTile;
-    if (spotlightKey !== spotlightStreamKey) {
-      spotlightStreamKey = spotlightKey;
-      if (spotlightTrack) {
-        spotlightStream = new MediaStream([spotlightTrack]);
-      } else if (tile) {
-        // No video: a still of the avatar, drawn once per spotlight change.
-        const label = callDisplayName(tile);
-        spotlightStream = createCanvasPlaceholder(label, label.charAt(0));
-      } else {
-        spotlightStream = null;
-      }
-    }
-    for (const el of [pipVideoElement, panelVideoElement]) {
-      if (!el) continue;
-      if (el.srcObject !== spotlightStream) el.srcObject = spotlightStream;
-      el.style.objectFit = spotlightFit;
-    }
-    const label = tile
-      ? callDisplayName(tile)
-      : "";
-    setPipSource(spotlightStream, label, spotlightFit);
+    setPipLayout(transportState.inCall ? {
+      tiles: tiles.map((tile) => ({ ...tile, label: callDisplayName(tile) })),
+      prefs: { ...callLayoutPrefs },
+      pin: callFocus.pinnedTileId,
+      speaker: spotlightTileId,
+      speaking: new Set(speakers.speaking),
+    } : null, (peers) => { spotlightStore.pipCameraPeers = peers; });
+  });
+
+  $effect(() => {
+    if (!transportState.inCall) return;
+    return () => {
+      setPipLayout(null, (peers) => { spotlightStore.pipCameraPeers = peers; });
+      void exitBrowserPip();
+    };
   });
 
   // Popped-out tiles follow the call from here rather than from the stage:
@@ -1081,7 +1075,7 @@
     const handler = async () => {
       // Nothing to see in a voice-only call: an avatar floating over another
       // tab is noise, not a call. The user can still open it by hand.
-      if (!spotlightTrack) return;
+      if (!hasPipVideo) return;
       // A stream already in a window of its own stays in view whatever tab
       // is on top - that is what the window is for - so a floating copy of
       // the call on a tab switch is a second picture of the same thing. The
@@ -2070,8 +2064,8 @@
   <!--
     Browser PiP video element: lives at app level so it is available for both
     the in-app panel and the stage's PiP button (which queries it with the
-    data attribute). Only rendered when in a call. Bound to the spotlight track
-    regardless of whether the panel is showing.
+    data attribute). Only rendered when in a call. Its composed layout stream
+    stays ready even when the panel is not showing.
   -->
   {#if transportState.inCall}
     <!-- Visually hidden, NOT display:none: requestPictureInPicture needs a
@@ -2079,6 +2073,7 @@
          not rendered at all. -->
     <video
       bind:this={pipVideoElement}
+      use:pipLayoutVideo={{ width: 320, height: 180, active: false }}
       data-call-pip-video
       class="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
       autoplay

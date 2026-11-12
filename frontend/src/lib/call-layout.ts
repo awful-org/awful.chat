@@ -87,7 +87,10 @@ export function cameraStripGeometry(width: number, height: number, prefs: CallLa
   const position = prefs.strip === "auto" ? (width >= 800 ? "side" : "bottom") : prefs.strip;
   const side = position === "side";
   const nominal = prefs.stripPx ?? (side ? { s: 168, m: 224, l: 296 }[prefs.size] : phone ? { s: 96, m: 112, l: 144 }[prefs.size] : { s: 96, m: 128, l: 168 }[prefs.size]);
-  const thickness = Math.max(0, Math.min(nominal, (side ? width : height) * 0.45));
+  // A portrait/narrow PiP must fit at least one complete tile (or +N cell)
+  // along the strip too, not only reserve enough room for the main content.
+  const crossLimit = side ? height * 16 / 9 : phone ? width / 0.75 : width * 9 / 16;
+  const thickness = Math.max(0, Math.min(nominal, (side ? width : height) * 0.45, crossLimit));
   const tileW = phone && !side ? thickness * 0.75 : side ? thickness : thickness * 16 / 9;
   const tileH = side ? thickness * 9 / 16 : thickness;
   const span = side ? height : width;
