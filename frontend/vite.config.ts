@@ -4,6 +4,7 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 import path from "path";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
 import { VitePWA } from "vite-plugin-pwa";
+import { noiseSuppressionAudioWorkletVitePlugin } from "@workadventure/noise-suppression/vite";
 import pkg from "./package.json";
 // @ts-expect-error - plain .mjs, no types, and this file is not type-checked
 import { resolveCommit } from "./scripts/git-commit.mjs";
@@ -96,6 +97,10 @@ export default defineConfig(({ mode }) => ({
     tailwindcss(),
     svelte(),
     nodePolyfills(),
+    // Dev server only: serves DeepFilterNet3's worklet, WASM and model raw,
+    // because Vite's transform would break a module run by addModule(). A
+    // build emits the three as hashed assets on its own.
+    noiseSuppressionAudioWorkletVitePlugin(),
     pageChunks({
       app: "/src/lib/components/AppView.svelte",
       gate: "/src/lib/components/IdentityGate.svelte",
@@ -117,6 +122,9 @@ export default defineConfig(({ mode }) => ({
           "assets/langs/**", // ~300 shiki language chunks, ~8 MB
           "assets/lazy/**", // shiki themes + the oniguruma wasm engine
           "audio-worklet.js", // DTLN wasm, ~8 MB
+          // DeepFilterNet3's wasm, ~15 MB - over the size limit above, which
+          // fails the build. Fetched on first use, like its ~8 MB model.
+          "assets/df_bg-*.wasm",
           "third-party-notices.txt", // ~500 KB of license texts, on demand
           // Instance configuration, deliberately NOT part of the build. A
           // precache entry carries the file's revision hash, so including it

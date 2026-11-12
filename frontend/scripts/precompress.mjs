@@ -24,8 +24,12 @@ import { extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { constants, gzipSync } from "node:zlib";
 
-/** The gzip_types of nginx.conf, by extension, minus JSON (see above). */
-const TYPES = new Set([".js", ".mjs", ".css", ".txt", ".svg", ".xml"]);
+/**
+ * The gzip_types of nginx.conf, by extension, minus JSON (see above), plus
+ * .wasm, which nginx serves only from this copy (see nginx.conf). Never .gz:
+ * the DeepFilterNet3 model is a .tar.gz that has to reach the browser as is.
+ */
+const TYPES = new Set([".js", ".mjs", ".css", ".txt", ".svg", ".xml", ".wasm"]);
 /** nginx.conf's gzip_min_length. */
 const MIN_BYTES = 1024;
 

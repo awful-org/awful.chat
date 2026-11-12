@@ -1,3 +1,5 @@
+import type { NoiseEngine } from "./audio-prefs";
+
 export interface TransportEvents {
   connect: (peerId: string) => void;
   disconnect: (peerId: string) => void;
@@ -109,7 +111,15 @@ export interface PeerTransport {
 }
 
 export interface VoiceEvents {
-  processingChanged: (dtlnEnabled: boolean, reason?: string) => void;
+  /**
+   * The noise suppression now in use, why when it is a fallback, and whether
+   * that is because a model cannot run on this device at all.
+   */
+  processingChanged: (
+    engine: NoiseEngine | "browser",
+    reason?: string,
+    unsupported?: boolean
+  ) => void;
   trackAdded: (peerId: string, track: MediaStreamTrack) => void;
   trackRemoved: (peerId: string) => void;
   peerJoined: (peerId: string) => void;

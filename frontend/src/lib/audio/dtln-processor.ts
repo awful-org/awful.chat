@@ -6,7 +6,25 @@ export interface DtlnMessage {
   noise_gate?: number;
 }
 
-export class DtlnProcessor {
+/**
+ * What the call path and the mic test need from a noise-suppression model,
+ * so DTLN and DeepFilterNet3 (dfn-processor.ts) can stand in for each other.
+ */
+export interface MicDenoiser {
+  waitUntilReady(): Promise<void>;
+  processStream(micStream: MediaStream, inputGain?: number): Promise<MediaStream>;
+  monitorStream(
+    micStream: MediaStream
+  ): Promise<{ processedStream: MediaStream; cleanup: () => void }>;
+  releaseTransport(): void;
+  disconnectFromTransport(): void;
+  reconnectToTransport(): void;
+  setInputGain(gain: number): void;
+  onFatal(handler: ((error: Error) => void) | null): void;
+  getProcessingLoad(): number | null;
+}
+
+export class DtlnProcessor implements MicDenoiser {
   private audioCtx: AudioContext | null = null;
   private workletNode: AudioWorkletNode | null = null;
   private worker: Worker | null = null;

@@ -4,6 +4,7 @@ import {
   loadPeerVolume,
   saveAudioPrefs,
   savePeerVolume,
+  type NoiseEngine,
 } from "./audio-prefs";
 import { peerIdToDid } from "./transport.svelte";
 import { looksLikeDid } from "$lib/identity/identity-utils";
@@ -17,7 +18,13 @@ import {
 } from "$lib/call-peer-quality.svelte";
 import type { CallQualityStatusEvent } from "$lib/call-quality";
 
-export const voiceProcessing = $state({ dtlnEnabled: true, fallbackReason: null as string | null });
+/** The noise suppression actually in use - not the setting, which a fallback leaves alone. */
+export const voiceProcessing = $state({
+  engine: "dfn3" as NoiseEngine | "browser",
+  fallbackReason: null as string | null,
+  /** The fallback is this device's limit, which no retry changes. */
+  unsupported: false,
+});
 
 let _voice: LibP2PVoice | null = null;
 let _dtln: DtlnProcessor | null = null;
@@ -33,9 +40,10 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
   _initialized = true;
   _voice = voice;
   _dtln = dtln;
-  _voice.on("processingChanged", (enabled, reason) => {
-    voiceProcessing.dtlnEnabled = enabled;
+  _voice.on("processingChanged", (engine, reason, unsupported) => {
+    voiceProcessing.engine = engine;
     voiceProcessing.fallbackReason = reason ?? null;
+    voiceProcessing.unsupported = unsupported === true;
   });
 
   _voice.on("trackAdded", (peerId, track) => {
@@ -178,6 +186,7 @@ function restoreVoicePrefs(): void {
   voice.setInputGain(prefs.inputGain);
   voice.setOutputVolume(prefs.outputVolume);
   void voice.setDtlnEnabled(prefs.dtlnEnabled);
+  void voice.setNoiseEngine(prefs.noiseEngine);
   getDtln().setNoiseGate(prefs.noiseGate);
   if (prefs.inputDevice) voice.setInputDevice(prefs.inputDevice);
   if (prefs.outputDevice) voice.setOutputDevice(prefs.outputDevice);
@@ -284,6 +293,17 @@ export async function setVoiceDtlnEnabled(enabled: boolean): Promise<void> {
 
 export function getVoiceDtlnEnabled(): boolean {
   return getVoice().isDtlnEnabled();
+}
+
+export async function setVoiceNoiseEngine(engine: NoiseEngine): Promise<void> {
+  saveAudioPrefs({ noiseEngine: engine });
+  await getVoice().setNoiseEngine(engine);
+  // Restarts the mic too - see setVoiceDtlnEnabled.
+  transportState.localMicStream = getVoice().getMicStream();
+}
+
+export function getVoiceNoiseEngine(): NoiseEngine {
+  return getVoice().getNoiseEngine();
 }
 
 export function getCallAudioBlockedReason(): "not-in-call" | "deafened" | null {

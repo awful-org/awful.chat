@@ -199,7 +199,7 @@ export function voiceEvent(event: string, args: unknown[]): Body | null {
       return ev("voice.teardown", { peer, d: { via: "trackRemoved" } });
     case "processingChanged":
       return ev("session.config", { d: {
-        voiceProcessing: args[0] === true ? "dtln" : "browser",
+        voiceProcessing: asString(args[0]) ?? "browser",
         reason: typeof args[1] === "string" ? args[1] : "selected",
       } });
     case "deviceChanged":

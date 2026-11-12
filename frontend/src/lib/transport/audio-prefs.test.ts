@@ -69,3 +69,27 @@ describe("screen-share priority", () => {
     expect(loadAudioPrefs().shareContentHint).toBe("");
   });
 });
+
+describe("noise-suppression engine", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("defaults to DeepFilterNet3 with suppression on", () => {
+    expect(loadAudioPrefs().noiseEngine).toBe("dfn3");
+    expect(loadAudioPrefs().dtlnEnabled).toBe(true);
+  });
+
+  it("gives prefs saved before the engine choice DeepFilterNet3, keeping their on/off", () => {
+    localStorage.setItem("awful_audio_prefs", JSON.stringify({ dtlnEnabled: false, noiseGate: 0.004 }));
+    const prefs = loadAudioPrefs();
+    expect(prefs.noiseEngine).toBe("dfn3");
+    expect(prefs.dtlnEnabled).toBe(false);
+    expect(prefs.noiseGate).toBe(0.004);
+  });
+
+  it("persists DTLN and drops an unknown engine", () => {
+    saveAudioPrefs({ noiseEngine: "dtln" });
+    expect(loadAudioPrefs().noiseEngine).toBe("dtln");
+    localStorage.setItem("awful_audio_prefs", JSON.stringify({ noiseEngine: "rnnoise" }));
+    expect(loadAudioPrefs().noiseEngine).toBe("dfn3");
+  });
+});
