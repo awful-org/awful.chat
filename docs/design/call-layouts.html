@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call layouts - mockups</title>
+<style>
+  :root { --bg: #000; --stage: #09090b; --tile: #18181b; --line: #27272a; --line2: #3f3f46; --fg: #fafafa; --muted: #a1a1aa; --accent: #24f29a; --danger: #dc2626; }
+  body { margin: 0; background: #111113; color: var(--fg); font: 14px/1.55 ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace; }
+  main { max-width: 1400px; margin: 0 auto; padding: 32px 24px 80px; }
+  h1 { font-size: 24px; margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 48px 0 8px; }
+  h3 { font-size: 15px; margin: 0 0 6px; }
+  p, li { color: #d4d4d8; max-width: 900px; }
+  code { color: var(--accent); }
+  .frame { margin: 28px 0 0; }
+  .frame > p { margin: 0 0 10px; }
+  .scroll { overflow-x: auto; padding-bottom: 6px; }
+  .stage { position: relative; width: 1280px; height: 760px; overflow: hidden; background: var(--stage); border-radius: 12px; outline: 1px solid var(--line); font-size: 13px; }
+  .area { position: absolute; left: 8px; top: 8px; width: 1264px; height: 672px; }
+  .tile { position: absolute; overflow: hidden; border-radius: 10px; background: var(--tile); }
+  .fill { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+  .label { position: absolute; left: 8px; bottom: 8px; display: flex; align-items: center; gap: 6px; max-width: calc(100% - 16px); box-sizing: border-box; padding: 3px 8px; border-radius: 6px; background: rgba(9,9,11,.78); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ring { position: absolute; inset: 0; border-radius: 10px; border: 2px solid var(--accent); pointer-events: none; }
+  .badge { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 5px 5px 5px 14px; border-radius: 999px; background: rgba(9,9,11,.88); border: 1px solid var(--line2); white-space: nowrap; }
+  .badge i { width: 8px; height: 8px; border-radius: 50%; background: #f87171; }
+  .btn { font: inherit; border: 0; cursor: pointer; color: var(--fg); }
+  .bar { position: absolute; left: 0; right: 0; bottom: 0; height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; box-sizing: border-box; }
+  .ctrl { width: 44px; height: 44px; border-radius: 10px; background: var(--line); display: flex; align-items: center; justify-content: center; }
+  .menu { position: absolute; right: 16px; bottom: 80px; width: 340px; box-sizing: border-box; padding: 14px; display: flex; flex-direction: column; gap: 16px; background: var(--tile); border: 1px solid var(--line2); border-radius: 12px; box-shadow: 0 16px 40px rgba(0,0,0,.55); }
+  .menu h4 { margin: 0; font-size: 12px; font-weight: 500; color: var(--muted); }
+  .opt { text-align: left; display: flex; align-items: center; gap: 12px; padding: 10px; border-radius: 10px; background: transparent; border: 1px solid var(--line); width: 100%; }
+  .opt.on { border-color: var(--accent); background: rgba(36,242,154,.08); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
+  .seg { display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--stage); }
+  .seg button { font: inherit; font-size: 12px; border: 0; border-radius: 6px; padding: 6px 10px; background: transparent; color: var(--muted); cursor: pointer; }
+  .seg button.on { background: var(--line2); color: var(--fg); }
+  .menu label { display: flex; align-items: center; justify-content: space-between; font-size: 12px; min-height: 28px; }
+  .menu input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<h1>Call layouts - mockups</h1>
+<p>Static mockups for a new call-stage layout system in awful.chat (Svelte 5 PWA; the stage is <code>frontend/src/lib/components/VoiceVideoCallView.svelte</code>). Names, screens and the app are stand-ins. Everything below is drawn by the script at the end of this file; open it in a browser.</p>
+
+<h2>The brief</h2>
+<p><strong>Today:</strong> one equal grid of tiles (cameras, screen shares, app tiles), columns by count. Clicking a tile pins it big with a thin thumbnail column - but when the pinned tile is a screen share the thumbnails are switched off, so every camera disappears. A grid menu can hide people without video, shares or apps. Nothing makes a share big on its own.</p>
+<p><strong>Proposed:</strong> one <em>Layout</em> menu (button at the right of the control bar) with three layouts, a camera strip, and filters.</p>
+<ul>
+<li><strong>Auto</strong> (default): only cameras → grid. Someone shares a screen or opens an app → that goes big, cameras move to a strip. Back to the grid when it ends.</li>
+<li><strong>Spotlight</strong>: one big tile - what you pinned, else whoever is speaking (with a short hold so it does not flicker; <code>SPEAKER_TAKEOVER_MS</code> in <code>spotlight.ts</code>) - plus the strip.</li>
+<li><strong>Grid</strong>: everyone the same size; shares and apps are tiles too.</li>
+<li><strong>Camera strip</strong>: side when the stage is wide, bottom when narrow (or as chosen), or hidden; sizes S/M/L; speakers first; overflow collapses into a "+N more people" tile. Cameras not on screen are not downloaded (the stage already only pulls visible remote cameras).</li>
+<li><strong>Show</strong>: people All / With video / None, screen shares, apps, your own camera (hide self view).</li>
+<li><strong>Two shares</strong> sit side by side in the big area.</li>
+<li><strong>Your own share is shown big</strong> (decided), with a "You're presenting · Stop sharing" bar on it.</li>
+<li>Choices are remembered per device. No host-only features (awful.chat has no host).</li>
+</ul>
+<p><strong>Phases:</strong> 1) Auto / Spotlight / Grid, strip side/bottom, shares go big automatically, cameras stay visible next to a pinned share, persistence. 2) Strip size and a draggable edge, hide self view, two shares side by side. 3) Several pins at once, drag to reorder.</p>
+
+<h2>Frames</h2>
+<div id="frames"></div>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var ACCENT = "#24f29a";
+  var W = 1264, H = 672, GAP = 8;
+
+  var BASE = [
+    { name: "Ana", ini: "A", color: "#fbbf24", bg: "#2b2416", video: true, speaking: true },
+    { name: "Bruno", ini: "B", color: "#60a5fa", bg: "#16202d", video: true },
+    { name: "Carla", ini: "C", color: "#f472b6", bg: "#2a1722", video: false, muted: true },
+    { name: "You", ini: "Y", color: "#a78bfa", bg: "#1f1a2e", video: true, self: true }
+  ];
+  var EXTRA = [
+    { name: "Diego", ini: "D", color: "#2dd4bf", bg: "#13262a", video: true },
+    { name: "Elif", ini: "E", color: "#fb923c", bg: "#2b1d13", video: false, muted: true },
+    { name: "Farid", ini: "F", color: "#c084fc", bg: "#231a2e", video: true },
+    { name: "Gus", ini: "G", color: "#f87171", bg: "#2b1717", video: false },
+    { name: "Hana", ini: "H", color: "#a3e635", bg: "#1f2613", video: true },
+    { name: "Ivo", ini: "I", color: "#38bdf8", bg: "#13222b", video: true, muted: true }
+  ];
+
+  var MIC_OFF = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2" stroke-linecap="round" role="img" aria-label="Muted"><path d="M2 2l20 20M9 9v3a3 3 0 0 0 5.1 2.1M15 9.3V5a3 3 0 0 0-5.9-.7M19 10v2a7 7 0 0 1-.6 2.8M5 10v2a7 7 0 0 0 11.9 5M12 19v3"/></svg>';
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function bars(list) { return list.map(function (w) { return '<span style="height:3%;width:' + w + '%;background:#a1a1aa;border-radius:2px"></span>'; }).join(""); }
+
+  function lightScreen(w, h) {
+    return '<div class="fill" style="background:#050506"><div style="display:flex;flex-direction:column;background:#f4f4f5;width:' + w + 'px;height:' + h + 'px">' +
+      '<div style="height:5%;flex:none;display:flex;align-items:center;gap:.8%;padding-left:1.4%;background:#d4d4d8"><span style="width:.9%;aspect-ratio:1;border-radius:50%;background:#f87171"></span><span style="width:.9%;aspect-ratio:1;border-radius:50%;background:#fbbf24"></span><span style="width:.9%;aspect-ratio:1;border-radius:50%;background:#4ade80"></span></div>' +
+      '<div style="flex:1;display:flex;min-height:0"><div style="width:16%;background:#e4e4e7;display:flex;flex-direction:column;gap:5%;padding:3% 2%;box-sizing:border-box">' + bars([80, 65, 72, 58]) + '</div>' +
+      '<div style="flex:1;display:flex;flex-direction:column;gap:4%;padding:3.5% 4%;box-sizing:border-box"><span style="height:7%;width:42%;background:#27272a;border-radius:3px"></span>' +
+      '<div style="height:34%;display:flex;gap:3%"><span style="flex:1;background:#fff;border:1px solid #d4d4d8;border-radius:4px"></span><span style="flex:1;background:#fff;border:1px solid #d4d4d8;border-radius:4px"></span><span style="flex:1;background:#dbeafe;border:1px solid #bfdbfe;border-radius:4px"></span></div>' +
+      bars([92, 84, 88, 55]) + '</div></div></div></div>';
+  }
+
+  function darkScreen(w, h) {
+    var lines = [[0, [["#c084fc", 10], ["#60a5fa", 22]]], [5, [["#fbbf24", 14], ["#a1a1aa", 30]]], [5, [["#c084fc", 8], ["#4ade80", 18], ["#a1a1aa", 12]]], [10, [["#a1a1aa", 26]]], [5, [["#c084fc", 6]]], [0, [["#a1a1aa", 4]]], [0, [["#c084fc", 12], ["#60a5fa", 20]]], [5, [["#4ade80", 34]]]];
+    return '<div class="fill" style="background:#050506"><div style="display:flex;flex-direction:column;background:#1e1e24;width:' + w + 'px;height:' + h + 'px"><div style="height:5%;flex:none;background:#2a2a31"></div>' +
+      '<div style="flex:1;display:flex;flex-direction:column;gap:3.2%;padding:3% 4%;box-sizing:border-box">' +
+      lines.map(function (l) { return '<div style="height:3%;display:flex;gap:1.5%;padding-left:' + l[0] + '%">' + l[1].map(function (s) { return '<span style="width:' + s[1] + '%;background:' + s[0] + ';border-radius:2px"></span>'; }).join("") + '</div>'; }).join("") +
+      '</div></div></div>';
+  }
+
+  function appBoard() {
+    return '<div style="width:100%;height:100%;position:relative;background:#fafaf9">' +
+      '<span style="position:absolute;left:12%;top:18%;width:22%;height:24%;border:3px solid #27272a;border-radius:6px"></span>' +
+      '<span style="position:absolute;left:44%;top:22%;width:13%;aspect-ratio:1;border:3px solid #2563eb;border-radius:50%"></span>' +
+      '<span style="position:absolute;left:66%;top:16%;width:14%;height:18%;background:#fde68a"></span>' +
+      '<span style="position:absolute;left:70%;top:52%;width:14%;height:18%;background:#fbcfe8"></span>' +
+      '<span style="position:absolute;left:20%;top:58%;width:38%;height:3px;background:#27272a"></span>' +
+      '<span style="position:absolute;left:20%;top:64%;width:26%;height:3px;background:#a1a1aa"></span></div>';
+  }
+
+  function tileHtml(item, x, y, w, h, where) {
+    var m = Math.min(w, h);
+    var fitW = Math.round(Math.min(w, h * 16 / 9)), fitH = Math.round(fitW * 9 / 16);
+    var inner = "", label = true, ring = false, badge = false;
+    if (item.more) {
+      inner = '<div class="fill" style="flex-direction:column;gap:4px;background:#27272a"><span style="font-weight:700;font-size:' + Math.round(Math.max(16, m * 0.2)) + 'px">+' + item.more + '</span><span style="font-size:11px;color:#d4d4d8">more people</span></div>';
+      label = false;
+    } else if (item.kind === "share") {
+      inner = item.dark ? darkScreen(fitW, fitH) : lightScreen(fitW, fitH);
+      badge = !!item.own && where === "big";
+    } else if (item.kind === "app") {
+      inner = appBoard();
+    } else if (item.video) {
+      var sil = Math.round(m * 0.78);
+      inner = '<div class="fill" style="align-items:flex-end;background:' + item.bg + '"><svg viewBox="0 0 100 100" aria-hidden="true" style="display:block;width:' + sil + 'px;height:' + sil + 'px"><circle cx="50" cy="40" r="19" fill="' + item.color + '" fill-opacity=".85"/><path d="M14 100c0-24 16-38 36-38s36 14 36 38z" fill="' + item.color + '" fill-opacity=".85"/></svg></div>';
+      ring = !!item.speaking;
+    } else {
+      var c = Math.round(Math.max(28, Math.min(112, m * 0.4))), f = Math.round(Math.max(13, Math.min(46, m * 0.17)));
+      inner = '<div class="fill"><div style="display:flex;align-items:center;justify-content:center;border-radius:50%;color:#09090b;font-weight:700;background:' + item.color + ';width:' + c + 'px;height:' + c + 'px;font-size:' + f + 'px">' + item.ini + '</div></div>';
+    }
+    var name = item.label || item.name || "";
+    return '<div class="tile" style="left:' + x + 'px;top:' + y + 'px;width:' + w + 'px;height:' + h + 'px">' + inner +
+      (label ? '<div class="label" style="font-size:' + (where === "strip" ? 11 : 12) + 'px">' + (item.muted ? MIC_OFF : "") + '<span>' + esc(name) + '</span></div>' : "") +
+      (ring ? '<div class="ring"></div>' : "") +
+      (badge ? '<div class="badge"><i></i><span>You\'re presenting</span><button type="button" class="btn" style="font-size:12px;background:#dc2626;border-radius:999px;padding:6px 12px">Stop sharing</button></div>' : "") +
+      '</div>';
+  }
+
+  function stage(o) {
+    var layout = o.layout || "auto", scene = o.scene || "share", strip = o.strip || "side", size = o.size || "m";
+    var people = BASE.slice();
+    if (scene === "many") people = people.concat(EXTRA);
+    var everyone = people.length;
+    if (o.hideSelf) people = people.filter(function (p) { return !p.self; });
+    var content = [];
+    if (scene === "share" || scene === "many") content = [{ kind: "share", label: "Ana's screen" }];
+    if (scene === "own") content = [{ kind: "share", label: "Your screen", own: true }];
+    if (scene === "two") content = [{ kind: "share", label: "Ana's screen" }, { kind: "share", label: "Bruno's screen", dark: true }];
+    if (scene === "app") content = [{ kind: "app", label: "Whiteboard (app)" }];
+    var speaker = people.filter(function (p) { return p.speaking; })[0] || people[0];
+    var out = [];
+
+    if (layout === "grid" || (layout === "auto" && !content.length)) {
+      var all = content.concat(people), n = all.length;
+      var cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4, rows = Math.ceil(n / cols);
+      var tw = Math.floor((W - GAP * (cols - 1)) / cols), th = Math.floor((H - GAP * (rows - 1)) / rows);
+      all.forEach(function (item, i) {
+        var r = Math.floor(i / cols), c = i % cols;
+        var inRow = r === rows - 1 ? n - r * cols : cols;
+        var off = Math.floor((W - (inRow * tw + (inRow - 1) * GAP)) / 2);
+        out.push(tileHtml(item, off + c * (tw + GAP), r * (th + GAP), tw, th, "grid"));
+      });
+    } else {
+      var big, rest;
+      if (content.length) { big = content.slice(0, 2); rest = people; }
+      else { big = [speaker]; rest = people.filter(function (p) { return p !== speaker; }); }
+      var sideW = { s: 168, m: 224, l: 296 }[size], bottomH = { s: 96, m: 128, l: 168 }[size];
+      var bigW = W, bigH = H;
+      if (strip === "side" && rest.length) bigW = W - sideW - GAP;
+      if (strip === "bottom" && rest.length) bigH = H - bottomH - GAP;
+      var bw = big.length === 2 ? Math.floor((bigW - GAP) / 2) : bigW;
+      big.forEach(function (item, i) { out.push(tileHtml(item, i * (bw + GAP), 0, bw, bigH, "big")); });
+      if (strip !== "hidden" && rest.length) {
+        var tileW = strip === "side" ? sideW : Math.round(bottomH * 16 / 9);
+        var tileH = strip === "side" ? Math.round(sideW * 9 / 16) : bottomH;
+        var span = strip === "side" ? H : W, step = strip === "side" ? tileH + GAP : tileW + GAP;
+        var fits = Math.max(1, Math.floor((span + GAP) / step));
+        var shown = rest.length > fits ? rest.slice(0, fits - 1).concat([{ more: rest.length - (fits - 1) }]) : rest;
+        var start = Math.floor((span - (shown.length * step - GAP)) / 2);
+        shown.forEach(function (item, i) {
+          if (strip === "side") out.push(tileHtml(item, W - sideW, start + i * step, tileW, tileH, "strip"));
+          else out.push(tileHtml(item, start + i * step, H - bottomH, tileW, tileH, "strip"));
+        });
+      }
+    }
+
+    var share = scene === "own";
+    var icon = function (path, label, extra) { return '<button type="button" class="btn ctrl" aria-label="' + label + '"' + (extra || "") + '><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">' + path + '</svg></button>'; };
+    var controls =
+      icon('<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/>', "Mute") +
+      icon('<rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l6-4v12l-6-4"/>', "Turn camera off") +
+      icon('<rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4M9 10l3-3 3 3M12 7v6"/>', "Share screen", share ? ' style="background:' + ACCENT + ';color:#09090b"' : "") +
+      icon('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>', "Apps") +
+      '<button type="button" class="btn ctrl" aria-label="Leave call" style="width:64px;background:#dc2626"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 15c5-4 13-4 18 0l-2 3-4-1v-3a12 12 0 0 0-6 0v3l-4 1z"/></svg></button>';
+    var layoutLabel = { auto: "Auto", spotlight: "Spotlight", grid: "Grid" }[layout];
+    var layoutBtn = '<button type="button" class="btn" aria-haspopup="menu" aria-expanded="' + !!o.menu + '" style="font-size:12px;height:44px;display:flex;align-items:center;gap:8px;padding:0 14px;border-radius:10px;background:' + (o.menu ? "#3f3f46" : "#27272a") + '"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="13" height="16" rx="1.5"/><rect x="18" y="4" width="3" height="4.5" rx="1"/><rect x="18" y="10" width="3" height="4" rx="1"/><rect x="18" y="15.5" width="3" height="4.5" rx="1"/></svg>Layout<span style="color:#a1a1aa">' + layoutLabel + '</span></button>';
+
+    return '<div class="stage" role="img" aria-label="' + esc(o.title) + '"><div class="area">' + out.join("") + '</div>' +
+      '<div class="bar"><span style="color:#a1a1aa;font-size:12px;width:220px">' + everyone + ' in the call</span><div style="display:flex;gap:8px">' + controls + '</div><div style="width:220px;display:flex;justify-content:flex-end">' + layoutBtn + '</div></div>' +
+      (o.menu ? menu(layout, strip, size) : "") + '</div>';
+  }
+
+  function menu(layout, strip, size) {
+    var opts = [["auto", "Auto", "Shares and apps go big, cameras in a strip"], ["spotlight", "Spotlight", "One big: what you pinned, or who is talking"], ["grid", "Grid", "Everyone the same size"]];
+    var seg = function (list, cur) { return '<div class="seg">' + list.map(function (x) { return '<button type="button" aria-pressed="' + (x[0] === cur) + '"' + (x[0] === cur ? ' class="on"' : "") + '>' + x[1] + '</button>'; }).join("") + '</div>'; };
+    return '<div class="menu" role="menu" aria-label="Layout">' +
+      '<div style="display:flex;flex-direction:column;gap:8px"><h4>Layout</h4>' +
+      opts.map(function (x) { var on = x[0] === layout; return '<button type="button" class="btn opt' + (on ? " on" : "") + '" role="menuitemradio" aria-checked="' + on + '"><span style="display:flex;flex-direction:column;gap:2px"><span style="font-weight:700">' + x[1] + '</span><span style="font-size:11px;color:#a1a1aa">' + x[2] + '</span></span></button>'; }).join("") + '</div>' +
+      '<div style="display:flex;flex-direction:column;gap:8px"><h4>Camera strip</h4><div class="row"><span>Position</span>' + seg([["side", "Side"], ["bottom", "Bottom"], ["hidden", "Hidden"]], strip) + '</div><div class="row"><span>Size</span>' + seg([["s", "S"], ["m", "M"], ["l", "L"]], size) + '</div></div>' +
+      '<div style="display:flex;flex-direction:column;gap:8px"><h4>Show</h4><div class="row"><span>People</span>' + seg([["all", "All"], ["video", "With video"], ["none", "None"]], "all") + '</div>' +
+      '<label>Screen shares<input type="checkbox" checked></label><label>Apps<input type="checkbox" checked></label><label>Your own camera<input type="checkbox" checked></label></div></div>';
+  }
+
+  var phone =
+    '<div class="stage" role="img" aria-label="Phone" style="width:390px;height:844px;display:flex;flex-direction:column;background:#000">' +
+    '<div style="height:52px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid #27272a"><span style="font-weight:700">design-review <span style="color:#a1a1aa;font-weight:400">· 4 in the call</span></span><span style="color:#a1a1aa;font-size:12px">Layout</span></div>' +
+    '<div style="flex:none;padding:8px;display:flex;flex-direction:column;gap:8px;background:#09090b">' +
+    '<div class="tile" style="position:relative;height:210px">' + lightScreen(374, 210) + '<div class="label" style="font-size:12px"><span>Ana\'s screen</span></div></div>' +
+    '<div style="display:flex;gap:8px;overflow-x:auto">' +
+    BASE.map(function (p) { return '<div class="tile" style="position:relative;width:84px;height:112px;flex:none">' + (p.video ? '<div class="fill" style="align-items:flex-end;background:' + p.bg + '"><svg viewBox="0 0 100 100" aria-hidden="true" style="width:76px;height:76px;display:block"><circle cx="50" cy="40" r="19" fill="' + p.color + '" fill-opacity=".85"/><path d="M14 100c0-24 16-38 36-38s36 14 36 38z" fill="' + p.color + '" fill-opacity=".85"/></svg></div>' : '<div class="fill"><div style="width:40px;height:40px;border-radius:50%;background:' + p.color + ';color:#09090b;font-weight:700;display:flex;align-items:center;justify-content:center">' + p.ini + '</div></div>') + '<div class="label" style="left:4px;bottom:4px;font-size:11px"><span>' + p.name + '</span></div>' + (p.speaking ? '<div class="ring"></div>' : "") + '</div>'; }).join("") +
+    '</div></div>' +
+    '<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;gap:12px;padding:12px;border-top:1px solid #27272a">' +
+    '<div><b style="color:#fbbf24;font-size:12px">Ana</b><div>can everyone see my screen?</div></div><div><b style="color:#60a5fa;font-size:12px">Bruno</b><div>yes, all good</div></div>' +
+    '<div style="height:48px;display:flex;align-items:center;padding:0 12px;border:1px solid #3f3f46;border-radius:12px;color:#a1a1aa">Type a message...</div></div></div>';
+
+  var FRAMES = [
+    ["Auto · someone shares", "Ana shares her screen: it goes big on its own, cameras move to a strip on the right. The person talking has a green outline.", { scene: "share" }],
+    ["Auto · cameras only", "Nobody shares: Auto falls back to the grid.", { scene: "cams" }],
+    ["Auto · you share (shown big)", "Your own share is big too, with a \"You're presenting · Stop sharing\" bar. The share button in the control bar is lit.", { scene: "own" }],
+    ["Spotlight · strip at the bottom", "No share: the person talking is big; the strip runs along the bottom.", { layout: "spotlight", scene: "cams", strip: "bottom" }],
+    ["Auto · two shares side by side", "Two people share at once: both screens split the big area. Strip size S.", { scene: "two", size: "s" }],
+    ["Grid · share as a tile", "Grid chosen: the share is just one tile among the cameras.", { layout: "grid", scene: "share" }],
+    ["Auto · big call, strip overflows", "Ten people: the strip shows who fits and ends in a \"+6 more people\" tile; those cameras are not downloaded.", { scene: "many" }],
+    ["Auto · an app goes big", "An app tile (a whiteboard here) is treated like a share. Strip at the bottom, size S.", { scene: "app", strip: "bottom", size: "s" }],
+    ["Layout menu open", "The Layout menu: three layouts, camera strip position and size, and what to show.", { scene: "share", menu: true }]
+  ];
+
+  var html = FRAMES.map(function (f) {
+    f[2].title = f[0];
+    return '<section class="frame"><h3>' + esc(f[0]) + '</h3><p>' + esc(f[1]) + '</p><div class="scroll">' + stage(f[2]) + '</div></section>';
+  }).join("");
+  html += '<section class="frame"><h3>Phone · someone shares</h3><p>The share on top, a strip of cameras you swipe sideways, then the chat. The Layout menu opens from the header.</p><div class="scroll">' + phone + '</div></section>';
+  document.getElementById("frames").innerHTML = html;
+})();
+</script>
+</body>
+</html>

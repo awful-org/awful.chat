@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import {
     Dialog,
@@ -95,12 +96,10 @@
     SquareArrowOutUpRight,
     SquareArrowDownLeft,
   } from "@lucide/svelte";
-  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, Rows2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus, Users as UsersIcon, UserX } from "@lucide/svelte";
+  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
 import { loadProfile, getScopedProfile } from "$lib/profile.svelte";
 import {
   displayPrefs,
-  setCallChatBeside,
-  setCallPip,
   setCallStageHeight,
 } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
@@ -139,6 +138,10 @@ import {
   rimStyle,
 } from "$lib/avatar-glow.svelte";
   import { Slider } from "./ui/slider";
+  import CallLayoutMenu from "./CallLayoutMenu.svelte";
+  import { callLayoutPrefs, setCallLayoutPrefs } from "$lib/call-layout-prefs.svelte";
+  import { callGridRects, callLayoutGroups, cameraStripGeometry, filterCallTiles } from "$lib/call-layout";
+  import { spotlight } from "$lib/spotlight";
 
   interface Props {
     /** The call stage is a column beside the chat, not a band above it. */
@@ -1007,7 +1010,7 @@ import {
         connectionDetails = { peerId: tile.peerId, name: tile.label };
         break;
       case "focus":
-        callFocus.pinnedTileId = tile.id;
+        pinTile(tile.id);
         break;
       case "unfocus":
         callFocus.pinnedTileId = null;
@@ -1109,10 +1112,34 @@ import {
     }
   }
 
+  let layoutMenuAnchor: HTMLButtonElement | null = null;
+  function mountLayoutMenu(node: HTMLElement) {
+    const position = () => {
+      if (!node.isConnected || !viewMenu) return;
+      const rect = layoutMenuAnchor?.getBoundingClientRect();
+      const pos = clampMenu(
+        rect ? rect.right - node.offsetWidth : viewMenu.x,
+        rect ? isSmallScreen ? rect.bottom + 8 : rect.top - node.offsetHeight - 8 : viewMenu.y,
+        node.offsetWidth, node.offsetHeight,
+      );
+      node.style.left = `${pos.x}px`;
+      node.style.top = `${pos.y}px`;
+    };
+    const observer = new ResizeObserver(position);
+    observer.observe(node);
+    window.addEventListener("resize", position);
+    queueMicrotask(() => {
+      position();
+      node.querySelector<HTMLButtonElement>('button[aria-pressed="true"]')?.focus();
+    });
+    return { destroy() { observer.disconnect(); window.removeEventListener("resize", position); } };
+  }
+
   function openViewMenu(e: MouseEvent): void {
     e.preventDefault();
+    layoutMenuAnchor = null;
     tileMenu = null;
-    viewMenu = clampMenu(e.clientX, e.clientY, 224, 320);
+    viewMenu = clampMenu(e.clientX, e.clientY, 340, Math.min(660, window.innerHeight - 16));
   }
 
   function closeMenus(): void {
@@ -1162,53 +1189,9 @@ import {
   };
 
 
-  // What the grid shows. "streaming" keeps anything worth watching - a camera
-  // as much as a share - while "screens" narrows to shares alone, which is
-  // what you want when someone is presenting and the cameras are noise.
-  // Either filter falls back to everyone if its last match goes away, so the
-  // panel never ends up empty.
-  // Per-category visibility instead of one exclusive filter: with people,
-  // screen shares AND app tiles all in the grid, "only X" radios stopped
-  // composing. People keeps three levels (hiding non-streamers is its own
-  // popular mode); shares and apps are plain toggles.
-  type PeopleMode = "all" | "streaming" | "hidden";
-  const gridView = $state({
-    people: "all" as PeopleMode,
-    screens: true,
-    apps: true,
-  });
-  const gridViewActive = $derived(
-    gridView.people !== "all" || !gridView.screens || !gridView.apps
-  );
-  /** The grid menu button in the stage's top-left corner is drawn. */
-  const gridMenuShown = $derived(gridViewActive || tiles.length > 1);
-  const tileHasVideo = (t: TileData) =>
-    t.videoTrack !== null ||
-    (t.kind === "transmission" && !!t.isPending) ||
-    t.kind === "plugin";
-  const visibleTiles = $derived.by(() => {
-    const kept = tiles.filter((t) => {
-      if (t.kind === "plugin") return gridView.apps;
-      if (t.kind === "screen" || t.kind === "transmission")
-        return gridView.screens;
-      if (gridView.people === "hidden") return false;
-      if (gridView.people === "streaming") return t.videoTrack !== null;
-      return true;
-    });
-    // Never an empty panel: a view that filters everything away shows
-    // everyone instead, so there is always a way back to the menu.
-    return kept.length ? kept : tiles;
-  });
-
-  // Container queries, not viewport ones: beside the chat the stage is a
-  // narrow column inside a wide window.
-  const gridCols = $derived.by(() => {
-    const n = visibleTiles.length;
-    if (n <= 1) return "grid-cols-1";
-    if (n <= 3) return "grid-cols-1 @md:grid-cols-2";
-    if (n <= 7) return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-3";
-    return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-4";
-  });
+  // Filters are literal: hiding everything leaves the always-visible Layout
+  // button available, rather than silently showing people again.
+  const visibleTiles = $derived(filterCallTiles(tiles, callLayoutPrefs));
 
   /**
    * The height the window really has right now.
@@ -1349,29 +1332,38 @@ import {
 
   // Pin state is in callFocus store so it survives navigation away from the
   // call room. The stage reads callFocus.pinnedTileId to determine what to focus.
-  const focusedTile = $derived(
-    callFocus.pinnedTileId
-      ? (visibleTiles.find((t) => t.id === callFocus.pinnedTileId) ?? null)
-      : null
-  );
-  // A focused tile is being WATCHED, not glanced at - but only where the
-  // focus visibly changes the layout. Stacked above the chat, the panel
-  // grows (rowClass) and the controls go immersive like fullscreen
-  // (dockedControls). BESIDE the chat the panel is already as big as it
-  // gets: a pin there rearranges tiles but grows nothing, and controls that
-  // vanished on a click that changed so little read as "watching a live
-  // undocked my controls" - so beside stays docked, and fullscreen is the
-  // immersive mode there. Cameras count like shares and app tiles: a
-  // focused face is watched the same way a focused stream is.
+  let stageSpeaker = $state<string | null>(null);
+  let isSmallScreen = $state(false);
+  // Use the existing speaker hold/takeover rule, but cameras only: Spotlight
+  // means the speaker, not the PiP rule's implicit screen-share priority.
+  $effect(() => {
+    const tick = () => {
+      stageSpeaker = spotlight(visibleTiles.filter((t) => t.kind === "camera"), null, null, speakers, untrack(() => stageSpeaker), Date.now());
+    };
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  });
+  const layoutGroups = $derived(callLayoutGroups(visibleTiles, callLayoutPrefs, callFocus.pinnedTileId, stageSpeaker, speakers.speaking));
+  const focusedTile = $derived(layoutGroups.grid ? null : layoutGroups.main[0] ?? null);
+  // Presentations get a taller band above chat; beside chat already fills
+  // the available height. Only fullscreen uses auto-hiding controls now.
   const watchingFocused = $derived(!!focusedTile && !beside);
-  const showThumbnails = $derived(
-    focusedTile ? focusedTile.kind !== "screen" : false
-  );
-  const thumbnailTiles = $derived(
-    focusedTile && showThumbnails
-      ? visibleTiles.filter((t) => t.id !== callFocus.pinnedTileId)
-      : []
-  );
+  const thumbnailTiles = $derived(layoutGroups.strip);
+  let tileAreaWidth = $state(0);
+  let tileAreaHeight = $state(0);
+  let stripDragPx = $state<number | null>(null);
+  let stripDragFrom = 0;
+  const stripGeometry = $derived(cameraStripGeometry(tileAreaWidth, tileAreaHeight, { ...callLayoutPrefs, stripPx: stripDragPx ?? callLayoutPrefs.stripPx }, thumbnailTiles.length, isSmallScreen));
+  const mainRects = $derived(callGridRects(layoutGroups.main.length, layoutGroups.grid ? tileAreaWidth : stripGeometry.mainW, layoutGroups.grid ? tileAreaHeight : stripGeometry.mainH));
+  const shownThumbnails = $derived(thumbnailTiles.slice(0, stripGeometry.shown));
+  function pinTile(id: string): void {
+    callFocus.pinnedTileId = id;
+    if (callLayoutPrefs.layout === "grid") setCallLayoutPrefs({ layout: "spotlight" });
+  }
+  function resizeStrip(px: number): number {
+    return Math.max(64, Math.min(480, (stripGeometry.side ? tileAreaWidth : tileAreaHeight) * 0.45, px));
+  }
 
   // Clear the pin if the pinned tile disappears (peer leaves, share ends).
   // This effect survives navigation away from the call room because the pin
@@ -1386,7 +1378,6 @@ import {
   let panelEl = $state<HTMLDivElement | null>(null);
   let isFullscreen = $state(false);
   let hoveringControls = $state(false);
-  let isSmallScreen = $state(false);
   /**
    * A finger, not a mouse.
    *
@@ -1402,13 +1393,9 @@ import {
   let transmissionVolumeSettleTimer: ReturnType<typeof setTimeout> | null =
     null;
 
-  // Docked (visible, in reserved space below the tiles) unless immersive:
-  // fullscreen, or the focused tall-panel view - there the controls (and
-  // the fullscreen button, and plugin tile chrome, which all key off this)
-  // fade after the idle timeout and return on mouse movement. Merely
-  // watching a live in the grid, or focusing one beside the chat, keeps
-  // the controls docked - see watchingFocused.
-  const dockedControls = $derived(!isFullscreen && !watchingFocused);
+  // The mockup reserves a real control bar, even during a presentation.
+  // Fullscreen keeps the existing immersive/auto-hide behaviour.
+  const dockedControls = $derived(!isFullscreen);
 
   // A tile can move without anything changing size: a tile joining or
   // leaving ahead of it in the grid, a focus moving it to the main slot or
@@ -1422,9 +1409,13 @@ import {
       visibleTiles.map((t) => t.id).join(","),
       focusedTile?.id ?? "",
       thumbnailTiles.map((t) => t.id).join(","),
-      gridCols,
       dockedControls,
       isFullscreen,
+      callLayoutPrefs.strip,
+      callLayoutPrefs.size,
+      stripDragPx,
+      callLayoutPrefs.stripPx,
+      layoutGroups.main.map((t) => t.id).join(","),
     ].join("|")
   );
   $effect(() => {
@@ -1485,7 +1476,7 @@ import {
 
   /** 44px is the smallest box a finger reliably hits. See coarsePointer. */
   const ctrlSize = $derived(
-    coarsePointer ? "h-11 w-11" : "h-8 w-8 md:h-10 md:w-10"
+    "h-11 w-11"
   );
 
   $effect(() => {
@@ -1676,6 +1667,20 @@ import {
   }
 </script>
 
+{#snippet layoutButton()}
+  <button type="button" class="call-layout-button" aria-label="Layout" aria-haspopup="dialog" aria-expanded={!!viewMenu}
+    onclick={(event) => {
+      event.stopPropagation();
+      if (viewMenu) { viewMenu = null; return; }
+      layoutMenuAnchor = event.currentTarget;
+      const rect = event.currentTarget.getBoundingClientRect();
+      tileMenu = null;
+      viewMenu = clampMenu(rect.right - 340, isSmallScreen ? rect.bottom + 8 : rect.top - Math.min(660, window.innerHeight - 16) - 8, 340, Math.min(660, window.innerHeight - 16));
+    }}>
+    <Columns2 class="size-4" /> <span>Layout</span>
+    {#if !isSmallScreen}<span class="text-zinc-400">{callLayoutPrefs.layout === "auto" ? "Auto" : callLayoutPrefs.layout === "grid" ? "Grid" : "Spotlight"}</span>{/if}
+  </button>
+{/snippet}
 
 <!-- ── CallTile snippet ── -->
 {#snippet callTile(
@@ -1742,9 +1747,7 @@ import {
               );
             }}
             aria-label="Leave {tile.label}"
-            class="absolute {isFocused && gridMenuShown
-              ? 'left-14 sm:left-16'
-              : 'left-1.5'} top-1.5 z-30 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 transition-opacity hover:bg-red-500/45 focus-visible:pointer-events-auto focus-visible:opacity-100 {isSmallScreen ||
+            class="absolute left-1.5 top-1.5 z-30 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 transition-opacity hover:bg-red-500/45 focus-visible:pointer-events-auto focus-visible:opacity-100 {isSmallScreen ||
             pluginTileHovered(tile.id)
               ? ''
               : 'pointer-events-none opacity-0'}"
@@ -1838,7 +1841,7 @@ import {
     class="group relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
       {tile.connecting ? 'connecting-wave' : ''}
       {isSpeaking
-      ? 'ring-2 ring-primary shadow-[0_0_8px_rgba(0,255,136,0.4)]'
+        ? 'ring-2 ring-inset ring-primary'
       : tile.quality === 'failed'
         ? 'ring-2 ring-red-500/80'
         : tile.quality === 'degraded'
@@ -1880,7 +1883,7 @@ import {
         autoplay
         playsinline
         muted
-        class="h-full w-full object-contain {isFullscreen || isFocused
+        class="h-full w-full {tile.kind === 'camera' ? 'object-cover' : 'object-contain'} {isFullscreen || isFocused
           ? 'bg-black'
           : ''} {tile.isLocal && tile.kind === 'camera' ? '-scale-x-100' : ''}"
         use:videoAction={tile.videoTrack!}
@@ -2008,8 +2011,8 @@ import {
           class="min-w-0 truncate text-xs mt-0.75 leading-none text-white font-mono"
           style={tileColor ? `color: ${tileColor}` : ""}
         >
-          {tile.kind === "transmission"
-            ? `${tile.label}'s screen`
+          {tile.kind === "transmission" || tile.kind === "screen"
+            ? tile.isLocal ? "Your screen" : `${tile.label}'s screen`
             : tile.isLocal
               ? `${tile.label} (You)`
               : tile.label}
@@ -2052,8 +2055,14 @@ import {
       </div>
     {/if}
   </button>
-  </div>
+  {#if tile.isLocal && tile.kind === "screen" && isFocused}
+    <div class="presenting-badge">
+      <span class="size-2 shrink-0 rounded-full bg-red-400"></span><span>You're presenting</span>
+      <button type="button" onclick={() => void stopScreenShare()}>Stop sharing</button>
+    </div>
   {/if}
+  </div>
+{/if}
 {/snippet}
 
 {#if nobodyInCall}
@@ -2188,54 +2197,61 @@ import {
     {/each}
 
     <!-- Tile area -->
-    <div class="@container relative flex-1 min-h-0 overflow-hidden p-1.5">
-      {#if focusedTile}
-        <div class="flex h-full gap-1.5">
-          <div class="flex-1 min-w-0">
-            {@render callTile(
-              focusedTile,
-              true,
-              focusedTile.kind === "camera" &&
-                speakers.speaking.has(focusedTile.peerId),
-              false,
-              false,
-              () => {},
-              () => (callFocus.pinnedTileId = null)
-            )}
+    {#if isSmallScreen}
+      <div class="call-mobile-header">
+        <span>{callPeerIds.size + 1} in the call</span>
+        {@render layoutButton()}
+      </div>
+    {/if}
+    <div class="relative flex-1 min-h-0 overflow-hidden bg-zinc-950 p-2">
+      <div class="relative h-full w-full" bind:clientWidth={tileAreaWidth} bind:clientHeight={tileAreaHeight}>
+        {#each layoutGroups.main as tile, index (tile.id)}
+          {@const rect = mainRects[index]}
+          <div class="call-layout-cell absolute" style={`left:${rect.x}px;top:${rect.y}px;width:${rect.w}px;height:${rect.h}px`}>
+            {@render callTile(tile, !layoutGroups.grid, tile.kind === "camera" && speakers.speaking.has(tile.peerId), visibleTiles.length === 1, false, () => pinTile(tile.id), () => {
+              if (callFocus.pinnedTileId === tile.id) callFocus.pinnedTileId = null;
+              else pinTile(tile.id);
+            })}
           </div>
-          {#if thumbnailTiles.length > 0}
-            <div
-              class="flex flex-col gap-1 overflow-y-auto w-20 @xl:w-28 shrink-0"
-            >
-              {#each thumbnailTiles as tile (tile.id)}
-                {@render callTile(
-                  tile,
-                  false,
-                  tile.kind === "camera" && speakers.speaking.has(tile.peerId),
-                  false,
-                  true,
-                  () => (callFocus.pinnedTileId = tile.id),
-                  () => (callFocus.pinnedTileId = null)
-                )}
-              {/each}
-            </div>
-          {/if}
-        </div>
-      {:else}
-        <div class="grid h-full auto-rows-fr gap-1.5 {gridCols}">
-          {#each visibleTiles as tile (tile.id)}
-            {@render callTile(
-              tile,
-              false,
-              tile.kind === "camera" && speakers.speaking.has(tile.peerId),
-              tiles.length === 1,
-              false,
-              () => (callFocus.pinnedTileId = tile.id),
-              () => (callFocus.pinnedTileId = null)
-            )}
-          {/each}
-        </div>
-      {/if}
+        {/each}
+        {#if !visibleTiles.length}
+          <div class="flex h-full items-center justify-center text-xs text-zinc-400 font-mono">No tiles to show. Change your Layout filters.</div>
+        {/if}
+        {#if !layoutGroups.grid && shownThumbnails.length + stripGeometry.more > 0}
+          <div
+            class="camera-strip absolute flex gap-2 {stripGeometry.side ? 'flex-col' : 'flex-row'} {stripGeometry.scroll ? 'overflow-x-auto' : 'justify-center overflow-hidden'}"
+            style={stripGeometry.side
+              ? `right:0;top:0;bottom:0;width:${stripGeometry.tileW}px`
+              : `left:0;right:0;bottom:0;height:${stripGeometry.tileH}px`}
+          >
+            {#each shownThumbnails as tile (tile.id)}
+              <div class="call-layout-cell shrink-0" style={`width:${stripGeometry.tileW}px;height:${stripGeometry.tileH}px`}>
+                {@render callTile(tile, false, tile.kind === "camera" && speakers.speaking.has(tile.peerId), false, true, () => pinTile(tile.id), () => (callFocus.pinnedTileId = null))}
+              </div>
+            {/each}
+            {#if stripGeometry.more > 0}
+              <div class="flex shrink-0 flex-col items-center justify-center gap-1 rounded-[10px] bg-zinc-800 font-mono" style={`width:${stripGeometry.tileW}px;height:${stripGeometry.tileH}px`} aria-label={`${stripGeometry.more} more people`}>
+                <strong class="text-xl">+{stripGeometry.more}</strong><span class="text-[11px] text-zinc-300">more people</span>
+              </div>
+            {/if}
+          </div>
+          <div class="absolute z-30" style={stripGeometry.side
+            ? `left:${stripGeometry.mainW + 4}px;top:0;bottom:0;width:0`
+            : `top:${stripGeometry.mainH + 4}px;left:0;right:0;height:0`}>
+            <SplitHandle
+              orientation={stripGeometry.side ? "column" : "row"}
+              label="Resize camera strip"
+              valueNow={100 * (stripGeometry.side ? stripGeometry.tileW / Math.max(1, tileAreaWidth) : stripGeometry.tileH / Math.max(1, tileAreaHeight))}
+              class={stripGeometry.side ? "-translate-x-1/2" : "-translate-y-1/2"}
+              onstart={() => { stripDragFrom = stripGeometry.side ? stripGeometry.tileW : stripGeometry.tileH; stripDragPx = stripDragFrom; }}
+              onmove={(delta) => (stripDragPx = resizeStrip(stripDragFrom - delta))}
+              onend={() => { if (stripDragPx !== null) setCallLayoutPrefs({ stripPx: stripDragPx }); stripDragPx = null; }}
+              onreset={() => setCallLayoutPrefs({ stripPx: null })}
+              onstep={(direction) => setCallLayoutPrefs({ stripPx: resizeStrip((stripGeometry.side ? stripGeometry.tileW : stripGeometry.tileH) - direction * 16) })}
+            />
+          </div>
+        {/if}
+      </div>
     </div>
 
     <!-- Persistent plugin content layer: mounted once per joined tile,
@@ -2291,13 +2307,12 @@ import {
               "relative shrink-0 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]",
               // Small screens' inner layout is a full-width 3-column grid;
               // desktop is a shrink-to-fit cluster row that wants centering.
-              isSmallScreen ? "w-full px-2" : "flex justify-center"
+              isSmallScreen ? "w-full px-2" : "grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center px-4 min-h-[72px]"
             )
           : cn(
-              "absolute left-1/2 -translate-x-1/2",
               isSmallScreen
-                ? "bottom-[max(0.5rem,env(safe-area-inset-bottom))] w-[calc(100%-1rem)] max-w-120"
-                : "bottom-[max(1rem,env(safe-area-inset-bottom))]",
+                ? "absolute left-2 right-2 bottom-[max(0.5rem,env(safe-area-inset-bottom))]"
+                : "absolute inset-x-0 bottom-0 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center px-4 min-h-[72px] bg-zinc-950/90",
               !controlsVisible &&
                 "opacity-0 pointer-events-none translate-y-4"
             )
@@ -2313,6 +2328,10 @@ import {
         if (!dockedControls) startHideTimer();
       }}
     >
+      {#if !isSmallScreen}
+        <span class="text-xs text-zinc-400 font-mono">{callPeerIds.size + 1} in the call</span>
+        <div class="order-last justify-self-end pl-4">{@render layoutButton()}</div>
+      {/if}
       {#if isSmallScreen}
         <!-- 1fr auto 1fr, not three equal thirds: the mic/camera/screen card
              is wider than a third of a phone, and an equal column let it
@@ -2409,7 +2428,7 @@ import {
                     : "Share screen"}
                   class="flex group relative h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                     {screenSharing
-                    ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                    ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                     : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
                 >
                   {#if screenSharing}
@@ -2591,7 +2610,7 @@ import {
                   : "Share screen"}
                 class="flex group relative {ctrlSize} items-center justify-center rounded-lg transition-all duration-200 shrink-0
                   {screenSharing
-                  ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
+                  ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                   : 'bg-white/10 text-zinc-100 hover:bg-white/20 hover:scale-105'}"
               >
                 {#if screenSharing}
@@ -2719,37 +2738,6 @@ import {
           "opacity-0 pointer-events-none"
       )}
     >
-    <!-- Worth showing only when it changes anything: some tile with
-         video AND some tile without. It also stays up whenever a filter is
-         active, so a filter picked from the menu always has a way out even
-         once everyone is streaming. -->
-    {#if gridMenuShown}
-      <Tip text="Configure what the grid shows">
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={(e) => {
-              // Without this the click bubbles to the panel's click-away
-              // closeMenus and the menu dies the same instant it opens.
-              e.stopPropagation();
-              openViewMenu(e);
-            }}
-            oncontextmenu={(e) => {
-              e.stopPropagation();
-              openViewMenu(e);
-            }}
-            aria-label="Configure what the grid shows"
-            class="absolute top-3 left-3 sm:top-4 sm:left-4 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 transition-all duration-200 hover:scale-105 z-20 {gridViewActive
-              ? 'text-primary'
-              : 'text-zinc-300'}"
-          >
-            <SlidersHorizontal class="size-4" />
-          </button>
-        {/snippet}
-      </Tip>
-    {/if}
-
     <!-- What the stage does with the spotlight, in one row top-right:
          from the right, fullscreen, pop out, picture in picture. Per-tile
          copies of the last two used to sit on the tiles themselves (two PiP
@@ -2833,97 +2821,18 @@ import {
          but is invisible for as long as the call is fullscreen, however high
          its z-index. -->
     {#if viewMenu}
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
       <div
-        role="menu"
+        role="dialog"
+        aria-label="Layout"
         tabindex="-1"
-        class="fixed z-50 w-56 rounded-md border border-border bg-popover py-1 shadow-xl font-mono"
+        use:mountLayoutMenu
+        class="fixed z-50 w-[340px] max-w-[calc(100vw-16px)] max-h-[calc(100dvh-16px)] overflow-y-auto"
         style="top: {viewMenu.y}px; left: {viewMenu.x}px"
         onkeydown={() => {}}
         onclick={(e) => e.stopPropagation()}
         oncontextmenu={(e) => e.preventDefault()}
       >
-        <p class="truncate px-3 pb-1 pt-0.5 text-xs text-muted-foreground">
-          People
-        </p>
-        {#each [{ value: "all", label: "Everyone", icon: UsersIcon }, { value: "streaming", label: "Only streamers", icon: Radio }, { value: "hidden", label: "Hidden", icon: UserX }] as opt (opt.value)}
-          <button
-            type="button"
-            role="menuitemradio"
-            aria-checked={gridView.people === opt.value}
-            class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
-            onclick={() => (gridView.people = opt.value as PeopleMode)}
-          >
-            <opt.icon class="size-4 shrink-0" />
-            <span class="flex-1 truncate text-left">{opt.label}</span>
-            {#if gridView.people === opt.value}
-              <Check class="size-3.5 shrink-0 text-primary" />
-            {/if}
-          </button>
-        {/each}
-
-        <div class="my-1 border-t border-border"></div>
-
-        <button
-          type="button"
-          role="menuitemcheckbox"
-          aria-checked={gridView.screens}
-          class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
-          onclick={() => (gridView.screens = !gridView.screens)}
-        >
-          <MonitorIcon class="size-4 shrink-0" />
-          <span class="flex-1 truncate text-left">Screen shares</span>
-          {#if gridView.screens}
-            <Check class="size-3.5 shrink-0 text-primary" />
-          {/if}
-        </button>
-        <button
-          type="button"
-          role="menuitemcheckbox"
-          aria-checked={gridView.apps}
-          class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
-          onclick={() => (gridView.apps = !gridView.apps)}
-        >
-          <Puzzle class="size-4 shrink-0" />
-          <span class="flex-1 truncate text-left">Apps</span>
-          {#if gridView.apps}
-            <Check class="size-3.5 shrink-0 text-primary" />
-          {/if}
-        </button>
-        <button
-          type="button"
-          role="menuitemcheckbox"
-          aria-checked={displayPrefs.callPip}
-          class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
-          onclick={() => setCallPip(!displayPrefs.callPip)}
-        >
-          <PictureInPicture2 class="size-4 shrink-0" />
-          <span class="flex-1 truncate text-left">Picture-in-picture</span>
-          {#if displayPrefs.callPip}
-            <Check class="size-3.5 shrink-0 text-primary" />
-          {/if}
-        </button>
-        {#if !isSmallScreen}
-          <div class="my-1 border-t border-border"></div>
-          <p class="truncate px-3 pb-1 pt-0.5 text-xs text-muted-foreground">
-            Layout
-          </p>
-          {#each [{ beside: false, label: "Chat below", icon: Rows2 }, { beside: true, label: "Chat beside", icon: Columns2 }] as opt (opt.label)}
-            <button
-              type="button"
-              role="menuitemradio"
-              aria-checked={displayPrefs.callChatBeside === opt.beside}
-              class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
-              onclick={() => setCallChatBeside(opt.beside)}
-            >
-              <opt.icon class="size-4 shrink-0" />
-              <span class="flex-1 truncate text-left">{opt.label}</span>
-              {#if displayPrefs.callChatBeside === opt.beside}
-                <Check class="size-3.5 shrink-0 text-primary" />
-              {/if}
-            </button>
-          {/each}
-        {/if}
+        <CallLayoutMenu phone={isSmallScreen} />
       </div>
     {/if}
 
@@ -3066,11 +2975,26 @@ import {
 <svelte:window
   onclick={closeMenus}
   onkeydown={(e) => {
-    if (e.key === "Escape") closeMenus();
+    if (e.key === "Escape") {
+      const anchor = viewMenu ? layoutMenuAnchor : null;
+      closeMenus();
+      anchor?.focus();
+    }
   }}
 />
 
 <style>
+  .call-layout-cell { min-width:0; min-height:0; }
+  .call-layout-cell > :global(*) { width:100%; height:100%; min-width:0; min-height:0; aspect-ratio:auto; border-radius:10px; }
+  .call-layout-cell > :global(div > button.group) { border-radius:10px; background-color:#18181b; }
+  .camera-strip { scrollbar-width:thin; }
+  .call-layout-button { display:flex; align-items:center; gap:8px; height:44px; padding:0 14px; border-radius:10px; background:rgb(255 255 255 / 10%); color:#fafafa; font:12px ui-monospace,monospace; cursor:pointer; white-space:nowrap; }
+  .call-layout-button:hover, .call-layout-button[aria-expanded="true"] { background:rgb(255 255 255 / 20%); }
+  .call-layout-button:focus-visible { outline:2px solid #24f29a; outline-offset:2px; }
+  .call-mobile-header { display:flex; align-items:center; justify-content:space-between; min-height:44px; padding:0 8px; border-bottom:1px solid #27272a; font:12px ui-monospace,monospace; color:#a1a1aa; }
+  .call-mobile-header .call-layout-button { background:transparent; }
+  .presenting-badge { position:absolute; top:12px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:10px; padding:5px 5px 5px 14px; border:1px solid #3f3f46; border-radius:999px; background:#09090be0; color:#fafafa; white-space:nowrap; font:12px ui-monospace,monospace; }
+  .presenting-badge button { border-radius:999px; padding:6px 12px; background:#dc2626; color:#fafafa; cursor:pointer; }
   /* Static film grain: one tiled SVG turbulence, desaturated so it is grain
      and not confetti, overlaid so it darkens and lightens rather than washing
      the tile grey. No animation - a call already has enough moving. */
