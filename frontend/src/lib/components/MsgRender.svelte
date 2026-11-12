@@ -74,6 +74,8 @@
   // The queued tooltip must not promise the relay is holding a copy when the
   // sender opted out of the mailbox, in which case no deposit happened.
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
+  import { queuedReceiptTip } from "$lib/dm-inbox-notice";
+  import { roomsStore } from "$lib/rooms.svelte";
   import {
     putSavedGif,
     deleteSavedGif,
@@ -162,6 +164,12 @@
   /** DM conversations are keyed "dm-<...>"; see announce.ts. */
   const isDmMessage = $derived(msg.roomCode.startsWith("dm-"));
 
+  /** The DM's other person has their offline inbox off, as they last said. */
+  function theirInboxOff(): boolean {
+    const did = roomsStore.dmRooms.find((r) => r.roomCode === msg.roomCode)?.participantDid;
+    return !!did && transportState.peerInboxOff.has(did);
+  }
+
   /**
    * What the tick under your own message means.
    *
@@ -173,14 +181,11 @@
     if (status === "sent") return "Sent - the relay holds it until they are online";
     if (status === "delivered") return "Delivered to their device";
     if (status === "read") return "Read";
-    // Too large for the mailbox, so it can only ever travel peer to peer:
-    // saying it is waiting in their offline inbox would be a flat lie.
-    if (transportState.dmQueuedP2POnly.has(msg.id)) {
-      return "Too long for the offline inbox, sends when they are online";
-    }
-    return mailboxPrefs.enabled
-      ? "Queued - waiting in their offline inbox"
-      : "Queued - will send when the recipient is reachable";
+    return queuedReceiptTip({
+      tooLongForInbox: transportState.dmQueuedP2POnly.has(msg.id),
+      myInboxOff: !mailboxPrefs.enabled,
+      theirInboxOff: theirInboxOff(),
+    });
   });
 
   // Opt-in auto-download: ask for another member's media as its message

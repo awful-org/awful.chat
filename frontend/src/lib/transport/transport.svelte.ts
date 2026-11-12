@@ -173,6 +173,7 @@ import { clearSearchCorpus } from "../search/corpus.svelte";
 import { announceMessage } from "../announce";
 import { mentionsMe } from "../mentions";
 import { appendToDmPanel, dmPanelIsShowing, mapDmPanelMessages } from "../dm-panel.svelte";
+import { relayCopyCounts } from "../dm-inbox-notice";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
 import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
@@ -5369,7 +5370,11 @@ async function _sendDmBatch(
   );
   guard();
   noteMailboxDeposit(wire.id, result);
-  return result === "sent" ? "sent" : "sending";
+  // Applied here, not only returned: the broadcast path drops the return
+  // value, and sendFile's row was already stored on the clock.
+  if (!relayCopyCounts(result, transportState.peerInboxOff.has(peerDid))) return "sending";
+  applyMessageStatus(wire.id, "sent");
+  return "sent";
 }
 
 export async function sendMessage(
