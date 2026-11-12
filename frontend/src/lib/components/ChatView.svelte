@@ -12,6 +12,7 @@
     LogOut,
     Menu,
     Phone,
+    Loader2,
     Send,
     Users,
     Copy,
@@ -67,6 +68,7 @@
     DrawerTitle,
   } from "$lib/components/ui/drawer";
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
+  import { voiceProcessing } from "$lib/transport/voice.svelte";
   import MsgRender from "./MsgRender.svelte";
   import LocalPluginCard from "./LocalPluginCard.svelte";
   import { closeLocalCard, localPluginCards } from "$lib/plugins/local-cards.svelte";
@@ -2703,7 +2705,10 @@
         <!-- Right beside the user list, outlined green so it reads as the
              way into the call. -->
         {#if !inCall}
-          <Tip text="Join call">
+          <!-- The only join control when nobody is in the call yet, so it is
+               the one that says a first DeepFilterNet3 download is the wait. -->
+          {@const loadingModel = transportState.joiningCall && voiceProcessing.loading}
+          <Tip text={loadingModel ? "Loading noise suppression…" : "Join call"}>
             {#snippet children(props)}
               <Button
                 {...props}
@@ -2712,12 +2717,16 @@
                 onclick={joinCall}
                 disabled={transportState.connecting || transportState.joiningCall}
                 aria-busy={transportState.joiningCall}
-                aria-label="Join call"
+                aria-label={loadingModel ? "Loading noise suppression…" : "Join call"}
                 class="border border-green-500/60 text-green-400 hover:bg-green-500/10 hover:text-green-300 cursor-pointer {transportState.joiningCall
                   ? 'animate-pulse'
                   : ''}"
               >
-                <Phone class="size-4" />
+                {#if loadingModel}
+                  <Loader2 class="size-4 animate-spin" />
+                {:else}
+                  <Phone class="size-4" />
+                {/if}
               </Button>
             {/snippet}
           </Tip>

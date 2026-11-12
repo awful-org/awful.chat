@@ -9,6 +9,7 @@ const backing = new Map<string, string>();
   clear: () => backing.clear(),
 };
 import {
+  clampDfnAttenuation,
   loadAudioPrefs,
   loadPeerVolume,
   savePeerVolume,
@@ -91,5 +92,47 @@ describe("noise-suppression engine", () => {
     expect(loadAudioPrefs().noiseEngine).toBe("dtln");
     localStorage.setItem("awful_audio_prefs", JSON.stringify({ noiseEngine: "rnnoise" }));
     expect(loadAudioPrefs().noiseEngine).toBe("dfn3");
+  });
+});
+
+describe("DeepFilterNet3 strength", () => {
+  beforeEach(() => localStorage.clear());
+
+  const strength = () => {
+    const p = loadAudioPrefs();
+    return [p.dfnSpeechAttenuationDb, p.dfnPauseAttenuationDb];
+  };
+
+  it("defaults to the package's 25 dB while speaking and 45 dB in pauses", () => {
+    expect(strength()).toEqual([25, 45]);
+    // Prefs saved before the setting existed get the same.
+    localStorage.setItem("awful_audio_prefs", JSON.stringify({ dtlnEnabled: true }));
+    expect(strength()).toEqual([25, 45]);
+  });
+
+  it("persists both", () => {
+    saveAudioPrefs({ dfnSpeechAttenuationDb: 12, dfnPauseAttenuationDb: 33 });
+    expect(strength()).toEqual([12, 33]);
+  });
+
+  it("brings stored values back into range and order", () => {
+    const stored = (speech: unknown, pause: unknown) => {
+      localStorage.setItem(
+        "awful_audio_prefs",
+        JSON.stringify({ dfnSpeechAttenuationDb: speech, dfnPauseAttenuationDb: pause })
+      );
+      return strength();
+    };
+    expect(stored(100, 100)).toEqual([40, 60]);
+    expect(stored(0, 0)).toEqual([6, 9]);
+    // Pauses never at or below speech: the pause gate must always exist.
+    expect(stored(30, 30)).toEqual([30, 33]);
+    expect(stored("loud", null)).toEqual([25, 45]);
+  });
+
+  it("clamps in one place, pushing pauses up with speech", () => {
+    expect(clampDfnAttenuation(40, 41)).toEqual({ speechDb: 40, pauseDb: 43 });
+    expect(clampDfnAttenuation(10, 60)).toEqual({ speechDb: 10, pauseDb: 60 });
+    expect(clampDfnAttenuation(Number.NaN, 45)).toEqual({ speechDb: 25, pauseDb: 45 });
   });
 });

@@ -22,6 +22,7 @@
   import {
     getVoicePeerVolume,
     setVoicePeerVolume,
+    voiceProcessing,
   } from "$lib/transport/voice.svelte";
   import {
     UNITY_STOP,
@@ -75,6 +76,7 @@
     MonitorOff,
     PhoneOff,
     Phone,
+    Loader2,
     Maximize,
     Minimize,
     Radio,
@@ -2136,9 +2138,16 @@ import {
         class:animate-pulse={transportState.joiningCall}
         class="group relative flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-all duration-200 hover:bg-primary/90 hover:scale-105 hover:shadow-primary/50 disabled:opacity-60 disabled:hover:scale-100"
       >
-        <Phone class="size-4" />
+        <!-- A first DeepFilterNet3 use downloads ~12 MB before the mic starts. -->
+        {#if transportState.joiningCall && voiceProcessing.loading}
+          <Loader2 class="size-4 animate-spin" />
+        {:else}
+          <Phone class="size-4" />
+        {/if}
         {transportState.joiningCall
-          ? "Joining..."
+          ? voiceProcessing.loading
+            ? "Loading noise suppression…"
+            : "Joining..."
           : transportState.connecting
             ? "Connecting..."
             : inOtherCall
