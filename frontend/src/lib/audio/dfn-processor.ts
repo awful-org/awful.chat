@@ -1,5 +1,6 @@
 import type { DeepFilterNetAudioWorkletHandle } from "@workadventure/noise-suppression/deepfilternet";
 import type { MicDenoiser } from "./dtln-processor";
+import { AUDIO_PREF_DEFAULTS, clampDfnAttenuation } from "$lib/transport/audio-prefs";
 
 /** DeepFilterNet3 runs at this rate only (the package's DEEPFILTERNET_SAMPLE_RATE). */
 const DFN_SAMPLE_RATE = 48000;
@@ -64,6 +65,36 @@ export class DfnProcessor implements MicDenoiser {
   private fatalHandler: ((error: Error) => void) | null = null;
   private tx: Graph | null = null;
   private mon: Graph | null = null;
+  private attenuation = clampDfnAttenuation(
+    AUDIO_PREF_DEFAULTS.dfnSpeechAttenuationDb,
+    AUDIO_PREF_DEFAULTS.dfnPauseAttenuationDb
+  );
+
+  /**
+   * How hard the model works: the most it removes while you speak, and in
+   * pauses, in dB. The package reads both only when it builds the node, and
+   * a context keeps its one node, so new values retire a built node with its
+   * context and graphs, and the next use builds a fresh one with them. True
+   * when that happened: whatever ran through it (a call, a mic test) has to
+   * come back through processStream / monitorStream.
+   *
+   * ponytail: a node still loading keeps the values it started with; the
+   * settings UI holds the sliders while anything loads.
+   */
+  setAttenuation(speechDb: number, pauseDb: number): boolean {
+    const next = clampDfnAttenuation(speechDb, pauseDb);
+    const changed =
+      next.speechDb !== this.attenuation.speechDb || next.pauseDb !== this.attenuation.pauseDb;
+    this.attenuation = next;
+    if (!changed || !this.node) return false;
+    this.discardContext();
+    this.ready = null;
+    return true;
+  }
+
+  getAttenuation(): { speechDb: number; pauseDb: number } {
+    return this.attenuation;
+  }
 
   /**
    * Lazy: neither the package nor its assets load before the first use. A
@@ -91,6 +122,8 @@ export class DfnProcessor implements MicDenoiser {
           import("@workadventure/noise-suppression/deepfilternet")
             .then(({ createDeepFilterNetAudioWorklet }) =>
               createDeepFilterNetAudioWorklet(ctx, {
+                speechAttenuationDb: this.attenuation.speechDb,
+                pauseAttenuationDb: this.attenuation.pauseDb,
                 // The package keeps an overloaded node running. Audio that
                 // crackles is no better than none, so this is fatal, as
                 // DTLN's processing budget is.

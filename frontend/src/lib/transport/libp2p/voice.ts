@@ -301,6 +301,8 @@ export class LibP2PVoice implements VoiceTransport {
   private failedEngines = new Set<NoiseEngine>();
   /** Bumped by every startMic and by leave(): an older run that sees it moved stops. */
   private micGen = 0;
+  /** The current startMic is waiting on a model - a first DFN3 use downloads ~12 MB. */
+  private modelLoading = false;
 
   private onTransportConnect: ((peerId: string) => void) | null = null;
   private onTransportDisconnect: (peerId: string) => void | null = () => {};
@@ -949,6 +951,7 @@ export class LibP2PVoice implements VoiceTransport {
 
     // A startMic still waiting on a model download stops where it is.
     this.micGen++;
+    this.setModelLoading(false);
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.dtln?.releaseTransport();
     this.dtln?.onFatal(null);
@@ -1172,6 +1175,17 @@ export class LibP2PVoice implements VoiceTransport {
   }
 
   /**
+   * A model was rebuilt with new settings (DeepFilterNet3's strength): a call
+   * running through it moves onto the new one by the path a setting change
+   * takes, falling back the same way if it cannot come up.
+   */
+  async reloadNoiseEngine(engine: NoiseEngine): Promise<void> {
+    if (this.audioCtx && this.activeNoiseEngine() === engine) {
+      await this.startMic(this.activeInputDevice ?? undefined);
+    }
+  }
+
+  /**
    * The model the mic runs through: the preferred one, then DTLN, skipping
    * any that failed this call. Null is the browser's own suppression.
    */
@@ -1235,8 +1249,16 @@ export class LibP2PVoice implements VoiceTransport {
 
   // ─── internals ────────────────────────────────────────────────────────────
 
+  private setModelLoading(loading: boolean): void {
+    if (this.modelLoading === loading) return;
+    this.modelLoading = loading;
+    this.emit("processingLoading", loading);
+  }
+
   private async startMic(deviceId?: string): Promise<void> {
     const gen = ++this.micGen;
+    // A run this one supersedes may have been loading; it no longer reports.
+    this.setModelLoading(false);
     /**
      * A newer run took over while this one waited - a setting changed, a
      * model died, or the call was left, during a download of up to 15 s.
@@ -1297,7 +1319,13 @@ export class LibP2PVoice implements VoiceTransport {
     while (engine && !processed) {
       const denoiser = this.denoiser(engine)!;
       try {
-        await denoiser.waitUntilReady();
+        // Shown while it lasts (a join can sit here for up to 15 s).
+        this.setModelLoading(true);
+        try {
+          await denoiser.waitUntilReady();
+        } finally {
+          if (gen === this.micGen) this.setModelLoading(false);
+        }
         if (superseded(mic)) return;
         processed = await denoiser.processStream(mic, this.currentInputGain);
         if (superseded(mic)) {

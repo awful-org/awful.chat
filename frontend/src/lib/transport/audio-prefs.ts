@@ -61,6 +61,13 @@ export interface AudioPrefs {
   /** DTLN's gate threshold; DeepFilterNet3 gates by itself. */
   noiseGate: number;
   /**
+   * DeepFilterNet3's strength, in dB: the most it removes while you speak,
+   * and how far noise is pushed down in pauses. Applied live (see
+   * DfnProcessor.setAttenuation); kept in range by clampDfnAttenuation.
+   */
+  dfnSpeechAttenuationDb: number;
+  dfnPauseAttenuationDb: number;
+  /**
    * Screen-share audio that could not be confirmed echo-free (see
    * share-audio.ts) is withheld by default - the sharer must opt in here
    * to send it anyway. Device-local and never sent to the room: it is a
@@ -92,6 +99,9 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   dtlnEnabled: true,
   noiseEngine: "dfn3",
   noiseGate: 0.002,
+  // The package's own defaults.
+  dfnSpeechAttenuationDb: 25,
+  dfnPauseAttenuationDb: 45,
   shareAudioDespiteEchoRisk: false,
   shareHeight: 0,
   shareFps: 30,
@@ -122,6 +132,35 @@ function num(value: unknown, fallback: number, min: number, max: number) {
     : fallback;
 }
 
+/**
+ * Pauses always get at least this much more than speech. The package builds
+ * its pause gate only when they do, and the gate is fixed at creation - with
+ * its 30 ms of delay - so a node must never be made without one.
+ */
+const DFN_PAUSE_MARGIN_DB = 3;
+export const DFN_SPEECH_DB = { min: 6, max: 40 };
+export const DFN_PAUSE_DB = { min: DFN_SPEECH_DB.min + DFN_PAUSE_MARGIN_DB, max: 60 };
+
+/**
+ * The one place DeepFilterNet3's two strengths are kept in range and in
+ * order: speech within DFN_SPEECH_DB, pauses above speech by the margin.
+ * Moving speech past pauses pushes pauses up with it.
+ */
+export function clampDfnAttenuation(
+  speechDb: number,
+  pauseDb: number
+): { speechDb: number; pauseDb: number } {
+  const speech = num(
+    speechDb, AUDIO_PREF_DEFAULTS.dfnSpeechAttenuationDb, DFN_SPEECH_DB.min, DFN_SPEECH_DB.max
+  );
+  return {
+    speechDb: speech,
+    pauseDb: num(
+      pauseDb, AUDIO_PREF_DEFAULTS.dfnPauseAttenuationDb, speech + DFN_PAUSE_MARGIN_DB, DFN_PAUSE_DB.max
+    ),
+  };
+}
+
 function oneOf<T extends number | string>(
   allowed: readonly T[],
   value: unknown,
@@ -138,6 +177,10 @@ export function loadAudioPrefs(): AudioPrefs {
     const raw = localStorage.getItem(KEY);
     if (!raw) return { ...AUDIO_PREF_DEFAULTS };
     const p = JSON.parse(raw) as Partial<AudioPrefs>;
+    const dfn = clampDfnAttenuation(
+      p.dfnSpeechAttenuationDb as number,
+      p.dfnPauseAttenuationDb as number
+    );
     return {
       inputDevice: typeof p.inputDevice === "string" ? p.inputDevice : null,
       outputDevice: typeof p.outputDevice === "string" ? p.outputDevice : null,
@@ -150,6 +193,8 @@ export function loadAudioPrefs(): AudioPrefs {
           : AUDIO_PREF_DEFAULTS.dtlnEnabled,
       noiseEngine: oneOf(NOISE_ENGINES, p.noiseEngine, AUDIO_PREF_DEFAULTS.noiseEngine),
       noiseGate: num(p.noiseGate, AUDIO_PREF_DEFAULTS.noiseGate, 0, 0.01),
+      dfnSpeechAttenuationDb: dfn.speechDb,
+      dfnPauseAttenuationDb: dfn.pauseDb,
       shareAudioDespiteEchoRisk:
         typeof p.shareAudioDespiteEchoRisk === "boolean"
           ? p.shareAudioDespiteEchoRisk

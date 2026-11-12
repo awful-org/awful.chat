@@ -910,6 +910,14 @@ Voice:
   - input chain:  mic → GainNode → MediaStreamDestination → peers
   - output chain: remoteStream → GainNode → AudioContext.destination (per peer)
   - gain supports boost above 1.0 via Web Audio
+  - DeepFilterNet3 strength (Settings > Audio > Advanced settings, device-
+    local): most removed while speaking 6-40 dB (default 25), in pauses up
+    to 60 dB (default 45), pauses kept 3 dB or more above speech so the
+    package always builds its pause gate. The package reads both only when
+    it builds its node, so a change rebuilds the node in a new 48 kHz
+    context and moves a call or mic test onto it. Adjusting it live would
+    need the package to expose the model's attenuation setter (libDF's
+    df_set_atten_lim, exported by its wasm, not bound by its worklet).
 
 Video:
   - mediasoup SFU over dedicated /sfu WebSocket signaling

@@ -1,4 +1,4 @@
-import { transportState, _transport } from "./transport.svelte";
+import { transportState, _transport, _dfn } from "./transport.svelte";
 import {
   loadAudioPrefs,
   loadPeerVolume,
@@ -24,6 +24,8 @@ export const voiceProcessing = $state({
   fallbackReason: null as string | null,
   /** The fallback is this device's limit, which no retry changes. */
   unsupported: false,
+  /** The mic waits on a model to load: a join, a setting change, a rebuild. */
+  loading: false,
 });
 
 let _voice: LibP2PVoice | null = null;
@@ -44,6 +46,9 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
     voiceProcessing.engine = engine;
     voiceProcessing.fallbackReason = reason ?? null;
     voiceProcessing.unsupported = unsupported === true;
+  });
+  _voice.on("processingLoading", (loading) => {
+    voiceProcessing.loading = loading;
   });
 
   _voice.on("trackAdded", (peerId, track) => {
@@ -188,6 +193,7 @@ function restoreVoicePrefs(): void {
   void voice.setDtlnEnabled(prefs.dtlnEnabled);
   void voice.setNoiseEngine(prefs.noiseEngine);
   getDtln().setNoiseGate(prefs.noiseGate);
+  _dfn.setAttenuation(prefs.dfnSpeechAttenuationDb, prefs.dfnPauseAttenuationDb);
   if (prefs.inputDevice) voice.setInputDevice(prefs.inputDevice);
   if (prefs.outputDevice) voice.setOutputDevice(prefs.outputDevice);
 }
@@ -280,6 +286,31 @@ export function setVoiceDtlnNoiseGate(threshold: number): void {
 
 export function getVoiceDtlnNoiseGate(): number {
   return getDtln().getNoiseGate();
+}
+
+/**
+ * DeepFilterNet3's strength. Saved, and when its node is built, rebuilt with
+ * the new values: a call on it is moved over before this resolves. `rebuilt`
+ * says a mic test running through it must move too (see AudioSettings).
+ * Returns the values applied, after clamping.
+ */
+export async function setVoiceDfnAttenuation(
+  speechDb: number,
+  pauseDb: number
+): Promise<{ speechDb: number; pauseDb: number; rebuilt: boolean }> {
+  const rebuilt = _dfn.setAttenuation(speechDb, pauseDb);
+  const next = _dfn.getAttenuation();
+  saveAudioPrefs({ dfnSpeechAttenuationDb: next.speechDb, dfnPauseAttenuationDb: next.pauseDb });
+  if (rebuilt) {
+    await getVoice().reloadNoiseEngine("dfn3");
+    // Restarts the mic too - see setVoiceDtlnEnabled.
+    transportState.localMicStream = getVoice().getMicStream();
+  }
+  return { ...next, rebuilt };
+}
+
+export function getVoiceDfnAttenuation(): { speechDb: number; pauseDb: number } {
+  return _dfn.getAttenuation();
 }
 
 export async function setVoiceDtlnEnabled(enabled: boolean): Promise<void> {

@@ -169,6 +169,10 @@ setting, tries the chosen engine again, and the saved setting never changes.
 DeepFilterNet3's WebAssembly and model (about 12 MB) download the first time
 suppression is used; joining a call waits for them for up to 15 seconds, and
 past that the call uses DTLN while the download finishes for the next one.
+Settings > Audio > Advanced settings has DeepFilterNet3's strength while
+speaking and in pauses. Each change rebuilds the model with the new values
+when the slider is released, so a call or mic test on it goes quiet for a
+moment while that happens.
 
 The DTLN noise-suppression worklet is built in a separate repo,
 [dtln-rs-web](https://github.com/FlavioZanoni/dtln-rs-web). Both

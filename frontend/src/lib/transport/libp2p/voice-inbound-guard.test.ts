@@ -664,4 +664,58 @@ describe("noise-suppression fallback chain", () => {
     expect(dfn.loads).toBe(0);
     expect(dtln.processed).toBe(2);
   });
+
+  it("a rebuilt model takes over the call only when the call runs on it", async () => {
+    const { voice, internals, dfn, dtln, startMic } = setup();
+    await startMic();
+    await voice.reloadNoiseEngine("dfn3");
+    expect(dfn.processed).toBe(2);
+    expect(live()).toEqual([voice.getMicStream()]);
+
+    await voice.reloadNoiseEngine("dtln");
+    expect(dtln.loads).toBe(0);
+    internals.audioCtx = null; // no call
+    await voice.reloadNoiseEngine("dfn3");
+    expect(dfn.processed).toBe(2);
+  });
+
+  describe("model loading state", () => {
+    function watch(voice: ReturnType<typeof setup>["voice"]) {
+      const states: boolean[] = [];
+      voice.on("processingLoading", (loading) => states.push(loading));
+      return states;
+    }
+
+    it("is on for exactly the wait on the model, through a fallback", async () => {
+      const slow = deferred();
+      const { voice, dfn, dtln, startMic } = setup(fakeDenoiser(1, slow.promise));
+      const states = watch(voice);
+      const run = startMic();
+      await vi.waitFor(() => expect(dfn.loads).toBe(1));
+      expect(states).toEqual([true]);
+
+      slow.resolve();
+      await run;
+      // DFN3 failed, DTLN loaded: one wait each, and nothing left showing.
+      expect(dtln.processed).toBe(1);
+      expect(states).toEqual([true, false, true, false]);
+    });
+
+    it.each([
+      ["switching suppression off", (v: ReturnType<typeof setup>["voice"]) => v.setDtlnEnabled(false)],
+      ["leaving", (v: ReturnType<typeof setup>["voice"]) => v.leave()],
+    ])("ends when %s abandons the load", async (_, abandon) => {
+      const slow = deferred();
+      const { voice, dfn, startMic } = setup(fakeDenoiser(0, slow.promise));
+      const states = watch(voice);
+      const run = startMic();
+      await vi.waitFor(() => expect(dfn.loads).toBe(1));
+
+      await abandon(voice);
+      expect(states).toEqual([true, false]);
+      slow.resolve();
+      await run;
+      expect(states).toEqual([true, false]);
+    });
+  });
 });

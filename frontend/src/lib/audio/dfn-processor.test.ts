@@ -337,6 +337,58 @@ describe("DfnProcessor graph wiring", () => {
   });
 });
 
+describe("DfnProcessor strength", () => {
+  const strength = (o: DeepFilterNetAudioWorkletOptions) => [o.speechAttenuationDb, o.pauseAttenuationDb];
+
+  it("builds the node with the package's defaults, or the values set before first use", async () => {
+    await new DfnProcessor().waitUntilReady();
+    const d = new DfnProcessor();
+    // Nothing built yet: nothing to retire.
+    expect(d.setAttenuation(12, 30)).toBe(false);
+    await d.waitUntilReady();
+
+    expect(options.map(strength)).toEqual([[25, 45], [12, 30]]);
+  });
+
+  it("new values retire the node with its context and graphs; the next use builds one with them", async () => {
+    const d = new DfnProcessor();
+    await d.processStream(micStream);
+    await d.monitorStream(micStream);
+    const fatal = vi.fn();
+    d.onFatal(fatal);
+    const [callGain] = contexts[0].gains;
+
+    expect(d.setAttenuation(10, 40)).toBe(true);
+    await Promise.resolve();
+    expect(contexts[0].state).toBe("closed");
+    expect(callGain.isConnectedTo(nodes[0])).toBe(false);
+    // Not a failure: nobody is told the model died.
+    nodes[0].post({ type: "error", message: "late" });
+    expect(fatal).not.toHaveBeenCalled();
+
+    await d.processStream(micStream);
+    expect(contexts).toHaveLength(2);
+    expect(strength(options[1])).toEqual([10, 40]);
+  });
+
+  it("the same values change nothing", async () => {
+    const d = new DfnProcessor();
+    await d.processStream(micStream);
+    expect(d.setAttenuation(25, 45)).toBe(false);
+    expect(contexts[0].state).toBe("running");
+  });
+
+  it("keeps both in range, pauses above speech", () => {
+    const d = new DfnProcessor();
+    d.setAttenuation(80, 20);
+    expect(d.getAttenuation()).toEqual({ speechDb: 40, pauseDb: 43 });
+    d.setAttenuation(1, 99);
+    expect(d.getAttenuation()).toEqual({ speechDb: 6, pauseDb: 60 });
+    d.setAttenuation(20, 21);
+    expect(d.getAttenuation()).toEqual({ speechDb: 20, pauseDb: 23 });
+  });
+});
+
 describe("dfnUnsupportedReason", () => {
   afterEach(() => {
     delete (globalThis as any).AudioWorkletNode;
