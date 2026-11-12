@@ -49,4 +49,20 @@ describe("ChatView's window over the rows it holds", () => {
   it("works out DM receipts from every row held, not the mounted window", () => {
     expect(source).toContain("dmReceiptIds(visibleMessages, isSelfSender)");
   });
+
+  // Sends overlap: one that finished after a new reply was picked cleared
+  // that new reply. Only the reply a send went out with is cleared by it.
+  it("never lets a finished send clear a reply picked while it was sending", () => {
+    // Text, slash command, GIF link and GIF file.
+    expect(source.match(/clearSentReply\(sentReplyId\)/g)).toHaveLength(4);
+    // The plain clears left: the guard itself, Escape, and a file send
+    // emptying the composer as it starts.
+    expect(source.match(/replyTargetId = null;/g)).toHaveLength(3);
+  });
+
+  // Double-click to reply goes through the same startReply as the button.
+  it("replies on a double click on a row's empty space, desktop only", () => {
+    expect(source).toContain("ondblclick={isMobile ? undefined : (e) => replyOnDoubleClick(msg, e)}");
+    expect(source).toContain("if (!isBlankMessageSpot(e.target, row, e.clientX, e.clientY)) return;");
+  });
 });
