@@ -13,22 +13,33 @@ export async function readCiphertext(hash: string): Promise<File | null> {
   try { return await (await (await directory()).getFileHandle(hash)).getFile(); }
   catch (e) { if (e instanceof DOMException && e.name === "NotFoundError") return null; throw e; }
 }
-export async function writeCiphertext(hash: string, source: Blob | AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<File> {
+export async function writeCiphertext(
+  hash: string,
+  source: Blob | AsyncIterable<Uint8Array>,
+  signal?: AbortSignal,
+  onProgress?: (bytesWritten: number) => void,
+): Promise<File> {
   check(hash);
   signal?.throwIfAborted();
   const dir = await directory();
   const handle = await dir.getFileHandle(hash, { create: true });
   const writer = await handle.createWritable();
   try {
+    let written = 0;
+    onProgress?.(0);
     if (source instanceof Blob) {
       for (let offset = 0; offset < source.size; offset += 1024 * 1024) {
         signal?.throwIfAborted();
         await writer.write(source.slice(offset, offset + 1024 * 1024));
+        written = Math.min(source.size, offset + 1024 * 1024);
+        onProgress?.(written);
       }
     } else {
       for await (const chunk of source) {
         signal?.throwIfAborted();
         await writer.write(new Uint8Array(chunk));
+        written += chunk.byteLength;
+        onProgress?.(written);
       }
     }
     signal?.throwIfAborted();

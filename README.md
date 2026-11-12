@@ -38,7 +38,7 @@ group video.
   message), rename-proof (always show the current name), and the mentioned
   person gets a highlighted message and a notification.
 - **Voice calls**, fully peer-to-peer, with optional neural noise
-  suppression (DTLN) and per-peer volume.
+  suppression (DeepFilterNet3 by default, or DTLN) and per-peer volume.
 - **Camera and screen share** at 30 fps through a self-hosted SFU: sharing is
   opt-in to watch, the sharer sees who is watching, and a streamers-only
   view hides everyone without video. Screen-share audio is scoped to the
@@ -158,6 +158,18 @@ cd frontend && pnpm check   # svelte-check + tsc
 cd relay && go test ./...   # rendezvous registry + TURN credentials
 ```
 
+Noise suppression defaults to DeepFilterNet3, from the
+`@workadventure/noise-suppression` package, running in an AudioWorklet at
+48 kHz; DTLN can be chosen instead in Settings > Audio. When DeepFilterNet3
+cannot run (audio hardware at another rate, no AudioWorklet or WebAssembly
+SIMD, a failed load, or overload) the call falls back to DTLN, and when DTLN
+cannot run either, to the browser's own suppression. Each fallback shows a
+notice and lasts only for that call: the next join, or a change to the
+setting, tries the chosen engine again, and the saved setting never changes.
+DeepFilterNet3's WebAssembly and model (about 12 MB) download the first time
+suppression is used; joining a call waits for them for up to 15 seconds, and
+past that the call uses DTLN while the download finishes for the next one.
+
 The DTLN noise-suppression worklet is built in a separate repo,
 [dtln-rs-web](https://github.com/FlavioZanoni/dtln-rs-web). Both
 `frontend/public/audio-worklet.js` and `frontend/src/lib/audio/worklet-url.ts`
@@ -180,7 +192,7 @@ of samples to that worker and buffers its output. Model inference can exceed
 a single render quantum, so running it directly in an AudioWorklet causes
 dropouts even when its average CPU usage is acceptable. A bounded queue and
 a short output cushion absorb that variation; a worker that cannot keep up
-causes the call to switch to browser suppression until DTLN is enabled again.
+switches the rest of the call to browser suppression.
 The adapter preserves the generated model and its resampler without editing
 either generated file. Buffering adds roughly 32 ms at 48 kHz, plus batching
 and the model's existing latency.

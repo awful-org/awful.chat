@@ -20,6 +20,13 @@ import { readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-
 import { CiphertextChunkStore, OPFSChunkStore } from "./opfs-store";
 import { OPFSLease, STAGING_DIR } from "./opfs-lease";
 
+export type FilePreparationPhase = "encrypting" | "hashing" | "caching";
+export type FilePreparationProgress = (
+  source: File,
+  phase: FilePreparationPhase,
+  progress: number,
+) => void;
+
 type TorrentLike = {
   infoHash: string;
   name?: string;
@@ -48,7 +55,8 @@ const WT_RECONCILE_MS = 5_000;
  */
 const WT_PROGRESS_MS = 250;
 /** Piece size of every protected file. Part of what the signed infoHash
- *  covers, so a file seeded again must be cut exactly the same way. */
+ * covers, so a file seeded again must be cut exactly the same way. Keep this
+ * compatible with attachments stored by earlier versions. */
 const ENCRYPTED_PIECE_LENGTH = 256 * 1024;
 /** Ceiling on the per-pair retry wait. */
 const WT_RETRY_MAX_MS = 60_000;
@@ -339,24 +347,44 @@ export class WebTorrentFileTransport implements FileTransferTransport {
 
   /** New protected sends only. The returned descriptor contains a secret and
    * must travel inside an authenticated room message, never public discovery. */
-  async seedEncryptedFiles(files: File[]): Promise<FileEntry[]> {
+  async seedEncryptedFiles(
+    files: File[],
+    onProgress?: FilePreparationProgress,
+  ): Promise<FileEntry[]> {
     const signal = this.lifecycle.signal;
     const descriptors: FileEntry[] = [];
     for (const source of files) {
-      const staged = await stageEncryptedFile(source, await this.lease.directory(STAGING_DIR), signal);
+      const report = (phase: FilePreparationPhase, progress: number) => {
+        onProgress?.(source, phase, Math.max(0, Math.min(1, progress)));
+      };
+      report("encrypting", 0);
+      const staged = await stageEncryptedFile(
+        source,
+        await this.lease.directory(STAGING_DIR),
+        signal,
+        (bytes) => report("encrypting", source.size ? bytes / source.size : 1),
+      );
       try {
         signal.throwIfAborted();
         // Served from the staged ciphertext itself, then from its durable
         // copy once that exists: no piece store copies it a third time.
         const pieces = new CiphertextChunkStore(ENCRYPTED_PIECE_LENGTH, staged.file);
+        report("hashing", 0);
         const descriptor = await this.seedSingle(staged.file, {
           descriptor: {
             infoHash: "", filename: source.name, mimeType: source.type || "application/octet-stream",
             size: source.size, encryption: staged.encryption,
           },
           pieces,
-        });
-        pieces.source = await writeCiphertext(descriptor.infoHash, staged.file, signal);
+        }, (hashed, total) => report("hashing", total ? hashed / total : 1));
+        report("caching", 0);
+        pieces.source = await writeCiphertext(
+          descriptor.infoHash,
+          staged.file,
+          signal,
+          (bytes) => report("caching", staged.file.size ? bytes / staged.file.size : 1),
+        );
+        report("caching", 1);
         pieces.reopen = () => readCiphertext(descriptor.infoHash);
         descriptors.push(descriptor);
       } finally { await staged.dispose(); }
@@ -1203,6 +1231,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     /** A protected file: its descriptor, and the ciphertext's own pieces, so
      *  seeding copies nothing (see CiphertextChunkStore). */
     protectedSeed?: { descriptor: FileEntry; pieces: CiphertextChunkStore },
+    onHashProgress?: (hashedBytes: number, totalBytes: number) => void,
   ): Promise<FileEntry> {
     const signal = this.lifecycle.signal;
     const protectedDescriptor = protectedSeed?.descriptor;
@@ -1214,7 +1243,10 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         { announce: [], ...(protectedSeed ? {
           name: file.name, pieceLength: ENCRYPTED_PIECE_LENGTH, private: true, storeCacheSlots: 2,
           preloadedStore: protectedSeed.pieces as unknown as WebTorrentType.TorrentOptions["preloadedStore"],
-        } : {}) },
+        } : {}), ...(onHashProgress ? { onProgress: onHashProgress } : {}) } as WebTorrentType.TorrentOptions & {
+          // create-torrent reports hashed bytes through this untyped option.
+          onProgress?: (hashedBytes: number, totalBytes: number) => void;
+        },
         (created: any) => {
           if (signal.aborted || (protectedDescriptor?.infoHash && protectedDescriptor.infoHash !== created.infoHash)) {
             created.destroy();

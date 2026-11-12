@@ -35,7 +35,11 @@ function parameters(d: EncryptedFileDescriptor, index: number): AesGcmParams {
  * A fresh random key is generated for EVERY encryption, including re-uploads.
  * The output is opaque bytes; filenames and MIME types belong in the protected
  * room message, not the torrent name. The sink must discard on abort. */
-export async function encryptFileTo(file: Blob, output: WritableStream<Uint8Array>): Promise<EncryptedFileDescriptor> {
+export async function encryptFileTo(
+  file: Blob,
+  output: WritableStream<Uint8Array>,
+  onProgress?: (bytesProcessed: number) => void,
+): Promise<EncryptedFileDescriptor> {
   const descriptor: EncryptedFileDescriptor = {
     version: 2, key: b64.encode(crypto.getRandomValues(new Uint8Array(32))),
     id: b64.encode(crypto.getRandomValues(new Uint8Array(16))), size: file.size, chunkSize: CHUNK,
@@ -44,10 +48,12 @@ export async function encryptFileTo(file: Blob, output: WritableStream<Uint8Arra
   const key = await crypto.subtle.importKey("raw", new Uint8Array(b64.decode(descriptor.key)), "AES-GCM", false, ["encrypt"]);
   const writer = output.getWriter();
   try {
+    onProgress?.(0);
     const count = Math.max(1, Math.ceil(file.size / CHUNK));
     for (let index = 0; index < count; index++) {
       const chunk = await file.slice(index * CHUNK, (index + 1) * CHUNK).arrayBuffer();
       await writer.write(new Uint8Array(await crypto.subtle.encrypt(parameters(descriptor, index), key, chunk)));
+      onProgress?.(Math.min(file.size, (index + 1) * CHUNK));
     }
     await writer.close();
     return descriptor;

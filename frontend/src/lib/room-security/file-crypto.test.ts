@@ -18,6 +18,17 @@ it.each([0, 11, 1024 * 1024 + 19])("round-trips %i file bytes with bounded authe
   expect(restored.every((byte, index) => byte === source[index])).toBe(true);
 });
 
+it("reports plaintext bytes encrypted after each completed chunk", async () => {
+  const encrypted = sink();
+  const progress: number[] = [];
+  await encryptFileTo(
+    new Blob([new Uint8Array(1024 * 1024 + 20)]),
+    encrypted.stream,
+    (bytes) => progress.push(bytes),
+  );
+  expect(progress).toEqual([0, 1024 * 1024, 1024 * 1024 + 20]);
+});
+
 it("rejects a substituted last chunk and aborts already-written partial plaintext", async () => {
   const encrypted = sink();
   const descriptor = await encryptFileTo(new Blob([new Uint8Array(1024 * 1024 + 20)]), encrypted.stream);

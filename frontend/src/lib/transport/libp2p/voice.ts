@@ -1,7 +1,9 @@
 import type { Libp2p } from "libp2p";
 import type { VoiceTransport, VoiceEvents } from "../types";
 import type { AppServices, LibP2PTransport } from "./transport";
-import type { DtlnProcessor } from "$lib/audio/dtln-processor";
+import type { MicDenoiser } from "$lib/audio/dtln-processor";
+import { dfnUnsupportedReason } from "$lib/audio/dfn-processor";
+import { NOISE_ENGINE_LABELS, noiseEngineOrder, type NoiseEngine } from "../audio-prefs";
 import { describeMediaError } from "../call-error";
 import { getIceServers, onIceServersChanged } from "../ice-server-list";
 import { succeededPair } from "../ice-stats";
@@ -121,6 +123,13 @@ const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {
   // produce, and every listener compensates per friend by hand.
   autoGainControl: true,
 };
+
+/**
+ * DeepFilterNet3 cannot run on this device (see dfnUnsupportedReason): told
+ * once a session. It is a hardware or browser limit, so every call and
+ * every settings toggle would otherwise say it again.
+ */
+let dfnUnsupportedNoticeShown = false;
 
 type VoiceSignal =
   | { type: "offer"; sdp: string }
@@ -285,14 +294,21 @@ export class LibP2PVoice implements VoiceTransport {
   };
   private handlers = new Map<keyof VoiceEvents, Set<Function>>();
 
+  /** Noise suppression on or off: the saved switch. A fallback never flips it. */
   private dtlnEnabled = true;
+  /** The preferred model, and the models that failed this call. */
+  private noiseEngine: NoiseEngine = "dfn3";
+  private failedEngines = new Set<NoiseEngine>();
+  /** Bumped by every startMic and by leave(): an older run that sees it moved stops. */
+  private micGen = 0;
 
   private onTransportConnect: ((peerId: string) => void) | null = null;
   private onTransportDisconnect: (peerId: string) => void | null = () => {};
 
   constructor(
     private transport: LibP2PTransport,
-    private dtln: DtlnProcessor | null = null
+    private dtln: MicDenoiser | null = null,
+    private dfn: MicDenoiser | null = null
   ) {
     // ICE servers are snapshotted at pc creation, so a pair built before
     // TURN credentials landed is STUN-only for its whole life - a
@@ -333,7 +349,10 @@ export class LibP2PVoice implements VoiceTransport {
     // silence forever - the track stays live, RTP keeps flowing, and
     // connectionState reads "connected" on both ends (finding 1). Rebuild
     // the mic once instead of leaving that peer permanently unheard.
-    this.dtln?.onFatal((error) => this.handleDtlnFatal(error));
+    this.dtln?.onFatal((error) => this.handleDtlnFatal(error, "dtln"));
+    this.dfn?.onFatal((error) => this.handleDtlnFatal(error, "dfn3"));
+    // A fallback lasts one call: every join starts from the preferred model.
+    if (this.failedEngines.size) this.rearmNoiseEngine();
 
     try {
       await this.startMic(this.activeInputDevice ?? undefined);
@@ -855,7 +874,7 @@ export class LibP2PVoice implements VoiceTransport {
         d: {
           bytes,
           delta: previous === null ? 0 : bytes - previous,
-          dtlnLoad: this.dtlnEnabled ? this.dtln?.getProcessingLoad?.() ?? null : null,
+          dtlnLoad: this.denoiser(this.activeNoiseEngine())?.getProcessingLoad() ?? null,
           jitter: typeof inbound.jitter === "number" ? inbound.jitter : null,
           lost:
             typeof inbound.packetsLost === "number" ? inbound.packetsLost : null,
@@ -928,9 +947,13 @@ export class LibP2PVoice implements VoiceTransport {
       this.emit("peerLeft", peerId);
     }
 
+    // A startMic still waiting on a model download stops where it is.
+    this.micGen++;
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.dtln?.releaseTransport();
     this.dtln?.onFatal(null);
+    this.dfn?.releaseTransport();
+    this.dfn?.onFatal(null);
     this.callAudioMixer?.dispose();
     this.audioCtx?.close();
 
@@ -1024,9 +1047,9 @@ export class LibP2PVoice implements VoiceTransport {
         this.audioCtx!.currentTime + 0.05
       );
     }
-    if (this.dtlnEnabled && this.dtln) {
-      this.dtln.setInputGain(clamped);
-    }
+    // Both remember it: the mic test previews with whichever is active.
+    this.dtln?.setInputGain(clamped);
+    this.dfn?.setInputGain(clamped);
   }
 
   getInputGain(): number {
@@ -1125,7 +1148,7 @@ export class LibP2PVoice implements VoiceTransport {
   async setDtlnEnabled(enabled: boolean): Promise<void> {
     if (this.dtlnEnabled === enabled) return;
     this.dtlnEnabled = enabled;
-    this.emit("processingChanged", enabled);
+    this.rearmNoiseEngine();
     if (this.audioCtx) {
       await this.startMic(this.activeInputDevice ?? undefined);
     }
@@ -1133,6 +1156,68 @@ export class LibP2PVoice implements VoiceTransport {
 
   isDtlnEnabled(): boolean {
     return this.dtlnEnabled;
+  }
+
+  async setNoiseEngine(engine: NoiseEngine): Promise<void> {
+    if (this.noiseEngine === engine) return;
+    this.noiseEngine = engine;
+    this.rearmNoiseEngine();
+    if (this.audioCtx && this.dtlnEnabled) {
+      await this.startMic(this.activeInputDevice ?? undefined);
+    }
+  }
+
+  getNoiseEngine(): NoiseEngine {
+    return this.noiseEngine;
+  }
+
+  /**
+   * The model the mic runs through: the preferred one, then DTLN, skipping
+   * any that failed this call. Null is the browser's own suppression.
+   */
+  private activeNoiseEngine(): NoiseEngine | null {
+    if (!this.dtlnEnabled) return null;
+    return (
+      noiseEngineOrder(this.noiseEngine).find(
+        (e) => this.denoiser(e) && !this.failedEngines.has(e)
+      ) ?? null
+    );
+  }
+
+  private denoiser(engine: NoiseEngine | null): MicDenoiser | null {
+    return engine === "dfn3" ? this.dfn : engine === "dtln" ? this.dtln : null;
+  }
+
+  /** Forget this call's fallbacks: the preferred model gets another go. */
+  private rearmNoiseEngine(): void {
+    this.failedEngines.clear();
+    this.emit("processingChanged", this.activeNoiseEngine() ?? "browser");
+  }
+
+  /**
+   * A model failed, or cannot run here: the next one in line carries the
+   * rest of this call, and the user is told. Both used to be silent and to
+   * last the whole session - noise suppression quietly gone until a reload.
+   * The saved choice is left alone; the next join re-arms it.
+   *
+   * `unsupported`: the model cannot run on this device at all (`reason` says
+   * why), which no retry changes - reported every call, said once a session.
+   */
+  private fallBack(engine: NoiseEngine, reason: string, unsupported = false): void {
+    this.failedEngines.add(engine);
+    const next = this.activeNoiseEngine();
+    this.emit("processingChanged", next ?? "browser", reason, unsupported);
+    const instead = next ? NOISE_ENGINE_LABELS[next] : "your browser's noise suppression";
+    if (unsupported) {
+      if (dfnUnsupportedNoticeShown) return;
+      dfnUnsupportedNoticeShown = true;
+    }
+    this.emit("status", {
+      type: "app-warning",
+      message: unsupported
+        ? `${NOISE_ENGINE_LABELS[engine]} noise suppression can't run on this device (${reason}), so ${instead} is used instead.`
+        : `${NOISE_ENGINE_LABELS[engine]} noise suppression isn't available right now, so this call uses ${instead} instead.`,
+    });
   }
 
   on<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void {
@@ -1151,11 +1236,32 @@ export class LibP2PVoice implements VoiceTransport {
   // ─── internals ────────────────────────────────────────────────────────────
 
   private async startMic(deviceId?: string): Promise<void> {
+    const gen = ++this.micGen;
+    /**
+     * A newer run took over while this one waited - a setting changed, a
+     * model died, or the call was left, during a download of up to 15 s.
+     * Carrying on would stack a stale model on the newer run's mic, or report
+     * a failure to someone who has gone. This run drops the mic it opened and
+     * leaves the rest to the newer one.
+     */
+    const superseded = (mic: MediaStream) => {
+      if (gen === this.micGen) return false;
+      mic.getTracks().forEach((t) => t.stop());
+      return true;
+    };
     this.micStream?.getTracks().forEach((t) => t.stop());
     this.inputSource?.disconnect();
     this.inputGain?.disconnect();
 
-    const useDtln = this.dtlnEnabled && this.dtln != null;
+    // Before anything downloads: the call's context runs at the hardware
+    // rate, and DFN3 runs only where that is 48 kHz (see dfnUnsupportedReason).
+    const unsupported =
+      this.activeNoiseEngine() === "dfn3" &&
+      dfnUnsupportedReason(this.audioCtx?.sampleRate);
+    if (unsupported) this.fallBack("dfn3", unsupported, true);
+    let engine = this.activeNoiseEngine();
+    // Any model: browser noise suppression goes off only when one runs.
+    const useDtln = engine !== null;
 
     const constraints: MediaStreamConstraints = {
       audio: deviceId
@@ -1169,68 +1275,86 @@ export class LibP2PVoice implements VoiceTransport {
       video: false,
     };
 
+    let mic: MediaStream;
     try {
-      this.micStream = await navigator.mediaDevices.getUserMedia(constraints);
+      mic = await navigator.mediaDevices.getUserMedia(constraints);
     } catch (err) {
       // The remembered mic may be unplugged by the time it is restored, and
       // `deviceId: {exact}` makes that a hard failure - fall back to whatever
       // the system offers rather than leaving the user with no audio at all.
       if (!deviceId) throw err;
-      this.micStream = await navigator.mediaDevices.getUserMedia({
+      mic = await navigator.mediaDevices.getUserMedia({
         audio: useDtln ? AUDIO_CONSTRAINTS : AUDIO_CONSTRAINTS_NO_DTLN,
         video: false,
       });
     }
-    const track = this.micStream.getAudioTracks()[0];
+    if (superseded(mic)) return;
+    this.micStream = mic;
+    const track = mic.getAudioTracks()[0];
     this.activeInputDevice = track.getSettings().deviceId ?? null;
 
     let processed: MediaStream | null = null;
-    if (useDtln) {
+    while (engine && !processed) {
+      const denoiser = this.denoiser(engine)!;
       try {
-        await this.dtln!.waitUntilReady();
-        processed = await this.dtln!.processStream(
-          this.micStream,
-          this.currentInputGain
-        );
-      } catch (err) {
-        // DTLN unavailable (load failure, unsupported browser, crashed
-        // worklet): fall back to the plain path with the browser's own noise
-        // suppression instead of joining the call with no mic at all.
-        // Re-request the mic so the native processing constraints apply.
-        console.error(
-          "[voice] DTLN failed, falling back to browser noise suppression:",
-          err
-        );
-        this.dtlnEnabled = false;
-        this.emit("processingChanged", false, err instanceof Error ? err.message : "DTLN unavailable");
-        this.dtln?.releaseTransport();
-        this.micStream.getTracks().forEach((t) => t.stop());
-        try {
-          this.micStream = await navigator.mediaDevices.getUserMedia({
-            audio: this.activeInputDevice
-              ? {
-                  ...AUDIO_CONSTRAINTS_NO_DTLN,
-                  deviceId: { exact: this.activeInputDevice },
-                }
-              : AUDIO_CONSTRAINTS_NO_DTLN,
-            video: false,
-          });
-        } catch {
-          // The remembered mic may be gone - same fallback as above.
-          this.micStream = await navigator.mediaDevices.getUserMedia({
-            audio: AUDIO_CONSTRAINTS_NO_DTLN,
-            video: false,
-          });
+        await denoiser.waitUntilReady();
+        if (superseded(mic)) return;
+        processed = await denoiser.processStream(mic, this.currentInputGain);
+        if (superseded(mic)) {
+          // A newer run on this same model has replaced (or will replace)
+          // this graph itself; releasing here could cut its graph instead.
+          if (this.activeNoiseEngine() !== engine) denoiser.releaseTransport();
+          return;
         }
+      } catch (err) {
+        // An abandoned run has no failure to report or fall back from.
+        if (superseded(mic)) return;
+        // Model unavailable (load failure, unsupported browser, crashed
+        // worklet): the next one in line gets the same mic.
+        console.error(`[voice] ${NOISE_ENGINE_LABELS[engine]} failed, falling back:`, err);
+        denoiser.releaseTransport();
+        this.fallBack(
+          engine,
+          err instanceof Error ? err.message : `${NOISE_ENGINE_LABELS[engine]} unavailable`
+        );
+        engine = this.activeNoiseEngine();
       }
     }
+    if (useDtln && !processed) {
+      // No model left: fall back to the plain path with the browser's own
+      // noise suppression instead of joining the call with no mic at all.
+      // Re-request the mic so the native processing constraints apply.
+      mic.getTracks().forEach((t) => t.stop());
+      try {
+        mic = await navigator.mediaDevices.getUserMedia({
+          audio: this.activeInputDevice
+            ? {
+                ...AUDIO_CONSTRAINTS_NO_DTLN,
+                deviceId: { exact: this.activeInputDevice },
+              }
+            : AUDIO_CONSTRAINTS_NO_DTLN,
+          video: false,
+        });
+      } catch {
+        // The remembered mic may be gone - same fallback as above.
+        mic = await navigator.mediaDevices.getUserMedia({
+          audio: AUDIO_CONSTRAINTS_NO_DTLN,
+          video: false,
+        });
+      }
+      if (superseded(mic)) return;
+      this.micStream = mic;
+    }
+    // Only the model in use keeps a peer-facing graph: one switched off,
+    // switched away from or fallen back from stops processing the (now
+    // stopped) previous mic.
+    if (engine !== "dtln") this.dtln?.releaseTransport();
+    if (engine !== "dfn3") this.dfn?.releaseTransport();
     let microphoneProcessed: MediaStream;
     if (processed) {
       microphoneProcessed = processed;
     } else {
-      // DTLN off: drop its graph so the worklet stops processing the (now
-      // stopped) previous mic and peers are fed by the plain path only.
-      this.dtln?.releaseTransport();
+      // No model: peers are fed by the plain path only.
       const ctx = this.audioCtx!;
       this.inputSource = ctx.createMediaStreamSource(this.micStream);
       this.inputGain = ctx.createGain();
@@ -1285,17 +1409,17 @@ export class LibP2PVoice implements VoiceTransport {
    * The worklet crashed after init (finding 1): its context is suspended
    * and the destination node feeding every RTCRtpSender has no input, but
    * the track itself stays live so nothing else notices. Rebuilding the mic
-   * replaces the track on every peer with native suppression, using the
-   * same path as a manual device switch.
+   * replaces the track on every peer with the next model in line (or native
+   * suppression), using the same path as a manual device switch.
    */
-  private handleDtlnFatal(error?: Error): void {
-    if (!this.audioCtx) return;
+  private handleDtlnFatal(error: Error, engine: NoiseEngine): void {
+    // An idle model dying is not this call's problem.
+    if (!this.audioCtx || this.activeNoiseEngine() !== engine) return;
     // A model that cannot keep up must not be restarted into the same
-    // overload loop. Use native suppression until explicitly enabled again.
-    this.dtlnEnabled = false;
-    this.emit("processingChanged", false, error?.message ?? "DTLN processing stopped");
+    // overload loop: the next one in line carries the rest of this call.
+    this.fallBack(engine, error.message);
     void this.startMic(this.activeInputDevice ?? undefined).catch((err) => {
-      console.error("[voice] mic rebuild after DTLN crash failed:", err);
+      console.error(`[voice] mic rebuild after ${NOISE_ENGINE_LABELS[engine]} crash failed:`, err);
     });
   }
 

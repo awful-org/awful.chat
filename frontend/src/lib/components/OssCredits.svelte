@@ -184,6 +184,16 @@
           url: "https://github.com/breizhn/DTLN",
         },
         {
+          name: "DeepFilterNet",
+          what: "the DeepFilterNet3 noise suppression: libDF, its Rust engine, and the model",
+          url: "https://github.com/Rikorose/DeepFilterNet",
+        },
+        {
+          name: "@workadventure/noise-suppression",
+          what: "the WebAssembly and AudioWorklet build of DeepFilterNet3 our mic pipeline loads",
+          url: "https://github.com/workadventure/noise-suppression",
+        },
+        {
           name: "idb",
           what: "local storage for messages, files and identity",
           url: "https://github.com/jakearchibald/idb",

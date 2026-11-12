@@ -1275,7 +1275,8 @@ Manifest: /manifest.webmanifest (vite-plugin-pwa), id "/", scope "/",
   narrow screenshots, launch_handler navigate-existing, two shortcuts
   (?new=1 new room, ?sync=1 device sync)
 Service Worker: /sw.js. Precaches the shell and hashed assets (not the
-  DTLN worklet or shiki grammars, cached on first use); every in-scope
+  DTLN worklet or shiki grammars, cached on first use, nor DeepFilterNet3's
+  wasm and model, fetched on first use); every in-scope
   navigation is answered from the precached index.html, revalidated in the
   background; /config.json is never cached by the worker or the HTTP cache.
   The app keeps the last copy it read in localStorage and a later launch
