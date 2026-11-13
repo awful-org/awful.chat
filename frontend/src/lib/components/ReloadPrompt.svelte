@@ -10,29 +10,27 @@
 
 <script lang="ts">
   import { writable } from "svelte/store";
+  import { onDestroy } from "svelte";
+  import { watchPwaUpdate } from "$lib/pwa-update";
   import { useRegisterSW } from "virtual:pwa-register/svelte";
   import { X } from "@lucide/svelte";
 
   const primary = !claimed;
   claimed = true;
+  let available = $state(false);
+  let destroyed = false;
+  let watcher: ReturnType<typeof watchPwaUpdate> | undefined;
 
   const { needRefresh, updateServiceWorker } = primary
     ? useRegisterSW({
         immediate: true,
         onRegisteredSW(swUrl, registration) {
           console.log(`Service Worker at: ${swUrl}`);
-          // A long-lived PWA tab only checks for updates on navigation, which a
-          // PWA never does - without this poll an update went unseen until the
-          // next full reload, days later.
-          if (registration) {
-            setInterval(() => {
-              if (navigator.onLine) void registration.update().catch(() => {});
-            }, 60 * 60 * 1000);
-            // A worker already waiting at launch is an update the user was
-            // offered and dismissed, and dismissing it only ever meant "not
-            // this second". Left unasked it waits forever, because a PWA
-            // never navigates and nothing else fires needRefresh again.
-            if (registration.waiting) needRefresh.set(true);
+          if (registration && !destroyed) {
+            watcher?.dispose();
+            watcher = watchPwaUpdate(registration, __APP_BUILD_ID__, (value) => {
+              available = value;
+            }, navigator.serviceWorker);
           }
         },
         onRegisterError(error) {
@@ -41,7 +39,18 @@
       })
     : { needRefresh: writable(false), updateServiceWorker: async () => {} };
 
+  // Workbox's signal is only a hint; a waiting worker must pass the build check.
+  const unsubscribe = needRefresh.subscribe((value) => {
+    if (value) watcher?.refresh();
+  });
+  onDestroy(() => {
+    destroyed = true;
+    unsubscribe();
+    watcher?.dispose();
+  });
+
   function close() {
+    watcher?.dismiss();
     needRefresh.set(false);
   }
 
@@ -51,6 +60,10 @@
   let updating = $state(false);
   let updateError = $state(false);
   async function update() {
+    if (!watcher?.isCurrent()) {
+      watcher?.refresh();
+      return;
+    }
     updating = true;
     updateError = false;
     try {
@@ -62,7 +75,7 @@
   }
 </script>
 
-{#if $needRefresh}
+{#if available}
   <div
     class="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))] max-w-[calc(100vw-2rem)] z-50 flex flex-wrap items-center gap-3 rounded-lg border bg-background/95 backdrop-blur px-4 py-3 text-sm font-mono text-foreground shadow-lg"
     role="alert"

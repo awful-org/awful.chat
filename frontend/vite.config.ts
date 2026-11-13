@@ -92,6 +92,9 @@ export default defineConfig(({ mode }) => ({
     // scripts/git-commit.mjs. Empty when the build has no repository to
     // read, and the UI then omits it.
     __APP_COMMIT__: JSON.stringify(resolveCommit()),
+    // Full release identity, shared with injectManifest's worker build. Do not
+    // use package.version: all pre-1.0 deployments currently say 0.0.0.
+    __APP_BUILD_ID__: JSON.stringify(resolveCommit({ full: true })),
   },
   plugins: [
     tailwindcss(),

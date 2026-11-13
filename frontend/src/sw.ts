@@ -96,6 +96,9 @@ self.addEventListener("notificationclick", (event) => {
 });
 
 self.addEventListener("message", (event) => {
+  if (event.data?.type === "AWFUL_BUILD_ID") {
+    event.ports[0]?.postMessage({ type: "AWFUL_BUILD_ID", buildId: __APP_BUILD_ID__ });
+  }
   if (event.data && event.data.type === "SKIP_WAITING") {
     void self.skipWaiting();
   }
