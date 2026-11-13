@@ -312,6 +312,8 @@ export interface FileDescriptor {
 export interface FileTransferSnapshot extends FileDescriptor {
   status: FileTransferStatus;
   progress: number;
+  /** Network bytes arrived; authenticating and committing encrypted storage. */
+  finishing?: boolean;
   done: boolean;
   seeding: boolean;
   peers: number;

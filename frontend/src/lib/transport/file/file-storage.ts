@@ -5,6 +5,7 @@ const MEMORY_LIMIT = 64 * 1024 * 1024;
 let used = 0;
 type Entry = { directory: Map<string, Entry> } | { file: Blob };
 const entries = new Map<string, Entry>();
+const directories = new WeakMap<FileSystemDirectoryHandle, Map<string, Entry>>();
 const missing = () => new DOMException("File not found", "NotFoundError");
 
 function drop(entry: Entry): void {
@@ -14,7 +15,7 @@ function drop(entry: Entry): void {
 
 function memoryDirectory(children: Map<string, Entry>): FileSystemDirectoryHandle {
   // Implements the subset consumed by staging, chunk stores and lease cleanup.
-  return {
+  const handle = {
     async getDirectoryHandle(name: string, options?: { create?: boolean }) {
       let entry = children.get(name);
       if (!entry && options?.create) {
@@ -34,7 +35,23 @@ function memoryDirectory(children: Map<string, Entry>): FileSystemDirectoryHandl
       if (!entry) throw missing();
       if (!("file" in entry)) throw new DOMException("Not a file", "TypeMismatchError");
       const file = entry;
+      let owner = children;
       return {
+        async move(destination: FileSystemDirectoryHandle, newName: string) {
+          const target = directories.get(destination);
+          if (!target) throw new DOMException("Unsupported destination", "NotSupportedError");
+          if (owner.get(name) !== file) throw missing();
+          if (target === owner && newName === name) return;
+          const previous = target.get(newName);
+          if (previous) {
+            if (!("file" in previous)) throw new DOMException("Not a file", "TypeMismatchError");
+            drop(previous);
+          }
+          target.set(newName, file);
+          owner.delete(name);
+          name = newName;
+          owner = target;
+        },
         async getFile() { return new File([file.file], name); },
         async createWritable() {
           let parts: Blob[] = [];
@@ -53,7 +70,7 @@ function memoryDirectory(children: Map<string, Entry>): FileSystemDirectoryHandl
             },
             async close() {
               if (closed) return;
-              if (children.get(name) !== file) throw missing();
+              if (owner.get(name) !== file) throw missing();
               const blob = new Blob(parts);
               used -= file.file.size;
               file.file = blob;
@@ -83,6 +100,8 @@ function memoryDirectory(children: Map<string, Entry>): FileSystemDirectoryHandl
     },
     async *keys() { yield* children.keys(); },
   } as unknown as FileSystemDirectoryHandle;
+  directories.set(handle, children);
+  return handle;
 }
 
 export async function fileStorageRoot(): Promise<FileSystemDirectoryHandle> {

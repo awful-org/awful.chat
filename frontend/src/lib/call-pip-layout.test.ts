@@ -52,4 +52,29 @@ describe("shared PiP layouts", () => {
     expect(small.cells[0].rect.w).not.toBe(large.cells[0].rect.w);
     expect(value.prefs).toEqual(before);
   });
+  it("retains independent stable speaker slots through PiP updates, filtering and resizing", () => {
+    const value = layout({ strip: "side" }, [...Array.from({ length: 7 }, (_, i) => camera(`p${i}`)), screen]);
+    const first = pipLayoutCells(value, 900, 500);
+    expect(first.stripState.ids).toEqual(["p0", "p1"]);
+    value.speaking = new Set(["p1"]);
+    const visibleSpeaker = pipLayoutCells(value, 900, 500, first.stripState);
+    expect(visibleSpeaker.stripState.ids).toEqual(first.stripState.ids);
+    value.speaking = new Set(["p4"]);
+    value.lastSpokeAt = new Map([["p0", 10], ["p1", 20], ["p4", 30]]);
+    const promoted = pipLayoutCells(value, 900, 500, visibleSpeaker.stripState);
+    expect(promoted.stripState.ids).toEqual(["p4", "p1"]);
+    expect(promoted.cells.slice(1).map((cell) => cell.tile.id)).toEqual(["p4", "p1"]);
+    expect(promoted.cells[2].rect).toEqual(first.cells[2].rect);
+    expect(promoted.overflow?.count).toBe(5);
+    // A second surface does not inherit the first surface's occupied slots.
+    value.speaking = new Set();
+    expect(pipLayoutCells(value, 900, 500).stripState.ids).toEqual(["p0", "p1"]);
+    expect(pipLayoutCells(value, 900, 750, promoted.stripState).stripState.ids.slice(0, 2)).toEqual(["p4", "p1"]);
+    value.tiles = value.tiles.filter((tile) => tile.id !== "p4");
+    expect(pipLayoutCells(value, 900, 500, promoted.stripState).stripState.ids).toEqual(["p0", "p1"]);
+    value.prefs.strip = "hidden";
+    const hidden = pipLayoutCells(value, 900, 500, promoted.stripState);
+    expect(hidden.stripState.ids).toEqual([]);
+    expect(hidden.cells.map((cell) => cell.tile.id)).toEqual(["screen"]);
+  });
 });

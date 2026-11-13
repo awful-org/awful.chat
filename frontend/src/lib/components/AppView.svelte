@@ -1021,6 +1021,7 @@
       pin: callFocus.pinnedTileId,
       speaker: spotlightTileId,
       speaking: new Set(speakers.speaking),
+      lastSpokeAt: new Map(speakers.lastSpokeAt),
     } : null, (peers) => { spotlightStore.pipCameraPeers = peers; });
   });
 

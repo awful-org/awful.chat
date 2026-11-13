@@ -1,4 +1,5 @@
 import { fileStorageRoot } from "./file-storage";
+import type { StagedFile } from "../../room-security/file-staging";
 
 /** Opaque ciphertext; durable in OPFS, page-local when storage is unavailable.
  * No keys, names or MIME types enter filesystem paths. */
@@ -49,6 +50,56 @@ export async function writeCiphertext(
     await writer.abort().catch(() => {});
     await dir.removeEntry(hash).catch(() => {});
     throw e;
+  }
+}
+
+/** Sender staging is already ciphertext. Adopt its entry, not a second full
+ * copy. Browsers without OPFS move retain the bounded streaming copy path. */
+export async function adoptCiphertext(hash: string, staged: StagedFile, signal: AbortSignal, onProgress?: (bytesWritten: number) => void): Promise<File> {
+  check(hash);
+  signal.throwIfAborted();
+  try {
+    const moved = await staged.moveTo(await directory(), hash);
+    signal.throwIfAborted();
+    return moved ?? await writeCiphertext(hash, staged.file, signal, onProgress);
+  } catch (error) {
+    await removeCiphertext(hash).catch(() => {});
+    throw error;
+  }
+}
+
+/** One traversal of received pieces: persist only ciphertext while the
+ * consumer authenticates/decrypts it. Commit before returning any plaintext.
+ * No tee/queue: each write and consumer read applies backpressure. */
+export async function consumeCiphertext<T>(
+  hash: string, source: AsyncIterable<Uint8Array>, signal: AbortSignal,
+  consume: (source: AsyncIterable<Uint8Array>) => Promise<T>,
+): Promise<T> {
+  check(hash);
+  signal.throwIfAborted();
+  const dir = await directory();
+  const handle = await dir.getFileHandle(hash, { create: true });
+  const writer = await handle.createWritable();
+  let exhausted = false;
+  async function* cached() {
+    for await (const chunk of source) {
+      signal.throwIfAborted();
+      await writer.write(new Uint8Array(chunk));
+      yield chunk;
+    }
+    exhausted = true;
+  }
+  try {
+    const result = await consume(cached());
+    if (!exhausted) throw new Error("Ciphertext consumer stopped early");
+    signal.throwIfAborted();
+    await writer.close();
+    signal.throwIfAborted();
+    return result;
+  } catch (error) {
+    await writer.abort().catch(() => {});
+    await dir.removeEntry(hash).catch(() => {});
+    throw error;
   }
 }
 export async function removeCiphertext(hash: string): Promise<void> {

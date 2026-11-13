@@ -18,6 +18,7 @@ class Client {
   torrents = new Map<string, Torrent>();
   constructor() { clients.push(this); }
   get(hash: string) { return this.torrents.get(hash); }
+  remove(hash: string, _opts: unknown, cb: () => void) { this.torrents.get(hash)?.destroy(); this.torrents.delete(hash); cb(); }
   add(hash: string) { const t = new Torrent(); t.infoHash = hash; this.torrents.set(hash, t); return t; }
   seed(file: File, opts: any, cb: (t: Torrent) => void) {
     seeded.push(file); const t = new Torrent();
@@ -64,7 +65,7 @@ async function encryptedOffer() {
   const bytes = await sender.persistableCiphertext(file.infoHash, 1000); sender.destroy();
   return { file, bytes: bytes! };
 }
-async function receive(file: FileDescriptor, bytes: ArrayBuffer) {
+async function receive(file: FileDescriptor, bytes: ArrayBuffer, source?: () => AsyncIterable<Uint8Array>) {
   const count = clients.length;
   network.message({ type: "__file_signal", payload: { kind: "file-seeder", file } });
   qs.acceptFile(file.infoHash);
@@ -74,8 +75,9 @@ async function receive(file: FileDescriptor, bytes: ArrayBuffer) {
   });
   const t = clients.at(-1)!.get(file.infoHash)!;
   t.length = bytes.byteLength;
-  t.files = [{ name: `${file.encryption!.id}.bin`, async *createReadStream() { yield new Uint8Array(bytes); } }];
-  t.emit("metadata"); t.done = true; t.emit("done");
+  t.files = [{ name: `${file.encryption!.id}.bin`, createReadStream: source ?? (async function* () { yield new Uint8Array(bytes); }) }];
+  t.emit("metadata"); t.done = true; t.progress = 1; t.emit("done");
+  return t;
 }
 it("quick offers seed opaque ciphertext, announce protected keys and delete owned ciphertext on stop", async () => {
   await qs.offerFiles([new File(["SECRET SENTINEL"], "private-diagnosis.txt")]);
@@ -107,4 +109,42 @@ it("wrong-room offers and corrupted ciphertext never produce a download URL or a
   expect(qs.quickSend.transfers.get(file.infoHash)?.blobURL).toBeUndefined();
   expect(messages().some(m => m.payload.type === "__qs_ack")).toBe(false);
   expect(seeded).toHaveLength(1);
+});
+
+it("shows finishing below 100%, survives sender departure and acknowledges only after cache commit", async () => {
+  const { file, bytes } = await encryptedOffer();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  await receive(file, bytes, async function* () {
+    yield new Uint8Array(bytes);
+    await gate;
+  });
+  await vi.waitFor(() => expect(qs.quickSend.transfers.get(file.infoHash)?.finishing).toBe(true));
+  expect(qs.quickSend.transfers.get(file.infoHash)?.progress).toBeLessThan(1);
+  expect(qs.quickSend.transfers.get(file.infoHash)?.blobURL).toBeUndefined();
+  expect(messages().some(m => m.payload.type === "__qs_ack")).toBe(false);
+  network.emit("disconnect", "friend");
+  expect(qs.quickSend.transfers.get(file.infoHash)?.status).toBe("downloading");
+  release();
+  await vi.waitFor(() => expect(qs.quickSend.transfers.get(file.infoHash)?.done).toBe(true));
+  expect(qs.quickSend.transfers.get(file.infoHash)?.finishing).toBe(false);
+  expect(await disk.entries.get(`room-v2-ciphertext/${file.infoHash}`)!.arrayBuffer()).toEqual(bytes);
+});
+
+it("declining during finishing cancels publication, cleans ciphertext and never acknowledges", async () => {
+  const { file, bytes } = await encryptedOffer();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const torrent = await receive(file, bytes, async function* () {
+    yield new Uint8Array(bytes).subarray(0, 1);
+    await gate;
+    yield new Uint8Array(bytes).subarray(1);
+  });
+  const declining = qs.declineFile(file.infoHash);
+  release();
+  await declining;
+  await vi.waitFor(() => expect(torrent.destroyed).toBe(true));
+  await vi.waitFor(() => expect(disk.entries.has(`room-v2-ciphertext/${file.infoHash}`)).toBe(false));
+  expect(qs.quickSend.transfers.has(file.infoHash)).toBe(false);
+  expect(messages().some(m => m.payload.type === "__qs_ack")).toBe(false);
 });

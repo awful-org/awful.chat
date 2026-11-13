@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { callGridRects, callLayoutGroups, cameraStripGeometry, DEFAULT_CALL_LAYOUT, filterCallTiles, parseCallLayout } from "./call-layout";
+import { callGridRects, callLayoutGroups, cameraStripGeometry, createCameraStripState, DEFAULT_CALL_LAYOUT, filterCallTiles, parseCallLayout, selectCameraStrip } from "./call-layout";
 import type { SpotlightTile } from "./spotlight";
 
 const camera = (id: string, local = false, video = true): SpotlightTile => ({ id, peerId: id, kind: "camera", isLocal: local, videoTrack: video ? {} as MediaStreamTrack : null });
@@ -34,8 +34,8 @@ describe("call layouts", () => {
     expect(groups(tiles, { layout: "spotlight" }, "screen", "bruno").main[0].id).toBe("screen");
     expect(groups(tiles, { layout: "spotlight" }, "gone", "bruno").main[0].id).toBe("bruno");
   });
-  it("orders current speakers first without changing the remaining order", () => {
-    expect(groups([people[1], people[2], people[0], share("s")]).strip.map((t) => t.id)).toEqual(["ana", "bruno", "carla"]);
+  it("does not reorder the strip when an existing participant speaks", () => {
+    expect(groups([people[1], people[2], people[0], share("s")]).strip.map((t) => t.id)).toEqual(["bruno", "carla", "ana"]);
   });
   it("honours all filters, including hiding self and deliberately empty views", () => {
     const tiles = [...people, share("s"), { ...share("app"), kind: "plugin" as const }];
@@ -43,6 +43,63 @@ describe("call layouts", () => {
     expect(filterCallTiles(tiles, { ...prefs, people: "video" }).map((t) => t.id)).not.toContain("carla");
     expect(filterCallTiles(tiles, { ...prefs, people: "none", screens: false, apps: false })).toEqual([]);
     expect(filterCallTiles(tiles, { ...prefs, people: "none" }).map((t) => t.id)).toEqual(["s", "app"]);
+  });
+});
+
+describe("stable visible camera slots", () => {
+  const tiles = [camera("a"), camera("b"), camera("c"), camera("d"), camera("e")];
+  const initial = () => selectCameraStrip(createCameraStripState(), tiles, 3, new Set());
+  it("keeps visible speakers in their exact slots, including the last slot", () => {
+    let state = initial();
+    for (const id of ["c", "a", "b", "c"]) {
+      state = selectCameraStrip(state, tiles, 3, new Set([id]));
+      expect(state.ids).toEqual(["a", "b", "c"]);
+    }
+  });
+  it("replaces only the least-recently-spoken visible camera, not the last array item", () => {
+    const state = selectCameraStrip(initial(), tiles, 3, new Set(["d"]), new Map([["a", 30], ["b", 10], ["c", 20], ["d", 40]]));
+    expect(state.ids).toEqual(["a", "d", "c"]);
+    expect(initial().ids).toEqual(["a", "b", "c"]);
+    expect(selectCameraStrip(state, tiles, 3, new Set()).ids).toEqual(state.ids);
+  });
+  it("tracks recency across silence without external timestamps and prefers never-spoken cameras", () => {
+    let state = selectCameraStrip(initial(), tiles, 3, new Set(["a"]));
+    state = selectCameraStrip(state, tiles, 3, new Set(["b"]));
+    state = selectCameraStrip(state, tiles, 3, new Set());
+    state = selectCameraStrip(state, tiles, 3, new Set(["d"]));
+    expect(state.ids).toEqual(["a", "b", "d"]);
+    state = selectCameraStrip(state, tiles, 3, new Set(["e"]));
+    expect(state.ids).toEqual(["e", "b", "d"]);
+  });
+  it("protects speaking occupants and content, and does not thrash overlapping speakers", () => {
+    const mixed = [share("s"), ...tiles];
+    let state = selectCameraStrip(createCameraStripState(), mixed, 3, new Set(["a"]));
+    state = selectCameraStrip(state, mixed, 3, new Set(["a", "d", "e"]));
+    expect(state.ids).toEqual(["s", "a", "d"]);
+    for (let i = 0; i < 10; i++) {
+      state = selectCameraStrip(state, mixed, 3, new Set(["a", "d", "e"]));
+      expect(state.ids).toEqual(["s", "a", "d"]);
+    }
+    state = selectCameraStrip(state, mixed, 3, new Set(["a", "e"]));
+    expect(state.ids).toEqual(["s", "a", "e"]);
+  });
+  it("uses peer IDs for speech but tile IDs for slots, and includes local/camera-off participants", () => {
+    const other = { ...camera("local", true, false), peerId: "self-peer" };
+    const state = selectCameraStrip(initial(), [...tiles, other], 3, new Set(["self-peer"]));
+    expect(state.ids).toEqual(["local", "b", "c"]);
+  });
+  it("preserves slots across source reordering and track updates, fills departures in place, and handles resize/reset", () => {
+    let state = selectCameraStrip(initial(), [...tiles].reverse().map((tile) => ({ ...tile, videoTrack: null })), 3, new Set());
+    expect(state.ids).toEqual(["a", "b", "c"]);
+    state = selectCameraStrip(state, tiles.filter((tile) => tile.id !== "b"), 3, new Set());
+    expect(state.ids).toEqual(["a", "d", "c"]);
+    state = selectCameraStrip(state, tiles, 2, new Set());
+    expect(state.ids).toEqual(["a", "d"]);
+    state = selectCameraStrip(state, tiles, 4, new Set());
+    expect(state.ids).toEqual(["a", "d", "b", "c"]);
+    expect(selectCameraStrip(state, tiles, 0, new Set()).ids).toEqual([]);
+    expect(selectCameraStrip(state, [], 4, new Set()).ids).toEqual([]);
+    expect(new Set(state.ids).size).toBe(state.ids.length);
   });
 });
 
