@@ -24,6 +24,7 @@ import {
   setShowConnectionInfo,
   setAvatarTint,
   setCallPip,
+  setShowScreenShareBanner,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
   setShowRoomProfileInSidebar,
@@ -550,6 +551,20 @@ async function loadLocalFonts(): Promise<void> {
       class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
       >Calls</Label
     >
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Show screen-sharing banner</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Shows the "You're presenting" banner and Stop sharing button over
+        your focused screen share.
+      </span>
+    </div>
+    <Switch
+      aria-label="Show screen-sharing banner"
+      checked={displayPrefs.showScreenShareBanner}
+      onCheckedChange={(checked) => setShowScreenShareBanner(checked)}
+    />
   </div>
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">

@@ -63,18 +63,52 @@ export async function encryptFileTo(
 
 /** Every chunk is authenticated before writing. Consumers must not publish
  * partial output; abort discards it if any later chunk fails authentication. */
-export async function decryptFileTo(file: Blob, descriptor: EncryptedFileDescriptor, output: WritableStream<Uint8Array>): Promise<void> {
+export async function decryptFileTo(file: Blob | AsyncIterable<Uint8Array>, descriptor: EncryptedFileDescriptor, output: WritableStream<Uint8Array>, onProgress?: (bytesProcessed: number) => void): Promise<void> {
   validateFileEncryption(descriptor);
   const count = Math.max(1, Math.ceil(descriptor.size / CHUNK));
-  if (file.size !== descriptor.size + count * 16) throw new Error("Encrypted file length mismatch");
+  const expected = descriptor.size + count * 16;
+  if (file instanceof Blob && file.size !== expected) throw new Error("Encrypted file length mismatch");
   const key = await crypto.subtle.importKey("raw", new Uint8Array(b64.decode(descriptor.key)), "AES-GCM", false, ["decrypt"]);
   const writer = output.getWriter();
+  const iterator = file instanceof Blob ? null : file[Symbol.asyncIterator]();
+  let pending = new Uint8Array(0) as Uint8Array<ArrayBufferLike>;
+  let position = 0;
+  const read = async (length: number): Promise<ArrayBuffer> => {
+    if (file instanceof Blob) {
+      const chunk = await file.slice(position, position + length).arrayBuffer();
+      position += length;
+      return chunk;
+    }
+    const chunk = new Uint8Array(length);
+    let filled = 0;
+    while (filled < length) {
+      if (!pending.length) {
+        const next = await iterator!.next();
+        if (next.done) throw new Error("Encrypted file length mismatch");
+        pending = next.value;
+        if (!pending.length) continue;
+      }
+      const size = Math.min(length - filled, pending.length);
+      chunk.set(pending.subarray(0, size), filled);
+      pending = pending.subarray(size);
+      filled += size;
+    }
+    return chunk.buffer;
+  };
   try {
+    onProgress?.(0);
     for (let index = 0; index < count; index++) {
-      const chunk = await file.slice(index * (CHUNK + 16), (index + 1) * (CHUNK + 16)).arrayBuffer();
+      const chunk = await read(Math.min(CHUNK, descriptor.size - index * CHUNK) + 16);
       await writer.write(new Uint8Array(await crypto.subtle.decrypt(parameters(descriptor, index), key, chunk)));
+      onProgress?.(Math.min(descriptor.size, (index + 1) * CHUNK));
+    }
+    if (pending.length) throw new Error("Encrypted file length mismatch");
+    if (iterator) {
+      for (let next = await iterator.next(); !next.done; next = await iterator.next()) {
+        if (next.value.length) throw new Error("Encrypted file length mismatch");
+      }
     }
     await writer.close();
   } catch (error) { await writer.abort(error).catch(() => {}); throw error; }
-  finally { writer.releaseLock(); }
+  finally { await iterator?.return?.(); writer.releaseLock(); }
 }

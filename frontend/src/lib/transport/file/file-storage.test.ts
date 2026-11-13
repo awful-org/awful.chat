@@ -55,6 +55,24 @@ it("removes a lease recursively without deleting another lease's files", async (
   expect(await (await (await (await directory.getDirectoryHandle("live")).getFileHandle("piece")).getFile()).text()).toBe("ciphertext");
 });
 
+it("moves ciphertext ownership without allocating or releasing its quota until the new owner deletes it", async () => {
+  const directory = await root();
+  const staging = await directory.getDirectoryHandle("stage", { create: true });
+  const durable = await directory.getDirectoryHandle("durable", { create: true });
+  const handle = await staging.getFileHandle("opaque", { create: true });
+  const writer = await handle.createWritable();
+  await writer.write(new Blob(Array(64).fill(new Blob([new Uint8Array(1024 * 1024)]))));
+  await writer.close();
+  await (handle as FileSystemFileHandle & { move(dir: FileSystemDirectoryHandle, name: string): Promise<void> }).move(durable, "hash");
+  await expect(staging.getFileHandle("opaque")).rejects.toMatchObject({ name: "NotFoundError" });
+  await directory.removeEntry("stage", { recursive: true });
+  expect((await (await durable.getFileHandle("hash")).getFile()).size).toBe(64 * 1024 * 1024);
+  const small = await (await directory.getFileHandle("small", { create: true })).createWritable();
+  await expect(small.write("x")).rejects.toMatchObject({ name: "QuotaExceededError" });
+  await durable.removeEntry("hash");
+  await small.write("x"); await small.close();
+});
+
 it("keeps native OPFS when it is usable", async () => {
   const native = { native: true };
   vi.stubGlobal("navigator", { storage: { getDirectory: async () => native } });

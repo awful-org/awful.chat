@@ -1,6 +1,7 @@
 /** In-memory OPFS contract for deterministic transfer lifecycle tests. */
 export function fakeOPFS(afterWrite?: () => void) {
   const entries = new Map<string, Blob>();
+  const reads: string[] = [];
   const missing = () => new DOMException("Missing", "NotFoundError");
   function directory(prefix = ""): any {
     return {
@@ -12,7 +13,7 @@ export function fakeOPFS(afterWrite?: () => void) {
           entries.set(path, new Blob());
         }
         return {
-          async getFile() { if (!entries.has(path)) throw missing(); return new File([entries.get(path)!], name); },
+          async getFile() { if (!entries.has(path)) throw missing(); reads.push(path); return new File([entries.get(path)!], name); },
           async createWritable() {
             const parts: BlobPart[] = [];
             return {
@@ -38,7 +39,7 @@ export function fakeOPFS(afterWrite?: () => void) {
       },
     };
   }
-  return { entries, storage: { async getDirectory() { return directory(); } } };
+  return { entries, reads, storage: { async getDirectory() { return directory(); } } };
 }
 
 /** In-memory Web Locks: exclusive, never queued, each held by a page

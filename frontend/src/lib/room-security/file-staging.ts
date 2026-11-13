@@ -6,6 +6,8 @@ import { safeBlobType } from "$lib/safe-mime";
  * be re-seeded under a protected attachment descriptor by mistake. */
 export interface StagedFile {
   file: File;
+  /** Transfer ownership without copying where OPFS supports file moves. */
+  moveTo(directory: FileSystemDirectoryHandle, name: string): Promise<File | null>;
   dispose(): Promise<void>;
 }
 
@@ -46,7 +48,25 @@ async function stage(
     signal?.throwIfAborted();
     const snapshot = await handle.getFile();
     signal?.throwIfAborted();
-    return { file: new File([snapshot], name, { type: mimeType }), dispose };
+    return {
+      file: new File([snapshot], name, { type: mimeType }), dispose,
+      async moveTo(destination, targetName) {
+        signal?.throwIfAborted();
+        const movable = handle as FileSystemFileHandle & {
+          move?: (directory: FileSystemDirectoryHandle, name: string) => Promise<void>;
+        };
+        if (!movable.move) return null;
+        try { await movable.move(destination, targetName); }
+        catch (error) {
+          if (error instanceof DOMException && error.name === "NotSupportedError") return null;
+          throw error;
+        }
+        // The lease no longer owns this entry. Even if cancellation lands
+        // now, dispose must never delete the new durable owner's file.
+        disposed = true;
+        return (await destination.getFileHandle(targetName)).getFile();
+      },
+    };
   } catch (error) {
     await writer?.abort(error).catch(() => {});
     await dispose().catch(() => {});
@@ -95,11 +115,12 @@ export async function stageEncryptedFile(
  * is put together from them only after the last one authenticates.
  */
 export async function stageDecryptedFile(
-  ciphertext: Blob,
+  ciphertext: Blob | AsyncIterable<Uint8Array>,
   encryption: EncryptedFileDescriptor,
   filename: string,
   mimeType: string,
   signal?: AbortSignal,
+  onProgress?: (bytesProcessed: number) => void,
 ): Promise<File> {
   signal?.throwIfAborted();
   let parts: Blob[] = [];
@@ -111,7 +132,7 @@ export async function stageDecryptedFile(
     },
     close() { signal?.throwIfAborted(); },
     abort() { parts = []; },
-  }));
+  }), onProgress);
   signal?.throwIfAborted();
   // The sender's claimed type, through the allowlist (safe-mime.ts): this
   // File becomes the blob URL every view of a downloaded file uses.

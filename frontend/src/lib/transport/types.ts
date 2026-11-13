@@ -120,6 +120,8 @@ export interface VoiceEvents {
     reason?: string,
     unsupported?: boolean
   ) => void;
+  /** The mic is waiting on a noise-suppression model to load (true), or no longer is. */
+  processingLoading: (loading: boolean) => void;
   trackAdded: (peerId: string, track: MediaStreamTrack) => void;
   trackRemoved: (peerId: string) => void;
   peerJoined: (peerId: string) => void;
@@ -310,6 +312,8 @@ export interface FileDescriptor {
 export interface FileTransferSnapshot extends FileDescriptor {
   status: FileTransferStatus;
   progress: number;
+  /** Network bytes arrived; authenticating and committing encrypted storage. */
+  finishing?: boolean;
   done: boolean;
   seeding: boolean;
   peers: number;

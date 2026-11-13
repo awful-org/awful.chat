@@ -10,9 +10,18 @@
     SelectTrigger,
   } from "$lib/components/ui/select";
   import { Button } from "$lib/components/ui/button";
+  import { Tip } from "$lib/components/ui/tooltip";
+  import { ChevronRight, Info, Loader2 } from "@lucide/svelte";
   import { transportState, _dtln, _dfn } from "$lib/transport/transport.svelte";
   import type { MicDenoiser } from "$lib/audio/dtln-processor";
-  import { NOISE_ENGINE_LABELS, type NoiseEngine } from "$lib/transport/audio-prefs";
+  import {
+    AUDIO_PREF_DEFAULTS,
+    DFN_PAUSE_DB,
+    DFN_SPEECH_DB,
+    NOISE_ENGINE_LABELS,
+    clampDfnAttenuation,
+    type NoiseEngine,
+  } from "$lib/transport/audio-prefs";
   import { pickMicTestEngine } from "./mic-test-engine";
   import {
     cameraLabel,
@@ -38,6 +47,8 @@
     getVoiceDtlnNoiseGate,
     getVoiceNoiseEngine,
     setVoiceNoiseEngine,
+    getVoiceDfnAttenuation,
+    setVoiceDfnAttenuation,
   } from "$lib/transport/voice.svelte";
   import {
     setDeafened,
@@ -84,6 +95,58 @@
   // Restored from the last session, not a fresh default.
   let noiseGateThreshold = $state(getVoiceDtlnNoiseGate());
   let noiseGateSlider = $state<number[]>([getVoiceDtlnNoiseGate() * 10000]);
+  // DeepFilterNet3's strength. Applied on release: new values rebuild its
+  // node, which a call and a mic test then move onto.
+  let dfnSpeechDb = $state(getVoiceDfnAttenuation().speechDb);
+  let dfnPauseDb = $state(getVoiceDfnAttenuation().pauseDb);
+  const DFN_DEFAULT_SPEECH_DB = AUDIO_PREF_DEFAULTS.dfnSpeechAttenuationDb;
+  const DFN_DEFAULT_PAUSE_DB = AUDIO_PREF_DEFAULTS.dfnPauseAttenuationDb;
+  let applyingDfn = $state(false);
+  /** Set while a DeepFilterNet3 mic test runs: moves it onto a rebuilt node. */
+  let rebuildMicTest: (() => Promise<void>) | null = null;
+  /** While dragging: pauses stay above speech, so the sliders show what will run. */
+  function clampDfnSliders() {
+    ({ speechDb: dfnSpeechDb, pauseDb: dfnPauseDb } = clampDfnAttenuation(dfnSpeechDb, dfnPauseDb));
+  }
+  async function applyDfnStrength() {
+    applyingDfn = true;
+    try {
+      let rebuilt = true;
+      try {
+        ({ rebuilt } = await setVoiceDfnAttenuation(dfnSpeechDb, dfnPauseDb));
+      } catch (e) {
+        // The node was retired before the call's mic failed to come back.
+        console.error("[audio] the call's mic did not restart:", e);
+      }
+      if (rebuilt && rebuildMicTest) {
+        try {
+          await rebuildMicTest();
+        } catch (e) {
+          // As a test that fails to start: it ends, nothing half-built stays.
+          console.error("[audio] mic test could not restart:", e);
+          if (isMicTesting) await handleMicTest();
+        }
+      }
+    } finally {
+      applyingDfn = false;
+    }
+  }
+  function resetDfnStrength() {
+    dfnSpeechDb = DFN_DEFAULT_SPEECH_DB;
+    dfnPauseDb = DFN_DEFAULT_PAUSE_DB;
+    void applyDfnStrength();
+  }
+  // A switch or engine change during a call rebuilds the mic, which can wait
+  // on a model download: the header says so until it is done.
+  let rearming = $state(0);
+  async function rearm(change: Promise<void>) {
+    rearming++;
+    try {
+      await change;
+    } finally {
+      rearming--;
+    }
+  }
   // Off by default: screen-share audio that could not be confirmed
   // echo-free is withheld unless the sharer opts in here (share-audio.ts).
   let shareAudioDespiteEchoRisk = $state(getShareAudioDespiteEchoRisk());
@@ -92,6 +155,11 @@
   // Distinct from isMicTesting: set only during async startup so a second
   // click can't stop-then-orphan a test that hasn't finished starting.
   let isMicStarting = $state(false);
+  // DeepFilterNet3's strength is held while anything rebuilds or loads the
+  // mic chain: a node still loading keeps the values it started with.
+  const dfnBusy = $derived(
+    applyingDfn || rearming > 0 || voiceProcessing.loading || isMicStarting
+  );
   // Closing the dialog mid-start (a cold DFN3 download takes up to 15 s) must
   // not let the test come up afterwards with nothing left to stop it: the
   // start path checks this after every await and bails through its catch.
@@ -195,7 +263,7 @@
 
   async function handleNoiseEngineChange(engine: NoiseEngine) {
     noiseEngine = engine;
-    await setVoiceNoiseEngine(engine);
+    await rearm(setVoiceNoiseEngine(engine));
   }
 
   async function handleMicTest() {
@@ -266,13 +334,33 @@
         dtlnCleanup = cleanup;
         bailIfDestroyed();
 
-        const source = ctx.createMediaStreamSource(processedStream);
+        let source = ctx.createMediaStreamSource(processedStream);
         source.connect(ctx.destination); // plays processed audio
 
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;
         source.connect(analyser);
         micLevelAnalyser = analyser;
+
+        // DeepFilterNet3's node is rebuilt when its strength changes, and its
+        // graphs go with it: play the new node's, peers still cut off.
+        const rebuild = async () => {
+          const next = await model.monitorStream(stream);
+          if (rebuildMicTest !== rebuild) {
+            // The test ended meanwhile: a monitor left behind would keep
+            // peers cut off on every later mic rebuild.
+            next.cleanup();
+            model.reconnectToTransport();
+            return;
+          }
+          model.disconnectFromTransport();
+          dtlnCleanup = next.cleanup;
+          source.disconnect();
+          source = ctx.createMediaStreamSource(next.processedStream);
+          source.connect(ctx.destination);
+          source.connect(analyser);
+        };
+        if (picked.engine === "dfn3") rebuildMicTest = rebuild;
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         micLevelInterval = setInterval(() => {
@@ -282,6 +370,7 @@
         }, 50);
 
         micTestDisconnect = () => {
+          rebuildMicTest = null;
           dtlnCleanup?.();
           model.reconnectToTransport();
           source.disconnect();
@@ -322,6 +411,7 @@
       isMicTesting = true;
     } catch (e) {
       console.error("Mic test failed:", e);
+      rebuildMicTest = null;
       // Failure can land with the setup half-built and micTestDisconnect not
       // yet assigned: drop the monitor graph and the captured mic, then
       // restore the transport edge (safe no-op when nothing was cut) - or a
@@ -497,17 +587,27 @@
         >
       </div>
       <label class="flex items-center gap-2 cursor-pointer">
-        <span
-          class="text-xs font-mono {shownEngine !== 'browser'
-            ? 'text-green-400'
-            : 'text-muted-foreground'}"
-        >
-          {NOISE_ENGINE_LABELS[shownEngine]}
-        </span>
+        {#if rearming || voiceProcessing.loading}
+          <span
+            class="flex items-center gap-1 text-xs font-mono text-muted-foreground"
+            role="status"
+          >
+            <Loader2 class="size-3 animate-spin" />
+            {voiceProcessing.loading ? "Loading…" : "Applying…"}
+          </span>
+        {:else}
+          <span
+            class="text-xs font-mono {shownEngine !== 'browser'
+              ? 'text-green-400'
+              : 'text-muted-foreground'}"
+          >
+            {NOISE_ENGINE_LABELS[shownEngine]}
+          </span>
+        {/if}
         <Switch
           aria-label="Noise suppression"
           bind:checked={dtlnEnabled}
-          onCheckedChange={(checked) => setVoiceDtlnEnabled(checked)}
+          onCheckedChange={(checked) => rearm(setVoiceDtlnEnabled(checked))}
         />
       </label>
     </div>
@@ -549,6 +649,108 @@
         {/if}
       </p>
     {/if}
+    <!-- Applied on release: a new strength rebuilds DeepFilterNet3's node,
+         and a call or mic test on it moves over (setVoiceDfnAttenuation). -->
+    {#if dtlnEnabled && noiseEngine === "dfn3"}
+      <details class="group rounded-md border border-border/70 bg-background/40">
+        <summary class="flex cursor-pointer list-none items-center gap-2 px-3 py-2">
+          <ChevronRight
+            class="size-3 text-muted-foreground transition-transform group-open:rotate-90"
+          />
+          <span class="min-w-0 flex-1 text-xs font-mono text-muted-foreground"
+            >Advanced settings</span
+          >
+          {#if applyingDfn}
+            <span
+              class="flex items-center gap-1 text-xs font-mono text-muted-foreground"
+              role="status"
+            >
+              <Loader2 class="size-3 animate-spin" /> Applying…
+            </span>
+          {/if}
+        </summary>
+        <div class="flex flex-col gap-3 px-3 pb-3">
+          <div class="flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="flex items-center gap-1 text-xs font-mono text-muted-foreground">
+                Strength while speaking
+                <Tip
+                  text="How much background noise is removed while you talk. Higher removes more but can make your voice sound thin or clipped."
+                >
+                  {#snippet children(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      aria-label="About strength while speaking"
+                      class="text-muted-foreground hover:text-foreground"
+                    >
+                      <Info class="size-3" />
+                    </button>
+                  {/snippet}
+                </Tip>
+              </span>
+              <span class="text-xs font-mono tabular-nums text-blue-400">{dfnSpeechDb} dB</span>
+            </div>
+            <Slider
+              aria-label="Strength while speaking"
+              type="single"
+              bind:value={dfnSpeechDb}
+              min={DFN_SPEECH_DB.min}
+              max={DFN_SPEECH_DB.max}
+              step={1}
+              disabled={dfnBusy}
+              onValueChange={clampDfnSliders}
+              onValueCommit={applyDfnStrength}
+              class="w-full"
+            />
+          </div>
+          <div class="flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="flex items-center gap-1 text-xs font-mono text-muted-foreground">
+                Strength in pauses
+                <Tip
+                  text="How far noise is pushed down between words. Higher is quieter between words; too high can sound like the mic cutting in and out."
+                >
+                  {#snippet children(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      aria-label="About strength in pauses"
+                      class="text-muted-foreground hover:text-foreground"
+                    >
+                      <Info class="size-3" />
+                    </button>
+                  {/snippet}
+                </Tip>
+              </span>
+              <span class="text-xs font-mono tabular-nums text-blue-400">{dfnPauseDb} dB</span>
+            </div>
+            <Slider
+              aria-label="Strength in pauses"
+              type="single"
+              bind:value={dfnPauseDb}
+              min={DFN_PAUSE_DB.min}
+              max={DFN_PAUSE_DB.max}
+              step={1}
+              disabled={dfnBusy}
+              onValueChange={clampDfnSliders}
+              onValueCommit={applyDfnStrength}
+              class="w-full"
+            />
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            class="self-start font-mono text-xs"
+            onclick={resetDfnStrength}
+            disabled={dfnBusy ||
+              (dfnSpeechDb === DFN_DEFAULT_SPEECH_DB && dfnPauseDb === DFN_DEFAULT_PAUSE_DB)}
+          >
+            Reset to defaults
+          </Button>
+        </div>
+      </details>
+    {/if}
     <!-- The gate is DTLN's; DeepFilterNet3 gates pauses by itself. -->
     {#if shownEngine === "dtln"}
       <div class="flex flex-col gap-2 pl-3 border-l-2 border-blue-500/30">
@@ -585,7 +787,7 @@
       size="sm"
       class="w-full font-mono text-xs mt-2"
       onclick={handleMicTest}
-      disabled={isMicStarting}
+      disabled={isMicStarting || applyingDfn}
     >
       {isMicTesting ? "■ Stop test" : isMicStarting ? "Loading…" : "▶ Test mic (hear yourself)"}
     </Button>

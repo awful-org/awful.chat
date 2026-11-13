@@ -16,7 +16,7 @@ import { rec, refs } from "../../telemetry/recorder";
 import type { FileEntry } from "../../types/message";
 import { encryptedFileSize, opaqueFileName } from "../../room-security/file-descriptor";
 import { stageEncryptedFile, stageDecryptedFile } from "../../room-security/file-staging";
-import { readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-store";
+import { adoptCiphertext, consumeCiphertext, readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-store";
 import { CiphertextChunkStore, OPFSChunkStore } from "./opfs-store";
 import { OPFSLease, STAGING_DIR } from "./opfs-lease";
 
@@ -338,6 +338,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   /** The decrypted files this session has shown, in memory (see stageDecryptedFile). */
   private plaintext = new Map<string, File>();
   private publishing = new Set<string>();
+  private publicationAbort = new Map<string, AbortController>();
   /**
    * Owner of this session's piece stores and send staging in OPFS. A new one
    * per session (see resetTransfers), so the entries of the session that
@@ -366,8 +367,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       );
       try {
         signal.throwIfAborted();
-        // Served from the staged ciphertext itself, then from its durable
-        // copy once that exists: no piece store copies it a third time.
+        // Served from staging, then adopted by durable storage without a copy
+        // on supported backends. Reopen after the move: OPFS snapshots can stale.
         const pieces = new CiphertextChunkStore(ENCRYPTED_PIECE_LENGTH, staged.file);
         report("hashing", 0);
         const descriptor = await this.seedSingle(staged.file, {
@@ -378,12 +379,14 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           pieces,
         }, (hashed, total) => report("hashing", total ? hashed / total : 1));
         report("caching", 0);
-        pieces.source = await writeCiphertext(
-          descriptor.infoHash,
-          staged.file,
-          signal,
-          (bytes) => report("caching", staged.file.size ? bytes / staged.file.size : 1),
-        );
+        try {
+          pieces.source = await adoptCiphertext(descriptor.infoHash, staged, signal,
+            // Leave 1% of the three-phase overall bar for writer.close().
+            bytes => report("caching", Math.min(0.97, staged.file.size ? bytes / staged.file.size : 1)));
+        } catch (error) {
+          await this.stopSeeding(descriptor.infoHash).catch(() => {});
+          throw error;
+        }
         report("caching", 1);
         pieces.reopen = () => readCiphertext(descriptor.infoHash);
         descriptors.push(descriptor);
@@ -613,7 +616,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     // dropped for having no torrent, over and over, for every file in the
     // room.
     const wanted = [...this.transfers]
-      .filter(([, snapshot]) => snapshot.status === "downloading")
+      .filter(([, snapshot]) => snapshot.status === "downloading" && !snapshot.finishing)
       .sort(
         ([a], [b]) => (this.wtRequested.get(b) ?? 0) - (this.wtRequested.get(a) ?? 0)
       );
@@ -737,6 +740,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
   }
 
   private forgetFile(infoHash: string): void {
+    this.publicationAbort.get(infoHash)?.abort();
+    this.publicationAbort.delete(infoHash);
     this.localSeedHashes.delete(infoHash);
     this.seedingByHash.delete(infoHash);
     this.attachedTorrents.delete(infoHash);
@@ -885,6 +890,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.knownFiles.set(file.infoHash, file);
     const existing = this.transfers.get(file.infoHash);
     const encrypted = !!(file as FileEntry).encryption;
+    if (existing?.finishing) return;
     // Seeded from its ciphertext alone - a peer asked for it, or it was sent
     // from here - a protected file is held but was never decrypted here.
     // Nothing to fetch, and still something to show.
@@ -1125,7 +1131,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       if (seeders.size === 0) {
         // When last seeder disconnects, fail any in-flight downloads
         const transfer = this.transfers.get(infoHash);
-        if (transfer && transfer.status === "downloading" && !transfer.done) {
+        if (transfer && transfer.status === "downloading" && !transfer.done && !transfer.finishing) {
           this.upsertTransfer({
             ...transfer,
             status: "failed",
@@ -1173,6 +1179,8 @@ export class WebTorrentFileTransport implements FileTransferTransport {
     this.wtReconcileQueued = false;
     this.plaintext.clear();
     this.publishing.clear();
+    for (const controller of this.publicationAbort.values()) controller.abort();
+    this.publicationAbort.clear();
     this.storedSeeds.clear();
     this.checkingLocal.clear();
     // A lock/reset must also stop torrents serving ciphertext and free stores.
@@ -1541,7 +1549,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         : torrent.done && (!encrypted || this.plaintext.has(infoHash))
           ? "complete"
           : "downloading";
-      const progress = torrent.progress ?? existing?.progress ?? 0;
+      const unpublished = encrypted && !isSeeding && !this.plaintext.has(infoHash);
+      const progress = Math.min(torrent.progress ?? existing?.progress ?? 0, unpublished ? 0.99 : 1);
+      const finishing = unpublished && torrent.done;
       const done = isSeeding || (torrent.done && (!encrypted || this.plaintext.has(infoHash)));
       const peers = torrent.numPeers ?? existing?.peers ?? 0;
       const seeders = this.seedersByHash.get(infoHash)?.size ?? existing?.seeders ?? 0;
@@ -1549,6 +1559,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       // there is nothing to tell the app.
       if (
         existing?.status === status && existing.progress === progress &&
+        existing.finishing === finishing &&
         existing.done === done && existing.seeding === isSeeding &&
         existing.peers === peers && existing.seeders === seeders
       ) return;
@@ -1560,6 +1571,7 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         size: descriptor.size,
         status,
         progress,
+        finishing,
         done,
         seeding: isSeeding,
         peers,
@@ -1628,10 +1640,13 @@ export class WebTorrentFileTransport implements FileTransferTransport {
       if (encrypted) {
         if (this.publishing.has(infoHash)) return;
         this.publishing.add(infoHash);
+        const controller = new AbortController();
+        this.publicationAbort.set(infoHash, controller);
+        const publicationSignal = AbortSignal.any([signal, controller.signal]);
         void (async () => {
           if (!file.createReadStream) throw new Error("Streaming torrent support required");
-          const ciphertext = await writeCiphertext(infoHash, file.createReadStream(), signal);
-          const plain = await stageDecryptedFile(ciphertext, descriptor.encryption!, descriptor.filename, descriptor.mimeType, signal);
+          const plain = await consumeCiphertext(infoHash, file.createReadStream(), publicationSignal, source =>
+            stageDecryptedFile(source, descriptor.encryption!, descriptor.filename, descriptor.mimeType, publicationSignal));
           if (signal.aborted) return;
           // Stopped (stopSeeding) while it was being written and decrypted:
           // nothing is published, and the copy written meanwhile goes too.
@@ -1643,16 +1658,19 @@ export class WebTorrentFileTransport implements FileTransferTransport {
           this.localSeedHashes.add(infoHash);
           this.seedingByHash.set(infoHash, true);
           this.upsertTransfer({ ...descriptor, status: "seeding", done: true, seeding: true,
-            progress: 1, peers: torrent.numPeers ?? 0, seeders: 1, blobURL: URL.createObjectURL(plain) });
+            progress: 1, finishing: false, peers: torrent.numPeers ?? 0, seeders: 1, blobURL: URL.createObjectURL(plain) });
           this.emit("downloaded", infoHash, plain);
         })().catch(async (error: unknown) => {
           await removeCiphertext(infoHash).catch(() => {});
           torrent.destroy?.();
           const live = this.attachedTorrents.delete(infoHash);
           if (live && !signal.aborted) this.upsertTransfer({ ...descriptor, status: "failed", done: false,
-            seeding: false, progress: 0, peers: 0, seeders: 0, blobURL: undefined,
+            seeding: false, progress: 0, finishing: false, peers: 0, seeders: 0, blobURL: undefined,
             error: error instanceof Error ? error.message : "Encrypted file authentication failed" });
-        }).finally(() => this.publishing.delete(infoHash));
+        }).finally(() => {
+          this.publishing.delete(infoHash);
+          if (this.publicationAbort.get(infoHash) === controller) this.publicationAbort.delete(infoHash);
+        });
         return;
       }
       file.getBlob((_err, blob) => {

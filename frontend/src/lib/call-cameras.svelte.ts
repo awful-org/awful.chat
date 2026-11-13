@@ -58,7 +58,7 @@ export function pushWantedCameras(): void {
   if (!transportState.inCall) return;
   _video.setWantedCameras(
     wantedCameras({
-      stage: stageTiles.values(),
+      stage: [...stageTiles.values(), ...spotlightStore.pipCameraPeers],
       spotlight: spotlightStore.spotlightTile,
       pinnedTileId: callFocus.pinnedTileId,
       poppedOut,

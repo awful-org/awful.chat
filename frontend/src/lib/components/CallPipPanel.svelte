@@ -21,18 +21,17 @@
   } from "$lib/call-pip.svelte";
   import { toggleMute, cameraOnPressed, leaveCall } from "$lib/transport/call.svelte";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
-  import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
+  import { transportState } from "$lib/transport/transport.svelte";
   import { roomsStore } from "$lib/rooms.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
-  import { getScopedProfile } from "$lib/profile.svelte";
   import { speakers } from "$lib/speakers.svelte";
   import {
     spotlightStore,
-    getSpeakingLabel,
     browserPipSupported,
     enterBrowserPip,
     exitBrowserPip,
   } from "$lib/call-spotlight.svelte";
+  import { pipLayoutVideo } from "$lib/call-pip-layout";
 
   // Read the shared spotlight from AppView.
   const spotlightTile = $derived(spotlightStore.spotlightTile);
@@ -55,14 +54,6 @@
     }
     return roomsStore.rooms.find((r) => r.roomCode === code)?.name || code.slice(0, 12);
   });
-
-  function participantName(tile: { peerId: string; isLocal?: boolean }): string {
-    const room = transportState.callRoomCode;
-    if (tile.isLocal) return getScopedProfile(room?.startsWith("rd2_") ? room : null).nickname || "You";
-    const did = peerIdToDid(tile.peerId) || tile.peerId;
-    const scoped = room?.startsWith("rd2_") ? transportState.peerRoomProfiles.get(room)?.get(did) : undefined;
-    return scoped?.nickname || transportState.peerNames.get(did) || transportState.peerNames.get(tile.peerId) || tile.peerId.slice(0, 8);
-  }
 
   function togglePip(): void {
     if (callPipPanel.browserPip) void exitBrowserPip();
@@ -100,7 +91,7 @@
   );
 
   // Voice-only call: nothing worth a video body, so the panel is its bar.
-  const hasVideo = $derived(!!spotlightTile?.videoTrack);
+  const hasVideo = $derived(spotlightStore.tiles.some((tile) => !!tile.videoTrack || tile.kind === "plugin"));
   const height = $derived(panelHeight(hasVideo));
   const width = $derived.by(() => {
     void viewportTick;
@@ -248,39 +239,21 @@
       </Tip>
     </div>
 
-    <!-- Panel body: shows the spotlight tile video -->
-    {#if hasVideo && spotlightTile}
+    <!-- Each surface computes the shared layout against its own bounds. -->
+    {#if hasVideo}
       <button
         type="button"
         class="relative flex-1 overflow-hidden bg-black cursor-pointer"
         onclick={handlePipVideoClick}
         aria-label="Click to return to call"
       >
-        <!-- Video element for in-app display. AppView's $effect updates its
-             srcObject to match the spotlight, along with the PiP video.
-             This way a single spotlight change swaps srcObject on both. -->
         <video
           class="absolute inset-0 w-full h-full object-contain bg-black"
           autoplay
           muted
           playsinline
-          style="object-fit: {spotlightTile.kind === 'screen' || spotlightTile.kind === 'transmission' ? 'contain' : 'cover'}"
-          bind:this={spotlightStore.panelVideoElement}
+          use:pipLayoutVideo={{ width, height: height - BAR_HEIGHT, active: true }}
         ></video>
-
-        <!-- Label and speaking/sharing tag overlay (bottom-left) -->
-        <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-2 py-2">
-          <div class="flex items-center justify-between gap-2">
-            <span class="text-xs font-medium text-white truncate">
-              {participantName(spotlightTile)}
-            </span>
-            {#if getSpeakingLabel(spotlightTile, speakers)}
-              <span class="text-xs text-gray-300 shrink-0">
-                {getSpeakingLabel(spotlightTile, speakers)}
-              </span>
-            {/if}
-          </div>
-        </div>
       </button>
     {/if}
   </div>

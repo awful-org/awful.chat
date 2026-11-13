@@ -7,7 +7,7 @@ import { remoteCameraTileId } from "./call-tiles";
 const h = vi.hoisted(() => ({
   setWantedCameras: vi.fn(),
   transportState: { inCall: false },
-  spotlightStore: { spotlightTile: null as unknown },
+  spotlightStore: { spotlightTile: null as unknown, pipCameraPeers: [] as string[] },
   callFocus: { pinnedTileId: null as string | null },
   poppedOut: new Set<string>(),
   speakers: { speaking: new Set<string>() },
@@ -52,6 +52,7 @@ beforeEach(() => {
   h.setWantedCameras.mockClear();
   h.transportState.inCall = true;
   h.spotlightStore.spotlightTile = null;
+  h.spotlightStore.pipCameraPeers = [];
   h.callFocus.pinnedTileId = null;
   h.poppedOut.clear();
   h.speakers.speaking = new Set();
@@ -63,6 +64,20 @@ afterEach(() => {
 });
 
 describe("call-cameras: what the SFU client is told to receive", () => {
+  it("receives every visible PiP camera after the stage unmounts, and releases hidden ones", () => {
+    const stage = tile();
+    stageCameraShown(stage, "peer-a");
+    h.spotlightStore.pipCameraPeers = ["peer-a", "peer-b", "peer-c"];
+    stageCameraHidden(stage);
+    pushWantedCameras();
+    expect(pushed()).toEqual(new Set(["peer-a", "peer-b", "peer-c"]));
+    h.spotlightStore.pipCameraPeers = ["peer-b"];
+    pushWantedCameras();
+    expect(pushed()).toEqual(new Set(["peer-b"]));
+    h.spotlightStore.pipCameraPeers = [];
+    pushWantedCameras();
+    expect(pushed()).toEqual(new Set());
+  });
   it("sends nothing outside a call, and the call's screen once one starts", () => {
     h.transportState.inCall = false;
     stageCameraShown(tile(), "peer-a");
