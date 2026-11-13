@@ -140,7 +140,7 @@ import {
   import { Slider } from "./ui/slider";
   import CallLayoutMenu from "./CallLayoutMenu.svelte";
   import { callLayoutPrefs, setCallLayoutPrefs } from "$lib/call-layout-prefs.svelte";
-  import { callGridRects, callLayoutGroups, cameraStripGeometry, filterCallTiles } from "$lib/call-layout";
+  import { callGridRects, callLayoutGroups, cameraStripGeometry, createCameraStripState, filterCallTiles, selectCameraStrip } from "$lib/call-layout";
   import { spotlight } from "$lib/spotlight";
 
   interface Props {
@@ -1356,7 +1356,11 @@ import {
   let stripDragFrom = 0;
   const stripGeometry = $derived(cameraStripGeometry(tileAreaWidth, tileAreaHeight, { ...callLayoutPrefs, stripPx: stripDragPx ?? callLayoutPrefs.stripPx }, thumbnailTiles.length, isSmallScreen));
   const mainRects = $derived(callGridRects(layoutGroups.main.length, layoutGroups.grid ? tileAreaWidth : stripGeometry.mainW, layoutGroups.grid ? tileAreaHeight : stripGeometry.mainH));
-  const shownThumbnails = $derived(thumbnailTiles.slice(0, stripGeometry.shown));
+  let stripSlots = $state.raw(createCameraStripState());
+  $effect(() => {
+    stripSlots = selectCameraStrip(untrack(() => stripSlots), thumbnailTiles, stripGeometry.shown, speakers.speaking, speakers.lastSpokeAt);
+  });
+  const shownThumbnails = $derived(stripSlots.ids.flatMap((id) => thumbnailTiles.find((tile) => tile.id === id) ?? []));
   function pinTile(id: string): void {
     callFocus.pinnedTileId = id;
     if (callLayoutPrefs.layout === "grid") setCallLayoutPrefs({ layout: "spotlight" });

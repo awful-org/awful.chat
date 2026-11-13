@@ -105,7 +105,7 @@
     // status that would have cleared its sample.
     for (const hash of samples.keys()) if (!quickSend.transfers.has(hash)) samples.delete(hash);
     for (const [hash, t] of quickSend.transfers) {
-      if (t.status !== "downloading") { samples.delete(hash); continue; }
+      if (t.status !== "downloading" || t.finishing) { samples.delete(hash); continue; }
       const bytes = (t.progress ?? 0) * t.size;
       const prev = samples.get(hash);
       if (!prev) { samples.set(hash, { at, bytes, rate: 0 }); continue; }
@@ -322,6 +322,7 @@
 
   function downloadStatus(file: FileDescriptor): string {
     const t = quickSend.transfers.get(file.infoHash);
+    if (t?.finishing) return "Finishing · verifying and saving…";
     if (t?.status !== "downloading") return "Connecting…";
     const progress = t.progress ?? 0;
     const parts = [`${Math.round(progress * 100)}%`];

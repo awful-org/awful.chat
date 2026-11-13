@@ -1,4 +1,4 @@
-import { callGridRects, callLayoutGroups, cameraStripGeometry, filterCallTiles, type CallLayoutPrefs, type LayoutRect } from "./call-layout";
+import { callGridRects, callLayoutGroups, cameraStripGeometry, createCameraStripState, filterCallTiles, selectCameraStrip, type CameraStripState, type CallLayoutPrefs, type LayoutRect } from "./call-layout";
 import type { SpotlightTile } from "./spotlight";
 
 export interface PipTile extends SpotlightTile { label: string }
@@ -8,23 +8,26 @@ export interface PipLayout {
   pin: string | null;
   speaker: string | null;
   speaking: ReadonlySet<string>;
+  lastSpokeAt?: ReadonlyMap<string, number>;
 }
 
 /** The same grouping, filters and strip constraints as the main call stage. */
-export function pipLayoutCells(layout: PipLayout, width: number, height: number) {
+export function pipLayoutCells(layout: PipLayout, width: number, height: number, previous = createCameraStripState()) {
   const groups = callLayoutGroups(filterCallTiles(layout.tiles, layout.prefs), layout.prefs, layout.pin, layout.speaker, layout.speaking);
   const strip = cameraStripGeometry(width, height, layout.prefs, groups.strip.length);
   const rects = callGridRects(groups.main.length, groups.grid ? width : strip.mainW, groups.grid ? height : strip.mainH);
   const cells = groups.main.map((tile, i) => ({ tile, rect: rects[i] }));
+  const stripState = selectCameraStrip(previous, groups.strip, strip.shown, layout.speaking, layout.lastSpokeAt);
   if (!groups.grid) {
-    groups.strip.slice(0, strip.shown).forEach((tile, i) => {
+    stripState.ids.forEach((id, i) => {
+      const tile = groups.strip.find((tile) => tile.id === id)!;
       cells.push({ tile, rect: stripRect(i) });
     });
   }
   function stripRect(i: number): LayoutRect {
     return { x: strip.side ? strip.mainW + 8 : i * (strip.tileW + 8), y: strip.side ? i * (strip.tileH + 8) : strip.mainH + 8, w: strip.tileW, h: strip.tileH };
   }
-  return { cells, overflow: !groups.grid && strip.more ? { count: strip.more, rect: stripRect(strip.shown) } : null };
+  return { cells, stripState, overflow: !groups.grid && strip.more ? { count: strip.more, rect: stripRect(strip.shown) } : null };
 }
 
 // All PiP paths use a composed stream: even browsers offering only video PiP
@@ -64,7 +67,8 @@ function createSurface(output: HTMLVideoElement, initial: PipVideoOptions) {
   const canvas = doc.createElement("canvas");
   const ctx = canvas.getContext("2d")!;
   let options = initial;
-  let cells: ReturnType<typeof pipLayoutCells> = { cells: [], overflow: null };
+  let stripState: CameraStripState = createCameraStripState();
+  let cells: Pick<ReturnType<typeof pipLayoutCells>, "cells" | "overflow"> = { cells: [], overflow: null };
   const sources = new Map<string, { track: MediaStreamTrack; video: HTMLVideoElement }>();
   let timer: number | undefined;
   let nativeWindow: PictureInPictureWindow | null = null;
@@ -133,7 +137,14 @@ function createSurface(output: HTMLVideoElement, initial: PipVideoOptions) {
   }
 
   function update() {
-    cells = current ? pipLayoutCells(current, options.width, options.height) : { cells: [], overflow: null };
+    if (current) {
+      const next = pipLayoutCells(current, options.width, options.height, stripState);
+      stripState = next.stripState;
+      cells = next;
+    } else {
+      stripState = createCameraStripState();
+      cells = { cells: [], overflow: null };
+    }
     const live = new Set(cells.cells.map(({ tile }) => tile.id));
     for (const [id, source] of sources) {
       const tile = cells.cells.find((c) => c.tile.id === id)?.tile;

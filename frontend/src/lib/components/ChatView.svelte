@@ -82,6 +82,8 @@
   import GifPicker from "./GifPicker.svelte";
   import GifImage from "./GifImage.svelte";
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
+  import MessageContextMenu from "./MessageContextMenu.svelte";
+  import { canOpenMessageMenu, getCopyableMessageText } from "$lib/message-context-menu";
   import MentionInput from "./MentionInput.svelte";
   import UserListSidebar from "./UserListSidebar.svelte";
   import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
@@ -303,6 +305,50 @@
   let replyTargetId = $state<string | null>(null);
   let reactionPickerFor = $state<string | null>(null);
   let reactionAnchor = $state<DOMRect | null>(null);
+  let reactionReturnFocus: HTMLElement | null = null;
+  let messageMenu = $state<{ msg: Message; row: HTMLElement; x: number; y: number; room: string } | null>(null);
+  let messageCopyNotice = $state("");
+  let messageCopyTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(messageCopyTimer));
+
+  async function copyMessage(msg: Message) {
+    const text = getCopyableMessageText(msg);
+    if (!text) return;
+    closeMessageMenu();
+    try {
+      await navigator.clipboard.writeText(text);
+      messageCopyNotice = "Message copied";
+    } catch {
+      messageCopyNotice = "Could not copy. Select the message text and copy it manually.";
+    }
+    clearTimeout(messageCopyTimer);
+    messageCopyTimer = setTimeout(() => (messageCopyNotice = ""), 3000);
+  }
+
+  function closeMessageMenu(restoreFocus = true) {
+    if (restoreFocus) messageMenu?.row.focus({ preventScroll: true });
+    messageMenu = null;
+  }
+
+  function openMessageMenu(msg: Message, e: MouseEvent | KeyboardEvent) {
+    if (e.defaultPrevented) return;
+    const row = e.currentTarget as HTMLElement;
+    if (!canOpenMessageMenu(e.target, row, window.getSelection())) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = row.getBoundingClientRect();
+    const pointer = e instanceof MouseEvent && (e.clientX !== 0 || e.clientY !== 0);
+    closeUserMenu();
+    reactionPickerFor = null;
+    activeMessageId = null;
+    messageMenu = { msg, row, room: roomCode, x: pointer ? e.clientX : rect.left + 16, y: pointer ? e.clientY : rect.top + 16 };
+  }
+
+  $effect(() => {
+    if (messageMenu && (messageMenu.room !== roomCode || !messageById.has(messageMenu.msg.id))) {
+      messageMenu = null;
+    }
+  });
   let composerEmojiOpen = $state(false);
   // Idle toy: each hover of the emoji button steps to the next icon, and it
   // STAYS there until the next hover. Deliberately not persisted - a refresh
@@ -1282,8 +1328,16 @@
   }
 
   function openReactionPicker(msgId: string, trigger: HTMLElement) {
+    reactionReturnFocus = null;
     reactionAnchor = trigger.getBoundingClientRect();
     reactionPickerFor = msgId;
+  }
+
+  function closeReactionPicker() {
+    reactionPickerFor = null;
+    activeMessageId = null;
+    reactionReturnFocus?.focus({ preventScroll: true });
+    reactionReturnFocus = null;
   }
 
   /** Drop an emoji in at the caret, replacing any selection. */
@@ -2449,7 +2503,7 @@
       closeUserMenu();
       copyMenuOpen = false;
       uiState.pinnedOpen = false;
-      reactionPickerFor = null;
+      closeReactionPicker();
       activeMessageId = null;
     }
   }}
@@ -3171,18 +3225,22 @@
                     ? 'bg-primary/5 border-l-2 border-l-primary pl-1.5'
                     : ''} {pinnedSet.has(msg.id) ? 'pr-6' : ''}"
                   role="button"
-                  tabindex={isMobile ? 0 : -1}
+                  tabindex={0}
+                  aria-haspopup="menu"
+                  aria-expanded={messageMenu?.msg.id === msg.id}
                   onclick={() => isMobile && handleMessageClick(msg.id)}
                   onmousedown={isMobile ? undefined : blockBlankSelection}
                   ondblclick={isMobile ? undefined : (e) => replyOnDoubleClick(msg, e)}
-                  onkeydown={isMobile
-                    ? (e) => {
-                        if (e.key === "Enter" || e.key === " ") {
+                  oncontextmenu={(e) => openMessageMenu(msg, e)}
+                  onkeydown={(e) => {
+                        if (e.target !== e.currentTarget) return;
+                        if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) {
+                          openMessageMenu(msg, e);
+                        } else if (isMobile && (e.key === "Enter" || e.key === " ")) {
                           e.preventDefault();
                           handleMessageClick(msg.id);
                         }
-                      }
-                    : undefined}
+                      }}
                   ontouchstart={isMobile
                     ? (e) => handleTouchStart(msg.id, e)
                     : undefined}
@@ -3588,6 +3646,12 @@
     </div>
   {/if}
 
+  {#if messageCopyNotice}
+    <p role="status" class="border-t border-border bg-muted/40 px-4 py-1.5 text-xs text-muted-foreground">
+      {messageCopyNotice}
+    </p>
+  {/if}
+
   {#if dmRequest}
     <!-- Answering accepts too (sendDirectMessage); Delete is the same act as
          deleting any conversation. -->
@@ -3972,13 +4036,37 @@
   onSelectFile={handleGifFileSelect}
 />
 
+{#if messageMenu}
+  {@const msg = messageMenu.msg}
+  <MessageContextMenu
+    x={messageMenu.x}
+    y={messageMenu.y}
+    onClose={closeMessageMenu}
+    actions={[
+      ...(getCopyableMessageText(msg) ? [{ label: "Copy", icon: Copy, run: () => { void copyMessage(msg); } }] : []),
+      { label: "Reply", icon: Reply, run: () => startReply(msg) },
+      { label: "Add reaction", icon: Smile, run: (trigger: HTMLElement) => {
+        const row = messageMenu?.row;
+        openReactionPicker(msg.id, trigger);
+        reactionReturnFocus = row ?? null;
+      } },
+      ...(!ephemeral ? [{
+        label: pinnedSet.has(msg.id) ? "Unpin message" : "Pin for yourself",
+        icon: pinnedSet.has(msg.id) ? PinOff : Pin,
+        run: () => {
+          const id = msg.id;
+          closeMessageMenu();
+          void toggleMessagePin(roomCode, id);
+        },
+      }] : []),
+    ]}
+  />
+{/if}
+
 <EmojiPickerPopup
   open={reactionPickerFor !== null}
   anchor={reactionAnchor}
-  onClose={() => {
-    reactionPickerFor = null;
-    activeMessageId = null;
-  }}
+  onClose={closeReactionPicker}
   onSelect={(emoji) => {
     if (!reactionPickerFor) return;
     toggleReaction?.(reactionPickerFor, emoji);
