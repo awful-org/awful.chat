@@ -2055,7 +2055,7 @@ import {
       </div>
     {/if}
   </button>
-  {#if tile.isLocal && tile.kind === "screen" && isFocused}
+  {#if displayPrefs.showScreenShareBanner && tile.isLocal && tile.kind === "screen" && isFocused}
     <div class="presenting-badge">
       <span class="size-2 shrink-0 rounded-full bg-red-400"></span><span>You're presenting</span>
       <button type="button" onclick={() => void stopScreenShare()}>Stop sharing</button>
