@@ -7,6 +7,7 @@
 /** Injected by vite define from package.json. */
 declare const __APP_VERSION__: string;
 declare const __APP_COMMIT__: string;
+declare const __APP_BUILD_ID__: string;
 
 declare module "virtual:pwa-register" {
   export function registerSW(options?: {

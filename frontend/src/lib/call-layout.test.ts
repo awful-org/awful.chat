@@ -124,6 +124,14 @@ describe("mockup geometry", () => {
   it("keeps the phone strip swipeable without rendering an overflow placeholder", () => {
     expect(cameraStripGeometry(374, 330, prefs, 10, true)).toMatchObject({ scroll: true, shown: 10, more: 0, tileW: 84, tileH: 112 });
   });
+  it("puts a top strip above the main tiles, the same size as a bottom one", () => {
+    const top = cameraStripGeometry(1264, 672, { ...prefs, strip: "top" }, 4);
+    const bottom = cameraStripGeometry(1264, 672, { ...prefs, strip: "bottom" }, 4);
+    expect(top).toMatchObject({ position: "top", top: true, side: false, tileH: bottom.tileH, mainH: bottom.mainH, stripY: 0 });
+    expect(top.mainY).toBe(top.tileH + 8);
+    expect(bottom).toMatchObject({ mainY: 0, stripY: bottom.mainH + 8 });
+    expect(cameraStripGeometry(1264, 672, { ...prefs, strip: "top" }, 0)).toMatchObject({ mainY: 0, mainH: 672 });
+  });
   it("always reserves an overflow cell, even when only one cell fits", () => {
     expect(cameraStripGeometry(800, 100, prefs, 10)).toMatchObject({ shown: 0, more: 10 });
   });
@@ -136,6 +144,7 @@ describe("device-local layout preference parsing", () => {
   it("round trips all layout choices", () => {
     const value = { layout: "grid", strip: "bottom", size: "l", people: "none", self: false, screens: false, apps: false, stripPx: 180 };
     expect(parseCallLayout(JSON.stringify(value))).toEqual(value);
+    expect(parseCallLayout('{"strip":"top"}').strip).toBe("top");
   });
   it("clamps dragged sizes and rejects nonnumeric sizes", () => {
     expect(parseCallLayout('{"stripPx":10000}').stripPx).toBe(480);
