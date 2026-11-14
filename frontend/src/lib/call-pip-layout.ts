@@ -16,7 +16,8 @@ export function pipLayoutCells(layout: PipLayout, width: number, height: number,
   const groups = callLayoutGroups(filterCallTiles(layout.tiles, layout.prefs), layout.prefs, layout.pin, layout.speaker, layout.speaking);
   const strip = cameraStripGeometry(width, height, layout.prefs, groups.strip.length);
   const rects = callGridRects(groups.main.length, groups.grid ? width : strip.mainW, groups.grid ? height : strip.mainH);
-  const cells = groups.main.map((tile, i) => ({ tile, rect: rects[i] }));
+  const offset = groups.grid ? 0 : strip.mainY;
+  const cells = groups.main.map((tile, i) => ({ tile, rect: { ...rects[i], y: rects[i].y + offset } }));
   const stripState = selectCameraStrip(previous, groups.strip, strip.shown, layout.speaking, layout.lastSpokeAt);
   if (!groups.grid) {
     stripState.ids.forEach((id, i) => {
@@ -25,7 +26,7 @@ export function pipLayoutCells(layout: PipLayout, width: number, height: number,
     });
   }
   function stripRect(i: number): LayoutRect {
-    return { x: strip.side ? strip.mainW + 8 : i * (strip.tileW + 8), y: strip.side ? i * (strip.tileH + 8) : strip.mainH + 8, w: strip.tileW, h: strip.tileH };
+    return { x: strip.side ? strip.mainW + 8 : i * (strip.tileW + 8), y: strip.side ? i * (strip.tileH + 8) : strip.stripY, w: strip.tileW, h: strip.tileH };
   }
   return { cells, stripState, overflow: !groups.grid && strip.more ? { count: strip.more, rect: stripRect(strip.shown) } : null };
 }

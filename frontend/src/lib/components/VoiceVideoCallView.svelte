@@ -1355,7 +1355,12 @@ import {
   let stripDragPx = $state<number | null>(null);
   let stripDragFrom = 0;
   const stripGeometry = $derived(cameraStripGeometry(tileAreaWidth, tileAreaHeight, { ...callLayoutPrefs, stripPx: stripDragPx ?? callLayoutPrefs.stripPx }, thumbnailTiles.length, isSmallScreen));
-  const mainRects = $derived(callGridRects(layoutGroups.main.length, layoutGroups.grid ? tileAreaWidth : stripGeometry.mainW, layoutGroups.grid ? tileAreaHeight : stripGeometry.mainH));
+  const mainRects = $derived.by(() => {
+    const rects = callGridRects(layoutGroups.main.length, layoutGroups.grid ? tileAreaWidth : stripGeometry.mainW, layoutGroups.grid ? tileAreaHeight : stripGeometry.mainH);
+    // Below a top strip, not under it (see the same offset in the PiP layout).
+    const offset = layoutGroups.grid ? 0 : stripGeometry.mainY;
+    return offset ? rects.map((rect) => ({ ...rect, y: rect.y + offset })) : rects;
+  });
   let stripSlots = $state.raw(createCameraStripState());
   $effect(() => {
     stripSlots = selectCameraStrip(untrack(() => stripSlots), thumbnailTiles, stripGeometry.shown, speakers.speaking, speakers.lastSpokeAt);
@@ -1845,7 +1850,7 @@ import {
     class="group relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
       {tile.connecting ? 'connecting-wave' : ''}
       {isSpeaking
-        ? 'ring-2 ring-inset ring-primary'
+        ? 'ring-2 ring-primary shadow-[0_0_8px_rgba(0,255,136,0.4)]'
       : tile.quality === 'failed'
         ? 'ring-2 ring-red-500/80'
         : tile.quality === 'degraded'
@@ -2222,11 +2227,15 @@ import {
           <div class="flex h-full items-center justify-center text-xs text-zinc-400 font-mono">No tiles to show. Change your Layout filters.</div>
         {/if}
         {#if !layoutGroups.grid && shownThumbnails.length + stripGeometry.more > 0}
+          <!-- 8px bigger than its tiles on every side (the stage's own
+               padding), padded back in: the strip clips, and a speaker's
+               ring and its 8px glow are drawn outside the tile. An inset
+               ring instead sat under the video and barely showed. -->
           <div
             class="camera-strip absolute flex gap-2 {stripGeometry.side ? 'flex-col' : 'flex-row'} {stripGeometry.scroll ? 'overflow-x-auto' : 'justify-center overflow-hidden'}"
             style={stripGeometry.side
-              ? `right:0;top:0;bottom:0;width:${stripGeometry.tileW}px`
-              : `left:0;right:0;bottom:0;height:${stripGeometry.tileH}px`}
+              ? `right:-8px;top:-8px;bottom:-8px;width:${stripGeometry.tileW + 16}px;padding:8px`
+              : `left:-8px;right:-8px;${stripGeometry.top ? "top" : "bottom"}:-8px;height:${stripGeometry.tileH + 16}px;padding:8px`}
           >
             {#each shownThumbnails as tile (tile.id)}
               <div class="call-layout-cell shrink-0" style={`width:${stripGeometry.tileW}px;height:${stripGeometry.tileH}px`}>
@@ -2241,17 +2250,17 @@ import {
           </div>
           <div class="absolute z-30" style={stripGeometry.side
             ? `left:${stripGeometry.mainW + 4}px;top:0;bottom:0;width:0`
-            : `top:${stripGeometry.mainH + 4}px;left:0;right:0;height:0`}>
+            : `top:${stripGeometry.top ? stripGeometry.tileH + 4 : stripGeometry.mainH + 4}px;left:0;right:0;height:0`}>
             <SplitHandle
               orientation={stripGeometry.side ? "column" : "row"}
               label="Resize camera strip"
               valueNow={100 * (stripGeometry.side ? stripGeometry.tileW / Math.max(1, tileAreaWidth) : stripGeometry.tileH / Math.max(1, tileAreaHeight))}
               class={stripGeometry.side ? "-translate-x-1/2" : "-translate-y-1/2"}
               onstart={() => { stripDragFrom = stripGeometry.side ? stripGeometry.tileW : stripGeometry.tileH; stripDragPx = stripDragFrom; }}
-              onmove={(delta) => (stripDragPx = resizeStrip(stripDragFrom - delta))}
+              onmove={(delta) => (stripDragPx = resizeStrip(stripGeometry.top ? stripDragFrom + delta : stripDragFrom - delta))}
               onend={() => { if (stripDragPx !== null) setCallLayoutPrefs({ stripPx: stripDragPx }); stripDragPx = null; }}
               onreset={() => setCallLayoutPrefs({ stripPx: null })}
-              onstep={(direction) => setCallLayoutPrefs({ stripPx: resizeStrip((stripGeometry.side ? stripGeometry.tileW : stripGeometry.tileH) - direction * 16) })}
+              onstep={(direction) => setCallLayoutPrefs({ stripPx: resizeStrip((stripGeometry.side ? stripGeometry.tileW : stripGeometry.tileH) + (stripGeometry.top ? 1 : -1) * direction * 16) })}
             />
           </div>
         {/if}

@@ -77,4 +77,11 @@ describe("shared PiP layouts", () => {
     expect(hidden.stripState.ids).toEqual([]);
     expect(hidden.cells.map((cell) => cell.tile.id)).toEqual(["screen"]);
   });
+  it("draws a top strip above the main tiles", () => {
+    const { cells } = pipLayoutCells(layout({ strip: "top", apps: false }), 320, 180);
+    const main = cells.find((c) => c.tile.id === "screen")!;
+    const strip = cells.filter((c) => c.tile.kind === "camera");
+    expect(strip.length).toBeGreaterThan(0);
+    for (const c of strip) expect(c.rect.y + c.rect.h).toBeLessThanOrEqual(main.rect.y);
+  });
 });

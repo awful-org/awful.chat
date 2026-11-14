@@ -2,7 +2,7 @@ import type { SpotlightTile } from "./spotlight";
 
 export interface CallLayoutPrefs {
   layout: "auto" | "spotlight" | "grid";
-  strip: "auto" | "side" | "bottom" | "hidden";
+  strip: "auto" | "side" | "top" | "bottom" | "hidden";
   size: "s" | "m" | "l";
   people: "all" | "video" | "none";
   screens: boolean;
@@ -25,7 +25,7 @@ export function parseCallLayout(raw: string | null): CallLayoutPrefs {
     if (!value || typeof value !== "object") return prefs;
     for (const key of ["layout", "strip", "size", "people"] as const) {
       const options = {
-        layout: ["auto", "spotlight", "grid"], strip: ["auto", "side", "bottom", "hidden"],
+        layout: ["auto", "spotlight", "grid"], strip: ["auto", "side", "top", "bottom", "hidden"],
         size: ["s", "m", "l"], people: ["all", "video", "none"],
       };
       if (options[key].includes(value[key])) Object.assign(prefs, { [key]: value[key] });
@@ -146,10 +146,17 @@ export function cameraStripGeometry(width: number, height: number, prefs: CallLa
   const hidden = position === "hidden" || count === 0;
   const scroll = phone && !side;
   const shown = hidden ? 0 : scroll ? count : count > fits ? Math.max(0, fits - 1) : count;
+  // A top strip is a bottom strip moved above the main tiles: same sizes,
+  // the main area starts below it instead of ending above it.
+  const top = position === "top";
+  const mainH = Math.max(0, height - (!hidden && !side ? tileH + 8 : 0));
   return {
-    position, side, tileW, tileH, shown, scroll,
+    position, side, top, tileW, tileH, shown, scroll,
     more: hidden || scroll ? 0 : count - shown,
     mainW: Math.max(0, width - (!hidden && side ? thickness + 8 : 0)),
-    mainH: Math.max(0, height - (!hidden && !side ? tileH + 8 : 0)),
+    mainH,
+    /** Where the main tiles start and the strip's row sits, within the area. */
+    mainY: !hidden && top ? tileH + 8 : 0,
+    stripY: top ? 0 : mainH + 8,
   };
 }
