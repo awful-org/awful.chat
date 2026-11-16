@@ -3415,11 +3415,6 @@ function _selfIds(): string[] {
 }
 
 /**
- * Bind an incoming message to this client's identity and view, then let
- * announce.ts decide whether to make a sound about it. The caller has already
- * established that the message is genuinely new.
- */
-/**
  * A DM call's start card arriving live: when this device saw the call
  * begin, on its own clock, so a length it later measures is one clock's
  * (call.svelte.ts). Not for cards from the mailbox or history: those are late.
@@ -3430,6 +3425,11 @@ function _noteLiveCallStart(row: { type: string; content: string }): void {
   if (card?.phase === "start") noteCallStartSeen(card.callId, Date.now());
 }
 
+/**
+ * Bind an incoming message to this client's identity and view, then let
+ * announce.ts decide whether to make a sound about it. The caller has already
+ * established that the message is genuinely new.
+ */
 function _announceMessage(
   msg: Message,
   opts: { viaMailbox?: boolean } = {}
@@ -3467,7 +3467,6 @@ function _announce(msg: Message, opts: { viaMailbox?: boolean }): void {
       selfIds: _selfIds(),
       uiRoomCode: transportState.uiRoomCode,
       resolveName: resolveMentionDisplayName,
-      callLive: (roomCode) => [...transportState.callPeerRooms.values()].includes(roomCode),
     },
     opts
   );
@@ -3488,7 +3487,6 @@ async function _handleChatMessage(
       wire.type === MessageType.File &&
       (!wire.meta?.files?.length || wire.meta.files.some(file => !file.encryption))) return;
   if (!callCardAllowed(wire, roomCode)) return;
-  _noteLiveCallStart(wire);
 
   // DM rooms now start with "dm-" (hash-based)
   // We don't need to ensure room here - it should already exist from sender context
@@ -3575,6 +3573,9 @@ async function _handleChatMessage(
     (await getMessage(msg.id));
   guard();
   const isNewMessage = !held;
+  // Only a start not held yet is a live sighting: a replay of one we hold
+  // (after a reload emptied the in-memory map) would date the call to now.
+  if (isNewMessage) _noteLiveCallStart(wire);
   // A row we hold under this id that is NOT this sender's message in this
   // room means this one is not stored and never will be. It must not claim a
   // watermark: that told every later digest we had the message, so no peer

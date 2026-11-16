@@ -167,8 +167,8 @@ export function callCardState(opts: {
   const { start, end, ongoing, joined, mine } = opts;
   if (!end && ongoing && start) return { kind: "ongoing", since: start.at };
   if (!joined && !mine) return { kind: "missed" };
-  const length = end && endCardLength(end, start);
-  if (length !== undefined && length !== null) return { kind: "ended", duration: length };
+  const length = end ? endCardLength(end, start) : undefined;
+  if (length !== undefined) return { kind: "ended", duration: length };
   return { kind: "ended-unknown" };
 }
 

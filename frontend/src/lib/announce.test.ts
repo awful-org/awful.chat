@@ -136,28 +136,13 @@ describe("announceMessage", () => {
     expect(notified).toHaveLength(1);
   });
 
-  it("tells a call that happened while you were away as missed, once", () => {
-    // Collected from the mailbox: the start of a call long over says nothing,
-    // its end says you missed it.
-    announceMessage(callCard("start", "c1"), { ...ctx, callLive: () => false }, { viaMailbox: true });
-    announceMessage(callCard("end", "c2"), { ...ctx, callLive: () => false }, { viaMailbox: true });
+  it("tells a call collected from the mailbox as 'called you', once", () => {
+    // Away for it: over or still going, it called you. Its end adds nothing.
+    announceMessage(callCard("start", "c1"), ctx, { viaMailbox: true });
+    announceMessage(callCard("end", "c2"), ctx, { viaMailbox: true });
     settle();
     expect(notified).toHaveLength(1);
-    expect(notified[0].body).toBe("Missed call");
-  });
-
-  it("still rings for a call collected from the mailbox that is going on now", () => {
-    announceMessage(callCard("start", "c1"), { ...ctx, callLive: (rc) => rc === "dm-abc" }, { viaMailbox: true });
-    settle();
-    expect(notified).toHaveLength(1);
-    expect(notified[0].body).toBe("started a call");
-  });
-
-  it("does not call a call missed that this device took part in", async () => {
-    (await import("./dm-call-joined")).noteDmCallJoined("joinedcall1");
-    announceMessage(callCard("end", "c3", "joinedcall1"), ctx, { viaMailbox: true });
-    settle();
-    expect(notified).toHaveLength(0);
+    expect(notified[0].body).toBe("called you");
   });
 
   it("announces the same message once, however many times it is delivered", () => {

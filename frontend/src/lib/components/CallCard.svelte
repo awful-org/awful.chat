@@ -6,7 +6,7 @@
   import { Phone, PhoneMissed } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { callCardState, formatCallDuration, parseCallCard, type CallCardPayload } from "$lib/call-card";
-  import { joinedDmCall } from "$lib/dm-call-joined";
+  import { callStartSeen, joinedDmCall } from "$lib/dm-call-joined";
   import { transportState } from "$lib/transport/transport.svelte";
   import { joinCall, leaveCall } from "$lib/transport/call.svelte";
   import type { Message } from "$lib/types/message";
@@ -50,6 +50,15 @@
         })
   );
 
+  /**
+   * When an ongoing call began, on this device's clock where it saw the start
+   * arrive live: the card's own time is the caller's clock, and one a few
+   * minutes off ran the timer that far ahead or held it at 0:00.
+   */
+  const since = $derived(
+    shown.kind === "ongoing" ? ((card && callStartSeen(card.callId)) ?? shown.since) : 0
+  );
+
   let now = $state(Date.now());
   $effect(() => {
     if (shown.kind !== "ongoing") return;
@@ -91,7 +100,7 @@
     <span>Missed call</span>
   {:else if shown.kind === "ongoing"}
     <Phone class="size-4 shrink-0 text-primary" />
-    <span>Call in progress · <span class="tabular-nums">{clock(now - shown.since)}</span></span>
+    <span>Call in progress · <span class="tabular-nums">{clock(now - since)}</span></span>
     {#if canJoin}
       <Button size="sm" class="h-7 font-mono text-xs" onclick={joinFromCard}>Join</Button>
     {/if}

@@ -9,7 +9,6 @@ import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
 import { isBlockedDid } from "./blocks.svelte";
 import { parseCallCard } from "./call-card";
-import { joinedDmCall } from "./dm-call-joined";
 
 /**
  * Telling the user a message arrived: the sound, and the notification when the
@@ -33,8 +32,6 @@ export interface AnnounceContext {
   uiRoomCode: string | null;
   /** DID -> display name, for rendering @mentions in the preview text. */
   resolveName: (did: string) => string;
-  /** Someone is in a call in this room right now (call presence). */
-  callLive?: (roomCode: string) => boolean;
 }
 
 /**
@@ -253,19 +250,13 @@ export function announceMessage(
     if (msg.type === MessageType.CallEvent) {
       const card = parseCallCard(msg.content);
       if (!card) return;
-      if (card.phase === "start") {
-        // A call that started pops up as a message. One collected from the
-        // mailbox started while you were away: worth a sound only while it
-        // is still going - one already over is told by its end, as missed.
-        if (opts.viaMailbox && !ctx.callLive?.(msg.roomCode)) return;
-        body = "started a call";
-      } else {
-        // An end is news only to someone away for the whole call: collected
-        // from the mailbox, and not taken on this device. Live, its start
-        // already rang.
-        if (!opts.viaMailbox || joinedDmCall(card.callId)) return;
-        body = "Missed call";
-      }
+      // A call pops up as a message, by its start; its end is not news.
+      if (card.phase !== "start") return;
+      // One collected from the mailbox started while you were away: it may
+      // be over or still going, and presence may not have said which yet.
+      // "called you" is true either way - and a caller whose app died never
+      // posts an end, so the start is the one card sure to arrive.
+      body = opts.viaMailbox ? "called you" : "started a call";
     } else if (msg.type === MessageType.PluginCard) {
       try {
         const payload = JSON.parse(msg.content);
