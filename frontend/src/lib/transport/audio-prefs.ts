@@ -272,3 +272,52 @@ export function saveVoiceWithheld(did: string, withheld: boolean): string[] {
   saveAudioPrefs({ voiceWithheld });
   return voiceWithheld;
 }
+
+/**
+ * The part of these settings that is about people rather than this device's
+ * hardware: how loud each of them is, and who gets none of your voice. Both
+ * are keyed by did:key, so they mean the same thing on any device of the
+ * account, and a device sync or a backup carries them. The microphone,
+ * camera and the rest stay with the device they were picked on.
+ */
+export interface PeerAudioPrefs {
+  peerVolumes: Record<string, number>;
+  voiceWithheld: string[];
+}
+
+export function peerAudioPrefs(): PeerAudioPrefs {
+  const prefs = loadAudioPrefs();
+  return { peerVolumes: prefs.peerVolumes, voiceWithheld: prefs.voiceWithheld };
+}
+
+/**
+ * Take in another device's PeerAudioPrefs. A replace adopts them as they
+ * came. A merge keeps everyone withheld on either device - withholding is
+ * the choice that must not quietly lapse - and keeps this device's volume
+ * for anyone both set, since that is the one heard here.
+ *
+ * Within the same bound as the lists themselves, which keep their FIRST
+ * entries when read: this device's come first, so an overflow drops the
+ * imported ones rather than the local.
+ */
+export function importPeerAudioPrefs(
+  imported: { peerVolumes?: unknown; voiceWithheld?: unknown },
+  mode: "add" | "replace"
+): void {
+  const peerVolumes = sanitizePeerVolumes(imported.peerVolumes);
+  const voiceWithheld = sanitizeDidList(imported.voiceWithheld);
+  if (mode === "replace") {
+    saveAudioPrefs({ peerVolumes, voiceWithheld });
+    return;
+  }
+  const local = loadAudioPrefs();
+  const mergedVolumes: Record<string, number> = { ...local.peerVolumes };
+  for (const [did, volume] of Object.entries(peerVolumes)) {
+    if (Object.keys(mergedVolumes).length >= MAX_PEER_VOLUME_ENTRIES) break;
+    if (!Object.hasOwn(mergedVolumes, did)) mergedVolumes[did] = volume;
+  }
+  const mergedWithheld = [
+    ...new Set([...local.voiceWithheld, ...voiceWithheld]),
+  ].slice(0, MAX_PEER_VOLUME_ENTRIES);
+  saveAudioPrefs({ peerVolumes: mergedVolumes, voiceWithheld: mergedWithheld });
+}

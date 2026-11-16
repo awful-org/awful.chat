@@ -17,6 +17,9 @@ import {
   type BackupFile,
   bytesFromExport,
   roomProfileToExport,
+  mergeImportedBlock,
+  mergeImportedContact,
+  sanitizeLocalState,
 } from "./backup";
 
 function backupJson(overrides: Record<string, unknown> = {}): string {
@@ -109,10 +112,26 @@ describe("room profile backup records", () => {
   });
 
   it("loads old backups without room collections", () => {
-    expect(BACKUP_VERSION).toBe(3);
+    expect(BACKUP_VERSION).toBe(4);
     const old = parseBackup(backupJson({ version: 2 }));
     expect(old.roomProfiles).toEqual([]);
     expect(old.roomDeletions).toEqual([]);
+  });
+
+  // A v3 file never carried the phonebook, blocks or local state. Coercing
+  // them to [] would read as "the other device has none", which a merge
+  // would then act on; absent says "not carried".
+  it("leaves the phonebook, blocks and local state absent when an older file has none", () => {
+    const old = parseBackup(backupJson({ version: 3 }));
+    expect(old).not.toHaveProperty("phonebook");
+    expect(old).not.toHaveProperty("blocks");
+    expect(old).not.toHaveProperty("localState");
+    const current = parseBackup(backupJson({
+      version: 4, phonebook: [], blocks: [], localState: { dmCallsJoined: [] },
+    }));
+    expect(current.phonebook).toEqual([]);
+    expect(current.blocks).toEqual([]);
+    expect(current.localState).toEqual({ dmCallsJoined: [] });
   });
 
   it("encodes nested avatar and banner bytes while preserving reset clocks", () => {
@@ -249,6 +268,163 @@ describe("mergeImportedRoom", () => {
       { ...local, pinnedMessages: ["m2", "m3"] }
     );
     expect(merged.pinnedMessages).toEqual(["m1", "m2", "m3"]);
+  });
+
+  // The name stayed local while nameAt came from the import, so an older
+  // name could carry a newer stamp - and win the next announcement against a
+  // real rename, putting the old name back for the whole room.
+  it("takes the name and its stamp together, from whichever is newer", () => {
+    const renamedHere = { ...local, name: "Renamed", nameAt: 2_000 };
+    const kept = mergeImportedRoom(renamedHere, { ...local, name: "Old", nameAt: 1_000 });
+    expect(kept.name).toBe("Renamed");
+    expect(kept.nameAt).toBe(2_000);
+
+    const renamedThere = mergeImportedRoom(renamedHere, { ...local, name: "Newer", nameAt: 3_000 });
+    expect(renamedThere.name).toBe("Newer");
+    expect(renamedThere.nameAt).toBe(3_000);
+
+    // A stampless local name is older than any stamped rename.
+    const legacy = mergeImportedRoom(local, { ...local, name: "Stamped", nameAt: 5 });
+    expect(legacy.name).toBe("Stamped");
+    expect(legacy.nameAt).toBe(5);
+    // And a stamped local name does not pick up a stamp it never had.
+    const stampless = mergeImportedRoom(renamedHere, { ...local, name: "Stampless" });
+    expect(stampless.name).toBe("Renamed");
+    expect(stampless.nameAt).toBe(2_000);
+    const noStamp = mergeImportedRoom(local, { ...local, nameAt: 0, name: "Room" });
+    expect(noStamp).not.toHaveProperty("nameAt");
+  });
+
+  it("never turns an accepted DM back into a request", () => {
+    const dm = { ...local, roomCode: "dm-x", type: "dm" as const, participantDid: "did:key:zA" };
+    const req = (request: boolean | undefined) => (request === undefined ? dm : { ...dm, request });
+    const merge = (here: boolean | undefined, there: boolean | undefined) =>
+      (mergeImportedRoom(req(here) as never, req(there)) as { request?: boolean }).request;
+    // Accepted here - explicitly, or from before requests existed.
+    expect(merge(false, true)).toBe(false);
+    expect(merge(undefined, true)).toBe(false);
+    // Accepted on the other device: that was the user's answer.
+    expect(merge(true, false)).toBe(false);
+    expect(merge(true, undefined)).toBe(false);
+    // A request on both stays one.
+    expect(merge(true, true)).toBe(true);
+    expect(merge(undefined, undefined)).toBeUndefined();
+  });
+
+  it("keeps the fields only this device has, and this device's room picture", () => {
+    const here = {
+      ...local, movedTo: "rd2_new", archiveOf: "legacy-room", seenAt: 900,
+      pfpURL: "https://example.invalid/here.png",
+    };
+    const merged = mergeImportedRoom(here, {
+      ...local, seenAt: 500, pfpData: new Uint8Array([1]).buffer,
+    });
+    expect(merged.movedTo).toBe("rd2_new");
+    expect(merged.archiveOf).toBe("legacy-room");
+    expect(merged.seenAt).toBe(900);
+    // As a pair: the import's bytes beside this device's URL showed neither.
+    expect(merged.pfpURL).toBe("https://example.invalid/here.png");
+    expect(merged).not.toHaveProperty("pfpData");
+
+    const filled = mergeImportedRoom(local, { ...local, seenAt: 500, movedTo: "rd2_there",
+      pfpURL: "https://example.invalid/there.png" });
+    expect(filled.seenAt).toBe(500);
+    expect(filled.movedTo).toBe("rd2_there");
+    expect(filled.pfpURL).toBe("https://example.invalid/there.png");
+  });
+});
+
+describe("merging soft blocks", () => {
+  const did = "did:key:zMallory";
+
+  it("keeps a block active on either device, with both devices' lifted windows", () => {
+    const merged = mergeImportedBlock(
+      { did, name: "Mallory", blockedAt: 500, earlier: [[10, 20]] },
+      { did, name: "M", blockedAt: 100, unblockedAt: 300, earlier: [[30, 40]] },
+    );
+    expect(merged.unblockedAt).toBeUndefined();
+    expect(merged.blockedAt).toBe(500);
+    expect(merged.name).toBe("Mallory");
+    expect(merged.earlier).toEqual([[10, 20], [30, 40], [100, 300]]);
+
+    const activeThere = mergeImportedBlock(
+      { did, name: "Mallory", blockedAt: 100, unblockedAt: 300 },
+      { did, name: "Mallory", blockedAt: 50 },
+    );
+    expect(activeThere.unblockedAt).toBeUndefined();
+    expect(activeThere.blockedAt).toBe(50);
+    expect(activeThere.earlier).toEqual([[100, 300]]);
+  });
+
+  it("keeps every window of a block lifted on both, the latest as its own", () => {
+    const merged = mergeImportedBlock(
+      { did, name: "Mallory", blockedAt: 100, unblockedAt: 300 },
+      { did, name: "Mallory", blockedAt: 400, unblockedAt: 600, earlier: [[100, 300]] },
+    );
+    expect(merged).toEqual({ did, name: "Mallory", blockedAt: 400, unblockedAt: 600, earlier: [[100, 300]] });
+  });
+
+  it("takes an entry this device never had as it came", () => {
+    const imported = { did, name: "Mallory", blockedAt: 100 };
+    expect(mergeImportedBlock(undefined, imported)).toBe(imported);
+  });
+});
+
+describe("merging phonebook rows", () => {
+  it("unions them: earliest added, favorite on either, this device's nickname", () => {
+    const merged = mergeImportedContact(
+      { peerId: "12D3KooWBob", nickname: "Bob", addedAt: 500 },
+      { peerId: "12D3KooWBob", did: "did:key:zBob", nickname: "Robert", addedAt: 100, favorite: true },
+    );
+    expect(merged).toEqual({ peerId: "12D3KooWBob", did: "did:key:zBob", nickname: "Bob",
+      addedAt: 100, favorite: true });
+    const unnamed = mergeImportedContact(
+      { peerId: "did:key:zBob", nickname: "", addedAt: 5 },
+      { peerId: "did:key:zBob", nickname: "Bob", addedAt: 9 },
+    );
+    expect(unnamed.nickname).toBe("Bob");
+    expect(unnamed).not.toHaveProperty("favorite");
+  });
+});
+
+describe("the new export sections are checked like the rest", () => {
+  const base = {
+    messages: [], attachments: [], pending: [], watermarks: [], yjsDocs: [],
+    rooms: [], profiles: [], savedGifs: [],
+  };
+
+  it("drops malformed phonebook and block rows, and counts them", () => {
+    const out = sanitizeCollections({
+      ...base,
+      phonebook: [
+        { peerId: "12D3KooWBob", nickname: "Bob", addedAt: 1 },
+        { peerId: "", nickname: "Nobody", addedAt: 1 },
+        { peerId: "12D3KooWEve", nickname: "Eve", addedAt: 1, did: "not-a-did" },
+      ],
+      blocks: [
+        { did: "did:key:zMallory", name: "Mallory", blockedAt: 1, earlier: [[1, 2]] },
+        { did: "12D3KooWNotADid", name: "x", blockedAt: 1 },
+        { did: "did:key:zTrent", name: "Trent", blockedAt: 1, earlier: [[1]] },
+      ],
+    });
+    expect(out.phonebook?.map((e) => e.peerId)).toEqual(["12D3KooWBob"]);
+    expect(out.blocks?.map((e) => e.did)).toEqual(["did:key:zMallory"]);
+    expect(out.dropped).toBe(4);
+  });
+
+  it("leaves lists an export never carried undefined, not empty", () => {
+    const out = sanitizeCollections(base);
+    expect(out.phonebook).toBeUndefined();
+    expect(out.blocks).toBeUndefined();
+  });
+
+  it("keeps only local-state fields of the right type", () => {
+    expect(sanitizeLocalState({
+      peerVolumes: { "did:key:zA": 0.5 }, voiceWithheld: "did:key:zA",
+      dmCallsJoined: ["call-1"], dmQueue: 42, extra: true,
+    })).toEqual({ peerVolumes: { "did:key:zA": 0.5 }, dmCallsJoined: ["call-1"] });
+    expect(sanitizeLocalState(["not", "an", "object"])).toBeUndefined();
+    expect(sanitizeLocalState(undefined)).toBeUndefined();
   });
 });
 
