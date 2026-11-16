@@ -274,6 +274,25 @@ export interface SavedGif {
   mimeType?: string;
 }
 
+/** Someone this device soft-blocked (see blocks.svelte.ts). */
+export interface BlockEntry {
+  did: string;
+  /** Their name when blocked, so the list in Settings can say who. */
+  name: string;
+  blockedAt: number;
+  /**
+   * Set when unblocked. The entry is kept so the DMs they wrote between
+   * blockedAt and this stay refused: they were turned away while blocked,
+   * and unblocking must not let history sync deliver them after all.
+   */
+  unblockedAt?: number;
+  /**
+   * The [blockedAt, unblockedAt) windows of blocks lifted before this one,
+   * still refused for the same reason.
+   */
+  earlier?: [number, number][];
+}
+
 export interface PhonebookEntry {
   peerId: string;
   did?: string;
@@ -347,6 +366,10 @@ type AppDB = IDBPDatabase<{
   phonebook: {
     key: Blinded;
     value: PhonebookEntry;
+  };
+  blocks: {
+    key: Blinded;
+    value: BlockEntry;
   };
   searchIndex: {
     key: Blinded;
@@ -423,7 +446,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 9, {
+  db = (await openDB(dbName(), 10, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -533,6 +556,10 @@ async function openDatabase(): Promise<AppDB> {
         transaction
           .objectStore("attachments")
           .createIndex("byRoom", "roomCode", { unique: false });
+      }
+      if (oldVersion < 10) {
+        // Soft blocks, sealed like the phonebook (see STORE_SPECS.blocks).
+        database.createObjectStore("blocks", { keyPath: "did" });
       }
     },
     blocking() {
@@ -3627,6 +3654,17 @@ export async function dedupePhonebook(): Promise<void> {
     }
     await database.put("phonebook", await _seal("phonebook", merged));
   }
+}
+
+export async function getBlockEntries(): Promise<BlockEntry[]> {
+  const database = await getDB();
+  const rows = await _openAll<BlockEntry>("blocks", await database.getAll("blocks"));
+  return rows.sort((a, b) => a.blockedAt - b.blockedAt);
+}
+
+export async function putBlockEntry(entry: BlockEntry): Promise<void> {
+  const database = await getDB();
+  await database.put("blocks", await _seal("blocks", entry));
 }
 
 export async function putPhonebookEntry(entry: PhonebookEntry): Promise<void> {

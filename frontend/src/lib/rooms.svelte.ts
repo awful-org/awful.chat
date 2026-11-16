@@ -22,6 +22,7 @@ import {
 import { identityStore } from "./identity/identity.svelte";
 import { dropRoomCorpus } from "./search/corpus.svelte";
 import { MessageType } from "./types/message";
+import { isBlockedDid, loadBlocks } from "./blocks.svelte";
 
 /**
  * Your own messages must never count as unread - they arrive back through
@@ -87,7 +88,7 @@ export async function loadRooms(): Promise<void> {
     }
     roomsStore.rooms = Array.from(merged.values());
     await migrateLegacyRoomOrder();
-    roomsStore.dmRooms = await getDMRooms();
+    roomsStore.dmRooms = await listedDmRooms();
     roomsStore.phonebook = await getPhonebookEntries();
     await _refreshAllUnread();
     await _refreshAllActivity();
@@ -96,12 +97,24 @@ export async function loadRooms(): Promise<void> {
   }
 }
 
+/**
+ * The DMs the list shows: a soft-blocked person's conversation is set aside,
+ * not deleted. The block list is read first - on unlock this runs beside
+ * connect(), and filtering against a list not read yet showed a blocked
+ * person's conversation until something refreshed it.
+ */
+async function listedDmRooms(): Promise<DMRoom[]> {
+  await loadBlocks().catch(() => {});
+  const rooms = await getDMRooms();
+  return rooms.filter((r) => !isBlockedDid(r.participantDid));
+}
+
 export async function refreshPhonebook(): Promise<void> {
   roomsStore.phonebook = await getPhonebookEntries();
 }
 
 export async function refreshDmRooms(): Promise<void> {
-  roomsStore.dmRooms = await getDMRooms();
+  roomsStore.dmRooms = await listedDmRooms();
 }
 
 /**

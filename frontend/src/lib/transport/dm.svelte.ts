@@ -63,6 +63,7 @@ import {
   applyMessageStatus,
   transportState,
 } from "./transport.svelte";
+import { isBlockedDid, removeBlock, storeBlock } from "$lib/blocks.svelte";
 import {
   looksLikePeerId,
   looksLikeDid,
@@ -1271,7 +1272,8 @@ export async function joinSavedDms(rooms: (Room | DMRoom)[]): Promise<void> {
       (r): r is DMRoom =>
         r.type === "dm" &&
         (r as DMRoom).request !== true &&
-        !contacts.has((r as DMRoom).participantDid)
+        !contacts.has((r as DMRoom).participantDid) &&
+        !isBlockedDid((r as DMRoom).participantDid)
     )
     .sort(
       (a, b) =>
@@ -1475,6 +1477,9 @@ export async function ensureDmRoomForPeer(
   }
   const roomCode = peerDid ? await dmConversationCodeAsync(peerIdOrDid) : null;
   if (!roomCode || !peerDid) return null;
+  // Soft-blocked: no conversation is joined or started with them, from
+  // either side - their introductions, their messages, our phonebook join.
+  if (isBlockedDid(peerDid)) return null;
   if (!unsolicited) _noteSolicited(peerDid);
   if (pqState) hybridPairwiseRoomSecret(session.privateKey, didToPublicKey(peerDid), pqState);
   const existing = (await getRoom(roomCode)) as DMRoom | undefined;
@@ -1770,6 +1775,43 @@ export async function removeFromPhonebook(peerIdOrDid: string): Promise<void> {
     }
   }
   _admissionChanged();
+}
+
+/**
+ * Soft-block someone (blocks.svelte.ts says what that means). Their DM is set
+ * aside, not deleted: no longer listened on, gone from the list, its history
+ * kept for an unblock. A call held in it is hung up, and the floating panel
+ * closes if it shows them. The other layers - receiving, voice, the views -
+ * read the list themselves.
+ */
+export async function blockPerson(peerIdOrDid: string, name: string): Promise<boolean> {
+  const did = dmPeerDid(peerIdOrDid);
+  if (!did || !(await storeBlock(did, name))) return false;
+  const roomCode = await dmConversationCodeAsync(did).catch(() => null);
+  if (roomCode) {
+    if (transportState.callRoomCode === roomCode) leaveCall();
+    _forgetJoin(roomCode);
+    if (dmPanel.roomCode === roomCode) closeDmPanel();
+  }
+  for (const id of [peerIdOrDid, did]) _solicited.delete(id);
+  _admissionChanged();
+  await refreshDmRooms();
+  return true;
+}
+
+/**
+ * Undo a block. A conversation kept from before comes back joined. With none
+ * (a DM they started while blocked was refused, so nothing was stored), it is
+ * joined the bounded way an introduction is: nothing stored and nothing in
+ * the list, but listened on, so their next message opens it as any first
+ * message would - without that, it went to a conversation nobody here heard.
+ */
+export async function unblockPerson(did: string): Promise<void> {
+  await removeBlock(did);
+  _admissionChanged();
+  const kept = await dmRoomExists(did);
+  await ensureDmRoomForPeer(did, undefined, kept ? {} : { provisional: true }).catch(() => null);
+  await refreshDmRooms();
 }
 
 export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
