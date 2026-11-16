@@ -59,6 +59,7 @@
     RefreshCw,
     MailX,
     EllipsisVertical,
+    Ban,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -148,6 +149,8 @@
     removeFromPhonebook,
     isInPhonebook,
     sendDmTyping,
+    blockPerson,
+    unblockPerson,
   } from "$lib/transport/dm.svelte";
   import { TypingAnnouncer, typingLine } from "$lib/typing";
   import { typersIn, typingPrefs } from "$lib/typing.svelte";
@@ -2368,6 +2371,14 @@
     closeUserMenu();
   }
 
+  /** Soft block from the author menu: local, and undone the same way. */
+  async function toggleBlockFromMenu(senderId: string): Promise<void> {
+    const did = senderDid(senderId);
+    closeUserMenu();
+    if (isBlockedDid(did)) await unblockPerson(did);
+    else await blockPerson(did, transportState.peerNames.get(did) ?? "");
+  }
+
   // Deleting destroys stored history, so the header button arms first.
   let confirmingDelete = $state(false);
 
@@ -4173,6 +4184,21 @@
           Remove from phonebook
         </button>
       {/if}
+    {/if}
+    {#if senderDid(userMenu.senderId).startsWith("did:")}
+      {@const blocked = isBlockedDid(senderDid(userMenu.senderId))}
+      {@const sender = userMenu.senderId}
+      <button
+        type="button"
+        title={blocked
+          ? "Let their DMs, messages and voice through again"
+          : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
+        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer {blocked ? '' : 'text-destructive'}"
+        onclick={() => toggleBlockFromMenu(sender)}
+      >
+        <Ban class="size-4" />
+        {blocked ? "Unblock" : "Block"}
+      </button>
     {/if}
   </div>
 {/if}

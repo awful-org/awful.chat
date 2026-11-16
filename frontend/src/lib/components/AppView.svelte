@@ -12,7 +12,8 @@
   import { secureInvitationLink } from "$lib/room-security/invitation-format";
   import { legacyMoveInviteText, linkLegacyMove } from "$lib/room-security/legacy-move";
   import MoveLegacyRoomDialog from "./MoveLegacyRoomDialog.svelte";
-  import { sendDirectMessage } from "$lib/transport/dm.svelte";
+  import { blockPerson, sendDirectMessage, unblockPerson } from "$lib/transport/dm.svelte";
+  import { blocks } from "$lib/blocks.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { cancelAllShortCodes } from "$lib/short-codes.svelte";
   import { isChosenName } from "$lib/room-name";
@@ -1194,6 +1195,7 @@
         addedAt: number;
         inPhonebook: boolean;
         request: boolean;
+        blocked?: boolean;
       }
     >();
     // Keyed by every identity form: dmInbox keys are DIDs while entries may
@@ -1235,13 +1237,49 @@
         dmPreviews.set(peerId, { text: data.text, ts: data.ts });
       }
     }
-    return [...map.values()].sort((a, b) => {
+    const listed = [...map.values()].sort((a, b) => {
       const aFav = !!phonebookByPeer.get(a.peerId)?.favorite;
       const bFav = !!phonebookByPeer.get(b.peerId)?.favorite;
       if (aFav !== bFav) return aFav ? -1 : 1;
       return b.addedAt - a.addedAt;
     });
+    // Conversations with someone blocked are kept out of the inbox (no
+    // reads, no unread), but listed, greyed, so the block can be lifted
+    // where the conversation was. Keyed by DID, which every DM path takes.
+    const shown = new Set(listed.map((e) => peerIdToDid(e.peerId) ?? e.peerId));
+    for (const room of roomsStore.blockedDmRooms) {
+      const did = room.participantDid;
+      if (!did || shown.has(did)) continue;
+      shown.add(did);
+      listed.push({
+        peerId: did,
+        nickname:
+          transportState.peerNames.get(did) ||
+          phonebookByPeer.get(did)?.nickname ||
+          blocks.entries.find((e) => e.did === did)?.name ||
+          did.slice(0, 16),
+        avatarUrl: transportState.peerAvatars.get(did) ?? null,
+        addedAt: 0,
+        inPhonebook: phonebookByPeer.has(did),
+        request: false,
+        blocked: true,
+      });
+    }
+    return listed;
   });
+
+  /** Block or unblock from a conversation's menu in the DM list. */
+  async function handleSetBlocked(peerId: string, block: boolean) {
+    const did = peerIdToDid(peerId) ?? peerId;
+    if (!block) {
+      await unblockPerson(did);
+      return;
+    }
+    const name = dmEntries.find((e) => e.peerId === peerId)?.nickname ?? "";
+    // The conversation is set aside: off the screen first, as removing it is.
+    if (activeDmPeerId === peerId && isDmActive) await handleCloseDmView();
+    await blockPerson(peerId, name);
+  }
 
   async function toggleFavorite(peerId: string) {
     const existing = roomsStore.phonebook.find((p) => p.peerId === peerId);
@@ -1539,6 +1577,7 @@
         onAddToPhonebook={handleAddToPhonebook}
         onRemoveFromPhonebook={handleRemoveFromPhonebook}
         onRemoveDmConversation={handleRemoveDm}
+        onSetBlocked={handleSetBlocked}
         onRemoveRoom={handleRemoveRoom}
         onOpenCreateJoin={openCreateJoin}
         onOpenPhonebook={() => (phonebookOpen = true)}

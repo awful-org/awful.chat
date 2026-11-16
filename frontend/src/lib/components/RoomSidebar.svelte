@@ -13,6 +13,8 @@
     PanelLeftOpen,
     Plus,
     Trash2,
+    Ban,
+    CircleCheck,
     User,
     Users,
   } from "@lucide/svelte";
@@ -37,12 +39,19 @@
     inPhonebook?: boolean;
     /** A message request: listed last, under its own heading. */
     request?: boolean;
+    /**
+     * Soft-blocked: listed greyed under its own heading, after the
+     * requests, so the block can be lifted where the conversation was.
+     */
+    blocked?: boolean;
   }
 
   type DmContextAction =
     | { type: "add"; peerId: string }
     | { type: "removePhonebook"; peerId: string }
-    | { type: "removeConversation"; peerId: string };
+    | { type: "removeConversation"; peerId: string }
+    | { type: "block"; peerId: string }
+    | { type: "unblock"; peerId: string };
 
   interface Props {
     rooms: Room[];
@@ -66,6 +75,8 @@
     onAddToPhonebook: (peerId: string) => void;
     onRemoveFromPhonebook: (peerId: string) => void;
     onRemoveDmConversation: (peerId: string) => void;
+    /** Block (true) or unblock (false) the person a conversation is with. */
+    onSetBlocked: (peerId: string, blocked: boolean) => void;
     dmContextActions?: DmContextAction[];
     onRemoveRoom: (code: string) => void;
     /** Pin or unpin. `rooms` already lists the pinned (pinnedAt) first. */
@@ -97,6 +108,7 @@
     onAddToPhonebook,
     onRemoveFromPhonebook,
     onRemoveDmConversation,
+    onSetBlocked,
     dmContextActions,
     onRemoveRoom,
     onTogglePin,
@@ -105,12 +117,15 @@
     onOpenPhonebook,
   }: Props = $props();
 
-  // Requests after every accepted conversation, whatever their recency.
+  // Requests after every accepted conversation, whatever their recency, and
+  // the blocked last of all.
   const dmList = $derived([
-    ...phonebook.filter((e) => !e.request),
-    ...phonebook.filter((e) => e.request),
+    ...phonebook.filter((e) => !e.request && !e.blocked),
+    ...phonebook.filter((e) => e.request && !e.blocked),
+    ...phonebook.filter((e) => e.blocked),
   ]);
-  const firstRequest = $derived(dmList.find((e) => e.request)?.peerId);
+  const firstRequest = $derived(dmList.find((e) => e.request && !e.blocked)?.peerId);
+  const firstBlocked = $derived(dmList.find((e) => e.blocked)?.peerId);
 
   let contextMenu = $state<{ code: string; x: number; y: number } | null>(null);
 
@@ -355,6 +370,24 @@
     e.preventDefault();
     e.stopPropagation();
     dmContextMenu = { peerId, inPhonebook, ...clampMenu(e.clientX, e.clientY) };
+  }
+
+  /** A blocked conversation does not open: its row offers its menu instead. */
+  function selectDmEntry(e: MouseEvent, entry: PhonebookEntry): void {
+    if (entry.blocked) openDmContextMenu(e, entry.peerId, !!entry.inPhonebook);
+    else onSelectDm(entry.peerId);
+  }
+
+  function dmActionsFor(peerId: string): DmContextAction[] {
+    if (dmContextActions?.length) return dmContextActions;
+    const blocked = !!phonebook.find((e) => e.peerId === peerId)?.blocked;
+    return [
+      isInPhonebook(peerId)
+        ? { type: "removePhonebook", peerId }
+        : { type: "add", peerId },
+      blocked ? { type: "unblock", peerId } : { type: "block", peerId },
+      { type: "removeConversation", peerId },
+    ];
   }
 
   function isInPhonebook(peerId: string): boolean {
@@ -655,7 +688,7 @@
         {/each}
       {:else}
         {#each dmList as entry (entry.peerId)}
-          {#if entry.peerId === firstRequest}
+          {#if entry.peerId === firstRequest || entry.peerId === firstBlocked}
             <div class="mx-2 my-1 h-px bg-border" aria-hidden="true"></div>
           {/if}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -669,11 +702,11 @@
                 <button
                   {...props}
                   type="button"
-                  onclick={() => onSelectDm(entry.peerId)}
+                  onclick={(e) => selectDmEntry(e, entry)}
                   class="relative mb-1 flex w-full items-center justify-center rounded-md p-2 transition-colors cursor-pointer hover:bg-accent/50 {activeDmPeerId ===
                   entry.peerId
                     ? 'bg-accent text-accent-foreground'
-                    : 'text-muted-foreground'}"
+                    : 'text-muted-foreground'} {entry.blocked ? 'opacity-50 grayscale' : ''}"
                 >
                   <div
                     class="flex size-6 shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground text-xs font-semibold font-mono"
@@ -816,6 +849,13 @@
             Requests
           </div>
         {/if}
+        {#if entry.peerId === firstBlocked}
+          <div
+            class="select-none px-2.5 pb-1 pt-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
+          >
+            Blocked
+          </div>
+        {/if}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
           role="none"
@@ -824,11 +864,12 @@
         >
           <button
             type="button"
-            onclick={() => onSelectDm(entry.peerId)}
+            onclick={(e) => selectDmEntry(e, entry)}
+            title={entry.blocked ? "Blocked - click for options" : undefined}
             class="flex w-full items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors cursor-pointer hover:bg-accent/50
         {activeDmPeerId === entry.peerId
               ? 'bg-accent text-accent-foreground'
-              : 'text-muted-foreground'}"
+              : 'text-muted-foreground'} {entry.blocked ? 'opacity-50 grayscale' : ''}"
           >
             <div
               class="mt-px flex size-6 shrink-0 items-center justify-center rounded-full bg-secondary text-secondary-foreground text-xs font-semibold font-mono"
@@ -857,11 +898,13 @@
                 {entry.nickname}
               </div>
               <div class="truncate text-xs opacity-60 font-mono">
-                {dmPreviews.get(entry.peerId)?.text ||
-                  entry.peerId.slice(0, 16)}
+                {entry.blocked
+                  ? "Blocked"
+                  : dmPreviews.get(entry.peerId)?.text ||
+                    entry.peerId.slice(0, 16)}
               </div>
             </div>
-            {#if dmPreviews.get(entry.peerId)?.ts}
+            {#if !entry.blocked && dmPreviews.get(entry.peerId)?.ts}
               <span class="shrink-0 text-[10px] opacity-60 font-mono">
                 {timeAgo(dmPreviews.get(entry.peerId)!.ts)}
               </span>
@@ -943,13 +986,15 @@
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
   >
-    {#each dmContextActions?.length ? dmContextActions : isInPhonebook(dmContextMenu.peerId) ? [{ type: "removePhonebook", peerId: dmContextMenu.peerId }, { type: "removeConversation", peerId: dmContextMenu.peerId }] : [{ type: "add", peerId: dmContextMenu.peerId }, { type: "removeConversation", peerId: dmContextMenu.peerId }] as action}
+    {#each dmActionsFor(dmContextMenu.peerId) as action}
       <button
         type="button"
         onclick={() => {
           if (action.type === "add") onAddToPhonebook(action.peerId);
           if (action.type === "removePhonebook")
             onRemoveFromPhonebook(action.peerId);
+          if (action.type === "block") onSetBlocked(action.peerId, true);
+          if (action.type === "unblock") onSetBlocked(action.peerId, false);
           if (action.type === "removeConversation") {
             if (!confirmingRemoveDm) {
               confirmingRemoveDm = true;
@@ -960,7 +1005,7 @@
           closeContextMenu();
         }}
         class="flex w-full items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted cursor-pointer font-mono {action.type ===
-          'removeConversation' || action.type === 'removePhonebook'
+          'removeConversation' || action.type === 'removePhonebook' || action.type === 'block'
           ? 'text-destructive'
           : ''}"
       >
@@ -970,6 +1015,12 @@
         {:else if action.type === "removePhonebook"}
           <Trash2 class="size-4" />
           Remove from phonebook
+        {:else if action.type === "block"}
+          <Ban class="size-4" />
+          Block
+        {:else if action.type === "unblock"}
+          <CircleCheck class="size-4" />
+          Unblock
         {:else}
           <Trash2 class="size-4" />
           {confirmingRemoveDm ? "Click again to confirm" : "Remove conversation"}

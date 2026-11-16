@@ -37,6 +37,12 @@ function selfSenderId(): string | undefined {
 interface RoomsStore {
   rooms: Room[];
   dmRooms: DMRoom[];
+  /**
+   * Conversations with someone soft-blocked: kept out of dmRooms (no joins,
+   * no unread, no search), but still listed, greyed, so the block can be
+   * found and lifted where the conversation was.
+   */
+  blockedDmRooms: DMRoom[];
   phonebook: PhonebookEntry[];
   loading: boolean;
   unreadCounts: Map<string, number>;
@@ -47,6 +53,7 @@ interface RoomsStore {
 export const roomsStore = $state<RoomsStore>({
   rooms: [],
   dmRooms: [],
+  blockedDmRooms: [],
   phonebook: [],
   loading: false,
   unreadCounts: new Map(),
@@ -106,6 +113,7 @@ export async function loadRooms(): Promise<void> {
 async function listedDmRooms(): Promise<DMRoom[]> {
   await loadBlocks().catch(() => {});
   const rooms = await getDMRooms();
+  roomsStore.blockedDmRooms = rooms.filter((r) => isBlockedDid(r.participantDid));
   return rooms.filter((r) => !isBlockedDid(r.participantDid));
 }
 
