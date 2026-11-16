@@ -249,6 +249,23 @@ export class LibP2PVoice implements VoiceTransport {
    * the durable copy lives in audio-prefs keyed by DID.
    */
   private peerVolumes = new Map<string, number>();
+  /**
+   * Who must not get this device's voice. Asked per peer at every point the
+   * outgoing track is attached, and again on refreshWithheld(): the answer
+   * can change as identities bind or the choice is made mid-call.
+   */
+  private withholdFrom: (peerId: string) => boolean = () => false;
+  /**
+   * What a withheld peer is sent instead: a disabled clone of the outgoing
+   * track. The browser encodes only silence from a disabled track, so none of
+   * the microphone reaches them - but packets keep flowing, as when muted.
+   * Sending nothing at all read as a dead link on their side: their stall
+   * watchdog flagged "no audio arriving" and rebuilt the connection, cutting
+   * their audio to us too. One clone serves every withheld peer; it follows
+   * the outgoing track when that is rebuilt.
+   */
+  private silentTrack: MediaStreamTrack | null = null;
+  private silentSource: MediaStreamTrack | null = null;
   private active = new Set<string>();
   /**
    * Who the app says shares our call. Voice links used to be created only on
@@ -953,6 +970,9 @@ export class LibP2PVoice implements VoiceTransport {
     this.micGen++;
     this.setModelLoading(false);
     this.micStream?.getTracks().forEach((t) => t.stop());
+    this.silentTrack?.stop();
+    this.silentTrack = null;
+    this.silentSource = null;
     this.dtln?.releaseTransport();
     this.dtln?.onFatal(null);
     this.dfn?.releaseTransport();
@@ -981,6 +1001,48 @@ export class LibP2PVoice implements VoiceTransport {
       this.reconcileTimer = null;
     }
     this.node = null;
+  }
+
+  /**
+   * Decide, per peer, who gets this device's voice. A withheld peer gets
+   * silence (see silentTrack), never the microphone, whatever their client.
+   */
+  setWithholdPolicy(policy: (peerId: string) => boolean): void {
+    this.withholdFrom = policy;
+    void this.refreshWithheld();
+  }
+
+  /** The silent stand-in for this outgoing track, made once per track. */
+  private silenceOf(track: MediaStreamTrack): MediaStreamTrack {
+    if (!this.silentTrack || this.silentSource !== track) {
+      this.silentTrack?.stop();
+      this.silentTrack = track.clone();
+      this.silentTrack.enabled = false;
+      this.silentSource = track;
+    }
+    return this.silentTrack;
+  }
+
+  /** What this peer's sender should carry: the voice, or silence. */
+  private outgoingFor(peerId: string, track: MediaStreamTrack): MediaStreamTrack {
+    return this.withholdFrom(peerId) ? this.silenceOf(track) : track;
+  }
+
+  /** Re-ask the policy for every connected peer and swap what it is sent. */
+  async refreshWithheld(): Promise<void> {
+    const track = this.processedStream?.getAudioTracks()[0];
+    if (!track) return;
+    await Promise.all([...this.remotePeers.values()].map(async (remote) => {
+      const sender = remote.pc.getSenders().find((s) => s.track?.kind === "audio");
+      if (!sender) return;
+      const want = this.outgoingFor(remote.peerId, track);
+      if (sender.track === want) return;
+      try {
+        await sender.replaceTrack(want);
+      } catch (err) {
+        console.warn(`[voice] withhold switch failed for ${remote.peerId}:`, err);
+      }
+    }));
   }
 
   mute(): void {
@@ -1404,10 +1466,11 @@ export class LibP2PVoice implements VoiceTransport {
           const sender = remote.pc
             .getSenders()
             .find((s) => s.track?.kind === "audio");
+          const want = this.outgoingFor(remote.peerId, newTrack);
           if (sender) {
-            await sender.replaceTrack(newTrack);
+            await sender.replaceTrack(want);
           } else {
-            remote.pc.addTrack(newTrack, this.processedStream);
+            remote.pc.addTrack(want, this.processedStream);
           }
         } catch (err) {
           // A peer torn down mid-switch (reconcile tick, redial) rejects
@@ -1546,7 +1609,7 @@ export class LibP2PVoice implements VoiceTransport {
 
     if (this.processedStream) {
       for (const track of this.processedStream.getAudioTracks()) {
-        pc.addTrack(track, this.processedStream);
+        pc.addTrack(this.outgoingFor(peerId, track), this.processedStream);
       }
     }
 

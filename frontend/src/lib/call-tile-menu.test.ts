@@ -450,4 +450,16 @@ describe("a call nobody keeps", () => {
     expect(rows.some((r) => r.type === "volume")).toBe(true);
     expect(labels.some((l) => /spotlight|focus/i.test(l))).toBe(true);
   });
+
+  it("offers to stop sending your voice to a named person, and to send it again", () => {
+    const labels = (state: Partial<Parameters<typeof tileMenuState>[0]>) =>
+      buildTileMenu(tileMenuState({ kind: "camera", label: "Ada", ...state }))
+        .flatMap((row) => (row.type === "item" ? [row.label] : []));
+    expect(labels({ canWithholdVoice: true })).toContain("Don't send my voice");
+    expect(labels({ canWithholdVoice: true, voiceWithheld: true })).toContain("Send my voice again");
+    // An unnamed person cannot be remembered, so nothing is offered.
+    expect(labels({})).not.toContain("Don't send my voice");
+    // Your own tile: there is nobody to withhold from.
+    expect(labels({ isLocal: true, canWithholdVoice: true })).not.toContain("Don't send my voice");
+  });
 });

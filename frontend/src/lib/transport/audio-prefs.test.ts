@@ -14,6 +14,7 @@ import {
   loadPeerVolume,
   savePeerVolume,
   saveAudioPrefs,
+  saveVoiceWithheld,
 } from "./audio-prefs";
 
 describe("per-peer volume persistence", () => {
@@ -53,6 +54,34 @@ describe("per-peer volume persistence", () => {
     expect(loaded["did:key:zBad"]).toBeUndefined();
     expect(loaded["12D3KooWNotADid"]).toBeUndefined();
     expect(Object.keys(loaded).length).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("people who get no voice", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("remembers and forgets a person by did", () => {
+    saveVoiceWithheld("did:key:zAlice", true);
+    saveVoiceWithheld("did:key:zAlice", true);
+    expect(loadAudioPrefs().voiceWithheld).toEqual(["did:key:zAlice"]);
+    saveVoiceWithheld("did:key:zAlice", false);
+    expect(loadAudioPrefs().voiceWithheld).toEqual([]);
+  });
+
+  it("keeps the newest choice when the list is full", () => {
+    for (let i = 0; i < 200; i++) saveVoiceWithheld(`did:key:z${i}`, true);
+    expect(saveVoiceWithheld("did:key:zNewest", true)).toContain("did:key:zNewest");
+    const stored = loadAudioPrefs().voiceWithheld;
+    expect(stored).toContain("did:key:zNewest");
+    expect(stored).not.toContain("did:key:z0");
+    expect(stored).toHaveLength(200);
+  });
+
+  it("refuses peer ids and drops stored junk", () => {
+    saveVoiceWithheld("12D3KooWSomePeer", true);
+    expect(loadAudioPrefs().voiceWithheld).toEqual([]);
+    localStorage.setItem("awful_audio_prefs", JSON.stringify({ voiceWithheld: ["did:key:zOk", 7, "nope", "did:key:zOk"] }));
+    expect(loadAudioPrefs().voiceWithheld).toEqual(["did:key:zOk"]);
   });
 });
 

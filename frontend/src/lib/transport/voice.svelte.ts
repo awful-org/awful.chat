@@ -4,10 +4,12 @@ import {
   loadPeerVolume,
   saveAudioPrefs,
   savePeerVolume,
+  saveVoiceWithheld,
   type NoiseEngine,
 } from "./audio-prefs";
 import { peerIdToDid } from "./transport.svelte";
 import { looksLikeDid } from "$lib/identity/identity-utils";
+import { shouldWithholdVoice } from "./voice-withhold";
 import type { LibP2PVoice } from "./libp2p/voice";
 import type { DtlnProcessor } from "../audio/dtln-processor";
 import {
@@ -28,6 +30,77 @@ export const voiceProcessing = $state({
   loading: false,
 });
 
+/**
+ * Who this device sends no voice to, by did:key. Reactive for the menus; the
+ * voice layer asks withholdVoiceFrom() per peer at every point it attaches
+ * the microphone, so a change here reaches a call already running.
+ */
+export const voiceWithheld = $state({ dids: loadAudioPrefs().voiceWithheld });
+
+/** Other reasons to withhold (a soft block), as did:key sets. */
+const withholdSources = new Set<() => ReadonlySet<string>>();
+
+/** Every did:key this device must not send voice to, whatever the reason. */
+function withheldDids(): Set<string> {
+  const all = new Set(voiceWithheld.dids);
+  for (const source of withholdSources) for (const did of source()) all.add(did);
+  return all;
+}
+
+/**
+ * Whether this peer must not get our voice (see shouldWithholdVoice for why
+ * an unknown peer gets none while anyone is withheld). The binding of their
+ * identity refreshes every link, so it flows the moment they are named.
+ */
+export function withholdVoiceFrom(peerId: string): boolean {
+  const did = peerIdToDid(peerId);
+  return shouldWithholdVoice(withheldDids(), looksLikeDid(did) ? did : null);
+}
+
+/** Add a reason to withhold (block lists); returns its removal. */
+export function addVoiceWithholdSource(source: () => ReadonlySet<string>): () => void {
+  withholdSources.add(source);
+  void _voice?.refreshWithheld();
+  return () => {
+    withholdSources.delete(source);
+    void _voice?.refreshWithheld();
+  };
+}
+
+/** Re-ask every live link after a list behind withholdVoiceFrom changed. */
+export function refreshVoiceWithheld(): void {
+  void _voice?.refreshWithheld();
+}
+
+/** Send this person no voice, or send it again. Needs their identity. */
+export function setVoiceWithheld(peerId: string, withheld: boolean): boolean {
+  const did = peerIdToDid(peerId);
+  if (!looksLikeDid(did)) return false;
+  // From the returned list, not a reload: blocked storage must not undo
+  // the choice for the call in progress. The effect in initVoice re-asks
+  // every live link when this changes.
+  voiceWithheld.dids = saveVoiceWithheld(did, withheld);
+  return true;
+}
+
+/**
+ * Why this peer gets no voice, for the tile marker: "chosen" (withheld by
+ * name), "unknown" (not named yet while anyone is withheld), or null.
+ */
+export function voiceWithheldReason(peerId: string): "chosen" | "unknown" | null {
+  void transportState.peerDidVersion;
+  void voiceWithheld.dids;
+  if (!withholdVoiceFrom(peerId)) return null;
+  return looksLikeDid(peerIdToDid(peerId)) ? "chosen" : "unknown";
+}
+
+/** This person was chosen to get no voice (not merely unknown yet). */
+export function isVoiceWithheld(peerId: string): boolean {
+  void voiceWithheld.dids;
+  const did = peerIdToDid(peerId);
+  return looksLikeDid(did) && withheldDids().has(did);
+}
+
 let _voice: LibP2PVoice | null = null;
 let _dtln: DtlnProcessor | null = null;
 let _initialized = false;
@@ -42,6 +115,17 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
   _initialized = true;
   _voice = voice;
   _dtln = dtln;
+  _voice.setWithholdPolicy(withholdVoiceFrom);
+  // A peer's identity binding can flip the answer for an unknown peer, so
+  // every binding - and every change of the list - re-asks the policy for
+  // every live link.
+  $effect.root(() => {
+    $effect(() => {
+      void transportState.peerDidVersion;
+      void voiceWithheld.dids;
+      void _voice?.refreshWithheld();
+    });
+  });
   _voice.on("processingChanged", (engine, reason, unsupported) => {
     voiceProcessing.engine = engine;
     voiceProcessing.fallbackReason = reason ?? null;
