@@ -20,7 +20,10 @@
     addToPhonebook,
     isInPhonebook,
     removeFromPhonebook,
+    blockPerson,
+    unblockPerson,
   } from "$lib/transport/dm.svelte";
+  import { isBlockedDid } from "$lib/blocks.svelte";
   import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
   import GifImage from "./GifImage.svelte";
@@ -31,6 +34,7 @@
     UserRoundMinus,
     Users,
     Workflow,
+    Ban,
   } from "@lucide/svelte";
   import { refreshPhonebook } from "$lib/rooms.svelte";
   import { Badge } from "$lib/components/ui/badge";
@@ -399,6 +403,18 @@
     closeUserMenu();
   }
 
+  /** Soft block from the member menu: local, and undone the same way. */
+  async function handleToggleBlock(user: User): Promise<void> {
+    const did = peerIdToDid(user.did);
+    closeUserMenu();
+    try {
+      if (isBlockedDid(did)) await unblockPerson(did);
+      else await blockPerson(did, user.name ?? "");
+    } catch (err) {
+      console.warn("[block] could not change the block:", err);
+    }
+  }
+
   async function handleOpenDm(peerId: string): Promise<void> {
     if (onOpenDm) {
       onOpenDm(peerId);
@@ -655,6 +671,28 @@
         <UserRoundMinus class="size-4" />
         Remove from phonebook
       </button>
+    {/if}
+    {#if userMenu.user.did.startsWith("did:")}
+      {@const blocked = isBlockedDid(userMenu.user.did)}
+      {@const user = userMenu.user}
+      <Tip
+        side="right"
+        text={blocked
+        ? "Let their DMs, messages and voice through again"
+        : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
+      >
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer {blocked ? '' : 'text-destructive'}"
+            onclick={() => handleToggleBlock(user)}
+          >
+            <Ban class="size-4" />
+            {blocked ? "Unblock" : "Block"}
+          </button>
+        {/snippet}
+      </Tip>
     {/if}
   </div>
 {/if}

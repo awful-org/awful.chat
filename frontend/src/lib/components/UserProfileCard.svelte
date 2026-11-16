@@ -6,6 +6,7 @@
   import { identityStore } from "$lib/identity/identity.svelte";
   import { nameEffectStyle } from "$lib/name-effect";
   import { Ban, Copy, Check, MessageSquare, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
+  import { Tip } from "$lib/components/ui/tooltip";
   import { isBlockedDid } from "$lib/blocks.svelte";
   import { blockPerson, unblockPerson } from "$lib/transport/dm.svelte";
   import {
@@ -119,6 +120,9 @@
     return () => media.removeEventListener("change", update);
   });
 
+  // Block is on the card and in the right-click menus alike; the card is
+  // also the way on a phone, which has no right-click (iOS fires no
+  // contextmenu on a long press).
   const blocked = $derived(isBlockedDid(did));
   let blockBusy = $state(false);
   async function toggleBlock() {
@@ -126,6 +130,8 @@
     try {
       if (blocked) await unblockPerson(did);
       else await blockPerson(did, name);
+    } catch (err) {
+      console.warn("[block] could not change the block:", err);
     } finally {
       blockBusy = false;
     }
@@ -275,22 +281,29 @@
       {/if}
 
       {#if !isSelf && did.startsWith("did:")}
-        <!-- Soft block: local, and undone the same way (blocks.svelte.ts). -->
         <div class="flex items-center px-1">
-          <button
-            type="button"
-            disabled={blockBusy}
-            onclick={toggleBlock}
-            title={blocked
+          <!-- No hover on a phone: the tip would never show there. -->
+          <Tip
+            disabled={isMobile}
+            text={blocked
               ? "Let their DMs, messages and voice through again"
               : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
-            class="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 font-mono text-xs transition-colors disabled:opacity-60 {blocked
-              ? 'border-border text-foreground hover:bg-muted'
-              : 'border-destructive/40 text-destructive hover:bg-destructive/10'}"
           >
-            <Ban class="size-3.5" />
-            {blocked ? "Unblock" : "Block"}
-          </button>
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                disabled={blockBusy}
+                onclick={toggleBlock}
+                class="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 font-mono text-xs transition-colors disabled:opacity-60 {blocked
+                  ? 'border-border text-foreground hover:bg-muted'
+                  : 'border-destructive/40 text-destructive hover:bg-destructive/10'}"
+              >
+                <Ban class="size-3.5" />
+                {blocked ? "Unblock" : "Block"}
+              </button>
+            {/snippet}
+          </Tip>
         </div>
       {/if}
 

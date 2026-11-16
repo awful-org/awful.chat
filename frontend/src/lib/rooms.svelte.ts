@@ -37,6 +37,12 @@ function selfSenderId(): string | undefined {
 interface RoomsStore {
   rooms: Room[];
   dmRooms: DMRoom[];
+  /**
+   * Conversations with someone soft-blocked: kept out of dmRooms (no joins,
+   * no unread, no search), but still listed, greyed, so the block can be
+   * found and lifted where the conversation was.
+   */
+  blockedDmRooms: DMRoom[];
   phonebook: PhonebookEntry[];
   loading: boolean;
   unreadCounts: Map<string, number>;
@@ -47,6 +53,7 @@ interface RoomsStore {
 export const roomsStore = $state<RoomsStore>({
   rooms: [],
   dmRooms: [],
+  blockedDmRooms: [],
   phonebook: [],
   loading: false,
   unreadCounts: new Map(),
@@ -88,7 +95,7 @@ export async function loadRooms(): Promise<void> {
     }
     roomsStore.rooms = Array.from(merged.values());
     await migrateLegacyRoomOrder();
-    roomsStore.dmRooms = await listedDmRooms();
+    await loadDmLists();
     roomsStore.phonebook = await getPhonebookEntries();
     await _refreshAllUnread();
     await _refreshAllActivity();
@@ -103,10 +110,13 @@ export async function loadRooms(): Promise<void> {
  * connect(), and filtering against a list not read yet showed a blocked
  * person's conversation until something refreshed it.
  */
-async function listedDmRooms(): Promise<DMRoom[]> {
+async function loadDmLists(): Promise<void> {
   await loadBlocks().catch(() => {});
   const rooms = await getDMRooms();
-  return rooms.filter((r) => !isBlockedDid(r.participantDid));
+  // Both lists from the one read, set together, so a conversation is never
+  // in both or in neither between two refreshes.
+  roomsStore.dmRooms = rooms.filter((r) => !isBlockedDid(r.participantDid));
+  roomsStore.blockedDmRooms = rooms.filter((r) => isBlockedDid(r.participantDid));
 }
 
 export async function refreshPhonebook(): Promise<void> {
@@ -114,7 +124,7 @@ export async function refreshPhonebook(): Promise<void> {
 }
 
 export async function refreshDmRooms(): Promise<void> {
-  roomsStore.dmRooms = await listedDmRooms();
+  await loadDmLists();
 }
 
 /**
