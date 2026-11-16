@@ -95,7 +95,7 @@ export async function loadRooms(): Promise<void> {
     }
     roomsStore.rooms = Array.from(merged.values());
     await migrateLegacyRoomOrder();
-    roomsStore.dmRooms = await listedDmRooms();
+    await loadDmLists();
     roomsStore.phonebook = await getPhonebookEntries();
     await _refreshAllUnread();
     await _refreshAllActivity();
@@ -110,11 +110,13 @@ export async function loadRooms(): Promise<void> {
  * connect(), and filtering against a list not read yet showed a blocked
  * person's conversation until something refreshed it.
  */
-async function listedDmRooms(): Promise<DMRoom[]> {
+async function loadDmLists(): Promise<void> {
   await loadBlocks().catch(() => {});
   const rooms = await getDMRooms();
+  // Both lists from the one read, set together, so a conversation is never
+  // in both or in neither between two refreshes.
+  roomsStore.dmRooms = rooms.filter((r) => !isBlockedDid(r.participantDid));
   roomsStore.blockedDmRooms = rooms.filter((r) => isBlockedDid(r.participantDid));
-  return rooms.filter((r) => !isBlockedDid(r.participantDid));
 }
 
 export async function refreshPhonebook(): Promise<void> {
@@ -122,7 +124,7 @@ export async function refreshPhonebook(): Promise<void> {
 }
 
 export async function refreshDmRooms(): Promise<void> {
-  roomsStore.dmRooms = await listedDmRooms();
+  await loadDmLists();
 }
 
 /**

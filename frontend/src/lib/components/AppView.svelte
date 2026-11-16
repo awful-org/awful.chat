@@ -13,7 +13,7 @@
   import { legacyMoveInviteText, linkLegacyMove } from "$lib/room-security/legacy-move";
   import MoveLegacyRoomDialog from "./MoveLegacyRoomDialog.svelte";
   import { blockPerson, sendDirectMessage, unblockPerson } from "$lib/transport/dm.svelte";
-  import { blocks } from "$lib/blocks.svelte";
+  import { blocks, isBlockedDid } from "$lib/blocks.svelte";
   import { parseJoinInput } from "$lib/invite";
   import { cancelAllShortCodes } from "$lib/short-codes.svelte";
   import { isChosenName } from "$lib/room-name";
@@ -1246,7 +1246,7 @@
     // Conversations with someone blocked are kept out of the inbox (no
     // reads, no unread), but listed, greyed, so the block can be lifted
     // where the conversation was. Keyed by DID, which every DM path takes.
-    const shown = new Set(listed.map((e) => peerIdToDid(e.peerId) ?? e.peerId));
+    const shown = new Set(listed.map((e) => peerIdToDid(e.peerId)));
     for (const room of roomsStore.blockedDmRooms) {
       const did = room.participantDid;
       if (!did || shown.has(did)) continue;
@@ -1270,16 +1270,27 @@
 
   /** Block or unblock from a conversation's menu in the DM list. */
   async function handleSetBlocked(peerId: string, block: boolean) {
-    const did = peerIdToDid(peerId) ?? peerId;
-    if (!block) {
-      await unblockPerson(did);
-      return;
+    try {
+      if (!block) {
+        await unblockPerson(peerIdToDid(peerId));
+        return;
+      }
+      const name = dmEntries.find((e) => e.peerId === peerId)?.nickname ?? "";
+      await blockPerson(peerId, name);
+    } catch (err) {
+      console.warn("[block] could not change the block:", err);
     }
-    const name = dmEntries.find((e) => e.peerId === peerId)?.nickname ?? "";
-    // The conversation is set aside: off the screen first, as removing it is.
-    if (activeDmPeerId === peerId && isDmActive) await handleCloseDmView();
-    await blockPerson(peerId, name);
   }
+
+  // A blocked person's conversation is set aside, so it does not stay on
+  // screen - whichever menu the block came from (DM list, a name in chat,
+  // the member list) or a sync that brought it.
+  $effect(() => {
+    if (!isDmActive || !activeDmPeerId) return;
+    if (isBlockedDid(peerIdToDid(activeDmPeerId))) {
+      untrack(() => void handleCloseDmView());
+    }
+  });
 
   async function toggleFavorite(peerId: string) {
     const existing = roomsStore.phonebook.find((p) => p.peerId === peerId);

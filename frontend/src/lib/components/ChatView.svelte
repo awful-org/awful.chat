@@ -2375,8 +2375,12 @@
   async function toggleBlockFromMenu(senderId: string): Promise<void> {
     const did = senderDid(senderId);
     closeUserMenu();
-    if (isBlockedDid(did)) await unblockPerson(did);
-    else await blockPerson(did, transportState.peerNames.get(did) ?? "");
+    try {
+      if (isBlockedDid(did)) await unblockPerson(did);
+      else await blockPerson(did, transportState.peerNames.get(did) ?? "");
+    } catch (err) {
+      console.warn("[block] could not change the block:", err);
+    }
   }
 
   // Deleting destroys stored history, so the header button arms first.

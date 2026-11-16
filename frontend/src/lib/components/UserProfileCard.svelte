@@ -5,7 +5,9 @@
   import { getScopedProfile } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { nameEffectStyle } from "$lib/name-effect";
-  import { Copy, Check, MessageSquare, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
+  import { Ban, Copy, Check, MessageSquare, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
+  import { isBlockedDid } from "$lib/blocks.svelte";
+  import { blockPerson, unblockPerson } from "$lib/transport/dm.svelte";
   import {
     Dialog,
     DialogContent,
@@ -116,6 +118,23 @@
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   });
+
+  // Block lives in the right-click menus; a phone has no right-click (iOS
+  // fires no contextmenu on a long press), so there the card - a bottom
+  // sheet - carries it too.
+  const blocked = $derived(isBlockedDid(did));
+  let blockBusy = $state(false);
+  async function toggleBlock() {
+    blockBusy = true;
+    try {
+      if (blocked) await unblockPerson(did);
+      else await blockPerson(did, name);
+    } catch (err) {
+      console.warn("[block] could not change the block:", err);
+    } finally {
+      blockBusy = false;
+    }
+  }
 
   let copied = $state(false);
   async function copyDid() {
@@ -257,6 +276,22 @@
               {/if}
             </button>
           {/if}
+        </div>
+      {/if}
+
+      {#if isMobile && !isSelf && did.startsWith("did:")}
+        <div class="flex items-center px-1">
+          <button
+            type="button"
+            disabled={blockBusy}
+            onclick={toggleBlock}
+            class="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 font-mono text-xs transition-colors disabled:opacity-60 {blocked
+              ? 'border-border text-foreground hover:bg-muted'
+              : 'border-destructive/40 text-destructive hover:bg-destructive/10'}"
+          >
+            <Ban class="size-3.5" />
+            {blocked ? "Unblock" : "Block"}
+          </button>
         </div>
       {/if}
 

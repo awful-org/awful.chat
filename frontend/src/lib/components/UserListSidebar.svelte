@@ -405,10 +405,14 @@
 
   /** Soft block from the member menu: local, and undone the same way. */
   async function handleToggleBlock(user: User): Promise<void> {
-    const did = peerIdToDid(user.did) || user.did;
+    const did = peerIdToDid(user.did);
     closeUserMenu();
-    if (isBlockedDid(did)) await unblockPerson(did);
-    else await blockPerson(did, user.name ?? "");
+    try {
+      if (isBlockedDid(did)) await unblockPerson(did);
+      else await blockPerson(did, user.name ?? "");
+    } catch (err) {
+      console.warn("[block] could not change the block:", err);
+    }
   }
 
   async function handleOpenDm(peerId: string): Promise<void> {

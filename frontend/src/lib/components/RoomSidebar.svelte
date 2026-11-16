@@ -333,7 +333,8 @@
     if (typeof window === "undefined") return { x, y };
     return {
       x: Math.max(8, Math.min(x, window.innerWidth - 168)),
-      y: Math.max(8, Math.min(y, window.innerHeight - 96)),
+      // Room for three items: the DM menu's Block/Unblock is the third.
+      y: Math.max(8, Math.min(y, window.innerHeight - 112)),
     };
   }
 
@@ -374,17 +375,35 @@
 
   /** A blocked conversation does not open: its row offers its menu instead. */
   function selectDmEntry(e: MouseEvent, entry: PhonebookEntry): void {
-    if (entry.blocked) openDmContextMenu(e, entry.peerId, !!entry.inPhonebook);
-    else onSelectDm(entry.peerId);
+    if (!entry.blocked) {
+      onSelectDm(entry.peerId);
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    // A keyboard activation has no pointer position: open by the row.
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const x = e.detail === 0 ? rect.left : e.clientX;
+    const y = e.detail === 0 ? rect.bottom : e.clientY;
+    dmContextMenu = {
+      peerId: entry.peerId,
+      inPhonebook: !!entry.inPhonebook,
+      ...clampMenu(x, y),
+    };
   }
 
   function dmActionsFor(peerId: string): DmContextAction[] {
     if (dmContextActions?.length) return dmContextActions;
     const blocked = !!phonebook.find((e) => e.peerId === peerId)?.blocked;
+    const inPhonebook = isInPhonebook(peerId);
     return [
-      isInPhonebook(peerId)
-        ? { type: "removePhonebook", peerId }
-        : { type: "add", peerId },
+      // Adding a blocked person is refused (no conversation is joined with
+      // them), so it is not offered until the block is lifted.
+      ...(inPhonebook
+        ? [{ type: "removePhonebook", peerId } as const]
+        : blocked
+          ? []
+          : [{ type: "add", peerId } as const]),
       blocked ? { type: "unblock", peerId } : { type: "block", peerId },
       { type: "removeConversation", peerId },
     ];
