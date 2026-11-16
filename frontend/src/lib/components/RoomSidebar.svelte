@@ -884,7 +884,6 @@
           <button
             type="button"
             onclick={(e) => selectDmEntry(e, entry)}
-            title={entry.blocked ? "Blocked - click for options" : undefined}
             class="flex w-full items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors cursor-pointer hover:bg-accent/50
         {activeDmPeerId === entry.peerId
               ? 'bg-accent text-accent-foreground'

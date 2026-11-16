@@ -675,17 +675,24 @@
     {#if userMenu.user.did.startsWith("did:")}
       {@const blocked = isBlockedDid(userMenu.user.did)}
       {@const user = userMenu.user}
-      <button
-        type="button"
-        title={blocked
-          ? "Let their DMs, messages and voice through again"
-          : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer {blocked ? '' : 'text-destructive'}"
-        onclick={() => handleToggleBlock(user)}
+      <Tip
+        side="right"
+        text={blocked
+        ? "Let their DMs, messages and voice through again"
+        : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
       >
-        <Ban class="size-4" />
-        {blocked ? "Unblock" : "Block"}
-      </button>
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer {blocked ? '' : 'text-destructive'}"
+            onclick={() => handleToggleBlock(user)}
+          >
+            <Ban class="size-4" />
+            {blocked ? "Unblock" : "Block"}
+          </button>
+        {/snippet}
+      </Tip>
     {/if}
   </div>
 {/if}
