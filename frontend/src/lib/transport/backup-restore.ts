@@ -377,7 +377,10 @@ export async function importDatabase(
   // A replace may install a different identity, so it clears them all.
   markAtRestSweepNeeded(localDid);
   try {
-    await importDatabaseInner(sanitizedData, mode, options.onProgress);
+    // A device sync whose source proved it is this account (checked above)
+    // hands over our own history, as a replace would take it whole.
+    const ownDevice = mode === "add" && options.sourceDid !== undefined && options.sourceDid === localDid;
+    await importDatabaseInner(sanitizedData, mode, options.onProgress, ownDevice);
   } finally {
     endPlaintextImport?.();
   }
@@ -405,11 +408,17 @@ const IMPORT_CHUNK = 200;
  *   anybody's name - was refused on the way in everywhere else, and used to
  *   be kept here because it simply carried no signature to fail.
  */
-async function mergeableMessages(messages: Message[]): Promise<Message[]> {
+async function mergeableMessages(messages: Message[], ownDevice = false): Promise<Message[]> {
   const { verifyMessage } = await import("../messaging");
   const keep = await Promise.all(messages.map(async (m) => {
     if (!messageIdAllowedFor(m.id, m.senderId)) return false;
     if (!m.sig) {
+      // From our own other device - its source proved this account - the
+      // rows are history that device already accepted (room messages from
+      // before signing, mirrored DM files), and a replace would take them
+      // whole. From a file or another account, only the one legitimately
+      // unsigned kind.
+      if (ownDevice) return true;
       return m.roomCode.startsWith("dm-") &&
         allowsUnsignedDmHistory(m as unknown as WireChatMessage, "*", false);
     }
@@ -421,7 +430,8 @@ async function mergeableMessages(messages: Message[]): Promise<Message[]> {
 async function importDatabaseInner(
   data: DatabaseExport,
   mode: "add" | "replace",
-  onProgress?: (done: number, total: number) => void
+  onProgress?: (done: number, total: number) => void,
+  ownDevice = false
 ): Promise<void> {
   // Markers lead the import, so an override from a generation that was left
   // is never written back (applyRoomDeletionMarkers: profiles only).
@@ -467,7 +477,7 @@ async function importDatabaseInner(
       // row that carries a signature which does not verify is a forgery -
       // every version a real row was ever signed with still verifies - while
       // an unsigned one is kept only where it is legitimately unsigned.
-      await bulkAddNewMessages(await mergeableMessages(chunk));
+      await bulkAddNewMessages(await mergeableMessages(chunk, ownDevice));
     } else {
       await bulkPutMessages(chunk);
     }

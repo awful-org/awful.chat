@@ -152,6 +152,8 @@ enum SyncMessageType {
   AwaitingPassword = "sync_awaiting_password",
 }
 
+const SYNC_MESSAGE_TYPES: ReadonlySet<string> = new Set(Object.values(SyncMessageType));
+
 interface SyncMessage {
   type: SyncMessageType;
   /** SYNC_PROTOCOL_VERSION of the sender; absent from version 1 builds. */
@@ -479,11 +481,8 @@ function decode(data: Uint8Array): unknown {
   return JSON.parse(new TextDecoder().decode(data));
 }
 
-function generateToken(): string {
-  const array = new Uint8Array(16);
-  crypto.getRandomValues(array);
-  return Array.from(array, (b) => b.toString(16).padStart(2, "0")).join("");
-}
+/** 128 random bits, hex: the same draw as a request nonce. */
+const generateToken = newSyncNonce;
 
 /**
  * Generate a short readable code from the room code, token and source peerId.
@@ -722,14 +721,6 @@ async function startSyncServer(): Promise<void> {
       syncState.isSyncing = false;
       syncState.syncError = "Lost the connection to the other device while sending - try again.";
       cleanup().catch(() => {});
-      return;
-    }
-    if (_ackSuspended) {
-      // The other device is waiting on its user's password with all the
-      // data in hand, so nothing crosses the link - and an idle link can
-      // drop and be redialled meanwhile (seen in testing ~50 s in). Nothing
-      // is lost; its next frame comes over the new connection. Calling it
-      // "Sync failed" told the user to retry a sync about to succeed.
       return;
     }
     // Everything is across and the import over there carries on without
@@ -1543,7 +1534,12 @@ export async function connectAsTarget(
 
     const handle = async (peerId: string, data: Uint8Array): Promise<void> => {
       if (!current()) return;
-      const msg = decode(data) as SyncMessage;
+      const msg = decode(data) as SyncMessage | null;
+      // Not every frame on this link is the protocol's: the transport's own
+      // keepalive (`__ping`) rides the same secure room, carries no version,
+      // and would otherwise read as a version 1 source below - failing a sync
+      // whose user was still reading the comparison code.
+      if (!msg || typeof msg !== "object" || !SYNC_MESSAGE_TYPES.has(msg.type)) return;
       console.log("[Sync][Target] Message type:", msg.type);
       if (msg.type === SyncMessageType.SyncError) {
         if (transferDone) return;

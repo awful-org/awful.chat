@@ -1003,20 +1003,20 @@ describe("the export is paced on acks and closed with a manifest", () => {
     expect(syncState.syncError).toBeNull();
   });
 
-  it("waits through a dropped link while the other device's user types the password", async () => {
+  it("keeps waiting on the password through the link's keepalive", async () => {
     const { t, pairing, ask } = await sourceWithHistory();
     ask("target", "replace");
     await approveWhenAsked(t);
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: 2 }), pairing.roomCode);
     await vi.waitFor(() => expect(syncState.phase).toBe("remote-password"));
-    // The link's keepalive is not the import resuming.
+    // A ping is the link, not the import resuming: it must not restart the
+    // clock that a person typing a password is exempt from.
     t.emit("message", "target", new TextEncoder().encode(JSON.stringify({ type: "__ping", n: 1 })), pairing.roomCode);
-    t.emit("disconnect", "target");
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(syncState.syncError).toBeNull();
     expect(syncState.phase).toBe("remote-password");
-    t.emit("message", "target", encodeFrame({ type: "sync_export_complete", v: 2 }), pairing.roomCode);
-    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
   });
 
   // The receiver's password prompt sends nothing for as long as a person
@@ -1090,6 +1090,18 @@ describe("the target confirms, checks and reports", () => {
     await vi.waitFor(() => expect(syncState.syncError).toBe(SYNC_VERSION_MISMATCH));
     expect(t.sent.at(-1)).toMatchObject({ type: "sync_error", payload: { error: SYNC_VERSION_MISMATCH } });
     expect(importCalls).toHaveLength(0);
+  });
+
+  // The transport's keepalive rides the secure room too, with no version.
+  it("ignores the link's keepalive while waiting for the source's user", async () => {
+    const t = await target();
+    fromSource(t, { type: "sync_approval_pending", v: 2, payload: { nonce: "d".repeat(32) } });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    fromSource(t, { type: "__ping", n: 1 });
+    fromSource(t, null);
+    fromSource(t, identityFrame());
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(false));
+    expect(syncState.syncError).toBeNull();
   });
 
   it("refuses a merge from a different account before anything is written", async () => {

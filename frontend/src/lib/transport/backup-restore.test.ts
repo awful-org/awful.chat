@@ -754,6 +754,22 @@ describe("a merge is for this account's data only", () => {
     expect((await getMessage(mine.id))?.content).toBe("signed by me");
   });
 
+  it("takes our own other device's unsigned history whole, once it proved the account", async () => {
+    const { keypair } = await createIdentity("my own password");
+    const row = (id: string, extra: Record<string, unknown> = {}) => ({
+      id, roomCode: "plainroom0000001", senderId: "did:key:zBob", senderName: "Bob",
+      timestamp: 1, lamport: 1, type: "text", content: "x", attachments: [], ...extra,
+    });
+    const impostor = signMessage(row("m-impostor2", { content: "my key, Bob's name" }) as never);
+    await importDatabase(exportOf({ messages: [
+      row("m-room-before-signing", { content: "from before signing" }),
+      impostor,
+    ] as never }), "add", { sourceDid: keypair.did });
+    expect((await getMessage("m-room-before-signing"))?.content).toBe("from before signing");
+    // A signature still has to be right.
+    expect(await getMessage("m-impostor2")).toBeUndefined();
+  });
+
   it("keeps only the installed account's own profile on a replace", async () => {
     const backup = await backupFromAnIdentity();
     const did = backup.identity!.keypair.did;
