@@ -3,6 +3,7 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { blocks, isBlockedDid } from "$lib/blocks.svelte";
   import { foldBlocked } from "$lib/blocked-folds";
+  import { foldCallCards } from "$lib/call-card";
   import type { Message } from "$lib/transport/transport.svelte";
   import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
   import { roomMemberCount } from "$lib/room-members";
@@ -528,14 +529,22 @@
     MessageType.Reply,
     MessageType.File,
     MessageType.PluginCard,
+    MessageType.CallEvent,
   ]);
+  /** DM call cards, each end folded into its start (call-card.ts). */
+  const callCards = $derived(
+    foldCallCards(messages.filter((m) => m.roomCode === roomCode), MessageType.CallEvent)
+  );
   // The roomCode check is the backstop for switch races: writes that land in
   // the shared array mid-switch (a sync batch for the room being left, a live
   // append during the open's awaits) must never RENDER in the wrong
   // conversation, whatever the transport layer let through.
   const visibleMessages = $derived(
     messages.filter(
-      (m) => RENDERABLE_TYPES.has(m.type) && m.roomCode === roomCode
+      (m) =>
+        RENDERABLE_TYPES.has(m.type) &&
+        m.roomCode === roomCode &&
+        !callCards.foldedEnds.has(m.id)
     )
   );
 
@@ -3432,6 +3441,8 @@
                     {fileTransfers}
                     onRequestFileDownload={requestFileDownload}
                     showReceipt={receiptIds.has(msg.id)}
+                    callEnd={callCards.endOf.get(msg.id) ?? null}
+                    callOpen={callCards.open?.row.id === msg.id}
                   />
 
                   {#if reactions?.size}

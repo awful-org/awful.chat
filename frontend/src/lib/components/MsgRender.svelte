@@ -70,6 +70,7 @@
   import type { FileTransferSnapshot } from "$lib/transport/types";
   import AudioPlayer from "./AudioPlayer.svelte";
   import GifImage from "./GifImage.svelte";
+  import CallCard from "./CallCard.svelte";
   import { mediaPrefs, canLoadMedia } from "$lib/media-prefs.svelte";
   // The queued tooltip must not promise the relay is holding a copy when the
   // sender opted out of the mailbox, in which case no deposit happened.
@@ -142,6 +143,10 @@
     onRequestFileDownload: (file: FileEntry, senderId?: string | null) => void;
     /** Only the last own DM of a run with one status shows a receipt. */
     showReceipt?: boolean;
+    /** A DM call card's end, folded into its start by the view (call-card.ts). */
+    callEnd?: import("$lib/call-card").CallCardPayload | null;
+    /** This call card is its DM's newest call with no end yet (call-card.ts). */
+    callOpen?: boolean;
   }
 
   type OgPreview = {
@@ -159,7 +164,7 @@
     mediaType: "video" | "image" | "none";
   };
 
-  let { msg, isOwn, fileTransfers, onRequestFileDownload, showReceipt = true }: Props = $props();
+  let { msg, isOwn, fileTransfers, onRequestFileDownload, showReceipt = true, callEnd = null, callOpen = false }: Props = $props();
 
   /** DM conversations are keyed "dm-<...>"; see announce.ts. */
   const isDmMessage = $derived(msg.roomCode.startsWith("dm-"));
@@ -1252,6 +1257,8 @@
         <Bookmark class="size-4 {gifSaved ? 'fill-current' : ''}" />
       </button>
     </div>
+  {:else if msg.type === MessageType.CallEvent}
+    <CallCard {msg} {isOwn} {callEnd} {callOpen} />
   {:else if msg.type === MessageType.PluginCard}
     {#if pluginCardDisabled}
       <!-- Not the error box: the user asked for this, so it is muted like the

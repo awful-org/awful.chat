@@ -174,6 +174,7 @@ import { announceMessage } from "../announce";
 import { mentionsMe } from "../mentions";
 import { appendToDmPanel, dmPanelIsShowing, mapDmPanelMessages } from "../dm-panel.svelte";
 import { clearBlocksInMemory, dmRefusedAt, loadBlocks } from "../blocks.svelte";
+import { encodeCallCard, parseCallCard, type CallCardPayload } from "../call-card";
 import { relayCopyCounts } from "../dm-inbox-notice";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
@@ -2350,7 +2351,9 @@ async function _storeSyncBatch(
     ) {
       continue;
     }
-    if (isPlugin && !pluginPayload) {
+    // A call card belongs to a DM and must parse (callCardAllowed): refused
+    // for good like a plugin row that fails its caps.
+    if ((isPlugin && !pluginPayload) || !callCardAllowed(w, roomCode)) {
       // Refused for good, so record it - otherwise every peer holding it
       // re-offers it on every repair tick forever. Recorded the same way as
       // the other deterministic rejects above: in memory, via _noteRefused,
@@ -3471,6 +3474,7 @@ async function _handleChatMessage(
   if ((roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) &&
       wire.type === MessageType.File &&
       (!wire.meta?.files?.length || wire.meta.files.some(file => !file.encryption))) return;
+  if (!callCardAllowed(wire, roomCode)) return;
 
   // DM rooms now start with "dm-" (hash-based)
   // We don't need to ensure room here - it should already exist from sender context
@@ -4755,6 +4759,7 @@ _transport.on("message", (peerId, data, room) => {
       case MessageType.File:
       case MessageType.PluginCard:
       case MessageType.PluginUpdate:
+      case MessageType.CallEvent:
         // A bare chat message is only legitimate over a room's pubsub topic
         // (room !== null). The same message type arriving over a direct
         // stream (room === null) would otherwise be stamped with whatever
@@ -5284,6 +5289,12 @@ export async function restoreFileAttachment(attachment: Attachment): Promise<boo
   return restored;
 }
 
+/** A call card is a DM's, and well-formed; any other row passes. */
+function callCardAllowed(wire: WireChatMessage, roomCode: string): boolean {
+  return wire.type !== MessageType.CallEvent ||
+    (roomCode.startsWith("dm-") && parseCallCard(wire.content) !== null);
+}
+
 /**
  * Chat used to ride gossipsub alone, and a publish into a dead or still-forming
  * mesh is silently dropped (allowPublishToZeroTopicPeers) - only the slow
@@ -5655,10 +5666,60 @@ export async function sendFiles(
   noteRoomActivity(msg.roomCode, msg.timestamp);
 }
 
-// ponytail: sendCard duplicates the send pipeline (signing, lamport, putMessage,
-// setWatermark, appendSorted, markRoomSeen, noteRoomActivity) without sharing
-// it with sendMessage. This is debt: generalize to a _sendChatMessage(type, ...)
-// path.
+// ponytail: _postSignedRow duplicates sendMessage's send pipeline (signing,
+// lamport, putMessage, setWatermark, appendSorted, markRoomSeen,
+// noteRoomActivity) without sharing it. This is debt: generalize to one
+// _sendChatMessage(type, ...) path.
+/** Sign, store and send one chat row of ours into a joined room. */
+async function _postSignedRow(
+  roomCode: string,
+  type: ChatMessageType,
+  content: string,
+  assertCurrent: () => void,
+): Promise<Message> {
+  const profile = await getOwnProfile(undefined, { skipBytes: true });
+  assertCurrent();
+  const myId = identityStore.did ?? _transport.selfId();
+  const ts = Date.now();
+  const lamport = await nextMessageLamport(roomCode);
+  assertCurrent();
+  const msg = signMessage({
+    id: newMessageId(myId),
+    roomCode,
+    senderId: myId,
+    senderName: profile?.nickname?.trim() || "Anonymous",
+    timestamp: ts,
+    lamport,
+    type,
+    content,
+    attachments: [],
+  });
+  await putMessage(msg, assertCurrent);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
+  assertCurrent();
+  _broadcastChatWire(messageToWire(msg), roomCode);
+  if (transportState.roomCode === roomCode) {
+    transportState.messages = appendSorted(transportState.messages, msg);
+    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  }
+  noteRoomActivity(msg.roomCode, msg.timestamp);
+  return msg;
+}
+
+/**
+ * Post a DM call's start or end card (call-card.ts) into that DM. A signed
+ * chat row like any other, sent the way a DM's plugin cards are: directly to
+ * the other side when they are online, else queued and left in their mailbox.
+ */
+export async function sendCallCard(roomCode: string, card: CallCardPayload): Promise<void> {
+  if (!roomCode.startsWith("dm-")) return;
+  const assertCurrent = captureSessionGuard();
+  if (!_transport.rooms().includes(roomCode)) return;
+  appendToDmPanel(
+    await _postSignedRow(roomCode, MessageType.CallEvent, encodeCallCard(card), assertCurrent)
+  );
+}
+
 export async function sendCard(
   pluginId: string,
   payload: unknown,
@@ -5682,44 +5743,8 @@ export async function sendCard(
     throw new Error(`Card payload error: ${payloadValidation.reason}`);
   }
 
-  const profile = await getOwnProfile(undefined, { skipBytes: true });
-  assertCurrent();
-  const senderName = profile?.nickname?.trim() || "Anonymous";
-  const myId = identityStore.did ?? _transport.selfId();
-  const ts = Date.now();
-  const lamport = await nextMessageLamport(roomCode);
-  assertCurrent();
-
-  const cardId = newMessageId(myId);
   const content = JSON.stringify({ pluginId, data: payload });
-
-  let msg: Message = {
-    id: cardId,
-    roomCode,
-    senderId: myId,
-    senderName,
-    timestamp: ts,
-    lamport,
-    type: MessageType.PluginCard,
-    content,
-    attachments: [],
-  };
-
-  // Sign the message
-  msg = signMessage(msg);
-
-  await putMessage(msg, assertCurrent);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
-  assertCurrent();
-  _broadcastChatWire(messageToWire(msg), roomCode);
-
-  if (transportState.roomCode === roomCode) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
-  }
-  noteRoomActivity(msg.roomCode, msg.timestamp);
-
-  return cardId;
+  return (await _postSignedRow(roomCode, MessageType.PluginCard, content, assertCurrent)).id;
 }
 
 let cachedPluginSenderName = "";

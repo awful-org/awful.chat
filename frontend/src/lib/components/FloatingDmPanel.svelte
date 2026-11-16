@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { foldCallCards } from "$lib/call-card";
   import { tick, untrack } from "svelte";
   import { CornerUpLeft, Minus, Send, X } from "@lucide/svelte";
   import { Tip } from "$lib/components/ui/tooltip";
@@ -110,8 +111,12 @@
 
   // Reactions are folded onto their target elsewhere; on their own they are
   // rows with nothing to read.
+  // A call's end card folds into its start, as in the pane (call-card.ts).
+  const callCards = $derived(foldCallCards(dmPanel.messages, MessageType.CallEvent));
   const visible = $derived(
-    dmPanel.messages.filter((m) => m.type !== MessageType.Reaction)
+    dmPanel.messages.filter(
+      (m) => m.type !== MessageType.Reaction && !callCards.foldedEnds.has(m.id)
+    )
   );
   const receiptIds = $derived(new Set(dmReceiptIds(visible, isSelfSender)));
 
@@ -357,6 +362,8 @@
               fileTransfers={transportState.fileTransfers}
               onRequestFileDownload={requestFileDownload}
               showReceipt={receiptIds.has(msg.id)}
+              callEnd={callCards.endOf.get(msg.id) ?? null}
+              callOpen={callCards.open?.row.id === msg.id}
             />
           {/each}
         {/if}

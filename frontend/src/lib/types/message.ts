@@ -10,6 +10,8 @@ export enum MessageType {
   File = "file",
   PluginCard = "plugin_card",
   PluginUpdate = "plugin_update",
+  /** A DM call's start or end card (call-card.ts). */
+  CallEvent = "call_event",
   // presence - wire only, never persisted
   Profile = "profile",
   CallPresence = "call_presence",
@@ -40,7 +42,8 @@ export type ChatMessageType =
   | MessageType.Reaction
   | MessageType.File
   | MessageType.PluginCard
-  | MessageType.PluginUpdate;
+  | MessageType.PluginUpdate
+  | MessageType.CallEvent;
 
 export type MessageStatus = "sending" | "sent" | "delivered" | "read";
 export type AttachmentStatus =
@@ -547,6 +550,7 @@ export function isChatMessage(msg: AnyWireMessage): msg is WireChatMessage {
     msg.type === MessageType.Reaction ||
     msg.type === MessageType.File ||
     msg.type === MessageType.PluginCard ||
-    msg.type === MessageType.PluginUpdate
+    msg.type === MessageType.PluginUpdate ||
+    msg.type === MessageType.CallEvent
   );
 }

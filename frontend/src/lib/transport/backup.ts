@@ -484,6 +484,7 @@ const VALID_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>([
   MessageType.File,
   MessageType.PluginCard,
   MessageType.PluginUpdate,
+  MessageType.CallEvent,
 ]);
 
 function isFiniteNonNegative(n: unknown): n is number {
