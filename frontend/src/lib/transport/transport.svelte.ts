@@ -173,6 +173,9 @@ import { clearSearchCorpus } from "../search/corpus.svelte";
 import { announceMessage } from "../announce";
 import { mentionsMe } from "../mentions";
 import { appendToDmPanel, dmPanelIsShowing, mapDmPanelMessages } from "../dm-panel.svelte";
+import { clearBlocksInMemory, dmRefusedAt, loadBlocks } from "../blocks.svelte";
+import { encodeCallCard, parseCallCard, type CallCardPayload } from "../call-card";
+import { noteCallStartSeen } from "../dm-call-joined";
 import { relayCopyCounts } from "../dm-inbox-notice";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
@@ -2093,6 +2096,16 @@ async function _storeSyncBatch(
       // expected === roomCode already proves fromDid resolved; be explicit.
       unsignedFrom = fromDid;
     }
+    // History sync must not deliver what a soft block refused live: a
+    // conversation joined again on unblock pulled in every DM they wrote
+    // while blocked. By each row's author as well as the pusher: our own
+    // other device, which keeps no block list, mirrors their rows too.
+    messages = messages.filter(
+      (w) =>
+        !dmRefusedAt(w.senderId, w.timestamp) &&
+        (isOwnDevice || !dmRefusedAt(fromDid, w.timestamp))
+    );
+    if (!messages.length) return null;
   }
   const allowUnsignedFor = (m: WireChatMessage) =>
     allowsUnsignedDmHistory(m, unsignedFrom, live);
@@ -2339,7 +2352,9 @@ async function _storeSyncBatch(
     ) {
       continue;
     }
-    if (isPlugin && !pluginPayload) {
+    // A call card belongs to a DM and must parse (callCardAllowed): refused
+    // for good like a plugin row that fails its caps.
+    if ((isPlugin && !pluginPayload) || !callCardAllowed(w, roomCode)) {
       // Refused for good, so record it - otherwise every peer holding it
       // re-offers it on every repair tick forever. Recorded the same way as
       // the other deterministic rejects above: in memory, via _noteRefused,
@@ -2393,6 +2408,20 @@ async function _storeSyncBatch(
   guard();
   await bulkPutMessages(fullMessages, guard);
   guard();
+  // A DM filled from history is listed now, not on the next live message:
+  // that message then arrives already held and refreshes nothing, so a
+  // conversation synced in first stayed missing from the list. Only one the
+  // list lacks - re-reading it for every batch of a listed one is the cost
+  // dm-list-mailbox.test.ts keeps out - and only once it has a record: one
+  // joined without being stored (an introduction's) has nothing to list.
+  if (roomCode.startsWith("dm-") && !roomsStore.dmRooms.some((r) => r.roomCode === roomCode)) {
+    const stored = await getRoom(roomCode);
+    guard();
+    if (stored) {
+      await refreshDmRooms();
+      guard();
+    }
+  }
   // Every row here verified under sigV3, which binds the room: its author
   // wrote in this room, as of when they wrote it. That is how a member we
   // have never been connected to gets listed, now that rosters from other
@@ -3386,6 +3415,17 @@ function _selfIds(): string[] {
 }
 
 /**
+ * A DM call's start card arriving live: when this device saw the call
+ * begin, on its own clock, so a length it later measures is one clock's
+ * (call.svelte.ts). Not for cards from the mailbox or history: those are late.
+ */
+function _noteLiveCallStart(row: { type: string; content: string }): void {
+  if (row.type !== MessageType.CallEvent) return;
+  const card = parseCallCard(row.content);
+  if (card?.phase === "start") noteCallStartSeen(card.callId, Date.now());
+}
+
+/**
  * Bind an incoming message to this client's identity and view, then let
  * announce.ts decide whether to make a sound about it. The caller has already
  * established that the message is genuinely new.
@@ -3446,6 +3486,7 @@ async function _handleChatMessage(
   if ((roomCode.startsWith("rd2_") || roomCode.startsWith("dm-")) &&
       wire.type === MessageType.File &&
       (!wire.meta?.files?.length || wire.meta.files.some(file => !file.encryption))) return;
+  if (!callCardAllowed(wire, roomCode)) return;
 
   // DM rooms now start with "dm-" (hash-based)
   // We don't need to ensure room here - it should already exist from sender context
@@ -3532,6 +3573,9 @@ async function _handleChatMessage(
     (await getMessage(msg.id));
   guard();
   const isNewMessage = !held;
+  // Only a start not held yet is a live sighting: a replay of one we hold
+  // (after a reload emptied the in-memory map) would date the call to now.
+  if (isNewMessage) _noteLiveCallStart(wire);
   // A row we hold under this id that is NOT this sender's message in this
   // room means this one is not stored and never will be. It must not claim a
   // watermark: that told every later digest we had the message, so no peer
@@ -4222,6 +4266,16 @@ function _handleDmChatAsync(
 ): Promise<void> {
   const guard = captureDmOwnership();
   return (async () => {
+    // Soft-blocked, or written while they were: refused, and from the
+    // mailbox acked away rather than kept for later - not stored, not
+    // answered with a receipt. The list is read first: the mailbox collector
+    // starts beside connect(), and a DM it drained before the list was read
+    // was let in and acked away.
+    if (!_ephemeralSession) {
+      await loadBlocks().catch(() => {});
+      guard();
+    }
+    if (dmRefusedAt(senderDid, envelope.payload.ts)) return;
     // Same binding verifyIncoming applies to room rows: a DM peer cannot file
     // a row under an id someone else's message was bound to.
     if (!messageIdAllowedFor(envelope.payload.id, senderDid)) return;
@@ -4332,6 +4386,7 @@ function _handleDmChatAsync(
         transportState.chatMode === "dm" &&
         (activeDid === senderDid || activeDid === peerId);
       // Reactions are filtered inside the funnel, same rule as rooms.
+      if (!viaMailbox) _noteLiveCallStart(msg);
       // A mailbox batch collapses into one notification instead of one per DM.
       _announceMessage(msg, { viaMailbox });
       // The floating panel is a second place this conversation can be on
@@ -4720,6 +4775,7 @@ _transport.on("message", (peerId, data, room) => {
       case MessageType.File:
       case MessageType.PluginCard:
       case MessageType.PluginUpdate:
+      case MessageType.CallEvent:
         // A bare chat message is only legitimate over a room's pubsub topic
         // (room !== null). The same message type arriving over a direct
         // stream (room === null) would otherwise be stamped with whatever
@@ -4855,6 +4911,10 @@ export async function connect() {
       // served one, and the node keeps the relay it starts with: give that
       // read a second, or a moved relay is dialled where it used to be.
       await configSettled(1000);
+      // The block list before the first frame: a blocked person's DM that
+      // arrived ahead of it would otherwise be let in. An ephemeral session
+      // has no store of its own to read one from.
+      if (!_ephemeralSession) await loadBlocks().catch(() => {});
       // This device's own libp2p key, NOT the identity key: two devices on the
       // same account would otherwise share a peerId and never connect.
       await _transport.connect(
@@ -5230,6 +5290,8 @@ function _disconnectWithoutBroadcasting(): void {
   // Both belong to the session that just ended: a new identity must not
   // inherit the previous one's undelivered-message notes.
   transportState.dmQueuedP2POnly = new Set();
+  // Whose they were is the unlocked session's to know, not the next one's.
+  clearBlocksInMemory();
 }
 
 onIdentityLock(_disconnectWithoutBroadcasting);
@@ -5241,6 +5303,12 @@ export async function restoreFileAttachment(attachment: Attachment): Promise<boo
   const restored = await restoreStoredFile(attachment);
   guard();
   return restored;
+}
+
+/** A call card is a DM's, and well-formed; any other row passes. */
+function callCardAllowed(wire: WireChatMessage, roomCode: string): boolean {
+  return wire.type !== MessageType.CallEvent ||
+    (roomCode.startsWith("dm-") && parseCallCard(wire.content) !== null);
 }
 
 /**
@@ -5614,10 +5682,60 @@ export async function sendFiles(
   noteRoomActivity(msg.roomCode, msg.timestamp);
 }
 
-// ponytail: sendCard duplicates the send pipeline (signing, lamport, putMessage,
-// setWatermark, appendSorted, markRoomSeen, noteRoomActivity) without sharing
-// it with sendMessage. This is debt: generalize to a _sendChatMessage(type, ...)
-// path.
+// ponytail: _postSignedRow duplicates sendMessage's send pipeline (signing,
+// lamport, putMessage, setWatermark, appendSorted, markRoomSeen,
+// noteRoomActivity) without sharing it. This is debt: generalize to one
+// _sendChatMessage(type, ...) path.
+/** Sign, store and send one chat row of ours into a joined room. */
+async function _postSignedRow(
+  roomCode: string,
+  type: ChatMessageType,
+  content: string,
+  assertCurrent: () => void,
+): Promise<Message> {
+  const profile = await getOwnProfile(undefined, { skipBytes: true });
+  assertCurrent();
+  const myId = identityStore.did ?? _transport.selfId();
+  const ts = Date.now();
+  const lamport = await nextMessageLamport(roomCode);
+  assertCurrent();
+  const msg = signMessage({
+    id: newMessageId(myId),
+    roomCode,
+    senderId: myId,
+    senderName: profile?.nickname?.trim() || "Anonymous",
+    timestamp: ts,
+    lamport,
+    type,
+    content,
+    attachments: [],
+  });
+  await putMessage(msg, assertCurrent);
+  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
+  assertCurrent();
+  _broadcastChatWire(messageToWire(msg), roomCode);
+  if (transportState.roomCode === roomCode) {
+    transportState.messages = appendSorted(transportState.messages, msg);
+    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  }
+  noteRoomActivity(msg.roomCode, msg.timestamp);
+  return msg;
+}
+
+/**
+ * Post a DM call's start or end card (call-card.ts) into that DM. A signed
+ * chat row like any other, sent the way a DM's plugin cards are: directly to
+ * the other side when they are online, else queued and left in their mailbox.
+ */
+export async function sendCallCard(roomCode: string, card: CallCardPayload): Promise<void> {
+  if (!roomCode.startsWith("dm-")) return;
+  const assertCurrent = captureSessionGuard();
+  if (!_transport.rooms().includes(roomCode)) return;
+  appendToDmPanel(
+    await _postSignedRow(roomCode, MessageType.CallEvent, encodeCallCard(card), assertCurrent)
+  );
+}
+
 export async function sendCard(
   pluginId: string,
   payload: unknown,
@@ -5641,44 +5759,8 @@ export async function sendCard(
     throw new Error(`Card payload error: ${payloadValidation.reason}`);
   }
 
-  const profile = await getOwnProfile(undefined, { skipBytes: true });
-  assertCurrent();
-  const senderName = profile?.nickname?.trim() || "Anonymous";
-  const myId = identityStore.did ?? _transport.selfId();
-  const ts = Date.now();
-  const lamport = await nextMessageLamport(roomCode);
-  assertCurrent();
-
-  const cardId = newMessageId(myId);
   const content = JSON.stringify({ pluginId, data: payload });
-
-  let msg: Message = {
-    id: cardId,
-    roomCode,
-    senderId: myId,
-    senderName,
-    timestamp: ts,
-    lamport,
-    type: MessageType.PluginCard,
-    content,
-    attachments: [],
-  };
-
-  // Sign the message
-  msg = signMessage(msg);
-
-  await putMessage(msg, assertCurrent);
-  await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
-  assertCurrent();
-  _broadcastChatWire(messageToWire(msg), roomCode);
-
-  if (transportState.roomCode === roomCode) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
-  }
-  noteRoomActivity(msg.roomCode, msg.timestamp);
-
-  return cardId;
+  return (await _postSignedRow(roomCode, MessageType.PluginCard, content, assertCurrent)).id;
 }
 
 let cachedPluginSenderName = "";

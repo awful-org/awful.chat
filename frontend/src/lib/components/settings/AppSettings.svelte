@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { blocks } from "$lib/blocks.svelte";
+  import { unblockPerson } from "$lib/transport/dm.svelte";
 import { Label } from "$lib/components/ui/label";
 import { shortcutLabel } from "$lib/platform";
 import { Switch } from "$lib/components/ui/switch";
@@ -595,6 +597,44 @@ async function loadLocalFonts(): Promise<void> {
       onCheckedChange={(checked) => setAvatarTint(checked)}
     />
   </div>
+</div>
+
+<!-- Blocked people: undone here as well as from their profile card. -->
+<div
+  class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+>
+  <div class="flex items-center gap-2">
+    <div class="w-1 h-4 bg-red-500 rounded-full"></div>
+    <Label
+      class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+      >Blocked people</Label
+    >
+  </div>
+  <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+    Their DMs are refused, their messages folded, they are muted in calls and
+    get none of your voice. Only on this device; they are not told.
+  </span>
+  {#if blocks.entries.length}
+    <ul class="flex flex-col gap-2">
+      {#each blocks.entries as entry (entry.did)}
+        <li class="flex items-center justify-between gap-3">
+          <div class="flex min-w-0 flex-col">
+            <span class="truncate text-xs font-mono">{entry.name || "Unnamed"}</span>
+            <span class="truncate text-[11px] font-mono text-muted-foreground" title={entry.did}>{entry.did}</span>
+          </div>
+          <button
+            type="button"
+            class="shrink-0 cursor-pointer rounded-md border border-border px-3 py-1.5 text-xs font-mono hover:bg-muted"
+            onclick={() => void unblockPerson(entry.did)}
+          >
+            Unblock
+          </button>
+        </li>
+      {/each}
+    </ul>
+  {:else}
+    <span class="text-xs font-mono text-muted-foreground">Nobody is blocked.</span>
+  {/if}
 </div>
 
 <!-- Debug Section -->

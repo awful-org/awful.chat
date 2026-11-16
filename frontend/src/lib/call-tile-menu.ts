@@ -63,6 +63,9 @@ export type TileMenuAction =
   /** Silence this person for you alone (their volume to 0), and back. */
   | { kind: "mute-peer" }
   | { kind: "unmute-peer" }
+  /** Send this person none of your voice, and send it again. */
+  | { kind: "withhold-voice" }
+  | { kind: "send-voice" }
   /** Subscribe to an offered SFU share / drop the one being watched. */
   | { kind: "watch" }
   | { kind: "stop-watching" }
@@ -138,6 +141,10 @@ export interface TileMenuState {
   inPhonebook: boolean;
   /** Their voice is at volume 0 for us. */
   peerMuted: boolean;
+  /** Our voice is not sent to them. */
+  voiceWithheld: boolean;
+  /** Their identity is known, so the choice can be remembered for them. */
+  canWithholdVoice: boolean;
   cameraOff: boolean;
   micMuted: boolean;
   /** The share carries audio at all. */
@@ -155,6 +162,8 @@ export function tileMenuState(
   partial: Partial<TileMenuState> & Pick<TileMenuState, "kind" | "label">
 ): TileMenuState {
   return {
+    voiceWithheld: false,
+    canWithholdVoice: false,
     isLocal: false,
     hasVideo: false,
     isPending: false,
@@ -432,6 +441,25 @@ export function buildTileMenu(s: TileMenuState): TileMenuRow[] {
           },
       { type: "volume", target: "peer" }
     );
+    // The other direction: what THEY hear from you. Not a mute of your mic -
+    // everyone else still hears you; this one person gets nothing at all.
+    if (s.voiceWithheld || s.canWithholdVoice) {
+      tail.push(
+        s.voiceWithheld
+          ? {
+              type: "item",
+              label: "Send my voice again",
+              icon: "mic",
+              action: { kind: "send-voice" },
+            }
+          : {
+              type: "item",
+              label: "Don't send my voice",
+              icon: "mic-off",
+              action: { kind: "withhold-voice" },
+            }
+      );
+    }
   } else {
     tail.push(...shareAudioRows(s));
     if (s.isWatched) {

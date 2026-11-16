@@ -32,6 +32,8 @@ export function getQuotableText(msg: Message, limit = 160): string {
     }
     return `[Plugin: ${name}]`;
   }
+  // A call card's content is JSON too (call-card.ts).
+  if (msg.type === MessageType.CallEvent) return "[Call]";
 
   // Text quotes as itself; a bare image link (the GIF picker) does not.
   if (msg.content && !isUrlLike(msg.content)) {

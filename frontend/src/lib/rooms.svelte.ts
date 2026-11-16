@@ -22,6 +22,7 @@ import {
 import { identityStore } from "./identity/identity.svelte";
 import { dropRoomCorpus } from "./search/corpus.svelte";
 import { MessageType } from "./types/message";
+import { blockedDids, isBlockedDid, loadBlocks } from "./blocks.svelte";
 
 /**
  * Your own messages must never count as unread - they arrive back through
@@ -87,7 +88,7 @@ export async function loadRooms(): Promise<void> {
     }
     roomsStore.rooms = Array.from(merged.values());
     await migrateLegacyRoomOrder();
-    roomsStore.dmRooms = await getDMRooms();
+    roomsStore.dmRooms = await listedDmRooms();
     roomsStore.phonebook = await getPhonebookEntries();
     await _refreshAllUnread();
     await _refreshAllActivity();
@@ -96,12 +97,24 @@ export async function loadRooms(): Promise<void> {
   }
 }
 
+/**
+ * The DMs the list shows: a soft-blocked person's conversation is set aside,
+ * not deleted. The block list is read first - on unlock this runs beside
+ * connect(), and filtering against a list not read yet showed a blocked
+ * person's conversation until something refreshed it.
+ */
+async function listedDmRooms(): Promise<DMRoom[]> {
+  await loadBlocks().catch(() => {});
+  const rooms = await getDMRooms();
+  return rooms.filter((r) => !isBlockedDid(r.participantDid));
+}
+
 export async function refreshPhonebook(): Promise<void> {
   roomsStore.phonebook = await getPhonebookEntries();
 }
 
 export async function refreshDmRooms(): Promise<void> {
-  roomsStore.dmRooms = await getDMRooms();
+  roomsStore.dmRooms = await listedDmRooms();
 }
 
 /**
@@ -150,6 +163,8 @@ export function noteUnreadArrivals(
       m.type !== MessageType.Reaction &&
       m.type !== MessageType.PluginUpdate &&
       (!self || m.senderId !== self) &&
+      // Soft-blocked: folded in the view and silent, so not unread either.
+      !isBlockedDid(m.senderId) &&
       _firstSighting(m.id)
   );
   if (!fresh.length) return;
@@ -222,7 +237,8 @@ async function _recountUnread(roomCode: string): Promise<void> {
   const count = await getUnreadCount(
     roomCode,
     room.lastSeenLamport,
-    selfSenderId()
+    selfSenderId(),
+    blockedDids()
   );
   // If markSeen advanced the watermark while the count was in flight, this
   // result is stale - writing it would relight the badge on a room the user
@@ -265,6 +281,11 @@ async function _refreshAllActivity(): Promise<void> {
  */
 async function _refreshAllUnread(): Promise<void> {
   await Promise.all(roomsStore.rooms.map((r) => refreshUnreadCount(r.roomCode)));
+}
+
+/** Recount every room: who counts changed (a block, or one lifted). */
+export function refreshAllUnreadCounts(): Promise<void> {
+  return _refreshAllUnread();
 }
 
 export async function saveRoom(roomCode: string, name: string, guard?: () => void): Promise<void> {

@@ -22,8 +22,11 @@ import type {
   WatermarkRecord,
   OwnRoomProfileRecord,
   RoomDeletionMarker,
+  BlockEntry,
+  PhonebookEntry,
 } from "../storage";
 import type { RoomProfileField } from "../room-profile";
+import { judgeRoomName } from "../room-name";
 
 export type RoomProfileExport = Omit<OwnRoomProfileRecord, "fields"> & {
   fields: Partial<Record<RoomProfileField, string | boolean | null>>;
@@ -73,6 +76,8 @@ export const EXPORT_SECTIONS = [
   "watermarks",
   "yjsDocs",
   "savedGifs",
+  "phonebook",
+  "blocks",
   "pending",
 ] as const;
 export type ExportSection = (typeof EXPORT_SECTIONS)[number];
@@ -106,6 +111,33 @@ export interface DatabaseExport {
   roomProfiles?: RoomProfileExport[];
   roomDeletions?: RoomDeletionMarker[];
   savedGifs: SavedGif[];
+  // Optional because exports from before they were carried lack them, and
+  // a missing list must not read as an empty one on a merge.
+  phonebook?: PhonebookEntry[];
+  /** Soft blocks, lifted ones included for their refusal windows. */
+  blocks?: BlockEntry[];
+  localState?: LocalStateExport;
+}
+
+/**
+ * Account state the app keeps in localStorage rather than IndexedDB, which
+ * an export of the database alone used to leave behind. Every field is
+ * optional: absent means the exporting build did not carry it, which is not
+ * the same as empty.
+ */
+export interface LocalStateExport {
+  /** transport/audio-prefs.ts: per-person volumes, by did:key. */
+  peerVolumes?: Record<string, number>;
+  /** transport/audio-prefs.ts: who gets none of your voice. */
+  voiceWithheld?: string[];
+  /** dm-call-joined.ts: the DM calls taken part in. */
+  dmCallsJoined?: string[];
+  /**
+   * transport/dm-queue.ts: the DM retry queue exactly as stored, sealed
+   * under the account's at-rest key - which every device of the account
+   * derives alike, so it travels without being opened.
+   */
+  dmQueue?: string;
 }
 
 export const BACKUP_FORMAT = "awful.chat/backup";
@@ -113,7 +145,9 @@ export const BACKUP_FORMAT = "awful.chat/backup";
 // old build restoring a v2 file would coerce the string to garbage bytes, so
 // it must refuse cleanly on the version instead.
 // v3 adds room overrides and leave markers. A v2 reader would discard them.
-export const BACKUP_VERSION = 3;
+// v4 adds the phonebook, soft blocks and the localStorage-held account state
+// (LocalStateExport), which a v3 reader would discard just as quietly.
+export const BACKUP_VERSION = 4;
 
 export interface BackupFile extends DatabaseExport {
   format: typeof BACKUP_FORMAT;
@@ -164,9 +198,16 @@ export function pfpToJson<T extends { pfpData?: unknown; bannerData?: unknown }>
 
 /**
  * Merge an imported room over the locally stored one (device sync, "add"
- * mode). Field rules mirror the monotonic guards used at runtime: the seen
- * watermark and per-participant activity never move backwards, membership is
- * a union, and a real local name is not overwritten by the import.
+ * mode, or a backup merged in).
+ *
+ * This device's record is the base: most of a room's fields are about how
+ * this device shows it (layout, what was read, a legacy room's move), and an
+ * import that took every field it did not name used to clobber those, or
+ * drop the ones only this device had. The fields with a rule of their own
+ * mirror the monotonic guards used at runtime: the seen watermark and
+ * per-participant activity never move backwards, membership is a union, the
+ * newer name wins with the stamp it was chosen at, and a request accepted on
+ * either device stays accepted.
  */
 export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   if (local.roomSecret && imported.roomSecret && local.roomSecret !== imported.roomSecret) {
@@ -181,8 +222,22 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   for (const [did, ts] of Object.entries(imported.participantLastSeen ?? {})) {
     participantLastSeen[did] = Math.max(participantLastSeen[did] ?? 0, ts ?? 0);
   }
-  return {
-    ...imported,
+  // The name and its stamp travel together, decided the way members decide
+  // between announced names (room-name.ts). Keeping the local name but taking
+  // the imported stamp made an old name look newer than a rename, and the
+  // next announcement put the old name back for the whole room.
+  const takeName = judgeRoomName(local, imported.name, imported.nameAt) === "take";
+  const named = takeName ? imported : local;
+  // A room avatar has no stamp to decide by, so it is this device's when it
+  // has one, and a pair either way: a URL from one side beside bytes from
+  // the other showed neither's choice.
+  const pictured = local.pfpData || local.pfpURL ? local : imported;
+  const localRequest = (local as { request?: boolean }).request;
+  const importedRequest = (imported as { request?: boolean }).request;
+  // Room is an interface, so neither side spreads as a plain record.
+  const merged: Record<string, unknown> = {
+    ...(imported as unknown as Record<string, unknown>),
+    ...(local as unknown as Record<string, unknown>),
     ...(local.roomSecret || imported.roomSecret
       ? { roomSecret: local.roomSecret ?? imported.roomSecret }
       : {}),
@@ -209,8 +264,7 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
       ]),
     ],
     participantLastSeen,
-    name:
-      !local.name || local.name === local.roomCode ? imported.name : local.name,
+    name: named.name,
     // This device's sidebar layout wins, the same way its room name does;
     // the import only fills in rooms this device never arranged.
     pinnedAt: local.pinnedAt ?? imported.pinnedAt,
@@ -222,6 +276,87 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
         ...(imported.pinnedMessages ?? []),
       ]),
     ],
+    // Only the user moves it, so the later read is the real one.
+    seenAt: Math.max(local.seenAt ?? 0, imported.seenAt ?? 0) || undefined,
+    archiveOf: local.archiveOf ?? imported.archiveOf,
+    movedTo: local.movedTo ?? imported.movedTo,
+    pfpData: pictured.pfpData,
+    pfpURL: pictured.pfpURL,
+  };
+  if (named.nameAt !== undefined) merged.nameAt = named.nameAt;
+  else delete merged.nameAt;
+  // Accepting a request is the user's decision and only ever goes one way.
+  // A request on both devices stays one; accepted (or from before requests,
+  // which counts the same) on either, it is accepted here. The import's
+  // `request: true` used to land over a conversation this device had long
+  // accepted and put it back among the requests.
+  if (localRequest === true || importedRequest === true) {
+    merged.request = localRequest === true && importedRequest === true ? true : false;
+  }
+  for (const key of ["seenAt", "archiveOf", "movedTo", "pfpData", "pfpURL", "pinnedAt", "position"]) {
+    if (merged[key] === undefined) delete merged[key];
+  }
+  return merged as T;
+}
+
+/**
+ * One soft block, from both devices (backup.ts has no storage, so
+ * blocks.svelte.ts's own helpers are not used here; the rule is the same
+ * one storeBlock applies). A block active on either device stays active:
+ * lifting it on one is not a decision about the other, and the safe answer
+ * to the disagreement is the block. Every lifted window from both is kept,
+ * because DMs refused in them must stay refused (dmRefusedAt).
+ */
+export function mergeImportedBlock(local: BlockEntry | undefined, imported: BlockEntry): BlockEntry {
+  if (!local) return imported;
+  const windowsOf = (e: BlockEntry): [number, number][] => [
+    ...(e.earlier ?? []),
+    ...(e.unblockedAt !== undefined ? [[e.blockedAt, e.unblockedAt] as [number, number]] : []),
+  ];
+  const seen = new Set<string>();
+  const windows = [...windowsOf(local), ...windowsOf(imported)]
+    .filter(([from, until]) => {
+      const key = `${from}:${until}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const name = local.name || imported.name;
+  const active = [local, imported].filter((e) => e.unblockedAt === undefined);
+  if (active.length > 0) {
+    return {
+      did: local.did,
+      name,
+      blockedAt: Math.min(...active.map((e) => e.blockedAt)),
+      ...(windows.length ? { earlier: windows } : {}),
+    };
+  }
+  // Lifted on both: the latest window is the entry's own, the rest earlier.
+  const [blockedAt, unblockedAt] = windows[windows.length - 1];
+  const earlier = windows.slice(0, -1);
+  return { did: local.did, name, blockedAt, unblockedAt, ...(earlier.length ? { earlier } : {}) };
+}
+
+/**
+ * One phonebook row, from both devices, under the same key. A union, like
+ * dedupePhonebook's: the earliest addedAt, a favorite on either side, and
+ * this device's nickname when it has one.
+ */
+export function mergeImportedContact(
+  local: PhonebookEntry | undefined,
+  imported: PhonebookEntry
+): PhonebookEntry {
+  if (!local) return imported;
+  const favorite = !!(local.favorite || imported.favorite);
+  const did = local.did ?? imported.did;
+  return {
+    ...imported,
+    ...local,
+    nickname: local.nickname || imported.nickname,
+    addedAt: Math.min(local.addedAt, imported.addedAt),
+    ...(did ? { did } : {}),
+    ...(favorite ? { favorite } : {}),
   };
 }
 
@@ -318,6 +453,11 @@ function parseBackupValue(parsed: unknown): BackupFile {
     roomProfiles: arr(d.roomProfiles),
     roomDeletions: arr(d.roomDeletions),
     savedGifs: arr(d.savedGifs),
+    // Left absent rather than coerced to [] when the file never had them:
+    // see DatabaseExport.
+    ...(Array.isArray(d.phonebook) ? { phonebook: d.phonebook } : {}),
+    ...(Array.isArray(d.blocks) ? { blocks: d.blocks } : {}),
+    ...(d.localState !== undefined ? { localState: d.localState } : {}),
   };
 }
 
@@ -484,6 +624,7 @@ const VALID_MESSAGE_TYPES: ReadonlySet<string> = new Set<string>([
   MessageType.File,
   MessageType.PluginCard,
   MessageType.PluginUpdate,
+  MessageType.CallEvent,
 ]);
 
 function isFiniteNonNegative(n: unknown): n is number {
@@ -628,6 +769,61 @@ export function isValidPendingRecord(p: unknown): p is PendingMessage {
   );
 }
 
+export function isValidPhonebookRecord(p: unknown): p is PhonebookEntry {
+  if (!p || typeof p !== "object") return false;
+  const r = p as Record<string, unknown>;
+  return (
+    isNonEmptyString(r.peerId) &&
+    r.peerId.length <= 256 &&
+    typeof r.nickname === "string" &&
+    r.nickname.length <= 1024 &&
+    isFiniteNonNegative(r.addedAt) &&
+    (r.did === undefined || (typeof r.did === "string" && r.did.startsWith("did:") && r.did.length <= 256)) &&
+    (r.favorite === undefined || typeof r.favorite === "boolean")
+  );
+}
+
+function isRefusalWindow(w: unknown): w is [number, number] {
+  return Array.isArray(w) && w.length === 2 && isFiniteNonNegative(w[0]) && isFiniteNonNegative(w[1]);
+}
+
+export function isValidBlockRecord(b: unknown): b is BlockEntry {
+  if (!b || typeof b !== "object") return false;
+  const r = b as Record<string, unknown>;
+  return (
+    // storeBlock's own rule: only a did:key can be blocked.
+    isNonEmptyString(r.did) &&
+    r.did.startsWith("did:") &&
+    r.did.length <= 256 &&
+    typeof r.name === "string" &&
+    isFiniteNonNegative(r.blockedAt) &&
+    (r.unblockedAt === undefined || isFiniteNonNegative(r.unblockedAt)) &&
+    (r.earlier === undefined ||
+      (Array.isArray(r.earlier) && r.earlier.length <= 1000 && r.earlier.every(isRefusalWindow)))
+  );
+}
+
+/** The largest DM retry queue blob taken in: the queue itself is bounded at 200 frames. */
+const MAX_DM_QUEUE_BLOB = 8 * 1024 * 1024;
+
+/**
+ * LocalStateExport with every field of the wrong shape left out. The
+ * importers check their own contents (audio-prefs.ts, dm-call-joined.ts,
+ * dm-queue.ts); this only stops a field of the wrong TYPE reaching them.
+ */
+export function sanitizeLocalState(value: unknown): LocalStateExport | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const r = value as Record<string, unknown>;
+  const out: LocalStateExport = {};
+  if (r.peerVolumes && typeof r.peerVolumes === "object" && !Array.isArray(r.peerVolumes)) {
+    out.peerVolumes = r.peerVolumes as Record<string, number>;
+  }
+  if (Array.isArray(r.voiceWithheld)) out.voiceWithheld = r.voiceWithheld as string[];
+  if (Array.isArray(r.dmCallsJoined)) out.dmCallsJoined = r.dmCallsJoined as string[];
+  if (typeof r.dmQueue === "string" && r.dmQueue.length <= MAX_DM_QUEUE_BLOB) out.dmQueue = r.dmQueue;
+  return out;
+}
+
 export function isValidYjsDocRecord(
   d: unknown
 ): d is { id: string; update: number[] } {
@@ -665,6 +861,9 @@ export interface SanitizedCollections {
   roomProfiles: RoomProfileExport[];
   roomDeletions: RoomDeletionMarker[];
   savedGifs: SavedGif[];
+  /** Undefined when the export never carried the list (see DatabaseExport). */
+  phonebook?: PhonebookEntry[];
+  blocks?: BlockEntry[];
   /** Total records dropped across every collection above. */
   dropped: number;
 }
@@ -688,6 +887,8 @@ export function sanitizeCollections(data: {
   roomProfiles?: unknown[];
   roomDeletions?: unknown[];
   savedGifs: unknown[];
+  phonebook?: unknown[];
+  blocks?: unknown[];
 }): SanitizedCollections {
   const messages = sanitize(data.messages, isValidMessageRecord);
   const attachments = sanitize(data.attachments, isValidAttachmentRecord);
@@ -699,6 +900,8 @@ export function sanitizeCollections(data: {
   const roomProfiles = sanitize(data.roomProfiles ?? [], isValidRoomProfileRecord);
   const roomDeletions = sanitize(data.roomDeletions ?? [], isValidRoomDeletionMarker);
   const savedGifs = sanitize(data.savedGifs, isValidSavedGifRecord);
+  const phonebook = data.phonebook ? sanitize(data.phonebook, isValidPhonebookRecord) : undefined;
+  const blocks = data.blocks ? sanitize(data.blocks, isValidBlockRecord) : undefined;
 
   return {
     messages: messages.records,
@@ -711,6 +914,8 @@ export function sanitizeCollections(data: {
     roomProfiles: roomProfiles.records,
     roomDeletions: roomDeletions.records,
     savedGifs: savedGifs.records,
+    ...(phonebook ? { phonebook: phonebook.records } : {}),
+    ...(blocks ? { blocks: blocks.records } : {}),
     dropped:
       messages.dropped +
       attachments.dropped +
@@ -721,6 +926,8 @@ export function sanitizeCollections(data: {
       profiles.dropped +
       roomProfiles.dropped +
       roomDeletions.dropped +
-      savedGifs.dropped,
+      savedGifs.dropped +
+      (phonebook?.dropped ?? 0) +
+      (blocks?.dropped ?? 0),
   };
 }

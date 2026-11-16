@@ -10,10 +10,13 @@ const backing = new Map<string, string>();
 };
 import {
   clampDfnAttenuation,
+  importPeerAudioPrefs,
+  peerAudioPrefs,
   loadAudioPrefs,
   loadPeerVolume,
   savePeerVolume,
   saveAudioPrefs,
+  saveVoiceWithheld,
 } from "./audio-prefs";
 
 describe("per-peer volume persistence", () => {
@@ -53,6 +56,34 @@ describe("per-peer volume persistence", () => {
     expect(loaded["did:key:zBad"]).toBeUndefined();
     expect(loaded["12D3KooWNotADid"]).toBeUndefined();
     expect(Object.keys(loaded).length).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("people who get no voice", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("remembers and forgets a person by did", () => {
+    saveVoiceWithheld("did:key:zAlice", true);
+    saveVoiceWithheld("did:key:zAlice", true);
+    expect(loadAudioPrefs().voiceWithheld).toEqual(["did:key:zAlice"]);
+    saveVoiceWithheld("did:key:zAlice", false);
+    expect(loadAudioPrefs().voiceWithheld).toEqual([]);
+  });
+
+  it("keeps the newest choice when the list is full", () => {
+    for (let i = 0; i < 200; i++) saveVoiceWithheld(`did:key:z${i}`, true);
+    expect(saveVoiceWithheld("did:key:zNewest", true)).toContain("did:key:zNewest");
+    const stored = loadAudioPrefs().voiceWithheld;
+    expect(stored).toContain("did:key:zNewest");
+    expect(stored).not.toContain("did:key:z0");
+    expect(stored).toHaveLength(200);
+  });
+
+  it("refuses peer ids and drops stored junk", () => {
+    saveVoiceWithheld("12D3KooWSomePeer", true);
+    expect(loadAudioPrefs().voiceWithheld).toEqual([]);
+    localStorage.setItem("awful_audio_prefs", JSON.stringify({ voiceWithheld: ["did:key:zOk", 7, "nope", "did:key:zOk"] }));
+    expect(loadAudioPrefs().voiceWithheld).toEqual(["did:key:zOk"]);
   });
 });
 
@@ -134,5 +165,45 @@ describe("DeepFilterNet3 strength", () => {
     expect(clampDfnAttenuation(40, 41)).toEqual({ speechDb: 40, pauseDb: 43 });
     expect(clampDfnAttenuation(10, 60)).toEqual({ speechDb: 10, pauseDb: 60 });
     expect(clampDfnAttenuation(Number.NaN, 45)).toEqual({ speechDb: 25, pauseDb: 45 });
+  });
+});
+
+// The per-person settings are keyed by did:key, so they mean the same on any
+// device of the account and a device sync carries them. The hardware choices
+// stay where they were made.
+describe("per-person audio settings across a device sync", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("exports only what is about people", () => {
+    saveAudioPrefs({ inputDevice: "mic-1", peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zB"] });
+    expect(peerAudioPrefs()).toEqual({ peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zB"] });
+  });
+
+  it("a merge keeps everyone withheld on either device and this device's volume where both set one", () => {
+    saveAudioPrefs({ inputDevice: "mic-1", peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zA"] });
+    importPeerAudioPrefs({
+      peerVolumes: { "did:key:zA": 2, "did:key:zB": 0.6, "12D3KooWNotADid": 1.5 },
+      voiceWithheld: ["did:key:zB", "not-a-did"],
+    }, "add");
+    const prefs = loadAudioPrefs();
+    expect(prefs.inputDevice).toBe("mic-1");
+    expect(prefs.peerVolumes).toEqual({ "did:key:zA": 0.4, "did:key:zB": 0.6 });
+    expect(prefs.voiceWithheld).toEqual(["did:key:zA", "did:key:zB"]);
+  });
+
+  it("a merge past the bound drops imported entries, never this device's", () => {
+    const local = Array.from({ length: 200 }, (_, i) => `did:key:zLocal${i}`);
+    saveAudioPrefs({ voiceWithheld: local });
+    importPeerAudioPrefs({ voiceWithheld: ["did:key:zImported"] }, "add");
+    expect(loadAudioPrefs().voiceWithheld).toEqual(local);
+  });
+
+  it("a replace adopts the other device's, and leaves this device's hardware alone", () => {
+    saveAudioPrefs({ inputDevice: "mic-1", peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zA"] });
+    importPeerAudioPrefs({ peerVolumes: { "did:key:zB": 0.6 }, voiceWithheld: [] }, "replace");
+    const prefs = loadAudioPrefs();
+    expect(prefs.inputDevice).toBe("mic-1");
+    expect(prefs.peerVolumes).toEqual({ "did:key:zB": 0.6 });
+    expect(prefs.voiceWithheld).toEqual([]);
   });
 });

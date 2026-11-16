@@ -70,6 +70,7 @@ import type {
   PendingMessage,
 } from "./types/message";
 import { MessageType } from "./types/message";
+import { parseCallCard } from "./call-card";
 import { compareMessages, type MessageCursor } from "./transport/message-order";
 import { issueLamport, observeLamport } from "./transport/logical-clock";
 import type {
@@ -274,6 +275,25 @@ export interface SavedGif {
   mimeType?: string;
 }
 
+/** Someone this device soft-blocked (see blocks.svelte.ts). */
+export interface BlockEntry {
+  did: string;
+  /** Their name when blocked, so the list in Settings can say who. */
+  name: string;
+  blockedAt: number;
+  /**
+   * Set when unblocked. The entry is kept so the DMs they wrote between
+   * blockedAt and this stay refused: they were turned away while blocked,
+   * and unblocking must not let history sync deliver them after all.
+   */
+  unblockedAt?: number;
+  /**
+   * The [blockedAt, unblockedAt) windows of blocks lifted before this one,
+   * still refused for the same reason.
+   */
+  earlier?: [number, number][];
+}
+
 export interface PhonebookEntry {
   peerId: string;
   did?: string;
@@ -347,6 +367,10 @@ type AppDB = IDBPDatabase<{
   phonebook: {
     key: Blinded;
     value: PhonebookEntry;
+  };
+  blocks: {
+    key: Blinded;
+    value: BlockEntry;
   };
   searchIndex: {
     key: Blinded;
@@ -423,7 +447,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 9, {
+  db = (await openDB(dbName(), 10, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -533,6 +557,10 @@ async function openDatabase(): Promise<AppDB> {
         transaction
           .objectStore("attachments")
           .createIndex("byRoom", "roomCode", { unique: false });
+      }
+      if (oldVersion < 10) {
+        // Soft blocks, sealed like the phonebook (see STORE_SPECS.blocks).
+        database.createObjectStore("blocks", { keyPath: "did" });
       }
     },
     blocking() {
@@ -2008,13 +2036,18 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
 export async function getUnreadCount(
   roomCode: string,
   lastSeenLamport: number,
-  excludeSenderId?: string
+  excludeSenderId?: string,
+  /** Senders whose rows never count: the soft-blocked (blocks.svelte.ts). */
+  skipSenders: Iterable<string> = []
 ): Promise<number> {
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
-  const blindedExcludeSenderId = excludeSenderId
-    ? await blindValue(excludeSenderId)
-    : undefined;
+  const skipped = new Set<string>();
+  for (const id of [...(excludeSenderId ? [excludeSenderId] : []), ...skipSenders]) {
+    // Rows hold the blinded id; a row from before the migration, the clear one.
+    skipped.add(await blindValue(id));
+    skipped.add(id);
+  }
   const blindedRange = IDBKeyRange.bound(
     [blindRoomCode, lastSeenLamport + 1],
     [blindRoomCode, Number.MAX_SAFE_INTEGER]
@@ -2050,12 +2083,20 @@ export async function getUnreadCount(
     messages = Array.from(byId.values());
   }
 
-  return messages.filter(
+  const counted = messages.filter(
     (m) =>
       m.type !== MessageType.Reaction &&
       m.type !== MessageType.PluginUpdate &&
-      (!blindedExcludeSenderId || m.senderId !== blindedExcludeSenderId)
-  ).length;
+      !skipped.has(m.senderId)
+  );
+  // A call's end card folds into its start in the view (call-card.ts): one
+  // card, one unread. Its phase is in the sealed content, so only these rows
+  // are opened - a handful, against the whole unread range.
+  const callRows = counted.filter((m) => m.type === MessageType.CallEvent);
+  if (!callRows.length) return counted.length;
+  const opened = await openRows<Message>(callRows, STORE_SPECS.messages).catch(() => [] as Message[]);
+  const ends = opened.filter((m) => parseCallCard(m.content)?.phase === "end").length;
+  return counted.length - ends;
 }
 
 const MESSAGE_STATUS_RANK: Record<MessageStatus, number> = {
@@ -3097,7 +3138,16 @@ export async function getOwnProfile(
   const database = await getDB();
   // did and isMe are clear fields, so both lookups run before any decrypt.
   const all = await database.getAll("profiles");
-  const mine = all.find((p) => p.isMe === true);
+  const own = all.filter((p) => p.isMe === true);
+  let mine = own[0];
+  // More than one isMe row is what a merge from another account used to
+  // leave behind (it wrote that account's own profile as ours), and "the
+  // first one" was then whichever sorted first. Ours is the one under our
+  // DID, when we know it.
+  if (own.length > 1 && selfDid) {
+    const blinded = await blindValue(selfDid);
+    mine = own.find((p) => p.did === blinded || p.did === selfDid) ?? mine;
+  }
   // skipBytes: senders only need the nickname - decrypting the avatar and
   // banner blobs on EVERY message send was a visible chunk of send latency.
   if (mine) return _open("profiles", mine as OwnProfile, opts);
@@ -3629,6 +3679,17 @@ export async function dedupePhonebook(): Promise<void> {
   }
 }
 
+export async function getBlockEntries(): Promise<BlockEntry[]> {
+  const database = await getDB();
+  const rows = await _openAll<BlockEntry>("blocks", await database.getAll("blocks"));
+  return rows.sort((a, b) => a.blockedAt - b.blockedAt);
+}
+
+export async function putBlockEntry(entry: BlockEntry): Promise<void> {
+  const database = await getDB();
+  await database.put("blocks", await _seal("blocks", entry));
+}
+
 export async function putPhonebookEntry(entry: PhonebookEntry): Promise<void> {
   const database = await getDB();
   await database.put("phonebook", await _seal("phonebook", entry));
@@ -3790,8 +3851,19 @@ export function clearAtRestFlagForCurrentOwner(): void {
 }
 
 /** Call after any write that may have landed plaintext (a locked import):
- *  the next unlock's sweep re-scans and seals it. */
-export function markAtRestSweepNeeded(): void {
+ *  the next unlock's sweep re-scans and seals it.
+ *
+ *  `did` names the identity the written rows belong to, when the caller
+ *  knows it: a merge into this device's own account. Then only that
+ *  identity's flag goes (and the unscoped one a locked session checks), not
+ *  every account's - wiping the others cost each of them a full re-sweep for
+ *  rows nobody had touched. */
+export function markAtRestSweepNeeded(did?: string | null): void {
+  if (did) {
+    const scoped = `${ATREST_FLAG_PREFIX}:${hashRef(did)}`;
+    removeAtRestFlags((key) => key === scoped || key === ATREST_FLAG_PREFIX);
+    return;
+  }
   // EVERY identity's flag, not just the current one. The caller that needs
   // this most is a backup restore from the signup screen, where no identity
   // is active yet - so _atRestOwner is null and the scoped key we would clear

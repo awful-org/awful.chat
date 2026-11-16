@@ -1,13 +1,17 @@
+import { untrack } from "svelte";
 import { transportState, _transport, _dfn } from "./transport.svelte";
 import {
   loadAudioPrefs,
   loadPeerVolume,
   saveAudioPrefs,
   savePeerVolume,
+  saveVoiceWithheld,
   type NoiseEngine,
 } from "./audio-prefs";
 import { peerIdToDid } from "./transport.svelte";
 import { looksLikeDid } from "$lib/identity/identity-utils";
+import { shouldWithholdVoice } from "./voice-withhold";
+import { blockedDids, blocks, isBlockedDid } from "$lib/blocks.svelte";
 import type { LibP2PVoice } from "./libp2p/voice";
 import type { DtlnProcessor } from "../audio/dtln-processor";
 import {
@@ -28,6 +32,93 @@ export const voiceProcessing = $state({
   loading: false,
 });
 
+/**
+ * Who this device sends no voice to, by did:key. Reactive for the menus; the
+ * voice layer asks withholdVoiceFrom() per peer at every point it attaches
+ * the microphone, so a change here reaches a call already running.
+ */
+export const voiceWithheld = $state({ dids: loadAudioPrefs().voiceWithheld });
+
+/** Every did:key this device must not send voice to, whatever the reason. */
+function withheldDids(): Set<string> {
+  const all = new Set(voiceWithheld.dids);
+  // A soft block keeps your voice from them too.
+  for (const did of blockedDids()) all.add(did);
+  return all;
+}
+
+/**
+ * Whether this peer must not get our voice (see shouldWithholdVoice for why
+ * an unknown peer gets none while anyone is withheld). The binding of their
+ * identity refreshes every link, so it flows the moment they are named.
+ */
+export function withholdVoiceFrom(peerId: string): boolean {
+  const did = peerIdToDid(peerId);
+  return shouldWithholdVoice(withheldDids(), looksLikeDid(did) ? did : null);
+}
+
+/** Re-ask every live link after a list behind withholdVoiceFrom changed. */
+export function refreshVoiceWithheld(): void {
+  void _voice?.refreshWithheld();
+}
+
+/** Send this person no voice, or send it again. Needs their identity. */
+export function setVoiceWithheld(peerId: string, withheld: boolean): boolean {
+  const did = peerIdToDid(peerId);
+  if (!looksLikeDid(did)) return false;
+  // From the returned list, not a reload: blocked storage must not undo
+  // the choice for the call in progress. The effect in initVoice re-asks
+  // every live link when this changes.
+  voiceWithheld.dids = saveVoiceWithheld(did, withheld);
+  return true;
+}
+
+/**
+ * Why this peer gets no voice, for the tile marker: "chosen" (withheld by
+ * name), "unknown" (not named yet while anyone is withheld), or null.
+ */
+export function voiceWithheldReason(peerId: string): "chosen" | "unknown" | null {
+  void transportState.peerDidVersion;
+  void voiceWithheld.dids;
+  if (!withholdVoiceFrom(peerId)) return null;
+  return looksLikeDid(peerIdToDid(peerId)) ? "chosen" : "unknown";
+}
+
+/**
+ * This person was chosen, by name, to get no voice - the menu's toggle. A
+ * block withholds too, but is undone by unblocking, not by this toggle.
+ */
+export function isVoiceWithheld(peerId: string): boolean {
+  void voiceWithheld.dids;
+  const did = peerIdToDid(peerId);
+  return looksLikeDid(did) && voiceWithheld.dids.includes(did);
+}
+
+/** Peers this device muted because they are blocked, to unmute on unblock. */
+const _mutedForBlock = new Set<string>();
+
+/** Silence a blocked peer for us, live only: their saved volume stays. */
+function muteForBlock(peerId: string): void {
+  _voice?.setPeerVolume(peerId, 0);
+  _mutedForBlock.add(peerId);
+}
+
+/**
+ * Bring every peer in the call in line with the block list: blocked ones
+ * muted, ones unblocked since back at the volume remembered for them.
+ */
+function syncBlockMutes(): void {
+  for (const peerId of transportState.participants.keys()) {
+    const did = peerIdToDid(peerId);
+    if (!looksLikeDid(did)) continue;
+    if (isBlockedDid(did)) {
+      if (!_mutedForBlock.has(peerId)) muteForBlock(peerId);
+    } else if (_mutedForBlock.delete(peerId)) {
+      _voice?.setPeerVolume(peerId, loadPeerVolume(did) ?? 1);
+    }
+  }
+}
+
 let _voice: LibP2PVoice | null = null;
 let _dtln: DtlnProcessor | null = null;
 let _initialized = false;
@@ -42,6 +133,22 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
   _initialized = true;
   _voice = voice;
   _dtln = dtln;
+  _voice.setWithholdPolicy(withholdVoiceFrom);
+  // A peer's identity binding can flip the answer for an unknown peer, so
+  // every binding - and every change of the list - re-asks the policy for
+  // every live link.
+  $effect.root(() => {
+    $effect(() => {
+      void transportState.peerDidVersion;
+      void voiceWithheld.dids;
+      void blocks.version;
+      void _voice?.refreshWithheld();
+      // Untracked: reading the participants here re-ran every withhold check
+      // on each track and stall change. A peer that joins is handled by
+      // trackAdded's applyStored; a binding or a block change re-runs this.
+      untrack(syncBlockMutes);
+    });
+  });
   _voice.on("processingChanged", (engine, reason, unsupported) => {
     voiceProcessing.engine = engine;
     voiceProcessing.fallbackReason = reason ?? null;
@@ -60,8 +167,19 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
     // at 1.0 while the menu showed the stored boost - a slider already "at"
     // 250% that audibly did nothing.
     const applyStored = (attempt: number) => {
-      if (_voice?.hasPeerVolume(peerId)) return;
       const did = peerIdToDid(peerId);
+      // Before the held-volume check: a volume is kept per peerId after they
+      // leave, so a blocked peer rejoining at a volume set earlier was heard,
+      // and one unblocked while away came back still muted.
+      if (looksLikeDid(did) && isBlockedDid(did)) {
+        muteForBlock(peerId);
+        return;
+      }
+      if (looksLikeDid(did) && _mutedForBlock.delete(peerId)) {
+        _voice?.setPeerVolume(peerId, loadPeerVolume(did) ?? 1);
+        return;
+      }
+      if (_voice?.hasPeerVolume(peerId)) return;
       if (looksLikeDid(did)) {
         const stored = loadPeerVolume(did);
         if (stored !== null) _voice?.setPeerVolume(peerId, stored);

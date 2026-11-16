@@ -9,8 +9,16 @@ const { FakeTransport, instances } = vi.hoisted(() => {
   const instances: any[] = [];
   class FakeTransport {
     handlers = new Map<string, ((...args: any[]) => void)[]>();
-    sent: { type: string; payload?: any }[] = [];
+    sent: { type: string; v?: number; payload?: any }[] = [];
+    /** Which peer each sent frame went to, index for index with `sent`. */
+    sentTo: string[] = [];
     sendResults: boolean[] = [];
+    /**
+     * When set, every data frame this transport sends is acked back as if
+     * by this peer - the export is paced on acks, and a test that is not
+     * about pacing should not have to answer each frame by hand.
+     */
+    autoAck: string | null = null;
     constructor() {
       instances.push(this);
     }
@@ -33,9 +41,18 @@ const { FakeTransport, instances } = vi.hoisted(() => {
     selfId() {
       return "12D3KooW" + "A".repeat(44);
     }
-    async send(_peerId: string, data: Uint8Array) {
-      this.sent.push(JSON.parse(new TextDecoder().decode(data)));
-      return this.sendResults.length ? this.sendResults.shift()! : true;
+    async send(peerId: string, data: Uint8Array) {
+      const msg = JSON.parse(new TextDecoder().decode(data));
+      this.sent.push(msg);
+      this.sentTo.push(peerId);
+      const ok = this.sendResults.length ? this.sendResults.shift()! : true;
+      if (ok && this.autoAck && msg.type === "sync_export_data") {
+        const from = this.autoAck;
+        queueMicrotask(() => this.emit("message", from, new TextEncoder().encode(JSON.stringify({
+          type: "sync_export_ack", v: 2, payload: { seq: msg.payload.seq },
+        }))));
+      }
+      return ok;
     }
   }
   return { FakeTransport, instances };
@@ -44,23 +61,33 @@ vi.mock("./libp2p/transport", () => ({ LibP2PTransport: FakeTransport }));
 
 // The import half is exercised in backup-restore.test.ts against a real
 // database; here only WHAT the target hands it matters.
-const { importCalls, importControl } = vi.hoisted(() => ({
+const { importCalls, importControl, markerControl } = vi.hoisted(() => ({
   importCalls: [] as { data: any; mode: string; options: any }[],
   importControl: { run: null as null | ((options: any) => Promise<void>) },
+  markerControl: { fail: false },
 }));
-vi.mock("./backup-restore", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./backup-restore")>()),
-  importDatabase: async (data: any, mode: any, options: any) => {
-    importCalls.push({ data, mode, options });
-    if (importControl.run) await importControl.run(options);
-    else options.beforeCommit?.();
-    return { droppedRecords: 0 };
-  },
-}));
+vi.mock("./backup-restore", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./backup-restore")>();
+  return {
+    ...original,
+    importDatabase: async (data: any, mode: any, options: any) => {
+      importCalls.push({ data, mode, options });
+      if (importControl.run) await importControl.run(options);
+      else options.beforeCommit?.();
+      return { droppedRecords: 0 };
+    },
+    applyRoomDeletionMarkers: async (markers: unknown[]) => {
+      if (markerControl.fail) throw new Error("storage went away");
+      return original.applyRoomDeletionMarkers(markers);
+    },
+  };
+});
 
 import {
+  approveSync,
   cancelSync,
   connectAsTarget,
+  denySync,
   generateShortCode,
   generateSyncCode,
   revealShortCode,
@@ -75,6 +102,10 @@ import {
 import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
 import * as storage from "$lib/storage";
 import QRCode from "qrcode";
+import { EXPORT_SECTIONS } from "./backup";
+import { DIFFERENT_ACCOUNT_MERGE } from "./backup-restore";
+import { SYNC_VERSION_MISMATCH, syncComparisonCode } from "./sync-protocol";
+import { signPeerBinding } from "$lib/messaging";
 const SECURE_SECRET = newRoomSecret();
 const SECURE_ROOM = deriveRoomKeys(SECURE_SECRET).discoveryId;
 
@@ -83,6 +114,28 @@ const SECURE_ROOM = deriveRoomKeys(SECURE_SECRET).discoveryId;
 const PEER_ID = "12D3KooWBmoLnSw8ChzC2K1LZjb1XkUJDihMAcqBRfsTGjfCgHz";
 const ROOM_CODE = "__sync_deadbeef";
 const TOKEN = "0123456789abcdef0123456789abcdef";
+
+const encodeFrame = (obj: unknown) => new TextEncoder().encode(JSON.stringify(obj));
+
+/** A version-2 export request, as the target sends it. */
+function exportRequest(token: string, mode: "add" | "replace", extra: Record<string, unknown> = {}) {
+  return encodeFrame({ type: "sync_export_request", v: 2, payload: { token, mode, ...extra } });
+}
+
+/** Source-side: wait for the request to be put to the user, then allow it. */
+async function approveWhenAsked(source: any, requester = "target") {
+  await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+  source.autoAck = requester;
+  await approveSync();
+}
+
+/** A manifest listing every section, empty unless `counts` says otherwise. */
+function manifest(counts: Record<string, { items: number; batches: number }> = {}) {
+  return Object.fromEntries([
+    ...EXPORT_SECTIONS.map((name) => [name, { items: 0, batches: 0 }]),
+    ...Object.entries(counts),
+  ]);
+}
 
 describe("secure sync invitation and source authorization", () => {
   afterEach(async () => { await cancelSync(); });
@@ -97,9 +150,8 @@ describe("secure sync invitation and source authorization", () => {
       await generateSyncCode();
       const source = instances.at(-1);
       const payload = parsePlaintextToken(syncState.plaintextToken!)!;
-      source.emit("message", "target", new TextEncoder().encode(JSON.stringify({
-        type: "sync_export_request", payload: { token: payload.token, mode: "add" },
-      })), payload.roomCode);
+      source.emit("message", "target", exportRequest(payload.token, "add"), payload.roomCode);
+      await approveWhenAsked(source);
       await vi.waitFor(() => expect(source.sent.some((m: any) =>
         m.type === "sync_export_data" && JSON.stringify(m).includes("watermark-export-sender"),
       )).toBe(true));
@@ -133,10 +185,10 @@ describe("secure sync invitation and source authorization", () => {
       await generateSyncCode();
       const source = instances.at(-1);
       const pairing = parsePlaintextToken(syncState.plaintextToken!)!;
-      source.emit("message", "target", new TextEncoder().encode(JSON.stringify({
-        type: "sync_export_request", payload: { token: pairing.token, mode: "add",
-          roomDeletions: [{ roomCode: otherCode, generation: 100, deletedAt: 300 }] },
-      })), pairing.roomCode);
+      source.emit("message", "target", exportRequest(pairing.token, "add", {
+        roomDeletions: [{ roomCode: otherCode, generation: 100, deletedAt: 300 }],
+      }), pairing.roomCode);
+      await approveWhenAsked(source);
       await vi.waitFor(() => expect(source.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
       // A leave on the other device governs room profiles only: this device
       // still holds the room in the generation the marker names, so it keeps
@@ -167,10 +219,9 @@ describe("secure sync invitation and source authorization", () => {
     await generateSyncCode();
     const source = instances.at(-1);
     const pairing = parsePlaintextToken(syncState.plaintextToken!)!;
-    source.emit("message", "target", new TextEncoder().encode(JSON.stringify({
-      type: "sync_export_request", payload: { token: "bad-token", mode: "add",
-        roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] },
-    })), pairing.roomCode);
+    source.emit("message", "target", exportRequest("bad-token", "add", {
+      roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }],
+    }), pairing.roomCode);
     await vi.waitFor(() => expect(source.sent.some((m: any) => m.type === "sync_error")).toBe(true));
     expect((await storage.getRoom(code))?.createdAt).toBe(100);
   });
@@ -204,11 +255,11 @@ describe("secure sync invitation and source authorization", () => {
     const db = await storage.getDB();
     let release!: (value: typeof db) => void;
     const pending = new Promise<typeof db>((resolve) => { release = resolve; });
+    old.emit("message", "target", exportRequest(payload.token, "add"), payload.roomCode);
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
     const spy = vi.spyOn(storage, "getDB").mockImplementationOnce(() => pending);
     try {
-      old.emit("message", "target", new TextEncoder().encode(JSON.stringify({
-        type: "sync_export_request", payload: { token: payload.token, mode: "add" },
-      })), payload.roomCode);
+      void approveSync();
       await vi.waitFor(() => expect(spy).toHaveBeenCalled());
       await cancelSync();
       await generateSyncCode();
@@ -218,7 +269,7 @@ describe("secure sync invitation and source authorization", () => {
       // Give the actual IndexedDB export time to drain its transactions.
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(replacement.sent).toHaveLength(0);
-      expect(old.sent).toHaveLength(0);
+      expect(old.sent.filter((m: any) => m.type === "sync_export_data")).toHaveLength(0);
       expect(syncState.plaintextToken).toBe(replacementCode);
       expect(syncState.syncError).toBeNull();
     } finally { release(db); spy.mockRestore(); }
@@ -277,9 +328,7 @@ describe("secure sync invitation and source authorization", () => {
     revealShortCode();
     const t = instances.at(-1);
     const payload = parsePlaintextToken(syncState.plaintextToken!)!;
-    const frame = (token: string) => new TextEncoder().encode(JSON.stringify({
-      type: "sync_export_request", payload: { token, mode: "replace" },
-    }));
+    const frame = (token: string) => exportRequest(token, "replace");
     t.emit("message", "intruder", frame(payload.token), null);
     await Promise.resolve();
     expect(t.sent).toHaveLength(0);
@@ -594,7 +643,20 @@ describe("target-side identity handling", () => {
     keypair: { did: "did:key:zSomebodyElse", publicKey: [4] },
   };
 
+  /**
+   * The account a merge proves it is: this device's own DID, and the
+   * account key's signature over the source's peer id. Any session of the
+   * account can make one, which in a test is this one.
+   */
+  async function sameAccount() {
+    await storage.wipeLocalDatabase();
+    const { createIdentity } = await import("$lib/identity/identity");
+    const { keypair } = await createIdentity("same-account-test-password");
+    return { did: keypair.did, binding: signPeerBinding(PEER_ID).bindingSig };
+  }
+
   async function runTarget(mode: "add" | "replace") {
+    const account = mode === "add" ? await sameAccount() : {};
     await connectAsTarget({
       roomCode: SECURE_ROOM,
       roomSecret: SECURE_SECRET,
@@ -609,32 +671,41 @@ describe("target-side identity handling", () => {
       "message",
       PEER_ID,
       frame({
-        type: "sync_export_data",
-        payload: { section: "identity", data: identitySection, token: TOKEN },
+        type: "sync_export_data", v: 2,
+        payload: { section: "identity", data: identitySection, token: TOKEN, seq: 0, ...account },
       })
     );
     await vi.waitFor(() => expect(t.sent.length).toBeGreaterThan(1));
-    t.emit("message", PEER_ID, frame({ type: "sync_export_complete" }));
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete", v: 2, payload: { manifest: manifest(), token: TOKEN } }));
     await vi.waitFor(() => expect(importCalls).toHaveLength(1));
     return importCalls[0];
   }
 
   it("passes received own overrides and leave markers to the importer", async () => {
+    const account = await sameAccount();
     await connectAsTarget({ roomCode: SECURE_ROOM, roomSecret: SECURE_SECRET,
       token: TOKEN, expires: Date.now() + 60_000, peerId: PEER_ID, mode: "add" });
     const t = instances.at(-1);
     t.emit("connect", PEER_ID);
+    t.emit("message", PEER_ID, frame({ type: "sync_export_data", v: 2, payload: {
+      section: "identity", token: TOKEN, seq: 0, ...account,
+    } }));
+    let seq = 1;
     for (const [section, record] of [
       ["roomProfiles", { roomCode: "room-a", did: "did:alice", generation: 100,
         fields: { nickname: null }, fieldEdits: { nickname: { at: 120, id: "a", reset: true } } }],
       ["roomDeletions", { roomCode: "room-b", generation: 100, deletedAt: 300 }],
     ] as const) {
-      t.emit("message", PEER_ID, frame({ type: "sync_export_data", payload: {
-        section, data: [record], token: TOKEN, batchIndex: 0, totalBatches: 1,
+      t.emit("message", PEER_ID, frame({ type: "sync_export_data", v: 2, payload: {
+        section, data: [record], token: TOKEN, batchIndex: 0, totalBatches: 1, seq: seq++,
       } }));
     }
-    await vi.waitFor(() => expect(t.sent.filter((m: any) => m.type === "sync_export_ack")).toHaveLength(2));
-    t.emit("message", PEER_ID, frame({ type: "sync_export_complete" }));
+    await vi.waitFor(() => expect(t.sent.filter((m: any) => m.type === "sync_export_ack")).toHaveLength(3));
+    expect(t.sent.filter((m: any) => m.type === "sync_export_ack").map((m: any) => m.payload.seq)).toEqual([0, 1, 2]);
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete", v: 2, payload: {
+      token: TOKEN,
+      manifest: manifest({ roomProfiles: { items: 1, batches: 1 }, roomDeletions: { items: 1, batches: 1 } }),
+    } }));
     await vi.waitFor(() => expect(importCalls).toHaveLength(1));
     expect(importCalls[0].data.roomProfiles).toEqual([{ roomCode: "room-a", did: "did:alice",
       generation: 100, fields: { nickname: null }, fieldEdits: { nickname: { at: 120, id: "a", reset: true } } }]);
@@ -710,5 +781,471 @@ describe("target-side identity handling", () => {
     const call = await runTarget("replace");
     expect(call.mode).toBe("replace");
     expect(call.data.identity.keypair.did).toBe("did:key:zSomebodyElse");
+  });
+});
+
+const ack = (seq: number) => encodeFrame({ type: "sync_export_ack", v: 2, payload: { seq } });
+
+/** A source device with an account and `messages` rows of history. */
+async function sourceWithHistory(messages = 0) {
+  const { createIdentity } = await import("$lib/identity/identity");
+  await storage.wipeLocalDatabase();
+  await createIdentity("source-test-password");
+  if (messages > 0) {
+    await storage.bulkPutMessages(Array.from({ length: messages }, (_, i) => ({
+      id: `pace-${i}`, roomCode: "pacing-room-0001", senderId: "did:key:zPacer", senderName: "P",
+      timestamp: i, lamport: i + 1, type: "text", content: `message ${i}`, attachments: [],
+    })) as never);
+  }
+  await generateSyncCode();
+  const t = instances.at(-1);
+  const pairing = parsePlaintextToken(syncState.plaintextToken!)!;
+  const ask = (peer: string, mode: "add" | "replace" = "add", extra: Record<string, unknown> = {}) =>
+    t.emit("message", peer, exportRequest(pairing.token, mode, extra), pairing.roomCode);
+  return { t, pairing, ask };
+}
+
+/** A source device in the sync room, without an account behind it. */
+async function bareSource() {
+  await generateSyncCode();
+  const t = instances.at(-1);
+  const pairing = parsePlaintextToken(syncState.plaintextToken!)!;
+  const ask = (peer: string, mode: "add" | "replace" = "add", extra: Record<string, unknown> = {}) =>
+    t.emit("message", peer, exportRequest(pairing.token, mode, extra), pairing.roomCode);
+  return { t, pairing, ask };
+}
+
+// Holding the token used to be all it took: the first peer to ask with it got
+// the whole account, and the real device's request was dropped without a word,
+// leaving it at 0% until its watchdog fired. Anyone who saw the QR or the
+// copied code holds the token.
+describe("the source asks its user before it sends anything", () => {
+  afterEach(async () => {
+    markerControl.fail = false;
+    vi.useRealTimers();
+    await cancelSync();
+    (await import("$lib/identity/identity")).lockIdentity();
+  });
+
+  it("answers a request with a code to compare, and nothing else", async () => {
+    const { t, pairing, ask } = await bareSource();
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    expect(t.sent.map((m: any) => m.type)).toEqual(["sync_approval_pending"]);
+    const { nonce } = t.sent[0].payload;
+    expect(nonce).toMatch(/^[0-9a-f]{32}$/);
+    expect(syncState.pairingCode).toBe(syncComparisonCode(t.selfId(), "target", pairing.token, nonce));
+    expect(syncState.isSyncing).toBe(false);
+  });
+
+  it("lets nothing an unapproved request carries touch this device", async () => {
+    await storage.wipeLocalDatabase();
+    await (await import("../storage-crypto")).initStorageCrypto(new Uint8Array(32).fill(33));
+    const secret = newRoomSecret();
+    const code = deriveRoomKeys(secret).discoveryId;
+    // Rejoined here since the leave the request reports: an allowed request
+    // would store its marker. One that is not allowed stores nothing.
+    await storage.putRoom({ roomCode: code, roomSecret: secret, type: "text", name: "Here",
+      createdAt: 400, lastSeenLamport: 0, participants: [] });
+    const { t, ask } = await bareSource();
+    ask("target", "add", { roomDeletions: [{ roomCode: code, generation: 100, deletedAt: 300 }] });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    expect(await storage.getRoomDeletionMarker(code)).toBeUndefined();
+    await denySync();
+    expect(await storage.getRoomDeletionMarker(code)).toBeUndefined();
+    expect(t.sent.filter((m: any) => m.type === "sync_export_data")).toHaveLength(0);
+  });
+
+  it("refuses a second requester out loud instead of leaving it waiting", async () => {
+    const { t, ask } = await sourceWithHistory();
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    ask("intruder");
+    await vi.waitFor(() => expect(t.sentTo).toContain("intruder"));
+    expect(t.sent[t.sentTo.indexOf("intruder")]).toMatchObject({
+      type: "sync_error", payload: { error: expect.stringMatching(/Another device is already syncing/) },
+    });
+    // The first request is still the one being asked about.
+    expect(syncState.awaitingApproval).toBe(true);
+    await approveWhenAsked(t);
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    ask("latecomer");
+    await vi.waitFor(() => expect(t.sentTo).toContain("latecomer"));
+    expect(t.sent[t.sentTo.indexOf("latecomer")].type).toBe("sync_error");
+    // Every data frame went to the one device that was allowed.
+    t.sent.forEach((m: any, i: number) => {
+      if (m.type === "sync_export_data") expect(t.sentTo[i]).toBe("target");
+    });
+  });
+
+  it("tells a denied requester, and spends the code", async () => {
+    const { t, ask } = await bareSource();
+    ask("intruder");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    await denySync();
+    expect(t.sentTo.at(-1)).toBe("intruder");
+    expect(t.sent.at(-1)).toMatchObject({ type: "sync_error", payload: { error: expect.stringMatching(/declined/) } });
+    expect(syncState.syncError).toMatch(/declined/);
+    expect(syncState.awaitingApproval).toBe(false);
+    const before = t.sent.length;
+    ask("target");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(t.sent).toHaveLength(before);
+  });
+
+  it("goes back to waiting when the requester gives up before an answer", async () => {
+    const { t, pairing, ask } = await bareSource();
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    t.emit("disconnect", "target");
+    expect(syncState.awaitingApproval).toBe(false);
+    expect(syncState.pairingCode).toBeNull();
+    expect(syncState.isConnecting).toBe(true);
+    ask("phone");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    t.emit("message", "phone", encodeFrame({ type: "sync_error", v: 2, payload: { error: "cancelled" } }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(false));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("refuses a version 1 request in words an old build shows", async () => {
+    const { t, pairing } = await bareSource();
+    t.emit("message", "old-target", encodeFrame({
+      type: "sync_export_request", payload: { token: pairing.token, mode: "add" },
+    }), pairing.roomCode);
+    await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+    expect(t.sent[0]).toMatchObject({ type: "sync_error", payload: { error: SYNC_VERSION_MISMATCH } });
+    expect(syncState.awaitingApproval).toBe(false);
+  });
+
+  it("ends with an error, not a spinner, when the target's leaves cannot be applied", async () => {
+    markerControl.fail = true;
+    const { t, ask } = await bareSource();
+    ask("target", "add", { roomDeletions: [{ roomCode: "room-x", generation: 1, deletedAt: 2 }] });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    await approveSync();
+    expect(syncState.isSyncing).toBe(false);
+    expect(syncState.syncError).toMatch(/room changes/);
+    expect(t.sent.at(-1)).toMatchObject({ type: "sync_error" });
+    expect(t.sent.filter((m: any) => m.type === "sync_export_data")).toHaveLength(0);
+  });
+});
+
+describe("the export is paced on acks and closed with a manifest", () => {
+  afterEach(async () => {
+    vi.useRealTimers();
+    await cancelSync();
+    (await import("$lib/identity/identity")).lockIdentity();
+  });
+
+  const data = (t: any) => t.sent.filter((m: any) => m.type === "sync_export_data");
+
+  it("has no more than a window of frames out unacknowledged", async () => {
+    const { t, ask } = await sourceWithHistory(300);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    void approveSync();
+    // The identity frame and three of the six message batches.
+    await vi.waitFor(() => expect(data(t)).toHaveLength(4));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(data(t)).toHaveLength(4);
+    t.emit("message", "target", ack(data(t)[0].payload.seq));
+    await vi.waitFor(() => expect(data(t)).toHaveLength(5));
+    const unanswered = data(t).slice(1);
+    t.autoAck = "target";
+    for (const m of unanswered) t.emit("message", "target", ack(m.payload.seq));
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    const { manifest: listed } = t.sent.find((m: any) => m.type === "sync_export_complete").payload;
+    expect(listed.messages).toEqual({ items: 300, batches: 6 });
+    // Empty sections are listed too: an absent one is what a lost frame looks like.
+    for (const name of EXPORT_SECTIONS) expect(listed).toHaveProperty(name);
+    expect(listed.localState).toEqual({ items: 1, batches: 1 });
+  });
+
+  it("says who it is in a merge, with a binding only the account key could sign", async () => {
+    const { t, ask } = await sourceWithHistory();
+    ask("target", "add");
+    await approveWhenAsked(t);
+    await vi.waitFor(() => expect(data(t).length).toBeGreaterThan(0));
+    const identity = data(t)[0].payload;
+    expect(identity.section).toBe("identity");
+    expect(identity.data).toBeUndefined();
+    expect(identity.did).toBe((await storage.getKeypairRecord())?.did);
+    const { verifyPeerBinding } = await import("$lib/messaging");
+    expect(await verifyPeerBinding(identity.did, t.selfId(), identity.binding)).toBe(true);
+  });
+
+  it("fails at once when the target is lost mid-transfer", async () => {
+    const { t, ask } = await sourceWithHistory(300);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    void approveSync();
+    await vi.waitFor(() => expect(data(t)).toHaveLength(4));
+    t.emit("disconnect", "target");
+    expect(syncState.syncError).toMatch(/while sending/);
+    expect(syncState.isSyncing).toBe(false);
+    t.emit("message", "target", ack(data(t)[0].payload.seq));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(data(t)).toHaveLength(4);
+  });
+
+  // The receiver's disconnect used to win over everything: a "Connection
+  // lost" said while the other device imported stuck, even over a success.
+  it("lets a late confirmation replace a connection lost during the remote import", async () => {
+    const { t, pairing, ask } = await sourceWithHistory();
+    ask("target");
+    await approveWhenAsked(t);
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    t.emit("disconnect", "target");
+    expect(syncState.syncError).toMatch(/while the other device was importing/);
+    t.emit("message", "target", encodeFrame({ type: "sync_export_complete", v: 2 }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("keeps waiting on the password through the link's keepalive", async () => {
+    const { t, pairing, ask } = await sourceWithHistory();
+    ask("target", "replace");
+    await approveWhenAsked(t);
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: 2 }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.phase).toBe("remote-password"));
+    // A ping is the link, not the import resuming: it must not restart the
+    // clock that a person typing a password is exempt from.
+    t.emit("message", "target", new TextEncoder().encode(JSON.stringify({ type: "__ping", n: 1 })), pairing.roomCode);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(syncState.syncError).toBeNull();
+    expect(syncState.phase).toBe("remote-password");
+  });
+
+  // The receiver's password prompt sends nothing for as long as a person
+  // takes to type, and the source's 120-second clock used to disconnect a
+  // sync that was waiting on exactly that.
+  it("stops timing the target while its user types a password, and starts again after", async () => {
+    const { t, pairing, ask } = await sourceWithHistory();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    ask("target", "replace");
+    await approveWhenAsked(t);
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: 2 }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.phase).toBe("remote-password"));
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(syncState.syncError).toBeNull();
+    t.emit("message", "target", encodeFrame({ type: "sync_import_progress", v: 2, payload: { percent: 95 } }), pairing.roomCode);
+    await vi.advanceTimersByTimeAsync(119_000);
+    expect(syncState.syncError).toBeNull();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(syncState.syncError).toMatch(/never confirmed the import/);
+  });
+});
+
+describe("the target confirms, checks and reports", () => {
+  afterEach(async () => {
+    importControl.run = null;
+    importCalls.length = 0;
+    vi.useRealTimers();
+    await cancelSync();
+    (await import("$lib/identity/identity")).lockIdentity();
+  });
+
+  const IDENTITY = {
+    mnemonic: { salt: [1], iv: [2], encrypted: [3], iterations: 600_000 },
+    keypair: { did: "did:key:zTheAccount", publicKey: [4] },
+  };
+
+  async function target(mode: "add" | "replace" = "replace", options: Parameters<typeof connectAsTarget>[1] = {}) {
+    await connectAsTarget({ roomCode: SECURE_ROOM, roomSecret: SECURE_SECRET, token: TOKEN,
+      expires: Date.now() + 60_000, peerId: PEER_ID, mode }, options);
+    const t = instances.at(-1);
+    t.emit("connect", PEER_ID);
+    return t;
+  }
+  const fromSource = (t: any, obj: unknown) => t.emit("message", PEER_ID, encodeFrame(obj));
+  const identityFrame = (extra: Record<string, unknown> = {}) => ({ type: "sync_export_data", v: 2,
+    payload: { section: "identity", data: IDENTITY, token: TOKEN, seq: 0, ...extra } });
+  const complete = (counts: Record<string, { items: number; batches: number }> = {}) =>
+    ({ type: "sync_export_complete", v: 2, payload: { manifest: manifest(counts), token: TOKEN } });
+
+  it("shows the code the source computed, and does not time out while that user decides", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = await target();
+    const nonce = "c".repeat(32);
+    fromSource(t, { type: "sync_approval_pending", v: 2, payload: { nonce } });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    expect(syncState.pairingCode).toBe(syncComparisonCode(PEER_ID, t.selfId(), TOKEN, nonce));
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(syncState.syncError).toBeNull();
+    // Allowed: the data starts, and from here silence is a stall again.
+    fromSource(t, identityFrame());
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(false));
+    expect(syncState.pairingCode).toBeNull();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(syncState.syncError).toMatch(/stopped sending/);
+  });
+
+  it("refuses a version 1 source's data and says why on both ends", async () => {
+    const t = await target();
+    fromSource(t, { type: "sync_export_data", payload: { section: "identity", data: IDENTITY, token: TOKEN } });
+    await vi.waitFor(() => expect(syncState.syncError).toBe(SYNC_VERSION_MISMATCH));
+    expect(t.sent.at(-1)).toMatchObject({ type: "sync_error", payload: { error: SYNC_VERSION_MISMATCH } });
+    expect(importCalls).toHaveLength(0);
+  });
+
+  // The transport's keepalive rides the secure room too, with no version.
+  it("ignores the link's keepalive while waiting for the source's user", async () => {
+    const t = await target();
+    fromSource(t, { type: "sync_approval_pending", v: 2, payload: { nonce: "d".repeat(32) } });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    fromSource(t, { type: "__ping", n: 1 });
+    fromSource(t, null);
+    fromSource(t, identityFrame());
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(false));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("refuses a merge from a different account before anything is written", async () => {
+    await storage.wipeLocalDatabase();
+    const { createIdentity } = await import("$lib/identity/identity");
+    await createIdentity("this-account-password");
+    const t = await target("add");
+    fromSource(t, identityFrame({ data: undefined, did: "did:key:zSomebodyElse", binding: "00".repeat(64) }));
+    await vi.waitFor(() => expect(syncState.syncError).toBe(DIFFERENT_ACCOUNT_MERGE));
+    expect(t.sent.at(-1)).toMatchObject({ type: "sync_error" });
+    fromSource(t, complete());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(importCalls).toHaveLength(0);
+  });
+
+  it("refuses this account's DID when the source cannot sign for it", async () => {
+    await storage.wipeLocalDatabase();
+    const { createIdentity } = await import("$lib/identity/identity");
+    const { keypair } = await createIdentity("this-account-password");
+    const t = await target("add");
+    fromSource(t, identityFrame({ data: undefined, did: keypair.did, binding: "00".repeat(64) }));
+    await vi.waitFor(() => expect(syncState.syncError).toBe(DIFFERENT_ACCOUNT_MERGE));
+    expect(importCalls).toHaveLength(0);
+  });
+
+  it("hands the proven account to the importer, which checks it again", async () => {
+    await storage.wipeLocalDatabase();
+    const { createIdentity } = await import("$lib/identity/identity");
+    const { keypair } = await createIdentity("this-account-password");
+    const t = await target("add");
+    fromSource(t, identityFrame({ data: undefined, did: keypair.did, binding: signPeerBinding(PEER_ID).bindingSig }));
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(importCalls).toHaveLength(1));
+    expect(importCalls[0].options.sourceDid).toBe(keypair.did);
+  });
+
+  it("refuses a transfer that holds less than the manifest lists, before importing", async () => {
+    const t = await target();
+    fromSource(t, identityFrame());
+    fromSource(t, { type: "sync_export_data", v: 2, payload: { section: "messages",
+      data: [{ id: "m1" }], batchIndex: 0, totalBatches: 2, token: TOKEN, seq: 1 } });
+    // rooms: one batch announced in the manifest, and its frame never came.
+    fromSource(t, complete({ messages: { items: 2, batches: 2 }, rooms: { items: 1, batches: 1 } }));
+    await vi.waitFor(() => expect(syncState.syncError).toMatch(/arrived incomplete/));
+    expect(syncState.syncError).toContain("messages (1/2)");
+    expect(syncState.syncError).toContain("rooms (0/1)");
+    expect(importCalls).toHaveLength(0);
+  });
+
+  it("keeps a batch that arrives twice once", async () => {
+    const t = await target();
+    fromSource(t, identityFrame());
+    const batch = { type: "sync_export_data", v: 2, payload: { section: "rooms",
+      data: [{ roomCode: "r1", type: "text" }], batchIndex: 0, totalBatches: 1, token: TOKEN, seq: 1 } };
+    fromSource(t, batch);
+    fromSource(t, { ...batch, payload: { ...batch.payload, seq: 2 } });
+    fromSource(t, complete({ rooms: { items: 1, batches: 1 } }));
+    await vi.waitFor(() => expect(importCalls).toHaveLength(1));
+    expect(importCalls[0].data.rooms).toHaveLength(1);
+  });
+
+  it("tells the source while it waits for the password, and when it is working again", async () => {
+    let answer!: (password: string | null) => void;
+    importControl.run = async (options) => {
+      expect(await options.requestPassword(false)).toBe("the password");
+      options.beforeCommit();
+    };
+    const t = await target("replace", {
+      requestPassword: () => new Promise((resolve) => { answer = resolve; }),
+    });
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_awaiting_password")).toBe(true));
+    answer("the password");
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+    const types = t.sent.map((m: any) => m.type);
+    expect(types.indexOf("sync_import_progress", types.indexOf("sync_awaiting_password")))
+      .toBeGreaterThan(types.indexOf("sync_awaiting_password"));
+  });
+
+  it("cannot be cancelled past the commit point, and still reports how it ended", async () => {
+    let finish!: () => void;
+    const writes = new Promise<void>((resolve) => { finish = resolve; });
+    importControl.run = async (options) => {
+      options.beforeCommit();
+      await writes;
+    };
+    const t = await target();
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(syncState.finishing).toBe(true));
+    await cancelSync();
+    expect(syncState.finishing).toBe(true);
+    finish();
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+    expect(syncState.finishing).toBe(false);
+    expect(syncState.syncError).toBeNull();
+    expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true);
+  });
+
+  it("says what state the device is in when a committed replace fails part way", async () => {
+    importControl.run = async (options) => {
+      options.beforeCommit();
+      throw new Error("QuotaExceededError");
+    };
+    const t = await target("replace");
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(syncState.syncError).toMatch(/previous data was already erased/));
+    expect(syncState.syncError).toContain("QuotaExceededError");
+    expect(syncState.finishing).toBe(false);
+    expect(syncState.isSyncing).toBe(false);
+    expect(t.sent.at(-1)).toMatchObject({ type: "sync_error" });
+  });
+
+  it("does not call a relay's disconnect a lost sync, nor the source's once the data is in", async () => {
+    let finish!: () => void;
+    const writes = new Promise<void>((resolve) => { finish = resolve; });
+    importControl.run = async (options) => {
+      options.beforeCommit();
+      await writes;
+    };
+    const t = await target();
+    t.emit("disconnect", "12D3KooW" + "R".repeat(44));
+    expect(syncState.syncError).toBeNull();
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(syncState.finishing).toBe(true));
+    t.emit("disconnect", PEER_ID);
+    // Nor an error frame from a source that gave up waiting.
+    fromSource(t, { type: "sync_error", v: 2, payload: { error: "The other device never confirmed the import" } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(syncState.syncError).toBeNull();
+    finish();
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("fails at once when the source is lost mid-transfer", async () => {
+    const t = await target();
+    fromSource(t, identityFrame());
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_ack")).toBe(true));
+    t.emit("disconnect", PEER_ID);
+    await vi.waitFor(() => expect(syncState.syncError).toMatch(/Lost the connection/));
+    expect(syncState.isSyncing).toBe(false);
   });
 });

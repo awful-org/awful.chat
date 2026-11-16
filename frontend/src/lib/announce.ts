@@ -7,6 +7,8 @@ import { getRoomNotifyMode } from "./notify-prefs.svelte";
 import { roomsStore } from "./rooms.svelte";
 import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
+import { isBlockedDid } from "./blocks.svelte";
+import { parseCallCard } from "./call-card";
 
 /**
  * Telling the user a message arrived: the sound, and the notification when the
@@ -224,6 +226,9 @@ export function announceMessage(
     // history. Announcing it would beep at you for what you just wrote.
     return;
   }
+  // Soft-blocked: their room messages are kept (folded in the view), but
+  // they make no sound and raise no notification.
+  if (isBlockedDid(msg.senderId)) return;
   if (!claim(msg.id)) return;
 
   try {
@@ -242,7 +247,17 @@ export function announceMessage(
     if (ctx.uiRoomCode === msg.roomCode) clearNotificationsFor(msg.roomCode);
 
     let body = msg.content || "[file]";
-    if (msg.type === MessageType.PluginCard) {
+    if (msg.type === MessageType.CallEvent) {
+      const card = parseCallCard(msg.content);
+      if (!card) return;
+      // A call pops up as a message, by its start; its end is not news.
+      if (card.phase !== "start") return;
+      // One collected from the mailbox started while you were away: it may
+      // be over or still going, and presence may not have said which yet.
+      // "called you" is true either way - and a caller whose app died never
+      // posts an end, so the start is the one card sure to arrive.
+      body = opts.viaMailbox ? "called you" : "started a call";
+    } else if (msg.type === MessageType.PluginCard) {
       try {
         const payload = JSON.parse(msg.content);
         const manifest = getManifest(payload.pluginId);

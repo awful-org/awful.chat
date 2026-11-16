@@ -636,6 +636,14 @@ export const STORE_SPECS = {
     blind: ["peerId"],
     clear: [],
   },
+  // Who this device soft-blocked, as private as the phonebook: the did is
+  // blinded (the key), the rest sealed.
+  blocks: {
+    storeName: "blocks",
+    key: "did",
+    blind: ["did"],
+    clear: [],
+  },
   savedGifs: {
     storeName: "savedGifs",
     key: "id",

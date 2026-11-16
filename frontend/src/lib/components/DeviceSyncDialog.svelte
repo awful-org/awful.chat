@@ -1,4 +1,5 @@
 <script lang="ts">
+import { untrack } from "svelte";
 import {
   Dialog,
   DialogContent,
@@ -14,8 +15,11 @@ import {
     parsePlaintextToken,
     revealShortCode,
     cancelSync,
+    approveSync,
+    denySync,
     type SyncPayload,
   } from "$lib/transport/sync.svelte";
+  import { formatComparisonCode } from "$lib/transport/sync-protocol";
   import {
     Copy,
     Camera,
@@ -119,16 +123,17 @@ import {
     }
   });
 
-  // Watch for sync state changes
+  // Watch for sync state changes. Completion wins over an error: a
+  // "connection lost" said while the other device was still importing is
+  // answered by the success that follows, and checking the error second
+  // used to put the failure view over a sync that had finished.
   $effect(() => {
-    if (syncState.qrDataUrl && view === "qr-display") {
-      // QR code is ready
-    }
     if (syncState.isComplete) {
-      view = "complete";
-      onComplete?.();
-    }
-    if (syncState.syncError) {
+      if (untrack(() => view) !== "complete") {
+        view = "complete";
+        onComplete?.();
+      }
+    } else if (syncState.syncError) {
       view = "error";
     }
   });
@@ -225,7 +230,11 @@ import {
       pendingPayload.mode = "replace";
       await startSync();
     } else if (flowMode === "scan-qr") {
+      // On the payload, not just the radio: connectAsTarget defaults a
+      // payload without a mode to "replace", so the merge this screen
+      // promises wiped the device and adopted the other account.
       syncMode = "add";
+      pendingPayload.mode = "add";
       await startSync();
     } else {
       view = "mode-select";
@@ -240,7 +249,9 @@ import {
       pendingPayload.mode = "replace";
       await startSync();
     } else if (flowMode === "scan-qr") {
+      // See handleSubmitManualToken: the mode has to be on the payload.
       syncMode = "add";
+      pendingPayload.mode = "add";
       await startSync();
     } else {
       view = "mode-select";
@@ -248,8 +259,24 @@ import {
   }
 
   async function handleClose() {
+    // Nothing to close while an import is finishing (see syncState.finishing):
+    // the controls are gone, and this is the one way left.
+    if (syncState.finishing) return;
+    const reload = view === "complete" && flowMode !== "generate-qr";
     await cancelSync();
     onClose();
+    // Closing a finished import is the same as Continue: the app reloads,
+    // which is what reads the synced data - and the settings kept outside
+    // the database - afresh.
+    if (reload) window.location.reload();
+  }
+
+  async function handleAllow() {
+    await approveSync();
+  }
+
+  async function handleDeny() {
+    await denySync();
   }
 
   async function handleRetry() {
@@ -295,8 +322,15 @@ import {
     if (!v) handleClose();
   }}
 >
+  <!-- An import past its commit point cannot be stopped, so while it
+       finishes the dialog cannot be dismissed either: closing it used to
+       leave the writes running unseen, with "Create new identity" one click
+       away from racing them. -->
   <DialogContent
     class="bg-card border-border text-card-foreground font-mono max-w-md"
+    showCloseButton={!syncState.finishing}
+    escapeKeydownBehavior={syncState.finishing ? "ignore" : "close"}
+    interactOutsideBehavior={syncState.finishing ? "ignore" : "close"}
   >
     <DialogHeader>
       <DialogTitle
@@ -305,7 +339,7 @@ import {
         {#if view === "select"}
           Sync with device
         {:else if view === "qr-display"}
-          Scan this code
+          {syncState.awaitingApproval ? "Allow this device?" : "Scan this code"}
         {:else if view === "scan"}
           Scan QR code
         {:else if view === "manual-input"}
@@ -315,7 +349,7 @@ import {
         {:else if view === "password"}
           Unlock the incoming account
         {:else if view === "progress"}
-          Syncing...
+          {syncState.awaitingApproval ? "Confirm on your other device" : "Syncing..."}
         {:else if view === "complete"}
           Sync complete
         {:else if view === "error"}
@@ -358,7 +392,39 @@ import {
         {/if}
       {:else if view === "qr-display"}
         <div class="flex flex-col items-center gap-4">
-          {#if syncState.isGenerating}
+          {#if syncState.awaitingApproval && syncState.pairingCode}
+            <!-- Holding the code is what makes a request, and anyone who saw
+                 the QR holds it: the person decides, by comparing what both
+                 screens show. -->
+            <div class="w-full space-y-4 py-2">
+              <p class="text-sm text-muted-foreground">
+                A device wants to sync with this one. Check that your other
+                device shows this code:
+              </p>
+              <p
+                class="text-3xl font-semibold tracking-widest text-center"
+                aria-label="Comparison code {syncState.pairingCode.split('').join(' ')}"
+              >
+                {formatComparisonCode(syncState.pairingCode)}
+              </p>
+              <p class="text-xs text-muted-foreground">
+                If it shows a different code, or none, someone else has your
+                sync code. Deny, and generate a new one.
+              </p>
+              <div class="flex gap-2">
+                <Button
+                  onclick={handleDeny}
+                  variant="outline"
+                  class="flex-1 font-mono"
+                >
+                  Deny
+                </Button>
+                <Button onclick={handleAllow} class="flex-1 font-mono">
+                  Allow
+                </Button>
+              </div>
+            </div>
+          {:else if syncState.isGenerating}
             <div
               class="w-64 h-64 flex items-center justify-center bg-muted rounded-lg"
             >
@@ -378,7 +444,9 @@ import {
             </div>
           {/if}
 
-          {#if shortCodeShown}
+          {#if syncState.awaitingApproval}
+            <!-- The code is in use; nothing to copy while it is decided. -->
+          {:else if shortCodeShown}
             <div class="w-full space-y-2">
               <p class="text-xs text-muted-foreground text-center">
                 Or copy this sync code to your other device:
@@ -431,7 +499,13 @@ import {
                 ></div>
               </div>
               <p class="text-xs text-muted-foreground text-center">
-                Transferring data... {syncState.syncProgress}%
+                {#if syncState.phase === "remote-password"}
+                  Waiting for the password on the other device...
+                {:else if syncState.phase === "importing-remote"}
+                  The other device is importing... {syncState.syncProgress}%
+                {:else}
+                  Transferring data... {syncState.syncProgress}%
+                {/if}
               </p>
             </div>
           {/if}
@@ -615,6 +689,29 @@ import {
             Cancel
           </Button>
         </div>
+      {:else if view === "progress" && syncState.awaitingApproval && syncState.pairingCode}
+        <div class="flex flex-col items-center gap-4 py-4">
+          <p class="text-sm text-muted-foreground text-center">
+            Confirm this code on your other device:
+          </p>
+          <p
+            class="text-3xl font-semibold tracking-widest"
+            aria-label="Comparison code {syncState.pairingCode.split('').join(' ')}"
+          >
+            {formatComparisonCode(syncState.pairingCode)}
+          </p>
+          <p class="text-xs text-muted-foreground text-center">
+            Nothing is sent until it is allowed there.
+          </p>
+        </div>
+
+        <Button
+          onclick={handleClose}
+          variant="outline"
+          class="w-full font-mono"
+        >
+          Cancel
+        </Button>
       {:else if view === "progress"}
         <div class="flex flex-col items-center gap-4 py-4">
           <RefreshCw class="w-8 h-8 animate-spin text-primary" />
@@ -628,6 +725,8 @@ import {
             <p class="text-sm text-center">
               {#if syncState.isConnecting}
                 Connecting to device...
+              {:else if syncState.finishing}
+                Finishing... {syncState.syncProgress}%
               {:else if syncState.phase === "importing"}
                 Importing on this device... {syncState.syncProgress}%
               {:else if syncState.phase === "importing-remote"}
@@ -641,13 +740,20 @@ import {
           </div>
         </div>
 
-        <Button
-          onclick={handleClose}
-          variant="outline"
-          class="w-full font-mono"
-        >
-          Cancel
-        </Button>
+        {#if syncState.finishing}
+          <!-- Past the commit point: Cancel would stop nothing. -->
+          <p class="text-xs text-muted-foreground text-center">
+            Keep this screen open until the import is done.
+          </p>
+        {:else}
+          <Button
+            onclick={handleClose}
+            variant="outline"
+            class="w-full font-mono"
+          >
+            Cancel
+          </Button>
+        {/if}
       {:else if view === "complete"}
         <div class="flex flex-col items-center gap-4 py-4">
           <div
@@ -663,15 +769,7 @@ import {
           </div>
         </div>
 
-        <Button
-          onclick={() => {
-            handleClose();
-            if (flowMode !== "generate-qr") {
-              window.location.reload();
-            }
-          }}
-          class="w-full font-mono"
-        >
+        <Button onclick={handleClose} class="w-full font-mono">
           Continue
         </Button>
       {:else if view === "error"}
