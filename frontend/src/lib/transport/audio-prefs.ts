@@ -88,6 +88,11 @@ export interface AudioPrefs {
    * where a peerId would not.
    */
   peerVolumes: Record<string, number>;
+  /**
+   * People this device sends no voice to, by did:key. Their call still
+   * works; your microphone simply never reaches them (libp2p/voice.ts).
+   */
+  voiceWithheld: string[];
 }
 
 export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
@@ -107,12 +112,23 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   shareFps: 30,
   shareContentHint: "",
   peerVolumes: {},
+  voiceWithheld: [],
 };
 
 /** Same ceiling as the per-person slider. */
 const MAX_PEER_VOLUME = 2.5;
 /** Bound the map: an old public-room habit must not grow it forever. */
 const MAX_PEER_VOLUME_ENTRIES = 200;
+
+function sanitizeDidList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out = new Set<string>();
+  for (const did of value) {
+    if (typeof did === "string" && did.startsWith("did:") && did.length <= 256) out.add(did);
+    if (out.size >= MAX_PEER_VOLUME_ENTRIES) break;
+  }
+  return [...out];
+}
 
 function sanitizePeerVolumes(value: unknown): Record<string, number> {
   if (!value || typeof value !== "object") return {};
@@ -209,6 +225,7 @@ export function loadAudioPrefs(): AudioPrefs {
         SHARE_CONTENT_HINTS, p.shareContentHint, AUDIO_PREF_DEFAULTS.shareContentHint
       ),
       peerVolumes: sanitizePeerVolumes(p.peerVolumes),
+      voiceWithheld: sanitizeDidList(p.voiceWithheld),
     };
   } catch {
     return { ...AUDIO_PREF_DEFAULTS };
@@ -238,4 +255,20 @@ export function savePeerVolume(did: string, volume: number): void {
 export function loadPeerVolume(did: string): number | null {
   const stored = loadAudioPrefs().peerVolumes[did];
   return typeof stored === "number" ? stored : null;
+}
+
+/**
+ * Send this person no voice, or send it again, by their durable identity.
+ * Returns the resulting list, so a caller need not trust storage to have
+ * taken it. The newest choice is kept when the list is full: the load-time
+ * bound keeps the first entries, so the oldest are dropped here instead.
+ */
+export function saveVoiceWithheld(did: string, withheld: boolean): string[] {
+  const list = new Set(loadAudioPrefs().voiceWithheld);
+  if (!did.startsWith("did:")) return [...list];
+  list.delete(did);
+  if (withheld) list.add(did);
+  const voiceWithheld = [...list].slice(-MAX_PEER_VOLUME_ENTRIES);
+  saveAudioPrefs({ voiceWithheld });
+  return voiceWithheld;
 }

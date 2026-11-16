@@ -22,9 +22,13 @@
   import PeerConnectionDetails from "./PeerConnectionDetails.svelte";
   import {
     getVoicePeerVolume,
+    isVoiceWithheld,
     setVoicePeerVolume,
+    setVoiceWithheld,
+    voiceWithheldReason,
     voiceProcessing,
   } from "$lib/transport/voice.svelte";
+  import { looksLikeDid } from "$lib/identity/identity-utils";
   import {
     UNITY_STOP,
     formatGain,
@@ -68,6 +72,7 @@
   } from "$lib/call-popout.svelte";
 
   import {
+    EarOff,
     Eye,
     Mic,
     MicOff,
@@ -901,6 +906,8 @@ import {
         tile.kind === "camera" &&
         !tile.isLocal &&
         sliderToGain(peerVolumeSlider) <= 0,
+      voiceWithheld: tile.kind === "camera" && !tile.isLocal && !!tile.peerId && isVoiceWithheld(tile.peerId),
+      canWithholdVoice: tile.kind === "camera" && !tile.isLocal && !!tile.peerId && looksLikeDid(peerIdToDid(tile.peerId)),
       cameraOff,
       micMuted: muted,
       // Screen-share audio, not the sharer's voice: it arrives as its own
@@ -1072,6 +1079,12 @@ import {
         if (tile.peerId) {
           setVoicePeerVolume(tile.peerId, preMuteGain.get(tile.peerId) ?? 1);
         }
+        break;
+      case "withhold-voice":
+        if (tile.peerId) setVoiceWithheld(tile.peerId, true);
+        break;
+      case "send-voice":
+        if (tile.peerId) setVoiceWithheld(tile.peerId, false);
         break;
       case "watch":
         if (tile.producerId) watchTransmission(tile.peerId, tile.producerId);
@@ -2015,6 +2028,18 @@ import {
         {/if}
         {#if tile.kind === "camera" && tile.deafened}
           <HeadphoneOff class="size-3 text-red-400" />
+        {/if}
+        {#if tile.kind === "camera" && !tile.isLocal && tile.peerId}
+          {@const withheldWhy = voiceWithheldReason(tile.peerId)}
+          {#if withheldWhy}
+            <!-- Your voice is not sent to them: the reverse of their mute.
+                 "unknown": not named yet while you withhold from anyone. -->
+            <EarOff
+              class="size-3 text-amber-400"
+              role="img"
+              aria-label={withheldWhy === "chosen" ? "Not getting your voice" : "Not getting your voice until we know who this is"}
+            />
+          {/if}
         {/if}
         <span
           class="min-w-0 truncate text-xs mt-0.75 leading-none text-white font-mono"
