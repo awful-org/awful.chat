@@ -904,3 +904,24 @@ describe("a soft block", () => {
     expect(JSON.stringify(raw)).not.toContain(them);
   });
 });
+
+describe("a DM call card", () => {
+  const card = (phase: "start" | "end", at = Date.now()) =>
+    JSON.stringify({ v: 1, callId: "abcdef123456", phase, at });
+
+  it("arrives from the mailbox into its DM, a signed row like any other", async () => {
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    const wire = signedWire(friend.who, friend.code, { type: MessageType.CallEvent, content: card("start") });
+    await deliverMailboxBatch(friend.who.did, encode({ type: MessageType.SyncBatch, roomCode: friend.code, messages: [wire], batchIndex: 0, totalBatches: 1 }));
+    expect((await getMessage(wire.id))?.type).toBe(MessageType.CallEvent);
+  });
+
+  it("is dropped when it does not parse", async () => {
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    const wire = signedWire(friend.who, friend.code, { type: MessageType.CallEvent, content: '{"v":1,"phase":"ring"}' });
+    await deliverMailboxBatch(friend.who.did, encode({ type: MessageType.SyncBatch, roomCode: friend.code, messages: [wire], batchIndex: 0, totalBatches: 1 })).catch(() => {});
+    expect(await getMessage(wire.id)).toBeUndefined();
+  });
+});

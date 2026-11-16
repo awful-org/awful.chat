@@ -8,6 +8,7 @@ import { roomsStore } from "./rooms.svelte";
 import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
 import { isBlockedDid } from "./blocks.svelte";
+import { parseCallCard } from "./call-card";
 
 /**
  * Telling the user a message arrived: the sound, and the notification when the
@@ -246,7 +247,12 @@ export function announceMessage(
     if (ctx.uiRoomCode === msg.roomCode) clearNotificationsFor(msg.roomCode);
 
     let body = msg.content || "[file]";
-    if (msg.type === MessageType.PluginCard) {
+    if (msg.type === MessageType.CallEvent) {
+      // A call that started pops up as a message; its end card is not news.
+      const card = parseCallCard(msg.content);
+      if (card?.phase !== "start") return;
+      body = "started a call";
+    } else if (msg.type === MessageType.PluginCard) {
       try {
         const payload = JSON.parse(msg.content);
         const manifest = getManifest(payload.pluginId);

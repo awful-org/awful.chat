@@ -18,6 +18,7 @@ import {
   _video,
   _voice,
   connect,
+  sendCallCard,
   transportState,
 } from "./transport.svelte";
 import {
@@ -38,6 +39,8 @@ import {
   describeShareError,
   setErrorWithAutoClear,
 } from "./call-error";
+import { foldCallCards, newCallId, type CallCardPayload } from "$lib/call-card";
+import { noteDmCallJoined } from "$lib/dm-call-joined";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
@@ -178,6 +181,85 @@ let _joinPromise: Promise<void> | null = null;
  */
 let _joinAbandoned = false;
 
+// ── DM call cards (call-card.ts) ───────────────────────────────────────────
+
+/** The DM call this device is in, for its end card. One call at a time. */
+let _dmCall: { roomCode: string; callId: string } | null = null;
+
+/** Someone other than us is in a call in this room right now. */
+function _othersInCall(roomCode: string): boolean {
+  for (const room of transportState.callPeerRooms.values()) if (room === roomCode) return true;
+  return false;
+}
+
+/** The newest started call in this DM with no end card yet, from the view. */
+function _openCallCard(roomCode: string): CallCardPayload | null {
+  const rows = transportState.messages.filter((m) => m.roomCode === roomCode);
+  return foldCallCards(rows, MessageType.CallEvent).open?.card ?? null;
+}
+
+/**
+ * Joining a DM call: alone in it, this starts a call and posts its card;
+ * with the other side already in, it joins theirs. Either way this device
+ * took part, so its card will never read "missed" here. `openAtStart` is the
+ * open card as the join began: the view may have moved to another room
+ * during the join's awaits, taking this DM's rows with it.
+ */
+function _noteDmCallJoin(roomCode: string, openAtStart: CallCardPayload | null): void {
+  if (!roomCode.startsWith("dm-")) return;
+  if (_othersInCall(roomCode)) {
+    const open = _openCallCard(roomCode) ?? openAtStart;
+    if (!open) return;
+    _dmCall = { roomCode, callId: open.callId };
+    noteDmCallJoined(open.callId);
+    return;
+  }
+  const callId = newCallId();
+  _dmCall = { roomCode, callId };
+  noteDmCallJoined(callId);
+  void sendCallCard(roomCode, { v: 1, callId, phase: "start", at: Date.now() }).catch(() => {});
+}
+
+/**
+ * A DM call this device left while someone was still in it. If they never
+ * post its end - they hung up at the same moment, so each still saw the
+ * other; their app crashed or the tab closed - whoever notices it empty
+ * posts it instead, on the presence update that shows it so. Both sides
+ * doing so is harmless: the view keeps the earliest end.
+ */
+let _leftOpenDmCall: { roomCode: string; callId: string; leftAt: number } | null = null;
+
+/** Leaving a DM call: the last one out posts its end card. */
+function _noteDmCallLeave(roomCode: string): void {
+  const call = _dmCall?.roomCode === roomCode ? _dmCall : null;
+  _dmCall = null;
+  if (!call) return;
+  if (_othersInCall(roomCode)) {
+    _leftOpenDmCall = { ...call, leftAt: Date.now() };
+    return;
+  }
+  void sendCallCard(roomCode, { v: 1, callId: call.callId, phase: "end", at: Date.now() }).catch(() => {});
+}
+
+// Event-driven, not timed: re-checked on every change to who is in which
+// call. Ends as soon as the call it watches is seen empty, or we rejoin.
+$effect.root(() => {
+  $effect(() => {
+    const presence = transportState.callPeerRooms;
+    const left = _leftOpenDmCall;
+    if (!left) return;
+    if (transportState.inCall && transportState.callRoomCode === left.roomCode) {
+      _leftOpenDmCall = null;
+      return;
+    }
+    if ([...presence.values()].includes(left.roomCode)) return;
+    _leftOpenDmCall = null;
+    // The moment the last of them was seen gone is when we left at the
+    // latest: the end reads when we hung up, which is when it ended for us.
+    void sendCallCard(left.roomCode, { v: 1, callId: left.callId, phase: "end", at: left.leftAt }).catch(() => {});
+  });
+});
+
 export function joinCall(): Promise<void> {
   if (_joinPromise) return _joinPromise;
   if (transportState.inCall) return Promise.resolve();
@@ -203,6 +285,7 @@ async function _joinCall(): Promise<void> {
   // Browsing another room while connect/microphone permission is pending
   // must not split voice, presence and video across different rooms.
   const callRoom = transportState.roomCode;
+  const openCallAtStart = callRoom?.startsWith("dm-") ? _openCallCard(callRoom) : null;
   // Clear any pending error timeout and reset the error state. Attempting
   // the operation again makes any stale error irrelevant.
   cancelErrorClear();
@@ -231,6 +314,7 @@ async function _joinCall(): Promise<void> {
     // not depend on the SFU, so there is no reason this waits for it.
     transportState.inCall = true;
     transportState.callRoomCode = callRoom;
+    if (callRoom) _noteDmCallJoin(callRoom, openCallAtStart);
     _syncVoiceRoster();
     // Announce BEFORE the SFU join: presence is what lets everyone else
     // dial us, voice is P2P and does not need the SFU - and a dead or slow
@@ -325,9 +409,11 @@ export function leaveCall(): void {
   resetPeerQuality();
   if (transportState.inCall) {
     playLeaveSound();
+    const leftRoom = transportState.callRoomCode;
     transportState.inCall = false;
     transportState.callRoomCode = null;
     _sendCallPresence();
+    if (leftRoom) _noteDmCallLeave(leftRoom);
   }
   stopCamera();
   stopScreenShare();

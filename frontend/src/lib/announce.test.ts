@@ -123,6 +123,18 @@ describe("announceMessage", () => {
     }
   });
 
+  it("pops up a DM call as a message, and stays quiet about its end", () => {
+    const card = (phase: "start" | "end", id: string) =>
+      msg({ id, roomCode: "dm-abc", type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId: "abcdefgh", phase, at: 1 }) });
+    announceMessage(card("start", "c1"), ctx);
+    settle();
+    expect(notified).toHaveLength(1);
+    expect(notified[0].body).toBe("started a call");
+    announceMessage(card("end", "c2"), ctx);
+    settle();
+    expect(notified).toHaveLength(1);
+  });
+
   it("announces the same message once, however many times it is delivered", () => {
     // The whole point: room chat arrives over pubsub AND as a direct copy.
     announceMessage(msg(), ctx);
