@@ -19,12 +19,22 @@ export interface CallCardPayload {
   /** When this happened, by the poster's clock. */
   at: number;
   /**
-   * End cards: when the call started, as the poster knew it. Lets an end
-   * card say how long the call was by itself - in the DM list's preview,
-   * which sees only the last row, and when its start card is not held.
+   * End cards: how long the call lasted, in ms, measured by the poster on its
+   * own clock - its start and its end read off one device, so another
+   * device's clock being off does not stretch or shrink the call. Lets an
+   * end card say its length by itself: in the DM list's preview, which sees
+   * only the last row, and when its start card is not held.
+   */
+  duration?: number;
+  /**
+   * End cards from before `duration`: when the call started, by the poster's
+   * knowledge. Read, no longer written.
    */
   startedAt?: number;
 }
+
+/** No call runs a week: a longer length is a broken clock or a lie. */
+const MAX_DURATION = 7 * 24 * 3_600_000;
 
 const CALL_ID = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -47,7 +57,11 @@ export function parseCallCard(content: string): CallCardPayload | null {
     if (value.phase !== "start" && value.phase !== "end") return null;
     if (typeof value.at !== "number" || !Number.isFinite(value.at) || value.at <= 0) return null;
     const card: CallCardPayload = { v: 1, callId: value.callId, phase: value.phase, at: value.at };
-    // Optional, and only believed when it makes sense: before the end.
+    // Optional, and only believed when it makes sense.
+    if (
+      value.phase === "end" && typeof value.duration === "number" &&
+      Number.isFinite(value.duration) && value.duration >= 0 && value.duration <= MAX_DURATION
+    ) card.duration = value.duration;
     if (
       value.phase === "end" && typeof value.startedAt === "number" &&
       Number.isFinite(value.startedAt) && value.startedAt > 0 && value.startedAt <= value.at
@@ -153,9 +167,20 @@ export function callCardState(opts: {
   const { start, end, ongoing, joined, mine } = opts;
   if (!end && ongoing && start) return { kind: "ongoing", since: start.at };
   if (!joined && !mine) return { kind: "missed" };
-  const began = start?.at ?? end?.startedAt;
-  if (end && began !== undefined) return { kind: "ended", duration: Math.max(0, end.at - began) };
+  const length = end && endCardLength(end, start);
+  if (length !== undefined && length !== null) return { kind: "ended", duration: length };
   return { kind: "ended-unknown" };
+}
+
+/**
+ * How long a call lasted, from its end card: the poster's own measure when
+ * it carries one, else the difference of two times (which may come from two
+ * clocks). Undefined when nothing tells.
+ */
+function endCardLength(end: CallCardPayload, start?: CallCardPayload): number | undefined {
+  if (end.duration !== undefined) return end.duration;
+  const began = end.startedAt ?? start?.at;
+  return began === undefined ? undefined : Math.max(0, end.at - began);
 }
 
 /**
@@ -166,5 +191,6 @@ export function callCardSummary(card: CallCardPayload | null, joined: boolean): 
   if (!card) return "Call";
   if (card.phase === "start") return "Started a call";
   if (!joined) return "Missed call";
-  return card.startedAt !== undefined ? `Call · ${formatCallDuration(card.at - card.startedAt)}` : "Call ended";
+  const length = endCardLength(card);
+  return length !== undefined ? `Call · ${formatCallDuration(length)}` : "Call ended";
 }

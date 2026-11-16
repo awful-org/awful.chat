@@ -9,6 +9,7 @@ import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
 import { isBlockedDid } from "./blocks.svelte";
 import { parseCallCard } from "./call-card";
+import { joinedDmCall } from "./dm-call-joined";
 
 /**
  * Telling the user a message arrived: the sound, and the notification when the
@@ -32,6 +33,8 @@ export interface AnnounceContext {
   uiRoomCode: string | null;
   /** DID -> display name, for rendering @mentions in the preview text. */
   resolveName: (did: string) => string;
+  /** Someone is in a call in this room right now (call presence). */
+  callLive?: (roomCode: string) => boolean;
 }
 
 /**
@@ -248,10 +251,21 @@ export function announceMessage(
 
     let body = msg.content || "[file]";
     if (msg.type === MessageType.CallEvent) {
-      // A call that started pops up as a message; its end card is not news.
       const card = parseCallCard(msg.content);
-      if (card?.phase !== "start") return;
-      body = "started a call";
+      if (!card) return;
+      if (card.phase === "start") {
+        // A call that started pops up as a message. One collected from the
+        // mailbox started while you were away: worth a sound only while it
+        // is still going - one already over is told by its end, as missed.
+        if (opts.viaMailbox && !ctx.callLive?.(msg.roomCode)) return;
+        body = "started a call";
+      } else {
+        // An end is news only to someone away for the whole call: collected
+        // from the mailbox, and not taken on this device. Live, its start
+        // already rang.
+        if (!opts.viaMailbox || joinedDmCall(card.callId)) return;
+        body = "Missed call";
+      }
     } else if (msg.type === MessageType.PluginCard) {
       try {
         const payload = JSON.parse(msg.content);

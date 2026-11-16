@@ -175,6 +175,7 @@ import { mentionsMe } from "../mentions";
 import { appendToDmPanel, dmPanelIsShowing, mapDmPanelMessages } from "../dm-panel.svelte";
 import { clearBlocksInMemory, dmRefusedAt, loadBlocks } from "../blocks.svelte";
 import { encodeCallCard, parseCallCard, type CallCardPayload } from "../call-card";
+import { noteCallStartSeen } from "../dm-call-joined";
 import { relayCopyCounts } from "../dm-inbox-notice";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
@@ -3418,6 +3419,17 @@ function _selfIds(): string[] {
  * announce.ts decide whether to make a sound about it. The caller has already
  * established that the message is genuinely new.
  */
+/**
+ * A DM call's start card arriving live: when this device saw the call
+ * begin, on its own clock, so a length it later measures is one clock's
+ * (call.svelte.ts). Not for cards from the mailbox or history: those are late.
+ */
+function _noteLiveCallStart(row: { type: string; content: string }): void {
+  if (row.type !== MessageType.CallEvent) return;
+  const card = parseCallCard(row.content);
+  if (card?.phase === "start") noteCallStartSeen(card.callId, Date.now());
+}
+
 function _announceMessage(
   msg: Message,
   opts: { viaMailbox?: boolean } = {}
@@ -3455,6 +3467,7 @@ function _announce(msg: Message, opts: { viaMailbox?: boolean }): void {
       selfIds: _selfIds(),
       uiRoomCode: transportState.uiRoomCode,
       resolveName: resolveMentionDisplayName,
+      callLive: (roomCode) => [...transportState.callPeerRooms.values()].includes(roomCode),
     },
     opts
   );
@@ -3475,6 +3488,7 @@ async function _handleChatMessage(
       wire.type === MessageType.File &&
       (!wire.meta?.files?.length || wire.meta.files.some(file => !file.encryption))) return;
   if (!callCardAllowed(wire, roomCode)) return;
+  _noteLiveCallStart(wire);
 
   // DM rooms now start with "dm-" (hash-based)
   // We don't need to ensure room here - it should already exist from sender context
@@ -4371,6 +4385,7 @@ function _handleDmChatAsync(
         transportState.chatMode === "dm" &&
         (activeDid === senderDid || activeDid === peerId);
       // Reactions are filtered inside the funnel, same rule as rooms.
+      if (!viaMailbox) _noteLiveCallStart(msg);
       // A mailbox batch collapses into one notification instead of one per DM.
       _announceMessage(msg, { viaMailbox });
       // The floating panel is a second place this conversation can be on

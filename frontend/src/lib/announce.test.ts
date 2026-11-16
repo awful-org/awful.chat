@@ -123,16 +123,41 @@ describe("announceMessage", () => {
     }
   });
 
+  const callCard = (phase: "start" | "end", id: string, callId = "abcdefgh") =>
+    msg({ id, roomCode: "dm-abc", type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId, phase, at: 1 }) });
+
   it("pops up a DM call as a message, and stays quiet about its end", () => {
-    const card = (phase: "start" | "end", id: string) =>
-      msg({ id, roomCode: "dm-abc", type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId: "abcdefgh", phase, at: 1 }) });
-    announceMessage(card("start", "c1"), ctx);
+    announceMessage(callCard("start", "c1"), ctx);
     settle();
     expect(notified).toHaveLength(1);
     expect(notified[0].body).toBe("started a call");
-    announceMessage(card("end", "c2"), ctx);
+    announceMessage(callCard("end", "c2"), ctx);
     settle();
     expect(notified).toHaveLength(1);
+  });
+
+  it("tells a call that happened while you were away as missed, once", () => {
+    // Collected from the mailbox: the start of a call long over says nothing,
+    // its end says you missed it.
+    announceMessage(callCard("start", "c1"), { ...ctx, callLive: () => false }, { viaMailbox: true });
+    announceMessage(callCard("end", "c2"), { ...ctx, callLive: () => false }, { viaMailbox: true });
+    settle();
+    expect(notified).toHaveLength(1);
+    expect(notified[0].body).toBe("Missed call");
+  });
+
+  it("still rings for a call collected from the mailbox that is going on now", () => {
+    announceMessage(callCard("start", "c1"), { ...ctx, callLive: (rc) => rc === "dm-abc" }, { viaMailbox: true });
+    settle();
+    expect(notified).toHaveLength(1);
+    expect(notified[0].body).toBe("started a call");
+  });
+
+  it("does not call a call missed that this device took part in", async () => {
+    (await import("./dm-call-joined")).noteDmCallJoined("joinedcall1");
+    announceMessage(callCard("end", "c3", "joinedcall1"), ctx, { viaMailbox: true });
+    settle();
+    expect(notified).toHaveLength(0);
   });
 
   it("announces the same message once, however many times it is delivered", () => {

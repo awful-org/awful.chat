@@ -32,3 +32,21 @@ export function noteDmCallJoined(callId: string): void {
 export function joinedDmCall(callId: string): boolean {
   return joined.has(callId);
 }
+
+/**
+ * When this device saw each call start, by its own clock: the local time a
+ * start card arrived live. A device that joins someone else's call measures
+ * the call's length from here, not from the card's `at`, which is the
+ * caller's clock. In memory only; bounded.
+ */
+const seenStart = new Map<string, number>();
+
+export function noteCallStartSeen(callId: string, localAt: number): void {
+  if (seenStart.has(callId)) return;
+  seenStart.set(callId, localAt);
+  if (seenStart.size > MAX) seenStart.delete(seenStart.keys().next().value as string);
+}
+
+export function callStartSeen(callId: string): number | undefined {
+  return seenStart.get(callId);
+}

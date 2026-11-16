@@ -40,7 +40,7 @@ import {
   setErrorWithAutoClear,
 } from "./call-error";
 import { foldCallCards, newCallId, type CallCardPayload } from "$lib/call-card";
-import { noteDmCallJoined } from "$lib/dm-call-joined";
+import { callStartSeen, noteDmCallJoined } from "$lib/dm-call-joined";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
@@ -184,7 +184,18 @@ let _joinAbandoned = false;
 // ── DM call cards (call-card.ts) ───────────────────────────────────────────
 
 /** The DM call this device is in, for its end card. One call at a time. */
-let _dmCall: { roomCode: string; callId: string; startedAt: number } | null = null;
+let _dmCall: { roomCode: string; callId: string; startedAt: number; joinedAt: number } | null = null;
+
+/**
+ * A call's length as this device measures it, on its own clock only. From
+ * when it saw the call start (its own start, or a start card arriving live);
+ * a call already running before this device heard of it is counted from
+ * the card's time, the caller's clock - but never as shorter than the time
+ * this device was in it.
+ */
+function _measuredLength(call: { startedAt: number; joinedAt: number }, endedAt: number): number {
+  return Math.max(0, endedAt - call.startedAt, endedAt - call.joinedAt);
+}
 
 /** Someone other than us is in a call in this room right now. */
 function _othersInCall(roomCode: string): boolean {
@@ -210,13 +221,13 @@ function _noteDmCallJoin(roomCode: string, openAtStart: CallCardPayload | null):
   if (_othersInCall(roomCode)) {
     const open = _openCallCard(roomCode) ?? openAtStart;
     if (!open) return;
-    _dmCall = { roomCode, callId: open.callId, startedAt: open.at };
+    _dmCall = { roomCode, callId: open.callId, startedAt: callStartSeen(open.callId) ?? open.at, joinedAt: Date.now() };
     noteDmCallJoined(open.callId);
     return;
   }
   const callId = newCallId();
   const startedAt = Date.now();
-  _dmCall = { roomCode, callId, startedAt };
+  _dmCall = { roomCode, callId, startedAt, joinedAt: startedAt };
   noteDmCallJoined(callId);
   void sendCallCard(roomCode, { v: 1, callId, phase: "start", at: startedAt }).catch(() => {});
 }
@@ -228,7 +239,7 @@ function _noteDmCallJoin(roomCode: string, openAtStart: CallCardPayload | null):
  * posts it instead, on the presence update that shows it so. Both sides
  * doing so is harmless: the view keeps the earliest end.
  */
-let _leftOpenDmCall: { roomCode: string; callId: string; startedAt: number; leftAt: number } | null = null;
+let _leftOpenDmCall: { roomCode: string; callId: string; startedAt: number; joinedAt: number; leftAt: number } | null = null;
 
 /** Leaving a DM call: the last one out posts its end card. */
 function _noteDmCallLeave(roomCode: string): void {
@@ -239,7 +250,8 @@ function _noteDmCallLeave(roomCode: string): void {
     _leftOpenDmCall = { ...call, leftAt: Date.now() };
     return;
   }
-  void sendCallCard(roomCode, { v: 1, callId: call.callId, phase: "end", at: Date.now(), startedAt: call.startedAt }).catch(() => {});
+  const now = Date.now();
+  void sendCallCard(roomCode, { v: 1, callId: call.callId, phase: "end", at: now, duration: _measuredLength(call, now) }).catch(() => {});
 }
 
 // Event-driven, not timed: re-checked on every change to who is in which
@@ -257,7 +269,7 @@ $effect.root(() => {
     _leftOpenDmCall = null;
     // The moment the last of them was seen gone is when we left at the
     // latest: the end reads when we hung up, which is when it ended for us.
-    void sendCallCard(left.roomCode, { v: 1, callId: left.callId, phase: "end", at: left.leftAt, startedAt: left.startedAt }).catch(() => {});
+    void sendCallCard(left.roomCode, { v: 1, callId: left.callId, phase: "end", at: left.leftAt, duration: _measuredLength(left, left.leftAt) }).catch(() => {});
   });
 });
 
