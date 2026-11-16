@@ -175,6 +175,7 @@ import { mentionsMe } from "../mentions";
 import { appendToDmPanel, dmPanelIsShowing, mapDmPanelMessages } from "../dm-panel.svelte";
 import { clearBlocksInMemory, dmRefusedAt, loadBlocks } from "../blocks.svelte";
 import { encodeCallCard, parseCallCard, type CallCardPayload } from "../call-card";
+import { noteCallStartSeen } from "../dm-call-joined";
 import { relayCopyCounts } from "../dm-inbox-notice";
 import { profileStore } from "../profile.svelte";
 import { getPlugin } from "../plugins/registry";
@@ -3414,6 +3415,17 @@ function _selfIds(): string[] {
 }
 
 /**
+ * A DM call's start card arriving live: when this device saw the call
+ * begin, on its own clock, so a length it later measures is one clock's
+ * (call.svelte.ts). Not for cards from the mailbox or history: those are late.
+ */
+function _noteLiveCallStart(row: { type: string; content: string }): void {
+  if (row.type !== MessageType.CallEvent) return;
+  const card = parseCallCard(row.content);
+  if (card?.phase === "start") noteCallStartSeen(card.callId, Date.now());
+}
+
+/**
  * Bind an incoming message to this client's identity and view, then let
  * announce.ts decide whether to make a sound about it. The caller has already
  * established that the message is genuinely new.
@@ -3561,6 +3573,9 @@ async function _handleChatMessage(
     (await getMessage(msg.id));
   guard();
   const isNewMessage = !held;
+  // Only a start not held yet is a live sighting: a replay of one we hold
+  // (after a reload emptied the in-memory map) would date the call to now.
+  if (isNewMessage) _noteLiveCallStart(wire);
   // A row we hold under this id that is NOT this sender's message in this
   // room means this one is not stored and never will be. It must not claim a
   // watermark: that told every later digest we had the message, so no peer
@@ -4371,6 +4386,7 @@ function _handleDmChatAsync(
         transportState.chatMode === "dm" &&
         (activeDid === senderDid || activeDid === peerId);
       // Reactions are filtered inside the funnel, same rule as rooms.
+      if (!viaMailbox) _noteLiveCallStart(msg);
       // A mailbox batch collapses into one notification instead of one per DM.
       _announceMessage(msg, { viaMailbox });
       // The floating panel is a second place this conversation can be on

@@ -248,10 +248,15 @@ export function announceMessage(
 
     let body = msg.content || "[file]";
     if (msg.type === MessageType.CallEvent) {
-      // A call that started pops up as a message; its end card is not news.
       const card = parseCallCard(msg.content);
-      if (card?.phase !== "start") return;
-      body = "started a call";
+      if (!card) return;
+      // A call pops up as a message, by its start; its end is not news.
+      if (card.phase !== "start") return;
+      // One collected from the mailbox started while you were away: it may
+      // be over or still going, and presence may not have said which yet.
+      // "called you" is true either way - and a caller whose app died never
+      // posts an end, so the start is the one card sure to arrive.
+      body = opts.viaMailbox ? "called you" : "started a call";
     } else if (msg.type === MessageType.PluginCard) {
       try {
         const payload = JSON.parse(msg.content);

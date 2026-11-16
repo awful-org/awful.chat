@@ -109,3 +109,22 @@ describe("an end card that knows when its call started", () => {
       .toEqual({ kind: "ended", duration: 180_000 });
   });
 });
+
+describe("a call's length, by the device that measured it", () => {
+  const measured = (duration: unknown, at = 181_000) =>
+    parseCallCard(JSON.stringify({ v: 1, callId: "abcdefgh", phase: "end", at, duration }));
+
+  it("prefers the poster's own measure over two cards' times", () => {
+    // The start says 1_000 by the caller's clock; the end's poster measured
+    // 90 s on its own. Its clock being off does not matter.
+    const end = measured(90_000)!;
+    expect(callCardState({ start: start("abcdefgh"), end, ongoing: false, joined: true, mine: false }))
+      .toEqual({ kind: "ended", duration: 90_000 });
+    expect(callCardSummary(end, true)).toBe("Call · 2 min");
+  });
+
+  it("refuses a length that is negative, not a number or longer than a week", () => {
+    for (const bad of [-1, "90", Number.MAX_SAFE_INTEGER, null]) expect(measured(bad)?.duration).toBeUndefined();
+    expect(measured(0)?.duration).toBe(0);
+  });
+});

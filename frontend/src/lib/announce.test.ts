@@ -123,16 +123,26 @@ describe("announceMessage", () => {
     }
   });
 
+  const callCard = (phase: "start" | "end", id: string, callId = "abcdefgh") =>
+    msg({ id, roomCode: "dm-abc", type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId, phase, at: 1 }) });
+
   it("pops up a DM call as a message, and stays quiet about its end", () => {
-    const card = (phase: "start" | "end", id: string) =>
-      msg({ id, roomCode: "dm-abc", type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId: "abcdefgh", phase, at: 1 }) });
-    announceMessage(card("start", "c1"), ctx);
+    announceMessage(callCard("start", "c1"), ctx);
     settle();
     expect(notified).toHaveLength(1);
     expect(notified[0].body).toBe("started a call");
-    announceMessage(card("end", "c2"), ctx);
+    announceMessage(callCard("end", "c2"), ctx);
     settle();
     expect(notified).toHaveLength(1);
+  });
+
+  it("tells a call collected from the mailbox as 'called you', once", () => {
+    // Away for it: over or still going, it called you. Its end adds nothing.
+    announceMessage(callCard("start", "c1"), ctx, { viaMailbox: true });
+    announceMessage(callCard("end", "c2"), ctx, { viaMailbox: true });
+    settle();
+    expect(notified).toHaveLength(1);
+    expect(notified[0].body).toBe("called you");
   });
 
   it("announces the same message once, however many times it is delivered", () => {

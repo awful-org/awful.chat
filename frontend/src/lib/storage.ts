@@ -70,6 +70,7 @@ import type {
   PendingMessage,
 } from "./types/message";
 import { MessageType } from "./types/message";
+import { parseCallCard } from "./call-card";
 import { compareMessages, type MessageCursor } from "./transport/message-order";
 import { issueLamport, observeLamport } from "./transport/logical-clock";
 import type {
@@ -2035,13 +2036,18 @@ export async function deleteMessagesForRoom(roomCode: string): Promise<void> {
 export async function getUnreadCount(
   roomCode: string,
   lastSeenLamport: number,
-  excludeSenderId?: string
+  excludeSenderId?: string,
+  /** Senders whose rows never count: the soft-blocked (blocks.svelte.ts). */
+  skipSenders: Iterable<string> = []
 ): Promise<number> {
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
-  const blindedExcludeSenderId = excludeSenderId
-    ? await blindValue(excludeSenderId)
-    : undefined;
+  const skipped = new Set<string>();
+  for (const id of [...(excludeSenderId ? [excludeSenderId] : []), ...skipSenders]) {
+    // Rows hold the blinded id; a row from before the migration, the clear one.
+    skipped.add(await blindValue(id));
+    skipped.add(id);
+  }
   const blindedRange = IDBKeyRange.bound(
     [blindRoomCode, lastSeenLamport + 1],
     [blindRoomCode, Number.MAX_SAFE_INTEGER]
@@ -2077,12 +2083,20 @@ export async function getUnreadCount(
     messages = Array.from(byId.values());
   }
 
-  return messages.filter(
+  const counted = messages.filter(
     (m) =>
       m.type !== MessageType.Reaction &&
       m.type !== MessageType.PluginUpdate &&
-      (!blindedExcludeSenderId || m.senderId !== blindedExcludeSenderId)
-  ).length;
+      !skipped.has(m.senderId)
+  );
+  // A call's end card folds into its start in the view (call-card.ts): one
+  // card, one unread. Its phase is in the sealed content, so only these rows
+  // are opened - a handful, against the whole unread range.
+  const callRows = counted.filter((m) => m.type === MessageType.CallEvent);
+  if (!callRows.length) return counted.length;
+  const opened = await openRows<Message>(callRows, STORE_SPECS.messages).catch(() => [] as Message[]);
+  const ends = opened.filter((m) => parseCallCard(m.content)?.phase === "end").length;
+  return counted.length - ends;
 }
 
 const MESSAGE_STATUS_RANK: Record<MessageStatus, number> = {

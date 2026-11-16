@@ -371,6 +371,23 @@ describe("unread counts and seen tracking", () => {
     expect(await getUnreadCount("room-a", 0, "me")).toBe(1);
   });
 
+  it("leaves out the senders it is told to skip (the soft-blocked)", async () => {
+    await putRoom(room);
+    await bulkPutMessages([msg({ senderId: "blocked" }), msg({ senderId: "alice" }), msg({ senderId: "me" })]);
+    expect(await getUnreadCount("room-a", 0, "me", ["blocked"])).toBe(1);
+  });
+
+  it("counts a call once: its end card folds into its start", async () => {
+    await putRoom(room);
+    const card = (phase: "start" | "end") => JSON.stringify({ v: 1, callId: "abcdefgh", phase, at: 1 });
+    await bulkPutMessages([
+      msg({ type: MessageType.CallEvent, content: card("start") }),
+      msg({ type: MessageType.CallEvent, content: card("end") }),
+      msg(),
+    ]);
+    expect(await getUnreadCount("room-a", 0)).toBe(2);
+  });
+
   it("markRoomSeen persists the watermark", async () => {
     await putRoom(room);
     await markRoomSeen("room-a", 42);

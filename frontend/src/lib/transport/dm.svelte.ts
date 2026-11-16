@@ -8,7 +8,7 @@ import {
 } from "$lib/identity/identity";
 import { hybridPairwiseRoomSecret, type DmPqState } from "$lib/room-security/pq-dm";
 import { joinDmConversation, joinStoredRoom } from "$lib/room-security/room-lifecycle";
-import { refreshDmRooms } from "$lib/rooms.svelte";
+import { refreshAllUnreadCounts, refreshDmRooms } from "$lib/rooms.svelte";
 import { dropRoomCorpus } from "$lib/search/corpus.svelte";
 import {
   deleteMessagesForRoom,
@@ -1796,6 +1796,9 @@ export async function blockPerson(peerIdOrDid: string, name: string): Promise<bo
   for (const id of [peerIdOrDid, did]) _solicited.delete(id);
   _admissionChanged();
   await refreshDmRooms();
+  // What they wrote in rooms stops counting as unread, and starts again on
+  // an unblock.
+  void refreshAllUnreadCounts().catch(() => {});
   return true;
 }
 
@@ -1812,6 +1815,7 @@ export async function unblockPerson(did: string): Promise<void> {
   const kept = await dmRoomExists(did);
   await ensureDmRoomForPeer(did, undefined, kept ? {} : { provisional: true }).catch(() => null);
   await refreshDmRooms();
+  void refreshAllUnreadCounts().catch(() => {});
 }
 
 export async function removeDmConversation(peerIdOrDid: string): Promise<void> {
