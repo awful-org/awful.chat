@@ -1,5 +1,6 @@
 <script lang="ts">
   import { callCardSummary, parseCallCard } from "$lib/call-card";
+  import { joinedDmCall } from "$lib/dm-call-joined";
   import { isShortcutModifier } from "$lib/platform";
   import { untrack } from "svelte";
   import { isLegacyArchive } from "$lib/room-security/legacy-archive";
@@ -131,7 +132,10 @@
   function previewText(msg: { type: string; content: string }): string {
     if (msg.type === MessageType.File) return "[file]";
     if (msg.type === MessageType.PluginUpdate) return "(message)"; // Skip plugin updates
-    if (msg.type === MessageType.CallEvent) return callCardSummary(parseCallCard(msg.content));
+    if (msg.type === MessageType.CallEvent) {
+      const card = parseCallCard(msg.content);
+      return callCardSummary(card, !!card && joinedDmCall(card.callId));
+    }
     if (msg.type === MessageType.PluginCard) {
       try {
         const payload = JSON.parse(msg.content);

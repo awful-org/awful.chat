@@ -18,6 +18,12 @@ export interface CallCardPayload {
   phase: "start" | "end";
   /** When this happened, by the poster's clock. */
   at: number;
+  /**
+   * End cards: when the call started, as the poster knew it. Lets an end
+   * card say how long the call was by itself - in the DM list's preview,
+   * which sees only the last row, and when its start card is not held.
+   */
+  startedAt?: number;
 }
 
 const CALL_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -40,7 +46,13 @@ export function parseCallCard(content: string): CallCardPayload | null {
     if (typeof value.callId !== "string" || !CALL_ID.test(value.callId)) return null;
     if (value.phase !== "start" && value.phase !== "end") return null;
     if (typeof value.at !== "number" || !Number.isFinite(value.at) || value.at <= 0) return null;
-    return { v: 1, callId: value.callId, phase: value.phase, at: value.at };
+    const card: CallCardPayload = { v: 1, callId: value.callId, phase: value.phase, at: value.at };
+    // Optional, and only believed when it makes sense: before the end.
+    if (
+      value.phase === "end" && typeof value.startedAt === "number" &&
+      Number.isFinite(value.startedAt) && value.startedAt > 0 && value.startedAt <= value.at
+    ) card.startedAt = value.startedAt;
+    return card;
   } catch {
     return null;
   }
@@ -141,12 +153,18 @@ export function callCardState(opts: {
   const { start, end, ongoing, joined, mine } = opts;
   if (!end && ongoing && start) return { kind: "ongoing", since: start.at };
   if (!joined && !mine) return { kind: "missed" };
-  if (start && end) return { kind: "ended", duration: Math.max(0, end.at - start.at) };
+  const began = start?.at ?? end?.startedAt;
+  if (end && began !== undefined) return { kind: "ended", duration: Math.max(0, end.at - began) };
   return { kind: "ended-unknown" };
 }
 
-/** A one-line description, for the DM list preview and notifications. */
-export function callCardSummary(card: CallCardPayload | null): string {
+/**
+ * A one-line description, for the DM list preview. `joined`: this device
+ * started or joined that call - an end it took no part in reads "Missed call".
+ */
+export function callCardSummary(card: CallCardPayload | null, joined: boolean): string {
   if (!card) return "Call";
-  return card.phase === "start" ? "Started a call" : "Call ended";
+  if (card.phase === "start") return "Started a call";
+  if (!joined) return "Missed call";
+  return card.startedAt !== undefined ? `Call · ${formatCallDuration(card.at - card.startedAt)}` : "Call ended";
 }

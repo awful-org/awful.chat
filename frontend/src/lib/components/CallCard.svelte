@@ -33,8 +33,14 @@
   );
   const shown = $derived(
     card?.phase === "end"
-      // An end whose start is not held stands alone.
-      ? { kind: "ended" as const, duration: -1 }
+      // An end whose start is not held stands alone: its own startedAt
+      // gives the length, and this device's part says missed or not.
+      ? callCardState({
+          end: card,
+          ongoing: false,
+          joined: joinedDmCall(card.callId),
+          mine: false,
+        })
       : callCardState({
           start: card ?? undefined,
           end: callEnd ?? undefined,
@@ -92,7 +98,7 @@
   {:else}
     <Phone class="size-4 shrink-0" />
     <span>
-      {#if shown.kind === "ended" && shown.duration >= 0}
+      {#if shown.kind === "ended"}
         Call · {formatCallDuration(shown.duration)}
       {:else}
         Call ended

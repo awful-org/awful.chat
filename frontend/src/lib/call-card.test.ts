@@ -84,7 +84,28 @@ describe("what a card says", () => {
     expect(formatCallDuration(12 * 60_000)).toBe("12 min");
     expect(formatCallDuration(65 * 60_000)).toBe("1 h 5 min");
     expect(formatCallDuration(2 * 3_600_000)).toBe("2 h");
-    expect(callCardSummary(start("abcdefgh"))).toBe("Started a call");
-    expect(callCardSummary(end("abcdefgh"))).toBe("Call ended");
+    expect(callCardSummary(start("abcdefgh"), false)).toBe("Started a call");
+    expect(callCardSummary(end("abcdefgh"), true)).toBe("Call ended");
+  });
+});
+
+describe("an end card that knows when its call started", () => {
+  const ended = (startedAt?: number): CallCardPayload => ({ v: 1, callId: "abcdefgh", phase: "end", at: 181_000, startedAt });
+
+  it("keeps a sane startedAt and drops one after its end", () => {
+    expect(parseCallCard(encodeCallCard(ended(1_000)))?.startedAt).toBe(1_000);
+    expect(parseCallCard(JSON.stringify({ ...ended(), startedAt: 999_999 }))?.startedAt).toBeUndefined();
+    expect(parseCallCard(JSON.stringify({ ...start("abcdefgh"), startedAt: 5 }))?.startedAt).toBeUndefined();
+  });
+
+  it("previews as the call's length, or as missed for a call this device took no part in", () => {
+    expect(callCardSummary(ended(1_000), true)).toBe("Call · 3 min");
+    expect(callCardSummary(ended(1_000), false)).toBe("Missed call");
+    expect(callCardSummary(ended(), true)).toBe("Call ended");
+  });
+
+  it("gives a stand-alone end its length", () => {
+    expect(callCardState({ end: ended(1_000), ongoing: false, joined: true, mine: false }))
+      .toEqual({ kind: "ended", duration: 180_000 });
   });
 });
