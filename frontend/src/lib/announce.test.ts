@@ -13,6 +13,8 @@ const notified: Array<{
 
 const closedTags: string[] = [];
 
+const blockedForTest = vi.hoisted(() => new Set<string>());
+vi.mock("./blocks.svelte", () => ({ isBlockedDid: (did: string) => blockedForTest.has(did) }));
 vi.mock("./notify.svelte", () => ({
   notifyMessage: (opts: (typeof notified)[number]) => notified.push(opts),
   closeNotificationsByTag: (tags: string[]) => closedTags.push(...tags),
@@ -108,6 +110,17 @@ describe("announceMessage", () => {
     });
     // ...and the mapping back is recorded, or the click could not route.
     expect(remembered).toEqual([[ref, "room-a"]]);
+  });
+
+  it("announces nothing from a soft-blocked person", () => {
+    blockedForTest.add(THEM);
+    try {
+      announceMessage(msg(), ctx);
+      settle();
+      expect(notified).toHaveLength(0);
+    } finally {
+      blockedForTest.clear();
+    }
   });
 
   it("announces the same message once, however many times it is delivered", () => {

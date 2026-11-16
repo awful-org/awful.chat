@@ -7,6 +7,7 @@ import { getRoomNotifyMode } from "./notify-prefs.svelte";
 import { roomsStore } from "./rooms.svelte";
 import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
+import { isBlockedDid } from "./blocks.svelte";
 
 /**
  * Telling the user a message arrived: the sound, and the notification when the
@@ -224,6 +225,9 @@ export function announceMessage(
     // history. Announcing it would beep at you for what you just wrote.
     return;
   }
+  // Soft-blocked: their room messages are kept (folded in the view), but
+  // they make no sound and raise no notification.
+  if (isBlockedDid(msg.senderId)) return;
   if (!claim(msg.id)) return;
 
   try {

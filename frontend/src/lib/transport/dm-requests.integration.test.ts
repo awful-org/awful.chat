@@ -119,7 +119,9 @@ import {
   MAX_UNSOLICITED_DMS,
   SAVED_DMS_JOINED_AT_CONNECT,
   acceptDmRequest,
+  blockPerson,
   ensureDmRoomForPeer,
+  unblockPerson,
   isDmRequestRoom,
   openDmConversation,
   openDmPanel,
@@ -146,7 +148,8 @@ import { MessageType, messageToWire, type Message, type WireChatMessage } from "
 import { canonicalContentV3 } from "$lib/messaging";
 import { dmPqEncapsulate, dmPqRole } from "$lib/room-security/pq-dm";
 import { derivePqKemKeypair } from "$lib/identity/pq-identity";
-import { roomsStore } from "$lib/rooms.svelte";
+import { refreshDmRooms, roomsStore } from "$lib/rooms.svelte";
+import { clearBlocksInMemory, isBlockedDid } from "$lib/blocks.svelte";
 import {
   encodeDmChatEnvelope,
   encodeDmReadEnvelope,
@@ -804,5 +807,100 @@ describe("a read receipt walks only what it has not walked before (P03.9)", () =
     await settled();
     expect(walks()).toEqual([[30, -1], [40, 24]]);
     expect((await getMessage(late))?.status).toBe("read");
+  });
+});
+
+describe("a soft block", () => {
+  beforeEach(() => {
+    closeDmPanel();
+    clearBlocksInMemory();
+  });
+
+  it("refuses a blocked person's mailbox DM: no conversation, no message, no notification", async () => {
+    const them = identity().did;
+    await blockPerson(them, "Them");
+    await deliverMailboxDm(them, chat(them));
+    await settled();
+    const code = await hashDmRoomCode(s.session!.did, them);
+    expect(await getRoom(code)).toBeUndefined();
+    expect(s.announce).not.toHaveBeenCalled();
+    expect(receipts()).toEqual([]);
+  });
+
+  it("drops a live DM in a conversation already held, and answers it with no receipt", async () => {
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    await blockPerson(friend.who.did, "Friend");
+    const payload = chat(friend.who.did);
+    receive(friend.device, encodeDmChatEnvelope(payload), friend.code);
+    await settled();
+    expect(await getMessage(payload.id)).toBeUndefined();
+    expect(receipts()).toEqual([]);
+  });
+
+  it("sets the conversation aside on block and brings it back on unblock", async () => {
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    await refreshDmRooms();
+    expect(roomsStore.dmRooms.map((r) => r.roomCode)).toContain(friend.code);
+
+    await blockPerson(friend.who.did, "Friend");
+    expect(isBlockedDid(friend.who.did)).toBe(true);
+    // No longer listened on, gone from the list, but its record is kept.
+    expect(s.joined.has(friend.code)).toBe(false);
+    expect(roomsStore.dmRooms.map((r) => r.roomCode)).not.toContain(friend.code);
+    expect(await getRoom(friend.code)).toBeDefined();
+    // Nothing joins it again while blocked, not even our own side.
+    expect(await ensureDmRoomForPeer(friend.who.did)).toBeNull();
+
+    await unblockPerson(friend.who.did);
+    expect(isBlockedDid(friend.who.did)).toBe(false);
+    expect(s.joined.has(friend.code)).toBe(true);
+    expect(roomsStore.dmRooms.map((r) => r.roomCode)).toContain(friend.code);
+  });
+
+  it("keeps refusing what they wrote while blocked once unblocked, and takes what they write after", async () => {
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    await blockPerson(friend.who.did, "Friend");
+    const during = chat(friend.who.did, "written while blocked", { ts: Date.now() });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await unblockPerson(friend.who.did);
+    // Arriving late - from the mailbox, or pulled by history sync on rejoin.
+    await deliverMailboxDm(friend.who.did, during);
+    await settled();
+    expect(await getMessage(during.id)).toBeUndefined();
+    const after = chat(friend.who.did, "written after", { ts: Date.now() + 1 });
+    await deliverMailboxDm(friend.who.did, after);
+    await vi.waitFor(async () => expect(await getMessage(after.id)).toBeDefined());
+    expect(isBlockedDid(friend.who.did)).toBe(false);
+  });
+
+  it("keeps refusing what they wrote in an earlier block after blocking and unblocking again", async () => {
+    const friend = await dmPeer("12D3-friend");
+    await ensureDmRoomForPeer(friend.who.did);
+    await blockPerson(friend.who.did, "Friend");
+    const first = chat(friend.who.did, "written in the first block", { ts: Date.now() });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await unblockPerson(friend.who.did);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await blockPerson(friend.who.did, "Friend");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await unblockPerson(friend.who.did);
+    await deliverMailboxDm(friend.who.did, first);
+    await settled();
+    expect(await getMessage(first.id)).toBeUndefined();
+  });
+
+  it("is kept in the store, sealed, across a reload of the list", async () => {
+    const them = identity().did;
+    await blockPerson(them, "Them");
+    clearBlocksInMemory();
+    expect(isBlockedDid(them)).toBe(false);
+    const { loadBlocks } = await import("$lib/blocks.svelte");
+    await loadBlocks();
+    expect(isBlockedDid(them)).toBe(true);
+    const raw = await (await getDB()).getAll("blocks");
+    expect(JSON.stringify(raw)).not.toContain(them);
   });
 });

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onDestroy, tick, untrack } from "svelte";
-  import { SvelteMap } from "svelte/reactivity";
+  import { SvelteMap, SvelteSet } from "svelte/reactivity";
+  import { blocks, isBlockedDid } from "$lib/blocks.svelte";
+  import { foldBlocked } from "$lib/blocked-folds";
   import type { Message } from "$lib/transport/transport.svelte";
   import { MAX_MESSAGE_FILES, MAX_CHAT_CONTENT_LENGTH } from "$lib/transport/verify-incoming";
   import { roomMemberCount } from "$lib/room-members";
@@ -1301,6 +1303,23 @@
     if (replyTargetId === sentReplyId) replyTargetId = null;
   }
 
+  /** Folded runs a reader chose to open. */
+  const revealedBlocked = new SvelteSet<string>();
+
+  /** A soft-blocked person's messages, folded (blocked-folds.ts). */
+  const blockedFolds = $derived.by(() => {
+    void blocks.version;
+    return foldBlocked(
+      renderedMessages,
+      (senderId) => {
+        const did = senderDid(senderId) || senderId;
+        return isBlockedDid(did) ? did : null;
+      },
+      isSelfSender,
+      revealedBlocked,
+    );
+  });
+
   function startReply(msg: Message) {
     replyTargetId = msg.id;
     reactionPickerFor = null;
@@ -1372,6 +1391,9 @@
   /** Scroll to a message and flash it - one this view does not hold, from
    *  storage (chat-window.ts, planJump). */
   function jumpToMessage(messageId: string, revealed = false) {
+    // A blocked person's message is folded and has no row to scroll to:
+    // jumping to it (a reply's quote, search, a pin) opens it first.
+    revealedBlocked.add(messageId);
     const plan = planJump(visibleMessages, range, messageId, revealed);
     if (plan.kind === "reveal") void revealStored(roomCode, messageId);
     if (plan.kind !== "show" || !messagesEl) return;
@@ -3217,6 +3239,22 @@
                     <Separator class="flex-1 bg-border" />
                   </div>
                 {/if}
+                {#if blockedFolds.has(msg.id)}
+                  {@const fold = blockedFolds.get(msg.id)}
+                  {#if fold}
+                    <!-- A soft-blocked person's run of messages, folded to one line. -->
+                    <div class="ml-9 flex items-center gap-2 px-2 py-1 font-mono text-xs text-muted-foreground">
+                      <span>{fold.count === 1 ? "Message" : `${fold.count} messages`} from a blocked person</span>
+                      <button
+                        type="button"
+                        class="cursor-pointer underline-offset-4 hover:text-foreground hover:underline"
+                        onclick={() => { for (const id of fold.ids) revealedBlocked.add(id); }}
+                      >
+                        Show
+                      </button>
+                    </div>
+                  {/if}
+                {:else}
                 <div
                   id={`msg-${msg.id}`}
                   class="group relative rounded-md px-2 py-0.5 hover:bg-muted/50 cursor-default! {showHeader
@@ -3515,6 +3553,7 @@
                     />
                   {/if}
                 </div>
+                {/if}
               </div>
             {/each}
 
