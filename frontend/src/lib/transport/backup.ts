@@ -234,9 +234,10 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   const pictured = local.pfpData || local.pfpURL ? local : imported;
   const localRequest = (local as { request?: boolean }).request;
   const importedRequest = (imported as { request?: boolean }).request;
+  // Room is an interface, so neither side spreads as a plain record.
   const merged: Record<string, unknown> = {
-    ...imported,
-    ...local,
+    ...(imported as unknown as Record<string, unknown>),
+    ...(local as unknown as Record<string, unknown>),
     ...(local.roomSecret || imported.roomSecret
       ? { roomSecret: local.roomSecret ?? imported.roomSecret }
       : {}),

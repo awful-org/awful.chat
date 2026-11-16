@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { Room } from "../storage";
 import {
   mergeImportedRoom,
   BACKUP_ENC_FORMAT,
@@ -207,7 +208,7 @@ describe("mergeImportedRoom", () => {
     createdAt: 100,
     participants: ["did:key:zA"],
     participantLastSeen: { "did:key:zA": 50 },
-  };
+  } as Room;
 
   it("never lowers the seen watermark or activity, unions members", () => {
     const merged = mergeImportedRoom(local, {
