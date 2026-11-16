@@ -10,6 +10,8 @@ const backing = new Map<string, string>();
 };
 import {
   clampDfnAttenuation,
+  importPeerAudioPrefs,
+  peerAudioPrefs,
   loadAudioPrefs,
   loadPeerVolume,
   savePeerVolume,
@@ -163,5 +165,45 @@ describe("DeepFilterNet3 strength", () => {
     expect(clampDfnAttenuation(40, 41)).toEqual({ speechDb: 40, pauseDb: 43 });
     expect(clampDfnAttenuation(10, 60)).toEqual({ speechDb: 10, pauseDb: 60 });
     expect(clampDfnAttenuation(Number.NaN, 45)).toEqual({ speechDb: 25, pauseDb: 45 });
+  });
+});
+
+// The per-person settings are keyed by did:key, so they mean the same on any
+// device of the account and a device sync carries them. The hardware choices
+// stay where they were made.
+describe("per-person audio settings across a device sync", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("exports only what is about people", () => {
+    saveAudioPrefs({ inputDevice: "mic-1", peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zB"] });
+    expect(peerAudioPrefs()).toEqual({ peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zB"] });
+  });
+
+  it("a merge keeps everyone withheld on either device and this device's volume where both set one", () => {
+    saveAudioPrefs({ inputDevice: "mic-1", peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zA"] });
+    importPeerAudioPrefs({
+      peerVolumes: { "did:key:zA": 2, "did:key:zB": 0.6, "12D3KooWNotADid": 1.5 },
+      voiceWithheld: ["did:key:zB", "not-a-did"],
+    }, "add");
+    const prefs = loadAudioPrefs();
+    expect(prefs.inputDevice).toBe("mic-1");
+    expect(prefs.peerVolumes).toEqual({ "did:key:zA": 0.4, "did:key:zB": 0.6 });
+    expect(prefs.voiceWithheld).toEqual(["did:key:zA", "did:key:zB"]);
+  });
+
+  it("a merge past the bound drops imported entries, never this device's", () => {
+    const local = Array.from({ length: 200 }, (_, i) => `did:key:zLocal${i}`);
+    saveAudioPrefs({ voiceWithheld: local });
+    importPeerAudioPrefs({ voiceWithheld: ["did:key:zImported"] }, "add");
+    expect(loadAudioPrefs().voiceWithheld).toEqual(local);
+  });
+
+  it("a replace adopts the other device's, and leaves this device's hardware alone", () => {
+    saveAudioPrefs({ inputDevice: "mic-1", peerVolumes: { "did:key:zA": 0.4 }, voiceWithheld: ["did:key:zA"] });
+    importPeerAudioPrefs({ peerVolumes: { "did:key:zB": 0.6 }, voiceWithheld: [] }, "replace");
+    const prefs = loadAudioPrefs();
+    expect(prefs.inputDevice).toBe("mic-1");
+    expect(prefs.peerVolumes).toEqual({ "did:key:zB": 0.6 });
+    expect(prefs.voiceWithheld).toEqual([]);
   });
 });

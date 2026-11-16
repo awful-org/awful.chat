@@ -3138,7 +3138,16 @@ export async function getOwnProfile(
   const database = await getDB();
   // did and isMe are clear fields, so both lookups run before any decrypt.
   const all = await database.getAll("profiles");
-  const mine = all.find((p) => p.isMe === true);
+  const own = all.filter((p) => p.isMe === true);
+  let mine = own[0];
+  // More than one isMe row is what a merge from another account used to
+  // leave behind (it wrote that account's own profile as ours), and "the
+  // first one" was then whichever sorted first. Ours is the one under our
+  // DID, when we know it.
+  if (own.length > 1 && selfDid) {
+    const blinded = await blindValue(selfDid);
+    mine = own.find((p) => p.did === blinded || p.did === selfDid) ?? mine;
+  }
   // skipBytes: senders only need the nickname - decrypting the avatar and
   // banner blobs on EVERY message send was a visible chunk of send latency.
   if (mine) return _open("profiles", mine as OwnProfile, opts);
@@ -3842,8 +3851,19 @@ export function clearAtRestFlagForCurrentOwner(): void {
 }
 
 /** Call after any write that may have landed plaintext (a locked import):
- *  the next unlock's sweep re-scans and seals it. */
-export function markAtRestSweepNeeded(): void {
+ *  the next unlock's sweep re-scans and seals it.
+ *
+ *  `did` names the identity the written rows belong to, when the caller
+ *  knows it: a merge into this device's own account. Then only that
+ *  identity's flag goes (and the unscoped one a locked session checks), not
+ *  every account's - wiping the others cost each of them a full re-sweep for
+ *  rows nobody had touched. */
+export function markAtRestSweepNeeded(did?: string | null): void {
+  if (did) {
+    const scoped = `${ATREST_FLAG_PREFIX}:${hashRef(did)}`;
+    removeAtRestFlags((key) => key === scoped || key === ATREST_FLAG_PREFIX);
+    return;
+  }
   // EVERY identity's flag, not just the current one. The caller that needs
   // this most is a backup restore from the signup screen, where no identity
   // is active yet - so _atRestOwner is null and the scoped key we would clear

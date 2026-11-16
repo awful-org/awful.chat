@@ -68,6 +68,22 @@ export function loadBlocks(): Promise<void> {
   return loading;
 }
 
+/**
+ * Read the list again, after something other than storeBlock/removeBlock
+ * wrote the store - a device sync or a backup merged into this one. Without
+ * it the merged blocks sat in storage while this session went on acting on
+ * the list it had read at unlock. A load already in flight adopts nothing
+ * once this one starts.
+ */
+export function reloadBlocks(): Promise<void> {
+  generation += 1;
+  const gen = generation;
+  loading = getBlockEntries().then((entries) => {
+    if (gen === generation) adopt(entries);
+  });
+  return loading;
+}
+
 /** Forget the list in memory, as a lock or a sign-out does. */
 export function clearBlocksInMemory(): void {
   generation += 1;

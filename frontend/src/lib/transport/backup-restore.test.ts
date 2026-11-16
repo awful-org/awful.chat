@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { applyBackup, importDatabase } from "./backup-restore";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { applyBackup, importDatabase, DIFFERENT_ACCOUNT_MERGE } from "./backup-restore";
 import { BACKUP_FORMAT, BACKUP_VERSION, type BackupFile } from "./backup";
 import {
   getAllMessages,
@@ -35,6 +35,22 @@ import {
 } from "../identity/identity";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { pqKeyCertificate } from "../identity/pq-identity";
+import {
+  getOwnProfile,
+  putOwnProfile,
+  getBlockEntries,
+  putBlockEntry,
+  getPhonebookEntries,
+  putPhonebookEntry,
+} from "../storage";
+import { hashRef } from "../storage-crypto";
+import { signMessage } from "../messaging";
+import { newMessageId } from "../message-id";
+import { isBlockedDid, dmRefusedAt } from "../blocks.svelte";
+import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
+import { joinedDmCall, noteDmCallJoined } from "../dm-call-joined";
+import { DM_QUEUE_KEY, loadQueuedDmMessages, saveQueuedDmMessages } from "./dm-queue";
+import type { DatabaseExport } from "./backup";
 
 const PASSWORD = "the password that was in use at backup time";
 
@@ -513,13 +529,13 @@ describe("a merge never overwrites or forges messages", () => {
       ...incoming,
       messages: [
         row("m-1", "forged"),
-        row("m-2", "new and unsigned"),
+        row("m-2", "new and unsigned, in a DM", { roomCode: "dm-restoredconversation" }),
         row("m-3", "forged with a bad signature", { senderDid: "did:key:zBob", sig: "00".repeat(64), sigV: 3 }),
       ],
     } as unknown as BackupFile, "add");
 
     expect((await getMessage("m-1"))?.content).toBe("the real message");
-    expect((await getMessage("m-2"))?.content).toBe("new and unsigned");
+    expect((await getMessage("m-2"))?.content).toBe("new and unsigned, in a DM");
     expect(await getMessage("m-3")).toBeUndefined();
   });
 });
@@ -634,5 +650,246 @@ describe("an import with an identity unlocks before it writes", () => {
     expect(asked).toBe(false);
     const raw = JSON.stringify(await (await getDB()).getAll("rooms"));
     expect(raw).not.toContain("restoredroom0001");
+  });
+});
+
+/** An export holding only `overrides`, as a device sync's source sends one. */
+function exportOf(overrides: Partial<DatabaseExport> = {}): DatabaseExport {
+  return {
+    messages: [], attachments: [], pending: [], watermarks: [], yjsDocs: [],
+    rooms: [], profiles: [], savedGifs: [], roomProfiles: [], roomDeletions: [],
+    ...overrides,
+  } as DatabaseExport;
+}
+
+/** localStorage for one test: the suite has none, and storage.ts and the prefs modules hide that. */
+function withLocalStorage(): Map<string, string> {
+  const store = new Map<string, string>();
+  (globalThis as Record<string, unknown>).localStorage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+    clear: () => store.clear(),
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    get length() {
+      return store.size;
+    },
+  };
+  return store;
+}
+
+// A device sync's merge used to take whatever the QR it scanned led to:
+// another account's own profile landed as this one's, and rows nothing else
+// in the app would take unsigned were kept because there was no signature
+// to fail.
+describe("a merge is for this account's data only", () => {
+  beforeEach(async () => {
+    await wipeLocalDatabase();
+  });
+
+  it("refuses a merge from another account before anything is written", async () => {
+    const { keypair } = await createIdentity("my own password");
+    await expect(importDatabase(exportOf({
+      rooms: [{ roomCode: "otheraccountroom", type: "text", name: "Theirs", lastSeenLamport: 0,
+        createdAt: 1, participants: [] } as never],
+    }), "add", { sourceDid: "did:key:zSomebodyElse" })).rejects.toThrow(DIFFERENT_ACCOUNT_MERGE);
+    expect(await getAllRooms()).toEqual([]);
+    // The same account goes through.
+    await importDatabase(exportOf(), "add", { sourceDid: keypair.did });
+  });
+
+  it("writes an own profile only for this account, and never a peer row over it", async () => {
+    const { keypair } = await createIdentity("my own password");
+    await putOwnProfile({ did: keypair.did, isMe: true, nickname: "Me", updatedAt: 10 });
+    await importDatabase(exportOf({ profiles: [
+      { did: "did:key:zSomebodyElse", isMe: true, nickname: "Not me", updatedAt: 99 },
+      { did: keypair.did, isMe: false, nickname: "A cached copy of me", updatedAt: 99 },
+    ] as never }), "add");
+    expect((await getOwnProfile())?.nickname).toBe("Me");
+    expect(await getPeerProfile("did:key:zSomebodyElse")).toBeUndefined();
+    const rows = await (await getDB()).getAll("profiles");
+    expect(rows.filter((p) => p.isMe === true)).toHaveLength(1);
+
+    await importDatabase(exportOf({ profiles: [
+      { did: keypair.did, isMe: true, nickname: "Me, renamed elsewhere", updatedAt: 20 },
+    ] as never }), "add");
+    expect((await getOwnProfile())?.nickname).toBe("Me, renamed elsewhere");
+  });
+
+  // What a merge from another account used to leave behind: two isMe rows,
+  // and "the first one" decided which was shown as us.
+  it("reads our own profile under our DID when an old merge left another isMe row", async () => {
+    const { keypair } = await createIdentity("my own password");
+    await putOwnProfile({ did: "did:key:zSomebodyElse", isMe: true, nickname: "Not me", updatedAt: 1 });
+    await putOwnProfile({ did: keypair.did, isMe: true, nickname: "Me", updatedAt: 1 });
+    expect((await getOwnProfile(keypair.did))?.nickname).toBe("Me");
+  });
+
+  it("keeps unsigned rows only where history sync from a paired device would", async () => {
+    const { keypair } = await createIdentity("my own password");
+    const row = (id: string, extra: Record<string, unknown> = {}) => ({
+      id, roomCode: "plainroom0000001", senderId: "did:key:zBob", senderName: "Bob",
+      timestamp: 1, lamport: 1, type: "text", content: "x", attachments: [], ...extra,
+    });
+    const squatted = newMessageId("did:key:zCarol");
+    const mine = signMessage(row(newMessageId(keypair.did), {
+      senderId: keypair.did, content: "signed by me",
+    }) as never);
+    // A valid signature, from a key that is not the sender it names.
+    const impostor = signMessage(row("m-impostor", { content: "my key, Bob's name" }) as never);
+    await importDatabase(exportOf({ messages: [
+      row("m-room-unsigned", { content: "unsigned, in a room" }),
+      row("m-dm-unsigned", { roomCode: "dm-aconversation", content: "unsigned DM text" }),
+      row("m-dm-file", { roomCode: "dm-aconversation", type: "file",
+        meta: { files: [{ name: "a.png", size: 1, mimeType: "image/png", infoHash: "x" }] } }),
+      row(squatted, { roomCode: "dm-aconversation", content: "an id bound to Carol" }),
+      mine,
+      impostor,
+    ] as never }), "add");
+    expect(await getMessage("m-room-unsigned")).toBeUndefined();
+    expect((await getMessage("m-dm-unsigned"))?.content).toBe("unsigned DM text");
+    expect(await getMessage("m-dm-file")).toBeUndefined();
+    expect(await getMessage(squatted)).toBeUndefined();
+    expect(await getMessage("m-impostor")).toBeUndefined();
+    expect((await getMessage(mine.id))?.content).toBe("signed by me");
+  });
+
+  it("takes our own other device's unsigned history whole, once it proved the account", async () => {
+    const { keypair } = await createIdentity("my own password");
+    const row = (id: string, extra: Record<string, unknown> = {}) => ({
+      id, roomCode: "plainroom0000001", senderId: "did:key:zBob", senderName: "Bob",
+      timestamp: 1, lamport: 1, type: "text", content: "x", attachments: [], ...extra,
+    });
+    const impostor = signMessage(row("m-impostor2", { content: "my key, Bob's name" }) as never);
+    await importDatabase(exportOf({ messages: [
+      row("m-room-before-signing", { content: "from before signing" }),
+      impostor,
+    ] as never }), "add", { sourceDid: keypair.did });
+    expect((await getMessage("m-room-before-signing"))?.content).toBe("from before signing");
+    // A signature still has to be right.
+    expect(await getMessage("m-impostor2")).toBeUndefined();
+  });
+
+  it("keeps only the installed account's own profile on a replace", async () => {
+    const backup = await backupFromAnIdentity();
+    const did = backup.identity!.keypair.did;
+    await wipeLocalDatabase();
+    lockIdentity();
+    await applyBackup({ ...backup, profiles: [
+      { did, isMe: true, nickname: "The restored me", updatedAt: 5 },
+      { did: "did:key:zSomebodyElse", isMe: true, nickname: "Not me", updatedAt: 9 },
+    ] } as unknown as BackupFile, "replace", { requestPassword: async () => PASSWORD });
+    expect((await getOwnProfile())?.nickname).toBe("The restored me");
+    const rows = await (await getDB()).getAll("profiles");
+    expect(rows.filter((p) => p.isMe === true)).toHaveLength(1);
+  });
+});
+
+// Soft blocks and the phonebook lived only in their own stores, which the
+// export never read: a second device came up with every blocked person
+// unblocked and an empty contact list.
+describe("a merge carries blocks and contacts", () => {
+  beforeEach(async () => {
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+  });
+
+  it("unions blocks, keeping an active block active and every refusal window, in this session too", async () => {
+    await putBlockEntry({ did: "did:key:zMallory", name: "Mallory", blockedAt: 100, unblockedAt: 200 });
+    await importDatabase(exportOf({ blocks: [
+      { did: "did:key:zMallory", name: "Mallory", blockedAt: 300 },
+      { did: "did:key:zTrent", name: "Trent", blockedAt: 50, unblockedAt: 60 },
+    ] }), "add");
+    const entries = new Map((await getBlockEntries()).map((e) => [e.did, e]));
+    expect(entries.get("did:key:zMallory")).toEqual({
+      did: "did:key:zMallory", name: "Mallory", blockedAt: 300, earlier: [[100, 200]],
+    });
+    expect(entries.get("did:key:zTrent")?.unblockedAt).toBe(60);
+    // The session already acts on the merged list, without a reload.
+    expect(isBlockedDid("did:key:zMallory")).toBe(true);
+    expect(isBlockedDid("did:key:zTrent")).toBe(false);
+    expect(dmRefusedAt("did:key:zTrent", 55)).toBe(true);
+    expect(dmRefusedAt("did:key:zMallory", 150)).toBe(true);
+  });
+
+  it("unions the phonebook and folds one contact added in two forms into one", async () => {
+    await putPhonebookEntry({ peerId: "12D3KooWBobPeerId", did: "did:key:zBob", nickname: "Bob", addedAt: 500 });
+    await importDatabase(exportOf({ phonebook: [
+      { peerId: "did:key:zBob", nickname: "Bob", addedAt: 100, favorite: true },
+      { peerId: "did:key:zCarol", nickname: "Carol", addedAt: 200 },
+    ] }), "add");
+    const book = await getPhonebookEntries();
+    expect(book).toHaveLength(2);
+    expect(book.find((e) => e.did === "did:key:zBob")).toMatchObject({
+      peerId: "12D3KooWBobPeerId", addedAt: 100, favorite: true,
+    });
+    expect(book.find((e) => e.peerId === "did:key:zCarol")?.nickname).toBe("Carol");
+  });
+
+  it("leaves both alone when the export never carried them", async () => {
+    await putBlockEntry({ did: "did:key:zMallory", name: "Mallory", blockedAt: 100 });
+    await putPhonebookEntry({ peerId: "did:key:zBob", nickname: "Bob", addedAt: 1 });
+    await importDatabase(exportOf(), "add");
+    expect(await getBlockEntries()).toHaveLength(1);
+    expect(await getPhonebookEntries()).toHaveLength(1);
+  });
+});
+
+describe("a merge carries the account state kept outside the database", () => {
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>).localStorage;
+  });
+
+  it("unions voice withholds and calls taken part in, keeping this device's volumes and devices", async () => {
+    withLocalStorage();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    saveAudioPrefs({ inputDevice: "this-devices-mic", peerVolumes: { "did:key:zA": 0.3 },
+      voiceWithheld: ["did:key:zA"] });
+    noteDmCallJoined("call-taken-here");
+    await importDatabase(exportOf({ localState: {
+      peerVolumes: { "did:key:zA": 2, "did:key:zB": 0.7 },
+      voiceWithheld: ["did:key:zB"],
+      dmCallsJoined: ["call-taken-there"],
+    } }), "add");
+    const prefs = loadAudioPrefs();
+    expect(prefs.inputDevice).toBe("this-devices-mic");
+    expect(prefs.peerVolumes).toEqual({ "did:key:zA": 0.3, "did:key:zB": 0.7 });
+    expect([...prefs.voiceWithheld].sort()).toEqual(["did:key:zA", "did:key:zB"]);
+    expect(joinedDmCall("call-taken-there")).toBe(true);
+    expect(joinedDmCall("call-taken-here")).toBe(true);
+  });
+
+  it("merges the other device's DM retry queue into this one's", async () => {
+    withLocalStorage();
+    await wipeLocalDatabase();
+    await createIdentity("my own password");
+    // Made "on the other device": the same account derives the same at-rest
+    // key, so the sealed blob opens here as it is.
+    await saveQueuedDmMessages([{ to: "did:key:zBob", data: [1, 2, 3], queuedAt: 10, messageId: "queued-there" }]);
+    const blob = localStorage.getItem(DM_QUEUE_KEY)!;
+    expect(blob).not.toContain("zBob");
+    await saveQueuedDmMessages([{ to: "did:key:zCarol", data: [4], queuedAt: 20, messageId: "queued-here" }]);
+    await importDatabase(exportOf({ localState: { dmQueue: blob } }), "add");
+    expect((await loadQueuedDmMessages()).map((e) => e.messageId)).toEqual(["queued-there", "queued-here"]);
+  });
+
+  // markAtRestSweepNeeded cleared every account's flag on any import, so a
+  // merge into one account cost every other account on the device a full
+  // re-sweep of rows nobody had touched.
+  it("re-arms the sweep for this account only", async () => {
+    withLocalStorage();
+    await wipeLocalDatabase();
+    const { keypair } = await createIdentity("my own password");
+    const mine = `awful:atrest:v3:${hashRef(keypair.did)}`;
+    for (let i = 0; i < 60 && localStorage.getItem(mine) === null; i++) {
+      await migrateAtRest();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(localStorage.getItem(mine)).not.toBeNull();
+    localStorage.setItem("awful:atrest:v3:anotheraccount00", "1");
+    await importDatabase(exportOf(), "add");
+    expect(localStorage.getItem(mine)).toBeNull();
+    expect(localStorage.getItem("awful:atrest:v3:anotheraccount00")).toBe("1");
   });
 });
