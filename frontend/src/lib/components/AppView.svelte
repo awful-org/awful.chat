@@ -96,6 +96,7 @@
   // Shared with the setup and unlock screens, which read the address bar
   // before this view exists (room-location.ts).
   import { consumeRoomLocation, parkedRoom } from "$lib/room-location";
+  import { warnBeforeLeavingCall } from "$lib/call-beforeunload";
   import {
     syncSpeakersFromCall,
     watchVisibilityForCall,
@@ -305,6 +306,8 @@
   });
 
   watchVisibilityForCall();
+
+  $effect(() => warnBeforeLeavingCall(transportState.inCall));
 
   let activeRoomCode = $state<string | null>(null);
   let activeRoomName = $state<string>("");

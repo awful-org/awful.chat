@@ -1034,11 +1034,8 @@ if (typeof window !== "undefined") {
       }
     }
   };
-  const onUnload = () => {
-    sayGoodbye();
-    _transport.disconnect();
-  };
-  window.addEventListener("beforeunload", onUnload);
+  // beforeunload can be cancelled by an active call (or transfer). Do not
+  // tear anything down until the browser actually leaves the page.
   window.addEventListener("pagehide", (event) => {
     sayGoodbye();
     // A PERSISTED pagehide is not an unload: the page goes into the

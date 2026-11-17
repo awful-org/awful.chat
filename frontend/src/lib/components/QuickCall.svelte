@@ -24,6 +24,8 @@
   import AppNotices from "$lib/components/AppNotices.svelte";
   import UnlockIdentity from "$lib/components/UnlockIdentity.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
+  import { transportState } from "$lib/transport/transport.svelte";
+  import { warnBeforeLeavingCall } from "$lib/call-beforeunload";
   import {
     syncSpeakersFromCall,
     watchVisibilityForCall,
@@ -134,6 +136,8 @@
     syncSpeakersFromCall();
   });
   watchVisibilityForCall();
+
+  $effect(() => warnBeforeLeavingCall(transportState.inCall));
 
   // UnlockIdentity runs the whole unlock itself, remembered password and all,
   // so the only thing left here is to notice that it landed.
