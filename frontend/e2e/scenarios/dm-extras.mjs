@@ -180,15 +180,14 @@ try {
   await alice.go("/app");
   // No network wait needed: the DM row and its opening resolve from storage
   // (participantDid is a DID), so this tests hydration, not reconnection.
-  // Through the real UI: the DMs tab row is what a user clicks after reload.
-  // Two steps - the row only exists once the tab has rendered.
+  // Through the real UI: the conversation row is what a user clicks after
+  // reload. Two steps - the row only exists once the rail's Direct messages
+  // button has put the conversations in the sidebar's column.
   await alice.waitFor("dm row visible", async () => {
-    // The tab click toggles: only click when the DM list is not showing,
-    // or every retry flips it straight back to Rooms.
     await alice.eval(`(() => {
       const showing = [...document.querySelectorAll('aside button')].some((b) => /Bob/.test(b.innerText));
       if (!showing) {
-        [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'DMs')?.click();
+        [...document.querySelectorAll('aside nav button')].find((b) => /^Direct messages/.test(b.textContent.trim()))?.click();
       }
       return true;
     })()`);

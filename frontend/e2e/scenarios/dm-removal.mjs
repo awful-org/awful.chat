@@ -54,11 +54,12 @@ try {
     return true;
   })()`);
 
-  // Remove through the real UI: DMs tab, right-click the row, Remove conversation.
+  // Remove through the real UI: Direct messages on the rail, right-click the
+  // row, Remove conversation.
   await alice.waitFor("dm context menu", async () => {
     await alice.eval(`(() => {
-      const tab = [...document.querySelectorAll('button')].find((b) => /^DMs\\b/.test(b.textContent.trim()));
-      tab?.click();
+      const dms = [...document.querySelectorAll('aside nav button')].find((b) => /^Direct messages/.test(b.textContent.trim()));
+      dms?.click();
       return true;
     })()`);
     await alice.eval(`(() => {
