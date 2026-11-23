@@ -52,7 +52,7 @@ import type {
 } from "../storage";
 import {
   BACKUP_FORMAT,
-  BACKUP_VERSION,
+  backupVersionFor,
   bytesFromExport,
   encryptBackup,
   parseBackup,
@@ -1820,7 +1820,7 @@ export async function downloadBackup(passphrase?: string): Promise<void> {
   const data = await exportDatabase(false);
   const backup: BackupFile = {
     format: BACKUP_FORMAT,
-    version: BACKUP_VERSION,
+    version: backupVersionFor(data),
     exportedAt: Date.now(),
     ...data,
   };

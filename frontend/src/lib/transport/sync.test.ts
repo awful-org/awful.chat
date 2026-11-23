@@ -49,7 +49,7 @@ const { FakeTransport, instances } = vi.hoisted(() => {
       if (ok && this.autoAck && msg.type === "sync_export_data") {
         const from = this.autoAck;
         queueMicrotask(() => this.emit("message", from, new TextEncoder().encode(JSON.stringify({
-          type: "sync_export_ack", v: 2, payload: { seq: msg.payload.seq },
+          type: "sync_export_ack", v: SYNC_PROTOCOL_VERSION, payload: { seq: msg.payload.seq },
         }))));
       }
       return ok;
@@ -104,7 +104,7 @@ import * as storage from "$lib/storage";
 import QRCode from "qrcode";
 import { EXPORT_SECTIONS } from "./backup";
 import { DIFFERENT_ACCOUNT_MERGE } from "./backup-restore";
-import { SYNC_VERSION_MISMATCH, syncComparisonCode } from "./sync-protocol";
+import { SYNC_PROTOCOL_VERSION, SYNC_VERSION_MISMATCH, syncComparisonCode } from "./sync-protocol";
 import { signPeerBinding } from "$lib/messaging";
 const SECURE_SECRET = newRoomSecret();
 const SECURE_ROOM = deriveRoomKeys(SECURE_SECRET).discoveryId;
@@ -119,7 +119,7 @@ const encodeFrame = (obj: unknown) => new TextEncoder().encode(JSON.stringify(ob
 
 /** A version-2 export request, as the target sends it. */
 function exportRequest(token: string, mode: "add" | "replace", extra: Record<string, unknown> = {}) {
-  return encodeFrame({ type: "sync_export_request", v: 2, payload: { token, mode, ...extra } });
+  return encodeFrame({ type: "sync_export_request", v: SYNC_PROTOCOL_VERSION, payload: { token, mode, ...extra } });
 }
 
 /** Source-side: wait for the request to be put to the user, then allow it. */
@@ -671,12 +671,12 @@ describe("target-side identity handling", () => {
       "message",
       PEER_ID,
       frame({
-        type: "sync_export_data", v: 2,
+        type: "sync_export_data", v: SYNC_PROTOCOL_VERSION,
         payload: { section: "identity", data: identitySection, token: TOKEN, seq: 0, ...account },
       })
     );
     await vi.waitFor(() => expect(t.sent.length).toBeGreaterThan(1));
-    t.emit("message", PEER_ID, frame({ type: "sync_export_complete", v: 2, payload: { manifest: manifest(), token: TOKEN } }));
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete", v: SYNC_PROTOCOL_VERSION, payload: { manifest: manifest(), token: TOKEN } }));
     await vi.waitFor(() => expect(importCalls).toHaveLength(1));
     return importCalls[0];
   }
@@ -687,7 +687,7 @@ describe("target-side identity handling", () => {
       token: TOKEN, expires: Date.now() + 60_000, peerId: PEER_ID, mode: "add" });
     const t = instances.at(-1);
     t.emit("connect", PEER_ID);
-    t.emit("message", PEER_ID, frame({ type: "sync_export_data", v: 2, payload: {
+    t.emit("message", PEER_ID, frame({ type: "sync_export_data", v: SYNC_PROTOCOL_VERSION, payload: {
       section: "identity", token: TOKEN, seq: 0, ...account,
     } }));
     let seq = 1;
@@ -696,13 +696,13 @@ describe("target-side identity handling", () => {
         fields: { nickname: null }, fieldEdits: { nickname: { at: 120, id: "a", reset: true } } }],
       ["roomDeletions", { roomCode: "room-b", generation: 100, deletedAt: 300 }],
     ] as const) {
-      t.emit("message", PEER_ID, frame({ type: "sync_export_data", v: 2, payload: {
+      t.emit("message", PEER_ID, frame({ type: "sync_export_data", v: SYNC_PROTOCOL_VERSION, payload: {
         section, data: [record], token: TOKEN, batchIndex: 0, totalBatches: 1, seq: seq++,
       } }));
     }
     await vi.waitFor(() => expect(t.sent.filter((m: any) => m.type === "sync_export_ack")).toHaveLength(3));
     expect(t.sent.filter((m: any) => m.type === "sync_export_ack").map((m: any) => m.payload.seq)).toEqual([0, 1, 2]);
-    t.emit("message", PEER_ID, frame({ type: "sync_export_complete", v: 2, payload: {
+    t.emit("message", PEER_ID, frame({ type: "sync_export_complete", v: SYNC_PROTOCOL_VERSION, payload: {
       token: TOKEN,
       manifest: manifest({ roomProfiles: { items: 1, batches: 1 }, roomDeletions: { items: 1, batches: 1 } }),
     } }));
@@ -784,7 +784,7 @@ describe("target-side identity handling", () => {
   });
 });
 
-const ack = (seq: number) => encodeFrame({ type: "sync_export_ack", v: 2, payload: { seq } });
+const ack = (seq: number) => encodeFrame({ type: "sync_export_ack", v: SYNC_PROTOCOL_VERSION, payload: { seq } });
 
 /** A source device with an account and `messages` rows of history. */
 async function sourceWithHistory(messages = 0) {
@@ -903,9 +903,21 @@ describe("the source asks its user before it sends anything", () => {
     expect(syncState.isConnecting).toBe(true);
     ask("phone");
     await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
-    t.emit("message", "phone", encodeFrame({ type: "sync_error", v: 2, payload: { error: "cancelled" } }), pairing.roomCode);
+    t.emit("message", "phone", encodeFrame({ type: "sync_error", v: SYNC_PROTOCOL_VERSION, payload: { error: "cancelled" } }), pairing.roomCode);
     await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(false));
     expect(syncState.syncError).toBeNull();
+  });
+
+  // Version 2 builds predate channels: they would show every channel's
+  // messages mixed in one chat, so they are refused like version 1.
+  it("refuses a version 2 request: that build has no channels", async () => {
+    const { t, pairing } = await bareSource();
+    t.emit("message", "older-target", encodeFrame({
+      type: "sync_export_request", v: 2, payload: { token: pairing.token, mode: "add" },
+    }), pairing.roomCode);
+    await vi.waitFor(() => expect(t.sent).toHaveLength(1));
+    expect(t.sent[0]).toMatchObject({ type: "sync_error", payload: { error: SYNC_VERSION_MISMATCH } });
+    expect(syncState.awaitingApproval).toBe(false);
   });
 
   it("refuses a version 1 request in words an old build shows", async () => {
@@ -998,7 +1010,7 @@ describe("the export is paced on acks and closed with a manifest", () => {
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
     t.emit("disconnect", "target");
     expect(syncState.syncError).toMatch(/while the other device was importing/);
-    t.emit("message", "target", encodeFrame({ type: "sync_export_complete", v: 2 }), pairing.roomCode);
+    t.emit("message", "target", encodeFrame({ type: "sync_export_complete", v: SYNC_PROTOCOL_VERSION }), pairing.roomCode);
     await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
     expect(syncState.syncError).toBeNull();
   });
@@ -1009,7 +1021,7 @@ describe("the export is paced on acks and closed with a manifest", () => {
     await approveWhenAsked(t);
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: 2 }), pairing.roomCode);
+    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: SYNC_PROTOCOL_VERSION }), pairing.roomCode);
     await vi.waitFor(() => expect(syncState.phase).toBe("remote-password"));
     // A ping is the link, not the import resuming: it must not restart the
     // clock that a person typing a password is exempt from.
@@ -1028,11 +1040,11 @@ describe("the export is paced on acks and closed with a manifest", () => {
     ask("target", "replace");
     await approveWhenAsked(t);
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
-    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: 2 }), pairing.roomCode);
+    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: SYNC_PROTOCOL_VERSION }), pairing.roomCode);
     await vi.waitFor(() => expect(syncState.phase).toBe("remote-password"));
     await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(syncState.syncError).toBeNull();
-    t.emit("message", "target", encodeFrame({ type: "sync_import_progress", v: 2, payload: { percent: 95 } }), pairing.roomCode);
+    t.emit("message", "target", encodeFrame({ type: "sync_import_progress", v: SYNC_PROTOCOL_VERSION, payload: { percent: 95 } }), pairing.roomCode);
     await vi.advanceTimersByTimeAsync(119_000);
     expect(syncState.syncError).toBeNull();
     await vi.advanceTimersByTimeAsync(2_000);
@@ -1062,16 +1074,16 @@ describe("the target confirms, checks and reports", () => {
     return t;
   }
   const fromSource = (t: any, obj: unknown) => t.emit("message", PEER_ID, encodeFrame(obj));
-  const identityFrame = (extra: Record<string, unknown> = {}) => ({ type: "sync_export_data", v: 2,
+  const identityFrame = (extra: Record<string, unknown> = {}) => ({ type: "sync_export_data", v: SYNC_PROTOCOL_VERSION,
     payload: { section: "identity", data: IDENTITY, token: TOKEN, seq: 0, ...extra } });
   const complete = (counts: Record<string, { items: number; batches: number }> = {}) =>
-    ({ type: "sync_export_complete", v: 2, payload: { manifest: manifest(counts), token: TOKEN } });
+    ({ type: "sync_export_complete", v: SYNC_PROTOCOL_VERSION, payload: { manifest: manifest(counts), token: TOKEN } });
 
   it("shows the code the source computed, and does not time out while that user decides", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const t = await target();
     const nonce = "c".repeat(32);
-    fromSource(t, { type: "sync_approval_pending", v: 2, payload: { nonce } });
+    fromSource(t, { type: "sync_approval_pending", v: SYNC_PROTOCOL_VERSION, payload: { nonce } });
     await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
     expect(syncState.pairingCode).toBe(syncComparisonCode(PEER_ID, t.selfId(), TOKEN, nonce));
     await vi.advanceTimersByTimeAsync(5 * 60_000);
@@ -1095,7 +1107,7 @@ describe("the target confirms, checks and reports", () => {
   // The transport's keepalive rides the secure room too, with no version.
   it("ignores the link's keepalive while waiting for the source's user", async () => {
     const t = await target();
-    fromSource(t, { type: "sync_approval_pending", v: 2, payload: { nonce: "d".repeat(32) } });
+    fromSource(t, { type: "sync_approval_pending", v: SYNC_PROTOCOL_VERSION, payload: { nonce: "d".repeat(32) } });
     await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
     fromSource(t, { type: "__ping", n: 1 });
     fromSource(t, null);
@@ -1141,7 +1153,7 @@ describe("the target confirms, checks and reports", () => {
   it("refuses a transfer that holds less than the manifest lists, before importing", async () => {
     const t = await target();
     fromSource(t, identityFrame());
-    fromSource(t, { type: "sync_export_data", v: 2, payload: { section: "messages",
+    fromSource(t, { type: "sync_export_data", v: SYNC_PROTOCOL_VERSION, payload: { section: "messages",
       data: [{ id: "m1" }], batchIndex: 0, totalBatches: 2, token: TOKEN, seq: 1 } });
     // rooms: one batch announced in the manifest, and its frame never came.
     fromSource(t, complete({ messages: { items: 2, batches: 2 }, rooms: { items: 1, batches: 1 } }));
@@ -1154,7 +1166,7 @@ describe("the target confirms, checks and reports", () => {
   it("keeps a batch that arrives twice once", async () => {
     const t = await target();
     fromSource(t, identityFrame());
-    const batch = { type: "sync_export_data", v: 2, payload: { section: "rooms",
+    const batch = { type: "sync_export_data", v: SYNC_PROTOCOL_VERSION, payload: { section: "rooms",
       data: [{ roomCode: "r1", type: "text" }], batchIndex: 0, totalBatches: 1, token: TOKEN, seq: 1 } };
     fromSource(t, batch);
     fromSource(t, { ...batch, payload: { ...batch.payload, seq: 2 } });
@@ -1232,7 +1244,7 @@ describe("the target confirms, checks and reports", () => {
     await vi.waitFor(() => expect(syncState.finishing).toBe(true));
     t.emit("disconnect", PEER_ID);
     // Nor an error frame from a source that gave up waiting.
-    fromSource(t, { type: "sync_error", v: 2, payload: { error: "The other device never confirmed the import" } });
+    fromSource(t, { type: "sync_error", v: SYNC_PROTOCOL_VERSION, payload: { error: "The other device never confirmed the import" } });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(syncState.syncError).toBeNull();
     finish();

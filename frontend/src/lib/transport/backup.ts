@@ -148,7 +148,25 @@ export const BACKUP_FORMAT = "awful.chat/backup";
 // v3 adds room overrides and leave markers. A v2 reader would discard them.
 // v4 adds the phonebook, soft blocks and the localStorage-held account state
 // (LocalStateExport), which a v3 reader would discard just as quietly.
-export const BACKUP_VERSION = 4;
+// v5 holds channels: messages tagged with one, and rooms' channel lists,
+// read marks and pins. A v4 reader shows every channel's messages mixed in
+// the room's one chat, so it must refuse. A file with no channel data is
+// still written as v4 (backupVersionFor), which a v4 reader restores fine.
+export const BACKUP_VERSION = 5;
+
+/** The version to write this export as: the lowest one that reads it correctly (see BACKUP_VERSION). */
+export function backupVersionFor(data: Pick<DatabaseExport, "messages" | "rooms">): number {
+  const tagged = data.messages.some((m) => typeof (m as { channel?: unknown }).channel === "string");
+  const listed = data.rooms.some((r) => {
+    const room = r as { channels?: unknown[]; channelSeen?: object; channelPins?: object };
+    return (
+      (Array.isArray(room.channels) && room.channels.length > 0) ||
+      (!!room.channelSeen && Object.keys(room.channelSeen).length > 0) ||
+      (!!room.channelPins && Object.keys(room.channelPins).length > 0)
+    );
+  });
+  return tagged || listed ? BACKUP_VERSION : 4;
+}
 
 export interface BackupFile extends DatabaseExport {
   format: typeof BACKUP_FORMAT;

@@ -17,8 +17,12 @@ import { utf8 } from "../utils";
  * closes with a manifest. A version 1 build never looks at this field, so
  * each side checks the other's and refuses with SYNC_VERSION_MISMATCH rather
  * than half-understanding the other.
+ *
+ * Version 3: the data can hold channels (messages tagged with one, rooms'
+ * channel lists). A version 2 build would show every channel's messages
+ * mixed in the room's one chat, so the two refuse each other.
  */
-export const SYNC_PROTOCOL_VERSION = 2;
+export const SYNC_PROTOCOL_VERSION = 3;
 
 export const SYNC_VERSION_MISMATCH =
   "The two devices run different versions of the app. Update both, then generate a new code.";
