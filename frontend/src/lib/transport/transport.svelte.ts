@@ -79,7 +79,14 @@ import {
   type Channel,
   type ChannelKind,
 } from "../channels";
-import { currentChannelOf, forgetCurrentChannel, setCurrentChannel } from "../channel-view.svelte";
+import {
+  currentChannelOf,
+  forgetCurrentChannel,
+  openingChannelOf,
+  setCurrentChannel,
+  setOpeningChannel,
+} from "../channel-view.svelte";
+import { forgetStillFrames } from "../still-frames";
 import { normalizeWireName } from "../wire-name";
 import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
@@ -1769,18 +1776,28 @@ function _viewChannel(roomCode: string): string | undefined {
 
 export async function _loadHistory(
   roomCode: string,
-  stillCurrent: () => boolean = () => true
+  stillCurrent: () => boolean = () => true,
+  /** A channel to open along with its page (selectChannel); else the open one. */
+  opening?: string
 ): Promise<void> {
   const page = { capped: false };
-  transportState.historyRoom = null;
-  const channel = _viewChannel(roomCode);
+  // Opening one, the page on screen is whole until the new one replaces it.
+  if (opening === undefined) transportState.historyRoom = null;
+  const channel = opening ?? _viewChannel(roomCode);
   const [msgs, profiles, roomProfiles] = await Promise.all([
     getMessages(roomCode, undefined, page, channel),
     getAllPeerProfiles(),
     getAllPeerRoomProfiles(roomCode),
   ]);
   // A channel picked while this read ran has a read of its own under way.
-  if (!stillCurrent() || _viewChannel(roomCode) !== channel) return;
+  if (!stillCurrent()) return;
+  if (opening === undefined) {
+    if (_viewChannel(roomCode) !== channel) return;
+  } else {
+    // Deleted while its page was read: there is nothing to open.
+    if (opening && !roomChannel(roomCode, opening)) return;
+    setCurrentChannel(roomCode, opening);
+  }
   // Storage and the live view share the same logical sequence/ID ordering.
   transportState.messages = [...msgs].sort(MSG_ORDER);
   // Whether a first read filled a page is the only honest answer to "is
@@ -5497,6 +5514,8 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.callPeerRooms = new Map();
   transportState.callPeerVoiceChannels = new Map();
   _callPeerSeen.clear();
+  // So do the avatars drawn for it.
+  forgetStillFrames();
   // Which channel each room was left on is keyed by room code, the room's
   // membership secret: it goes with the session, like the roster above.
   forgetCurrentChannel();
@@ -6372,15 +6391,18 @@ export async function markSeen(): Promise<void> {
   const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
   if (idx !== -1) {
     const room = roomsStore.rooms[idx];
-    roomsStore.rooms[idx] = channel
-      ? {
+    // Only a mark that moves: the rooms are what the whole sidebar renders,
+    // and a write that changes nothing still renders it again.
+    if (channel) {
+      if ((room.channelSeen?.[channel] ?? 0) < maxLamport) {
+        roomsStore.rooms[idx] = {
           ...room,
-          channelSeen: {
-            ...(room.channelSeen ?? {}),
-            [channel]: Math.max(room.channelSeen?.[channel] ?? 0, maxLamport),
-          },
-        }
-      : { ...room, lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, maxLamport) };
+          channelSeen: { ...(room.channelSeen ?? {}), [channel]: maxLamport },
+        };
+      }
+    } else if ((room.lastSeenLamport ?? 0) < maxLamport) {
+      roomsStore.rooms[idx] = { ...room, lastSeenLamport: maxLamport };
+    }
   }
   noteRoomRead(roomCode, channel);
 }
@@ -6405,15 +6427,25 @@ export function currentChannel(roomCode: string | null = transportState.roomCode
 export async function selectChannel(roomCode: string, channel: string): Promise<boolean> {
   if (roomCode.startsWith("dm-")) return false;
   if (channel && !roomChannel(roomCode, channel)) return false;
-  const changed = currentChannelOf(roomCode) !== channel;
-  setCurrentChannel(roomCode, channel);
-  if (!changed || transportState.roomCode !== roomCode) return true;
-  // Nothing of the channel left is shown while the next one is read.
-  transportState.messages = [];
-  await _loadHistory(
-    roomCode,
-    () => transportState.roomCode === roomCode && currentChannelOf(roomCode) === channel
-  );
+  // Any other channel still being opened is not the one wanted any more.
+  setOpeningChannel(roomCode, null);
+  if (transportState.roomCode !== roomCode) {
+    setCurrentChannel(roomCode, channel);
+    return true;
+  }
+  if (currentChannelOf(roomCode) === channel) return true;
+  // The channel on screen stays there until the page of the next one is
+  // read, and the two change places at once. Emptied first, every picture in
+  // the list was taken down and put back up: a blink on each change.
+  setOpeningChannel(roomCode, channel);
+  const opening = () => openingChannelOf(roomCode) === channel;
+  try {
+    await _loadHistory(roomCode, () => opening() && transportState.roomCode === roomCode, channel);
+    // Another room was opened meanwhile: the choice is kept for this one.
+    if (opening() && transportState.roomCode !== roomCode) setCurrentChannel(roomCode, channel);
+  } finally {
+    if (opening()) setOpeningChannel(roomCode, null);
+  }
   return true;
 }
 

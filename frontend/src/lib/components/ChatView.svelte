@@ -2067,8 +2067,14 @@
     };
   });
 
+  // Untracked: markSeen reads the room's record and then writes its read
+  // mark to that same record. Tracked, it was its own trigger, and a room
+  // left on any channel but the original one marked itself read, and wrote
+  // the record to storage, as fast as the page could run.
   $effect(() => {
-    if (messages.length > 0) markSeen().catch(() => {});
+    void roomCode;
+    void channel;
+    if (messages.length > 0) untrack(() => void markSeen().catch(() => {}));
   });
 
   // markSeen refuses to run while the page is hidden, so the room the user was

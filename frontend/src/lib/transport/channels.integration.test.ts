@@ -98,7 +98,7 @@ import { decode, encode, hex, utf8 } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV4 } from "$lib/messaging";
 import { channelUnreadCount, roomChannels, roomsStore } from "$lib/rooms.svelte";
-import { forgetCurrentChannel } from "$lib/channel-view.svelte";
+import { forgetCurrentChannel, openingChannelOf } from "$lib/channel-view.svelte";
 import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
 import { newMessageId } from "$lib/message-id";
 import {
@@ -265,6 +265,59 @@ describe("messages in channels", () => {
     expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
   });
 
+  it("keeps the channel on screen until the next one's page is read", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    // Not emptied in between: the list, and where a message goes, are still
+    // the channel's on screen. Only the list of channels shows the pick.
+    expect(openingChannelOf(ROOM)).toBe(games.id);
+    expect(currentChannel(ROOM)).toBe("");
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+    await opening;
+    expect(openingChannelOf(ROOM)).toBeNull();
+    expect(currentChannel(ROOM)).toBe(games.id);
+    expect(transportState.messages).toEqual([]);
+  });
+
+  it("opens the last of several picked, and none when the pick is taken back", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const music = await createChannel(ROOM, "music");
+    await Promise.all([selectChannel(ROOM, games.id), selectChannel(ROOM, music.id)]);
+    expect(currentChannel(ROOM)).toBe(music.id);
+    await Promise.all([selectChannel(ROOM, games.id), selectChannel(ROOM, music.id)]);
+    expect(currentChannel(ROOM)).toBe(music.id);
+    expect(openingChannelOf(ROOM)).toBeNull();
+  });
+
+  it("opens nothing that was deleted while its page was read", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    roomsStore.rooms = roomsStore.rooms.map((r) => ({
+      ...r, channels: [{ ...games, deleted: true as const, updatedAt: games.updatedAt + 1 }],
+    }));
+    await opening;
+    expect(currentChannel(ROOM)).toBe("");
+    expect(openingChannelOf(ROOM)).toBeNull();
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+  });
+
+  // The mark is written to the record the sidebar, and the channel's own
+  // name, are read from: a write that moves nothing renders all of it again,
+  // and set off the read that writes it.
+  it("writes a channel's read mark to the room only when it moves", async () => {
+    const games = await createChannel(ROOM, "games");
+    await selectChannel(ROOM, games.id);
+    await sendMessage("read this");
+    await markSeen();
+    const held = roomsStore.rooms[0];
+    expect(held.channelSeen?.[games.id]).toBeGreaterThan(0);
+    await markSeen();
+    expect(roomsStore.rooms[0]).toBe(held);
+  });
+
   it("reacts in the channel of the message reacted to", async () => {
     const games = await createChannel(ROOM, "games");
     await selectChannel(ROOM, games.id);
@@ -319,6 +372,7 @@ describe("messages in channels", () => {
     const music = await createChannel(ROOM, "music");
     await selectChannel(ROOM, music.id);
     await deleteChannel(ROOM, music.id);
+    await settled();
     expect(currentChannel(ROOM)).toBe("");
   });
 });
