@@ -5344,6 +5344,11 @@ function _disconnectWithoutBroadcasting(): void {
   _inboxHeardLive.clear();
   transportState.error = null;
   transportState.callPeerIds = new Set();
+  // Who sits in which call and channel was learned over this session's
+  // connections: the next session (maybe another identity) starts from none.
+  transportState.callPeerRooms = new Map();
+  transportState.callPeerVoiceChannels = new Map();
+  _callPeerSeen.clear();
   transportState.pendingTransmissions = new Map();
   transportState.watchingTransmissions = new Map();
   transportState.fileTransfers = new Map();
