@@ -40,7 +40,18 @@
     announceRoomName,
     removeRoomCompletely,
     connect,
-    peerIdToDid, resolveMentionDisplayName} from "$lib/transport/transport.svelte";
+    peerIdToDid, resolveMentionDisplayName,
+    peerId as selfPeerId,
+  } from "$lib/transport/transport.svelte";
+  import { joinCall, leaveCall } from "$lib/transport/call.svelte";
+  import type { SidebarView } from "$lib/sidebar-rail";
+  import {
+    DEFAULT_CHANNEL_ID,
+    defaultTextChannels,
+    defaultVoiceChannels,
+    roomsWithCalls,
+    type SidebarChannels,
+  } from "$lib/sidebar-channels";
   import {
     roomsStore,
     loadRooms,
@@ -312,7 +323,7 @@
   let activeRoomCode = $state<string | null>(null);
   let activeRoomName = $state<string>("");
   let activeDmPeerId = $state<string | null>(null);
-  let sidebarTab = $state<"rooms" | "users">("rooms");
+  let sidebarView = $state<SidebarView>("rooms");
   let dmPreviews = $state(new Map<string, { text: string; ts: number }>());
   let dmInbox = $state(
     new Map<
@@ -350,6 +361,79 @@
   const orderedRooms = $derived(
     sortRooms(roomsStore.rooms.filter((r) => !r.movedTo))
   );
+
+  // ── The sidebar's channel column (sidebar-channels.ts) ─────────────────────
+  // STAND-INS until rooms have real channels: every room shows one text
+  // channel ("general", id "") that is the room's chat, and one voice channel
+  // ("voice", id "") that is the room's one call, built from the call roster.
+  // Swap these for the channel list and voice occupancy APIs, and pass the
+  // create/rename/delete/reorder handlers, when those land.
+
+  /** Rooms with a call going on, for the live marker on their rail tiles. */
+  const liveRoomCodes = $derived(
+    roomsWithCalls(
+      transportState.callPeerRooms,
+      transportState.inCall ? transportState.callRoomCode : null
+    )
+  );
+
+  /** Who someone in a room's call is, the way the call tiles name them. */
+  function describeCallPeer(roomCode: string, pid: string) {
+    const did = peerIdToDid(pid) || pid;
+    const scoped = roomCode.startsWith("rd2_")
+      ? transportState.peerRoomProfiles.get(roomCode)?.get(did)
+      : undefined;
+    const name =
+      scoped?.nickname ||
+      transportState.peerNames.get(did) ||
+      transportState.peerNames.get(pid) ||
+      did.slice(0, 12);
+    const avatarUrl = scoped
+      ? scoped.pfpURL || null
+      : transportState.peerAvatars.get(did) || transportState.peerAvatars.get(pid) || null;
+    return { name, avatarUrl };
+  }
+
+  /** Join the room's one call; switching from another room's call, as the stage does. */
+  function joinRoomVoice(roomCode: string): void {
+    sidebarOpen = false;
+    // joinCall joins the call of the room on screen: only once it is open.
+    if (transportState.roomCode !== roomCode) return;
+    if (transportState.connecting || transportState.joiningCall) return;
+    if (transportState.inCall) {
+      if (transportState.callRoomCode === roomCode) return;
+      leaveCall();
+    }
+    void joinCall();
+  }
+
+  const sidebarChannels = $derived.by((): SidebarChannels | null => {
+    const code = activeRoomCode;
+    if (!code || !orderedRooms.some((r) => r.roomCode === code)) return null;
+    const self = getScopedProfile(code.startsWith("rd2_") ? code : null);
+    return {
+      text: defaultTextChannels(roomsStore.unreadCounts.get(code) ?? 0),
+      voice: defaultVoiceChannels(code, {
+        callPeerRooms: transportState.callPeerRooms,
+        callPeerStates: transportState.callPeerStates,
+        speaking: speakers.speaking,
+        self: {
+          id: selfId(),
+          peerId: selfPeerId(),
+          inCall: transportState.inCall,
+          callRoomCode: transportState.callRoomCode,
+          muted: transportState.muted,
+          name: self.nickname || "You",
+          avatarUrl: self.avatarUrl ?? null,
+        },
+        describe: (pid) => describeCallPeer(code, pid),
+      }),
+      selectedTextId: DEFAULT_CHANNEL_ID,
+      // The room's chat is already what is on screen; on a phone, show it.
+      onSelectChannel: () => (sidebarOpen = false),
+      onJoinVoice: () => joinRoomVoice(code),
+    };
+  });
 
   // ── Moving an old room to a secure one (room-security/legacy-move.ts) ─────
   const activeLegacyRoom = $derived(
@@ -592,7 +676,7 @@
     activeRoomCode = roomCode;
     activeRoomName = label;
     activeDmPeerId = null;
-    sidebarTab = "rooms";
+    sidebarView = "rooms";
     const backOut = () => {
       if (!current()) return;
       activeRoomCode = prev.roomCode;
@@ -609,7 +693,7 @@
       activeRoomCode = roomCode;
       activeRoomName = label;
       activeDmPeerId = null;
-      sidebarTab = "rooms";
+      sidebarView = "rooms";
       if (isLegacyArchive(roomCode)) {
         history.pushState({ roomCode }, "", `/r/#${roomCode}`);
         return;
@@ -746,7 +830,7 @@
     sidebarOpen = false;
     await handleJoin(code, "", room?.name);
     activeDmPeerId = null;
-    sidebarTab = "rooms";
+    sidebarView = "rooms";
   }
 
   /**
@@ -829,7 +913,7 @@
     activeRoomName = dmTitleFor(normalizedPeerId);
     transportState.roomName = activeRoomName;
     activeDmPeerId = normalizedPeerId;
-    sidebarTab = "users";
+    sidebarView = "dms";
     sidebarOpen = false;
     history.pushState({}, "", "/app");
     await refreshDmRooms();
@@ -1580,8 +1664,10 @@
         {dmUnreadTotal}
         {activeRoomCode}
         {activeDmPeerId}
-        activeTab={sidebarTab}
-        onChangeTab={(tab) => (sidebarTab = tab)}
+        view={sidebarView}
+        onChangeView={(next) => (sidebarView = next)}
+        {liveRoomCodes}
+        channels={sidebarChannels}
         unreadCounts={roomsStore.unreadCounts}
         roomActivity={roomsStore.lastActivity}
         isOpen={sidebarOpen}
@@ -1716,7 +1802,7 @@
           onMove={(invite) => void moveLegacyRoom(invite)}
           onCheckDms={() => {
             moveDialogOpen = false;
-            sidebarTab = "users";
+            sidebarView = "dms";
             sidebarOpen = true;
           }}
           onClose={() => (moveDialogOpen = false)}
