@@ -5,6 +5,7 @@ import {
   BACKUP_ENC_FORMAT,
   BACKUP_FORMAT,
   BACKUP_VERSION,
+  backupVersionFor,
   decryptBackup,
   encryptBackup,
   parseBackupFileText,
@@ -112,8 +113,23 @@ describe("room profile backup records", () => {
     expect(result.dropped).toBe(4);
   });
 
+  // A v4 reader restores a file with no channels correctly, so only one that
+  // holds channel data is marked as something it must refuse.
+  it("marks a file v5 only when it holds channel data", () => {
+    const room = { roomCode: "rd2_a", type: "text", name: "A", lastSeenLamport: 0, createdAt: 1, participants: [] };
+    const msg = { id: "m1", roomCode: "rd2_a", senderId: "did:key:z", senderName: "Z", timestamp: 1, lamport: 1, type: "text", content: "x", attachments: [] };
+    const version = (data: { messages: unknown[]; rooms: unknown[] }) => backupVersionFor(data as never);
+    expect(version({ messages: [msg], rooms: [room] })).toBe(4);
+    expect(version({ messages: [{ ...msg, channel: "abcdefgh" }], rooms: [room] })).toBe(5);
+    expect(version({ messages: [msg], rooms: [{ ...room, channels: [{ id: "abcdefgh", kind: "text", name: "dev", position: 0, updatedAt: 1 }] }] })).toBe(5);
+    expect(version({ messages: [msg], rooms: [{ ...room, channelSeen: { abcdefgh: 3 } }] })).toBe(5);
+    expect(version({ messages: [msg], rooms: [{ ...room, channels: [], channelSeen: {}, channelPins: {} }] })).toBe(4);
+    // And this build still reads a v5 file.
+    expect(parseBackup(backupJson({ version: 5 })).version).toBe(5);
+  });
+
   it("loads old backups without room collections", () => {
-    expect(BACKUP_VERSION).toBe(4);
+    expect(BACKUP_VERSION).toBe(5);
     const old = parseBackup(backupJson({ version: 2 }));
     expect(old.roomProfiles).toEqual([]);
     expect(old.roomDeletions).toEqual([]);
