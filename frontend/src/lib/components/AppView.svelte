@@ -1754,10 +1754,14 @@
             Phonebook
           </DrawerTitle>
         </DrawerHeader>
-        <div class="p-3 overflow-y-auto space-y-2 min-h-50">
+        <div
+          class="flex-1 p-3 overflow-y-auto space-y-2 min-h-50 {sortedPhonebook.length === 0
+            ? 'flex flex-col'
+            : ''}"
+        >
           {#if sortedPhonebook.length === 0}
             <div
-              class="flex flex-col items-center justify-center h-40 text-muted-foreground"
+              class="flex flex-1 flex-col items-center justify-center text-muted-foreground"
             >
               <Notebook class="size-12 mb-2 opacity-50" />
               <p class="text-sm">No contacts yet</p>
@@ -1922,16 +1926,20 @@
           class="fixed inset-0 z-40 bg-black/50 "
         />
         <Dialog.Content
-          class="fixed left-1/2 top-1/2 z-50 w-[90vw] max-w-md -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-background p-4 shadow-lg min-h-75"
+          class="fixed left-1/2 top-1/2 z-50 flex w-[90vw] max-w-md flex-col -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-background p-4 shadow-lg min-h-75"
         >
           <Dialog.Title class="font-mono text-base font-semibold flex items-center gap-2">
             <Users class="size-4" />
             Phonebook
           </Dialog.Title>
-          <div class="mt-4 max-h-96 overflow-y-auto space-y-2 min-h-50">
+          <div
+            class="mt-4 max-h-96 flex-1 overflow-y-auto space-y-2 min-h-50 {sortedPhonebook.length === 0
+              ? 'flex flex-col'
+              : ''}"
+          >
             {#if sortedPhonebook.length === 0}
               <div
-                class="flex flex-col items-center justify-center h-40 text-muted-foreground"
+                class="flex flex-1 flex-col items-center justify-center text-muted-foreground"
               >
                 <Notebook class="size-12 mb-2 opacity-50" />
                 <p class="text-sm">No contacts yet</p>
