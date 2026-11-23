@@ -1,0 +1,130 @@
+/**
+ * Channels on screen, as plain decisions: what the chat header and the
+ * composer say about the channel open, what a channel's notification menu
+ * offers and what each item stores, which call the stage shows, and how the
+ * call status names the call. The components render these; kept here so they
+ * can be tested without a DOM.
+ */
+import type { RoomNotifyMode } from "./notify-prefs.svelte";
+import { DEFAULT_TEXT_CHANNEL, DEFAULT_VOICE_CHANNEL } from "./channels";
+import type { CallTag } from "./transport/voice-channel";
+
+export type { RoomNotifyMode };
+
+// ── The channel on screen ───────────────────────────────────────────────────
+
+/**
+ * The channel name the chat header shows beside the room's ("# name"), or
+ * null to show the room's name alone: a room with only its original chat
+ * looks as it did before channels.
+ */
+export function channelHeading(
+  textChannels: readonly { id: string; name: string }[],
+  current: string
+): string | null {
+  if (!textChannels.some((c) => c.id !== DEFAULT_TEXT_CHANNEL)) return null;
+  return textChannels.find((c) => c.id === current)?.name ?? null;
+}
+
+/** The composer's placeholder: it names the channel once there is a choice. */
+export function composerPlaceholder(heading: string | null, mobile: boolean): string {
+  if (heading) return `Message #${heading}`;
+  return mobile ? "Message..." : "Type a message...";
+}
+
+// ── Notifications ───────────────────────────────────────────────────────────
+
+/** The chat header's wording, unchanged from before channels. */
+export const NOTIFY_LABEL: Readonly<Record<RoomNotifyMode, string>> = {
+  all: "All messages",
+  mentions: "Mentions only",
+  muted: "Muted",
+};
+
+/** The header bell cycles: all, mentions only, muted, all. */
+export const NOTIFY_NEXT: Readonly<Record<RoomNotifyMode, RoomNotifyMode>> = {
+  all: "mentions",
+  mentions: "muted",
+  muted: "all",
+};
+
+/**
+ * What to store for a channel that should now be `mode`: nothing of its own
+ * (null, follow the room) when that is what the room gives it anyway, so a
+ * channel only keeps a mode while it differs from its room's.
+ */
+export function channelModeToStore(mode: RoomNotifyMode, roomMode: RoomNotifyMode): RoomNotifyMode | null {
+  return mode === roomMode ? null : mode;
+}
+
+/** The header bell's label: for the room, or for the channel on screen. */
+export function notifyLabel(mode: RoomNotifyMode, channelName: string | null): string {
+  return channelName
+    ? `Notifications for #${channelName}: ${NOTIFY_LABEL[mode]}`
+    : `Notifications: ${NOTIFY_LABEL[mode]}`;
+}
+
+export interface NotifyMenuItem {
+  id: "mute" | "unmute" | "mentions" | "all" | "follow";
+  label: string;
+  /** What setChannelNotifyMode gets: a mode, or null to follow the room. */
+  mode: RoomNotifyMode | null;
+}
+
+/**
+ * The notification items of a text channel's menu, for its current state.
+ *
+ * The original chat has no mode of its own - its mode is the room's, and
+ * every channel that follows the room follows that - so its items say
+ * "room": muting it from here mutes the room, and saying "channel" would be
+ * a lie about what happens.
+ */
+export function notifyMenuItems(opts: {
+  isDefault: boolean;
+  /** The mode in force: the channel's own, or its room's. */
+  mode: RoomNotifyMode;
+  /** The channel's own mode; null when it follows the room. */
+  own: RoomNotifyMode | null;
+  roomMode: RoomNotifyMode;
+}): NotifyMenuItem[] {
+  const { isDefault, mode, own, roomMode } = opts;
+  const what = isDefault ? "room" : "channel";
+  const store = (m: RoomNotifyMode) => (isDefault ? m : channelModeToStore(m, roomMode));
+  const items: NotifyMenuItem[] = [];
+  if (mode === "muted") {
+    // Unmuted is "all" for the room; for a channel it is whatever its room
+    // gives when that is not muted, else "all" of its own.
+    const unmuted: RoomNotifyMode = isDefault || roomMode === "muted" ? "all" : roomMode;
+    items.push({ id: "unmute", label: `Unmute ${what}`, mode: store(unmuted) });
+  } else {
+    items.push({ id: "mute", label: `Mute ${what}`, mode: store("muted") });
+  }
+  if (mode !== "mentions") items.push({ id: "mentions", label: "Mentions only", mode: store("mentions") });
+  if (mode === "mentions") items.push({ id: "all", label: "All messages", mode: store("all") });
+  if (!isDefault && own !== null) items.push({ id: "follow", label: "Use room setting", mode: null });
+  return items;
+}
+
+// ── Calls ───────────────────────────────────────────────────────────────────
+
+/**
+ * The call the stage and the member list show for the room on screen: ours
+ * when we are in a call in that room, whichever voice channel it is in;
+ * otherwise the room's original call, which is the one their "Join call"
+ * joins. Null with no room on screen.
+ */
+export function stageCall(roomOnScreen: string | null, myCall: CallTag | null): CallTag | null {
+  if (!roomOnScreen) return null;
+  if (myCall && myCall.roomCode === roomOnScreen) return myCall;
+  return { roomCode: roomOnScreen, voiceChannel: DEFAULT_VOICE_CHANNEL };
+}
+
+/**
+ * How the call status names the call: the room, and the voice channel when
+ * it is not the room's original call. A channel whose entry has not reached
+ * us is still named as one.
+ */
+export function callPlaceLabel(roomName: string, voiceChannel: string, channelName: string | null): string {
+  if (voiceChannel === DEFAULT_VOICE_CHANNEL) return roomName;
+  return `${roomName} · ${channelName ?? "voice channel"}`;
+}

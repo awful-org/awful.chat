@@ -41,17 +41,32 @@
     removeRoomCompletely,
     connect,
     peerIdToDid, resolveMentionDisplayName,
-    peerId as selfPeerId,
+    _transport,
+    currentChannel,
+    selectChannel,
+    createChannel,
+    renameChannel,
+    deleteChannel,
+    reorderChannels,
   } from "$lib/transport/transport.svelte";
   import { joinCall, leaveCall } from "$lib/transport/call.svelte";
+  import { currentVoiceChannel, voiceChannelsIn } from "$lib/transport/voice-channels";
+  import { roomHasVoiceChannels } from "$lib/transport/voice-channel";
   import type { SidebarView } from "$lib/sidebar-rail";
   import {
     DEFAULT_CHANNEL_ID,
-    defaultTextChannels,
-    defaultVoiceChannels,
+    buildTextChannels,
+    buildVoiceChannels,
+    roomHasChannelsToPick,
     roomsWithCalls,
     type SidebarChannels,
   } from "$lib/sidebar-channels";
+  import {
+    effectiveNotifyMode,
+    getChannelNotifyMode,
+    getRoomNotifyMode,
+    setChannelNotifyMode,
+  } from "$lib/notify-prefs.svelte";
   import {
     roomsStore,
     loadRooms,
@@ -60,6 +75,8 @@
     refreshDmRooms,
     setRoomOrder,
     toggleRoomPin,
+    roomChannels,
+    channelUnreadCount,
   } from "$lib/rooms.svelte";
   import { uiState } from "$lib/ui-state.svelte";
   import { sortRooms } from "$lib/room-order";
@@ -363,11 +380,13 @@
   );
 
   // ── The sidebar's channel column (sidebar-channels.ts) ─────────────────────
-  // STAND-INS until rooms have real channels: every room shows one text
-  // channel ("general", id "") that is the room's chat, and one voice channel
-  // ("voice", id "") that is the room's one call, built from the call roster.
-  // Swap these for the channel list and voice occupancy APIs, and pass the
-  // create/rename/delete/reorder handlers, when those land.
+  // The open room's text channels from its channel list, with their unread
+  // counts and notification state; its voice channels from the same list,
+  // joined with who is in each call. Management (create, rename, delete,
+  // reorder) only where channels exist at all: a protected group room - what
+  // the channel list and the call layer themselves accept (see
+  // channelsAllowedIn). Elsewhere the column shows the room's one chat and
+  // one call, as before.
 
   /** Rooms with a call going on, for the live marker on their rail tiles. */
   const liveRoomCodes = $derived(
@@ -394,46 +413,134 @@
     return { name, avatarUrl };
   }
 
-  /** Join the room's one call; switching from another room's call, as the stage does. */
-  function joinRoomVoice(roomCode: string): void {
-    sidebarOpen = false;
+  /**
+   * Whether a room can have channels. The list refuses DMs and legacy
+   * archives (transport createChannel, _handleChannelList); the call layer
+   * puts a call in a voice channel only in a protected group room
+   * (call.svelte.ts _channelsAllowedIn). One answer for both kinds, so a
+   * room never offers text channels it could not offer calls beside.
+   */
+  function channelsAllowedIn(roomCode: string): boolean {
+    return (
+      !isLegacyArchive(roomCode) &&
+      roomHasVoiceChannels(roomCode) &&
+      _transport.isSecureRoom(roomCode)
+    );
+  }
+
+  /** A channel edit that did not take: said where the app's warnings go. */
+  function channelEditFailed(err: unknown): void {
+    _transport.announce({
+      type: "app-warning",
+      message: err instanceof Error ? err.message : "Could not change the channel.",
+    });
+  }
+
+  /**
+   * Join one of the room's voice channels: switch to it from another of the
+   * room's, or leave another room's call for it, as the stage does. The
+   * drawer stays open on a phone - joining is not leaving the channel list.
+   */
+  function joinRoomVoice(roomCode: string, channel: string): void {
     // joinCall joins the call of the room on screen: only once it is open.
     if (transportState.roomCode !== roomCode) return;
     if (transportState.connecting || transportState.joiningCall) return;
     if (transportState.inCall) {
-      if (transportState.callRoomCode === roomCode) return;
-      leaveCall();
+      if (transportState.callRoomCode !== roomCode) leaveCall();
+      else if (transportState.callVoiceChannel === channel) return;
     }
-    void joinCall();
+    joinCall(channel).catch((err) => console.warn("[call] join failed:", err));
   }
 
   const sidebarChannels = $derived.by((): SidebarChannels | null => {
     const code = activeRoomCode;
     if (!code || !orderedRooms.some((r) => r.roomCode === code)) return null;
+    const manage = channelsAllowedIn(code);
     const self = getScopedProfile(code.startsWith("rd2_") ? code : null);
-    return {
-      text: defaultTextChannels(roomsStore.unreadCounts.get(code) ?? 0),
-      voice: defaultVoiceChannels(code, {
-        callPeerRooms: transportState.callPeerRooms,
-        callPeerStates: transportState.callPeerStates,
-        speaking: speakers.speaking,
-        self: {
-          id: selfId(),
-          peerId: selfPeerId(),
-          inCall: transportState.inCall,
-          callRoomCode: transportState.callRoomCode,
-          muted: transportState.muted,
-          name: self.nickname || "You",
-          avatarUrl: self.avatarUrl ?? null,
-        },
-        describe: (pid) => describeCallPeer(code, pid),
-      }),
-      selectedTextId: DEFAULT_CHANNEL_ID,
-      // The room's chat is already what is on screen; on a phone, show it.
-      onSelectChannel: () => (sidebarOpen = false),
-      onJoinVoice: () => joinRoomVoice(code),
+    const selfSpeakerId = selfId();
+    // A room never counted per channel holds only its total, which is all
+    // the original chat's (rooms.svelte.ts noteRoomRead).
+    const counted = roomsStore.channelUnread.has(code);
+    const text = buildTextChannels(
+      roomChannels(code, "text"),
+      (id) =>
+        counted
+          ? channelUnreadCount(code, id)
+          : id === DEFAULT_CHANNEL_ID
+            ? (roomsStore.unreadCounts.get(code) ?? 0)
+            : 0,
+      (id) => ({
+        mode: effectiveNotifyMode(code, id),
+        own: getChannelNotifyMode(code, id),
+      })
+    );
+    const occupancy = voiceChannelsIn(code);
+    const mine = currentVoiceChannel();
+    const voice = buildVoiceChannels(
+      manage ? roomChannels(code, "voice") : roomChannels(code, "voice").slice(0, 1),
+      manage ? occupancy : new Map([[DEFAULT_CHANNEL_ID, occupancy.get(DEFAULT_CHANNEL_ID) ?? []]]),
+      mine && mine.roomCode === code ? mine.voiceChannel : null,
+      (m) =>
+        m.self
+          ? {
+              peerId: selfSpeakerId,
+              name: self.nickname || "You",
+              avatarUrl: self.avatarUrl ?? null,
+              speaking: speakers.speaking.has(selfSpeakerId),
+              muted: transportState.muted,
+            }
+          : {
+              peerId: m.peerId,
+              ...describeCallPeer(code, m.peerId),
+              speaking: speakers.speaking.has(m.peerId),
+              muted: !!transportState.callPeerStates.get(m.peerId)?.muted,
+            }
+    );
+    const channels: SidebarChannels = {
+      text,
+      voice,
+      selectedTextId: currentChannel(code),
+      onSelectChannel: (id) => {
+        // A channel picked on a phone is what the user came for: show it.
+        sidebarOpen = false;
+        void selectChannel(code, id);
+      },
+      onJoinVoice: (id) => joinRoomVoice(code, id),
     };
+    if (!isLegacyArchive(code)) {
+      channels.roomNotifyMode = getRoomNotifyMode(code);
+      channels.onSetNotify = (id, mode) => setChannelNotifyMode(code, id, mode);
+    }
+    if (manage) {
+      channels.onCreateChannel = (kind, name) => {
+        createChannel(code, name, kind)
+          .then((made) => {
+            // A new text channel opens, the way a new room does.
+            if (kind === "text" && activeRoomCode === code) void selectChannel(code, made.id);
+          })
+          .catch(channelEditFailed);
+      };
+      channels.onRenameChannel = (kind, id, name) =>
+        void renameChannel(code, id, name, kind).catch(channelEditFailed);
+      channels.onDeleteChannel = (kind, id) =>
+        void deleteChannel(code, id, kind).catch(channelEditFailed);
+      channels.onReorderChannels = (kind, order) =>
+        void reorderChannels(code, order, kind).catch(channelEditFailed);
+    }
+    return channels;
   });
+
+  /**
+   * A room tile tapped on the rail. On a phone the drawer stays open when
+   * the room has channels to pick from; a room with only its chat and call
+   * opens straight onto the chat, as before.
+   */
+  function handleRailSelectRoom(code: string): void {
+    const pick =
+      channelsAllowedIn(code) &&
+      roomHasChannelsToPick(roomChannels(code, "text"), roomChannels(code, "voice"));
+    void handleSelectRoom(code, !pick);
+  }
 
   // ── Moving an old room to a secure one (room-security/legacy-move.ts) ─────
   const activeLegacyRoom = $derived(
@@ -820,14 +927,14 @@
     };
   });
 
-  async function handleSelectRoom(code: string) {
+  async function handleSelectRoom(code: string, closeDrawer = true) {
     const room = roomsStore.rooms.find((r) => r.roomCode === code);
     // Always go through the token-claiming join, even for the room already
     // on screen: the fast paths skipped the claim, so a second quick click
     // during an in-flight switch either no-opped or wrote view state that
     // the losing join later contradicted. Last click wins, by construction.
     // The drawer closes on the tap, not once the room is open.
-    sidebarOpen = false;
+    if (closeDrawer) sidebarOpen = false;
     await handleJoin(code, "", room?.name);
     activeDmPeerId = null;
     sidebarView = "rooms";
@@ -1672,7 +1779,7 @@
         roomActivity={roomsStore.lastActivity}
         isOpen={sidebarOpen}
         onClose={() => (sidebarOpen = false)}
-        onSelectRoom={handleSelectRoom}
+        onSelectRoom={handleRailSelectRoom}
         onSelectDm={handleSelectDm}
         onAddToPhonebook={handleAddToPhonebook}
         onRemoveFromPhonebook={handleRemoveFromPhonebook}

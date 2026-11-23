@@ -1,90 +1,158 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CHANNEL_ID,
-  defaultTextChannels,
-  defaultVoiceChannels,
+  UNLISTED_VOICE_NAME,
+  buildTextChannels,
+  buildVoiceChannels,
+  channelMoveOrder,
+  onScreenRoomUnread,
+  roomHasChannelsToPick,
   roomsWithCalls,
-  type CallRoster,
+  type SidebarVoicePerson,
+  type VoiceOccupant,
 } from "./sidebar-channels";
+import type { RoomNotifyMode } from "./channel-ui";
 
-const names: Record<string, string> = { pBob: "Bob", pCarol: "Carol", pDan: "Dan" };
+const names: Record<string, string> = { me: "Alice", pBob: "Bob", pCarol: "Carol", pDan: "Dan" };
+const person = (m: VoiceOccupant): SidebarVoicePerson => ({
+  peerId: m.peerId,
+  name: names[m.peerId] ?? m.peerId,
+  avatarUrl: null,
+  speaking: m.peerId === "pCarol",
+  muted: m.peerId === "pBob",
+});
+const follow = (mode: RoomNotifyMode = "all") => () => ({ mode, own: null });
 
-function roster(over: Partial<CallRoster> = {}, self: Partial<CallRoster["self"]> = {}): CallRoster {
-  return {
-    callPeerRooms: new Map([
-      ["pCarol", "room1"],
-      ["pBob", "room1"],
-      ["pDan", "room2"],
-    ]),
-    callPeerStates: new Map([["pBob", { muted: true }]]),
-    speaking: new Set(["pCarol"]),
-    describe: (peerId) => ({ name: names[peerId] ?? peerId, avatarUrl: null }),
-    ...over,
-    self: {
-      id: "did:me",
-      peerId: "pMe",
-      inCall: false,
-      callRoomCode: null,
-      muted: false,
-      name: "Alice",
-      ...self,
-    },
-  };
-}
+describe("the text section", () => {
+  it("lists the room's channels in order with their unread counts", () => {
+    const text = buildTextChannels(
+      [
+        { id: "", name: "general" },
+        { id: "aaaaaaaaaaaaaaaa", name: "random" },
+      ],
+      (id) => (id === "" ? 2 : 5),
+      follow()
+    );
+    expect(text.map((c) => [c.id, c.name, c.unread, c.muted])).toEqual([
+      ["", "general", 2, false],
+      ["aaaaaaaaaaaaaaaa", "random", 5, false],
+    ]);
+  });
 
-describe("the stand-in text channel", () => {
-  it("is the room's chat, carrying the room's unread count", () => {
-    expect(defaultTextChannels(4)).toEqual([
-      { id: DEFAULT_CHANNEL_ID, name: "general", unread: 4, muted: false },
+  it("draws a channel muted when its mode, its own or its room's, is muted", () => {
+    const text = buildTextChannels(
+      [
+        { id: "", name: "general" },
+        { id: "aaaaaaaaaaaaaaaa", name: "random" },
+        { id: "bbbbbbbbbbbbbbbb", name: "loud" },
+      ],
+      () => 0,
+      (id) =>
+        id === "bbbbbbbbbbbbbbbb"
+          ? { mode: "all" as const, own: "all" as const }
+          : { mode: "muted" as const, own: null }
+    );
+    expect(text.map((c) => c.muted)).toEqual([true, true, false]);
+    expect(text[2]).toMatchObject({ notifyMode: "all", notifyOwn: "all" });
+  });
+
+  it("never draws the original chat muted in a room with nothing else, as before channels", () => {
+    const [general] = buildTextChannels([{ id: "", name: "general" }], () => 3, follow("muted"));
+    expect(general).toMatchObject({ id: DEFAULT_CHANNEL_ID, unread: 3, muted: false, notifyMode: "muted" });
+  });
+});
+
+describe("the voice section", () => {
+  const list = [
+    { id: "", name: "voice" },
+    { id: "cccccccccccccccc", name: "gaming" },
+  ];
+
+  it("lists every channel, empty ones included, with you first and the others by name", () => {
+    const voice = buildVoiceChannels(
+      list,
+      new Map([
+        ["", []],
+        [
+          "cccccccccccccccc",
+          [
+            { peerId: "pCarol", self: false },
+            { peerId: "me", self: true },
+            { peerId: "pBob", self: false },
+          ],
+        ],
+      ]),
+      "cccccccccccccccc",
+      person
+    );
+    expect(voice.map((c) => [c.id, c.joined, c.people.map((p) => p.name)])).toEqual([
+      ["", false, []],
+      ["cccccccccccccccc", true, ["Alice", "Bob", "Carol"]],
+    ]);
+    expect(voice[1].people[1]).toMatchObject({ muted: true, speaking: false });
+    expect(voice[1].people[2]).toMatchObject({ muted: false, speaking: true });
+  });
+
+  it("is joined only in the channel you are in, and nowhere when you are in no call here", () => {
+    const occupancy = new Map<string, VoiceOccupant[]>([["", [{ peerId: "pDan", self: false }]]]);
+    expect(buildVoiceChannels(list, occupancy, null, person).map((c) => c.joined)).toEqual([false, false]);
+    expect(buildVoiceChannels(list, occupancy, "", person).map((c) => c.joined)).toEqual([true, false]);
+  });
+
+  it("lists a call in a channel the list does not hold, after the others, so nobody is hidden", () => {
+    const voice = buildVoiceChannels(
+      [{ id: "", name: "voice" }],
+      new Map([
+        ["", []],
+        ["dddddddddddddddd", [{ peerId: "pDan", self: false }]],
+      ]),
+      null,
+      person
+    );
+    expect(voice.map((c) => [c.id, c.name])).toEqual([
+      ["", "voice"],
+      ["dddddddddddddddd", UNLISTED_VOICE_NAME],
     ]);
   });
 });
 
-describe("the stand-in voice channel", () => {
-  it("lists who is in this room's call, by name, with their speaking and mute state", () => {
-    const [voice] = defaultVoiceChannels("room1", roster());
-    expect(voice.id).toBe(DEFAULT_CHANNEL_ID);
-    expect(voice.joined).toBe(false);
-    expect(voice.people).toEqual([
-      { peerId: "pBob", name: "Bob", avatarUrl: null, speaking: false, muted: true },
-      { peerId: "pCarol", name: "Carol", avatarUrl: null, speaking: true, muted: false },
-    ]);
+describe("the rail tile of the room on screen", () => {
+  it("counts the room's other channels, not the one being read", () => {
+    const text = [
+      { id: "", unread: 4 },
+      { id: "a", unread: 2 },
+      { id: "b", unread: 1 },
+    ];
+    expect(onScreenRoomUnread(text, "")).toBe(3);
+    expect(onScreenRoomUnread(text, "a")).toBe(5);
   });
 
-  it("puts you first and marks it joined when you are in it", () => {
-    const [voice] = defaultVoiceChannels(
-      "room1",
-      roster({ speaking: new Set(["did:me"]) }, { inCall: true, callRoomCode: "room1", muted: true })
-    );
-    expect(voice.joined).toBe(true);
-    expect(voice.people[0]).toEqual({
-      peerId: "did:me",
-      name: "Alice",
-      avatarUrl: null,
-      speaking: true,
-      muted: true,
-    });
-    expect(voice.people.map((p) => p.name)).toEqual(["Alice", "Bob", "Carol"]);
+  it("is 0 in a room with only its original chat, as before", () => {
+    expect(onScreenRoomUnread([{ id: "", unread: 7 }], "")).toBe(0);
+  });
+});
+
+describe("a room tap on a phone", () => {
+  it("keeps the drawer open only when there is a channel beyond the originals", () => {
+    expect(roomHasChannelsToPick([{ id: "" }], [{ id: "" }])).toBe(false);
+    expect(roomHasChannelsToPick([{ id: "" }, { id: "a" }], [{ id: "" }])).toBe(true);
+    expect(roomHasChannelsToPick([{ id: "" }], [{ id: "" }, { id: "v" }])).toBe(true);
+  });
+});
+
+describe("moving a channel a step", () => {
+  const ids = ["", "a", "b", "c"];
+
+  it("moves it among the others, the original left out of the order", () => {
+    expect(channelMoveOrder(ids, "b", -1)).toEqual(["b", "a", "c"]);
+    expect(channelMoveOrder(ids, "b", 1)).toEqual(["a", "c", "b"]);
   });
 
-  it("does not list you twice when the roster echoes your own presence", () => {
-    const rooms = new Map([["pMe", "room1"]]);
-    const [voice] = defaultVoiceChannels(
-      "room1",
-      roster({ callPeerRooms: rooms }, { inCall: true, callRoomCode: "room1" })
-    );
-    expect(voice.people.map((p) => p.name)).toEqual(["Alice"]);
-  });
-
-  it("is not joined, and does not list you, while your call is in another room", () => {
-    const [voice] = defaultVoiceChannels("room2", roster({}, { inCall: true, callRoomCode: "room1" }));
-    expect(voice.joined).toBe(false);
-    expect(voice.people.map((p) => p.name)).toEqual(["Dan"]);
-  });
-
-  it("is empty with nobody in the call", () => {
-    const [voice] = defaultVoiceChannels("room3", roster());
-    expect(voice.people).toEqual([]);
+  it("never moves the original, nor anything above it, nor past the end", () => {
+    expect(channelMoveOrder(ids, "", 1)).toBeNull();
+    expect(channelMoveOrder(ids, "a", -1)).toBeNull();
+    expect(channelMoveOrder(ids, "c", 1)).toBeNull();
+    expect(channelMoveOrder(ids, "zz", 1)).toBeNull();
   });
 });
 

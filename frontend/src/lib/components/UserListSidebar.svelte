@@ -51,6 +51,9 @@
   import UserProfileCard from "./UserProfileCard.svelte";
   import { openSettings } from "$lib/ui-state.svelte";
   import { activityFor } from "$lib/plugins/activity.svelte";
+  import { currentVoiceChannel } from "$lib/transport/voice-channels";
+  import { peersInCall } from "$lib/transport/voice-channel";
+  import { stageCall } from "$lib/channel-ui";
 
   interface Props {
     open: boolean;
@@ -162,6 +165,13 @@
   const users = $derived.by(() => {
     const allUsers: User[] = [];
     const rows = new Map<string, User>();
+    // Who is in the call the stage shows for this room (channel-ui.ts).
+    const stage = stageCall(transportState.roomCode, currentVoiceChannel());
+    const stagePeers = new Set(
+      stage
+        ? peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, stage)
+        : []
+    );
 
     // One pass over the connections instead of one per member: which
     // connected id, if any, each DID has. The first one wins, as find did.
@@ -265,15 +275,14 @@
         tagChipColor = meta?.tagChipColor || null;
       }
 
-      // In a call in THIS room: presence is announced per peer, self via
-      // local state. Grouped separately in the list, like a voice channel.
+      // In the call this room's stage shows (stageCall): ours when it is in
+      // this room, whichever voice channel, else the room's original call.
+      // Presence is announced per peer, self via local state. Grouped
+      // separately in the list, like a voice channel.
       const inCall = isSelf
         ? transportState.inCall &&
           transportState.callRoomCode === transportState.roomCode
-        : (!!mappedPeerId &&
-            transportState.callPeerRooms.get(mappedPeerId) ===
-              transportState.roomCode) ||
-          transportState.callPeerRooms.get(did) === transportState.roomCode;
+        : (!!mappedPeerId && stagePeers.has(mappedPeerId)) || stagePeers.has(did);
 
       // A pending entry means they are sharing and we are not watching;
       // watching moves them out of pending and into watchingTransmissions.

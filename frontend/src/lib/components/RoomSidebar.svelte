@@ -32,13 +32,19 @@
   } from "$lib/sidebar-rail";
   import {
     DEFAULT_CHANNEL_ID,
+    channelMoveOrder,
+    onScreenRoomUnread,
     type ChannelKind,
     type SidebarChannels,
   } from "$lib/sidebar-channels";
+  import { notifyMenuItems } from "$lib/channel-ui";
+  import { MAX_CHANNEL_NAME } from "$lib/channels";
   import {
     ArrowDown,
     ArrowUp,
+    AtSign,
     Ban,
+    Bell,
     BellOff,
     ChevronDown,
     CircleCheck,
@@ -52,6 +58,7 @@
     PinOff,
     Plus,
     Trash2,
+    Undo2,
     User,
     Users,
     Volume2,
@@ -164,9 +171,11 @@
   const dmsSelected = $derived(column.kind === "dms");
   const dmsPill = $derived(railPill(dmsSelected, dmUnreadTotal));
 
-  // The room on screen is being read, so it does not count as unread.
+  // The channel on screen is being read, so it does not count as unread;
+  // the room's other channels do (0 in a room with only its original chat).
   function unreadOf(code: string): number {
-    return code === activeRoomCode ? 0 : (unreadCounts.get(code) ?? 0);
+    if (code !== activeRoomCode) return unreadCounts.get(code) ?? 0;
+    return channels ? onScreenRoomUnread(channels.text, channels.selectedTextId) : 0;
   }
 
   const roomName = (room: Room): string => room.name || room.roomCode;
@@ -517,11 +526,37 @@
     const { channelKind: kind, id } = t;
     const order = (kind === "text" ? ch.text : ch.voice).map((c) => c.id);
     const reorder = ch.onReorderChannels;
-    const up = reorder ? moveStep(order, id, -1) : null;
-    const down = reorder ? moveStep(order, id, 1) : null;
+    const up = reorder ? channelMoveOrder(order, id, -1) : null;
+    const down = reorder ? channelMoveOrder(order, id, 1) : null;
     const rename = ch.onRenameChannel;
     const remove = ch.onDeleteChannel;
+    const setNotify = ch.onSetNotify;
+    const text = kind === "text" ? ch.text.find((c) => c.id === id) : undefined;
+    const notify =
+      setNotify && text?.notifyMode
+        ? notifyMenuItems({
+            isDefault: id === DEFAULT_CHANNEL_ID,
+            mode: text.notifyMode,
+            own: text.notifyOwn ?? null,
+            roomMode: ch.roomNotifyMode ?? "all",
+          }).map(
+            (n): MenuItem => ({
+              id: `notify-${n.id}`,
+              label: n.label,
+              icon:
+                n.id === "mute"
+                  ? BellOff
+                  : n.id === "mentions"
+                    ? AtSign
+                    : n.id === "follow"
+                      ? Undo2
+                      : Bell,
+              run: () => setNotify(id, n.mode),
+            })
+          )
+        : [];
     return [
+      ...notify,
       ...(rename ? [{ id: "rename", label: "Rename channel", icon: Pencil, run: () => startRename(kind, id) }] : []),
       ...(reorder && up ? [{ id: "up", label: "Move up", icon: ArrowUp, run: () => reorder(kind, up) }] : []),
       ...(reorder && down ? [{ id: "down", label: "Move down", icon: ArrowDown, run: () => reorder(kind, down) }] : []),
@@ -639,6 +674,7 @@
   function startRename(kind: ChannelKind, id: string): void {
     const list = kind === "text" ? channels?.text : channels?.voice;
     renameValue = list?.find((c) => c.id === id)?.name ?? "";
+    creating = null;
     renaming = { kind, id };
   }
 
@@ -675,14 +711,48 @@
     if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown") || !ch.onReorderChannels) return;
     e.preventDefault();
     const order = (kind === "text" ? ch.text : ch.voice).map((c) => c.id);
-    const next = moveStep(order, id, e.key === "ArrowUp" ? -1 : 1);
+    const next = channelMoveOrder(order, id, e.key === "ArrowUp" ? -1 : 1);
     if (next) ch.onReorderChannels(kind, next);
   }
 
   const channelMenus = $derived(
     !!channels &&
-      !!(channels.onRenameChannel || channels.onDeleteChannel || channels.onReorderChannels)
+      !!(
+        channels.onRenameChannel ||
+        channels.onDeleteChannel ||
+        channels.onReorderChannels ||
+        channels.onSetNotify
+      )
   );
+
+  // A new channel is named before it exists: "+" opens a field at the end of
+  // its section, and Enter (or leaving the field with a name in it) makes it.
+  let creating = $state<ChannelKind | null>(null);
+  let createValue = $state("");
+
+  function startCreate(kind: ChannelKind): void {
+    renaming = null;
+    createValue = "";
+    creating = kind;
+  }
+
+  async function endCreate(commit: boolean, refocus: boolean): Promise<void> {
+    const kind = creating;
+    if (!kind) return;
+    creating = null;
+    const name = createValue.trim();
+    if (commit && name) channels?.onCreateChannel?.(kind, name);
+    if (!refocus) return;
+    await tick();
+    columnEl?.querySelector<HTMLElement>(`[data-create="${kind}"]`)?.focus();
+  }
+
+  // Another room's column, or none: a half-typed name does not follow.
+  $effect(() => {
+    void activeRoomCode;
+    creating = null;
+    renaming = null;
+  });
 
   // ── Shared classes ────────────────────────────────────────────────────────
 
@@ -693,6 +763,9 @@
   const iconButton = `inline-flex size-8 max-sm:size-11 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent hover:text-foreground cursor-pointer ${focusRing}`;
   const badge =
     "inline-flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 text-[10px] font-bold leading-none text-primary-foreground tabular-nums";
+  /** A muted channel's count: still there, as a muted room's is, but quiet. */
+  const quietBadge =
+    "inline-flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded-full bg-sidebar-accent px-1.5 text-[10px] font-bold leading-none text-muted-foreground tabular-nums";
   const railBadge =
     "pointer-events-none absolute -top-1 right-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold leading-none text-primary-foreground tabular-nums ring-2 ring-sidebar";
   const tile = `relative flex size-12 sm:size-11 shrink-0 items-center justify-center text-sm font-bold transition-[border-radius,background-color,color] duration-150 cursor-pointer ${focusRing}`;
@@ -1022,15 +1095,16 @@
   <div class="flex items-center pr-1 {first ? 'pb-1.5' : 'pt-4 pb-1.5'}">
     <h3 {id} class="{sectionTitle} flex-1">{title}</h3>
     {#if channels?.onCreateChannel}
-      {@const create = channels.onCreateChannel}
       <Tip text="Create a {kind} channel" side="top">
         {#snippet children(props)}
           <!-- The visible glyph is small; on a phone its hit area is not. -->
           <button
             {...props}
             type="button"
+            data-create={kind}
             aria-label="Add a {kind} channel"
-            onclick={chain(props, "onclick", () => create(kind))}
+            aria-expanded={creating === kind}
+            onclick={chain(props, "onclick", () => (creating === kind ? void endCreate(false, false) : startCreate(kind)))}
             class="relative inline-flex size-5 items-center justify-center rounded text-muted-foreground hover:text-foreground cursor-pointer max-sm:after:absolute max-sm:after:-inset-3 {focusRing}"
           >
             <Plus class="size-3.5" />
@@ -1046,7 +1120,7 @@
     type="text"
     bind:value={renameValue}
     aria-label="Channel name"
-    maxlength={64}
+    maxlength={MAX_CHANNEL_NAME}
     {@attach focusAndSelect}
     onkeydown={(e) => {
       if (e.key === "Enter") {
@@ -1066,6 +1140,39 @@
   />
 {/snippet}
 
+{#snippet createInput(kind: ChannelKind)}
+  <li class="relative">
+    {#if kind === "voice"}
+      <Volume2 class="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+    {:else}
+      <Hash class="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+    {/if}
+    <input
+      type="text"
+      bind:value={createValue}
+      aria-label="New {kind} channel name"
+      placeholder="new-channel"
+      maxlength={MAX_CHANNEL_NAME}
+      {@attach focusAndSelect}
+      onkeydown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          void endCreate(true, true);
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          e.stopPropagation();
+          void endCreate(false, true);
+        }
+      }}
+      onblur={() => void endCreate(true, false)}
+      class="h-8 max-sm:h-11 w-full rounded-md border border-input bg-background pr-2 text-sm text-foreground select-text placeholder:text-muted-foreground/60 {kind ===
+      'voice'
+        ? 'pl-8'
+        : 'pl-7'} {rowFocus}"
+    />
+  </li>
+{/snippet}
+
 {#snippet channelList()}
   {@const ch = channels!}
   <section aria-labelledby="{uid}-text">
@@ -1073,7 +1180,7 @@
     <ul class="flex flex-col gap-0.5">
       {#each ch.text as channel (channel.id)}
         {@const selected = ch.selectedTextId === channel.id}
-        {@const unread = selected || channel.muted ? 0 : channel.unread}
+        {@const unread = selected ? 0 : channel.unread}
         <li class="relative">
           {#if renaming?.kind === "text" && renaming.id === channel.id}
             <Hash class="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
@@ -1090,7 +1197,7 @@
               onkeydown={(e) => onChannelKeydown(e, "text", channel.id)}
               class="flex h-8 max-sm:h-11 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors cursor-pointer {rowFocus} {selected
                 ? 'bg-sidebar-accent font-semibold text-foreground'
-                : unread > 0
+                : unread > 0 && !channel.muted
                   ? 'font-bold text-foreground hover:bg-sidebar-accent/50'
                   : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground'}"
             >
@@ -1101,7 +1208,7 @@
                 <span class="sr-only">, muted</span>
               {/if}
               {#if unread > 0}
-                <span class={badge}>
+                <span class={channel.muted ? quietBadge : badge}>
                   <span aria-hidden="true">{badgeText(unread)}</span>
                   <span class="sr-only">, {unread} unread</span>
                 </span>
@@ -1110,6 +1217,9 @@
           {/if}
         </li>
       {/each}
+      {#if creating === "text"}
+        {@render createInput("text")}
+      {/if}
     </ul>
   </section>
 
@@ -1186,6 +1296,9 @@
           {/if}
         </li>
       {/each}
+      {#if creating === "voice"}
+        {@render createInput("voice")}
+      {/if}
     </ul>
   </section>
 {/snippet}

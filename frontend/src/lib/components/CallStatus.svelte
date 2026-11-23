@@ -2,7 +2,6 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import {
     transportState,
-    _transport,
     _peerIdToDid,
   } from "$lib/transport/transport.svelte";
   import {
@@ -12,7 +11,9 @@
     WifiOff,
     Radio,
   } from "@lucide/svelte";
-  import { roomsStore } from "$lib/rooms.svelte";
+  import { roomChannel, roomsStore } from "$lib/rooms.svelte";
+  import { peersInMyCall } from "$lib/transport/voice-channels";
+  import { callPlaceLabel } from "$lib/channel-ui";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
   import { cn } from "$lib/utils";
   import { worstQuality } from "$lib/call-quality";
@@ -104,12 +105,9 @@
   // actually connected against who announced they are in this call.
   // voiceLinkState is the same set the call tiles pulse from, so the two
   // can never disagree about who is connected.
-  const expectedPeers = $derived.by(() => {
-    const self = _transport?.selfId();
-    return [...transportState.callPeerRooms]
-      .filter(([pid, room]) => room === transportState.callRoomCode && pid !== self)
-      .map(([pid]) => pid);
-  });
+  // Our call is a room AND a voice channel: somebody in another channel of
+  // the same room is in a different call, never one we wait on.
+  const expectedPeers = $derived(peersInMyCall());
   const expectedCount = $derived(expectedPeers.length);
 
   /** Who in this call is heard through TURN, by name, for the badge's tip. */
@@ -163,7 +161,10 @@
       )?.participantDid;
       return (did && transportState.peerNames.get(did)) || "Direct call";
     }
-    return roomsStore.rooms.find((r) => r.roomCode === code)?.name || code;
+    const room = roomsStore.rooms.find((r) => r.roomCode === code)?.name || code;
+    // A voice channel other than the room's original call is named too.
+    const channel = transportState.callVoiceChannel;
+    return callPlaceLabel(room, channel, channel ? (roomChannel(code, channel, "voice")?.name ?? null) : null);
   });
 
   // Away from the call the chip stops being a status line and becomes the way

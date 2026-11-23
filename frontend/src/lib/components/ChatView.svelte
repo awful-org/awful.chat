@@ -114,7 +114,19 @@
     requestFileDownload,
     resolveMentionDisplayName,
     trimMessageView,
+    currentChannel,
   } from "$lib/transport/transport.svelte";
+  import { currentVoiceChannel } from "$lib/transport/voice-channels";
+  import { peersInCall } from "$lib/transport/voice-channel";
+  import { messageChannel } from "$lib/channels";
+  import {
+    NOTIFY_NEXT,
+    channelHeading,
+    channelModeToStore,
+    composerPlaceholder,
+    notifyLabel,
+    stageCall,
+  } from "$lib/channel-ui";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
   import { compareMessages } from "$lib/transport/message-order";
   import { dmReceiptIds } from "$lib/dm-receipt";
@@ -122,6 +134,7 @@
   import {
     pinnedMessagesOf,
     refreshPhonebook,
+    roomChannels,
     toggleMessagePin,
   } from "$lib/rooms.svelte";
   import { getMessage } from "$lib/storage";
@@ -152,7 +165,7 @@
     blockPerson,
     unblockPerson,
   } from "$lib/transport/dm.svelte";
-  import { TypingAnnouncer, typingLine } from "$lib/typing";
+  import { TypingAnnouncer, typingKey, typingLine } from "$lib/typing";
   import { typersIn, typingPrefs } from "$lib/typing.svelte";
   import { mailboxPrefs } from "$lib/transport/mailbox.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
@@ -182,9 +195,10 @@
   import ArchivedHistory from "./ArchivedHistory.svelte";
   import { roomsStore } from "$lib/rooms.svelte";
   import {
+    effectiveNotifyMode,
     getRoomNotifyMode,
+    setChannelNotifyMode,
     setRoomNotifyMode,
-    type RoomNotifyMode,
   } from "$lib/notify-prefs.svelte";
   import { takeDroppedReplyDraft } from "$lib/notify-intents";
   import { formatRoomCode } from "$lib/room-code";
@@ -253,9 +267,20 @@
     onAcceptDmRequest,
   }: Props = $props();
 
-  // Reset scroll state when room changes
+  /**
+   * The channel of the room on screen (channels.ts): "" for its original
+   * chat, and always "" in a DM, which has none. selectChannel swaps the
+   * page; what is per conversation here is reset when it changes too.
+   */
+  const channel = $derived(roomCode.startsWith("dm-") ? "" : currentChannel(roomCode));
+  const textChannels = $derived(roomCode.startsWith("dm-") ? [] : roomChannels(roomCode, "text"));
+  /** "# name" in the header, once the room has more than its original chat. */
+  const heading = $derived(channelHeading(textChannels, channel));
+
+  // Reset scroll state when the room or its channel changes
   $effect(() => {
     roomCode;
+    channel;
     initialScrollDone = false;
     untrack(beginSettling);
     autoScroll = true;
@@ -284,9 +309,18 @@
     connecting,
   } = $derived(transportState);
 
-  const peersInThisRoom = $derived(
-    [...callPeerIds].filter((peerId) => callPeerRooms.get(peerId) === roomCode)
-  );
+  // The call the stage shows here (channel-ui.ts stageCall): ours when it is
+  // in this room, whichever voice channel; else the room's original call,
+  // the one "Join call" joins.
+  const peersInThisRoom = $derived.by(() => {
+    void callPeerIds;
+    const call = stageCall(roomCode, currentVoiceChannel());
+    if (!call) return [];
+    const me = myPeerId();
+    return peersInCall(callPeerRooms, transportState.callPeerVoiceChannels, call).filter(
+      (peerId) => peerId !== me
+    );
+  });
 
   const showCallView = $derived(
     (inCall && callRoomCode === roomCode) || peersInThisRoom.length > 0
@@ -542,14 +576,26 @@
   // the shared array mid-switch (a sync batch for the room being left, a live
   // append during the open's awaits) must never RENDER in the wrong
   // conversation, whatever the transport layer let through.
+  // Channels the same: the page is the open channel's, and a row of another
+  // channel landing mid-switch does not render in this one.
   const visibleMessages = $derived(
     messages.filter(
       (m) =>
         RENDERABLE_TYPES.has(m.type) &&
         m.roomCode === roomCode &&
+        (roomCode.startsWith("dm-") || messageChannel(m) === channel) &&
         !callCards.foldedEnds.has(m.id)
     )
   );
+
+  // A reply started in one channel is not sent into the next one.
+  $effect(() => {
+    void channel;
+    untrack(() => {
+      replyTargetId = null;
+      messageMenu = null;
+    });
+  });
 
   /**
    * Which of them are mounted (chat-window.ts): null follows the newest; a
@@ -1747,17 +1793,20 @@
    * The icon carries the state, because "is this room muted" is a question you
    * ask by glancing at the header, not by opening a menu.
    */
-  const notifyMode = $derived(getRoomNotifyMode(roomCode));
-  const NOTIFY_LABEL: Record<RoomNotifyMode, string> = {
-    all: "All messages",
-    mentions: "Mentions only",
-    muted: "Muted",
-  };
-  const NOTIFY_NEXT: Record<RoomNotifyMode, RoomNotifyMode> = {
-    all: "mentions",
-    mentions: "muted",
-    muted: "all",
-  };
+  /**
+   * In a channel other than the room's original chat the bell is that
+   * channel's (notify-prefs.svelte.ts): its own mode, or the room's while it
+   * follows the room, and its label names it. The original chat's mode is
+   * the room's, as it always was.
+   */
+  const notifyChannel = $derived(channel && heading ? heading : null);
+  const notifyMode = $derived(effectiveNotifyMode(roomCode, channel));
+  const notifyText = $derived(notifyLabel(notifyMode, notifyChannel));
+  function cycleNotify(): void {
+    const next = NOTIFY_NEXT[notifyMode];
+    if (!channel) setRoomNotifyMode(roomCode, next);
+    else setChannelNotifyMode(roomCode, channel, channelModeToStore(next, getRoomNotifyMode(roomCode)));
+  }
 
   /**
    * A reply typed into a notification that could not be sent - the user had
@@ -2209,10 +2258,10 @@
   }
 
   // ── Typing indicator ──────────────────────────────────────────────────
-  const typing = new TypingAnnouncer<{ roomCode: string; dmPeerId: string | null }>(
+  const typing = new TypingAnnouncer<{ roomCode: string; dmPeerId: string | null; channel: string }>(
     (to, on) => {
       if (to.dmPeerId) sendDmTyping(to.dmPeerId, on);
-      else sendRoomTyping(to.roomCode, on);
+      else sendRoomTyping(to.roomCode, on, to.channel);
     }
   );
 
@@ -2220,9 +2269,9 @@
   function noteDraftTyping() {
     const hasText = typingPrefs.sendTyping && !dmRequest && draft.trim().length > 0;
     typing.input(hasText, Date.now(), () => {
-      if (!roomCode.startsWith("dm-")) return { roomCode, dmPeerId: null };
+      if (!roomCode.startsWith("dm-")) return { roomCode, dmPeerId: null, channel };
       const dmPeerId = transportState.activeDmPeerId;
-      return dmPeerId ? { roomCode, dmPeerId } : null;
+      return dmPeerId ? { roomCode, dmPeerId, channel: "" } : null;
     });
   }
 
@@ -2230,13 +2279,15 @@
     typing.stop();
   }
 
+  // The "stop" goes to the conversation (and channel) being left.
   $effect(() => {
     void roomCode;
+    void channel;
     return () => untrack(stopTyping);
   });
 
   const typingText = $derived(
-    typingLine(typersIn(roomCode).map((did) => displayNameFor(did)))
+    typingLine(typersIn(typingKey(roomCode, channel)).map((did) => displayNameFor(did)))
   );
 
   /** What a reply should QUOTE.
@@ -2695,6 +2746,11 @@
         <h1 class="select-text text-sm font-semibold truncate text-foreground">
           {roomName || roomCode}
         </h1>
+        {#if heading}
+          <span class="select-text min-w-0 truncate text-sm text-muted-foreground">
+            <span aria-hidden="true">#</span><span class="sr-only">channel</span> {heading}
+          </span>
+        {/if}
         {#if !isDmChat}
           <Badge
             variant="outline"
@@ -2764,17 +2820,14 @@
             {/if}
           </div>
         {/if}
-        <Tip text="Notifications: {NOTIFY_LABEL[notifyMode]}">
+        <Tip text={notifyText}>
           {#snippet children(props)}
             <Button
               {...props}
               variant="ghost"
               size="icon"
-              onclick={() =>
-                setRoomNotifyMode(roomCode, NOTIFY_NEXT[notifyMode])}
-              aria-label="Notifications: {NOTIFY_LABEL[
-                notifyMode
-              ]}. Tap to change."
+              onclick={cycleNotify}
+              aria-label="{notifyText}. Tap to change."
               class="size-11 sm:size-8 cursor-pointer hover:text-foreground {notifyMode ===
               'all'
                 ? 'text-muted-foreground'
@@ -3919,7 +3972,7 @@
           segments={draftSegments}
           onkeydown={handleKeydown}
           padLeft
-          placeholder={isMobile ? "Message..." : "Type a message..."}
+          placeholder={composerPlaceholder(heading, isMobile)}
           oninput={() => {
             autoResize();
             updateMentionState();
