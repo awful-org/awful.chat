@@ -104,9 +104,12 @@ describe("announceMessage", () => {
     const ref = conversationRef("room-a");
     expect(ref).not.toContain("room-a");
     expect(notified[0].tag).toBe(`room:${ref}`);
+    // The channel is the room's original chat (""): a random id at most,
+    // never anything about the room.
     expect(notified[0].data).toEqual({
       roomCode: ref,
       dmPeerDid: undefined,
+      channel: "",
     });
     // ...and the mapping back is recorded, or the click could not route.
     expect(remembered).toEqual([[ref, "room-a"]]);

@@ -417,7 +417,7 @@ export class MediasoupVideo implements VideoTransport {
    */
   private resumeToken: string | null = null;
   private joinSigner: ((nonce: string, room: string, peer: string) => string) | null = null;
-  private roomAdmission: ((room: string, nonce: string, peer: string) => { roomCode: string; capability: string } | undefined) | null = null;
+  private roomAdmission: ((room: string, nonce: string, peer: string, voiceChannel: string) => { roomCode: string; capability: string } | undefined) | null = null;
 
   setRoomAdmission(provider: NonNullable<typeof this.roomAdmission>): void {
     this.roomAdmission = provider;
@@ -428,6 +428,9 @@ export class MediasoupVideo implements VideoTransport {
   }
   private currentRoomCode: string | null = null;
   private currentPeerId: string | null = null;
+  // Which voice channel of currentRoomCode: each has its own SFU room, so a
+  // rejoin or resume has to come back to this one, not the room's default.
+  private currentVoiceChannel = "";
   private joinGeneration = 0; // incremented on each join() to guard against stale attemptRejoin
   // The one pending rejoin, and the one rebuild in flight. Both are single by
   // construction now - see scheduleRejoin and attemptRejoin.
@@ -459,12 +462,13 @@ export class MediasoupVideo implements VideoTransport {
   private consumerStats: Map<string, { bytes: number; misses: number }> =
     new Map();
 
-  async join(roomCode: string, peerId: string): Promise<void> {
+  async join(roomCode: string, peerId: string, voiceChannel = ""): Promise<void> {
     this.joinGeneration++;
     try {
       this.currentRoomCode = roomCode;
       this.currentPeerId = peerId;
-      await this.connectSfu(roomCode, peerId);
+      this.currentVoiceChannel = voiceChannel;
+      await this.connectSfu(roomCode, peerId, voiceChannel);
       rec(ev("sfu.join", { peer: peerId }));
 
       const capMsg = await this.request<MSCapabilities>(
@@ -539,6 +543,7 @@ export class MediasoupVideo implements VideoTransport {
     this.resumeToken = null;
     this.currentRoomCode = null;
     this.currentPeerId = null;
+    this.currentVoiceChannel = "";
   }
 
   async startCamera(stream?: MediaStream): Promise<void> {
@@ -754,6 +759,7 @@ export class MediasoupVideo implements VideoTransport {
   private connectSfu(
     roomCode: string,
     peerId: string,
+    voiceChannel: string,
     resume?: string
   ): Promise<"joined" | "resumed"> {
     return new Promise((resolve, reject) => {
@@ -806,7 +812,7 @@ export class MediasoupVideo implements VideoTransport {
           if (!authenticated) {
             if (msg.type === "auth:challenge" && !proofSent && this.joinSigner) {
               proofSent = true;
-              const admission = this.roomAdmission?.(roomCode, msg.nonce, peerId);
+              const admission = this.roomAdmission?.(roomCode, msg.nonce, peerId, voiceChannel);
               if (roomCode.startsWith("rd2_") && !admission) throw new Error("Room capability unavailable");
               const wireRoom = admission?.roomCode ?? roomCode;
               const signature = this.joinSigner(msg.nonce, wireRoom, peerId);
@@ -1012,6 +1018,7 @@ export class MediasoupVideo implements VideoTransport {
   private async attemptRejoinInner(expectedGeneration: number): Promise<void> {
     const roomCode = this.currentRoomCode;
     const peerId = this.currentPeerId;
+    const voiceChannel = this.currentVoiceChannel;
     if (!roomCode || !peerId) return;
     // Bail if joinGeneration changed (manual rejoin happened in the interim)
     if (this.joinGeneration !== expectedGeneration) return;
@@ -1026,7 +1033,7 @@ export class MediasoupVideo implements VideoTransport {
     // A transport can fail while the resume is out: its own rung lands on
     // this same rebuild (attemptRejoin runs one at a time) and must not be
     // answered by a resumed session that carries nothing on it.
-    if (this.canResume() && (await this.tryResume(roomCode, peerId)) && !this.transportGone()) return;
+    if (this.canResume() && (await this.tryResume(roomCode, peerId, voiceChannel)) && !this.transportGone()) return;
 
     const republish: Omit<Producer, "producer">[] = [];
     for (const [source, ps] of this.producers) {
@@ -1092,7 +1099,7 @@ export class MediasoupVideo implements VideoTransport {
     this.sfuWs = null;
     this.resumeToken = null;
 
-    await this.join(roomCode, peerId);
+    await this.join(roomCode, peerId, voiceChannel);
     for (const { source, stream, encoding } of republish) {
       await this.publish(stream, source, encoding);
     }
@@ -1125,12 +1132,12 @@ export class MediasoupVideo implements VideoTransport {
    * cannot be reached, so the ladder tries again with everything on screen
    * left as it is - the SFU keeps the session a while for exactly that.
    */
-  private async tryResume(roomCode: string, peerId: string): Promise<boolean> {
+  private async tryResume(roomCode: string, peerId: string, voiceChannel: string): Promise<boolean> {
     const token = this.resumeToken!;
     rec(ev("sfu.resume", { d: { phase: "try" } }));
     let how: "joined" | "resumed";
     try {
-      how = await this.connectSfu(roomCode, peerId, token);
+      how = await this.connectSfu(roomCode, peerId, voiceChannel, token);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       rec(ev("sfu.resume", { d: { phase: "failed", message } }));

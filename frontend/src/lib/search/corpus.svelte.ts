@@ -457,13 +457,20 @@ export function searchRooms(
   q: SearchQuery,
   roomCodes: readonly string[],
   limit = 80,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  /**
+   * Only the entries of one channel (channels.ts), "" for the original chat;
+   * absent, every channel of the rooms. The corpus itself stays per room -
+   * a channel is a filter over it, not a second index to keep in step.
+   */
+  channel?: string
 ): SearchHit[] {
   void corpusState.version;
   const lists: SearchEntry[][] = [];
   for (const roomCode of roomCodes) {
     const c = _rooms.get(roomCode);
-    if (c) lists.push(c.entries);
+    if (!c) continue;
+    lists.push(channel === undefined ? c.entries : c.entries.filter((e) => (e.channel ?? "") === channel));
   }
   return searchEntries(lists, q, limit, nowMs);
 }

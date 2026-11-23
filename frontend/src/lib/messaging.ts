@@ -38,7 +38,7 @@ type Signable = Pick<
   | "reactionOp"
   | "replyTo"
   | "meta"
-> & { sigV?: number; type?: MessageType; roomCode?: string; timestamp?: number };
+> & { sigV?: number; type?: MessageType; roomCode?: string; timestamp?: number; channel?: string };
 
 /**
  * v2 canonical form - additionally covers reaction fields, the replied-to
@@ -93,8 +93,46 @@ export function canonicalContentV3(msg: Signable): string {
   ]);
 }
 
+/**
+ * v4 canonical form - v3 plus the CHANNEL the message was written in
+ * (channels.ts). Without it a relaying peer could move a signed message into
+ * another channel of the same room, and it would still verify. Used only for
+ * a message in a channel other than the room's original chat, so everything
+ * written there stays v3 and every older build still verifies it.
+ *
+ * An older build never misfiles a v4 message: its verifyIncoming accepts
+ * sigV 3 and nothing else, and refuses the rest as "sig-version" - so a
+ * channel message is dropped there, never shown in the original chat. (Its
+ * canonicalFor, which falls back to v1 for a version it does not know, is
+ * only reached through verifyMessage on a backup merge, where a v4 signature
+ * cannot verify against the v1 string either.)
+ */
+export function canonicalContentV4(msg: Signable): string {
+  return JSON.stringify([
+    4,
+    msg.type ?? null,
+    msg.roomCode ?? null,
+    msg.channel ?? null,
+    msg.id,
+    msg.senderId,
+    msg.lamport,
+    msg.content,
+    msg.reactionTo ?? null,
+    msg.reactionEmoji ?? null,
+    msg.reactionOp ?? null,
+    msg.replyTo?.id ?? null,
+    msg.meta?.files?.map(
+      fileSignatureBinding
+    ) ?? null,
+    // As in v3. No build signs an ephemeral with v4, but a canonical that
+    // left freshness out would be one a captured update could be replayed in.
+    ...(msg.type === MessageType.PluginEphemeral ? [msg.timestamp ?? null] : []),
+  ]);
+}
+
 /** Pick the canonical form matching the message's signature version. */
 export function canonicalFor(msg: Signable): string {
+  if (msg.sigV === 4) return canonicalContentV4(msg);
   if (msg.sigV === 3) return canonicalContentV3(msg);
   return msg.sigV === 2 ? canonicalContentV2(msg) : canonicalContent(msg);
 }
@@ -109,8 +147,12 @@ export function canonicalFor(msg: Signable): string {
  */
 export function signMessage(message: Message): Message {
   const { privateKey, did } = requireSession();
-  const sig = ed25519.sign(utf8(canonicalContentV3(message)), privateKey);
-  return { ...message, senderDid: did, sig: hex(sig), sigV: 3 };
+  // v4 only for a channel message: the original chat stays v3, which is what
+  // keeps older builds reading it (canonicalContentV4).
+  const sigV = message.channel ? 4 : 3;
+  const canonical = sigV === 4 ? canonicalContentV4(message) : canonicalContentV3(message);
+  const sig = ed25519.sign(utf8(canonical), privateKey);
+  return { ...message, senderDid: did, sig: hex(sig), sigV };
 }
 
 /**

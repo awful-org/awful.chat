@@ -6,7 +6,8 @@
  * standing between a peer and a forged message in someone else's name.
  */
 import { messageIdAllowedFor } from "../message-id";
-import { canonicalContentV3, verifySignature } from "../messaging";
+import { isChannelId } from "../channels";
+import { canonicalContentV3, canonicalContentV4, verifySignature } from "../messaging";
 import type { WireChatMessage } from "../types/message";
 import { remoteLamportAllowed } from "./logical-clock";
 
@@ -51,6 +52,7 @@ export type VerifyReason =
   | "did-mismatch"
   | "no-room"
   | "id-sender"
+  | "channel"
   | "bad-signature";
 
 export type VerifyVerdict = { ok: true } | { ok: false; reason: VerifyReason };
@@ -83,6 +85,11 @@ export function _resetVerifiedSignatures(): void {
   _verified.clear();
 }
 
+/** The signature versions a received chat message may carry (see below). */
+export function isCurrentSigVersion(sigV: unknown): sigV is 3 | 4 {
+  return sigV === 3 || sigV === 4;
+}
+
 export async function verifyIncoming(
   wire: WireChatMessage,
   opts: VerifyOpts = {}
@@ -109,12 +116,20 @@ export async function verifyIncoming(
   if (!messageIdAllowedFor(wire.id, wire.senderId)) {
     return { ok: false, reason: "id-sender" };
   }
+  // A channel id is a capability over nothing, but it keys a storage index,
+  // a page and an unread count: a malformed one is refused, signed or not.
+  // DMs have no channels, and the unsigned DM history rows below must not be
+  // a way to file one into some channel either.
+  if (wire.channel !== undefined) {
+    if (!isChannelId(wire.channel)) return { ok: false, reason: "channel" };
+    if (opts.room?.startsWith("dm-")) return { ok: false, reason: "channel" };
+  }
   if (!wire.sig) {
     return opts.allowUnsigned === true
       ? { ok: true }
       : { ok: false, reason: "unsigned" };
   }
-  // v3 ONLY, as of the 2026-08-28 sunset.
+  // v3 ONLY (and its channel form, v4), as of the 2026-08-28 sunset.
   //
   // v1's canonical left reaction/reply/file fields unsigned, so a relay could
   // swap an infoHash or an emoji undetected. v2 fixed that but signed neither
@@ -129,7 +144,15 @@ export async function verifyIncoming(
   // sync transfers the database wholesale rather than re-verifying it, so
   // nothing already on a device is lost - a peer simply cannot backfill a
   // room's pre-v3 past to a device that never had it.
-  if (wire.sigV !== 3) return { ok: false, reason: "sig-version" };
+  //
+  // v4 is v3 plus the channel (messaging.ts canonicalContentV4), and is used
+  // for exactly the messages that carry one. A v3 message claiming a channel
+  // would have it unsigned - anyone relaying it could move it - and a v4 one
+  // with none is not something any build signs.
+  if (!isCurrentSigVersion(wire.sigV)) return { ok: false, reason: "sig-version" };
+  if ((wire.sigV === 4) !== (wire.channel !== undefined)) {
+    return { ok: false, reason: "channel" };
+  }
   if (!wire.senderDid) return { ok: false, reason: "no-did" };
   // The signing DID must BE the claimed sender, always. This was once checked
   // only when senderId was already in did:key form, so a senderId in any
@@ -149,7 +172,10 @@ export async function verifyIncoming(
   // under - a message signed for another room (or with its type flipped in
   // transit) fails verification here.
   if (!opts.room) return { ok: false, reason: "no-room" };
-  const canonical = canonicalContentV3({ ...wire, roomCode: opts.room });
+  const canonical =
+    wire.sigV === 4
+      ? canonicalContentV4({ ...wire, roomCode: opts.room })
+      : canonicalContentV3({ ...wire, roomCode: opts.room });
   const key = JSON.stringify([wire.senderDid, wire.sig, canonical]);
   if (_verified.has(key)) return { ok: true };
   const valid = await verifySignature(wire.senderDid, wire.sig, canonical);

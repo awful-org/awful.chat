@@ -9,7 +9,7 @@
   } from "$lib/search/corpus.svelte";
   import { snippetFor, type SearchHit } from "$lib/search/engine";
   import { match } from "$lib/palette/scorer";
-  import { roomsStore } from "$lib/rooms.svelte";
+  import { roomChannel, roomsStore } from "$lib/rooms.svelte";
   import { transportState } from "$lib/transport/transport.svelte";
   import { revealMessage } from "$lib/reveal-message";
 
@@ -111,9 +111,24 @@
     })();
   });
 
+  /**
+   * One channel of the scope room, when the search was opened on one
+   * (openSearch's second argument); undefined - the whole room, every room -
+   * otherwise.
+   */
+  const scopeChannel = $derived(
+    searchUi.scope && searchUi.scopeChannel !== null ? searchUi.scopeChannel : undefined
+  );
+  /** The channel's name for the scope chip: only for one other than the original chat. */
+  const scopeChannelName = $derived(
+    searchUi.scope && scopeChannel
+      ? (roomChannel(searchUi.scope, scopeChannel)?.name ?? null)
+      : null
+  );
+
   const results = $derived.by(() => {
     if (!searchUi.open || isEmptyQuery(parsed)) return [];
-    return searchRooms(parsed, scopedRooms);
+    return searchRooms(parsed, scopedRooms, undefined, undefined, scopeChannel);
   });
 
   const progress = $derived(
@@ -233,7 +248,9 @@
           <span
             class="shrink-0 rounded bg-primary/15 px-1.5 py-0.5 font-mono text-[10px] text-primary"
           >
-            {roomName.get(searchUi.scope) ?? searchUi.scope}
+            {roomName.get(searchUi.scope) ?? searchUi.scope}{scopeChannelName
+              ? ` #${scopeChannelName}`
+              : ""}
           </span>
         {/if}
         <button

@@ -21,6 +21,7 @@ import type { DmPqState } from "$lib/room-security/pq-dm";
 import { ROOM_SECURITY_V2_RELEASED } from "$lib/room-security/invitation-release";
 import { onIdentityLock, type UnlockedSession } from "$lib/identity/identity";
 import { roomSfuAdmission } from "$lib/room-security/sfu";
+import { DEFAULT_VOICE_CHANNEL, roomHasVoiceChannels } from "../voice-channel";
 import { multiaddr, type Multiaddr } from "@multiformats/multiaddr";
 import type { Connection, Stream } from "@libp2p/interface";
 import type { StreamMessageEvent, StreamCloseEvent } from "@libp2p/interface";
@@ -810,18 +811,24 @@ export class LibP2PTransport implements PeerTransport {
     return this.send(peerId, data);
   }
 
-  sfuAdmission(room: string, nonce: string, peer: string): { roomCode: string; capability: string } | undefined {
+  sfuAdmission(room: string, nonce: string, peer: string, voiceChannel: string = DEFAULT_VOICE_CHANNEL): { roomCode: string; capability: string } | undefined {
     if (!this.dmCurrent(room)) throw new Error("Identity session ended");
+    // Checked on the local code: a DM's wire room is an rd2_ id like any
+    // other, and a DM has only its one call.
+    if (voiceChannel !== DEFAULT_VOICE_CHANNEL && !roomHasVoiceChannels(room)) throw new Error("A DM has no voice channels");
     room = this.wireRoom(room);
     if (room.startsWith("dm-")) throw new Error("DM capability unavailable");
     if (room.startsWith("r2_")) throw new Error("Room secret cannot be an SFU identifier");
     if (!room.startsWith("rd2_")) {
       if (ROOM_SECURITY_V2_RELEASED) throw new Error("Legacy rooms are read-only");
+      // A legacy room's SFU id is its code, the same for every channel:
+      // refuse rather than put two channels' cameras in one SFU room.
+      if (voiceChannel !== DEFAULT_VOICE_CHANNEL) throw new Error("Legacy rooms have no voice channels");
       return undefined;
     }
     const keys = this.secureRooms.get(room as DiscoveryId);
     if (!keys) throw new Error("Room capability unavailable");
-    return roomSfuAdmission(keys, nonce, peer);
+    return roomSfuAdmission(keys, nonce, peer, voiceChannel);
   }
 
   private ensureSecureRoom(peerId: string, room: DiscoveryId): Promise<SecureRoomChannel | null> {

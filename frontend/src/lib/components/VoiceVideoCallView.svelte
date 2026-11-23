@@ -58,6 +58,9 @@
     toggleDeafen,
   } from "$lib/transport/call.svelte";
   import { speakers } from "$lib/speakers.svelte";
+  import { currentVoiceChannel } from "$lib/transport/voice-channels";
+  import { peersInCall } from "$lib/transport/voice-channel";
+  import { stageCall } from "$lib/channel-ui";
   import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
   import { latestWatched } from "$lib/watch-presence";
   import { requestReturnToCall } from "$lib/ui-state.svelte";
@@ -252,16 +255,23 @@ import {
     callPeerStates = new Map<string, { muted: boolean; deafened: boolean }>(),
   } = $derived(transportState);
 
-  // Only the call in the room on screen. Peers of another room's call are
-  // still tracked (we stay subscribed to rooms we switched away from), and
-  // reading the whole set drew them as tiles in whatever call this view showed.
-  const callPeerIds = $derived(
-    new Set(
-      [...transportState.callPeerIds].filter(
-        (p) => transportState.callPeerRooms.get(p) === transportState.roomCode
+  // Only the call this stage is for (channel-ui.ts stageCall): ours when it
+  // is in the room on screen - our room AND our voice channel, so people in
+  // the room's other voice channels are not drawn as tiles of it - else the
+  // room's original call, the one "Join call" joins. Peers of another room's
+  // call are still tracked (we stay subscribed to rooms we switched away
+  // from), and reading the whole set drew them as tiles in whatever call
+  // this view showed.
+  const callPeerIds = $derived.by(() => {
+    const call = stageCall(transportState.roomCode, currentVoiceChannel());
+    if (!call) return new Set<string>();
+    const me = selfPeerId();
+    return new Set(
+      peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, call).filter(
+        (p) => p !== me
       )
-    )
-  );
+    );
+  });
 
   /**
    * The room whose profiles this view shows: the room on screen, like

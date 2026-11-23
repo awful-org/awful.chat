@@ -35,10 +35,17 @@
     Users,
     Workflow,
     Ban,
+    Copy,
+    Pencil,
+    UserRound,
   } from "@lucide/svelte";
   import { refreshPhonebook } from "$lib/rooms.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { Tip } from "$lib/components/ui/tooltip";
+  import { isMenuKey, longPress } from "$lib/actions/long-press";
+  import { SELF_MENU, type SelfMenuAction } from "$lib/self-menu";
+  import { clampMenu, menuFocusIndex } from "$lib/sidebar-rail";
+  import type { Attachment } from "svelte/attachments";
   import { nameEffectStyle } from "$lib/name-effect";
   import { RELAY_TIP } from "$lib/copy";
   import { ScrollArea } from "$lib/components/ui/scroll-area";
@@ -51,6 +58,9 @@
   import UserProfileCard from "./UserProfileCard.svelte";
   import { openSettings } from "$lib/ui-state.svelte";
   import { activityFor } from "$lib/plugins/activity.svelte";
+  import { currentVoiceChannel } from "$lib/transport/voice-channels";
+  import { peersInCall } from "$lib/transport/voice-channel";
+  import { stageCall } from "$lib/channel-ui";
 
   interface Props {
     open: boolean;
@@ -162,6 +172,13 @@
   const users = $derived.by(() => {
     const allUsers: User[] = [];
     const rows = new Map<string, User>();
+    // Who is in the call the stage shows for this room (channel-ui.ts).
+    const stage = stageCall(transportState.roomCode, currentVoiceChannel());
+    const stagePeers = new Set(
+      stage
+        ? peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, stage)
+        : []
+    );
 
     // One pass over the connections instead of one per member: which
     // connected id, if any, each DID has. The first one wins, as find did.
@@ -265,15 +282,14 @@
         tagChipColor = meta?.tagChipColor || null;
       }
 
-      // In a call in THIS room: presence is announced per peer, self via
-      // local state. Grouped separately in the list, like a voice channel.
+      // In the call this room's stage shows (stageCall): ours when it is in
+      // this room, whichever voice channel, else the room's original call.
+      // Presence is announced per peer, self via local state. Grouped
+      // separately in the list, like a voice channel.
       const inCall = isSelf
         ? transportState.inCall &&
           transportState.callRoomCode === transportState.roomCode
-        : (!!mappedPeerId &&
-            transportState.callPeerRooms.get(mappedPeerId) ===
-              transportState.roomCode) ||
-          transportState.callPeerRooms.get(did) === transportState.roomCode;
+        : (!!mappedPeerId && stagePeers.has(mappedPeerId)) || stagePeers.has(did);
 
       // A pending entry means they are sharing and we are not watching;
       // watching moves them out of pending and into watchingTransmissions.
@@ -351,7 +367,9 @@
     return (name || "?").charAt(0).toUpperCase();
   }
 
-  let userMenu = $state<{ user: User; x: number; y: number } | null>(null);
+  let userMenu = $state<{ user: User; x: number; y: number; keyboard?: boolean } | null>(null);
+  /** The card a key opened the menu from: focus goes back to it. */
+  let menuOpener: HTMLElement | null = null;
   /**
    * Who the member menu adds or removes. Offline members too: the phonebook
    * stores them by DID until they are next seen, and merges the rows then
@@ -362,22 +380,57 @@
   );
   let selectedUserForProfile = $state<User | null>(null);
 
-  function openUserMenu(e: MouseEvent, user: User): void {
-    if (user.isSelf) return;
+  function openUserMenu(e: MouseEvent | KeyboardEvent, user: User): void {
+    // Your own card included: it opens its own menu (self-menu.ts). It used
+    // to return here, and a right-click on it got the browser's.
     e.preventDefault();
     e.stopPropagation();
+    // From the keyboard (the menu key, Shift+F10) there is no pointer: the
+    // menu opens under the card, as it does for a held finger.
+    const pointer = "clientX" in e && (e.clientX !== 0 || e.clientY !== 0);
+    if (!pointer) {
+      openUserMenuUnder(e.currentTarget as HTMLElement, user, true);
+      return;
+    }
     const pos = clampMenuPosition(e.clientX, e.clientY);
+    menuOpener = null;
     userMenu = { user, x: pos.x, y: pos.y };
   }
+
+  /** The menu under a card, for a hold or a key: there is no pointer to put it at. */
+  function openUserMenuUnder(el: HTMLElement, user: User, keyboard = false): void {
+    const rect = el.getBoundingClientRect();
+    const pos = clampMenuPosition(rect.left + 8, rect.bottom + 4);
+    menuOpener = keyboard ? el : null;
+    userMenu = { user, x: pos.x, y: pos.y, keyboard };
+  }
+
+  /** Opened from the keyboard: focus goes into the menu, or Tab would leave it behind. */
+  const focusFirstItem: Attachment<HTMLElement> = (el) => {
+    if (userMenu?.keyboard) el.querySelector<HTMLElement>("button")?.focus();
+  };
 
   function openProfileCard(user: User): void {
     selectedUserForProfile = user;
   }
 
+  /** The phone's drawer, while the list is in one. */
+  let drawerEl = $state<HTMLElement | null>(null);
+
   function clampMenuPosition(x: number, y: number): { x: number; y: number } {
     if (typeof window === "undefined") return { x, y };
     const menuWidth = 250;
     const menuHeight = 170;
+    if (isMobile && drawerEl) {
+      // Drawn inside the drawer, so placed and kept within it.
+      const box = drawerEl.getBoundingClientRect();
+      return clampMenu(
+        x - box.left,
+        y - box.top,
+        { width: menuWidth, height: menuHeight },
+        { width: box.width, height: box.height }
+      );
+    }
     let adjustedX = x;
     if (x + menuWidth > window.innerWidth) {
       adjustedX = x - menuWidth;
@@ -389,6 +442,34 @@
 
   function closeUserMenu(): void {
     userMenu = null;
+    menuOpener = null;
+  }
+
+  /** Arrows walk the menu; Escape and Tab close it, back to the card. */
+  function onMenuKeydown(e: KeyboardEvent): void {
+    if (e.key === "Tab" || e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      const opener = menuOpener;
+      closeUserMenu();
+      if (opener?.isConnected) opener.focus();
+      return;
+    }
+    const items = [...(e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>("button")];
+    const i = menuFocusIndex(e.key, items.indexOf(document.activeElement as HTMLElement), items.length);
+    if (i === null) return;
+    e.preventDefault();
+    items[i].focus();
+  }
+
+  function runSelfAction(action: SelfMenuAction, user: User): void {
+    closeUserMenu();
+    if (action === "profile") openProfileCard(user);
+    else if (action === "edit") openSettings("profile", currentRoomProfile);
+    else
+      void navigator.clipboard?.writeText(user.did).catch(() => {
+        // Clipboard blocked: the ID is on the profile card to select by hand.
+      });
   }
 
   async function handleAddToPhonebook(peerId: string): Promise<void> {
@@ -439,12 +520,14 @@
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     role="button"
-    tabindex={user.isSelf ? -1 : 0}
-    aria-disabled={user.isSelf}
+    tabindex="0"
     oncontextmenu={(e) => openUserMenu(e, user)}
     onclick={() => openProfileCard(user)}
+    {@attach longPress((el) => openUserMenuUnder(el, user))}
     onkeydown={(e) => {
-      if (e.key === "Enter" || e.key === " ") {
+      if (isMenuKey(e)) {
+        openUserMenu(e, user);
+      } else if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         openProfileCard(user);
       }
@@ -594,9 +677,94 @@
   </div>
 {/snippet}
 
+{#snippet UserMenu()}
+  {#if userMenu}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div
+      role="menu"
+      tabindex="-1"
+      data-vaul-no-drag
+      class="{isMobile ? 'absolute' : 'fixed'} z-50 min-w-40 select-none rounded-md border border-border bg-popover py-1 shadow-xl"
+      style="top: {userMenu.y}px; left: {userMenu.x}px"
+      {@attach focusFirstItem}
+      onkeydown={onMenuKeydown}
+      onclick={(e) => e.stopPropagation()}
+      oncontextmenu={(e) => e.preventDefault()}
+    >
+      {#if userMenu.user.isSelf}
+        {@const self = userMenu.user}
+        {#each SELF_MENU as item (item.action)}
+          {@const Icon = item.action === "profile" ? UserRound : item.action === "edit" ? Pencil : Copy}
+          <button
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted focus-visible:bg-muted focus-visible:outline-none cursor-pointer"
+            onclick={() => runSelfAction(item.action, self)}
+          >
+            <Icon class="size-4" />
+            {item.label}
+          </button>
+        {/each}
+      {:else}
+        <!-- Never "unavailable": an offline member is reached by DID, and the
+             DM itself warns when it will only land while both are online. -->
+        <button
+          type="button"
+          class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted focus-visible:bg-muted focus-visible:outline-none cursor-pointer"
+          onclick={() =>
+            userMenu && handleOpenDm(userMenu.user.peerId ?? userMenu.user.did)}
+        >
+          <Users class="size-4" />
+          Send DM
+        </button>
+        {#if !isInPhonebook(userMenuContact)}
+          <button
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted focus-visible:bg-muted focus-visible:outline-none cursor-pointer"
+            onclick={() => handleAddToPhonebook(userMenuContact)}
+          >
+            <UserPlus class="size-4" />
+            Add to phonebook
+          </button>
+        {:else}
+          <button
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono text-destructive hover:bg-muted focus-visible:bg-muted focus-visible:outline-none cursor-pointer"
+            onclick={() => handleRemoveFromPhonebook(userMenuContact)}
+          >
+            <UserRoundMinus class="size-4" />
+            Remove from phonebook
+          </button>
+        {/if}
+        {#if userMenu.user.did.startsWith("did:")}
+          {@const blocked = isBlockedDid(userMenu.user.did)}
+          {@const user = userMenu.user}
+          <Tip
+            side="right"
+            text={blocked
+            ? "Let their DMs, messages and voice through again"
+            : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
+          >
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted focus-visible:bg-muted focus-visible:outline-none cursor-pointer {blocked ? '' : 'text-destructive'}"
+                onclick={() => handleToggleBlock(user)}
+              >
+                <Ban class="size-4" />
+                {blocked ? "Unblock" : "Block"}
+              </button>
+            {/snippet}
+          </Tip>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
 {#if isMobile}
   <Drawer {open} onOpenChange={onToggle} direction="bottom">
-    <DrawerContent class="bg-card text-card-foreground overflow-hidden h-2/3">
+    <DrawerContent bind:ref={drawerEl} class="bg-card text-card-foreground overflow-hidden h-2/3">
       <DrawerHeader class="px-4 py-3 border-b border-border shrink-0">
         <DrawerTitle class="m-auto font-semibold flex items-center gap-2">
           <Users class="size-4 text-muted-foreground" />
@@ -609,6 +777,10 @@
       <ScrollArea class="flex-1 min-h-0 overflow-y-auto">
         {@render UserListContent()}
       </ScrollArea>
+      <!-- In here, not beside: the drawer covers what is under it and takes
+           every tap outside it, so a menu left there is neither seen nor
+           pressed. -->
+      {@render UserMenu()}
     </DrawerContent>
   </Drawer>
 {:else if open}
@@ -632,69 +804,8 @@
   </aside>
 {/if}
 
-{#if userMenu}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    role="menu"
-    tabindex="-1"
-    class="fixed z-50 min-w-40 select-none rounded-md border border-border bg-popover py-1 shadow-xl"
-    style="top: {userMenu.y}px; left: {userMenu.x}px"
-    onclick={(e) => e.stopPropagation()}
-    oncontextmenu={(e) => e.preventDefault()}
-  >
-    <!-- Never "unavailable": an offline member is reached by DID, and the
-         DM itself warns when it will only land while both are online. -->
-    <button
-      type="button"
-      class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
-      onclick={() =>
-        userMenu && handleOpenDm(userMenu.user.peerId ?? userMenu.user.did)}
-    >
-      <Users class="size-4" />
-      Send DM
-    </button>
-    {#if !isInPhonebook(userMenuContact)}
-      <button
-        type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
-        onclick={() => handleAddToPhonebook(userMenuContact)}
-      >
-        <UserPlus class="size-4" />
-        Add to phonebook
-      </button>
-    {:else}
-      <button
-        type="button"
-        class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono text-destructive hover:bg-muted cursor-pointer"
-        onclick={() => handleRemoveFromPhonebook(userMenuContact)}
-      >
-        <UserRoundMinus class="size-4" />
-        Remove from phonebook
-      </button>
-    {/if}
-    {#if userMenu.user.did.startsWith("did:")}
-      {@const blocked = isBlockedDid(userMenu.user.did)}
-      {@const user = userMenu.user}
-      <Tip
-        side="right"
-        text={blocked
-        ? "Let their DMs, messages and voice through again"
-        : "Refuse their DMs, fold their messages, mute them in calls and send them none of your voice. Only on this device; they are not told."}
-      >
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer {blocked ? '' : 'text-destructive'}"
-            onclick={() => handleToggleBlock(user)}
-          >
-            <Ban class="size-4" />
-            {blocked ? "Unblock" : "Block"}
-          </button>
-        {/snippet}
-      </Tip>
-    {/if}
-  </div>
+{#if !isMobile}
+  {@render UserMenu()}
 {/if}
 
 {#if selectedUserForProfile}

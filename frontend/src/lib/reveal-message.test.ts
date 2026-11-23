@@ -5,14 +5,16 @@ const s = vi.hoisted(() => ({
     roomCode: "room-a" as string | null,
     messages: [] as { id: string; lamport: number; roomCode: string }[],
   },
-  stored: new Map<string, { id: string; lamport: number; roomCode: string }>(),
+  stored: new Map<string, { id: string; lamport: number; roomCode: string; channel?: string }>(),
   read: null as Promise<unknown> | null,
   loadMore: vi.fn(async (..._args: unknown[]) => true),
+  select: vi.fn(async (_room: string, _channel: string) => true),
   jump: vi.fn(),
 }));
 vi.mock("$lib/transport/transport.svelte", () => ({
   transportState: s.state,
   loadMoreMessages: s.loadMore,
+  selectChannel: s.select,
 }));
 vi.mock("$lib/ui-state.svelte", () => ({ requestJumpToMessage: s.jump }));
 vi.mock("$lib/storage", () => ({
@@ -73,4 +75,17 @@ it("marks the jump it ends with as revealed", async () => {
   await revealMessage("room-a", "m501", 501);
   expect(s.loadMore).not.toHaveBeenCalled();
   expect(s.jump).toHaveBeenCalledWith("room-a", "m501", true);
+});
+
+// A search hit or a pin in another channel of the room: the page on screen
+// is one channel's, so that channel is opened before the walk back.
+it("opens the channel a message is in before revealing it", async () => {
+  s.stored.set("m30", { ...row(30), channel: "gamesgames" });
+  await revealStored("room-a", "m30");
+  expect(s.select).toHaveBeenCalledWith("room-a", "gamesgames");
+  expect(s.jump).toHaveBeenCalledWith("room-a", "m30", true);
+  s.select.mockClear();
+  // One in the channel on screen needs no switch.
+  await revealMessage("room-a", "m501", 501);
+  expect(s.select).not.toHaveBeenCalled();
 });

@@ -3,7 +3,8 @@ import { closeNotificationsByTag, notifyMessage } from "./notify.svelte";
 import { mentionsMe } from "./mentions";
 import { stripMarkdown } from "./markdown";
 import { getManifest } from "./plugins/registry";
-import { getRoomNotifyMode } from "./notify-prefs.svelte";
+import { effectiveNotifyMode } from "./notify-prefs.svelte";
+import { findLiveChannel, messageChannel } from "./channels";
 import { roomsStore } from "./rooms.svelte";
 import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
@@ -30,6 +31,12 @@ export interface AnnounceContext {
   selfIds: string[];
   /** The conversation on screen, so a sound is not played over the reader. */
   uiRoomCode: string | null;
+  /**
+   * The channel of uiRoomCode on screen (channels.ts), "" or absent for the
+   * original chat. A message in another channel of the open room is not
+   * being read, so it is announced like one in another room.
+   */
+  uiChannel?: string;
   /** DID -> display name, for rendering @mentions in the preview text. */
   resolveName: (did: string) => string;
 }
@@ -82,6 +89,21 @@ interface Pending {
   urgent: boolean;
   viewing: boolean;
   dmPeerDid?: string;
+  /**
+   * The room's channel the message is in ("" for the original chat), so a
+   * click opens it and an inline reply is sent into it rather than into
+   * whichever channel the room was last left on. Absent for a DM.
+   */
+  channel?: string;
+}
+
+/** A notification's data bag: where its click and its inline reply go. */
+function clickData(p: Pending, channel: string | undefined) {
+  return {
+    roomCode: p.ref,
+    dmPeerDid: p.dmPeerDid,
+    ...(channel !== undefined ? { channel } : {}),
+  };
 }
 
 let pending: Pending[] = [];
@@ -110,13 +132,15 @@ function emit(p: Pending): void {
     tag: p.tag,
     viewingConversation: p.viewing,
     urgent: p.urgent,
-    data: { roomCode: p.ref, dmPeerDid: p.dmPeerDid },
+    data: clickData(p, p.channel),
   });
 }
 
 function flushBurst(): void {
   burstTimer = null;
-  const items = pending;
+  // Asked again here: a room muted while its burst was waiting must not beep
+  // for what arrived just before.
+  const items = pending.filter((p) => effectiveNotifyMode(p.roomCode, p.channel ?? "") !== "muted");
   pending = [];
   if (items.length === 0) return;
   windowEndsAt = Date.now() + BURST_MS;
@@ -143,8 +167,10 @@ function flushBurst(): void {
     isPreview: false,
     viewingConversation: items.every((i) => i.viewing),
     urgent: items.some((i) => i.urgent),
+    // A burst over several channels of one room names none of them: the
+    // reply then goes where the room is, as it did before channels.
     data: sameRoom
-      ? { roomCode: first.ref, dmPeerDid: first.dmPeerDid }
+      ? clickData(first, items.every((i) => i.channel === first.channel) ? first.channel : undefined)
       : undefined,
   });
 }
@@ -238,13 +264,22 @@ export function announceMessage(
     // A DM is addressed to you by construction, so it counts as a mention for
     // a conversation turned down to mentions only.
     const mentioned = isDm || mentionsMe(msg.content ?? "", ctx.selfIds);
-    const mode = getRoomNotifyMode(msg.roomCode);
+    // A channel, the original chat included, goes by its own mode when one
+    // was picked for it, and by the room's otherwise.
+    const channelId = isDm ? "" : messageChannel(msg);
+    const room = isDm ? undefined : roomsStore.rooms.find((r) => r.roomCode === msg.roomCode);
+    // A channel the list does not hold - deleted, or not heard of yet - has
+    // nowhere on screen to read it, and no unread count either.
+    const channel = channelId ? findLiveChannel(room?.channels ?? [], channelId) : undefined;
+    if (channelId && !channel) return;
+    const mode = effectiveNotifyMode(msg.roomCode, channelId);
     if (mode === "muted") return;
     if (mode === "mentions" && !mentioned) return;
 
     // The conversation on screen is being read: whatever it still has on the
     // lock screen is answered, not left for the user to swipe away.
-    if (ctx.uiRoomCode === msg.roomCode) clearNotificationsFor(msg.roomCode);
+    const viewing = ctx.uiRoomCode === msg.roomCode && (ctx.uiChannel ?? "") === channelId;
+    if (viewing) clearNotificationsFor(msg.roomCode);
 
     let body = msg.content || "[file]";
     if (msg.type === MessageType.CallEvent) {
@@ -276,7 +311,11 @@ export function announceMessage(
       title = msg.senderName;
       preview = body;
     } else if (mentioned) {
-      title = `${msg.senderName} mentioned you`;
+      // The channel, when it is not the original chat: "mentioned you"
+      // alone sends the reader to the wrong place in a busy room.
+      title = channel
+        ? `${msg.senderName} mentioned you in #${channel.name}`
+        : `${msg.senderName} mentioned you`;
       preview = `${msg.senderName}: ${body}`;
     } else {
       // The message's OWN room, not the one on screen: titling a background
@@ -284,9 +323,8 @@ export function announceMessage(
       // wrong conversation. An unnamed room falls back to a generic label,
       // NEVER to the code - a notification is read on a lock screen, over a
       // shoulder, and the code is the room's membership secret.
-      title =
-        roomsStore.rooms.find((r) => r.roomCode === msg.roomCode)?.name ||
-        "New message";
+      const roomName = room?.name || "New message";
+      title = channel ? `${roomName} #${channel.name}` : roomName;
       preview = `${msg.senderName}: ${body}`;
     }
 
@@ -299,10 +337,11 @@ export function announceMessage(
         title,
         preview,
         urgent: mentioned,
-        viewing: ctx.uiRoomCode === msg.roomCode,
+        viewing,
         // An inbound DM's sender IS the other side of the conversation, so a
         // click on the notification routes straight back to it.
         dmPeerDid: isDm ? msg.senderDid || msg.senderId : undefined,
+        channel: isDm ? undefined : channelId,
       },
       opts.viaMailbox ?? false
     );

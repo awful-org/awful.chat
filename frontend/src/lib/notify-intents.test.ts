@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   drainNotifyIntents,
+  intentChannel,
   keepDroppedReplyDraft,
   rememberRoomRef,
   storeNotifyIntent,
@@ -28,6 +29,19 @@ beforeEach(async () => {
 });
 
 describe("notify intents", () => {
+  it("keeps the channel a reply belongs in, and only a well-formed one", async () => {
+    await storeNotifyIntent(intent({ channel: "gamesgames" }));
+    const [drained] = await drainNotifyIntents();
+    expect(intentChannel(drained)).toBe("gamesgames");
+    expect(intentChannel(intent({ channel: "" }))).toBe("");
+    // None named (an older build's notification, a burst): the room as is.
+    expect(intentChannel(intent())).toBeUndefined();
+    expect(intentChannel(intent({ channel: "NOT A CHANNEL" }))).toBeUndefined();
+    expect(intentChannel(intent({ channel: 5 as unknown as string }))).toBeUndefined();
+    // A DM has no channels, whatever the record says.
+    expect(intentChannel(intent({ channel: "gamesgames", dmPeerDid: "did:key:x" }))).toBeUndefined();
+  });
+
   it("drains stored intents oldest first and clears the store", async () => {
     await storeNotifyIntent(intent({ text: "first" }));
     await storeNotifyIntent(intent({ text: "second", kind: "open" }));
