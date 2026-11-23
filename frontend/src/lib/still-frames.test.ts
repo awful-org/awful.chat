@@ -30,6 +30,12 @@ describe("still frames kept for the next place a picture shows", () => {
     expect(keptStillFrame("a")?.width).toBe(84);
   });
 
+  it("keeps the latest of two the same size: a url can change its picture", () => {
+    keep("a", canvas(28, 28));
+    keep("a", canvas(28, 14));
+    expect(keptStillFrame("a")?.height).toBe(14);
+  });
+
   it("keeps no large frame, and none of nothing", () => {
     keep("wide", canvas(MAX_KEPT_SIDE + 1, 10));
     keep("tall", canvas(10, MAX_KEPT_SIDE + 1));

@@ -304,6 +304,60 @@ describe("messages in channels", () => {
     expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
   });
 
+  it("puts what lands while a channel is being opened on its page", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    await sendMessage("straight in", { channel: games.id });
+    const wire = theirMessage(games.id);
+    receive(wire);
+    await opening;
+    await settled();
+    expect(transportState.messages.map((m) => m.content).sort()).toEqual([
+      "hello in a channel",
+      "straight in",
+    ]);
+  });
+
+  it("keeps the channel picked when the one on screen is deleted meanwhile", async () => {
+    const games = await createChannel(ROOM, "games");
+    const music = await createChannel(ROOM, "music");
+    await selectChannel(ROOM, music.id);
+    await sendMessage("in music");
+    await selectChannel(ROOM, games.id);
+    await sendMessage("in games");
+    const opening = selectChannel(ROOM, music.id);
+    await deleteChannel(ROOM, games.id);
+    await opening;
+    await settled();
+    expect(currentChannel(ROOM)).toBe(music.id);
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in music"]);
+  });
+
+  it("shows the original chat, and marks nothing of it read, when the open channel is deleted", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    await selectChannel(ROOM, games.id);
+    await sendMessage("in games");
+    const seen = (await getRoom(ROOM))?.lastSeenLamport;
+    const deleted = deleteChannel(ROOM, games.id);
+    while (currentChannel(ROOM) !== "") await new Promise((r) => setTimeout(r));
+    await markSeen();
+    expect((await getRoom(ROOM))?.lastSeenLamport).toBe(seen);
+    // Picked by hand while its page is still being read.
+    await selectChannel(ROOM, "");
+    await deleted;
+    await settled();
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+  });
+
+  it("says when it opened nothing", async () => {
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    await selectChannel(ROOM, "");
+    expect(await opening).toBe(false);
+  });
+
   // The mark is written to the record the sidebar, and the channel's own
   // name, are read from: a write that moves nothing renders all of it again,
   // and set off the read that writes it.

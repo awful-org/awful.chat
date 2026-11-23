@@ -1774,6 +1774,41 @@ function _viewChannel(roomCode: string): string | undefined {
   return channel;
 }
 
+/**
+ * Rows of the channel being opened (selectChannel) that land while its page
+ * is read: the read may have missed them, and the page on screen, where they
+ * would go, is another channel's. Put in with the page.
+ */
+let _openingRows: { roomCode: string; channel: string; rows: Message[] } | null = null;
+
+function _noteOpeningRows(roomCode: string, rows: readonly Message[]): void {
+  const into = _openingRows;
+  if (!into || into.roomCode !== roomCode) return;
+  into.rows.push(...rows.filter((m) => messageChannel(m) === into.channel));
+}
+
+/** The page read, and what landed during the read; none below a full page's floor. */
+function _withOpeningRows(msgs: Message[], rows: readonly Message[], capped: boolean): Message[] {
+  const page = [...msgs].sort(MSG_ORDER);
+  const floor = capped ? page[0] : undefined;
+  const byId = new Map(page.map((m) => [m.id, m]));
+  for (const m of rows) {
+    if (!byId.has(m.id) && (!floor || MSG_ORDER(m, floor) >= 0)) byId.set(m.id, m);
+  }
+  return [...byId.values()].sort(MSG_ORDER);
+}
+
+/** Put a message just stored on the page on screen, if it is of that page. */
+function _showInView(msg: Message): boolean {
+  if (transportState.roomCode !== msg.roomCode) return false;
+  if (!_inViewChannel(msg)) {
+    _noteOpeningRows(msg.roomCode, [msg]);
+    return false;
+  }
+  transportState.messages = appendSorted(transportState.messages, msg);
+  return true;
+}
+
 export async function _loadHistory(
   roomCode: string,
   stillCurrent: () => boolean = () => true,
@@ -1784,11 +1819,15 @@ export async function _loadHistory(
   // Opening one, the page on screen is whole until the new one replaces it.
   if (opening === undefined) transportState.historyRoom = null;
   const channel = opening ?? _viewChannel(roomCode);
+  const landing = opening === undefined ? null : { roomCode, channel: opening, rows: [] as Message[] };
+  if (landing) _openingRows = landing;
   const [msgs, profiles, roomProfiles] = await Promise.all([
     getMessages(roomCode, undefined, page, channel),
     getAllPeerProfiles(),
     getAllPeerRoomProfiles(roomCode),
-  ]);
+  ]).finally(() => {
+    if (landing && _openingRows === landing) _openingRows = null;
+  });
   // A channel picked while this read ran has a read of its own under way.
   if (!stillCurrent()) return;
   if (opening === undefined) {
@@ -1799,7 +1838,7 @@ export async function _loadHistory(
     setCurrentChannel(roomCode, opening);
   }
   // Storage and the live view share the same logical sequence/ID ordering.
-  transportState.messages = [...msgs].sort(MSG_ORDER);
+  transportState.messages = _withOpeningRows(msgs, landing?.rows ?? [], page.capped);
   // Whether a first read filled a page is the only honest answer to "is
   // there more?", and it is known here and nowhere else.
   transportState.historyCapped = page.capped;
@@ -2679,6 +2718,7 @@ async function _mergeSyncedIntoView(
   // The page on screen is one channel's: rows of the room's other channels
   // are stored, counted and announced, and wait there until it is opened.
   const channel = _viewChannel(roomCode);
+  _noteOpeningRows(roomCode, rows);
   if (channel !== undefined) rows = rows.filter((m) => messageChannel(m) === channel);
   const onScreen = transportState.messages;
   const windowFloor = onScreen[0];
@@ -3367,7 +3407,16 @@ async function _applyChannelList(
 function _noteChannels(roomCode: string, channels: Channel[]): void {
   noteRoomChannels(roomCode, channels);
   const open = currentChannelOf(roomCode);
-  if (open && !roomChannel(roomCode, open)) {
+  if (!open || roomChannel(roomCode, open)) return;
+  // At once, not once the next page is read (selectChannel): a channel that
+  // is gone is neither kept on screen nor marked read. One already being
+  // opened instead stays the user's pick.
+  setCurrentChannel(roomCode, "");
+  if (transportState.roomCode !== roomCode) return;
+  transportState.messages = [];
+  transportState.historyRoom = null;
+  const opening = openingChannelOf(roomCode);
+  if (opening === null || (opening && !roomChannel(roomCode, opening))) {
     void selectChannel(roomCode, "").catch(() => {});
   }
 }
@@ -3878,13 +3927,7 @@ async function _handleChatMessage(
   // Match on the open room, not the mode: DM file messages arrive through
   // this path too, and the mode check kept them invisible until reopen. And
   // on the open channel: the page is that channel's alone.
-  if (
-    isNewMessage &&
-    transportState.roomCode === msg.roomCode &&
-    _inViewChannel(msg)
-  ) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-  }
+  if (isNewMessage) _showInView(msg);
 
   if (msg.type !== MessageType.File || !msg.meta?.files?.length) return;
 
@@ -5755,9 +5798,7 @@ export async function sendMessage(
 
   // Echo BEFORE the storage writes: seal + two IDB round-trips gated the
   // local echo, which read as send lag - the network send already left.
-  if (transportState.roomCode === roomCode && _inViewChannel(msg)) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-  }
+  _showInView(msg);
   applyMessageStatus(msg.id, msg.status);
 
   markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
@@ -5935,9 +5976,7 @@ export async function sendFiles(
     msg.status = _broadcastChatWire(wire, roomCode) ? "sent" : "sending";
     applyMessageStatus(msg.id, msg.status);
   }
-  if (transportState.roomCode === roomCode && _inViewChannel(msg)) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-  }
+  _showInView(msg);
 
   markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
@@ -5978,8 +6017,7 @@ async function _postSignedRow(
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
   assertCurrent();
   _broadcastChatWire(messageToWire(msg), roomCode);
-  if (transportState.roomCode === roomCode && _inViewChannel(msg)) {
-    transportState.messages = appendSorted(transportState.messages, msg);
+  if (_showInView(msg)) {
     markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   }
   noteRoomActivity(msg.roomCode, msg.timestamp);
@@ -6349,14 +6387,15 @@ export async function markSeen(): Promise<void> {
   if (!roomCode) return;
   // Only this room's messages: a sync batch for another room can share the
   // array briefly, and its lamports must not become this room's watermark.
+  // And only the open channel's: it is that channel that was read.
+  const open = _viewChannel(roomCode);
+  const channel = open ?? "";
   let maxLamport = 0;
   for (const m of transportState.messages) {
-    if (m.roomCode === roomCode && m.lamport > maxLamport)
-      maxLamport = m.lamport;
+    if (m.roomCode !== roomCode || m.lamport <= maxLamport) continue;
+    if (open === undefined || messageChannel(m) === open) maxLamport = m.lamport;
   }
   if (maxLamport === 0) return;
-  // The page is the open channel's, so it is that channel that was read.
-  const channel = _viewChannel(roomCode) ?? "";
   await markRoomSeen(roomCode, maxLamport, undefined, channel);
   if (roomCode.startsWith("dm-")) {
     // DM rooms live in their own mirror, and the DM badge recomputes on
@@ -6433,7 +6472,8 @@ export async function selectChannel(roomCode: string, channel: string): Promise<
     setCurrentChannel(roomCode, channel);
     return true;
   }
-  if (currentChannelOf(roomCode) === channel) return true;
+  // Its page is up, unless a delete emptied it (_noteChannels).
+  if (currentChannelOf(roomCode) === channel && transportState.historyRoom === roomCode) return true;
   // The channel on screen stays there until the page of the next one is
   // read, and the two change places at once. Emptied first, every picture in
   // the list was taken down and put back up: a blink on each change.
@@ -6446,7 +6486,7 @@ export async function selectChannel(roomCode: string, channel: string): Promise<
   } finally {
     if (opening()) setOpeningChannel(roomCode, null);
   }
-  return true;
+  return currentChannelOf(roomCode) === channel;
 }
 
 /** Store our own edit to a room's list, and tell the room. */

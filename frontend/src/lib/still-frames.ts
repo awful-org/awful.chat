@@ -31,8 +31,9 @@ export function keepStillFrame(
 ): void {
   if (!keepable(canvas)) return;
   const held = frames.get(src);
-  // The sharpest one drawn: each place draws at its own size.
-  const copy = held && held.width >= canvas.width ? held : copyOf(canvas);
+  // The sharpest one drawn, each place drawing at its own size; of the same
+  // size the latest, as a url can come to answer with another picture.
+  const copy = held && held.width > canvas.width ? held : copyOf(canvas);
   frames.delete(src);
   frames.set(src, copy);
   while (frames.size > MAX_KEPT_FRAMES) frames.delete(frames.keys().next().value!);

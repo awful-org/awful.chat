@@ -171,9 +171,17 @@
         if (own && own.width === canvas.width && own.height === canvas.height) {
           // The kept frame in it stays: setting the size wipes a canvas, and
           // a frame went by with nothing there before it was drawn again.
-          // Drawn over, as the url may answer with another picture by now.
+          // Its pixels are replaced, not drawn over: the url may answer with
+          // another picture by now, the canvas may hold an earlier src's, and
+          // either would show through one with transparency.
           drawn = own;
-          canvas.getContext("2d")?.drawImage(img, 0, 0, own.width, own.height);
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.globalCompositeOperation = "copy";
+            ctx.drawImage(img, 0, 0, own.width, own.height);
+            ctx.globalCompositeOperation = "source-over";
+            keepStillFrame(key, canvas);
+          }
         } else {
           canvas.width = w;
           canvas.height = h;
