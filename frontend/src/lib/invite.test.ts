@@ -26,7 +26,7 @@ it("accepts six-character online pairing codes, lowercase, folding human lookali
   }
 });
 it("accepts a short link, in the fragment only", () => {
-  for (const input of ["https://awful.chat/r/#k5t-8r5", "awful.chat/r/#K5T8R5", "/r/#k5t-8r5", " http://127.0.0.1:5173/r/#k5t-8r5 "]) {
+  for (const input of ["https://awful.chat/r/#k5t-8r5", "awful.chat/r/#K5T8R5", "/r/#k5t-8r5", "https://awful.chat/r#k5t-8r5", "https://awful.chat/r/?fbclid=x#k5t-8r5", " http://127.0.0.1:5173/r/#k5t-8r5 "]) {
     expect(parseJoinInput(input)).toEqual({ kind: "pairing", code: "k5t-8r5" });
   }
   for (const input of ["https://awful.chat/r/k5t-8r5", "https://awful.chat/r/#k5t-8r5/x", "https://awful.chat/r/?c=k5t-8r5", "https://awful.chat/#k5t-8r5"]) {
@@ -59,6 +59,10 @@ it("takes none that is cut, lengthened, in a path or query, or one of two", () =
   for (const input of [
     link.slice(0, -1), `${link}a`, `${link}/x`, `https://chat.example/r/${secret}.`, `see https://chat.example/?s=${secret} there`,
     `${link} or https://chat.example/r/#${newRoomSecret()}`,
+    // A quick call or a quick send is not a room, nor is any other address.
+    `https://chat.example/qc#${secret}`, `https://chat.example/qs#${secret}`, `see chat.example/qc#${secret}.`, `/qs#${secret}`,
+    `https://chat.example/x/y#${secret}`, `https://chat.example/x/r/#${secret}`, `https://chat.example/rr#${secret}`,
+    `https://chat.example/r/?next=%23${secret}`, `#${secret}`,
   ]) {
     expect(parseJoinInput(input), input).toEqual({ kind: "invalid" });
   }
@@ -75,5 +79,12 @@ it("honors the compiled release decision for ordinary invitations", () => {
     expect(requireRoomSecurityRelease).not.toThrow();
   } else {
     expect(requireRoomSecurityRelease).toThrow("awaiting");
+  }
+});
+it("searches long text in no time", () => {
+  for (const text of ["(".repeat(300_000), "a".repeat(300_000), "(a".repeat(150_000), "/r/?".repeat(80_000), `${"(x/r/?".repeat(50_000)}#r2_`]) {
+    const started = performance.now();
+    expect(parseJoinInput(text).kind).toBe("invalid");
+    expect(performance.now() - started, text.slice(0, 8)).toBeLessThan(2000);
   }
 });

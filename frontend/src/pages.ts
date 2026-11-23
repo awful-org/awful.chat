@@ -100,8 +100,7 @@ export function preloadPage(page: LazyPage | null): void {
  * idle, so it never competes with what is on screen. Under Save-Data too:
  * the service worker's precache downloads the same chunks on a first visit
  * anyway, and with them in hand the unlock needs no network, where a chunk
- * that does not load reloads the page and drops the invitation the gate
- * holds.
+ * that does not load reloads the page under the gate.
  *
  * Its stylesheets as prefetches: a preload is for the page on screen, and
  * one still unused a few seconds after the load - the app's, while a

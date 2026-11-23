@@ -170,3 +170,21 @@ it("asks for up to half an hour", async () => {
     expect(pair.expiresAt - Date.now()).toBeGreaterThan(29 * 60_000);
   } finally { pair.cancel(); }
 }, 15000);
+
+it("ends the code at the relay when the page goes away, and not when it is only hidden", async () => {
+  const relay = mailbox();
+  const page = new EventTarget();
+  vi.stubGlobal("addEventListener", page.addEventListener.bind(page));
+  vi.stubGlobal("removeEventListener", page.removeEventListener.bind(page));
+  try {
+    const pair = await hostInvitationPairing(newRoomSecret(), vi.fn());
+    const ended = () => relay.requests.some((r) => r.body.action === "cancel");
+    page.dispatchEvent(Object.assign(new Event("pagehide"), { persisted: true }));
+    expect(ended()).toBe(false);
+    page.dispatchEvent(Object.assign(new Event("pagehide"), { persisted: false }));
+    expect(ended()).toBe(true);
+    const sent = relay.fetchSpy.mock.calls.find(([, o]) => String(o?.body).includes('"cancel"'))!;
+    expect(sent[1]?.keepalive).toBe(true);
+    pair.cancel();
+  } finally { vi.unstubAllGlobals(); }
+}, 15000);

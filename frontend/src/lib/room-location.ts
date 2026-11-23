@@ -1,7 +1,9 @@
 import { parseJoinInput } from "$lib/invite";
 import { normalizeRoomCode } from "$lib/room-code";
 import { parseSecureInvitation } from "$lib/room-security/invitation-format";
-import { DISCOVERY_ID_RE } from "$lib/room-security/keys";
+import { DISCOVERY_ID_RE, b32 } from "$lib/room-security/keys";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 
 /**
  * The room this tab was opened for, once read out of the address bar and
@@ -28,18 +30,30 @@ export const parkedRoom = {
 let parked: string | null = null;
 
 /*
- * An invitation also outlives a reload, in this tab's sessionStorage, until
- * its join has run. Memory alone lost it: a phone drops a page left for
- * another app - to put the recovery phrase somewhere, say - and what came
- * back was an app that had never heard of the room. The tab's own storage
- * dies with the tab, and the link it holds was this tab's address a moment
- * before. Never a saved room's public id: that one stays in the address.
+ * An invitation also outlives a reload of the page it opened, in this tab's
+ * sessionStorage, until its join has run. Memory alone lost it: a phone drops
+ * a page left for another app - to put the recovery phrase somewhere, say -
+ * and what came back was an app that had never heard of the room.
+ *
+ * Only a reload: the address it leaves is /r/, and any other address is the
+ * user having gone elsewhere, which calls the invitation off. A saved room's
+ * public id is never kept: that one stays in the address.
+ *
+ * Sealed under a key in localStorage, because a wipe reaches that and not a
+ * tab the phone has dropped: without the key what such a tab holds is noise,
+ * and it comes back with nothing. forgetParkedRooms is the same for the ways
+ * of removing an account that leave localStorage alone.
  */
 const PARKED_KEY = "awful:parked-invitation:v1";
+const SEAL_KEY = "awful:parked-key:v1";
 
 function readParked(): string | null {
   try {
-    return sessionStorage.getItem(PARKED_KEY);
+    const held = sessionStorage.getItem(PARKED_KEY);
+    if (!held) return null;
+    const code = /^\/r\/?$/.test(window.location.pathname) ? unseal(held) : null;
+    if (!code) sessionStorage.removeItem(PARKED_KEY);
+    return code;
   } catch {
     return null;
   }
@@ -48,11 +62,46 @@ function readParked(): string | null {
 function writeParked(code: string | null): void {
   try {
     if (code && !DISCOVERY_ID_RE.test(code) && parseJoinInput(code).kind !== "invalid") {
-      sessionStorage.setItem(PARKED_KEY, code);
+      sessionStorage.setItem(PARKED_KEY, seal(code));
     } else sessionStorage.removeItem(PARKED_KEY);
   } catch {
     // No storage to be had: memory is what there is.
   }
+}
+
+/** No tab finds its parked invitation again; this one's is gone at once. */
+export function forgetParkedRooms(): void {
+  parkedRoom.code = null;
+  try {
+    localStorage.removeItem(SEAL_KEY);
+  } catch {
+    // Nothing is kept without storage.
+  }
+}
+
+/** The bytes a nonce stands for under the key; null with no key. */
+function keystream(nonce: Uint8Array, length: number): Uint8Array | null {
+  const key = localStorage.getItem(SEAL_KEY);
+  return key ? hkdf(sha256, b32.decode(key), nonce, undefined, length) : null;
+}
+
+function seal(code: string): string {
+  if (!localStorage.getItem(SEAL_KEY)) {
+    localStorage.setItem(SEAL_KEY, b32.encode(crypto.getRandomValues(new Uint8Array(32))));
+  }
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const bytes = new TextEncoder().encode(code);
+  const stream = keystream(nonce, bytes.length)!;
+  return `${b32.encode(nonce)}.${b32.encode(bytes.map((b, i) => b ^ stream[i]))}`;
+}
+
+/** What was sealed, if it is an invitation; noise under another key is not. */
+function unseal(held: string): string | null {
+  const [nonce, sealed] = held.split(".").map((part) => b32.decode(part));
+  const stream = keystream(nonce, sealed.length);
+  if (!stream) return null;
+  const code = new TextDecoder().decode(sealed.map((b, i) => b ^ stream[i]));
+  return parseJoinInput(code).kind === "invalid" ? null : code;
 }
 
 /**

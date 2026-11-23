@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { forgetParkedRooms } from "$lib/room-location";
   import {
     unlock,
     unlockWithBiometrics,
@@ -42,6 +43,7 @@
       await clearRememberedPassword().catch(() => {});
       await deleteWebAuthnRecord().catch(() => {});
       await wipeLocalDatabase();
+      forgetParkedRooms();
       window.location.reload();
     } catch (e) {
       switching = false;

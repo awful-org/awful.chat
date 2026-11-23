@@ -26,10 +26,10 @@ class PairingRequestError extends Error {
  * can land on the same one; a new draw almost always clears it.
  */
 const CREATE_TRIES = 6;
-async function request(body: Record<string, unknown>, signal?: AbortSignal): Promise<{ token?: string; messages: Message[] }> {
+async function request(body: Record<string, unknown>, signal?: AbortSignal, keepalive = false): Promise<{ token?: string; messages: Message[] }> {
   const response = await fetch(`${apiUrl()}/invite`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ version: 2, ...body }), cache: "no-store",
+    body: JSON.stringify({ version: 2, ...body }), cache: "no-store", keepalive,
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10000)]) : AbortSignal.timeout(10000),
   });
   if (!response.ok) throw new PairingRequestError(response.status);
@@ -142,8 +142,14 @@ export async function hostInvitationPairing(
     if (cancelled) return;
     cancelled = true; host.cancel(); controller.abort();
     signal?.removeEventListener("abort", cancel);
-    void request({ action: "cancel", locator: host.locator, token }).catch(() => {});
+    // Kept alive: it may be the page going away that ends the code.
+    void request({ action: "cancel", locator: host.locator, token }, undefined, true).catch(() => {});
   };
+  // A page that closes or reloads takes the code with it. Told so, the relay
+  // refuses the people still to join at once, and does not count a dead code
+  // against this address for the rest of its half hour.
+  const onPageHide = (e: Event) => { if (!(e as PageTransitionEvent).persisted) cancel(); };
+  globalThis.addEventListener?.("pagehide", onPageHide);
   signal?.addEventListener("abort", cancel, { once: true });
   if (signal?.aborted) { cancel(); signal.throwIfAborted(); }
   const run = async () => {
@@ -214,7 +220,7 @@ export async function hostInvitationPairing(
         void request({ action: "cancel", locator: host.locator, token }).catch(() => {});
       }
     }
-    finally { timer.close(); host.cancel(); signal?.removeEventListener("abort", cancel); }
+    finally { timer.close(); globalThis.removeEventListener?.("pagehide", onPageHide); host.cancel(); signal?.removeEventListener("abort", cancel); }
   };
   void run();
   return { code: formatPairingCode(host.locator, host.password), expiresAt: host.expiresAt, uses: host.uses, cancel };

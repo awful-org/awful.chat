@@ -21,12 +21,15 @@ export function parseSecureInvitation(input: string): RoomSecret {
  * tracking parameter, without the slash before its #, with the full stop or
  * the bracket after it, or in the middle of the message it came in.
  *
- * Bare or in a fragment only, as above, and one room only: text with two
- * different invitations in it does not say which was meant. The secret has to
- * stand on its own, so a cut or lengthened one is not taken for another room.
+ * Bare, or in the fragment of an `/r/` address and no other: a quick call's
+ * and a quick send's links (`/qc#`, `/qs#`) hold a secret of the same shape,
+ * and are not rooms to join. One room only: text with two invitations in it
+ * does not say which was meant. The secret has to stand on its own, so a cut
+ * or lengthened one is not taken for another room. The lengths are bounded,
+ * so no text makes the search slow.
  */
 const IN_TEXT_RE =
-  /(?:^|[\s<>([{"'*_~`|]|#|%23)(r2_[a-z2-7]{52})(?=[.,;:!?)>\]}"'*_~`|]*(?:\s|$))/gi;
+  /(?:^|[\s<>([{"'*_~`|])(?:(?:[a-z][a-z0-9+.-]{0,20}:\/\/)?[^/?#\s]{0,255}\/r\/?(?:(?:\?[^#\s]{0,2048})?#|%23))?(r2_[a-z2-7]{52})(?=[.,;:!?)>\]}"'*_~`|]{0,16}(?:\s|$))/gi;
 
 export function findInvitation(text: string): RoomSecret | null {
   const found = new Set<RoomSecret>();

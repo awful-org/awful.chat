@@ -13,7 +13,7 @@ export type JoinInput =
  * Fragment only, like a full invitation: a live code has no business in a path
  * that reaches server logs.
  */
-const SHORT_LINK_RE = /^(?:(?:[a-z][a-z0-9+.-]*:\/\/)?[^/?#\s]+)?\/r\/#([^/?#]+)$/i;
+const SHORT_LINK_RE = /^(?:(?:[a-z][a-z0-9+.-]*:\/\/)?[^/?#\s]+)?\/r\/?(?:\?[^#\s]*)?#([^/?#]+)$/i;
 
 /** All invitation entry points reject public IDs and retired plaintext aliases. */
 export function parseJoinInput(input: string): JoinInput {
