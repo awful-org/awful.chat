@@ -58,9 +58,77 @@ export function setRoomNotifyMode(roomCode: string, mode: RoomNotifyMode): void 
   }
 }
 
+// ── per channel (channels.ts) ───────────────────────────────────────────────
+//
+// A channel follows its room until someone picks a mode for that channel,
+// and then keeps it whatever the room is set to - "all" included, so one
+// channel can stay loud in a muted room. Kept apart from the room modes,
+// under the same hashed keys (of the room and the channel together), so a
+// build without channels reads its room map exactly as before.
+
+const CHANNEL_KEY = "awful:channel-notify:v1";
+
+function channelRef(roomCode: string, channel: string): string {
+  return hashRef(`${roomCode}\u0000${channel}`);
+}
+
+function loadChannels(): Record<string, RoomNotifyMode> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const raw = JSON.parse(localStorage.getItem(CHANNEL_KEY) ?? "{}") as unknown;
+    if (!raw || typeof raw !== "object") return {};
+    const out: Record<string, RoomNotifyMode> = {};
+    for (const [ref, mode] of Object.entries(raw)) {
+      if (isMode(mode)) out[ref] = mode;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+const channelPrefs = $state<{ modes: Record<string, RoomNotifyMode> }>({
+  modes: loadChannels(),
+});
+
+/**
+ * The mode picked for one channel, or null when it follows its room. The
+ * original chat ("") has no mode of its own: it is the room's.
+ */
+export function getChannelNotifyMode(roomCode: string, channel: string): RoomNotifyMode | null {
+  if (!channel) return null;
+  return channelPrefs.modes[channelRef(roomCode, channel)] ?? null;
+}
+
+/** Pick a channel's mode, or null to have it follow its room again. */
+export function setChannelNotifyMode(
+  roomCode: string,
+  channel: string,
+  mode: RoomNotifyMode | null
+): void {
+  if (!channel) {
+    if (mode) setRoomNotifyMode(roomCode, mode);
+    return;
+  }
+  const ref = channelRef(roomCode, channel);
+  if (mode === null) delete channelPrefs.modes[ref];
+  else channelPrefs.modes[ref] = mode;
+  try {
+    localStorage.setItem(CHANNEL_KEY, JSON.stringify(channelPrefs.modes));
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
+/** How loud a message in this channel of the room may be. */
+export function effectiveNotifyMode(roomCode: string, channel = ""): RoomNotifyMode {
+  return getChannelNotifyMode(roomCode, channel) ?? getRoomNotifyMode(roomCode);
+}
+
 // A second tab muting a room should be reflected here, not fought.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (e) => {
     if (e.key === KEY) prefs.modes = load();
+    if (e.key === CHANNEL_KEY) channelPrefs.modes = loadChannels();
   });
 }

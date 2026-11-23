@@ -3,7 +3,8 @@ import { closeNotificationsByTag, notifyMessage } from "./notify.svelte";
 import { mentionsMe } from "./mentions";
 import { stripMarkdown } from "./markdown";
 import { getManifest } from "./plugins/registry";
-import { getRoomNotifyMode } from "./notify-prefs.svelte";
+import { effectiveNotifyMode } from "./notify-prefs.svelte";
+import { findLiveChannel, messageChannel } from "./channels";
 import { roomsStore } from "./rooms.svelte";
 import { hashRef } from "./storage-crypto";
 import { ROOM_REF_PREFIX, rememberRoomRef } from "./notify-intents";
@@ -30,6 +31,12 @@ export interface AnnounceContext {
   selfIds: string[];
   /** The conversation on screen, so a sound is not played over the reader. */
   uiRoomCode: string | null;
+  /**
+   * The channel of uiRoomCode on screen (channels.ts), "" or absent for the
+   * original chat. A message in another channel of the open room is not
+   * being read, so it is announced like one in another room.
+   */
+  uiChannel?: string;
   /** DID -> display name, for rendering @mentions in the preview text. */
   resolveName: (did: string) => string;
 }
@@ -238,13 +245,22 @@ export function announceMessage(
     // A DM is addressed to you by construction, so it counts as a mention for
     // a conversation turned down to mentions only.
     const mentioned = isDm || mentionsMe(msg.content ?? "", ctx.selfIds);
-    const mode = getRoomNotifyMode(msg.roomCode);
+    // A channel other than the original chat goes by its own mode when one
+    // was picked for it, and by the room's otherwise.
+    const channelId = isDm ? "" : messageChannel(msg);
+    const room = isDm ? undefined : roomsStore.rooms.find((r) => r.roomCode === msg.roomCode);
+    // A channel the list does not hold - deleted, or not heard of yet - has
+    // nowhere on screen to read it, and no unread count either.
+    const channel = channelId ? findLiveChannel(room?.channels ?? [], channelId) : undefined;
+    if (channelId && !channel) return;
+    const mode = effectiveNotifyMode(msg.roomCode, channelId);
     if (mode === "muted") return;
     if (mode === "mentions" && !mentioned) return;
 
     // The conversation on screen is being read: whatever it still has on the
     // lock screen is answered, not left for the user to swipe away.
-    if (ctx.uiRoomCode === msg.roomCode) clearNotificationsFor(msg.roomCode);
+    const viewing = ctx.uiRoomCode === msg.roomCode && (ctx.uiChannel ?? "") === channelId;
+    if (viewing) clearNotificationsFor(msg.roomCode);
 
     let body = msg.content || "[file]";
     if (msg.type === MessageType.CallEvent) {
@@ -276,7 +292,11 @@ export function announceMessage(
       title = msg.senderName;
       preview = body;
     } else if (mentioned) {
-      title = `${msg.senderName} mentioned you`;
+      // The channel, when it is not the original chat: "mentioned you"
+      // alone sends the reader to the wrong place in a busy room.
+      title = channel
+        ? `${msg.senderName} mentioned you in #${channel.name}`
+        : `${msg.senderName} mentioned you`;
       preview = `${msg.senderName}: ${body}`;
     } else {
       // The message's OWN room, not the one on screen: titling a background
@@ -284,9 +304,8 @@ export function announceMessage(
       // wrong conversation. An unnamed room falls back to a generic label,
       // NEVER to the code - a notification is read on a lock screen, over a
       // shoulder, and the code is the room's membership secret.
-      title =
-        roomsStore.rooms.find((r) => r.roomCode === msg.roomCode)?.name ||
-        "New message";
+      const roomName = room?.name || "New message";
+      title = channel ? `${roomName} #${channel.name}` : roomName;
       preview = `${msg.senderName}: ${body}`;
     }
 
@@ -299,7 +318,7 @@ export function announceMessage(
         title,
         preview,
         urgent: mentioned,
-        viewing: ctx.uiRoomCode === msg.roomCode,
+        viewing,
         // An inbound DM's sender IS the other side of the conversation, so a
         // click on the notification routes straight back to it.
         dmPeerDid: isDm ? msg.senderDid || msg.senderId : undefined,

@@ -6,7 +6,7 @@ import {
   deleteRoom,
   deleteRoomProfilesForRoom,
   getRoomDeletionMarker,
-  getUnreadCount,
+  getChannelUnreadCounts,
   getLastMessage,
   getRoom,
   getMessages,
@@ -23,6 +23,8 @@ import { identityStore } from "./identity/identity.svelte";
 import { dropRoomCorpus } from "./search/corpus.svelte";
 import { MessageType } from "./types/message";
 import { blockedDids, isBlockedDid, loadBlocks } from "./blocks.svelte";
+import { findLiveChannel, liveChannels, type Channel, type ChannelKind } from "./channels";
+import { currentChannelOf, forgetCurrentChannel } from "./channel-view.svelte";
 
 /**
  * Your own messages must never count as unread - they arrive back through
@@ -46,6 +48,12 @@ interface RoomsStore {
   phonebook: PhonebookEntry[];
   loading: boolean;
   unreadCounts: Map<string, number>;
+  /**
+   * roomCode -> channel id -> unread, for rooms counted since load: "" is
+   * the original chat. unreadCounts is always the sum of a room's entries
+   * here, so the sidebar's room total and a channel list's badges agree.
+   */
+  channelUnread: Map<string, Map<string, number>>;
   /** roomCode -> timestamp of the newest message from anyone. */
   lastActivity: Map<string, number>;
 }
@@ -57,6 +65,7 @@ export const roomsStore = $state<RoomsStore>({
   phonebook: [],
   loading: false,
   unreadCounts: new Map(),
+  channelUnread: new Map(),
   lastActivity: new Map(),
 });
 
@@ -164,7 +173,7 @@ function _firstSighting(id: string): boolean {
  */
 export function noteUnreadArrivals(
   roomCode: string,
-  rows: ReadonlyArray<{ id: string; senderId: string; lamport: number; type: string }>
+  rows: ReadonlyArray<{ id: string; senderId: string; lamport: number; type: string; channel?: string }>
 ): void {
   if (roomCode.startsWith("dm-")) return;
   const self = selfSenderId();
@@ -183,20 +192,65 @@ export function noteUnreadArrivals(
     void refreshUnreadCount(roomCode).catch(() => {});
     return;
   }
-  const added = fresh.filter((m) => m.lamport > room.lastSeenLamport).length;
-  if (!added) return;
+  // Each against its own channel's mark. A row in a channel the list does
+  // not hold (deleted, or not heard of yet) is in no count, the same rule
+  // the recount applies (storage.ts getChannelUnreadCounts).
+  const live = new Set(liveChannels(room.channels ?? [], "text").map((c) => c.id));
+  const byChannel = new Map<string, number>();
+  for (const m of fresh) {
+    const channel = m.channel ?? "";
+    if (!live.has(channel)) continue;
+    const mark = channel ? room.channelSeen?.[channel] ?? 0 : room.lastSeenLamport;
+    if (m.lamport > mark) byChannel.set(channel, (byChannel.get(channel) ?? 0) + 1);
+  }
+  if (!byChannel.size) return;
+  const breakdown = new Map(roomsStore.channelUnread.get(roomCode) ?? []);
+  let added = 0;
+  for (const [channel, n] of byChannel) {
+    breakdown.set(channel, (breakdown.get(channel) ?? 0) + n);
+    added += n;
+  }
+  _setBreakdown(roomCode, breakdown, (roomsStore.unreadCounts.get(roomCode) ?? 0) + added);
+}
+
+/** Put a room's per-channel counts and its total in place together. */
+function _setBreakdown(roomCode: string, breakdown: Map<string, number>, total: number): void {
+  const channels = new Map(roomsStore.channelUnread);
+  channels.set(roomCode, breakdown);
+  roomsStore.channelUnread = channels;
+  if (roomsStore.unreadCounts.get(roomCode) === total) return;
   const next = new Map(roomsStore.unreadCounts);
-  next.set(roomCode, (next.get(roomCode) ?? 0) + added);
+  next.set(roomCode, total);
   roomsStore.unreadCounts = next;
 }
 
-/** The user read the room up to what is on screen. */
-export function noteRoomRead(roomCode: string): void {
+/**
+ * The user read a channel of the room (the original chat by default) up to
+ * what is on screen. The room's total keeps every other channel's count.
+ */
+export function noteRoomRead(roomCode: string, channel = ""): void {
   _counted.delete(roomCode);
-  if (roomsStore.unreadCounts.get(roomCode) === 0) return;
-  const next = new Map(roomsStore.unreadCounts);
-  next.set(roomCode, 0);
-  roomsStore.unreadCounts = next;
+  const held = roomsStore.channelUnread.get(roomCode);
+  if (!held) {
+    // Never counted per channel: what the room total was is all there is,
+    // and in a room without channels it is all the original chat's.
+    if (roomsStore.unreadCounts.get(roomCode) === 0) return;
+    const next = new Map(roomsStore.unreadCounts);
+    next.set(roomCode, 0);
+    roomsStore.unreadCounts = next;
+    return;
+  }
+  if ((held.get(channel) ?? 0) === 0 && roomsStore.unreadCounts.has(roomCode)) return;
+  const breakdown = new Map(held);
+  breakdown.set(channel, 0);
+  let total = 0;
+  for (const n of breakdown.values()) total += n;
+  _setBreakdown(roomCode, breakdown, total);
+}
+
+/** Unread messages in one channel of a room ("" is the original chat). */
+export function channelUnreadCount(roomCode: string, channel: string): number {
+  return roomsStore.channelUnread.get(roomCode)?.get(channel) ?? 0;
 }
 
 /**
@@ -244,25 +298,46 @@ async function _recountUnread(roomCode: string): Promise<void> {
     roomsStore.rooms.find((r) => r.roomCode === roomCode) ??
     (await getRoom(roomCode));
   if (!room) return;
-  const count = await getUnreadCount(
+  // Every live text channel, each against its own mark; the original chat
+  // against lastSeenLamport. A room without channels is one read of the
+  // rows above lastSeenLamport, counted as it always was.
+  const channels: Record<string, number> = {};
+  for (const c of liveChannels(room.channels ?? [], "text")) {
+    if (c.id) channels[c.id] = room.channelSeen?.[c.id] ?? 0;
+  }
+  const counts = await getChannelUnreadCounts(
     roomCode,
-    room.lastSeenLamport,
+    { base: room.lastSeenLamport, channels },
     selfSenderId(),
     blockedDids()
   );
-  // If markSeen advanced the watermark while the count was in flight, this
-  // result is stale - writing it would relight the badge on a room the user
-  // is reading. Drop it; the next event recomputes. A room still absent from
+  // If markSeen advanced a mark while the count was in flight, this result
+  // is stale - writing it would relight the badge on a channel the user is
+  // reading. Drop it; the next event recomputes. A room still absent from
   // the mirror cannot have been read through it, so it keeps its count.
+  // The list too: a channel made or deleted meanwhile is counted next time.
   const now = roomsStore.rooms.find((r) => r.roomCode === roomCode);
-  if (now && now.lastSeenLamport !== room.lastSeenLamport) return;
+  if (now && _marksMoved(room, now)) return;
   _counted.add(roomCode);
+  let count = 0;
+  for (const n of counts.values()) count += n;
   // Only when it changed: every consumer of the map - the sidebar, the tab
   // title, the app badge - recomputes on a new one.
-  if (roomsStore.unreadCounts.get(roomCode) === count) return;
-  const next = new Map(roomsStore.unreadCounts);
-  next.set(roomCode, count);
-  roomsStore.unreadCounts = next;
+  const held = roomsStore.channelUnread.get(roomCode);
+  if (held && held.size === counts.size && [...counts].every(([c, n]) => held.get(c) === n) &&
+      roomsStore.unreadCounts.get(roomCode) === count) return;
+  _setBreakdown(roomCode, counts, count);
+}
+
+/** Whether a room's read marks or channel list differ between two copies of it. */
+function _marksMoved(before: Room, after: Room): boolean {
+  if (after.lastSeenLamport !== before.lastSeenLamport) return true;
+  if (JSON.stringify(after.channels ?? []) !== JSON.stringify(before.channels ?? [])) return true;
+  const a = before.channelSeen ?? {};
+  const b = after.channelSeen ?? {};
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) if (a[k] !== b[k]) return true;
+  return false;
 }
 
 /** Seed the last-activity map from stored history on startup. */
@@ -375,34 +450,71 @@ export async function toggleRoomPin(roomCode: string): Promise<void> {
   await setRoomPinned(roomCode, pinnedAt);
 }
 
-/** This user's pinned messages in a room or DM, oldest pin first. */
-export function pinnedMessagesOf(roomCode: string): string[] {
-  return (
-    roomsStore.rooms.find((r) => r.roomCode === roomCode)?.pinnedMessages ??
-    roomsStore.dmRooms.find((r) => r.roomCode === roomCode)?.pinnedMessages ??
-    []
-  );
+/**
+ * This user's pinned messages in a room or DM, oldest pin first: those of
+ * one channel, the one open in the room unless another is named. A DM has
+ * only its one chat.
+ */
+export function pinnedMessagesOf(roomCode: string, channel = currentChannelOf(roomCode)): string[] {
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  if (room) return (channel ? room.channelPins?.[channel] : room.pinnedMessages) ?? [];
+  return roomsStore.dmRooms.find((r) => r.roomCode === roomCode)?.pinnedMessages ?? [];
 }
 
-/** Pin a message for yourself in its room or DM, or unpin it. */
+/**
+ * Pin a message for yourself in its room or DM, or unpin it. Filed under
+ * the channel the message is in - the one open, unless another is named.
+ */
 export async function toggleMessagePin(
   roomCode: string,
-  messageId: string
+  messageId: string,
+  channel = currentChannelOf(roomCode)
 ): Promise<void> {
-  const pinned = !pinnedMessagesOf(roomCode).includes(messageId);
+  if (roomCode.startsWith("dm-")) channel = "";
+  const pinned = !pinnedMessagesOf(roomCode, channel).includes(messageId);
+  const toggle = (current: string[]) =>
+    pinned ? [...current, messageId] : current.filter((id) => id !== messageId);
   const apply = <T extends Room>(r: T): T => {
     if (r.roomCode !== roomCode) return r;
-    const current = r.pinnedMessages ?? [];
+    if (!channel) return { ...r, pinnedMessages: toggle(r.pinnedMessages ?? []) };
     return {
       ...r,
-      pinnedMessages: pinned
-        ? [...current, messageId]
-        : current.filter((id) => id !== messageId),
+      channelPins: { ...(r.channelPins ?? {}), [channel]: toggle(r.channelPins?.[channel] ?? []) },
     };
   };
   roomsStore.rooms = roomsStore.rooms.map(apply);
   roomsStore.dmRooms = roomsStore.dmRooms.map(apply);
-  await setMessagePinned(roomCode, messageId, pinned);
+  await setMessagePinned(roomCode, messageId, pinned, channel);
+}
+
+// ── channels (channels.ts) ───────────────────────────────────────────────────
+
+/**
+ * A room's channels as the UI lists them: live ones only, the original
+ * first, then by position. Of one kind, or every text channel then every
+ * voice channel. Reactive: it reads the sidebar's mirror of the rooms.
+ */
+export function roomChannels(roomCode: string, kind?: ChannelKind): Channel[] {
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  return liveChannels(room?.channels ?? [], kind);
+}
+
+/** The live channel with this id in a room, or undefined (deleted, unknown). */
+export function roomChannel(roomCode: string, id: string, kind: ChannelKind = "text"): Channel | undefined {
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  return findLiveChannel(room?.channels ?? [], id, kind);
+}
+
+/**
+ * Put a room's merged channel list in the mirror (storage already holds it).
+ * Its unread counts are counted again: a channel that came or went changes
+ * which rows count.
+ */
+export function noteRoomChannels(roomCode: string, channels: Channel[]): void {
+  const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
+  if (idx === -1) return;
+  roomsStore.rooms[idx] = { ...roomsStore.rooms[idx], channels };
+  void refreshUnreadCount(roomCode).catch(() => {});
 }
 
 /** The unpinned rooms' order after a sidebar drag or keyboard move. */
@@ -462,9 +574,13 @@ export async function removeRoom(roomCode: string): Promise<void> {
   await deleteRoom(roomCode);
   roomsStore.rooms = roomsStore.rooms.filter((r) => r.roomCode !== roomCode);
   _counted.delete(roomCode);
+  forgetCurrentChannel(roomCode);
   const unread = new Map(roomsStore.unreadCounts);
   unread.delete(roomCode);
   roomsStore.unreadCounts = unread;
+  const channels = new Map(roomsStore.channelUnread);
+  channels.delete(roomCode);
+  roomsStore.channelUnread = channels;
   const activity = new Map(roomsStore.lastActivity);
   activity.delete(roomCode);
   roomsStore.lastActivity = activity;

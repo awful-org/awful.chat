@@ -99,6 +99,19 @@ export interface StoreCryptoSpec {
    * three possible inputs and compares - those stay in `clear`.
    */
   blind?: string[];
+  /**
+   * Index fields DERIVED from two fields of the row: `{ out: [a, b] }` stores
+   * the keyed hash of the pair (see blindPair) under `out`, when `b` is a
+   * non-empty string, and nothing when it is absent. The pair's real values
+   * are sealed with the rest of the row, so `out` is never read back - it
+   * exists only for an index to look up, and openRow leaves it out.
+   *
+   * For a lookup by a value that is only unique WITHIN another one: a
+   * channel id is random, but nothing stops a member of one room naming a
+   * channel the same as one in another room, so the index has to be over
+   * the room and the channel together.
+   */
+  pairBlind?: Record<string, readonly [string, string]>;
   /** ArrayBuffer fields encrypted as raw buffers instead of via JSON. */
   bytes?: string[];
   /**
@@ -244,6 +257,16 @@ export async function blindValue(value: string): Promise<Blinded> {
   if (_blindCache.size >= BLIND_CACHE_MAX) _blindCache.clear();
   _blindCache.set(value, out);
   return out as Blinded;
+}
+
+/**
+ * The keyed hash of a pair of values, for an index over both (see
+ * StoreCryptoSpec.pairBlind). Domain-separated and NUL-joined, so it can
+ * never equal the blind of either value alone or of a different split of
+ * the same characters.
+ */
+export function blindPair(kind: string, a: string, b: string): Promise<Blinded> {
+  return blindValue(`pair\u0000${kind}\u0000${a}\u0000${b}`);
 }
 
 /**
@@ -412,6 +435,14 @@ export async function sealRow<T extends Record<string, unknown>>(
       ) as Uint8Array<ArrayBuffer>;
     } else {
       rest[k] = v;
+    }
+  }
+
+  for (const [field, [a, b]] of Object.entries(spec.pairBlind ?? {})) {
+    const first = record[a];
+    const second = record[b];
+    if (typeof first === "string" && typeof second === "string" && second) {
+      out[field] = await blindPair(field, first, second);
     }
   }
 
@@ -588,6 +619,11 @@ export const STORE_SPECS = {
     // Both were readable with no key at all, which is how a second account on
     // one device could list the previous account's rooms and everyone in them.
     blind: ["roomCode", "senderId"],
+    // A channel's page is read through [roomChannel, lamport]. Only rows in
+    // a channel carry it: the room's original chat is every row without one,
+    // which is how the rows stored before channels existed are in it
+    // without being rewritten. The channel itself stays sealed.
+    pairBlind: { roomChannel: ["roomCode", "channel"] },
   },
   attachments: {
     storeName: "attachments",

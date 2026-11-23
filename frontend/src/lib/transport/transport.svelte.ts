@@ -64,9 +64,21 @@ import {
   cleanupInactiveParticipants,
   getDeletedFloor,
   addRoomParticipants,
+  mergeRoomChannels,
   MAX_ROOM_PARTICIPANTS,
   type DMRoom,
 } from "../storage";
+import {
+  createChannelEntry,
+  deleteChannelEntry,
+  messageChannel,
+  parseChannelList,
+  renameChannelEntry,
+  reorderChannelEntries,
+  type Channel,
+  type ChannelKind,
+} from "../channels";
+import { currentChannelOf, setCurrentChannel } from "../channel-view.svelte";
 import { normalizeWireName } from "../wire-name";
 import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
@@ -83,6 +95,7 @@ import {
   type WirePluginEphemeral,
   type WireProfile,
   type WireRoomName,
+  type WireChannelList,
   type WireRoomUsersSync,
   type WireCallState,
   type WireTyping,
@@ -97,6 +110,8 @@ import {
   refreshDmRooms,
   renameRoom,
   noteRoomActivity,
+  noteRoomChannels,
+  roomChannel,
   roomsStore,
   loadRooms,
 } from "../rooms.svelte";
@@ -107,7 +122,7 @@ import type { FileDescriptor, FileTransferSnapshot } from "./types";
 import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
-import { verifyIncoming, type VerifyVerdict } from "./verify-incoming";
+import { isCurrentSigVersion, verifyIncoming, type VerifyVerdict } from "./verify-incoming";
 import { messageIdAllowedFor, newMessageId } from "../message-id";
 import { LiveUpdateAdmission } from "../room-security/live-updates";
 
@@ -347,6 +362,11 @@ export type { Message };
 // ── State shapes ──────────────────────────────────────────────────────────────
 
 interface SendMessageOptions {
+  /**
+   * The channel to send into (channels.ts). Absent: the one open in the
+   * room. Never set in a DM, which has none.
+   */
+  channel?: string;
   replyTo?: Message["replyTo"];
   type?: ChatMessageType;
   meta?: FileMeta;
@@ -1114,6 +1134,35 @@ function _sendRoomName(peerId?: string, roomCode: string | null = transportState
   } else _transport.broadcast(payload, roomCode);
 }
 
+/**
+ * Announce a room's channel list (channels.ts): to the room, or to one peer -
+ * a welcome, or the answer to a member whose list is behind ours. The same
+ * gates as _sendRoomName, for the same reason: the frame names the room code.
+ * A room nobody made a channel in announces nothing, so it sends exactly
+ * what it sent before channels existed.
+ */
+function _sendChannelList(
+  peerId?: string,
+  roomCode: string | null = transportState.roomCode,
+  answer = false
+): void {
+  if (!roomCode || roomCode.startsWith("dm-") || isLegacyArchive(roomCode)) return;
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  const channels = room?.channels ?? [];
+  if (!channels.length) return;
+  const frame: WireChannelList = {
+    type: MessageType.ChannelList,
+    roomCode,
+    channels,
+    ...(answer ? { answer: true as const } : {}),
+  };
+  const payload = encode(frame);
+  if (peerId) {
+    if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
+    void _transport.sendRoom(peerId, roomCode, payload).catch(() => {});
+  } else void _transport.broadcast(payload, roomCode).catch(() => {});
+}
+
 /** `missingOnly`, with a peerId: send them only what they were never delivered. */
 async function _sendProfile(peerId?: string, isReply = false, missingOnly = false): Promise<void> {
   // A lock landing while this call is under way must not leave the profile it
@@ -1656,6 +1705,22 @@ async function _sendDigestForRoom(
 
 // ── History ───────────────────────────────────────────────────────────────────
 
+/**
+ * The channel whose page the view shows for a room (channels.ts): the one
+ * open, or undefined - the whole room - for a DM, which has no channels. A
+ * channel that was deleted, or is not in the list, puts the room back in its
+ * original chat.
+ */
+function _viewChannel(roomCode: string): string | undefined {
+  if (roomCode.startsWith("dm-")) return undefined;
+  const channel = currentChannelOf(roomCode);
+  if (channel && !roomChannel(roomCode, channel)) {
+    setCurrentChannel(roomCode, "");
+    return "";
+  }
+  return channel;
+}
+
 export async function _loadHistory(
   roomCode: string,
   stillCurrent: () => boolean = () => true
@@ -1663,7 +1728,7 @@ export async function _loadHistory(
   const page = { capped: false };
   transportState.historyRoom = null;
   const [msgs, profiles, roomProfiles] = await Promise.all([
-    getMessages(roomCode, undefined, page),
+    getMessages(roomCode, undefined, page, _viewChannel(roomCode)),
     getAllPeerProfiles(),
     getAllPeerRoomProfiles(roomCode),
   ]);
@@ -2270,7 +2335,11 @@ async function _storeSyncBatch(
     // every repair tick forever. Leaving v2 in the "signed, might be repaired
     // by a better copy" bucket below would have done exactly that to the
     // whole pre-v3 backlog.
-    if (!m.sig || m.sigV !== 3) {
+    //
+    // A row whose channel tag is malformed, or does not match its signature
+    // version, is refused the same way on every retry, so it joins them.
+    const verdict = verdicts[i];
+    if (!m.sig || !isCurrentSigVersion(m.sigV) || (!verdict.ok && verdict.reason === "channel")) {
       const at = permanentMax.get(m.senderId);
       if (at === undefined || m.lamport > at) {
         permanentMax.set(m.senderId, m.lamport);
@@ -2542,6 +2611,10 @@ async function _mergeSyncedIntoView(
   rows: Message[]
 ): Promise<void> {
   if (transportState.roomCode !== roomCode) return;
+  // The page on screen is one channel's: rows of the room's other channels
+  // are stored, counted and announced, and wait there until it is opened.
+  const channel = _viewChannel(roomCode);
+  if (channel !== undefined) rows = rows.filter((m) => messageChannel(m) === channel);
   const onScreen = transportState.messages;
   const windowFloor = onScreen[0];
   const existingIds = new Set(onScreen.map((m) => m.id));
@@ -2556,8 +2629,8 @@ async function _mergeSyncedIntoView(
   }
 
   const page = { capped: false };
-  const newest = await getMessages(roomCode, undefined, page);
-  if (transportState.roomCode !== roomCode) return;
+  const newest = await getMessages(roomCode, undefined, page, channel);
+  if (transportState.roomCode !== roomCode || _viewChannel(roomCode) !== channel) return;
   // Identity-preserving: a row already on screen keeps its OBJECT, not
   // just its key. A re-read that built brand-new objects for every id made
   // every mounted row see all its props change and re-render. Message rows
@@ -3158,6 +3231,48 @@ function _handleRoomName(msg: WireRoomName, room: string | null, peerId: string)
 }
 
 /**
+ * A member's channel list (channels.ts): folded into ours entry by entry,
+ * and answered with ours when they are behind - the way room names catch a
+ * member up. Trust as for a room name: the authenticated topic names the
+ * room, and a direct send may only speak of a room we have joined. Any
+ * member may change the list; rooms have no roles.
+ */
+function _handleChannelList(msg: WireChannelList, room: string | null, peerId: string): void {
+  const target = room ?? msg.roomCode;
+  if (typeof target !== "string" || !target) return;
+  if (target.startsWith("dm-") || isLegacyArchive(target)) return;
+  if (room === null && !_transport.rooms().includes(target)) return;
+  const incoming = parseChannelList(msg.channels);
+  _applyChannelList(peerId, target, incoming, msg.answer === true).catch(() => {});
+}
+
+async function _applyChannelList(
+  peerId: string,
+  target: string,
+  incoming: Channel[],
+  isAnswer: boolean
+): Promise<void> {
+  const result = await mergeRoomChannels(target, incoming);
+  if (!result) return;
+  if (result.changed) _noteChannels(target, result.merged);
+  // An answer is never answered: one exchange leaves both sides holding
+  // every entry either would take, so a second could only repeat it.
+  if (result.behind && !isAnswer) _sendChannelList(peerId, target, true);
+}
+
+/**
+ * A room's list changed (an announcement, or our own edit): mirror it, and
+ * if the channel open in the room is gone, go back to the original chat.
+ */
+function _noteChannels(roomCode: string, channels: Channel[]): void {
+  noteRoomChannels(roomCode, channels);
+  const open = currentChannelOf(roomCode);
+  if (open && !roomChannel(roomCode, open)) {
+    void selectChannel(roomCode, "").catch(() => {});
+  }
+}
+
+/**
  * A peer may only announce ITSELF. `claimedDid` arrives in the message body,
  * which anybody in the room can write, so it is checked against the DID bound
  * to the authenticated connection it came in on. Without that check a peer
@@ -3457,12 +3572,19 @@ function _announceMessage(
     .catch(() => {});
 }
 
+/** Whether a message of the open room belongs on the page on screen. */
+function _inViewChannel(msg: Message): boolean {
+  const channel = _viewChannel(msg.roomCode);
+  return channel === undefined || messageChannel(msg) === channel;
+}
+
 function _announce(msg: Message, opts: { viaMailbox?: boolean }): void {
   announceMessage(
     msg,
     {
       selfIds: _selfIds(),
       uiRoomCode: transportState.uiRoomCode,
+      uiChannel: currentChannelOf(transportState.uiRoomCode),
       resolveName: resolveMentionDisplayName,
     },
     opts
@@ -3654,8 +3776,13 @@ async function _handleChatMessage(
   if (isNewMessage) _announceMessage(msg);
 
   // Match on the open room, not the mode: DM file messages arrive through
-  // this path too, and the mode check kept them invisible until reopen.
-  if (isNewMessage && transportState.roomCode === msg.roomCode) {
+  // this path too, and the mode check kept them invisible until reopen. And
+  // on the open channel: the page is that channel's alone.
+  if (
+    isNewMessage &&
+    transportState.roomCode === msg.roomCode &&
+    _inViewChannel(msg)
+  ) {
     transportState.messages = appendSorted(transportState.messages, msg);
   }
 
@@ -3758,6 +3885,7 @@ _transport.on("roomPeers", (room, peerIds) => {
     // never heard about a call in it. All three handlers are idempotent, so
     // repeating them when the relay re-lists a peer costs a few small frames.
     _sendRoomName(pid, room);
+    _sendChannelList(pid, room);
     _sendCallFramesTo(pid);
     _sendRoomUsers(pid, room).catch(() => {});
     if (!_peerIdToDid.has(pid)) continue;
@@ -3812,7 +3940,10 @@ _transport.on("connect", (peerId) => {
   // nothing here; the "roomPeers" handler is what catches them up.
   // Every room we share, not just the one on screen: a rename made while this
   // peer was away otherwise reached them only if they happened to open it.
-  for (const room of _transport.rooms()) _sendRoomName(peerId, room);
+  for (const room of _transport.rooms()) {
+    _sendRoomName(peerId, room);
+    _sendChannelList(peerId, room);
+  }
   _sendCallFramesTo(peerId);
   _sendDigest(peerId);
   if (transportState.roomCode) {
@@ -4649,6 +4780,9 @@ _transport.on("message", (peerId, data, room) => {
       case MessageType.RoomName:
         _handleRoomName(msg, room, peerId);
         break;
+      case MessageType.ChannelList:
+        _handleChannelList(msg, room, peerId);
+        break;
       case MessageType.PluginEphemeral: {
         // Wire-only ephemeral messages: verify, fold to card state, but never persist.
         // No watermark, lamport, or storage side effects.
@@ -5454,9 +5588,12 @@ export async function sendMessage(
   }
   const roomCode = transportState.roomCode;
   if (!roomCode) throw new Error("Open a conversation before sending");
+  // Into the channel open in the room, unless the caller names one (a
+  // reaction goes where the message it reacts to is).
+  const channel = _sendChannel(roomCode, options.channel);
   const prepared = prepareOutgoingText(text);
   if (prepared.files.length) {
-    await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo });
+    await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo, channel });
     return;
   }
 
@@ -5476,6 +5613,7 @@ export async function sendMessage(
     lamport,
     type: options.type ?? MessageType.Text,
     content: text,
+    ...(channel ? { channel } : {}),
     meta: options.meta,
     attachments: options.attachments ?? [],
     replyTo: options.replyTo,
@@ -5505,13 +5643,25 @@ export async function sendMessage(
 
   // Echo BEFORE the storage writes: seal + two IDB round-trips gated the
   // local echo, which read as send lag - the network send already left.
-  if (transportState.roomCode === roomCode) {
+  if (transportState.roomCode === roomCode && _inViewChannel(msg)) {
     transportState.messages = appendSorted(transportState.messages, msg);
   }
   applyMessageStatus(msg.id, msg.status);
 
-  markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
+}
+
+/**
+ * The channel a message sent now goes into: the one named, else the one
+ * open in the room. Never one in a DM. A channel that is not in the room's
+ * live list is refused rather than sent into: nobody could see the message.
+ */
+function _sendChannel(roomCode: string, named?: string): string {
+  if (roomCode.startsWith("dm-")) return "";
+  const channel = named ?? currentChannelOf(roomCode);
+  if (channel && !roomChannel(roomCode, channel)) throw new Error("That channel no longer exists");
+  return channel;
 }
 
 /**
@@ -5547,11 +5697,12 @@ export async function sendReply(text: string, target: Message): Promise<void> {
 export async function sendFiles(
   files: File[],
   text = "",
-  options: Pick<SendMessageOptions, "replyTo"> & { roomCode?: string } = {}
+  options: Pick<SendMessageOptions, "replyTo" | "channel"> & { roomCode?: string } = {}
 ): Promise<void> {
   const roomCode = options.roomCode ?? transportState.roomCode;
   requireWritableRoom(roomCode);
   if (!roomCode) throw new Error("Open a conversation before sending");
+  const channel = _sendChannel(roomCode, options.channel);
   const session = requireSession();
   const assertCurrent = () => {
     if (requireSession() !== session) throw new Error("Identity changed");
@@ -5643,6 +5794,7 @@ export async function sendFiles(
     lamport,
     type: MessageType.File,
     content: text.trim(),
+    ...(channel ? { channel } : {}),
     meta: {
       files: seeded.map((f) => ({ ...f, ...dimsByHash.get(f.infoHash) })),
     },
@@ -5671,11 +5823,11 @@ export async function sendFiles(
     msg.status = _broadcastChatWire(wire, roomCode) ? "sent" : "sending";
     applyMessageStatus(msg.id, msg.status);
   }
-  if (transportState.roomCode === roomCode) {
+  if (transportState.roomCode === roomCode && _inViewChannel(msg)) {
     transportState.messages = appendSorted(transportState.messages, msg);
   }
 
-  markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
 }
 
@@ -5689,6 +5841,8 @@ async function _postSignedRow(
   type: ChatMessageType,
   content: string,
   assertCurrent: () => void,
+  /** See _sendChannel; "" for a DM's call card. */
+  channel = "",
 ): Promise<Message> {
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   assertCurrent();
@@ -5705,15 +5859,16 @@ async function _postSignedRow(
     lamport,
     type,
     content,
+    ...(channel ? { channel } : {}),
     attachments: [],
   });
   await putMessage(msg, assertCurrent);
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
   assertCurrent();
   _broadcastChatWire(messageToWire(msg), roomCode);
-  if (transportState.roomCode === roomCode) {
+  if (transportState.roomCode === roomCode && _inViewChannel(msg)) {
     transportState.messages = appendSorted(transportState.messages, msg);
-    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+    markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   }
   noteRoomActivity(msg.roomCode, msg.timestamp);
   return msg;
@@ -5757,7 +5912,10 @@ export async function sendCard(
   }
 
   const content = JSON.stringify({ pluginId, data: payload });
-  return (await _postSignedRow(roomCode, MessageType.PluginCard, content, assertCurrent)).id;
+  // A card is a message like any other: posted into the channel open in
+  // its room. Its updates are not (see sendUpdate).
+  const channel = _sendChannel(roomCode);
+  return (await _postSignedRow(roomCode, MessageType.PluginCard, content, assertCurrent, channel)).id;
 }
 
 let cachedPluginSenderName = "";
@@ -5857,9 +6015,13 @@ export async function sendUpdate(
   _broadcastChatWire(messageToWire(msg), roomCode);
   // View and seen-watermark belong to the OPEN room only: a widget update
   // for a background room must not paint here or mark that room read.
+  //
+  // An update carries no channel (channels.ts): it is state for a card,
+  // which is found by its id across the whole room, never a row a page
+  // shows. The mark it moves is the open channel's - the one being read.
   if (transportState.roomCode === msg.roomCode) {
     transportState.messages = appendSorted(transportState.messages, msg);
-    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+    markRoomSeen(msg.roomCode, msg.lamport, undefined, currentChannelOf(msg.roomCode)).catch(() => {});
   }
 
   // Fold our OWN update into the card state - the dispatcher only folds
@@ -5929,7 +6091,7 @@ export function sendUpdateImmediately(
   // same closed/left state without waiting for another peer's next digest.
   void putMessage(msg, guard)
     .then(() => { guard(); return setWatermark(roomCode, msg.senderId, msg.lamport, guard); })
-    .then(() => { guard(); return markRoomSeen(roomCode, msg.lamport, guard); })
+    .then(() => { guard(); return markRoomSeen(roomCode, msg.lamport, guard, currentChannelOf(roomCode)); })
     .catch(() => {});
 }
 
@@ -5974,11 +6136,17 @@ export async function toggleReaction(
     return;
   }
 
+  // In the channel of the message reacted to: the page that shows the
+  // message is the only one that folds its reactions (channels.ts). The
+  // message is on screen to be reacted to; storage is the fallback.
+  const target =
+    transportState.messages.find((m) => m.id === messageId) ?? (await getMessage(messageId));
   await sendMessage("", {
     type: MessageType.Reaction,
     reactionTo: messageId,
     reactionEmoji: emoji,
     reactionOp,
+    channel: target?.roomCode === roomCode ? messageChannel(target) : undefined,
   });
 }
 
@@ -5994,15 +6162,17 @@ export async function loadMoreMessages(
 ): Promise<boolean> {
   const roomCode = transportState.roomCode;
   if (!roomCode) return false;
+  const channel = _viewChannel(roomCode);
   const older: Message[] = [];
   let cursor = beforeLamport;
   let capped = false;
   for (let i = 0; i < (reach ? reach.pages : 1); i++) {
     const page = { capped: false };
-    const rows = await getMessages(roomCode, cursor, page);
+    const rows = await getMessages(roomCode, cursor, page, channel);
     // The user can switch rooms while the page loads; prepending the old
-    // room's backlog into the new room's view crosses histories.
-    if (transportState.roomCode !== roomCode) return false;
+    // room's backlog into the new room's view crosses histories. Channels
+    // the same.
+    if (transportState.roomCode !== roomCode || _viewChannel(roomCode) !== channel) return false;
     older.push(...rows);
     capped = page.capped;
     if (!rows.length || !page.capped) break;
@@ -6073,7 +6243,9 @@ export async function markSeen(): Promise<void> {
       maxLamport = m.lamport;
   }
   if (maxLamport === 0) return;
-  await markRoomSeen(roomCode, maxLamport);
+  // The page is the open channel's, so it is that channel that was read.
+  const channel = _viewChannel(roomCode) ?? "";
+  await markRoomSeen(roomCode, maxLamport, undefined, channel);
   if (roomCode.startsWith("dm-")) {
     // DM rooms live in their own mirror, and the DM badge recomputes on
     // dmVersion - the rooms maps below never carried them.
@@ -6106,19 +6278,110 @@ export async function markSeen(): Promise<void> {
   }
   const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
   if (idx !== -1) {
-    roomsStore.rooms[idx] = {
-      ...roomsStore.rooms[idx],
-      lastSeenLamport: Math.max(
-        roomsStore.rooms[idx].lastSeenLamport ?? 0,
-        maxLamport
-      ),
-    };
+    const room = roomsStore.rooms[idx];
+    roomsStore.rooms[idx] = channel
+      ? {
+          ...room,
+          channelSeen: {
+            ...(room.channelSeen ?? {}),
+            [channel]: Math.max(room.channelSeen?.[channel] ?? 0, maxLamport),
+          },
+        }
+      : { ...room, lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, maxLamport) };
   }
-  noteRoomRead(roomCode);
+  noteRoomRead(roomCode, channel);
 }
 
 export function broadcastProfile(): void {
   _broadcastProfile().catch(() => {});
+}
+
+// ── Channels (channels.ts) ───────────────────────────────────────────────────
+
+/** The channel open in a room: "" for its original chat. */
+export function currentChannel(roomCode: string | null = transportState.roomCode): string {
+  return currentChannelOf(roomCode);
+}
+
+/**
+ * Open a channel of a room ("" for the original chat). For the room on
+ * screen the page is swapped for the channel's newest one; for another room
+ * the choice is kept for when it is opened. Resolves false for a DM or a
+ * channel that is not live in the room's list.
+ */
+export async function selectChannel(roomCode: string, channel: string): Promise<boolean> {
+  if (roomCode.startsWith("dm-")) return false;
+  if (channel && !roomChannel(roomCode, channel)) return false;
+  const changed = currentChannelOf(roomCode) !== channel;
+  setCurrentChannel(roomCode, channel);
+  if (!changed || transportState.roomCode !== roomCode) return true;
+  // Nothing of the channel left is shown while the next one is read.
+  transportState.messages = [];
+  await _loadHistory(
+    roomCode,
+    () => transportState.roomCode === roomCode && currentChannelOf(roomCode) === channel
+  );
+  return true;
+}
+
+/** Store our own edit to a room's list, and tell the room. */
+async function _commitChannelEdit(roomCode: string, entries: Channel[]): Promise<void> {
+  requireWritableRoom(roomCode);
+  if (roomCode.startsWith("dm-")) throw new Error("Direct messages have no channels");
+  const result = await mergeRoomChannels(roomCode, entries);
+  if (!result) throw new Error("No such room");
+  if (result.changed) _noteChannels(roomCode, result.merged);
+  _sendChannelList(undefined, roomCode);
+}
+
+async function _channelsOf(roomCode: string): Promise<Channel[]> {
+  const room =
+    roomsStore.rooms.find((r) => r.roomCode === roomCode) ?? (await getRoom(roomCode));
+  if (!room) throw new Error("No such room");
+  return room.channels ?? [];
+}
+
+/** Make a channel in a room; any member may. Resolves the new channel. */
+export async function createChannel(
+  roomCode: string,
+  name: string,
+  kind: ChannelKind = "text"
+): Promise<Channel> {
+  const entry = createChannelEntry(await _channelsOf(roomCode), kind, name);
+  await _commitChannelEdit(roomCode, [entry]);
+  return entry;
+}
+
+/** Rename a channel; the empty id renames the room's original one. */
+export async function renameChannel(
+  roomCode: string,
+  id: string,
+  name: string,
+  kind: ChannelKind = "text"
+): Promise<void> {
+  await _commitChannelEdit(roomCode, [renameChannelEntry(await _channelsOf(roomCode), kind, id, name)]);
+}
+
+/**
+ * Delete a channel. Its messages stay stored but are shown nowhere; a member
+ * who has it open is put back in the original chat.
+ */
+export async function deleteChannel(
+  roomCode: string,
+  id: string,
+  kind: ChannelKind = "text"
+): Promise<void> {
+  await _commitChannelEdit(roomCode, [deleteChannelEntry(await _channelsOf(roomCode), kind, id)]);
+}
+
+/** Put a kind's channels in this order (the original always stays first). */
+export async function reorderChannels(
+  roomCode: string,
+  order: string[],
+  kind: ChannelKind = "text"
+): Promise<void> {
+  const entries = reorderChannelEntries(await _channelsOf(roomCode), kind, order);
+  if (entries.length) await _commitChannelEdit(roomCode, entries);
 }
 
 /** Tell the room its name as this device has it; see _sendRoomName. */
