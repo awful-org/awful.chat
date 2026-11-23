@@ -54,10 +54,41 @@ describe("DM receipts", () => {
 
   it("skips own messages with no status and other people's statuses", () => {
     expect(dmReceiptIds([
-      msg("mine", "me", "read"),
       msg("theirs", "them", "read"),
+      msg("mine", "me", "read"),
       msg("draft", "me"),
     ], own)).toEqual(["mine"]);
     expect(dmReceiptIds([msg("theirs", "them", "read")], own)).toEqual([]);
+  });
+
+  it("drops the receipt from what they answered: they wrote after it, so they got it", () => {
+    expect(dmReceiptIds([
+      msg("mine", "me", "read"),
+      msg("theirs", "them"),
+    ], own)).toEqual([]);
+    // A delivered one too, and a run with a different status before it.
+    expect(dmReceiptIds([
+      msg("read", "me", "read"),
+      msg("delivered", "me", "delivered"),
+      msg("theirs", "them"),
+      msg("newer", "me", "delivered"),
+    ], own)).toEqual(["newer"]);
+  });
+
+  it("keeps a receipt that says the message has not arrived, answered or not", () => {
+    // Their reply does not prove this one reached them.
+    expect(dmReceiptIds([
+      msg("stuck", "me", "sending"),
+      msg("queued", "me", "sent"),
+      msg("theirs", "them"),
+    ], own)).toEqual(["stuck", "queued"]);
+  });
+
+  it("answers only what came before their latest message", () => {
+    expect(dmReceiptIds([
+      msg("old", "me", "read"),
+      msg("theirs", "them"),
+      msg("after", "me", "read"),
+    ], own)).toEqual(["after"]);
   });
 });
