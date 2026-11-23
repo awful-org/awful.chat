@@ -17,12 +17,17 @@
   import { cubicOut } from "svelte/easing";
   import { dropIndex, moveItem, slotTop, type RowBox } from "$lib/room-order";
   import {
+    HOLD_MS,
+    HOLD_SLOP_PX,
+    RoomPictureUrls,
     badgeText,
     clampMenu,
     dmMenuActions,
     dmSections,
+    holdRelease,
     menuFocusIndex,
     moveStep,
+    pressMove,
     railPill,
     roomInitials,
     sidebarColumn,
@@ -30,6 +35,7 @@
     type DmContextAction,
     type SidebarView,
   } from "$lib/sidebar-rail";
+  import { pfpBlobURL } from "$lib/storage";
   import {
     DEFAULT_CHANNEL_ID,
     channelMoveOrder,
@@ -223,10 +229,28 @@
   let lastClientY = 0;
   let scrollFrame = 0;
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
-  /** A mouse press on a tile that may yet become a drag. */
-  let press: { code: string; pointerId: number; x: number; y: number } | null = null;
+  /**
+   * A press on a tile that may yet become a drag: a mouse or pen one past a
+   * few pixels, a finger one once it has held still (HOLD_MS).
+   */
+  let press: {
+    code: string;
+    pointerId: number;
+    x: number;
+    y: number;
+    touch: boolean;
+    el: HTMLElement;
+  } | null = null;
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A drag a held finger started: where it lifted, and whether it moved since. */
+  let held: { x: number; y: number; moved: boolean } | null = null;
   /** The click that ends a drag is not a click on the room. */
   let suppressClick = false;
+
+  function clearHold(): void {
+    if (holdTimer) clearTimeout(holdTimer);
+    holdTimer = null;
+  }
 
   // Pinned rooms sit above the rest and do not drag; every index the drag
   // code uses is into `movable`, so nothing can be dropped above a pin.
@@ -248,36 +272,81 @@
   function onTilePointerDown(e: PointerEvent, roomCode: string): void {
     suppressClick = false;
     press = null;
-    if (e.pointerType === "touch" || e.button !== 0 || drag) return;
-    press = { code: roomCode, pointerId: e.pointerId, x: e.clientX, y: e.clientY };
+    held = null;
+    clearHold();
+    if (e.button !== 0 || drag) return;
+    const touch = e.pointerType === "touch";
+    const p = {
+      code: roomCode,
+      pointerId: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      touch,
+      el: e.currentTarget as HTMLElement,
+    };
+    press = p;
+    if (!touch) return;
+    // A finger lifts the tile by holding still; a swipe (pressMove) leaves
+    // first and the rail scrolls as it always did.
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      if (press !== p) return;
+      press = null;
+      if (startRoomDrag(p.el, p.pointerId, p.code, p.y, p.y)) {
+        held = { x: p.x, y: p.y, moved: false };
+      }
+    }, HOLD_MS);
   }
 
   function onTilePointerMove(e: PointerEvent): void {
     if (drag) {
       lastClientY = e.clientY;
+      if (held && !held.moved && Math.hypot(e.clientX - held.x, e.clientY - held.y) > HOLD_SLOP_PX) {
+        held.moved = true;
+      }
       updateDrag();
       return;
     }
     const p = press;
     if (!p || e.pointerId !== p.pointerId) return;
-    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) < DRAG_SLOP_PX) return;
+    const distance = Math.hypot(e.clientX - p.x, e.clientY - p.y);
+    if (p.touch) {
+      if (pressMove(distance) === "swipe") {
+        press = null;
+        clearHold();
+      }
+      return;
+    }
+    if (distance < DRAG_SLOP_PX) return;
     press = null;
-    startRoomDrag(e, p.code, p.y);
+    startRoomDrag(e.currentTarget as HTMLElement, e.pointerId, p.code, p.y, e.clientY);
   }
 
-  function startRoomDrag(e: PointerEvent, roomCode: string, pressY: number): void {
-    if (!listEl || drag) return;
+  /** Lift a tile. False when the rail's rows could not be measured. */
+  function startRoomDrag(
+    tileEl: HTMLElement,
+    pointerId: number,
+    roomCode: string,
+    pressY: number,
+    clientY: number
+  ): boolean {
+    if (!listEl || drag) return false;
     const from = movable.findIndex((r) => r.roomCode === roomCode);
-    if (from === -1) return;
+    if (from === -1) return false;
     const listTop = listEl.getBoundingClientRect().top - listEl.scrollTop;
     rowBoxes = [...listEl.querySelectorAll<HTMLElement>("[data-drag-row]")].map((el) => {
       const r = el.getBoundingClientRect();
       return { top: r.top - listTop, height: r.height };
     });
-    if (rowBoxes.length !== movable.length) return;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    if (rowBoxes.length !== movable.length) return false;
+    try {
+      tileEl.setPointerCapture(pointerId);
+    } catch {
+      // The finger already left: there is nothing to drag.
+      return false;
+    }
     startContentY = contentY(pressY);
-    lastClientY = e.clientY;
+    lastClientY = clientY;
     const base = movable.map((r) => r.roomCode);
     drag = {
       code: roomCode,
@@ -291,6 +360,7 @@
     };
     updateDrag();
     scrollFrame = requestAnimationFrame(autoScroll);
+    return true;
   }
 
   function updateDrag(): void {
@@ -354,12 +424,49 @@
 
   function onTilePointerUp(e: PointerEvent): void {
     press = null;
+    clearHold();
+    const hold = held;
+    held = null;
     if (!drag) return;
     const tile = e.currentTarget as HTMLElement;
     if (tile.hasPointerCapture(e.pointerId)) tile.releasePointerCapture(e.pointerId);
-    suppressClick = e.type === "pointerup";
-    finishDrag(e.type === "pointerup");
+    const up = e.type === "pointerup";
+    suppressClick = up;
+    // A held tile let go where it lifted: the long press's menu, as before.
+    if (hold && up && holdRelease(hold.moved) === "menu") {
+      const code = drag.code;
+      finishDrag(false);
+      openMenuUnder(tile, { kind: "room", code });
+      return;
+    }
+    finishDrag(up);
   }
+
+  /**
+   * The platform's own long press (Android's context menu) on a tile a
+   * finger is holding: the hold already answers it - a drag, or the menu on
+   * release - so it does not open a second time underneath.
+   */
+  function onTileContextMenu(e: MouseEvent, roomCode: string, canDrag: boolean): void {
+    if (canDrag && (press?.touch || held || drag)) {
+      e.preventDefault();
+      return;
+    }
+    openMenu(e, { kind: "room", code: roomCode });
+  }
+
+  // While a finger drags a tile, the rail must not scroll under it. Only
+  // then: before the hold a swipe is a scroll, and is left alone. Not a
+  // passive listener, or preventDefault is ignored.
+  $effect(() => {
+    const el = listEl;
+    if (!el) return;
+    const onTouchMove = (e: TouchEvent) => {
+      if (held && drag) e.preventDefault();
+    };
+    el.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => el.removeEventListener("touchmove", onTouchMove);
+  });
 
   function onTileClick(code: string): void {
     if (suppressClick) {
@@ -370,10 +477,25 @@
   }
 
   function selectDms(): void {
-    onChangeView("dms");
-    // Rail only has nowhere to list the conversations: open the column.
-    if (collapsed) onToggleCollapsed?.();
+    // Collapsed, the rail lists the conversations itself, under this
+    // button; pressed again it goes back to the rooms. Neither expands the
+    // sidebar nor touches the saved collapsed setting.
+    if (collapsed) onChangeView(view === "dms" ? "rooms" : "dms");
+    else onChangeView("dms");
   }
+
+  // ── Room pictures (sidebar-rail.ts RoomPictureUrls) ───────────────────────
+
+  const pictureUrls = new RoomPictureUrls(
+    (data) => pfpBlobURL(data),
+    (url) => URL.revokeObjectURL(url)
+  );
+  /** roomCode -> the picture to draw on its tile; initials without one. */
+  let pictures = $state(new Map<string, string>());
+  $effect(() => {
+    pictures = pictureUrls.sync(rooms);
+  });
+  $effect(() => () => pictureUrls.dispose());
 
   /**
    * Arrow keys walk the rail; Alt+Arrow moves a room tile one place, the
@@ -416,6 +538,7 @@
   $effect(() => () => {
     cancelAnimationFrame(scrollFrame);
     if (settleTimer) clearTimeout(settleTimer);
+    clearHold();
   });
 
   /** Run the tooltip trigger's own handler, then ours. */
@@ -588,13 +711,36 @@
     e.preventDefault();
     e.stopPropagation();
     const el = e.currentTarget as HTMLElement;
-    const rect = el.getBoundingClientRect();
     const noPointer =
       below || (e.type === "click" && e.detail === 0) || (e.clientX === 0 && e.clientY === 0);
+    showMenu(el, target, items.length, noPointer ? null : { x: e.clientX, y: e.clientY });
+  }
+
+  /**
+   * Open a menu under a control with no event to hang it on: a tile a finger
+   * held and let go. The click the release may still produce lands on the
+   * window after this and must not close it again (keepMenuOnce).
+   */
+  function openMenuUnder(el: HTMLElement, target: MenuTarget): void {
+    const items = itemsFor(target);
+    if (items.length === 0) return;
+    keepMenuOnce = true;
+    showMenu(el, target, items.length, null);
+  }
+
+  let keepMenuOnce = false;
+
+  function showMenu(
+    el: HTMLElement,
+    target: MenuTarget,
+    count: number,
+    pointer: { x: number; y: number } | null
+  ): void {
+    const rect = el.getBoundingClientRect();
     const at = clampMenu(
-      noPointer ? rect.left : e.clientX,
-      noPointer ? rect.bottom + 4 : e.clientY,
-      { width: MENU_WIDTH, height: items.length * MENU_ITEM_PX + 8 },
+      pointer ? pointer.x : rect.left,
+      pointer ? pointer.y : rect.bottom + 4,
+      { width: MENU_WIDTH, height: count * MENU_ITEM_PX + 8 },
       { width: window.innerWidth, height: window.innerHeight }
     );
     menuOpener = el;
@@ -774,7 +920,14 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <svelte:window
-  onclick={() => closeMenu(false)}
+  onpointerdown={() => (keepMenuOnce = false)}
+  onclick={() => {
+    if (keepMenuOnce) {
+      keepMenuOnce = false;
+      return;
+    }
+    closeMenu(false);
+  }}
   onkeydown={(e) => {
     onDragKeydown(e);
     if (e.key === "Escape") closeMenu(true);
@@ -796,7 +949,7 @@
   class="flex h-dvh w-80 max-w-[calc(100vw-3rem)] shrink-0 flex-col border-r border-sidebar-border bg-sidebar
       fixed inset-y-0 left-0 z-40 transition-transform duration-200
       sm:static sm:max-w-none sm:translate-x-0 sm:z-auto sm:transition-[width] sm:duration-200
-      {collapsed ? 'sm:w-16' : 'sm:w-76'}
+      {collapsed ? 'sm:w-14' : 'sm:w-68'}
       {isOpen ? 'translate-x-0' : '-translate-x-full'}"
 >
   <div class="flex min-h-0 flex-1">
@@ -805,9 +958,9 @@
     <nav
       bind:this={railEl}
       aria-label="Rooms"
-      class="flex w-16 shrink-0 flex-col bg-background/40 select-none [-webkit-touch-callout:none] {collapsed
-        ? ''
-        : 'border-r border-sidebar-border'}"
+      class="flex shrink-0 flex-col bg-background/40 select-none [-webkit-touch-callout:none] {collapsed
+        ? 'w-14'
+        : 'w-16 border-r border-sidebar-border'}"
     >
       {#if collapsed}
         <!-- Level with the chat header (h-13 plus the safe area), as before. -->
@@ -845,7 +998,7 @@
                 ? 'h-2 group-hover:h-5'
                 : 'h-0 group-hover:h-5'}"
           ></span>
-          <Tip text="Direct messages" side="right">
+          <Tip text={collapsed && dmsSelected ? "Back to rooms" : "Direct messages"} side="right">
             {#snippet children(props)}
               <button
                 {...props}
@@ -883,6 +1036,7 @@
           {@const unread = unreadOf(code)}
           {@const live = liveRoomCodes.has(code)}
           {@const lifted = drag?.code === code}
+          {@const picture = pictures.get(code)}
           <button
             {...props}
             type="button"
@@ -890,7 +1044,7 @@
             aria-current={selected ? "true" : undefined}
             aria-keyshortcuts={canDrag ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
             onclick={chain(props, "onclick", () => onTileClick(code))}
-            oncontextmenu={(e) => openMenu(e, { kind: "room", code })}
+            oncontextmenu={(e) => onTileContextMenu(e, code, canDrag)}
             onkeydown={(e) => onRailKeydown(e, code)}
             onpointerdown={chain(props, "onpointerdown", (e: PointerEvent) => {
               if (canDrag) onTilePointerDown(e, code);
@@ -906,9 +1060,13 @@
               ? 'rounded-2xl bg-foreground text-background'
               : 'rounded-[50%] bg-sidebar-accent text-muted-foreground hover:text-foreground'} {lifted
               ? 'cursor-grabbing shadow-lg ring-1 ring-border'
-              : ''}"
+              : ''} {picture ? 'overflow-hidden' : ''}"
           >
-            <span aria-hidden="true" class="max-w-full truncate px-1">{roomInitials(room.name, room.roomCode)}</span>
+            {#if picture}
+              <GifImage src={picture} alt="" class="size-full object-cover" animate="hover" />
+            {:else}
+              <span aria-hidden="true" class="max-w-full truncate px-1">{roomInitials(room.name, room.roomCode)}</span>
+            {/if}
             <!-- The name, for screen readers and for anything that reads the
                  tile's text. -->
             <span class="sr-only">
@@ -942,6 +1100,22 @@
                 : 'h-0 group-hover:h-5'}"
           ></span>
         {/snippet}
+
+        <!-- Collapsed with direct messages selected: the conversations, as
+             the column lists them (sections, badges, menus), above the rooms. -->
+        {#if collapsed && dmsSelected}
+          {#each dmGroups as group, gi (group.title ?? "")}
+            {#if gi > 0}
+              <div class="h-px w-7 shrink-0 bg-sidebar-border" aria-hidden="true"></div>
+            {/if}
+            {#each group.entries as entry (entry.peerId)}
+              {@render dmTile(entry, group.title)}
+            {/each}
+          {/each}
+          {#if phonebook.length > 0 && rooms.length > 0}
+            <div class="h-px w-7 shrink-0 bg-sidebar-border" aria-hidden="true"></div>
+          {/if}
+        {/if}
 
         <!-- Pinned: on top, in pin order, and not draggable. -->
         {#each pinnedList as room (room.roomCode)}
@@ -1090,6 +1264,56 @@
   <CallStatus {collapsed} />
   <SidebarControls {collapsed} />
 </aside>
+
+{#snippet dmTile(entry: PhonebookEntry, section: string | null)}
+  {@const selected = activeDmPeerId === entry.peerId}
+  {@const unread = dmUnreadCounts.get(entry.peerId) ?? 0}
+  {@const color = colorForPeer(entry.peerId)}
+  {@const p = railPill(selected, unread)}
+  <div class="group relative flex w-full shrink-0 justify-center">
+    <span
+      aria-hidden="true"
+      class="pointer-events-none absolute left-0 top-1/2 w-1 -translate-y-1/2 rounded-r-full bg-foreground transition-[height] duration-150 {p ===
+      'selected'
+        ? 'h-8'
+        : p === 'unread'
+          ? 'h-2 group-hover:h-5'
+          : 'h-0 group-hover:h-5'}"
+    ></span>
+    <Tip text={entry.nickname} side="right">
+      {#snippet children(props)}
+        <button
+          {...props}
+          type="button"
+          data-rail-item
+          aria-current={selected ? "page" : undefined}
+          aria-haspopup={entry.blocked ? "menu" : undefined}
+          onclick={chain(props, "onclick", (e: MouseEvent) => selectDmEntry(e, entry))}
+          oncontextmenu={(e) => openMenu(e, { kind: "dm", peerId: entry.peerId })}
+          onkeydown={(e) => onRailKeydown(e)}
+          style={color ? `color: ${color}` : ""}
+          class="{tile} overflow-hidden bg-secondary text-secondary-foreground {selected
+            ? 'rounded-2xl'
+            : 'rounded-[50%]'} {entry.blocked ? 'opacity-60 grayscale' : ''}"
+        >
+          {#if entry.avatarUrl}
+            <GifImage src={entry.avatarUrl} alt="" class="size-full object-cover" animate="hover" />
+          {:else}
+            <span aria-hidden="true">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
+          {/if}
+          <span class="sr-only">
+            {entry.nickname}{section === "Requests" ? ", message request" : ""}{entry.blocked
+              ? ", blocked"
+              : ""}{unread > 0 ? `, ${unread} unread` : ""}
+          </span>
+        </button>
+      {/snippet}
+    </Tip>
+    {#if unread > 0}
+      <span aria-hidden="true" class={railBadge}>{badgeText(unread)}</span>
+    {/if}
+  </div>
+{/snippet}
 
 {#snippet sectionHeader(id: string, title: string, kind: ChannelKind, first: boolean)}
   <div class="flex items-center pr-1 {first ? 'pb-1.5' : 'pt-4 pb-1.5'}">
@@ -1414,10 +1638,14 @@
             class="flex h-12 w-full items-center gap-2.5 rounded-md px-2 text-left transition-colors cursor-pointer hover:bg-sidebar-accent/50 {rowFocus}"
           >
             <span
-              class="flex size-7.5 shrink-0 items-center justify-center rounded-full bg-sidebar-accent text-[11px] font-bold text-muted-foreground"
+              class="flex size-7.5 shrink-0 items-center justify-center overflow-hidden rounded-full bg-sidebar-accent text-[11px] font-bold text-muted-foreground"
               aria-hidden="true"
             >
-              {roomInitials(room.name, code)}
+              {#if pictures.get(code)}
+                <GifImage src={pictures.get(code)!} alt="" class="size-full object-cover" animate="hover" />
+              {:else}
+                {roomInitials(room.name, code)}
+              {/if}
             </span>
             <span class="flex min-w-0 flex-1 flex-col gap-0.5">
               <span

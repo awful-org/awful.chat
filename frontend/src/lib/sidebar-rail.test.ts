@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  HOLD_SLOP_PX,
+  RoomPictureUrls,
+  holdRelease,
+  pressMove,
   badgeText,
   clampMenu,
   dmMenuActions,
@@ -157,5 +161,65 @@ describe("menus", () => {
     expect(menuFocusIndex("End", 0, 3)).toBe(2);
     expect(menuFocusIndex("Tab", 0, 3)).toBeNull();
     expect(menuFocusIndex("ArrowDown", 0, 0)).toBeNull();
+  });
+});
+
+describe("holding a room tile on a touch screen", () => {
+  it("a finger that moves before the hold is a swipe, and scrolls", () => {
+    expect(pressMove(HOLD_SLOP_PX)).toBe("wait");
+    expect(pressMove(HOLD_SLOP_PX + 1)).toBe("swipe");
+  });
+
+  it("after the hold, moving drops the tile where it went, and not moving opens the menu", () => {
+    expect(holdRelease(true)).toBe("drop");
+    expect(holdRelease(false)).toBe("menu");
+  });
+});
+
+describe("room pictures on the rail", () => {
+  function setup() {
+    let n = 0;
+    const revoked: string[] = [];
+    const urls = new RoomPictureUrls(
+      () => `blob:${++n}`,
+      (url) => revoked.push(url)
+    );
+    return { urls, revoked };
+  }
+
+  it("uses an external picture as it is, and a local upload through one blob URL", () => {
+    const { urls, revoked } = setup();
+    const data = new ArrayBuffer(4);
+    const rooms = [
+      { roomCode: "a", pfpURL: "https://example.test/a.gif" },
+      { roomCode: "b", pfpData: data },
+      { roomCode: "c" },
+    ];
+    const first = urls.sync(rooms);
+    expect([...first]).toEqual([
+      ["a", "https://example.test/a.gif"],
+      ["b", "blob:1"],
+    ]);
+    // The same upload keeps its URL: nothing is made or revoked again.
+    expect(urls.sync(rooms).get("b")).toBe("blob:1");
+    expect(revoked).toEqual([]);
+  });
+
+  it("revokes the old URL when the upload changes, the room goes, or the rail is done", () => {
+    const { urls, revoked } = setup();
+    urls.sync([{ roomCode: "b", pfpData: new ArrayBuffer(1) }, { roomCode: "c", pfpData: new ArrayBuffer(1) }]);
+    expect(urls.sync([{ roomCode: "b", pfpData: new ArrayBuffer(2) }]).get("b")).toBe("blob:3");
+    expect(revoked.sort()).toEqual(["blob:1", "blob:2"]);
+    urls.dispose();
+    expect(revoked).toContain("blob:3");
+  });
+
+  it("prefers the external picture, letting go of an upload it replaced", () => {
+    const { urls, revoked } = setup();
+    urls.sync([{ roomCode: "b", pfpData: new ArrayBuffer(1) }]);
+    expect(urls.sync([{ roomCode: "b", pfpURL: "https://example.test/b.png" }]).get("b")).toBe(
+      "https://example.test/b.png"
+    );
+    expect(revoked).toEqual(["blob:1"]);
   });
 });

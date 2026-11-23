@@ -157,3 +157,88 @@ export function menuFocusIndex(key: string, current: number, count: number): num
       return null;
   }
 }
+
+// ── Touch: hold a room tile to move it ──────────────────────────────────────
+//
+// A finger on the rail scrolls it, so a touch cannot start a drag the way a
+// mouse press does. Holding still on a tile is the signal instead: a swipe
+// leaves before the hold and scrolls; a hold lifts the tile, and then moving
+// drags it and letting go without moving opens its menu - the menu a long
+// press opened before, kept on the same gesture.
+
+/**
+ * How long a finger rests on a tile before it lifts. Not a guess at when
+ * something finishes: it is what makes a press a hold, the same order as the
+ * platform's own long press, which would otherwise open the menu at once.
+ */
+export const HOLD_MS = 400;
+/** Movement within this, before the hold, is a still finger, not a swipe. */
+export const HOLD_SLOP_PX = 8;
+
+/** A move of the finger, before the tile lifted: still waiting, or a swipe. */
+export function pressMove(distance: number): "wait" | "swipe" {
+  return distance > HOLD_SLOP_PX ? "swipe" : "wait";
+}
+
+/**
+ * The finger came up after the tile lifted: a tile that went somewhere is
+ * dropped there; one that never left its place opens its menu.
+ */
+export function holdRelease(moved: boolean): "drop" | "menu" {
+  return moved ? "drop" : "menu";
+}
+
+// ── Room pictures ───────────────────────────────────────────────────────────
+
+export interface RoomPicture {
+  roomCode: string;
+  pfpURL?: string;
+  pfpData?: ArrayBuffer;
+}
+
+/**
+ * The pictures the rail shows, by room: an external pfpURL as it is, a local
+ * upload (pfpData) through a blob URL made once per upload and revoked when
+ * the picture changes, the room goes, or the rail is done. The same choice
+ * the profile picture makes (profile.svelte.ts): the URL first, else the
+ * upload.
+ */
+export class RoomPictureUrls {
+  private held = new Map<string, { data: ArrayBuffer; url: string }>();
+
+  constructor(
+    private readonly make: (data: ArrayBuffer) => string,
+    private readonly revoke: (url: string) => void
+  ) {}
+
+  sync(rooms: readonly RoomPicture[]): Map<string, string> {
+    const out = new Map<string, string>();
+    const keep = new Set<string>();
+    for (const room of rooms) {
+      if (room.pfpURL) {
+        out.set(room.roomCode, room.pfpURL);
+        continue;
+      }
+      if (!room.pfpData) continue;
+      let blob = this.held.get(room.roomCode);
+      if (!blob || blob.data !== room.pfpData) {
+        if (blob) this.revoke(blob.url);
+        blob = { data: room.pfpData, url: this.make(room.pfpData) };
+        this.held.set(room.roomCode, blob);
+      }
+      keep.add(room.roomCode);
+      out.set(room.roomCode, blob.url);
+    }
+    for (const [code, blob] of this.held) {
+      if (keep.has(code)) continue;
+      this.revoke(blob.url);
+      this.held.delete(code);
+    }
+    return out;
+  }
+
+  dispose(): void {
+    for (const blob of this.held.values()) this.revoke(blob.url);
+    this.held.clear();
+  }
+}
