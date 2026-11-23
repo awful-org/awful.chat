@@ -778,7 +778,7 @@
                 {...props}
                 type="button"
                 data-rail-item
-                aria-current={dmsSelected ? "page" : undefined}
+                aria-current={dmsSelected ? "true" : undefined}
                 onclick={chain(props, "onclick", selectDms)}
                 onkeydown={(e) => onRailKeydown(e)}
                 class="{tile} rounded-2xl {dmsSelected
@@ -814,7 +814,7 @@
             {...props}
             type="button"
             data-rail-item
-            aria-current={selected ? "page" : undefined}
+            aria-current={selected ? "true" : undefined}
             aria-keyshortcuts={canDrag ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
             onclick={chain(props, "onclick", () => onTileClick(code))}
             oncontextmenu={(e) => openMenu(e, { kind: "room", code })}
@@ -1059,7 +1059,7 @@
       }
     }}
     onblur={() => void endRename(true, false)}
-    class="h-8 max-sm:h-11 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground select-text {kind ===
+    class="h-8 max-sm:h-11 w-full rounded-md border border-input bg-background pr-2 text-sm text-foreground select-text {kind ===
     'voice'
       ? 'pl-8'
       : 'pl-7'} {rowFocus}"
