@@ -75,7 +75,9 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import CallStatus from "./CallStatus.svelte";
   import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
-  import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { displayPrefs, setSidebarWidth } from "$lib/display-prefs.svelte";
+  import SidebarResizeHandle from "./SidebarResizeHandle.svelte";
+  import { SIDEBAR_DEFAULT_PX, SIDEBAR_MIN_PX, clampSidebarWidth, sidebarMaxWidth } from "$lib/sidebar-width";
 
   interface DmPreview {
     text: string;
@@ -900,6 +902,20 @@
     renaming = null;
   });
 
+  // ── Width (sidebar-width.ts) ──────────────────────────────────────────────
+  // The expanded width on a desktop, dragged at the right edge. Drawn from
+  // the saved width clamped to this window, so a width saved on a big
+  // screen does not swallow a small one, and comes back with the big one.
+
+  let viewportWidth = $state(typeof window === "undefined" ? 0 : window.innerWidth);
+  /** While the edge is dragged: the width to draw, not yet saved. */
+  let previewWidth = $state<number | null>(null);
+  const sidebarWidth = $derived(
+    clampSidebarWidth(previewWidth ?? displayPrefs.sidebarWidth ?? SIDEBAR_DEFAULT_PX, viewportWidth)
+  );
+  /** A window too narrow for any range (a phone, a small tablet) has no handle. */
+  const resizable = $derived(!collapsed && sidebarMaxWidth(viewportWidth) > SIDEBAR_MIN_PX);
+
   // ── Shared classes ────────────────────────────────────────────────────────
 
   const focusRing =
@@ -920,6 +936,7 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <svelte:window
+  bind:innerWidth={viewportWidth}
   onpointerdown={() => (keepMenuOnce = false)}
   onclick={() => {
     if (keepMenuOnce) {
@@ -944,12 +961,16 @@
   ></div>
 {/if}
 
+<!-- sm:relative, not static: the resize handle sits on its right edge.
+     The width animates on collapse and on a key press, not under a drag. -->
 <aside
+  id="{uid}-sidebar"
   aria-label="Sidebar"
+  style="--sidebar-w: {sidebarWidth}px"
   class="flex h-dvh w-80 max-w-[calc(100vw-3rem)] shrink-0 flex-col border-r border-sidebar-border bg-sidebar
       fixed inset-y-0 left-0 z-40 transition-transform duration-200
-      sm:static sm:max-w-none sm:translate-x-0 sm:z-auto sm:transition-[width] sm:duration-200
-      {collapsed ? 'sm:w-14' : 'sm:w-68'}
+      sm:relative sm:max-w-none sm:translate-x-0 sm:z-auto {previewWidth === null ? 'sm:transition-[width] sm:duration-200' : ''}
+      {collapsed ? 'sm:w-14' : 'sm:w-(--sidebar-w)'}
       {isOpen ? 'translate-x-0' : '-translate-x-full'}"
 >
   <div class="flex min-h-0 flex-1">
@@ -1263,6 +1284,16 @@
   {/if}
   <CallStatus {collapsed} />
   <SidebarControls {collapsed} />
+
+  {#if resizable}
+    <SidebarResizeHandle
+      width={sidebarWidth}
+      {viewportWidth}
+      controls="{uid}-sidebar"
+      onpreview={(px) => (previewWidth = px)}
+      oncommit={setSidebarWidth}
+    />
+  {/if}
 </aside>
 
 {#snippet dmTile(entry: PhonebookEntry, section: string | null)}
@@ -1489,7 +1520,11 @@
             </button>
           {/if}
           {#if channel.people.length > 0}
-            <ul aria-label="In {channel.name}" class="flex flex-col">
+            <!-- Flush against the channel's row the first person read as
+                 cramped. The same 2px as between channels, between the row
+                 and its people and between them, keeps one rhythm down the
+                 section. -->
+            <ul aria-label="In {channel.name}" class="mt-0.5 flex flex-col gap-0.5">
               {#each channel.people as person (person.peerId)}
                 <li class="flex h-7 items-center gap-2 pl-8 pr-2 text-xs text-sidebar-foreground/80">
                   <span
@@ -1531,7 +1566,7 @@
   {#if phonebook.length === 0}
     <div class="flex h-full select-none flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
       <User class="size-8 opacity-50" aria-hidden="true" />
-      No DMs yet
+      <p class="whitespace-nowrap">No DMs yet</p>
     </div>
   {:else}
     {#each dmGroups as group (group.title ?? "")}
@@ -1612,15 +1647,19 @@
   {#if rooms.length === 0}
     <div class="flex h-full select-none flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
       <Hash class="size-8 opacity-50" aria-hidden="true" />
-      No rooms yet
+      <p class="whitespace-nowrap">No rooms yet</p>
       {#if onOpenCreateJoin}
+        <!-- Short enough for one line in the narrowest column (208px), so the
+             icon and the label stay one centred unit. The name keeps the
+             visible words and says what is created or joined. -->
         <button
           type="button"
           onclick={onOpenCreateJoin}
-          class="inline-flex h-9 max-sm:h-11 items-center gap-2 rounded-md border border-sidebar-border px-3 text-sm text-foreground hover:bg-sidebar-accent cursor-pointer {focusRing}"
+          aria-label="Create or join a room"
+          class="inline-flex h-9 max-sm:h-11 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-sidebar-border px-3 text-sm text-foreground hover:bg-sidebar-accent cursor-pointer {focusRing}"
         >
-          <Plus class="size-4" aria-hidden="true" />
-          Create or join a room
+          <Plus class="size-4 shrink-0" aria-hidden="true" />
+          Create or join
         </button>
       {/if}
     </div>
