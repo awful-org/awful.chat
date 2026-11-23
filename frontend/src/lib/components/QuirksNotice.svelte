@@ -60,7 +60,7 @@
     {
       icon: Hash,
       title: "A short code invites; the permanent link is the key",
-      body: "A short code lets in the number of people you choose, for up to 10 minutes, and only while your app is open: it is the careful way to invite someone. The room's permanent link never expires - anyone holding it can join, now or later, including anyone it is forwarded to. Either way, whoever gets in holds the room like any member and can invite others too. There are no roles, bans or moderation tools yet.",
+      body: "A short code lets in the number of people you choose, for up to 30 minutes, and only while your app is open: it is the careful way to invite someone. The room's permanent link never expires - anyone holding it can join, now or later, including anyone it is forwarded to. Either way, whoever gets in holds the room like any member and can invite others too. There are no roles, bans or moderation tools yet.",
     },
     {
       icon: FileDown,

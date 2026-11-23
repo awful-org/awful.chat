@@ -1,3 +1,4 @@
+import { forgetParkedRooms } from "$lib/room-location";
 import {
   Camera,
   CameraOff,
@@ -426,6 +427,7 @@ export const actionCommands: CmdSource = () => {
             console.warn("wipe local database failed", err);
             return;
           }
+          forgetParkedRooms();
           window.location.reload();
         },
       }),

@@ -1,4 +1,4 @@
-import { parseSecureInvitation } from "./room-security/invitation-format";
+import { findInvitation, parseSecureInvitation } from "./room-security/invitation-format";
 // Not invitation-pairing.ts: reading a code must not load the pairing's
 // cryptography, and an invite link is read before this device has an identity.
 import { parsePairingCode, formatPairingCode } from "./room-security/pairing-code";
@@ -13,11 +13,13 @@ export type JoinInput =
  * Fragment only, like a full invitation: a live code has no business in a path
  * that reaches server logs.
  */
-const SHORT_LINK_RE = /^(?:(?:[a-z][a-z0-9+.-]*:\/\/)?[^/?#\s]+)?\/r\/#([^/?#]+)$/i;
+const SHORT_LINK_RE = /^(?:(?:[a-z][a-z0-9+.-]*:\/\/)?[^/?#\s]+)?\/r\/?(?:\?[^#\s]*)?#([^/?#]+)$/i;
 
 /** All invitation entry points reject public IDs and retired plaintext aliases. */
 export function parseJoinInput(input: string): JoinInput {
   try { return { kind: "room", code: parseSecureInvitation(input) }; } catch { /* Try online pairing. */ }
+  const inText = findInvitation(input);
+  if (inText) return { kind: "room", code: inText };
   const link = SHORT_LINK_RE.exec(input.trim());
   const pair = parsePairingCode(link ? link[1] : input);
   return pair ? { kind: "pairing", code: formatPairingCode(pair.locator, pair.password) } : { kind: "invalid" };

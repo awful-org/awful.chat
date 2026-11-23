@@ -1023,7 +1023,7 @@ short: six characters, a 2-character public locator and a 4-character
        secret over OPAQUE through the relay's /invite mailbox, with an
        ML-KEM-768 secret alongside - see room-security/invitation-pairing.ts.
        The inviter chooses how many people it lets in (1-25) and how long it
-       lives (1, 5 or 10 minutes); it allows one start per person plus four
+       lives (1, 5, 10 or 30 minutes); it allows one start per person plus four
        for mistyped tries, the relay holds it to the same limits
        (relay/pairing.go), and it closes after the last person. The
        inviter's app answers each pairing, so it must stay open while the

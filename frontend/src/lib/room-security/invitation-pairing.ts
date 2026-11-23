@@ -35,7 +35,7 @@ function loadOpaque(): Promise<typeof Opaque> {
 export const PAIRING_TTL = 300_000;
 /** A code's lifetime, chosen by the inviter within these bounds (the relay holds the same). */
 export const PAIRING_MIN_TTL = 60_000;
-export const PAIRING_MAX_TTL = 600_000;
+export const PAIRING_MAX_TTL = 1_800_000;
 /** How many people one code may let in. */
 export const PAIRING_MAX_USES = 25;
 /**

@@ -43,7 +43,7 @@
     },
     {
       q: "How do I invite people to a room?",
-      a: "Give them a short code. You choose how many people it lets in, up to 25, and how long it lasts, up to 10 minutes; they type it, open it as a link or scan its QR, and it stops working once they are in or the time runs out. Your app hands the room over, so it only works while you have the app open. Each room also has a permanent link, which never expires and lets in anyone who has it, including whoever it gets forwarded to: share that one only with people you would hand a key to.",
+      a: "Give them a short code. You choose how many people it lets in, up to 25, and how long it lasts, up to 30 minutes; they type it, open it as a link or scan its QR, and it stops working once they are in or the time runs out. Your app hands the room over, so it only works while you have the app open. Each room also has a permanent link, which never expires and lets in anyone who has it, including whoever it gets forwarded to: share that one only with people you would hand a key to.",
     },
     {
       q: "Can I host it myself?",

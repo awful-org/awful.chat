@@ -88,8 +88,10 @@ export function parseRoomCode(text: string): string | null {
   try {
     return parseSecureInvitation(trimmed);
   } catch {
-    // Try legacy formats below.
+    // Try the forms below.
   }
+  const inText = findInvitation(trimmed);
+  if (inText) return inText;
 
   const candidates = [trimmed];
   const afterPath = trimmed.split("/r/")[1];
@@ -109,4 +111,4 @@ export function parseRoomCode(text: string): string | null {
   }
   return null;
 }
-import { parseSecureInvitation } from "$lib/room-security/invitation-format";
+import { findInvitation, parseSecureInvitation } from "$lib/room-security/invitation-format";

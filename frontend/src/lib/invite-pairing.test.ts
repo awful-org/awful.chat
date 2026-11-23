@@ -117,3 +117,74 @@ it("does not contact the relay for an already cancelled join", async () => {
   await expect(joinInvitationPairing("1234-5678 ABCD-EFGH", controller.signal)).rejects.toThrow();
   expect(spy).not.toHaveBeenCalled();
 });
+
+it("keeps a code open through requests lost on the way, and sends a lost answer again", async () => {
+  const relay = mailbox();
+  const real = relay.fetchSpy.getMockImplementation()!;
+  let polls = 0;
+  let transfers = 0;
+  relay.fetchSpy.mockImplementation(async (url, options) => {
+    const b = JSON.parse(options!.body as string);
+    if (b.action === "host-poll" && ++polls <= 3) {
+      if (polls === 1) throw new TypeError("Failed to fetch");
+      if (polls === 2) throw new DOMException("timed out", "TimeoutError");
+      return new Response("{}", { status: 502 });
+    }
+    if (b.action === "reply" && b.kind === "transfer" && ++transfers === 1) {
+      // Arrived; only the relay's word that it did was lost.
+      await real(url, options);
+      throw new TypeError("Failed to fetch");
+    }
+    if (b.action === "reply" && b.kind === "transfer") return new Response("{}", { status: 409 });
+    return real(url, options);
+  });
+  const status = vi.fn();
+  const secret = newRoomSecret();
+  const pair = await hostInvitationPairing(secret, status);
+  try {
+    expect(await joinInvitationPairing(pair.code, new AbortController().signal)).toBe(secret);
+    await vi.waitFor(() => expect(status).toHaveBeenCalledWith("Invitation delivered. This code is now used."), 5000);
+    expect(transfers).toBe(2);
+  } finally { pair.cancel(); }
+}, 30000);
+
+it("ends a code the relay no longer knows", async () => {
+  const relay = mailbox();
+  const real = relay.fetchSpy.getMockImplementation()!;
+  relay.fetchSpy.mockImplementation(async (url, options) => {
+    if (JSON.parse(options!.body as string).action === "host-poll") return new Response("{}", { status: 403 });
+    return real(url, options);
+  });
+  const status = vi.fn();
+  const pair = await hostInvitationPairing(newRoomSecret(), status);
+  try {
+    await vi.waitFor(() => expect(status).toHaveBeenCalledWith("Pairing stopped. Generate a new code."), 5000);
+  } finally { pair.cancel(); }
+}, 15000);
+
+it("asks for up to half an hour", async () => {
+  const relay = mailbox();
+  const pair = await hostInvitationPairing(newRoomSecret(), vi.fn(), undefined, { ttlMs: 30 * 60_000 });
+  try {
+    expect(relay.requests.find((r) => r.body.action === "create")!.body.ttl).toBe(1800);
+    expect(pair.expiresAt - Date.now()).toBeGreaterThan(29 * 60_000);
+  } finally { pair.cancel(); }
+}, 15000);
+
+it("ends the code at the relay when the page goes away, and not when it is only hidden", async () => {
+  const relay = mailbox();
+  const page = new EventTarget();
+  vi.stubGlobal("addEventListener", page.addEventListener.bind(page));
+  vi.stubGlobal("removeEventListener", page.removeEventListener.bind(page));
+  try {
+    const pair = await hostInvitationPairing(newRoomSecret(), vi.fn());
+    const ended = () => relay.requests.some((r) => r.body.action === "cancel");
+    page.dispatchEvent(Object.assign(new Event("pagehide"), { persisted: true }));
+    expect(ended()).toBe(false);
+    page.dispatchEvent(Object.assign(new Event("pagehide"), { persisted: false }));
+    expect(ended()).toBe(true);
+    const sent = relay.fetchSpy.mock.calls.find(([, o]) => String(o?.body).includes('"cancel"'))!;
+    expect(sent[1]?.keepalive).toBe(true);
+    pair.cancel();
+  } finally { vi.unstubAllGlobals(); }
+}, 15000);
