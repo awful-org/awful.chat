@@ -4,7 +4,9 @@ import {
   UNLISTED_VOICE_NAME,
   buildTextChannels,
   buildVoiceChannels,
+  channelDropOrder,
   channelMoveOrder,
+  draggableChannelIds,
   onScreenRoomUnread,
   roomHasChannelsToPick,
   roomsWithCalls,
@@ -161,5 +163,36 @@ describe("rooms with a call going on", () => {
     const live = roomsWithCalls(new Map([["a", "r1"], ["b", "r1"], ["c", "r2"]]), "r3");
     expect([...live].sort()).toEqual(["r1", "r2", "r3"]);
     expect([...roomsWithCalls(new Map(), null)]).toEqual([]);
+  });
+});
+
+describe("dragging a channel", () => {
+  const ids = ["", "a", "b", "c"];
+
+  it("lifts every channel but the original", () => {
+    expect(draggableChannelIds(ids)).toEqual(["a", "b", "c"]);
+    expect(draggableChannelIds([""])).toEqual([]);
+  });
+
+  it("drops a channel at its new place, the original left out of the order", () => {
+    expect(channelDropOrder(ids, "a", 2)).toEqual(["b", "c", "a"]);
+    expect(channelDropOrder(ids, "c", 0)).toEqual(["c", "a", "b"]);
+    expect(channelDropOrder(ids, "b", 1)).toBeNull();
+  });
+
+  it("never lands above the original, nor past the end", () => {
+    expect(channelDropOrder(ids, "b", -4)).toEqual(["b", "a", "c"]);
+    expect(channelDropOrder(ids, "a", 9)).toEqual(["b", "c", "a"]);
+  });
+
+  it("does not move the original or a channel the list does not hold", () => {
+    expect(channelDropOrder(ids, "", 2)).toBeNull();
+    expect(channelDropOrder(ids, "zz", 0)).toBeNull();
+    expect(channelDropOrder(ids, "a", 1.5)).toBeNull();
+  });
+
+  it("agrees with the keyboard's one-step move", () => {
+    expect(channelDropOrder(ids, "b", 0)).toEqual(channelMoveOrder(ids, "b", -1));
+    expect(channelDropOrder(ids, "b", 2)).toEqual(channelMoveOrder(ids, "b", 1));
   });
 });

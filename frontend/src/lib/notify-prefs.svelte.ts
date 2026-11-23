@@ -47,12 +47,42 @@ export function getRoomNotifyMode(roomCode: string): RoomNotifyMode {
   return prefs.modes[hashRef(roomCode)] ?? "all";
 }
 
-export function setRoomNotifyMode(roomCode: string, mode: RoomNotifyMode): void {
+/**
+ * Set how loud a room may be.
+ *
+ * Muting a room is "no sound from this room", so it also takes back the
+ * louder modes its channels kept from before (`channels`: the room's channel
+ * ids): a channel set to "all messages" while the room was loud would
+ * otherwise go on beeping in a room the user has just muted. Those channels
+ * follow the room again; one that should stay loud is unmuted again from its
+ * own menu, after this, and then keeps that.
+ */
+export function setRoomNotifyMode(
+  roomCode: string,
+  mode: RoomNotifyMode,
+  channels: readonly string[] = []
+): void {
   const ref = hashRef(roomCode);
   if (mode === "all") delete prefs.modes[ref];
   else prefs.modes[ref] = mode;
   try {
     localStorage.setItem(KEY, JSON.stringify(prefs.modes));
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+  if (mode !== "muted") return;
+  let dropped = false;
+  for (const channel of channels) {
+    if (!channel) continue;
+    const cref = channelRef(roomCode, channel);
+    const own = channelPrefs.modes[cref];
+    if (own === undefined || own === "muted") continue;
+    delete channelPrefs.modes[cref];
+    dropped = true;
+  }
+  if (!dropped) return;
+  try {
+    localStorage.setItem(CHANNEL_KEY, JSON.stringify(channelPrefs.modes));
   } catch {
     // Storage blocked: the choice just does not survive a reload.
   }

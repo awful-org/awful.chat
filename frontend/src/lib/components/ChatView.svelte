@@ -33,6 +33,8 @@
     FileText,
     ArrowDown,
     UserPlus,
+    Pencil,
+    UserRound,
     UserRoundMinus,
     Trash2,
     Angry,
@@ -90,6 +92,7 @@
   import { canOpenMessageMenu, getCopyableMessageText } from "$lib/message-context-menu";
   import MentionInput from "./MentionInput.svelte";
   import UserListSidebar from "./UserListSidebar.svelte";
+  import { SELF_MENU, profileScopeFor, type SelfMenuAction } from "$lib/self-menu";
   import { profileStore, getScopedProfile, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs, setCallChatWidth } from "$lib/display-prefs.svelte";
   import { resolveSplit } from "$lib/call-split";
@@ -274,7 +277,7 @@
    */
   const channel = $derived(roomCode.startsWith("dm-") ? "" : currentChannel(roomCode));
   const textChannels = $derived(roomCode.startsWith("dm-") ? [] : roomChannels(roomCode, "text"));
-  /** "# name" in the header, once the room has more than its original chat. */
+  /** "#name" in the header, once the room has more than its original chat. */
   const heading = $derived(channelHeading(textChannels, channel));
 
   // Reset scroll state when the room or its channel changes
@@ -539,6 +542,8 @@
     senderId: string;
     x: number;
     y: number;
+    /** Your own message: the menu is your own (self-menu.ts). */
+    own?: Message;
   } | null>(null);
   /** Who the author menu acts on; offline authors too, by DID. */
   const userMenuContact = $derived(
@@ -1804,7 +1809,7 @@
   const notifyText = $derived(notifyLabel(notifyMode, notifyChannel));
   function cycleNotify(): void {
     const next = NOTIFY_NEXT[notifyMode];
-    if (!channel) setRoomNotifyMode(roomCode, next);
+    if (!channel) setRoomNotifyMode(roomCode, next, textChannels.map((c) => c.id));
     else setChannelNotifyMode(roomCode, channel, channelModeToStore(next, getRoomNotifyMode(roomCode)));
   }
 
@@ -2372,11 +2377,24 @@
   }
 
   function openUserMenuFromMessage(msg: Message, e: MouseEvent): void {
-    if (isSelfSender(msg.senderId)) return;
     e.stopPropagation();
-    const peerId = peerIdForSender(msg.senderId);
     const pos = clampMenu(e.clientX, e.clientY);
+    if (isSelfSender(msg.senderId)) {
+      userMenu = { peerId: null, senderId: msg.senderId, x: pos.x, y: pos.y, own: msg };
+      return;
+    }
+    const peerId = peerIdForSender(msg.senderId);
     userMenu = { peerId, senderId: msg.senderId, x: pos.x, y: pos.y };
+  }
+
+  function runSelfAction(action: SelfMenuAction, msg: Message): void {
+    closeUserMenu();
+    if (action === "profile") openProfileFromMessage(msg);
+    else if (action === "edit") openSettings("profile", profileScopeFor(roomCode));
+    else
+      void navigator.clipboard?.writeText(selfId()).catch(() => {
+        // Clipboard blocked: the ID is on the profile card to select by hand.
+      });
   }
 
   function clampMenu(x: number, y: number): { x: number; y: number } {
@@ -2748,7 +2766,9 @@
         </h1>
         {#if heading}
           <span class="select-text min-w-0 truncate text-sm text-muted-foreground">
-            <span aria-hidden="true">#</span><span class="sr-only">channel</span> {heading}
+            <!-- "#general" is one token, as everywhere else the app writes
+                 a channel's name in text. -->
+            <span class="sr-only">channel </span><span aria-hidden="true">#</span>{heading}
           </span>
         {/if}
         {#if !isDmChat}
@@ -3447,6 +3467,10 @@
                             role="button"
                             tabindex="0"
                             onclick={() => openProfileFromMessage(msg)}
+                            oncontextmenu={(e) => {
+                              e.preventDefault();
+                              openUserMenuFromMessage(msg, e);
+                            }}
                             onkeydown={(e) => {
                               if (e.key === "Enter") openProfileFromMessage(msg);
                             }}
@@ -4211,8 +4235,22 @@
     onclick={(e) => e.stopPropagation()}
     oncontextmenu={(e) => e.preventDefault()}
   >
+    {#if userMenu.own}
+      {@const own = userMenu.own}
+      {#each SELF_MENU as item (item.action)}
+        {@const Icon = item.action === "profile" ? UserRound : item.action === "edit" ? Pencil : Copy}
+        <button
+          type="button"
+          class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
+          onclick={() => runSelfAction(item.action, own)}
+        >
+          <Icon class="size-4" />
+          {item.label}
+        </button>
+      {/each}
+    {/if}
     <!-- Offline authors too: their DID opens the DM and keys the contact. -->
-    {#if userMenuContact}
+    {#if userMenuContact && !userMenu.own}
       {@const contact = userMenuContact}
       <button
         type="button"
@@ -4242,7 +4280,7 @@
         </button>
       {/if}
     {/if}
-    {#if senderDid(userMenu.senderId).startsWith("did:")}
+    {#if !userMenu.own && senderDid(userMenu.senderId).startsWith("did:")}
       {@const blocked = isBlockedDid(senderDid(userMenu.senderId))}
       {@const sender = userMenu.senderId}
       <Tip

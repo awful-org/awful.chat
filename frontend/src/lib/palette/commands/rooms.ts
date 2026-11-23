@@ -14,7 +14,7 @@ import {
   Trash2,
   Users,
 } from "@lucide/svelte";
-import { roomsStore, toggleRoomPin } from "$lib/rooms.svelte";
+import { roomChannels, roomsStore, toggleRoomPin } from "$lib/rooms.svelte";
 import { uiState } from "$lib/ui-state.svelte";
 import { savedRoomInvitationLink } from "$lib/room-security/invitations";
 import {
@@ -263,7 +263,12 @@ export const roomCommands: CmdSource = (host) => {
               badge: m === mode ? "Current" : undefined,
               action: {
                 kind: "act" as const,
-                perform: () => setRoomNotifyMode(activeCode, m),
+                perform: () =>
+                  setRoomNotifyMode(
+                    activeCode,
+                    m,
+                    roomChannels(activeCode, "text").map((c) => c.id)
+                  ),
               },
             })),
         }),

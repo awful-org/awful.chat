@@ -14,7 +14,7 @@ export type { RoomNotifyMode };
 // ── The channel on screen ───────────────────────────────────────────────────
 
 /**
- * The channel name the chat header shows beside the room's ("# name"), or
+ * The channel name the chat header shows beside the room's ("#name"), or
  * null to show the room's name alone: a room with only its original chat
  * looks as it did before channels.
  */

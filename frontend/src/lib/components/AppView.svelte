@@ -66,6 +66,8 @@
     getChannelNotifyMode,
     getRoomNotifyMode,
     setChannelNotifyMode,
+    setRoomNotifyMode,
+    type RoomNotifyMode,
   } from "$lib/notify-prefs.svelte";
   import {
     roomsStore,
@@ -452,6 +454,15 @@
     joinCall(channel).catch((err) => console.warn("[call] join failed:", err));
   }
 
+  /** A room's mode for its rail menu and tile; null for one that has none. */
+  function sidebarRoomNotifyMode(code: string): RoomNotifyMode | null {
+    return isLegacyArchive(code) ? null : getRoomNotifyMode(code);
+  }
+
+  function setRoomFromSidebar(code: string, mode: RoomNotifyMode): void {
+    setRoomNotifyMode(code, mode, roomChannels(code, "text").map((c) => c.id));
+  }
+
   const sidebarChannels = $derived.by((): SidebarChannels | null => {
     const code = activeRoomCode;
     if (!code || !orderedRooms.some((r) => r.roomCode === code)) return null;
@@ -484,6 +495,7 @@
         m.self
           ? {
               peerId: selfSpeakerId,
+              self: true,
               name: self.nickname || "You",
               avatarUrl: self.avatarUrl ?? null,
               speaking: speakers.speaking.has(selfSpeakerId),
@@ -509,7 +521,12 @@
     };
     if (!isLegacyArchive(code)) {
       channels.roomNotifyMode = getRoomNotifyMode(code);
-      channels.onSetNotify = (id, mode) => setChannelNotifyMode(code, id, mode);
+      channels.onSetNotify = (id, mode) => {
+        // The original chat's mode is the room's: set it as the room's, so
+        // muting it also quiets the channels that kept a louder mode.
+        if (id === DEFAULT_CHANNEL_ID) setRoomFromSidebar(code, mode ?? "all");
+        else setChannelNotifyMode(code, id, mode);
+      };
     }
     if (manage) {
       channels.onCreateChannel = (kind, name) => {
@@ -1473,13 +1490,13 @@
   });
 
   /** Block or unblock from a conversation's menu in the DM list. */
-  async function handleSetBlocked(peerId: string, block: boolean) {
+  async function handleSetBlocked(peerId: string, block: boolean, shownName?: string) {
     try {
       if (!block) {
         await unblockPerson(peerIdToDid(peerId));
         return;
       }
-      const name = dmEntries.find((e) => e.peerId === peerId)?.nickname ?? "";
+      const name = dmEntries.find((e) => e.peerId === peerId)?.nickname ?? shownName ?? "";
       await blockPerson(peerId, name);
     } catch (err) {
       console.warn("[block] could not change the block:", err);
@@ -1775,6 +1792,8 @@
         rooms={orderedRooms}
         onReorderRooms={(order) => void setRoomOrder(order)}
         onTogglePin={(code) => void toggleRoomPin(code)}
+        roomNotifyMode={sidebarRoomNotifyMode}
+        onSetRoomNotify={setRoomFromSidebar}
         phonebook={dmEntries}
         {dmPreviews}
         dmUnreadCounts={dmUnreadByPeer}

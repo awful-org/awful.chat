@@ -75,9 +75,20 @@ export interface DmListEntry {
   inPhonebook?: boolean;
 }
 
+/** Which group of the DM list: also what its folded state is stored under. */
+export type DmSectionKey = "messages" | "requests" | "blocked";
+
+export const DM_SECTION_KEYS: readonly DmSectionKey[] = ["messages", "requests", "blocked"];
+
 export interface DmSection<T> {
-  /** null for the accepted conversations, which carry no heading. */
-  title: null | "Requests" | "Blocked";
+  key: DmSectionKey;
+  /**
+   * The heading. The accepted conversations carry one ("Messages") only
+   * while another group is listed: alone they are the whole list, and a
+   * heading over everything says nothing - nor is there anything to fold
+   * them away from. Null means no heading, and no folding.
+   */
+  title: null | "Messages" | "Requests" | "Blocked";
   entries: T[];
 }
 
@@ -87,11 +98,71 @@ export interface DmSection<T> {
  */
 export function dmSections<T extends DmListEntry>(entries: readonly T[]): DmSection<T>[] {
   const sections: DmSection<T>[] = [
-    { title: null, entries: entries.filter((e) => !e.request && !e.blocked) },
-    { title: "Requests", entries: entries.filter((e) => e.request && !e.blocked) },
-    { title: "Blocked", entries: entries.filter((e) => e.blocked) },
+    { key: "messages", title: null, entries: entries.filter((e) => !e.request && !e.blocked) },
+    { key: "requests", title: "Requests", entries: entries.filter((e) => e.request && !e.blocked) },
+    { key: "blocked", title: "Blocked", entries: entries.filter((e) => e.blocked) },
   ];
-  return sections.filter((s) => s.entries.length > 0);
+  const listed = sections.filter((s) => s.entries.length > 0);
+  if (listed.length > 1 && listed[0].key === "messages") listed[0].title = "Messages";
+  return listed;
+}
+
+/** A section is folded only when it has a heading to unfold it from. */
+export function dmSectionFolded(
+  section: DmSection<unknown>,
+  folded: readonly DmSectionKey[]
+): boolean {
+  return section.title !== null && folded.includes(section.key);
+}
+
+/**
+ * The rows a section shows. Folded, it keeps the conversation on screen
+ * (if it is in there): folding a heading should not take away the row you
+ * are reading, and the selection would otherwise point at nothing.
+ */
+export function dmSectionRows<T extends { peerId: string }>(
+  section: DmSection<T>,
+  folded: boolean,
+  activePeerId: string | null
+): T[] {
+  if (!folded) return section.entries;
+  return section.entries.filter((e) => e.peerId === activePeerId);
+}
+
+/**
+ * What a folded heading says about what it hides: how many conversations,
+ * and how many unread messages among them, so nothing is hidden in silence.
+ */
+export function dmSectionSummary(
+  entries: readonly { peerId: string }[],
+  unreadOf: (peerId: string) => number
+): { count: number; unread: number } {
+  let unread = 0;
+  for (const e of entries) unread += Math.max(0, unreadOf(e.peerId) || 0);
+  return { count: entries.length, unread };
+}
+
+/**
+ * The folded sections as stored on this device: a JSON list of section keys.
+ * Anything else (an old shape, a hand edit, a key a later build dropped) is
+ * left out rather than trusted, and a broken value folds nothing.
+ */
+export function parseFoldedDmSections(raw: string | null): DmSectionKey[] {
+  if (!raw) return [];
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(value)) return [];
+  return DM_SECTION_KEYS.filter((k) => value.includes(k));
+}
+
+/** Fold an open section or open a folded one; the list stays in a fixed order. */
+export function toggleDmSection(folded: readonly DmSectionKey[], key: DmSectionKey): DmSectionKey[] {
+  const on = !folded.includes(key);
+  return DM_SECTION_KEYS.filter((k) => (k === key ? on : folded.includes(k)));
 }
 
 export type DmContextAction =

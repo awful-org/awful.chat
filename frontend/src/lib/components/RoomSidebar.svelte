@@ -23,7 +23,12 @@
     badgeText,
     clampMenu,
     dmMenuActions,
+    dmSectionFolded,
+    dmSectionRows,
+    dmSectionSummary,
     dmSections,
+    toggleDmSection,
+    type DmSectionKey,
     holdRelease,
     menuFocusIndex,
     moveStep,
@@ -38,12 +43,15 @@
   import { pfpBlobURL } from "$lib/storage";
   import {
     DEFAULT_CHANNEL_ID,
+    channelDropOrder,
     channelMoveOrder,
+    draggableChannelIds,
     onScreenRoomUnread,
     type ChannelKind,
     type SidebarChannels,
+    type SidebarVoicePerson,
   } from "$lib/sidebar-channels";
-  import { notifyMenuItems } from "$lib/channel-ui";
+  import { notifyMenuItems, type NotifyMenuItem, type RoomNotifyMode } from "$lib/channel-ui";
   import { MAX_CHANNEL_NAME } from "$lib/channels";
   import {
     ArrowDown,
@@ -54,6 +62,7 @@
     BellOff,
     ChevronDown,
     CircleCheck,
+    Copy,
     Hash,
     MessageCircle,
     MicOff,
@@ -66,6 +75,7 @@
     Trash2,
     Undo2,
     User,
+    UserRound,
     Users,
     Volume2,
   } from "@lucide/svelte";
@@ -73,9 +83,20 @@
   import PluginWidgetSlots from "./PluginWidgetSlots.svelte";
   import GifImage from "./GifImage.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
+  import { isMenuKey, longPress } from "$lib/actions/long-press";
+  import { SELF_MENU, profileScopeFor, type SelfMenuAction } from "$lib/self-menu";
+  import { openSettings } from "$lib/ui-state.svelte";
+  import UserProfileCard from "./UserProfileCard.svelte";
+  import { isBlockedDid } from "$lib/blocks.svelte";
+  import { isInPhonebook } from "$lib/transport/dm.svelte";
   import CallStatus from "./CallStatus.svelte";
-  import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
-  import { displayPrefs, setSidebarCollapsed, setSidebarWidth } from "$lib/display-prefs.svelte";
+  import { transportState, peerIdToDid, selfId } from "$lib/transport/transport.svelte";
+  import {
+    displayPrefs,
+    setFoldedDmSections,
+    setSidebarCollapsed,
+    setSidebarWidth,
+  } from "$lib/display-prefs.svelte";
   import SidebarResizeHandle from "./SidebarResizeHandle.svelte";
   import {
     SIDEBAR_DEFAULT_PX,
@@ -132,14 +153,24 @@
     onAddToPhonebook: (peerId: string) => void;
     onRemoveFromPhonebook: (peerId: string) => void;
     onRemoveDmConversation: (peerId: string) => void;
-    /** Block (true) or unblock (false) the person a conversation is with. */
-    onSetBlocked: (peerId: string, blocked: boolean) => void;
+    /**
+     * Block (true) or unblock (false) a person: the one a conversation is
+     * with, or one listed in a call. `name` is theirs as shown, kept with a
+     * block (blocks.svelte.ts) for somebody with no conversation to name them.
+     */
+    onSetBlocked: (peerId: string, blocked: boolean, name?: string) => void;
     dmContextActions?: DmContextAction[];
     onRemoveRoom: (code: string) => void;
     /** Pin or unpin. `rooms` already lists the pinned (pinnedAt) first. */
     onTogglePin: (code: string) => void;
     /** The full room order after a drag or keyboard move, as roomCodes. */
     onReorderRooms: (order: string[]) => void;
+    /**
+     * How loud a room is (notify-prefs.svelte.ts), for its menu and its tile;
+     * null for a room with no setting of its own (a legacy archive).
+     */
+    roomNotifyMode?: (code: string) => RoomNotifyMode | null;
+    onSetRoomNotify?: (code: string, mode: RoomNotifyMode) => void;
     onOpenCreateJoin?: () => void;
     onOpenPhonebook?: () => void;
   }
@@ -174,6 +205,8 @@
     onRemoveRoom,
     onTogglePin,
     onReorderRooms,
+    roomNotifyMode,
+    onSetRoomNotify,
     onOpenCreateJoin,
     onOpenPhonebook,
   }: Props = $props();
@@ -198,33 +231,44 @@
 
   function roomTip(room: Room): string {
     const pinned = room.pinnedAt != null ? " · pinned" : "";
-    return `${roomName(room)} · ${timeAgo(roomActivity.get(room.roomCode) ?? room.createdAt)}${pinned}`;
+    const muted = roomMuted(room.roomCode) ? " · muted" : "";
+    return `${roomName(room)} · ${timeAgo(roomActivity.get(room.roomCode) ?? room.createdAt)}${pinned}${muted}`;
   }
 
-  // ── Rail order: pinned first, then the rest, which drag ───────────────────
+  // ── Drag to reorder: rooms on the rail, channels in the column ────────────
 
-  // Drag-to-reorder on the rail, mouse and pen. The lifted tile follows the
-  // pointer while the others slide aside (animate:flip on a PREVIEW order);
-  // the order is committed once, on drop. A press only becomes a drag past a
-  // few pixels, so a click still opens the room. Pointer capture keeps the
+  // Drag-to-reorder, mouse and pen. The lifted row follows the pointer while
+  // the others slide aside (animate:flip on a PREVIEW order); the order is
+  // committed once, on drop. A press only becomes a drag past a few pixels,
+  // so a click still opens the room or the channel. Pointer capture keeps the
   // move/up events coming wherever the pointer goes, and the keyed {#each}
-  // keeps the tile the same element as it moves, so capture survives. Touch
-  // scrolls the rail instead; there, and from the keyboard, the room menu's
-  // Move up / Move down and Alt+Arrow do the same.
+  // keeps the row the same element as it moves, so capture survives. A
+  // finger holds still first (HOLD_MS) and a swipe scrolls as before; from
+  // the keyboard, the menus' Move up / Move down and Alt+Arrow do the same.
+  //
+  // One machine for three lists - the rail's rooms, a room's text channels
+  // and its voice channels - so they feel the same: a drag lives in one list,
+  // measures that list's rows and scrolls that list's scroller.
   const SETTLE_MS = 180;
   const EDGE_PX = 40;
   const FLIP_MS = 180;
   const DRAG_SLOP_PX = 4;
 
+  type DragList = "rooms" | ChannelKind;
+
   let railEl = $state<HTMLElement | null>(null);
   let listEl = $state<HTMLDivElement | null>(null);
+  /** The column's scroller, which a channel drag scrolls. */
+  let columnScrollEl = $state<HTMLDivElement | null>(null);
   let drag = $state<{
-    code: string;
+    list: DragList;
+    /** The room code, or the channel id, being dragged. */
+    id: string;
     /** The order when the drag began; `from`/`to` index into it. */
     base: string[];
     from: number;
     to: number;
-    /** Pixels from the tile's current slot to where it is drawn. */
+    /** Pixels from the row's current slot to where it is drawn. */
     dy: number;
     order: string[];
     /** Released: the pointer no longer moves it. */
@@ -240,11 +284,12 @@
   let scrollFrame = 0;
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
   /**
-   * A press on a tile that may yet become a drag: a mouse or pen one past a
+   * A press on a row that may yet become a drag: a mouse or pen one past a
    * few pixels, a finger one once it has held still (HOLD_MS).
    */
   let press: {
-    code: string;
+    list: DragList;
+    id: string;
     pointerId: number;
     x: number;
     y: number;
@@ -254,7 +299,7 @@
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
   /** A drag a held finger started: where it lifted, and whether it moved since. */
   let held: { x: number; y: number; moved: boolean } | null = null;
-  /** The click that ends a drag is not a click on the room. */
+  /** The click that ends a drag is not a click on the room or channel. */
   let suppressClick = false;
 
   function clearHold(): void {
@@ -269,17 +314,58 @@
   const movable = $derived(rooms.filter((r) => r.pinnedAt == null));
   const roomsByCode = $derived(new Map(rooms.map((r) => [r.roomCode, r])));
   const displayRooms = $derived(
-    drag
+    drag?.list === "rooms"
       ? drag.order.flatMap((code) => roomsByCode.get(code) ?? [])
       : movable
   );
 
-  function contentY(clientY: number): number {
-    const rect = listEl!.getBoundingClientRect();
-    return clientY - rect.top + listEl!.scrollTop;
+  /**
+   * A kind's channels as drawn: during a drag of that kind, in the preview
+   * order, the original still first (it never moves and is not in the order).
+   */
+  function displayChannels<C extends { id: string }>(kind: ChannelKind, list: C[]): C[] {
+    if (drag?.list !== kind) return list;
+    const byId = new Map(list.map((c) => [c.id, c]));
+    const head = list.filter((c) => c.id === DEFAULT_CHANNEL_ID);
+    return [...head, ...drag.order.flatMap((id) => byId.get(id) ?? [])];
   }
 
-  function onTilePointerDown(e: PointerEvent, roomCode: string): void {
+  /**
+   * A channel can be dragged where the room lets its channels be reordered,
+   * all but the original. A row being renamed stays a drag row (its slot is
+   * measured with the others) but has no button to press.
+   */
+  function canDragChannel(id: string): boolean {
+    return !!channels?.onReorderChannels && id !== DEFAULT_CHANNEL_ID;
+  }
+
+  /** A channel row's click, unless it is the click that ends a drag. */
+  function onChannelClick(run: () => void): void {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    run();
+  }
+
+  function scrollerOf(list: DragList): HTMLElement | null {
+    return list === "rooms" ? listEl : columnScrollEl;
+  }
+
+  /** The order a drag starts from: what can move, as ids. */
+  function baseOrder(list: DragList): string[] {
+    if (list === "rooms") return movable.map((r) => r.roomCode);
+    const ch = channels;
+    if (!ch) return [];
+    return draggableChannelIds((list === "text" ? ch.text : ch.voice).map((c) => c.id));
+  }
+
+  function contentY(scroller: HTMLElement, clientY: number): number {
+    const rect = scroller.getBoundingClientRect();
+    return clientY - rect.top + scroller.scrollTop;
+  }
+
+  function onDragPointerDown(e: PointerEvent, list: DragList, id: string): void {
     suppressClick = false;
     press = null;
     held = null;
@@ -287,7 +373,8 @@
     if (e.button !== 0 || drag) return;
     const touch = e.pointerType === "touch";
     const p = {
-      code: roomCode,
+      list,
+      id,
       pointerId: e.pointerId,
       x: e.clientX,
       y: e.clientY,
@@ -296,19 +383,19 @@
     };
     press = p;
     if (!touch) return;
-    // A finger lifts the tile by holding still; a swipe (pressMove) leaves
-    // first and the rail scrolls as it always did.
+    // A finger lifts the row by holding still; a swipe (pressMove) leaves
+    // first and the list scrolls as it always did.
     holdTimer = setTimeout(() => {
       holdTimer = null;
       if (press !== p) return;
       press = null;
-      if (startRoomDrag(p.el, p.pointerId, p.code, p.y, p.y)) {
+      if (startDrag(p.el, p.pointerId, p.list, p.id, p.y, p.y)) {
         held = { x: p.x, y: p.y, moved: false };
       }
     }, HOLD_MS);
   }
 
-  function onTilePointerMove(e: PointerEvent): void {
+  function onDragPointerMove(e: PointerEvent): void {
     if (drag) {
       lastClientY = e.clientY;
       if (held && !held.moved && Math.hypot(e.clientX - held.x, e.clientY - held.y) > HOLD_SLOP_PX) {
@@ -329,37 +416,40 @@
     }
     if (distance < DRAG_SLOP_PX) return;
     press = null;
-    startRoomDrag(e.currentTarget as HTMLElement, e.pointerId, p.code, p.y, e.clientY);
+    startDrag(e.currentTarget as HTMLElement, e.pointerId, p.list, p.id, p.y, e.clientY);
   }
 
-  /** Lift a tile. False when the rail's rows could not be measured. */
-  function startRoomDrag(
-    tileEl: HTMLElement,
+  /** Lift a row. False when the list's rows could not be measured. */
+  function startDrag(
+    rowEl: HTMLElement,
     pointerId: number,
-    roomCode: string,
+    list: DragList,
+    id: string,
     pressY: number,
     clientY: number
   ): boolean {
-    if (!listEl || drag) return false;
-    const from = movable.findIndex((r) => r.roomCode === roomCode);
+    const scroller = scrollerOf(list);
+    if (!scroller || drag) return false;
+    const base = baseOrder(list);
+    const from = base.indexOf(id);
     if (from === -1) return false;
-    const listTop = listEl.getBoundingClientRect().top - listEl.scrollTop;
-    rowBoxes = [...listEl.querySelectorAll<HTMLElement>("[data-drag-row]")].map((el) => {
+    const listTop = scroller.getBoundingClientRect().top - scroller.scrollTop;
+    rowBoxes = [...scroller.querySelectorAll<HTMLElement>(`[data-drag-row="${list}"]`)].map((el) => {
       const r = el.getBoundingClientRect();
       return { top: r.top - listTop, height: r.height };
     });
-    if (rowBoxes.length !== movable.length) return false;
+    if (rowBoxes.length !== base.length) return false;
     try {
-      tileEl.setPointerCapture(pointerId);
+      rowEl.setPointerCapture(pointerId);
     } catch {
       // The finger already left: there is nothing to drag.
       return false;
     }
-    startContentY = contentY(pressY);
+    startContentY = contentY(scroller, pressY);
     lastClientY = clientY;
-    const base = movable.map((r) => r.roomCode);
     drag = {
-      code: roomCode,
+      list,
+      id,
       base,
       from,
       to: from,
@@ -374,8 +464,9 @@
   }
 
   function updateDrag(): void {
-    if (!drag || drag.dropping) return;
-    const delta = contentY(lastClientY) - startContentY;
+    const scroller = drag ? scrollerOf(drag.list) : null;
+    if (!drag || drag.dropping || !scroller) return;
+    const delta = contentY(scroller, lastClientY) - startContentY;
     const { from } = drag;
     const center = rowBoxes[from].top + rowBoxes[from].height / 2 + delta;
     const to = dropIndex(rowBoxes, from, center);
@@ -386,11 +477,12 @@
     drag.dy = rowBoxes[from].top + delta - slotTop(rowBoxes, from, to);
   }
 
-  // Dragging near the rail's edge scrolls it, so a room can travel further
-  // than the part of the rail on screen.
+  // Dragging near the list's edge scrolls it, so a row can travel further
+  // than the part of the list on screen.
   function autoScroll(): void {
-    if (!drag || drag.dropping || !listEl) return;
-    const rect = listEl.getBoundingClientRect();
+    const scroller = drag ? scrollerOf(drag.list) : null;
+    if (!drag || drag.dropping || !scroller) return;
+    const rect = scroller.getBoundingClientRect();
     const speed =
       lastClientY < rect.top + EDGE_PX
         ? -Math.ceil((rect.top + EDGE_PX - lastClientY) / 4)
@@ -398,7 +490,7 @@
           ? Math.ceil((lastClientY - (rect.bottom - EDGE_PX)) / 4)
           : 0;
     if (speed !== 0) {
-      listEl.scrollTop += speed;
+      scroller.scrollTop += speed;
       updateDrag();
     }
     scrollFrame = requestAnimationFrame(autoScroll);
@@ -410,13 +502,20 @@
     const d = drag;
     const heldTop = slotTop(rowBoxes, d.from, d.to) + d.dy;
     if (commit && d.to !== d.from) {
-      onReorderRooms(d.order);
+      if (d.list === "rooms") {
+        onReorderRooms(d.order);
+      } else {
+        const ch = channels;
+        const ids = (d.list === "text" ? ch?.text : ch?.voice)?.map((c) => c.id) ?? [];
+        const order = channelDropOrder(ids, d.id, d.to);
+        if (order) ch?.onReorderChannels?.(d.list, order);
+      }
     } else {
       d.to = d.from;
       d.order = d.base;
     }
     d.dropping = true;
-    // A cancel moves the tile's slot back under it; keep it drawn where it is
+    // A cancel moves the row's slot back under it; keep it drawn where it is
     // held for this frame, then glide it into the slot instead of snapping.
     d.dy = heldTop - slotTop(rowBoxes, d.from, d.to);
     requestAnimationFrame(() => {
@@ -432,50 +531,63 @@
     }, SETTLE_MS + 20);
   }
 
-  function onTilePointerUp(e: PointerEvent): void {
+  function onDragPointerUp(e: PointerEvent): void {
     press = null;
     clearHold();
     const hold = held;
     held = null;
     if (!drag) return;
-    const tile = e.currentTarget as HTMLElement;
-    if (tile.hasPointerCapture(e.pointerId)) tile.releasePointerCapture(e.pointerId);
+    const row = e.currentTarget as HTMLElement;
+    if (row.hasPointerCapture(e.pointerId)) row.releasePointerCapture(e.pointerId);
     const up = e.type === "pointerup";
     suppressClick = up;
-    // A held tile let go where it lifted: the long press's menu, as before.
+    // A held row let go where it lifted: the long press's menu, as before.
     if (hold && up && holdRelease(hold.moved) === "menu") {
-      const code = drag.code;
+      const { list, id } = drag;
       finishDrag(false);
-      openMenuUnder(tile, { kind: "room", code });
+      if (list === "rooms") openMenuUnder(row, { kind: "room", code: id });
+      else openMenuUnder(row, { kind: "channel", channelKind: list, id });
       return;
     }
     finishDrag(up);
   }
 
   /**
-   * The platform's own long press (Android's context menu) on a tile a
+   * The platform's own long press (Android's context menu) on a row a
    * finger is holding: the hold already answers it - a drag, or the menu on
    * release - so it does not open a second time underneath.
    */
-  function onTileContextMenu(e: MouseEvent, roomCode: string, canDrag: boolean): void {
+  function onDragContextMenu(e: MouseEvent, target: MenuTarget, canDrag: boolean): void {
     if (canDrag && (press?.touch || held || drag)) {
       e.preventDefault();
       return;
     }
-    openMenu(e, { kind: "room", code: roomCode });
+    openMenu(e, target);
   }
 
-  // While a finger drags a tile, the rail must not scroll under it. Only
+  // The dragged row can go away mid-drag - the channel deleted by somebody
+  // else, the room left, the column folded - and its pointerup with it. The
+  // drag ends with the row, or the list would stay frozen in the preview.
+  $effect(() => {
+    if (!drag || drag.dropping) return;
+    if (scrollerOf(drag.list) && baseOrder(drag.list).includes(drag.id)) return;
+    cancelAnimationFrame(scrollFrame);
+    held = null;
+    drag = null;
+  });
+
+  // While a finger drags a row, its list must not scroll under it. Only
   // then: before the hold a swipe is a scroll, and is left alone. Not a
   // passive listener, or preventDefault is ignored.
   $effect(() => {
-    const el = listEl;
-    if (!el) return;
+    const els = [listEl, columnScrollEl].filter((el): el is HTMLDivElement => !!el);
     const onTouchMove = (e: TouchEvent) => {
       if (held && drag) e.preventDefault();
     };
-    el.addEventListener("touchmove", onTouchMove, { passive: false });
-    return () => el.removeEventListener("touchmove", onTouchMove);
+    for (const el of els) el.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => {
+      for (const el of els) el.removeEventListener("touchmove", onTouchMove);
+    };
   });
 
   function onTileClick(code: string): void {
@@ -529,9 +641,17 @@
     next.focus();
   }
 
-  function rowStyle(roomCode: string): string {
-    if (drag?.code !== roomCode) return "";
-    const lift = drag.dropping ? "" : " scale(1.05)";
+  /** Whether this row is the one lifted in that list. */
+  function isLifted(list: DragList, id: string): boolean {
+    return drag?.list === list && drag.id === id;
+  }
+
+  function rowStyle(list: DragList, id: string): string {
+    if (!drag || !isLifted(list, id)) return "";
+    // A rail tile grows as it lifts; a channel row is as wide as the column,
+    // where the same 5% would push it past both edges, so it lifts by its
+    // shadow alone.
+    const lift = drag.dropping || list !== "rooms" ? "" : " scale(1.05)";
     const glide = drag.gliding
       ? `transition: transform ${SETTLE_MS}ms cubic-bezier(0.2, 0, 0, 1);`
       : "";
@@ -569,7 +689,11 @@
   type MenuTarget =
     | { kind: "room"; code: string }
     | { kind: "dm"; peerId: string }
-    | { kind: "channel"; channelKind: ChannelKind; id: string };
+    | { kind: "channel"; channelKind: ChannelKind; id: string }
+    /** Somebody under a voice channel: the member list's menu for them. */
+    | { kind: "person"; peerId: string; name: string }
+    /** This user under a voice channel: their own menu (self-menu.ts). */
+    | { kind: "self"; name: string; avatarUrl: string | null };
 
   interface MenuItem {
     id: string;
@@ -590,6 +714,15 @@
   const MENU_WIDTH = 240;
   const MENU_ITEM_PX = 36;
 
+  function notifyIcon(id: NotifyMenuItem["id"]): typeof Pin {
+    return id === "mute" ? BellOff : id === "mentions" ? AtSign : id === "follow" ? Undo2 : Bell;
+  }
+
+  /** A room's mode, for its tile: what the bell in its header would say. */
+  function roomMuted(code: string): boolean {
+    return roomNotifyMode?.(code) === "muted";
+  }
+
   function itemsFor(t: MenuTarget): MenuItem[] {
     if (t.kind === "room") {
       const code = t.code;
@@ -597,7 +730,22 @@
       const order = movable.map((r) => r.roomCode);
       const up = pinned ? null : moveStep(order, code, -1);
       const down = pinned ? null : moveStep(order, code, 1);
+      // The room's own notification choices, for the room under the pointer
+      // whether or not it is open - the same items, in the same words, as
+      // its original chat's channel menu.
+      const mode = roomNotifyMode?.(code) ?? null;
+      const setNotify = onSetRoomNotify;
+      const notify: MenuItem[] =
+        mode && setNotify
+          ? notifyMenuItems({ isDefault: true, mode, own: null, roomMode: mode }).map((n) => ({
+              id: `notify-${n.id}`,
+              label: n.label,
+              icon: notifyIcon(n.id),
+              run: () => setNotify(code, n.mode ?? "all"),
+            }))
+          : [];
       return [
+        ...notify,
         {
           id: "pin",
           label: pinned ? "Unpin" : "Pin to top",
@@ -616,6 +764,35 @@
           confirm: true,
           run: () => onRemoveRoom(code),
         },
+      ];
+    }
+    if (t.kind === "self") {
+      return SELF_MENU.map((item) => ({
+        id: item.action,
+        label: item.label,
+        icon: item.action === "profile" ? UserRound : item.action === "edit" ? Pencil : Copy,
+        run: () => runSelfAction(item.action, t),
+      }));
+    }
+    if (t.kind === "person") {
+      // The member list's menu (UserListSidebar), item for item, so a person
+      // offers the same things wherever they are listed.
+      const did = peerIdToDid(t.peerId) || t.peerId;
+      const blocked = isBlockedDid(did);
+      return [
+        { id: "dm", label: "Send DM", icon: MessageCircle, run: () => onSelectDm(t.peerId) },
+        isInPhonebook(t.peerId)
+          ? {
+              id: "removePhonebook",
+              label: "Remove from phonebook",
+              icon: Trash2,
+              destructive: true,
+              run: () => onRemoveFromPhonebook(t.peerId),
+            }
+          : { id: "add", label: "Add to phonebook", icon: User, run: () => onAddToPhonebook(t.peerId) },
+        blocked
+          ? { id: "unblock", label: "Unblock", icon: CircleCheck, run: () => onSetBlocked(did, false) }
+          : { id: "block", label: "Block", icon: Ban, destructive: true, run: () => onSetBlocked(did, true, t.name) },
       ];
     }
     if (t.kind === "dm") {
@@ -676,14 +853,7 @@
             (n): MenuItem => ({
               id: `notify-${n.id}`,
               label: n.label,
-              icon:
-                n.id === "mute"
-                  ? BellOff
-                  : n.id === "mentions"
-                    ? AtSign
-                    : n.id === "follow"
-                      ? Undo2
-                      : Bell,
+              icon: notifyIcon(n.id),
               run: () => setNotify(id, n.mode),
             })
           )
@@ -715,15 +885,18 @@
    * Open a menu at the pointer, or under the control when there is no
    * pointer (a keyboard activation, or a button made to open it).
    */
-  function openMenu(e: MouseEvent, target: MenuTarget, below = false): void {
+  function openMenu(e: MouseEvent | KeyboardEvent, target: MenuTarget, below = false): void {
     const items = itemsFor(target);
     if (items.length === 0) return;
     e.preventDefault();
     e.stopPropagation();
     const el = e.currentTarget as HTMLElement;
     const noPointer =
-      below || (e.type === "click" && e.detail === 0) || (e.clientX === 0 && e.clientY === 0);
-    showMenu(el, target, items.length, noPointer ? null : { x: e.clientX, y: e.clientY });
+      below ||
+      !("clientX" in e) ||
+      (e.type === "click" && e.detail === 0) ||
+      (e.clientX === 0 && e.clientY === 0);
+    showMenu(el, target, items.length, noPointer || !("clientX" in e) ? null : { x: e.clientX, y: e.clientY });
   }
 
   /**
@@ -799,8 +972,26 @@
       ? `${roomsByCode.get(menu.code)?.name || "Room"} options`
       : menu?.kind === "dm"
         ? "Conversation options"
-        : "Channel options"
+        : menu?.kind === "person"
+          ? `${menu.name || "Member"} options`
+          : menu?.kind === "self"
+            ? "Your options"
+            : "Channel options"
   );
+
+  // ── Your own row under a voice channel ────────────────────────────────────
+
+  /** Your profile card, opened from your own row's menu. */
+  let ownProfile = $state<{ name: string; avatarUrl: string | null } | null>(null);
+
+  function runSelfAction(action: SelfMenuAction, t: { name: string; avatarUrl: string | null }): void {
+    if (action === "profile") ownProfile = { name: t.name, avatarUrl: t.avatarUrl };
+    else if (action === "edit") openSettings("profile", profileScopeFor(activeRoomCode));
+    else
+      void navigator.clipboard?.writeText(selfId()).catch(() => {
+        // Clipboard blocked: the ID is on the profile card to select by hand.
+      });
+  }
 
   // ── Conversations ─────────────────────────────────────────────────────────
 
@@ -858,7 +1049,7 @@
   /** Alt+Arrow moves a channel one place; F2 renames it. */
   function onChannelKeydown(e: KeyboardEvent, kind: ChannelKind, id: string): void {
     const ch = channels;
-    if (!ch) return;
+    if (!ch || drag) return;
     if (e.key === "F2" && ch.onRenameChannel) {
       e.preventDefault();
       startRename(kind, id);
@@ -951,8 +1142,24 @@
     "inline-flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded-full bg-sidebar-accent px-1.5 text-[10px] font-bold leading-none text-muted-foreground tabular-nums";
   const railBadge =
     "pointer-events-none absolute -top-1 right-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold leading-none text-primary-foreground tabular-nums ring-2 ring-sidebar";
+  const quietRailBadge =
+    "pointer-events-none absolute -top-1 right-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-sidebar-accent px-1 text-[10px] font-bold leading-none text-muted-foreground tabular-nums ring-2 ring-sidebar";
   const tile = `relative flex size-12 sm:size-11 shrink-0 items-center justify-center text-sm font-bold transition-[border-radius,background-color,color] duration-150 cursor-pointer ${focusRing}`;
   const sectionTitle = "select-none px-2 text-[11px] font-semibold text-muted-foreground";
+  const personRow = "flex h-7 items-center gap-2 rounded-md pl-8 pr-2 text-xs text-sidebar-foreground/80";
+  /** A channel row lifted by a drag: solid, so the rows it passes do not show through. */
+  const liftedRow = "z-10 rounded-md bg-sidebar shadow-lg ring-1 ring-border";
+  /**
+   * A row's glyph, set in the line of its label. A flex item is centred on
+   * the label's line box, and where the letters sit in that box depends on
+   * the font's ascent and descent - measured, the icon hung up to 2px low.
+   * In the line, `vertical-align` can be measured from the text itself:
+   * ICON_ON_TEXT puts the icon's middle between the lowercase middle (ex)
+   * and the capitals' (cap), whatever the font, the size, or the line height. `middle` (the x-height alone) is the
+   * fallback for a browser without the cap unit.
+   */
+  const iconOnText = "mr-2 inline-block size-4";
+  const ICON_ON_TEXT = "vertical-align: middle; vertical-align: calc((1cap + 1ex) / 4 - 0.5rem)";
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1078,7 +1285,8 @@
           {@const selected = selectedRoomCode === code}
           {@const unread = unreadOf(code)}
           {@const live = liveRoomCodes.has(code)}
-          {@const lifted = drag?.code === code}
+          {@const muted = roomMuted(code)}
+          {@const lifted = isLifted("rooms", code)}
           {@const picture = pictures.get(code)}
           <button
             {...props}
@@ -1087,18 +1295,18 @@
             aria-current={selected ? "true" : undefined}
             aria-keyshortcuts={canDrag ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
             onclick={chain(props, "onclick", () => onTileClick(code))}
-            oncontextmenu={(e) => onTileContextMenu(e, code, canDrag)}
+            oncontextmenu={(e) => onDragContextMenu(e, { kind: "room", code }, canDrag)}
             onkeydown={(e) => onRailKeydown(e, code)}
             onpointerdown={chain(props, "onpointerdown", (e: PointerEvent) => {
-              if (canDrag) onTilePointerDown(e, code);
+              if (canDrag) onDragPointerDown(e, "rooms", code);
             })}
             onpointermove={chain(props, "onpointermove", (e: PointerEvent) => {
-              if (canDrag) onTilePointerMove(e);
+              if (canDrag) onDragPointerMove(e);
             })}
             onpointerup={chain(props, "onpointerup", (e: PointerEvent) => {
-              if (canDrag) onTilePointerUp(e);
+              if (canDrag) onDragPointerUp(e);
             })}
-            onpointercancel={canDrag ? onTilePointerUp : undefined}
+            onpointercancel={canDrag ? onDragPointerUp : undefined}
             class="{tile} {selected
               ? 'rounded-2xl bg-foreground text-background'
               : 'rounded-[50%] bg-sidebar-accent text-muted-foreground hover:text-foreground'} {lifted
@@ -1113,11 +1321,22 @@
             <!-- The name, for screen readers and for anything that reads the
                  tile's text. -->
             <span class="sr-only">
-              {roomName(room)}{room.pinnedAt != null ? ", pinned" : ""}{unread > 0
+              {roomName(room)}{room.pinnedAt != null ? ", pinned" : ""}{muted ? ", muted" : ""}{unread > 0
                 ? `, ${unread} unread`
                 : ""}{live ? ", call going on" : ""}
             </span>
           </button>
+          {#if muted}
+            <!-- Muted: a small bell-off in the corner the live marker does
+                 not use, and its count drawn quiet, as a muted channel's is
+                 in the column. -->
+            <span
+              aria-hidden="true"
+              class="pointer-events-none absolute -bottom-0.5 left-1.5 flex size-4 items-center justify-center rounded-full bg-sidebar text-muted-foreground"
+            >
+              <BellOff class="size-2.5" strokeWidth={3} />
+            </span>
+          {/if}
           {#if live}
             <span
               aria-hidden="true"
@@ -1127,12 +1346,17 @@
             </span>
           {/if}
           {#if unread > 0}
-            <span aria-hidden="true" class={railBadge}>{badgeText(unread)}</span>
+            <span aria-hidden="true" class={muted ? quietRailBadge : railBadge}>{badgeText(unread)}</span>
           {/if}
         {/snippet}
 
         {#snippet pill(room: Room)}
-          {@const p = railPill(selectedRoomCode === room.roomCode, unreadOf(room.roomCode))}
+          <!-- A muted room's unread does not raise the dot: it is still
+               counted on the tile, quietly, but does not call for a look. -->
+          {@const p = railPill(
+            selectedRoomCode === room.roomCode,
+            roomMuted(room.roomCode) ? 0 : unreadOf(room.roomCode)
+          )}
           <span
             aria-hidden="true"
             class="pointer-events-none absolute left-0 top-1/2 w-1 -translate-y-1/2 rounded-r-full bg-foreground transition-[height] duration-150 {p ===
@@ -1147,12 +1371,15 @@
         <!-- Collapsed with direct messages selected: the conversations, as
              the column lists them (sections, badges, menus), above the rooms. -->
         {#if collapsed && dmsSelected}
-          {#each dmGroups as group, gi (group.title ?? "")}
+          <!-- Every section, folded or not: the rail has no headings to
+               unfold one from, and a conversation that vanished from it
+               with no trace would be one that cannot be reached here. -->
+          {#each dmGroups as group, gi (group.key)}
             {#if gi > 0}
               <div class="h-px w-7 shrink-0 bg-sidebar-border" aria-hidden="true"></div>
             {/if}
             {#each group.entries as entry (entry.peerId)}
-              {@render dmTile(entry, group.title)}
+              {@render dmTile(entry, group.key)}
             {/each}
           {/each}
           {#if phonebook.length > 0 && rooms.length > 0}
@@ -1178,11 +1405,11 @@
           <div class="h-px w-7 shrink-0 bg-sidebar-border" aria-hidden="true"></div>
         {/if}
         {#each displayRooms as room (room.roomCode)}
-          {@const lifted = drag?.code === room.roomCode}
+          {@const lifted = isLifted("rooms", room.roomCode)}
           <div
-            data-drag-row
+            data-drag-row="rooms"
             animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
-            style={rowStyle(room.roomCode)}
+            style={rowStyle("rooms", room.roomCode)}
             class="group relative flex w-full shrink-0 justify-center {lifted ? 'z-10' : ''}"
           >
             {@render pill(room)}
@@ -1288,7 +1515,10 @@
         </div>
 
         <!-- Many channels or conversations scroll here. -->
-        <div class="min-h-0 flex-1 overflow-y-auto px-2 py-3 select-none [-webkit-touch-callout:none]">
+        <div
+          bind:this={columnScrollEl}
+          class="min-h-0 flex-1 overflow-y-auto px-2 py-3 select-none [-webkit-touch-callout:none]"
+        >
           {#if column.kind === "room" && channels}
             {@render channelList()}
           {:else if column.kind === "dms"}
@@ -1322,7 +1552,7 @@
   {/if}
 </aside>
 
-{#snippet dmTile(entry: PhonebookEntry, section: string | null)}
+{#snippet dmTile(entry: PhonebookEntry, section: DmSectionKey)}
   {@const selected = activeDmPeerId === entry.peerId}
   {@const unread = dmUnreadCounts.get(entry.peerId) ?? 0}
   {@const color = colorForPeer(entry.peerId)}
@@ -1359,7 +1589,7 @@
             <span aria-hidden="true">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
           {/if}
           <span class="sr-only">
-            {entry.nickname}{section === "Requests" ? ", message request" : ""}{entry.blocked
+            {entry.nickname}{section === "requests" ? ", message request" : ""}{entry.blocked
               ? ", blocked"
               : ""}{unread > 0 ? `, ${unread} unread` : ""}
           </span>
@@ -1454,15 +1684,47 @@
   </li>
 {/snippet}
 
+{#snippet voicePerson(person: SidebarVoicePerson)}
+  <span
+    class="flex size-5 shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary text-[10px] font-bold text-secondary-foreground ring-2 transition-[box-shadow] duration-150 {person.speaking
+      ? 'ring-primary'
+      : 'ring-transparent'}"
+    aria-hidden="true"
+  >
+    {#if person.avatarUrl}
+      <GifImage
+        src={person.avatarUrl}
+        alt=""
+        class="size-full rounded-full object-cover"
+        animate={person.speaking}
+      />
+    {:else}
+      {(person.name || "?").charAt(0).toUpperCase()}
+    {/if}
+  </span>
+  <span class="min-w-0 flex-1 truncate">{person.name}</span>
+  {#if person.muted}
+    <MicOff class="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+    <span class="sr-only">, muted</span>
+  {/if}
+{/snippet}
+
 {#snippet channelList()}
   {@const ch = channels!}
   <section aria-labelledby="{uid}-text">
     {@render sectionHeader(`${uid}-text`, "Text", "text", true)}
     <ul class="flex flex-col gap-0.5">
-      {#each ch.text as channel (channel.id)}
+      {#each displayChannels("text", ch.text) as channel (channel.id)}
         {@const selected = ch.selectedTextId === channel.id}
         {@const unread = selected ? 0 : channel.unread}
-        <li class="relative">
+        {@const draggable = canDragChannel(channel.id)}
+        {@const lifted = isLifted("text", channel.id)}
+        <li
+          data-drag-row={draggable ? "text" : undefined}
+          animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
+          style={rowStyle("text", channel.id)}
+          class="relative {lifted ? liftedRow : ''}"
+        >
           {#if renaming?.kind === "text" && renaming.id === channel.id}
             <Hash class="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
             {@render renameInput("text")}
@@ -1471,19 +1733,31 @@
               type="button"
               data-channel="text:{channel.id}"
               aria-current={selected ? "page" : undefined}
-              onclick={() => ch.onSelectChannel(channel.id)}
+              aria-keyshortcuts={draggable ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
+              onclick={() => onChannelClick(() => ch.onSelectChannel(channel.id))}
               oncontextmenu={channelMenus
-                ? (e) => openMenu(e, { kind: "channel", channelKind: "text", id: channel.id })
+                ? (e) => onDragContextMenu(e, { kind: "channel", channelKind: "text", id: channel.id }, draggable)
                 : undefined}
               onkeydown={(e) => onChannelKeydown(e, "text", channel.id)}
-              class="flex h-8 max-sm:h-11 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors cursor-pointer {rowFocus} {selected
+              onpointerdown={draggable ? (e) => onDragPointerDown(e, "text", channel.id) : undefined}
+              onpointermove={draggable ? onDragPointerMove : undefined}
+              onpointerup={draggable ? onDragPointerUp : undefined}
+              onpointercancel={draggable ? onDragPointerUp : undefined}
+              class="flex h-8 max-sm:h-11 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors {lifted
+                ? 'cursor-grabbing'
+                : 'cursor-pointer'} {rowFocus} {selected
                 ? 'bg-sidebar-accent font-semibold text-foreground'
                 : unread > 0 && !channel.muted
                   ? 'font-bold text-foreground hover:bg-sidebar-accent/50'
                   : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground'}"
             >
-              <Hash class="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-              <span class="min-w-0 flex-1 truncate">{channel.name}</span>
+              <!-- The glyph sits in the name's own line (iconOnText), not
+                   beside it as a flex item: centred on the label's box it
+                   hung below the letters, by however far the font's ascent
+                   and descent are uneven. -->
+              <span class="min-w-0 flex-1 truncate"
+                ><Hash class="{iconOnText} text-muted-foreground" style={ICON_ON_TEXT} aria-hidden="true" />{channel.name}</span
+              >
               {#if channel.muted}
                 <BellOff class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
                 <span class="sr-only">, muted</span>
@@ -1507,8 +1781,17 @@
   <section aria-labelledby="{uid}-voice">
     {@render sectionHeader(`${uid}-voice`, "Voice", "voice", false)}
     <ul class="flex flex-col gap-0.5">
-      {#each ch.voice as channel (channel.id)}
-        <li class="relative">
+      {#each displayChannels("voice", ch.voice) as channel (channel.id)}
+        {@const draggable = canDragChannel(channel.id)}
+        {@const lifted = isLifted("voice", channel.id)}
+        <!-- The row and the people in its call are one item: they move
+             together in a drag. -->
+        <li
+          data-drag-row={draggable ? "voice" : undefined}
+          animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
+          style={rowStyle("voice", channel.id)}
+          class="relative {lifted ? liftedRow : ''}"
+        >
           {#if renaming?.kind === "voice" && renaming.id === channel.id}
             <Volume2 class="pointer-events-none absolute left-2 top-4 max-sm:top-5.5 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
             {@render renameInput("voice")}
@@ -1517,20 +1800,29 @@
               type="button"
               data-channel="voice:{channel.id}"
               aria-current={channel.joined ? "true" : undefined}
-              onclick={() => ch.onJoinVoice(channel.id)}
+              aria-keyshortcuts={draggable ? "Alt+ArrowUp Alt+ArrowDown" : undefined}
+              onclick={() => onChannelClick(() => ch.onJoinVoice(channel.id))}
               oncontextmenu={channelMenus
-                ? (e) => openMenu(e, { kind: "channel", channelKind: "voice", id: channel.id })
+                ? (e) => onDragContextMenu(e, { kind: "channel", channelKind: "voice", id: channel.id }, draggable)
                 : undefined}
               onkeydown={(e) => onChannelKeydown(e, "voice", channel.id)}
-              class="flex h-8 max-sm:h-11 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors cursor-pointer {rowFocus} {channel.joined
+              onpointerdown={draggable ? (e) => onDragPointerDown(e, "voice", channel.id) : undefined}
+              onpointermove={draggable ? onDragPointerMove : undefined}
+              onpointerup={draggable ? onDragPointerUp : undefined}
+              onpointercancel={draggable ? onDragPointerUp : undefined}
+              class="flex h-8 max-sm:h-11 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors {lifted
+                ? 'cursor-grabbing'
+                : 'cursor-pointer'} {rowFocus} {channel.joined
                 ? 'bg-primary/10 text-foreground hover:bg-primary/15'
                 : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground'}"
             >
-              <Volume2
-                class="size-4 shrink-0 {channel.joined ? 'text-primary' : 'text-muted-foreground'}"
-                aria-hidden="true"
-              />
-              <span class="min-w-0 flex-1 truncate">{channel.name}</span>
+              <span class="min-w-0 flex-1 truncate"
+                ><Volume2
+                  class="{iconOnText} {channel.joined ? 'text-primary' : 'text-muted-foreground'}"
+                  style={ICON_ON_TEXT}
+                  aria-hidden="true"
+                />{channel.name}</span
+              >
               {#if channel.people.length > 0}
                 <span class="shrink-0 text-[11px] text-muted-foreground tabular-nums" aria-hidden="true">
                   {channel.people.length}
@@ -1546,35 +1838,35 @@
             </button>
           {/if}
           {#if channel.people.length > 0}
-            <!-- Flush against the channel's row the first person read as
-                 cramped. The same 2px as between channels, between the row
-                 and its people and between them, keeps one rhythm down the
-                 section. -->
-            <ul aria-label="In {channel.name}" class="mt-0.5 flex flex-col gap-0.5">
+            <!-- At 2px the people read as the next rows of the list rather
+                 than the channel's own: 6px under the row and 4px after the
+                 last person (plus the list's 2px) set them apart as a
+                 group, and the avatars start under the channel's name. -->
+            <ul aria-label="In {channel.name}" class="mt-1.5 mb-1 flex flex-col gap-0.5">
               {#each channel.people as person (person.peerId)}
-                <li class="flex h-7 items-center gap-2 pl-8 pr-2 text-xs text-sidebar-foreground/80">
-                  <span
-                    class="flex size-5 shrink-0 items-center justify-center overflow-hidden rounded-full bg-secondary text-[10px] font-bold text-secondary-foreground ring-2 transition-[box-shadow] duration-150 {person.speaking
-                      ? 'ring-primary'
-                      : 'ring-transparent'}"
-                    aria-hidden="true"
-                  >
-                    {#if person.avatarUrl}
-                      <GifImage
-                        src={person.avatarUrl}
-                        alt=""
-                        class="size-full rounded-full object-cover"
-                        animate={person.speaking}
-                      />
-                    {:else}
-                      {(person.name || "?").charAt(0).toUpperCase()}
-                    {/if}
-                  </span>
-                  <span class="min-w-0 flex-1 truncate">{person.name}</span>
-                  {#if person.muted}
-                    <MicOff class="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-                    <span class="sr-only">, muted</span>
-                  {/if}
+                {@const target: MenuTarget = person.self
+                  ? { kind: "self", name: person.name, avatarUrl: person.avatarUrl ?? null }
+                  : { kind: "person", peerId: person.peerId, name: person.name }}
+                <!-- A person's row opens the same menu as their card in the
+                     member list, and your own row your own menu, from anywhere
+                     on the row: a right-click, a click, a held finger, or the
+                     menu key / Shift+F10. -->
+                <li>
+                  <div
+                      role="button"
+                      tabindex="0"
+                      aria-haspopup="menu"
+                      onclick={(e) => openMenu(e, target)}
+                      oncontextmenu={(e) => openMenu(e, target)}
+                      onkeydown={(e) => {
+                        if (!isMenuKey(e) && e.key !== "Enter" && e.key !== " ") return;
+                        openMenu(e, target, true);
+                      }}
+                      {@attach longPress((el) => openMenuUnder(el, target))}
+                      class="{personRow} cursor-pointer hover:bg-sidebar-accent/50 {rowFocus}"
+                    >
+                      {@render voicePerson(person)}
+                    </div>
                 </li>
               {/each}
             </ul>
@@ -1595,13 +1887,46 @@
       <p class="whitespace-nowrap">No DMs yet</p>
     </div>
   {:else}
-    {#each dmGroups as group (group.title ?? "")}
+    {#each dmGroups as group, gi (group.key)}
+      {@const folded = dmSectionFolded(group, displayPrefs.foldedDmSections)}
+      {@const rows = dmSectionRows(group, folded, activeDmPeerId)}
       <section aria-label={group.title ?? "Conversations"}>
         {#if group.title}
-          <h3 class="{sectionTitle} pt-3.5 pb-1.5">{group.title}</h3>
+          <!-- The whole heading folds its section. Folded, it says what it
+               holds and what is unread in there, so nothing goes quiet just
+               because it is out of sight. -->
+          {@const summary = dmSectionSummary(group.entries, (id) => dmUnreadCounts.get(id) ?? 0)}
+          <h3 class={gi === 0 ? "pb-1" : "pt-2.5 pb-1"}>
+            <button
+              type="button"
+              aria-expanded={!folded}
+              aria-controls="{uid}-dm-{group.key}"
+              onclick={() =>
+                setFoldedDmSections(toggleDmSection(displayPrefs.foldedDmSections, group.key))}
+              class="{sectionTitle} flex h-6 max-sm:h-9 w-full items-center gap-1 rounded-md text-left hover:text-foreground cursor-pointer {rowFocus}"
+            >
+              <ChevronDown
+                class="size-3 shrink-0 transition-transform duration-150 {folded ? '-rotate-90' : ''}"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1 truncate">{group.title}</span>
+              {#if folded}
+                <span class="shrink-0 font-normal tabular-nums" aria-hidden="true">{summary.count}</span>
+                {#if summary.unread > 0}
+                  <span class={badge} aria-hidden="true">{badgeText(summary.unread)}</span>
+                {/if}
+                <span class="sr-only">
+                  , folded, {summary.count} {summary.count === 1 ? "conversation" : "conversations"}{summary.unread >
+                  0
+                    ? `, ${summary.unread} unread`
+                    : ""}
+                </span>
+              {/if}
+            </button>
+          </h3>
         {/if}
-        <ul class="flex flex-col gap-0.5">
-          {#each group.entries as entry (entry.peerId)}
+        <ul id="{uid}-dm-{group.key}" class="flex flex-col gap-0.5">
+          {#each rows as entry (entry.peerId)}
             {@const selected = activeDmPeerId === entry.peerId}
             {@const unread = dmUnreadCounts.get(entry.peerId) ?? 0}
             {@const color = colorForPeer(entry.peerId)}
@@ -1695,6 +2020,7 @@
         {@const code = room.roomCode}
         {@const unread = unreadOf(code)}
         {@const live = liveRoomCodes.has(code)}
+        {@const muted = roomMuted(code)}
         <li>
           <button
             type="button"
@@ -1714,7 +2040,7 @@
             </span>
             <span class="flex min-w-0 flex-1 flex-col gap-0.5">
               <span
-                class="truncate text-sm {unread > 0
+                class="truncate text-sm {unread > 0 && !muted
                   ? 'font-bold text-foreground'
                   : 'font-medium text-sidebar-foreground/85'}"
               >
@@ -1728,12 +2054,16 @@
                 <span class="truncate">{timeAgo(roomActivity.get(code) ?? room.createdAt)}</span>
               </span>
             </span>
+            {#if muted}
+              <BellOff class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+              <span class="sr-only">, muted</span>
+            {/if}
             {#if live}
               <Volume2 class="size-3.5 shrink-0 text-primary" aria-hidden="true" />
               <span class="sr-only">, call going on</span>
             {/if}
             {#if unread > 0}
-              <span class={badge}>
+              <span class={muted ? quietBadge : badge}>
                 <span aria-hidden="true">{badgeText(unread)}</span>
                 <span class="sr-only">, {unread} unread</span>
               </span>
@@ -1774,4 +2104,21 @@
       </button>
     {/each}
   </div>
+{/if}
+
+{#if ownProfile}
+  <UserProfileCard
+    open={!!ownProfile}
+    onOpenChange={(open) => {
+      if (!open) ownProfile = null;
+    }}
+    did={selfId()}
+    name={ownProfile.name}
+    avatarUrl={ownProfile.avatarUrl ?? undefined}
+    roomCode={profileScopeFor(activeRoomCode)}
+    onEdit={() => {
+      ownProfile = null;
+      openSettings("profile", profileScopeFor(activeRoomCode));
+    }}
+  />
 {/if}

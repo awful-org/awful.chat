@@ -37,17 +37,27 @@ export interface RowBox {
 
 /**
  * Where the row dragged from `from` lands with its center at `center`: one
- * slot past every other row whose midpoint it has crossed. Measured against
- * the pre-drag layout, so the answer does not wobble as rows slide aside.
+ * slot past every other row whose midpoint it has crossed, or whose whole
+ * length its leading edge has covered. Measured against the pre-drag layout,
+ * so the answer does not wobble as rows slide aside.
+ *
+ * Between rows of one height the two say the same. They differ for a tall
+ * row (a voice channel with its people) over a short one: its center is so
+ * far down that it could hide a neighbour completely without passing it.
  *
  * Symmetric by construction - the old "insert before the row under the
  * pointer" rule could only ever move a row UP: dropped on the next row down
  * it went back where it started.
  */
 export function dropIndex(rows: readonly RowBox[], from: number, center: number): number {
+  const top = center - rows[from].height / 2;
+  const bottom = center + rows[from].height / 2;
   let index = 0;
   for (let i = 0; i < rows.length; i++) {
-    if (i !== from && center > rows[i].top + rows[i].height / 2) index++;
+    if (i === from) continue;
+    const row = rows[i];
+    const crossed = center > row.top + row.height / 2;
+    if (i < from ? crossed && top >= row.top : crossed || bottom > row.top + row.height) index++;
   }
   return index;
 }

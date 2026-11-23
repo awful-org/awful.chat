@@ -114,6 +114,54 @@ describe("a message in a channel", () => {
     expect(getChannelNotifyMode("room-a", "")).toBeNull();
   });
 
+  it("goes quiet in every channel when the room is muted after a channel was made loud", () => {
+    // Muting a room from its menu is "no sound from this room": a channel
+    // that kept "all messages" from before must not go on beeping.
+    setRoomNotifyMode("room-a", "mentions");
+    setChannelNotifyMode("room-a", GAMES, "all");
+    announce(msg({ channel: GAMES }));
+    expect(notified).toHaveLength(1);
+
+    setRoomNotifyMode("room-a", "muted", ["", GAMES]);
+    expect(getChannelNotifyMode("room-a", GAMES)).toBeNull();
+    announce(msg({ channel: GAMES }));
+    announce(msg({ channel: GAMES, content: `hey @[${ME}]` }));
+    announce(msg());
+    expect(notified).toHaveLength(1);
+
+    // A channel muted on its own stays muted when the room comes back.
+    setChannelNotifyMode("room-a", GAMES, "muted");
+    setRoomNotifyMode("room-a", "muted", [GAMES]);
+    setRoomNotifyMode("room-a", "all", [GAMES]);
+    expect(getChannelNotifyMode("room-a", GAMES)).toBe("muted");
+    // Turning the room up leaves the channels' own choices alone.
+    setChannelNotifyMode("room-a", GAMES, "mentions");
+    setRoomNotifyMode("room-a", "all", [GAMES]);
+    expect(getChannelNotifyMode("room-a", GAMES)).toBe("mentions");
+  });
+
+  it("drops what a burst was still holding when the room is muted", () => {
+    announceMessage(msg(), ctx); // the first goes out at once
+    announceMessage(msg(), ctx); // the next waits for the window
+    expect(notified).toHaveLength(1);
+    setRoomNotifyMode("room-a", "muted");
+    vi.advanceTimersByTime(5000);
+    expect(notified).toHaveLength(1);
+  });
+
+  it("makes no sound at all for a call starting in a muted room", () => {
+    setRoomNotifyMode("room-a", "muted", [GAMES]);
+    announce(
+      msg({ type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId: "abcdefgh", phase: "start", at: 1 }) })
+    );
+    expect(notified).toHaveLength(0);
+    setRoomNotifyMode("room-a", "all");
+    announce(
+      msg({ type: MessageType.CallEvent, content: JSON.stringify({ v: 1, callId: "bcdefghi", phase: "start", at: 1 }) })
+    );
+    expect(notified).toHaveLength(1);
+  });
+
   it("tells a click and an inline reply which channel it is about", () => {
     // Without it the reply was sent into whichever channel the room was
     // last left on: a reply to a mention in #games landed in the original chat.

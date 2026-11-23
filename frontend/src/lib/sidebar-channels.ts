@@ -33,6 +33,8 @@ export interface SidebarVoicePerson {
   avatarUrl?: string | null;
   speaking: boolean;
   muted: boolean;
+  /** This user: listed like the others, but with no menu (nothing to DM or block). */
+  self?: boolean;
 }
 
 export interface SidebarVoiceChannel {
@@ -178,6 +180,37 @@ export function channelMoveOrder(
   const next = [...movable];
   next.splice(from, 1);
   next.splice(to, 0, id);
+  return next;
+}
+
+/**
+ * The channels of one kind a drag can lift, in list order: all but the
+ * original, which stays first and is not draggable.
+ */
+export function draggableChannelIds(ids: readonly string[]): string[] {
+  return ids.filter((c) => c !== DEFAULT_CHANNEL_ID);
+}
+
+/**
+ * The order the sidebar hands onReorderChannels after a drag dropped `id`
+ * at index `to` among the draggable channels (draggableChannelIds) - the
+ * drag's twin of channelMoveOrder, so the original is never in it and
+ * nothing lands above it. Null when the drop changes nothing.
+ */
+export function channelDropOrder(
+  ids: readonly string[],
+  id: string,
+  to: number
+): string[] | null {
+  if (id === DEFAULT_CHANNEL_ID) return null;
+  const movable = draggableChannelIds(ids);
+  const from = movable.indexOf(id);
+  if (from === -1 || !Number.isInteger(to)) return null;
+  const at = Math.max(0, Math.min(to, movable.length - 1));
+  if (at === from) return null;
+  const next = [...movable];
+  next.splice(from, 1);
+  next.splice(at, 0, id);
   return next;
 }
 

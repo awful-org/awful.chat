@@ -7,8 +7,13 @@ import {
   badgeText,
   clampMenu,
   dmMenuActions,
+  dmSectionFolded,
+  dmSectionRows,
+  dmSectionSummary,
   dmSections,
   menuFocusIndex,
+  parseFoldedDmSections,
+  toggleDmSection,
   moveStep,
   railPill,
   roomInitials,
@@ -91,16 +96,74 @@ describe("grouping the conversations", () => {
       e("b"),
       e("blockedRequest", { request: true, blocked: true }),
     ]);
-    expect(sections.map((s) => [s.title, s.entries.map((x) => x.peerId)])).toEqual([
-      [null, ["a", "b"]],
-      ["Requests", ["req1"]],
-      ["Blocked", ["blk", "blockedRequest"]],
+    expect(sections.map((s) => [s.key, s.title, s.entries.map((x) => x.peerId)])).toEqual([
+      ["messages", "Messages", ["a", "b"]],
+      ["requests", "Requests", ["req1"]],
+      ["blocked", "Blocked", ["blk", "blockedRequest"]],
     ]);
   });
 
   it("leaves empty sections out", () => {
     expect(dmSections([e("a")]).map((s) => s.title)).toEqual([null]);
     expect(dmSections([])).toEqual([]);
+    expect(dmSections([e("r", { request: true })]).map((s) => s.title)).toEqual(["Requests"]);
+  });
+
+  it("heads the accepted conversations only when another section is listed", () => {
+    expect(dmSections([e("a"), e("b")]).map((s) => s.title)).toEqual([null]);
+    expect(dmSections([e("a"), e("x", { blocked: true })]).map((s) => s.title)).toEqual([
+      "Messages",
+      "Blocked",
+    ]);
+  });
+});
+
+describe("folding the conversation sections", () => {
+  const e = (peerId: string, extra: object = {}) => ({ peerId, ...extra });
+
+  it("folds only a section with a heading", () => {
+    const [alone] = dmSections([e("a")]);
+    expect(dmSectionFolded(alone, ["messages"])).toBe(false);
+    const [messages, requests] = dmSections([e("a"), e("r", { request: true })]);
+    expect(dmSectionFolded(messages, ["messages"])).toBe(true);
+    expect(dmSectionFolded(requests, ["messages"])).toBe(false);
+  });
+
+  it("hides a folded section's rows but keeps the conversation on screen", () => {
+    const [messages] = dmSections([e("a"), e("b"), e("r", { request: true })]);
+    expect(dmSectionRows(messages, false, null).map((x) => x.peerId)).toEqual(["a", "b"]);
+    expect(dmSectionRows(messages, true, null)).toEqual([]);
+    expect(dmSectionRows(messages, true, "b").map((x) => x.peerId)).toEqual(["b"]);
+    expect(dmSectionRows(messages, true, "r")).toEqual([]);
+  });
+
+  it("counts what a folded heading hides, unread included", () => {
+    const unread = new Map([["a", 2], ["c", 5]]);
+    expect(dmSectionSummary([e("a"), e("b"), e("c")], (id) => unread.get(id) ?? 0)).toEqual({
+      count: 3,
+      unread: 7,
+    });
+    expect(dmSectionSummary([], () => 1)).toEqual({ count: 0, unread: 0 });
+    // A bad count does not make the total lie.
+    expect(dmSectionSummary([e("a")], () => -3)).toEqual({ count: 1, unread: 0 });
+    expect(dmSectionSummary([e("a")], () => NaN)).toEqual({ count: 1, unread: 0 });
+  });
+
+  it("reads the stored folds, keeping only known sections", () => {
+    expect(parseFoldedDmSections(null)).toEqual([]);
+    expect(parseFoldedDmSections("")).toEqual([]);
+    expect(parseFoldedDmSections("not json")).toEqual([]);
+    expect(parseFoldedDmSections('{"requests":true}')).toEqual([]);
+    expect(parseFoldedDmSections('["blocked","nope",3,"requests","blocked"]')).toEqual([
+      "requests",
+      "blocked",
+    ]);
+  });
+
+  it("toggles a section in and out, in a fixed order", () => {
+    expect(toggleDmSection([], "blocked")).toEqual(["blocked"]);
+    expect(toggleDmSection(["blocked"], "messages")).toEqual(["messages", "blocked"]);
+    expect(toggleDmSection(["messages", "blocked"], "blocked")).toEqual(["messages"]);
   });
 });
 

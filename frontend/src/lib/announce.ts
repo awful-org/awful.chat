@@ -138,7 +138,9 @@ function emit(p: Pending): void {
 
 function flushBurst(): void {
   burstTimer = null;
-  const items = pending;
+  // Asked again here: a room muted while its burst was waiting must not beep
+  // for what arrived just before.
+  const items = pending.filter((p) => effectiveNotifyMode(p.roomCode, p.channel ?? "") !== "muted");
   pending = [];
   if (items.length === 0) return;
   windowEndsAt = Date.now() + BURST_MS;

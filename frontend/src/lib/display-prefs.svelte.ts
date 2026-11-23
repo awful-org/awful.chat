@@ -12,6 +12,7 @@ import {
 } from "./chat-font";
 import { parseFraction } from "./call-split";
 import { parseSidebarWidth, storedSidebarWidth } from "./sidebar-width";
+import { parseFoldedDmSections, type DmSectionKey } from "./sidebar-rail";
 
 const ITALIC_KEY = "awful:italic-own-name:v1";
 const PEER_COLORS_KEY = "awful:show-peer-colors:v1";
@@ -27,6 +28,7 @@ const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
 const CALL_STAGE_HEIGHT_KEY = "awful:call-stage-height:v1";
 const CALL_CHAT_WIDTH_KEY = "awful:call-chat-width:v1";
 const ROOM_PROFILE_SIDEBAR_KEY = "awful:room-profile-sidebar:v1";
+const DM_SECTIONS_FOLDED_KEY = "awful:dm-sections-folded:v1";
 
 function readFraction(key: string): number | null {
   if (typeof localStorage === "undefined") return null;
@@ -113,7 +115,21 @@ export const displayPrefs = $state({
   ),
   /** Show the current chat room's profile in the bottom-left identity card. */
   showRoomProfileInSidebar: readStored(ROOM_PROFILE_SIDEBAR_KEY, false),
+  /** The direct-message list's sections folded under their headings. */
+  foldedDmSections: parseFoldedDmSections(
+    typeof localStorage === "undefined" ? null : localStorage.getItem(DM_SECTIONS_FOLDED_KEY),
+  ),
 });
+
+export function setFoldedDmSections(keys: DmSectionKey[]): void {
+  displayPrefs.foldedDmSections = keys;
+  try {
+    if (keys.length === 0) localStorage.removeItem(DM_SECTIONS_FOLDED_KEY);
+    else localStorage.setItem(DM_SECTIONS_FOLDED_KEY, JSON.stringify(keys));
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
 
 export function setShowRoomProfileInSidebar(on: boolean): void {
   displayPrefs.showRoomProfileInSidebar = on;
@@ -282,5 +298,7 @@ if (typeof window !== "undefined") {
       displayPrefs.callStageHeight = parseFraction(e.newValue);
     if (e.key === CALL_CHAT_WIDTH_KEY)
       displayPrefs.callChatWidth = parseFraction(e.newValue);
+    if (e.key === DM_SECTIONS_FOLDED_KEY)
+      displayPrefs.foldedDmSections = parseFoldedDmSections(e.newValue);
   });
 }

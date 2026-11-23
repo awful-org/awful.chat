@@ -63,6 +63,25 @@ describe("dropIndex", () => {
     expect(dropIndex(boxes, 2, 19)).toBe(0);
   });
 
+  it("lets a tall row pass a short one it has covered, and a short row a tall one", () => {
+    // short (0-32), tall (34-104), short (106-138): a voice channel with people.
+    const mixed = [
+      { top: 0, height: 32 },
+      { top: 34, height: 70 },
+      { top: 106, height: 32 },
+    ];
+    // The tall row's center rests at 69. Up: covered once its top passes 0.
+    expect(dropIndex(mixed, 1, 69)).toBe(1);
+    expect(dropIndex(mixed, 1, 36)).toBe(1);
+    expect(dropIndex(mixed, 1, 34)).toBe(0);
+    // Down: covered once its bottom passes 138.
+    expect(dropIndex(mixed, 1, 102)).toBe(1);
+    expect(dropIndex(mixed, 1, 104)).toBe(2);
+    // A short row need not travel the whole of the tall one.
+    expect(dropIndex(mixed, 0, 70)).toBe(1);
+    expect(dropIndex(mixed, 2, 68)).toBe(1);
+  });
+
   it("clamps past either end", () => {
     expect(dropIndex(boxes, 1, -500)).toBe(0);
     expect(dropIndex(boxes, 1, 500)).toBe(2);
