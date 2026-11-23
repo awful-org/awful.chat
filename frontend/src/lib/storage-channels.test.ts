@@ -239,6 +239,15 @@ describe("upgrading a database from before channels", () => {
     expect((await getMessages(ROOM, undefined, undefined, "")).map((m) => m.id)).toEqual(["m-0001", "m-0002"]);
     expect((await getMessages(ROOM, undefined, undefined, GAMES)).map((m) => m.id)).toEqual(["m-0003"]);
 
+    // A channel row an older build stored (from a newer device's backup or
+    // device sync): sealed with its channel inside but no index field. It
+    // is not the original chat's, whatever its clear fields say.
+    const { pairBlind: _unused, ...v10Spec } = STORE_SPECS.messages;
+    const stray = await sealRow(msg({ channel: GAMES }) as never, v10Spec);
+    expect("roomChannel" in stray).toBe(false);
+    await database.put("messages", stray as never);
+    expect((await getMessages(ROOM, undefined, undefined, "")).map((m) => m.id)).toEqual(["m-0001", "m-0002"]);
+
     // Not rewritten: the same sealed blob, IV and all, as before the upgrade.
     const after = (await database.getAll("messages")) as unknown as Array<{ id: string; _enc: { iv: Uint8Array } }>;
     for (const row of sealed as unknown as Array<{ id: string; _enc: { iv: Uint8Array } }>) {

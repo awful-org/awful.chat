@@ -459,6 +459,24 @@ describe("voice channels", () => {
     expect(transportState.inCall).toBe(false);
   });
 
+  it("does not carry a channel pressed during a join into a room opened since", async () => {
+    let fail: (err: Error) => void = () => {};
+    voiceMock.join.mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => { fail = reject; })
+    );
+    const first = joinCall();
+    const second = joinCall("lounge01");
+    // The user moves on to another room, and the first join then fails.
+    transportState.roomCode = OTHER;
+    fail(new Error("Could not start audio source"));
+    await first.catch(() => {});
+    await second;
+    // The waiting press was for a channel of ROOM: it is not one of OTHER's,
+    // and nobody pressed anything in OTHER.
+    expect(transportState.inCall).toBe(false);
+    expect(videoMock.join).not.toHaveBeenCalled();
+  });
+
   it("unwinds a switch hung up while its SFU join was out", async () => {
     await joinCall();
     let finish: () => void = () => {};

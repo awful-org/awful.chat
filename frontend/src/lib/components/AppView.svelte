@@ -866,13 +866,21 @@
     if (drainingIntents || !identityStore.isUnlocked) return;
     drainingIntents = true;
     try {
-      const { drainNotifyIntents, keepDroppedReplyDraft } = await import(
+      const { drainNotifyIntents, keepDroppedReplyDraft, intentChannel } = await import(
         "$lib/notify-intents"
       );
       const intents = await drainNotifyIntents();
       for (const it of intents) {
         if (it.dmPeerDid) await handleSelectDm(it.dmPeerDid);
         else await handleSelectRoom(it.roomCode);
+        // The channel the notification was about (announce.ts) is the one
+        // opened, and the one a reply goes into: the room alone would send
+        // it into whichever channel the room was last left on. False when
+        // that channel is gone, and then the reply is kept as a draft.
+        const channel = intentChannel(it);
+        const inChannel =
+          channel === undefined ||
+          (transportState.roomCode === it.roomCode && (await selectChannel(it.roomCode, channel)));
         if (it.kind === "reply" && it.text.trim()) {
           const { sendMessage } = await import(
             "$lib/transport/transport.svelte"
@@ -888,7 +896,9 @@
           const onTarget = it.dmPeerDid
             ? transportState.chatMode === "dm" && activeDmDid === it.dmPeerDid
             : transportState.chatMode !== "dm" &&
-              transportState.roomCode === it.roomCode;
+              transportState.roomCode === it.roomCode &&
+              inChannel &&
+              (channel === undefined || currentChannel(it.roomCode) === channel);
           if (!onTarget) {
             console.warn("[notify] reply skipped: conversation changed");
             // Not thrown away: it becomes the draft the composer prefills
@@ -896,7 +906,7 @@
             keepDroppedReplyDraft(it.roomCode, it.text);
             continue;
           }
-          await sendMessage(it.text.trim());
+          await sendMessage(it.text.trim(), channel === undefined ? {} : { channel });
         }
       }
     } catch (err) {

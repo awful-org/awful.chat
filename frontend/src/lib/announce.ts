@@ -89,6 +89,21 @@ interface Pending {
   urgent: boolean;
   viewing: boolean;
   dmPeerDid?: string;
+  /**
+   * The room's channel the message is in ("" for the original chat), so a
+   * click opens it and an inline reply is sent into it rather than into
+   * whichever channel the room was last left on. Absent for a DM.
+   */
+  channel?: string;
+}
+
+/** A notification's data bag: where its click and its inline reply go. */
+function clickData(p: Pending, channel: string | undefined) {
+  return {
+    roomCode: p.ref,
+    dmPeerDid: p.dmPeerDid,
+    ...(channel !== undefined ? { channel } : {}),
+  };
 }
 
 let pending: Pending[] = [];
@@ -117,7 +132,7 @@ function emit(p: Pending): void {
     tag: p.tag,
     viewingConversation: p.viewing,
     urgent: p.urgent,
-    data: { roomCode: p.ref, dmPeerDid: p.dmPeerDid },
+    data: clickData(p, p.channel),
   });
 }
 
@@ -150,8 +165,10 @@ function flushBurst(): void {
     isPreview: false,
     viewingConversation: items.every((i) => i.viewing),
     urgent: items.some((i) => i.urgent),
+    // A burst over several channels of one room names none of them: the
+    // reply then goes where the room is, as it did before channels.
     data: sameRoom
-      ? { roomCode: first.ref, dmPeerDid: first.dmPeerDid }
+      ? clickData(first, items.every((i) => i.channel === first.channel) ? first.channel : undefined)
       : undefined,
   });
 }
@@ -322,6 +339,7 @@ export function announceMessage(
         // An inbound DM's sender IS the other side of the conversation, so a
         // click on the notification routes straight back to it.
         dmPeerDid: isDm ? msg.senderDid || msg.senderId : undefined,
+        channel: isDm ? undefined : channelId,
       },
       opts.viaMailbox ?? false
     );

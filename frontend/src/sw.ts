@@ -50,7 +50,7 @@ self.addEventListener("activate", (event) => {
 // now" nudge for a window that is already alive.
 self.addEventListener("notificationclick", (event) => {
   const data = event.notification.data as
-    | { roomCode?: string; dmPeerDid?: string }
+    | { roomCode?: string; dmPeerDid?: string; channel?: unknown }
     | undefined;
   const reply = (event as NotificationEvent & { reply?: string }).reply;
   event.notification.close();
@@ -61,6 +61,9 @@ self.addEventListener("notificationclick", (event) => {
           kind: event.action === "reply" && reply ? "reply" : "open",
           roomCode: data.roomCode,
           dmPeerDid: data.dmPeerDid,
+          // Which channel of the room it was about, so the reply lands there
+          // (checked when drained, notify-intents.ts intentChannel).
+          ...(typeof data.channel === "string" ? { channel: data.channel } : {}),
           text: reply ?? "",
           ts: Date.now(),
         }).catch(() => {});

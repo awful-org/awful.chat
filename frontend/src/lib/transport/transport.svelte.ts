@@ -79,7 +79,7 @@ import {
   type Channel,
   type ChannelKind,
 } from "../channels";
-import { currentChannelOf, setCurrentChannel } from "../channel-view.svelte";
+import { currentChannelOf, forgetCurrentChannel, setCurrentChannel } from "../channel-view.svelte";
 import { normalizeWireName } from "../wire-name";
 import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
@@ -3236,6 +3236,10 @@ function _handleTyping(
     // Per channel: dots in one channel are not shown in another.
     const channel = typingFrameChannel(msg.channel, isChannelId);
     if (channel === null) return;
+    // Only a channel the room's list holds. Each channel is a typer list of
+    // its own, capped per list, so any id a member cared to name would be
+    // one more list - and nothing could show the dots of one not listed.
+    if (channel && !roomChannel(room, channel)) return;
     noteTyping(typingKey(room, channel), did, msg.typing);
     return;
   }
@@ -5493,6 +5497,9 @@ function _disconnectWithoutBroadcasting(): void {
   transportState.callPeerRooms = new Map();
   transportState.callPeerVoiceChannels = new Map();
   _callPeerSeen.clear();
+  // Which channel each room was left on is keyed by room code, the room's
+  // membership secret: it goes with the session, like the roster above.
+  forgetCurrentChannel();
   transportState.pendingTransmissions = new Map();
   transportState.watchingTransmissions = new Map();
   transportState.fileTransfers = new Map();

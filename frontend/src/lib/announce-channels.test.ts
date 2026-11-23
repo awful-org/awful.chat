@@ -5,7 +5,12 @@ import { MessageType, type Message } from "./types/message";
 // as loud as that channel is allowed to be, and "being read" only when that
 // very channel is on screen.
 
-const notified: Array<{ title: string; body: string; viewingConversation?: boolean }> = [];
+const notified: Array<{
+  title: string;
+  body: string;
+  viewingConversation?: boolean;
+  data?: { roomCode: string; channel?: string };
+}> = [];
 const GAMES = "gamesgames";
 const GONE = "gonegone00";
 
@@ -107,6 +112,33 @@ describe("a message in a channel", () => {
     expect(effectiveNotifyMode("room-a", GAMES)).toBe("muted");
     // The original chat has no mode apart from the room's.
     expect(getChannelNotifyMode("room-a", "")).toBeNull();
+  });
+
+  it("tells a click and an inline reply which channel it is about", () => {
+    // Without it the reply was sent into whichever channel the room was
+    // last left on: a reply to a mention in #games landed in the original chat.
+    announce(msg({ channel: GAMES }));
+    announce(msg());
+    expect(notified.map((x) => x.data?.channel)).toEqual([GAMES, ""]);
+  });
+
+  it("names no channel for a burst across channels of one room", () => {
+    announceMessage(msg({ channel: GAMES }), ctx);
+    announceMessage(msg({ channel: GAMES }), ctx);
+    announceMessage(msg(), ctx);
+    vi.advanceTimersByTime(2500);
+    // The first goes out at once; the two behind it are one burst.
+    expect(notified.map((x) => x.data?.channel)).toEqual([GAMES, undefined]);
+    expect(notified[1].data).toHaveProperty("roomCode");
+    expect(notified[1].data).not.toHaveProperty("channel");
+
+    announceMessage(msg({ channel: GAMES }), ctx);
+    announceMessage(msg({ channel: GAMES }), ctx);
+    announceMessage(msg({ channel: GAMES }), ctx);
+    vi.advanceTimersByTime(2500);
+    // Still inside the window the burst opened: all three are one, of #games.
+    expect(notified).toHaveLength(3);
+    expect(notified[2].data?.channel).toBe(GAMES);
   });
 
   it("is being read only when its own channel is on screen", () => {

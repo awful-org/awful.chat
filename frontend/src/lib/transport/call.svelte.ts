@@ -316,10 +316,16 @@ export function joinCall(voiceChannel: string = DEFAULT_VOICE_CHANNEL): Promise<
   if (_joinPromise) {
     if (_joinTarget === voiceChannel) return _joinPromise;
     // Event-driven: the next step starts when the one in flight settles.
+    // Only in the room it was pressed in: a channel id is one room's, and
+    // once another room is on screen the waiting join would land in a
+    // channel of that room nobody chose (the first join having failed).
     const leaves = _leaveCount;
+    const room = transportState.roomCode;
     return _joinPromise
       .catch(() => {})
-      .then(() => (leaves === _leaveCount ? joinCall(voiceChannel) : undefined));
+      .then(() =>
+        leaves === _leaveCount && transportState.roomCode === room ? joinCall(voiceChannel) : undefined
+      );
   }
   if (transportState.inCall) {
     if (

@@ -809,9 +809,16 @@ async function _channelRanges(
 /**
  * Rows opened for a channel, checked against the channel they carry: the
  * index hash says where a row was filed, the sealed field is what it says.
+ *
+ * The original chat too. Its walk keeps every row without the index field,
+ * and a row can carry a channel without one: an older build seals no index
+ * field, and one that imported a newer device's backup or device sync
+ * stored channel rows that way - which, once that device updates, would
+ * otherwise read as messages of the original chat.
  */
 function _keepChannel(rows: Message[], channel: string | undefined): Message[] {
-  if (!channel) return rows;
+  if (channel === undefined) return rows;
+  if (channel === "") return rows.filter((m) => !m.channel);
   return rows.filter((m) => m.channel === channel);
 }
 
