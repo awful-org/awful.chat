@@ -65,17 +65,26 @@ export function channelModeToStore(mode: RoomNotifyMode, roomMode: RoomNotifyMod
 /**
  * Whose notifications the header bell sets: the channel's on screen, the
  * original chat included, once the room has a choice of them. With one chat
- * there is one setting, the room's (or DM's), as before channels.
+ * there is one setting, the room's (or DM's), as before channels; and in a
+ * muted room the room's is the one that decides.
  */
 export function bellScope(
   textChannels: readonly { id: string }[],
-  current: string
+  current: string,
+  roomMode: RoomNotifyMode = "all"
 ): "room" | "channel" {
+  if (roomMode === "muted") return "room";
   return current === DEFAULT_TEXT_CHANNEL && hasOneChat(textChannels) ? "room" : "channel";
 }
 
 /** The header bell's label: for the room, or for the channel on screen. */
-export function notifyLabel(mode: RoomNotifyMode, channelName: string | null): string {
+export function notifyLabel(
+  mode: RoomNotifyMode,
+  channelName: string | null,
+  roomMode: RoomNotifyMode = "all"
+): string {
+  // In a room of several channels: that it is all of them, not this one.
+  if (channelName && roomMode === "muted") return "Notifications: Room muted";
   return channelName
     ? `Notifications for #${channelName}: ${NOTIFY_LABEL[mode]}`
     : `Notifications: ${NOTIFY_LABEL[mode]}`;
@@ -96,6 +105,9 @@ export interface NotifyMenuItem {
  * setting between them, the room's, and saying "channel" would be a lie
  * about what happens. With other text channels the original chat is a
  * channel like them, with a mode of its own.
+ *
+ * A muted room is silent in every channel, so a channel's menu there has one
+ * item, the room's own: no choice of the channel's would be heard.
  */
 export function notifyMenuItems(opts: {
   scope: "room" | "channel";
@@ -108,11 +120,11 @@ export function notifyMenuItems(opts: {
   const { scope, mode, own, roomMode } = opts;
   const isRoom = scope === "room";
   const store = (m: RoomNotifyMode) => (isRoom ? m : channelModeToStore(m, roomMode));
+  if (!isRoom && roomMode === "muted") return [{ id: "unmute", label: "Unmute room", mode: "all" }];
   const items: NotifyMenuItem[] = [];
   if (mode === "muted") {
-    // Unmuted is "all" for the room; for a channel it is whatever its room
-    // gives when that is not muted, else "all" of its own.
-    const unmuted: RoomNotifyMode = isRoom || roomMode === "muted" ? "all" : roomMode;
+    // Unmuted is "all" for the room; for a channel, whatever its room gives.
+    const unmuted: RoomNotifyMode = isRoom ? "all" : roomMode;
     items.push({ id: "unmute", label: `Unmute ${scope}`, mode: store(unmuted) });
   } else {
     items.push({ id: "mute", label: `Mute ${scope}`, mode: store("muted") });

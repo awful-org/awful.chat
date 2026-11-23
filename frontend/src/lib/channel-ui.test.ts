@@ -53,9 +53,18 @@ describe("the header bell", () => {
     expect(notifyLabel("muted", channelHeading([general], ""))).toBe("Notifications: Muted");
   });
 
+  it("is the room's in a muted room, and says so", () => {
+    expect(bellScope([general, random], random.id, "muted")).toBe("room");
+    expect(bellScope([general, random], "", "muted")).toBe("room");
+    expect(bellScope([general, random], random.id, "mentions")).toBe("channel");
+    expect(notifyLabel("muted", "random", "muted")).toBe("Notifications: Room muted");
+    expect(notifyLabel("muted", "random", "all")).toBe("Notifications for #random: Muted");
+    expect(notifyLabel("muted", null, "muted")).toBe("Notifications: Muted");
+  });
+
   it("stores a channel mode only while it differs from the room's", () => {
-    expect(channelModeToStore("muted", "muted")).toBeNull();
-    expect(channelModeToStore("all", "muted")).toBe("all");
+    expect(channelModeToStore("mentions", "mentions")).toBeNull();
+    expect(channelModeToStore("all", "mentions")).toBe("all");
   });
 });
 
@@ -77,9 +86,12 @@ describe("a channel's notification menu", () => {
     ]);
   });
 
-  it("unmutes a channel of a muted room by giving it a mode of its own", () => {
-    const items = notifyMenuItems({ scope: "channel", mode: "muted", own: null, roomMode: "muted" });
-    expect(items[0]).toEqual({ id: "unmute", label: "Unmute channel", mode: "all" });
+  it("offers a channel of a muted room its room, and nothing of its own", () => {
+    for (const own of [null, "all", "mentions", "muted"] as const) {
+      expect(notifyMenuItems({ scope: "channel", mode: "muted", own, roomMode: "muted" })).toEqual([
+        { id: "unmute", label: "Unmute room", mode: "all" },
+      ]);
+    }
   });
 
   it("offers all messages back from mentions only", () => {

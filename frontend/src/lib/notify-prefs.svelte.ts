@@ -70,15 +70,13 @@ export function roomNotifySetting(roomCode: string, channels: readonly string[])
 /**
  * Set how loud a room may be.
  *
- * Muting a room is "no sound from this room", so it also takes back the
- * louder modes its channels kept from before (`channels`: the room's text
- * channel ids, "" being its original chat): a channel set to "all messages"
- * while the room was loud would otherwise go on beeping in a room the user
- * has just muted. Those channels follow the room again; one that should stay
- * loud is unmuted again from its own menu, after this, and then keeps that.
+ * A muted room is silent in all its channels, whatever each is set to
+ * (effectiveNotifyMode); what they were set to is kept, and is theirs again
+ * when the room comes back.
  *
  * In a room whose only chat is the original one, any mode replaces what that
  * chat kept: there the room's setting is the chat's (roomNotifySetting).
+ * `channels` is the room's text channel ids, which says whether it is one.
  */
 export function setRoomNotifyMode(
   roomCode: string,
@@ -93,17 +91,9 @@ export function setRoomNotifyMode(
   } catch {
     // Storage blocked: the choice just does not survive a reload.
   }
-  const single = oneChat(channels);
-  if (mode !== "muted" && !single) return;
-  let dropped = false;
-  for (const channel of channels) {
-    const cref = channelRef(roomCode, channel);
-    const own = channelPrefs.modes[cref];
-    if (own === undefined || (own === "muted" && !single)) continue;
-    delete channelPrefs.modes[cref];
-    dropped = true;
-  }
-  if (!dropped) return;
+  const cref = channelRef(roomCode, "");
+  if (!oneChat(channels) || channelPrefs.modes[cref] === undefined) return;
+  delete channelPrefs.modes[cref];
   try {
     localStorage.setItem(CHANNEL_KEY, JSON.stringify(channelPrefs.modes));
   } catch {
@@ -114,9 +104,9 @@ export function setRoomNotifyMode(
 // ── per channel (channels.ts) ───────────────────────────────────────────────
 //
 // A channel follows its room until someone picks a mode for that channel,
-// and then keeps it whatever the room is set to - "all" included, so one
-// channel can stay loud in a muted room. The original chat ("") is a channel
-// like the others. Kept apart from the room modes, under the same hashed keys
+// and then keeps it, louder or quieter than its room - but for a muted room,
+// which is silent in every channel. The original chat ("") is a channel like
+// the others. Kept apart from the room modes, under the same hashed keys
 // (of the room and the channel together: the original chat's is the room code
 // and the separator, never the room's own key), so a build without channels
 // reads its room map exactly as before, and a room muted before channels is a
@@ -173,7 +163,8 @@ export function setChannelNotifyMode(
 
 /** How loud a message in this channel of the room may be. */
 export function effectiveNotifyMode(roomCode: string, channel = ""): RoomNotifyMode {
-  return getChannelNotifyMode(roomCode, channel) ?? getRoomNotifyMode(roomCode);
+  const room = getRoomNotifyMode(roomCode);
+  return room === "muted" ? room : (getChannelNotifyMode(roomCode, channel) ?? room);
 }
 
 // A second tab muting a room should be reflected here, not fought.
