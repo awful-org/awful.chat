@@ -1727,12 +1727,14 @@ export async function _loadHistory(
 ): Promise<void> {
   const page = { capped: false };
   transportState.historyRoom = null;
+  const channel = _viewChannel(roomCode);
   const [msgs, profiles, roomProfiles] = await Promise.all([
-    getMessages(roomCode, undefined, page, _viewChannel(roomCode)),
+    getMessages(roomCode, undefined, page, channel),
     getAllPeerProfiles(),
     getAllPeerRoomProfiles(roomCode),
   ]);
-  if (!stillCurrent()) return;
+  // A channel picked while this read ran has a read of its own under way.
+  if (!stillCurrent() || _viewChannel(roomCode) !== channel) return;
   // Storage and the live view share the same logical sequence/ID ordering.
   transportState.messages = [...msgs].sort(MSG_ORDER);
   // Whether a first read filled a page is the only honest answer to "is

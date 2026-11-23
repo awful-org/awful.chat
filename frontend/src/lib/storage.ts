@@ -2174,8 +2174,12 @@ export interface ChannelMarks {
 }
 
 /**
- * Unread rows per channel, from one read of the room above the lowest mark:
- * "" for the original chat, and each channel named in `marks.channels`.
+ * Unread rows per channel: "" for the original chat, and each channel named
+ * in `marks.channels`. Each is read above its own mark only - the original
+ * chat through the room index, skipping the other channels' rows on the way
+ * from their clear index field, and every other channel through its own
+ * index - so a channel nobody has opened yet costs a read of that channel,
+ * never of the whole room.
  *
  * A row in a channel not named there is in no count: a channel that was
  * deleted, or one whose list has not reached us yet - nothing on screen
@@ -2188,30 +2192,19 @@ export async function getChannelUnreadCounts(
   excludeSenderId?: string,
   skipSenders: Iterable<string> = []
 ): Promise<Map<string, number>> {
-  const ids = Object.keys(marks.channels);
-  const lowest = Math.min(marks.base, ...ids.map((id) => marks.channels[id]));
-  const rows = await _rowsAbove(roomCode, lowest);
   const skipped = await _skippedSenders(excludeSenderId, skipSenders);
-  // Rows say which channel they are in by the index hash: one hash per
-  // channel named, computed once.
-  const byKey = new Map<string, string>();
-  for (const id of ids) byKey.set(await _roomChannelKey(roomCode, id), id);
-  const perChannel = new Map<string, Message[]>([["", []]]);
-  for (const id of ids) perChannel.set(id, []);
-  for (const row of rows) {
-    const hint = row as unknown as { roomChannel?: unknown; channel?: unknown };
-    const channel =
-      typeof hint.roomChannel === "string"
-        ? byKey.get(hint.roomChannel)
-        : typeof hint.channel === "string" && hint.channel
-          ? (ids.includes(hint.channel) ? hint.channel : undefined)
-          : "";
-    if (channel === undefined) continue;
-    const mark = channel === "" ? marks.base : marks.channels[channel];
-    if (row.lamport > mark) perChannel.get(channel)!.push(row);
-  }
   const out = new Map<string, number>();
-  for (const [channel, list] of perChannel) out.set(channel, await _countUnread(list, skipped));
+  const original = (await _rowsAbove(roomCode, marks.base)).filter((r) => !_inSomeChannel(r));
+  out.set("", await _countUnread(original, skipped));
+  for (const [channel, mark] of Object.entries(marks.channels)) {
+    if (!channel) continue;
+    const key = await _roomChannelKey(roomCode, channel);
+    const rows = await (await getDB())
+      .transaction("messages")
+      .store.index("byRoomChannelLamport")
+      .getAll(IDBKeyRange.bound([key, mark + 1], [key, Number.MAX_SAFE_INTEGER]));
+    out.set(channel, await _countUnread(rows, skipped));
+  }
   return out;
 }
 
