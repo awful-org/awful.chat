@@ -71,6 +71,7 @@ import {
 import {
   createChannelEntry,
   deleteChannelEntry,
+  isChannelId,
   messageChannel,
   parseChannelList,
   renameChannelEntry,
@@ -198,6 +199,7 @@ import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
 import { _sendWatchPresence } from "./transmission.svelte";
 import { watchedFromWire } from "$lib/watch-presence";
 import { clearTyping, noteTyping, typingPrefs } from "$lib/typing.svelte";
+import { typingFrameChannel, typingKey } from "$lib/typing";
 import {
   type DmPayload,
   encodeDmAckEnvelope,
@@ -3231,7 +3233,10 @@ function _handleTyping(
   const did = _peerIdToDid.get(peerId);
   if (!did || did === identityStore.did) return;
   if (!room.startsWith("dm-")) {
-    noteTyping(room, did, msg.typing);
+    // Per channel: dots in one channel are not shown in another.
+    const channel = typingFrameChannel(msg.channel, isChannelId);
+    if (channel === null) return;
+    noteTyping(typingKey(room, channel), did, msg.typing);
     return;
   }
   // Same binding a DM message gets: the conversation must be the one
@@ -4999,7 +5004,10 @@ _transport.on("message", (peerId, data, room) => {
         // clearing their own dots is nothing a "stopped" frame could not do.
         if (msg.type !== MessageType.Reaction && msg.type !== MessageType.PluginUpdate) {
           const author = _peerIdToDid.get(peerId);
-          if (author) clearTyping(room, author);
+          // In the channel it says it was written in; a malformed tag is
+          // refused by the verify below, and clearing dots harms nothing.
+          const written = typeof msg.channel === "string" ? msg.channel : "";
+          if (author) clearTyping(typingKey(room, written), author);
         }
         _verifyIncoming(msg, { room })
           .then((v) => {
@@ -5747,10 +5755,10 @@ function _sendChannel(roomCode: string, named?: string): string {
  * queued: a "typing" that arrives late is wrong, not late. DMs go through
  * sendDmTyping, which knows the peer.
  */
-export function sendRoomTyping(roomCode: string, typing: boolean): void {
+export function sendRoomTyping(roomCode: string, typing: boolean, channel = ""): void {
   if (typing && !typingPrefs.sendTyping) return;
   if (roomCode.startsWith("dm-") || !_transport.isSecureRoom(roomCode)) return;
-  const frame: WireTyping = { type: MessageType.Typing, typing };
+  const frame: WireTyping = { type: MessageType.Typing, typing, ...(channel ? { channel } : {}) };
   void _transport.broadcast(encode(frame), roomCode).catch(() => {});
 }
 

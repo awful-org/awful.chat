@@ -6,6 +6,8 @@ import {
   TypingAnnouncer,
   TypingSender,
   TypingTracker,
+  typingFrameChannel,
+  typingKey,
   typingLine,
 } from "./typing";
 
@@ -134,5 +136,29 @@ describe("typingLine", () => {
     expect(typingLine(["Ana", "Bo"])).toBe("Ana and Bo are typing…");
     expect(typingLine(["Ana", "Bo", "Cy"])).toBe("Ana, Bo and Cy are typing…");
     expect(typingLine(["Ana", "Bo", "Cy", "Di"])).toBe("4 people are typing…");
+  });
+});
+
+describe("typing per channel", () => {
+  it("keeps the room's own key for its original chat, and a key of its own per channel", () => {
+    expect(typingKey("rd2_room")).toBe("rd2_room");
+    expect(typingKey("rd2_room", "")).toBe("rd2_room");
+    expect(typingKey("rd2_room", "aaaaaaaaaaaaaaaa")).not.toBe("rd2_room");
+    expect(typingKey("rd2_room", "aaaaaaaaaaaaaaaa")).not.toBe(typingKey("rd2_room", "bbbbbbbbbbbbbbbb"));
+  });
+
+  it("does not show one channel's typer in another", () => {
+    const t = new TypingTracker();
+    t.note(typingKey("r", "aaaaaaaaaaaaaaaa"), "did:bob", true, 0);
+    expect(t.typers(typingKey("r", "aaaaaaaaaaaaaaaa"), 1)).toEqual(["did:bob"]);
+    expect(t.typers(typingKey("r"), 1)).toEqual([]);
+  });
+
+  it("reads a frame's channel: none is the original chat, a malformed one drops it", () => {
+    const isId = (v: unknown) => typeof v === "string" && /^[a-z0-9]{8,32}$/.test(v);
+    expect(typingFrameChannel(undefined, isId)).toBe("");
+    expect(typingFrameChannel("aaaaaaaaaaaaaaaa", isId)).toBe("aaaaaaaaaaaaaaaa");
+    expect(typingFrameChannel("", isId)).toBeNull();
+    expect(typingFrameChannel(42, isId)).toBeNull();
   });
 });

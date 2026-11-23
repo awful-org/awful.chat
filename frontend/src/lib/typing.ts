@@ -28,6 +28,28 @@ export const MAX_TYPERS_PER_ROOM = 64;
 export type TypingAction = "start" | "stop" | null;
 
 /**
+ * Where typers are tracked: a conversation, or one channel of a room
+ * (channels.ts). The original chat ("") is the room itself, so a room with no
+ * channels - and every frame an older build sends, which names none - keeps
+ * the key it always had. The separator cannot occur in a room code.
+ */
+export function typingKey(room: string, channel = ""): string {
+  return channel ? `${room}\u0000${channel}` : room;
+}
+
+/**
+ * The channel a room's typing frame is about: "" when it names none, null
+ * when what it names is not a channel id (the frame is dropped).
+ */
+export function typingFrameChannel(
+  channel: unknown,
+  isChannelId: (v: unknown) => boolean
+): string | null {
+  if (channel === undefined) return "";
+  return isChannelId(channel) ? (channel as string) : null;
+}
+
+/**
  * The sending half, one per composer. `input` runs on every change to the
  * draft and says what, if anything, to put on the wire.
  */

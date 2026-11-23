@@ -305,6 +305,12 @@ export interface WireWatchPresence {
 export interface WireTyping {
   type: MessageType.Typing;
   typing: boolean;
+  /**
+   * The room's channel being typed in (channels.ts). Absent for the original
+   * chat, so an older build, which only knows that one, reads the frame as
+   * it always did.
+   */
+  channel?: string;
 }
 
 export interface WirePluginEphemeral {
