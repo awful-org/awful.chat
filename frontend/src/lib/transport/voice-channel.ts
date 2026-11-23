@@ -12,27 +12,14 @@
  * know that one.
  */
 
-/**
- * The room's original call. Mirrors DEFAULT_VOICE_CHANNEL in
- * $lib/channels.ts (the channel list, owned by the text-channels work); once
- * both branches are merged this should import from there instead.
- */
-export const DEFAULT_VOICE_CHANNEL = "";
+// One definition of a channel id and of the default channel, shared with
+// the channel list ($lib/channels.ts). Whether an id is in a room's list is
+// deliberately not asked here: any well-formed id is a valid call tag. The
+// list arrives over sync like any other room state, and a call in a channel
+// whose entry has not reached us yet must still connect.
+import { DEFAULT_VOICE_CHANNEL, isChannelId } from "../channels";
+export { DEFAULT_VOICE_CHANNEL, isChannelId };
 
-/**
- * A well-formed channel id. Mirrors isChannelId in $lib/channels.ts; import
- * from there once both branches are merged.
- *
- * Whether the id is in the room's channel list is deliberately not asked:
- * any well-formed id is a valid call tag. The list arrives over sync like
- * any other room state, and a call in a channel whose entry has not reached
- * us yet must still connect.
- */
-export function isChannelId(value: unknown): value is string {
-  return typeof value === "string" && /^[a-z0-9]{8,32}$/.test(value);
-}
-
-/** The default channel or a well-formed channel id. */
 export function isVoiceChannel(value: unknown): value is string {
   return value === DEFAULT_VOICE_CHANNEL || isChannelId(value);
 }
