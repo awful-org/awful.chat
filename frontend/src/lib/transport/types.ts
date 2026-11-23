@@ -255,7 +255,8 @@ export interface VideoEvents {
  *   - Max 1 transmission watched simultaneously (enforced by the caller).
  */
 export interface VideoTransport {
-  join(roomCode: string, peerId: string): Promise<void>;
+  /** `voiceChannel` picks the SFU room: each voice channel has its own. */
+  join(roomCode: string, peerId: string, voiceChannel?: string): Promise<void>;
   leave(): void;
   /** If `stream` is provided, publish it directly (avoids a second getUserMedia call). */
   startCamera(stream?: MediaStream): Promise<void>;
