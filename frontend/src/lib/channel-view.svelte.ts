@@ -12,7 +12,10 @@
  */
 import { DEFAULT_TEXT_CHANNEL } from "./channels";
 
-const view = $state<{ current: Record<string, string> }>({ current: {} });
+const view = $state<{ current: Record<string, string>; opening: Record<string, string> }>({
+  current: {},
+  opening: {},
+});
 
 /** The channel open in a room; the original chat ("") when none was picked. */
 export function currentChannelOf(roomCode: string | null | undefined): string {
@@ -30,8 +33,27 @@ export function setCurrentChannel(roomCode: string, channel: string): void {
   else view.current[roomCode] = channel;
 }
 
+/**
+ * The channel picked whose page is still being read, which the list marks as
+ * the open one; null when there is none. Until then the channel on screen,
+ * and the one a message goes into, is the one before it.
+ */
+export function openingChannelOf(roomCode: string): string | null {
+  return view.opening[roomCode] ?? null;
+}
+
+export function setOpeningChannel(roomCode: string, channel: string | null): void {
+  if (channel === null) delete view.opening[roomCode];
+  else view.opening[roomCode] = channel;
+}
+
 /** A room left or removed, or the session ending. */
 export function forgetCurrentChannel(roomCode?: string): void {
-  if (roomCode === undefined) view.current = {};
-  else delete view.current[roomCode];
+  if (roomCode === undefined) {
+    view.current = {};
+    view.opening = {};
+  } else {
+    delete view.current[roomCode];
+    delete view.opening[roomCode];
+  }
 }

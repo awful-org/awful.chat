@@ -138,6 +138,20 @@ export function stageCall(roomOnScreen: string | null, myCall: CallTag | null): 
 }
 
 /**
+ * Whether the stage is above the chat. Always with the call we are in. A
+ * call we are not in has one, with who is in it and the way to join, only
+ * where the sidebar does not say both: it lists a room's voice channels, but
+ * a DM has none, and a quick call has no sidebar.
+ */
+export function showsStage(opts: {
+  inThisCall: boolean;
+  othersInCall: boolean;
+  sidebarListsCall: boolean;
+}): boolean {
+  return opts.inThisCall || (opts.othersInCall && !opts.sidebarListsCall);
+}
+
+/**
  * How the call status names the call: the room, and the voice channel when
  * it is not the room's original call. A channel whose entry has not reached
  * us is still named as one.

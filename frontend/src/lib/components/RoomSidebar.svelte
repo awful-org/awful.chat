@@ -14,6 +14,7 @@
   import type { Attachment } from "svelte/attachments";
   import { tick } from "svelte";
   import { flip } from "svelte/animate";
+  import { slideFlip } from "$lib/sidebar-flip";
   import { cubicOut } from "svelte/easing";
   import { dropIndex, moveItem, slotTop, type RowBox } from "$lib/room-order";
   import {
@@ -1723,7 +1724,7 @@
         {@const lifted = isLifted("text", channel.id)}
         <li
           data-drag-row={draggable ? "text" : undefined}
-          animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
+          animate:slideFlip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
           style={rowStyle("text", channel.id)}
           class="relative {lifted ? liftedRow : ''}"
         >
@@ -1790,7 +1791,7 @@
              together in a drag. -->
         <li
           data-drag-row={draggable ? "voice" : undefined}
-          animate:flip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
+          animate:slideFlip={{ duration: lifted ? 0 : FLIP_MS, easing: cubicOut }}
           style={rowStyle("voice", channel.id)}
           class="relative {lifted ? liftedRow : ''}"
         >

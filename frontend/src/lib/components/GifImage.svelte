@@ -5,7 +5,9 @@
     animatedView,
     canDecodeStillFrame,
     stillFrameRedraw,
+    stillFrameSize,
   } from "$lib/image-size";
+  import { keepStillFrame, keptStillFrame } from "$lib/still-frames";
   /**
    * An image that can hold an animated GIF still. Browsers cannot pause a
    * GIF, so a canvas keeps the first frame and the animated img only exists
@@ -44,13 +46,24 @@
   }
 
   let {
-    src,
-    alt = "",
-    class: cls = "",
+    src: srcProp,
+    alt: altProp = "",
+    class: clsProp = "",
     animate = true,
     animated = undefined,
     loading,
   }: Props = $props();
+
+  // A prop is whatever the parent's expression reads: with `person.avatarUrl`
+  // every new `person` is a change to it, the same url included, and an
+  // effect reading it runs again. Each run loaded the image anew and wiped
+  // the canvas. As deriveds they change only when their value does.
+  const src = $derived(srcProp);
+  const alt = $derived(altProp);
+  const cls = $derived(clsProp);
+  // With the class, which is what sizes it: the frame of an avatar is not
+  // the frame of the same picture in a message.
+  const stillKey = $derived(`${cls}\0${src}`);
 
   let hovered = $state(false);
   let imgReady = $state(false);
@@ -123,8 +136,20 @@
     };
   });
 
+  // Until the copy is ready, the frame last drawn of this picture, so one
+  // that was on screen a moment ago does not blink.
+  $effect(() => {
+    if (view !== "loading" || !allowed || !canvasEl) return;
+    const kept = keptStillFrame(stillKey);
+    if (!kept) return;
+    canvasEl.width = kept.width;
+    canvasEl.height = kept.height;
+    canvasEl.getContext("2d")?.drawImage(kept, 0, 0);
+  });
+
   $effect(() => {
     if (view !== "shown" || !loaded || !canvasEl) return;
+    const key = stillKey;
     const canvas = canvasEl;
     const img = loaded;
     const { naturalWidth: w, naturalHeight: h } = img;
@@ -140,9 +165,27 @@
         // a message). Nothing is drawn at that size, so no backing store
         // is ever made for it. The box is read once laid out, along with
         // every other canvas's: read here, it forced a layout per frame.
-        canvas.width = w;
-        canvas.height = h;
         let drawn: { width: number; height: number } | undefined;
+        const kept = keptStillFrame(key);
+        const own = kept && stillFrameSize(w, h, kept.width, kept.height, 1);
+        if (own && own.width === canvas.width && own.height === canvas.height) {
+          // The kept frame in it stays: setting the size wipes a canvas, and
+          // a frame went by with nothing there before it was drawn again.
+          // Its pixels are replaced, not drawn over: the url may answer with
+          // another picture by now, the canvas may hold an earlier src's, and
+          // either would show through one with transparency.
+          drawn = own;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.globalCompositeOperation = "copy";
+            ctx.drawImage(img, 0, 0, own.width, own.height);
+            ctx.globalCompositeOperation = "source-over";
+            keepStillFrame(key, canvas);
+          }
+        } else {
+          canvas.width = w;
+          canvas.height = h;
+        }
         observer = new ResizeObserver(([entry]) => {
           const size = stillFrameRedraw(
             drawn,
@@ -159,6 +202,9 @@
           canvas
             .getContext("2d")
             ?.drawImage(img, 0, 0, size.width, size.height);
+          // Not one at its own size: only the image sizes that box, and a
+          // kept frame would come to size it instead.
+          if (entry.contentRect.width !== w) keepStillFrame(key, canvas);
         });
         try {
           // Its device pixels too, where the browser counts them: a zoom
@@ -179,7 +225,8 @@
 {#if !allowed}
   <span class={cls} role="img" aria-label={alt ? `${alt}: external image blocked` : "External image blocked"} title="External media is off. Enable it in App Settings.">◻</span>
 {:else if !isAnimated}
-  <img {src} {alt} class={cls} {loading} />
+  <!-- Decoded with the frame it first appears in, not some frames after. -->
+  <img {src} {alt} class={cls} {loading} decoding={loading === "lazy" ? undefined : "sync"} />
 {:else if view === "too-large"}
   <span class={cls} role="img" aria-label={alt ? `${alt}: image too large` : "Image too large"} title="This image is too large to show.">◻</span>
 {:else if view === "failed"}

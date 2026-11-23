@@ -16,7 +16,20 @@ const s = vi.hoisted(() => ({
   sent: [] as { peer: string; room: string; data: Uint8Array }[],
   broadcasts: [] as { room: string; data: Uint8Array }[],
   announce: vi.fn(),
+  /** Holds a page read open: its messages are read, its profiles are not. */
+  gate: null as Promise<void> | null,
 }));
+
+vi.mock("$lib/storage", async (original) => {
+  const actual = await original<typeof import("$lib/storage")>();
+  return {
+    ...actual,
+    getAllPeerProfiles: async () => {
+      await s.gate;
+      return actual.getAllPeerProfiles();
+    },
+  };
+});
 
 vi.mock("$lib/identity/identity", async (original) => ({
   ...(await original<typeof import("$lib/identity/identity")>()),
@@ -98,7 +111,7 @@ import { decode, encode, hex, utf8 } from "$lib/utils";
 import { MessageType, messageToWire, type Message, type WireChatMessage } from "$lib/types/message";
 import { canonicalContentV4 } from "$lib/messaging";
 import { channelUnreadCount, roomChannels, roomsStore } from "$lib/rooms.svelte";
-import { forgetCurrentChannel } from "$lib/channel-view.svelte";
+import { forgetCurrentChannel, openingChannelOf } from "$lib/channel-view.svelte";
 import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
 import { newMessageId } from "$lib/message-id";
 import {
@@ -122,6 +135,16 @@ let them: UnlockedSession;
 /** A frame from the other member over the room's channel. */
 function receive(frame: unknown, peer = PEER): void {
   s.handlers.get("message")!(peer, encode(frame), ROOM);
+}
+
+/** Hold page reads open from here until the returned function is called. */
+function holdReads(): () => void {
+  let open!: () => void;
+  s.gate = new Promise((resolve) => (open = resolve));
+  return () => {
+    s.gate = null;
+    open();
+  };
 }
 
 /** Long enough for every storage round trip a frame sets off to finish. */
@@ -170,6 +193,7 @@ beforeEach(async () => {
   s.connected = [PEER];
   s.sent = [];
   s.broadcasts = [];
+  s.gate = null;
   _peerIdToDid.clear();
   _peerIdToDid.set(PEER, them.did);
   Object.assign(transportState, {
@@ -265,6 +289,127 @@ describe("messages in channels", () => {
     expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
   });
 
+  it("keeps the channel on screen until the next one's page is read", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    // Not emptied in between: the list, and where a message goes, are still
+    // the channel's on screen. Only the list of channels shows the pick.
+    expect(openingChannelOf(ROOM)).toBe(games.id);
+    expect(currentChannel(ROOM)).toBe("");
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+    await opening;
+    expect(openingChannelOf(ROOM)).toBeNull();
+    expect(currentChannel(ROOM)).toBe(games.id);
+    expect(transportState.messages).toEqual([]);
+  });
+
+  it("opens the last of several picked, and none when the pick is taken back", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const music = await createChannel(ROOM, "music");
+    await Promise.all([selectChannel(ROOM, games.id), selectChannel(ROOM, music.id)]);
+    expect(currentChannel(ROOM)).toBe(music.id);
+    await Promise.all([selectChannel(ROOM, games.id), selectChannel(ROOM, music.id)]);
+    expect(currentChannel(ROOM)).toBe(music.id);
+    expect(openingChannelOf(ROOM)).toBeNull();
+  });
+
+  it("opens nothing that was deleted while its page was read", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    roomsStore.rooms = roomsStore.rooms.map((r) => ({
+      ...r, channels: [{ ...games, deleted: true as const, updatedAt: games.updatedAt + 1 }],
+    }));
+    await opening;
+    expect(currentChannel(ROOM)).toBe("");
+    expect(openingChannelOf(ROOM)).toBeNull();
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+  });
+
+  it("puts what lands while a channel is being opened on its page", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    const release = holdReads();
+    const opening = selectChannel(ROOM, games.id);
+    await settled();
+    await sendMessage("straight in", { channel: games.id });
+    receive(theirMessage(games.id));
+    await settled();
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+    release();
+    await opening;
+    expect(transportState.messages.map((m) => m.content).sort()).toEqual([
+      "hello in a channel",
+      "straight in",
+    ]);
+  });
+
+  it("keeps the channel picked when the one on screen is deleted meanwhile", async () => {
+    const games = await createChannel(ROOM, "games");
+    const music = await createChannel(ROOM, "music");
+    await selectChannel(ROOM, music.id);
+    await sendMessage("in music");
+    await selectChannel(ROOM, games.id);
+    await sendMessage("in games");
+    const release = holdReads();
+    const opening = selectChannel(ROOM, music.id);
+    await settled();
+    await deleteChannel(ROOM, games.id);
+    expect(openingChannelOf(ROOM)).toBe(music.id);
+    expect(currentChannel(ROOM)).toBe("");
+    expect(transportState.messages).toEqual([]);
+    release();
+    await opening;
+    await settled();
+    expect(currentChannel(ROOM)).toBe(music.id);
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in music"]);
+  });
+
+  it("shows the original chat, and marks nothing of it read, when the open channel is deleted", async () => {
+    await sendMessage("in general");
+    const games = await createChannel(ROOM, "games");
+    await selectChannel(ROOM, games.id);
+    await sendMessage("in games");
+    const seen = (await getRoom(ROOM))?.lastSeenLamport;
+    const release = holdReads();
+    await deleteChannel(ROOM, games.id);
+    await settled();
+    // Gone at once, though the original's page is still being read.
+    expect(currentChannel(ROOM)).toBe("");
+    expect(transportState.messages).toEqual([]);
+    await markSeen();
+    expect((await getRoom(ROOM))?.lastSeenLamport).toBe(seen);
+    // Picked by hand meanwhile: still opened, not taken for already up.
+    const picked = selectChannel(ROOM, "");
+    release();
+    expect(await picked).toBe(true);
+    await settled();
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+  });
+
+  it("says when it opened nothing", async () => {
+    const games = await createChannel(ROOM, "games");
+    const opening = selectChannel(ROOM, games.id);
+    await selectChannel(ROOM, "");
+    expect(await opening).toBe(false);
+  });
+
+  // The mark is written to the record the sidebar, and the channel's own
+  // name, are read from: a write that moves nothing renders all of it again,
+  // and set off the read that writes it.
+  it("writes a channel's read mark to the room only when it moves", async () => {
+    const games = await createChannel(ROOM, "games");
+    await selectChannel(ROOM, games.id);
+    await sendMessage("read this");
+    await markSeen();
+    const held = roomsStore.rooms[0];
+    expect(held.channelSeen?.[games.id]).toBeGreaterThan(0);
+    await markSeen();
+    expect(roomsStore.rooms[0]).toBe(held);
+  });
+
   it("reacts in the channel of the message reacted to", async () => {
     const games = await createChannel(ROOM, "games");
     await selectChannel(ROOM, games.id);
@@ -319,6 +464,7 @@ describe("messages in channels", () => {
     const music = await createChannel(ROOM, "music");
     await selectChannel(ROOM, music.id);
     await deleteChannel(ROOM, music.id);
+    await settled();
     expect(currentChannel(ROOM)).toBe("");
   });
 });
