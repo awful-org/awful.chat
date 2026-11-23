@@ -637,7 +637,7 @@
       if (!anchor) return;
       let url: URL;
       try { url = new URL(anchor.href); } catch { return; }
-      if (url.origin !== window.location.origin || url.pathname !== "/r/") return;
+      if (url.origin !== window.location.origin || !/^\/r\/?$/.test(url.pathname)) return;
       // A full invitation or a short link; a saved room's own address is not one.
       const parsed = parseJoinInput(url.href);
       if (parsed.kind === "invalid") return;

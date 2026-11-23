@@ -1,4 +1,5 @@
 import { apiUrl } from "./runtime-config";
+import { createWakeTimer } from "./wake-timer";
 import {
   InvitationPairingHost,
   PAIRING_MAX_TTL,
@@ -54,7 +55,18 @@ async function request(body: Record<string, unknown>, signal?: AbortSignal): Pro
   if (result.messages !== undefined && (!Array.isArray(result.messages) || result.messages.length > 10 || result.messages.some((m: Message) => !m || typeof m.attempt !== "string" || typeof m.kind !== "string" || typeof m.payload !== "string" || m.payload.length > 2048))) throw new Error("Invalid pairing response");
   return { ...result, messages: result.messages ?? [] };
 }
-const pause = () => new Promise<void>(resolve => setTimeout(resolve, 1500));
+const POLL_MS = 1500;
+const pause = () => new Promise<void>(resolve => setTimeout(resolve, POLL_MS));
+
+/**
+ * Whether a request failed on the way - no network, no answer in time, a
+ * server error - rather than being refused. A code stays open for up to half
+ * an hour, and one dropped request in it used to end it for everybody.
+ */
+function lostOnTheWay(err: unknown): boolean {
+  if (err instanceof PairingRequestError) return err.status >= 500;
+  return err instanceof TypeError || (err as Error | null)?.name === "TimeoutError";
+}
 
 /** How long a rate-limited pairing request waits before it asks again. */
 const RATE_LIMIT_WAIT_MS = 5_000;
@@ -135,10 +147,33 @@ export async function hostInvitationPairing(
   signal?.addEventListener("abort", cancel, { once: true });
   if (signal?.aborted) { cancel(); signal.throwIfAborted(); }
   const run = async () => {
+    const timer = createWakeTimer();
+    // An answer lost on the way is sent again while the code lives: the
+    // person it lets in is counted already. The relay takes an answer once,
+    // so a repeat it refuses is one that had arrived.
+    const answer = async (send: () => Promise<unknown>) => {
+      for (let again = false; ; again = true) {
+        try {
+          await send();
+          return;
+        } catch (err) {
+          if (again && err instanceof PairingRequestError && err.status === 409) return;
+          if (cancelled || Date.now() >= host.expiresAt || !lostOnTheWay(err)) throw err;
+          await timer.wait(POLL_MS);
+        }
+      }
+    };
     try {
       while (host.active && !cancelled) {
         const alive = () => host.active && !cancelled;
-        const { messages } = await paced(() => request({ action: "host-poll", locator: host.locator, token }, controller.signal), alive, controller.signal);
+        let messages: Message[];
+        try {
+          ({ messages } = await paced(() => request({ action: "host-poll", locator: host.locator, token }, controller.signal), alive, controller.signal));
+        } catch (err) {
+          if (!lostOnTheWay(err)) throw err;
+          await timer.wait(POLL_MS);
+          continue;
+        }
         for (const m of messages) {
           if (cancelled || !host.active) break;
           let payload: string;
@@ -147,11 +182,11 @@ export async function hostInvitationPairing(
           } catch { continue; } // Host counts every start, including malformed requests.
           if (!payload || cancelled) continue;
           // A transfer is still owed after the code closes on its last person.
-          await paced(
+          await answer(() => paced(
             () => request({ action: "reply", locator: host.locator, token, attempt: m.attempt, kind: m.kind === "start" ? "response" : "transfer", payload }, controller.signal),
             () => !cancelled,
             controller.signal,
-          );
+          ));
           if (m.kind === "finish") {
             onJoined?.(host.joined);
             if (host.joined >= host.uses) {
@@ -164,7 +199,7 @@ export async function hostInvitationPairing(
         }
         // A full batch may have more behind it (the relay hands out a few
         // at a time): ask again at once.
-        if (!messages.length) await pause();
+        if (!messages.length) await timer.wait(POLL_MS);
       }
       if (!cancelled) {
         onStatus(host.joined > 0
@@ -179,7 +214,7 @@ export async function hostInvitationPairing(
         void request({ action: "cancel", locator: host.locator, token }).catch(() => {});
       }
     }
-    finally { host.cancel(); signal?.removeEventListener("abort", cancel); }
+    finally { timer.close(); host.cancel(); signal?.removeEventListener("abort", cancel); }
   };
   void run();
   return { code: formatPairingCode(host.locator, host.password), expiresAt: host.expiresAt, uses: host.uses, cancel };

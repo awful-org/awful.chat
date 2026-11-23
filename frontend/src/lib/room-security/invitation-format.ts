@@ -16,6 +16,26 @@ export function parseSecureInvitation(input: string): RoomSecret {
     : parseRoomSecret(fragment);
 }
 
+/**
+ * The invitation in text somebody pasted: the link with no scheme, with a
+ * tracking parameter, without the slash before its #, with the full stop or
+ * the bracket after it, or in the middle of the message it came in.
+ *
+ * Bare or in a fragment only, as above, and one room only: text with two
+ * different invitations in it does not say which was meant. The secret has to
+ * stand on its own, so a cut or lengthened one is not taken for another room.
+ */
+const IN_TEXT_RE =
+  /(?:^|[\s<>([{"'*_~`|]|#|%23)(r2_[a-z2-7]{52})(?=[.,;:!?)>\]}"'*_~`|]*(?:\s|$))/gi;
+
+export function findInvitation(text: string): RoomSecret | null {
+  const found = new Set<RoomSecret>();
+  for (const [, secret] of text.matchAll(IN_TEXT_RE)) {
+    try { found.add(parseRoomSecret(secret)); } catch { /* Not one after all. */ }
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
 function parseProtocolInvitation(input: string): RoomSecret {
   // Not parsed as a URL: the secret is not a hostname. Its case no longer
   // matters (lowercase base32, see keys.ts), so a browser folding it is fine.

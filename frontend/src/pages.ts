@@ -53,7 +53,7 @@ export function optionalRoute(pathname: string): "qs" | "qc" | null {
 
 /** What an address shows: App.svelte's routing, and main.ts's preload. */
 export function routeFor(pathname: string): Route {
-  if (pathname.startsWith("/r/")) return "app";
+  if (pathname === "/r" || pathname.startsWith("/r/")) return "app";
   // A disabled optional route falls through to the landing page rather than
   // 404ing: the flag is an operator's choice, not a broken link, and the
   // page it would have shown does not exist here.

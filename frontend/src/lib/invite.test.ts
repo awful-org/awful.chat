@@ -42,6 +42,27 @@ it("rejects public IDs, old room codes and malformed or path/query capabilities"
     expect(parseJoinInput(input)).toEqual({ kind: "invalid" });
   }
 });
+it("finds an invitation in what people paste", () => {
+  const secret = newRoomSecret();
+  const link = `https://chat.example/r/#${secret}`;
+  for (const input of [
+    `chat.example/r/#${secret}`, `${link}.`, `(${link})`, `<${link}>`, `"${link}"`, `**${link}**`,
+    `join us: ${link} - see you there`, `${link}\n${link}`, `https://chat.example/r/?utm_source=x#${secret}`,
+    `https://chat.example/r#${secret}`, `https://chat.example/r/%23${secret}`, link.toUpperCase(), `${secret}!`,
+  ]) {
+    expect(parseJoinInput(input), input).toEqual({ kind: "room", code: secret });
+  }
+});
+it("takes none that is cut, lengthened, in a path or query, or one of two", () => {
+  const secret = newRoomSecret();
+  const link = `https://chat.example/r/#${secret}`;
+  for (const input of [
+    link.slice(0, -1), `${link}a`, `${link}/x`, `https://chat.example/r/${secret}.`, `see https://chat.example/?s=${secret} there`,
+    `${link} or https://chat.example/r/#${newRoomSecret()}`,
+  ]) {
+    expect(parseJoinInput(input), input).toEqual({ kind: "invalid" });
+  }
+});
 it("retires every plaintext alias request without contacting the network", async () => {
   const fetchSpy = vi.spyOn(globalThis, "fetch");
   try {

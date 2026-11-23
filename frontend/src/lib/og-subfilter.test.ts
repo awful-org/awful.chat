@@ -18,7 +18,7 @@ const html = readFileSync("index.html", "utf8");
 
 /** The /r/ block's match strings, in order. */
 function inviteMatches(): string[] {
-  const block = nginx.slice(nginx.indexOf("location ~ ^/r/"));
+  const block = nginx.slice(nginx.indexOf("location ~ ^/r(/|$)"));
   const end = block.indexOf("\n    }");
   return [...block.slice(0, end).matchAll(/sub_filter\s+'((?:[^'\\]|\\.)*)'/g)].map(
     (m) => m[1]
@@ -50,7 +50,7 @@ describe("invite card rewriting", () => {
   // saying here either: the room code lives in the fragment, which the server
   // never sees.
   it("never interpolates the request line into an attribute", () => {
-    const block = nginx.slice(nginx.indexOf("location ~ ^/r/"));
+    const block = nginx.slice(nginx.indexOf("location ~ ^/r(/|$)"));
     const body = block.slice(0, block.indexOf("\n    }"));
     // Directives only - the comment above them names the variable it bans.
     const directives = body
@@ -60,7 +60,7 @@ describe("invite card rewriting", () => {
   });
 
   it("rewrites to the requesting host, so any instance points at itself", () => {
-    const block = nginx.slice(nginx.indexOf("location ~ ^/r/"));
+    const block = nginx.slice(nginx.indexOf("location ~ ^/r(/|$)"));
     const body = block.slice(0, block.indexOf("\n    }"));
     for (const line of body.split("\n")) {
       if (!line.includes("sub_filter '") || !line.includes("http")) continue;

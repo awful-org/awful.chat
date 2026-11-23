@@ -400,7 +400,7 @@ func TestPairingAttemptsFollowTheUses(t *testing.T) {
 
 func TestPairingLimitsAreBounded(t *testing.T) {
 	for _, bad := range []map[string]any{
-		{"uses": 26}, {"uses": -1}, {"ttl": 59}, {"ttl": 601}, {"ttl": -5},
+		{"uses": 26}, {"uses": -1}, {"ttl": 59}, {"ttl": 1801}, {"ttl": -5},
 	} {
 		resetPairing(t)
 		bad["action"] = "create"
@@ -413,12 +413,12 @@ func TestPairingLimitsAreBounded(t *testing.T) {
 	if rec := pairingRequest(t, "10.0.0.1", map[string]any{"action": "host-poll", "token": "x", "uses": 2}); rec.Code != 400 {
 		t.Fatalf("limits on host-poll: %d", rec.Code)
 	}
-	createPairingWith(t, map[string]any{"uses": 25, "ttl": 600})
+	createPairingWith(t, map[string]any{"uses": 25, "ttl": 1800})
 	pairingMu.Lock()
 	e := pairingStore["k5"]
 	left := time.Until(e.expires)
 	pairingMu.Unlock()
-	if e.maxUses != 25 || e.maxAttempts != 29 || left < 9*time.Minute || left > 10*time.Minute {
+	if e.maxUses != 25 || e.maxAttempts != 29 || left < 29*time.Minute || left > 30*time.Minute {
 		t.Fatalf("got uses %d attempts %d ttl %v", e.maxUses, e.maxAttempts, left)
 	}
 }
