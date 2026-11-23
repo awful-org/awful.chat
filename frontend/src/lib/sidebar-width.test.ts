@@ -4,12 +4,154 @@ import {
   SIDEBAR_MAX_PX,
   SIDEBAR_MIN_PX,
   SIDEBAR_STEP_PX,
+  SIDEBAR_COLLAPSED_PX,
+  SIDEBAR_COLLAPSE_AT_PX,
   clampSidebarWidth,
+  collapsedSidebarKey,
   parseSidebarWidth,
+  sidebarDragCommit,
+  sidebarDragState,
   sidebarMaxWidth,
   sidebarWidthForKey,
   storedSidebarWidth,
 } from "./sidebar-width";
+
+describe("SIDEBAR_COLLAPSE_AT_PX", () => {
+  it("is halfway between the rail and the minimum width", () => {
+    expect(SIDEBAR_COLLAPSE_AT_PX).toBe(164);
+    expect(SIDEBAR_MIN_PX - SIDEBAR_COLLAPSE_AT_PX).toBe(108);
+    expect(SIDEBAR_COLLAPSE_AT_PX - SIDEBAR_COLLAPSED_PX).toBe(108);
+  });
+});
+
+describe("sidebarDragState", () => {
+  it("follows the pointer while the sidebar is open", () => {
+    expect(sidebarDragState(false, 300, 40, 1920)).toEqual({ collapsed: false, width: 340 });
+    expect(sidebarDragState(false, 300, -20, 1920)).toEqual({ collapsed: false, width: 280 });
+  });
+
+  it("stops at the minimum, and stays open, short of the line", () => {
+    expect(sidebarDragState(false, 300, -60, 1920)).toEqual({
+      collapsed: false,
+      width: SIDEBAR_MIN_PX,
+    });
+    // From the minimum: 108px further left is exactly on the line, still open.
+    expect(sidebarDragState(false, SIDEBAR_MIN_PX, -108, 1920)).toEqual({
+      collapsed: false,
+      width: SIDEBAR_MIN_PX,
+    });
+  });
+
+  it("collapses once the edge is past the line", () => {
+    expect(sidebarDragState(false, SIDEBAR_MIN_PX, -109, 1920)).toEqual({ collapsed: true });
+    expect(sidebarDragState(false, 400, -300, 1920)).toEqual({ collapsed: true });
+    // Out past the window's left edge.
+    expect(sidebarDragState(false, 400, -2000, 1920)).toEqual({ collapsed: true });
+  });
+
+  it("measures the line from where the edge is, not from where the drag began", () => {
+    // A wide sidebar travels further before it folds: 400 - 164 = 236px.
+    expect(sidebarDragState(false, 400, -236, 1920)).toEqual({
+      collapsed: false,
+      width: SIDEBAR_MIN_PX,
+    });
+    expect(sidebarDragState(false, 400, -237, 1920)).toEqual({ collapsed: true });
+  });
+
+  it("opens again when the same drag comes back across the line", () => {
+    expect(sidebarDragState(false, 400, -250, 1920)).toEqual({ collapsed: true });
+    expect(sidebarDragState(false, 400, -200, 1920)).toEqual({
+      collapsed: false,
+      width: SIDEBAR_MIN_PX,
+    });
+    expect(sidebarDragState(false, 400, -50, 1920)).toEqual({ collapsed: false, width: 350 });
+  });
+
+  it("keeps a collapsed sidebar on the rail for a click or a small drag", () => {
+    expect(sidebarDragState(true, 400, 0, 1920)).toEqual({ collapsed: true });
+    expect(sidebarDragState(true, 400, 20, 1920)).toEqual({ collapsed: true });
+    expect(sidebarDragState(true, 400, -40, 1920)).toEqual({ collapsed: true });
+    // 56 + 107 = 163: one short of the line.
+    expect(sidebarDragState(true, 400, 107, 1920)).toEqual({ collapsed: true });
+  });
+
+  it("opens a collapsed sidebar at the minimum past the line, then follows the pointer", () => {
+    expect(sidebarDragState(true, 400, 108, 1920)).toEqual({
+      collapsed: false,
+      width: SIDEBAR_MIN_PX,
+    });
+    expect(sidebarDragState(true, 400, 300, 1920)).toEqual({ collapsed: false, width: 356 });
+    // The saved width is not where it opens: the edge is.
+    expect(sidebarDragState(true, 400, 1000, 1920)).toEqual({
+      collapsed: false,
+      width: SIDEBAR_MAX_PX,
+    });
+  });
+
+  it("clamps the open width to this window", () => {
+    expect(sidebarDragState(false, 300, 500, 1000)).toEqual({ collapsed: false, width: 400 });
+  });
+
+  it("stays where it started for a pointer position that is not a number", () => {
+    expect(sidebarDragState(false, 300, Number.NaN, 1920)).toEqual({
+      collapsed: false,
+      width: 300,
+    });
+    expect(sidebarDragState(true, 300, Number.NaN, 1920)).toEqual({ collapsed: true });
+  });
+});
+
+describe("sidebarDragCommit", () => {
+  it("saves nothing for a press that never moved", () => {
+    expect(sidebarDragCommit(false, null)).toEqual({});
+    expect(sidebarDragCommit(true, null)).toEqual({});
+  });
+
+  it("saves the width an open drag ends at", () => {
+    expect(sidebarDragCommit(false, { collapsed: false, width: 340 })).toEqual({ width: 340 });
+  });
+
+  it("saves only the collapse, never the minimum the drag passed through", () => {
+    expect(sidebarDragCommit(false, { collapsed: true })).toEqual({ collapsed: true });
+  });
+
+  it("saves nothing when a collapsed sidebar is left collapsed", () => {
+    expect(sidebarDragCommit(true, { collapsed: true })).toEqual({});
+  });
+
+  it("saves the expand and the width when a collapsed sidebar is dragged open", () => {
+    expect(sidebarDragCommit(true, { collapsed: false, width: 300 })).toEqual({
+      collapsed: false,
+      width: 300,
+    });
+  });
+});
+
+describe("collapsedSidebarKey", () => {
+  it("expands with Right arrow and Enter", () => {
+    expect(collapsedSidebarKey("ArrowRight")).toBe("expand");
+    expect(collapsedSidebarKey("Enter")).toBe("expand");
+  });
+
+  it("ignores every other key", () => {
+    expect(collapsedSidebarKey("ArrowLeft")).toBeNull();
+    expect(collapsedSidebarKey("Home")).toBeNull();
+    expect(collapsedSidebarKey("End")).toBeNull();
+    expect(collapsedSidebarKey(" ")).toBeNull();
+  });
+});
+
+describe("sidebarWidthForKey never collapses", () => {
+  it("holds Left arrow at the minimum", () => {
+    let w = 400;
+    for (let i = 0; i < 50; i++) {
+      const next = sidebarWidthForKey("ArrowLeft", w, 1920);
+      expect(typeof next).toBe("number");
+      w = next as number;
+    }
+    expect(w).toBe(SIDEBAR_MIN_PX);
+  });
+});
 
 describe("sidebarMaxWidth", () => {
   it("is 480px in a wide window", () => {

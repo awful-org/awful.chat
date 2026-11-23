@@ -75,9 +75,15 @@
   import { Tip } from "$lib/components/ui/tooltip";
   import CallStatus from "./CallStatus.svelte";
   import { transportState, peerIdToDid } from "$lib/transport/transport.svelte";
-  import { displayPrefs, setSidebarWidth } from "$lib/display-prefs.svelte";
+  import { displayPrefs, setSidebarCollapsed, setSidebarWidth } from "$lib/display-prefs.svelte";
   import SidebarResizeHandle from "./SidebarResizeHandle.svelte";
-  import { SIDEBAR_DEFAULT_PX, SIDEBAR_MIN_PX, clampSidebarWidth, sidebarMaxWidth } from "$lib/sidebar-width";
+  import {
+    SIDEBAR_DEFAULT_PX,
+    SIDEBAR_MIN_PX,
+    clampSidebarWidth,
+    sidebarMaxWidth,
+    type SidebarDrag,
+  } from "$lib/sidebar-width";
 
   interface DmPreview {
     text: string;
@@ -154,7 +160,9 @@
     channels = null,
     isOpen = false,
     onClose,
-    collapsed = false,
+    // The saved setting; `collapsed` below is what is drawn, which a drag
+    // on the edge previews ahead of saving.
+    collapsed: savedCollapsed = false,
     onToggleCollapsed,
     onSelectRoom,
     onSelectDm,
@@ -908,13 +916,26 @@
   // screen does not swallow a small one, and comes back with the big one.
 
   let viewportWidth = $state(typeof window === "undefined" ? 0 : window.innerWidth);
-  /** While the edge is dragged: the width to draw, not yet saved. */
-  let previewWidth = $state<number | null>(null);
+  /** While the edge is dragged: the rail or the width to draw, not yet saved. */
+  let dragPreview = $state<SidebarDrag | null>(null);
+  /** Drawn as the rail alone: the saved setting, or where a drag has taken it. */
+  const collapsed = $derived(dragPreview ? dragPreview.collapsed : savedCollapsed);
+  /** The open width: drawn when open, and kept (not drawn) when collapsed. */
   const sidebarWidth = $derived(
-    clampSidebarWidth(previewWidth ?? displayPrefs.sidebarWidth ?? SIDEBAR_DEFAULT_PX, viewportWidth)
+    clampSidebarWidth(
+      (dragPreview && !dragPreview.collapsed ? dragPreview.width : null) ??
+        displayPrefs.sidebarWidth ??
+        SIDEBAR_DEFAULT_PX,
+      viewportWidth
+    )
   );
-  /** A window too narrow for any range (a phone, a small tablet) has no handle. */
-  const resizable = $derived(!collapsed && sidebarMaxWidth(viewportWidth) > SIDEBAR_MIN_PX);
+  /**
+   * A window too narrow for any range (a phone, a small tablet) has no
+   * handle. Not tied to `collapsed`: the handle sits on the rail's edge too,
+   * and must stay the same element while a drag flips the sidebar between
+   * the two, or its pointer capture (and the drag) would go with it.
+   */
+  const resizable = $derived(sidebarMaxWidth(viewportWidth) > SIDEBAR_MIN_PX);
 
   // ── Shared classes ────────────────────────────────────────────────────────
 
@@ -962,14 +983,15 @@
 {/if}
 
 <!-- sm:relative, not static: the resize handle sits on its right edge.
-     The width animates on collapse and on a key press, not under a drag. -->
+     The width animates on collapse and on a key press, not under a drag
+     (including a drag that folds it to the rail and back). -->
 <aside
   id="{uid}-sidebar"
   aria-label="Sidebar"
   style="--sidebar-w: {sidebarWidth}px"
   class="flex h-dvh w-80 max-w-[calc(100vw-3rem)] shrink-0 flex-col border-r border-sidebar-border bg-sidebar
       fixed inset-y-0 left-0 z-40 transition-transform duration-200
-      sm:relative sm:max-w-none sm:translate-x-0 sm:z-auto {previewWidth === null ? 'sm:transition-[width] sm:duration-200' : ''}
+      sm:relative sm:max-w-none sm:translate-x-0 sm:z-auto {dragPreview === null ? 'sm:transition-[width] sm:duration-200' : ''}
       {collapsed ? 'sm:w-14' : 'sm:w-(--sidebar-w)'}
       {isOpen ? 'translate-x-0' : '-translate-x-full'}"
 >
@@ -1286,12 +1308,16 @@
   <SidebarControls {collapsed} />
 
   {#if resizable}
+    <!-- Collapses and expands through the same saved setting as the
+         collapse button and Ctrl+B, so the three never disagree. -->
     <SidebarResizeHandle
       width={sidebarWidth}
+      {collapsed}
       {viewportWidth}
       controls="{uid}-sidebar"
-      onpreview={(px) => (previewWidth = px)}
-      oncommit={setSidebarWidth}
+      onpreview={(state) => (dragPreview = state)}
+      onwidth={setSidebarWidth}
+      oncollapse={setSidebarCollapsed}
     />
   {/if}
 </aside>

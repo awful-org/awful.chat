@@ -12,6 +12,12 @@
  * - Re-clamped, not rewritten. A width saved on a big screen is kept as
  *   asked for and only drawn narrower while the window is small, so the
  *   sidebar grows back when the window does.
+ * - Folds to the rail, as an editor's side panel does. Dragged on past the
+ *   minimum by a clear distance (a distance, not "for a while": nothing
+ *   here waits on a clock), the sidebar collapses; dragged back the other
+ *   way across the same line, it opens again. The collapse is the same
+ *   saved setting the collapse button and Ctrl+B use, and it leaves the
+ *   saved width alone, so expanding comes back to the width from before.
  */
 
 /** Today's expanded width, and the narrowest the column still fits in. */
@@ -22,6 +28,74 @@ export const SIDEBAR_MAX_PX = 480;
 export const SIDEBAR_MAX_SHARE = 0.4;
 /** One arrow-key press. */
 export const SIDEBAR_STEP_PX = 16;
+/** The collapsed sidebar: the rail alone (RoomSidebar's `sm:w-14`). */
+export const SIDEBAR_COLLAPSED_PX = 56;
+/**
+ * Where a drag folds the sidebar to its rail: an edge left of the midpoint
+ * between the rail and the minimum width (164px, so 108px past the
+ * minimum - more than anyone overshoots by). The same line opens the rail
+ * again when a drag crosses it rightwards.
+ */
+export const SIDEBAR_COLLAPSE_AT_PX = (SIDEBAR_COLLAPSED_PX + SIDEBAR_MIN_PX) / 2;
+
+/** What a drag on the edge shows: the rail alone, or the sidebar this wide. */
+export type SidebarDrag = { collapsed: true } | { collapsed: false; width: number };
+
+/**
+ * Where a drag on the edge has got to. `dx` is how far the pointer has
+ * moved since the press; the edge started at the rail when collapsed, or at
+ * `startWidth` (the width drawn) when not. Left of SIDEBAR_COLLAPSE_AT_PX it
+ * is the rail; right of it, the width the edge is at, clamped as always, so
+ * the sidebar stops at the minimum on its way to collapsing.
+ */
+export function sidebarDragState(
+  startCollapsed: boolean,
+  startWidth: number,
+  dx: number,
+  viewportWidth: number
+): SidebarDrag {
+  const edge = (startCollapsed ? SIDEBAR_COLLAPSED_PX : startWidth) + dx;
+  if (!Number.isFinite(edge)) {
+    return startCollapsed
+      ? { collapsed: true }
+      : { collapsed: false, width: clampSidebarWidth(startWidth, viewportWidth) };
+  }
+  if (edge < SIDEBAR_COLLAPSE_AT_PX) return { collapsed: true };
+  return { collapsed: false, width: clampSidebarWidth(edge, viewportWidth) };
+}
+
+/** What a finished drag saves; a field left out is left as it is. */
+export interface SidebarDragCommit {
+  collapsed?: boolean;
+  width?: number;
+}
+
+/**
+ * What to save when a drag ends at `end` (null: the pointer never moved,
+ * so a click saves nothing). Ending on the rail saves only the collapse -
+ * never the minimum width the drag passed through - so the width from
+ * before comes back when the sidebar is expanded. Ending open saves the
+ * width the edge was left at, and the expand when it started on the rail.
+ */
+export function sidebarDragCommit(
+  startCollapsed: boolean,
+  end: SidebarDrag | null
+): SidebarDragCommit {
+  if (end === null) return {};
+  if (end.collapsed) return startCollapsed ? {} : { collapsed: true };
+  return startCollapsed ? { collapsed: false, width: end.width } : { width: end.width };
+}
+
+/**
+ * What a key does on the handle of a collapsed sidebar: Right arrow (the
+ * way the edge would move) and Enter open it, at its saved width; nothing
+ * else does anything. The open sidebar's keys only ever change the width
+ * (sidebarWidthForKey): Left arrow stops at the minimum rather than
+ * collapsing, so holding a key down cannot fold the sidebar away.
+ */
+export function collapsedSidebarKey(key: string): "expand" | null {
+  return key === "ArrowRight" || key === "Enter" ? "expand" : null;
+}
 
 /** The widest the sidebar may be in a window this wide; never below the minimum. */
 export function sidebarMaxWidth(viewportWidth: number): number {
