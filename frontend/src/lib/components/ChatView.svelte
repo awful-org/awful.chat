@@ -1808,15 +1808,16 @@
    * The bell is the channel's on screen (notify-prefs.svelte.ts), the
    * original chat's too: its own mode, or the room's while it follows the
    * room, and its label names it. With one chat it is the room's, as it was
-   * before channels (bellScope).
+   * before channels, and in a muted room it is the room's too (bellScope).
    */
   const notifyMode = $derived(effectiveNotifyMode(roomCode, channel));
-  const notifyText = $derived(notifyLabel(notifyMode, heading));
+  const roomNotify = $derived(getRoomNotifyMode(roomCode));
+  const notifyText = $derived(notifyLabel(notifyMode, heading, roomNotify));
   function cycleNotify(): void {
     const next = NOTIFY_NEXT[notifyMode];
-    if (bellScope(textChannels, channel) === "room")
+    if (bellScope(textChannels, channel, roomNotify) === "room")
       setRoomNotifyMode(roomCode, next, textChannels.map((c) => c.id));
-    else setChannelNotifyMode(roomCode, channel, channelModeToStore(next, getRoomNotifyMode(roomCode)));
+    else setChannelNotifyMode(roomCode, channel, channelModeToStore(next, roomNotify));
   }
 
   /**

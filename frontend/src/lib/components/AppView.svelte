@@ -529,7 +529,8 @@
       channels.roomNotifyMode = getRoomNotifyMode(code);
       channels.onSetNotify = (id, mode) => {
         // One chat, one setting: the room's, which the header bell sets too.
-        if (hasOneChat(text)) setRoomFromSidebar(code, mode ?? "all");
+        // And of a muted room the menu offers the room's.
+        if (hasOneChat(text) || getRoomNotifyMode(code) === "muted") setRoomFromSidebar(code, mode ?? "all");
         else setChannelNotifyMode(code, id, mode);
       };
     }
