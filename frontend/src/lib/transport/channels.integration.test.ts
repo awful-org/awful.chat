@@ -16,7 +16,20 @@ const s = vi.hoisted(() => ({
   sent: [] as { peer: string; room: string; data: Uint8Array }[],
   broadcasts: [] as { room: string; data: Uint8Array }[],
   announce: vi.fn(),
+  /** Holds a page read open: its messages are read, its profiles are not. */
+  gate: null as Promise<void> | null,
 }));
+
+vi.mock("$lib/storage", async (original) => {
+  const actual = await original<typeof import("$lib/storage")>();
+  return {
+    ...actual,
+    getAllPeerProfiles: async () => {
+      await s.gate;
+      return actual.getAllPeerProfiles();
+    },
+  };
+});
 
 vi.mock("$lib/identity/identity", async (original) => ({
   ...(await original<typeof import("$lib/identity/identity")>()),
@@ -124,6 +137,16 @@ function receive(frame: unknown, peer = PEER): void {
   s.handlers.get("message")!(peer, encode(frame), ROOM);
 }
 
+/** Hold page reads open from here until the returned function is called. */
+function holdReads(): () => void {
+  let open!: () => void;
+  s.gate = new Promise((resolve) => (open = resolve));
+  return () => {
+    s.gate = null;
+    open();
+  };
+}
+
 /** Long enough for every storage round trip a frame sets off to finish. */
 const settled = () => new Promise((resolve) => setTimeout(resolve, 60));
 
@@ -170,6 +193,7 @@ beforeEach(async () => {
   s.connected = [PEER];
   s.sent = [];
   s.broadcasts = [];
+  s.gate = null;
   _peerIdToDid.clear();
   _peerIdToDid.set(PEER, them.did);
   Object.assign(transportState, {
@@ -307,12 +331,15 @@ describe("messages in channels", () => {
   it("puts what lands while a channel is being opened on its page", async () => {
     await sendMessage("in general");
     const games = await createChannel(ROOM, "games");
+    const release = holdReads();
     const opening = selectChannel(ROOM, games.id);
-    await sendMessage("straight in", { channel: games.id });
-    const wire = theirMessage(games.id);
-    receive(wire);
-    await opening;
     await settled();
+    await sendMessage("straight in", { channel: games.id });
+    receive(theirMessage(games.id));
+    await settled();
+    expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
+    release();
+    await opening;
     expect(transportState.messages.map((m) => m.content).sort()).toEqual([
       "hello in a channel",
       "straight in",
@@ -326,8 +353,14 @@ describe("messages in channels", () => {
     await sendMessage("in music");
     await selectChannel(ROOM, games.id);
     await sendMessage("in games");
+    const release = holdReads();
     const opening = selectChannel(ROOM, music.id);
+    await settled();
     await deleteChannel(ROOM, games.id);
+    expect(openingChannelOf(ROOM)).toBe(music.id);
+    expect(currentChannel(ROOM)).toBe("");
+    expect(transportState.messages).toEqual([]);
+    release();
     await opening;
     await settled();
     expect(currentChannel(ROOM)).toBe(music.id);
@@ -340,13 +373,18 @@ describe("messages in channels", () => {
     await selectChannel(ROOM, games.id);
     await sendMessage("in games");
     const seen = (await getRoom(ROOM))?.lastSeenLamport;
-    const deleted = deleteChannel(ROOM, games.id);
-    while (currentChannel(ROOM) !== "") await new Promise((r) => setTimeout(r));
+    const release = holdReads();
+    await deleteChannel(ROOM, games.id);
+    await settled();
+    // Gone at once, though the original's page is still being read.
+    expect(currentChannel(ROOM)).toBe("");
+    expect(transportState.messages).toEqual([]);
     await markSeen();
     expect((await getRoom(ROOM))?.lastSeenLamport).toBe(seen);
-    // Picked by hand while its page is still being read.
-    await selectChannel(ROOM, "");
-    await deleted;
+    // Picked by hand meanwhile: still opened, not taken for already up.
+    const picked = selectChannel(ROOM, "");
+    release();
+    expect(await picked).toBe(true);
     await settled();
     expect(transportState.messages.map((m) => m.content)).toEqual(["in general"]);
   });
