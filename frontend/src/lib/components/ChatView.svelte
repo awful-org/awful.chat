@@ -2847,7 +2847,7 @@
                 {...props}
                 variant="ghost"
                 size="icon"
-                onclick={joinCall}
+                onclick={() => joinCall()}
                 disabled={transportState.connecting || transportState.joiningCall}
                 aria-busy={transportState.joiningCall}
                 aria-label={loadingModel ? "Loading noise suppression…" : "Join call"}

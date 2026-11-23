@@ -236,6 +236,13 @@ export interface WireCallPresence {
   type: MessageType.CallPresence;
   inCall: boolean;
   roomCode?: string; // the room where they're calling
+  /**
+   * A call in a voice channel other than the room's default one names its
+   * room here instead of in roomCode, with the channel beside it. See
+   * callPresenceFields in transport/voice-channel.ts for why.
+   */
+  voiceRoomCode?: string;
+  voiceChannel?: string;
 }
 
 export interface WireCallState {

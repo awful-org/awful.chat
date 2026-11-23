@@ -163,7 +163,7 @@ describe("_joinCall roster sequencing (finding 6)", () => {
     await joined;
     expect(voiceMock.join).toHaveBeenLastCalledWith("room1");
     expect(transportState.callRoomCode).toBe("room1");
-    expect(videoMock.join).toHaveBeenLastCalledWith("room1", "self-id");
+    expect(videoMock.join).toHaveBeenLastCalledWith("room1", "self-id", "");
   });
   it("sets inCall/callRoomCode before the FIRST roster sync, not after _video.join()", async () => {
     const snapshots: Array<{ inCall: unknown; callRoomCode: unknown }> = [];
