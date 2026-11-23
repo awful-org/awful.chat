@@ -9,7 +9,7 @@
 import { identityStore } from "$lib/identity/identity.svelte";
 import { looksLikeDid } from "$lib/identity/identity-utils";
 import { _transport, peerIdToDid, transportState } from "./transport.svelte";
-import { voiceChannelRoster, type CallTag } from "./voice-channel";
+import { peersInCall, voiceChannelRoster, type CallTag } from "./voice-channel";
 
 export { joinCall, leaveCall, switchVoiceChannel } from "./call.svelte";
 export { DEFAULT_VOICE_CHANNEL, isChannelId, type CallTag } from "./voice-channel";
@@ -27,6 +27,21 @@ export function currentVoiceChannel(): CallTag | null {
   const roomCode = transportState.callRoomCode;
   if (!transportState.inCall || !roomCode) return null;
   return { roomCode, voiceChannel: transportState.callVoiceChannel };
+}
+
+/**
+ * Everyone else in our call: our room AND our voice channel. What a reader
+ * that today filters callPeerRooms by callRoomCode (the call stage, the
+ * "connecting x/y" status) should read once channels are on screen; the room
+ * alone counts people in the room's other channels too.
+ */
+export function peersInMyCall(): string[] {
+  const call = currentVoiceChannel();
+  if (!call) return [];
+  const self = _transport.selfId();
+  return peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, call).filter(
+    (peerId) => peerId !== self
+  );
 }
 
 /**
