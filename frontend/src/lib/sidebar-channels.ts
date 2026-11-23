@@ -8,7 +8,7 @@
  * handlers only for a room that can have channels; the sidebar shows its
  * "+" buttons and its management items only when those exist.
  */
-import type { RoomNotifyMode as NotifyMode } from "./channel-ui";
+import { hasOneChat, type RoomNotifyMode as NotifyMode } from "./channel-ui";
 
 export type ChannelKind = "text" | "voice";
 
@@ -43,6 +43,8 @@ export interface SidebarVoiceChannel {
   people: SidebarVoicePerson[];
   /** This user is in this channel's call. */
   joined: boolean;
+  /** In nobody's list (UNLISTED_VOICE_NAME): shown last, and has no place to move. */
+  unlisted?: true;
 }
 
 /** Everything the column needs for the selected room's channels. */
@@ -58,13 +60,16 @@ export interface SidebarChannels {
   onRenameChannel?: (kind: ChannelKind, id: string, name: string) => void;
   onDeleteChannel?: (kind: ChannelKind, id: string) => void;
   /**
-   * That kind's channels after a move, as ids, the original one left out
-   * (it is always first and never moves; see channelMoveOrder).
+   * That kind's channels after a move, as ids, the original one (the empty
+   * id) among them.
    */
   onReorderChannels?: (kind: ChannelKind, order: string[]) => void;
   /** The room's own notification mode: what a channel that follows it gets. */
   roomNotifyMode?: NotifyMode;
-  /** Set a text channel's mode; null makes it follow the room again. */
+  /**
+   * Set a text channel's mode; null makes it follow the room again. In a room
+   * with one chat (hasOneChat) the mode is the room's.
+   */
   onSetNotify?: (id: string, mode: NotifyMode | null) => void;
 }
 
@@ -77,17 +82,17 @@ export const UNLISTED_VOICE_NAME = "Unlisted call";
  * The text section: the room's live text channels in list order, each with
  * its unread count and notification state.
  *
- * The original chat's own mode IS the room's. In a room with no other text
- * channel the header bell already says so, and the row stays as it was
- * before channels (never drawn muted); once there are others it is drawn
- * the way they are.
+ * In a room with no other text channel the original chat's mode is the
+ * room's: the header bell and the rail tile already say so, and the row stays
+ * as it was before channels (never drawn muted). Once there are others it has
+ * its own, and is drawn the way they are.
  */
 export function buildTextChannels(
   list: readonly { id: string; name: string }[],
   unreadOf: (id: string) => number,
   notifyOf: (id: string) => { mode: NotifyMode; own: NotifyMode | null }
 ): SidebarTextChannel[] {
-  const onlyDefault = list.every((c) => c.id === DEFAULT_CHANNEL_ID);
+  const onlyDefault = hasOneChat(list);
   return list.map((c) => {
     const notify = notifyOf(c.id);
     const quiet = c.id === DEFAULT_CHANNEL_ID && onlyDefault;
@@ -122,10 +127,10 @@ export function buildVoiceChannels(
   joinedId: string | null,
   person: (member: VoiceOccupant) => SidebarVoicePerson
 ): SidebarVoiceChannel[] {
-  const channels = [...list];
+  const channels: { id: string; name: string; unlisted?: true }[] = [...list];
   const listed = new Set(list.map((c) => c.id));
   for (const [id, members] of occupancy) {
-    if (!listed.has(id) && members.length > 0) channels.push({ id, name: UNLISTED_VOICE_NAME });
+    if (!listed.has(id) && members.length > 0) channels.push({ id, name: UNLISTED_VOICE_NAME, unlisted: true });
   }
   return channels.map((c) => {
     const members = occupancy.get(c.id) ?? [];
@@ -134,7 +139,8 @@ export function buildVoiceChannels(
       .filter((m) => !m.self)
       .map(person)
       .sort((a, b) => a.name.localeCompare(b.name));
-    return { id: c.id, name: c.name, people: [...selves, ...others], joined: joinedId === c.id };
+    const row = { id: c.id, name: c.name, people: [...selves, ...others], joined: joinedId === c.id };
+    return c.unlisted ? { ...row, unlisted: true } : row;
   });
 }
 
@@ -162,47 +168,48 @@ export function roomHasChannelsToPick(
   return [...text, ...voice].some((c) => c.id !== DEFAULT_CHANNEL_ID);
 }
 
+/** A kind's channels that have a place in the room's order, as ids. */
+export function orderedChannelIds(list: readonly { id: string; unlisted?: true }[]): string[] {
+  return list.filter((c) => !c.unlisted).map((c) => c.id);
+}
+
 /**
  * The order the sidebar hands onReorderChannels after moving one channel a
- * step: the original channel stays first and does not move, and nothing
- * moves above it. Null when the move goes nowhere.
+ * step, the original among them like any other. Null when the move goes
+ * nowhere.
  */
 export function channelMoveOrder(
   ids: readonly string[],
   id: string,
   step: -1 | 1
 ): string[] | null {
-  if (id === DEFAULT_CHANNEL_ID) return null;
-  const movable = ids.filter((c) => c !== DEFAULT_CHANNEL_ID);
-  const from = movable.indexOf(id);
+  const from = ids.indexOf(id);
   const to = from + step;
-  if (from === -1 || to < 0 || to >= movable.length) return null;
-  const next = [...movable];
+  if (from === -1 || to < 0 || to >= ids.length) return null;
+  const next = [...ids];
   next.splice(from, 1);
   next.splice(to, 0, id);
   return next;
 }
 
 /**
- * The channels of one kind a drag can lift, in list order: all but the
- * original, which stays first and is not draggable.
+ * The channels of one kind a drag can lift, in list order: all of them, or
+ * none where there is only one and nowhere to move it.
  */
 export function draggableChannelIds(ids: readonly string[]): string[] {
-  return ids.filter((c) => c !== DEFAULT_CHANNEL_ID);
+  return ids.length > 1 ? [...ids] : [];
 }
 
 /**
  * The order the sidebar hands onReorderChannels after a drag dropped `id`
  * at index `to` among the draggable channels (draggableChannelIds) - the
- * drag's twin of channelMoveOrder, so the original is never in it and
- * nothing lands above it. Null when the drop changes nothing.
+ * drag's twin of channelMoveOrder. Null when the drop changes nothing.
  */
 export function channelDropOrder(
   ids: readonly string[],
   id: string,
   to: number
 ): string[] | null {
-  if (id === DEFAULT_CHANNEL_ID) return null;
   const movable = draggableChannelIds(ids);
   const from = movable.indexOf(id);
   if (from === -1 || !Number.isInteger(to)) return null;

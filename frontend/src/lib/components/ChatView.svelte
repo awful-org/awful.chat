@@ -124,6 +124,7 @@
   import { messageChannel } from "$lib/channels";
   import {
     NOTIFY_NEXT,
+    bellScope,
     channelHeading,
     channelModeToStore,
     composerPlaceholder,
@@ -1799,17 +1800,17 @@
    * ask by glancing at the header, not by opening a menu.
    */
   /**
-   * In a channel other than the room's original chat the bell is that
-   * channel's (notify-prefs.svelte.ts): its own mode, or the room's while it
-   * follows the room, and its label names it. The original chat's mode is
-   * the room's, as it always was.
+   * The bell is the channel's on screen (notify-prefs.svelte.ts), the
+   * original chat's too: its own mode, or the room's while it follows the
+   * room, and its label names it. With one chat it is the room's, as it was
+   * before channels (bellScope).
    */
-  const notifyChannel = $derived(channel && heading ? heading : null);
   const notifyMode = $derived(effectiveNotifyMode(roomCode, channel));
-  const notifyText = $derived(notifyLabel(notifyMode, notifyChannel));
+  const notifyText = $derived(notifyLabel(notifyMode, heading));
   function cycleNotify(): void {
     const next = NOTIFY_NEXT[notifyMode];
-    if (!channel) setRoomNotifyMode(roomCode, next, textChannels.map((c) => c.id));
+    if (bellScope(textChannels, channel) === "room")
+      setRoomNotifyMode(roomCode, next, textChannels.map((c) => c.id));
     else setChannelNotifyMode(roomCode, channel, channelModeToStore(next, getRoomNotifyMode(roomCode)));
   }
 

@@ -43,19 +43,42 @@ const prefs = $state<{ modes: Record<string, RoomNotifyMode> }>({
   modes: load(),
 });
 
+/**
+ * The room's own mode: what a channel of it gets that has none of its own
+ * (effectiveNotifyMode, which is what a message goes by).
+ */
 export function getRoomNotifyMode(roomCode: string): RoomNotifyMode {
   return prefs.modes[hashRef(roomCode)] ?? "all";
+}
+
+/** Whether these text channels are the original chat alone: one chat, one setting. */
+function oneChat(channels: readonly string[]): boolean {
+  return channels.length > 0 && channels.every((c) => c === "");
+}
+
+/**
+ * How loud a room is, as its tile, its menu and the palette say it
+ * (`channels`: the room's text channel ids). Its own mode - but where its
+ * only chat is the original one, what that chat goes by: a chat muted while
+ * the room had other channels is still muted when they are gone, and the
+ * room is as quiet as it.
+ */
+export function roomNotifySetting(roomCode: string, channels: readonly string[]): RoomNotifyMode {
+  return oneChat(channels) ? effectiveNotifyMode(roomCode) : getRoomNotifyMode(roomCode);
 }
 
 /**
  * Set how loud a room may be.
  *
  * Muting a room is "no sound from this room", so it also takes back the
- * louder modes its channels kept from before (`channels`: the room's channel
- * ids): a channel set to "all messages" while the room was loud would
- * otherwise go on beeping in a room the user has just muted. Those channels
- * follow the room again; one that should stay loud is unmuted again from its
- * own menu, after this, and then keeps that.
+ * louder modes its channels kept from before (`channels`: the room's text
+ * channel ids, "" being its original chat): a channel set to "all messages"
+ * while the room was loud would otherwise go on beeping in a room the user
+ * has just muted. Those channels follow the room again; one that should stay
+ * loud is unmuted again from its own menu, after this, and then keeps that.
+ *
+ * In a room whose only chat is the original one, any mode replaces what that
+ * chat kept: there the room's setting is the chat's (roomNotifySetting).
  */
 export function setRoomNotifyMode(
   roomCode: string,
@@ -70,13 +93,13 @@ export function setRoomNotifyMode(
   } catch {
     // Storage blocked: the choice just does not survive a reload.
   }
-  if (mode !== "muted") return;
+  const single = oneChat(channels);
+  if (mode !== "muted" && !single) return;
   let dropped = false;
   for (const channel of channels) {
-    if (!channel) continue;
     const cref = channelRef(roomCode, channel);
     const own = channelPrefs.modes[cref];
-    if (own === undefined || own === "muted") continue;
+    if (own === undefined || (own === "muted" && !single)) continue;
     delete channelPrefs.modes[cref];
     dropped = true;
   }
@@ -92,9 +115,12 @@ export function setRoomNotifyMode(
 //
 // A channel follows its room until someone picks a mode for that channel,
 // and then keeps it whatever the room is set to - "all" included, so one
-// channel can stay loud in a muted room. Kept apart from the room modes,
-// under the same hashed keys (of the room and the channel together), so a
-// build without channels reads its room map exactly as before.
+// channel can stay loud in a muted room. The original chat ("") is a channel
+// like the others. Kept apart from the room modes, under the same hashed keys
+// (of the room and the channel together: the original chat's is the room code
+// and the separator, never the room's own key), so a build without channels
+// reads its room map exactly as before, and a room muted before channels is a
+// muted room, not a muted original chat.
 
 const CHANNEL_KEY = "awful:channel-notify:v1";
 
@@ -121,12 +147,10 @@ const channelPrefs = $state<{ modes: Record<string, RoomNotifyMode> }>({
   modes: loadChannels(),
 });
 
-/**
- * The mode picked for one channel, or null when it follows its room. The
- * original chat ("") has no mode of its own: it is the room's.
- */
+/** The mode picked for one channel ("" for the original chat), or null when it follows its room. */
 export function getChannelNotifyMode(roomCode: string, channel: string): RoomNotifyMode | null {
-  if (!channel) return null;
+  // A DM has no channels, so nothing of its own apart from its one mode.
+  if (roomCode.startsWith("dm-")) return null;
   return channelPrefs.modes[channelRef(roomCode, channel)] ?? null;
 }
 
@@ -136,10 +160,7 @@ export function setChannelNotifyMode(
   channel: string,
   mode: RoomNotifyMode | null
 ): void {
-  if (!channel) {
-    if (mode) setRoomNotifyMode(roomCode, mode);
-    return;
-  }
+  if (roomCode.startsWith("dm-")) return;
   const ref = channelRef(roomCode, channel);
   if (mode === null) delete channelPrefs.modes[ref];
   else channelPrefs.modes[ref] = mode;

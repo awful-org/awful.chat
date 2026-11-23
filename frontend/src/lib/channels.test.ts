@@ -75,6 +75,18 @@ describe("parsing an untrusted entry", () => {
     expect(parseChannelEntry(ch("", { name: "lobby" }))).not.toBeNull();
   });
 
+  it("takes an original's position under the same checks as any other, and nothing more", () => {
+    const moved = ch("", { kind: "voice", name: "hangout", position: 4 });
+    expect(parseChannelEntry({ ...moved, extra: 1 })).toEqual(moved);
+    expect(parseChannelEntry({ ...moved, position: -2 })?.position).toBe(0);
+    expect(parseChannelEntry({ ...moved, position: 1e12 })?.position).toBe(1_000_000);
+    for (const position of [undefined, null, "1", Number.NaN, Infinity]) {
+      expect(parseChannelEntry({ ...moved, position })).toBeNull();
+    }
+    expect(parseChannelEntry({ ...moved, deleted: true })).toBeNull();
+    expect(parseChannelEntry({ ...moved, kind: "video" })).toBeNull();
+  });
+
   it("parses a list by dropping what does not parse", () => {
     expect(parseChannelList([ch(A), { junk: 1 }, ch(B)]).map((c) => c.id)).toEqual([A, B]);
     expect(parseChannelList("nope")).toEqual([]);
@@ -156,7 +168,7 @@ describe("the merge rule", () => {
 });
 
 describe("the list as members see it", () => {
-  it("always holds the originals, first, under their default names until renamed", () => {
+  it("always holds the originals, first until one is moved, under their default names until renamed", () => {
     const list = [ch(B, { position: 2 }), ch(A, { position: 1 }), { ...ch("cccccccc"), deleted: true as const }];
     expect(liveChannels(list, "text").map((c) => [c.id, c.name])).toEqual([
       ["", DEFAULT_CHANNEL_NAMES.text], [A, A], [B, B],
@@ -168,6 +180,17 @@ describe("the list as members see it", () => {
     expect(findLiveChannel(list, "cccccccc")).toBeUndefined();
     expect(findLiveChannel(list, A)?.name).toBe(A);
     expect(findLiveChannel(list, A, "voice")).toBeUndefined();
+  });
+
+  it("shows an original where it was moved to, its kind alone", () => {
+    const list = [ch(A, { position: 0 }), ch("", { name: "lobby", position: 1 }), ch(B, { position: 2 })];
+    expect(liveChannels(list, "text").map((c) => c.id)).toEqual([A, "", B]);
+    expect(liveChannels(list, "voice").map((c) => c.id)).toEqual([""]);
+    // Whatever is first, the empty id is the original.
+    expect(findLiveChannel(list, "")).toMatchObject({ id: "", name: "lobby", position: 1 });
+    // At one position the original is in front, so an old list that says
+    // nothing of it cannot put it behind another.
+    expect(liveChannels([ch(A, { position: 0 })], "text").map((c) => c.id)).toEqual(["", A]);
   });
 
   it("keys a rename of an original by its kind, so text and voice are apart", () => {
@@ -184,6 +207,9 @@ describe("edits", () => {
     const full = Array.from({ length: MAX_CHANNELS }, (_, i) => ch(`full${String(i).padStart(4, "0")}`));
     expect(() => createChannelEntry(full, "text", "one more", NOW)).toThrow();
     expect(() => createChannelEntry([], "text", "   ", NOW)).toThrow();
+    // After the original too, where that was moved to the end.
+    expect(createChannelEntry([ch(A, { position: 0 }), ch("", { position: 5 })], "text", "last", NOW).position).toBe(6);
+    expect(createChannelEntry([], "text", "first", NOW).position).toBe(1);
   });
 
   it("stamps a change after the one it replaces, even behind a fast clock elsewhere", () => {
@@ -203,6 +229,46 @@ describe("edits", () => {
     expect(after).toEqual(["", "cccccccc", A, B]);
     expect(moved.every((c) => c.updatedAt === NOW)).toBe(true);
     expect(reorderChannelEntries(list, "text", [A, B, "cccccccc"], NOW)).toEqual([]);
+    // In front the original needs no entry of its own.
+    expect(reorderChannelEntries(list, "text", ["", A, B, "cccccccc"], NOW)).toEqual([]);
+  });
+
+  it("moves an original like any other channel, the entry keeping its name", () => {
+    const list = [ch(A, { position: 1 }), ch(B, { position: 2 })];
+    const moved = reorderChannelEntries(list, "text", [A, "", B], NOW);
+    expect(moved).toEqual([
+      ch(A, { position: 0, updatedAt: NOW }),
+      { id: "", kind: "text", name: DEFAULT_CHANNEL_NAMES.text, position: 1, updatedAt: NOW },
+    ]);
+    const after = mergeChannelLists(list, moved, NOW).merged;
+    expect(liveChannels(after, "text").map((c) => c.id)).toEqual([A, "", B]);
+    // A rename leaves it where it is, a move leaves its name alone.
+    const renamed = mergeChannelLists(after, [renameChannelEntry(after, "text", "", "lobby", NOW + 1)], NOW + 1).merged;
+    expect(liveChannels(renamed, "text").map((c) => c.name)).toEqual([A, "lobby", B]);
+    const last = mergeChannelLists(
+      renamed, reorderChannelEntries(renamed, "text", [A, B, ""], NOW + 2), NOW + 2
+    ).merged;
+    expect(liveChannels(last, "text").map((c) => c.name)).toEqual([A, B, "lobby"]);
+    // Still never deleted.
+    expect(() => deleteChannelEntry(last, "text", "", NOW + 3)).toThrow();
+    // And back in front.
+    const back = mergeChannelLists(
+      last, reorderChannelEntries(last, "text", ["", A, B], NOW + 4), NOW + 4
+    ).merged;
+    expect(liveChannels(back, "text").map((c) => c.id)).toEqual(["", A, B]);
+  });
+
+  it("moves the original voice channel apart from the original chat", () => {
+    const list = [ch(A, { kind: "voice", position: 1 }), ch(B, { position: 1 })];
+    const after = mergeChannelLists(list, reorderChannelEntries(list, "voice", [A, ""], NOW), NOW).merged;
+    expect(liveChannels(after, "voice").map((c) => c.id)).toEqual([A, ""]);
+    expect(liveChannels(after, "text").map((c) => c.id)).toEqual(["", B]);
+  });
+
+  it("leaves an original an order does not name at the place it holds", () => {
+    const list = [ch(A, { position: 0 }), ch("", { position: 1 }), ch(B, { position: 2 })];
+    const after = mergeChannelLists(list, reorderChannelEntries(list, "text", [B, A], NOW), NOW).merged;
+    expect(liveChannels(after, "text").map((c) => c.id)).toEqual([B, "", A]);
   });
 });
 
@@ -219,6 +285,25 @@ describe("sync between two members", () => {
     to.list = r.merged;
     if (r.behind && !answer) deliver(to, from, true, now);
   }
+
+  it("carries a move of an original, and settles one made while apart by the newer stamp", () => {
+    const alice: Member = { list: [ch(A, { position: 1 }), ch(B, { position: 2 })], sent: 0 };
+    const bob: Member = { list: [...alice.list], sent: 0 };
+    const move = (m: Member, order: string[], at: number) => {
+      m.list = mergeChannelLists(m.list, reorderChannelEntries(m.list, "text", order, at), at).merged;
+    };
+    move(alice, [A, B, ""], NOW);
+    deliver(alice, bob, false, NOW);
+    expect(liveChannels(bob.list, "text").map((c) => c.id)).toEqual([A, B, ""]);
+    // Apart: Alice puts it in front, then Bob between the two.
+    move(alice, ["", A, B], NOW + 1);
+    move(bob, [A, "", B], NOW + 2);
+    deliver(alice, bob, false, NOW + 3);
+    expect(sameChannelList(alice.list, bob.list)).toBe(true);
+    // Bob's copy of the original, the newer, holds its place (1); Alice's
+    // moves of the others hold theirs (A 1, B 2).
+    expect(liveChannels(alice.list, "text").map((c) => c.id)).toEqual(["", A, B]);
+  });
 
   it("converges after edits on both sides while apart, in one exchange", () => {
     const alice: Member = { list: [], sent: 0 };

@@ -18,7 +18,7 @@ import { roomChannels, roomsStore, toggleRoomPin } from "$lib/rooms.svelte";
 import { uiState } from "$lib/ui-state.svelte";
 import { savedRoomInvitationLink } from "$lib/room-security/invitations";
 import {
-  getRoomNotifyMode,
+  roomNotifySetting,
   setRoomNotifyMode,
   type RoomNotifyMode,
 } from "$lib/notify-prefs.svelte";
@@ -240,7 +240,9 @@ export const roomCommands: CmdSource = (host) => {
       action: { kind: "act", perform: () => void toggleRoomPin(activeCode) },
     });
 
-    const mode = getRoomNotifyMode(activeCode);
+    // The whole room's, whatever channel is open; what the room menu says.
+    const textIds = roomChannels(activeCode, "text").map((c) => c.id);
+    const mode = roomNotifySetting(activeCode, textIds);
     cmds.push({
       id: "room.notify",
       title: "Room notifications",

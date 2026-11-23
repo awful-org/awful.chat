@@ -7,6 +7,7 @@ import {
   channelDropOrder,
   channelMoveOrder,
   draggableChannelIds,
+  orderedChannelIds,
   onScreenRoomUnread,
   roomHasChannelsToPick,
   roomsWithCalls,
@@ -95,6 +96,19 @@ describe("the voice section", () => {
     expect(voice[1].people[2]).toMatchObject({ muted: false, speaking: true });
   });
 
+  it("keeps the original call's people with it wherever it was moved to", () => {
+    const voice = buildVoiceChannels(
+      [...list].reverse(),
+      new Map([["", [{ peerId: "pDan", self: false }]]]),
+      "",
+      person
+    );
+    expect(voice.map((c) => [c.id, c.joined, c.people.length])).toEqual([
+      ["cccccccccccccccc", false, 0],
+      ["", true, 1],
+    ]);
+  });
+
   it("is joined only in the channel you are in, and nowhere when you are in no call here", () => {
     const occupancy = new Map<string, VoiceOccupant[]>([["", [{ peerId: "pDan", self: false }]]]);
     expect(buildVoiceChannels(list, occupancy, null, person).map((c) => c.joined)).toEqual([false, false]);
@@ -115,6 +129,8 @@ describe("the voice section", () => {
       ["", "voice"],
       ["dddddddddddddddd", UNLISTED_VOICE_NAME],
     ]);
+    // It has no place in the order: the original is alone there, and stays.
+    expect(orderedChannelIds(voice)).toEqual([""]);
   });
 });
 
@@ -145,16 +161,20 @@ describe("a room tap on a phone", () => {
 describe("moving a channel a step", () => {
   const ids = ["", "a", "b", "c"];
 
-  it("moves it among the others, the original left out of the order", () => {
-    expect(channelMoveOrder(ids, "b", -1)).toEqual(["b", "a", "c"]);
-    expect(channelMoveOrder(ids, "b", 1)).toEqual(["a", "c", "b"]);
+  it("moves it among the others, the original in the order like any other", () => {
+    expect(channelMoveOrder(ids, "b", -1)).toEqual(["", "b", "a", "c"]);
+    expect(channelMoveOrder(ids, "b", 1)).toEqual(["", "a", "c", "b"]);
+    expect(channelMoveOrder(ids, "", 1)).toEqual(["a", "", "b", "c"]);
+    expect(channelMoveOrder(ids, "a", -1)).toEqual(["a", "", "b", "c"]);
+    expect(channelMoveOrder(["a", ""], "", -1)).toEqual(["", "a"]);
   });
 
-  it("never moves the original, nor anything above it, nor past the end", () => {
-    expect(channelMoveOrder(ids, "", 1)).toBeNull();
-    expect(channelMoveOrder(ids, "a", -1)).toBeNull();
+  it("goes nowhere past either end, alone, or for a channel not in the list", () => {
+    expect(channelMoveOrder(ids, "", -1)).toBeNull();
     expect(channelMoveOrder(ids, "c", 1)).toBeNull();
     expect(channelMoveOrder(ids, "zz", 1)).toBeNull();
+    expect(channelMoveOrder([""], "", 1)).toBeNull();
+    expect(channelMoveOrder([""], "", -1)).toBeNull();
   });
 });
 
@@ -169,30 +189,32 @@ describe("rooms with a call going on", () => {
 describe("dragging a channel", () => {
   const ids = ["", "a", "b", "c"];
 
-  it("lifts every channel but the original", () => {
-    expect(draggableChannelIds(ids)).toEqual(["a", "b", "c"]);
+  it("lifts every channel, the original too, and none where there is only one", () => {
+    expect(draggableChannelIds(ids)).toEqual(ids);
     expect(draggableChannelIds([""])).toEqual([]);
   });
 
-  it("drops a channel at its new place, the original left out of the order", () => {
-    expect(channelDropOrder(ids, "a", 2)).toEqual(["b", "c", "a"]);
-    expect(channelDropOrder(ids, "c", 0)).toEqual(["c", "a", "b"]);
-    expect(channelDropOrder(ids, "b", 1)).toBeNull();
+  it("drops a channel at its new place, above the original too", () => {
+    expect(channelDropOrder(ids, "a", 3)).toEqual(["", "b", "c", "a"]);
+    expect(channelDropOrder(ids, "c", 0)).toEqual(["c", "", "a", "b"]);
+    expect(channelDropOrder(ids, "", 2)).toEqual(["a", "b", "", "c"]);
+    expect(channelDropOrder(ids, "b", 2)).toBeNull();
   });
 
-  it("never lands above the original, nor past the end", () => {
-    expect(channelDropOrder(ids, "b", -4)).toEqual(["b", "a", "c"]);
-    expect(channelDropOrder(ids, "a", 9)).toEqual(["b", "c", "a"]);
+  it("never lands past either end", () => {
+    expect(channelDropOrder(ids, "b", -4)).toEqual(["b", "", "a", "c"]);
+    expect(channelDropOrder(ids, "a", 9)).toEqual(["", "b", "c", "a"]);
   });
 
-  it("does not move the original or a channel the list does not hold", () => {
-    expect(channelDropOrder(ids, "", 2)).toBeNull();
+  it("does not move a lone channel or one the list does not hold", () => {
+    expect(channelDropOrder([""], "", 1)).toBeNull();
     expect(channelDropOrder(ids, "zz", 0)).toBeNull();
     expect(channelDropOrder(ids, "a", 1.5)).toBeNull();
   });
 
   it("agrees with the keyboard's one-step move", () => {
-    expect(channelDropOrder(ids, "b", 0)).toEqual(channelMoveOrder(ids, "b", -1));
-    expect(channelDropOrder(ids, "b", 2)).toEqual(channelMoveOrder(ids, "b", 1));
+    expect(channelDropOrder(ids, "b", 1)).toEqual(channelMoveOrder(ids, "b", -1));
+    expect(channelDropOrder(ids, "b", 3)).toEqual(channelMoveOrder(ids, "b", 1));
+    expect(channelDropOrder(ids, "", 1)).toEqual(channelMoveOrder(ids, "", 1));
   });
 });

@@ -145,6 +145,20 @@ describe("channels and pins of a room", () => {
     expect(roomChannel(ROOM, "")?.name).toBe("general");
   });
 
+  it("lists the original where it was moved to, and counts its unread the same", async () => {
+    const moved: Channel[] = [
+      { id: "", kind: "text", name: "lobby", position: 9, updatedAt: STAMP },
+      ...room().channels!,
+    ];
+    await putRoom(room({ channels: moved }));
+    roomsStore.rooms = [room({ channels: moved })];
+    expect(roomChannels(ROOM, "text").map((c) => c.name)).toEqual(["games", "lobby"]);
+    expect(roomChannel(ROOM, "")?.name).toBe("lobby");
+    await bulkPutMessages([msg(1), msg(2)]);
+    await refreshUnreadCount(ROOM);
+    expect(channelUnreadCount(ROOM, "")).toBe(2);
+  });
+
   it("files a pin under the channel open in the room", async () => {
     await putRoom(room());
     roomsStore.rooms = [room()];

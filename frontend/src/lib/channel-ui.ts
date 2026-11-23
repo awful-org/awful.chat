@@ -13,6 +13,11 @@ export type { RoomNotifyMode };
 
 // ── The channel on screen ───────────────────────────────────────────────────
 
+/** Whether a conversation's only chat is its original one: a room with no other text channel, or a DM. */
+export function hasOneChat(textChannels: readonly { id: string }[]): boolean {
+  return textChannels.every((c) => c.id === DEFAULT_TEXT_CHANNEL);
+}
+
 /**
  * The channel name the chat header shows beside the room's ("#name"), or
  * null to show the room's name alone: a room with only its original chat
@@ -22,7 +27,7 @@ export function channelHeading(
   textChannels: readonly { id: string; name: string }[],
   current: string
 ): string | null {
-  if (!textChannels.some((c) => c.id !== DEFAULT_TEXT_CHANNEL)) return null;
+  if (hasOneChat(textChannels)) return null;
   return textChannels.find((c) => c.id === current)?.name ?? null;
 }
 
@@ -57,6 +62,18 @@ export function channelModeToStore(mode: RoomNotifyMode, roomMode: RoomNotifyMod
   return mode === roomMode ? null : mode;
 }
 
+/**
+ * Whose notifications the header bell sets: the channel's on screen, the
+ * original chat included, once the room has a choice of them. With one chat
+ * there is one setting, the room's (or DM's), as before channels.
+ */
+export function bellScope(
+  textChannels: readonly { id: string }[],
+  current: string
+): "room" | "channel" {
+  return current === DEFAULT_TEXT_CHANNEL && hasOneChat(textChannels) ? "room" : "channel";
+}
+
 /** The header bell's label: for the room, or for the channel on screen. */
 export function notifyLabel(mode: RoomNotifyMode, channelName: string | null): string {
   return channelName
@@ -72,36 +89,37 @@ export interface NotifyMenuItem {
 }
 
 /**
- * The notification items of a text channel's menu, for its current state.
+ * The notification items of a menu, for the current state of what it sets:
+ * a room, or one of its text channels.
  *
- * The original chat has no mode of its own - its mode is the room's, and
- * every channel that follows the room follows that - so its items say
- * "room": muting it from here mutes the room, and saying "channel" would be
- * a lie about what happens.
+ * A room's items say "room", and so do those of its only chat: there is one
+ * setting between them, the room's, and saying "channel" would be a lie
+ * about what happens. With other text channels the original chat is a
+ * channel like them, with a mode of its own.
  */
 export function notifyMenuItems(opts: {
-  isDefault: boolean;
+  scope: "room" | "channel";
   /** The mode in force: the channel's own, or its room's. */
   mode: RoomNotifyMode;
   /** The channel's own mode; null when it follows the room. */
   own: RoomNotifyMode | null;
   roomMode: RoomNotifyMode;
 }): NotifyMenuItem[] {
-  const { isDefault, mode, own, roomMode } = opts;
-  const what = isDefault ? "room" : "channel";
-  const store = (m: RoomNotifyMode) => (isDefault ? m : channelModeToStore(m, roomMode));
+  const { scope, mode, own, roomMode } = opts;
+  const isRoom = scope === "room";
+  const store = (m: RoomNotifyMode) => (isRoom ? m : channelModeToStore(m, roomMode));
   const items: NotifyMenuItem[] = [];
   if (mode === "muted") {
     // Unmuted is "all" for the room; for a channel it is whatever its room
     // gives when that is not muted, else "all" of its own.
-    const unmuted: RoomNotifyMode = isDefault || roomMode === "muted" ? "all" : roomMode;
-    items.push({ id: "unmute", label: `Unmute ${what}`, mode: store(unmuted) });
+    const unmuted: RoomNotifyMode = isRoom || roomMode === "muted" ? "all" : roomMode;
+    items.push({ id: "unmute", label: `Unmute ${scope}`, mode: store(unmuted) });
   } else {
-    items.push({ id: "mute", label: `Mute ${what}`, mode: store("muted") });
+    items.push({ id: "mute", label: `Mute ${scope}`, mode: store("muted") });
   }
   if (mode !== "mentions") items.push({ id: "mentions", label: "Mentions only", mode: store("mentions") });
   if (mode === "mentions") items.push({ id: "all", label: "All messages", mode: store("all") });
-  if (!isDefault && own !== null) items.push({ id: "follow", label: "Use room setting", mode: null });
+  if (!isRoom && own !== null) items.push({ id: "follow", label: "Use room setting", mode: null });
   return items;
 }
 

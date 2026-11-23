@@ -25,13 +25,17 @@ export type ChannelKind = "text" | "voice";
 export interface Channel {
   /**
    * Random, see isChannelId. The empty id is the room's original chat or
-   * call; an entry with the empty id only ever renames that one (see
-   * DEFAULT_CHANNEL_NAMES), it never creates or deletes anything.
+   * call; an entry with the empty id only ever renames or moves that one
+   * (see DEFAULT_CHANNEL_NAMES), it never creates or deletes anything.
    */
   id: string;
   kind: ChannelKind;
   name: string;
-  /** Sort key among the room's channels of the same kind, lowest first. */
+  /**
+   * Sort key among the room's channels of the same kind, lowest first. An
+   * original with no entry is at 0, which is before everything else: channels
+   * are made at 1 and up, and at the same position the empty id sorts first.
+   */
   position: number;
   /** When this entry last changed, ms since the epoch. The newest wins. */
   updatedAt: number;
@@ -49,10 +53,10 @@ export const DEFAULT_TEXT_CHANNEL = "";
 export const DEFAULT_VOICE_CHANNEL = "";
 
 /**
- * What the original chat and call are called until a member renames them. A
- * rename is an entry with the empty id and that kind; it can change the name
- * and nothing else - the original channels cannot be deleted or moved, they
- * stay first.
+ * What the original chat and call are called until a member renames them. An
+ * entry with the empty id and that kind holds their name and their position;
+ * the original channels cannot be deleted. Until somebody moves one, it is
+ * first.
  */
 export const DEFAULT_CHANNEL_NAMES: Readonly<Record<ChannelKind, string>> = {
   text: "general",
@@ -122,7 +126,7 @@ export function sanitizeChannelName(raw: unknown): string | null {
   return capped || null;
 }
 
-/** What identifies an entry: its id, or for a rename of an original, its kind. */
+/** What identifies an entry: its id, or for an original, its kind. */
 export function channelKey(c: Pick<Channel, "id" | "kind">): string {
   return c.id === "" ? `\u0000${c.kind}` : c.id;
 }
@@ -287,25 +291,31 @@ function findEntry(list: readonly Channel[], kind: ChannelKind, id: string): Cha
 }
 
 /**
- * The channels a member can see, sorted, deleted ones left out: the
- * original first under its current name, then the rest by position. Of one
- * kind, or of both with every text channel first.
+ * The channels a member can see, by position, deleted ones left out. The
+ * original is always among them, under its current name and at the place it
+ * was moved to - first, until somebody moves it. Of one kind, or of both with
+ * every text channel first.
  */
 export function liveChannels(list: readonly Channel[], kind?: ChannelKind): Channel[] {
   const kinds: ChannelKind[] = kind ? [kind] : ["text", "voice"];
   const out: Channel[] = [];
   for (const k of kinds) {
-    const rename = findEntry(list, k, "");
-    out.push({
-      id: "",
-      kind: k,
-      name: rename?.name ?? DEFAULT_CHANNEL_NAMES[k],
-      position: 0,
-      updatedAt: rename?.updatedAt ?? 0,
-    });
-    out.push(...list.filter((c) => c.kind === k && c.id !== "" && !c.deleted).sort(byPositionThenId));
+    const others = list.filter((c) => c.kind === k && c.id !== "" && !c.deleted);
+    out.push(...[originalChannel(list, k), ...others].sort(byPositionThenId));
   }
   return out;
+}
+
+/** The original of a kind: its entry where one was made, else what it starts as. */
+function originalChannel(list: readonly Channel[], kind: ChannelKind): Channel {
+  const entry = findEntry(list, kind, "");
+  return {
+    id: "",
+    kind,
+    name: entry?.name ?? DEFAULT_CHANNEL_NAMES[kind],
+    position: entry?.position ?? 0,
+    updatedAt: entry?.updatedAt ?? 0,
+  };
 }
 
 /**
@@ -317,7 +327,7 @@ export function findLiveChannel(
   id: string,
   kind: ChannelKind = "text"
 ): Channel | undefined {
-  if (id === "") return liveChannels(list, kind)[0];
+  if (id === "") return originalChannel(list, kind);
   const c = list.find((e) => e.id === id);
   return c && !c.deleted && c.kind === kind ? c : undefined;
 }
@@ -334,12 +344,12 @@ export function createChannelEntry(
   if (!name) throw new Error("A channel needs a name");
   const live = list.filter((c) => c.id !== "" && !c.deleted);
   if (live.length >= MAX_CHANNELS) throw new Error(`A room can have at most ${MAX_CHANNELS} channels`);
-  const ofKind = live.filter((c) => c.kind === kind);
-  const position = ofKind.length ? Math.max(...ofKind.map((c) => c.position)) + 1 : 1;
+  // Last of its kind, the original counted wherever it was moved to.
+  const position = Math.max(...liveChannels(list, kind).map((c) => c.position)) + 1;
   return { id, kind, name, position: Math.min(position, MAX_POSITION), updatedAt: now };
 }
 
-/** The entry that renames a channel (the empty id renames the original). */
+/** The entry that renames a channel where it is (the empty id renames the original). */
 export function renameChannelEntry(
   list: readonly Channel[],
   kind: ChannelKind,
@@ -374,9 +384,12 @@ export function deleteChannelEntry(
 }
 
 /**
- * The entries that put a kind's channels in the given order. Ids not in the
- * list are ignored, live channels missing from `order` keep their place
- * after the ones named, and only entries whose position moves are restamped.
+ * The entries that put a kind's channels in the given order, the original
+ * (the empty id) among them at any place. Ids not in the list are ignored,
+ * live channels missing from `order` keep their place after the ones named -
+ * except the original, which stays at the place it holds - and only entries
+ * whose position moves are restamped. Moving the original past another
+ * channel is what makes it an entry; in front it needs none.
  */
 export function reorderChannelEntries(
   list: readonly Channel[],
@@ -384,15 +397,20 @@ export function reorderChannelEntries(
   order: readonly string[],
   now = Date.now()
 ): Channel[] {
-  const live = liveChannels(list, kind).filter((c) => c.id !== "");
+  const live = liveChannels(list, kind);
   const named = order
     .map((id) => live.find((c) => c.id === id))
     .filter((c): c is Channel => !!c);
   const unique = [...new Set(named)];
   const rest = live.filter((c) => !unique.includes(c));
+  const next = [...unique, ...rest];
+  if (!order.includes("")) {
+    const at = live.findIndex((c) => c.id === "");
+    const [original] = next.splice(next.findIndex((c) => c.id === ""), 1);
+    next.splice(at, 0, original);
+  }
   const out: Channel[] = [];
-  [...unique, ...rest].forEach((c, i) => {
-    const position = i + 1;
+  next.forEach((c, position) => {
     if (c.position !== position) {
       out.push({ ...c, position, updatedAt: nextChannelStamp(c, now) });
     }

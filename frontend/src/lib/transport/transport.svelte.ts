@@ -6467,7 +6467,7 @@ export async function deleteChannel(
   await _commitChannelEdit(roomCode, [deleteChannelEntry(await _channelsOf(roomCode), kind, id)]);
 }
 
-/** Put a kind's channels in this order (the original always stays first). */
+/** Put a kind's channels in this order, the original ("") among them. */
 export async function reorderChannels(
   roomCode: string,
   order: string[],

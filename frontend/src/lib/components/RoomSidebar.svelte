@@ -46,12 +46,13 @@
     channelDropOrder,
     channelMoveOrder,
     draggableChannelIds,
+    orderedChannelIds,
     onScreenRoomUnread,
     type ChannelKind,
     type SidebarChannels,
     type SidebarVoicePerson,
   } from "$lib/sidebar-channels";
-  import { notifyMenuItems, type NotifyMenuItem, type RoomNotifyMode } from "$lib/channel-ui";
+  import { hasOneChat, notifyMenuItems, type NotifyMenuItem, type RoomNotifyMode } from "$lib/channel-ui";
   import { MAX_CHANNEL_NAME } from "$lib/channels";
   import {
     ArrowDown,
@@ -166,7 +167,7 @@
     /** The full room order after a drag or keyboard move, as roomCodes. */
     onReorderRooms: (order: string[]) => void;
     /**
-     * How loud a room is (notify-prefs.svelte.ts), for its menu and its tile;
+     * How loud a room is (roomNotifySetting), for its menu and its tile;
      * null for a room with no setting of its own (a legacy archive).
      */
     roomNotifyMode?: (code: string) => RoomNotifyMode | null;
@@ -321,22 +322,22 @@
 
   /**
    * A kind's channels as drawn: during a drag of that kind, in the preview
-   * order, the original still first (it never moves and is not in the order).
+   * order, what has no place in it (an unlisted call) last as ever.
    */
   function displayChannels<C extends { id: string }>(kind: ChannelKind, list: C[]): C[] {
     if (drag?.list !== kind) return list;
+    const { order } = drag;
     const byId = new Map(list.map((c) => [c.id, c]));
-    const head = list.filter((c) => c.id === DEFAULT_CHANNEL_ID);
-    return [...head, ...drag.order.flatMap((id) => byId.get(id) ?? [])];
+    return [...order.flatMap((id) => byId.get(id) ?? []), ...list.filter((c) => !order.includes(c.id))];
   }
 
   /**
-   * A channel can be dragged where the room lets its channels be reordered,
-   * all but the original. A row being renamed stays a drag row (its slot is
-   * measured with the others) but has no button to press.
+   * A kind's channels can be dragged where the room lets its channels be
+   * reordered and there is another to move past. A row being renamed stays a
+   * drag row (its slot is measured with the others) but has no button to press.
    */
-  function canDragChannel(id: string): boolean {
-    return !!channels?.onReorderChannels && id !== DEFAULT_CHANNEL_ID;
+  function canDragChannels(list: readonly { id: string; unlisted?: true }[]): boolean {
+    return !!channels?.onReorderChannels && draggableChannelIds(orderedChannelIds(list)).length > 0;
   }
 
   /** A channel row's click, unless it is the click that ends a drag. */
@@ -357,7 +358,7 @@
     if (list === "rooms") return movable.map((r) => r.roomCode);
     const ch = channels;
     if (!ch) return [];
-    return draggableChannelIds((list === "text" ? ch.text : ch.voice).map((c) => c.id));
+    return draggableChannelIds(orderedChannelIds(list === "text" ? ch.text : ch.voice));
   }
 
   function contentY(scroller: HTMLElement, clientY: number): number {
@@ -506,7 +507,7 @@
         onReorderRooms(d.order);
       } else {
         const ch = channels;
-        const ids = (d.list === "text" ? ch?.text : ch?.voice)?.map((c) => c.id) ?? [];
+        const ids = orderedChannelIds((d.list === "text" ? ch?.text : ch?.voice) ?? []);
         const order = channelDropOrder(ids, d.id, d.to);
         if (order) ch?.onReorderChannels?.(d.list, order);
       }
@@ -718,7 +719,7 @@
     return id === "mute" ? BellOff : id === "mentions" ? AtSign : id === "follow" ? Undo2 : Bell;
   }
 
-  /** A room's mode, for its tile: what the bell in its header would say. */
+  /** A room's own setting, for its tile; a channel muted alone says so on its row. */
   function roomMuted(code: string): boolean {
     return roomNotifyMode?.(code) === "muted";
   }
@@ -731,13 +732,12 @@
       const up = pinned ? null : moveStep(order, code, -1);
       const down = pinned ? null : moveStep(order, code, 1);
       // The room's own notification choices, for the room under the pointer
-      // whether or not it is open - the same items, in the same words, as
-      // its original chat's channel menu.
+      // whether or not it is open.
       const mode = roomNotifyMode?.(code) ?? null;
       const setNotify = onSetRoomNotify;
       const notify: MenuItem[] =
         mode && setNotify
-          ? notifyMenuItems({ isDefault: true, mode, own: null, roomMode: mode }).map((n) => ({
+          ? notifyMenuItems({ scope: "room", mode, own: null, roomMode: mode }).map((n) => ({
               id: `notify-${n.id}`,
               label: n.label,
               icon: notifyIcon(n.id),
@@ -834,7 +834,7 @@
     const ch = channels;
     if (!ch) return [];
     const { channelKind: kind, id } = t;
-    const order = (kind === "text" ? ch.text : ch.voice).map((c) => c.id);
+    const order = orderedChannelIds(kind === "text" ? ch.text : ch.voice);
     const reorder = ch.onReorderChannels;
     const up = reorder ? channelMoveOrder(order, id, -1) : null;
     const down = reorder ? channelMoveOrder(order, id, 1) : null;
@@ -845,7 +845,7 @@
     const notify =
       setNotify && text?.notifyMode
         ? notifyMenuItems({
-            isDefault: id === DEFAULT_CHANNEL_ID,
+            scope: hasOneChat(ch.text) ? "room" : "channel",
             mode: text.notifyMode,
             own: text.notifyOwn ?? null,
             roomMode: ch.roomNotifyMode ?? "all",
@@ -1057,7 +1057,7 @@
     }
     if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown") || !ch.onReorderChannels) return;
     e.preventDefault();
-    const order = (kind === "text" ? ch.text : ch.voice).map((c) => c.id);
+    const order = orderedChannelIds(kind === "text" ? ch.text : ch.voice);
     const next = channelMoveOrder(order, id, e.key === "ArrowUp" ? -1 : 1);
     if (next) ch.onReorderChannels(kind, next);
   }
@@ -1711,13 +1711,15 @@
 
 {#snippet channelList()}
   {@const ch = channels!}
+  {@const canDragText = canDragChannels(ch.text)}
+  {@const canDragVoice = canDragChannels(ch.voice)}
   <section aria-labelledby="{uid}-text">
     {@render sectionHeader(`${uid}-text`, "Text", "text", true)}
     <ul class="flex flex-col gap-0.5">
       {#each displayChannels("text", ch.text) as channel (channel.id)}
         {@const selected = ch.selectedTextId === channel.id}
         {@const unread = selected ? 0 : channel.unread}
-        {@const draggable = canDragChannel(channel.id)}
+        {@const draggable = canDragText}
         {@const lifted = isLifted("text", channel.id)}
         <li
           data-drag-row={draggable ? "text" : undefined}
@@ -1782,7 +1784,7 @@
     {@render sectionHeader(`${uid}-voice`, "Voice", "voice", false)}
     <ul class="flex flex-col gap-0.5">
       {#each displayChannels("voice", ch.voice) as channel (channel.id)}
-        {@const draggable = canDragChannel(channel.id)}
+        {@const draggable = canDragVoice && !channel.unlisted}
         {@const lifted = isLifted("voice", channel.id)}
         <!-- The row and the people in its call are one item: they move
              together in a drag. -->

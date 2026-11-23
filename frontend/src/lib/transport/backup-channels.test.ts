@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Room } from "../storage";
-import { isValidMessageRecord, mergeImportedRoom, sanitizeCollections } from "./backup";
+import { isValidMessageRecord, mergeImportedRoom, sanitizeCollections, sanitizeRoomChannels } from "./backup";
 import { MAX_CHANNEL_FUTURE_MS, type Channel } from "../channels";
 import { MessageType } from "../types/message";
 
@@ -85,6 +85,16 @@ describe("checking imported records", () => {
       expect(isValidMessageRecord(message({ channel }))).toBe(false);
     }
     expect(isValidMessageRecord(message({ roomCode: "dm-x", channel: GAMES }))).toBe(false);
+  });
+
+  it("keeps and merges where an original was moved to", () => {
+    const moved = entry("", { name: "general", position: 3, updatedAt: NOW - 1 });
+    expect(sanitizeRoomChannels({ ...local, channels: [moved, entry(GAMES)] }).channels).toContainEqual(moved);
+    const bad = [{ ...moved, position: "3" }, { ...moved, kind: "voice", deleted: true }] as unknown as Channel[];
+    expect(sanitizeRoomChannels({ ...local, channels: bad })).not.toHaveProperty("channels");
+    const renamed = entry("", { name: "lobby", position: 0, updatedAt: NOW - 5 });
+    const merged = mergeImportedRoom({ ...local, channels: [renamed] }, { ...local, channels: [moved] }, NOW);
+    expect(merged.channels).toEqual([moved]);
   });
 
   it("keeps a room whose channel fields are partly bad, with only the good parts", () => {

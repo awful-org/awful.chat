@@ -53,6 +53,7 @@
   import { currentVoiceChannel, voiceChannelsIn } from "$lib/transport/voice-channels";
   import { roomHasVoiceChannels } from "$lib/transport/voice-channel";
   import type { SidebarView } from "$lib/sidebar-rail";
+  import { hasOneChat } from "$lib/channel-ui";
   import {
     DEFAULT_CHANNEL_ID,
     buildTextChannels,
@@ -65,6 +66,7 @@
     effectiveNotifyMode,
     getChannelNotifyMode,
     getRoomNotifyMode,
+    roomNotifySetting,
     setChannelNotifyMode,
     setRoomNotifyMode,
     type RoomNotifyMode,
@@ -456,7 +458,8 @@
 
   /** A room's mode for its rail menu and tile; null for one that has none. */
   function sidebarRoomNotifyMode(code: string): RoomNotifyMode | null {
-    return isLegacyArchive(code) ? null : getRoomNotifyMode(code);
+    if (isLegacyArchive(code)) return null;
+    return roomNotifySetting(code, roomChannels(code, "text").map((c) => c.id));
   }
 
   function setRoomFromSidebar(code: string, mode: RoomNotifyMode): void {
@@ -488,7 +491,9 @@
     const occupancy = voiceChannelsIn(code);
     const mine = currentVoiceChannel();
     const voice = buildVoiceChannels(
-      manage ? roomChannels(code, "voice") : roomChannels(code, "voice").slice(0, 1),
+      manage
+        ? roomChannels(code, "voice")
+        : roomChannels(code, "voice").filter((c) => c.id === DEFAULT_CHANNEL_ID),
       manage ? occupancy : new Map([[DEFAULT_CHANNEL_ID, occupancy.get(DEFAULT_CHANNEL_ID) ?? []]]),
       mine && mine.roomCode === code ? mine.voiceChannel : null,
       (m) =>
@@ -522,9 +527,8 @@
     if (!isLegacyArchive(code)) {
       channels.roomNotifyMode = getRoomNotifyMode(code);
       channels.onSetNotify = (id, mode) => {
-        // The original chat's mode is the room's: set it as the room's, so
-        // muting it also quiets the channels that kept a louder mode.
-        if (id === DEFAULT_CHANNEL_ID) setRoomFromSidebar(code, mode ?? "all");
+        // One chat, one setting: the room's, which the header bell sets too.
+        if (hasOneChat(text)) setRoomFromSidebar(code, mode ?? "all");
         else setChannelNotifyMode(code, id, mode);
       };
     }

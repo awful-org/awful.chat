@@ -39,8 +39,14 @@ vi.mock("./notify-intents", async (orig) => ({
 }));
 
 const { announceMessage, _resetAnnounced } = await import("./announce");
-const { setRoomNotifyMode, setChannelNotifyMode, effectiveNotifyMode, getChannelNotifyMode } =
-  await import("./notify-prefs.svelte");
+const {
+  setRoomNotifyMode,
+  getRoomNotifyMode,
+  setChannelNotifyMode,
+  effectiveNotifyMode,
+  getChannelNotifyMode,
+  roomNotifySetting,
+} = await import("./notify-prefs.svelte");
 
 const ME = "did:key:me";
 const ctx = {
@@ -67,6 +73,7 @@ beforeEach(() => {
   _resetAnnounced();
   setRoomNotifyMode("room-a", "all");
   setChannelNotifyMode("room-a", GAMES, null);
+  setChannelNotifyMode("room-a", "", null);
 });
 afterEach(() => vi.useRealTimers());
 
@@ -110,7 +117,7 @@ describe("a message in a channel", () => {
     setChannelNotifyMode("room-a", GAMES, null);
     expect(getChannelNotifyMode("room-a", GAMES)).toBeNull();
     expect(effectiveNotifyMode("room-a", GAMES)).toBe("muted");
-    // The original chat has no mode apart from the room's.
+    // The original chat follows the room until it is given a mode of its own.
     expect(getChannelNotifyMode("room-a", "")).toBeNull();
   });
 
@@ -138,6 +145,79 @@ describe("a message in a channel", () => {
     setChannelNotifyMode("room-a", GAMES, "mentions");
     setRoomNotifyMode("room-a", "all", [GAMES]);
     expect(getChannelNotifyMode("room-a", GAMES)).toBe("mentions");
+  });
+
+  it("mutes the original chat alone, and the room with it or without it", () => {
+    setChannelNotifyMode("room-a", "", "muted");
+    expect(getRoomNotifyMode("room-a")).toBe("all");
+    announce(msg());
+    announce(msg({ content: `hey @[${ME}]` }));
+    expect(notified).toHaveLength(0);
+    announce(msg({ channel: GAMES }));
+    expect(notified).toHaveLength(1);
+
+    // The room muted before is a muted room, not a muted original chat.
+    setChannelNotifyMode("room-a", "", null);
+    setRoomNotifyMode("room-a", "muted");
+    expect(getChannelNotifyMode("room-a", "")).toBeNull();
+    expect(effectiveNotifyMode("room-a")).toBe("muted");
+    announce(msg());
+    expect(notified).toHaveLength(1);
+    // Unmuted from its own menu after that, it is loud on its own.
+    setChannelNotifyMode("room-a", "", "all");
+    announce(msg());
+    announce(msg({ channel: GAMES }));
+    expect(notified).toHaveLength(2);
+    // And muting the room again takes that back, as for any other channel.
+    setRoomNotifyMode("room-a", "muted", ["", GAMES]);
+    expect(getChannelNotifyMode("room-a", "")).toBeNull();
+    announce(msg());
+    expect(notified).toHaveLength(2);
+
+    // Muted on its own, it stays so when the room comes back.
+    setChannelNotifyMode("room-a", "", "muted");
+    setRoomNotifyMode("room-a", "muted", ["", GAMES]);
+    setRoomNotifyMode("room-a", "all", ["", GAMES]);
+    expect(getChannelNotifyMode("room-a", "")).toBe("muted");
+  });
+
+  it("goes by mentions only in the original chat alone", () => {
+    setChannelNotifyMode("room-a", "", "mentions");
+    announce(msg());
+    announce(msg({ channel: GAMES }));
+    announce(msg({ content: `hey @[${ME}]` }));
+    expect(notified.map((x) => x.title)).toEqual(["The Room #games", "Them mentioned you"]);
+  });
+
+  it("is one setting in a room with one chat", () => {
+    // The chat was muted while there were others, and they are gone since.
+    setChannelNotifyMode("room-a", "", "muted");
+    expect(roomNotifySetting("room-a", ["", GAMES])).toBe("all");
+    expect(roomNotifySetting("room-a", [""])).toBe("muted");
+    // Turning the room up is turning the chat up: nothing of its own is left.
+    setRoomNotifyMode("room-a", "all", [""]);
+    expect(getChannelNotifyMode("room-a", "")).toBeNull();
+    expect(roomNotifySetting("room-a", [""])).toBe("all");
+    announce(msg());
+    expect(notified).toHaveLength(1);
+  });
+
+  it("is nothing a DM has", () => {
+    setRoomNotifyMode("dm-x", "mentions");
+    setChannelNotifyMode("dm-x", "", "muted");
+    expect(getChannelNotifyMode("dm-x", "")).toBeNull();
+    expect(effectiveNotifyMode("dm-x")).toBe("mentions");
+    expect(roomNotifySetting("dm-x", [])).toBe("mentions");
+    setRoomNotifyMode("dm-x", "all");
+  });
+
+  it("drops what a burst was still holding when the original chat is muted, not another channel's", () => {
+    announceMessage(msg(), ctx); // the first goes out at once
+    announceMessage(msg(), ctx);
+    announceMessage(msg({ channel: GAMES }), ctx);
+    setChannelNotifyMode("room-a", "", "muted");
+    vi.advanceTimersByTime(5000);
+    expect(notified.map((x) => x.title)).toEqual(["The Room", "The Room #games"]);
   });
 
   it("drops what a burst was still holding when the room is muted", () => {

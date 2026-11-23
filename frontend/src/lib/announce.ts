@@ -264,7 +264,7 @@ export function announceMessage(
     // A DM is addressed to you by construction, so it counts as a mention for
     // a conversation turned down to mentions only.
     const mentioned = isDm || mentionsMe(msg.content ?? "", ctx.selfIds);
-    // A channel other than the original chat goes by its own mode when one
+    // A channel, the original chat included, goes by its own mode when one
     // was picked for it, and by the room's otherwise.
     const channelId = isDm ? "" : messageChannel(msg);
     const room = isDm ? undefined : roomsStore.rooms.find((r) => r.roomCode === msg.roomCode);

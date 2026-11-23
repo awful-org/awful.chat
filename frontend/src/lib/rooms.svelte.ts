@@ -490,8 +490,8 @@ export async function toggleMessagePin(
 // ── channels (channels.ts) ───────────────────────────────────────────────────
 
 /**
- * A room's channels as the UI lists them: live ones only, the original
- * first, then by position. Of one kind, or every text channel then every
+ * A room's channels as the UI lists them: live ones only, by position (the
+ * original first until somebody moves it). Of one kind, or every text channel then every
  * voice channel. Reactive: it reads the sidebar's mirror of the rooms.
  */
 export function roomChannels(roomCode: string, kind?: ChannelKind): Channel[] {
