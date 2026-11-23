@@ -5,7 +5,7 @@ import {
   transportState,
 } from "$lib/transport/transport.svelte";
 import { messageChannel } from "$lib/channels";
-import { currentChannelOf } from "$lib/channel-view.svelte";
+import { currentChannelOf, openingChannelOf } from "$lib/channel-view.svelte";
 import { requestJumpToMessage } from "$lib/ui-state.svelte";
 
 /** At most this many pages are read back to reach a message. */
@@ -43,10 +43,16 @@ export async function revealMessage(
   _inFlight += 1;
   try {
     if (transportState.roomCode !== roomCode) return;
-    if (!roomCode.startsWith("dm-") && !transportState.messages.some((m) => m.id === id)) {
+    // One being opened would put its page in place of the message's, on
+    // screen or not: opening the message's own channel calls it off.
+    const opening = openingChannelOf(roomCode) !== null;
+    if (
+      !roomCode.startsWith("dm-") &&
+      (opening || !transportState.messages.some((m) => m.id === id))
+    ) {
       const where =
         channel ?? messageChannel((await getMessage(id).catch(() => undefined)) ?? {});
-      if (where !== currentChannelOf(roomCode)) {
+      if (opening || where !== currentChannelOf(roomCode)) {
         if (!(await selectChannel(roomCode, where))) return;
         if (transportState.roomCode !== roomCode) return;
       }

@@ -7,6 +7,7 @@ import {
   composerPlaceholder,
   notifyLabel,
   notifyMenuItems,
+  showsStage,
   stageCall,
 } from "./channel-ui";
 
@@ -118,5 +119,18 @@ describe("the call status's name for the call", () => {
     expect(callPlaceLabel("Friends", "", null)).toBe("Friends");
     expect(callPlaceLabel("Friends", "cccccccccccccccc", "gaming")).toBe("Friends · gaming");
     expect(callPlaceLabel("Friends", "cccccccccccccccc", null)).toBe("Friends · voice channel");
+  });
+});
+
+describe("showsStage", () => {
+  const not = { inThisCall: false, othersInCall: false, sidebarListsCall: false };
+  it("is up for the call we are in, wherever it is", () => {
+    expect(showsStage({ ...not, inThisCall: true })).toBe(true);
+    expect(showsStage({ inThisCall: true, othersInCall: true, sidebarListsCall: true })).toBe(true);
+  });
+  it("offers a call others are in only where the sidebar does not list it", () => {
+    expect(showsStage({ ...not, othersInCall: true })).toBe(true);
+    expect(showsStage({ ...not, othersInCall: true, sidebarListsCall: true })).toBe(false);
+    expect(showsStage(not)).toBe(false);
   });
 });

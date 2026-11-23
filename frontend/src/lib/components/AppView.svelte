@@ -30,6 +30,7 @@
   import RoomCreateJoin from "$lib/components/RoomCreateJoin.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import RoomSidebar from "$lib/components/RoomSidebar.svelte";
+  import { openingChannelOf } from "$lib/channel-view.svelte";
   import TransportStatus from "$lib/components/TransportStatus.svelte";
   import AppNotices from "$lib/components/AppNotices.svelte";
   import {
@@ -516,7 +517,7 @@
     const channels: SidebarChannels = {
       text,
       voice,
-      selectedTextId: currentChannel(code),
+      selectedTextId: openingChannelOf(code) ?? currentChannel(code),
       onSelectChannel: (id) => {
         // A channel picked on a phone is what the user came for: show it.
         sidebarOpen = false;

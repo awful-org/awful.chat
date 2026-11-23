@@ -120,7 +120,7 @@
     currentChannel,
   } from "$lib/transport/transport.svelte";
   import { currentVoiceChannel } from "$lib/transport/voice-channels";
-  import { peersInCall } from "$lib/transport/voice-channel";
+  import { peersInCall, roomHasVoiceChannels } from "$lib/transport/voice-channel";
   import { messageChannel } from "$lib/channels";
   import {
     NOTIFY_NEXT,
@@ -129,6 +129,7 @@
     channelModeToStore,
     composerPlaceholder,
     notifyLabel,
+    showsStage,
     stageCall,
   } from "$lib/channel-ui";
   import { syncProgress } from "$lib/transport/sync-progress.svelte";
@@ -327,7 +328,11 @@
   });
 
   const showCallView = $derived(
-    (inCall && callRoomCode === roomCode) || peersInThisRoom.length > 0
+    showsStage({
+      inThisCall: inCall && callRoomCode === roomCode,
+      othersInCall: peersInThisRoom.length > 0,
+      sidebarListsCall: !ephemeral && roomHasVoiceChannels(roomCode),
+    })
   );
   const showUserList = $derived(uiState.userListOpen);
 
@@ -2067,8 +2072,14 @@
     };
   });
 
+  // Untracked: markSeen reads the room's record and then writes its read
+  // mark to that same record. Tracked, it was its own trigger, and a room
+  // left on any channel but the original one marked itself read, and wrote
+  // the record to storage, as fast as the page could run.
   $effect(() => {
-    if (messages.length > 0) markSeen().catch(() => {});
+    void roomCode;
+    void channel;
+    if (messages.length > 0) untrack(() => void markSeen().catch(() => {}));
   });
 
   // markSeen refuses to run while the page is hidden, so the room the user was
@@ -2912,19 +2923,27 @@
         <!-- Right beside the user list, outlined green so it reads as the
              way into the call. -->
         {#if !inCall}
-          <!-- The only join control when nobody is in the call yet, so it is
+          <!-- The only join control in the pane when no stage is up, so it is
                the one that says a first DeepFilterNet3 download is the wait. -->
           {@const loadingModel = transportState.joiningCall && voiceProcessing.loading}
-          <Tip text={loadingModel ? "Loading noise suppression…" : "Join call"}>
+          <!-- On a phone the voice channels are in the closed drawer, and
+               this is all that says a call is on. -->
+          {@const waiting = isMobile && !showCallView ? peersInThisRoom.length : 0}
+          {@const joinLabel = loadingModel
+            ? "Loading noise suppression…"
+            : waiting
+              ? `Join call, ${waiting} in it`
+              : "Join call"}
+          <Tip text={joinLabel}>
             {#snippet children(props)}
               <Button
                 {...props}
                 variant="ghost"
-                size="icon"
+                size={waiting ? "sm" : "icon"}
                 onclick={() => joinCall()}
                 disabled={transportState.connecting || transportState.joiningCall}
                 aria-busy={transportState.joiningCall}
-                aria-label={loadingModel ? "Loading noise suppression…" : "Join call"}
+                aria-label={joinLabel}
                 class="border border-green-500/60 text-green-400 hover:bg-green-500/10 hover:text-green-300 cursor-pointer {transportState.joiningCall
                   ? 'animate-pulse'
                   : ''}"
@@ -2934,6 +2953,7 @@
                 {:else}
                   <Phone class="size-4" />
                 {/if}
+                {#if waiting}<span class="font-mono text-xs tabular-nums">{waiting}</span>{/if}
               </Button>
             {/snippet}
           </Tip>
