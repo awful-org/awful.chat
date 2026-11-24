@@ -252,6 +252,12 @@ export async function playWafuruSound() {
   source.start();
 }
 
+/** The sound above was turned off: two soft falling notes. */
+export async function playWafuruOffSound() {
+  playOsc(520, 0.06, "sine", 0.05);
+  playOsc(390, 0.09, "sine", 0.04, 0.005, 0.06);
+}
+
 export async function playCallRejectSound() {
   playOsc(300, 0.08, "triangle", 0.15);
   playOsc(200, 0.1, "triangle", 0.1);

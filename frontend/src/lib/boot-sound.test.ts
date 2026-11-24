@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const playWafuruSound = vi.hoisted(() => vi.fn(async () => {}));
-vi.mock("./sounds", () => ({ playWafuruSound }));
+const { playWafuruSound, playWafuruOffSound } = vi.hoisted(() => ({
+  playWafuruSound: vi.fn(async () => {}),
+  playWafuruOffSound: vi.fn(async () => {}),
+}));
+vi.mock("./sounds", () => ({ playWafuruSound, playWafuruOffSound }));
 
 import { bootSoundOn, playBootSound, pressDmsButton } from "./boot-sound";
 
@@ -32,9 +35,13 @@ const press = (times: number, type: "pointerdown" | "keydown" = "pointerdown", o
 };
 const played = () => playWafuruSound.mock.calls.length;
 
+let now = 10_000;
+vi.spyOn(performance, "now").mockImplementation(() => now);
+
 beforeEach(() => {
   store.clear();
   playWafuruSound.mockClear();
+  playWafuruOffSound.mockClear();
   fire("pointerdown", other);
 });
 
@@ -48,16 +55,35 @@ describe("boot sound", () => {
     expect(bootSoundOn()).toBe(true);
   });
 
-  it("turns off at seven more, without a sound", () => {
+  it("turns off at seven more, with its own small sound", () => {
     press(7);
     press(6);
     expect(bootSoundOn()).toBe(true);
     press(1);
     expect(bootSoundOn()).toBe(false);
     expect(played()).toBe(1);
+    expect(playWafuruOffSound).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["pointerdown", "keydown", "wheel", "blur"])("starts again at a %s elsewhere", (type) => {
+  it.each([false, true])("starts again after a second without a press (on: %s)", (on) => {
+    if (on) press(7);
+    press(6);
+    now += 1000;
+    press(6);
+    expect(bootSoundOn()).toBe(on);
+    press(1);
+    expect(bootSoundOn()).toBe(!on);
+  });
+
+  it("allows just under a second between presses", () => {
+    for (let i = 0; i < 7; i++) {
+      now += 999;
+      press(1);
+    }
+    expect(bootSoundOn()).toBe(true);
+  });
+
+  it.each(["pointerdown", "keydown"])("starts again at a %s elsewhere", (type) => {
     press(6);
     fire(type, other);
     press(6);
