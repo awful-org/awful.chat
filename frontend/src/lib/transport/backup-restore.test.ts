@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyBackup, importDatabase, DIFFERENT_ACCOUNT_MERGE } from "./backup-restore";
 import { BACKUP_FORMAT, BACKUP_VERSION, type BackupFile } from "./backup";
 import {
@@ -301,6 +301,24 @@ describe("restoring a backup onto a device with no identity", () => {
     // unlock seals them - either way the room has to be readable.
     const rooms = await getAllRooms();
     expect(rooms.map((r) => r.roomCode)).toContain("restoredroom0001");
+  });
+
+  it("leaves no key to the DMs in the tab's history, and any parked invitation's", async () => {
+    const kept = new Map([["awful:place-key:v1", "theirs"], ["awful:parked-key:v1", "waiting"]]);
+    vi.stubGlobal("localStorage", {
+      get length() { return kept.size; },
+      key: (i: number) => [...kept.keys()][i] ?? null,
+      getItem: (k: string) => kept.get(k) ?? null,
+      setItem: (k: string, v: string) => void kept.set(k, v),
+      removeItem: (k: string) => void kept.delete(k),
+    });
+    try {
+      await applyBackup(backup, "replace");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(kept.has("awful:place-key:v1")).toBe(false);
+    expect(kept.get("awful:parked-key:v1")).toBe("waiting");
   });
 
   it("unlocks with the password that was in use when the backup was taken", async () => {

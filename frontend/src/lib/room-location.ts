@@ -76,6 +76,15 @@ export function forgetParkedRooms(): void {
   parkedRoom.code = null;
   try {
     localStorage.removeItem(SEAL_KEY);
+  } catch {
+    // Nothing is kept without storage.
+  }
+  forgetPlaces();
+}
+
+/** No tab finds a DM it was on again; a parked invitation stays. */
+export function forgetPlaces(): void {
+  try {
     localStorage.removeItem(PLACE_KEY);
   } catch {
     // Nothing is kept without storage.

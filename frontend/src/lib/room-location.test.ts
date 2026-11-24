@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { discoveryIdOf, newRoomSecret } from "$lib/room-security/keys";
-import { channelOfPlace, consumeRoomLocation, dmOfPlace, dmPlace, noteChannel, parkedRoom, showPlace } from "./room-location";
+import { channelOfPlace, consumeRoomLocation, dmOfPlace, dmPlace, forgetPlaces, noteChannel, parkedRoom, showPlace } from "./room-location";
 
 /** window.location and history.replaceState over one address. */
 function addressBar(href: string) {
@@ -204,6 +204,15 @@ describe("the place a history entry stands for", () => {
     // Nor under the next key there.
     dmPlace("dm-other");
     expect(dmOfPlace()).toBeNull();
+  });
+
+  it("reads nothing once the places are forgotten", () => {
+    const { store } = tab();
+    store.set("awful:parked-key:v1", "kept");
+    showPlace(dmPlace(DM), "/app");
+    forgetPlaces();
+    expect(dmOfPlace()).toBeNull();
+    expect([...store.keys()]).toEqual(["awful:parked-key:v1"]);
   });
 
   it("reads nothing from an entry that is not one", () => {
