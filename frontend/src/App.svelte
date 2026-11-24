@@ -29,7 +29,7 @@
    * it is about 2 MB, and an invite link's first visit waited for all of it
    * before showing a form that needs none of it. From the first unlock on,
    * AppView keeps the screen and shows its own lock screen, as it always
-   * did: locking must not close the room that was open.
+   * did: the unlock comes back to the room that was open.
    */
   let appOpened = $state(false);
   $effect(() => {

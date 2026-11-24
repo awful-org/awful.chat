@@ -7,6 +7,7 @@
   import LegacyArchive from "./LegacyArchive.svelte";
   import { storeSecureInvitation } from "$lib/room-security/invitations";
   import { captureSessionGuard } from "$lib/identity/session-guard";
+  import { onIdentityLock } from "$lib/identity/lock-events";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
   import { secureInvitationLink } from "$lib/room-security/invitation-format";
@@ -238,6 +239,7 @@
   let joiningRoom = $state(false);
   // A short link waits on the inviter's tab, for up to a minute: say so.
   let joiningWithCode = $state(false);
+  let joiningInvite = $state(false);
   let bootstrapped = $state(false);
 
   // Lock now tears down the application transport. Re-arm each unlocked
@@ -250,6 +252,7 @@
       return;
     }
     untrack(() => {
+      if (parkedBy && parkedBy !== identityStore.did) unpark();
       const guard = captureSessionGuard();
       void connect();
       void loadRooms();
@@ -328,22 +331,39 @@
       const code = pendingRoomCode;
       pendingRoomCode = null;
       joiningRoom = true;
-      joiningWithCode = parseJoinInput(code).kind === "pairing";
+      const { kind } = parseJoinInput(code);
+      joiningWithCode = kind === "pairing";
+      joiningInvite = kind !== "invalid";
+      const run = ++joinRun;
+      const seq = joinSeq;
+      const dmSeq = selectDmSeq;
       // Join only after the stored rooms are loaded: the join saves the room,
       // and racing loadRooms() could drop it from the sidebar mirror.
       loadRooms()
         .catch(() => {})
         .then(() => {
+          // What was opened meanwhile - from a notification, by Back - is newer
+          // than the room this tab was on. An invitation is joined all the same.
+          if (run !== joinRun) return;
+          if (kind === "invalid" && (seq !== joinSeq || dmSeq !== selectDmSeq)) return;
           pickChannelOfPlace(code);
           return handleJoin(code, "");
         })
         .finally(() => {
+          // A lock cut it short: the unlock has it still to run, or has begun.
+          if (run !== joinRun) return;
           joiningRoom = false;
           // Done with it - unless this instance was replaced mid-join, and
           // the one that replaced it still has to open the room on screen.
           if (alive && parkedRoom.code === code) parkedRoom.code = null;
         });
     }
+  });
+
+  // A room behind another tab's node waits for as long as that tab has it, and
+  // not in place of the app. An invitation takes the node over (claimForInvite).
+  $effect(() => {
+    if (transportState.nodeHeldElsewhere && joiningRoom && !joiningInvite) joiningRoom = false;
   });
 
   // The conversation opens once the node is up, which is what it needs. Until
@@ -357,11 +377,16 @@
     if (!identityStore.isUnlocked || !transportState.relayConnected || !pendingDm) return;
     const code = pendingDm;
     untrack(() => {
+      const guard = captureSessionGuard();
+      // After a lock it waits for the next unlock, under the same code.
+      const waiting = () => {
+        try { guard(); return pendingDm === code; } catch { return false; }
+      };
       void loadRooms()
         .catch(() => {})
-        .then(() => (pendingDm === code ? openDmByCode(code) : undefined))
+        .then(() => (waiting() ? openDmByCode(code) : undefined))
         .finally(() => {
-          if (pendingDm === code) pendingDm = null;
+          if (waiting()) pendingDm = null;
         });
     });
   });
@@ -786,6 +811,10 @@
 
   /** Bumped per join so a failed one only backs out if nothing newer ran. */
   let joinSeq = 0;
+  /** Bumped per pending room opened, and by a lock, which calls that off. */
+  let joinRun = 0;
+  /** Bumped per DM chosen, which is newer than a room still to be opened. */
+  let selectDmSeq = 0;
   let pairingController: AbortController | undefined;
   $effect(() => () => pairingController?.abort());
 
@@ -805,9 +834,9 @@
     _displayName: string,
     roomName?: string
   ) {
+    const guard = captureSessionGuard();
     joinError = null;
     pendingDm = null;
-    const guard = captureSessionGuard();
     const current = () => {
       try { guard(); return seq === joinSeq; } catch { return false; }
     };
@@ -1106,9 +1135,20 @@
     showStartScreen();
   }
 
-  function handleSelectDm(peerId: string): Promise<void> {
+  async function handleSelectDm(peerId: string): Promise<void> {
+    if (!identityStore.isUnlocked) return;
+    const seq = joinSeq;
+    const dmSeq = ++selectDmSeq;
+    awaitingRelay = null;
     pendingDm = null;
-    return openDm(peerId);
+    if (_transport.selfId()) return openDm(peerId);
+    // No node to open it with yet, as right after an unlock: once there is.
+    await loadRooms().catch(() => {});
+    if (seq !== joinSeq || dmSeq !== selectDmSeq || !identityStore.isUnlocked) return;
+    const did = peerIdToDid(peerId) || peerId;
+    pendingDm = roomsStore.dmRooms.find((r) => r.participantDid === did)?.roomCode ?? null;
+    openingDm =
+      pendingDm !== null && !activeRoomCode && !transportState.error && !transportState.nodeHeldElsewhere;
   }
 
   async function openDm(peerId: string) {
@@ -1454,16 +1494,53 @@
     if (event.newURL === window.location.href) handlePopState();
   }
 
+  /** Whose place waits for the unlock; a lock's, as no other names one. */
+  let parkedBy: string | null = null;
+
+  /** Leaves a place to be opened at the next unlock. */
+  function park(code: string | null): void {
+    pendingRoomCode = code;
+    parkedRoom.code = code;
+    pendingDm = code ? null : dmOfPlace();
+    openingDm = pendingDm !== null && !transportState.error && !transportState.nodeHeldElsewhere;
+  }
+
+  /** Another account was restored over the one that locked: not its place. */
+  function unpark(): void {
+    park(null);
+    pendingDm = null;
+    openingDm = false;
+    history.replaceState({}, "", "/app");
+  }
+
+  // A lock takes the room out of the transport. Left on screen, the unlock
+  // showed a room nothing had joined, under its raw id. Closed here instead,
+  // it is opened again at the unlock as a reload opens it - and so is a room
+  // still opening or waiting for the relay, which the address does not name
+  // yet, and an invitation whose join the lock cut short.
+  $effect(() =>
+    onIdentityLock(() => {
+      if (!identityStore.isUnlocked) return;
+      const onScreen = activeDmPeerId || activeRoomCode?.startsWith("dm-") ? null : activeRoomCode;
+      const opening = awaitingRelay?.roomCode ?? onScreen;
+      ++joinRun;
+      joiningRoom = false;
+      showStartScreen();
+      parkedBy = identityStore.did;
+      park(opening ?? consumeRoomLocation() ?? parkedRoom.code);
+    })
+  );
+
   function handlePopState() {
     const code = consumeRoomLocation();
     const dm = code ? null : dmOfPlace();
     pendingDm = null;
     if (!identityStore.isUnlocked) {
-      pendingRoomCode = code;
-      parkedRoom.code = code;
-      pendingDm = dm;
+      park(code);
       return;
     }
+    // Gone elsewhere than what this tab was opened for.
+    parkedRoom.code = null;
     if (dm) {
       if (dm === activeRoomCode && transportState.roomCode === dm) return;
       ++joinSeq;
