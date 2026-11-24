@@ -18,8 +18,8 @@ const icon = {};
 const other = {};
 const button = { contains: (node: unknown) => node === icon || node === button } as unknown as Element;
 
-function fire(type: "pointerdown" | "keydown", target: unknown): void {
-  const event = new Event(type);
+function fire(type: string, target: unknown, repeat = false): void {
+  const event = Object.assign(new Event(type), { repeat });
   Object.defineProperty(event, "target", { value: target });
   win.dispatchEvent(event);
 }
@@ -30,10 +30,7 @@ const press = (times: number, type: "pointerdown" | "keydown" = "pointerdown", o
     pressDmsButton(button);
   }
 };
-const played = async () => {
-  await vi.dynamicImportSettled();
-  return playWafuruSound.mock.calls.length;
-};
+const played = () => playWafuruSound.mock.calls.length;
 
 beforeEach(() => {
   store.clear();
@@ -42,33 +39,39 @@ beforeEach(() => {
 });
 
 describe("boot sound", () => {
-  it("plays and turns on at the seventh press in a row", async () => {
+  it("plays and turns on at the seventh press in a row", () => {
     press(6);
-    expect(await played()).toBe(0);
+    expect(played()).toBe(0);
     expect(bootSoundOn()).toBe(false);
     press(1);
-    expect(await played()).toBe(1);
+    expect(played()).toBe(1);
     expect(bootSoundOn()).toBe(true);
   });
 
-  it("turns off at seven more, without a sound", async () => {
+  it("turns off at seven more, without a sound", () => {
     press(7);
     press(6);
     expect(bootSoundOn()).toBe(true);
     press(1);
     expect(bootSoundOn()).toBe(false);
-    expect(await played()).toBe(1);
+    expect(played()).toBe(1);
   });
 
-  it("starts again when anything else is pressed or typed", () => {
+  it.each(["pointerdown", "keydown", "wheel", "blur"])("starts again at a %s elsewhere", (type) => {
     press(6);
-    fire("pointerdown", other);
-    press(6);
-    fire("keydown", other);
+    fire(type, other);
     press(6);
     expect(bootSoundOn()).toBe(false);
     press(1);
     expect(bootSoundOn()).toBe(true);
+  });
+
+  it("counts a held Enter as one press", () => {
+    for (let i = 0; i < 30; i++) {
+      fire("keydown", button, i > 0);
+      pressDmsButton(button);
+    }
+    expect(bootSoundOn()).toBe(false);
   });
 
   it("counts Enter and Space on the button itself", () => {
@@ -76,12 +79,12 @@ describe("boot sound", () => {
     expect(bootSoundOn()).toBe(true);
   });
 
-  it("plays when the app loads only while it is on", async () => {
+  it("plays when the app loads only while it is on", () => {
     playBootSound();
-    expect(await played()).toBe(0);
+    expect(played()).toBe(0);
     press(7);
     playWafuruSound.mockClear();
     playBootSound();
-    expect(await played()).toBe(1);
+    expect(played()).toBe(1);
   });
 });

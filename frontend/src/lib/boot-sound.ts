@@ -3,9 +3,12 @@
  * makes every load of the app play it, until seven more. Device-local, like
  * the display preferences.
  *
- * "In a row" is what keeps it hidden: the button is pressed all day, so any
- * press of anything else starts the count again.
+ * "In a row" is what keeps it hidden: the button is pressed all day, so
+ * pressing, typing or scrolling anything else, or leaving the window, starts
+ * the count again.
  */
+
+import { playWafuruSound } from "./sounds";
 
 const KEY = "awful:boot-sound:v1";
 
@@ -31,15 +34,19 @@ function setBootSound(on: boolean): void {
 let presses = 0;
 let button: Element | null = null;
 
-function onOtherPress(event: Event): void {
-  if (!button?.contains(event.target as Node)) presses = 0;
+function onOther(event: Event): void {
+  // A held Enter presses the button over and over: that is one press.
+  const held = "repeat" in event && event.repeat;
+  if (held || !button?.contains(event.target as Node)) presses = 0;
 }
 
 /** The DMs button was pressed. */
 export function pressDmsButton(el: Element): void {
   if (!button) {
-    window.addEventListener("pointerdown", onOtherPress, true);
-    window.addEventListener("keydown", onOtherPress, true);
+    // A click inside another site's frame reaches this page only as a blur.
+    for (const type of ["pointerdown", "keydown", "wheel", "blur"]) {
+      window.addEventListener(type, onOther, { capture: true, passive: true });
+    }
   }
   button = el;
   if (++presses < PRESSES) return;
@@ -55,6 +62,5 @@ export function playBootSound(): void {
 }
 
 function play(): void {
-  // Imported when needed: the landing page has no use for the sounds.
-  import("./sounds").then((sounds) => sounds.playWafuruSound()).catch(() => {});
+  playWafuruSound().catch(() => {});
 }

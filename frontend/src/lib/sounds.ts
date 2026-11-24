@@ -30,6 +30,10 @@ if (typeof window !== "undefined") {
   // session with a suspended context - which is every incoming-message beep
   // on the device where beeps matter most.
   window.addEventListener("touchstart", unlock, { passive: true });
+  // A touch counts as a gesture only when it lifts: at pointerdown and
+  // touchstart the resume is still refused, and the first tap unlocked nothing.
+  window.addEventListener("pointerup", unlock, { passive: true });
+  window.addEventListener("touchend", unlock, { passive: true });
 }
 
 function playOsc(
