@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createIdentity, generateMnemonic, lockIdentity } from "./identity";
 import { identityStore, init, lock, restore, unlock } from "./identity.svelte";
 import { wipeLocalDatabase } from "../storage";
@@ -25,6 +25,15 @@ describe("restoring an account from its phrase", () => {
     expect(identityStore.did).toBeNull();
   });
 
+  it("is too after a password that did not unlock it", async () => {
+    await unlock(PASSWORD);
+    lock();
+    identityStore.justLoggedOut = false; // As the unlock screen does on a try.
+    await expect(unlock("wrong")).rejects.toThrow();
+    expect(await restore(generateMnemonic(), PASSWORD)).toBe(true);
+    expect(identityStore.isUnlocked).toBe(false);
+  });
+
   it("unlocks the same account", async () => {
     await unlock(PASSWORD);
     lock();
@@ -33,6 +42,9 @@ describe("restoring an account from its phrase", () => {
   });
 
   it("unlocks another account where the last was never opened in this page", async () => {
+    vi.resetModules(); // A page of its own.
+    const { identityStore, init, restore } = await import("./identity.svelte");
+    await init();
     expect(await restore(generateMnemonic(), PASSWORD)).toBe(false);
     expect(identityStore.isUnlocked).toBe(true);
   });

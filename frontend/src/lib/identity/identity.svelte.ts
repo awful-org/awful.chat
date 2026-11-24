@@ -81,6 +81,13 @@ function setUnlocked(keypair: KeypairRecord): void {
   requestPersistentStorage().catch(() => {});
 }
 
+/** The account last locked in this page, whose state is still in its memory. */
+let heldDid: string | null = null;
+
+export function heldAnotherAccount(did: string): boolean {
+  return heldDid !== null && heldDid !== did;
+}
+
 function setLocked(): void {
   identityStore.isUnlocked = false;
   identityStore.did = null;
@@ -176,9 +183,9 @@ export async function restore(
   identityStore.loading = true;
   identityStore.error = null;
   try {
-    const held = identityStore.justLoggedOut ? identityStore.keypair?.did : undefined;
     const keypair = await restoreIdentity(mnemonic, password);
-    if (held && held !== keypair.did) return true;
+    identityStore.hasWebAuthn = false; // Its record went with the last password.
+    if (heldAnotherAccount(keypair.did)) return true;
     setUnlocked(keypair);
     return false;
   } catch (err) {
@@ -241,6 +248,7 @@ export async function unlock(password: string): Promise<void> {
  * screen auto-logged straight back in, so the button appeared to do nothing.
  */
 export function lock(): void {
+  heldDid = identityStore.did ?? heldDid;
   identityStore.justLoggedOut = true;
   lockIdentity();
   setLocked();
