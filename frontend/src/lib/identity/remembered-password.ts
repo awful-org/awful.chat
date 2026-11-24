@@ -44,6 +44,11 @@ async function authDb(): Promise<AuthDB> {
     upgrade(db) {
       db.createObjectStore("auth", { keyPath: "id" });
     },
+    // A wipe deletes this database (identity.ts). Left open, the connection
+    // held the delete, and every later open, until it was collected.
+    blocking(_current, _blocked, event) {
+      (event.target as IDBDatabase).close();
+    },
   })) as AuthDB;
 }
 

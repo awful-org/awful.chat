@@ -252,7 +252,6 @@
       return;
     }
     untrack(() => {
-      if (parkedBy && parkedBy !== identityStore.did) unpark();
       const guard = captureSessionGuard();
       void connect();
       void loadRooms();
@@ -1494,23 +1493,12 @@
     if (event.newURL === window.location.href) handlePopState();
   }
 
-  /** Whose place waits for the unlock; a lock's, as no other names one. */
-  let parkedBy: string | null = null;
-
   /** Leaves a place to be opened at the next unlock. */
   function park(code: string | null): void {
     pendingRoomCode = code;
     parkedRoom.code = code;
     pendingDm = code ? null : dmOfPlace();
     openingDm = pendingDm !== null && !transportState.error && !transportState.nodeHeldElsewhere;
-  }
-
-  /** Another account was restored over the one that locked: not its place. */
-  function unpark(): void {
-    park(null);
-    pendingDm = null;
-    openingDm = false;
-    history.replaceState({}, "", "/app");
   }
 
   // A lock takes the room out of the transport. Left on screen, the unlock
@@ -1526,7 +1514,6 @@
       ++joinRun;
       joiningRoom = false;
       showStartScreen();
-      parkedBy = identityStore.did;
       park(opening ?? consumeRoomLocation() ?? parkedRoom.code);
     })
   );
