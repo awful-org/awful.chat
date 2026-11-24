@@ -226,6 +226,7 @@ const IDENTITY_SCOPED_KEYS = [
   "awful:duress:v1", // the old account's duress registration
   "awful_remember_duration",
   "awful_remember_reset_timer",
+  "awful:place-key:v1", // reads the DMs in the tab's history (room-location.ts)
 ];
 
 /**

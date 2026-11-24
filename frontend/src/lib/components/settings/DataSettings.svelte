@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { forgetParkedRooms } from "$lib/room-location";
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import {
@@ -113,6 +114,7 @@
 
   async function handleEraseLocalData() {
     await wipeLocalDatabase();
+    forgetParkedRooms();
     window.location.reload();
   }
 

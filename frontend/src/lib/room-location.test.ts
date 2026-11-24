@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { discoveryIdOf, newRoomSecret } from "$lib/room-security/keys";
-import { consumeRoomLocation, parkedRoom } from "./room-location";
+import { channelOfPlace, consumeRoomLocation, dmOfPlace, dmPlace, noteChannel, parkedRoom, showPlace } from "./room-location";
 
 /** window.location and history.replaceState over one address. */
 function addressBar(href: string) {
@@ -160,5 +160,83 @@ describe("parkedRoom", () => {
     parkedRoom.code = "k5t-8r5";
     expect(parkedRoom.code).toBe("k5t-8r5");
     parkedRoom.code = null;
+  });
+});
+
+describe("the place a history entry stands for", () => {
+  const DM = "dm-4f1c0a";
+
+  /** The tab's history, with storage for the key. */
+  function tab() {
+    const store = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+    });
+    const entries: { state: any; url: string }[] = [{ state: null, url: "/app" }];
+    const at = () => new URL(entries.at(-1)!.url, "https://awful.example");
+    vi.stubGlobal("window", { get location() { return at(); } });
+    vi.stubGlobal("history", {
+      get state() { return entries.at(-1)!.state; },
+      pushState: (state: unknown, _: string, url: string) => void entries.push({ state, url }),
+      replaceState: (state: unknown, _: string, url?: string) => {
+        entries[entries.length - 1] = { state, url: url ?? entries.at(-1)!.url };
+      },
+    });
+    return { entries, store };
+  }
+
+  it("keeps a DM in the entry, sealed, and out of the address", () => {
+    const { entries } = tab();
+    expect(dmOfPlace()).toBeNull();
+    showPlace(dmPlace(DM), "/app");
+    expect(dmOfPlace()).toBe(DM);
+    expect(entries.at(-1)!.url).toBe("/app");
+    expect(JSON.stringify(entries)).not.toContain("4f1c0a");
+  });
+
+  it("reads nothing once a wipe took the key", () => {
+    const { store } = tab();
+    showPlace(dmPlace(DM), "/app");
+    store.clear();
+    expect(dmOfPlace()).toBeNull();
+    // Nor under the next key there.
+    dmPlace("dm-other");
+    expect(dmOfPlace()).toBeNull();
+  });
+
+  it("reads nothing from an entry that is not one", () => {
+    const { entries } = tab();
+    dmPlace(DM);
+    for (const dm of ["", "junk", "a.b.c", 7, {}, null]) {
+      entries[0].state = { dm };
+      expect(dmOfPlace()).toBeNull();
+    }
+  });
+
+  it("adds no entry for the place already there", () => {
+    const { entries } = tab();
+    showPlace(dmPlace(DM), "/app");
+    showPlace(dmPlace(DM), "/app");
+    expect(entries).toHaveLength(2);
+    showPlace(dmPlace("dm-other"), "/app");
+    showPlace({ roomCode: "a" }, "/r/#a");
+    showPlace({ roomCode: "a", channel: "x" }, "/r/#a");
+    showPlace({}, "/app");
+    expect(entries.map((e) => e.url)).toEqual(["/app", "/app", "/app", "/r/#a", "/app"]);
+  });
+
+  it("keeps the channel of the room it is on", () => {
+    tab();
+    showPlace({ roomCode: "a" }, "/r/#a");
+    expect(channelOfPlace("a")).toBe("");
+    noteChannel("a", "x");
+    expect(channelOfPlace("a")).toBe("x");
+    noteChannel("b", "y");
+    expect(channelOfPlace("a")).toBe("x");
+    expect(channelOfPlace("b")).toBeNull();
+    noteChannel("a", "");
+    expect(channelOfPlace("a")).toBe("");
   });
 });
