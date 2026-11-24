@@ -46,6 +46,8 @@ let parked: string | null = null;
  */
 const PARKED_KEY = "awful:parked-invitation:v1";
 const SEAL_KEY = "awful:parked-key:v1";
+/** For DM places below. The account's: it goes with it (identity.ts). */
+export const PLACE_KEY = "awful:place-key:v1";
 
 function readParked(): string | null {
   try {
@@ -69,29 +71,30 @@ function writeParked(code: string | null): void {
   }
 }
 
-/** No tab finds its parked invitation again; this one's is gone at once. */
+/** No tab finds its parked invitation, or a DM it was on, again. */
 export function forgetParkedRooms(): void {
   parkedRoom.code = null;
   try {
     localStorage.removeItem(SEAL_KEY);
+    localStorage.removeItem(PLACE_KEY);
   } catch {
     // Nothing is kept without storage.
   }
 }
 
 /** The bytes a nonce stands for under the key; null with no key. */
-function keystream(nonce: Uint8Array, length: number): Uint8Array | null {
-  const key = localStorage.getItem(SEAL_KEY);
+function keystream(name: string, nonce: Uint8Array, length: number): Uint8Array | null {
+  const key = localStorage.getItem(name);
   return key ? hkdf(sha256, b32.decode(key), nonce, undefined, length) : null;
 }
 
-function seal(code: string): string {
-  if (!localStorage.getItem(SEAL_KEY)) {
-    localStorage.setItem(SEAL_KEY, b32.encode(crypto.getRandomValues(new Uint8Array(32))));
+function seal(code: string, key = SEAL_KEY): string {
+  if (!localStorage.getItem(key)) {
+    localStorage.setItem(key, b32.encode(crypto.getRandomValues(new Uint8Array(32))));
   }
   const nonce = crypto.getRandomValues(new Uint8Array(16));
   const bytes = new TextEncoder().encode(code);
-  const stream = keystream(nonce, bytes.length)!;
+  const stream = keystream(key, nonce, bytes.length)!;
   return `${b32.encode(nonce)}.${b32.encode(bytes.map((b, i) => b ^ stream[i]))}`;
 }
 
@@ -101,9 +104,9 @@ function unsealInvitation(held: string): string | null {
   return !code || parseJoinInput(code).kind === "invalid" ? null : code;
 }
 
-function unseal(held: string): string | null {
+function unseal(held: string, key = SEAL_KEY): string | null {
   const [nonce, sealed] = held.split(".").map((part) => b32.decode(part));
-  const stream = keystream(nonce, sealed.length);
+  const stream = keystream(key, nonce, sealed.length);
   if (!stream) return null;
   return new TextDecoder().decode(sealed.map((b, i) => b ^ stream[i]));
 }
@@ -119,17 +122,17 @@ function unseal(held: string): string | null {
 /** The history entry for a DM conversation. */
 export function dmPlace(roomCode: string): { dm?: string } {
   try {
-    return { dm: seal(roomCode) };
+    return { dm: seal(roomCode, PLACE_KEY) };
   } catch {
     return {}; // No storage for the key: a reload shows the start screen.
   }
 }
 
 /** The DM conversation this history entry stands for. */
-export function dmOfPlace(): string | null {
+export function dmOfPlace(state: { dm?: unknown } | null = history.state): string | null {
   try {
-    const held: unknown = history.state?.dm;
-    const code = typeof held === "string" ? unseal(held) : null;
+    const held = state?.dm;
+    const code = typeof held === "string" ? unseal(held, PLACE_KEY) : null;
     return code?.startsWith("dm-") ? code : null;
   } catch {
     return null;
@@ -157,8 +160,7 @@ export function noteChannel(roomCode: string, channel: string): void {
  */
 export function showPlace(state: { roomCode?: string; channel?: string; dm?: string }, url: string): void {
   const here = window.location.pathname + window.location.hash;
-  const dm = state.dm ? unseal(state.dm) : null;
-  if (here === url && dm === dmOfPlace()) history.replaceState(state, "", url);
+  if (here === url && dmOfPlace(state) === dmOfPlace()) history.replaceState(state, "", url);
   else history.pushState(state, "", url);
 }
 
