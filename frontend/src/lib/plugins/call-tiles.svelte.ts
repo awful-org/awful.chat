@@ -19,8 +19,10 @@
  */
 import { SvelteMap } from "svelte/reactivity";
 import { onIdentityLock } from "$lib/identity/lock-events";
+import { identityStore } from "$lib/identity/identity.svelte";
 import { getPluginCardMessages, onMessageStored } from "$lib/storage";
 import { MessageType } from "$lib/types/message";
+import type { PluginDefinition } from "./api";
 import { getManifest, getPlugin } from "./registry";
 import { getCardState, rowRoute } from "./state.svelte";
 import { isPluginEnabled } from "./prefs.svelte";
@@ -36,6 +38,8 @@ export interface PluginCallTile {
   focusOnJoin?: boolean;
   /** What people are doing in the tile, by DID (`callTileActivities`). */
   activities?: Record<string, string>;
+  /** What this user is doing in it (`callTileActivity`). */
+  ownActivity?: string;
 }
 
 export const callTilesState = $state({
@@ -232,6 +236,12 @@ async function _recompute(roomCode: string): Promise<void> {
       } catch {
         // Same as viewers: a broken hook costs the labels, not the tile.
       }
+      let ownActivity: string | undefined;
+      try {
+        ownActivity = ownTileActivity(plugin, state, identityStore.did ?? "") ?? undefined;
+      } catch {
+        // And here: no line of our own.
+      }
       tiles.push({
         pluginId,
         cardId,
@@ -239,6 +249,7 @@ async function _recompute(roomCode: string): Promise<void> {
         viewers,
         focusOnJoin: plugin.callTileFocusOnJoin !== false,
         activities,
+        ownActivity,
       });
     }
     if (seq !== _seq || roomCode !== _callRoom) return;
@@ -249,6 +260,17 @@ async function _recompute(roomCode: string): Promise<void> {
   } catch (err) {
     console.warn("[plugins] call tile scan failed:", err);
   }
+}
+
+/**
+ * What this user is doing in a tile, as its plugin says - or, from one that
+ * says nothing, that they are in it, where it can tell whose a card is.
+ */
+function ownTileActivity(plugin: PluginDefinition, state: unknown, selfDid: string): string | null {
+  if (!selfDid) return null;
+  if (plugin.callTileActivity) return cleanActivity(plugin.callTileActivity(state, selfDid));
+  if (!plugin.widgetMine?.(state, selfDid)) return null;
+  return cleanActivity(`In ${plugin.manifest.name}`);
 }
 
 // All of it dies with the session: the watched rooms are room codes, and a
@@ -272,6 +294,7 @@ function sameTiles(a: PluginCallTile[], b: PluginCallTile[]): boolean {
       t.cardId === u.cardId &&
       t.roomCode === u.roomCode &&
       t.focusOnJoin === u.focusOnJoin &&
+      t.ownActivity === u.ownActivity &&
       t.viewers.length === u.viewers.length &&
       t.viewers.every((v, j) => v === u.viewers[j]) &&
       JSON.stringify(t.activities ?? {}) === JSON.stringify(u.activities ?? {})

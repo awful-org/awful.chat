@@ -314,3 +314,65 @@ describe("the read API", () => {
     expect(channelsOf(ROOM)).toEqual({ "": ["12D3-alice"] });
   });
 });
+
+describe("what a peer says they are doing in a call", () => {
+  const state = (over: object = {}) => ({ type: MessageType.CallState, muted: false, deafened: false, ...over });
+  const status = (peer = "12D3-alice") => transportState.callPeerStates.get(peer)?.status;
+  const app = { plugin: "app", label: "Playing Jeopardy" };
+
+  it("is kept for somebody in a call of the room, in any channel, and goes with it", () => {
+    receive("12D3-alice", presence(ROOM, GAMING));
+    receive("12D3-alice", state({ status: { sharing: true, activities: [app] } }));
+    expect(status()).toEqual({ sharing: true, activities: [app] });
+    receive("12D3-alice", state({ status: {} }));
+    expect(status()).toEqual({ sharing: false, activities: [] });
+    receive("12D3-alice", presence(null));
+    expect(transportState.callPeerStates.has("12D3-alice")).toBe(false);
+  });
+
+  it("is null from a build that says nothing, whose mute still counts", () => {
+    receive("12D3-alice", presence(ROOM));
+    receive("12D3-alice", state({ muted: true }));
+    expect(transportState.callPeerStates.get("12D3-alice")).toEqual({ muted: true, deafened: false, status: null });
+  });
+
+  it("is not taken from somebody in no call, or not in the room", () => {
+    receive("12D3-bob", state({ status: { sharing: true } }));
+    receive("12D3-dave", presence(ROOM), OTHER_ROOM);
+    receive("12D3-dave", state({ status: { sharing: true } }), OTHER_ROOM);
+    expect(status("12D3-bob")).toBeUndefined();
+    expect(status("12D3-dave")).toBeUndefined();
+  });
+
+  it("stands over what can be seen from inside the call, which is for older builds", async () => {
+    const { peerCallStatus } = await import("$lib/call-status.svelte");
+    receive("12D3-alice", presence(ROOM));
+    transportState.pendingTransmissions = new Map([["12D3-alice", "producer"]]);
+    receive("12D3-alice", state());
+    expect(peerCallStatus("12D3-alice", "did:key:zAlice", ROOM).sharing).toBe(true);
+    // They turned it off: nothing is shown, whatever we could tell.
+    receive("12D3-alice", state({ status: {} }));
+    expect(peerCallStatus("12D3-alice", "did:key:zAlice", ROOM)).toEqual({ sharing: false, activities: [] });
+  });
+});
+
+describe("our own call status", () => {
+  it("is what the room is told, and nothing once turned off or out of the call", async () => {
+    const { ownCallStatus } = await import("$lib/call-status.svelte");
+    const { setSelfActivity } = await import("$lib/plugins/activity.svelte");
+    const { setShareCallStatus } = await import("$lib/display-prefs.svelte");
+    inCall(ROOM, LOUNGE);
+    transportState.screenSharing = true;
+    setSelfActivity("app", "In an app");
+    const told = { sharing: true, activities: [{ plugin: "app", label: "In an app" }] };
+    expect(ownCallStatus()).toEqual(told);
+    setShareCallStatus(false);
+    expect(ownCallStatus()).toEqual({ sharing: false, activities: [] });
+    setShareCallStatus(true);
+    expect(ownCallStatus()).toEqual(told);
+    transportState.inCall = false;
+    expect(ownCallStatus()).toEqual({ sharing: false, activities: [] });
+    transportState.screenSharing = false;
+    setSelfActivity("app", null);
+  });
+});

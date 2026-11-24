@@ -16,6 +16,7 @@
     Menu,
     Phone,
     Loader2,
+    MessageCircle,
     Send,
     Users,
     Copy,
@@ -215,6 +216,11 @@
 
   interface Props {
     roomCode: string;
+    /**
+     * The room's name is on screen at the top of the sidebar: the header
+     * beside it names the channel alone, rather than both say it twice.
+     */
+    nameInSidebar?: boolean;
     roomName: string;
     selfId: string;
     onLeave: () => void;
@@ -262,6 +268,7 @@
     roomName,
     onLeave,
     ephemeral = false,
+    nameInSidebar = false,
     inviteLink,
     onOpenSidebar,
     onOpenDm,
@@ -281,6 +288,7 @@
   const textChannels = $derived(roomCode.startsWith("dm-") ? [] : roomChannels(roomCode, "text"));
   /** "#name" in the header, once the room has more than its original chat. */
   const heading = $derived(channelHeading(textChannels, channel));
+  const channelName = $derived(textChannels.find((c) => c.id === channel)?.name ?? null);
 
   // Reset scroll state when the room or its channel changes
   $effect(() => {
@@ -2775,9 +2783,13 @@
         <!-- select-text, against the heading rule in app.css: a room name is
              something people copy and paste to each other, not a label. -->
         <h1 class="select-text text-sm font-semibold truncate text-foreground">
-          {roomName || roomCode}
+          {#if nameInSidebar && channelName}
+            <span class="sr-only">{roomName || roomCode}, channel </span><span aria-hidden="true">#</span>{channelName}
+          {:else}
+            {roomName || roomCode}
+          {/if}
         </h1>
-        {#if heading}
+        {#if heading && !(nameInSidebar && channelName)}
           <span class="select-text min-w-0 truncate text-sm text-muted-foreground">
             <!-- "#general" is one token, as everywhere else the app writes
                  a channel's name in text. -->
@@ -4279,7 +4291,7 @@
         class="flex w-full items-center gap-2 px-3 py-1.5 text-sm font-mono hover:bg-muted cursor-pointer"
         onclick={() => startDmFromMenu(contact)}
       >
-        <Users class="size-4" />
+        <MessageCircle class="size-4" />
         Send DM
       </button>
       {#if !isInPhonebook(contact)}

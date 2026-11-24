@@ -128,6 +128,25 @@ it.each(["rd2_" + "A".repeat(43), "dm-" + "a".repeat(40)])(
   },
 );
 
+it("says with it what we are doing, unless that is turned off", async () => {
+  const { setShareCallStatus } = await import("$lib/display-prefs.svelte");
+  const state = transportState as Record<string, unknown>;
+  state.callRoomCode = "rd2_" + "A".repeat(43);
+  state.inCall = true;
+  state.screenSharing = true;
+  const sent = () => {
+    transportMock.sendRoom.mockClear();
+    _sendCallState("member");
+    return decode(transportMock.sendRoom.mock.calls[0][2] as Uint8Array) as { status?: unknown };
+  };
+  expect(sent().status).toEqual({ sharing: true });
+  setShareCallStatus(false);
+  expect(sent().status).toEqual({});
+  setShareCallStatus(true);
+  state.screenSharing = false;
+  state.inCall = false;
+});
+
 beforeEach(() => {
   transportState.roomCode = "room1";
   transportState.relayConnected = true;

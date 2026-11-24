@@ -68,12 +68,14 @@
     Hash,
     MessageCircle,
     MicOff,
+    Monitor,
     PanelLeftClose,
     PanelLeftOpen,
     Pencil,
     Pin,
     PinOff,
     Plus,
+    Puzzle,
     Trash2,
     Undo2,
     User,
@@ -84,6 +86,7 @@
   import SidebarControls from "./SidebarControls.svelte";
   import PluginWidgetSlots from "./PluginWidgetSlots.svelte";
   import GifImage from "./GifImage.svelte";
+  import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { isMenuKey, longPress } from "$lib/actions/long-press";
   import { SELF_MENU, profileScopeFor, type SelfMenuAction } from "$lib/self-menu";
@@ -1149,6 +1152,9 @@
   const sectionTitle = "select-none px-2 text-[11px] font-semibold text-muted-foreground";
   const personRow = "flex h-7 items-center gap-2 rounded-md pl-8 pr-2 text-xs text-sidebar-foreground/80";
   /** A channel row lifted by a drag: solid, so the rows it passes do not show through. */
+  /** A badge after the name of a person in a call. */
+  const personBadge =
+    "flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded text-[10px]";
   const liftedRow = "z-10 rounded-md bg-sidebar shadow-lg ring-1 ring-border";
   /**
    * A row's glyph, set in the line of its label. A flex item is centred on
@@ -1704,10 +1710,37 @@
     {/if}
   </span>
   <span class="min-w-0 flex-1 truncate">{person.name}</span>
-  {#if person.muted}
-    <MicOff class="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-    <span class="sr-only">, muted</span>
-  {/if}
+  <!-- Against the far edge, close together: the name keeps the rest. -->
+  <span class="flex shrink-0 items-center gap-0.5">
+    {#each person.badges?.activities ?? [] as activity, i (i)}
+      <Tip text={activity.label} side="right">
+        {#snippet children(props)}
+          <span {...props} class="{personBadge} bg-secondary text-foreground">
+            {#if activity.icon}
+              <PluginIcon icon={activity.icon} class="size-3" />
+            {:else}
+              <Puzzle class="size-3" aria-hidden="true" />
+            {/if}
+            <span class="sr-only">, {activity.label}</span>
+          </span>
+        {/snippet}
+      </Tip>
+    {/each}
+    {#if person.badges?.sharing}
+      <Tip text="Sharing screen" side="right">
+        {#snippet children(props)}
+          <span {...props} class="{personBadge} bg-primary/15 text-primary">
+            <Monitor class="size-3" aria-hidden="true" />
+            <span class="sr-only">, sharing their screen</span>
+          </span>
+        {/snippet}
+      </Tip>
+    {/if}
+    {#if person.muted}
+      <MicOff class="ml-0.5 size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+      <span class="sr-only">, muted</span>
+    {/if}
+  </span>
 {/snippet}
 
 {#snippet channelList()}

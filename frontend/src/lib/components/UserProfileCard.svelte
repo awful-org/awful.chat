@@ -5,7 +5,7 @@
   import { getScopedProfile } from "$lib/profile.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { nameEffectStyle } from "$lib/name-effect";
-  import { Ban, Copy, Check, MessageSquare, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
+  import { Ban, Copy, Check, MessageCircle, Pencil, UserPlus, UserRoundMinus, X } from "@lucide/svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { isBlockedDid } from "$lib/blocks.svelte";
   import { blockPerson, unblockPerson } from "$lib/transport/dm.svelte";
@@ -256,7 +256,7 @@
               onclick={onMessage}
               class="flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-1.5 font-mono text-xs font-semibold text-primary-foreground hover:bg-primary/90 transition-colors"
             >
-              <MessageSquare class="size-3.5" />
+              <MessageCircle class="size-3.5" />
               Message
             </button>
           {/if}

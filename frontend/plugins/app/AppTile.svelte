@@ -14,7 +14,7 @@
   import { Switch } from "$lib/components/ui/switch";
   import { Check, Maximize2, Minimize2, TriangleAlert, X } from "@lucide/svelte";
   import type { CallTileProps } from "$lib/plugins/api";
-  import { HEARTBEAT_MS, playerId, playing, presentPlayers, type AppState } from "./logic";
+  import { HEARTBEAT_MS, IN_AN_APP, playerId, playing, presentPlayers, type AppState } from "./logic";
   import { helloMessage, PROTOCOL, rateLimiter, readAppMessage, type Player } from "./bridge";
   import { agree, hasAgreed } from "./consent";
   import SiteAddress from "./SiteAddress.svelte";
@@ -82,30 +82,17 @@
     frame?.contentWindow?.postMessage(message, app.origin);
   }
 
-  /**
-   * The game the app says this player is in. Plain, not $state: presence()
-   * reads it inside the open effect, and a dependency there would re-run
-   * the effect - rejoining and re-listening - on every change.
-   */
-  let game: string | null = null;
-  let gameTimer: ReturnType<typeof setTimeout> | undefined;
-
   function presence(t: "join" | "here" | "leave"): void {
-    const data = t !== "leave" && game ? { t, g: game } : { t };
-    void host.sendUpdate(card.id, data, { ephemeral: true }).catch(() => {});
+    void host.sendUpdate(card.id, { t }, { ephemeral: true }).catch(() => {});
   }
 
-  /** The app advertised a game: our own row now, everyone else's soon. */
-  function setGame(name: string | null): void {
-    if (name === game) return;
-    game = name;
+  /**
+   * What we are doing, for the host to tell the room or not, as the user
+   * chose: the game the app advertised, or being in an app; null closed.
+   */
+  function setActivity(label: string | null): void {
     // Guarded, not `requires`d: an older host just shows no activity.
-    if (typeof host.setActivity === "function") host.setActivity(name ? playing(name) : null);
-    // At most one extra presence a second, however chatty the app.
-    gameTimer ??= setTimeout(() => {
-      gameTimer = undefined;
-      if (phase === "open") presence("here");
-    }, 1_000);
+    if (typeof host.setActivity === "function") host.setActivity(label);
   }
 
   function agreeAndOpen(): void {
@@ -117,13 +104,14 @@
     if (phase === "open") presence("leave");
     phase = "closed";
     ready = 0;
-    setGame(null);
+    setActivity(null);
   }
 
   // Open: say so, keep saying so, and listen to the app.
   $effect(() => {
     if (phase !== "open") return;
     presence("join");
+    setActivity(IN_AN_APP);
     const beat = setInterval(() => presence("here"), HEARTBEAT_MS);
     const tick = setInterval(() => (now = Date.now()), 5_000);
     const allow = rateLimiter();
@@ -137,10 +125,10 @@
       // may not be what this one is.
       if (message.type === "ready") {
         ready += 1;
-        setGame(null);
+        setActivity(IN_AN_APP);
       }
       else if (message.type === "close") close();
-      else if (message.type === "activity") setGame(message.name);
+      else if (message.type === "activity") setActivity(message.name ? playing(message.name) : IN_AN_APP);
     };
     window.addEventListener("message", onMessage);
     // The page's theme can change while the app is open.
@@ -200,7 +188,6 @@
   }
 
   onDestroy(() => {
-    clearTimeout(gameTimer);
     if (phase === "open") presence("leave");
   });
 </script>
