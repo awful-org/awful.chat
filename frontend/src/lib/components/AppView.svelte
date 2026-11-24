@@ -7,6 +7,7 @@
   import LegacyArchive from "./LegacyArchive.svelte";
   import { storeSecureInvitation } from "$lib/room-security/invitations";
   import { captureSessionGuard } from "$lib/identity/session-guard";
+  import { onIdentityLock } from "$lib/identity/lock-events";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
   import { secureInvitationLink } from "$lib/room-security/invitation-format";
@@ -1454,14 +1455,32 @@
     if (event.newURL === window.location.href) handlePopState();
   }
 
+  /** Leaves the place this tab is at to be opened at the next unlock. */
+  function park(code: string | null): void {
+    pendingRoomCode = code;
+    parkedRoom.code = code;
+    pendingDm = code ? null : dmOfPlace();
+    openingDm = pendingDm !== null;
+  }
+
+  // A lock takes the room out of the transport. Left on screen, the unlock
+  // showed a room nothing had joined, under its raw id. Closed here instead,
+  // it is opened again at the unlock as a reload opens it - and so is an
+  // invitation whose join the lock cut short.
+  $effect(() =>
+    onIdentityLock(() => {
+      if (!identityStore.isUnlocked) return;
+      showStartScreen();
+      park(consumeRoomLocation() ?? parkedRoom.code);
+    })
+  );
+
   function handlePopState() {
     const code = consumeRoomLocation();
     const dm = code ? null : dmOfPlace();
     pendingDm = null;
     if (!identityStore.isUnlocked) {
-      pendingRoomCode = code;
-      parkedRoom.code = code;
-      pendingDm = dm;
+      park(code);
       return;
     }
     if (dm) {
