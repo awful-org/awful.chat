@@ -373,7 +373,8 @@ host }`); `localCard` has its own (below):
   icon beside their name in the voice channel, the line in the user list -
   and the user can turn that off (Settings > App > Calls), so do not send it
   yourself. With neither, a user your `widgetMine` claims the card for is
-  "In <your name>". It clears `setActivity` when your tile unmounts.
+  "In <your name>". All of it counts only while the user has your tile open:
+  a `setActivity` from a card, a widget or a closed tile does nothing.
   `callTileActivities(cardState)` is deprecated: it is read only for people
   on a build that does not tell the room.
 

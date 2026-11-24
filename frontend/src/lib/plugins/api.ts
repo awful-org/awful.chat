@@ -141,7 +141,8 @@ export interface HostApi {
    * clears it. The host tells the call's room, unless the user turned that
    * off in Settings: your icon beside their name in the voice channel, the
    * line in the user list. One plain line of up to 48 characters; it wins
-   * over `callTileActivity`, and the host clears it when your tile unmounts.
+   * over `callTileActivity`. Only from your tile, while it is open: from a
+   * card, a widget or a tile already closed it does nothing.
    * Do not send it yourself: what goes out this way is the user's choice.
    */
   setActivity(label: string | null): void;
@@ -519,9 +520,10 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
   /**
    * What this user is doing in your tile, from your card's state, or null:
    * `(s, did) => (s.members.has(did) ? "In Waffle Party" : null)`. PURE. Read
-   * while your tile is active in the call; the host tells the room as it
-   * does for `host.setActivity`, which is for what your state cannot say.
-   * Absent, a user your `widgetMine` claims the card for is "In <your name>".
+   * while the user has your tile open in the call; the host tells the room
+   * as it does for `host.setActivity`, which is for what your state cannot
+   * say. Absent, a user your `widgetMine` claims the card for is "In <your
+   * name>" while they have it open.
    */
   callTileActivity?(cardState: State, selfDid: string): string | null;
   /**

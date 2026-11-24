@@ -94,6 +94,11 @@
     // Guarded, not `requires`d: an older host just shows no activity.
     if (typeof host.setActivity === "function") host.setActivity(label);
   }
+  // Its own effect, on the phase alone: one that ran again would take back
+  // the game the app advertised, which it does once.
+  $effect(() => {
+    if (phase === "open") untrack(() => setActivity(IN_AN_APP));
+  });
 
   function agreeAndOpen(): void {
     if (remember) agree(app.origin);
@@ -111,7 +116,6 @@
   $effect(() => {
     if (phase !== "open") return;
     presence("join");
-    setActivity(IN_AN_APP);
     const beat = setInterval(() => presence("here"), HEARTBEAT_MS);
     const tick = setInterval(() => (now = Date.now()), 5_000);
     const allow = rateLimiter();

@@ -348,6 +348,8 @@ describe("what a peer says they are doing in a call", () => {
     const { peerCallStatus } = await import("$lib/call-status.svelte");
     receive("12D3-alice", presence(ROOM));
     transportState.pendingTransmissions = new Map([["12D3-alice", "producer"]]);
+    // Not heard from yet: they may be about to say nothing.
+    expect(peerCallStatus("12D3-alice", "did:key:zAlice", ROOM).sharing).toBe(false);
     receive("12D3-alice", state());
     expect(peerCallStatus("12D3-alice", "did:key:zAlice", ROOM).sharing).toBe(true);
     // They turned it off: nothing is shown, whatever we could tell.
@@ -359,11 +361,12 @@ describe("what a peer says they are doing in a call", () => {
 describe("our own call status", () => {
   it("is what the room is told, and nothing once turned off or out of the call", async () => {
     const { ownCallStatus } = await import("$lib/call-status.svelte");
-    const { setSelfActivity } = await import("$lib/plugins/activity.svelte");
+    const { openTile, setSelfActivity } = await import("$lib/plugins/activity.svelte");
     const { setShareCallStatus } = await import("$lib/display-prefs.svelte");
     inCall(ROOM, LOUNGE);
     transportState.screenSharing = true;
-    setSelfActivity("app", "In an app");
+    const close = openTile("app", ROOM);
+    setSelfActivity("app", ROOM, "In an app");
     const told = { sharing: true, activities: [{ plugin: "app", label: "In an app" }] };
     expect(ownCallStatus()).toEqual(told);
     setShareCallStatus(false);
@@ -373,6 +376,6 @@ describe("our own call status", () => {
     transportState.inCall = false;
     expect(ownCallStatus()).toEqual({ sharing: false, activities: [] });
     transportState.screenSharing = false;
-    setSelfActivity("app", null);
+    close();
   });
 });

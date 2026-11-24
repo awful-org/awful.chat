@@ -9,21 +9,23 @@ import { transportState } from "./transport/transport.svelte";
 /** Our own status as everyone else has it: nothing, once turned off, or in no call. */
 export function ownCallStatus(): Readonly<CallStatus> {
   if (!displayPrefs.shareCallStatus || !transportState.inCall) return NO_CALL_STATUS;
-  return { sharing: transportState.screenSharing, activities: ownActivities() };
+  return { sharing: transportState.screenSharing, activities: ownActivities(transportState.callRoomCode) };
 }
 
 /**
- * A peer's status: what they said. From an older build, which says nothing,
- * what can be seen of it from inside the same call - a share on offer, a
- * plugin's own account of who is doing what.
+ * A peer's status: what they said. From an older build, whose state says
+ * nothing of it, what can be seen from inside the same call - a share on
+ * offer, a plugin's own account of who is doing what. Of somebody not heard
+ * from yet, nothing: they may be about to say they are not telling.
  */
 export function peerCallStatus(
   peerId: string | null,
   did: string,
   roomCode: string | null
 ): Readonly<CallStatus> {
-  const said = peerId ? transportState.callPeerStates.get(peerId)?.status : undefined;
-  if (said) return said;
+  const state = peerId ? transportState.callPeerStates.get(peerId) : undefined;
+  if (!state) return NO_CALL_STATUS;
+  if (state.status) return state.status;
   const sharing = [peerId, did].some(
     (k) =>
       !!k &&

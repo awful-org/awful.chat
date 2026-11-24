@@ -38,7 +38,7 @@ export interface PluginCallTile {
   focusOnJoin?: boolean;
   /** What people are doing in the tile, by DID (`callTileActivities`). */
   activities?: Record<string, string>;
-  /** What this user is doing in it (`callTileActivity`). */
+  /** What this user is doing in it, if they have it open (`callTileActivity`). */
   ownActivity?: string;
 }
 
@@ -264,7 +264,8 @@ async function _recompute(roomCode: string): Promise<void> {
 
 /**
  * What this user is doing in a tile, as its plugin says - or, from one that
- * says nothing, that they are in it, where it can tell whose a card is.
+ * says nothing, that they are in it, where it can tell whose a card is. Not
+ * enough by itself: it counts while they have the tile open (ownActivities).
  */
 function ownTileActivity(plugin: PluginDefinition, state: unknown, selfDid: string): string | null {
   if (!selfDid) return null;
