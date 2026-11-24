@@ -229,6 +229,22 @@ export function stopRingtone() {
   }
 }
 
+import wafuruUrl from "/sounds/wafuru.mp3?url";
+
+/**
+ * boot-sound.ts. Played at launch, the context may still be waiting for a
+ * gesture: a source started on a suspended context sounds once it resumes,
+ * which the listeners above do on the first one.
+ */
+export async function playWafuruSound() {
+  const res = await fetch(wafuruUrl);
+  const ctx = getCtx();
+  const source = ctx.createBufferSource();
+  source.buffer = await ctx.decodeAudioData(await res.arrayBuffer());
+  source.connect(ctx.destination);
+  source.start();
+}
+
 export async function playCallRejectSound() {
   playOsc(300, 0.08, "triangle", 0.15);
   playOsc(200, 0.1, "triangle", 0.1);

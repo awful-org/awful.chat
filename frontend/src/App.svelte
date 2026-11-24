@@ -8,6 +8,7 @@
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
   import { applyRouteMeta } from "$lib/page-meta";
+  import { playBootSound } from "$lib/boot-sound";
   // The app, its setup and unlock screens, /qs and /qc are chunks of their
   // own, so the landing page paints from a small entry; and the routes are
   // pages.ts's, which main.ts preloads from before this mounts.
@@ -84,6 +85,15 @@
 
   $effect(() => {
     init();
+  });
+
+  // Once for each load of the app, locked or not; not on the landing page or
+  // the quick ones.
+  let bootSoundDone = false;
+  $effect(() => {
+    if (currentRoute !== "app" || bootSoundDone) return;
+    bootSoundDone = true;
+    playBootSound();
   });
 
   // Push, once there is an identity to be pushed to. Reads the permission so

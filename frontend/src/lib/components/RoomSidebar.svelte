@@ -91,6 +91,7 @@
   import { isMenuKey, longPress } from "$lib/actions/long-press";
   import { SELF_MENU, profileScopeFor, type SelfMenuAction } from "$lib/self-menu";
   import { openSettings } from "$lib/ui-state.svelte";
+  import { pressDmsButton } from "$lib/boot-sound";
   import UserProfileCard from "./UserProfileCard.svelte";
   import { isBlockedDid } from "$lib/blocks.svelte";
   import { isInPhonebook } from "$lib/transport/dm.svelte";
@@ -1262,7 +1263,10 @@
                 type="button"
                 data-rail-item
                 aria-current={dmsSelected ? "true" : undefined}
-                onclick={chain(props, "onclick", selectDms)}
+                onclick={chain(props, "onclick", (e: MouseEvent) => {
+                  selectDms();
+                  pressDmsButton(e.currentTarget as Element);
+                })}
                 onkeydown={(e) => onRailKeydown(e)}
                 class="{tile} rounded-2xl {dmsSelected
                   ? 'bg-foreground text-background'
