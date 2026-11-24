@@ -8,6 +8,7 @@
  * handlers only for a room that can have channels; the sidebar shows its
  * "+" buttons and its management items only when those exist.
  */
+import type { CallBadges } from "./call-status.svelte";
 import { hasOneChat, type RoomNotifyMode as NotifyMode } from "./channel-ui";
 
 export type ChannelKind = "text" | "voice";
@@ -33,6 +34,8 @@ export interface SidebarVoicePerson {
   avatarUrl?: string | null;
   speaking: boolean;
   muted: boolean;
+  /** What they say they are doing, as badges after their name. */
+  badges?: CallBadges;
   /** This user: listed like the others, but with no menu (nothing to DM or block). */
   self?: boolean;
 }

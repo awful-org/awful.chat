@@ -81,6 +81,13 @@ function setUnlocked(keypair: KeypairRecord): void {
   requestPersistentStorage().catch(() => {});
 }
 
+/** The account last locked in this page, whose state is still in its memory. */
+let heldDid: string | null = null;
+
+export function heldAnotherAccount(did: string): boolean {
+  return heldDid !== null && heldDid !== did;
+}
+
 function setLocked(): void {
   identityStore.isUnlocked = false;
   identityStore.did = null;
@@ -163,17 +170,24 @@ export async function createEphemeral(mnemonic?: string): Promise<void> {
  * Restore an identity from an existing mnemonic and immediately unlock the session.
  * Updates the store reactively on success.
  *
+ * @returns true when this page holds another account's session, locked: its
+ * name, its rooms and the rest of what it read are in memory all over, and
+ * would be shown - the name sent to peers - as this account's. It is left
+ * locked then, and the caller reloads the page.
  * @throws Re-throws any underlying error after setting store.error.
  */
 export async function restore(
   mnemonic: string,
   password: string
-): Promise<void> {
+): Promise<boolean> {
   identityStore.loading = true;
   identityStore.error = null;
   try {
     const keypair = await restoreIdentity(mnemonic, password);
+    identityStore.hasWebAuthn = false; // Its record went with the last password.
+    if (heldAnotherAccount(keypair.did)) return true;
     setUnlocked(keypair);
+    return false;
   } catch (err) {
     identityStore.error = err instanceof Error ? err.message : String(err);
     throw err;
@@ -234,6 +248,7 @@ export async function unlock(password: string): Promise<void> {
  * screen auto-logged straight back in, so the button appeared to do nothing.
  */
 export function lock(): void {
+  heldDid = identityStore.did ?? heldDid;
   identityStore.justLoggedOut = true;
   lockIdentity();
   setLocked();

@@ -21,6 +21,7 @@
     saveRememberedPassword,
     loadRememberedPassword,
     clearRememberedPassword,
+    resetTimerOnLogin,
   } from "$lib/identity/remembered-password";
   import { wipeLocalDatabase, deleteWebAuthnRecord } from "$lib/storage";
 
@@ -97,9 +98,7 @@
         startAutoLogin(
           unlock(stored)
             .then(() => {
-              const resetTimer =
-                localStorage.getItem("awful_remember_reset_timer") === "true";
-              if (resetTimer) {
+              if (resetTimerOnLogin()) {
                 return saveRememberedPassword(stored, getRememberDuration());
               }
             })

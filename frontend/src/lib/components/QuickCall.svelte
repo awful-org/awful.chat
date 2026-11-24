@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { broadcastCallStatus } from "$lib/call-status.svelte";
   import GifImage from "./GifImage.svelte";
   import { mediaPrefs } from "$lib/media-prefs.svelte";
   /**
@@ -136,6 +137,7 @@
     syncSpeakersFromCall();
   });
   watchVisibilityForCall();
+  broadcastCallStatus();
 
   $effect(() => warnBeforeLeavingCall(transportState.inCall));
 
@@ -304,7 +306,7 @@
                 />
               {:else}
                 <span
-                  class="text-3xl font-semibold text-primary font-mono select-none"
+                  class="initial text-3xl font-semibold text-primary font-mono select-none"
                   >{initial}</span
                 >
               {/if}

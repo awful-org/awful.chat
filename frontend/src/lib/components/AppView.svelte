@@ -7,6 +7,7 @@
   import LegacyArchive from "./LegacyArchive.svelte";
   import { storeSecureInvitation } from "$lib/room-security/invitations";
   import { captureSessionGuard } from "$lib/identity/session-guard";
+  import { onIdentityLock } from "$lib/identity/lock-events";
   import { requireRoomSecurityRelease } from "$lib/room-security/invitation-release";
   import { deriveRoomKeys, newRoomSecret } from "$lib/room-security/keys";
   import { secureInvitationLink } from "$lib/room-security/invitation-format";
@@ -30,12 +31,20 @@
   import RoomCreateJoin from "$lib/components/RoomCreateJoin.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import RoomSidebar from "$lib/components/RoomSidebar.svelte";
+  import { sidebarColumn } from "$lib/sidebar-rail";
   import { openingChannelOf } from "$lib/channel-view.svelte";
+  import {
+    broadcastCallStatus,
+    callBadges,
+    ownCallStatus,
+    peerCallStatus,
+  } from "$lib/call-status.svelte";
   import TransportStatus from "$lib/components/TransportStatus.svelte";
   import AppNotices from "$lib/components/AppNotices.svelte";
   import {
     transportState,
     joinRoom,
+    beginConversationOpen,
     leaveRoom,
     selfId,
     announceRoomName,
@@ -128,7 +137,15 @@
   import CallPipPanel from "$lib/components/CallPipPanel.svelte";
   // Shared with the setup and unlock screens, which read the address bar
   // before this view exists (room-location.ts).
-  import { consumeRoomLocation, parkedRoom } from "$lib/room-location";
+  import {
+    channelOfPlace,
+    consumeRoomLocation,
+    dmOfPlace,
+    dmPlace,
+    noteChannel,
+    parkedRoom,
+    showPlace,
+  } from "$lib/room-location";
   import { warnBeforeLeavingCall } from "$lib/call-beforeunload";
   import {
     syncSpeakersFromCall,
@@ -186,6 +203,8 @@
   const openedWith = consumeRoomLocation() ?? parkedRoom.code;
   parkedRoom.code = openedWith;
   let pendingRoomCode = $state<string | null>(openedWith);
+  /** The DM this tab was on when it was reloaded, until it is open again. */
+  let pendingDm = $state<string | null>(openedWith ? null : dmOfPlace());
   let alive = true;
   $effect(() => () => {
     alive = false;
@@ -220,6 +239,7 @@
   let joiningRoom = $state(false);
   // A short link waits on the inviter's tab, for up to a minute: say so.
   let joiningWithCode = $state(false);
+  let joiningInvite = $state(false);
   let bootstrapped = $state(false);
 
   // Lock now tears down the application transport. Re-arm each unlocked
@@ -310,19 +330,64 @@
       const code = pendingRoomCode;
       pendingRoomCode = null;
       joiningRoom = true;
-      joiningWithCode = parseJoinInput(code).kind === "pairing";
+      const { kind } = parseJoinInput(code);
+      joiningWithCode = kind === "pairing";
+      joiningInvite = kind !== "invalid";
+      const run = ++joinRun;
+      const seq = joinSeq;
+      const dmSeq = selectDmSeq;
       // Join only after the stored rooms are loaded: the join saves the room,
       // and racing loadRooms() could drop it from the sidebar mirror.
       loadRooms()
         .catch(() => {})
-        .then(() => handleJoin(code, ""))
+        .then(() => {
+          // What was opened meanwhile - from a notification, by Back - is newer
+          // than the room this tab was on. An invitation is joined all the same.
+          if (run !== joinRun) return;
+          if (kind === "invalid" && (seq !== joinSeq || dmSeq !== selectDmSeq)) return;
+          pickChannelOfPlace(code);
+          return handleJoin(code, "");
+        })
         .finally(() => {
+          // A lock cut it short: the unlock has it still to run, or has begun.
+          if (run !== joinRun) return;
           joiningRoom = false;
           // Done with it - unless this instance was replaced mid-join, and
           // the one that replaced it still has to open the room on screen.
           if (alive && parkedRoom.code === code) parkedRoom.code = null;
         });
     }
+  });
+
+  // A room behind another tab's node waits for as long as that tab has it, and
+  // not in place of the app. An invitation takes the node over (claimForInvite).
+  $effect(() => {
+    if (transportState.nodeHeldElsewhere && joiningRoom && !joiningInvite) joiningRoom = false;
+  });
+
+  // The conversation opens once the node is up, which is what it needs. Until
+  // then a dot, so a reload does not pass through the start screen - but once
+  // that has been shown, for want of a relay or of the node, it stays.
+  let openingDm = $state(untrack(() => pendingDm !== null));
+  $effect(() => {
+    if (!pendingDm || transportState.error || transportState.nodeHeldElsewhere) openingDm = false;
+  });
+  $effect(() => {
+    if (!identityStore.isUnlocked || !transportState.relayConnected || !pendingDm) return;
+    const code = pendingDm;
+    untrack(() => {
+      const guard = captureSessionGuard();
+      // After a lock it waits for the next unlock, under the same code.
+      const waiting = () => {
+        try { guard(); return pendingDm === code; } catch { return false; }
+      };
+      void loadRooms()
+        .catch(() => {})
+        .then(() => (waiting() ? openDmByCode(code) : undefined))
+        .finally(() => {
+          if (waiting()) pendingDm = null;
+        });
+    });
   });
 
   $effect(() => {
@@ -339,6 +404,7 @@
   });
 
   watchVisibilityForCall();
+  broadcastCallStatus();
 
   $effect(() => warnBeforeLeavingCall(transportState.inCall));
 
@@ -506,12 +572,14 @@
               avatarUrl: self.avatarUrl ?? null,
               speaking: speakers.speaking.has(selfSpeakerId),
               muted: transportState.muted,
+              badges: callBadges(ownCallStatus()),
             }
           : {
               peerId: m.peerId,
               ...describeCallPeer(code, m.peerId),
               speaking: speakers.speaking.has(m.peerId),
               muted: !!transportState.callPeerStates.get(m.peerId)?.muted,
+              badges: callBadges(peerCallStatus(m.peerId, peerIdToDid(m.peerId), code)),
             }
     );
     const channels: SidebarChannels = {
@@ -650,6 +718,13 @@
     return () => document.removeEventListener("click", onClick, true);
   });
 
+  // A lock closes the room and forgets its open channel, and the history
+  // entry keeps it.
+  $effect(() => {
+    if (!activeRoomCode || transportState.roomCode !== activeRoomCode) return;
+    noteChannel(activeRoomCode, currentChannel(activeRoomCode));
+  });
+
   // Tell the transport what is actually on screen; see uiRoomCode.
   $effect(() => {
     transportState.uiRoomCode = activeRoomCode;
@@ -735,6 +810,10 @@
 
   /** Bumped per join so a failed one only backs out if nothing newer ran. */
   let joinSeq = 0;
+  /** Bumped per pending room opened, and by a lock, which calls that off. */
+  let joinRun = 0;
+  /** Bumped per DM chosen, which is newer than a room still to be opened. */
+  let selectDmSeq = 0;
   let pairingController: AbortController | undefined;
   $effect(() => () => pairingController?.abort());
 
@@ -754,8 +833,9 @@
     _displayName: string,
     roomName?: string
   ) {
-    joinError = null;
     const guard = captureSessionGuard();
+    joinError = null;
+    pendingDm = null;
     const current = () => {
       try { guard(); return seq === joinSeq; } catch { return false; }
     };
@@ -825,7 +905,7 @@
       activeDmPeerId = null;
       sidebarView = "rooms";
       if (isLegacyArchive(roomCode)) {
-        history.pushState({ roomCode }, "", `/r/#${roomCode}`);
+        showPlace({ roomCode }, `/r/#${roomCode}`);
         return;
       }
       transportState.roomName = label;
@@ -841,7 +921,7 @@
         transportState.roomName = saved.name;
       }
       announceRoomName(roomCode);
-      history.pushState({ roomCode }, "", `/r/#${roomCode}`);
+      showPlace({ roomCode, channel: currentChannel(roomCode) }, `/r/#${roomCode}`);
     } catch (err) {
       if (!current()) return;
       backOut();
@@ -1037,7 +1117,40 @@
     );
   }
 
-  async function handleSelectDm(peerId: string) {
+  /**
+   * The channel the history entry was left on, picked before its room opens
+   * so that its page is the one read. One deleted since changes nothing.
+   */
+  function pickChannelOfPlace(code: string): void {
+    const channel = channelOfPlace(code);
+    if (channel !== null) void selectChannel(code, channel);
+  }
+
+  /** A DM by its stored conversation: one deleted or blocked opens nothing. */
+  async function openDmByCode(code: string): Promise<void> {
+    const peer = roomsStore.dmRooms.find((r) => r.roomCode === code)?.participantDid;
+    if (peer) return openDm(peer);
+    history.replaceState({}, "", "/app");
+    showStartScreen();
+  }
+
+  async function handleSelectDm(peerId: string): Promise<void> {
+    if (!identityStore.isUnlocked) return;
+    const seq = joinSeq;
+    const dmSeq = ++selectDmSeq;
+    awaitingRelay = null;
+    pendingDm = null;
+    if (_transport.selfId()) return openDm(peerId);
+    // No node to open it with yet, as right after an unlock: once there is.
+    await loadRooms().catch(() => {});
+    if (seq !== joinSeq || dmSeq !== selectDmSeq || !identityStore.isUnlocked) return;
+    const did = peerIdToDid(peerId) || peerId;
+    pendingDm = roomsStore.dmRooms.find((r) => r.participantDid === did)?.roomCode ?? null;
+    openingDm =
+      pendingDm !== null && !activeRoomCode && !transportState.error && !transportState.nodeHeldElsewhere;
+  }
+
+  async function openDm(peerId: string) {
     // A superseded open (user clicked something else meanwhile) must not
     // write view state for the conversation it lost.
     if (!(await openDmConversation(peerId))) return;
@@ -1055,7 +1168,7 @@
     activeDmPeerId = normalizedPeerId;
     sidebarView = "dms";
     sidebarOpen = false;
-    history.pushState({}, "", "/app");
+    showPlace(activeRoomCode ? dmPlace(activeRoomCode) : {}, "/app");
     await refreshDmRooms();
     const dmCode = activeRoomCode;
     if (!dmCode) return;
@@ -1380,30 +1493,84 @@
     if (event.newURL === window.location.href) handlePopState();
   }
 
+  /** Leaves a place to be opened at the next unlock. */
+  function park(code: string | null): void {
+    pendingRoomCode = code;
+    parkedRoom.code = code;
+    pendingDm = code ? null : dmOfPlace();
+    openingDm = pendingDm !== null && !transportState.error && !transportState.nodeHeldElsewhere;
+  }
+
+  // A lock takes the room out of the transport. Left on screen, the unlock
+  // showed a room nothing had joined, under its raw id. Closed here instead,
+  // it is opened again at the unlock as a reload opens it - and so is a room
+  // still opening or waiting for the relay, which the address does not name
+  // yet, and an invitation whose join the lock cut short.
+  $effect(() =>
+    onIdentityLock(() => {
+      if (!identityStore.isUnlocked) return;
+      const onScreen = activeDmPeerId || activeRoomCode?.startsWith("dm-") ? null : activeRoomCode;
+      const opening = awaitingRelay?.roomCode ?? onScreen;
+      ++joinRun;
+      joiningRoom = false;
+      showStartScreen();
+      park(opening ?? consumeRoomLocation() ?? parkedRoom.code);
+    })
+  );
+
   function handlePopState() {
     const code = consumeRoomLocation();
+    const dm = code ? null : dmOfPlace();
+    pendingDm = null;
     if (!identityStore.isUnlocked) {
-      pendingRoomCode = code;
-      parkedRoom.code = code;
+      park(code);
+      return;
+    }
+    // Gone elsewhere than what this tab was opened for.
+    parkedRoom.code = null;
+    if (dm) {
+      if (dm === activeRoomCode && transportState.roomCode === dm) return;
+      ++joinSeq;
+      awaitingRelay = null;
+      if (_transport.selfId()) void openDmByCode(dm);
+      else {
+        showStartScreen();
+        pendingDm = dm;
+      }
       return;
     }
     // The URL is the truth: even if the view already names this room, the
     // transport can be elsewhere (a DM opened underneath) - re-join then.
     if (code && (code !== activeRoomCode || transportState.roomCode !== code)) {
       const room = roomsStore.rooms.find((r) => r.roomCode === code);
+      pickChannelOfPlace(code);
       handleJoin(code, "", room?.name);
-    } else if (!code && activeRoomCode) {
-      activeRoomCode = null;
-      activeRoomName = "";
-      activeDmPeerId = null;
-      transportState.chatMode = "room";
-      transportState.activeDmPeerId = null;
-      transportState.roomName = "";
-    }
+    } else if (!code) showStartScreen();
+  }
+
+  /** Nothing open, nor about to be: what was still opening is called off. */
+  function showStartScreen(): void {
+    ++joinSeq;
+    pairingController?.abort();
+    awaitingRelay = null;
+    beginConversationOpen();
+    activeRoomCode = null;
+    activeRoomName = "";
+    activeDmPeerId = null;
+    transportState.connecting = false;
+    transportState.chatMode = "room";
+    transportState.activeDmPeerId = null;
+    transportState.roomName = "";
   }
 
   const myId = $derived(selfId());
   const hasSidebar = $derived(roomsStore.rooms.length > 0);
+  // On a phone the sidebar is a closed drawer, and collapsed it is the rail.
+  const roomNameInSidebar = $derived(
+    !isMobile &&
+      !displayPrefs.sidebarCollapsed &&
+      sidebarColumn(sidebarView, activeRoomCode, orderedRooms.map((r) => r.roomCode)).kind === "room"
+  );
   const isDmActive = $derived(transportState.chatMode === "dm");
   const activeDmRequest = $derived(
     isDmActive &&
@@ -1766,7 +1933,7 @@
        new identity" with the password, mnemonic and keypair they had just
        generated all gone. The genuine first-load spinner is App.svelte's,
        gated on identityStore.initializing, which is what that flag is for. -->
-  {#if joiningRoom}
+  {#if joiningRoom || (openingDm && identityStore.isUnlocked)}
     <div class="min-h-dvh bg-background flex flex-col items-center justify-center gap-3">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
       {#if transportState.nodeHeldElsewhere}
@@ -1847,6 +2014,7 @@
           <ChatView
             roomCode={activeRoomCode}
             roomName={transportState.roomName || activeRoomName}
+            nameInSidebar={roomNameInSidebar}
             selfId={myId}
             onLeave={() =>
               isDmActive && activeDmPeerId
@@ -2021,7 +2189,7 @@
                         animate="hover"
                       />
                     {:else}
-                      {(entry.nickname || "?").charAt(0).toUpperCase()}
+                      <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                     {/if}
                   </div>
                   <button
@@ -2094,7 +2262,7 @@
                         animate="hover"
                       />
                     {:else}
-                      {(entry.nickname || "?").charAt(0).toUpperCase()}
+                      <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                     {/if}
                   </div>
                   <button
@@ -2199,7 +2367,7 @@
                           animate="hover"
                         />
                       {:else}
-                        {(entry.nickname || "?").charAt(0).toUpperCase()}
+                        <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                       {/if}
                     </div>
                     <button
@@ -2277,7 +2445,7 @@
                           animate="hover"
                         />
                       {:else}
-                        {(entry.nickname || "?").charAt(0).toUpperCase()}
+                        <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                       {/if}
                     </div>
                     <button

@@ -194,7 +194,7 @@
           aria-label={away ? `Back to call in ${callRoomName}` : undefined}
           onclick={away ? requestReturnToCall : undefined}
           class={cn(
-            "mx-2 mb-2 flex items-center justify-center rounded-lg border py-2",
+            "m-2 flex items-center justify-center rounded-lg border py-2",
             config.bg,
             config.border,
             away && "cursor-pointer hover:brightness-125"

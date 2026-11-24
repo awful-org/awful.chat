@@ -1,9 +1,10 @@
 <script lang="ts">
   import GifImage from "./GifImage.svelte";
   import { mediaPrefs } from "$lib/media-prefs.svelte";
-  import { restore, identityStore } from "$lib/identity/identity.svelte";
+  import { heldAnotherAccount, restore, identityStore } from "$lib/identity/identity.svelte";
   import { createIdentity } from "$lib/identity/identity";
   import { viewportHeight } from "$lib/actions/viewport-height";
+  import { forgetParkedRooms } from "$lib/room-location";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import {
@@ -313,11 +314,11 @@
     step = "profile";
   }
 
-  function handleFinish() {
+  async function handleFinish() {
     // The profile row is keyed by did, and identityStore.did is not set until
     // finalizeSession(), so pass it explicitly - otherwise the row lands under
     // an empty key and the name looks like it was never saved.
-    saveName(profileStore.nickname, pendingKeypair?.did).catch(() => {});
+    await saveName(profileStore.nickname, pendingKeypair?.did).catch(() => {});
     if (
       identityStore.webAuthnCapabilities?.supported &&
       identityStore.webAuthnCapabilities?.canEnroll
@@ -330,24 +331,42 @@
 
   async function finalizeSession() {
     if (!pendingKeypair) return;
+    const reload = heldAnotherAccount(pendingKeypair.did);
     // New identity: nothing is stored anywhere else, so ask for persistence.
     requestPersistentStorage().catch(() => {});
-    identityStore.isUnlocked = true;
-    identityStore.did = pendingKeypair.did;
-    identityStore.publicKey = pendingKeypair.publicKey;
-    identityStore.keypair = pendingKeypair;
-    identityStore.error = null;
+    if (!reload) {
+      identityStore.isUnlocked = true;
+      identityStore.did = pendingKeypair.did;
+      identityStore.publicKey = pendingKeypair.publicKey;
+      identityStore.keypair = pendingKeypair;
+      identityStore.error = null;
+    }
     if (remember && !identityStore.hasWebAuthn) {
       await saveRememberedPassword(createdPassword, getRememberDuration());
     }
+    if (reload) leaveLastAccount();
     createdPassword = "";
     mnemonic = null;
   }
 
+  /**
+   * This page had another account open before it was locked. It starts over:
+   * what it read is in memory, and the place it was at, or an invitation it
+   * was joining, is that account's.
+   */
+  function leaveLastAccount() {
+    forgetParkedRooms();
+    history.replaceState({}, "", "/app");
+    window.location.reload();
+  }
+
   async function handleRestore() {
     try {
-      await restore(restoreMnemonic.trim(), restorePassword);
-      if (remember && !identityStore.hasWebAuthn) await saveRememberedPassword(restorePassword, getRememberDuration());
+      const reload = await restore(restoreMnemonic.trim(), restorePassword);
+      const remembered = remember ? saveRememberedPassword(restorePassword, getRememberDuration()) : undefined;
+      if (!reload) return void (await remembered);
+      await remembered?.catch(() => {}); // The unlock screen asks for it then.
+      leaveLastAccount();
     } catch { /* restore exposes the error beside the preserved fields */ }
   }
 
@@ -615,7 +634,7 @@
             />
           {:else}
             <span
-              class="text-3xl font-semibold text-primary font-mono select-none"
+              class="initial text-3xl font-semibold text-primary font-mono select-none"
               >{profileInitial}</span
             >
           {/if}

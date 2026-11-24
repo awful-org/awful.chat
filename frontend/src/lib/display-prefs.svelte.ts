@@ -22,6 +22,7 @@ const CALL_CHAT_BESIDE_KEY = "awful:call-chat-beside:v1";
 const CONNECTION_INFO_KEY = "awful:debug-connection-info:v1";
 const CALL_PIP_KEY = "awful:call-pip:v1";
 const SCREEN_SHARE_BANNER_KEY = "awful:screen-share-banner:v1";
+const SHARE_CALL_STATUS_KEY = "awful:share-call-status:v1";
 const AVATAR_TINT_KEY = "awful:avatar-tint:v1";
 const CHAT_FONT_SIZE_KEY = "awful:chat-font-size:v1";
 const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
@@ -89,6 +90,11 @@ export const displayPrefs = $state({
   /** Show the presenting banner over your focused screen share. */
   showScreenShareBanner: readStored(SCREEN_SHARE_BANNER_KEY, true),
   /**
+   * Tell the room what this user is doing in a call: sharing the screen, in
+   * a plugin or an app (call-status.ts). Off, nothing of it is sent.
+   */
+  shareCallStatus: readStored(SHARE_CALL_STATUS_KEY, true),
+  /**
    * Fill a camera-off call tile with the average colour of that person's
    * avatar, grain over it, and a rim on the circle. On by default - it is
    * the look the call was designed around, and it costs one canvas read per
@@ -153,6 +159,15 @@ export function setShowScreenShareBanner(on: boolean): void {
   displayPrefs.showScreenShareBanner = on;
   try {
     localStorage.setItem(SCREEN_SHARE_BANNER_KEY, on ? "1" : "0");
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
+export function setShareCallStatus(on: boolean): void {
+  displayPrefs.shareCallStatus = on;
+  try {
+    localStorage.setItem(SHARE_CALL_STATUS_KEY, on ? "1" : "0");
   } catch {
     // Storage blocked: the choice just does not survive a reload.
   }
@@ -283,6 +298,8 @@ if (typeof window !== "undefined") {
     if (e.key === CALL_PIP_KEY) displayPrefs.callPip = e.newValue === "1";
     if (e.key === SCREEN_SHARE_BANNER_KEY)
       displayPrefs.showScreenShareBanner = e.newValue === null || e.newValue === "1";
+    if (e.key === SHARE_CALL_STATUS_KEY)
+      displayPrefs.shareCallStatus = e.newValue === null || e.newValue === "1";
     if (e.key === ROOM_PROFILE_SIDEBAR_KEY)
       displayPrefs.showRoomProfileInSidebar = e.newValue === "1";
     if (e.key === AVATAR_TINT_KEY)

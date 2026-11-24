@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./registry", () => ({
   getPlugin: async (id: string) => (id === "app" ? app : null),
   getManifest: (id: string) => (id === "app" ? { id } : null),
 }));
+vi.mock("$lib/identity/identity.svelte", () => ({ identityStore: { did: "did:key:zMe", isUnlocked: true } }));
 vi.mock("./prefs.svelte", () => ({ isPluginEnabled: () => true }));
 // The real storage, except that a test can make the next card scans fail.
 const failScans = vi.hoisted(() => ({ left: 0 }));
@@ -205,5 +206,47 @@ describe("the call's tiles", () => {
     refreshCallTiles(null);
     expect(callTilesState.tiles).toEqual([]);
     expect(newestCardOf(ROOM, "app")).toBeUndefined();
+  });
+});
+
+describe("what we are doing in a tile", () => {
+  const plugin = app as PluginDefinition & Record<string, unknown>;
+  const own = async () => {
+    refreshCallTiles(null);
+    refreshCallTiles(ROOM);
+    await vi.waitFor(() => expect(callTilesState.tiles).toHaveLength(1));
+    return callTilesState.tiles[0].ownActivity;
+  };
+  beforeEach(async () => {
+    (plugin.manifest as { name: string }).name = "Waffle Party";
+    await putMessage(appCard());
+  });
+  afterEach(() => {
+    delete plugin.callTileActivity;
+    delete plugin.widgetMine;
+  });
+
+  it("is nothing from a plugin that does not say", async () => {
+    expect(await own()).toBeUndefined();
+  });
+
+  it("is being in it, for one that claims the card as ours", async () => {
+    plugin.widgetMine = (_s: unknown, did: string) => did === "did:key:zMe";
+    expect(await own()).toBe("In Waffle Party");
+    plugin.widgetMine = () => false;
+    expect(await own()).toBeUndefined();
+  });
+
+  it("is what the plugin says, cleaned, and its no is a no", async () => {
+    plugin.widgetMine = () => true;
+    plugin.callTileActivity = (_s: unknown, did: string) => `with\n${did.slice(-2)}`;
+    expect(await own()).toBe("with Me");
+    plugin.callTileActivity = () => null;
+    expect(await own()).toBeUndefined();
+  });
+
+  it("costs the line, not the tile, when the plugin throws", async () => {
+    plugin.callTileActivity = () => { throw new Error("broken"); };
+    expect(await own()).toBeUndefined();
   });
 });

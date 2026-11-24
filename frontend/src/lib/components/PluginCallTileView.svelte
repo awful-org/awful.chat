@@ -3,8 +3,8 @@
   import { getPlugin } from "$lib/plugins/registry";
   import { getCardState, onCardStateChange } from "$lib/plugins/state.svelte";
   import { makeHostApi } from "$lib/plugins/host";
-  import { setSelfActivity } from "$lib/plugins/activity.svelte";
-  import { onDestroy } from "svelte";
+  import { openTile } from "$lib/plugins/activity.svelte";
+  import { onDestroy, untrack } from "svelte";
   import { getMessage } from "$lib/storage";
   import type { Message } from "$lib/transport/transport.svelte";
 
@@ -34,10 +34,16 @@
 
   // One host per (plugin, room): a fresh host per render meant a fresh
   // now-playing token per card-state tick, churning the OS media surface.
-  const hostApi = $derived(makeHostApi(pluginId, roomCode));
+  // By value: the props are read off a list rebuilt on every change in the
+  // call, and each rebuild made a new host, which re-ran everything in the
+  // plugin that reads it.
+  const plugin = $derived(pluginId);
+  const room = $derived(roomCode);
+  const hostApi = $derived(makeHostApi(plugin, room));
 
-  // Whatever the tile said you were doing ends with the tile.
-  onDestroy(() => setSelfActivity(pluginId, null));
+  // Open as long as it is drawn, and from before its plugin runs: what the
+  // plugin says you are doing counts only from here.
+  onDestroy(untrack(() => openTile(pluginId, roomCode)));
 
   // Same tick bridge as MsgRender/PluginWidgetBox: repaint when updates fold.
   let tick = $state(0);

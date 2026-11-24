@@ -68,12 +68,14 @@
     Hash,
     MessageCircle,
     MicOff,
+    Monitor,
     PanelLeftClose,
     PanelLeftOpen,
     Pencil,
     Pin,
     PinOff,
     Plus,
+    Puzzle,
     Trash2,
     Undo2,
     User,
@@ -84,10 +86,12 @@
   import SidebarControls from "./SidebarControls.svelte";
   import PluginWidgetSlots from "./PluginWidgetSlots.svelte";
   import GifImage from "./GifImage.svelte";
+  import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { isMenuKey, longPress } from "$lib/actions/long-press";
   import { SELF_MENU, profileScopeFor, type SelfMenuAction } from "$lib/self-menu";
   import { openSettings } from "$lib/ui-state.svelte";
+  import { pressDmsButton } from "$lib/boot-sound";
   import UserProfileCard from "./UserProfileCard.svelte";
   import { isBlockedDid } from "$lib/blocks.svelte";
   import { isInPhonebook } from "$lib/transport/dm.svelte";
@@ -1149,6 +1153,9 @@
   const sectionTitle = "select-none px-2 text-[11px] font-semibold text-muted-foreground";
   const personRow = "flex h-7 items-center gap-2 rounded-md pl-8 pr-2 text-xs text-sidebar-foreground/80";
   /** A channel row lifted by a drag: solid, so the rows it passes do not show through. */
+  /** A badge after the name of a person in a call. */
+  const personBadge =
+    "flex h-4.5 min-w-4.5 shrink-0 items-center justify-center rounded text-[10px]";
   const liftedRow = "z-10 rounded-md bg-sidebar shadow-lg ring-1 ring-border";
   /**
    * A row's glyph, set in the line of its label. A flex item is centred on
@@ -1256,7 +1263,10 @@
                 type="button"
                 data-rail-item
                 aria-current={dmsSelected ? "true" : undefined}
-                onclick={chain(props, "onclick", selectDms)}
+                onclick={chain(props, "onclick", (e: MouseEvent) => {
+                  selectDms();
+                  pressDmsButton(e.currentTarget as Element);
+                })}
                 onkeydown={(e) => onRailKeydown(e)}
                 class="{tile} rounded-2xl {dmsSelected
                   ? 'bg-foreground text-background'
@@ -1317,7 +1327,7 @@
             {#if picture}
               <GifImage src={picture} alt="" class="size-full object-cover" animate="hover" />
             {:else}
-              <span aria-hidden="true" class="max-w-full truncate px-1">{roomInitials(room.name, room.roomCode)}</span>
+              <span aria-hidden="true" class="initial max-w-full truncate px-1">{roomInitials(room.name, room.roomCode)}</span>
             {/if}
             <!-- The name, for screen readers and for anything that reads the
                  tile's text. -->
@@ -1587,7 +1597,7 @@
           {#if entry.avatarUrl}
             <GifImage src={entry.avatarUrl} alt="" class="size-full object-cover" animate="hover" />
           {:else}
-            <span aria-hidden="true">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
+            <span aria-hidden="true" class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
           {/if}
           <span class="sr-only">
             {entry.nickname}{section === "requests" ? ", message request" : ""}{entry.blocked
@@ -1700,14 +1710,41 @@
         animate={person.speaking}
       />
     {:else}
-      {(person.name || "?").charAt(0).toUpperCase()}
+      <span class="initial">{(person.name || "?").charAt(0).toUpperCase()}</span>
     {/if}
   </span>
   <span class="min-w-0 flex-1 truncate">{person.name}</span>
-  {#if person.muted}
-    <MicOff class="size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-    <span class="sr-only">, muted</span>
-  {/if}
+  <!-- Against the far edge, close together: the name keeps the rest. -->
+  <span class="flex shrink-0 items-center gap-0.5">
+    {#each person.badges?.activities ?? [] as activity, i (i)}
+      <Tip text={activity.label} side="right">
+        {#snippet children(props)}
+          <span {...props} class="{personBadge} bg-secondary text-foreground">
+            {#if activity.icon}
+              <PluginIcon icon={activity.icon} class="size-3" />
+            {:else}
+              <Puzzle class="size-3" aria-hidden="true" />
+            {/if}
+            <span class="sr-only">, {activity.label}</span>
+          </span>
+        {/snippet}
+      </Tip>
+    {/each}
+    {#if person.badges?.sharing}
+      <Tip text="Sharing screen" side="right">
+        {#snippet children(props)}
+          <span {...props} class="{personBadge} bg-primary/15 text-primary">
+            <Monitor class="size-3" aria-hidden="true" />
+            <span class="sr-only">, sharing their screen</span>
+          </span>
+        {/snippet}
+      </Tip>
+    {/if}
+    {#if person.muted}
+      <MicOff class="ml-0.5 size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+      <span class="sr-only">, muted</span>
+    {/if}
+  </span>
 {/snippet}
 
 {#snippet channelList()}
@@ -1958,7 +1995,7 @@
                       animate="hover"
                     />
                   {:else}
-                    {(entry.nickname || "?").charAt(0).toUpperCase()}
+                    <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                   {/if}
                 </span>
                 <span class="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -2038,7 +2075,7 @@
               {#if pictures.get(code)}
                 <GifImage src={pictures.get(code)!} alt="" class="size-full object-cover" animate="hover" />
               {:else}
-                {roomInitials(room.name, code)}
+                <span class="initial">{roomInitials(room.name, code)}</span>
               {/if}
             </span>
             <span class="flex min-w-0 flex-1 flex-col gap-0.5">

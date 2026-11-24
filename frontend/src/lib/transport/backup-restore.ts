@@ -78,6 +78,7 @@ import { messageIdAllowedFor } from "../message-id";
 import { allowsUnsignedDmHistory } from "./dm-ownership";
 import type { WireChatMessage } from "../types/message";
 import { reloadBlocks } from "../blocks.svelte";
+import { forgetPlaces } from "../room-location";
 import { importPeerAudioPrefs } from "./audio-prefs";
 import { importDmCallsJoined } from "../dm-call-joined";
 import { importDmQueueBlob } from "./dm-queue";
@@ -354,6 +355,9 @@ export async function importDatabase(
     // Clear existing data first
     console.log("[Sync] Wiping local database (replace mode)");
     await wipeLocalDatabase();
+    // What reads the DMs in the tabs' history goes with them. Not a parked
+    // invitation: a restore may be what it was waiting for.
+    forgetPlaces();
     // Replace mode installs a possibly DIFFERENT identity. Sealing the
     // imported rows with the currently armed key would brick them for the
     // identity that owns them, so drop the key: the rows land plaintext and

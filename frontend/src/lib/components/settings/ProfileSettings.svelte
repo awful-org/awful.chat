@@ -404,7 +404,7 @@
           ? 'bg-black/15 text-accent-foreground'
           : room ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground'}"
       >
-        {#if room}{(room.name || "#").charAt(0).toUpperCase()}{:else}<User class="size-4 text-current" />{/if}
+        {#if room}<span class="initial">{(room.name || "#").charAt(0).toUpperCase()}</span>{:else}<User class="size-4 text-current" />{/if}
       </span>
     {/if}
     <span class="min-w-0 flex-1 text-left">
@@ -568,7 +568,7 @@
             animate={mediaPrefs.gifAutoplay ? true : "hover"}
           />
         {:else}
-          <span class="font-mono text-lg font-semibold text-primary select-none"
+          <span class="initial font-mono text-lg font-semibold text-primary select-none"
             >{profileInitial}</span
           >
         {/if}

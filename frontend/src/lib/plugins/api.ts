@@ -137,10 +137,13 @@ export interface HostApi {
   /** This user's display name, the same value `ctx.senderName` carries for their own updates. */
   selfName(): string;
   /**
-   * What this user is doing in your call tile, under their name in their
-   * own user list ("Playing Jeopardy"); null clears it. Local: everyone
-   * else's row comes from `callTileActivities(cardState)`. The host clears
-   * it when your tile unmounts.
+   * What this user is doing in your call tile ("Playing Jeopardy"); null
+   * clears it. The host tells the call's room, unless the user turned that
+   * off in Settings: your icon beside their name in the voice channel, the
+   * line in the user list. One plain line of up to 48 characters; it wins
+   * over `callTileActivity`. Only from your tile, while it is open: from a
+   * card, a widget or a tile already closed it does nothing.
+   * Do not send it yourself: what goes out this way is the user's choice.
    */
   setActivity(label: string | null): void;
   /** Peers connected right now, with the display names the host knows. */
@@ -515,11 +518,18 @@ export interface PluginDefinition<State = unknown, CardData = unknown> {
    */
   callTileFocusOnJoin?: boolean;
   /**
-   * What each person is doing in your tile, by DID, shown under their name
-   * in the call's user list: `{ "did:key:...": "Playing Jeopardy" }`.
-   * PURE, like `callTileViewers`. The host keeps one plain line of up to 48
-   * characters. Your own row is `host.setActivity`: your own live updates
-   * never fold back to you, so your state never lists you.
+   * What this user is doing in your tile, from your card's state, or null:
+   * `(s, did) => (s.members.has(did) ? "In Waffle Party" : null)`. PURE. Read
+   * while the user has your tile open in the call; the host tells the room
+   * as it does for `host.setActivity`, which is for what your state cannot
+   * say. Absent, a user your `widgetMine` claims the card for is "In <your
+   * name>" while they have it open.
+   */
+  callTileActivity?(cardState: State, selfDid: string): string | null;
+  /**
+   * What each person is doing in your tile, by DID.
+   * @deprecated Read only for people whose build does not tell the room
+   * itself. Use `callTileActivity` or `host.setActivity`.
    */
   callTileActivities?(cardState: State): Record<string, string>;
   /**

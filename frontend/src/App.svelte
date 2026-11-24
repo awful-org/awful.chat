@@ -8,6 +8,7 @@
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
   import { applyRouteMeta } from "$lib/page-meta";
+  import { playBootSound } from "$lib/boot-sound";
   // The app, its setup and unlock screens, /qs and /qc are chunks of their
   // own, so the landing page paints from a small entry; and the routes are
   // pages.ts's, which main.ts preloads from before this mounts.
@@ -28,7 +29,7 @@
    * it is about 2 MB, and an invite link's first visit waited for all of it
    * before showing a form that needs none of it. From the first unlock on,
    * AppView keeps the screen and shows its own lock screen, as it always
-   * did: locking must not close the room that was open.
+   * did: the unlock comes back to the room that was open.
    */
   let appOpened = $state(false);
   $effect(() => {
@@ -84,6 +85,15 @@
 
   $effect(() => {
     init();
+  });
+
+  // Once for each load of the app, locked or not; not on the landing page or
+  // the quick ones.
+  let bootSoundDone = false;
+  $effect(() => {
+    if (currentRoute !== "app" || bootSoundDone) return;
+    bootSoundDone = true;
+    playBootSound();
   });
 
   // Push, once there is an identity to be pushed to. Reads the permission so

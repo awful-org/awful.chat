@@ -32,6 +32,7 @@
     Headphones,
     UserPlus,
     UserRoundMinus,
+    MessageCircle,
     Users,
     Workflow,
     Ban,
@@ -57,7 +58,8 @@
   } from "$lib/components/ui/drawer";
   import UserProfileCard from "./UserProfileCard.svelte";
   import { openSettings } from "$lib/ui-state.svelte";
-  import { activityFor } from "$lib/plugins/activity.svelte";
+  import { NO_CALL_STATUS } from "$lib/call-status";
+  import { ownCallStatus, peerCallStatus } from "$lib/call-status.svelte";
   import { currentVoiceChannel } from "$lib/transport/voice-channels";
   import { peersInCall } from "$lib/transport/voice-channel";
   import { stageCall } from "$lib/channel-ui";
@@ -291,16 +293,11 @@
           transportState.callRoomCode === transportState.roomCode
         : (!!mappedPeerId && stagePeers.has(mappedPeerId)) || stagePeers.has(did);
 
-      // A pending entry means they are sharing and we are not watching;
-      // watching moves them out of pending and into watchingTransmissions.
-      const sharing = isSelf
-        ? transportState.screenSharing
-        : [mappedPeerId, did].some(
-            (k) =>
-              !!k &&
-              (transportState.pendingTransmissions.has(k) ||
-                transportState.watchingTransmissions.has(k))
-          );
+      const status = !inCall
+        ? NO_CALL_STATUS
+        : isSelf
+          ? ownCallStatus()
+          : peerCallStatus(mappedPeerId, did, transportState.roomCode);
 
       const row = keepUnchanged(previousRows.get(did), {
         did,
@@ -317,8 +314,8 @@
         named,
         isRelayed: userIsRelayed,
         inCall,
-        sharing: inCall && sharing,
-        activity: inCall ? activityFor(did, isSelf, transportState.roomCode) : null,
+        sharing: status.sharing,
+        activity: status.activities[0]?.label ?? null,
         tagText,
         tagTextColor,
         tagChipColor,
@@ -556,7 +553,7 @@
             animate="hover"
           />
         {:else}
-          {getInitials(user.name)}
+          <span class="initial">{getInitials(user.name)}</span>
         {/if}
       </div>
       <div
@@ -713,7 +710,7 @@
           onclick={() =>
             userMenu && handleOpenDm(userMenu.user.peerId ?? userMenu.user.did)}
         >
-          <Users class="size-4" />
+          <MessageCircle class="size-4" />
           Send DM
         </button>
         {#if !isInPhonebook(userMenuContact)}

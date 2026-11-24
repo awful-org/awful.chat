@@ -104,7 +104,7 @@
     SquareArrowOutUpRight,
     SquareArrowDownLeft,
   } from "@lucide/svelte";
-  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
+  import { Check, Columns2, MessageCircle, MonitorIcon, PictureInPicture2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
 import { loadProfile, getScopedProfile } from "$lib/profile.svelte";
 import {
   displayPrefs,
@@ -1193,7 +1193,7 @@ import {
     popin: SquareArrowDownLeft,
     fullscreen: Maximize,
     "fullscreen-exit": Minimize,
-    message: MessageSquare,
+    message: MessageCircle,
     watch: Eye,
     "stop-watching": Radio,
     "screen-off": MonitorOff,
@@ -1952,7 +1952,7 @@ import {
             animate={speakers.speaking.has(tile.peerId)}
           />
         {:else}
-          {tile.label.charAt(0).toUpperCase()}
+          <span class="initial">{tile.label.charAt(0).toUpperCase()}</span>
         {/if}
       </div>
     {/if}
@@ -2144,7 +2144,7 @@ import {
                 animate={speakers.speaking.has(peerId)}
               />
             {:else}
-              {label.charAt(0).toUpperCase()}
+              <span class="initial">{label.charAt(0).toUpperCase()}</span>
             {/if}
             <!-- Relayed badge on peer avatars in "others in call" view: always shown,
                  not gated on showConnectionInfo. That setting controls only the floating

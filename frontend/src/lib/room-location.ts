@@ -46,12 +46,14 @@ let parked: string | null = null;
  */
 const PARKED_KEY = "awful:parked-invitation:v1";
 const SEAL_KEY = "awful:parked-key:v1";
+/** For DM places below. The account's: it goes with it (identity.ts). */
+export const PLACE_KEY = "awful:place-key:v1";
 
 function readParked(): string | null {
   try {
     const held = sessionStorage.getItem(PARKED_KEY);
     if (!held) return null;
-    const code = /^\/r\/?$/.test(window.location.pathname) ? unseal(held) : null;
+    const code = /^\/r\/?$/.test(window.location.pathname) ? unsealInvitation(held) : null;
     if (!code) sessionStorage.removeItem(PARKED_KEY);
     return code;
   } catch {
@@ -69,7 +71,7 @@ function writeParked(code: string | null): void {
   }
 }
 
-/** No tab finds its parked invitation again; this one's is gone at once. */
+/** No tab finds its parked invitation, or a DM it was on, again. */
 export function forgetParkedRooms(): void {
   parkedRoom.code = null;
   try {
@@ -77,31 +79,98 @@ export function forgetParkedRooms(): void {
   } catch {
     // Nothing is kept without storage.
   }
+  forgetPlaces();
+}
+
+/** No tab finds a DM it was on again; a parked invitation stays. */
+export function forgetPlaces(): void {
+  try {
+    localStorage.removeItem(PLACE_KEY);
+  } catch {
+    // Nothing is kept without storage.
+  }
 }
 
 /** The bytes a nonce stands for under the key; null with no key. */
-function keystream(nonce: Uint8Array, length: number): Uint8Array | null {
-  const key = localStorage.getItem(SEAL_KEY);
+function keystream(name: string, nonce: Uint8Array, length: number): Uint8Array | null {
+  const key = localStorage.getItem(name);
   return key ? hkdf(sha256, b32.decode(key), nonce, undefined, length) : null;
 }
 
-function seal(code: string): string {
-  if (!localStorage.getItem(SEAL_KEY)) {
-    localStorage.setItem(SEAL_KEY, b32.encode(crypto.getRandomValues(new Uint8Array(32))));
+function seal(code: string, key = SEAL_KEY): string {
+  if (!localStorage.getItem(key)) {
+    localStorage.setItem(key, b32.encode(crypto.getRandomValues(new Uint8Array(32))));
   }
   const nonce = crypto.getRandomValues(new Uint8Array(16));
   const bytes = new TextEncoder().encode(code);
-  const stream = keystream(nonce, bytes.length)!;
+  const stream = keystream(key, nonce, bytes.length)!;
   return `${b32.encode(nonce)}.${b32.encode(bytes.map((b, i) => b ^ stream[i]))}`;
 }
 
 /** What was sealed, if it is an invitation; noise under another key is not. */
-function unseal(held: string): string | null {
+function unsealInvitation(held: string): string | null {
+  const code = unseal(held);
+  return !code || parseJoinInput(code).kind === "invalid" ? null : code;
+}
+
+function unseal(held: string, key = SEAL_KEY): string | null {
   const [nonce, sealed] = held.split(".").map((part) => b32.decode(part));
-  const stream = keystream(nonce, sealed.length);
+  const stream = keystream(key, nonce, sealed.length);
   if (!stream) return null;
-  const code = new TextDecoder().decode(sealed.map((b, i) => b ^ stream[i]));
-  return parseJoinInput(code).kind === "invalid" ? null : code;
+  return new TextDecoder().decode(sealed.map((b, i) => b ^ stream[i]));
+}
+
+/*
+ * Which place an entry of the tab's history stands for, for a reload and for
+ * going back. A room is in the address already, as its public id, and the
+ * channel open in it goes in the entry. A DM has no address: one would leave
+ * whom you write to in the browser's history, where a wipe does not reach. It
+ * is in the entry alone, sealed like a parked invitation.
+ */
+
+/** The history entry for a DM conversation. */
+export function dmPlace(roomCode: string): { dm?: string } {
+  try {
+    return { dm: seal(roomCode, PLACE_KEY) };
+  } catch {
+    return {}; // No storage for the key: a reload shows the start screen.
+  }
+}
+
+/** The DM conversation this history entry stands for. */
+export function dmOfPlace(state: { dm?: unknown } | null = history.state): string | null {
+  try {
+    const held = state?.dm;
+    const code = typeof held === "string" ? unseal(held, PLACE_KEY) : null;
+    return code?.startsWith("dm-") ? code : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The channel this history entry has open in a room ("" is its main chat);
+    null when the entry is not one for that room. */
+export function channelOfPlace(roomCode: string): string | null {
+  const state = history.state;
+  if (state?.roomCode !== roomCode) return null;
+  return typeof state.channel === "string" ? state.channel : "";
+}
+
+/** The channel open in a room, on the entry that stands for it. */
+export function noteChannel(roomCode: string, channel: string): void {
+  const state = history.state;
+  if (state?.roomCode !== roomCode || (state.channel ?? "") === channel) return;
+  history.replaceState({ ...state, channel }, "");
+}
+
+/**
+ * Show a place in the address bar. The place the entry stands for already
+ * takes no new one: a reload, or going back to it, would add its own.
+ */
+export function showPlace(state: { roomCode?: string; channel?: string; dm?: string }, url: string): void {
+  const here = window.location.pathname + window.location.hash;
+  if (here === url && dmOfPlace(state) === dmOfPlace()) history.replaceState(state, "", url);
+  else history.pushState(state, "", url);
 }
 
 /**

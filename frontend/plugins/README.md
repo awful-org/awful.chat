@@ -126,7 +126,7 @@ the sections below or right here when one line covers it:
 | `onCardStateChange(cb)` | Fires after a persisted update folds; returns unsubscribe |
 | `roomCode()` / `selfDid()` | The room this host is bound to; the user's own DID |
 | `selfName()` | The user's own display name, as their updates carry it |
-| `setActivity(label \| null)` | "Playing Jeopardy" under the user's own name in the call's user list |
+| `setActivity(label \| null)` | What the user is doing in your call tile ("Playing Jeopardy"). The host tells the room, if the user lets it |
 | `peers()` | Connected peers as `{ did, name }` |
 | `onPeerDisconnect(cb)` / `onBeforeDisconnect(cb)` | A peer left / this page is going away; both return unsubscribe |
 | `showLocalCard(data?)` / `closeLocalCard(id)` | Open (returns its id) / close the private floating surface |
@@ -366,12 +366,17 @@ host }`); `localCard` has its own (below):
   swallows that click, so give such a tile a visible Focus button. The
   host's Leave button sits in the tile's top-left corner, 3rem in when
   unfocused and 6.5rem in when focused (the stage's grid menu takes the
-  corner): keep that clear. `callTileActivities(cardState)`, also PURE,
-  returns what each person is doing in the tile by DID (`{ [did]: "Playing
-  Jeopardy" }`), shown under their name in the call's user list as one
-  plain line of up to 48 characters. Your own updates never fold back to
-  you, so your own row is `host.setActivity(label)` instead; the host
-  clears it when your tile unmounts.
+  corner): keep that clear. `callTileActivity(cardState, selfDid)`, also
+  PURE, says what this user is doing in the tile ("In Waffle Party"), or
+  null; `host.setActivity(label)` says what your state cannot, and wins. One
+  plain line of up to 48 characters. The host tells the call's room - your
+  icon beside their name in the voice channel, the line in the user list -
+  and the user can turn that off (Settings > App > Calls), so do not send it
+  yourself. With neither, a user your `widgetMine` claims the card for is
+  "In <your name>". All of it counts only while the user has your tile open:
+  a `setActivity` from a card, a widget or a closed tile does nothing.
+  `callTileActivities(cardState)` is deprecated: it is read only for people
+  on a build that does not tell the room.
 
 - `callTileMenu` - extra rows for your call tile's RIGHT-CLICK menu, so a
   viewer finds the controls of a stream where they expect them. The host
