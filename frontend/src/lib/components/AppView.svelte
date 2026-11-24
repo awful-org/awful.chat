@@ -239,6 +239,7 @@
   let joiningRoom = $state(false);
   // A short link waits on the inviter's tab, for up to a minute: say so.
   let joiningWithCode = $state(false);
+  let joiningInvite = $state(false);
   let bootstrapped = $state(false);
 
   // Lock now tears down the application transport. Re-arm each unlocked
@@ -332,16 +333,19 @@
       joiningRoom = true;
       const { kind } = parseJoinInput(code);
       joiningWithCode = kind === "pairing";
+      joiningInvite = kind !== "invalid";
       const run = ++joinRun;
       const seq = joinSeq;
+      const dmSeq = selectDmSeq;
       // Join only after the stored rooms are loaded: the join saves the room,
       // and racing loadRooms() could drop it from the sidebar mirror.
       loadRooms()
         .catch(() => {})
         .then(() => {
-          // What was opened meanwhile - a notification's room, Back - is newer
+          // What was opened meanwhile - from a notification, by Back - is newer
           // than the room this tab was on. An invitation is joined all the same.
-          if (run !== joinRun || (kind === "invalid" && seq !== joinSeq)) return;
+          if (run !== joinRun) return;
+          if (kind === "invalid" && (seq !== joinSeq || dmSeq !== selectDmSeq)) return;
           pickChannelOfPlace(code);
           return handleJoin(code, "");
         })
@@ -354,6 +358,12 @@
           if (alive && parkedRoom.code === code) parkedRoom.code = null;
         });
     }
+  });
+
+  // A room behind another tab's node waits for as long as that tab has it, and
+  // not in place of the app. An invitation takes the node over (claimForInvite).
+  $effect(() => {
+    if (transportState.nodeHeldElsewhere && joiningRoom && !joiningInvite) joiningRoom = false;
   });
 
   // The conversation opens once the node is up, which is what it needs. Until
@@ -803,6 +813,8 @@
   let joinSeq = 0;
   /** Bumped per pending room opened, and by a lock, which calls that off. */
   let joinRun = 0;
+  /** Bumped per DM chosen, which is newer than a room still to be opened. */
+  let selectDmSeq = 0;
   let pairingController: AbortController | undefined;
   $effect(() => () => pairingController?.abort());
 
@@ -1123,9 +1135,20 @@
     showStartScreen();
   }
 
-  function handleSelectDm(peerId: string): Promise<void> {
-    if (identityStore.isUnlocked) pendingDm = null;
-    return openDm(peerId);
+  async function handleSelectDm(peerId: string): Promise<void> {
+    if (!identityStore.isUnlocked) return;
+    const seq = joinSeq;
+    const dmSeq = ++selectDmSeq;
+    awaitingRelay = null;
+    pendingDm = null;
+    if (_transport.selfId()) return openDm(peerId);
+    // No node to open it with yet, as right after an unlock: once there is.
+    await loadRooms().catch(() => {});
+    if (seq !== joinSeq || dmSeq !== selectDmSeq || !identityStore.isUnlocked) return;
+    const did = peerIdToDid(peerId) || peerId;
+    pendingDm = roomsStore.dmRooms.find((r) => r.participantDid === did)?.roomCode ?? null;
+    openingDm =
+      pendingDm !== null && !activeRoomCode && !transportState.error && !transportState.nodeHeldElsewhere;
   }
 
   async function openDm(peerId: string) {
@@ -1498,7 +1521,8 @@
   $effect(() =>
     onIdentityLock(() => {
       if (!identityStore.isUnlocked) return;
-      const opening = awaitingRelay?.roomCode ?? (activeDmPeerId ? null : activeRoomCode);
+      const onScreen = activeDmPeerId || activeRoomCode?.startsWith("dm-") ? null : activeRoomCode;
+      const opening = awaitingRelay?.roomCode ?? onScreen;
       ++joinRun;
       joiningRoom = false;
       showStartScreen();
