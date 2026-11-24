@@ -4,6 +4,7 @@
   import { restore, identityStore } from "$lib/identity/identity.svelte";
   import { createIdentity } from "$lib/identity/identity";
   import { viewportHeight } from "$lib/actions/viewport-height";
+  import { forgetParkedRooms } from "$lib/room-location";
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
   import {
@@ -330,24 +331,41 @@
 
   async function finalizeSession() {
     if (!pendingKeypair) return;
+    const { justLoggedOut } = identityStore;
     // New identity: nothing is stored anywhere else, so ask for persistence.
     requestPersistentStorage().catch(() => {});
-    identityStore.isUnlocked = true;
-    identityStore.did = pendingKeypair.did;
-    identityStore.publicKey = pendingKeypair.publicKey;
-    identityStore.keypair = pendingKeypair;
-    identityStore.error = null;
+    if (!justLoggedOut) {
+      identityStore.isUnlocked = true;
+      identityStore.did = pendingKeypair.did;
+      identityStore.publicKey = pendingKeypair.publicKey;
+      identityStore.keypair = pendingKeypair;
+      identityStore.error = null;
+    }
     if (remember && !identityStore.hasWebAuthn) {
       await saveRememberedPassword(createdPassword, getRememberDuration());
     }
+    if (justLoggedOut) leaveLastAccount();
     createdPassword = "";
     mnemonic = null;
   }
 
+  /**
+   * This page had another account open before it was locked. It starts over:
+   * what it read is in memory, and the place it was at, or an invitation it
+   * was joining, is that account's.
+   */
+  function leaveLastAccount() {
+    forgetParkedRooms();
+    history.replaceState({}, "", "/app");
+    window.location.reload();
+  }
+
   async function handleRestore() {
     try {
-      await restore(restoreMnemonic.trim(), restorePassword);
+      const reload = await restore(restoreMnemonic.trim(), restorePassword);
       if (remember && !identityStore.hasWebAuthn) await saveRememberedPassword(restorePassword, getRememberDuration());
+      if (!reload) return;
+      leaveLastAccount();
     } catch { /* restore exposes the error beside the preserved fields */ }
   }
 

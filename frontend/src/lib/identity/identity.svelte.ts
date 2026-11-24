@@ -163,17 +163,24 @@ export async function createEphemeral(mnemonic?: string): Promise<void> {
  * Restore an identity from an existing mnemonic and immediately unlock the session.
  * Updates the store reactively on success.
  *
+ * @returns true when this page holds another account's session, locked: its
+ * name, its rooms and the rest of what it read are in memory all over, and
+ * would be shown - the name sent to peers - as this account's. It is left
+ * locked then, and the caller reloads the page.
  * @throws Re-throws any underlying error after setting store.error.
  */
 export async function restore(
   mnemonic: string,
   password: string
-): Promise<void> {
+): Promise<boolean> {
   identityStore.loading = true;
   identityStore.error = null;
   try {
+    const held = identityStore.justLoggedOut ? identityStore.keypair?.did : undefined;
     const keypair = await restoreIdentity(mnemonic, password);
+    if (held && held !== keypair.did) return true;
     setUnlocked(keypair);
+    return false;
   } catch (err) {
     identityStore.error = err instanceof Error ? err.message : String(err);
     throw err;
