@@ -32,6 +32,9 @@ const transportState: Record<string, unknown> = {
   relayConnected: true,
   inCall: false,
   callRoomCode: null,
+  callVoiceChannel: "",
+  callPeerRooms: new Map(),
+  callPeerVoiceChannels: new Map(),
   joiningCall: false,
   muted: false,
   deafened: false,
@@ -109,7 +112,9 @@ vi.mock("./transport.svelte", () => ({
 // vi.mock calls above must resolve before call.svelte.ts's own top-level
 // `import { ... } from "./transport.svelte"` runs, and only a module loaded
 // after those mocks land observes the mocked version.
-const { joinCall, leaveCall, setDeafened, startScreenShare, _sendCallState } = await import("./call.svelte");
+const { joinCall, leaveCall, setDeafened, startScreenShare, switchVoiceChannel, _sendCallState } = await import("./call.svelte");
+const { decode } = await import("$lib/utils");
+const { MessageType } = await import("$lib/types/message");
 
 it.each(["rd2_" + "A".repeat(43), "dm-" + "a".repeat(40)])(
   "routes call state through the protected call scope %s when another room is displayed",
@@ -128,6 +133,7 @@ beforeEach(() => {
   transportState.relayConnected = true;
   transportState.inCall = false;
   transportState.callRoomCode = null;
+  transportState.callVoiceChannel = "";
   transportState.deafened = false;
   transportState.muted = false;
   transportState.transmissionOutputVolume = 1;
@@ -163,7 +169,7 @@ describe("_joinCall roster sequencing (finding 6)", () => {
     await joined;
     expect(voiceMock.join).toHaveBeenLastCalledWith("room1");
     expect(transportState.callRoomCode).toBe("room1");
-    expect(videoMock.join).toHaveBeenLastCalledWith("room1", "self-id");
+    expect(videoMock.join).toHaveBeenLastCalledWith("room1", "self-id", "");
   });
   it("sets inCall/callRoomCode before the FIRST roster sync, not after _video.join()", async () => {
     const snapshots: Array<{ inCall: unknown; callRoomCode: unknown }> = [];
@@ -335,5 +341,171 @@ describe("presence heartbeat replays watch presence and call state", () => {
       leaveCall();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("voice channels", () => {
+  const ROOM = "rd2_" + "r".repeat(52);
+  const OTHER = "rd2_" + "o".repeat(52);
+  const presences = () =>
+    transportMock.broadcast.mock.calls
+      .map(([payload, room]) => ({ room, frame: decode(payload as Uint8Array) as Record<string, unknown> }))
+      .filter(({ frame }) => frame.type === MessageType.CallPresence);
+
+  beforeEach(() => {
+    transportState.roomCode = ROOM;
+    transportMock.broadcast.mockClear();
+    voiceMock.join.mockClear();
+    voiceMock.leave.mockClear();
+    videoMock.leave.mockClear();
+    videoMock.stopCamera.mockClear();
+  });
+
+  it("joins a named channel: its own SFU room, and the channel in the presence", async () => {
+    await joinCall("lounge01");
+    expect(transportState.callVoiceChannel).toBe("lounge01");
+    expect(videoMock.join).toHaveBeenLastCalledWith(ROOM, "self-id", "lounge01");
+    expect(presences().at(-1)).toEqual({
+      room: ROOM,
+      frame: { type: MessageType.CallPresence, inCall: true, voiceRoomCode: ROOM, voiceChannel: "lounge01" },
+    });
+  });
+
+  it("announces the default channel in the frame old clients read", async () => {
+    await joinCall();
+    expect(presences().at(-1)?.frame).toEqual({ type: MessageType.CallPresence, inCall: true, roomCode: ROOM });
+  });
+
+  it("switches channel in place: same microphone, same mute, never out of the call", async () => {
+    await joinCall();
+    voiceMuted = true;
+    transportState.muted = true;
+    transportMock.broadcast.mockClear();
+    videoMock.join.mockClear();
+    voiceMock.join.mockClear();
+    const snapshots: unknown[] = [];
+    syncVoiceRoster.mockImplementation(() => snapshots.push(transportState.callVoiceChannel));
+
+    await joinCall("lounge01");
+
+    // The voice pipeline is not rebuilt; its links follow the roster.
+    expect(voiceMock.leave).not.toHaveBeenCalled();
+    expect(voiceMock.join).not.toHaveBeenCalled();
+    expect(snapshots[0]).toBe("lounge01");
+    // The SFU room is the channel's own.
+    expect(videoMock.leave).toHaveBeenCalledTimes(1);
+    expect(videoMock.join).toHaveBeenLastCalledWith(ROOM, "self-id", "lounge01");
+    expect(transportState).toMatchObject({ inCall: true, callRoomCode: ROOM, callVoiceChannel: "lounge01", muted: true });
+    // No "left the call" in between: nobody hears us leave and rejoin, and
+    // the frame that moves us is the one that takes us out of the old channel.
+    expect(presences().map((p) => p.frame.inCall)).not.toContain(false);
+    expect(presences().at(-1)?.frame).toMatchObject({ voiceRoomCode: ROOM, voiceChannel: "lounge01" });
+
+    await switchVoiceChannel("");
+    expect(transportState.callVoiceChannel).toBe("");
+    expect(presences().at(-1)?.frame).toEqual({ type: MessageType.CallPresence, inCall: true, roomCode: ROOM });
+  });
+
+  it("stops a camera published into the channel it leaves", async () => {
+    await joinCall();
+    const track = { stop: vi.fn() };
+    transportState.cameraOff = false;
+    transportState.localCameraStream = { getTracks: () => [track] };
+    await joinCall("lounge01");
+    expect(track.stop).toHaveBeenCalled();
+    expect(videoMock.stopCamera).toHaveBeenCalled();
+    expect(transportState.cameraOff).toBe(true);
+  });
+
+  it.each(["LOUNGE01", "short", "a".repeat(33), "lounge-01"])("refuses the malformed channel id %s", async (bad) => {
+    await expect(joinCall(bad)).rejects.toThrow();
+    expect(voiceMock.join).not.toHaveBeenCalled();
+    expect(transportState.inCall).toBe(false);
+
+    await joinCall("lounge01");
+    await expect(joinCall(bad)).rejects.toThrow();
+    await expect(switchVoiceChannel(bad)).rejects.toThrow();
+    expect(transportState.callVoiceChannel).toBe("lounge01");
+  });
+
+  it("refuses a channel in a DM, and in a room without protection", async () => {
+    transportState.roomCode = "dm-" + "a".repeat(40);
+    await expect(joinCall("lounge01")).rejects.toThrow();
+    transportState.roomCode = "room1";
+    await expect(joinCall("lounge01")).rejects.toThrow();
+    expect(voiceMock.join).not.toHaveBeenCalled();
+  });
+
+  it("lands in the channel pressed last when it was pressed during a join", async () => {
+    let finish: () => void = () => {};
+    voiceMock.join.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const first = joinCall();
+    const second = joinCall("lounge01");
+    finish();
+    await first;
+    await second;
+    expect(transportState).toMatchObject({ inCall: true, callVoiceChannel: "lounge01" });
+  });
+
+  it("does not undo a hang-up with a channel pressed before it", async () => {
+    let finish: () => void = () => {};
+    voiceMock.join.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const first = joinCall();
+    const second = joinCall("lounge01");
+    leaveCall();
+    finish();
+    await first;
+    await second;
+    expect(transportState.inCall).toBe(false);
+  });
+
+  it("does not carry a channel pressed during a join into a room opened since", async () => {
+    let fail: (err: Error) => void = () => {};
+    voiceMock.join.mockImplementationOnce(
+      () => new Promise<void>((_resolve, reject) => { fail = reject; })
+    );
+    const first = joinCall();
+    const second = joinCall("lounge01");
+    // The user moves on to another room, and the first join then fails.
+    transportState.roomCode = OTHER;
+    fail(new Error("Could not start audio source"));
+    await first.catch(() => {});
+    await second;
+    // The waiting press was for a channel of ROOM: it is not one of OTHER's,
+    // and nobody pressed anything in OTHER.
+    expect(transportState.inCall).toBe(false);
+    expect(videoMock.join).not.toHaveBeenCalled();
+  });
+
+  it("unwinds a switch hung up while its SFU join was out", async () => {
+    await joinCall();
+    let finish: () => void = () => {};
+    videoMock.join.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const switching = joinCall("lounge01");
+    leaveCall();
+    videoMock.leave.mockClear();
+    finish();
+    await switching;
+    expect(transportState.inCall).toBe(false);
+    expect(videoMock.leave).toHaveBeenCalledTimes(1);
+  });
+
+  // The leave used to go to whatever room was on screen once callRoomCode
+  // was cleared - so hanging up from another room left a ghost in the call.
+  it("sends the leave into the call's room when another room is on screen", async () => {
+    await joinCall("lounge01");
+    transportState.roomCode = OTHER;
+    transportMock.broadcast.mockClear();
+    leaveCall();
+    expect(presences()).toEqual([{ room: ROOM, frame: { type: MessageType.CallPresence, inCall: false } }]);
+  });
+
+  it("stays out of another room's channels while in a call elsewhere", async () => {
+    await joinCall("lounge01");
+    transportState.roomCode = OTHER;
+    videoMock.join.mockClear();
+    await joinCall("gaming01");
+    expect(transportState).toMatchObject({ callRoomCode: ROOM, callVoiceChannel: "lounge01" });
+    expect(videoMock.join).not.toHaveBeenCalled();
   });
 });

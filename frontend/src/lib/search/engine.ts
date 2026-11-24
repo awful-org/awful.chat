@@ -21,6 +21,11 @@ export const HAS_LINK = 32;
 export interface SearchEntry {
   id: string;
   roomCode: string;
+  /**
+   * The channel the message is in (channels.ts); absent for the room's
+   * original chat, which is also what every entry saved before channels is.
+   */
+  channel?: string;
   lamport: number;
   timestamp: number;
   senderDid: string;
@@ -46,6 +51,7 @@ const LINK_RE = /(https?:\/\/|www\.)\S/i;
 export interface SearchableMessage {
   id: string;
   roomCode: string;
+  channel?: string;
   lamport: number;
   timestamp: number;
   senderId: string;
@@ -110,6 +116,7 @@ export function entryFromMessage(
   return {
     id: msg.id,
     roomCode: msg.roomCode,
+    ...(msg.channel ? { channel: msg.channel } : {}),
     lamport: msg.lamport,
     timestamp: msg.timestamp,
     senderDid: msg.senderDid || msg.senderId,

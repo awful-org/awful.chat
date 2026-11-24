@@ -11,10 +11,13 @@ import {
   sanitizeFontFamily,
 } from "./chat-font";
 import { parseFraction } from "./call-split";
+import { parseSidebarWidth, storedSidebarWidth } from "./sidebar-width";
+import { parseFoldedDmSections, type DmSectionKey } from "./sidebar-rail";
 
 const ITALIC_KEY = "awful:italic-own-name:v1";
 const PEER_COLORS_KEY = "awful:show-peer-colors:v1";
 const SIDEBAR_COLLAPSED_KEY = "awful:sidebar-collapsed:v1";
+const SIDEBAR_WIDTH_KEY = "awful:sidebar-width:v1";
 const CALL_CHAT_BESIDE_KEY = "awful:call-chat-beside:v1";
 const CONNECTION_INFO_KEY = "awful:debug-connection-info:v1";
 const CALL_PIP_KEY = "awful:call-pip:v1";
@@ -25,6 +28,7 @@ const CHAT_FONT_FAMILY_KEY = "awful:chat-font-family:v1";
 const CALL_STAGE_HEIGHT_KEY = "awful:call-stage-height:v1";
 const CALL_CHAT_WIDTH_KEY = "awful:call-chat-width:v1";
 const ROOM_PROFILE_SIDEBAR_KEY = "awful:room-profile-sidebar:v1";
+const DM_SECTIONS_FOLDED_KEY = "awful:dm-sections-folded:v1";
 
 function readFraction(key: string): number | null {
   if (typeof localStorage === "undefined") return null;
@@ -61,6 +65,13 @@ export const displayPrefs = $state({
   showPeerNicknameColors: readStored(PEER_COLORS_KEY, true),
   /** Desktop only: the room sidebar shows as an icon rail. */
   sidebarCollapsed: readStored(SIDEBAR_COLLAPSED_KEY, false),
+  /**
+   * Desktop only: the expanded sidebar's width in pixels, once its edge was
+   * dragged (sidebar-width.ts). Null is the default width.
+   */
+  sidebarWidth: parseSidebarWidth(
+    typeof localStorage === "undefined" ? null : localStorage.getItem(SIDEBAR_WIDTH_KEY),
+  ),
   /** Desktop only: in a call the chat sits beside the stage, not below it. */
   callChatBeside: readStored(CALL_CHAT_BESIDE_KEY, false),
   /**
@@ -104,7 +115,21 @@ export const displayPrefs = $state({
   ),
   /** Show the current chat room's profile in the bottom-left identity card. */
   showRoomProfileInSidebar: readStored(ROOM_PROFILE_SIDEBAR_KEY, false),
+  /** The direct-message list's sections folded under their headings. */
+  foldedDmSections: parseFoldedDmSections(
+    typeof localStorage === "undefined" ? null : localStorage.getItem(DM_SECTIONS_FOLDED_KEY),
+  ),
 });
+
+export function setFoldedDmSections(keys: DmSectionKey[]): void {
+  displayPrefs.foldedDmSections = keys;
+  try {
+    if (keys.length === 0) localStorage.removeItem(DM_SECTIONS_FOLDED_KEY);
+    else localStorage.setItem(DM_SECTIONS_FOLDED_KEY, JSON.stringify(keys));
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
 
 export function setShowRoomProfileInSidebar(on: boolean): void {
   displayPrefs.showRoomProfileInSidebar = on;
@@ -164,6 +189,18 @@ export function setSidebarCollapsed(on: boolean): void {
   displayPrefs.sidebarCollapsed = on;
   try {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, on ? "1" : "0");
+  } catch {
+    // Storage blocked: the choice just does not survive a reload.
+  }
+}
+
+/** Null goes back to the default width. */
+export function setSidebarWidth(px: number | null): void {
+  const stored = storedSidebarWidth(px);
+  displayPrefs.sidebarWidth = parseSidebarWidth(stored);
+  try {
+    if (stored === null) localStorage.removeItem(SIDEBAR_WIDTH_KEY);
+    else localStorage.setItem(SIDEBAR_WIDTH_KEY, stored);
   } catch {
     // Storage blocked: the choice just does not survive a reload.
   }
@@ -235,6 +272,8 @@ if (typeof window !== "undefined") {
       displayPrefs.showPeerNicknameColors = e.newValue === "1";
     if (e.key === SIDEBAR_COLLAPSED_KEY)
       displayPrefs.sidebarCollapsed = e.newValue === "1";
+    if (e.key === SIDEBAR_WIDTH_KEY)
+      displayPrefs.sidebarWidth = parseSidebarWidth(e.newValue);
     if (e.key === CALL_CHAT_BESIDE_KEY)
       displayPrefs.callChatBeside = e.newValue === "1";
     if (e.key === CONNECTION_INFO_KEY)
@@ -259,5 +298,7 @@ if (typeof window !== "undefined") {
       displayPrefs.callStageHeight = parseFraction(e.newValue);
     if (e.key === CALL_CHAT_WIDTH_KEY)
       displayPrefs.callChatWidth = parseFraction(e.newValue);
+    if (e.key === DM_SECTIONS_FOLDED_KEY)
+      displayPrefs.foldedDmSections = parseFoldedDmSections(e.newValue);
   });
 }

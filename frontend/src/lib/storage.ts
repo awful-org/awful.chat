@@ -53,6 +53,7 @@ import {
   rowHasBytes,
   storageCryptoReady,
   blindValue,
+  blindPair,
   hashRef,
   setAtRestSweepPending,
   STORE_SPECS,
@@ -73,6 +74,7 @@ import { MessageType } from "./types/message";
 import { parseCallCard } from "./call-card";
 import { compareMessages, type MessageCursor } from "./transport/message-order";
 import { issueLamport, observeLamport } from "./transport/logical-clock";
+import { mergeChannelLists, type Channel, type ChannelMerge } from "./channels";
 import type {
   KeypairRecord,
   MnemonicRecord,
@@ -122,6 +124,22 @@ export interface Room {
    * (room-name.ts). 0 for the placeholder a bare invite link stores.
    */
   nameAt?: number;
+  /**
+   * The room's channel list (channels.ts), shared by every member and merged
+   * entry by entry. Absent until somebody makes a channel; the original chat
+   * and call are never entries of it.
+   */
+  channels?: Channel[];
+  /**
+   * Read marks of the channels other than the original chat, by channel id:
+   * like lastSeenLamport, which stays the original chat's. Private.
+   */
+  channelSeen?: Record<string, number>;
+  /**
+   * Pinned messages of the channels other than the original chat, by
+   * channel id; pinnedMessages stays the original chat's. Private.
+   */
+  channelPins?: Record<string, string[]>;
 }
 
 const PARTICIPANT_INACTIVE_DAYS = 30;
@@ -310,6 +328,7 @@ type AppDB = IDBPDatabase<{
       byRoom: Blinded;
       byRoomLamport: [Blinded, number];
       bySender: Blinded;
+      byRoomChannelLamport: [Blinded, number];
     };
   };
   attachments: {
@@ -447,7 +466,7 @@ export async function getDB(): Promise<AppDB> {
 }
 
 async function openDatabase(): Promise<AppDB> {
-  db = (await openDB(dbName(), 10, {
+  db = (await openDB(dbName(), 11, {
     async upgrade(database, oldVersion, _newVersion, transaction) {
       if (oldVersion < 1) {
         // messages
@@ -561,6 +580,15 @@ async function openDatabase(): Promise<AppDB> {
       if (oldVersion < 10) {
         // Soft blocks, sealed like the phonebook (see STORE_SPECS.blocks).
         database.createObjectStore("blocks", { keyPath: "did" });
+      }
+      if (oldVersion < 11) {
+        // One channel's page without walking the whole room
+        // (STORE_SPECS.messages.pairBlind). Only rows in a channel carry
+        // roomChannel, so the index starts empty: every row already stored is
+        // in the room's original chat, and stays there with nothing rewritten.
+        transaction
+          .objectStore("messages")
+          .createIndex("byRoomChannelLamport", ["roomChannel", "lamport"], { unique: false });
       }
     },
     blocking() {
@@ -720,6 +748,80 @@ async function _openAllHealing<T extends { id: string }>(
   return out;
 }
 
+// ── channels ─────────────────────────────────────────────────────────────────
+//
+// A message in a channel other than the room's original chat carries a
+// sealed `channel` and, beside it in the clear, `roomChannel`: the keyed
+// hash of the room and the channel together (STORE_SPECS.messages.pairBlind),
+// indexed with the lamport. The original chat is every row WITHOUT one,
+// which is how the history stored before channels is in it unchanged.
+//
+// Every read below takes an optional channel: absent means the whole room,
+// as it always has - history sync, watermarks and digests stay whole-room -
+// "" means the original chat, and an id means that channel.
+
+/** The index key a channel's rows are stored under. */
+function _roomChannelKey(roomCode: string, channel: string): Promise<Blinded> {
+  return blindPair("roomChannel", roomCode, channel);
+}
+
+/**
+ * Whether a stored row is in a channel other than the original chat, from
+ * what is readable without decrypting it: the index hash on a sealed row, the
+ * field itself on a plaintext one the at-rest sweep has not reached.
+ */
+function _inSomeChannel(row: unknown): boolean {
+  const r = row as { roomChannel?: unknown; channel?: unknown };
+  return typeof r.roomChannel === "string" || (typeof r.channel === "string" && r.channel !== "");
+}
+
+/** Whether a row read for `channel` (see above) belongs in it. */
+function _rowInChannel(row: unknown, channel: string | undefined): boolean {
+  if (channel === undefined) return true;
+  return channel === "" ? !_inSomeChannel(row) : true;
+}
+
+/**
+ * The index ranges a read for `channel` walks, newest-first cursors over
+ * each. A channel has one: its own index. The room and the original chat
+ * walk the room index, twice during the migration window (see getMessages).
+ */
+async function _channelRanges(
+  roomCode: string,
+  channel: string | undefined,
+  from: number,
+  to: number
+): Promise<Array<{ index: "byRoomLamport" | "byRoomChannelLamport"; range: IDBKeyRange }>> {
+  if (channel) {
+    const key = await _roomChannelKey(roomCode, channel);
+    return [{ index: "byRoomChannelLamport", range: IDBKeyRange.bound([key, from], [key, to]) }];
+  }
+  const blindRoomCode = await blindValue(roomCode);
+  const ranges: Array<{ index: "byRoomLamport"; range: IDBKeyRange }> = [
+    { index: "byRoomLamport", range: IDBKeyRange.bound([blindRoomCode, from], [blindRoomCode, to]) },
+  ];
+  if (!isMigrationComplete()) {
+    ranges.push({ index: "byRoomLamport", range: IDBKeyRange.bound([roomCode, from], [roomCode, to]) });
+  }
+  return ranges;
+}
+
+/**
+ * Rows opened for a channel, checked against the channel they carry: the
+ * index hash says where a row was filed, the sealed field is what it says.
+ *
+ * The original chat too. Its walk keeps every row without the index field,
+ * and a row can carry a channel without one: an older build seals no index
+ * field, and one that imported a newer device's backup or device sync
+ * stored channel rows that way - which, once that device updates, would
+ * otherwise read as messages of the original chat.
+ */
+function _keepChannel(rows: Message[], channel: string | undefined): Message[] {
+  if (channel === undefined) return rows;
+  if (channel === "") return rows.filter((m) => !m.channel);
+  return rows.filter((m) => m.channel === channel);
+}
+
 /**
  * Load a page of messages for a room, sorted by lamport ascending.
  * Pass beforeLamport for cursor-based pagination (scroll up to load older).
@@ -735,7 +837,9 @@ export async function getMessages(
    * decrypt, so a full page can arrive as 49 and look like the end of the
    * room when it is not.
    */
-  out?: { capped: boolean }
+  out?: { capped: boolean },
+  /** One channel's page (see "channels" above); absent, the whole room's. */
+  channel?: string
 ): Promise<Message[]> {
   const database = await getDB();
 
@@ -749,27 +853,17 @@ export async function getMessages(
   // The second cursor exists only for the migration window: until the sweep
   // finishes, a room's history is split between blinded and plaintext rows,
   // and reading just one of them silently drops half the conversation.
-  const ranges: Array<[string, number][]> = [];
-  const blindRoomCode = await blindValue(roomCode);
   const before = typeof beforeLamport === "object" ? beforeLamport : undefined;
   const top = before?.lamport ?? (typeof beforeLamport === "number" ? beforeLamport : Number.MAX_SAFE_INTEGER);
-  ranges.push([
-    [blindRoomCode, 0],
-    [blindRoomCode, top],
-  ]);
-  if (!isMigrationComplete()) {
-    ranges.push([
-      [roomCode, 0],
-      [roomCode, top],
-    ]);
-  }
-
   const exclusive = typeof beforeLamport === "number";
+  const ranges = await _channelRanges(roomCode, channel, 0, top);
+
   const tx = database.transaction("messages");
-  const index = tx.store.index("byRoomLamport");
   const cursors = await Promise.all(
     ranges.map((r) =>
-      index.openCursor(IDBKeyRange.bound(r[0], r[1], false, exclusive), "prev")
+      tx.store
+        .index(r.index)
+        .openCursor(IDBKeyRange.bound(r.range.lower, r.range.upper, false, exclusive), "prev")
     )
   );
 
@@ -803,7 +897,11 @@ export async function getMessages(
     // replays them from storage directly). Letting them fill the page meant
     // one steam-roulette library link (~40 update rows per member) pushed
     // every real message out of the newest page.
-    if (row.type !== MessageType.PluginUpdate && !seen.has(row.id)) {
+    //
+    // The original chat's page skips the rows of other channels on the same
+    // walk, from their clear index field: no decrypt, and a room nobody made
+    // a channel in has nothing to skip.
+    if (row.type !== MessageType.PluginUpdate && _rowInChannel(row, channel) && !seen.has(row.id)) {
       seen.add(row.id);
       results.push(row);
       if (results.length >= PAGE_SIZE) break;
@@ -813,7 +911,7 @@ export async function getMessages(
 
   if (out) out.capped = results.length >= PAGE_SIZE;
   // Decrypt AFTER filtering - the filter reads only clear fields.
-  return _openAll("messages", results.reverse());
+  return _keepChannel(await _openAll("messages", results.reverse()), channel);
 }
 
 /**
@@ -821,8 +919,11 @@ export async function getMessages(
  * whole page per room adds up.
  */
 export async function getLastMessage(
-  roomCode: string
+  roomCode: string,
+  /** The newest of one channel (see "channels" above); absent, of the room. */
+  channel?: string
 ): Promise<Message | undefined> {
+  if (channel !== undefined) return _lastInChannel(roomCode, channel);
   const database = await getDB();
   const blindRoomCode = await blindValue(roomCode);
   const blindedRange = IDBKeyRange.bound(
@@ -852,6 +953,33 @@ export async function getLastMessage(
   }
 
   return _open("messages", newest?.value);
+}
+
+/** getLastMessage for one channel: the newest row of it that opens. */
+async function _lastInChannel(roomCode: string, channel: string): Promise<Message | undefined> {
+  const database = await getDB();
+  const ranges = await _channelRanges(roomCode, channel, 0, Number.MAX_SAFE_INTEGER);
+  const tx = database.transaction("messages");
+  const cursors = await Promise.all(
+    ranges.map((r) => tx.store.index(r.index).openCursor(r.range, "prev"))
+  );
+  for (;;) {
+    let pick = -1;
+    for (let i = 0; i < cursors.length; i++) {
+      const c = cursors[i];
+      if (!c) continue;
+      if (pick === -1 || compareMessages(c.value, cursors[pick]!.value) > 0) pick = i;
+    }
+    if (pick === -1) return undefined;
+    const cursor = cursors[pick]!;
+    if (_rowInChannel(cursor.value, channel)) {
+      // The newest row only, like getLastMessage: one that will not open
+      // reads as none rather than as an older message.
+      const opened = await _open<Message>("messages", cursor.value);
+      return opened ? _keepChannel([opened], channel)[0] : undefined;
+    }
+    cursors[pick] = await cursor.continue();
+  }
 }
 
 /**
@@ -2040,23 +2168,76 @@ export async function getUnreadCount(
   /** Senders whose rows never count: the soft-blocked (blocks.svelte.ts). */
   skipSenders: Iterable<string> = []
 ): Promise<number> {
-  const database = await getDB();
-  const blindRoomCode = await blindValue(roomCode);
+  const rows = await _rowsAbove(roomCode, lastSeenLamport);
+  return _countUnread(rows, await _skippedSenders(excludeSenderId, skipSenders));
+}
+
+/** Read marks of a room's channels: the original chat's and each other's. */
+export interface ChannelMarks {
+  /** The original chat's: Room.lastSeenLamport. */
+  base: number;
+  /** Every other channel to count, by id: Room.channelSeen, 0 if unread. */
+  channels: Record<string, number>;
+}
+
+/**
+ * Unread rows per channel: "" for the original chat, and each channel named
+ * in `marks.channels`. Each is read above its own mark only - the original
+ * chat through the room index, skipping the other channels' rows on the way
+ * from their clear index field, and every other channel through its own
+ * index - so a channel nobody has opened yet costs a read of that channel,
+ * never of the whole room.
+ *
+ * A row in a channel not named there is in no count: a channel that was
+ * deleted, or one whose list has not reached us yet - nothing on screen
+ * could show it, so nothing should light a badge for it. The caller counts
+ * again when the list changes.
+ */
+export async function getChannelUnreadCounts(
+  roomCode: string,
+  marks: ChannelMarks,
+  excludeSenderId?: string,
+  skipSenders: Iterable<string> = []
+): Promise<Map<string, number>> {
+  const skipped = await _skippedSenders(excludeSenderId, skipSenders);
+  const out = new Map<string, number>();
+  const original = (await _rowsAbove(roomCode, marks.base)).filter((r) => !_inSomeChannel(r));
+  out.set("", await _countUnread(original, skipped));
+  for (const [channel, mark] of Object.entries(marks.channels)) {
+    if (!channel) continue;
+    const key = await _roomChannelKey(roomCode, channel);
+    const rows = await (await getDB())
+      .transaction("messages")
+      .store.index("byRoomChannelLamport")
+      .getAll(IDBKeyRange.bound([key, mark + 1], [key, Number.MAX_SAFE_INTEGER]));
+    out.set(channel, await _countUnread(rows, skipped));
+  }
+  return out;
+}
+
+/** Every id a sender may be stored under: blinded, and clear on a row from before the migration. */
+async function _skippedSenders(
+  excludeSenderId: string | undefined,
+  skipSenders: Iterable<string>
+): Promise<Set<string>> {
   const skipped = new Set<string>();
   for (const id of [...(excludeSenderId ? [excludeSenderId] : []), ...skipSenders]) {
-    // Rows hold the blinded id; a row from before the migration, the clear one.
     skipped.add(await blindValue(id));
     skipped.add(id);
   }
+  return skipped;
+}
+
+/** A room's raw rows above a lamport, still sealed - both ranges during the migration window. */
+async function _rowsAbove(roomCode: string, lastSeenLamport: number): Promise<Message[]> {
+  const database = await getDB();
+  const blindRoomCode = await blindValue(roomCode);
   const blindedRange = IDBKeyRange.bound(
     [blindRoomCode, lastSeenLamport + 1],
     [blindRoomCode, Number.MAX_SAFE_INTEGER]
   );
 
-  // Reactions and plugin updates are not "new messages": a heart on an old
-  // message or a plugin update must not light the unread badge with nothing
-  // visible to read. The range holds only unseen messages, so materializing
-  // it stays cheap.
+  // The range holds only unseen messages, so materializing it stays cheap.
   let messages = await database
     .transaction("messages")
     .store.index("byRoomLamport")
@@ -2082,7 +2263,14 @@ export async function getUnreadCount(
     }
     messages = Array.from(byId.values());
   }
+  return messages;
+}
 
+/** How many of these unseen raw rows are unread messages. */
+async function _countUnread(messages: Message[], skipped: Set<string>): Promise<number> {
+  // Reactions and plugin updates are not "new messages": a heart on an old
+  // message or a plugin update must not light the unread badge with nothing
+  // visible to read.
   const counted = messages.filter(
     (m) =>
       m.type !== MessageType.Reaction &&
@@ -2781,21 +2969,22 @@ export async function setRoomPinned(
   });
 }
 
-/** Pin a message in its room for this user, or unpin it. */
+/** Pin a message in its room (and channel) for this user, or unpin it. */
 export async function setMessagePinned(
   roomCode: string,
   messageId: string,
-  pinned: boolean
+  pinned: boolean,
+  /** The channel the message is in; "" is the original chat. */
+  channel = ""
 ): Promise<void> {
   await _patchRoom(roomCode, (room) => {
-    const current = room.pinnedMessages ?? [];
+    const current = channel ? room.channelPins?.[channel] ?? [] : room.pinnedMessages ?? [];
     if (current.includes(messageId) === pinned) return null;
-    return {
-      ...room,
-      pinnedMessages: pinned
-        ? [...current, messageId]
-        : current.filter((id) => id !== messageId),
-    };
+    const next = pinned
+      ? [...current, messageId]
+      : current.filter((id) => id !== messageId);
+    if (!channel) return { ...room, pinnedMessages: next };
+    return { ...room, channelPins: { ...(room.channelPins ?? {}), [channel]: next } };
   });
 }
 
@@ -2934,12 +3123,48 @@ export async function markRoomSeen(
   roomCode: string,
   lamport: number,
   guard: WriteGuard = captureWriteGuard(),
+  /**
+   * The channel read (channels.ts). The original chat's mark is
+   * lastSeenLamport, as it always was; another channel's is its own, so
+   * reading one channel never marks another read.
+   */
+  channel = "",
 ): Promise<void> {
-  await _patchRoom(roomCode, (room) => ({
-    ...room,
-    lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, lamport),
-    seenAt: Date.now(),
-  }), guard);
+  await _patchRoom(roomCode, (room) => {
+    if (!channel) {
+      return {
+        ...room,
+        lastSeenLamport: Math.max(room.lastSeenLamport ?? 0, lamport),
+        seenAt: Date.now(),
+      };
+    }
+    const seen = room.channelSeen ?? {};
+    return {
+      ...room,
+      channelSeen: { ...seen, [channel]: Math.max(seen[channel] ?? 0, lamport) },
+      seenAt: Date.now(),
+    };
+  }, guard);
+}
+
+/**
+ * Fold a channel list into the room's (channels.ts mergeChannelLists): an
+ * announcement, or this member's own edit. On the room's patch queue, so two
+ * at once both land. Resolves the merge, or null for a room we do not hold.
+ */
+export async function mergeRoomChannels(
+  roomCode: string,
+  incoming: readonly Channel[],
+  now = Date.now(),
+  guard: WriteGuard = captureWriteGuard(),
+): Promise<ChannelMerge | null> {
+  let result: ChannelMerge | null = null;
+  await _patchRoom(roomCode, (room) => {
+    result = mergeChannelLists(room.channels ?? [], incoming, now);
+    if (!result.changed) return null;
+    return { ...room, channels: result.merged };
+  }, guard);
+  return result;
 }
 
 export async function deleteRoom(roomCode: string): Promise<void> {

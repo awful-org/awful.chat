@@ -123,15 +123,18 @@ describe("verifyIncoming", () => {
     });
   });
 
-  it("rejects every signature version but 3", async () => {
+  it("rejects every signature version but 3 and its channel form, 4", async () => {
     const base = wire({ senderId: alice.did, senderDid: alice.did });
-    for (const sigV of [undefined, 1, 2, 4, 99]) {
+    for (const sigV of [undefined, 1, 2, 5, 99]) {
       const w = { ...base, sig: "00".repeat(64), sigV } as WireChatMessage;
       expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({
         ok: false,
         reason: "sig-version",
       });
     }
+    // v4 is only ever a channel message's; one with no channel is malformed.
+    const w = { ...base, sig: "00".repeat(64), sigV: 4 } as WireChatMessage;
+    expect(await verifyIncoming(w, { room: ROOM })).toMatchObject({ ok: false, reason: "channel" });
   });
 
   // The 2026-08-28 sunset. v2 signs neither the type nor the room, so a

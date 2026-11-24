@@ -62,17 +62,18 @@ var pairingStartPayload = regexp.MustCompile(`^[A-Za-z0-9_-]{128}$`)
 const pairingMaxLive = 256
 
 // What a creator may ask for. A code lets in 1 to pairingMaxUses people and
-// lives 1 to 10 minutes; one that asks for neither (an older client) gets one
+// lives 1 to 30 minutes; one that asks for neither (an older client) gets one
 // person and five minutes, as every code used to. Each person spends a start,
 // and a code buys pairingSpareAttempts more for mistyped tries - the only
 // budget a guesser has against the four-character password: 29 tries at the
-// most, about 1 in 36,000 for a code that is gone within ten minutes.
+// most, about 1 in 36,000 for a code that is gone within half an hour. The
+// tries are counted, not timed: a longer life buys a guesser none.
 const (
 	pairingMaxUses       = 25
 	pairingSpareAttempts = 4
 	pairingMaxAttempts   = pairingMaxUses + pairingSpareAttempts
 	pairingMinTTL        = 60
-	pairingMaxTTL        = 600
+	pairingMaxTTL        = 1800
 	pairingDefaultTTL    = 300
 )
 

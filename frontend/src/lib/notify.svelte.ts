@@ -164,8 +164,10 @@ export function notifyMessage(opts: {
    * announce.ts mints, and notify-intents.ts turns it back into a room code
    * behind the device key when the intent is drained. The field keeps its name
    * because the service worker copies it straight into the stored intent.
+   * `channel` is the room's channel (channels.ts) a reply belongs in: a
+   * random id that says nothing about the room, so it may sit there as is.
    */
-  data?: { roomCode: string; dmPeerDid?: string };
+  data?: { roomCode: string; dmPeerDid?: string; channel?: string };
 }): void {
   // Sound and notification now share a rule - what the reader can already
   // see is the conversation, not the app - but they are asked separately:

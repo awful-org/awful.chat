@@ -41,6 +41,13 @@ import {
 } from "./call-error";
 import { foldCallCards, newCallId, type CallCardPayload } from "$lib/call-card";
 import { callStartSeen, noteDmCallJoined } from "$lib/dm-call-joined";
+import {
+  DEFAULT_VOICE_CHANNEL,
+  callPresenceFields,
+  isVoiceChannel,
+  peersInCall,
+  roomHasVoiceChannels,
+} from "./voice-channel";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
@@ -100,19 +107,27 @@ function _directTargets(rooms: Set<string>): Set<string> {
   return targets;
 }
 
-export function _sendCallPresence(peerId?: string): void {
+/**
+ * `leftRoom` is for the leave: by the time it goes out callRoomCode is already
+ * cleared, and without it the leave was sent to the room on screen - so
+ * hanging up from another room (the PiP panel's button) left everyone in the
+ * call with a ghost of us until the 60s sweep.
+ */
+export function _sendCallPresence(peerId?: string, leftRoom?: string | null): void {
   // The room the CALL is in, not the one on screen. Reporting the current room
   // meant that as soon as you looked at another room, everyone filtered you
   // out of the call you were actually sitting in and you vanished from it.
   const callRoom = transportState.inCall
     ? transportState.callRoomCode ?? transportState.roomCode ?? undefined
     : undefined;
+  // The voice channel rides in the same frame, so it reaches exactly the
+  // people the room code does - the members of the call's room - and nobody
+  // outside the room learns who sits in which channel.
   const payload = encode({
     type: MessageType.CallPresence,
-    inCall: transportState.inCall,
-    roomCode: callRoom,
+    ...callPresenceFields(callRoom ? { roomCode: callRoom, voiceChannel: transportState.callVoiceChannel } : null),
   });
-  const secureCallRoom = transportState.callRoomCode ?? transportState.roomCode;
+  const secureCallRoom = leftRoom ?? transportState.callRoomCode ?? transportState.roomCode;
   if (secureCallRoom && _transport.isSecureRoom(secureCallRoom)) {
     if (peerId) void _transport.sendRoom(peerId, secureCallRoom, payload);
     else _transport.broadcast(payload, secureCallRoom);
@@ -125,7 +140,7 @@ export function _sendCallPresence(peerId?: string): void {
   // Announce into the call's room, and into the room on screen when they
   // differ, so peers in either place hear about it.
   const rooms = new Set(
-    [callRoom, transportState.roomCode].filter((r): r is string => !!r)
+    [callRoom, leftRoom, transportState.roomCode].filter((r): r is string => !!r)
   );
   for (const room of rooms) _transport.broadcast(payload, room);
   // ...and directly to everyone we hold a connection to. Broadcast alone is
@@ -197,10 +212,11 @@ function _measuredLength(call: { startedAt: number; joinedAt: number }, endedAt:
   return Math.max(0, endedAt - call.startedAt, endedAt - call.joinedAt);
 }
 
-/** Someone other than us is in a call in this room right now. */
+/** Someone other than us is in this DM's call right now. A DM has only its
+ *  default voice channel, so that is the one asked about. */
 function _othersInCall(roomCode: string): boolean {
-  for (const room of transportState.callPeerRooms.values()) if (room === roomCode) return true;
-  return false;
+  const call = { roomCode, voiceChannel: DEFAULT_VOICE_CHANNEL };
+  return peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, call).length > 0;
 }
 
 /** The newest started call in this DM with no end card yet, from the view. */
@@ -273,16 +289,146 @@ $effect.root(() => {
   });
 });
 
-export function joinCall(): Promise<void> {
-  if (_joinPromise) return _joinPromise;
-  if (transportState.inCall) return Promise.resolve();
+/** The voice channel the join or switch in flight is for. */
+let _joinTarget = DEFAULT_VOICE_CHANNEL;
+/**
+ * Bumped by every leaveCall. A join for another channel pressed while one is
+ * still in flight waits for that one to land; if the user hung up meanwhile,
+ * the hang-up was the later wish and the waiting join must not undo it.
+ */
+let _leaveCount = 0;
+
+/**
+ * Join a voice channel of the room on screen: the room's default call when
+ * none is named, as it always was.
+ *
+ * Already in a call in this same room, in another channel: moves there, as
+ * one step (switchVoiceChannel) - the microphone, mute and deafen carry
+ * over, and the transport room is never left. Already in a call in another
+ * room: a no-op, as it always was; callers hang up first, on purpose, since
+ * that is leaving a room's call for another room's.
+ *
+ * A malformed channel id is refused, and so is any channel but the default
+ * in a DM: a DM has only its one call.
+ */
+export function joinCall(voiceChannel: string = DEFAULT_VOICE_CHANNEL): Promise<void> {
+  if (!isVoiceChannel(voiceChannel)) return Promise.reject(new Error("Invalid voice channel"));
+  if (_joinPromise) {
+    if (_joinTarget === voiceChannel) return _joinPromise;
+    // Event-driven: the next step starts when the one in flight settles.
+    // Only in the room it was pressed in: a channel id is one room's, and
+    // once another room is on screen the waiting join would land in a
+    // channel of that room nobody chose (the first join having failed).
+    const leaves = _leaveCount;
+    const room = transportState.roomCode;
+    return _joinPromise
+      .catch(() => {})
+      .then(() =>
+        leaves === _leaveCount && transportState.roomCode === room ? joinCall(voiceChannel) : undefined
+      );
+  }
+  if (transportState.inCall) {
+    if (
+      transportState.callRoomCode &&
+      transportState.callRoomCode === transportState.roomCode &&
+      transportState.callVoiceChannel !== voiceChannel
+    ) {
+      return switchVoiceChannel(voiceChannel);
+    }
+    return Promise.resolve();
+  }
+  const room = transportState.roomCode;
+  if (voiceChannel !== DEFAULT_VOICE_CHANNEL && !_channelsAllowedIn(room)) {
+    return Promise.reject(new Error("This conversation has no voice channels"));
+  }
   _joinAbandoned = false;
+  _joinTarget = voiceChannel;
   transportState.joiningCall = true;
-  _joinPromise = _joinCall().finally(() => {
+  _joinPromise = _joinCall(voiceChannel).finally(() => {
     _joinPromise = null;
     transportState.joiningCall = false;
   });
   return _joinPromise;
+}
+
+/**
+ * Voice channels need a protected group room: a DM has one call, and a
+ * legacy room's SFU id is its own code, the same for every channel.
+ */
+function _channelsAllowedIn(room: string | null): room is string {
+  return !!room && roomHasVoiceChannels(room) && _transport.isSecureRoom(room);
+}
+
+/**
+ * Move our call to another voice channel of the room it is in.
+ *
+ * The voice mesh is not rebuilt: its links follow the roster, so changing
+ * which channel the roster is for tears down the old channel's links and
+ * dials the new one's, with the same microphone, mute and deafen. The SFU is
+ * left and joined again, since each channel has its own SFU room - so a
+ * camera or a screen share, published into the old one, is stopped, and
+ * whatever we watched there is gone.
+ *
+ * Nobody is left with a ghost of us: the presence that says where we are now
+ * also says where we are not, and everyone in the room gets it. One that
+ * goes missing is repaired by the 20s heartbeat, long before the 60s sweep.
+ *
+ * Not in a call, or asked for the channel we are in: does what joinCall does.
+ */
+export function switchVoiceChannel(voiceChannel: string): Promise<void> {
+  if (!isVoiceChannel(voiceChannel)) return Promise.reject(new Error("Invalid voice channel"));
+  if (_joinPromise || !transportState.inCall) return joinCall(voiceChannel);
+  if (transportState.callVoiceChannel === voiceChannel) return Promise.resolve();
+  const room = transportState.callRoomCode;
+  if (voiceChannel !== DEFAULT_VOICE_CHANNEL && !_channelsAllowedIn(room)) {
+    return Promise.reject(new Error("This conversation has no voice channels"));
+  }
+  _joinAbandoned = false;
+  _joinTarget = voiceChannel;
+  transportState.joiningCall = true;
+  _joinPromise = _switchVoiceChannel(room ?? "", voiceChannel).finally(() => {
+    _joinPromise = null;
+    transportState.joiningCall = false;
+  });
+  return _joinPromise;
+}
+
+async function _switchVoiceChannel(room: string, voiceChannel: string): Promise<void> {
+  cancelErrorClear();
+  transportState.error = null;
+  // Published into the old channel's SFU room, which we are about to leave
+  // (and leaving it stops their tracks anyway): stop them properly, so the
+  // state and the browser's capture indicator agree.
+  if (!transportState.cameraOff) stopCamera();
+  if (transportState.screenSharing) stopScreenShare();
+  _video.leave();
+  // Per-peer voice verdicts are about links that are about to go.
+  resetPeerQuality();
+  transportState.callVoiceChannel = voiceChannel;
+  // The roster now names the new channel: the old channel's links go down
+  // here, before the presence below lets anyone in it think we still answer.
+  _syncVoiceRoster();
+  transportState.participants = new Map();
+  transportState.pendingTransmissions = new Map();
+  transportState.transmissionViewers = new Map();
+  transportState.watchingTransmissions = new Map();
+  _sendCallPresence();
+  _sendWatchPresence();
+  playJoinSound();
+  try {
+    await _video.join(room, _transport.selfId(), voiceChannel);
+  } catch {
+    // As in a join: the call stands without the SFU, which heals behind it.
+    _video.ensureLive();
+  }
+  if (_joinAbandoned) {
+    // Hung up while the SFU join was out: leaveCall has unwound everything
+    // else already, and left a session it did not know was coming.
+    _video.leave();
+    return;
+  }
+  _syncVoiceRoster();
+  _sendCallPresence();
 }
 
 /** Thrown to unwind a join the user has already left. Never surfaced. */
@@ -294,7 +440,7 @@ function throwIfAbandoned(): void {
 
 let _presenceHeartbeat: ReturnType<typeof setInterval> | null = null;
 
-async function _joinCall(): Promise<void> {
+async function _joinCall(voiceChannel: string): Promise<void> {
   // Browsing another room while connect/microphone permission is pending
   // must not split voice, presence and video across different rooms.
   const callRoom = transportState.roomCode;
@@ -327,6 +473,7 @@ async function _joinCall(): Promise<void> {
     // not depend on the SFU, so there is no reason this waits for it.
     transportState.inCall = true;
     transportState.callRoomCode = callRoom;
+    transportState.callVoiceChannel = voiceChannel;
     if (callRoom) _noteDmCallJoin(callRoom, openCallAtStart);
     _syncVoiceRoster();
     // Announce BEFORE the SFU join: presence is what lets everyone else
@@ -350,7 +497,7 @@ async function _joinCall(): Promise<void> {
     // whose DNS had moved) failed the whole join, taking out calls that never
     // needed it. Keep the call, say what is missing, heal in the background.
     try {
-      await _video.join(callRoom ?? "", _transport.selfId());
+      await _video.join(callRoom ?? "", _transport.selfId(), voiceChannel);
       // Presence is announced before SFU join, so even a zero-peer snapshot
       // cannot prove node misplacement. Transport failures have their own
       // error/recovery path; do not turn a normal join race into a fatal warning.
@@ -381,6 +528,7 @@ async function _joinCall(): Promise<void> {
     _video.leave();
     transportState.inCall = false;
     transportState.callRoomCode = null;
+    transportState.callVoiceChannel = DEFAULT_VOICE_CHANNEL;
     transportState.muted = false;
     transportState.localCameraStream = null;
     transportState.localScreenStream = null;
@@ -402,6 +550,7 @@ export function leaveCall(): void {
   // Tell any in-flight join to unwind. Without this the join runs to
   // completion after the user has left and puts them back in the call.
   if (_joinPromise) _joinAbandoned = true;
+  _leaveCount++;
   // Clear any pending error auto-clear timer and the error itself. Once the
   // user leaves the call, any call-related error (like a permission denial
   // during camera startup) becomes stale.
@@ -425,7 +574,8 @@ export function leaveCall(): void {
     const leftRoom = transportState.callRoomCode;
     transportState.inCall = false;
     transportState.callRoomCode = null;
-    _sendCallPresence();
+    transportState.callVoiceChannel = DEFAULT_VOICE_CHANNEL;
+    _sendCallPresence(undefined, leftRoom);
     if (leftRoom) _noteDmCallLeave(leftRoom);
   }
   stopCamera();
@@ -440,6 +590,7 @@ export function leaveCall(): void {
   _video.leave();
   transportState.inCall = false;
   transportState.callRoomCode = null;
+  transportState.callVoiceChannel = DEFAULT_VOICE_CHANNEL;
   transportState.muted = false;
   transportState.deafened = false;
   transportState.participants = new Map();

@@ -27,6 +27,7 @@ import type {
 } from "../storage";
 import type { RoomProfileField } from "../room-profile";
 import { judgeRoomName } from "../room-name";
+import { isChannelId, mergeChannelLists, normalizeChannelList, parseChannelList } from "../channels";
 
 export type RoomProfileExport = Omit<OwnRoomProfileRecord, "fields"> & {
   fields: Partial<Record<RoomProfileField, string | boolean | null>>;
@@ -147,7 +148,25 @@ export const BACKUP_FORMAT = "awful.chat/backup";
 // v3 adds room overrides and leave markers. A v2 reader would discard them.
 // v4 adds the phonebook, soft blocks and the localStorage-held account state
 // (LocalStateExport), which a v3 reader would discard just as quietly.
-export const BACKUP_VERSION = 4;
+// v5 holds channels: messages tagged with one, and rooms' channel lists,
+// read marks and pins. A v4 reader shows every channel's messages mixed in
+// the room's one chat, so it must refuse. A file with no channel data is
+// still written as v4 (backupVersionFor), which a v4 reader restores fine.
+export const BACKUP_VERSION = 5;
+
+/** The version to write this export as: the lowest one that reads it correctly (see BACKUP_VERSION). */
+export function backupVersionFor(data: Pick<DatabaseExport, "messages" | "rooms">): number {
+  const tagged = data.messages.some((m) => typeof (m as { channel?: unknown }).channel === "string");
+  const listed = data.rooms.some((r) => {
+    const room = r as { channels?: unknown[]; channelSeen?: object; channelPins?: object };
+    return (
+      (Array.isArray(room.channels) && room.channels.length > 0) ||
+      (!!room.channelSeen && Object.keys(room.channelSeen).length > 0) ||
+      (!!room.channelPins && Object.keys(room.channelPins).length > 0)
+    );
+  });
+  return tagged || listed ? BACKUP_VERSION : 4;
+}
 
 export interface BackupFile extends DatabaseExport {
   format: typeof BACKUP_FORMAT;
@@ -209,7 +228,7 @@ export function pfpToJson<T extends { pfpData?: unknown; bannerData?: unknown }>
  * newer name wins with the stamp it was chosen at, and a request accepted on
  * either device stays accepted.
  */
-export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
+export function mergeImportedRoom<T extends Room>(local: Room, imported: T, now = Date.now()): T {
   if (local.roomSecret && imported.roomSecret && local.roomSecret !== imported.roomSecret) {
     throw new Error("Imported room capability conflicts with the local room");
   }
@@ -282,6 +301,15 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
     movedTo: local.movedTo ?? imported.movedTo,
     pfpData: pictured.pfpData,
     pfpURL: pictured.pfpURL,
+    // The channel list is the room's, not this device's: merged entry by
+    // entry the way members merge announcements (channels.ts), never taken
+    // whole from either side - an older copy must not bring a deleted
+    // channel back, nor drop one made since.
+    channels: mergeChannelLists(local.channels ?? [], parseChannelList(imported.channels), now).merged,
+    // Read marks only move forward, like lastSeenLamport; pins are a union,
+    // like pinnedMessages - per channel.
+    channelSeen: mergeMarks(local.channelSeen, imported.channelSeen),
+    channelPins: mergePins(local.channelPins, imported.channelPins),
   };
   if (named.nameAt !== undefined) merged.nameAt = named.nameAt;
   else delete merged.nameAt;
@@ -296,7 +324,84 @@ export function mergeImportedRoom<T extends Room>(local: Room, imported: T): T {
   for (const key of ["seenAt", "archiveOf", "movedTo", "pfpData", "pfpURL", "pinnedAt", "position"]) {
     if (merged[key] === undefined) delete merged[key];
   }
+  // A room nobody made a channel in stays exactly the record it was.
+  if (!(merged.channels as unknown[]).length) delete merged.channels;
+  if (!Object.keys(merged.channelSeen as object).length) delete merged.channelSeen;
+  if (!Object.keys(merged.channelPins as object).length) delete merged.channelPins;
   return merged as T;
+}
+
+function mergeMarks(
+  a: Record<string, number> | undefined,
+  b: Record<string, number> | undefined
+): Record<string, number> {
+  const out: Record<string, number> = { ...sanitizeChannelMarks(a) };
+  for (const [id, mark] of Object.entries(sanitizeChannelMarks(b))) {
+    out[id] = Math.max(out[id] ?? 0, mark);
+  }
+  return out;
+}
+
+function mergePins(
+  a: Record<string, string[]> | undefined,
+  b: Record<string, string[]> | undefined
+): Record<string, string[]> {
+  const out: Record<string, string[]> = { ...sanitizeChannelPins(a) };
+  for (const [id, pins] of Object.entries(sanitizeChannelPins(b))) {
+    out[id] = [...new Set([...(out[id] ?? []), ...pins])];
+  }
+  return out;
+}
+
+/** Per-channel read marks from a file: channel ids to finite, non-negative lamports. */
+export function sanitizeChannelMarks(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [id, mark] of Object.entries(raw as Record<string, unknown>)) {
+    if (isChannelId(id) && isFiniteNonNegative(mark)) out[id] = mark;
+  }
+  return out;
+}
+
+/** Per-channel pins from a file: channel ids to lists of message ids. */
+export function sanitizeChannelPins(raw: unknown): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [id, pins] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isChannelId(id) || !Array.isArray(pins)) continue;
+    const ids = pins.filter(isNonEmptyString).slice(0, MAX_PINS_PER_CHANNEL);
+    if (ids.length) out[id] = [...new Set(ids)];
+  }
+  return out;
+}
+
+/** More pins than anybody makes by hand; only a hostile file gets near it. */
+const MAX_PINS_PER_CHANNEL = 1000;
+
+/**
+ * A room record's channel fields, as a file holds them, made safe to store:
+ * the list parsed entry by entry and normalized, the marks and pins checked.
+ * A room is never dropped over them - losing a room is data loss, a bad
+ * channel entry is not - so what does not parse is left out instead.
+ */
+export function sanitizeRoomChannels<T extends Room>(room: T): T {
+  const r = room as T & Record<string, unknown>;
+  if (r.channels === undefined && r.channelSeen === undefined && r.channelPins === undefined) {
+    return room;
+  }
+  const out: Record<string, unknown> = { ...r };
+  delete out.channels;
+  delete out.channelSeen;
+  delete out.channelPins;
+  // DMs have no channels.
+  if (room.roomCode.startsWith("dm-")) return out as T;
+  const channels = normalizeChannelList(parseChannelList(r.channels));
+  const seen = sanitizeChannelMarks(r.channelSeen);
+  const pins = sanitizeChannelPins(r.channelPins);
+  if (channels.length) out.channels = channels;
+  if (Object.keys(seen).length) out.channelSeen = seen;
+  if (Object.keys(pins).length) out.channelPins = pins;
+  return out as T;
 }
 
 /**
@@ -643,6 +748,14 @@ function isNonEmptyString(v: unknown): v is string {
 export function isValidMessageRecord(m: unknown): m is Message {
   if (!m || typeof m !== "object") return false;
   const r = m as Record<string, unknown>;
+  // A channel tag keys a storage index: a malformed one, or one in a DM
+  // (which has no channels), is refused like any other broken field.
+  if (
+    r.channel !== undefined &&
+    (!isChannelId(r.channel) || (typeof r.roomCode === "string" && r.roomCode.startsWith("dm-")))
+  ) {
+    return false;
+  }
   return (
     isNonEmptyString(r.id) &&
     isNonEmptyString(r.roomCode) &&
@@ -896,6 +1009,7 @@ export function sanitizeCollections(data: {
   const watermarks = sanitize(data.watermarks, isValidWatermarkRecord);
   const yjsDocs = sanitize(data.yjsDocs, isValidYjsDocRecord);
   const rooms = sanitize(data.rooms, isValidRoomRecord);
+  rooms.records = rooms.records.map(sanitizeRoomChannels);
   const profiles = sanitize(data.profiles, isValidProfileRecord);
   const roomProfiles = sanitize(data.roomProfiles ?? [], isValidRoomProfileRecord);
   const roomDeletions = sanitize(data.roomDeletions ?? [], isValidRoomDeletionMarker);

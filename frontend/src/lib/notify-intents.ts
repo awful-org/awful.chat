@@ -29,6 +29,8 @@
  * by the time someone taps it.
  */
 
+import { isChannelId } from "./channels";
+
 const DB_NAME = "awful-notify";
 const STORE = "intents";
 const KEY_STORE = "device-key";
@@ -55,8 +57,26 @@ export interface NotifyIntent {
   kind: "open" | "reply";
   roomCode: string;
   dmPeerDid?: string;
+  /**
+   * The channel of the room the notification was about (channels.ts): "" for
+   * the original chat, absent when it named none - a DM, a burst across
+   * channels, or a notification an older build showed.
+   */
+  channel?: string;
   text: string;
   ts: number;
+}
+
+/**
+ * The channel a drained intent opens and replies into, or undefined to leave
+ * the room on the channel it is on. Read back from a record anything could
+ * have written, so only a well-formed id (or "") counts.
+ */
+export function intentChannel(intent: Pick<NotifyIntent, "channel" | "dmPeerDid">): string | undefined {
+  if (intent.dmPeerDid) return undefined;
+  const channel: unknown = intent.channel;
+  if (channel === "") return "";
+  return isChannelId(channel) ? channel : undefined;
 }
 
 /** What actually goes in the store: AES-GCM over the JSON of the intent.

@@ -53,7 +53,7 @@ export function optionalRoute(pathname: string): "qs" | "qc" | null {
 
 /** What an address shows: App.svelte's routing, and main.ts's preload. */
 export function routeFor(pathname: string): Route {
-  if (pathname.startsWith("/r/")) return "app";
+  if (pathname === "/r" || pathname.startsWith("/r/")) return "app";
   // A disabled optional route falls through to the landing page rather than
   // 404ing: the flag is an operator's choice, not a broken link, and the
   // page it would have shown does not exist here.
@@ -100,8 +100,7 @@ export function preloadPage(page: LazyPage | null): void {
  * idle, so it never competes with what is on screen. Under Save-Data too:
  * the service worker's precache downloads the same chunks on a first visit
  * anyway, and with them in hand the unlock needs no network, where a chunk
- * that does not load reloads the page and drops the invitation the gate
- * holds.
+ * that does not load reloads the page under the gate.
  *
  * Its stylesheets as prefetches: a preload is for the page on screen, and
  * one still unused a few seconds after the load - the app's, while a

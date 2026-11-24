@@ -28,7 +28,7 @@
   let people = $state<number | null>(lastPeople);
   let minutes = $state(lastMinutes);
   const PEOPLE_PICKS = [1, 5, 10, 20];
-  const MINUTE_PICKS = [1, 5, 10];
+  const MINUTE_PICKS = [1, 5, 10, 30];
   const peopleId = $props.id();
 
   /** The typed number, whole and within 1..25 (an empty field is one person). */

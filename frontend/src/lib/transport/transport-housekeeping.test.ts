@@ -15,6 +15,7 @@ const s = vi.hoisted(() => {
     joined: new Set<string>(),
     roomPeers: new Map<string, Set<string>>(),
     broadcasts: [] as { room: string; data: Uint8Array }[],
+    disconnect: vi.fn(),
   };
 });
 
@@ -43,7 +44,7 @@ vi.mock("./libp2p/transport", () => ({
     reconcileNow() {}
     dialNow() {}
     async checkRelayLiveness() {}
-    async disconnect() {}
+    disconnect() { s.disconnect(); }
   },
 }));
 vi.mock("./ice-server-list", () => ({ refreshTurnCredentials: async () => {} }));
@@ -94,10 +95,23 @@ beforeEach(() => {
   s.identity.did = s.session.did;
   s.joined.clear(); s.roomPeers.clear();
   s.broadcasts = [];
+  s.disconnect.mockClear();
   Object.assign(transportState, {
     roomCode: null, chatMode: "room", activeDmPeerId: null, roomUsers: [], messages: [],
     inCall: false, callRoomCode: null, callPeerIds: new Set(), callPeerRooms: new Map(),
     transmissionViewers: new Map(),
+  });
+});
+
+describe("unload teardown", () => {
+  it("does not disconnect before a navigation confirmation can be cancelled", () => {
+    window.dispatchEvent(new Event("beforeunload", { cancelable: true }));
+    expect(s.disconnect).not.toHaveBeenCalled();
+  });
+
+  it("disconnects when the page actually leaves", () => {
+    window.dispatchEvent(new Event("pagehide"));
+    expect(s.disconnect).toHaveBeenCalledOnce();
   });
 });
 

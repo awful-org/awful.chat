@@ -1,8 +1,11 @@
 import { getMessage } from "$lib/storage";
 import {
   loadMoreMessages,
+  selectChannel,
   transportState,
 } from "$lib/transport/transport.svelte";
+import { messageChannel } from "$lib/channels";
+import { currentChannelOf, openingChannelOf } from "$lib/channel-view.svelte";
 import { requestJumpToMessage } from "$lib/ui-state.svelte";
 
 /** At most this many pages are read back to reach a message. */
@@ -29,11 +32,31 @@ export function revealInFlight(): boolean {
 export async function revealMessage(
   roomCode: string,
   id: string,
-  lamport: number
+  lamport: number,
+  /**
+   * The channel the message is in (channels.ts), when the caller knows it.
+   * Otherwise it is read from storage for a message not on screen: the page
+   * on screen is one channel's, and a search hit or a pin can be in another.
+   */
+  channel?: string
 ): Promise<void> {
   _inFlight += 1;
   try {
     if (transportState.roomCode !== roomCode) return;
+    // One being opened would put its page in place of the message's, on
+    // screen or not: opening the message's own channel calls it off.
+    const opening = openingChannelOf(roomCode) !== null;
+    if (
+      !roomCode.startsWith("dm-") &&
+      (opening || !transportState.messages.some((m) => m.id === id))
+    ) {
+      const where =
+        channel ?? messageChannel((await getMessage(id).catch(() => undefined)) ?? {});
+      if (opening || where !== currentChannelOf(roomCode)) {
+        if (!(await selectChannel(roomCode, where))) return;
+        if (transportState.roomCode !== roomCode) return;
+      }
+    }
     const oldest = transportState.messages[0];
     if (
       oldest &&
@@ -60,7 +83,7 @@ export async function revealStored(roomCode: string, id: string): Promise<void> 
   try {
     const stored = await getMessage(id).catch(() => undefined);
     if (!stored || stored.roomCode !== roomCode) return;
-    await revealMessage(roomCode, stored.id, stored.lamport);
+    await revealMessage(roomCode, stored.id, stored.lamport, messageChannel(stored));
   } finally {
     _inFlight -= 1;
   }

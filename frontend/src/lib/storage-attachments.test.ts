@@ -72,6 +72,9 @@ it("a database from before the index finds its rows through it once upgraded", a
   await new Promise<void>((resolve, reject) => {
     const open = indexedDB.open("awful-chat", 8);
     open.onupgradeneeded = () => {
+      // Every real v8 database has a messages store (it is v1's); later
+      // upgrade steps index it, and without it the upgrade throws.
+      open.result.createObjectStore("messages", { keyPath: "id" });
       const store = open.result.createObjectStore("attachments", { keyPath: "id" });
       store.createIndex("byMessage", "messageId", { unique: false });
       store.createIndex("byInfoHash", "infoHash", { unique: false });

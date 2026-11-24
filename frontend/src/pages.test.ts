@@ -140,7 +140,9 @@ describe("routeFor", () => {
     expect(routeFor("/share-target")).toBe("app");
     // Matched exactly: "/app/" is the landing page.
     expect(routeFor("/app/")).toBe("landing");
-    expect(routeFor("/r")).toBe("landing");
+    // Not /r: some apps drop the slash of an invite link, /r#<code>.
+    expect(routeFor("/r")).toBe("app");
+    expect(routeFor("/rx")).toBe("landing");
   });
 
   it("knows /qs and /qc only when the instance serves them", async () => {

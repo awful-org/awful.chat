@@ -20,6 +20,8 @@ export enum MessageType {
   VoiceRedial = "voice_redial",
   VoiceSignal = "voice_signal",
   RoomName = "room_name",
+  /** A room's channel list (channels.ts); older builds ignore the type. */
+  ChannelList = "channel_list",
   PluginEphemeral = "plugin_ephemeral",
   Typing = "typing",
   // room users - wire only, never persisted
@@ -63,11 +65,17 @@ export interface Message {
   senderName: string;
   senderDid?: string;
   sig?: string; // ed25519 over the canonical form (see messaging.ts)
-  sigV?: number; // canonical version: absent = v1, 2 = covers reactions/reply/meta
+  sigV?: number; // canonical version: absent = v1, 2 = covers reactions/reply/meta, 3 = type/room, 4 = channel
   timestamp: number; // wall clock; orders the timeline, and is displayed
   lamport: number; // logical clock; tiebreaks the timeline, orders plugin folds
   type: ChatMessageType;
   content: string;
+  /**
+   * The channel it was written in (channels.ts). Absent for the room's
+   * original chat - never the empty string - and always absent in a DM.
+   * Signed (sigV 4) whenever present.
+   */
+  channel?: string;
   meta?: FileMeta;
   attachments: string[]; // Attachment.id refs
   replyTo?: ReplyTo;
@@ -160,6 +168,8 @@ export interface WireChatMessage {
   timestamp: number;
   lamport: number;
   content: string;
+  /** See Message.channel. Checked by verifyIncoming before anything else uses it. */
+  channel?: string;
   meta?: FileMeta;
   replyTo?: ReplyTo;
   reactionTo?: string;
@@ -236,6 +246,13 @@ export interface WireCallPresence {
   type: MessageType.CallPresence;
   inCall: boolean;
   roomCode?: string; // the room where they're calling
+  /**
+   * A call in a voice channel other than the room's default one names its
+   * room here instead of in roomCode, with the channel beside it. See
+   * callPresenceFields in transport/voice-channel.ts for why.
+   */
+  voiceRoomCode?: string;
+  voiceChannel?: string;
 }
 
 export interface WireCallState {
@@ -288,6 +305,12 @@ export interface WireWatchPresence {
 export interface WireTyping {
   type: MessageType.Typing;
   typing: boolean;
+  /**
+   * The room's channel being typed in (channels.ts). Absent for the original
+   * chat, so an older build, which only knows that one, reads the frame as
+   * it always did.
+   */
+  channel?: string;
 }
 
 export interface WirePluginEphemeral {
@@ -317,6 +340,20 @@ export interface WireRoomName {
   movedFrom?: string;
   /** When this name was chosen (ms); the newest wins (room-name.ts). */
   nameAt?: number;
+}
+
+/**
+ * A room's channel list (channels.ts), announced the way a room name is: on
+ * join, on a change, and in answer to a member whose list is behind ours.
+ * Every field is untrusted; the receiver keeps only entries that parse.
+ */
+export interface WireChannelList {
+  type: MessageType.ChannelList;
+  /** Which room; required on a direct send, see WireRoomName.roomCode. */
+  roomCode?: string;
+  channels: unknown[];
+  /** Set on an answer, which is never answered in turn. */
+  answer?: true;
 }
 
 export interface WireJoinRoom {
@@ -430,6 +467,7 @@ export type AnyWireMessage =
   | WirePluginEphemeral
   | WireTyping
   | WireRoomName
+  | WireChannelList
   | WireJoinRoom
   | WireLeaveRoom
   | WireRoomUsersSync
@@ -512,6 +550,8 @@ export function wireToMessage(
     lamport: wire.lamport,
     type: wire.type,
     content: wire.content,
+    // verifyIncoming has already refused a malformed one; absent stays absent.
+    ...(typeof wire.channel === "string" && wire.channel ? { channel: wire.channel } : {}),
     meta: wire.meta,
     attachments: [],
     replyTo: boundReplyTo(wire.replyTo),
@@ -534,6 +574,7 @@ export function messageToWire(msg: Message): WireChatMessage {
     timestamp: msg.timestamp,
     lamport: msg.lamport,
     content: msg.content,
+    ...(msg.channel ? { channel: msg.channel } : {}),
     meta: msg.meta,
     replyTo: msg.replyTo,
     reactionTo: msg.reactionTo,

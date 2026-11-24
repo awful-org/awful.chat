@@ -17,7 +17,7 @@
   import UnlockIdentity from "./UnlockIdentity.svelte";
 
   // What AppView does when it mounts locked: the invitation leaves the
-  // address bar at once, and waits in memory for AppView to join it.
+  // address bar at once, and waits (parkedRoom) for AppView to join it.
   parkedRoom.code = consumeRoomLocation() ?? parkedRoom.code;
 
   // And on every navigation, as AppView's popstate handler does while locked:

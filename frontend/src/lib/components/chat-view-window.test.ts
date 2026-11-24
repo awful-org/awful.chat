@@ -55,9 +55,9 @@ describe("ChatView's window over the rows it holds", () => {
   it("never lets a finished send clear a reply picked while it was sending", () => {
     // Text, slash command, GIF link and GIF file.
     expect(source.match(/clearSentReply\(sentReplyId\)/g)).toHaveLength(4);
-    // The plain clears left: the guard itself, Escape, and a file send
-    // emptying the composer as it starts.
-    expect(source.match(/replyTargetId = null;/g)).toHaveLength(3);
+    // The plain clears left: the guard itself, Escape, a file send
+    // emptying the composer as it starts, and a switch to another channel.
+    expect(source.match(/replyTargetId = null;/g)).toHaveLength(4);
   });
 
   // Double-click to reply goes through the same startReply as the button.

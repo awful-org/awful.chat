@@ -64,9 +64,29 @@ import {
   cleanupInactiveParticipants,
   getDeletedFloor,
   addRoomParticipants,
+  mergeRoomChannels,
   MAX_ROOM_PARTICIPANTS,
   type DMRoom,
 } from "../storage";
+import {
+  createChannelEntry,
+  deleteChannelEntry,
+  isChannelId,
+  messageChannel,
+  parseChannelList,
+  renameChannelEntry,
+  reorderChannelEntries,
+  type Channel,
+  type ChannelKind,
+} from "../channels";
+import {
+  currentChannelOf,
+  forgetCurrentChannel,
+  openingChannelOf,
+  setCurrentChannel,
+  setOpeningChannel,
+} from "../channel-view.svelte";
+import { forgetStillFrames } from "../still-frames";
 import { normalizeWireName } from "../wire-name";
 import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
@@ -83,6 +103,7 @@ import {
   type WirePluginEphemeral,
   type WireProfile,
   type WireRoomName,
+  type WireChannelList,
   type WireRoomUsersSync,
   type WireCallState,
   type WireTyping,
@@ -97,6 +118,8 @@ import {
   refreshDmRooms,
   renameRoom,
   noteRoomActivity,
+  noteRoomChannels,
+  roomChannel,
   roomsStore,
   loadRooms,
 } from "../rooms.svelte";
@@ -107,7 +130,7 @@ import type { FileDescriptor, FileTransferSnapshot } from "./types";
 import { LibP2PTransport } from "./libp2p/transport";
 import { refreshTurnCredentials } from "./ice-server-list";
 import { LibP2PVoice } from "./libp2p/voice";
-import { verifyIncoming, type VerifyVerdict } from "./verify-incoming";
+import { isCurrentSigVersion, verifyIncoming, type VerifyVerdict } from "./verify-incoming";
 import { messageIdAllowedFor, newMessageId } from "../message-id";
 import { LiveUpdateAdmission } from "../room-security/live-updates";
 
@@ -183,6 +206,7 @@ import { _sendCallPresence, _sendCallState, leaveCall } from "./call.svelte";
 import { _sendWatchPresence } from "./transmission.svelte";
 import { watchedFromWire } from "$lib/watch-presence";
 import { clearTyping, noteTyping, typingPrefs } from "$lib/typing.svelte";
+import { typingFrameChannel, typingKey } from "$lib/typing";
 import {
   type DmPayload,
   encodeDmAckEnvelope,
@@ -338,6 +362,14 @@ function _parsePluginPayload(
 
 import { playPeerJoinSound, playPeerLeaveSound } from "../sounds";
 import { peerCallChime } from "./call-chime";
+import {
+  DEFAULT_VOICE_CHANNEL,
+  callFromPresence,
+  callOfPeer,
+  peersInCall,
+  sameCall,
+  type CallTag,
+} from "./voice-channel";
 import { sanitizePeerProfile } from "../profile-sanitize";
 import type { PeerProfile } from "../storage";
 
@@ -347,6 +379,11 @@ export type { Message };
 // ── State shapes ──────────────────────────────────────────────────────────────
 
 interface SendMessageOptions {
+  /**
+   * The channel to send into (channels.ts). Absent: the one open in the
+   * room. Never set in a DM, which has none.
+   */
+  channel?: string;
   replyTo?: Message["replyTo"];
   type?: ChatMessageType;
   meta?: FileMeta;
@@ -468,6 +505,13 @@ interface TransportState {
   error: string | null;
   callPeerIds: Set<string>;
   callPeerRooms: Map<string, string>; // peerId -> roomCode they're calling in
+  /**
+   * peerId -> the voice channel of that room they are in ("" is the room's
+   * default call). Kept beside callPeerRooms, entry for entry, rather than
+   * folded into it: every reader that only asks "which room" keeps working,
+   * and a call is (room, channel) for whoever asks that.
+   */
+  callPeerVoiceChannels: Map<string, string>;
   transmissionViewers: Map<string, Set<string>>; // sharer peerId -> viewer peerIds
   pendingTransmissions: Map<string, string>;
   /**
@@ -484,6 +528,11 @@ interface TransportState {
   activeDmPeerId: string | null;
   dmVersion: number;
   callRoomCode: string | null;
+  /**
+   * The voice channel of callRoomCode our call is in; "" is the room's
+   * default call, and what this reads whenever we are in no call.
+   */
+  callVoiceChannel: string;
   /**
    * getUserMedia failed, so this call is listen-only. Fed by voice.ts's
    * mic-unavailable/mic-available statuses; withdrawn as soon as a later mic
@@ -536,6 +585,7 @@ export const transportState = $state<TransportState>({
   error: null,
   callPeerIds: new Set(),
   callPeerRooms: new Map(),
+  callPeerVoiceChannels: new Map(),
   transmissionViewers: new Map(),
   pendingTransmissions: new Map(),
   watchingTransmissions: new Map(),
@@ -546,6 +596,7 @@ export const transportState = $state<TransportState>({
   activeDmPeerId: null,
   dmVersion: 0,
   callRoomCode: null,
+  callVoiceChannel: DEFAULT_VOICE_CHANNEL,
   micUnavailable: false,
   dmQueuedP2POnly: new Set(),
 });
@@ -725,7 +776,9 @@ _transport.setDmIntroduction(() => {
 (peer, did, state) => onIntroductionUpgraded(_introductionHookDeps, peer, did, state));
 export const _voice = new LibP2PVoice(_transport, _dtln, _dfn);
 export const _video = new MediasoupVideo();
-_video.setRoomAdmission((room, nonce, peer) => _transport.sfuAdmission(room, nonce, peer));
+_video.setRoomAdmission((room, nonce, peer, voiceChannel) =>
+  _transport.sfuAdmission(room, nonce, peer, voiceChannel)
+);
 _video.setJoinSigner((nonce, room, peer) =>
   signSfuJoin(_ephemeralSession ? quickSessionSeed() : deviceKeySeed(), nonce, room, peer)
 );
@@ -739,15 +792,29 @@ initVoice(_voice, _dtln);
 initTransmission(_video);
 initFiles(_fileTransport);
 
+/** Our own call: the room and the voice channel within it. */
+export function myCall(): CallTag | null {
+  const roomCode = transportState.callRoomCode;
+  return roomCode ? { roomCode, voiceChannel: transportState.callVoiceChannel } : null;
+}
+
+/** The call the roster puts this peer in, if any. */
+function _callOf(peerId: string): CallTag | null {
+  return callOfPeer(transportState.callPeerRooms, transportState.callPeerVoiceChannels, peerId);
+}
+
+/** Is this peer in our call - our room AND our voice channel? */
+export function isInMyCall(peerId: string): boolean {
+  return sameCall(_callOf(peerId), myCall());
+}
+
 // Who the SFU is allowed to name as a producer: the same roster the voice
 // layer gets. Without it the media server decides which peerId a camera or
 // screen share is filed under, and that peerId is what the tile, the name
-// and the avatar are drawn from.
-_video.setCallPeerAdmission(
-  (peerId) =>
-    !!transportState.callRoomCode &&
-    transportState.callPeerRooms.get(peerId) === transportState.callRoomCode
-);
+// and the avatar are drawn from. Each voice channel has its own SFU room, so
+// this is a second lock, not the only one: a producer named for somebody in
+// another channel of the room is refused here too.
+_video.setCallPeerAdmission((peerId) => isInMyCall(peerId));
 
 /** Resolve the SFU host list once per call; each entry may be unparseable. */
 function _diagSfuHosts(): string[] {
@@ -1034,11 +1101,8 @@ if (typeof window !== "undefined") {
       }
     }
   };
-  const onUnload = () => {
-    sayGoodbye();
-    _transport.disconnect();
-  };
-  window.addEventListener("beforeunload", onUnload);
+  // beforeunload can be cancelled by an active call (or transfer). Do not
+  // tear anything down until the browser actually leaves the page.
   window.addEventListener("pagehide", (event) => {
     sayGoodbye();
     // A PERSISTED pagehide is not an unload: the page goes into the
@@ -1115,6 +1179,35 @@ function _sendRoomName(peerId?: string, roomCode: string | null = transportState
     if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
     _transport.sendRoom(peerId, roomCode, payload);
   } else _transport.broadcast(payload, roomCode);
+}
+
+/**
+ * Announce a room's channel list (channels.ts): to the room, or to one peer -
+ * a welcome, or the answer to a member whose list is behind ours. The same
+ * gates as _sendRoomName, for the same reason: the frame names the room code.
+ * A room nobody made a channel in announces nothing, so it sends exactly
+ * what it sent before channels existed.
+ */
+function _sendChannelList(
+  peerId?: string,
+  roomCode: string | null = transportState.roomCode,
+  answer = false
+): void {
+  if (!roomCode || roomCode.startsWith("dm-") || isLegacyArchive(roomCode)) return;
+  const room = roomsStore.rooms.find((r) => r.roomCode === roomCode);
+  const channels = room?.channels ?? [];
+  if (!channels.length) return;
+  const frame: WireChannelList = {
+    type: MessageType.ChannelList,
+    roomCode,
+    channels,
+    ...(answer ? { answer: true as const } : {}),
+  };
+  const payload = encode(frame);
+  if (peerId) {
+    if (!_transport.peersInRoom(roomCode).includes(peerId)) return;
+    void _transport.sendRoom(peerId, roomCode, payload).catch(() => {});
+  } else void _transport.broadcast(payload, roomCode).catch(() => {});
 }
 
 /** `missingOnly`, with a peerId: send them only what they were never delivered. */
@@ -1425,8 +1518,12 @@ if (typeof window !== "undefined") {
       const now = Date.now();
       let purged = false;
       const roomNext = new Map(transportState.callPeerRooms);
+      const channelNext = new Map(transportState.callPeerVoiceChannels);
       const idsNext = new Set(transportState.callPeerIds);
       const statesNext = new Map(transportState.callPeerStates);
+      // Per entry, and an entry is one peer in one (room, channel): a peer is
+      // in one call at a time, so each channel's ghosts age on their own
+      // clocks, and somebody who moved channel was moved, not duplicated.
       for (const [pid] of transportState.callPeerRooms) {
         if (live.has(pid)) {
           _callPeerSeen.set(pid, now);
@@ -1441,8 +1538,9 @@ if (typeof window !== "undefined") {
         if (now - seen > CALL_PRESENCE_TTL_MS) {
           // For everyone still in the call this IS a disconnect - same
           // chime as a drop, not a silent vanishing.
-          _peerCallSound(roomNext.get(pid), false, idsNext.has(pid));
+          _peerCallSound(_callOf(pid), null);
           roomNext.delete(pid);
+          channelNext.delete(pid);
           // Out of the call is out of its audience, as when they leave it.
           _dropViewer(pid);
           idsNext.delete(pid);
@@ -1453,6 +1551,7 @@ if (typeof window !== "undefined") {
       }
       if (purged) {
         transportState.callPeerRooms = roomNext;
+        transportState.callPeerVoiceChannels = channelNext;
         transportState.callPeerIds = idsNext;
         transportState.callPeerStates = statesNext;
       }
@@ -1659,20 +1758,87 @@ async function _sendDigestForRoom(
 
 // ── History ───────────────────────────────────────────────────────────────────
 
+/**
+ * The channel whose page the view shows for a room (channels.ts): the one
+ * open, or undefined - the whole room - for a DM, which has no channels. A
+ * channel that was deleted, or is not in the list, puts the room back in its
+ * original chat.
+ */
+function _viewChannel(roomCode: string): string | undefined {
+  if (roomCode.startsWith("dm-")) return undefined;
+  const channel = currentChannelOf(roomCode);
+  if (channel && !roomChannel(roomCode, channel)) {
+    setCurrentChannel(roomCode, "");
+    return "";
+  }
+  return channel;
+}
+
+/**
+ * Rows of the channel being opened (selectChannel) that land while its page
+ * is read: the read may have missed them, and the page on screen, where they
+ * would go, is another channel's. Put in with the page.
+ */
+let _openingRows: { roomCode: string; channel: string; rows: Message[] } | null = null;
+
+function _noteOpeningRows(roomCode: string, rows: readonly Message[]): void {
+  const into = _openingRows;
+  if (!into || into.roomCode !== roomCode) return;
+  into.rows.push(...rows.filter((m) => messageChannel(m) === into.channel));
+}
+
+/** The page read, and what landed during the read; none below a full page's floor. */
+function _withOpeningRows(msgs: Message[], rows: readonly Message[], capped: boolean): Message[] {
+  const page = [...msgs].sort(MSG_ORDER);
+  const floor = capped ? page[0] : undefined;
+  const byId = new Map(page.map((m) => [m.id, m]));
+  for (const m of rows) {
+    if (!byId.has(m.id) && (!floor || MSG_ORDER(m, floor) >= 0)) byId.set(m.id, m);
+  }
+  return [...byId.values()].sort(MSG_ORDER);
+}
+
+/** Put a message just stored on the page on screen, if it is of that page. */
+function _showInView(msg: Message): boolean {
+  if (transportState.roomCode !== msg.roomCode) return false;
+  if (!_inViewChannel(msg)) {
+    _noteOpeningRows(msg.roomCode, [msg]);
+    return false;
+  }
+  transportState.messages = appendSorted(transportState.messages, msg);
+  return true;
+}
+
 export async function _loadHistory(
   roomCode: string,
-  stillCurrent: () => boolean = () => true
+  stillCurrent: () => boolean = () => true,
+  /** A channel to open along with its page (selectChannel); else the open one. */
+  opening?: string
 ): Promise<void> {
   const page = { capped: false };
-  transportState.historyRoom = null;
+  // Opening one, the page on screen is whole until the new one replaces it.
+  if (opening === undefined) transportState.historyRoom = null;
+  const channel = opening ?? _viewChannel(roomCode);
+  const landing = opening === undefined ? null : { roomCode, channel: opening, rows: [] as Message[] };
+  if (landing) _openingRows = landing;
   const [msgs, profiles, roomProfiles] = await Promise.all([
-    getMessages(roomCode, undefined, page),
+    getMessages(roomCode, undefined, page, channel),
     getAllPeerProfiles(),
     getAllPeerRoomProfiles(roomCode),
-  ]);
+  ]).finally(() => {
+    if (landing && _openingRows === landing) _openingRows = null;
+  });
+  // A channel picked while this read ran has a read of its own under way.
   if (!stillCurrent()) return;
+  if (opening === undefined) {
+    if (_viewChannel(roomCode) !== channel) return;
+  } else {
+    // Deleted while its page was read: there is nothing to open.
+    if (opening && !roomChannel(roomCode, opening)) return;
+    setCurrentChannel(roomCode, opening);
+  }
   // Storage and the live view share the same logical sequence/ID ordering.
-  transportState.messages = [...msgs].sort(MSG_ORDER);
+  transportState.messages = _withOpeningRows(msgs, landing?.rows ?? [], page.capped);
   // Whether a first read filled a page is the only honest answer to "is
   // there more?", and it is known here and nowhere else.
   transportState.historyCapped = page.capped;
@@ -2273,7 +2439,11 @@ async function _storeSyncBatch(
     // every repair tick forever. Leaving v2 in the "signed, might be repaired
     // by a better copy" bucket below would have done exactly that to the
     // whole pre-v3 backlog.
-    if (!m.sig || m.sigV !== 3) {
+    //
+    // A row whose channel tag is malformed, or does not match its signature
+    // version, is refused the same way on every retry, so it joins them.
+    const verdict = verdicts[i];
+    if (!m.sig || !isCurrentSigVersion(m.sigV) || (!verdict.ok && verdict.reason === "channel")) {
       const at = permanentMax.get(m.senderId);
       if (at === undefined || m.lamport > at) {
         permanentMax.set(m.senderId, m.lamport);
@@ -2545,6 +2715,11 @@ async function _mergeSyncedIntoView(
   rows: Message[]
 ): Promise<void> {
   if (transportState.roomCode !== roomCode) return;
+  // The page on screen is one channel's: rows of the room's other channels
+  // are stored, counted and announced, and wait there until it is opened.
+  const channel = _viewChannel(roomCode);
+  _noteOpeningRows(roomCode, rows);
+  if (channel !== undefined) rows = rows.filter((m) => messageChannel(m) === channel);
   const onScreen = transportState.messages;
   const windowFloor = onScreen[0];
   const existingIds = new Set(onScreen.map((m) => m.id));
@@ -2559,8 +2734,8 @@ async function _mergeSyncedIntoView(
   }
 
   const page = { capped: false };
-  const newest = await getMessages(roomCode, undefined, page);
-  if (transportState.roomCode !== roomCode) return;
+  const newest = await getMessages(roomCode, undefined, page, channel);
+  if (transportState.roomCode !== roomCode || _viewChannel(roomCode) !== channel) return;
   // Identity-preserving: a row already on screen keeps its OBJECT, not
   // just its key. A re-read that built brand-new objects for every id made
   // every mounted row see all its props change and re-render. Message rows
@@ -2889,17 +3064,12 @@ async function _handleProfile(
 }
 
 /** Chime when somebody else joins or leaves the call we are sitting in. */
-function _peerCallSound(
-  room: string | undefined,
-  nowInCall: boolean,
-  wasInCall: boolean
-): void {
+function _peerCallSound(before: CallTag | null, after: CallTag | null): void {
   const chime = peerCallChime({
     imInCall: transportState.inCall,
-    myCallRoom: transportState.callRoomCode,
-    room,
-    wasInCall,
-    nowInCall,
+    myCall: myCall(),
+    before,
+    after,
   });
   if (chime === "join") playPeerJoinSound();
   else if (chime === "leave") playPeerLeaveSound();
@@ -2936,16 +3106,20 @@ export function _handleWatchPresence(
   // call: any vouched room was enough, and a DM is one - so a DM's peer, a
   // stranger's request included, could list itself watching a share in a
   // private room's call it had no part in.
-  const theirRoom = transportState.callPeerRooms.get(viewerPeerId);
+  //
+  // Our call is a room AND a voice channel: somebody in another channel of
+  // the same room watches nothing of ours, since each channel's shares live
+  // in that channel's own SFU room.
+  const theirCall = _callOf(viewerPeerId);
   const admitted =
-    !!theirRoom &&
-    theirRoom === transportState.callRoomCode &&
-    _transport.isRoomPeer(theirRoom, viewerPeerId);
+    !!theirCall &&
+    sameCall(theirCall, myCall()) &&
+    _transport.isRoomPeer(theirCall.roomCode, viewerPeerId);
   if (admitted) {
     const self = _transport.selfId();
     for (const sharer of watching) {
       if (!looksLikePeerId(sharer)) continue;
-      if (sharer !== self && transportState.callPeerRooms.get(sharer) !== theirRoom) continue;
+      if (sharer !== self && !sameCall(_callOf(sharer), theirCall)) continue;
       const set = new Set(next.get(sharer) ?? []);
       set.add(viewerPeerId);
       next.set(sharer, set);
@@ -2973,20 +3147,19 @@ function _dropViewer(peerId: string): void {
 const _callPeerSeen = new Map<string, number>();
 const CALL_PRESENCE_TTL_MS = 60_000;
 
-function _handleCallPresence(
-  peerId: string,
-  inCall: boolean,
-  roomCode?: string
-): void {
+/**
+ * A peer's call presence, as callFromPresence read it off the wire: the call
+ * (room and voice channel) it says it is in, or null for none.
+ */
+function _handleCallPresence(peerId: string, call: CallTag | null): void {
   const next = new Set(transportState.callPeerIds);
   const roomNext = new Map(transportState.callPeerRooms);
-  const wasInCall = next.has(peerId);
-  const theirRoom = roomNext.get(peerId);
+  const channelNext = new Map(transportState.callPeerVoiceChannels);
+  const before = _callOf(peerId);
 
   if (
-    inCall &&
-    roomCode &&
-    _transport.rooms().includes(roomCode) &&
+    call &&
+    _transport.rooms().includes(call.roomCode) &&
     // ...and the SENDER has to be in that room too. Only OUR membership was
     // ever checked, so any peer that could reach us could claim to be in a
     // call in a room they are not in, land in callPeerRooms, and be handed
@@ -2996,35 +3169,36 @@ function _handleCallPresence(
     // intersected with the connection list: a presence frame legitimately
     // reaches us through the gossip mesh from a member we have not dialled,
     // which is exactly the case the dialNow below exists for.
-    _transport.isRoomPeer(roomCode, peerId)
+    //
+    // The voice channel needs no check of its own beyond being well formed
+    // (callFromPresence): a member may join any channel of its room, so
+    // naming one is no claim we could verify further. What keeps a channel
+    // from reaching our microphone is that _syncVoiceRoster admits only the
+    // channel WE joined, and nothing on the wire can change which that is.
+    _transport.isRoomPeer(call.roomCode, peerId)
   ) {
     // Membership-gated like the handlers above: "in a call" for a room we
     // never joined is unverifiable noise - at best meaningless, at worst a
     // fake ring sound from any connected peer.
-    // Moved to another room's call: whatever they watched was in the old one.
-    if (theirRoom && theirRoom !== roomCode) _dropViewer(peerId);
+    //
+    // Moved to another call - another room's, or another voice channel of
+    // this one: they left the one they were in, for everything that was
+    // theirs in it. Shares and what they watched live in a channel's own SFU
+    // room, and a voice tile belongs to the call it was in.
+    if (before && !sameCall(before, call)) _leftCallCleanup(peerId);
     next.add(peerId);
-    roomNext.set(peerId, roomCode);
+    roomNext.set(peerId, call.roomCode);
+    channelNext.set(peerId, call.voiceChannel);
     _callPeerSeen.set(peerId, Date.now());
-    _peerCallSound(roomCode, true, wasInCall);
+    _peerCallSound(before, call);
   } else {
     _callPeerSeen.delete(peerId);
     next.delete(peerId);
     roomNext.delete(peerId);
-    _peerCallSound(theirRoom, false, wasInCall);
+    channelNext.delete(peerId);
+    _peerCallSound(before, null);
 
-    const parts = new Map(transportState.participants);
-    parts.delete(peerId);
-    transportState.participants = parts;
-
-    const txNext = new Map(transportState.pendingTransmissions);
-    txNext.delete(peerId);
-    transportState.pendingTransmissions = txNext;
-
-    _forgetWatched(peerId);
-    // Out of the call is out of its audience: the entry used to outlive the
-    // presence that admitted it, until a disconnect or their next frame.
-    _dropViewer(peerId);
+    _leftCallCleanup(peerId);
 
     const callStateNext = new Map(transportState.callPeerStates);
     callStateNext.delete(peerId);
@@ -3033,14 +3207,15 @@ function _handleCallPresence(
 
   transportState.callPeerIds = next;
   transportState.callPeerRooms = roomNext;
+  transportState.callPeerVoiceChannels = channelNext;
   // Somebody in OUR call that we have no peer connection to is the one case
   // worth jumping the dial backoff for: no connection means no voice link, and
   // the presence frame we just handled may have come the long way round via
   // gossipsub rather than from them directly.
   if (
-    inCall &&
+    call &&
     transportState.inCall &&
-    roomCode === transportState.callRoomCode &&
+    sameCall(call, myCall()) &&
     !_transport.peers().includes(peerId)
   ) {
     _transport.dialNow(peerId);
@@ -3049,23 +3224,51 @@ function _handleCallPresence(
 }
 
 /**
+ * What a peer leaves behind when it leaves a call: its tile, its share on
+ * offer, the share of theirs we watched, its place in a share's audience.
+ * Its mute/deafen badge is not here: that follows the person, not the call,
+ * and goes only when they are in no call at all.
+ */
+function _leftCallCleanup(peerId: string): void {
+  if (transportState.participants.has(peerId)) {
+    const parts = new Map(transportState.participants);
+    parts.delete(peerId);
+    transportState.participants = parts;
+  }
+
+  if (transportState.pendingTransmissions.has(peerId)) {
+    const txNext = new Map(transportState.pendingTransmissions);
+    txNext.delete(peerId);
+    transportState.pendingTransmissions = txNext;
+  }
+
+  _forgetWatched(peerId);
+  // Out of the call is out of its audience: the entry used to outlive the
+  // presence that admitted it, until a disconnect or their next frame.
+  _dropViewer(peerId);
+}
+
+/**
  * Tell the voice layer who it should have a link with: everyone whose call
- * presence puts them in OUR call's room. The voice layer cannot work this out
- * itself - it only sees libp2p connections, which say nothing about who is in
- * a call - and without it, a link was only ever created on a connect event,
- * so joining a call over an already-open connection silently got no audio.
+ * presence puts them in OUR call - our room and our voice channel. The voice
+ * layer cannot work this out itself - it only sees libp2p connections, which
+ * say nothing about who is in a call - and without it, a link was only ever
+ * created on a connect event, so joining a call over an already-open
+ * connection silently got no audio.
+ *
+ * This roster is the voice layer's whole admission rule: an offer from
+ * anybody outside it is never answered, so a member sitting in another
+ * channel of the same room never gets a link, and never our microphone.
  */
 export function _syncVoiceRoster(): void {
-  const room = transportState.callRoomCode;
-  if (!transportState.inCall || !room) {
+  const call = myCall();
+  if (!transportState.inCall || !call) {
     _voice.setCallPeers([]);
     return;
   }
-  const peers: string[] = [];
-  for (const [peerId, theirRoom] of transportState.callPeerRooms) {
-    if (theirRoom === room) peers.push(peerId);
-  }
-  _voice.setCallPeers(peers);
+  _voice.setCallPeers(
+    peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, call)
+  );
   // Same roster, same moment: the SFU's producer announcements are gated on
   // it too, and presence routinely lands after the announcement it admits.
   _video.retryDeferredProducers();
@@ -3087,7 +3290,14 @@ function _handleTyping(
   const did = _peerIdToDid.get(peerId);
   if (!did || did === identityStore.did) return;
   if (!room.startsWith("dm-")) {
-    noteTyping(room, did, msg.typing);
+    // Per channel: dots in one channel are not shown in another.
+    const channel = typingFrameChannel(msg.channel, isChannelId);
+    if (channel === null) return;
+    // Only a channel the room's list holds. Each channel is a typer list of
+    // its own, capped per list, so any id a member cared to name would be
+    // one more list - and nothing could show the dots of one not listed.
+    if (channel && !roomChannel(room, channel)) return;
+    noteTyping(typingKey(room, channel), did, msg.typing);
     return;
   }
   // Same binding a DM message gets: the conversation must be the one
@@ -3157,6 +3367,57 @@ function _handleRoomName(msg: WireRoomName, room: string | null, peerId: string)
   // secure room: the claim is about THIS room, from one of its members.
   if (msg.movedFrom !== undefined && room !== null && target.startsWith("rd2_")) {
     _claimLegacyPredecessor(peerId, target, msg.movedFrom);
+  }
+}
+
+/**
+ * A member's channel list (channels.ts): folded into ours entry by entry,
+ * and answered with ours when they are behind - the way room names catch a
+ * member up. Trust as for a room name: the authenticated topic names the
+ * room, and a direct send may only speak of a room we have joined. Any
+ * member may change the list; rooms have no roles.
+ */
+function _handleChannelList(msg: WireChannelList, room: string | null, peerId: string): void {
+  const target = room ?? msg.roomCode;
+  if (typeof target !== "string" || !target) return;
+  if (target.startsWith("dm-") || isLegacyArchive(target)) return;
+  if (room === null && !_transport.rooms().includes(target)) return;
+  const incoming = parseChannelList(msg.channels);
+  _applyChannelList(peerId, target, incoming, msg.answer === true).catch(() => {});
+}
+
+async function _applyChannelList(
+  peerId: string,
+  target: string,
+  incoming: Channel[],
+  isAnswer: boolean
+): Promise<void> {
+  const result = await mergeRoomChannels(target, incoming);
+  if (!result) return;
+  if (result.changed) _noteChannels(target, result.merged);
+  // An answer is never answered: one exchange leaves both sides holding
+  // every entry either would take, so a second could only repeat it.
+  if (result.behind && !isAnswer) _sendChannelList(peerId, target, true);
+}
+
+/**
+ * A room's list changed (an announcement, or our own edit): mirror it, and
+ * if the channel open in the room is gone, go back to the original chat.
+ */
+function _noteChannels(roomCode: string, channels: Channel[]): void {
+  noteRoomChannels(roomCode, channels);
+  const open = currentChannelOf(roomCode);
+  if (!open || roomChannel(roomCode, open)) return;
+  // At once, not once the next page is read (selectChannel): a channel that
+  // is gone is neither kept on screen nor marked read. One already being
+  // opened instead stays the user's pick.
+  setCurrentChannel(roomCode, "");
+  if (transportState.roomCode !== roomCode) return;
+  transportState.messages = [];
+  transportState.historyRoom = null;
+  const opening = openingChannelOf(roomCode);
+  if (opening === null || (opening && !roomChannel(roomCode, opening))) {
+    void selectChannel(roomCode, "").catch(() => {});
   }
 }
 
@@ -3460,12 +3721,19 @@ function _announceMessage(
     .catch(() => {});
 }
 
+/** Whether a message of the open room belongs on the page on screen. */
+function _inViewChannel(msg: Message): boolean {
+  const channel = _viewChannel(msg.roomCode);
+  return channel === undefined || messageChannel(msg) === channel;
+}
+
 function _announce(msg: Message, opts: { viaMailbox?: boolean }): void {
   announceMessage(
     msg,
     {
       selfIds: _selfIds(),
       uiRoomCode: transportState.uiRoomCode,
+      uiChannel: currentChannelOf(transportState.uiRoomCode),
       resolveName: resolveMentionDisplayName,
     },
     opts
@@ -3657,10 +3925,9 @@ async function _handleChatMessage(
   if (isNewMessage) _announceMessage(msg);
 
   // Match on the open room, not the mode: DM file messages arrive through
-  // this path too, and the mode check kept them invisible until reopen.
-  if (isNewMessage && transportState.roomCode === msg.roomCode) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-  }
+  // this path too, and the mode check kept them invisible until reopen. And
+  // on the open channel: the page is that channel's alone.
+  if (isNewMessage) _showInView(msg);
 
   if (msg.type !== MessageType.File || !msg.meta?.files?.length) return;
 
@@ -3761,6 +4028,7 @@ _transport.on("roomPeers", (room, peerIds) => {
     // never heard about a call in it. All three handlers are idempotent, so
     // repeating them when the relay re-lists a peer costs a few small frames.
     _sendRoomName(pid, room);
+    _sendChannelList(pid, room);
     _sendCallFramesTo(pid);
     _sendRoomUsers(pid, room).catch(() => {});
     if (!_peerIdToDid.has(pid)) continue;
@@ -3815,7 +4083,10 @@ _transport.on("connect", (peerId) => {
   // nothing here; the "roomPeers" handler is what catches them up.
   // Every room we share, not just the one on screen: a rename made while this
   // peer was away otherwise reached them only if they happened to open it.
-  for (const room of _transport.rooms()) _sendRoomName(peerId, room);
+  for (const room of _transport.rooms()) {
+    _sendRoomName(peerId, room);
+    _sendChannelList(peerId, room);
+  }
   _sendCallFramesTo(peerId);
   _sendDigest(peerId);
   if (transportState.roomCode) {
@@ -3898,11 +4169,7 @@ _transport.on("disconnect", (peerId) => {
 
   // A peer that drops out never sends a leave, so the chime belongs here too.
   const calls = new Set(transportState.callPeerIds);
-  _peerCallSound(
-    transportState.callPeerRooms.get(peerId),
-    false,
-    calls.has(peerId)
-  );
+  _peerCallSound(_callOf(peerId), null);
   calls.delete(peerId);
   transportState.callPeerIds = calls;
 
@@ -3911,6 +4178,9 @@ _transport.on("disconnect", (peerId) => {
   const callRoomsNext = new Map(transportState.callPeerRooms);
   callRoomsNext.delete(peerId);
   transportState.callPeerRooms = callRoomsNext;
+  const callChannelsNext = new Map(transportState.callPeerVoiceChannels);
+  callChannelsNext.delete(peerId);
+  transportState.callPeerVoiceChannels = callChannelsNext;
   _syncVoiceRoster();
 
   const callStates = new Map(transportState.callPeerStates);
@@ -4633,7 +4903,7 @@ _transport.on("message", (peerId, data, room) => {
         _handleProfile(peerId, msg, room ?? null);
         break;
       case MessageType.CallPresence:
-        _handleCallPresence(peerId, msg.inCall, msg.roomCode);
+        _handleCallPresence(peerId, callFromPresence(msg));
         break;
       case MessageType.CallState:
         _handleCallState(peerId, msg);
@@ -4651,6 +4921,9 @@ _transport.on("message", (peerId, data, room) => {
         break;
       case MessageType.RoomName:
         _handleRoomName(msg, room, peerId);
+        break;
+      case MessageType.ChannelList:
+        _handleChannelList(msg, room, peerId);
         break;
       case MessageType.PluginEphemeral: {
         // Wire-only ephemeral messages: verify, fold to card state, but never persist.
@@ -4795,7 +5068,10 @@ _transport.on("message", (peerId, data, room) => {
         // clearing their own dots is nothing a "stopped" frame could not do.
         if (msg.type !== MessageType.Reaction && msg.type !== MessageType.PluginUpdate) {
           const author = _peerIdToDid.get(peerId);
-          if (author) clearTyping(room, author);
+          // In the channel it says it was written in; a malformed tag is
+          // refused by the verify below, and clearing dots harms nothing.
+          const written = typeof msg.channel === "string" ? msg.channel : "";
+          if (author) clearTyping(typingKey(room, written), author);
         }
         _verifyIncoming(msg, { room })
           .then((v) => {
@@ -5276,6 +5552,16 @@ function _disconnectWithoutBroadcasting(): void {
   _inboxHeardLive.clear();
   transportState.error = null;
   transportState.callPeerIds = new Set();
+  // Who sits in which call and channel was learned over this session's
+  // connections: the next session (maybe another identity) starts from none.
+  transportState.callPeerRooms = new Map();
+  transportState.callPeerVoiceChannels = new Map();
+  _callPeerSeen.clear();
+  // So do the avatars drawn for it.
+  forgetStillFrames();
+  // Which channel each room was left on is keyed by room code, the room's
+  // membership secret: it goes with the session, like the roster above.
+  forgetCurrentChannel();
   transportState.pendingTransmissions = new Map();
   transportState.watchingTransmissions = new Map();
   transportState.fileTransfers = new Map();
@@ -5457,9 +5743,12 @@ export async function sendMessage(
   }
   const roomCode = transportState.roomCode;
   if (!roomCode) throw new Error("Open a conversation before sending");
+  // Into the channel open in the room, unless the caller names one (a
+  // reaction goes where the message it reacts to is).
+  const channel = _sendChannel(roomCode, options.channel);
   const prepared = prepareOutgoingText(text);
   if (prepared.files.length) {
-    await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo });
+    await sendFiles(prepared.files, prepared.text, { roomCode, replyTo: options.replyTo, channel });
     return;
   }
 
@@ -5479,6 +5768,7 @@ export async function sendMessage(
     lamport,
     type: options.type ?? MessageType.Text,
     content: text,
+    ...(channel ? { channel } : {}),
     meta: options.meta,
     attachments: options.attachments ?? [],
     replyTo: options.replyTo,
@@ -5508,13 +5798,23 @@ export async function sendMessage(
 
   // Echo BEFORE the storage writes: seal + two IDB round-trips gated the
   // local echo, which read as send lag - the network send already left.
-  if (transportState.roomCode === roomCode) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-  }
+  _showInView(msg);
   applyMessageStatus(msg.id, msg.status);
 
-  markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
+}
+
+/**
+ * The channel a message sent now goes into: the one named, else the one
+ * open in the room. Never one in a DM. A channel that is not in the room's
+ * live list is refused rather than sent into: nobody could see the message.
+ */
+function _sendChannel(roomCode: string, named?: string): string {
+  if (roomCode.startsWith("dm-")) return "";
+  const channel = named ?? currentChannelOf(roomCode);
+  if (channel && !roomChannel(roomCode, channel)) throw new Error("That channel no longer exists");
+  return channel;
 }
 
 /**
@@ -5522,10 +5822,10 @@ export async function sendMessage(
  * queued: a "typing" that arrives late is wrong, not late. DMs go through
  * sendDmTyping, which knows the peer.
  */
-export function sendRoomTyping(roomCode: string, typing: boolean): void {
+export function sendRoomTyping(roomCode: string, typing: boolean, channel = ""): void {
   if (typing && !typingPrefs.sendTyping) return;
   if (roomCode.startsWith("dm-") || !_transport.isSecureRoom(roomCode)) return;
-  const frame: WireTyping = { type: MessageType.Typing, typing };
+  const frame: WireTyping = { type: MessageType.Typing, typing, ...(channel ? { channel } : {}) };
   void _transport.broadcast(encode(frame), roomCode).catch(() => {});
 }
 
@@ -5550,11 +5850,12 @@ export async function sendReply(text: string, target: Message): Promise<void> {
 export async function sendFiles(
   files: File[],
   text = "",
-  options: Pick<SendMessageOptions, "replyTo"> & { roomCode?: string } = {}
+  options: Pick<SendMessageOptions, "replyTo" | "channel"> & { roomCode?: string } = {}
 ): Promise<void> {
   const roomCode = options.roomCode ?? transportState.roomCode;
   requireWritableRoom(roomCode);
   if (!roomCode) throw new Error("Open a conversation before sending");
+  const channel = _sendChannel(roomCode, options.channel);
   const session = requireSession();
   const assertCurrent = () => {
     if (requireSession() !== session) throw new Error("Identity changed");
@@ -5646,6 +5947,7 @@ export async function sendFiles(
     lamport,
     type: MessageType.File,
     content: text.trim(),
+    ...(channel ? { channel } : {}),
     meta: {
       files: seeded.map((f) => ({ ...f, ...dimsByHash.get(f.infoHash) })),
     },
@@ -5674,11 +5976,9 @@ export async function sendFiles(
     msg.status = _broadcastChatWire(wire, roomCode) ? "sent" : "sending";
     applyMessageStatus(msg.id, msg.status);
   }
-  if (transportState.roomCode === roomCode) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-  }
+  _showInView(msg);
 
-  markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   noteRoomActivity(msg.roomCode, msg.timestamp);
 }
 
@@ -5692,6 +5992,8 @@ async function _postSignedRow(
   type: ChatMessageType,
   content: string,
   assertCurrent: () => void,
+  /** See _sendChannel; "" for a DM's call card. */
+  channel = "",
 ): Promise<Message> {
   const profile = await getOwnProfile(undefined, { skipBytes: true });
   assertCurrent();
@@ -5708,15 +6010,15 @@ async function _postSignedRow(
     lamport,
     type,
     content,
+    ...(channel ? { channel } : {}),
     attachments: [],
   });
   await putMessage(msg, assertCurrent);
   await setWatermark(msg.roomCode, msg.senderId, msg.lamport, assertCurrent);
   assertCurrent();
   _broadcastChatWire(messageToWire(msg), roomCode);
-  if (transportState.roomCode === roomCode) {
-    transportState.messages = appendSorted(transportState.messages, msg);
-    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+  if (_showInView(msg)) {
+    markRoomSeen(msg.roomCode, msg.lamport, undefined, channel).catch(() => {});
   }
   noteRoomActivity(msg.roomCode, msg.timestamp);
   return msg;
@@ -5760,7 +6062,10 @@ export async function sendCard(
   }
 
   const content = JSON.stringify({ pluginId, data: payload });
-  return (await _postSignedRow(roomCode, MessageType.PluginCard, content, assertCurrent)).id;
+  // A card is a message like any other: posted into the channel open in
+  // its room. Its updates are not (see sendUpdate).
+  const channel = _sendChannel(roomCode);
+  return (await _postSignedRow(roomCode, MessageType.PluginCard, content, assertCurrent, channel)).id;
 }
 
 let cachedPluginSenderName = "";
@@ -5860,9 +6165,13 @@ export async function sendUpdate(
   _broadcastChatWire(messageToWire(msg), roomCode);
   // View and seen-watermark belong to the OPEN room only: a widget update
   // for a background room must not paint here or mark that room read.
+  //
+  // An update carries no channel (channels.ts): it is state for a card,
+  // which is found by its id across the whole room, never a row a page
+  // shows. The mark it moves is the open channel's - the one being read.
   if (transportState.roomCode === msg.roomCode) {
     transportState.messages = appendSorted(transportState.messages, msg);
-    markRoomSeen(msg.roomCode, msg.lamport).catch(() => {});
+    markRoomSeen(msg.roomCode, msg.lamport, undefined, currentChannelOf(msg.roomCode)).catch(() => {});
   }
 
   // Fold our OWN update into the card state - the dispatcher only folds
@@ -5932,7 +6241,7 @@ export function sendUpdateImmediately(
   // same closed/left state without waiting for another peer's next digest.
   void putMessage(msg, guard)
     .then(() => { guard(); return setWatermark(roomCode, msg.senderId, msg.lamport, guard); })
-    .then(() => { guard(); return markRoomSeen(roomCode, msg.lamport, guard); })
+    .then(() => { guard(); return markRoomSeen(roomCode, msg.lamport, guard, currentChannelOf(roomCode)); })
     .catch(() => {});
 }
 
@@ -5977,11 +6286,17 @@ export async function toggleReaction(
     return;
   }
 
+  // In the channel of the message reacted to: the page that shows the
+  // message is the only one that folds its reactions (channels.ts). The
+  // message is on screen to be reacted to; storage is the fallback.
+  const target =
+    transportState.messages.find((m) => m.id === messageId) ?? (await getMessage(messageId));
   await sendMessage("", {
     type: MessageType.Reaction,
     reactionTo: messageId,
     reactionEmoji: emoji,
     reactionOp,
+    channel: target?.roomCode === roomCode ? messageChannel(target) : undefined,
   });
 }
 
@@ -5997,15 +6312,17 @@ export async function loadMoreMessages(
 ): Promise<boolean> {
   const roomCode = transportState.roomCode;
   if (!roomCode) return false;
+  const channel = _viewChannel(roomCode);
   const older: Message[] = [];
   let cursor = beforeLamport;
   let capped = false;
   for (let i = 0; i < (reach ? reach.pages : 1); i++) {
     const page = { capped: false };
-    const rows = await getMessages(roomCode, cursor, page);
+    const rows = await getMessages(roomCode, cursor, page, channel);
     // The user can switch rooms while the page loads; prepending the old
-    // room's backlog into the new room's view crosses histories.
-    if (transportState.roomCode !== roomCode) return false;
+    // room's backlog into the new room's view crosses histories. Channels
+    // the same.
+    if (transportState.roomCode !== roomCode || _viewChannel(roomCode) !== channel) return false;
     older.push(...rows);
     capped = page.capped;
     if (!rows.length || !page.capped) break;
@@ -6070,13 +6387,16 @@ export async function markSeen(): Promise<void> {
   if (!roomCode) return;
   // Only this room's messages: a sync batch for another room can share the
   // array briefly, and its lamports must not become this room's watermark.
+  // And only the open channel's: it is that channel that was read.
+  const open = _viewChannel(roomCode);
+  const channel = open ?? "";
   let maxLamport = 0;
   for (const m of transportState.messages) {
-    if (m.roomCode === roomCode && m.lamport > maxLamport)
-      maxLamport = m.lamport;
+    if (m.roomCode !== roomCode || m.lamport <= maxLamport) continue;
+    if (open === undefined || messageChannel(m) === open) maxLamport = m.lamport;
   }
   if (maxLamport === 0) return;
-  await markRoomSeen(roomCode, maxLamport);
+  await markRoomSeen(roomCode, maxLamport, undefined, channel);
   if (roomCode.startsWith("dm-")) {
     // DM rooms live in their own mirror, and the DM badge recomputes on
     // dmVersion - the rooms maps below never carried them.
@@ -6109,19 +6429,124 @@ export async function markSeen(): Promise<void> {
   }
   const idx = roomsStore.rooms.findIndex((r) => r.roomCode === roomCode);
   if (idx !== -1) {
-    roomsStore.rooms[idx] = {
-      ...roomsStore.rooms[idx],
-      lastSeenLamport: Math.max(
-        roomsStore.rooms[idx].lastSeenLamport ?? 0,
-        maxLamport
-      ),
-    };
+    const room = roomsStore.rooms[idx];
+    // Only a mark that moves: the rooms are what the whole sidebar renders,
+    // and a write that changes nothing still renders it again.
+    if (channel) {
+      if ((room.channelSeen?.[channel] ?? 0) < maxLamport) {
+        roomsStore.rooms[idx] = {
+          ...room,
+          channelSeen: { ...(room.channelSeen ?? {}), [channel]: maxLamport },
+        };
+      }
+    } else if ((room.lastSeenLamport ?? 0) < maxLamport) {
+      roomsStore.rooms[idx] = { ...room, lastSeenLamport: maxLamport };
+    }
   }
-  noteRoomRead(roomCode);
+  noteRoomRead(roomCode, channel);
 }
 
 export function broadcastProfile(): void {
   _broadcastProfile().catch(() => {});
+}
+
+// ── Channels (channels.ts) ───────────────────────────────────────────────────
+
+/** The channel open in a room: "" for its original chat. */
+export function currentChannel(roomCode: string | null = transportState.roomCode): string {
+  return currentChannelOf(roomCode);
+}
+
+/**
+ * Open a channel of a room ("" for the original chat). For the room on
+ * screen the page is swapped for the channel's newest one; for another room
+ * the choice is kept for when it is opened. Resolves false for a DM or a
+ * channel that is not live in the room's list.
+ */
+export async function selectChannel(roomCode: string, channel: string): Promise<boolean> {
+  if (roomCode.startsWith("dm-")) return false;
+  if (channel && !roomChannel(roomCode, channel)) return false;
+  // Any other channel still being opened is not the one wanted any more.
+  setOpeningChannel(roomCode, null);
+  if (transportState.roomCode !== roomCode) {
+    setCurrentChannel(roomCode, channel);
+    return true;
+  }
+  // Its page is up, unless a delete emptied it (_noteChannels).
+  if (currentChannelOf(roomCode) === channel && transportState.historyRoom === roomCode) return true;
+  // The channel on screen stays there until the page of the next one is
+  // read, and the two change places at once. Emptied first, every picture in
+  // the list was taken down and put back up: a blink on each change.
+  setOpeningChannel(roomCode, channel);
+  const opening = () => openingChannelOf(roomCode) === channel;
+  try {
+    await _loadHistory(roomCode, () => opening() && transportState.roomCode === roomCode, channel);
+    // Another room was opened meanwhile: the choice is kept for this one.
+    if (opening() && transportState.roomCode !== roomCode) setCurrentChannel(roomCode, channel);
+  } finally {
+    if (opening()) setOpeningChannel(roomCode, null);
+  }
+  return currentChannelOf(roomCode) === channel;
+}
+
+/** Store our own edit to a room's list, and tell the room. */
+async function _commitChannelEdit(roomCode: string, entries: Channel[]): Promise<void> {
+  requireWritableRoom(roomCode);
+  if (roomCode.startsWith("dm-")) throw new Error("Direct messages have no channels");
+  const result = await mergeRoomChannels(roomCode, entries);
+  if (!result) throw new Error("No such room");
+  if (result.changed) _noteChannels(roomCode, result.merged);
+  _sendChannelList(undefined, roomCode);
+}
+
+async function _channelsOf(roomCode: string): Promise<Channel[]> {
+  const room =
+    roomsStore.rooms.find((r) => r.roomCode === roomCode) ?? (await getRoom(roomCode));
+  if (!room) throw new Error("No such room");
+  return room.channels ?? [];
+}
+
+/** Make a channel in a room; any member may. Resolves the new channel. */
+export async function createChannel(
+  roomCode: string,
+  name: string,
+  kind: ChannelKind = "text"
+): Promise<Channel> {
+  const entry = createChannelEntry(await _channelsOf(roomCode), kind, name);
+  await _commitChannelEdit(roomCode, [entry]);
+  return entry;
+}
+
+/** Rename a channel; the empty id renames the room's original one. */
+export async function renameChannel(
+  roomCode: string,
+  id: string,
+  name: string,
+  kind: ChannelKind = "text"
+): Promise<void> {
+  await _commitChannelEdit(roomCode, [renameChannelEntry(await _channelsOf(roomCode), kind, id, name)]);
+}
+
+/**
+ * Delete a channel. Its messages stay stored but are shown nowhere; a member
+ * who has it open is put back in the original chat.
+ */
+export async function deleteChannel(
+  roomCode: string,
+  id: string,
+  kind: ChannelKind = "text"
+): Promise<void> {
+  await _commitChannelEdit(roomCode, [deleteChannelEntry(await _channelsOf(roomCode), kind, id)]);
+}
+
+/** Put a kind's channels in this order, the original ("") among them. */
+export async function reorderChannels(
+  roomCode: string,
+  order: string[],
+  kind: ChannelKind = "text"
+): Promise<void> {
+  const entries = reorderChannelEntries(await _channelsOf(roomCode), kind, order);
+  if (entries.length) await _commitChannelEdit(roomCode, entries);
 }
 
 /** Tell the room its name as this device has it; see _sendRoomName. */

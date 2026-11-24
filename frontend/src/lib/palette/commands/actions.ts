@@ -1,3 +1,4 @@
+import { forgetParkedRooms } from "$lib/room-location";
 import {
   Camera,
   CameraOff,
@@ -29,6 +30,8 @@ import {
   connect,
   peerIdToDid,
 } from "$lib/transport/transport.svelte";
+import { peersInMyCall } from "$lib/transport/voice-channels";
+import { DEFAULT_VOICE_CHANNEL, peersInCall } from "$lib/transport/voice-channel";
 import {
   stopWatchingTransmission,
   watchTransmission,
@@ -273,8 +276,9 @@ export const actionCommands: CmdSource = () => {
 
     // Every share on offer in this call, and every one being watched - each
     // its own row, so the one you mean is the one that starts or stops.
-    const inThisCall = (pid: string) =>
-      transportState.callPeerRooms.get(pid) === callRoom;
+    // Our call is our room AND our voice channel.
+    const mine = new Set(peersInMyCall());
+    const inThisCall = (pid: string) => mine.has(pid);
     for (const [pid, producerId] of transportState.pendingTransmissions) {
       if (!inThisCall(pid)) continue;
       cmds.push({
@@ -304,13 +308,17 @@ export const actionCommands: CmdSource = () => {
     }
   }
 
-  // In a call elsewhere, and this room has one going: move to it.
+  // In a call elsewhere, and this room's original call - the one joinCall()
+  // joins - has people in it: move to it.
   const here = transportState.roomCode;
   if (
     transportState.inCall &&
     here &&
     transportState.callRoomCode !== here &&
-    [...transportState.callPeerRooms.values()].includes(here)
+    peersInCall(transportState.callPeerRooms, transportState.callPeerVoiceChannels, {
+      roomCode: here,
+      voiceChannel: DEFAULT_VOICE_CHANNEL,
+    }).length > 0
   ) {
     cmds.push({
       id: "actions.call.switch",
@@ -419,6 +427,7 @@ export const actionCommands: CmdSource = () => {
             console.warn("wipe local database failed", err);
             return;
           }
+          forgetParkedRooms();
           window.location.reload();
         },
       }),

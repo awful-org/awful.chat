@@ -326,7 +326,7 @@ describe("a rejoin does not demote a watched transmission (movie-night drop)", (
       internals.joinGeneration as number
     );
 
-    expect(join).toHaveBeenCalledWith("room", "me");
+    expect(join).toHaveBeenCalledWith("room", "me", "");
     expect(left).not.toHaveBeenCalled();
     expect(removed).toHaveBeenCalledWith("sharer", "screen", "video");
     // Session state is rebuilt from scratch…
@@ -1533,7 +1533,7 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
       own: ["p-mine"],
     });
     await done;
-    expect(s.join).toHaveBeenCalledWith("room", "me");
+    expect(s.join).toHaveBeenCalledWith("room", "me", "");
   });
 
   it("rebuilds as before when the SFU no longer holds the session", async () => {
@@ -1545,7 +1545,7 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     // The fresh session on that socket is let go; the rebuild opens its own.
     expect(ws.readyState).toBe(FakeWs.CLOSED);
     expect(s.bob.consumer.close).toHaveBeenCalled();
-    expect(s.join).toHaveBeenCalledWith("room", "me");
+    expect(s.join).toHaveBeenCalledWith("room", "me", "");
   });
 
   it("keeps everything and its token while the SFU cannot be reached", async () => {
@@ -1562,6 +1562,23 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     // A socket that never authenticated does not restart the ladder itself:
     // that was a busy loop for as long as the network stayed down.
     expect(s.internals.rejoinTimer).toBeNull();
+  });
+
+  // Each voice channel is its own SFU room. A resume or a rebuild that forgot
+  // the channel would land this device in the room's default SFU room: its
+  // camera shown to the wrong call, and the right call's cameras gone.
+  it("resumes and rebuilds into the same voice channel's SFU room", async () => {
+    const s = dropped();
+    s.internals.currentVoiceChannel = "lounge0001";
+    const admission = vi.fn(() => ({ roomCode: "rs2_lounge", capability: "cap" }));
+    s.video.setRoomAdmission(admission);
+    const done = s.rejoin();
+    const { ws, join } = challenged();
+    expect(admission).toHaveBeenCalledWith("room", "n1", "me", "lounge0001");
+    expect(join).toMatchObject({ type: "join", roomCode: "rs2_lounge", resume: "tok-1" });
+    ws.receive({ type: "auth:joined", resumeToken: "fresh" });
+    await done;
+    expect(s.join).toHaveBeenCalledWith("room", "me", "lounge0001");
   });
 
   it("tries the resume at once when a joined socket drops", async () => {
