@@ -553,7 +553,7 @@
             animate="hover"
           />
         {:else}
-          {getInitials(user.name)}
+          <span class="initial">{getInitials(user.name)}</span>
         {/if}
       </div>
       <div

@@ -102,6 +102,7 @@ function createSurface(output: HTMLVideoElement, initial: PipVideoOptions) {
       } else {
         ctx.fillStyle = "#e4e4e7";
         ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
         ctx.font = `${Math.max(12, Math.min(32, h / 3))}px system-ui`;
         ctx.fillText(tile.kind === "camera" ? tile.label.charAt(0).toUpperCase() : tile.kind === "plugin" ? "Open app in call" : "Connecting…", x + w / 2, y + h / 2, Math.max(0, w - 8));
       }

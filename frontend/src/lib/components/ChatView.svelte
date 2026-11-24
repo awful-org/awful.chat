@@ -3488,9 +3488,9 @@
                           <!-- Our own initial from our nickname, as the
                                sidebar shows it: the message's stored name can
                                be a placeholder ("You"). -->
-                          {(ownProfile.nickname || "You").charAt(0).toUpperCase()}
+                          <span class="initial">{(ownProfile.nickname || "You").charAt(0).toUpperCase()}</span>
                         {:else}
-                          {initials(msg)}
+                          <span class="initial">{initials(msg)}</span>
                         {/if}
                       </div>
                       <div class="flex min-w-0 items-baseline gap-2">
@@ -3721,7 +3721,7 @@
                       {#if own.avatarUrl}
                         <GifImage src={own.avatarUrl} alt="You" class="size-full object-cover" />
                       {:else}
-                        {(own.nickname || "You").charAt(0).toUpperCase()}
+                        <span class="initial">{(own.nickname || "You").charAt(0).toUpperCase()}</span>
                       {/if}
                     </div>
                     <div class="flex min-w-0 items-baseline gap-2">

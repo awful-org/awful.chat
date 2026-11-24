@@ -46,6 +46,6 @@
       onerror={() => (attempt += 1)}
     />
   {:else}
-    {letter}
+    <span class="initial">{letter}</span>
   {/if}
 </span>

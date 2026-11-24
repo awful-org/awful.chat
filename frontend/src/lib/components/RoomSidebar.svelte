@@ -1323,7 +1323,7 @@
             {#if picture}
               <GifImage src={picture} alt="" class="size-full object-cover" animate="hover" />
             {:else}
-              <span aria-hidden="true" class="max-w-full truncate px-1">{roomInitials(room.name, room.roomCode)}</span>
+              <span aria-hidden="true" class="initial max-w-full truncate px-1">{roomInitials(room.name, room.roomCode)}</span>
             {/if}
             <!-- The name, for screen readers and for anything that reads the
                  tile's text. -->
@@ -1593,7 +1593,7 @@
           {#if entry.avatarUrl}
             <GifImage src={entry.avatarUrl} alt="" class="size-full object-cover" animate="hover" />
           {:else}
-            <span aria-hidden="true">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
+            <span aria-hidden="true" class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
           {/if}
           <span class="sr-only">
             {entry.nickname}{section === "requests" ? ", message request" : ""}{entry.blocked
@@ -1706,7 +1706,7 @@
         animate={person.speaking}
       />
     {:else}
-      {(person.name || "?").charAt(0).toUpperCase()}
+      <span class="initial">{(person.name || "?").charAt(0).toUpperCase()}</span>
     {/if}
   </span>
   <span class="min-w-0 flex-1 truncate">{person.name}</span>
@@ -1991,7 +1991,7 @@
                       animate="hover"
                     />
                   {:else}
-                    {(entry.nickname || "?").charAt(0).toUpperCase()}
+                    <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                   {/if}
                 </span>
                 <span class="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -2071,7 +2071,7 @@
               {#if pictures.get(code)}
                 <GifImage src={pictures.get(code)!} alt="" class="size-full object-cover" animate="hover" />
               {:else}
-                {roomInitials(room.name, code)}
+                <span class="initial">{roomInitials(room.name, code)}</span>
               {/if}
             </span>
             <span class="flex min-w-0 flex-1 flex-col gap-0.5">

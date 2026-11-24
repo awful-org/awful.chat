@@ -615,7 +615,7 @@
             />
           {:else}
             <span
-              class="text-3xl font-semibold text-primary font-mono select-none"
+              class="initial text-3xl font-semibold text-primary font-mono select-none"
               >{profileInitial}</span
             >
           {/if}

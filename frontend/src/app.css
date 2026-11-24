@@ -161,6 +161,36 @@ body {
   line-height: 1;
 }
 
+/* The letter standing in for a picture. Centering a line of text leaves a
+   capital too high, as the line keeps room below it for descenders. This box is
+   as tall as a capital and sits on its baseline, so centering it centers the
+   letter. An accent or a tail sticks out of it, so `truncate` clips it only
+   sideways. */
+.initial {
+  display: inline-block;
+  line-height: 1;
+  text-box: trim-both cap alphabetic;
+  white-space: nowrap;
+}
+
+.initial.truncate {
+  overflow: clip visible;
+}
+
+/* Firefox: lines of height 0, held open by a strut about a capital tall. Not
+   1cap, which it resolves to the font's ascent. */
+@supports not (text-box: trim-both cap alphabetic) {
+  .initial {
+    line-height: 0;
+  }
+
+  .initial::before {
+    content: "";
+    display: inline-block;
+    height: 0.7em;
+  }
+}
+
 /* A fullscreen call whose controls have faded (VoiceVideoCallView): the
    pointer goes with them, like a video player. The class was set there all
    along with no rule behind it, so the cursor never hid. The descendants too,

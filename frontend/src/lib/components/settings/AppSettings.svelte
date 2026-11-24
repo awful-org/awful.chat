@@ -526,7 +526,7 @@ async function loadLocalFonts(): Promise<void> {
           <div
             class="size-8 shrink-0 rounded-full bg-muted flex items-center justify-center text-[10px] font-semibold text-muted-foreground"
           >
-            {line.name.slice(0, 2).toUpperCase()}
+            <span class="initial">{line.name.slice(0, 2).toUpperCase()}</span>
           </div>
           <div class="min-w-0 flex flex-col">
             <span

@@ -2038,7 +2038,7 @@
                         animate="hover"
                       />
                     {:else}
-                      {(entry.nickname || "?").charAt(0).toUpperCase()}
+                      <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                     {/if}
                   </div>
                   <button
@@ -2111,7 +2111,7 @@
                         animate="hover"
                       />
                     {:else}
-                      {(entry.nickname || "?").charAt(0).toUpperCase()}
+                      <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                     {/if}
                   </div>
                   <button
@@ -2216,7 +2216,7 @@
                           animate="hover"
                         />
                       {:else}
-                        {(entry.nickname || "?").charAt(0).toUpperCase()}
+                        <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                       {/if}
                     </div>
                     <button
@@ -2294,7 +2294,7 @@
                           animate="hover"
                         />
                       {:else}
-                        {(entry.nickname || "?").charAt(0).toUpperCase()}
+                        <span class="initial">{(entry.nickname || "?").charAt(0).toUpperCase()}</span>
                       {/if}
                     </div>
                     <button

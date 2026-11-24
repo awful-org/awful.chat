@@ -208,7 +208,7 @@
           />
         {:else}
           <span
-            class="text-2xl font-semibold text-primary font-mono select-none"
+            class="initial text-2xl font-semibold text-primary font-mono select-none"
           >
             {(name || "?").charAt(0).toUpperCase()}
           </span>
