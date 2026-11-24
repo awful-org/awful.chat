@@ -30,6 +30,10 @@ if (typeof window !== "undefined") {
   // session with a suspended context - which is every incoming-message beep
   // on the device where beeps matter most.
   window.addEventListener("touchstart", unlock, { passive: true });
+  // A touch counts as a gesture only when it lifts: at pointerdown and
+  // touchstart the resume is still refused, and the first tap unlocked nothing.
+  window.addEventListener("pointerup", unlock, { passive: true });
+  window.addEventListener("touchend", unlock, { passive: true });
 }
 
 function playOsc(
@@ -227,6 +231,31 @@ export function stopRingtone() {
     ringGain.disconnect();
     ringGain = null;
   }
+}
+
+import wafuruUrl from "/sounds/wafuru.mp3?url";
+
+/**
+ * boot-sound.ts. Played at launch, the context may still be waiting for a
+ * gesture: a source started on a suspended context sounds once it resumes,
+ * which the listeners above do on the first one.
+ */
+export async function playWafuruSound() {
+  const res = await fetch(wafuruUrl);
+  const ctx = getCtx();
+  const source = ctx.createBufferSource();
+  source.buffer = await ctx.decodeAudioData(await res.arrayBuffer());
+  const gain = ctx.createGain();
+  gain.gain.value = 0.64;
+  source.connect(gain);
+  gain.connect(ctx.destination);
+  source.start();
+}
+
+/** The sound above was turned off: two soft falling notes. */
+export async function playWafuruOffSound() {
+  playOsc(520, 0.06, "sine", 0.05);
+  playOsc(390, 0.09, "sine", 0.04, 0.005, 0.06);
 }
 
 export async function playCallRejectSound() {
