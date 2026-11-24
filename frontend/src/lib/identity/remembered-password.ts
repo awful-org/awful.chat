@@ -25,6 +25,19 @@ type AuthDB = IDBPDatabase<{
 }>;
 
 const LEGACY_COOKIE = "awful_password";
+const RESET_TIMER_KEY = "awful_remember_reset_timer";
+
+/**
+ * Whether signing in with the remembered password starts its time over. On
+ * unless turned off in Settings > Session/Sync.
+ */
+export function resetTimerOnLogin(): boolean {
+  return localStorage.getItem(RESET_TIMER_KEY) !== "false";
+}
+
+export function setResetTimerOnLogin(on: boolean): void {
+  localStorage.setItem(RESET_TIMER_KEY, String(on));
+}
 
 async function authDb(): Promise<AuthDB> {
   return (await openDB("awful-auth", 1, {

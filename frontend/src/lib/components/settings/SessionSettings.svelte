@@ -17,6 +17,10 @@ import {
 } from "$lib/identity/identity.svelte";
 import { unlockIdentity } from "$lib/identity/identity";
 import {
+  resetTimerOnLogin,
+  setResetTimerOnLogin,
+} from "$lib/identity/remembered-password";
+import {
   clearDuressPassword,
   hasDuressPassword,
   setDuressPassword,
@@ -40,9 +44,7 @@ let { isMobile = false, onClose, onOpenSync }: Props = $props();
   let rememberDuration = $state(
     parseInt(localStorage.getItem("awful_remember_duration") ?? "15", 10)
   );
-  let rememberResetTimer = $state(
-    localStorage.getItem("awful_remember_reset_timer") === "true"
-  );
+  let rememberResetTimer = $state(resetTimerOnLogin());
 
   let biometricPassword = $state("");
   let biometricLoading = $state(false);
@@ -138,7 +140,7 @@ let { isMobile = false, onClose, onOpenSync }: Props = $props();
         bind:checked={rememberResetTimer}
         onCheckedChange={(checked) => {
           rememberResetTimer = checked;
-          localStorage.setItem("awful_remember_reset_timer", String(checked));
+          setResetTimerOnLogin(checked);
         }}
       />
       <span class="text-xs text-muted-foreground font-mono"
