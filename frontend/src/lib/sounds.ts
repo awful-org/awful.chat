@@ -246,7 +246,7 @@ export async function playWafuruSound() {
   const source = ctx.createBufferSource();
   source.buffer = await ctx.decodeAudioData(await res.arrayBuffer());
   const gain = ctx.createGain();
-  gain.gain.value = 0.8;
+  gain.gain.value = 0.64;
   source.connect(gain);
   gain.connect(ctx.destination);
   source.start();
