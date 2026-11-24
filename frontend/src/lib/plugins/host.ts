@@ -247,7 +247,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
     // The name this user's own updates carry (sendUpdate signs the main
     // profile's nickname), so a plugin can list itself the way peers see it.
     selfName: () => profileStore.nickname?.trim() || "Anonymous",
-    setActivity: (label) => setSelfActivity(pluginId, label),
+    setActivity: (label) => setSelfActivity(pluginId, roomCode, label),
     peers: () =>
       transportState.peers.map((peerId) => {
         const did = peerIdToDid(peerId);

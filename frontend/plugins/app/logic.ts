@@ -188,6 +188,9 @@ export function presentPlayers(
     .map(([did, p]) => ({ did, name: p.name, game: p.game }));
 }
 
+/** In an app that advertises no game. Never its address: that is in the card. */
+export const IN_AN_APP = "In an app";
+
 /** "Playing Jeopardy", for the user list. */
 export function playing(game: string): string {
   return `Playing ${game}`;

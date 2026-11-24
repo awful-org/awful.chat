@@ -87,6 +87,7 @@ import {
   setOpeningChannel,
 } from "../channel-view.svelte";
 import { forgetStillFrames } from "../still-frames";
+import { parseCallStatus, type CallStatus } from "../call-status";
 import { normalizeWireName } from "../wire-name";
 import { hasRoomOverrides, resolveRoomProfile } from "../room-profile";
 import {
@@ -523,7 +524,8 @@ interface TransportState {
   watchingTransmissions: Map<string, string>;
   transmissionOutputVolume: number;
   fileTransfers: Map<string, FileTransferSnapshot>;
-  callPeerStates: Map<string, { muted: boolean; deafened: boolean }>;
+  /** `status`: what they say they are doing; null from a build that says nothing. */
+  callPeerStates: Map<string, { muted: boolean; deafened: boolean; status?: CallStatus | null }>;
   chatMode: "room" | "dm";
   activeDmPeerId: string | null;
   dmVersion: number;
@@ -3324,6 +3326,7 @@ function _handleCallState(peerId: string, msg: WireCallState): void {
   next.set(peerId, {
     muted: !!msg.muted,
     deafened: !!msg.deafened,
+    status: parseCallStatus(msg.status),
   });
   transportState.callPeerStates = next;
 }

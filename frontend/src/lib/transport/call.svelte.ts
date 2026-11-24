@@ -41,6 +41,8 @@ import {
 } from "./call-error";
 import { foldCallCards, newCallId, type CallCardPayload } from "$lib/call-card";
 import { callStartSeen, noteDmCallJoined } from "$lib/dm-call-joined";
+import { wireCallStatus } from "$lib/call-status";
+import { ownCallStatus } from "$lib/call-status.svelte";
 import {
   DEFAULT_VOICE_CHANNEL,
   callPresenceFields,
@@ -55,7 +57,12 @@ let _mutedBeforeDeafen = false;
 export function _sendCallState(peerId?: string): void {
   const secureCallRoom = transportState.callRoomCode ?? transportState.roomCode;
   if (secureCallRoom && _transport.isSecureRoom(secureCallRoom)) {
-    const payload = encode({ type: MessageType.CallState, muted: transportState.muted, deafened: transportState.deafened });
+    const payload = encode({
+      type: MessageType.CallState,
+      muted: transportState.muted,
+      deafened: transportState.deafened,
+      status: wireCallStatus(ownCallStatus()),
+    });
     if (peerId) void _transport.sendRoom(peerId, secureCallRoom, payload);
     else _transport.broadcast(payload, secureCallRoom);
     return;

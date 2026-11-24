@@ -30,7 +30,14 @@
   import RoomCreateJoin from "$lib/components/RoomCreateJoin.svelte";
   import ChatView from "$lib/components/ChatView.svelte";
   import RoomSidebar from "$lib/components/RoomSidebar.svelte";
+  import { sidebarColumn } from "$lib/sidebar-rail";
   import { openingChannelOf } from "$lib/channel-view.svelte";
+  import {
+    broadcastCallStatus,
+    callBadges,
+    ownCallStatus,
+    peerCallStatus,
+  } from "$lib/call-status.svelte";
   import TransportStatus from "$lib/components/TransportStatus.svelte";
   import AppNotices from "$lib/components/AppNotices.svelte";
   import {
@@ -339,6 +346,7 @@
   });
 
   watchVisibilityForCall();
+  broadcastCallStatus();
 
   $effect(() => warnBeforeLeavingCall(transportState.inCall));
 
@@ -506,12 +514,14 @@
               avatarUrl: self.avatarUrl ?? null,
               speaking: speakers.speaking.has(selfSpeakerId),
               muted: transportState.muted,
+              badges: callBadges(ownCallStatus()),
             }
           : {
               peerId: m.peerId,
               ...describeCallPeer(code, m.peerId),
               speaking: speakers.speaking.has(m.peerId),
               muted: !!transportState.callPeerStates.get(m.peerId)?.muted,
+              badges: callBadges(peerCallStatus(m.peerId, peerIdToDid(m.peerId), code)),
             }
     );
     const channels: SidebarChannels = {
@@ -1404,6 +1414,12 @@
 
   const myId = $derived(selfId());
   const hasSidebar = $derived(roomsStore.rooms.length > 0);
+  // On a phone the sidebar is a closed drawer, and collapsed it is the rail.
+  const roomNameInSidebar = $derived(
+    !isMobile &&
+      !displayPrefs.sidebarCollapsed &&
+      sidebarColumn(sidebarView, activeRoomCode, orderedRooms.map((r) => r.roomCode)).kind === "room"
+  );
   const isDmActive = $derived(transportState.chatMode === "dm");
   const activeDmRequest = $derived(
     isDmActive &&
@@ -1847,6 +1863,7 @@
           <ChatView
             roomCode={activeRoomCode}
             roomName={transportState.roomName || activeRoomName}
+            nameInSidebar={roomNameInSidebar}
             selfId={myId}
             onLeave={() =>
               isDmActive && activeDmPeerId

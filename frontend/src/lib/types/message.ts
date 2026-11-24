@@ -1,3 +1,4 @@
+import type { WireCallStatus } from "../call-status";
 import type { FileSignalEnvelope } from "$lib/transport/types";
 import { normalizeWireName, stripWireControls } from "$lib/wire-name";
 import type { PqKeyCertificate } from "$lib/identity/pq-identity";
@@ -259,6 +260,8 @@ export interface WireCallState {
   type: MessageType.CallState;
   muted: boolean;
   deafened: boolean;
+  /** What the sender is doing (call-status.ts). Absent from older builds. */
+  status?: WireCallStatus;
 }
 
 /**

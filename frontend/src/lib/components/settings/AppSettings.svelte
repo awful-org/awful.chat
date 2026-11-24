@@ -26,6 +26,7 @@ import {
   setShowConnectionInfo,
   setAvatarTint,
   setCallPip,
+  setShareCallStatus,
   setShowScreenShareBanner,
   setShowPeerNicknameColors,
   setSidebarCollapsed,
@@ -553,6 +554,22 @@ async function loadLocalFonts(): Promise<void> {
       class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
       >Calls</Label
     >
+  </div>
+  <div class="flex items-center justify-between gap-3">
+    <div class="flex flex-col gap-1 min-w-0">
+      <span class="text-xs font-mono">Show what I'm doing in calls</span>
+      <span class="text-xs font-mono text-muted-foreground leading-relaxed">
+        Tells everyone in the room when you share your screen or are in an
+        app or a watch party, as a badge by your name. Off, none of it is
+        sent. People in your call can still see the share itself, and who is
+        in a party or an app with them.
+      </span>
+    </div>
+    <Switch
+      aria-label="Show what I'm doing in calls"
+      checked={displayPrefs.shareCallStatus}
+      onCheckedChange={(checked) => setShareCallStatus(checked)}
+    />
   </div>
   <div class="flex items-center justify-between gap-3">
     <div class="flex flex-col gap-1 min-w-0">

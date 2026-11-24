@@ -104,7 +104,7 @@
     SquareArrowOutUpRight,
     SquareArrowDownLeft,
   } from "@lucide/svelte";
-  import { Check, Columns2, MessageSquare, MonitorIcon, PictureInPicture2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
+  import { Check, Columns2, MessageCircle, MonitorIcon, PictureInPicture2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
 import { loadProfile, getScopedProfile } from "$lib/profile.svelte";
 import {
   displayPrefs,
@@ -1193,7 +1193,7 @@ import {
     popin: SquareArrowDownLeft,
     fullscreen: Maximize,
     "fullscreen-exit": Minimize,
-    message: MessageSquare,
+    message: MessageCircle,
     watch: Eye,
     "stop-watching": Radio,
     "screen-off": MonitorOff,
