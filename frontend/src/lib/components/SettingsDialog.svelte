@@ -13,16 +13,14 @@
     DrawerHeader,
     DrawerTitle,
   } from "$lib/components/ui/drawer";
-  import { pageZoom, visibleHeight as measureVisibleHeight } from "$lib/visible-height";
   let visibleHeight = $state(typeof window === "undefined" ? 800 : window.innerHeight);
   let viewportTop = $state(0);
   let viewportBottom = $state(0);
   $effect(() => {
     const viewport = window.visualViewport;
     const update = () => {
-      visibleHeight = measureVisibleHeight();
-      // Where the keyboard pushed the page to, which zoom's panning is not.
-      viewportTop = pageZoom() === 1 ? (viewport?.offsetTop ?? 0) : 0;
+      visibleHeight = viewport?.height ?? window.innerHeight;
+      viewportTop = viewport?.offsetTop ?? 0;
       viewportBottom = Math.max(0, window.innerHeight - visibleHeight - viewportTop);
     };
     update();

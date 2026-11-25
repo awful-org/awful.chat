@@ -59,7 +59,7 @@ func getCandidateUrls(targetURL *url.URL) []string {
 	candidates := []string{targetURL.String()}
 	switch targetURL.Host {
 	case "instagram.com", "www.instagram.com":
-		if instagramPostPath.MatchString(targetURL.Path) && !strings.HasPrefix(targetURL.Path, "/share/") {
+		if instagramPostPath.MatchString(targetURL.Path) && !strings.HasPrefix(strings.ToLower(targetURL.Path), "/share/") {
 			mirror := url.URL{Scheme: "https", Host: "kkinstagram.com", Path: targetURL.Path}
 			if i := targetURL.Query().Get("img_index"); instagramImageIndex.MatchString(i) {
 				mirror.RawQuery = url.Values{"img_index": {i}}.Encode()
@@ -74,7 +74,8 @@ func getCandidateUrls(targetURL *url.URL) []string {
 // and the page behind it are the caller's choice: thirty pages at a time, each
 // one five-megabyte tag of made-up attributes, took the relay to 3 GB.
 const (
-	// The most of a page that is read. YouTube's tags start 1.3 MB in.
+	// The most of a page that is read. YouTube's is 2 MB, with some of its
+	// tags 1.3 MB in.
 	ogMaxPageBytes = 2 << 20
 	// The longest single tag or script; the tags found before a longer one
 	// are kept. The tokenizer holds a tag's attributes many times over.
@@ -84,20 +85,39 @@ const (
 	ogMaxDescription = 1000
 	ogMaxName        = 100
 	ogMaxURL         = 4096
+	// What is kept of any value: past ogMaxURL however the cut falls, so that
+	// a url that was cut is seen to be.
+	ogMaxValue = ogMaxURL + utf8.UTFMax
+	// What a server may say before its page: Go allows 10 MiB of it.
+	ogMaxHeaderBytes = 64 << 10
 	// Links being fetched, and pages being parsed, at any one time. Few are
 	// parsed at once since each takes milliseconds and the memory; a fetch
-	// mostly waits.
-	ogMaxFetches = 24
-	ogMaxParses  = 2
-	// All of it, for one link, inside the API server's WriteTimeout, past
-	// which the answer would go nowhere. Shared between the candidates.
-	ogDeadline = 12 * time.Second
+	// mostly waits. No client has more than a third of them, or a few with
+	// links to slow servers would hold up everybody's.
+	ogMaxFetches       = 24
+	ogMaxClientFetches = 8
+	ogMaxParses        = 2
+	// How long a link waits for its turn, and how long it then has. Apart,
+	// or a turn that came late would leave a site too little time to answer
+	// and have it remembered as dead. Together inside the API server's
+	// WriteTimeout, past which the answer would go nowhere.
+	ogMaxWait  = 4 * time.Second
+	ogDeadline = 10 * time.Second // shared between the candidates
 )
 
 var (
 	ogFetchSlots = make(chan struct{}, ogMaxFetches)
 	ogParseSlots = make(chan struct{}, ogMaxParses)
+
+	// Each client's own share, for as long as it has links under way.
+	ogClientsMu sync.Mutex
+	ogClients   = map[string]*ogClient{}
 )
+
+type ogClient struct {
+	slots chan struct{}
+	links int // holding a slot or waiting for one
+}
 
 // ogTake waits for a slot; false when the context ended first.
 func ogTake(ctx context.Context, slots chan struct{}) bool {
@@ -106,6 +126,45 @@ func ogTake(ctx context.Context, slots chan struct{}) bool {
 		return true
 	case <-ctx.Done():
 		return false
+	}
+}
+
+// ogTurn waits for a link's turn to be fetched: a slot of its client's share,
+// then one of everybody's. release gives both back; nil when the turn did not
+// come.
+func ogTurn(client string) (release func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), ogMaxWait)
+	defer cancel()
+
+	ogClientsMu.Lock()
+	c := ogClients[client]
+	if c == nil {
+		c = &ogClient{slots: make(chan struct{}, ogMaxClientFetches)}
+		ogClients[client] = c
+	}
+	c.links++
+	ogClientsMu.Unlock()
+	leave := func() {
+		ogClientsMu.Lock()
+		defer ogClientsMu.Unlock()
+		if c.links--; c.links == 0 {
+			delete(ogClients, client)
+		}
+	}
+
+	if !ogTake(ctx, c.slots) {
+		leave()
+		return nil
+	}
+	if !ogTake(ctx, ogFetchSlots) {
+		<-c.slots
+		leave()
+		return nil
+	}
+	return func() {
+		<-ogFetchSlots
+		<-c.slots
+		leave()
 	}
 }
 
@@ -134,7 +193,7 @@ func readOgTags(page string) ogTags {
 			return tags
 		case html.TextToken:
 			if inTitle && tags.title == "" {
-				tags.title = ogClip(string(z.Text()), ogMaxURL)
+				tags.title = ogClip(string(z.Text()), ogMaxValue)
 			}
 		case html.EndTagToken:
 			inTitle = false
@@ -156,11 +215,11 @@ func readOgTags(page string) ogTags {
 				k, v, more = z.TagAttr()
 				switch {
 				case tag == "video" && string(k) == "poster" && tags.poster == "":
-					tags.poster = ogClip(string(v), ogMaxURL+1)
+					tags.poster = ogClip(string(v), ogMaxValue)
 				case tag == "meta" && (string(k) == "property" || string(k) == "name"):
 					keys = append(keys, strings.ToLower(ogClip(string(v), ogMaxName)))
 				case tag == "meta" && string(k) == "content":
-					content = ogClip(string(v), ogMaxURL+1)
+					content = ogClip(string(v), ogMaxValue)
 				}
 			}
 			if content == "" {
@@ -183,10 +242,11 @@ func readOgTags(page string) ogTags {
 func ogClip(s string, limit int) string {
 	s = strings.TrimSpace(s)
 	if len(s) > limit {
-		for limit > 0 && !utf8.RuneStart(s[limit]) {
+		// No further back than one character: it may not be UTF-8 at all.
+		for i := 0; i < utf8.UTFMax-1 && !utf8.RuneStart(s[limit]); i++ {
 			limit--
 		}
-		s = strings.TrimSpace(s[:limit])
+		s = s[:limit]
 	}
 	return strings.Clone(s)
 }
@@ -195,17 +255,20 @@ func ogClip(s string, limit int) string {
 func (t ogTags) text(limit int, keys ...string) *string {
 	for _, key := range keys {
 		if v, ok := t.meta[key]; ok {
-			v = ogClip(v, limit)
+			v = strings.TrimSpace(ogClip(v, limit))
 			return &v
 		}
 	}
 	return nil
 }
 
-// link is the same for a url, as an absolute one, or nil.
+// link is the same for a url, as an absolute one, or nil. A url that was cut
+// is none.
 func (t ogTags) link(base string, keys ...string) *string {
-	if v := t.text(ogMaxURL+1, keys...); v != nil {
-		return absolutizeUrl(*v, base)
+	for _, key := range keys {
+		if v, ok := t.meta[key]; ok {
+			return absolutizeUrl(v, base)
+		}
 	}
 	return nil
 }
@@ -425,6 +488,8 @@ var ogHTTPClient = &http.Client{
 		IdleConnTimeout:     90 * time.Second,
 		MaxIdleConns:        64,
 		MaxIdleConnsPerHost: 4,
+
+		MaxResponseHeaderBytes: ogMaxHeaderBytes,
 	},
 	// via holds the requests already made, so this errors on the sixth
 	// redirect exactly as the per-request counter it replaced did.
@@ -549,7 +614,7 @@ func ogPreviewFor(r *http.Request, target *url.URL) (body []byte, status int) {
 		if !rateAllowClient(r, ogRatePrefix, ogRateLimit) {
 			return nil, http.StatusTooManyRequests
 		}
-		body, busy := ogBuild(target)
+		body, busy := ogBuild(clientIP(r), target)
 		if busy {
 			return nil, http.StatusServiceUnavailable
 		}
@@ -581,7 +646,7 @@ func ogPreviewFor(r *http.Request, target *url.URL) (body []byte, status int) {
 		}
 		ogCacheMu.Unlock()
 		if !joined {
-			ogRunFetch(key, target, call)
+			ogRunFetch(clientIP(r), key, target, call)
 		}
 	}
 	select {
@@ -604,7 +669,7 @@ func ogAnswer(body []byte) ([]byte, int) {
 
 // ogRunFetch fetches one preview for everybody waiting on call, and keeps
 // the answer.
-func ogRunFetch(key string, target *url.URL, call *ogCall) {
+func ogRunFetch(client, key string, target *url.URL, call *ogCall) {
 	defer func() {
 		ogCacheMu.Lock()
 		delete(ogInflight, key)
@@ -615,20 +680,21 @@ func ogRunFetch(key string, target *url.URL, call *ogCall) {
 		ogCacheMu.Unlock()
 		close(call.done)
 	}()
-	call.body, call.busy = ogBuild(target)
+	call.body, call.busy = ogBuild(client, target)
 }
 
 // ogBuild fetches a link and returns its preview as the JSON answer, or nil
 // when it could not be fetched. The first candidate with a picture or a video
 // wins; failing that, the first that answered at all. busy means it was not
 // tried: too much else was under way.
-func ogBuild(target *url.URL) (body []byte, busy bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), ogDeadline)
-	defer cancel()
-	if !ogTake(ctx, ogFetchSlots) {
+func ogBuild(client string, target *url.URL) (body []byte, busy bool) {
+	release := ogTurn(client)
+	if release == nil {
 		return nil, true
 	}
-	defer func() { <-ogFetchSlots }()
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), ogDeadline)
+	defer cancel()
 
 	var best *OgPreview
 	candidates := getCandidateUrls(target)
@@ -643,11 +709,11 @@ func ogBuild(target *url.URL) (body []byte, busy bool) {
 		if !ok {
 			continue
 		}
-		if !ogTake(ctx, ogParseSlots) {
-			return nil, true
+		preview, ok := ogParseInTurn(ctx, page)
+		if !ok {
+			busy = true
+			break
 		}
-		preview := ogParse(page)
-		<-ogParseSlots
 		if best == nil || preview.MediaType != "none" {
 			best = &preview
 		}
@@ -656,13 +722,23 @@ func ogBuild(target *url.URL) (body []byte, busy bool) {
 		}
 	}
 	if best == nil {
-		return nil, false
+		return nil, busy
 	}
 	body, err := json.Marshal(best)
 	if err != nil {
 		return nil, false
 	}
 	return append(body, '\n'), false
+}
+
+// ogParseInTurn parses a page when there is a slot for it; false when there
+// was none in time.
+func ogParseInTurn(ctx context.Context, page ogPage) (OgPreview, bool) {
+	if !ogTake(ctx, ogParseSlots) {
+		return OgPreview{}, false
+	}
+	defer func() { <-ogParseSlots }()
+	return ogParse(page), true
 }
 
 // ogPage is what one url answered with.
@@ -692,6 +768,11 @@ var ogFetchPage = func(ctx context.Context, candidate string) (ogPage, bool) {
 		return ogPage{}, false
 	}
 	page := ogPage{url: resp.Request.URL.String()}
+	if len(page.url) > ogMaxURL {
+		// Where a redirect led, so not the caller's own choice of link. It is
+		// the base of the page's urls and goes back in the answer.
+		return ogPage{}, false
+	}
 	media, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	// The type is read even where its parameters are not well formed: an
 	// unquoted codecs list is common.
@@ -731,7 +812,7 @@ func ogParse(page ogPage) OgPreview {
 	tags := readOgTags(page.html)
 	preview.Title = tags.text(ogMaxTitle, "og:title", "twitter:title")
 	if preview.Title == nil && tags.title != "" {
-		title := ogClip(tags.title, ogMaxTitle)
+		title := strings.TrimSpace(ogClip(tags.title, ogMaxTitle))
 		preview.Title = &title
 	}
 	preview.Description = tags.text(ogMaxDescription, "og:description", "twitter:description", "description")

@@ -13,12 +13,16 @@ export function visibleHeight(): number {
   return vv ? vv.height * pageZoom() : window.innerHeight;
 }
 
-/** How far the page is zoomed in on its layout: 1 when it is not. */
-export function pageZoom(): number {
+/**
+ * How far the page is zoomed in on its layout: 1 when it is not, and when it is
+ * zoomed out past it (something wider than the screen), where what is seen is
+ * taller than the layout and is all there to be filled.
+ */
+function pageZoom(): number {
   const vv = window.visualViewport;
   const layoutWidth = document.documentElement.clientWidth;
   if (!vv || !(vv.width > 0) || !(layoutWidth > 0)) return 1;
   const zoom = layoutWidth / vv.width;
   // Fractional widths round differently; that is not a zoom.
-  return Math.abs(zoom - 1) < 0.01 ? 1 : zoom;
+  return zoom < 1.01 ? 1 : zoom;
 }

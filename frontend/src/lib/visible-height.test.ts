@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { pageZoom, visibleHeight } from "./visible-height";
+import { visibleHeight } from "./visible-height";
 
 function page(layout: [number, number], visual: [number, number] | null) {
   vi.stubGlobal("window", {
@@ -27,7 +27,6 @@ describe("visibleHeight", () => {
   it("does not shrink for zoom", () => {
     page([980, 1900], [980 / 1.5, 1900 / 1.5]);
     expect(visibleHeight()).toBeCloseTo(1900);
-    expect(pageZoom()).toBeCloseTo(1.5);
   });
 
   it("shrinks for a keyboard alone when zoomed as well", () => {
@@ -35,9 +34,9 @@ describe("visibleHeight", () => {
     expect(visibleHeight()).toBeCloseTo(480);
   });
 
-  it("holds for a page zoomed out past its layout", () => {
+  it("fills what is seen of a page zoomed out past its layout", () => {
     page([412, 800], [824, 1600]);
-    expect(visibleHeight()).toBeCloseTo(800);
+    expect(visibleHeight()).toBe(1600);
   });
 
   it("takes rounding for no zoom, and nonsense for none either", () => {

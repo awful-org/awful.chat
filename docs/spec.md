@@ -1373,10 +1373,11 @@ Caching: the relay keeps each answer in memory for an hour (a failure for
          for each ask and never kept.
 Limit:   30 fetches a minute per client. Past it the answer is 429 with a
          Retry-After naming when the window ends, and the app asks again then.
-Cost:    24 links are fetched and 2 pages parsed at once; past that a link
-         waits its turn, up to the 12 s each one gets, and is answered 503 (not
-         remembered as failed) if it never comes. 2 MiB of a page is read, text
-         is cut to 300-1000 bytes, a URL over 4 KiB is none.
+Cost:    24 links are fetched and 2 pages parsed at once, 8 links for any one
+         client. Past that a link waits up to 4 s for its turn, and is answered
+         503 (not remembered as failed) if it never comes; then it has 10 s.
+         64 KiB of a server's headers and 2 MiB of a page are read, text is cut
+         to 100-1000 bytes, a URL over 4 KiB is none.
 Media:   a URL that is itself a picture or a video is its own preview; the
          relay reads no more than its headers. A video the page gives as
          anything but a video file (YouTube, Vimeo embeds) opens on its site.

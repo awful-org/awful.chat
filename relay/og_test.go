@@ -31,7 +31,7 @@ func TestInstagramCandidateURLs(t *testing.T) {
 		"https://www.instagram.com/some.one/": {"https://www.instagram.com/some.one/"},
 		// A share's id is one person's.
 		"https://www.instagram.com/share/reel/abc/": {"https://www.instagram.com/share/reel/abc/"},
-		"https://www.instagram.com/share/p/abc":     {"https://www.instagram.com/share/p/abc"},
+		"https://www.instagram.com/Share/p/abc":     {"https://www.instagram.com/Share/p/abc"},
 		post + "?img_index=sharer-1234":             {post + "?img_index=sharer-1234", "https://kkinstagram.com/p/abc-12_3/"},
 		"https://www.instagram.com/direct/inbox/":   {"https://www.instagram.com/direct/inbox/"},
 		"https://www.instagram.com/p/a/../../x/":    {"https://www.instagram.com/p/a/../../x/"},
@@ -136,6 +136,20 @@ func TestOgParseCapsWhatItKeeps(t *testing.T) {
 	if err != nil || len(body) > ogCacheMaxBodyBytes {
 		t.Errorf("the answer is %d bytes", len(body))
 	}
+	// However the cut falls, a cut url is none: here inside a character, and
+	// on a space.
+	for _, tail := range []string{strings.Repeat("\u00e9", 40), strings.Repeat(" x", 40)} {
+		for pad := 0; pad < 4; pad++ {
+			img := "/" + strings.Repeat("a", ogMaxURL-30-pad) + tail
+			if p := parsePage(`<meta property="og:image" content="` + img + `">`); p.Image != nil {
+				t.Errorf("a cut url came back: %d of %d bytes", len(*p.Image), len(img))
+			}
+		}
+	}
+	// Not UTF-8 at all.
+	if got := value(parsePage(`<meta property="og:title" content="` + strings.Repeat("\x80", 500) + `">`).Title); len(got) < ogMaxTitle-4 {
+		t.Errorf("a title that is not UTF-8: %d bytes", len(got))
+	}
 	// A title only in <title>, and a long one.
 	if got := value(parsePage("<title>" + long + "</title>").Title); len(got) > ogMaxTitle {
 		t.Errorf("<title>: %d bytes", len(got))
@@ -176,11 +190,11 @@ func TestOgBuildSharesItsDeadline(t *testing.T) {
 		shares = append(shares, time.Until(d))
 		return ogPage{}, false
 	}
-	ogBuild(mustURL(t, "https://www.instagram.com/p/abc/"))
+	ogBuild("203.0.113.9", mustURL(t, "https://www.instagram.com/p/abc/"))
 	if len(shares) != 2 || shares[0] > ogDeadline/2 || shares[1] > ogDeadline {
 		t.Errorf("shares %v of %v", shares, ogDeadline)
 	}
-	if ogDeadline >= 15*time.Second {
+	if ogMaxWait+ogDeadline >= 15*time.Second {
 		t.Error("longer than the API server's WriteTimeout")
 	}
 }
@@ -214,7 +228,7 @@ func TestOgBuildFallsBackToTheNextCandidate(t *testing.T) {
 			p, ok := c.pages[candidate]
 			return p, ok
 		}
-		body, busy := ogBuild(mustURL(t, own))
+		body, busy := ogBuild("203.0.113.9", mustURL(t, own))
 		if busy {
 			t.Errorf("%s: busy", c.name)
 		}
@@ -254,6 +268,8 @@ func TestOgFetchPageKnowsMediaFromPages(t *testing.T) {
 		case "/page":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Write([]byte("<title>x</title>"))
+		case "/far":
+			http.Redirect(w, r, "/page?"+strings.Repeat("&", ogMaxURL), http.StatusFound)
 		case "/empty":
 		default:
 			http.NotFound(w, r)
@@ -270,7 +286,7 @@ func TestOgFetchPageKnowsMediaFromPages(t *testing.T) {
 	if p, ok := ogFetchPage(context.Background(), srv.URL+"/page"); !ok || p.media != "" || p.html != "<title>x</title>" {
 		t.Errorf("a page: %v %+v", ok, p)
 	}
-	for _, path := range []string{"/empty", "/gone"} {
+	for _, path := range []string{"/empty", "/gone", "/far"} {
 		if p, ok := ogFetchPage(context.Background(), srv.URL+path); ok {
 			t.Errorf("%s answered: %+v", path, p)
 		}
@@ -418,5 +434,42 @@ func TestAbsolutizeUrlOnlyReturnsWebURLs(t *testing.T) {
 		case want != "" && (got == nil || *got != want):
 			t.Errorf("%q: got %v, want %q", raw, got, want)
 		}
+	}
+}
+
+// Go reads 10 MiB of a server's headers, thirty servers at a time, unless told
+// not to.
+func TestOgClientBoundsResponseHeaders(t *testing.T) {
+	transport := ogHTTPClient.Transport.(*http.Transport).Clone()
+	transport.DialContext = nil // the test server is on loopback
+	client := &http.Client{Transport: transport}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for i := 0; i < 200; i++ {
+			w.Header().Add("X-Pad", strings.Repeat("p", 1000))
+		}
+	}))
+	defer srv.Close()
+	if resp, err := client.Get(srv.URL); err == nil {
+		resp.Body.Close()
+		t.Fatal("200 kB of headers were read")
+	}
+}
+
+// An answer already had is kept when the next candidate's page cannot be
+// parsed in time.
+func TestOgBuildKeepsWhatItHasWhenBusy(t *testing.T) {
+	savedFetch, savedSlots := ogFetchPage, ogParseSlots
+	t.Cleanup(func() { ogFetchPage, ogParseSlots = savedFetch, savedSlots })
+	ogParseSlots = make(chan struct{}, 1)
+	asked := 0
+	ogFetchPage = func(ctx context.Context, candidate string) (ogPage, bool) {
+		if asked++; asked == 2 {
+			ogParseSlots <- struct{}{} // taken, and never given back
+		}
+		return ogPage{url: candidate, html: "<title>wall</title>"}, true
+	}
+	body, busy := ogBuild("203.0.113.9", mustURL(t, "https://www.instagram.com/p/abc/"))
+	if busy || !strings.Contains(string(body), "wall") {
+		t.Errorf("busy %v, body %s", busy, body)
 	}
 }

@@ -333,11 +333,71 @@ func TestOgPreviewBoundsFetchesAtOnce(t *testing.T) {
 		t.Fatalf("slots still held: %d and %d", len(ogFetchSlots), len(ogParseSlots))
 	}
 
+	if len(ogClients) != 0 {
+		t.Fatalf("%d clients still kept", len(ogClients))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	full := make(chan struct{}, 1)
 	full <- struct{}{}
 	if ogTake(ctx, full) {
 		t.Fatal("took a slot that was not free")
+	}
+}
+
+// One client's slow links leave slots for everybody else's.
+func TestOgPreviewLeavesRoomForOtherClients(t *testing.T) {
+	resetRateLimiter(t)
+	resetOgCache(t)
+	up := &fakeOgUpstream{release: make(chan struct{})}
+	up.install(t)
+	var wg sync.WaitGroup
+	ask := func(addr string, n int) {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ogRequest(t, addr, "https://"+addr+".example/"+strconv.Itoa(i))
+			}(i)
+		}
+	}
+	reached := func(n int32) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for up.fetches.Load() < n && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if got := up.fetches.Load(); got != n {
+			t.Fatalf("%d fetches under way, want %d", got, n)
+		}
+	}
+	ask("198.51.100.1", ogRateLimit)
+	reached(ogMaxClientFetches)
+	ask("198.51.100.2", 1)
+	reached(ogMaxClientFetches + 1)
+	close(up.release)
+	wg.Wait()
+}
+
+// A link whose turn never came is busy, and is tried afresh when asked again.
+func TestOgPreviewBusyIsNotRemembered(t *testing.T) {
+	resetRateLimiter(t)
+	resetOgCache(t)
+	up := &fakeOgUpstream{}
+	up.install(t)
+	saved := ogFetchSlots
+	ogFetchSlots = make(chan struct{}) // none, ever
+	w := ogRequest(t, "198.51.100.3", "https://example.com/busy")
+	ogFetchSlots = saved
+	if w.Code != http.StatusServiceUnavailable || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("%d, Cache-Control %q", w.Code, w.Header().Get("Cache-Control"))
+	}
+	if len(ogCache) != 0 || len(ogClients) != 0 || up.fetches.Load() != 0 {
+		t.Fatalf("%d cached, %d clients, %d fetches", len(ogCache), len(ogClients), up.fetches.Load())
+	}
+	if w := ogRequest(t, "198.51.100.3", "https://example.com/busy"); w.Code != http.StatusOK {
+		t.Fatalf("asked again: %d", w.Code)
 	}
 }

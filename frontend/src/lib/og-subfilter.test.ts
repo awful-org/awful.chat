@@ -75,7 +75,7 @@ describe("invite card rewriting", () => {
     const allowed = [...map.slice(0, map.indexOf("\n}")).matchAll(/"~(\S+)" \$host;/g)].map((m) => new RegExp(m[1]));
     expect(allowed).toHaveLength(2);
     const passes = (host: string) => allowed.some((r) => r.test(host));
-    for (const ok of ["awful.chat", "localhost", "10.0.0.1", "[2001:db8::1]"]) expect(passes(ok)).toBe(true);
+    for (const ok of ["awful.chat", "localhost", "my_host.local", "10.0.0.1", "[2001:db8::1]"]) expect(passes(ok)).toBe(true);
     for (const bad of ['a"><script>', "a b", "a'b", "a<b", "", "a/b"]) expect(passes(bad)).toBe(false);
   });
 
