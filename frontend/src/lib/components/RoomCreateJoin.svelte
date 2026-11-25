@@ -423,11 +423,12 @@
     use:viewportHeight
     class="flex min-h-dvh h-full overflow-y-auto p-4 bg-background"
   >
+    <!-- Solid: the card scrolls under it on a short screen. -->
     {#if toggleSidebar != null && !createdCode}
       <Button
         onclick={toggleSidebar}
         variant="outline"
-        class="absolute top-4 left-4 sm:hidden"
+        class="absolute top-4 left-4 z-10 bg-card dark:bg-card hover:bg-accent dark:hover:bg-accent sm:hidden"
         aria-label="Open sidebar"
       >
         <Menu />
