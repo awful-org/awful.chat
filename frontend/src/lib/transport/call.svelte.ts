@@ -10,6 +10,7 @@ import {
   playUndeafenSound,
   playUnmuteSound,
 } from "$lib/sounds";
+import { keepScreenAwake } from "$lib/screen-awake";
 import { MessageType } from "$lib/types/message";
 import { encode } from "$lib/utils";
 import {
@@ -160,31 +161,16 @@ export function _sendCallPresence(peerId?: string, leftRoom?: string | null): vo
   for (const pid of _directTargets(rooms)) _transport.send(pid, payload);
 }
 
-// Keep the screen awake for the duration of a call. The browser drops the lock
-// whenever the page is hidden, so re-take it when the user comes back.
-let _wakeLock: WakeLockSentinel | null = null;
+// Keep the screen awake for the duration of a call.
+let _releaseScreen: (() => void) | null = null;
 
-async function acquireWakeLock(): Promise<void> {
-  try {
-    if (!("wakeLock" in navigator) || _wakeLock) return;
-    _wakeLock = await navigator.wakeLock.request("screen");
-    _wakeLock.addEventListener("release", () => {
-      _wakeLock = null;
-    });
-  } catch {
-    // Denied or unsupported - a call without a wake lock still works.
-  }
+function keepCallScreenAwake(): void {
+  _releaseScreen ??= keepScreenAwake();
 }
 
-function releaseWakeLock(): void {
-  _wakeLock?.release().catch(() => {});
-  _wakeLock = null;
-}
-
-if (typeof document !== "undefined") {
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && transportState.inCall) acquireWakeLock();
-  });
+function releaseCallScreen(): void {
+  _releaseScreen?.();
+  _releaseScreen = null;
 }
 
 /**
@@ -517,7 +503,7 @@ async function _joinCall(voiceChannel: string): Promise<void> {
     // Peers already in this call are known from their presence heartbeats -
     // sync again in case one arrived while _video.join() was in flight.
     _syncVoiceRoster();
-    acquireWakeLock();
+    keepCallScreenAwake();
     playJoinSound();
     // A second announce after the SFU join: cheap, and covers a peer whose
     // first one raced the transport still settling.
@@ -526,7 +512,7 @@ async function _joinCall(voiceChannel: string): Promise<void> {
     _sendCallState();
     transportState.localMicStream = _voice.getMicStream();
   } catch (err) {
-    releaseWakeLock();
+    releaseCallScreen();
     if (_presenceHeartbeat) {
       clearInterval(_presenceHeartbeat);
       _presenceHeartbeat = null;
@@ -569,7 +555,7 @@ export function leaveCall(): void {
     document.exitPictureInPicture().catch(() => {});
   }
 
-  releaseWakeLock();
+  releaseCallScreen();
   if (_presenceHeartbeat) {
     clearInterval(_presenceHeartbeat);
     _presenceHeartbeat = null;

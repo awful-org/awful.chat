@@ -19,6 +19,7 @@ import {
     denySync,
     type SyncPayload,
   } from "$lib/transport/sync.svelte";
+  import { keepScreenAwake } from "$lib/screen-awake";
   import { formatComparisonCode } from "$lib/transport/sync-protocol";
   import {
     Copy,
@@ -105,6 +106,22 @@ import {
     if (value !== null) view = "progress";
     resolve?.(value);
   }
+
+  // A phone that locks itself pauses the page, and the sync with it. From the
+  // code being shown or used until it ended, one way or the other.
+  const underWay = $derived(
+    open &&
+      !syncState.isComplete &&
+      !syncState.syncError &&
+      (syncState.qrDataUrl !== null ||
+        syncState.isConnecting ||
+        syncState.isSyncing ||
+        syncState.awaitingApproval ||
+        syncState.finishing)
+  );
+  $effect(() => {
+    if (underWay) return keepScreenAwake();
+  });
 
   // Reset state when dialog closes
   $effect(() => {
@@ -336,6 +353,7 @@ import {
        away from racing them. -->
   <DialogContent
     class="bg-card border-border text-card-foreground font-mono max-w-md"
+    closeClass="top-7"
     showCloseButton={!syncState.finishing}
     escapeKeydownBehavior={syncState.finishing ? "ignore" : "close"}
     interactOutsideBehavior={syncState.finishing ? "ignore" : "close"}
