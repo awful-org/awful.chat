@@ -257,7 +257,7 @@ let _sendWindow: SendWindow | null = null;
  */
 type Recovery = "quiet" | "back" | "lost" | "asked";
 /** Source-side: do that. */
-let _recover: ((how: Recovery) => Promise<void>) | null = null;
+let _recover: ((how: Recovery) => Promise<boolean>) | null = null;
 let _onAck: (() => void) | null = null;
 /** Source-side: runs while something sent is unanswered (SilenceTimer). */
 let _unanswered: SilenceTimer | null = null;
@@ -388,7 +388,8 @@ const MAX_ITEM_BYTES = 2_200_000;
 const SEND_WINDOW_FRAMES = 4;
 /** Closed channels answered at once, one after another with nothing acked between. */
 const MAX_LOST_CHANNELS = 3;
-const SEND_WINDOW_BYTES = 2 * BATCH_BYTES;
+// Two full frames, with what a frame adds to its items.
+const SEND_WINDOW_BYTES = 2 * (BATCH_BYTES + 8_000);
 
 const SECOND_REQUESTER =
   "Another device is already syncing with this code. If that isn't your device, deny it on your other device and generate a new code.";
@@ -474,7 +475,9 @@ function armAckTimer(): void {
  */
 const RECONNECT_TIMEOUT = 60_000;
 /** How long a finished target makes sure the source knows. */
-const DONE_TIMEOUT = 8_000;
+const DONE_TIMEOUT = 12_000;
+/** After how long it says so again, another way: once, inside that. */
+const DONE_RETELL = 5_000;
 /** And how long it waits for one that was away when it finished. */
 const DONE_RETURN_TIMEOUT = 10_000;
 let _lostTimer: ReturnType<typeof setTimeout> | null = null;
@@ -501,6 +504,11 @@ function stopWaitingForReturn(): boolean {
 
 /** Target-side: the request, until the source says anything. */
 let _unansweredRequest: SilenceTimer | null = null;
+/** Source-side: the clock on the target's silence, which is none while it is away. */
+function timeTarget(): void {
+  if (!_ackSuspended && (_exportSent || (_sendWindow?.pending ?? 0) > 0)) armAckTimer();
+}
+
 /** Target-side: guards against a second ExportRequest on a re-connect. */
 let _exportRequested = false;
 /** Target-side: the source has to actually show up in the sync room. */
@@ -786,11 +794,6 @@ async function startSyncServer(): Promise<void> {
     }
   });
 
-  /** The clock on the target's silence, which is not one while it is away. */
-  const timeTarget = (): void => {
-    if (!_ackSuspended && (_exportSent || (_sendWindow?.pending ?? 0) > 0)) armAckTimer();
-  };
-
   _transport.on("disconnect", (peerId: string) => {
     if (_transport !== sourceTransport) return;
     if (peerId === _pendingRequest?.peerId) {
@@ -973,7 +976,7 @@ async function handleExportRequest(
         .catch(() => false);
     } else {
       // Already allowed, and it has not heard: the data that said so is lost.
-      stopWaitingForReturn();
+      if (stopWaitingForReturn()) timeTarget();
       void _recover?.("asked");
     }
     return;
@@ -1104,19 +1107,22 @@ async function sendExportData(
 
   let recovering = false;
   let recoverNext: Recovery | null = null;
+  /** Recoveries begun. */
+  let recoveries = 0;
   /** Channels that closed since anything was acked: past a few, it is not the link. */
   let lost = 0;
   const outstanding = () => [...pacing.unacked(), ...(_unconfirmedClose ? [_unconfirmedClose] : [])];
-  const recover = async (how: Recovery): Promise<void> => {
+  /** False when there was nothing to do, or nobody to do it for. */
+  const recover = async (how: Recovery): Promise<boolean> => {
     // Nobody to send it to: their return runs this.
-    if (!current() || syncState.reconnecting || outstanding().length === 0) return;
-    if (how === "lost" && ++lost > MAX_LOST_CHANNELS) return;
+    if (!current() || syncState.reconnecting || outstanding().length === 0) return false;
     if (recovering) {
       // The one running may be waiting on the very path they left.
       if (how !== "quiet") recoverNext = how;
-      return;
+      return false;
     }
     recovering = true;
+    recoveries++;
     try {
       console.log(`[Sync][Source] Sending again what was not confirmed (${how})`);
       if (how === "quiet") transport.reopen(peerId);
@@ -1127,9 +1133,13 @@ async function sendExportData(
     } finally {
       recovering = false;
     }
+    if (!current()) return true;
+    // A new start: the tries before it say nothing about this path.
+    if (how !== "quiet" && outstanding().length > 0) unanswered.restart();
     const next = recoverNext;
     recoverNext = null;
     if (next) await recover(next);
+    return true;
   };
   const unanswered = new SilenceTimer(
     () => (writing > 0 || recovering ? false : recover("quiet")),
@@ -1138,7 +1148,13 @@ async function sendExportData(
   _recover = recover;
   _unanswered = unanswered;
   _onAck = () => { lost = 0; };
-  transport.onChannelLost = (peer) => { if (peer === peerId) void recover("lost"); };
+  transport.onChannelLost = (peer) => {
+    if (peer !== peerId || ++lost > MAX_LOST_CHANNELS) return;
+    // A write that failed closes its channel on this side, and is about to say
+    // so itself: its path is bad, where one that just closed may be fine.
+    const before = recoveries;
+    setTimeout(() => { if (recoveries === before) void recover("lost"); }, 0);
+  };
 
   console.log(`[Sync][Source] Exporting data in ${mode} mode`);
 
@@ -1636,15 +1652,13 @@ export async function connectAsTarget(
         sourceHeard = resolve;
         giveUp = setTimeout(resolve, DONE_TIMEOUT);
       });
-      let telling = true;
+      // Whatever became of the first: it may be opening on a path that is gone.
       const again = new SilenceTimer(async () => {
-        // Not while the first is still opening its channel.
-        if (telling) return false;
         targetTransport.reopen(peerId);
         await tell(SyncMessageType.ExportComplete);
-      }, () => DONE_TIMEOUT / 2);
+      }, () => DONE_RETELL);
       again.restart();
-      void tell(SyncMessageType.ExportComplete).finally(() => { telling = false; });
+      void tell(SyncMessageType.ExportComplete);
       await heard;
       again.stop();
       clearTimeout(giveUp);
@@ -1680,8 +1694,9 @@ export async function connectAsTarget(
         if (Date.now() - lastReport < 2000) return;
         report();
       };
-      // At once: it is the answer to the closing frame.
-      report();
+      // At once: it is the answer to the closing frame. With a password to
+      // ask for, AwaitingPassword is, and must not be the one left unconfirmed.
+      if (mode === "add" || !importOptions.requestPassword) report();
       let committed = false;
       let releaseCommit: (() => void) | undefined;
       try {

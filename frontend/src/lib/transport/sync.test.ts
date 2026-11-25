@@ -1103,6 +1103,43 @@ describe("the export is paced on acks and closed with a manifest", () => {
     await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
   });
 
+  it("times the target again when its return is a request, not a connect", async () => {
+    const { t, ask } = await sourceWithHistory(5);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    void approveSync();
+    await vi.waitFor(() => expect(data(t)).toHaveLength(3));
+    t.emit("disconnect", "target");
+    ask("target");
+    await vi.advanceTimersByTimeAsync(10);
+    t.emit("connect", "target");
+    await vi.advanceTimersByTimeAsync(125_000);
+    expect(syncState.syncError).toMatch(/stopped taking in the data/);
+    expect(syncState.isSyncing).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("goes another way when it was a write that failed, though its channel closed first", async () => {
+    const { t, ask } = await sourceWithHistory(5);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    t.autoAck = "target";
+    let failed = false;
+    t.sendSecureRoom = async (peer: string, _room: string, bytes: Uint8Array) => {
+      const msg = JSON.parse(new TextDecoder().decode(bytes));
+      if (!failed && msg.payload?.section === "messages") {
+        failed = true;
+        t.onChannelLost("target");
+        return false;
+      }
+      return FakeTransport.prototype.send.call(t, peer, bytes);
+    };
+    void approveSync();
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    expect(t.reopened).toEqual(["target"]);
+  });
+
   it("sends again at once when the channel closes, a few times, and no more without an ack", async () => {
     const { t, ask } = await sourceWithHistory(5);
     ask("target");
@@ -1492,12 +1529,31 @@ describe("the target confirms, checks and reports", () => {
     fromSource(t, complete());
     await vi.waitFor(() => expect(dones()).toBe(1));
     expect(syncState.isComplete).toBe(false);
-    await vi.advanceTimersByTimeAsync(4_500);
+    await vi.advanceTimersByTimeAsync(5_500);
     expect(dones()).toBe(2);
     expect(t.reopened).toEqual([PEER_ID]);
-    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(7_000);
     await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
     expect(syncState.syncError).toBeNull();
+  });
+
+  it("says it again when the first is stuck on a path that is gone", async () => {
+    const t = await target();
+    t.autoDone = false;
+    let stuck = 0;
+    t.sendSecureRoom = async (peer: string, _room: string, bytes: Uint8Array) => {
+      const msg = JSON.parse(new TextDecoder().decode(bytes));
+      if (msg.type === "sync_export_complete" && stuck++ === 0) return new Promise<boolean>(() => {});
+      return FakeTransport.prototype.send.call(t, peer, bytes);
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(stuck).toBe(1));
+    await vi.advanceTimersByTimeAsync(5_500);
+    expect(stuck).toBe(2);
+    fromSource(t, { type: "sync_done", v: SYNC_PROTOCOL_VERSION });
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
   });
 
   it("ends at once when the source says it heard, or leaves as an older build does", async () => {
