@@ -6,7 +6,7 @@
  * doing real work: nginx answers every unknown path with the app shell at 200,
  * so without it the whole URL space would be duplicate content. It also means
  * every route declares itself a copy of the root - fine for /app and /r/,
- * which are behind robots.txt and have nothing to index anyway.
+ * which have nothing to index (robots.txt and a noindex say so).
  *
  * /qs and /qc are the exception. They are the two pages somebody might arrive
  * at from a search ("send a large file without uploading it", "video call with
@@ -24,7 +24,8 @@ interface RouteMeta {
   path: string | null;
 }
 
-const META: Record<string, RouteMeta> = {
+/** nginx-cards/ says the same to scrapers, which run no scripts. */
+export const META: Record<string, RouteMeta> = {
   qs: {
     title: "Send a file with no account - Awful.chat",
     description:

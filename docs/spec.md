@@ -1371,6 +1371,20 @@ Caching: the relay keeps each answer in memory for an hour (a failure for
          URLs it was asked about for that long, within 1024 entries and
          8 MiB counting URLs and answers alike; a URL over 8 KiB is fetched
          for each ask and never kept.
+Limit:   30 fetches a minute per client. Past it the answer is 429 with a
+         Retry-After naming when the window ends, and the app asks again then.
+Cost:    24 links are fetched and 2 pages parsed at once, 8 links for any one
+         client. Past that a link waits up to 4 s for its turn, and is answered
+         503 (not remembered as failed) if it never comes; then it has 10 s.
+         64 KiB of a server's headers and 2 MiB of a page are read, text is cut
+         to 100-1000 bytes, a URL over 4 KiB is none.
+Media:   a URL that is itself a picture or a video is its own preview; the
+         relay reads no more than its headers. A video the page gives as
+         anything but a video file (YouTube, Vimeo embeds) opens on its site.
+Instagram: a post is asked of Instagram, and when that gives nothing (it
+         refuses many servers), of kkinstagram.com, a third party that is
+         told the post and which picture of it, nothing else. Profiles are
+         not sent there.
 Security: URL allowlist/blocklist, size limits, timeout protection
 ```
 

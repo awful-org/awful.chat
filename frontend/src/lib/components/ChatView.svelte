@@ -3760,7 +3760,7 @@
                           <!-- svelte-ignore a11y_media_has_caption -->
                           <video
                             src={p.url}
-                            class="mt-2 max-h-56 max-w-xs rounded-md"
+                            class="mt-2 max-h-56 min-h-32 max-w-xs min-w-56 rounded-md bg-black"
                             muted
                             playsinline
                           ></video>

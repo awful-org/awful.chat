@@ -34,12 +34,18 @@
 
   /**
    * A textarea cannot style its own content, so the highlight is a mirror
-   * behind transparent text. The mirror is only trustworthy while it shares
-   * every box and type metric with the textarea, so both read this one
-   * string. Change a value here and the two move together.
+   * behind it. The mirror is only trustworthy while it shares every box and
+   * type metric with the textarea, so both read this one string. Change a
+   * value here and the two move together.
+   *
+   * The text read is the textarea's own, and the mirror's is the invisible
+   * one: it only lays out the mention chips' backgrounds. The other way round
+   * (a coloured mirror under transparent text) left nothing to read
+   * whenever the mirror fell behind or was covered: a page the browser
+   * translates, a keyboard that paints the word being typed itself.
    *
    * Nothing in the mirror may alter glyph advance widths - the mention chips
-   * carry colour and background only, never a different weight or spacing.
+   * carry a background only, never a different weight or spacing.
    *
    * The right padding keeps the text clear of the icon buttons the caller
    * overlays there; widen it if a button is added. It is responsive because
@@ -194,14 +200,17 @@
       </div>
     </div>
   {/if}
+  <!-- translate="no": a browser translating the page swaps text nodes for its
+       own, and this one then never followed the draft past its first letter. -->
   <div
     aria-hidden="true"
-    class="pointer-events-none absolute left-px top-px overflow-hidden whitespace-pre-wrap break-words border-transparent text-foreground {BOX}"
+    translate="no"
+    class="pointer-events-none absolute left-px top-px overflow-hidden whitespace-pre-wrap break-words border-transparent text-transparent {BOX}"
     style={`height:calc(100% - 2px);${contentWidth === null ? "" : `width:${contentWidth}px;`}`}
   >
     <div style={`transform:translateY(${-scrollTop}px);`}>
       {#each segments as segment, index (index)}{#if segment.did === null}{segment.text}{:else}<span
-            class="rounded-sm bg-primary/15 text-primary">{segment.text}</span
+            class="rounded-sm bg-primary/30">{segment.text}</span
           >{/if}{/each}<!--
         A draft ending in a newline leaves an empty final line that collapses
         in a block container, so the mirror would come up one line short of
@@ -233,6 +242,6 @@
     rows={1}
     oninput={(event) => { value = event.currentTarget.value; syncCaret(); oninput?.(); }}
     onscroll={(e) => (scrollTop = e.currentTarget.scrollTop)}
-    class="relative block max-h-30 min-h-10 w-full resize-none overflow-y-auto rounded-md border-input bg-transparent text-transparent caret-foreground placeholder:text-muted-foreground selection:bg-primary/30 focus:outline-none focus:ring-1 focus:ring-ring {BOX}"
+    class="relative block max-h-30 min-h-10 w-full resize-none overflow-y-auto rounded-md border-input bg-transparent text-foreground caret-foreground placeholder:text-muted-foreground selection:bg-primary/30 focus:outline-none focus:ring-1 focus:ring-ring {BOX}"
   ></textarea>
 </div>

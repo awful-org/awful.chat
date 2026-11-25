@@ -65,6 +65,8 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 # frontend/ prefixes here too: the context is the repo root (see the top of
 # this file). Only the --from=builder copy above is relative to the image.
 COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+# The /qs and /qc link cards, put in use at start by 42-awful-cards.sh.
+COPY frontend/nginx-cards/ /etc/nginx/awful-cards/
 # nginx runs everything here before it starts, which is where /config.json
 # gets written from the container's environment.
 COPY frontend/docker-entrypoint.d/ /docker-entrypoint.d/

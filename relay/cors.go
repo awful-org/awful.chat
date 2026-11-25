@@ -79,10 +79,10 @@ func corsHeaders(r *http.Request) http.Header {
 	// Response headers a player needs to read to know what it got back. Only
 	// the CORS-safelisted ones are visible to script by default, and
 	// Content-Range is not among them, so a ranged response looks like a
-	// full one without this.
+	// full one without this. Retry-After is /og's: when to ask again.
 	headers.Set(
 		"Access-Control-Expose-Headers",
-		"Content-Length, Content-Range, Accept-Ranges",
+		"Content-Length, Content-Range, Accept-Ranges, Retry-After",
 	)
 	headers.Set("Access-Control-Max-Age", "86400")
 	headers.Set("Vary", "Origin")
