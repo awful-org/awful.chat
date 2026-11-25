@@ -109,7 +109,8 @@ it("takes an event holding many whole frames, whatever they add up to", async ()
   for (const f of held) { all.set(f, at); at += f.length; }
   p.b.dispatchEvent(Object.assign(new Event("message"), { data: all }));
   await vi.waitFor(() => expect(p.onData).toHaveBeenCalledOnce());
-  expect(p.onData.mock.calls[0][1]).toEqual(data);
+  // Not toEqual, which walks over a million numbers one at a time.
+  expect(Buffer.compare(p.onData.mock.calls[0][1], data)).toBe(0);
   expect(p.closed).not.toHaveBeenCalled();
 });
 
