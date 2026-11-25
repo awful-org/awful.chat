@@ -147,6 +147,7 @@ import {
 } from "$lib/avatar-glow.svelte";
   import { Slider } from "./ui/slider";
   import CallLayoutMenu from "./CallLayoutMenu.svelte";
+  import { visibleHeight } from "$lib/visible-height";
   import { callLayoutPrefs, setCallLayoutPrefs } from "$lib/call-layout-prefs.svelte";
   import { callGridRects, callLayoutGroups, cameraStripGeometry, createCameraStripState, filterCallTiles, selectCameraStrip } from "$lib/call-layout";
   import { spotlight } from "$lib/spotlight";
@@ -1224,7 +1225,8 @@ import {
    * nothing at all about the software keyboard. A stage asking for 45% of a
    * viewport 15% taller than the screen took 52% of the screen, and the
    * composer below it went off the bottom edge. visualViewport is the only
-   * number that describes the box the tiles actually have to fit in.
+   * number that describes the box the tiles actually have to fit in, less
+   * any zoom.
    *
    * Zero until the first read, and the dvh classes below cover that frame and
    * any browser without visualViewport.
@@ -1235,7 +1237,7 @@ import {
     if (typeof window === "undefined") return;
     const vv = window.visualViewport;
     const read = () => {
-      viewportPx = vv ? vv.height : window.innerHeight;
+      viewportPx = visibleHeight();
     };
     read();
     if (!vv) {

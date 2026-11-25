@@ -46,6 +46,16 @@ describe("fetchOgPreview", () => {
     expect(fetch.mock.calls[0][0]).toContain("url=https%3A%2F%2Fa.b%2F%3Fx%3D1%26y");
   });
 
+  it("gives up in the end", async () => {
+    const fetch = vi.fn().mockImplementation(async () => answer(429, {}, { "Retry-After": "1" }));
+    vi.stubGlobal("fetch", fetch);
+    const got = fetchOgPreview("https://a.b/", new AbortController().signal, () => {});
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await got).toEqual({ url: "https://a.b/", mediaType: "none" });
+    expect(fetch).toHaveBeenCalledTimes(6);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("stops waiting when the message goes away", async () => {
     const fetch = vi.fn().mockResolvedValue(answer(429, {}, { "Retry-After": "5" }));
     vi.stubGlobal("fetch", fetch);
@@ -90,6 +100,12 @@ describe("playableVideo", () => {
     expect(playableVideo(video("video/mp4"))).toBe("https://a.b/v");
     expect(playableVideo(video("Video/MP4; codecs=avc1"))).toBe("https://a.b/v");
     expect(playableVideo(video())).toBe("https://a.b/v");
+  });
+
+  it("takes what this browser says it plays", () => {
+    const hls = video("application/vnd.apple.mpegurl");
+    expect(playableVideo(hls, () => true)).toBe("https://a.b/v");
+    expect(playableVideo(hls, () => false)).toBeNull();
   });
 
   it("refuses an embed page, which a video element cannot play", () => {

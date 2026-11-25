@@ -28,6 +28,13 @@ export function bareOgPreview(url: string): OgPreview {
 const MAX_RETRY_AFTER_S = 600;
 
 /**
+ * How many times one link is asked again. At thirty a minute that fills a
+ * whole screen of history; past it, a flood of links somebody posted is not
+ * worth spending the budget of the next ones on.
+ */
+const MAX_RETRIES = 5;
+
+/**
  * How long a 429 asks us to wait, in ms, or null when it does not say. Bounded
  * at both ends: zero would ask again at once, forever, and so would a wait too
  * long for setTimeout, which fires straight away.
@@ -66,7 +73,7 @@ export async function fetchOgPreview(
   signal: AbortSignal,
   onWait: () => void
 ): Promise<OgPreview> {
-  for (;;) {
+  for (let tries = 0; ; tries++) {
     const response = await fetch(
       // No hardcoded origin: an unset apiUrl means this instance never said
       // where its relay is, and defaulting to awful.frav.in would hand every
@@ -77,7 +84,7 @@ export async function fetchOgPreview(
     );
     if (response.ok) return (await response.json()) as OgPreview;
     const ms =
-      response.status === 429
+      response.status === 429 && tries < MAX_RETRIES
         ? retryAfterMs(response.headers.get("Retry-After"))
         : null;
     // Every other answer is an {error} body, which is not a preview.
@@ -91,9 +98,20 @@ export async function fetchOgPreview(
  * The address to give a video element, if this preview has one it can play.
  * Many sites (YouTube, Vimeo) name an embed page here instead, as text/html.
  */
-export function playableVideo(preview: OgPreview): string | null {
+export function playableVideo(
+  preview: OgPreview,
+  canPlay: (type: string) => boolean = browserPlays
+): string | null {
   if (preview.mediaType !== "video" || !preview.video) return null;
   const type = preview.videoContentType;
-  // With no type given, the element finds out; its error shows the link.
-  return !type || /^video\//i.test(type) ? preview.video : null;
+  // With no type given, the element finds out; its error shows the link. Not
+  // only video/*: Safari plays HLS, which calls itself application/*.
+  return !type || /^video\//i.test(type) || canPlay(type) ? preview.video : null;
+}
+
+function browserPlays(type: string): boolean {
+  return (
+    typeof document !== "undefined" &&
+    document.createElement("video").canPlayType(type) !== ""
+  );
 }

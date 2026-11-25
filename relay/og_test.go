@@ -7,9 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 )
 
 // An Instagram post is asked of Instagram first and of the mirror second, and
@@ -24,11 +28,15 @@ func TestInstagramCandidateURLs(t *testing.T) {
 		"https://instagram.com/reel/abc":    {"https://instagram.com/reel/abc", "https://kkinstagram.com/reel/abc"},
 		"https://www.instagram.com/some.one/reel/abc/": {
 			"https://www.instagram.com/some.one/reel/abc/", "https://kkinstagram.com/some.one/reel/abc/"},
-		"https://www.instagram.com/some.one/":      {"https://www.instagram.com/some.one/"},
-		"https://www.instagram.com/direct/inbox/":  {"https://www.instagram.com/direct/inbox/"},
-		"https://www.instagram.com/p/a/../../x/":   {"https://www.instagram.com/p/a/../../x/"},
-		"https://example.com/p/abc/":               {"https://example.com/p/abc/"},
-		"https://www.instagram.com.example/p/abc/": {"https://www.instagram.com.example/p/abc/"},
+		"https://www.instagram.com/some.one/": {"https://www.instagram.com/some.one/"},
+		// A share's id is one person's.
+		"https://www.instagram.com/share/reel/abc/": {"https://www.instagram.com/share/reel/abc/"},
+		"https://www.instagram.com/share/p/abc":     {"https://www.instagram.com/share/p/abc"},
+		post + "?img_index=sharer-1234":             {post + "?img_index=sharer-1234", "https://kkinstagram.com/p/abc-12_3/"},
+		"https://www.instagram.com/direct/inbox/":   {"https://www.instagram.com/direct/inbox/"},
+		"https://www.instagram.com/p/a/../../x/":    {"https://www.instagram.com/p/a/../../x/"},
+		"https://example.com/p/abc/":                {"https://example.com/p/abc/"},
+		"https://www.instagram.com.example/p/abc/":  {"https://www.instagram.com.example/p/abc/"},
 	}
 	for link, want := range cases {
 		if got := getCandidateUrls(mustURL(t, link)); !slices.Equal(got, want) {
@@ -66,6 +74,7 @@ func TestOgParseReadsTheWholeValue(t *testing.T) {
 		`<meta name="twitter:title" content="t"><meta property="og:title" content="og">`:                                        "og",
 		`<title> A &amp; B </title><svg><title>icon</title></svg>`:                                                              "A & B",
 		`<title></title>`: "<none>",
+		`<noscript><meta property="og:title" content="no scripts"></noscript>`: "no scripts",
 		// What only looks like a tag is not one.
 		`<!-- <meta property="og:title" content="commented"> --><title>real</title>`:             "real",
 		`<script>var x = '<meta property="og:title" content="script">'</script><title>r</title>`: "r",
@@ -103,6 +112,79 @@ func TestOgParseMedia(t *testing.T) {
 	}
 }
 
+// Nothing a page says comes back at any length it likes.
+func TestOgParseCapsWhatItKeeps(t *testing.T) {
+	long := strings.Repeat("\u00e9<", 1<<17)
+	p := parsePage(`<meta property="og:title" content="` + long + `"><meta property="og:description" content="` + long +
+		`"><meta property="og:site_name" content="` + long + `"><meta property="og:video:type" content="` + long +
+		`"><meta property="og:image" content="/` + long + `"><meta property="og:video" content="https://a.b/` + strings.Repeat("v", ogMaxURL) + `">`)
+	for name, c := range map[string]struct {
+		got *string
+		max int
+	}{
+		"title": {p.Title, ogMaxTitle}, "description": {p.Description, ogMaxDescription},
+		"site": {p.SiteName, ogMaxName}, "type": {p.VideoContentType, ogMaxName},
+	} {
+		if c.got == nil || len(*c.got) > c.max || len(*c.got) < c.max-4 || !utf8.ValidString(*c.got) {
+			t.Errorf("%s: %d bytes, want up to %d", name, len(value(c.got)), c.max)
+		}
+	}
+	if p.Image != nil || p.Video != nil {
+		t.Errorf("a cut url came back: %d and %d bytes", len(value(p.Image)), len(value(p.Video)))
+	}
+	body, err := json.Marshal(p)
+	if err != nil || len(body) > ogCacheMaxBodyBytes {
+		t.Errorf("the answer is %d bytes", len(body))
+	}
+	// A title only in <title>, and a long one.
+	if got := value(parsePage("<title>" + long + "</title>").Title); len(got) > ogMaxTitle {
+		t.Errorf("<title>: %d bytes", len(got))
+	}
+}
+
+// One tag as long as a page: what came before it is kept, and reading it stops
+// short of the tokenizer's copies of each of its attributes.
+func TestOgParseStopsAtAnEndlessTag(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`<meta property="og:title" content="before"><a`)
+	for i := 0; b.Len() < ogMaxPageBytes; i++ {
+		b.WriteByte(' ')
+		b.WriteString(strconv.FormatInt(int64(i), 36))
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	p := parsePage(b.String())
+	runtime.ReadMemStats(&after)
+	if value(p.Title) != "before" {
+		t.Errorf("title %q", value(p.Title))
+	}
+	if mb := (after.TotalAlloc - before.TotalAlloc) >> 20; mb > 160 {
+		t.Errorf("one page allocated %d MB", mb)
+	}
+}
+
+// A first candidate that hangs leaves the next one time of its own.
+func TestOgBuildSharesItsDeadline(t *testing.T) {
+	saved := ogFetchPage
+	t.Cleanup(func() { ogFetchPage = saved })
+	var shares []time.Duration
+	ogFetchPage = func(ctx context.Context, candidate string) (ogPage, bool) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			t.Error("no deadline")
+		}
+		shares = append(shares, time.Until(d))
+		return ogPage{}, false
+	}
+	ogBuild(mustURL(t, "https://www.instagram.com/p/abc/"))
+	if len(shares) != 2 || shares[0] > ogDeadline/2 || shares[1] > ogDeadline {
+		t.Errorf("shares %v of %v", shares, ogDeadline)
+	}
+	if ogDeadline >= 15*time.Second {
+		t.Error("longer than the API server's WriteTimeout")
+	}
+}
+
 // The next candidate is asked when one fails, or answers with nothing to
 // show; what did answer is kept if none does better.
 func TestOgBuildFallsBackToTheNextCandidate(t *testing.T) {
@@ -127,12 +209,15 @@ func TestOgBuildFallsBackToTheNextCandidate(t *testing.T) {
 	t.Cleanup(func() { ogFetchPage = saved })
 	for _, c := range cases {
 		asked := 0
-		ogFetchPage = func(candidate string) (ogPage, bool) {
+		ogFetchPage = func(_ context.Context, candidate string) (ogPage, bool) {
 			asked++
 			p, ok := c.pages[candidate]
 			return p, ok
 		}
-		body := ogBuild(mustURL(t, own))
+		body, busy := ogBuild(mustURL(t, own))
+		if busy {
+			t.Errorf("%s: busy", c.name)
+		}
 		if asked != c.asked {
 			t.Errorf("%s: asked %d candidates, want %d", c.name, asked, c.asked)
 		}
@@ -163,6 +248,9 @@ func TestOgFetchPageKnowsMediaFromPages(t *testing.T) {
 		case "/a.jpg":
 			w.Header().Set("Content-Type", "image/jpeg; q=1")
 			w.Write([]byte("not html"))
+		case "/b.mp4":
+			w.Header().Set("Content-Type", "video/mp4; codecs=avc1.42E01E, mp4a.40.2")
+			w.Write([]byte("not html"))
 		case "/page":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Write([]byte("<title>x</title>"))
@@ -173,14 +261,17 @@ func TestOgFetchPageKnowsMediaFromPages(t *testing.T) {
 	}))
 	defer srv.Close()
 	ogHTTPClient = srv.Client()
-	if p, ok := ogFetchPage(srv.URL + "/moved"); !ok || p.media != "image/jpeg" || p.url != srv.URL+"/a.jpg" || p.html != "" {
+	if p, ok := ogFetchPage(context.Background(), srv.URL+"/moved"); !ok || p.media != "image/jpeg" || p.url != srv.URL+"/a.jpg" || p.html != "" {
 		t.Errorf("a redirect to a picture: %v %+v", ok, p)
 	}
-	if p, ok := ogFetchPage(srv.URL + "/page"); !ok || p.media != "" || p.html != "<title>x</title>" {
+	if p, ok := ogFetchPage(context.Background(), srv.URL+"/b.mp4"); !ok || p.media != "video/mp4" {
+		t.Errorf("a video with a sloppy type: %v %+v", ok, p)
+	}
+	if p, ok := ogFetchPage(context.Background(), srv.URL+"/page"); !ok || p.media != "" || p.html != "<title>x</title>" {
 		t.Errorf("a page: %v %+v", ok, p)
 	}
 	for _, path := range []string{"/empty", "/gone"} {
-		if p, ok := ogFetchPage(srv.URL + path); ok {
+		if p, ok := ogFetchPage(context.Background(), srv.URL+path); ok {
 			t.Errorf("%s answered: %+v", path, p)
 		}
 	}

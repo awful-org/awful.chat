@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -24,7 +25,7 @@ type fakeOgUpstream struct {
 func (f *fakeOgUpstream) install(t *testing.T) {
 	t.Helper()
 	saved := ogFetchPage
-	ogFetchPage = func(candidate string) (ogPage, bool) {
+	ogFetchPage = func(_ context.Context, candidate string) (ogPage, bool) {
 		f.fetches.Add(1)
 		if f.release != nil {
 			<-f.release
@@ -280,4 +281,63 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// An answer too long to keep pushed every other preview out of the cache on
+// its way to being dropped itself.
+func TestOgPreviewLongAnswerDoesNotEmptyTheCache(t *testing.T) {
+	resetOgCache(t)
+	ogCacheMu.Lock()
+	defer ogCacheMu.Unlock()
+	now := time.Now()
+	ogCacheStoreLocked("https://example.com/a", []byte("{}"), now)
+	ogCacheStoreLocked("https://example.com/b", make([]byte, ogCacheMaxBytes+1), now)
+	ogCacheStoreLocked("https://example.com/c", make([]byte, ogCacheMaxBodyBytes+1), now)
+	if len(ogCache) != 1 || ogCache["https://example.com/a"].body == nil {
+		t.Fatalf("%d entries left, want the one that fits", len(ogCache))
+	}
+}
+
+// However many links are asked for, so many are fetched at once. One that
+// never got its turn is answered as busy, and not remembered as dead.
+func TestOgPreviewBoundsFetchesAtOnce(t *testing.T) {
+	resetRateLimiter(t)
+	resetOgCache(t)
+	up := &fakeOgUpstream{release: make(chan struct{})}
+	up.install(t)
+	var wg sync.WaitGroup
+	codes := make([]int, ogMaxFetches*2)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i] = ogRequest(t, "198.51.100."+strconv.Itoa(i+1), "https://example.com/"+strconv.Itoa(i)).Code
+		}(i)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for up.fetches.Load() < ogMaxFetches && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := up.fetches.Load(); n != ogMaxFetches {
+		t.Fatalf("%d fetches at once, want %d", n, ogMaxFetches)
+	}
+	close(up.release)
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("link %d: %d", i, c)
+		}
+	}
+	if len(ogFetchSlots) != 0 || len(ogParseSlots) != 0 {
+		t.Fatalf("slots still held: %d and %d", len(ogFetchSlots), len(ogParseSlots))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	full := make(chan struct{}, 1)
+	full <- struct{}{}
+	if ogTake(ctx, full) {
+		t.Fatal("took a slot that was not free")
+	}
 }

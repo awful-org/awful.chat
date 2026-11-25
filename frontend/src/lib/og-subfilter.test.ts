@@ -69,13 +69,23 @@ describe("invite card rewriting", () => {
     expect(directives.join("\n")).not.toContain("$request_uri");
   });
 
+  // It is the requester's text, written inside an attribute.
+  it("drops a host that could close the attribute", () => {
+    const map = nginx.slice(nginx.indexOf("map $host $awful_host {"));
+    const allowed = [...map.slice(0, map.indexOf("\n}")).matchAll(/"~(\S+)" \$host;/g)].map((m) => new RegExp(m[1]));
+    expect(allowed).toHaveLength(2);
+    const passes = (host: string) => allowed.some((r) => r.test(host));
+    for (const ok of ["awful.chat", "localhost", "10.0.0.1", "[2001:db8::1]"]) expect(passes(ok)).toBe(true);
+    for (const bad of ['a"><script>', "a b", "a'b", "a<b", "", "a/b"]) expect(passes(bad)).toBe(false);
+  });
+
   it("rewrites to the requesting host, so any instance points at itself", () => {
     const block = nginx.slice(nginx.indexOf("location ~ ^/r(/|$)"));
     const body = block.slice(0, block.indexOf("\n    }"));
     for (const line of body.split("\n")) {
       if (!line.includes("sub_filter '") || !line.includes("http")) continue;
       const replacement = [...line.matchAll(/'((?:[^'\\]|\\.)*)'/g)][1]?.[1] ?? "";
-      if (replacement.includes("http")) expect(replacement).toContain("$host");
+      if (replacement.includes("http")) expect(replacement).toContain("https://$awful_host/");
     }
   });
 });
@@ -103,9 +113,9 @@ describe.each(["qs", "qc"])("the /%s card", (path) => {
   });
 
   it("names itself and its own picture, on whichever host", () => {
-    expect(card).toContain(`href="https://$host/${path}"`);
-    expect(card).toContain(`content="https://$host/${path}"`);
-    expect(card.split(`https://$host/og-${path}.png`)).toHaveLength(3);
+    expect(card).toContain(`href="https://$awful_host/${path}"`);
+    expect(card).toContain(`content="https://$awful_host/${path}"`);
+    expect(card.split(`https://$awful_host/og-${path}.png`)).toHaveLength(3);
     expect(card).not.toContain("awful.chat/og.png");
     expect(existsSync(`public/og-${path}.png`)).toBe(true);
     expect(conf).not.toContain("$request_uri");

@@ -643,14 +643,6 @@
     pluginPrefs.pinnedWidgets.some((p) => p.pluginId === pluginCardPluginId)
   );
 
-  $effect(() => {
-    linkedUrl;
-    videoPlaying = false;
-    videoFailed = false;
-    videoNaturalWidth = 0;
-    videoNaturalHeight = 0;
-  });
-
   // Load plugin card component AND its state. Subscribing to the tick is
   // what makes live votes re-render; getCardState is a cache hit after the
   // first build. ($effect callbacks must be sync - an async fn's returned
@@ -780,6 +772,12 @@
   $effect(() => {
     ogPreview = null;
     ogLoading = false;
+    // The player belongs to the preview: one coming back (external media
+    // switched off and on) neither plays by itself nor stays failed.
+    videoPlaying = false;
+    videoFailed = false;
+    videoNaturalWidth = 0;
+    videoNaturalHeight = 0;
     if (!mediaPrefs.externalMedia || !shouldShowOg || !linkedUrl) return;
     const previewUrl = remotePreviewUrl(linkedUrl);
     if (!previewUrl) return;
@@ -1381,6 +1379,10 @@
                 class="min-h-0 min-w-0 flex-1 object-contain"
                 onloadedmetadata={onVideoMeta}
                 onerror={() => {
+                  // Only a video that cannot be played at all. One whose
+                  // connection broke half way keeps its player.
+                  const failed = videoEl?.error?.code;
+                  if (failed !== MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) return;
                   videoFailed = true;
                   videoPlaying = false;
                 }}
