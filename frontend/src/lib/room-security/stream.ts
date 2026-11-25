@@ -76,7 +76,10 @@ export function attachRoomStream(options: {
     try {
       if (closed || connection.status !== "open") { close(); return; }
       const chunk = event.data instanceof Uint8Array ? event.data : event.data.subarray();
-      if (buf.length + chunk.length > LIMIT + 4) throw new Error("Room frame buffer exceeded");
+      // No limit on the two together: one event can hold many whole frames (a
+      // relay circuit hands over as much as its window lets it read at once),
+      // and a limit here closed a channel every one of whose frames was fine.
+      // What is left over below is part of one frame, which has its own.
       const merged = new Uint8Array(buf.length + chunk.length);
       merged.set(buf); merged.set(chunk, buf.length); buf = merged;
       while (buf.length >= 4) {

@@ -8,6 +8,7 @@
 import QRCode from "qrcode";
 import { stopQrScan } from "../qr-scanner.svelte";
 import type { PeerTransport } from "./types";
+import { MAX_ROOM_MESSAGE } from "$lib/room-security/channel";
 import { SecureSyncTransport } from "$lib/room-security/sync-transport";
 import { deriveRoomKeys, newRoomSecret, parseRoomSecret, type RoomSecret } from "$lib/room-security/keys";
 import {
@@ -70,6 +71,8 @@ import {
   SYNC_PROTOCOL_VERSION,
   SYNC_VERSION_MISMATCH,
   SendWindow,
+  SilenceTimer,
+  silenceFor,
   manifestProblems,
   newSyncNonce,
   syncComparisonCode,
@@ -133,6 +136,8 @@ enum SyncMessageType {
    * user to allow it; both ends derive the comparison code from the nonce.
    */
   ApprovalPending = "sync_approval_pending",
+  /** The source has the target's ExportComplete. A build before it only leaves. */
+  Done = "sync_done",
   /** Source to target: `{ section, data, seq, ... }`; acked by seq. */
   ExportData = "sync_export_data",
   /** Target to source: `{ seq }`, once the frame was taken in. Paces the export. */
@@ -193,6 +198,8 @@ export interface SyncState {
    * Deny is being asked. On the target: it is waiting for that answer.
    */
   awaitingApproval: boolean;
+  /** The other device went away mid-sync and is being waited for. */
+  reconnecting: boolean;
   /** The six digits both devices show for the request in play. */
   pairingCode: string | null;
   /**
@@ -214,11 +221,12 @@ export const syncState = $state<SyncState>({
   syncError: null,
   isComplete: false,
   awaitingApproval: false,
+  reconnecting: false,
   pairingCode: null,
   finishing: false,
 });
 
-let _transport: PeerTransport | null = null;
+let _transport: SecureSyncTransport | null = null;
 // A committed multi-transaction import cannot be rolled back. Keep its write
 // lease through cleanup so a replacement sync cannot overlap identity/storage.
 let _importCommitDone: Promise<void> | null = null;
@@ -241,6 +249,20 @@ interface PendingRequest {
 let _pendingRequest: PendingRequest | null = null;
 /** Source-side: paces the export on the target's acks (SendWindow). */
 let _sendWindow: SendWindow | null = null;
+/**
+ * What was sent and not confirmed goes again: on another connection ("quiet",
+ * nothing came of it), on a fresh channel ("back", they left and returned, or
+ * "lost", the channel closed), or on the one there is ("asked", they just asked
+ * over it).
+ */
+type Recovery = "quiet" | "back" | "lost" | "asked";
+/** Source-side: do that. */
+let _recover: ((how: Recovery) => Promise<boolean>) | null = null;
+let _onAck: (() => void) | null = null;
+/** Source-side: runs while something sent is unanswered (SilenceTimer). */
+let _unanswered: SilenceTimer | null = null;
+/** Source-side: the closing frame, until anything answers it. */
+let _unconfirmedClose: Uint8Array | null = null;
 /** Source-side: the transfer is over; what is left is the target's import. */
 let _exportSent = false;
 /** Source-side: the target is asking its user for a password (AwaitingPassword). */
@@ -343,8 +365,20 @@ export function peerIdShortPrefix(peerId: string): string {
 const SYNC_ROOM_PREFIX = "__sync_";
 const SYNC_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 const BATCH_SIZE = 50;
-/** Encoded-bytes budget per frame; the transport aborts frames over 4MB. */
-const MAX_BATCH_BYTES = 2_500_000;
+/**
+ * Encoded bytes a frame is closed at. Small, so that a slow link is heard from
+ * often - what is not acked is all the sender knows of it - and so that what
+ * is queued on one does not hold up the link's own pings, which takes the
+ * connection down. Measured over yamux at 40 ms: with four times both, a
+ * 250 KB/s uplink lost its connection on the way; with these, 125 KB/s kept it.
+ */
+const BATCH_BYTES = 128_000;
+/**
+ * The largest single item that goes whole. On the wire it is about 1.8 times
+ * this, and a receiver closes a channel holding more than 4 MiB of that unread
+ * - which a fast relay circuit hands it all at once.
+ */
+const MAX_ITEM_BYTES = 2_200_000;
 /**
  * Frames the export may have out before the target acks them, and the bytes
  * they may add up to (SendWindow). One frame always may go, whatever its
@@ -352,7 +386,10 @@ const MAX_BATCH_BYTES = 2_500_000;
  * which is what a single frame could always ask of it - or a few small ones.
  */
 const SEND_WINDOW_FRAMES = 4;
-const SEND_WINDOW_BYTES = MAX_BATCH_BYTES;
+/** Closed channels answered at once, one after another with nothing acked between. */
+const MAX_LOST_CHANNELS = 3;
+// Two full frames, with what a frame adds to its items.
+const SEND_WINDOW_BYTES = 2 * (BATCH_BYTES + 8_000);
 
 const SECOND_REQUESTER =
   "Another device is already syncing with this code. If that isn't your device, deny it on your other device and generate a new code.";
@@ -431,6 +468,47 @@ function armAckTimer(): void {
   }, ACK_TIMEOUT_MS);
 }
 
+/**
+ * How long a device that went away mid-sync is waited for. A phone whose
+ * browser was left for a moment, or that changed networks, is back within it;
+ * the transport keeps redialing, and returning to the page redials at once.
+ */
+const RECONNECT_TIMEOUT = 60_000;
+/** How long a finished target makes sure the source knows. */
+const DONE_TIMEOUT = 12_000;
+/** After how long it says so again, another way: once, inside that. */
+const DONE_RETELL = 5_000;
+/** And how long it waits for one that was away when it finished. */
+const DONE_RETURN_TIMEOUT = 10_000;
+let _lostTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** The other device is gone; `giveUp` runs if it stays gone. */
+function waitForReturn(giveUp: () => void): void {
+  syncState.reconnecting = true;
+  if (_lostTimer) return;
+  _lostTimer = setTimeout(() => {
+    _lostTimer = null;
+    syncState.reconnecting = false;
+    giveUp();
+  }, RECONNECT_TIMEOUT);
+}
+
+/** It is back, or the session is over. True when it had been gone. */
+function stopWaitingForReturn(): boolean {
+  const gone = syncState.reconnecting;
+  syncState.reconnecting = false;
+  if (_lostTimer) clearTimeout(_lostTimer);
+  _lostTimer = null;
+  return gone;
+}
+
+/** Target-side: the request, until the source says anything. */
+let _unansweredRequest: SilenceTimer | null = null;
+/** Source-side: the clock on the target's silence, which is none while it is away. */
+function timeTarget(): void {
+  if (!_ackSuspended && (_exportSent || (_sendWindow?.pending ?? 0) > 0)) armAckTimer();
+}
+
 /** Target-side: guards against a second ExportRequest on a re-connect. */
 let _exportRequested = false;
 /** Target-side: the source has to actually show up in the sync room. */
@@ -469,7 +547,12 @@ function armStallTimer(): void {
     syncState.isSyncing = false;
     syncState.syncError =
       "The other device stopped sending. Keep both sync screens open and try a new code.";
-    cleanup().catch(() => {});
+    // Said on the way out, or the source waits a minute for our return.
+    const source = _targetSourcePeerId;
+    cleanup(source ? {
+      peerId: source,
+      data: errorFrame("The other device heard nothing for a minute and stopped. Generate a new code and try again."),
+    } : undefined).catch(() => {});
   }, SYNC_STALL_TIMEOUT);
 }
 
@@ -703,6 +786,12 @@ async function startSyncServer(): Promise<void> {
   // Set up handlers
   _transport.on("connect", (peerId: string) => {
     console.log("[Sync][Source] Peer connected:", peerId.slice(0, 8));
+    if (_transport !== sourceTransport || peerId !== _authorizedExportPeer) return;
+    // Back: what was on the way when it left went with the connection.
+    if (stopWaitingForReturn()) {
+      timeTarget();
+      void _recover?.("back");
+    }
   });
 
   _transport.on("disconnect", (peerId: string) => {
@@ -715,21 +804,24 @@ async function startSyncServer(): Promise<void> {
     }
     if (peerId !== _authorizedExportPeer || syncState.isComplete) return;
     console.log("[Sync][Source] Peer disconnected");
-    if (!_exportSent) {
-      // Mid-transfer: whatever was in flight went with the connection.
-      _sendWindow?.fail(new Error("Connection lost"));
-      syncState.isSyncing = false;
-      syncState.syncError = "Lost the connection to the other device while sending - try again.";
-      cleanup().catch(() => {});
-      return;
-    }
-    // Everything is across and the import over there carries on without
-    // this device. Said, but not torn down: if its confirmation still
-    // arrives, the success replaces this message.
     clearAckTimer();
-    syncState.isSyncing = false;
-    syncState.syncError =
-      "Lost the connection while the other device was importing. Check it to see whether the sync finished.";
+    waitForReturn(() => {
+      if (_transport !== sourceTransport || syncState.isComplete) return;
+      if (!_exportSent) {
+        _sendWindow?.fail(new Error("Connection lost"));
+        syncState.isSyncing = false;
+        syncState.syncError = "Lost the connection to the other device while sending - try again.";
+        cleanup().catch(() => {});
+        return;
+      }
+      // Everything is across and the import over there carries on without
+      // this device. Said, but not torn down: if its confirmation still
+      // arrives, the success replaces this message.
+      _unanswered?.stop();
+      syncState.isSyncing = false;
+      syncState.syncError =
+        "Lost the connection while the other device was importing. Check it to see whether the sync finished.";
+    });
   });
 
   // Source handles requests from target
@@ -754,6 +846,14 @@ async function startSyncServer(): Promise<void> {
       }
       if (peerId !== _authorizedExportPeer) return;
       console.log("[Sync][Source] Message type:", msg.type);
+      if (SYNC_MESSAGE_TYPES.has(msg.type)) {
+        if (stopWaitingForReturn()) timeTarget();
+        // Past the last ack, anything it says means the close reached it.
+        if (_exportSent && msg.type !== SyncMessageType.ExportAck) {
+          _unconfirmedClose = null;
+          _unanswered?.stop();
+        }
+      }
       // A frame of the import after the password prompt is the target
       // working again. Only those: the transport's own keepalive pings come
       // through here too, and one of them used to end the pause - so the
@@ -772,7 +872,12 @@ async function startSyncServer(): Promise<void> {
         // The window is what paces the export; each ack is also a sign of
         // life for the silence clock.
         const { seq } = (msg.payload ?? {}) as { seq?: unknown };
-        if (_sendWindow?.ack(seq) && !_exportSent) armAckTimer();
+        if (_sendWindow?.ack(seq) && !_exportSent) {
+          armAckTimer();
+          _onAck?.();
+          if (_sendWindow.pending > 0) _unanswered?.restart();
+          else _unanswered?.stop();
+        }
       } else if (msg.type === SyncMessageType.AwaitingPassword) {
         // A person typing a password takes as long as it takes. The clock
         // restarts with whatever the target sends next.
@@ -798,7 +903,7 @@ async function startSyncServer(): Promise<void> {
         syncState.syncProgress = 100;
         // A "connection lost" said while the import ran is answered now.
         syncState.syncError = null;
-        await cleanup();
+        await cleanup({ peerId, data: frame(SyncMessageType.Done) });
       } else if (msg.type === SyncMessageType.SyncError) {
         clearAckTimer();
         _sendWindow?.fail(new Error("The other device stopped the sync"));
@@ -869,6 +974,10 @@ async function handleExportRequest(
     if (_pendingRequest) {
       await transport.send(peerId, frame(SyncMessageType.ApprovalPending, { nonce: _pendingRequest.nonce }))
         .catch(() => false);
+    } else {
+      // Already allowed, and it has not heard: the data that said so is lost.
+      if (stopWaitingForReturn()) timeTarget();
+      void _recover?.("asked");
     }
     return;
   }
@@ -925,6 +1034,8 @@ export async function approveSync(): Promise<void> {
     if (_transport !== transport) return;
   }
   console.log(`[Sync][Source] Approved, sending data in ${request.mode} mode`);
+  // Nothing is on the channel now: the request was answered and they wait.
+  transport.preferDirect(request.peerId);
   await sendExportData(request.peerId, request.mode);
 }
 
@@ -961,27 +1072,88 @@ async function sendExportData(
   const pacing = new SendWindow(SEND_WINDOW_FRAMES, SEND_WINDOW_BYTES);
   _sendWindow = pacing;
   let seq = 0;
+  /** Frames being written right now. */
+  let writing = 0;
 
   // One data frame, once the window has room for it. Echoes the
   // proof-of-scan token, so the target can reject data from a peer that
   // never proved it holds the shared secret, and a seq for the ack to name.
   //
-  // send() resolving false means the stream is gone; silently pouring the
-  // rest of the export into it is how the source reached 90% with a target
-  // that had stopped hearing anything at 20%. It resolves in bounded time:
-  // the transport gives a frame a drain budget scaled to its size, so a far
-  // end that stopped reading fails the send instead of parking this loop.
+  // send() resolving true means the frame was handed to the link, not that
+  // anything came out at the other end, so a frame is kept until its ack. One
+  // refused, or not heard of, goes again on a fresh channel (recover); the
+  // target takes a batch that arrives twice once. It is the ack clock, not a
+  // failed send, that ends this: the window lets only a few frames out ahead.
   const sendData = async (payload: Record<string, unknown>, what: string): Promise<boolean> => {
     const bytes = frame(SyncMessageType.ExportData, { ...payload, token, seq });
+    // Refused however often it is sent: say which, now.
+    if (bytes.length > MAX_ROOM_MESSAGE) throw new Error(`Part of ${what} is too large to send`);
     await pacing.reserve(bytes.length);
     if (!current()) return false;
-    pacing.sent(seq, bytes.length);
+    pacing.sent(seq, bytes.length, bytes);
     seq++;
     if (!_ackTimeoutTimer) armAckTimer();
-    const ok = await transport.send(peerId, bytes);
+    writing++;
+    const ok = await transport.send(peerId, bytes).catch(() => false);
+    writing--;
     if (!current()) return false;
-    if (!ok) throw new Error(`Connection lost while sending ${what} - try again`);
+    if (pacing.pending > 0) unanswered.ensure();
+    if (!ok) {
+      console.warn(`[Sync][Source] ${what} was not taken by the link`);
+      void recover("quiet");
+    }
     return true;
+  };
+
+  let recovering = false;
+  let recoverNext: Recovery | null = null;
+  /** Recoveries begun. */
+  let recoveries = 0;
+  /** Channels that closed since anything was acked: past a few, it is not the link. */
+  let lost = 0;
+  const outstanding = () => [...pacing.unacked(), ...(_unconfirmedClose ? [_unconfirmedClose] : [])];
+  /** False when there was nothing to do, or nobody to do it for. */
+  const recover = async (how: Recovery): Promise<boolean> => {
+    // Nobody to send it to: their return runs this.
+    if (!current() || syncState.reconnecting || outstanding().length === 0) return false;
+    if (recovering) {
+      // The one running may be waiting on the very path they left.
+      if (how !== "quiet") recoverNext = how;
+      return false;
+    }
+    recovering = true;
+    recoveries++;
+    try {
+      console.log(`[Sync][Source] Sending again what was not confirmed (${how})`);
+      if (how === "quiet") transport.reopen(peerId);
+      else if (how !== "asked") transport.refresh(peerId);
+      for (const again of outstanding()) {
+        if (!current() || !(await transport.send(peerId, again).catch(() => false))) break;
+      }
+    } finally {
+      recovering = false;
+    }
+    if (!current()) return true;
+    // A new start: the tries before it say nothing about this path.
+    if (how !== "quiet" && outstanding().length > 0) unanswered.restart();
+    const next = recoverNext;
+    recoverNext = null;
+    if (next) await recover(next);
+    return true;
+  };
+  const unanswered = new SilenceTimer(
+    () => (writing > 0 || recovering ? false : recover("quiet")),
+    () => silenceFor(pacing.pendingBytes)
+  );
+  _recover = recover;
+  _unanswered = unanswered;
+  _onAck = () => { lost = 0; };
+  transport.onChannelLost = (peer) => {
+    if (peer !== peerId || ++lost > MAX_LOST_CHANNELS) return;
+    // A write that failed closes its channel on this side, and is about to say
+    // so itself: its path is bad, where one that just closed may be fine.
+    const before = recoveries;
+    setTimeout(() => { if (recoveries === before) void recover("lost"); }, 0);
   };
 
   console.log(`[Sync][Source] Exporting data in ${mode} mode`);
@@ -1000,8 +1172,7 @@ async function sendExportData(
     const { bindingSig } = signPeerBinding(transport.selfId());
     if (!current()) return;
 
-    // Identity first. Checked like every other send: this is the one frame
-    // whose loss leaves the target sitting at exactly 0%.
+    // Identity first.
     if (!(await sendData({ section: "identity", data: exportData.identity, did, binding: bindingSig }, "identity"))) {
       return;
     }
@@ -1033,7 +1204,7 @@ async function sendExportData(
       for (const item of section.data) {
         let entry = item;
         let sz = utf8Length(JSON.stringify(entry) ?? "");
-        if (sz > MAX_BATCH_BYTES) {
+        if (sz > MAX_ITEM_BYTES) {
           const { [heavy]: _dropped, ...rest } = entry as Record<string, unknown>;
           console.warn(
             `[Sync][Source] ${section.name} item exceeds the frame budget - sent without ${heavy}`
@@ -1041,7 +1212,7 @@ async function sendExportData(
           entry = rest;
           sz = utf8Length(JSON.stringify(entry) ?? "");
         }
-        if (cur.length && (cur.length >= BATCH_SIZE || curBytes + sz > MAX_BATCH_BYTES)) {
+        if (cur.length && (cur.length >= BATCH_SIZE || curBytes + sz > BATCH_BYTES)) {
           batches.push(cur);
           cur = [];
           curBytes = 0;
@@ -1088,14 +1259,13 @@ async function sendExportData(
     syncState.syncProgress = 90;
     syncState.phase = "importing-remote";
     armAckTimer();
-    const okComplete = await transport.send(
-      peerId,
-      frame(SyncMessageType.ExportComplete, { manifest, token })
-    );
+    // Kept until the target says anything: it has no ack of its own.
+    const close = frame(SyncMessageType.ExportComplete, { manifest, token });
+    _unconfirmedClose = close;
+    unanswered.restart();
+    const closed = await transport.send(peerId, close).catch(() => false);
     if (!current()) return;
-    if (!okComplete) {
-      throw new Error("Connection lost before the export finished - try again");
-    }
+    if (!closed) void recover("quiet");
     console.log("[Sync][Source] Waiting for target to finish importing...");
   } catch (err) {
     if (!current()) return;
@@ -1192,6 +1362,13 @@ export async function connectAsTarget(
      * source - so neither its errors nor its connection dropping stop it.
      */
     let transferDone = false;
+    /** The source heard that the import is done (confirmDone). */
+    let sourceHeard: (() => void) | null = null;
+    /** The link to the source is down, and what runs when it is back. */
+    let sourceGone = false;
+    let sourceBack: (() => void) | null = null;
+    /** What the source was last told about the import, for one that missed it. */
+    let lastTold: Uint8Array | null = null;
     /** Data has started to arrive, which only an allowed request gets. */
     let allowed = false;
     /** Frames are handled one at a time, in the order they came. */
@@ -1208,6 +1385,18 @@ export async function connectAsTarget(
       await cleanup(tellSource && source ? { peerId: source, data: errorFrame(tellSource) } : undefined);
     };
 
+    const armPeerWait = (): void => {
+      if (_peerWaitTimer) clearTimeout(_peerWaitTimer);
+      _peerWaitTimer = setTimeout(() => {
+        _peerWaitTimer = null;
+        if (!current() || _exportRequested || syncState.isSyncing || syncState.isComplete) return;
+        syncState.isConnecting = false;
+        syncState.syncError =
+          "Could not reach the other device. Make sure its sync screen is still open, then generate a new code and try again.";
+        cleanup().catch(() => {});
+      }, PEER_WAIT_TIMEOUT);
+    };
+
     /**
      * Send the ExportRequest until the transport confirms a write.
      *
@@ -1218,7 +1407,11 @@ export async function connectAsTarget(
      * this device at 0% until the stall watchdog blamed the other side for
      * a request that never left this one.
      */
+    let requests = 0;
     const requestExport = async (peerId: string): Promise<void> => {
+      // One asked before the link dropped says nothing about the next.
+      const mine = ++requests;
+      const live = () => current() && mine === requests && _exportRequested;
       const roomDeletions = mode === "add" ? await getAllRoomDeletionMarkers() : [];
       const request = frame(SyncMessageType.ExportRequest, {
         mode, token: payload.token, roomDeletions,
@@ -1226,10 +1419,25 @@ export async function connectAsTarget(
       // ponytail: 3 tries, 2s apart; each send already spends the
       // transport's ~5.6s confirm budget before resolving false.
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (_transport !== targetTransport || !syncState.isSyncing || syncState.isComplete) return;
-        if (await _transport.send(peerId, request)) return;
+        if (!live() || !syncState.isSyncing || syncState.isComplete) return;
+        const sent = await targetTransport.send(peerId, request);
+        if (!live()) return;
+        if (sent) {
+          if (allowed || syncState.awaitingApproval) return;
+          // Handed to the link, which is not the same as heard.
+          _unansweredRequest?.stop();
+          _unansweredRequest = new SilenceTimer(async () => {
+            if (!live()) return;
+            console.log("[Sync][Target] No answer, asking again");
+            targetTransport.reopen(peerId);
+            await targetTransport.send(peerId, request).catch(() => false);
+          });
+          _unansweredRequest.restart();
+          return;
+        }
         await new Promise((r) => setTimeout(r, 2000));
       }
+      if (!live()) return;
       syncState.isSyncing = false;
       syncState.syncError =
         "Could not send the sync request to the other device - generate a new code and try again.";
@@ -1262,8 +1470,12 @@ export async function connectAsTarget(
       // WebRTC, which happens mid-transfer - and the transport re-emits
       // "connect" for it. Re-sending here made the source restart the whole
       // export on top of the one in flight.
+      sourceGone = false;
+      sourceBack?.();
       if (_exportRequested) {
         console.log("[Sync][Target] Re-connect to source, export already requested");
+        // The source sends again what it has no ack for; nothing to ask.
+        if (stopWaitingForReturn()) armStallTimer();
         return;
       }
       _exportRequested = true;
@@ -1287,9 +1499,27 @@ export async function connectAsTarget(
     // once the transfer is done: the import that follows needs nothing from
     // the source.
     _transport.on("disconnect", (peerId: string) => {
-      if (!current() || peerId !== _targetSourcePeerId || transferDone || syncState.isComplete) return;
+      if (!current() || peerId !== _targetSourcePeerId) return;
+      sourceGone = true;
+      sourceHeard?.();
+      if (transferDone || syncState.isComplete) return;
       console.log("[Sync][Target] Disconnected from source");
-      void fail("Lost the connection to the other device. Nothing on this device was changed - generate a new code and try again.");
+      clearStallTimer();
+      if (!allowed) {
+        // Nothing was answered yet: ask again once it is back. The code on
+        // this screen is for the request that went with the connection.
+        _unansweredRequest?.stop();
+        _exportRequested = false;
+        syncState.awaitingApproval = false;
+        syncState.pairingCode = null;
+        syncState.isSyncing = false;
+        syncState.isConnecting = true;
+        armPeerWait();
+        return;
+      }
+      waitForReturn(() => {
+        void fail("Lost the connection to the other device. Nothing on this device was changed - generate a new code and try again.");
+      });
     });
 
     const onData = async (peerId: string, raw: unknown): Promise<void> => {
@@ -1344,7 +1574,7 @@ export async function connectAsTarget(
         } else {
           receivedIdentity = (p.data ?? null) as DatabaseExport["identity"] | null;
         }
-        syncState.syncProgress = 10;
+        syncState.syncProgress = Math.max(syncState.syncProgress, 10);
       } else if (typeof p.section === "string" && knownSections.includes(p.section)) {
         const { section, data: sectionData, batchIndex, totalBatches } = p as {
           section: string; data: unknown; batchIndex: unknown; totalBatches: unknown;
@@ -1398,10 +1628,48 @@ export async function connectAsTarget(
       void targetTransport.send(peerId, frame(SyncMessageType.ExportAck, { seq: p.seq })).catch(() => false);
     };
 
+    /**
+     * Tell the source it is done until it says it heard, or leaves - which is
+     * how one of an older build says so - but not for long: everything is
+     * written here, and only the other screen is waiting.
+     */
+    const confirmDone = async (
+      peerId: string,
+      tell: (type: SyncMessageType) => Promise<boolean>
+    ): Promise<void> => {
+      // Away when the import ended (a password takes a person a while): its
+      // return is waited for, or it would never be told.
+      if (sourceGone) {
+        await new Promise<void>((resolve) => {
+          const giveUp = setTimeout(resolve, DONE_RETURN_TIMEOUT);
+          sourceBack = () => { clearTimeout(giveUp); resolve(); };
+        });
+        sourceBack = null;
+        if (sourceGone || !current()) return;
+      }
+      let giveUp: ReturnType<typeof setTimeout> | undefined;
+      const heard = new Promise<void>((resolve) => {
+        sourceHeard = resolve;
+        giveUp = setTimeout(resolve, DONE_TIMEOUT);
+      });
+      // Whatever became of the first: it may be opening on a path that is gone.
+      const again = new SilenceTimer(async () => {
+        targetTransport.reopen(peerId);
+        await tell(SyncMessageType.ExportComplete);
+      }, () => DONE_RETELL);
+      again.restart();
+      void tell(SyncMessageType.ExportComplete);
+      await heard;
+      again.stop();
+      clearTimeout(giveUp);
+    };
+
     /** The import, once the transfer checked out. Always ends reported. */
     const runImport = async (peerId: string): Promise<void> => {
-      const tell = (type: SyncMessageType, framePayload?: unknown) =>
-        targetTransport.send(peerId, frame(type, framePayload)).catch(() => false);
+      const tell = (type: SyncMessageType, framePayload?: unknown) => {
+        lastTold = frame(type, framePayload);
+        return targetTransport.send(peerId, lastTold).catch(() => false);
+      };
       // The transfer is done; the last ten percent is this device writing
       // what arrived. It used to sit at the transfer's final number with
       // "Syncing data" on it for as long as the import took, which on a
@@ -1426,6 +1694,9 @@ export async function connectAsTarget(
         if (Date.now() - lastReport < 2000) return;
         report();
       };
+      // At once: it is the answer to the closing frame. With a password to
+      // ask for, AwaitingPassword is, and must not be the one left unconfirmed.
+      if (mode === "add" || !importOptions.requestPassword) report();
       let committed = false;
       let releaseCommit: (() => void) | undefined;
       try {
@@ -1501,11 +1772,9 @@ export async function connectAsTarget(
         console.log(
           "[Sync][Target] Import complete, sending acknowledgment"
         );
-        // AWAIT it, then tear down: dropping the promise before
-        // cleanup() disconnected the transport meant the source often
-        // never saw the completion. The transport bounds the wait, so a
-        // source that already gave up cannot hold this side at 99.
-        if (_transport === targetTransport) await tell(SyncMessageType.ExportComplete);
+        // Heard, before tearing down: the source otherwise waits out its
+        // clock for an import that went fine, and says it never finished.
+        if (_transport === targetTransport) await confirmDone(peerId, tell);
 
         // Reported whatever happened to the connection meanwhile: past the
         // commit point this is the only word on what this device now holds.
@@ -1541,13 +1810,25 @@ export async function connectAsTarget(
       // whose user was still reading the comparison code.
       if (!msg || typeof msg !== "object" || !SYNC_MESSAGE_TYPES.has(msg.type)) return;
       console.log("[Sync][Target] Message type:", msg.type);
+      _unansweredRequest?.stop();
+      stopWaitingForReturn();
       if (msg.type === SyncMessageType.SyncError) {
         if (transferDone) return;
         await fail((msg.payload as { error?: string } | undefined)?.error ??
           "The other device stopped the sync");
         return;
       }
-      if (transferDone) return;
+      if (msg.type === SyncMessageType.Done) {
+        sourceHeard?.();
+        return;
+      }
+      if (transferDone) {
+        // Closing again means it has not heard that the first arrived.
+        if (msg.type === SyncMessageType.ExportComplete && lastTold) {
+          void targetTransport.send(peerId, lastTold).catch(() => false);
+        }
+        return;
+      }
       // A version 1 source streams everything the moment it is asked, with
       // no manifest to check it against and no account in a merge: refuse
       // its first frame and tell it why, rather than import half of a format.
@@ -1642,16 +1923,7 @@ export async function connectAsTarget(
     // source may have expired its code, closed the dialog, or never gotten
     // its own server up. Without this the target spun forever on
     // "Connecting..." with nothing to act on.
-    if (_peerWaitTimer) clearTimeout(_peerWaitTimer);
-    _peerWaitTimer = setTimeout(() => {
-      _peerWaitTimer = null;
-      if (_targetSourcePeerId || syncState.isSyncing || syncState.isComplete)
-        return;
-      syncState.isConnecting = false;
-      syncState.syncError =
-        "Could not reach the other device. Make sure its sync screen is still open, then generate a new code and try again.";
-      cleanup().catch(() => {});
-    }, PEER_WAIT_TIMEOUT);
+    if (!_targetSourcePeerId) armPeerWait();
   } catch (err) {
     syncState.isConnecting = false;
     syncState.syncError = err instanceof Error ? err.message : String(err);
@@ -1856,6 +2128,7 @@ export function resetSyncState(): void {
   syncState.syncError = null;
   syncState.isComplete = false;
   syncState.awaitingApproval = false;
+  syncState.reconnecting = false;
   syncState.pairingCode = null;
   syncState.finishing = false;
 }
@@ -1875,6 +2148,14 @@ async function cleanup(parting?: { peerId: string; data: Uint8Array }): Promise<
   _pendingRequest = null;
   _sendWindow?.fail(new Error("Sync ended"));
   _sendWindow = null;
+  _recover = null;
+  _onAck = null;
+  _unanswered?.stop();
+  _unanswered = null;
+  _unconfirmedClose = null;
+  _unansweredRequest?.stop();
+  _unansweredRequest = null;
+  stopWaitingForReturn();
   _exportSent = false;
   _ackSuspended = false;
   syncState.awaitingApproval = false;

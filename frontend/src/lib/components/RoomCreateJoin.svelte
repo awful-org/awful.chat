@@ -331,6 +331,7 @@
           <Dialog bind:open={scanning}>
             <DialogContent
               class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-sm flex flex-col gap-0 p-0 max-h-[calc(100dvh-2rem)] overflow-hidden"
+              closeClass="top-5"
             >
               <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
                 <DialogTitle class="font-mono text-base font-semibold">Scan a QR code</DialogTitle>
@@ -423,11 +424,12 @@
     use:viewportHeight
     class="flex min-h-dvh h-full overflow-y-auto p-4 bg-background"
   >
+    <!-- Solid: the card scrolls under it on a short screen. -->
     {#if toggleSidebar != null && !createdCode}
       <Button
         onclick={toggleSidebar}
         variant="outline"
-        class="absolute top-4 left-4 sm:hidden"
+        class="absolute top-4 left-4 z-10 bg-card dark:bg-card hover:bg-accent dark:hover:bg-accent sm:hidden"
         aria-label="Open sidebar"
       >
         <Menu />

@@ -3020,6 +3020,7 @@ import {
 <Dialog bind:open={deviceSettingsOpen}>
   <DialogContent
     class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg flex flex-col p-0 max-h-[85dvh]"
+    closeClass="top-5"
   >
     <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
       <DialogTitle class="font-mono text-base font-semibold">

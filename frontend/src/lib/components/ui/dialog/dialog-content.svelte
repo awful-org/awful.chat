@@ -14,12 +14,19 @@
     children,
     showCloseButton = true,
     overlayClass,
+    closeClass = "top-[25px]",
     ...restProps
   }: WithoutChildrenOrChild<DialogPrimitive.ContentProps> & {
     portalProps?: WithoutChildrenOrChild<ComponentProps<typeof DialogPortal>>;
     children: Snippet;
     showCloseButton?: boolean;
     overlayClass?: string;
+    /**
+     * Where the close button is, level with the title: 25px for the plain
+     * p-6 dialog and its text-lg title. A dialog with a padding or a title
+     * size of its own says where.
+     */
+    closeClass?: string;
   } = $props();
 </script>
 
@@ -37,7 +44,10 @@
     {@render children?.()}
     {#if showCloseButton}
       <DialogPrimitive.Close
-        class="ring-offset-background focus:ring-ring absolute inset-e-4 top-4 rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
+        class={cn(
+          "ring-offset-background focus:ring-ring absolute inset-e-4 rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+          closeClass
+        )}
       >
         <XIcon />
         <span class="sr-only">Close</span>

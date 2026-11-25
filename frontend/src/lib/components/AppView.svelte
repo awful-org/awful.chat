@@ -2084,7 +2084,7 @@
                     </p>
                   {/if}
                   <Dialog.Close
-                    class="absolute right-4 top-4 rounded-sm opacity-70 hover:opacity-100"
+                    class="absolute right-4 top-5 rounded-sm opacity-70 hover:opacity-100"
                   >
                     <X class="size-4" />
                   </Dialog.Close>
@@ -2497,7 +2497,7 @@
             {/if}
           </div>
           <Dialog.Close
-            class="absolute right-4 top-4 rounded-sm opacity-70 hover:opacity-100 cursor-pointer"
+            class="absolute right-4 top-5 rounded-sm opacity-70 hover:opacity-100 cursor-pointer"
           >
             <X class="size-4" />
           </Dialog.Close>

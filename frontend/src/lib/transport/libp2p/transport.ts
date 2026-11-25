@@ -639,7 +639,11 @@ export class LibP2PTransport implements PeerTransport {
           this.emit("message", peer, data, this.localRoom(room));
         }
       },
-      onClose: () => { this.secureStreams.delete(entry); settle(); },
+      onClose: () => {
+        this.secureStreams.delete(entry);
+        settle();
+        if (entry.channel && entry.room) this.roomChannelClosed(entry.peer, entry.room);
+      },
     });
     entry.close = handle.close;
     entry.getChannel = handle.getChannel;
@@ -902,8 +906,8 @@ export class LibP2PTransport implements PeerTransport {
         // The wait for a turn can be long enough for theirs to have arrived:
         // joined, back at the top, rather than raced with a dial of ours.
         if (waited && (this.liveRoomChannel(room, peerId) || this.roomHandshake(room, peerId))) continue;
-        const signal = AbortSignal.timeout(30_000);
-        const connection = await node.dial(peerIdFromString(peerId), { signal });
+        const signal = AbortSignal.timeout(this.roomOpenTimeoutMs);
+        const connection = await this.roomConnection(node, peerId, signal);
         if (!current()) return null;
         const stream = await connection.newStream(ROOM_PROTOCOL, { runOnLimitedConnection: true, signal });
         if (!current()) { stream.abort(new Error("Room session ended")); return null; }
@@ -937,6 +941,58 @@ export class LibP2PTransport implements PeerTransport {
       this.noteRoomRefusal("refused", peerId, room);
     }
     return null;
+  }
+
+  /** A proven channel to a peer in a room has closed, for whatever reason. */
+  protected roomChannelClosed(_peerId: string, _room: DiscoveryId): void {}
+
+  /** How long dialing for a room channel and opening its stream may take. */
+  protected roomOpenTimeoutMs = 30_000;
+
+  /** The connection a room channel to a peer is opened on. */
+  protected roomConnection(
+    node: Libp2p<AppServices>, peerId: string, signal: AbortSignal,
+  ): Promise<Connection> {
+    return node.dial(peerIdFromString(peerId), { signal });
+  }
+
+  /** The connections open to a peer, newest first. */
+  protected openConnections(peerId: string): Connection[] {
+    return (this.node?.getConnections(peerIdFromString(peerId)) ?? [])
+      .filter((c) => c.status === "open")
+      .sort((a, b) => b.timeline.open - a.timeline.open);
+  }
+
+  /**
+   * A connection of its own to a peer, whatever others there are: directly or
+   * through the relay.
+   */
+  protected dialAnother(
+    node: Libp2p<AppServices>, peerId: string, via: "direct" | "relay", signal: AbortSignal,
+  ): Promise<Connection> {
+    const path = via === "direct" ? "/p2p-circuit/webrtc/p2p/" : "/p2p-circuit/p2p/";
+    return node.dial(multiaddr(`${relayMultiaddr()}${path}${peerId}`), { signal, force: true });
+  }
+
+  /** The connection the proven channel to a peer in a room is on. */
+  protected secureRoomConnection(peerId: string, room: DiscoveryId): Connection | null {
+    return this.liveRoomChannel(room, peerId)?.connection ?? null;
+  }
+
+  /**
+   * Close our channels to a peer in a room, proven or not, and stop waiting
+   * for one being opened; the connections they were on. The next send opens a
+   * fresh one.
+   */
+  protected closeSecureRoom(peerId: string, room: DiscoveryId): Connection[] {
+    const connections: Connection[] = [];
+    for (const entry of [...this.secureStreams]) {
+      if (entry.room !== room || entry.peer !== peerId) continue;
+      connections.push(entry.connection);
+      entry.close();
+    }
+    this.secureOpening.delete(`${room}:${peerId}`);
+    return connections;
   }
 
   private verifyDiscoveredRoomPeer(room: string, peer: string): void {

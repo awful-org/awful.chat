@@ -540,6 +540,7 @@
   <Dialog.Root {open} {onOpenChange}>
     <Dialog.Content
       class="sm:max-w-lg h-1/2 flex flex-col p-0 overflow-hidden font-mono"
+      closeClass="top-5"
     >
       <Dialog.Header class="p-4 pb-0 shrink-0">
         <Dialog.Title class="font-mono text-base font-semibold">Choose a GIF</Dialog.Title>

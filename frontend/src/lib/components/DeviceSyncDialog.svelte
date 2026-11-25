@@ -19,6 +19,7 @@ import {
     denySync,
     type SyncPayload,
   } from "$lib/transport/sync.svelte";
+  import { keepScreenAwake } from "$lib/screen-awake";
   import { formatComparisonCode } from "$lib/transport/sync-protocol";
   import {
     Copy,
@@ -105,6 +106,22 @@ import {
     if (value !== null) view = "progress";
     resolve?.(value);
   }
+
+  // A phone that locks itself pauses the page, and the sync with it. From the
+  // code being shown or used until it ended, one way or the other.
+  const underWay = $derived(
+    open &&
+      !syncState.isComplete &&
+      !syncState.syncError &&
+      (syncState.qrDataUrl !== null ||
+        syncState.isConnecting ||
+        syncState.isSyncing ||
+        syncState.awaitingApproval ||
+        syncState.finishing)
+  );
+  $effect(() => {
+    if (underWay) return keepScreenAwake();
+  });
 
   // Reset state when dialog closes
   $effect(() => {
@@ -316,6 +333,14 @@ import {
   }
 </script>
 
+<!-- Under whatever a sync is doing. Leaving the app is what stalls one: a
+     phone pauses the page, and the other device can only wait. -->
+{#snippet stay()}
+  <p class="text-xs text-muted-foreground text-center">
+    Keep Awful.chat open on both devices.
+  </p>
+{/snippet}
+
 <Dialog
   bind:open
   onOpenChange={(v) => {
@@ -328,6 +353,7 @@ import {
        away from racing them. -->
   <DialogContent
     class="bg-card border-border text-card-foreground font-mono max-w-md"
+    closeClass="top-7"
     showCloseButton={!syncState.finishing}
     escapeKeydownBehavior={syncState.finishing ? "ignore" : "close"}
     interactOutsideBehavior={syncState.finishing ? "ignore" : "close"}
@@ -411,6 +437,9 @@ import {
                 If it shows a different code, or none, someone else has your
                 sync code. Deny, and generate a new one.
               </p>
+              <!-- Keyed on the code: a press that began over one request does not end
+                   on the buttons of another that took its place. -->
+              {#key syncState.pairingCode}
               <div class="flex gap-2">
                 <Button
                   onclick={handleDeny}
@@ -423,6 +452,7 @@ import {
                   Allow
                 </Button>
               </div>
+              {/key}
             </div>
           {:else if syncState.isGenerating}
             <div
@@ -499,7 +529,9 @@ import {
                 ></div>
               </div>
               <p class="text-xs text-muted-foreground text-center">
-                {#if syncState.phase === "remote-password"}
+                {#if syncState.reconnecting}
+                  Connection lost. Reconnecting...
+                {:else if syncState.phase === "remote-password"}
                   Waiting for the password on the other device...
                 {:else if syncState.phase === "importing-remote"}
                   The other device is importing... {syncState.syncProgress}%
@@ -507,6 +539,7 @@ import {
                   Transferring data... {syncState.syncProgress}%
                 {/if}
               </p>
+              {@render stay()}
             </div>
           {/if}
         </div>
@@ -703,6 +736,7 @@ import {
           <p class="text-xs text-muted-foreground text-center">
             Nothing is sent until it is allowed there.
           </p>
+          {@render stay()}
         </div>
 
         <Button
@@ -725,6 +759,8 @@ import {
             <p class="text-sm text-center">
               {#if syncState.isConnecting}
                 Connecting to device...
+              {:else if syncState.reconnecting}
+                Connection lost. Reconnecting...
               {:else if syncState.finishing}
                 Finishing... {syncState.syncProgress}%
               {:else if syncState.phase === "importing"}
@@ -737,6 +773,7 @@ import {
                 Finishing up...
               {/if}
             </p>
+            {#if !syncState.finishing}{@render stay()}{/if}
           </div>
         </div>
 
