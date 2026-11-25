@@ -411,6 +411,9 @@ import {
                 If it shows a different code, or none, someone else has your
                 sync code. Deny, and generate a new one.
               </p>
+              <!-- Keyed on the code: a press that began over one request does not end
+                   on the buttons of another that took its place. -->
+              {#key syncState.pairingCode}
               <div class="flex gap-2">
                 <Button
                   onclick={handleDeny}
@@ -423,6 +426,7 @@ import {
                   Allow
                 </Button>
               </div>
+              {/key}
             </div>
           {:else if syncState.isGenerating}
             <div
@@ -499,7 +503,9 @@ import {
                 ></div>
               </div>
               <p class="text-xs text-muted-foreground text-center">
-                {#if syncState.phase === "remote-password"}
+                {#if syncState.reconnecting}
+                  Connection lost. Reconnecting...
+                {:else if syncState.phase === "remote-password"}
                   Waiting for the password on the other device...
                 {:else if syncState.phase === "importing-remote"}
                   The other device is importing... {syncState.syncProgress}%
@@ -725,6 +731,8 @@ import {
             <p class="text-sm text-center">
               {#if syncState.isConnecting}
                 Connecting to device...
+              {:else if syncState.reconnecting}
+                Connection lost. Reconnecting...
               {:else if syncState.finishing}
                 Finishing... {syncState.syncProgress}%
               {:else if syncState.phase === "importing"}

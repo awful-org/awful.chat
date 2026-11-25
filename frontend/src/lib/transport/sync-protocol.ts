@@ -74,7 +74,7 @@ export function newSyncNonce(): string {
  * what the receiver can be holding.
  */
 export class SendWindow {
-  private readonly inFlight = new Map<number, number>();
+  private readonly inFlight = new Map<number, { bytes: number; frame: Uint8Array | null }>();
   private bytes = 0;
   private failure: Error | null = null;
   private waiters: (() => void)[] = [];
@@ -106,18 +106,27 @@ export class SendWindow {
     }
   }
 
-  sent(seq: number, bytes: number): void {
-    this.inFlight.set(seq, bytes);
+  sent(seq: number, bytes: number, frame: Uint8Array | null = null): void {
+    this.inFlight.set(seq, { bytes, frame });
     this.bytes += bytes;
+  }
+
+  get pendingBytes(): number {
+    return this.bytes;
+  }
+
+  /** The frames nothing has been heard about, oldest first, to send again. */
+  unacked(): Uint8Array[] {
+    return [...this.inFlight.values()].flatMap(({ frame }) => (frame ? [frame] : []));
   }
 
   /** True when `seq` was a frame still waiting for its ack. */
   ack(seq: unknown): boolean {
     if (typeof seq !== "number") return false;
-    const bytes = this.inFlight.get(seq);
-    if (bytes === undefined) return false;
+    const entry = this.inFlight.get(seq);
+    if (entry === undefined) return false;
     this.inFlight.delete(seq);
-    this.bytes -= bytes;
+    this.bytes -= entry.bytes;
     this.wake();
     return true;
   }
@@ -141,6 +150,75 @@ export class SendWindow {
     const waiters = this.waiters;
     this.waiters = [];
     for (const resolve of waiters) resolve();
+  }
+}
+
+/** The slowest link a frame is given time to cross, in bytes a second. */
+const SLOWEST_LINK = 128 * 1024;
+/** What a byte of a frame becomes on the wire: it is base64 in an envelope, twice. */
+const WIRE_OVERHEAD = 1.8;
+
+/**
+ * How long nothing may be heard of `bytes` before they are taken for lost. A
+ * write that resolved is in a buffer, not across, so this is the whole way.
+ */
+export function silenceFor(bytes: number): number {
+  return 8_000 + Math.ceil((bytes * WIRE_OVERHEAD * 1000) / SLOWEST_LINK);
+}
+
+/**
+ * What to do when something sent goes unanswered.
+ *
+ * Every answer restarts it, so it measures silence and nothing else: how long
+ * a sync takes does not matter to it. It is the one clock there has to be. A
+ * path that stops carrying frames says nothing - a write to it succeeds, and
+ * it can stay open for minutes - so the missing answer is the only sign.
+ *
+ * Each try in a row waits twice as long as the one before, in case it is the
+ * other device that is slow. What gives up is the caller's own watchdog.
+ */
+export class SilenceTimer {
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private tries = 0;
+  private stopped = true;
+
+  /** `act` answers false when it was not the time, which is no try. */
+  constructor(
+    private readonly act: () => Promise<boolean | void> | boolean | void,
+    private readonly wait: () => number = () => 8_000
+  ) {}
+
+  /** Something was answered, or just sent with nothing outstanding before it. */
+  restart(): void {
+    this.stopped = false;
+    this.tries = 0;
+    this.arm();
+  }
+
+  /** Something more was sent: the clock already running stands. */
+  ensure(): void {
+    if (this.stopped) this.restart();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private arm(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => void this.fire(), this.wait() * 2 ** Math.min(this.tries, 2));
+  }
+
+  private async fire(): Promise<void> {
+    this.timer = null;
+    try {
+      if ((await this.act()) !== false) this.tries++;
+    } finally {
+      // Unless it was answered, or given up on, meanwhile.
+      if (!this.stopped && !this.timer) this.arm();
+    }
   }
 }
 
