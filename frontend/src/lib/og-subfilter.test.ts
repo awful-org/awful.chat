@@ -45,6 +45,15 @@ describe("invite card rewriting", () => {
     expect(matches.some((m) => m.startsWith('href="http'))).toBe(true);
   });
 
+  // Both halves: blocked in robots.txt, a crawler that obeys it can build no
+  // card, and never sees the noindex that keeps invites out of search.
+  it("lets crawlers fetch an invite's card but not index it", () => {
+    expect(inviteMatches()).toContain('<meta name="robots" content="index, follow" />');
+    const block = nginx.slice(nginx.indexOf("location ~ ^/r(/|$)"));
+    expect(block.slice(0, block.indexOf("\n    }"))).toContain('content="noindex"');
+    expect(readFileSync("public/robots.txt", "utf8")).not.toMatch(/^Disallow: \/r/m);
+  });
+
   // $request_uri is the raw request line, and these replacements land inside
   // an HTML attribute that a scraper parses. A crafted invite link could close
   // the quote and write its own markup into the card. Nothing per-room needs
