@@ -111,6 +111,10 @@ export class SendWindow {
     this.bytes += bytes;
   }
 
+  get pendingBytes(): number {
+    return this.bytes;
+  }
+
   /** The frames nothing has been heard about, oldest first, to send again. */
   unacked(): Uint8Array[] {
     return [...this.inFlight.values()].flatMap(({ frame }) => (frame ? [frame] : []));
@@ -149,6 +153,19 @@ export class SendWindow {
   }
 }
 
+/** The slowest link a frame is given time to cross, in bytes a second. */
+const SLOWEST_LINK = 128 * 1024;
+/** What a byte of a frame becomes on the wire: it is base64 in an envelope, twice. */
+const WIRE_OVERHEAD = 1.8;
+
+/**
+ * How long nothing may be heard of `bytes` before they are taken for lost. A
+ * write that resolved is in a buffer, not across, so this is the whole way.
+ */
+export function silenceFor(bytes: number): number {
+  return 8_000 + Math.ceil((bytes * WIRE_OVERHEAD * 1000) / SLOWEST_LINK);
+}
+
 /**
  * What to do when something sent goes unanswered.
  *
@@ -162,21 +179,19 @@ export class SendWindow {
  */
 export class SilenceTimer {
   private timer: ReturnType<typeof setTimeout> | null = null;
-  private wait: number;
+  private tries = 0;
   private stopped = true;
 
+  /** `act` answers false when it was not the time, which is no try. */
   constructor(
-    private readonly act: () => Promise<void> | void,
-    private readonly firstMs = 8_000,
-    private readonly maxMs = 32_000
-  ) {
-    this.wait = firstMs;
-  }
+    private readonly act: () => Promise<boolean | void> | boolean | void,
+    private readonly wait: () => number = () => 8_000
+  ) {}
 
   /** Something was answered, or just sent with nothing outstanding before it. */
   restart(): void {
     this.stopped = false;
-    this.wait = this.firstMs;
+    this.tries = 0;
     this.arm();
   }
 
@@ -193,14 +208,13 @@ export class SilenceTimer {
 
   private arm(): void {
     if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => void this.fire(), this.wait);
+    this.timer = setTimeout(() => void this.fire(), this.wait() * 2 ** Math.min(this.tries, 2));
   }
 
   private async fire(): Promise<void> {
     this.timer = null;
-    this.wait = Math.min(this.wait * 2, this.maxMs);
     try {
-      await this.act();
+      if ((await this.act()) !== false) this.tries++;
     } finally {
       // Unless it was answered, or given up on, meanwhile.
       if (!this.stopped && !this.timer) this.arm();

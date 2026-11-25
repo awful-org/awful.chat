@@ -1525,9 +1525,11 @@ Two buttons added:
 - The target reports its import (`sync_import_progress { percent }`, at most
   every two seconds) so the source's bar follows it and the source's ack
   timeout (120 s) bounds silence rather than the whole import.
-- A frame is kept until the target's ack and sent again if 8 s pass with
-  nothing heard (then 16, then 32), on a fresh channel over another of the two
-  devices' connections. The target takes a batch that arrives twice once. The
+- Frames are closed at 128 KB (one item may be up to 2.2 MB, alone), and a
+  frame is kept until the target's ack. It is sent again on a fresh channel
+  when its channel closes, and over another of the two devices' connections
+  when nothing is heard: 8 s, plus the time what is outstanding takes at
+  128 KiB/s, doubling. The target takes a batch that arrives twice once. The
   request, the closing manifest and the target's completion are sent again the
   same way; the source answers the completion with `sync_done`.
 - The export goes over the direct connection when there is one.

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SendWindow,
   SilenceTimer,
+  silenceFor,
   formatComparisonCode,
   manifestProblems,
   newSyncNonce,
@@ -170,7 +171,7 @@ describe("SilenceTimer", () => {
   it("acts on silence only, less and less often, until stopped", async () => {
     vi.useFakeTimers();
     const act = vi.fn();
-    const t = new SilenceTimer(act, 100, 400);
+    const t = new SilenceTimer(act, () => 100);
     t.restart();
     for (let i = 0; i < 5; i++) {
       await vi.advanceTimersByTimeAsync(90);
@@ -195,7 +196,7 @@ describe("SilenceTimer", () => {
     vi.useFakeTimers();
     let done!: () => void;
     const act = vi.fn(() => new Promise<void>((r) => { done = r; }));
-    const t = new SilenceTimer(act, 100, 100);
+    const t = new SilenceTimer(act, () => 100);
     t.restart();
     await vi.advanceTimersByTimeAsync(5_000);
     expect(act).toHaveBeenCalledTimes(1);
@@ -206,10 +207,44 @@ describe("SilenceTimer", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("does not count a time that was not one", async () => {
+    vi.useFakeTimers();
+    let ready = false;
+    const act = vi.fn(() => ready);
+    const t = new SilenceTimer(act, () => 100);
+    t.restart();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(act).toHaveBeenCalledTimes(5);
+    t.stop();
+  });
+
+  it("gives what is outstanding the time a slow link takes to carry it", async () => {
+    expect(silenceFor(0)).toBe(8_000);
+    // A quarter megabyte, at 128 KiB/s with the wire's overhead.
+    expect(silenceFor(256_000)).toBeGreaterThan(11_000);
+    expect(silenceFor(256_000)).toBeLessThan(12_000);
+    // The largest item there is, and still inside the target's minute.
+    expect(silenceFor(2_200_000)).toBeGreaterThan(35_000);
+    expect(silenceFor(2_200_000)).toBeLessThan(45_000);
+    vi.useFakeTimers();
+    let bytes = 0;
+    const act = vi.fn();
+    const t = new SilenceTimer(act, () => silenceFor(bytes));
+    bytes = 2_000_000;
+    t.restart();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(act).not.toHaveBeenCalled();
+    bytes = 0;
+    t.restart();
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(act).toHaveBeenCalledTimes(1);
+    t.stop();
+  });
+
   it("leaves a running clock alone when more is sent", async () => {
     vi.useFakeTimers();
     const act = vi.fn();
-    const t = new SilenceTimer(act, 100, 400);
+    const t = new SilenceTimer(act, () => 100);
     t.ensure();
     await vi.advanceTimersByTimeAsync(60);
     t.ensure();

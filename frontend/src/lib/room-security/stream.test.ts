@@ -91,3 +91,34 @@ it("asks before answering a hello, and closes a stream it is told to refuse", as
   expect(p.ready).not.toHaveBeenCalled();
   expect(p.closed).toHaveBeenCalledOnce();
 });
+
+// A relay circuit hands over as much as its window lets it read at once, which
+// can be several whole frames and more than one frame's limit.
+it("takes an event holding many whole frames, whatever they add up to", async () => {
+  const p = setup();
+  await p.outbound.getChannel()!.ready;
+  await vi.waitFor(() => expect(p.ready).toHaveBeenCalledOnce());
+  const held: Uint8Array[] = [];
+  p.a.send = (data: Uint8Array) => { held.push(data); return true; };
+  const data = new Uint8Array(1_400_000).map((_, i) => i % 251);
+  expect(await p.outbound.getChannel()!.send(data)).toBe(true);
+  const total = held.reduce((n, f) => n + f.length, 0);
+  expect(total).toBeGreaterThan(2 * 1024 * 1024);
+  const all = new Uint8Array(total);
+  let at = 0;
+  for (const f of held) { all.set(f, at); at += f.length; }
+  p.b.dispatchEvent(Object.assign(new Event("message"), { data: all }));
+  await vi.waitFor(() => expect(p.onData).toHaveBeenCalledOnce());
+  expect(p.onData.mock.calls[0][1]).toEqual(data);
+  expect(p.closed).not.toHaveBeenCalled();
+});
+
+it("still refuses a frame announced longer than one may be", async () => {
+  const p = setup();
+  await p.outbound.getChannel()!.ready;
+  await vi.waitFor(() => expect(p.ready).toHaveBeenCalledOnce());
+  const announced = new Uint8Array(4);
+  new DataView(announced.buffer).setUint32(0, 2 * 1024 * 1024 + 1);
+  p.b.dispatchEvent(Object.assign(new Event("message"), { data: announced }));
+  expect(p.closed).toHaveBeenCalledOnce();
+});

@@ -1040,7 +1040,6 @@ describe("the export is paced on acks and closed with a manifest", () => {
     t.autoAck = "target";
     t.emit("connect", "target");
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
-    expect(t.reopened).toEqual(["target"]);
     const seqs = data(t).map((m: any) => m.payload.seq);
     // The unconfirmed four again, the confirmed one not.
     expect(seqs.filter((n: number) => n === 0)).toHaveLength(1);
@@ -1083,6 +1082,57 @@ describe("the export is paced on acks and closed with a manifest", () => {
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(closes()).toBe(2);
     expect(syncState.syncError).toBeNull();
+  });
+
+  it("does not time a target that is away, and times it again once it is back", async () => {
+    const { t, pairing, ask } = await sourceWithHistory();
+    ask("target");
+    await approveWhenAsked(t);
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    t.emit("message", "target", encodeFrame({ type: "sync_import_progress", v: SYNC_PROTOCOL_VERSION, payload: { percent: 92 } }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.syncProgress).toBe(92));
+    await vi.advanceTimersByTimeAsync(75_000);
+    t.emit("disconnect", "target");
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(syncState.syncError).toBeNull();
+    t.emit("connect", "target");
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(syncState.syncError).toBeNull();
+    t.emit("message", "target", encodeFrame({ type: "sync_export_complete", v: SYNC_PROTOCOL_VERSION }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+  });
+
+  it("sends again at once when the channel closes, a few times, and no more without an ack", async () => {
+    const { t, ask } = await sourceWithHistory(5);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    void approveSync();
+    await vi.waitFor(() => expect(data(t)).toHaveLength(3));
+    for (let i = 1; i <= 6; i++) {
+      t.onChannelLost("somebody else");
+      t.onChannelLost("target");
+      await vi.advanceTimersByTimeAsync(10);
+    }
+    expect(data(t)).toHaveLength(3 * 4);
+    t.emit("message", "target", ack(0));
+    t.onChannelLost("target");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(data(t)).toHaveLength(3 * 4 + 2);
+  });
+
+  it("answers a request asked again after Allow over the channel it came on", async () => {
+    const { t, ask } = await sourceWithHistory(5);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    void approveSync();
+    await vi.waitFor(() => expect(data(t).length).toBeGreaterThanOrEqual(3));
+    const before = data(t).length;
+    ask("target");
+    await vi.waitFor(() => expect(data(t)).toHaveLength(before * 2));
+    expect(t.reopened).toEqual([]);
+    expect(syncState.awaitingApproval).toBe(false);
   });
 
   it("stops after two minutes with no word at all, however often it sent again", async () => {
@@ -1350,7 +1400,10 @@ describe("the target confirms, checks and reports", () => {
     fromSource(t, { type: "sync_error", v: SYNC_PROTOCOL_VERSION, payload: { error: "The other device never confirmed the import" } });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(syncState.syncError).toBeNull();
+    // Told when it is back, or not for long: everything is written here.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     finish();
+    await vi.advanceTimersByTimeAsync(10_500);
     await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
     expect(syncState.syncError).toBeNull();
   });
@@ -1458,5 +1511,67 @@ describe("the target confirms, checks and reports", () => {
       else t.emit("disconnect", PEER_ID);
       await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
     }
+  });
+
+  it("does not end a session over a request from before the link dropped", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = await target();
+    t.sent.length = 0;
+    t.emit("disconnect", PEER_ID);
+    // The first asks three times and is refused three times, across a return.
+    t.sendResults = [false, false];
+    t.emit("connect", PEER_ID);
+    await vi.advanceTimersByTimeAsync(1_000);
+    t.emit("disconnect", PEER_ID);
+    t.sendResults = [];
+    t.emit("connect", PEER_ID);
+    await vi.advanceTimersByTimeAsync(100);
+    fromSource(t, { type: "sync_approval_pending", v: SYNC_PROTOCOL_VERSION, payload: { nonce: "ef".repeat(16) } });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(syncState.syncError).toBeNull();
+    expect(syncState.awaitingApproval).toBe(true);
+  });
+
+  it("leaves no timer behind when cancelled while its request goes out", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = await target();
+    await vi.advanceTimersByTimeAsync(0);
+    await cancelSync();
+    await vi.advanceTimersByTimeAsync(60_000);
+    const sent = t.sent.length;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(t.sent).toHaveLength(sent);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("tells the source when it gives up, so that one does not wait for it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = await target();
+    fromSource(t, identityFrame());
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_ack")).toBe(true));
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(syncState.syncError).toMatch(/stopped sending/);
+    expect(t.sent.some((m: any) => m.type === "sync_error")).toBe(true);
+  });
+
+  it("tells a source that was away when the import ended, once it is back", async () => {
+    const t = await target();
+    t.autoDone = false;
+    let finish!: () => void;
+    importControl.run = async (options) => { options.beforeCommit(); await new Promise<void>((r) => { finish = r; }); };
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(syncState.finishing).toBe(true));
+    t.emit("disconnect", PEER_ID);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    finish();
+    const dones = () => t.sent.filter((m: any) => m.type === "sync_export_complete").length;
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(dones()).toBe(0);
+    t.emit("connect", PEER_ID);
+    await vi.waitFor(() => expect(dones()).toBe(1));
+    fromSource(t, { type: "sync_done", v: SYNC_PROTOCOL_VERSION });
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
   });
 });

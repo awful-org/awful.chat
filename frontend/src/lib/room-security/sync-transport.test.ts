@@ -10,8 +10,10 @@ vi.mock("$lib/transport/libp2p/transport", () => ({
     openConnections() { return this.open; }
     secureRoomConnection() { return this.on; }
     closeSecureRoom() { const was = this.on; this.on = null; return was ? [was] : []; }
+    roomChannelClosed() {}
     async roomConnection() { return "plain dial"; }
-    async dialAnother(_n: unknown, _p: string, via: string) { this.dialled.push(via); if (this.failDial) throw new Error("no route"); return "new connection"; }
+    async dialAnother(_n: unknown, _p: string, via: string) { this.dialled.push(via); if (this.failDial) throw new Error("no route"); return this.next; }
+    next: any = { name: "new", direct: true, close: vi.fn(async () => {}) };
   },
 }));
 
@@ -60,7 +62,7 @@ describe("which connection a sync goes over", () => {
     expect(await pick(t)).toBe(other);
     t.on = other;
     t.reopen("peer");
-    expect(await pick(t)).toBe("new connection");
+    expect(await pick(t)).toBe(t.next);
     // A direct one was the last to go quiet.
     expect(t.dialled).toEqual(["relay"]);
   });
@@ -80,6 +82,63 @@ describe("which connection a sync goes over", () => {
     t.failDial = true;
     expect(await pick(t)).toBe(direct);
     expect(t.dialled).toEqual(["direct", "relay"]);
+  });
+
+  it("closes what it made itself, once that went quiet too, and nothing else", async () => {
+    const own = { ...direct, close: vi.fn() };
+    const t = sync([own], own);
+    t.reopen("peer");
+    expect(own.close).not.toHaveBeenCalled();
+    const made = await pick(t);
+    t.on = made;
+    t.reopen("peer");
+    expect(made.close).toHaveBeenCalledOnce();
+  });
+
+  it("does not take a dial already running to a dead one for a new one", async () => {
+    const t = sync([direct], direct);
+    t.reopen("peer");
+    t.next = direct;
+    expect(await pick(t)).toBe(direct);
+    expect(t.dialled).toEqual(["relay", "direct"]);
+  });
+
+  it("judges each peer's connections apart", async () => {
+    const t = sync([direct, circuit]);
+    expect(await t.roomConnection({}, "target", new AbortController().signal)).toBe(direct);
+    const strangers = { name: "a stranger's", direct: true };
+    t.open = [strangers];
+    await t.roomConnection({}, "stranger", new AbortController().signal);
+    t.open = [direct, circuit];
+    t.reopen("target");
+    expect(await t.roomConnection({}, "target", new AbortController().signal)).toBe(circuit);
+    t.open = [strangers];
+    expect(await t.roomConnection({}, "stranger", new AbortController().signal)).toBe(strangers);
+  });
+
+  it("says when a channel closed under it, not when it left one or has another", () => {
+    const t = sync([direct, circuit], direct);
+    const lost = vi.fn();
+    t.onChannelLost = lost;
+    t.closeSecureRoom = () => { const was = t.on; t.on = null; t.roomChannelClosed("peer", t.pairingRoom); return was ? [was] : []; };
+    t.reopen("peer");
+    t.refresh("peer");
+    expect(lost).not.toHaveBeenCalled();
+    t.roomChannelClosed("peer", "another room");
+    expect(lost).not.toHaveBeenCalled();
+    t.on = circuit;
+    t.roomChannelClosed("peer", t.pairingRoom);
+    expect(lost).not.toHaveBeenCalled();
+    t.on = null;
+    t.roomChannelClosed("peer", t.pairingRoom);
+    expect(lost).toHaveBeenCalledWith("peer");
+  });
+
+  it("keeps its opinion of the connections when only the channel is left", async () => {
+    const t = sync([direct, circuit], direct);
+    t.refresh("peer");
+    expect(t.on).toBeNull();
+    expect(await pick(t)).toBe(direct);
   });
 
   it("moves a channel to the direct one only when that is an improvement", () => {

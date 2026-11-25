@@ -639,7 +639,11 @@ export class LibP2PTransport implements PeerTransport {
           this.emit("message", peer, data, this.localRoom(room));
         }
       },
-      onClose: () => { this.secureStreams.delete(entry); settle(); },
+      onClose: () => {
+        this.secureStreams.delete(entry);
+        settle();
+        if (entry.channel && entry.room) this.roomChannelClosed(entry.peer, entry.room);
+      },
     });
     entry.close = handle.close;
     entry.getChannel = handle.getChannel;
@@ -938,6 +942,9 @@ export class LibP2PTransport implements PeerTransport {
     }
     return null;
   }
+
+  /** A proven channel to a peer in a room has closed, for whatever reason. */
+  protected roomChannelClosed(_peerId: string, _room: DiscoveryId): void {}
 
   /** How long dialing for a room channel and opening its stream may take. */
   protected roomOpenTimeoutMs = 30_000;

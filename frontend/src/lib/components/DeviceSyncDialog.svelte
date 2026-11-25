@@ -411,6 +411,9 @@ import {
                 If it shows a different code, or none, someone else has your
                 sync code. Deny, and generate a new one.
               </p>
+              <!-- Keyed on the code: a press that began over one request does not end
+                   on the buttons of another that took its place. -->
+              {#key syncState.pairingCode}
               <div class="flex gap-2">
                 <Button
                   onclick={handleDeny}
@@ -423,6 +426,7 @@ import {
                   Allow
                 </Button>
               </div>
+              {/key}
             </div>
           {:else if syncState.isGenerating}
             <div
