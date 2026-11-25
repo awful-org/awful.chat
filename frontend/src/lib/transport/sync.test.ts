@@ -19,6 +19,12 @@ const { FakeTransport, instances } = vi.hoisted(() => {
      * about pacing should not have to answer each frame by hand.
      */
     autoAck: string | null = null;
+    /** A finished target is told it was heard. */
+    autoDone = true;
+    /** Channels left for a fresh one (SecureSyncTransport.reopen). */
+    reopened: string[] = [];
+    /** Frames from here on are taken by the link and come out nowhere. */
+    blackhole = false;
     constructor() {
       instances.push(this);
     }
@@ -38,6 +44,17 @@ const { FakeTransport, instances } = vi.hoisted(() => {
       return FakeTransport.prototype.send.call(this, peer, data);
     }
     async disconnect() {}
+    openConnections() {
+      return [];
+    }
+    secureRoomConnection() {
+      return null;
+    }
+    closeSecureRoom(peer: string) {
+      this.reopened.push(peer);
+      this.blackhole = false;
+      return [];
+    }
     selfId() {
       return "12D3KooW" + "A".repeat(44);
     }
@@ -46,7 +63,11 @@ const { FakeTransport, instances } = vi.hoisted(() => {
       this.sent.push(msg);
       this.sentTo.push(peerId);
       const ok = this.sendResults.length ? this.sendResults.shift()! : true;
-      if (ok && this.autoAck && msg.type === "sync_export_data") {
+      if (ok && this.autoDone && msg.type === "sync_export_complete" && !msg.payload) {
+        queueMicrotask(() => this.emit("message", peerId, new TextEncoder().encode(
+          JSON.stringify({ type: "sync_done", v: SYNC_PROTOCOL_VERSION }))));
+      }
+      if (ok && !this.blackhole && this.autoAck && msg.type === "sync_export_data") {
         const from = this.autoAck;
         queueMicrotask(() => this.emit("message", from, new TextEncoder().encode(JSON.stringify({
           type: "sync_export_ack", v: SYNC_PROTOCOL_VERSION, payload: { seq: msg.payload.seq },
@@ -987,18 +1008,96 @@ describe("the export is paced on acks and closed with a manifest", () => {
     expect(await verifyPeerBinding(identity.did, t.selfId(), identity.binding)).toBe(true);
   });
 
-  it("fails at once when the target is lost mid-transfer", async () => {
+  it("waits for a target lost mid-transfer, and gives up when it stays gone", async () => {
+    const { t, ask } = await sourceWithHistory(300);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    void approveSync();
+    await vi.waitFor(() => expect(data(t)).toHaveLength(4));
+    t.emit("disconnect", "target");
+    expect(syncState.reconnecting).toBe(true);
+    expect(syncState.syncError).toBeNull();
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(syncState.syncError).toBeNull();
+    // Nobody there to send anything again to.
+    expect(data(t)).toHaveLength(4);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(syncState.syncError).toMatch(/while sending/);
+    expect(syncState.isSyncing).toBe(false);
+    expect(syncState.reconnecting).toBe(false);
+  });
+
+  it("sends what was on the way again when a lost target comes back, and finishes", async () => {
     const { t, ask } = await sourceWithHistory(300);
     ask("target");
     await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
     void approveSync();
     await vi.waitFor(() => expect(data(t)).toHaveLength(4));
+    t.emit("message", "target", ack(0));
+    await vi.waitFor(() => expect(data(t)).toHaveLength(5));
     t.emit("disconnect", "target");
-    expect(syncState.syncError).toMatch(/while sending/);
-    expect(syncState.isSyncing).toBe(false);
-    t.emit("message", "target", ack(data(t)[0].payload.seq));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(data(t)).toHaveLength(4);
+    t.autoAck = "target";
+    t.emit("connect", "target");
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    expect(t.reopened).toEqual(["target"]);
+    const seqs = data(t).map((m: any) => m.payload.seq);
+    // The unconfirmed four again, the confirmed one not.
+    expect(seqs.filter((n: number) => n === 0)).toHaveLength(1);
+    for (const again of [1, 2, 3, 4]) expect(seqs.filter((n: number) => n === again)).toHaveLength(2);
+    expect(syncState.syncError).toBeNull();
+  });
+
+  // The reported stall: the sender at 83% and the new device at 10%. The path
+  // under the channel stopped carrying frames and nothing said so.
+  it("leaves a channel nothing is heard from, and sends again on another", async () => {
+    const { t, ask } = await sourceWithHistory(5);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    t.autoAck = "target";
+    t.blackhole = true;
+    void approveSync();
+    await vi.waitFor(() => expect(data(t)).toHaveLength(3));
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(t.reopened).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(t.reopened).toEqual(["target"]);
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("sends the close again until the target says anything", async () => {
+    const { t, pairing, ask } = await sourceWithHistory();
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    t.autoAck = "target";
+    void approveSync();
+    const closes = () => t.sent.filter((m: any) => m.type === "sync_export_complete").length;
+    await vi.waitFor(() => expect(closes()).toBe(1));
+    await vi.advanceTimersByTimeAsync(8_500);
+    expect(closes()).toBe(2);
+    t.emit("message", "target", encodeFrame({ type: "sync_awaiting_password", v: SYNC_PROTOCOL_VERSION }), pairing.roomCode);
+    await vi.waitFor(() => expect(syncState.phase).toBe("remote-password"));
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(closes()).toBe(2);
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("stops after two minutes with no word at all, however often it sent again", async () => {
+    const { t, ask } = await sourceWithHistory(300);
+    ask("target");
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    void approveSync();
+    await vi.waitFor(() => expect(data(t)).toHaveLength(4));
+    await vi.advanceTimersByTimeAsync(121_000);
+    expect(syncState.syncError).toMatch(/stopped taking in the data/);
+    const sent = t.sent.length;
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(t.sent).toHaveLength(sent);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   // The receiver's disconnect used to win over everything: a "Connection
@@ -1008,8 +1107,12 @@ describe("the export is paced on acks and closed with a manifest", () => {
     ask("target");
     await approveWhenAsked(t);
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     t.emit("disconnect", "target");
+    expect(syncState.syncError).toBeNull();
+    await vi.advanceTimersByTimeAsync(61_000);
     expect(syncState.syncError).toMatch(/while the other device was importing/);
+    vi.useRealTimers();
     t.emit("message", "target", encodeFrame({ type: "sync_export_complete", v: SYNC_PROTOCOL_VERSION }), pairing.roomCode);
     await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
     expect(syncState.syncError).toBeNull();
@@ -1252,12 +1355,108 @@ describe("the target confirms, checks and reports", () => {
     expect(syncState.syncError).toBeNull();
   });
 
-  it("fails at once when the source is lost mid-transfer", async () => {
+  it("waits for a source lost mid-transfer, and takes the rest when it is back", async () => {
     const t = await target();
     fromSource(t, identityFrame());
     await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_ack")).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     t.emit("disconnect", PEER_ID);
-    await vi.waitFor(() => expect(syncState.syncError).toMatch(/Lost the connection/));
+    expect(syncState.reconnecting).toBe(true);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(syncState.syncError).toBeNull();
+    t.emit("connect", PEER_ID);
+    expect(syncState.reconnecting).toBe(false);
+    // It does not ask for the whole export over again.
+    expect(t.sent.filter((m: any) => m.type === "sync_export_request")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(syncState.syncError).toBeNull();
+    vi.useRealTimers();
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+  });
+
+  it("gives up on a source that stays gone, with nothing changed", async () => {
+    const t = await target();
+    fromSource(t, identityFrame());
+    await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_ack")).toBe(true));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    t.emit("disconnect", PEER_ID);
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(syncState.syncError).toMatch(/Lost the connection/);
     expect(syncState.isSyncing).toBe(false);
+    expect(importCalls).toHaveLength(0);
+  });
+
+  it("asks again when the source went away before it answered", async () => {
+    const t = await target();
+    await vi.waitFor(() => expect(t.sent.filter((m: any) => m.type === "sync_export_request")).toHaveLength(1));
+    fromSource(t, { type: "sync_approval_pending", v: SYNC_PROTOCOL_VERSION, payload: { nonce: "ab".repeat(16) } });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    t.emit("disconnect", PEER_ID);
+    expect(syncState.pairingCode).toBeNull();
+    expect(syncState.isConnecting).toBe(true);
+    t.emit("connect", PEER_ID);
+    await vi.waitFor(() => expect(t.sent.filter((m: any) => m.type === "sync_export_request")).toHaveLength(2));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("asks again when a request the link took is not answered, until it is", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = await target();
+    const requests = () => t.sent.filter((m: any) => m.type === "sync_export_request").length;
+    await vi.waitFor(() => expect(requests()).toBe(1));
+    await vi.advanceTimersByTimeAsync(8_500);
+    expect(requests()).toBe(2);
+    expect(t.reopened).toEqual([PEER_ID]);
+    fromSource(t, { type: "sync_approval_pending", v: SYNC_PROTOCOL_VERSION, payload: { nonce: "cd".repeat(16) } });
+    await vi.waitFor(() => expect(syncState.awaitingApproval).toBe(true));
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    expect(requests()).toBe(2);
+  });
+
+  it("says again where its import is to a source that closes twice", async () => {
+    importControl.run = async (options) => { await options.requestPassword(false); options.beforeCommit(); };
+    let answer!: (password: string) => void;
+    const t = await target("replace", { requestPassword: () => new Promise((resolve) => { answer = resolve; }) });
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    const waits = () => t.sent.filter((m: any) => m.type === "sync_awaiting_password").length;
+    await vi.waitFor(() => expect(waits()).toBe(1));
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(waits()).toBe(2));
+    expect(importCalls).toHaveLength(1);
+    answer("pw");
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+  });
+
+  it("makes sure a source that missed it hears the import is done, then ends anyway", async () => {
+    const t = await target();
+    t.autoDone = false;
+    const dones = () => t.sent.filter((m: any) => m.type === "sync_export_complete").length;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fromSource(t, identityFrame());
+    fromSource(t, complete());
+    await vi.waitFor(() => expect(dones()).toBe(1));
+    expect(syncState.isComplete).toBe(false);
+    await vi.advanceTimersByTimeAsync(4_500);
+    expect(dones()).toBe(2);
+    expect(t.reopened).toEqual([PEER_ID]);
+    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+    expect(syncState.syncError).toBeNull();
+  });
+
+  it("ends at once when the source says it heard, or leaves as an older build does", async () => {
+    for (const how of ["says", "leaves"] as const) {
+      const t = await target();
+      t.autoDone = false;
+      fromSource(t, identityFrame());
+      fromSource(t, complete());
+      await vi.waitFor(() => expect(t.sent.some((m: any) => m.type === "sync_export_complete")).toBe(true));
+      if (how === "says") fromSource(t, { type: "sync_done", v: SYNC_PROTOCOL_VERSION });
+      else t.emit("disconnect", PEER_ID);
+      await vi.waitFor(() => expect(syncState.isComplete).toBe(true));
+    }
   });
 });

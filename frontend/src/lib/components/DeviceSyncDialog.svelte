@@ -499,7 +499,9 @@ import {
                 ></div>
               </div>
               <p class="text-xs text-muted-foreground text-center">
-                {#if syncState.phase === "remote-password"}
+                {#if syncState.reconnecting}
+                  Connection lost. Reconnecting...
+                {:else if syncState.phase === "remote-password"}
                   Waiting for the password on the other device...
                 {:else if syncState.phase === "importing-remote"}
                   The other device is importing... {syncState.syncProgress}%
@@ -725,6 +727,8 @@ import {
             <p class="text-sm text-center">
               {#if syncState.isConnecting}
                 Connecting to device...
+              {:else if syncState.reconnecting}
+                Connection lost. Reconnecting...
               {:else if syncState.finishing}
                 Finishing... {syncState.syncProgress}%
               {:else if syncState.phase === "importing"}

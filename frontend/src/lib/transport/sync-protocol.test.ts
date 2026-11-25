@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SendWindow,
+  SilenceTimer,
   formatComparisonCode,
   manifestProblems,
   newSyncNonce,
@@ -146,5 +147,74 @@ describe("manifestProblems", () => {
       .toEqual(["rooms (bad manifest entry)"]);
     expect(manifestProblems({ rooms: { items: 0, batches: 0 } },
       new Map([["extra", got(1, [0])]]), ["rooms"])).toEqual(["extra (not listed)"]);
+  });
+});
+
+describe("SendWindow's unacked frames", () => {
+  it("are kept until their ack, oldest first", () => {
+    const w = new SendWindow(4, 1000);
+    const frames = [1, 2, 3].map((n) => new Uint8Array([n]));
+    frames.forEach((f, i) => w.sent(i, 1, f));
+    expect(w.unacked()).toEqual(frames);
+    expect(w.ack(1)).toBe(true);
+    expect(w.unacked()).toEqual([frames[0], frames[2]]);
+    // A second ack of it, for the copy that was sent again, changes nothing.
+    expect(w.ack(1)).toBe(false);
+    expect(w.pending).toBe(2);
+  });
+});
+
+describe("SilenceTimer", () => {
+  afterEach(() => void vi.useRealTimers());
+
+  it("acts on silence only, less and less often, until stopped", async () => {
+    vi.useFakeTimers();
+    const act = vi.fn();
+    const t = new SilenceTimer(act, 100, 400);
+    t.restart();
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(90);
+      t.restart();
+    }
+    expect(act).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(act).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(act).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(act).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(act).toHaveBeenCalledTimes(4);
+    t.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(act).toHaveBeenCalledTimes(4);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not act again while it is still acting, nor after being stopped in it", async () => {
+    vi.useFakeTimers();
+    let done!: () => void;
+    const act = vi.fn(() => new Promise<void>((r) => { done = r; }));
+    const t = new SilenceTimer(act, 100, 100);
+    t.restart();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(act).toHaveBeenCalledTimes(1);
+    t.stop();
+    done();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(act).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("leaves a running clock alone when more is sent", async () => {
+    vi.useFakeTimers();
+    const act = vi.fn();
+    const t = new SilenceTimer(act, 100, 400);
+    t.ensure();
+    await vi.advanceTimersByTimeAsync(60);
+    t.ensure();
+    await vi.advanceTimersByTimeAsync(40);
+    expect(act).toHaveBeenCalledTimes(1);
+    t.stop();
   });
 });
