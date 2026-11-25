@@ -3,6 +3,7 @@
   import { shortcutKeys } from "$lib/platform";
   import {
     Dialog,
+    DialogClose,
     DialogContent,
     DialogHeader,
     DialogTitle,
@@ -81,6 +82,7 @@
   import DataSettings from "./settings/DataSettings.svelte";
   import DiagnosticsSettings from "./settings/DiagnosticsSettings.svelte";
   import PluginSettings from "./settings/PluginSettings.svelte";
+  import XIcon from "@lucide/svelte/icons/x";
   import AvatarPickerDialog from "./AvatarPickerDialog.svelte";
   import { getScopedProfile, saveAvatar, saveScopedFields } from "$lib/profile.svelte";
   import QuirksNotice from "./QuirksNotice.svelte";
@@ -414,12 +416,14 @@
 {:else}
   <Dialog bind:open onOpenChange={closeHandler}>
     <DialogContent
+      showCloseButton={false}
       class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg lg:max-w-5xl min-h-0 sm:h-178.75 lg:h-195 flex flex-col overflow-hidden p-0"
       style="max-height: {Math.max(0, visibleHeight - 32)}px; top: {viewportTop + visibleHeight / 2}px;"
     >
-      <!-- pr-12 clears the dialog's own close button, absolute at the right. -->
-      <DialogHeader class="flex-row items-center justify-between gap-4 px-6 py-4 pr-12 border-b border-border shrink-0">
-        <DialogTitle class="font-mono text-base font-semibold"
+      <!-- The close button is in the row, not the dialog's own: that one is at
+           a fixed place in the corner, 5px above this row's middle. -->
+      <DialogHeader class="flex-row items-center gap-4 pl-6 pr-4 py-4 border-b border-border shrink-0">
+        <DialogTitle class="mr-auto font-mono text-base font-semibold"
           >Settings</DialogTitle
         >
         <!-- Every setting is a row in the palette, under ">": a hint, not a
@@ -435,6 +439,12 @@
           <kbd class="rounded border border-border px-1">&gt;</kbd>
           <span>finds any setting</span>
         </button>
+        <DialogClose
+          class="ring-offset-background focus:ring-ring rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden"
+        >
+          <XIcon class="size-4" />
+          <span class="sr-only">Close</span>
+        </DialogClose>
       </DialogHeader>
       <div class="min-h-0 flex-1 overflow-hidden px-4 pb-4">
         {@render DesktopContent()}
