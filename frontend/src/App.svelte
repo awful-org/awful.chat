@@ -8,6 +8,7 @@
   import { ensurePushSubscription } from "$lib/push.svelte";
   import { parseRoomCode } from "$lib/palette/query";
   import { applyRouteMeta } from "$lib/page-meta";
+  import { setPageTranslatable } from "$lib/page-translation";
   import { playBootSound } from "$lib/boot-sound";
   // The app, its setup and unlock screens, /qs and /qc are chunks of their
   // own, so the landing page paints from a small entry; and the routes are
@@ -119,6 +120,7 @@
     // /qs and /qc are the only routes worth finding from a search, so they
     // say who they are instead of canonicalising to the root - see page-meta.
     applyRouteMeta(currentRoute);
+    setPageTranslatable(currentRoute);
   });
 
   function handlePopState() {
@@ -126,6 +128,7 @@
 
     currentRoute = routeFor(window.location.pathname);
     applyRouteMeta(currentRoute);
+    setPageTranslatable(currentRoute);
   }
 </script>
 
