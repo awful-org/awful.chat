@@ -24,7 +24,8 @@ interface RouteMeta {
   path: string | null;
 }
 
-const META: Record<string, RouteMeta> = {
+/** nginx-cards/ says the same to scrapers, which run no scripts. */
+export const META: Record<string, RouteMeta> = {
   qs: {
     title: "Send a file with no account - Awful.chat",
     description:

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // OgPreview represents the Open Graph preview response
@@ -32,96 +35,110 @@ type OgPreview struct {
 	MediaType        string  `json:"mediaType"`
 }
 
-var ogRewriteRules = []struct {
-	Hosts    []string
-	Rewrites []func(*url.URL) string
-}{
-	{
-		Hosts: []string{"instagram.com", "www.instagram.com"},
-		Rewrites: []func(*url.URL) string{
-			func(u *url.URL) string {
-				if u.RawQuery == "" {
-					return fmt.Sprintf("https://d.vxinstagram.com%s", u.Path)
-				}
-				return fmt.Sprintf("https://d.vxinstagram.com%s?%s", u.Path, u.RawQuery)
-			},
-			func(u *url.URL) string {
-				if u.RawQuery == "" {
-					return fmt.Sprintf("https://www.ddinstagram.com%s", u.Path)
-				}
-				return fmt.Sprintf("https://www.ddinstagram.com%s?%s", u.Path, u.RawQuery)
-			},
-		},
-	},
+// instagramPostPath matches the paths a mirror can answer for: one post or
+// reel, optionally under its author's name.
+var instagramPostPath = regexp.MustCompile(`^(?:/[A-Za-z0-9._]+)?/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+/?$`)
+
+// getCandidateUrls lists the urls to build a preview from, best first: the
+// link itself, and for an Instagram post a mirror of it. Instagram refuses
+// many servers' addresses outright, so on those the mirror is the only answer
+// there is; where it does answer, its own page has the caption too. The
+// mirror redirects to the post's picture or video.
+//
+// It is another party's service, so it is asked about posts and nothing
+// else, and only which picture of a post is passed on: the rest of a shared
+// link's query says who shared it.
+func getCandidateUrls(targetURL *url.URL) []string {
+	candidates := []string{targetURL.String()}
+	switch targetURL.Host {
+	case "instagram.com", "www.instagram.com":
+		if instagramPostPath.MatchString(targetURL.Path) {
+			mirror := url.URL{Scheme: "https", Host: "kkinstagram.com", Path: targetURL.Path}
+			if i := targetURL.Query().Get("img_index"); i != "" {
+				mirror.RawQuery = url.Values{"img_index": {i}}.Encode()
+			}
+			candidates = append(candidates, mirror.String())
+		}
+	}
+	return candidates
 }
 
-func getCandidateUrls(targetURL *url.URL) []string {
-	for _, rule := range ogRewriteRules {
-		for _, host := range rule.Hosts {
-			if targetURL.Host == host {
-				results := make([]string, len(rule.Rewrites))
-				for i, rewrite := range rule.Rewrites {
-					results[i] = rewrite(targetURL)
+// ogTags is what a preview needs out of a page.
+type ogTags struct {
+	meta   map[string]string // og:*, twitter:* and description, by lower-case name
+	title  string            // the text of <title>
+	poster string            // the first <video poster>
+}
+
+// readOgTags reads a page's tags with an HTML tokenizer. The first value that
+// says anything wins.
+//
+// It replaced patterns matched against the raw text, which ended every value
+// at its first apostrophe ("no matter if it" for "no matter if it's"), left
+// every entity but &amp; as it stood ("Schr\u00f6dinger&#039;s cat"), and
+// missed tags written in capitals.
+func readOgTags(page string) ogTags {
+	tags := ogTags{meta: map[string]string{}}
+	z := html.NewTokenizer(strings.NewReader(page))
+	inTitle := false
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return tags
+		case html.TextToken:
+			if inTitle && tags.title == "" {
+				tags.title = strings.TrimSpace(string(z.Text()))
+			}
+		case html.EndTagToken:
+			inTitle = false
+		case html.StartTagToken, html.SelfClosingTagToken:
+			name, hasAttr := z.TagName()
+			tag := string(name)
+			inTitle = tag == "title"
+			if !hasAttr || (tag != "meta" && tag != "video") {
+				continue
+			}
+			var keys []string
+			content := ""
+			for more := true; more; {
+				var k, v []byte
+				k, v, more = z.TagAttr()
+				switch {
+				case tag == "video" && string(k) == "poster" && tags.poster == "":
+					tags.poster = strings.TrimSpace(string(v))
+				case tag == "meta" && (string(k) == "property" || string(k) == "name"):
+					keys = append(keys, strings.ToLower(strings.TrimSpace(string(v))))
+				case tag == "meta" && string(k) == "content":
+					content = strings.TrimSpace(string(v))
 				}
-				return results
+			}
+			if content == "" {
+				continue
+			}
+			for _, key := range keys {
+				if key != "description" && !strings.HasPrefix(key, "og:") && !strings.HasPrefix(key, "twitter:") {
+					continue
+				}
+				if _, seen := tags.meta[key]; !seen {
+					tags.meta[key] = content
+				}
 			}
 		}
 	}
-	return []string{targetURL.String()}
 }
 
-func escapeRegex(s string) string {
-	specialChars := []string{".", "*", "+", "?", "^", "$", "(", ")", "[", "]", "{", "}", "|", "\\"}
-	result := s
-	for _, char := range specialChars {
-		result = strings.ReplaceAll(result, char, "\\"+char)
-	}
-	return result
-}
-
-// The two patterns for each meta key, compiled once. The keys are the fixed
-// literals below, so this holds a couple of dozen entries at most; compiling
-// them on every preview was up to 46 compiles a request.
-var (
-	ogMetaPatternsMu sync.Mutex
-	ogMetaPatterns   = map[string][2]*regexp.Regexp{}
-)
-
-func ogMetaPatternsFor(key string) [2]*regexp.Regexp {
-	ogMetaPatternsMu.Lock()
-	defer ogMetaPatternsMu.Unlock()
-	if p, ok := ogMetaPatterns[key]; ok {
-		return p
-	}
-	escaped := escapeRegex(key)
-	p := [2]*regexp.Regexp{
-		regexp.MustCompile(`<meta[^>]+(?:property|name)=["']` + escaped + `["'][^>]*content=["']([^"']+)["'][^>]*>`),
-		regexp.MustCompile(`<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["']` + escaped + `["'][^>]*>`),
-	}
-	ogMetaPatterns[key] = p
-	return p
-}
-
-var (
-	ogTitlePattern  = regexp.MustCompile(`<title[^>]*>([^<]+)</title>`)
-	ogPosterPattern = regexp.MustCompile(`poster=["']([^"']+)["']`)
-)
-
-func extractMetaContent(html string, keys []string) *string {
+// text is the first of keys the page has, or nil.
+func (t ogTags) text(keys ...string) *string {
 	for _, key := range keys {
-		for _, pattern := range ogMetaPatternsFor(key) {
-			matches := pattern.FindStringSubmatch(html)
-			if len(matches) > 1 {
-				value := strings.TrimSpace(strings.ReplaceAll(matches[1], "&amp;", "&"))
-				return &value
-			}
+		if v, ok := t.meta[key]; ok {
+			return &v
 		}
 	}
 	return nil
 }
 
-func extractMetaNumber(html string, keys []string) *int {
-	val := extractMetaContent(html, keys)
+func (t ogTags) number(keys ...string) *int {
+	val := t.text(keys...)
 	if val == nil {
 		return nil
 	}
@@ -366,6 +383,11 @@ var ogHTTPClient = &http.Client{
 // nothing but its url, so counting answers alone let a thousand made-up
 // urls of a megabyte each sit in an "8 MiB" cache.
 const (
+	// Fetches a minute for one client. Ten, the plugin proxy's, is fewer
+	// links than one busy room shows when it opens.
+	ogRateLimit  = 30
+	ogRatePrefix = "og:"
+
 	ogCacheTTL        = time.Hour
 	ogCacheFailTTL    = 5 * time.Minute
 	ogCacheMaxEntries = 1024
@@ -444,7 +466,7 @@ func ogPreviewFor(r *http.Request, target *url.URL) (body []byte, status int) {
 		// ask that joins a running fetch spends no budget, so sharing would
 		// let any number of them wait out the fetch, each holding its
 		// megabyte of url, for the price of one.
-		if !rateAllowClient(r, "og:", pluginProxyRateLimit) {
+		if !rateAllowClient(r, ogRatePrefix, ogRateLimit) {
 			return nil, http.StatusTooManyRequests
 		}
 		return ogAnswer(ogBuild(target))
@@ -462,11 +484,10 @@ func ogPreviewFor(r *http.Request, target *url.URL) (body []byte, status int) {
 	if !joined {
 		// The one outbound-fetch handler that had NO throttle: each request
 		// is a DNS lookup plus up to 10s of held goroutine and a 5MB read -
-		// the cheapest-for-attacker, dearest-for-server call here. Same
-		// budget as its plugin-proxy sibling. A cache hit, or an ask that
-		// joins a fetch already running, costs none of that and spends none
-		// of it.
-		if !rateAllowClient(r, "og:", pluginProxyRateLimit) {
+		// the cheapest-for-attacker, dearest-for-server call here. A cache
+		// hit, or an ask that joins a fetch already running, costs none of
+		// that and spends none of the budget.
+		if !rateAllowClient(r, ogRatePrefix, ogRateLimit) {
 			return nil, http.StatusTooManyRequests
 		}
 		ogCacheMu.Lock()
@@ -507,107 +528,120 @@ func ogRunFetch(key string, target *url.URL, call *ogCall) {
 	call.body = ogBuild(target)
 }
 
-// ogBuild fetches a page and returns its preview as the JSON answer, or nil
-// when it could not be fetched.
+// ogBuild fetches a link and returns its preview as the JSON answer, or nil
+// when it could not be fetched. The first candidate with a picture or a video
+// wins; failing that, the first that answered at all.
 func ogBuild(target *url.URL) []byte {
-	html, finalUrl := ogFetchPage(target)
-	if html == "" {
+	var best *OgPreview
+	for _, candidate := range getCandidateUrls(target) {
+		page, ok := ogFetchPage(candidate)
+		if !ok {
+			continue
+		}
+		preview := ogParse(page)
+		if best == nil || preview.MediaType != "none" {
+			best = &preview
+		}
+		if best.MediaType != "none" {
+			break
+		}
+	}
+	if best == nil {
 		return nil
 	}
-	body, err := json.Marshal(ogParse(html, finalUrl))
+	body, err := json.Marshal(best)
 	if err != nil {
 		return nil
 	}
 	return append(body, '\n')
 }
 
-// ogFetchPage fetches the page a preview is built from: the first candidate
-// url (see ogRewriteRules) that answers 200, and the url it ended up at
-// after redirects. Empty html when none did. A package var so a test can
-// stand in for the upstream.
-var ogFetchPage = func(target *url.URL) (html, finalUrl string) {
-	finalUrl = target.String()
-
-	const maxBodyBytes = 5 * 1024 * 1024 // 5 MB limit
-
-	for _, candidate := range getCandidateUrls(target) {
-		req, err := http.NewRequest("GET", candidate, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("User-Agent", "TelegramBot (like TwitterBot)")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml")
-
-		resp, err := ogHTTPClient.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			continue
-		}
-
-		// Wrap body in size limiter before reading
-		limitedBody := io.LimitReader(resp.Body, maxBodyBytes)
-		body, err := io.ReadAll(limitedBody)
-		if err != nil {
-			continue
-		}
-		html = string(body)
-		finalUrl = resp.Request.URL.String()
-		if finalUrl == "" {
-			finalUrl = candidate
-		}
-		break
-	}
-	return html, finalUrl
+// ogPage is what one url answered with.
+type ogPage struct {
+	url   string // after redirects
+	media string // the content type, for a url that is itself a picture or a video
+	html  string // the page otherwise
 }
 
-// ogParse builds a preview from a fetched page.
-func ogParse(html, finalUrl string) OgPreview {
-	preview := OgPreview{
-		URL: finalUrl,
-	}
+// ogFetchPage fetches one candidate url; false unless it answered 200 with
+// something in it. A package var so a test can stand in for the upstream.
+var ogFetchPage = func(candidate string) (ogPage, bool) {
+	const maxBodyBytes = 5 * 1024 * 1024 // 5 MB limit
 
-	// Extract title
-	title := extractMetaContent(html, []string{"og:title", "twitter:title"})
-	if title == nil {
-		matches := ogTitlePattern.FindStringSubmatch(html)
-		if len(matches) > 1 {
-			s := strings.TrimSpace(matches[1])
-			title = &s
+	req, err := http.NewRequest("GET", candidate, nil)
+	if err != nil {
+		return ogPage{}, false
+	}
+	req.Header.Set("User-Agent", "TelegramBot (like TwitterBot)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+
+	resp, err := ogHTTPClient.Do(req)
+	if err != nil {
+		return ogPage{}, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ogPage{}, false
+	}
+	page := ogPage{url: resp.Request.URL.String()}
+	if media, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err == nil &&
+		(strings.HasPrefix(media, "image/") || strings.HasPrefix(media, "video/")) {
+		// The url is the preview. Its bytes are the viewer's to fetch, not
+		// the relay's to read as if they were a page.
+		page.media = media
+		return page, true
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+	if err != nil || len(body) == 0 {
+		return ogPage{}, false
+	}
+	page.html = string(body)
+	return page, true
+}
+
+// ogParse builds a preview from what a url answered with.
+func ogParse(page ogPage) OgPreview {
+	preview := OgPreview{URL: page.url, MediaType: "none"}
+
+	if page.media != "" {
+		media := absolutizeUrl(page.url, page.url)
+		switch {
+		case media == nil:
+		case strings.HasPrefix(page.media, "video/"):
+			preview.Video, preview.VideoContentType = media, &page.media
+			preview.MediaType = "video"
+		default:
+			preview.Image = media
+			preview.MediaType = "image"
 		}
+		return preview
 	}
-	preview.Title = title
 
-	// Extract description
-	preview.Description = extractMetaContent(html, []string{"og:description", "twitter:description", "description"})
-
-	// Extract site name
-	preview.SiteName = extractMetaContent(html, []string{"og:site_name"})
-
-	// Extract video
-	if videoURL := extractMetaContent(html, []string{"og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"}); videoURL != nil {
-		preview.Video = absolutizeUrl(*videoURL, finalUrl)
+	tags := readOgTags(page.html)
+	preview.Title = tags.text("og:title", "twitter:title")
+	if preview.Title == nil && tags.title != "" {
+		preview.Title = &tags.title
 	}
-	preview.VideoWidth = extractMetaNumber(html, []string{"og:video:width", "twitter:player:width"})
-	preview.VideoHeight = extractMetaNumber(html, []string{"og:video:height", "twitter:player:height"})
-	preview.VideoContentType = extractMetaContent(html, []string{"og:video:type", "twitter:player:stream:content_type"})
+	preview.Description = tags.text("og:description", "twitter:description", "description")
+	preview.SiteName = tags.text("og:site_name")
 
-	// Extract image
-	if imageURL := extractMetaContent(html, []string{"og:image", "twitter:image", "twitter:image:src"}); imageURL != nil {
-		preview.Image = absolutizeUrl(*imageURL, finalUrl)
+	if videoURL := tags.text("og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"); videoURL != nil {
+		preview.Video = absolutizeUrl(*videoURL, page.url)
 	}
-	preview.ImageWidth = extractMetaNumber(html, []string{"og:image:width", "twitter:image:width"})
-	preview.ImageHeight = extractMetaNumber(html, []string{"og:image:height", "twitter:image:height"})
+	preview.VideoWidth = tags.number("og:video:width", "twitter:player:width")
+	preview.VideoHeight = tags.number("og:video:height", "twitter:player:height")
+	preview.VideoContentType = tags.text("og:video:type", "twitter:player:stream:content_type")
+
+	if imageURL := tags.text("og:image", "twitter:image", "twitter:image:src"); imageURL != nil {
+		preview.Image = absolutizeUrl(*imageURL, page.url)
+	}
+	preview.ImageWidth = tags.number("og:image:width", "twitter:image:width")
+	preview.ImageHeight = tags.number("og:image:height", "twitter:image:height")
 
 	// If no image but has video, try poster attribute
-	if preview.Image == nil && preview.Video != nil {
-		matches := ogPosterPattern.FindStringSubmatch(html)
-		if len(matches) > 1 {
-			preview.Image = absolutizeUrl(matches[1], finalUrl)
-		}
+	if preview.Image == nil && preview.Video != nil && tags.poster != "" {
+		preview.Image = absolutizeUrl(tags.poster, page.url)
 	}
 
 	// Determine media type
@@ -615,8 +649,6 @@ func ogParse(html, finalUrl string) OgPreview {
 		preview.MediaType = "video"
 	} else if preview.Image != nil {
 		preview.MediaType = "image"
-	} else {
-		preview.MediaType = "none"
 	}
 	return preview
 }
@@ -651,6 +683,11 @@ func handleOgPreview(w http.ResponseWriter, r *http.Request) {
 	body, status := ogPreviewFor(r, targetURL)
 	switch status {
 	case http.StatusTooManyRequests:
+		// When the window really ends, so the app can ask again then. Whole
+		// seconds, and past the end rather than on it: the window is still
+		// closed at the instant it ends.
+		wait := rateWaitClient(r, ogRatePrefix, ogRateLimit)
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+1))
 		apiError(w, r, "rate limited", status)
 	case http.StatusOK:
 		withCors(w, r, func(w http.ResponseWriter) {

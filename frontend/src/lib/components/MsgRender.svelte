@@ -41,9 +41,9 @@
 </script>
 
 <script lang="ts">
-  import { apiUrl } from "$lib/runtime-config";
   import { isGifUrl } from "$lib/media-url";
   import { remotePreviewUrl } from "$lib/preview-url";
+  import { bareOgPreview, fetchOgPreview, playableVideo, type OgPreview } from "$lib/og-preview";
   import { LazyTip, Tip } from "$lib/components/ui/tooltip";
   import {
     ChevronDown,
@@ -89,7 +89,7 @@
   import { messageBody } from "$lib/actions/message-body";
   import { renderMessageMarkdown, firstLinkedUrl } from "$lib/markdown";
   import { formatSize, isImageBytes } from "$lib/utils";
-  import { animatedView, mediaBoxStyle } from "$lib/image-size";
+  import { animatedView, mediaBoxStyle, videoBoxStyle } from "$lib/image-size";
   import {
     INLINE_FILE_MAX_BYTES,
     attachmentHydration,
@@ -148,21 +148,6 @@
     /** This call card is its DM's newest call with no end yet (call-card.ts). */
     callOpen?: boolean;
   }
-
-  type OgPreview = {
-    url: string;
-    title?: string;
-    description?: string;
-    siteName?: string;
-    image?: string;
-    imageWidth?: number;
-    imageHeight?: number;
-    video?: string;
-    videoWidth?: number;
-    videoHeight?: number;
-    videoContentType?: string;
-    mediaType: "video" | "image" | "none";
-  };
 
   let { msg, isOwn, fileTransfers, onRequestFileDownload, showReceipt = true, callEnd = null, callOpen = false }: Props = $props();
 
@@ -641,6 +626,8 @@
     };
   });
   let videoPlaying = $state(false);
+  /** The preview's video would not load, so its picture is a link instead. */
+  let videoFailed = $state(false);
   let videoEl = $state<HTMLVideoElement | null>(null);
   let videoNaturalWidth = $state(0);
   let videoNaturalHeight = $state(0);
@@ -659,6 +646,7 @@
   $effect(() => {
     linkedUrl;
     videoPlaying = false;
+    videoFailed = false;
     videoNaturalWidth = 0;
     videoNaturalHeight = 0;
   });
@@ -774,6 +762,10 @@
     }
   });
 
+  const ogVideo = $derived(
+    ogPreview && !videoFailed ? playableVideo(ogPreview) : null
+  );
+
   // aspect-ratio style: video metadata wins over og metadata, og metadata wins over 16/9
   const videoAspectStyle = $derived.by(() => {
     if (videoNaturalWidth && videoNaturalHeight) {
@@ -793,20 +785,21 @@
     if (!previewUrl) return;
     ogLoading = true;
     const ctrl = new AbortController();
-    fetch(
-      // No hardcoded origin: an unset apiUrl means this instance never said
-      // where its relay is, and defaulting to awful.frav.in would hand every
-      // link its users open to a stranger's server. Empty resolves
-      // same-origin and 404s, so previews are simply off.
-      `${apiUrl()}/og/preview?url=${encodeURIComponent(previewUrl)}`,
-      { signal: ctrl.signal }
-    )
-      .then((r) => r.json())
-      .then((json: OgPreview) => {
-        if (!ctrl.signal.aborted && mediaPrefs.externalMedia) ogPreview = json;
+    fetchOgPreview(previewUrl, ctrl.signal, () => {
+      if (ctrl.signal.aborted) return;
+      // A wait of up to a minute is not "loading": the settling cover would
+      // sit over the whole conversation for it.
+      if (mediaPrefs.externalMedia) ogPreview = bareOgPreview(previewUrl);
+      ogLoading = false;
+    })
+      .then((json) => {
+        if (ctrl.signal.aborted) return;
+        if (mediaPrefs.externalMedia) ogPreview = json;
         ogLoading = false;
       })
-      .catch(() => { ogLoading = false; });
+      .catch(() => {
+        if (!ctrl.signal.aborted) ogLoading = false;
+      });
     return () => ctrl.abort();
   });
 
@@ -979,6 +972,20 @@
   }
 </script>
 
+{#snippet playBadge()}
+  <div
+    class="absolute inset-0 flex items-center justify-center bg-black/35 group-hover/play:bg-black/50 transition-colors"
+  >
+    <div
+      class="flex size-11 items-center justify-center rounded-full bg-white/90 group-hover/play:bg-white transition-colors"
+    >
+      <svg width="14" height="16" viewBox="0 0 14 16" fill="none">
+        <path d="M2 1.5L12.5 8L2 14.5V1.5Z" fill="black" />
+      </svg>
+    </div>
+  </div>
+{/snippet}
+
 <!--
   `leading-normal` is not decoration. `text-sm` shipped a ratio line-height with
   it for free; `text-(length:…)` emits font-size only, so without an explicit
@@ -1145,7 +1152,7 @@
             </div>
             {/if}
           {:else if file.mimeType.startsWith("video/")}
-            {@const box = mediaBoxStyle(file.width, file.height)}
+            {@const box = videoBoxStyle(file.width, file.height)}
             {#if !transfer?.blobURL}
               <!-- Same reservation an image gets, on the same condition. A
                    video shifts too: with no dimensions the browser lays out
@@ -1180,7 +1187,7 @@
               controls
               preload="metadata"
               style={box}
-              class="mt-2 {box ? '' : 'max-w-xs max-h-56'} rounded-md"
+              class="mt-2 {box ? '' : 'min-w-56 min-h-32 max-w-xs max-h-56'} rounded-md bg-black"
             ></video>
             {/if}
           {:else if transfer?.blobURL && file.mimeType.startsWith("audio/")}
@@ -1358,9 +1365,9 @@
       <div
         class="mt-2 max-w-sm overflow-hidden rounded-lg border border-border/70 bg-card"
       >
-        {#if ogPreview.mediaType === "video" && ogPreview.video}
+        {#if ogVideo}
           {#if videoPlaying}
-            <div class="w-full bg-black" style={videoAspectStyle}>
+            <div class="flex max-h-96 min-h-32 w-full bg-black" style={videoAspectStyle}>
               <!-- svelte-ignore a11y_media_has_caption -->
               <!-- No referrerpolicy here: <video> does not support the
                    attribute, so this fetch still carries the document
@@ -1368,17 +1375,21 @@
                    unlike the poster image below. -->
               <video
                 bind:this={videoEl}
-                src={ogPreview.video}
+                src={ogVideo}
                 controls
                 autoplay
-                class="w-full h-full object-contain"
+                class="min-h-0 min-w-0 flex-1 object-contain"
                 onloadedmetadata={onVideoMeta}
+                onerror={() => {
+                  videoFailed = true;
+                  videoPlaying = false;
+                }}
               ></video>
             </div>
           {:else}
             <button
               type="button"
-              class="relative block w-full bg-black group/play"
+              class="relative block max-h-96 min-h-32 w-full bg-black group/play"
               style={videoAspectStyle}
               onclick={() => (videoPlaying = true)}
               aria-label="Play video"
@@ -1391,26 +1402,20 @@
                   class="absolute inset-0 w-full h-full object-cover"
                 />
               {/if}
-              <div
-                class="absolute inset-0 flex items-center justify-center bg-black/35 group-hover/play:bg-black/50 transition-colors"
-              >
-                <div
-                  class="flex size-11 items-center justify-center rounded-full bg-white/90 group-hover/play:bg-white transition-colors"
-                >
-                  <svg width="14" height="16" viewBox="0 0 14 16" fill="none">
-                    <path d="M2 1.5L12.5 8L2 14.5V1.5Z" fill="black" />
-                  </svg>
-                </div>
-              </div>
+              {@render playBadge()}
             </button>
           {/if}
-        {:else if ogPreview.mediaType === "image" && ogPreview.image}
+        {:else if ogPreview.image}
+          {@const opensVideo = ogPreview.mediaType === "video"}
+          <!-- For a video that plays only on its own page (YouTube), this is
+               the play button, so it is one to the keyboard too. -->
           <a
             href={linkedUrl}
             target="_blank"
             rel="noopener noreferrer"
-            class="block w-full overflow-hidden bg-muted/20"
-            tabindex="-1"
+            class="group/play relative block w-full overflow-hidden bg-muted/20"
+            tabindex={opensVideo ? undefined : -1}
+            aria-label={opensVideo ? `Play on ${ogPreview.siteName ?? ogDomain}` : undefined}
           >
             <img
               src={ogPreview.image}
@@ -1420,6 +1425,7 @@
               height={ogPreview.imageHeight}
               class="w-full max-h-80 object-contain object-center"
             />
+            {#if opensVideo}{@render playBadge()}{/if}
           </a>
         {/if}
         <!-- text meta - always a link to the site -->

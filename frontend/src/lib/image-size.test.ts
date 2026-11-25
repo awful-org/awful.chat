@@ -10,6 +10,7 @@ import {
   stillFrameGrows,
   stillFrameRedraw,
   stillFrameSize,
+  videoBoxStyle,
 } from "./image-size";
 import { bytesToBase64 } from "./utils";
 
@@ -25,6 +26,34 @@ describe("isSaneDimension", () => {
     for (const bad of [0, -5, 1e9, 20001, 1.5, NaN, Infinity, "800", null, undefined]) {
       expect(isSaneDimension(bad)).toBe(false);
     }
+  });
+});
+
+describe("videoBoxStyle", () => {
+  const size = (style: string) => {
+    const m = /^width: ([\d.]+)rem; aspect-ratio: ([\d.]+) \/ ([\d.]+);$/.exec(style)!;
+    return { w: Number(m[1]), h: (Number(m[1]) * Number(m[3])) / Number(m[2]) };
+  };
+
+  it("is an ordinary video's box unchanged", () => {
+    expect(videoBoxStyle(1920, 1080)).toBe(mediaBoxStyle(1920, 1080));
+    expect(videoBoxStyle(1080, 1080)).toBe(mediaBoxStyle(1080, 1080));
+  });
+
+  it("leaves room for the controls of a very wide or narrow one", () => {
+    for (const [w, h] of [[1920, 240], [1920, 400], [1080, 1920], [400, 1600], [64, 64], [2000, 100], [100, 2000]]) {
+      const box = size(videoBoxStyle(w, h));
+      expect(box.w).toBeGreaterThanOrEqual(14);
+      expect(box.h).toBeGreaterThanOrEqual(7.99);
+      expect(box.w).toBeLessThanOrEqual(20);
+      expect(box.h).toBeLessThanOrEqual(14.01);
+    }
+  });
+
+  it("believes no more than mediaBoxStyle does", () => {
+    expect(videoBoxStyle(undefined, 5)).toBe("");
+    expect(videoBoxStyle(20000, 1)).toBe("");
+    expect(videoBoxStyle(1e9, 1e9)).toBe("");
   });
 });
 

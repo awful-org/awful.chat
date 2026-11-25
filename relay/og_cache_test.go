@@ -24,15 +24,15 @@ type fakeOgUpstream struct {
 func (f *fakeOgUpstream) install(t *testing.T) {
 	t.Helper()
 	saved := ogFetchPage
-	ogFetchPage = func(target *url.URL) (string, string) {
+	ogFetchPage = func(candidate string) (ogPage, bool) {
 		f.fetches.Add(1)
 		if f.release != nil {
 			<-f.release
 		}
 		if f.fail {
-			return "", target.String()
+			return ogPage{}, false
 		}
-		return `<html><head><meta property="og:title" content="A page"></head></html>`, target.String()
+		return ogPage{url: candidate, html: `<html><head><meta property="og:title" content="A page"></head></html>`}, true
 	}
 	t.Cleanup(func() { ogFetchPage = saved })
 }
@@ -112,9 +112,8 @@ func TestOgPreviewIsFetchedOnceForEveryone(t *testing.T) {
 	}
 }
 
-// Ten previews a minute from one address used to be ten upstream fetches;
-// opening a room with a dozen links degraded the newest to bare domains.
-// Only an ask that really fetches spends the budget now.
+// Only an ask that really fetches spends the budget, and one refused for want
+// of it says when there will be some.
 func TestOgPreviewCacheHitsAreNotRateLimited(t *testing.T) {
 	resetRateLimiter(t)
 	resetOgCache(t)
@@ -122,20 +121,39 @@ func TestOgPreviewCacheHitsAreNotRateLimited(t *testing.T) {
 	up.install(t)
 	const addr = "203.0.113.20"
 
-	for i := 0; i < pluginProxyRateLimit*3; i++ {
+	for i := 0; i < ogRateLimit*3; i++ {
 		if w := ogRequest(t, addr, "https://example.com/same"); w.Code != http.StatusOK {
 			t.Fatalf("ask %d for one link: %d", i, w.Code)
 		}
 	}
-	// The budget is spent only by fetches: nine more distinct links fit,
-	// the one after does not.
-	for i := 0; i < pluginProxyRateLimit-1; i++ {
+	// The budget is spent only by fetches: one fewer than it distinct links
+	// fit, the one after does not.
+	for i := 0; i < ogRateLimit-1; i++ {
 		if w := ogRequest(t, addr, "https://example.com/p"+strconv.Itoa(i)); w.Code != http.StatusOK {
 			t.Fatalf("distinct link %d: %d", i, w.Code)
 		}
 	}
-	if w := ogRequest(t, addr, "https://example.com/one-too-many"); w.Code != http.StatusTooManyRequests {
+	w := ogRequest(t, addr, "https://example.com/one-too-many")
+	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("a fetch past the budget got %d, want 429", w.Code)
+	}
+	// The wait it names is the window's real end, and asking again after it
+	// works.
+	wait, err := strconv.Atoi(w.Header().Get("Retry-After"))
+	if err != nil || wait < 1 || wait > int(pluginProxyRateWindow/time.Second)+1 {
+		t.Fatalf("Retry-After %q", w.Header().Get("Retry-After"))
+	}
+	rateMu.Lock()
+	for k, e := range rateBy {
+		if time.Until(e.resetAt) > time.Duration(wait)*time.Second {
+			t.Errorf("the window %s outlasts Retry-After %d", k, wait)
+		}
+		e.resetAt = e.resetAt.Add(-time.Duration(wait) * time.Second)
+		rateBy[k] = e
+	}
+	rateMu.Unlock()
+	if w := ogRequest(t, addr, "https://example.com/one-too-many"); w.Code != http.StatusOK {
+		t.Fatalf("asked again after Retry-After: %d", w.Code)
 	}
 	if w := ogRequest(t, addr, "https://example.com/same"); w.Code != http.StatusOK {
 		t.Fatalf("a cached link after the budget ran out: %d", w.Code)
@@ -242,13 +260,13 @@ func TestOgPreviewLongURLsAreNeitherKeptNorShared(t *testing.T) {
 	up.fail = false
 	link := "https://example.com/long?" + pad
 	before := up.fetches.Load()
-	for i := 0; i < pluginProxyRateLimit; i++ {
+	for i := 0; i < ogRateLimit; i++ {
 		if w := ogRequest(t, "203.0.113.30", link); w.Code != http.StatusOK {
 			t.Fatalf("ask %d for a long link: %d", i, w.Code)
 		}
 	}
-	if n := up.fetches.Load() - before; n != pluginProxyRateLimit {
-		t.Fatalf("%d asks for one long link cost %d fetches, want one each", pluginProxyRateLimit, n)
+	if n := up.fetches.Load() - before; n != ogRateLimit {
+		t.Fatalf("%d asks for one long link cost %d fetches, want one each", ogRateLimit, n)
 	}
 	if w := ogRequest(t, "203.0.113.30", link); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("an ask past the budget for a long link got %d, want 429", w.Code)

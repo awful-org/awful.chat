@@ -359,11 +359,23 @@ func clientIP(r *http.Request) string {
 // charged, so a request the aggregate refuses does not also eat into the
 // client's own window.
 func rateAllowClient(r *http.Request, prefix string, limit int) bool {
+	return rateAllowAll(clientRateKeys(r, prefix, limit))
+}
+
+// rateWaitClient is how long until a request refused by rateAllowClient would
+// be allowed, as things stand.
+func rateWaitClient(r *http.Request, prefix string, limit int) time.Duration {
+	return rateWait(clientRateKeys(r, prefix, limit))
+}
+
+// clientRateKeys is the windows one client's request is charged to, and the
+// limit of each.
+func clientRateKeys(r *http.Request, prefix string, limit int) ([]string, []int) {
 	own, agg := clientBuckets(clientAddr(r))
 	if agg == "" {
-		return rateAllow(prefix+own, limit)
+		return []string{prefix + own}, []int{limit}
 	}
-	return rateAllowAll([]string{prefix + own, prefix + agg}, []int{limit, limit * ipv6AggregateFactor})
+	return []string{prefix + own, prefix + agg}, []int{limit, limit * ipv6AggregateFactor}
 }
 
 // ── Proxy class ──────────────────────────────────────────────────────────

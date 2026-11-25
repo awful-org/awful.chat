@@ -27,6 +27,14 @@ const MAX_DIMENSION = 20000;
 const MAX_W_REM = 20;
 const MAX_H_REM = 14;
 
+/**
+ * The least room a video's own controls need, in rem. Chromium drops them one
+ * by one as the player shrinks: the play button is gone from a video 40px
+ * tall, and from one 126px wide - any phone video held upright at MAX_H_REM.
+ */
+const MIN_VIDEO_W_REM = 14;
+const MIN_VIDEO_H_REM = 8;
+
 /** Beyond this the box is a sliver, which is a layout weapon of its own. */
 const MAX_RATIO = 20;
 
@@ -50,12 +58,36 @@ export function mediaBoxStyle(
   width: unknown,
   height: unknown
 ): string {
-  if (!isSaneDimension(width) || !isSaneDimension(height)) return "";
+  const w = boxWidth(width, height);
+  return w === null
+    ? ""
+    : `width: ${w.toFixed(3)}rem; aspect-ratio: ${width} / ${height};`;
+}
+
+/**
+ * The same for a video, which is never drawn smaller than its controls need.
+ * Black bars fill what a very wide or very narrow one leaves.
+ */
+export function videoBoxStyle(width: unknown, height: unknown): string {
+  const w = boxWidth(width, height);
+  if (w === null) return "";
+  const h = (w * (height as number)) / (width as number);
+  if (w >= MIN_VIDEO_W_REM && h >= MIN_VIDEO_H_REM) {
+    return mediaBoxStyle(width, height);
+  }
+  const boxW = Math.max(w, MIN_VIDEO_W_REM);
+  const boxH = Math.max(h, MIN_VIDEO_H_REM);
+  return `width: ${boxW.toFixed(3)}rem; aspect-ratio: ${boxW.toFixed(3)} / ${boxH.toFixed(3)};`;
+}
+
+/** The width of that box in rem, or null for dimensions not to be believed. */
+function boxWidth(width: unknown, height: unknown): number | null {
+  if (!isSaneDimension(width) || !isSaneDimension(height)) return null;
   // A pair inside the range can still be absurd as a RATIO: 20000x1 passes
   // both bounds and lays out a box a fraction of a pixel tall.
   const ratio = width / height;
-  if (ratio > MAX_RATIO || ratio < 1 / MAX_RATIO) return "";
-  const w = Math.min(
+  if (ratio > MAX_RATIO || ratio < 1 / MAX_RATIO) return null;
+  return Math.min(
     MAX_W_REM,
     MAX_H_REM * ratio,
     // Never larger than the picture itself. The limits are a ceiling, not a
@@ -63,7 +95,6 @@ export function mediaBoxStyle(
     // blurred, where before it simply rendered at 64.
     width / 16
   );
-  return `width: ${w.toFixed(3)}rem; aspect-ratio: ${width} / ${height};`;
 }
 
 /**

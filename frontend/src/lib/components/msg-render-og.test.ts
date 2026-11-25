@@ -18,8 +18,14 @@ describe("Open Graph preview layout", () => {
     expect(source).toContain("height={ogPreview.imageHeight}");
   });
 
-  it("clears loading on success and failure", () => {
-    expect(source).toMatch(/ogPreview = json;\s+ogLoading = false;/);
-    expect(source).toContain(".catch(() => { ogLoading = false; })");
+  it("clears loading on success, on failure and while told to wait", () => {
+    const fetching = source.slice(source.indexOf("fetchOgPreview(previewUrl"));
+    expect(fetching.match(/ogLoading = false/g)!.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("gives a video element only what it can play, and links the rest", () => {
+    expect(source).toContain("playableVideo(ogPreview)");
+    expect(source).toContain("src={ogVideo}");
+    expect(source).not.toContain("src={ogPreview.video}");
   });
 });

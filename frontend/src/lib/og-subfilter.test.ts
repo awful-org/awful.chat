@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { META } from "./page-meta";
 
 /**
  * The invite card is built by nginx rewriting index.html for /r/*, because
@@ -67,5 +68,50 @@ describe("invite card rewriting", () => {
       const replacement = [...line.matchAll(/'((?:[^'\\]|\\.)*)'/g)][1]?.[1] ?? "";
       if (replacement.includes("http")) expect(replacement).toContain("$host");
     }
+  });
+});
+
+/** nginx's cards for /qs and /qc, in files of their own (nginx-cards/). */
+describe.each(["qs", "qc"])("the /%s card", (path) => {
+  const conf = readFileSync(`nginx-cards/${path}.conf`, "utf8");
+  const filters = [...conf.matchAll(/^\s*sub_filter\s+'([^']*)'\s+'([^']*)';$/gm)].map(
+    (m) => ({ match: m[1], replacement: m[2] })
+  );
+  const card = filters.reduce((page, f) => page.replaceAll(f.match, f.replacement), html);
+
+  it("matches only strings index.html actually contains", () => {
+    expect(filters).toHaveLength(conf.match(/^\s*sub_filter\s/gm)!.length);
+    expect(filters.filter((f) => !html.includes(f.match))).toEqual([]);
+  });
+
+  it("says what page-meta.ts says", () => {
+    const { title, description } = META[path];
+    expect(card).toContain(`<title>${title}</title>`);
+    // og:title and twitter:title.
+    expect(card.split(`content="${title}"`)).toHaveLength(3);
+    // The plain description, og:description and twitter:description.
+    expect(card.split(`content="${description}"`)).toHaveLength(4);
+  });
+
+  it("names itself and its own picture, on whichever host", () => {
+    expect(card).toContain(`href="https://$host/${path}"`);
+    expect(card).toContain(`content="https://$host/${path}"`);
+    expect(card.split(`https://$host/og-${path}.png`)).toHaveLength(3);
+    expect(card).not.toContain("awful.chat/og.png");
+    expect(existsSync(`public/og-${path}.png`)).toBe(true);
+    expect(conf).not.toContain("$request_uri");
+  });
+
+  it("is included only where the page is served", () => {
+    expect(nginx).toContain("include /etc/nginx/awful-cards-on/*.conf;");
+    const script = readFileSync("docker-entrypoint.d/42-awful-cards.sh", "utf8");
+    expect(script).toContain(`cp "$CARDS/${path}.conf" "$ON/"`);
+    expect(statSync("docker-entrypoint.d/42-awful-cards.sh").mode & 0o111).not.toBe(0);
+  });
+
+  it("sends the headers the other pages send", () => {
+    const headers = (text: string) => [...text.matchAll(/add_header (\S+)/g)].map((m) => m[1]);
+    const block = nginx.slice(nginx.indexOf("location ~ ^/r(/|$)"));
+    expect(headers(conf)).toEqual(headers(block.slice(0, block.indexOf("\n    }"))));
   });
 });
