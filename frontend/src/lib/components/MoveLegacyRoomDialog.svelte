@@ -52,6 +52,7 @@
 <Dialog bind:open onOpenChange={(o) => { if (!o) onClose(); }}>
   <DialogContent
     class="bg-card border-border text-card-foreground font-mono w-[calc(100%-2rem)] sm:max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto flex flex-col p-0"
+    closeClass="top-5"
   >
     <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
       <DialogTitle class="font-mono text-base font-semibold">

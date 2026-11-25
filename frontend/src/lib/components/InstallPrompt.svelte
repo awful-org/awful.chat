@@ -71,7 +71,7 @@
        button at the top of the app root, whose line box pushed the whole
        layout down by a row. -->
   <Dialog.Root bind:open>
-    <Dialog.Content class="font-mono">
+    <Dialog.Content class="font-mono" closeClass="top-7">
       <Dialog.Header>
         <div class="flex items-center gap-2 justify-center mb-2">
           {#if manual}

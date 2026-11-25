@@ -956,6 +956,7 @@
   >
     <DialogContent
       class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-lg flex flex-col max-h-[85vh] p-0"
+      closeClass="top-6"
     >
       <DialogHeader class="px-5 pt-5 pb-3 border-b border-border shrink-0">
         <DialogTitle class="font-mono text-base font-semibold">
