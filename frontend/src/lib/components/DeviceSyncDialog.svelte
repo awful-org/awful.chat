@@ -316,6 +316,14 @@ import {
   }
 </script>
 
+<!-- Under whatever a sync is doing. Leaving the app is what stalls one: a
+     phone pauses the page, and the other device can only wait. -->
+{#snippet stay()}
+  <p class="text-xs text-muted-foreground text-center">
+    Keep Awful.chat open on both devices.
+  </p>
+{/snippet}
+
 <Dialog
   bind:open
   onOpenChange={(v) => {
@@ -513,6 +521,7 @@ import {
                   Transferring data... {syncState.syncProgress}%
                 {/if}
               </p>
+              {@render stay()}
             </div>
           {/if}
         </div>
@@ -709,6 +718,7 @@ import {
           <p class="text-xs text-muted-foreground text-center">
             Nothing is sent until it is allowed there.
           </p>
+          {@render stay()}
         </div>
 
         <Button
@@ -745,6 +755,7 @@ import {
                 Finishing up...
               {/if}
             </p>
+            {#if !syncState.finishing}{@render stay()}{/if}
           </div>
         </div>
 
