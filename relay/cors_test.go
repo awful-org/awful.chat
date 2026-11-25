@@ -73,7 +73,7 @@ func TestCorsHeadersCoverRangedStreaming(t *testing.T) {
 		t.Errorf("Range is not allowed: %q", h.Get("Access-Control-Allow-Headers"))
 	}
 	exposed := h.Get("Access-Control-Expose-Headers")
-	for _, want := range []string{"Content-Length", "Content-Range", "Accept-Ranges"} {
+	for _, want := range []string{"Content-Length", "Content-Range", "Accept-Ranges", "Retry-After"} {
 		if !strings.Contains(exposed, want) {
 			t.Errorf("%s is not exposed: %q", want, exposed)
 		}

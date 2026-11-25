@@ -1,7 +1,7 @@
 User-agent: *
 Allow: /
-# app shell and room invite links have no indexable content
+# The app shell has no indexable content. Invite links (/r/) have none either,
+# but stay fetchable for their preview cards: they say noindex instead.
 Disallow: /app
-Disallow: /r/
 
 Sitemap: https://awful.chat/sitemap.xml

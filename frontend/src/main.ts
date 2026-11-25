@@ -3,8 +3,15 @@ import "./app.css";
 import App from "./App.svelte";
 import { configSettled, loadRuntimeConfig } from "$lib/runtime-config";
 import { sweepOrphanQuickStorage } from "$lib/quick/quick-storage";
+import { setPageTranslatable } from "$lib/page-translation";
 import { captureInstallPrompt } from "$lib/install-prompt.svelte";
 import { firstPage, optionalRoute, preloadPage, routeFor } from "./pages";
+
+// First, so that a browser finds it when it decides about translating. Whether
+// /qs and /qc exist is not known yet; App says it again once it is.
+setPageTranslatable(
+  optionalRoute(window.location.pathname) ?? routeFor(window.location.pathname)
+);
 
 // The service worker still has exactly ONE registration: useRegisterSW inside
 // ReloadPrompt.svelte. A second registerSW() here used to race it - each

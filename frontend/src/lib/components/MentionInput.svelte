@@ -40,9 +40,9 @@
    *
    * The text read is the textarea's own, and the mirror's is the invisible
    * one: it only lays out the mention chips' backgrounds. The other way round
-   * (a coloured mirror under transparent text) was unreadable on Samsung
-   * phones. A keyboard may paint the word being typed itself, in a colour and
-   * on a background of its choosing, and that lands on top of the mirror.
+   * (a coloured mirror under transparent text) left nothing to read
+   * whenever the mirror fell behind or was covered: a page the browser
+   * translates, a keyboard that paints the word being typed itself.
    *
    * Nothing in the mirror may alter glyph advance widths - the mention chips
    * carry a background only, never a different weight or spacing.
@@ -200,8 +200,11 @@
       </div>
     </div>
   {/if}
+  <!-- translate="no": a browser translating the page swaps text nodes for its
+       own, and this one then never followed the draft past its first letter. -->
   <div
     aria-hidden="true"
+    translate="no"
     class="pointer-events-none absolute left-px top-px overflow-hidden whitespace-pre-wrap break-words border-transparent text-transparent {BOX}"
     style={`height:calc(100% - 2px);${contentWidth === null ? "" : `width:${contentWidth}px;`}`}
   >

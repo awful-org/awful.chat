@@ -182,6 +182,21 @@ func rateAllowAll(keys []string, limits []int) bool {
 	return true
 }
 
+// rateWait is how long until every one of keys is below its limit again: zero
+// when they all are now. All of them, since a request needs all of them.
+func rateWait(keys []string, limits []int) time.Duration {
+	now := time.Now()
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	var wait time.Duration
+	for i, key := range keys {
+		if e, ok := rateBy[key]; ok && e.count >= limits[i] {
+			wait = max(wait, e.resetAt.Sub(now))
+		}
+	}
+	return wait
+}
+
 func pluginProxyAllow(r *http.Request) bool {
 	return rateAllowClient(r, "pp:", pluginProxyRateLimit)
 }

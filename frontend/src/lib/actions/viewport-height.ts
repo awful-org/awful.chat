@@ -1,4 +1,5 @@
 import type { ActionReturn } from "svelte/action";
+import { visibleHeight } from "$lib/visible-height";
 
 /**
  * Size a node to the space that actually exists, not the space the layout
@@ -8,7 +9,8 @@ import type { ActionReturn } from "svelte/action";
  * software keyboard, so on a phone both describe a box taller than what the
  * user can see the moment a text field is focused - which is exactly when it
  * matters, because the thing under the keyboard is the input they are typing
- * into. visualViewport is the only thing that reports the real number.
+ * into. visualViewport is the only thing that reports the real number, once
+ * zoom is taken out of it (visible-height.ts).
  *
  * `min-height` is set alongside `height` on purpose: several of these nodes
  * carry a `min-h-dvh` class as the fallback for a browser with no
@@ -21,8 +23,9 @@ export function viewportHeight(node: HTMLElement): ActionReturn {
   }
   const vv = window.visualViewport;
   const update = () => {
-    node.style.height = vv.height + "px";
-    node.style.minHeight = vv.height + "px";
+    const height = visibleHeight() + "px";
+    node.style.height = height;
+    node.style.minHeight = height;
   };
   vv.addEventListener("resize", update);
   vv.addEventListener("scroll", update);
