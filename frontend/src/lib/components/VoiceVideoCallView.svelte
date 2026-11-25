@@ -1714,6 +1714,65 @@ import {
   </button>
 {/snippet}
 
+<!-- What the stage does with the spotlight: from the right, fullscreen, pop
+     out, picture in picture. Over the stage's top-right corner, or in the bar
+     on a phone, whose Layout button has that corner. -->
+{#snippet stageButtons(button: string, icon: string)}
+  {#if browserPipSupported()}
+    <Tip text={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}>
+      {#snippet children(props)}
+        <button
+          {...props}
+          type="button"
+          onclick={toggleBrowserPiP}
+          aria-label={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}
+          class="{button} {callPipPanel.browserPip ? 'text-primary' : 'text-zinc-300'}"
+        >
+          <PictureInPicture2 class={icon} />
+        </button>
+      {/snippet}
+    </Tip>
+  {/if}
+  {#if spotlightPopped || spotlightPoppable}
+    <Tip text={spotlightPopped ? "Bring back into the call" : "Pop out"}>
+      {#snippet children(props)}
+        <button
+          {...props}
+          type="button"
+          onclick={toggleSpotlightPopout}
+          aria-label={spotlightPopped
+            ? "Bring back into the call"
+            : `Pop out ${spotlightStageTile?.label ?? ""}`.trim()}
+          class="{button} {spotlightPopped ? 'text-primary' : 'text-zinc-300'}"
+        >
+          {#if spotlightPopped}
+            <SquareArrowDownLeft class={icon} />
+          {:else}
+            <SquareArrowOutUpRight class={icon} />
+          {/if}
+        </button>
+      {/snippet}
+    </Tip>
+  {/if}
+  <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+    {#snippet children(props)}
+      <button
+        {...props}
+        type="button"
+        onclick={toggleFullscreen}
+        aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+        class="{button} text-zinc-300"
+      >
+        {#if isFullscreen}
+          <Minimize class={icon} />
+        {:else}
+          <Maximize class={icon} />
+        {/if}
+      </button>
+    {/snippet}
+  </Tip>
+{/snippet}
+
 <!-- ── CallTile snippet ── -->
 {#snippet callTile(
   tile: TileData,
@@ -2389,7 +2448,7 @@ import {
         <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
           <div class="flex justify-start">
             <div
-              class="flex gap-2 rounded-xl border border-white/10 bg-zinc-900/95 px-2.5 py-2"
+              class="flex gap-1.5 rounded-xl border border-white/10 bg-zinc-900/95 p-2"
             >
               <Tip text={muted ? "Unmute microphone" : "Mute microphone"}>
                 {#snippet children(props)}
@@ -2398,15 +2457,15 @@ import {
                 type="button"
                 onclick={toggleMute}
                 aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-                class="group relative flex h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                class="group relative flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                 {muted
                   ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                   : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
               >
                 {#if muted}
-                  <MicOff class="size-4" />
+                  <MicOff class="size-3.5" />
                 {:else}
-                  <Mic class="size-4" />
+                  <Mic class="size-3.5" />
                 {/if}
               </button>
                 {/snippet}
@@ -2424,15 +2483,15 @@ import {
                 type="button"
                 onclick={toggleDeafen}
                 aria-label={deafened ? "Undeafen" : "Deafen"}
-                class="group relative flex h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                class="group relative flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                 {deafened
                   ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                   : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
               >
                 {#if deafened}
-                  <HeadphoneOff class="size-4" />
+                  <HeadphoneOff class="size-3.5" />
                 {:else}
-                  <Headphones class="size-4" />
+                  <Headphones class="size-3.5" />
                 {/if}
               </button>
                 {/snippet}
@@ -2448,15 +2507,15 @@ import {
                 aria-busy={transportState.cameraPending}
                 class:animate-pulse={transportState.cameraPending}
                 aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
-                class="group relative flex h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                class="group relative flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                   {!cameraOff
                   ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/50'
                   : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
               >
                 {#if cameraOff}
-                  <Camera class="size-4" />
+                  <Camera class="size-3.5" />
                 {:else}
-                  <CameraOff class="size-4" />
+                  <CameraOff class="size-3.5" />
                 {/if}
               </button>
                 {/snippet}
@@ -2474,15 +2533,15 @@ import {
                   aria-label={screenSharing
                     ? "Stop screen share"
                     : "Share screen"}
-                  class="flex group relative h-11 w-11 items-center justify-center rounded-lg transition-all duration-200 shrink-0
+                  class="flex group relative h-10 w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                     {screenSharing
                     ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                     : 'bg-white/10 text-zinc-100 hover:bg-white/20'}"
                 >
                   {#if screenSharing}
-                    <MonitorOff class="size-4" />
+                    <MonitorOff class="size-3.5" />
                   {:else}
-                    <Monitor class="size-4" />
+                    <Monitor class="size-3.5" />
                   {/if}
                 </button>
                   {/snippet}
@@ -2499,15 +2558,16 @@ import {
               type="button"
               onclick={onHangUp}
               aria-label="Leave call"
-              class="group relative flex h-11 w-16 items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500"
+              class="group relative flex h-10 w-[3.6rem] items-center justify-center rounded-lg bg-linear-to-br from-red-500 to-red-600 text-white shadow-lg shadow-red-500/30 transition-all duration-200 hover:from-red-400 hover:to-red-500"
             >
-              <PhoneOff class="size-4" />
+              <PhoneOff class="size-3.5" />
             </button>
               {/snippet}
             </Tip>
           </div>
 
-          <div class="flex justify-end">
+          <!-- Wraps, upwards, where a narrow phone has no room for it all. -->
+          <div class="flex flex-wrap-reverse items-center justify-end gap-1.5">
             {#if isWatchingTransmission}
               <div
                 data-transmission-volume
@@ -2561,6 +2621,12 @@ import {
                 {/if}
               </div>
             {/if}
+            <div class="flex flex-wrap-reverse justify-end gap-1.5">
+              {@render stageButtons(
+                "flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-white/10 bg-zinc-900/95 transition-colors hover:bg-zinc-800",
+                "size-3.5"
+              )}
+            </div>
           </div>
         </div>
       {:else}
@@ -2776,76 +2842,22 @@ import {
       {/if}
     </div>
 
+    {#if !isSmallScreen}
     <!-- Same visibility rule as plugin tile chrome: these corner buttons sit
          OVER the video, so they only exist while the mouse is on the call
-         section (windowed) or the fullscreen chrome is up. -->
+         section (windowed) or the fullscreen chrome is up. Per-tile copies
+         used to sit on the tiles themselves (two PiP buttons for one window);
+         a tile's own are in its right-click menu. -->
     <div
       class={cn(
-        "transition-all duration-300",
+        "absolute top-3 right-3 sm:top-4 sm:right-4 z-20 flex items-center gap-2 transition-all duration-300",
         !(dockedControls ? panelMouse !== null : controlsVisible) &&
           "opacity-0 pointer-events-none"
       )}
     >
-    <!-- What the stage does with the spotlight, in one row top-right:
-         from the right, fullscreen, pop out, picture in picture. Per-tile
-         copies of the last two used to sit on the tiles themselves (two PiP
-         buttons for one window); a tile's own are in its right-click menu. -->
-    <div class="absolute top-3 right-3 sm:top-4 sm:right-4 z-20 flex items-center gap-2">
-      {#if browserPipSupported()}
-        <Tip text={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}>
-          {#snippet children(props)}
-            <button
-              {...props}
-              type="button"
-              onclick={toggleBrowserPiP}
-              aria-label={callPipPanel.browserPip ? "Exit picture in picture" : "Picture in picture"}
-              class="{headerBtn} {callPipPanel.browserPip ? 'text-primary' : 'text-zinc-300'}"
-            >
-              <PictureInPicture2 class="size-4" />
-            </button>
-          {/snippet}
-        </Tip>
-      {/if}
-      {#if spotlightPopped || spotlightPoppable}
-        <Tip text={spotlightPopped ? "Bring back into the call" : "Pop out"}>
-          {#snippet children(props)}
-            <button
-              {...props}
-              type="button"
-              onclick={toggleSpotlightPopout}
-              aria-label={spotlightPopped
-                ? "Bring back into the call"
-                : `Pop out ${spotlightStageTile?.label ?? ""}`.trim()}
-              class="{headerBtn} {spotlightPopped ? 'text-primary' : 'text-zinc-300'}"
-            >
-              {#if spotlightPopped}
-                <SquareArrowDownLeft class="size-4" />
-              {:else}
-                <SquareArrowOutUpRight class="size-4" />
-              {/if}
-            </button>
-          {/snippet}
-        </Tip>
-      {/if}
-      <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-        {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={toggleFullscreen}
-            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-            class="{headerBtn} text-zinc-300"
-          >
-            {#if isFullscreen}
-              <Minimize class="size-4" />
-            {:else}
-              <Maximize class="size-4" />
-            {/if}
-          </button>
-        {/snippet}
-      </Tip>
+      {@render stageButtons(headerBtn, "size-4")}
     </div>
-    </div>
+    {/if}
 
     <!-- The line under the stage, straddling the panel's bottom edge. -->
     {#if showStageHandle}
