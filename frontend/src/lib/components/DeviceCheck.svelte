@@ -15,6 +15,7 @@
    * The stream is stopped on unmount and whenever the panel is closed. A
    * preview left running holds the camera light on behind a joined call.
    */
+  import { cameraCaptureConstraints, isHandheld } from "$lib/transport/camera-quality";
   import { onDestroy, untrack } from "svelte";
   import { Mic, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
@@ -126,7 +127,14 @@
     pending = true;
     try {
       const acquired = await navigator.mediaDevices.getUserMedia({
-        video: cameraId ? { deviceId: { ideal: cameraId } } : true,
+        // The size the call itself asks for. The browser keeps a camera
+        // that is already open at the size it was opened at, and "Start
+        // camera" asks for it while this preview still holds it: a preview
+        // at the default 640x480 held the call's camera to 640x480.
+        video: {
+          ...(cameraId ? { deviceId: { ideal: cameraId } } : {}),
+          ...cameraCaptureConstraints(isHandheld()),
+        },
         audio: showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false,
       });
       if (request !== requestId || !open) {

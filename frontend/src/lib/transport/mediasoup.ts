@@ -17,6 +17,13 @@ import type { SfuSnapshot } from "$lib/telemetry/schema";
  * somebody in a call rather than naming a component they have never heard of.
  */
 import { SFU_PUBLISH_UNAVAILABLE, SFU_UNREACHABLE } from "./types";
+import {
+  cameraCaptureConstraints,
+  cameraEncodings,
+  isHandheld,
+  layerForTile,
+  TOP_LAYER,
+} from "./camera-quality";
 
 /** What a click on a tile for a share that no longer exists surfaces. */
 export const PRODUCER_GONE = "That stream has ended";
@@ -93,6 +100,9 @@ interface MSConsume {
   requestId: string;
   producerId: string;
   rtpCapabilities: mediasoupClient.types.RtpCapabilities;
+  /** The camera level to start on, when less than the top (see
+   *  setCameraDisplaySizes). An SFU from before levels ignores it. */
+  spatialLayer?: number;
 }
 interface MSConsumerOptions {
   type: "ms:consumer-options";
@@ -177,6 +187,14 @@ interface MSResumeConsumer {
   type: "ms:resume-consumer";
   producerId: string;
 }
+/** The most of a camera this viewer wants: its level, 0 to TOP_LAYER. The
+ *  SFU still sends less when the viewer's connection cannot carry it. An SFU
+ *  from before levels logs it as unknown and carries on. */
+interface MSSetLayers {
+  type: "ms:set-layers";
+  producerId: string;
+  spatialLayer: number;
+}
 /**
  * How the SFU refuses a session: it sends this and closes the socket. Without
  * a variant here the frame fell through handleSignal's switch and the refusal
@@ -243,6 +261,7 @@ type MSMessage =
   | MSCloseConsumer
   | MSCloseProducer
   | MSResumeConsumer
+  | MSSetLayers
   | MSError
   | MSDiag
   | MSDiagReply
@@ -393,6 +412,11 @@ export class MediasoupVideo implements VideoTransport {
   // The remote cameras something on screen shows, by peerId, or null for no
   // opinion (every camera received). See setWantedCameras.
   private wantedCameras: ReadonlySet<string> | null = null;
+  /** The camera level each peer's largest tile calls for; a peer missing
+   *  here gets the top. See setCameraDisplaySizes. */
+  private cameraLayers: Map<string, number> = new Map();
+  /** The level last asked of the SFU for each camera consumer, by producer. */
+  private cameraLayersSent: Map<string, number> = new Map();
   // Cameras not received because nothing showed them: producerId → peerId.
   // The app still holds each one's last track - see setWantedCameras - unless
   // bringing it back failed twice (unparkCamera).
@@ -535,6 +559,8 @@ export class MediasoupVideo implements VideoTransport {
     this.clearParkedCameras();
     // The next call starts with no opinion, until its own screen says.
     this.wantedCameras = null;
+    this.cameraLayers.clear();
+    this.cameraLayersSent.clear();
     this.queuedProducers = [];
     this.device = null;
     this.sendTransport = null;
@@ -550,11 +576,7 @@ export class MediasoupVideo implements VideoTransport {
     const s =
       stream ??
       (await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30 },
-        },
+        video: cameraCaptureConstraints(isHandheld()),
         audio: false, // audio stays p2p via VoiceTransport
       }));
     await this.publish(s, "camera");
@@ -723,6 +745,40 @@ export class MediasoupVideo implements VideoTransport {
         if (c.source === "camera") this.reviewCamera(peerId, c);
       }
     }
+  }
+
+  /**
+   * How large each shown camera is on screen: its largest tile's long side
+   * in CSS pixels, or null for a surface that is not measured. A camera is
+   * sent at three levels (camera-quality.ts), and this asks the SFU for the
+   * smallest that still fills the tile: a thumbnail does not need, or get,
+   * the full 1080p. A peer missing from `sizes` gets the top level.
+   *
+   * Only a change of level is sent, so a window being dragged wider asks
+   * once per level it crosses, not once per pixel.
+   */
+  setCameraDisplaySizes(sizes: ReadonlyMap<string, number | null>): void {
+    const ratio = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+    this.cameraLayers.clear();
+    for (const [peerId, size] of sizes) {
+      const layer = layerForTile(size, ratio);
+      if (layer !== TOP_LAYER) this.cameraLayers.set(peerId, layer);
+    }
+    for (const [peerId, cs] of this.consumers) {
+      for (const c of cs) {
+        if (c.source === "camera" && !c.consumer.closed) {
+          this.sendCameraLayer(peerId, c.consumer.producerId);
+        }
+      }
+    }
+  }
+
+  private sendCameraLayer(peerId: string, producerId: string): void {
+    const layer = this.cameraLayers.get(peerId) ?? TOP_LAYER;
+    // A new consumer starts at the top unless its consume said otherwise.
+    if ((this.cameraLayersSent.get(producerId) ?? TOP_LAYER) === layer) return;
+    this.cameraLayersSent.set(producerId, layer);
+    this.signal({ type: "ms:set-layers", producerId, spatialLayer: layer });
   }
 
   on<K extends keyof VideoEvents>(event: K, handler: VideoEvents[K]): void {
@@ -1412,9 +1468,21 @@ export class MediasoupVideo implements VideoTransport {
                   opusMaxAverageBitrate: 128_000,
                 },
               }
-            : encoding
-              ? { encodings: [encoding] }
-              : {}),
+            : source === "camera"
+              ? {
+                  // Three levels at once; the SFU gives each viewer the one
+                  // its connection and its tile call for (camera-quality.ts).
+                  // Worked out from the track every time, not kept, so a
+                  // republish after a rebuild matches what is captured now.
+                  encodings: cameraEncodings(
+                    track.getSettings().width ?? 0,
+                    track.getSettings().height ?? 0
+                  ),
+                  codecOptions: { videoGoogleStartBitrate: 1000 },
+                }
+              : encoding
+                ? { encodings: [encoding] }
+                : {}),
         });
         rec(ev("sfu.produce", { d: { source, kind: track.kind } }));
 
@@ -1999,15 +2067,22 @@ export class MediasoupVideo implements VideoTransport {
     await this.ensureRecvTransport();
     if (!this.recvTransport) return;
 
+    // A camera starts on the level its tile calls for, rather than at the
+    // top and stepping down a moment later. The SFU makes a new consumer
+    // each time, so what was sent for an earlier one no longer holds.
+    const layer = source === "camera" ? this.cameraLayers.get(peerId) : undefined;
+    this.cameraLayersSent.delete(producerId);
     const response = await this.request<MSConsumerOptions | MSConsumeFailed>(
       {
         type: "ms:consume",
         requestId: this.nextRequestId(),
         producerId,
         rtpCapabilities: this.device.recvRtpCapabilities,
+        ...(layer !== undefined ? { spatialLayer: layer } : {}),
       },
       "ms:consumer-options"
     );
+    if (layer !== undefined) this.cameraLayersSent.set(producerId, layer);
     if (response.type !== "ms:consumer-options") {
       throw new Error(PRODUCER_GONE);
     }
@@ -2072,6 +2147,8 @@ export class MediasoupVideo implements VideoTransport {
       // the grace period - see setWantedCameras.
       this.parkedCameras.delete(producerId);
       this.reviewCamera(peerId, entry);
+      // The tile may have changed size while the consume was out.
+      this.sendCameraLayer(peerId, producerId);
     }
 
     if (!this.active.has(peerId)) {
