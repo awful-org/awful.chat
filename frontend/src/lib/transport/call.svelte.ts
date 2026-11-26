@@ -32,6 +32,7 @@ import {
   shareVideoEncoding,
 } from "./share-audio";
 import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
+import { cameraCaptureConstraints, isHandheld } from "./camera-quality";
 import { openCameraPicker, openSharePicker } from "$lib/ui-state.svelte";
 import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
@@ -636,9 +637,8 @@ export async function startCamera(): Promise<void> {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         ...(preferred ? { deviceId: { ideal: preferred } } : {}),
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30 },
+        // 1080p on a computer, 720p on a phone: see camera-quality.ts.
+        ...cameraCaptureConstraints(isHandheld()),
       },
       audio: false,
     });

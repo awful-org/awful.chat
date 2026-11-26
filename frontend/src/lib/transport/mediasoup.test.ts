@@ -1604,3 +1604,170 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     expect(errors).not.toHaveBeenCalled();
   });
 });
+
+describe("camera levels: sent at three sizes, received at the one a tile needs", () => {
+  interface Sent {
+    type: string;
+    producerId?: string;
+    spatialLayer?: number;
+  }
+
+  function session() {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    const sent: Sent[] = [];
+    internals.device = { recvRtpCapabilities: {} };
+    internals.ensureRecvTransport = async () => {};
+    internals.signal = (msg: Sent) => sent.push(msg);
+    internals.request = async (msg: Sent) => {
+      sent.push(msg);
+      return { type: "ms:consumer-options", options: { producerId: msg.producerId } };
+    };
+    internals.recvTransport = {
+      ...fakeTransport(),
+      consume: async (options: { producerId: string }) => ({
+        id: `c-${options.producerId}`,
+        producerId: options.producerId,
+        kind: "video",
+        track: { id: `t-${options.producerId}` },
+        closed: false,
+        close: vi.fn(),
+        on: vi.fn(),
+      }),
+    };
+    const consume = (peerId: string, producerId: string, source: "camera" | "screen") =>
+      (internals.consumeProducer as (p: string, id: string, s: string) => Promise<void>).call(
+        video,
+        peerId,
+        producerId,
+        source
+      );
+    const layers = () =>
+      sent.filter((m) => m.type === "ms:set-layers").map((m) => [m.producerId, m.spatialLayer]);
+    internals.sfuWs = { readyState: WebSocket.OPEN };
+    return { video, internals, sent, consume, layers };
+  }
+
+  it("publishes a camera as three levels, smallest first, from what is captured", async () => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    const produce = vi.fn(async () => ({ id: "p1", on: vi.fn(), close: vi.fn() }));
+    internals.device = {};
+    internals.ensureSendTransport = async () => {};
+    internals.sendTransport = { ...fakeTransport(), produce };
+    internals.signal = vi.fn();
+    const track = { kind: "video", getSettings: () => ({ width: 1920, height: 1080 }) };
+    const stream = { getVideoTracks: () => [track], getAudioTracks: () => [] };
+    await video.startCamera(stream as unknown as MediaStream);
+
+    const options = (produce.mock.calls[0] as unknown[])[0] as {
+      encodings: RTCRtpEncodingParameters[];
+    };
+    expect(options.encodings.map((e) => e.scaleResolutionDownBy)).toEqual([4, 2, 1]);
+    expect(options.encodings.map((e) => e.maxBitrate)).toEqual([250_000, 800_000, 2_500_000]);
+  });
+
+  it("a screen share stays one stream with its own caps", async () => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    const produce = vi.fn(async () => ({ id: "p1", on: vi.fn(), close: vi.fn() }));
+    internals.device = {};
+    internals.ensureSendTransport = async () => {};
+    internals.sendTransport = { ...fakeTransport(), produce };
+    internals.signal = vi.fn();
+    const track = { kind: "video", getSettings: () => ({ width: 1920, height: 1080 }) };
+    const stream = { getVideoTracks: () => [track], getAudioTracks: () => [] };
+    await video.startScreenShare(stream as unknown as MediaStream, { maxBitrate: 4_000_000 });
+
+    const options = (produce.mock.calls[0] as unknown[])[0] as {
+      encodings: RTCRtpEncodingParameters[];
+    };
+    expect(options.encodings).toEqual([{ maxBitrate: 4_000_000 }]);
+  });
+
+  it("asks once per change of level, and only for cameras", async () => {
+    const { video, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    await consume("peer-a", "share-a", "screen");
+    // Nothing said yet: the SFU's own default, the top, stands.
+    expect(layers()).toEqual([]);
+
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    expect(layers()).toEqual([["cam-a", 0]]);
+    // The same level again, from a tile a few pixels larger: nothing sent.
+    video.setCameraDisplaySizes(new Map([["peer-a", 240]]));
+    expect(layers()).toEqual([["cam-a", 0]]);
+
+    video.setCameraDisplaySizes(new Map([["peer-a", 500]]));
+    // Not measured (the floating panel): the top.
+    video.setCameraDisplaySizes(new Map([["peer-a", null]]));
+    expect(layers()).toEqual([
+      ["cam-a", 0],
+      ["cam-a", 1],
+      ["cam-a", 2],
+    ]);
+  });
+
+  it("a camera that leaves the screen keeps its level until it is parked", async () => {
+    const { video, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    expect(layers()).toEqual([["cam-a", 0]]);
+    // Another room opened: nothing shows peer-a any more.
+    video.setCameraDisplaySizes(new Map());
+    expect(layers()).toEqual([["cam-a", 0]]);
+  });
+
+  it("a level asked for with no socket is sent once there is one", async () => {
+    const { video, internals, sent, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    let open = false;
+    internals.sfuWs = {
+      get readyState() {
+        return open ? WebSocket.OPEN : WebSocket.CLOSED;
+      },
+    };
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    // The frame went nowhere, but the next push, the same size, tries again.
+    open = true;
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    expect(layers()).toEqual([
+      ["cam-a", 0],
+      ["cam-a", 0],
+    ]);
+    sent.length = 0;
+    video.setCameraDisplaySizes(new Map([["peer-a", 210]]));
+    expect(layers()).toEqual([]);
+  });
+
+  it("a resume says every camera's level again", async () => {
+    const { video, internals, sent, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    sent.length = 0;
+    (internals.reconcileResumed as (s: unknown) => void).call(video, {
+      producers: [{ producerId: "cam-a", peerId: "peer-a", source: "camera" }],
+      peers: ["peer-a"],
+      own: [],
+      consuming: ["cam-a"],
+    });
+    expect(layers()).toEqual([["cam-a", 0]]);
+  });
+
+  it("a camera consumed after its size is known starts on that level", async () => {
+    const { video, sent, consume, layers } = session();
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    await consume("peer-a", "cam-a", "camera");
+
+    const request = sent.find((m) => m.type === "ms:consume");
+    expect(request?.spatialLayer).toBe(0);
+    // Already on it: no separate ask.
+    expect(layers()).toEqual([]);
+  });
+
+  it("a camera wanted at the top is consumed without naming a level", async () => {
+    const { sent, consume } = session();
+    await consume("peer-a", "cam-a", "camera");
+    expect(sent.find((m) => m.type === "ms:consume")).not.toHaveProperty("spatialLayer");
+  });
+});

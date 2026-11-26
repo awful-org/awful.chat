@@ -6,6 +6,7 @@ import { remoteCameraTileId } from "./call-tiles";
 // call the push the module's effect runs, with the stores it reads stubbed.
 const h = vi.hoisted(() => ({
   setWantedCameras: vi.fn(),
+  setCameraDisplaySizes: vi.fn(),
   transportState: { inCall: false },
   spotlightStore: { spotlightTile: null as unknown, pipCameraPeers: [] as string[] },
   callFocus: { pinnedTileId: null as string | null },
@@ -14,7 +15,10 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("$lib/transport/transport.svelte", () => ({
-  _video: { setWantedCameras: h.setWantedCameras },
+  _video: {
+    setWantedCameras: h.setWantedCameras,
+    setCameraDisplaySizes: h.setCameraDisplaySizes,
+  },
   transportState: h.transportState,
   selfId: () => "self",
 }));
@@ -160,5 +164,58 @@ describe("call-cameras: what the SFU client is told to receive", () => {
     pushWantedCameras();
 
     expect(pushed()).toEqual(new Set(["peer-a"]));
+  });
+
+  it("hands over each camera's largest size, and null where it cannot be measured", () => {
+    // The observer is made once for the module, so one test covers it.
+    let report: ((entries: { target: Element; contentRect: { width: number; height: number } }[]) => void) | null = null;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: typeof report) {
+          report = cb;
+        }
+        observe() {}
+        unobserve() {}
+      }
+    );
+    try {
+      const sized = (width: number, height: number): Element => {
+        const el = { getBoundingClientRect: () => ({ width, height }) } as unknown as Element;
+        tiles.push(el);
+        return el;
+      };
+      const small = sized(300, 169);
+      stageCameraShown(small, "peer-a");
+      stageCameraShown(sized(150, 84), "peer-b");
+      stageCameraShown(sized(400, 225), "peer-b");
+      h.spotlightStore.spotlightTile = camera("peer-c");
+
+      h.speakers.speaking = new Set(["peer-d"]);
+      h.poppedOut.add(remoteCameraTileId("peer-e"));
+      h.spotlightStore.pipCameraPeers = ["peer-f"];
+
+      pushWantedCameras();
+      // Stage tiles at their size; the spotlight and the talker at the
+      // floating panel's (320); a window of its own and picture in picture
+      // unmeasured.
+      expect(h.setCameraDisplaySizes.mock.calls.at(-1)?.[0]).toEqual(
+        new Map<string, number | null>([
+          ["peer-a", 300],
+          ["peer-b", 400],
+          ["peer-f", null],
+          ["peer-c", 320],
+          ["peer-d", 320],
+          ["peer-e", null],
+        ])
+      );
+
+      // The tile grows, say the window is made wider.
+      report!([{ target: small, contentRect: { width: 900, height: 506 } }]);
+      pushWantedCameras();
+      expect(h.setCameraDisplaySizes.mock.calls.at(-1)?.[0].get("peer-a")).toBe(900);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

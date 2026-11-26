@@ -89,6 +89,8 @@ interface MSConsume {
   requestId: string;
   producerId: string;
   rtpCapabilities: mediasoup.types.RtpCapabilities;
+  /** The camera level to start on; absent is the top. See MSSetLayers. */
+  spatialLayer?: number;
 }
 
 // The options object sent to the browser client (matches mediasoup-client ConsumerOptions)
@@ -158,6 +160,17 @@ interface MSResumeConsumer {
   type: "ms:resume-consumer";
   producerId: string;
 }
+/**
+ * The most of a camera this viewer wants. A camera is sent at up to three
+ * sizes (simulcast), numbered from 0, the smallest. The viewer asks for the
+ * one its tile needs; mediasoup still sends less when the viewer's own
+ * connection cannot carry it, and moves back up when it can.
+ */
+interface MSSetLayers {
+  type: "ms:set-layers";
+  producerId: string;
+  spatialLayer: number;
+}
 interface MSPeerLeft {
   type: "ms:peer-left";
   peerId: string;
@@ -204,6 +217,7 @@ type ClientMsg =
   | MSCloseConsumer
   | MSCloseProducer
   | MSResumeConsumer
+  | MSSetLayers
   | MSDiag;
 
 // ── Per-peer state ────────────────────────────────────────────────────────────
@@ -369,6 +383,7 @@ const WORKER_OP_TYPES = new Set<string>([
   "ms:produce",
   "ms:consume",
   "ms:resume-consumer",
+  "ms:set-layers",
   "ms:close-consumer",
   "ms:close-producer",
 ]);
@@ -1080,6 +1095,46 @@ async function handleProduce(peer: PeerState, msg: MSProduce): Promise<void> {
   );
 }
 
+// The highest level a client may name. mediasoup itself sends no more than
+// the camera has, so this only bounds what is accepted off the wire.
+const MAX_SPATIAL_LAYER = 2;
+
+/** A client's level, or undefined for anything that is not one. */
+function spatialLayerOf(value: unknown): number | undefined {
+  return Number.isInteger(value) &&
+    (value as number) >= 0 &&
+    (value as number) <= MAX_SPATIAL_LAYER
+    ? (value as number)
+    : undefined;
+}
+
+/**
+ * Ask mediasoup for a camera level. Only a simulcast consumer has levels:
+ * for any other (audio, a screen share, a camera from a build that sent one
+ * stream) there is nothing to choose, and nothing is asked of the worker.
+ */
+async function setConsumerLayer(
+  consumer: mediasoup.types.Consumer,
+  spatialLayer: number,
+): Promise<void> {
+  if (consumer.type !== "simulcast" || consumer.closed) return;
+  if (consumer.preferredLayers?.spatialLayer === spatialLayer) return;
+  await consumer.setPreferredLayers({ spatialLayer });
+}
+
+async function handleSetLayers(peer: PeerState, msg: MSSetLayers): Promise<void> {
+  const spatialLayer = spatialLayerOf(msg.spatialLayer);
+  if (spatialLayer === undefined) return;
+  const consumerId = peer.consumersByProducerId.get(msg.producerId);
+  const entry = consumerId ? peer.consumers.get(consumerId) : undefined;
+  if (!entry) return;
+  try {
+    await setConsumerLayer(entry.consumer, spatialLayer);
+  } catch (err) {
+    console.warn(`[sfu] set-layers failed for peer ${peer.peerId}:`, err);
+  }
+}
+
 async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
   if (!peer.recvTransport) {
     console.warn(`[sfu] consume: no recv transport for peer ${peer.peerId}`);
@@ -1095,6 +1150,17 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
   if (existingConsumerId) {
     const existingConsumer = peer.consumers.get(existingConsumerId);
     if (existingConsumer) {
+      // The client takes this answer for a new consumer, at the level this
+      // consume names (the top when it names none), so the old one is put
+      // on that level too.
+      try {
+        await setConsumerLayer(
+          existingConsumer.consumer,
+          spatialLayerOf(msg.spatialLayer) ?? MAX_SPATIAL_LAYER,
+        );
+      } catch (err) {
+        console.warn(`[sfu] set-layers failed for peer ${peer.peerId}:`, err);
+      }
       console.log(
         `[sfu] peer ${peer.peerId} already consuming producer ${msg.producerId}; resending consumer options`,
       );
@@ -1181,6 +1247,11 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
       // resolves; mediasoup requests a fresh keyframe on resume, so the
       // first frame the decoder ever sees is always an IDR.
       paused: true,
+      // A camera tile that needs less than the top starts on its level.
+      // Ignored by mediasoup for anything without levels.
+      ...(spatialLayerOf(msg.spatialLayer) !== undefined
+        ? { preferredLayers: { spatialLayer: spatialLayerOf(msg.spatialLayer)! } }
+        : {}),
     });
   } finally {
     peer.consumersInFlight--;
@@ -1512,6 +1583,12 @@ async function handleDiag(peer: PeerState, msg: MSDiag): Promise<void> {
       score: entry.consumer.score.score,
       paused: entry.consumer.paused,
       producerPaused: entry.consumer.producerPaused,
+      ...(entry.consumer.type === "simulcast"
+        ? {
+            preferredSpatialLayer: entry.consumer.preferredLayers?.spatialLayer ?? null,
+            currentSpatialLayer: entry.consumer.currentLayers?.spatialLayer ?? null,
+          }
+        : {}),
       bitrate: rtp.bitrate,
       packetsLost: rtp.packetsLost,
     });
@@ -2029,6 +2106,9 @@ async function main(): Promise<void> {
             // never lets frameChain (and the queued-bytes backpressure behind
             // it) throttle a socket that loops this frame.
             await handleResumeConsumer(peer, msg as MSResumeConsumer);
+            break;
+          case "ms:set-layers":
+            await handleSetLayers(peer, msg as MSSetLayers);
             break;
           case "ms:close-consumer":
             handleCloseConsumer(peer, msg as MSCloseConsumer);
