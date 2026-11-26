@@ -5,9 +5,10 @@
    * sliders sit next to the picture they change instead of in Settings,
    * whose dialog covers it.
    *
-   * It stays open until closed (the X, Escape, or the camera going off), not
-   * on a click elsewhere: a slider dragged and let go outside the panel ends
-   * in a click on the page, which would close it under the pointer.
+   * It closes with the X, Escape, the camera going off, or a press anywhere
+   * outside it. A press, not a click: a slider dragged and let go outside
+   * the panel ends in a click on the page, which would close it under the
+   * pointer.
    */
   import { X } from "@lucide/svelte";
   import CameraPicture from "./settings/CameraPicture.svelte";
@@ -18,10 +19,19 @@
     y,
     onClose,
   }: { track: MediaStreamTrack; x: number; y: number; onClose: () => void } = $props();
+
+  let panel = $state<HTMLElement | null>(null);
+
+  function pressedOutside(e: PointerEvent) {
+    if (panel && e.target instanceof Node && !panel.contains(e.target)) onClose();
+  }
 </script>
+
+<svelte:window onpointerdown={pressedOutside} />
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
+  bind:this={panel}
   role="dialog"
   aria-label="Camera picture"
   tabindex="-1"
