@@ -15,7 +15,6 @@
    * The stream is stopped on unmount and whenever the panel is closed. A
    * preview left running holds the camera light on behind a joined call.
    */
-  import { restorePicture } from "$lib/camera-picture";
   import { onDestroy, untrack } from "svelte";
   import { Mic, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
@@ -27,6 +26,7 @@
     SelectTrigger,
   } from "$lib/components/ui/select";
   import { cameraLabel, cameras, refreshCameras, watchCameras } from "$lib/cameras.svelte";
+  import { restorePicture } from "$lib/camera-picture";
   import { loadAudioPrefs, saveAudioPrefs } from "$lib/transport/audio-prefs";
   import { setVoiceInputDevice } from "$lib/transport/voice.svelte";
 

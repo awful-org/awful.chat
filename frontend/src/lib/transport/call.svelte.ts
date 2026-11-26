@@ -32,7 +32,6 @@ import {
   shareVideoEncoding,
 } from "./share-audio";
 import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
-import { restorePicture } from "$lib/camera-picture";
 import { openCameraPicker, openSharePicker } from "$lib/ui-state.svelte";
 import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
@@ -52,6 +51,7 @@ import {
   peersInCall,
   roomHasVoiceChannels,
 } from "./voice-channel";
+import { restorePicture } from "$lib/camera-picture";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
