@@ -52,6 +52,7 @@ import {
   peersInCall,
   roomHasVoiceChannels,
 } from "./voice-channel";
+import { restorePicture } from "$lib/camera-picture";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
@@ -642,6 +643,10 @@ export async function startCamera(): Promise<void> {
       },
       audio: false,
     });
+    // What was chosen for this camera's picture last time (camera-picture.ts),
+    // before anyone sees it.
+    const cameraTrack = stream.getVideoTracks()[0];
+    if (cameraTrack) await restorePicture(cameraTrack);
     transportState.localCameraStream = stream;
     transportState.cameraOff = false;
     // Permission has just been granted, if it had not been before, so the

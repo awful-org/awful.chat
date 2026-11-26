@@ -65,7 +65,7 @@ import type { CmdSource } from "../host";
  *  palette's shortcuts stay visually identical to the dialog's own tab bar. */
 const SETTINGS_TABS = [
   { id: "profile", label: "Profile", icon: User },
-  { id: "audio", label: "Audio", icon: Volume2 },
+  { id: "audio", label: "Camera & audio", icon: Volume2 },
   { id: "app", label: "App", icon: SlidersHorizontal },
   { id: "session", label: "Session/Sync", icon: RefreshCw },
   { id: "data", label: "Data", icon: ChartPie },

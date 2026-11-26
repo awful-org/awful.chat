@@ -31,6 +31,7 @@ export type TileMenuIcon =
   | "screen-off"
   | "camera"
   | "camera-off"
+  | "picture"
   | "mic"
   | "mic-off"
   | "volume"
@@ -71,6 +72,8 @@ export type TileMenuAction =
   | { kind: "stop-watching" }
   | { kind: "stop-sharing" }
   | { kind: "toggle-camera" }
+  /** Your camera's own brightness, contrast and exposure (camera-picture). */
+  | { kind: "camera-picture" }
   | { kind: "toggle-mic" }
   /** Silence the share's own audio, not the sharer's voice. */
   | { kind: "mute-share" }
@@ -146,6 +149,8 @@ export interface TileMenuState {
   /** Their identity is known, so the choice can be remembered for them. */
   canWithholdVoice: boolean;
   cameraOff: boolean;
+  /** Your camera is on and offers picture controls (camera-picture.ts). */
+  hasPicture: boolean;
   micMuted: boolean;
   /** The share carries audio at all. */
   shareAudio: boolean;
@@ -178,6 +183,7 @@ export function tileMenuState(
     inPhonebook: false,
     peerMuted: false,
     cameraOff: false,
+    hasPicture: false,
     micMuted: false,
     shareAudio: false,
     shareMuted: false,
@@ -358,6 +364,16 @@ export function buildTileMenu(s: TileMenuState): TileMenuRow[] {
             icon: "camera-off",
             action: { kind: "toggle-camera" },
           },
+      ...(s.cameraOff || !s.hasPicture
+        ? []
+        : [
+            {
+              type: "item" as const,
+              label: "Camera picture",
+              icon: "picture" as const,
+              action: { kind: "camera-picture" as const },
+            },
+          ]),
       s.micMuted
         ? {
             type: "item",
