@@ -482,7 +482,7 @@
       >
         <SelectTrigger
           aria-label="Camera"
-          class="bg-background border-input font-mono text-sm focus:ring-ring"
+          class="w-full bg-background border-input font-mono text-sm focus:ring-ring"
         >
           <span class="block truncate">
             {cameras.devices.find((d) => d.deviceId === cameras.selected)

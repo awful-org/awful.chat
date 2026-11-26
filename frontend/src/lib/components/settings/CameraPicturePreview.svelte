@@ -105,17 +105,21 @@
 {/if}
 
 {#if stream && track}
-  <!-- svelte-ignore a11y_media_has_caption -->
-  <video
-    bind:this={video}
-    autoplay
-    playsinline
-    muted
-    class="aspect-video w-full rounded-lg border border-border bg-muted/40 object-cover scale-x-[-1]"
-  ></video>
-  {#key track}
-    <CameraPicture {track} live={false} />
-  {/key}
+  <!-- Side by side where there is room, so the sliders sit next to the
+       picture they change rather than under the fold. -->
+  <div class="grid gap-4 sm:grid-cols-2 sm:items-start">
+    <!-- svelte-ignore a11y_media_has_caption -->
+    <video
+      bind:this={video}
+      autoplay
+      playsinline
+      muted
+      class="aspect-video w-full rounded-lg border border-border bg-muted/40 object-cover scale-x-[-1]"
+    ></video>
+    {#key track}
+      <CameraPicture {track} live={false} />
+    {/key}
+  </div>
 {:else if !starting && !error}
   <p class="text-xs text-muted-foreground font-mono">
     Your camera is off. Preview it to adjust its picture, and the call uses
