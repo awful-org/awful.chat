@@ -51,6 +51,29 @@ const stageTileSizes = new SvelteMap<Element, number>();
 let tileSizeObserver: ResizeObserver | null = null;
 
 /**
+ * The screen's pixel ratio, kept current. The level a tile needs depends on
+ * it (layerForTile), and a window moved to a sharper monitor changes it
+ * without resizing anything: no tile is measured again, so without this the
+ * thumbnails stayed at the level the old screen needed. A media query
+ * matches one ratio only, so it is set up again for each new one.
+ */
+const display = $state({ pixelRatio: typeof window === "undefined" ? 1 : window.devicePixelRatio || 1 });
+
+function watchPixelRatio(): void {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+  const query = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+  query.addEventListener(
+    "change",
+    () => {
+      display.pixelRatio = window.devicePixelRatio || 1;
+      watchPixelRatio();
+    },
+    { once: true }
+  );
+}
+watchPixelRatio();
+
+/**
  * The long side a 16:9 camera is drawn at in a tile of this size. Camera
  * tiles crop to fill (object-cover), so in a tile taller than 16:9 the
  * picture is drawn wider than the tile: a 300x600 tile shows it 1067 wide.
@@ -97,6 +120,9 @@ export function stageCameraHidden(tile: Element): void {
  */
 export function pushWantedCameras(): void {
   if (!transportState.inCall) return;
+  // Read so a new pixel ratio pushes again: the client turns sizes into
+  // levels with the ratio of the moment.
+  void display.pixelRatio;
   const surfaces = {
     spotlight: spotlightStore.spotlightTile,
     pinnedTileId: callFocus.pinnedTileId,
