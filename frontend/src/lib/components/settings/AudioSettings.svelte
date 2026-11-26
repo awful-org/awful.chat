@@ -3,6 +3,7 @@
   import { Label } from "$lib/components/ui/label";
   import { Slider } from "$lib/components/ui/slider";
   import CameraPicture from "./CameraPicture.svelte";
+  import CameraPicturePreview from "./CameraPicturePreview.svelte";
   import { Switch } from "$lib/components/ui/switch";
   import {
     Select,
@@ -523,9 +524,7 @@
             <CameraPicture track={cameraTrack} />
           {/key}
         {:else}
-          <p class="text-xs text-muted-foreground font-mono">
-            Turn your camera on to adjust its brightness, contrast, saturation and exposure.
-          </p>
+          <CameraPicturePreview />
         {/if}
       </div>
     {/if}

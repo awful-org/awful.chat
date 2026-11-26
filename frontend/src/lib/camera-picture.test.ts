@@ -11,8 +11,8 @@ const backing = new Map<string, string>();
 
 const {
   PICTURE_KEYS,
-  autoExposure,
-  exposureByHand,
+  autoMode,
+  byHand,
   pictureChanged,
   pictureSets,
   pictureControls,
@@ -134,8 +134,8 @@ describe("changing and keeping the picture", () => {
       { exposureMode: "manual", exposureTime: 100 },
     ]);
     // A mode on its own only if the camera offers it.
-    expect(pictureSets({}, { exposureMode: ["manual"] }, "none")).toEqual([]);
-    expect(pictureSets({}, { exposureMode: ["continuous"] }, "continuous")).toEqual([
+    expect(pictureSets({}, { exposureMode: ["manual"] }, { exposureMode: "none" })).toEqual([]);
+    expect(pictureSets({}, { exposureMode: ["continuous"] }, { exposureMode: "continuous" })).toEqual([
       { exposureMode: "continuous" },
     ]);
   });
@@ -192,11 +192,11 @@ describe("changing and keeping the picture", () => {
     await restorePicture(first.track);
     await setPicture(first.track, "brightness", 200);
     await setPicture(first.track, "exposureTime", 300);
-    expect(exposureByHand(first.track)).toBe(true);
-    await autoExposure(first.track);
+    expect(byHand(first.track, "exposureTime")).toBe(true);
+    await autoMode(first.track, "exposureTime");
     expect(first.state.exposureMode).toBe("continuous");
     expect(first.state.brightness).toBe(200);
-    expect(exposureByHand(first.track)).toBe(false);
+    expect(byHand(first.track, "exposureTime")).toBe(false);
     expect(pictureChanged(first.track)).toBe(true);
   });
 
@@ -237,6 +237,51 @@ describe("changing and keeping the picture", () => {
     expect(pictureChanged(later.track)).toBe(false);
   });
 
+  it("warmth is the white balance, set with its manual mode, and Auto and Reset give it back", async () => {
+    const warm = () =>
+      camera(
+        "wb",
+        {
+          brightness: { min: 0, max: 255, step: 1 },
+          whiteBalanceMode: ["manual", "continuous"],
+          colorTemperature: { min: 2800, max: 6500, step: 10 },
+        },
+        { brightness: 128, whiteBalanceMode: "continuous", colorTemperature: 4600 }
+      );
+    const first = warm();
+    expect(pictureControls(first.track, false).map((c) => [c.key, c.label])).toEqual([
+      ["brightness", "Brightness"],
+      ["colorTemperature", "Warmth"],
+    ]);
+    await restorePicture(first.track);
+    await setPicture(first.track, "colorTemperature", 5600);
+    expect(first.applied.at(-1)).toEqual({ whiteBalanceMode: "manual", colorTemperature: 5600 });
+    expect(byHand(first.track, "colorTemperature")).toBe(true);
+
+    // Auto: the camera's white balance again, the rest kept.
+    await setPicture(first.track, "brightness", 200);
+    await autoMode(first.track, "colorTemperature");
+    expect(first.state.whiteBalanceMode).toBe("continuous");
+    expect(first.state.brightness).toBe(200);
+    expect(byHand(first.track, "colorTemperature")).toBe(false);
+
+    // Reset after a warmth set by hand: automatic white balance, as it started.
+    await setPicture(first.track, "colorTemperature", 3000);
+    await resetPicture(first.track);
+    expect(first.state.whiteBalanceMode).toBe("continuous");
+    expect(first.state.brightness).toBe(128);
+    expect(first.applied.at(-1)).not.toHaveProperty("colorTemperature");
+  });
+
+  it("warmth without a manual white balance cannot hold, so is not offered", () => {
+    const { track } = camera(
+      "wb-auto-only",
+      { whiteBalanceMode: ["continuous"], colorTemperature: { min: 2800, max: 6500 } },
+      {}
+    );
+    expect(pictureControls(track, false)).toEqual([]);
+  });
+
   it("a camera that refuses keeps its picture, and nothing throws", async () => {
     const { track } = webcam();
     (track as unknown as { applyConstraints: () => Promise<void> }).applyConstraints = async () => {
@@ -256,6 +301,7 @@ describe("saved settings", () => {
       values: { brightness: 1, zoom: 3, contrast: "x", saturation: Infinity },
       defaults: { brightness: 0 },
       exposureMode: "continuous",
+      whiteBalanceMode: "continuous",
     };
     saveAudioPrefs({ cameraPicture: many as never });
     const saved = loadAudioPrefs().cameraPicture;
@@ -265,6 +311,7 @@ describe("saved settings", () => {
       values: { brightness: 1 },
       defaults: { brightness: 0 },
       exposureMode: "continuous",
+      whiteBalanceMode: "continuous",
     });
   });
 

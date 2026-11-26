@@ -9,13 +9,15 @@
   import { Slider } from "$lib/components/ui/slider";
   import { Button } from "$lib/components/ui/button";
   import {
-    autoExposure,
-    exposureByHand,
-    hasAutoExposure,
+    MODE_OF,
+    autoMode,
+    byHand as setByHand,
+    hasAuto,
     pictureChanged,
     pictureControls,
     resetPicture,
     setPicture,
+    type ManualKey,
     type PictureControl,
     type PictureKey,
   } from "$lib/camera-picture";
@@ -31,12 +33,20 @@
 
   let controls = $state<PictureControl[]>([]);
   let changed = $state(false);
-  let byHand = $state(false);
+  /** The controls set by hand, whose automatic mode is off (MODE_OF). */
+  let byHand = $state<Partial<Record<ManualKey, boolean>>>({});
+
+  function manual(key: PictureKey): key is ManualKey {
+    return key in MODE_OF;
+  }
 
   function read(t: MediaStreamTrack) {
     controls = pictureControls(t);
     changed = pictureChanged(t);
-    byHand = exposureByHand(t);
+    byHand = {
+      exposureTime: setByHand(t, "exposureTime"),
+      colorTemperature: setByHand(t, "colorTemperature"),
+    };
   }
 
   $effect(() => {
@@ -52,7 +62,7 @@
   function onChange(c: PictureControl, value: number) {
     if (moving !== c.key) return;
     changed = true;
-    if (c.key === "exposureTime") byHand = true;
+    if (manual(c.key)) byHand = { ...byHand, [c.key]: true };
     void setPicture(track, c.key, value);
   }
 
@@ -63,9 +73,9 @@
     read(track);
   }
 
-  async function auto() {
+  async function auto(key: ManualKey) {
     moving = null;
-    await autoExposure(track);
+    await autoMode(track, key);
     read(track);
   }
 
@@ -87,11 +97,13 @@
         <div class="flex items-center justify-between gap-2">
           <Label class="text-xs font-mono text-muted-foreground">{c.label}</Label>
           <div class="flex items-center gap-2">
-            {#if c.key === "exposureTime" && byHand && hasAutoExposure(track)}
+            {#if manual(c.key) && byHand[c.key] && hasAuto(track, c.key)}
+              {@const key = c.key}
               <button
                 type="button"
+                aria-label="Automatic {c.label.toLowerCase()}"
                 class="text-xs font-mono text-primary hover:underline"
-                onclick={auto}>Auto</button
+                onclick={() => auto(key)}>Auto</button
               >
             {/if}
             <span class="text-xs font-mono text-muted-foreground tabular-nums"

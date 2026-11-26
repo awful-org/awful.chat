@@ -161,6 +161,9 @@ function sanitizeCameraPicture(value: unknown): Record<string, CameraPicture> {
       ...(typeof e.exposureMode === "string" && e.exposureMode.length <= 32
         ? { exposureMode: e.exposureMode }
         : {}),
+      ...(typeof e.whiteBalanceMode === "string" && e.whiteBalanceMode.length <= 32
+        ? { whiteBalanceMode: e.whiteBalanceMode }
+        : {}),
     };
   }
   return out;
@@ -330,6 +333,8 @@ export interface CameraPicture {
   defaults: Partial<Record<CameraPictureKey, number>>;
   /** Its exposure mode then, so Reset can turn automatic exposure back on. */
   exposureMode?: string;
+  /** Its white balance mode then, likewise. */
+  whiteBalanceMode?: string;
 }
 
 /** Kept in step with PICTURE_KEYS in camera-picture.ts (a test checks). */
@@ -337,6 +342,7 @@ export const CAMERA_PICTURE_KEYS = [
   "brightness",
   "contrast",
   "saturation",
+  "colorTemperature",
   "exposureCompensation",
   "exposureTime",
 ] as const;

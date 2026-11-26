@@ -1,6 +1,6 @@
 /**
- * The camera's own picture controls: brightness, contrast, saturation and
- * exposure.
+ * The camera's own picture controls: brightness, contrast, saturation,
+ * warmth (its white balance) and exposure.
  *
  * These are the camera's settings, changed through the track
  * (applyConstraints), not a filter drawn over the video: they cost nothing,
@@ -26,6 +26,7 @@ export const PICTURE_KEYS = [
   "brightness",
   "contrast",
   "saturation",
+  "colorTemperature",
   "exposureCompensation",
   "exposureTime",
 ] as const;
@@ -45,18 +46,44 @@ const LABELS: Record<PictureKey, string> = {
   brightness: "Brightness",
   contrast: "Contrast",
   saturation: "Saturation",
+  colorTemperature: "Warmth",
   exposureCompensation: "Exposure",
   exposureTime: "Exposure",
 };
 
+/** A camera's automatic modes, each of which a control set by hand turns off. */
+export type ModeKey = "exposureMode" | "whiteBalanceMode";
+
+/**
+ * The controls that hold only with their automatic mode off: an exposure
+ * time while automatic exposure runs, or a white balance while automatic
+ * white balance does, is overridden by the camera at once. Each is sent with
+ * its mode set to manual, offered only where the camera has that mode, and
+ * has an Auto to go back.
+ *
+ * A white balance is a colour temperature in kelvin: the light the camera
+ * takes the room to be lit by. Set higher than the room's, it corrects for
+ * a bluer light than there is, so the picture comes out warmer: the slider's
+ * right is warmer, as its name says.
+ */
+export const MODE_OF = {
+  exposureTime: "exposureMode",
+  colorTemperature: "whiteBalanceMode",
+} as const satisfies Partial<Record<PictureKey, ModeKey>>;
+export type ManualKey = keyof typeof MODE_OF;
+
+function modeOf(key: PictureKey): ModeKey | undefined {
+  return (MODE_OF as Partial<Record<PictureKey, ModeKey>>)[key];
+}
+
 // Not in every TypeScript DOM library yet.
 type Range = { min?: number; max?: number; step?: number };
-type Capabilities = Partial<Record<PictureKey, Range>> & { exposureMode?: string[] };
-type Settings = Partial<Record<PictureKey, number>> & {
-  exposureMode?: string;
-  deviceId?: string;
-  frameRate?: number;
-};
+type Capabilities = Partial<Record<PictureKey, Range>> & Partial<Record<ModeKey, string[]>>;
+type Settings = Partial<Record<PictureKey, number>> &
+  Partial<Record<ModeKey, string>> & {
+    deviceId?: string;
+    frameRate?: number;
+  };
 
 function capabilitiesOf(track: MediaStreamTrack): Capabilities {
   try {
@@ -98,9 +125,9 @@ export function pictureControls(
   const out: PictureControl[] = [];
   for (const key of PICTURE_KEYS) {
     if (key === "exposureCompensation" && !compensation) continue;
-    if (key === "exposureTime") {
-      if (compensation || !(caps.exposureMode ?? []).includes("manual")) continue;
-    }
+    if (key === "exposureTime" && compensation) continue;
+    const mode = modeOf(key);
+    if (mode && !(caps[mode] ?? []).includes("manual")) continue;
     const range = caps[key];
     if (!usable(range)) continue;
     let { min, max } = range;
@@ -138,30 +165,39 @@ function clamp(v: number, min: number, max: number): number {
 
 /**
  * The constraint sets that put the camera at these values, one per
- * control. An exposure time goes with the manual mode it needs, in the same
- * set. `exposureMode` is a mode to set on its own (Reset, Auto), sent only
- * if the camera offers it: Chrome on Linux reports "none" for a camera
- * without automatic exposure, which no set may name.
+ * control. A control that needs a manual mode (MODE_OF) goes with it, in
+ * the same set. `modes` are modes to set on their own (Reset, Auto), each
+ * sent only if its control is not being set and the camera offers that
+ * mode: Chrome on Linux reports "none" for a camera without automatic
+ * exposure, which no set may name.
  */
 export function pictureSets(
   values: PictureValues,
   caps: Capabilities = {},
-  exposureMode?: string
+  modes: Partial<Record<ModeKey, string>> = {}
 ): MediaTrackConstraintSet[] {
   const sets: Record<string, unknown>[] = [];
   for (const key of PICTURE_KEYS) {
     const v = values[key];
     if (v === undefined) continue;
-    sets.push(key === "exposureTime" ? { exposureMode: "manual", exposureTime: v } : { [key]: v });
+    const mode = modeOf(key);
+    sets.push(mode ? { [mode]: "manual", [key]: v } : { [key]: v });
   }
-  if (
-    exposureMode &&
-    values.exposureTime === undefined &&
-    (caps.exposureMode ?? []).includes(exposureMode)
-  ) {
-    sets.push({ exposureMode });
+  for (const [key, mode] of Object.entries(MODE_OF) as [ManualKey, ModeKey][]) {
+    const want = modes[mode];
+    if (want && values[key] === undefined && (caps[mode] ?? []).includes(want)) {
+      sets.push({ [mode]: want });
+    }
   }
   return sets as MediaTrackConstraintSet[];
+}
+
+/** The camera's modes as they are now, to keep for Reset. */
+function modesOf(s: Settings): Pick<CameraPicture, ModeKey> {
+  const out: Pick<CameraPicture, ModeKey> = {};
+  if (s.exposureMode) out.exposureMode = s.exposureMode;
+  if (s.whiteBalanceMode) out.whiteBalanceMode = s.whiteBalanceMode;
+  return out;
 }
 
 /** What is saved for this track's camera, if anything. */
@@ -210,7 +246,7 @@ export function restorePicture(track: MediaStreamTrack): Promise<void> {
     if (controls.length === 0) return Promise.resolve();
     const defaults: PictureValues = {};
     for (const c of controls) defaults[c.key] = c.value;
-    save(deviceId, { values: {}, defaults, exposureMode: settingsOf(track).exposureMode });
+    save(deviceId, { values: {}, defaults, ...modesOf(settingsOf(track)) });
     return Promise.resolve();
   }
   return enqueue(track, () => apply(track, pictureSets(saved.values)));
@@ -249,42 +285,47 @@ export function resetPicture(track: MediaStreamTrack): Promise<void> {
   if (!deviceId || !saved) return queue.get(track) ?? Promise.resolve();
   save(deviceId, { ...saved, values: {} });
   const defaults = { ...saved.defaults };
-  // Back to automatic exposure, if that is how it started: its time is the
-  // camera's to choose then.
-  const auto = saved.exposureMode && saved.exposureMode !== "manual";
-  if (auto) delete defaults.exposureTime;
+  // Back to an automatic mode, where that is how it started: its value is
+  // the camera's to choose then.
+  const modes: Partial<Record<ModeKey, string>> = {};
+  for (const [key, mode] of Object.entries(MODE_OF) as [ManualKey, ModeKey][]) {
+    const was = saved[mode];
+    if (!was) continue;
+    modes[mode] = was;
+    if (was !== "manual") delete defaults[key];
+  }
   const caps = capabilitiesOf(track);
-  return enqueue(track, () => apply(track, pictureSets(defaults, caps, saved.exposureMode)));
+  return enqueue(track, () => apply(track, pictureSets(defaults, caps, modes)));
 }
 
-/** Whether the exposure time is set by hand, and so automatic exposure off. */
-export function exposureByHand(track: MediaStreamTrack): boolean {
-  return savedFor(settingsOf(track).deviceId)?.values.exposureTime !== undefined;
+/** Whether this control is set by hand, and so its automatic mode off. */
+export function byHand(track: MediaStreamTrack, key: ManualKey): boolean {
+  return savedFor(settingsOf(track).deviceId)?.values[key] !== undefined;
 }
 
 /**
- * Automatic exposure back on, keeping every other control as it is. Only
- * where the camera has an automatic mode.
+ * This control's automatic mode back on, keeping every other control as it
+ * is. Only where the camera has an automatic mode for it.
  */
-export function autoExposure(track: MediaStreamTrack): Promise<void> {
+export function autoMode(track: MediaStreamTrack, key: ManualKey): Promise<void> {
   const caps = capabilitiesOf(track);
   const { deviceId } = settingsOf(track);
   const saved = savedFor(deviceId);
   const p = pending.get(track);
-  if (p) {
-    delete p.exposureTime;
-  }
+  if (p) delete p[key];
   if (deviceId && saved) {
     const values = { ...saved.values };
-    delete values.exposureTime;
+    delete values[key];
     save(deviceId, { ...saved, values });
   }
-  return enqueue(track, () => apply(track, pictureSets({}, caps, "continuous")));
+  return enqueue(track, () =>
+    apply(track, pictureSets({}, caps, { [MODE_OF[key]]: "continuous" }))
+  );
 }
 
-/** Whether this camera has an automatic exposure to go back to. */
-export function hasAutoExposure(track: MediaStreamTrack): boolean {
-  return (capabilitiesOf(track).exposureMode ?? []).includes("continuous");
+/** Whether this camera has an automatic mode for this control to go back to. */
+export function hasAuto(track: MediaStreamTrack, key: ManualKey): boolean {
+  return (capabilitiesOf(track)[MODE_OF[key]] ?? []).includes("continuous");
 }
 
 /** Whether anything is changed from the camera's own values. */
