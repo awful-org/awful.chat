@@ -1069,3 +1069,95 @@ test("sweepHeartbeatConnection: says why it terminated", () => {
   const stuck = { backpressured: true, backpressuredSince: 0, ping() {}, terminate() {} };
   assert.equal(sweepHeartbeatConnection(stuck, 30_001, 20_000), "backpressure");
 });
+
+test("a camera sent at three sizes is consumed at the level asked for, and moved by ms:set-layers", async () => {
+  const roomCode = "room-camera-layers";
+  const wsA = await connectAndJoin(roomCode, "peer-layers-a");
+  const viewers: WebSocket[] = [];
+  try {
+    wsA.send(JSON.stringify({ type: "ms:create-transport", direction: "send" }));
+    await nextMessage(wsA, (m) => m.type === "ms:transport-options" && m.direction === "send");
+    wsA.send(
+      JSON.stringify({
+        type: "ms:produce",
+        kind: "video",
+        source: "camera",
+        rtpParameters: {
+          mid: "0",
+          codecs: [
+            {
+              mimeType: "video/VP8",
+              payloadType: 101,
+              clockRate: 90000,
+              parameters: {},
+              rtcpFeedback: [{ type: "nack" }, { type: "nack", parameter: "pli" }],
+            },
+          ],
+          headerExtensions: [],
+          // Three levels, smallest first, as the browser sends them.
+          encodings: [
+            { ssrc: 71000001, scalabilityMode: "L1T3" },
+            { ssrc: 71000002, scalabilityMode: "L1T3" },
+            { ssrc: 71000003, scalabilityMode: "L1T3" },
+          ],
+          rtcp: { cname: "probe-layers", reducedSize: true },
+        },
+      }),
+    );
+    const { producerId } = await nextMessage(wsA, (m) => m.type === "ms:produced");
+
+    // A viewer with a recv transport and a consumer of the camera. Each
+    // check has its own: ms:diag answers a peer once per interval.
+    const viewer = async (name: string, spatialLayer?: number): Promise<WebSocket> => {
+      const ws = await connectAndJoin(roomCode, name);
+      viewers.push(ws);
+      ws.send(JSON.stringify({ type: "ms:get-capabilities", requestId: "caps" }));
+      const caps = await nextMessage(ws, (m) => m.type === "ms:capabilities");
+      ws.send(JSON.stringify({ type: "ms:create-transport", direction: "recv" }));
+      await nextMessage(ws, (m) => m.type === "ms:transport-options" && m.direction === "recv");
+      const consume = (requestId: string, layer?: number) => {
+        ws.send(
+          JSON.stringify({
+            type: "ms:consume",
+            requestId,
+            producerId,
+            rtpCapabilities: caps.rtpCapabilities,
+            ...(layer === undefined ? {} : { spatialLayer: layer }),
+          }),
+        );
+        return nextMessage(ws, (m) => m.type === "ms:consumer-options" && m.requestId === requestId);
+      };
+      await consume("first", spatialLayer);
+      (ws as unknown as { consumeAgain: () => Promise<unknown> }).consumeAgain = () => consume("again");
+      return ws;
+    };
+    const preferred = async (ws: WebSocket): Promise<number | null | undefined> => {
+      ws.send(JSON.stringify({ type: "ms:diag", requestId: "layers" }));
+      const diag = await nextMessage(ws, (m) => m.type === "ms:diag" && m.requestId === "layers");
+      return diag.snapshot.self.consumers.find(
+        (c: { producerId: string }) => c.producerId === producerId,
+      )?.preferredSpatialLayer;
+    };
+
+    // A thumbnail: consumed straight onto the smallest level.
+    const thumb = await viewer("peer-layers-b", 0);
+    assert.equal(await preferred(thumb), 0);
+
+    // A tile that changes size; then frames that name no level, ignored.
+    const resized = await viewer("peer-layers-c");
+    resized.send(JSON.stringify({ type: "ms:set-layers", producerId, spatialLayer: 1 }));
+    resized.send(JSON.stringify({ type: "ms:set-layers", producerId, spatialLayer: 7 }));
+    resized.send(JSON.stringify({ type: "ms:set-layers", producerId, spatialLayer: "0" }));
+    resized.send(JSON.stringify({ type: "ms:set-layers", producerId: "nope", spatialLayer: 0 }));
+    assert.equal(await preferred(resized), 1);
+
+    // A repeated consume that names no level is answered with the same
+    // consumer, put back on the top as the client now believes it is.
+    const again = await viewer("peer-layers-d", 0);
+    await (again as unknown as { consumeAgain: () => Promise<unknown> }).consumeAgain();
+    assert.equal(await preferred(again), 2);
+  } finally {
+    wsA.close();
+    for (const ws of viewers) ws.close();
+  }
+});

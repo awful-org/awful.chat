@@ -2,6 +2,8 @@
   import { onDestroy } from "svelte";
   import { Label } from "$lib/components/ui/label";
   import { Slider } from "$lib/components/ui/slider";
+  import CameraPicture from "./CameraPicture.svelte";
+  import CameraPicturePreview from "./CameraPicturePreview.svelte";
   import { Switch } from "$lib/components/ui/switch";
   import {
     Select,
@@ -452,6 +454,11 @@
       isMicTesting = false;
     }
   });
+
+  // The camera that is on now, whose own picture controls are shown.
+  const cameraTrack = $derived(
+    transportState.localCameraStream?.getVideoTracks().find((t) => t.readyState === "live") ?? null
+  );
 </script>
 
 <div class="flex flex-col gap-6">
@@ -475,7 +482,7 @@
       >
         <SelectTrigger
           aria-label="Camera"
-          class="bg-background border-input font-mono text-sm focus:ring-ring"
+          class="w-full bg-background border-input font-mono text-sm focus:ring-ring"
         >
           <span class="block truncate">
             {cameras.devices.find((d) => d.deviceId === cameras.selected)
@@ -505,6 +512,21 @@
       <p class="text-xs text-muted-foreground font-mono">
         No cameras found on this device.
       </p>
+    {/if}
+
+    {#if cameras.devices.length > 0}
+      <div class="flex flex-col gap-3 pt-3 border-t border-border/50">
+        <Label class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Picture</Label
+        >
+        {#if cameraTrack}
+          {#key cameraTrack}
+            <CameraPicture track={cameraTrack} />
+          {/key}
+        {:else}
+          <CameraPicturePreview />
+        {/if}
+      </div>
     {/if}
   </div>
 

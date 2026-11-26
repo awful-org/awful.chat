@@ -32,6 +32,7 @@ import {
   shareVideoEncoding,
 } from "./share-audio";
 import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
+import { cameraCaptureConstraints, isHandheld, openCamera } from "./camera-quality";
 import { openCameraPicker, openSharePicker } from "$lib/ui-state.svelte";
 import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
@@ -51,6 +52,7 @@ import {
   peersInCall,
   roomHasVoiceChannels,
 } from "./voice-channel";
+import { restorePicture } from "$lib/camera-picture";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
@@ -629,19 +631,17 @@ export async function startCamera(): Promise<void> {
   cancelErrorClear();
   transportState.error = null;
   try {
-    // `ideal`, not `exact`: a remembered camera that has since been unplugged
-    // (or an iPhone that stopped offering itself) must fall back to whatever
-    // is there rather than failing the whole call's video.
-    const preferred = loadAudioPrefs().cameraDevice;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        ...(preferred ? { deviceId: { ideal: preferred } } : {}),
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        frameRate: { ideal: 30 },
-      },
-      audio: false,
-    });
+    // The chosen camera, or whatever is there if it has since been unplugged
+    // (or an iPhone stopped offering itself), rather than no video at all.
+    // 1080p on a computer, 720p on a phone: see camera-quality.ts.
+    const stream = await openCamera(
+      loadAudioPrefs().cameraDevice,
+      cameraCaptureConstraints(isHandheld())
+    );
+    // What was chosen for this camera's picture last time (camera-picture.ts),
+    // before anyone sees it.
+    const cameraTrack = stream.getVideoTracks()[0];
+    if (cameraTrack) await restorePicture(cameraTrack);
     transportState.localCameraStream = stream;
     transportState.cameraOff = false;
     // Permission has just been granted, if it had not been before, so the

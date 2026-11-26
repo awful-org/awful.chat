@@ -15,8 +15,9 @@
    * The stream is stopped on unmount and whenever the panel is closed. A
    * preview left running holds the camera light on behind a joined call.
    */
+  import { cameraCaptureConstraints, isHandheld, openCamera } from "$lib/transport/camera-quality";
   import { onDestroy, untrack } from "svelte";
-  import { Mic, Video, VideoOff } from "@lucide/svelte";
+  import { ChevronDown, Mic, SunMedium, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import {
@@ -26,6 +27,8 @@
     SelectTrigger,
   } from "$lib/components/ui/select";
   import { cameraLabel, cameras, refreshCameras, watchCameras } from "$lib/cameras.svelte";
+  import { pictureControls, restorePicture } from "$lib/camera-picture";
+  import CameraPicture from "$lib/components/settings/CameraPicture.svelte";
   import { loadAudioPrefs, saveAudioPrefs } from "$lib/transport/audio-prefs";
   import { setVoiceInputDevice } from "$lib/transport/voice.svelte";
 
@@ -50,6 +53,16 @@
   let error = $state<string | null>(null);
   let permissionDenied = $state(false);
   let pending = $state(false);
+  /**
+   * The preview's camera, while it has picture controls: set here, they are
+   * saved for that camera and the call's camera starts with them.
+   */
+  /** The picture sliders are folded away until asked for. */
+  let pictureOpen = $state(false);
+  const pictureTrack = $derived.by(() => {
+    const track = stream?.getVideoTracks()[0];
+    return track && pictureControls(track).length > 0 ? track : null;
+  });
   let requestId = 0;
   let audioCtx: AudioContext | null = null;
   let raf = 0;
@@ -125,10 +138,23 @@
     const wasDenied = permissionDenied;
     pending = true;
     try {
-      const acquired = await navigator.mediaDevices.getUserMedia({
-        video: cameraId ? { deviceId: { ideal: cameraId } } : true,
-        audio: showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false,
-      });
+      // The size the call itself asks for. The browser keeps a camera that
+      // is already open at the size it was opened at, and "Start camera"
+      // asks for it while this preview still holds it: a preview at the
+      // default 640x480 held the call's camera to 640x480. The chosen camera
+      // exactly, as the call opens it (openCamera).
+      const acquired = await openCamera(
+        cameraId,
+        cameraCaptureConstraints(isHandheld()),
+        showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false
+      );
+      if (request !== requestId || !open) {
+        acquired.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      // The preview shows the picture chosen for this camera, as the call will.
+      const previewTrack = acquired.getVideoTracks()[0];
+      if (previewTrack) await restorePicture(previewTrack);
       if (request !== requestId || !open) {
         acquired.getTracks().forEach((track) => track.stop());
         return;
@@ -292,7 +318,7 @@
         <Video class="mr-1 inline size-3" /> Camera
       </Label>
       <Select type="single" value={camera ?? ""} onValueChange={pickCamera}>
-        <SelectTrigger class="bg-background border-input font-mono text-sm">
+        <SelectTrigger class="w-full bg-background border-input font-mono text-sm">
           <span class="block truncate">
             {cameras.devices.find((d) => d.deviceId === camera)?.label ||
               "System default"}
@@ -308,6 +334,26 @@
       </Select>
     </div>
 
+    {#if pictureTrack}
+      <div class="flex flex-col gap-1.5">
+        <button
+          type="button"
+          aria-expanded={pictureOpen}
+          onclick={() => (pictureOpen = !pictureOpen)}
+          class="flex w-full cursor-pointer items-center gap-1 text-left text-xs font-mono uppercase tracking-wider text-muted-foreground hover:text-foreground"
+        >
+          <SunMedium class="size-3" />
+          <span class="ml-1 flex-1">Picture</span>
+          <ChevronDown class="size-3.5 transition-transform {pictureOpen ? 'rotate-180' : ''}" />
+        </button>
+        {#if pictureOpen}
+          {#key pictureTrack}
+            <CameraPicture track={pictureTrack} live={false} />
+          {/key}
+        {/if}
+      </div>
+    {/if}
+
     {#if showMic}
       <div class="flex flex-col gap-1.5">
         <Label
@@ -316,7 +362,7 @@
           <Mic class="mr-1 inline size-3" /> Microphone
         </Label>
         <Select type="single" value={mic ?? ""} onValueChange={pickMic}>
-          <SelectTrigger class="bg-background border-input font-mono text-sm">
+          <SelectTrigger class="w-full bg-background border-input font-mono text-sm">
             <span class="block truncate">
               {mics.find((d) => d.deviceId === mic)?.label || "System default"}
             </span>

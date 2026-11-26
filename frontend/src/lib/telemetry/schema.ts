@@ -518,6 +518,11 @@ export interface DiagConsumerView {
   score: number;
   paused: boolean;
   producerPaused: boolean;
+  /** A camera sent at several sizes: the level this viewer asked for, and
+   *  the one it is getting now (null while nothing is forwarded). Absent for
+   *  a stream with one size. */
+  preferredSpatialLayer?: number | null;
+  currentSpatialLayer?: number | null;
   bitrate: number;
   packetsLost: number;
 }
