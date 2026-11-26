@@ -13,6 +13,7 @@
     autoMode,
     byHand as setByHand,
     hasAuto,
+    isAuto,
     pictureChanged,
     pictureControls,
     resetPicture,
@@ -35,6 +36,8 @@
   let changed = $state(false);
   /** The controls set by hand, whose automatic mode is off (MODE_OF). */
   let byHand = $state<Partial<Record<ManualKey, boolean>>>({});
+  /** The controls the camera is choosing itself now: shown as Auto, not a value. */
+  let auto_ = $state<Partial<Record<ManualKey, boolean>>>({});
 
   function manual(key: PictureKey): key is ManualKey {
     return key in MODE_OF;
@@ -46,6 +49,10 @@
     byHand = {
       exposureTime: setByHand(t, "exposureTime"),
       colorTemperature: setByHand(t, "colorTemperature"),
+    };
+    auto_ = {
+      exposureTime: isAuto(t, "exposureTime"),
+      colorTemperature: isAuto(t, "colorTemperature"),
     };
   }
 
@@ -62,7 +69,10 @@
   function onChange(c: PictureControl, value: number) {
     if (moving !== c.key) return;
     changed = true;
-    if (manual(c.key)) byHand = { ...byHand, [c.key]: true };
+    if (manual(c.key)) {
+      byHand = { ...byHand, [c.key]: true };
+      auto_ = { ...auto_, [c.key]: false };
+    }
     void setPicture(track, c.key, value);
   }
 
@@ -107,7 +117,7 @@
               >
             {/if}
             <span class="text-xs font-mono text-muted-foreground tabular-nums"
-              >{shown(c)}</span
+              >{manual(c.key) && auto_[c.key] ? "Auto" : shown(c)}</span
             >
           </div>
         </div>

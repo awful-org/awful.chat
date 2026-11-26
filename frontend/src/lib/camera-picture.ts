@@ -249,7 +249,31 @@ export function restorePicture(track: MediaStreamTrack): Promise<void> {
     save(deviceId, { values: {}, defaults, ...modesOf(settingsOf(track)) });
     return Promise.resolve();
   }
+  // A control with no value of its own noted yet (one added since this
+  // camera was first seen, or one it offers only in another browser): its
+  // value now is the camera's own, as long as it was never set here. Without
+  // it Reset would leave that control where it was moved to.
+  const filled = backfill(track, saved);
+  if (filled) save(deviceId, filled);
   return enqueue(track, () => apply(track, pictureSets(saved.values)));
+}
+
+function backfill(track: MediaStreamTrack, saved: CameraPicture): CameraPicture | null {
+  const now = settingsOf(track);
+  const defaults = { ...saved.defaults };
+  const modes: Pick<CameraPicture, ModeKey> = {};
+  let changed = false;
+  for (const c of pictureControls(track)) {
+    if (c.key in defaults || c.key in saved.values) continue;
+    defaults[c.key] = c.value;
+    changed = true;
+  }
+  for (const [key, mode] of Object.entries(MODE_OF) as [ManualKey, ModeKey][]) {
+    if (saved[mode] || key in saved.values || !now[mode]) continue;
+    modes[mode] = now[mode];
+    changed = true;
+  }
+  return changed ? { ...saved, ...modes, defaults } : null;
 }
 
 /**
@@ -321,6 +345,12 @@ export function autoMode(track: MediaStreamTrack, key: ManualKey): Promise<void>
   return enqueue(track, () =>
     apply(track, pictureSets({}, caps, { [MODE_OF[key]]: "continuous" }))
   );
+}
+
+/** Whether the camera is choosing this control itself now (its automatic mode). */
+export function isAuto(track: MediaStreamTrack, key: ManualKey): boolean {
+  const mode = settingsOf(track)[MODE_OF[key]];
+  return !!mode && mode !== "manual" && mode !== "none";
 }
 
 /** Whether this camera has an automatic mode for this control to go back to. */

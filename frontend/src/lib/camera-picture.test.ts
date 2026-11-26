@@ -282,6 +282,30 @@ describe("changing and keeping the picture", () => {
     expect(pictureControls(track, false)).toEqual([]);
   });
 
+  it("Reset covers a control added after the camera was first seen", async () => {
+    // Saved before warmth existed: no value of its own noted for it.
+    saveAudioPrefs({
+      cameraPicture: {
+        wb: { values: { brightness: 10 }, defaults: { brightness: 128 }, exposureMode: "continuous" },
+      },
+    });
+    const cam = camera(
+      "wb",
+      {
+        brightness: { min: 0, max: 255, step: 1 },
+        whiteBalanceMode: ["manual", "continuous"],
+        colorTemperature: { min: 2800, max: 6500, step: 10 },
+      },
+      { brightness: 128, whiteBalanceMode: "continuous", colorTemperature: 4600 }
+    );
+    await restorePicture(cam.track);
+    await setPicture(cam.track, "colorTemperature", 6000);
+    await resetPicture(cam.track);
+    expect(cam.state.brightness).toBe(128);
+    expect(cam.state.whiteBalanceMode).toBe("continuous");
+    expect(pictureChanged(cam.track)).toBe(false);
+  });
+
   it("a camera that refuses keeps its picture, and nothing throws", async () => {
     const { track } = webcam();
     (track as unknown as { applyConstraints: () => Promise<void> }).applyConstraints = async () => {
