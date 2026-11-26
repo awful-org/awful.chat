@@ -9,34 +9,56 @@
   import { Slider } from "$lib/components/ui/slider";
   import { Button } from "$lib/components/ui/button";
   import {
+    autoExposure,
+    exposureByHand,
+    hasAutoExposure,
     pictureChanged,
     pictureControls,
     resetPicture,
     setPicture,
     type PictureControl,
+    type PictureKey,
   } from "$lib/camera-picture";
 
   let { track }: { track: MediaStreamTrack } = $props();
 
   let controls = $state<PictureControl[]>([]);
   let changed = $state(false);
+  let byHand = $state(false);
 
   function read(t: MediaStreamTrack) {
     controls = pictureControls(t);
     changed = pictureChanged(t);
+    byHand = exposureByHand(t);
   }
 
   $effect(() => {
     read(track);
   });
 
+  // The slider also reports a value it only moved onto its own step grid,
+  // when it is drawn and after Reset: a camera whose exposure step is a
+  // third of a stop has 0 just off that grid. Only a value the person moved
+  // it to is a change.
+  let moving: PictureKey | null = null;
+
   function onChange(c: PictureControl, value: number) {
+    if (moving !== c.key) return;
     changed = true;
+    if (c.key === "exposureTime") byHand = true;
     void setPicture(track, c.key, value);
   }
 
   async function reset() {
+    // What the slider reports after this is its own snapping, not a move.
+    moving = null;
     await resetPicture(track);
+    read(track);
+  }
+
+  async function auto() {
+    moving = null;
+    await autoExposure(track);
     read(track);
   }
 
@@ -49,10 +71,26 @@
 {#if controls.length > 0}
   <div class="flex flex-col gap-3" role="group" aria-label="Camera picture">
     {#each controls as c (c.key)}
-      <div class="flex flex-col gap-1.5">
-        <div class="flex items-center justify-between">
+      <div
+        class="flex flex-col gap-1.5"
+        role="none"
+        onpointerdown={() => (moving = c.key)}
+        onkeydown={() => (moving = c.key)}
+      >
+        <div class="flex items-center justify-between gap-2">
           <Label class="text-xs font-mono text-muted-foreground">{c.label}</Label>
-          <span class="text-xs font-mono text-muted-foreground tabular-nums">{shown(c)}</span>
+          <div class="flex items-center gap-2">
+            {#if c.key === "exposureTime" && byHand && hasAutoExposure(track)}
+              <button
+                type="button"
+                class="text-xs font-mono text-primary hover:underline"
+                onclick={auto}>Auto</button
+              >
+            {/if}
+            <span class="text-xs font-mono text-muted-foreground tabular-nums"
+              >{shown(c)}</span
+            >
+          </div>
         </div>
         <Slider
           aria-label={c.label}

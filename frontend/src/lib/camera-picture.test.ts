@@ -11,8 +11,10 @@ const backing = new Map<string, string>();
 
 const {
   PICTURE_KEYS,
+  autoExposure,
+  exposureByHand,
   pictureChanged,
-  pictureConstraints,
+  pictureSets,
   pictureControls,
   resetPicture,
   restorePicture,
@@ -33,8 +35,16 @@ function camera(
   const track = {
     getCapabilities: () => caps,
     getSettings: () => ({ ...state }),
+    // Like Chrome: each set whole or not at all, and resolved either way.
     applyConstraints: async (c: { advanced: Record<string, unknown>[] }) => {
       for (const set of c.advanced) {
+        const ok = Object.entries(set).every(([k, v]) => {
+          const cap = caps[k];
+          if (Array.isArray(cap)) return cap.includes(v);
+          const r = cap as { min?: number; max?: number } | undefined;
+          return !!r && typeof v === "number" && v >= (r.min ?? -Infinity) && v <= (r.max ?? Infinity);
+        });
+        if (!ok) continue;
         applied.push(set);
         Object.assign(state, set);
       }
@@ -61,7 +71,7 @@ beforeEach(() => backing.clear());
 describe("which controls a camera has", () => {
   it("lists what the camera offers, where it is now", () => {
     const { track } = webcam();
-    expect(pictureControls(track).map((c) => [c.label, c.value])).toEqual([
+    expect(pictureControls(track, false).map((c) => [c.label, c.value])).toEqual([
       ["Brightness", 128],
       ["Contrast", 50],
       ["Saturation", 100],
@@ -79,7 +89,29 @@ describe("which controls a camera has", () => {
       },
       { exposureCompensation: 0 }
     );
-    expect(pictureControls(track).map((c) => c.key)).toEqual(["exposureCompensation"]);
+    expect(pictureControls(track, false).map((c) => c.key)).toEqual(["exposureCompensation"]);
+  });
+
+  it("on Windows, where compensation is the camera's gain, the exposure time instead", () => {
+    const { track } = camera(
+      "win",
+      {
+        exposureCompensation: { min: 0, max: 255, step: 1 },
+        exposureMode: ["manual", "continuous"],
+        exposureTime: { min: 1, max: 10000, step: 1 },
+      },
+      { exposureCompensation: 0, exposureTime: 100 }
+    );
+    expect(pictureControls(track, true).map((c) => c.key)).toEqual(["exposureTime"]);
+  });
+
+  it("an exposure time stops at one frame's time, so the frame rate holds", () => {
+    const { track } = camera(
+      "linux",
+      { exposureMode: ["manual", "continuous"], exposureTime: { min: 3, max: 2047, step: 1 } },
+      { exposureTime: 156, frameRate: 30 }
+    );
+    expect(pictureControls(track, false)[0].max).toBe(333);
   });
 
   it("nothing from a browser that offers nothing, or an empty range", () => {
@@ -96,9 +128,32 @@ describe("which controls a camera has", () => {
 });
 
 describe("changing and keeping the picture", () => {
-  it("an exposure time turns the automatic exposure off", () => {
-    expect(pictureConstraints({ exposureTime: 100 })).toEqual({ exposureTime: 100, exposureMode: "manual" });
-    expect(pictureConstraints({ brightness: 1 })).toEqual({ brightness: 1 });
+  it("one set per control; an exposure time with its manual mode", () => {
+    expect(pictureSets({ brightness: 1, exposureTime: 100 })).toEqual([
+      { brightness: 1 },
+      { exposureMode: "manual", exposureTime: 100 },
+    ]);
+    // A mode on its own only if the camera offers it.
+    expect(pictureSets({}, { exposureMode: ["manual"] }, "none")).toEqual([]);
+    expect(pictureSets({}, { exposureMode: ["continuous"] }, "continuous")).toEqual([
+      { exposureMode: "continuous" },
+    ]);
+  });
+
+  it("a value the camera no longer takes does not keep the others from being restored", async () => {
+    const first = webcam();
+    await restorePicture(first.track);
+    await setPicture(first.track, "brightness", 200);
+    await setPicture(first.track, "saturation", 150);
+    // Opened in a mode with a narrower saturation range.
+    const narrow = camera(
+      "cam-1",
+      { brightness: { min: 0, max: 255 }, saturation: { min: 0, max: 100 } },
+      { brightness: 128, saturation: 50 }
+    );
+    await restorePicture(narrow.track);
+    expect(narrow.state.brightness).toBe(200);
+    expect(narrow.state.saturation).toBe(50);
   });
 
   it("a change is applied and kept for the camera, then put back when it opens again", async () => {
@@ -114,13 +169,47 @@ describe("changing and keeping the picture", () => {
     expect(again.state.brightness).toBe(200);
   });
 
-  it("only the latest of a burst of slider moves is applied after the one in flight", async () => {
+  it("a burst of slider moves applies the latest", async () => {
     const { track, applied } = webcam();
     const a = setPicture(track, "brightness", 10);
     void setPicture(track, "brightness", 20);
-    void setPicture(track, "brightness", 30);
+    await setPicture(track, "brightness", 30);
     await a;
-    expect(applied.map((s) => s.brightness)).toEqual([10, 30]);
+    expect(applied.map((s) => s.brightness)).toEqual([30]);
+  });
+
+  it("a move sent just before Reset does not land after it", async () => {
+    const first = webcam();
+    await restorePicture(first.track);
+    void setPicture(first.track, "brightness", 250);
+    await resetPicture(first.track);
+    expect(first.state.brightness).toBe(128);
+    expect(pictureChanged(first.track)).toBe(false);
+  });
+
+  it("Auto turns automatic exposure back on and keeps the rest", async () => {
+    const first = webcam();
+    await restorePicture(first.track);
+    await setPicture(first.track, "brightness", 200);
+    await setPicture(first.track, "exposureTime", 300);
+    expect(exposureByHand(first.track)).toBe(true);
+    await autoExposure(first.track);
+    expect(first.state.exposureMode).toBe("continuous");
+    expect(first.state.brightness).toBe(200);
+    expect(exposureByHand(first.track)).toBe(false);
+    expect(pictureChanged(first.track)).toBe(true);
+  });
+
+  it("Reset with a mode the camera does not offer still restores the rest", async () => {
+    const first = camera(
+      "no-auto",
+      { brightness: { min: 0, max: 255 }, exposureMode: ["manual"], exposureTime: { min: 1, max: 300 } },
+      { brightness: 100, exposureMode: "none", exposureTime: 50 }
+    );
+    await restorePicture(first.track);
+    await setPicture(first.track, "brightness", 10);
+    await resetPicture(first.track);
+    expect(first.state.brightness).toBe(100);
   });
 
   it("reset goes back to the camera's values from the first time it was seen", async () => {
