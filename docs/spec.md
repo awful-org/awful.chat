@@ -1577,3 +1577,4 @@ Two buttons added:
 - Check saved password before prompting
 - Better merge conflict resolution (thinking in having a events table and merge based on timestamps, latest always wins)
 - Progress indicators for large databases
+
