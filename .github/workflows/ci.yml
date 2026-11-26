@@ -2,6 +2,12 @@
 # nothing reaches it without these five jobs going green: protect the branch
 # and require them as status checks (Settings > Branches > main).
 #
+# On a pull request, a job whose code the PR does not touch is skipped (see
+# `changes`). A push to main runs everything. The skipping is done with `if:`
+# on jobs and steps, never with `paths:` on the trigger: a required check
+# whose workflow never starts stays "expected" forever and blocks the merge,
+# while a job skipped by `if:` reports success.
+#
 # Every `uses:` here and in the other two workflows names a COMMIT, with the
 # tag it was cut from in the comment beside it. A tag is a movable pointer in
 # somebody else's repository, so `@v7` is a standing invitation to run whatever
@@ -20,7 +26,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which parts of the repo this run has to check. Each output is "true" or
+  # "false". The jobs below run unless their output is exactly "false", so if
+  # this job fails or is cancelled they all run: a broken detector must cost
+  # time, never let a change through unchecked.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.diff.outputs.frontend }}
+      frontend_image: ${{ steps.diff.outputs.frontend_image }}
+      relay: ${{ steps.diff.outputs.relay }}
+      sfu: ${{ steps.diff.outputs.sfu }}
+      dashboard: ${{ steps.diff.outputs.dashboard }}
+    steps:
+      # A pull request is checked out as GitHub's merge of it into its base,
+      # so the merge's first parent is the base and the diff between them is
+      # exactly what the PR changes once merged.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'pull_request'
+        with: { fetch-depth: 2 }
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          areas="frontend frontend_image relay sfu dashboard"
+          if [ "$EVENT" != pull_request ]; then
+            for a in $areas; do echo "$a=true" >> "$GITHUB_OUTPUT"; done
+            echo "Not a pull request: everything runs."
+            exit 0
+          fi
+          files=$(git diff --name-only HEAD^1 HEAD)
+          printf 'Changed:\n%s\n' "$files"
+          # The workflows themselves can change what any job does.
+          all=false
+          if grep -q '^\.github/' <<<"$files"; then all=true; fi
+          check() { # area, then the paths it reads
+            local area=$1; shift
+            local hit=$all
+            for p in "$@"; do
+              # A plain prefix match: index(), not a regex, so the dot in
+              # ".dockerignore" means a dot.
+              if awk -v p="$p" 'index($0, p) == 1 { f = 1 } END { exit !f }' <<<"$files"; then hit=true; fi
+            done
+            echo "$area=$hit" >> "$GITHUB_OUTPUT"
+            echo "$area: $hit"
+          }
+          # The frontend's tests import the SFU's auth code (sfu/auth.ts) to
+          # prove both ends agree, and its job installs the SFU's packages.
+          check frontend frontend/ sfu/
+          # The frontend image's context is the repo root, trimmed by the
+          # root .dockerignore; it takes nothing from sfu/.
+          check frontend_image frontend/ .dockerignore
+          check relay relay/
+          check sfu sfu/
+          check dashboard dashboard/
+
   frontend:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.frontend != 'false' }}
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: frontend } }
     steps:
@@ -80,6 +144,8 @@ jobs:
           fi
 
   relay:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.relay != 'false' }}
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: relay } }
     steps:
@@ -92,6 +158,8 @@ jobs:
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   sfu:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.sfu != 'false' }}
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: sfu } }
     steps:
@@ -108,6 +176,8 @@ jobs:
   # engine is the thing that reads a bundle, and a broken engine is worse than
   # no engine - it names the wrong root cause.
   dashboard:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.dashboard != 'false' }}
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: dashboard } }
     steps:
@@ -142,19 +212,30 @@ jobs:
     # and a renamed check that is required in branch protection never
     # reports, blocking every PR on a job that no longer exists.
     name: images (${{ matrix.name }})
+    needs: changes
+    # Skipped per image at the step level, not here: a job-level `if:` cannot
+    # see the matrix, and a matrix job skipped as a whole reports under its
+    # unexpanded name ("images (${{ matrix.name }})"), which is not the
+    # required check and would leave it waiting.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - { name: relay, context: relay, dockerfile: relay/Dockerfile }
-          - { name: sfu, context: sfu, dockerfile: sfu/Dockerfile }
+          - { name: relay, context: relay, dockerfile: relay/Dockerfile, gate: relay }
+          - { name: sfu, context: sfu, dockerfile: sfu/Dockerfile, gate: sfu }
           # The repo root, so the build can read .git and resolve its own
           # commit. See frontend/Dockerfile.
-          - { name: frontend, context: ".", dockerfile: frontend/Dockerfile }
+          - { name: frontend, context: ".", dockerfile: frontend/Dockerfile, gate: frontend_image }
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      - if: needs.changes.outputs[matrix.gate] == 'false'
+        run: echo "Nothing this image is built from changed; not building it."
+      - if: needs.changes.outputs[matrix.gate] != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - if: needs.changes.outputs[matrix.gate] != 'false'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - if: needs.changes.outputs[matrix.gate] != 'false'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
