@@ -1644,6 +1644,7 @@ describe("camera levels: sent at three sizes, received at the one a tile needs",
       );
     const layers = () =>
       sent.filter((m) => m.type === "ms:set-layers").map((m) => [m.producerId, m.spatialLayer]);
+    internals.sfuWs = { readyState: WebSocket.OPEN };
     return { video, internals, sent, consume, layers };
   }
 
@@ -1705,6 +1706,52 @@ describe("camera levels: sent at three sizes, received at the one a tile needs",
       ["cam-a", 1],
       ["cam-a", 2],
     ]);
+  });
+
+  it("a camera that leaves the screen keeps its level until it is parked", async () => {
+    const { video, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    expect(layers()).toEqual([["cam-a", 0]]);
+    // Another room opened: nothing shows peer-a any more.
+    video.setCameraDisplaySizes(new Map());
+    expect(layers()).toEqual([["cam-a", 0]]);
+  });
+
+  it("a level asked for with no socket is sent once there is one", async () => {
+    const { video, internals, sent, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    let open = false;
+    internals.sfuWs = {
+      get readyState() {
+        return open ? WebSocket.OPEN : WebSocket.CLOSED;
+      },
+    };
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    // The frame went nowhere, but the next push, the same size, tries again.
+    open = true;
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    expect(layers()).toEqual([
+      ["cam-a", 0],
+      ["cam-a", 0],
+    ]);
+    sent.length = 0;
+    video.setCameraDisplaySizes(new Map([["peer-a", 210]]));
+    expect(layers()).toEqual([]);
+  });
+
+  it("a resume says every camera's level again", async () => {
+    const { video, internals, sent, consume, layers } = session();
+    await consume("peer-a", "cam-a", "camera");
+    video.setCameraDisplaySizes(new Map([["peer-a", 200]]));
+    sent.length = 0;
+    (internals.reconcileResumed as (s: unknown) => void).call(video, {
+      producers: [{ producerId: "cam-a", peerId: "peer-a", source: "camera" }],
+      peers: ["peer-a"],
+      own: [],
+      consuming: ["cam-a"],
+    });
+    expect(layers()).toEqual([["cam-a", 0]]);
   });
 
   it("a camera consumed after its size is known starts on that level", async () => {

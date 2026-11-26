@@ -412,8 +412,8 @@ export class MediasoupVideo implements VideoTransport {
   // The remote cameras something on screen shows, by peerId, or null for no
   // opinion (every camera received). See setWantedCameras.
   private wantedCameras: ReadonlySet<string> | null = null;
-  /** The camera level each peer's largest tile calls for; a peer missing
-   *  here gets the top. See setCameraDisplaySizes. */
+  /** The camera level each peer's largest tile last called for; a peer
+   *  never sized gets the top. See setCameraDisplaySizes. */
   private cameraLayers: Map<string, number> = new Map();
   /** The level last asked of the SFU for each camera consumer, by producer. */
   private cameraLayersSent: Map<string, number> = new Map();
@@ -752,19 +752,24 @@ export class MediasoupVideo implements VideoTransport {
    * in CSS pixels, or null for a surface that is not measured. A camera is
    * sent at three levels (camera-quality.ts), and this asks the SFU for the
    * smallest that still fills the tile: a thumbnail does not need, or get,
-   * the full 1080p. A peer missing from `sizes` gets the top level.
+   * the full 1080p.
+   *
+   * A peer missing from `sizes` is one nothing shows any more, and it keeps
+   * its last level: its camera is parked a few seconds later (see
+   * setWantedCameras). Raised to the top instead, every thumbnail of a grid
+   * left for another room asked its sender for a 1080p keyframe that
+   * nobody would see.
    *
    * Only a change of level is sent, so a window being dragged wider asks
    * once per level it crosses, not once per pixel.
    */
   setCameraDisplaySizes(sizes: ReadonlyMap<string, number | null>): void {
     const ratio = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
-    this.cameraLayers.clear();
     for (const [peerId, size] of sizes) {
-      const layer = layerForTile(size, ratio);
-      if (layer !== TOP_LAYER) this.cameraLayers.set(peerId, layer);
+      this.cameraLayers.set(peerId, layerForTile(size, ratio));
     }
     for (const [peerId, cs] of this.consumers) {
+      if (!sizes.has(peerId)) continue;
       for (const c of cs) {
         if (c.source === "camera" && !c.consumer.closed) {
           this.sendCameraLayer(peerId, c.consumer.producerId);
@@ -773,11 +778,17 @@ export class MediasoupVideo implements VideoTransport {
     }
   }
 
-  private sendCameraLayer(peerId: string, producerId: string): void {
+  /** The level that is not known to have reached the SFU. */
+  private static readonly LAYER_UNSENT = -1;
+
+  private sendCameraLayer(peerId: string, producerId: string, force = false): void {
     const layer = this.cameraLayers.get(peerId) ?? TOP_LAYER;
     // A new consumer starts at the top unless its consume said otherwise.
-    if ((this.cameraLayersSent.get(producerId) ?? TOP_LAYER) === layer) return;
-    this.cameraLayersSent.set(producerId, layer);
+    if (!force && (this.cameraLayersSent.get(producerId) ?? TOP_LAYER) === layer) return;
+    // Recorded as sent only when there is a socket to send it on; otherwise
+    // the next change, or the resume, sends it whatever it is.
+    const open = this.sfuWs?.readyState === WebSocket.OPEN;
+    this.cameraLayersSent.set(producerId, open ? layer : MediasoupVideo.LAYER_UNSENT);
     this.signal({ type: "ms:set-layers", producerId, spatialLayer: layer });
   }
 
@@ -1313,6 +1324,17 @@ export class MediasoupVideo implements VideoTransport {
     for (const ps of this.producers.values()) for (const p of ps) mine.add(p.producer.id);
     for (const producerId of state.own) {
       if (!mine.has(producerId)) this.signal({ type: "ms:close-producer", producerId });
+    }
+
+    // A resume keeps the SFU's consumers as they were, so a level asked for
+    // while the socket was down, or on one that was dead without knowing it,
+    // never reached them. Each camera's level is said again.
+    for (const [peerId, cs] of this.consumers) {
+      for (const c of cs) {
+        if (c.source === "camera" && !c.consumer.closed) {
+          this.sendCameraLayer(peerId, c.consumer.producerId, true);
+        }
+      }
     }
   }
 
