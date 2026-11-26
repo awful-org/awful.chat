@@ -32,6 +32,7 @@ import {
   shareVideoEncoding,
 } from "./share-audio";
 import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
+import { restorePicture } from "$lib/camera-picture";
 import { openCameraPicker, openSharePicker } from "$lib/ui-state.svelte";
 import { resetPeerQuality } from "$lib/call-peer-quality.svelte";
 import {
@@ -642,6 +643,10 @@ export async function startCamera(): Promise<void> {
       },
       audio: false,
     });
+    // What was chosen for this camera's picture last time (camera-picture.ts),
+    // before anyone sees it.
+    const cameraTrack = stream.getVideoTracks()[0];
+    if (cameraTrack) await restorePicture(cameraTrack);
     transportState.localCameraStream = stream;
     transportState.cameraOff = false;
     // Permission has just been granted, if it had not been before, so the

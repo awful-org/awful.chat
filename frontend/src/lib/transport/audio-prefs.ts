@@ -93,6 +93,11 @@ export interface AudioPrefs {
    * works; your microphone simply never reaches them (libp2p/voice.ts).
    */
   voiceWithheld: string[];
+  /**
+   * Each camera's picture settings, by deviceId (see camera-picture.ts).
+   * Device-local: it is about this device's cameras.
+   */
+  cameraPicture: Record<string, CameraPicture>;
 }
 
 export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
@@ -113,6 +118,7 @@ export const AUDIO_PREF_DEFAULTS: AudioPrefs = {
   shareContentHint: "",
   peerVolumes: {},
   voiceWithheld: [],
+  cameraPicture: {},
 };
 
 /** Same ceiling as the per-person slider. */
@@ -128,6 +134,36 @@ function sanitizeDidList(value: unknown): string[] {
     if (out.size >= MAX_PEER_VOLUME_ENTRIES) break;
   }
   return [...out];
+}
+
+const MAX_CAMERAS = 20;
+
+function sanitizePictureValues(value: unknown): Partial<Record<CameraPictureKey, number>> {
+  const out: Partial<Record<CameraPictureKey, number>> = {};
+  if (!value || typeof value !== "object") return out;
+  for (const key of CAMERA_PICTURE_KEYS) {
+    const v = (value as Record<string, unknown>)[key];
+    if (typeof v === "number" && Number.isFinite(v)) out[key] = v;
+  }
+  return out;
+}
+
+function sanitizeCameraPicture(value: unknown): Record<string, CameraPicture> {
+  if (!value || typeof value !== "object") return {};
+  const out: Record<string, CameraPicture> = {};
+  // The newest are last (camera-picture.ts saves them so): keep those.
+  for (const [id, entry] of Object.entries(value as Record<string, unknown>).slice(-MAX_CAMERAS)) {
+    if (!id || id.length > 256 || !entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    out[id] = {
+      values: sanitizePictureValues(e.values),
+      defaults: sanitizePictureValues(e.defaults),
+      ...(typeof e.exposureMode === "string" && e.exposureMode.length <= 32
+        ? { exposureMode: e.exposureMode }
+        : {}),
+    };
+  }
+  return out;
 }
 
 function sanitizePeerVolumes(value: unknown): Record<string, number> {
@@ -226,6 +262,7 @@ export function loadAudioPrefs(): AudioPrefs {
       ),
       peerVolumes: sanitizePeerVolumes(p.peerVolumes),
       voiceWithheld: sanitizeDidList(p.voiceWithheld),
+      cameraPicture: sanitizeCameraPicture(p.cameraPicture),
     };
   } catch {
     return { ...AUDIO_PREF_DEFAULTS };
@@ -284,6 +321,26 @@ export interface PeerAudioPrefs {
   peerVolumes: Record<string, number>;
   voiceWithheld: string[];
 }
+
+/** What is kept for one camera: see camera-picture.ts. */
+export interface CameraPicture {
+  /** What was chosen. Empty is the camera's own picture. */
+  values: Partial<Record<CameraPictureKey, number>>;
+  /** What the camera had the first time it was seen here: what Reset restores. */
+  defaults: Partial<Record<CameraPictureKey, number>>;
+  /** Its exposure mode then, so Reset can turn automatic exposure back on. */
+  exposureMode?: string;
+}
+
+/** Kept in step with PICTURE_KEYS in camera-picture.ts (a test checks). */
+export const CAMERA_PICTURE_KEYS = [
+  "brightness",
+  "contrast",
+  "saturation",
+  "exposureCompensation",
+  "exposureTime",
+] as const;
+export type CameraPictureKey = (typeof CAMERA_PICTURE_KEYS)[number];
 
 export function peerAudioPrefs(): PeerAudioPrefs {
   const prefs = loadAudioPrefs();

@@ -132,7 +132,7 @@
 
   const tabs = $state([
     { id: "profile" as SettingsTab, label: "Profile", icon: User },
-    { id: "audio" as SettingsTab, label: "Audio", icon: Volume2 },
+    { id: "audio" as SettingsTab, label: "Camera & audio", icon: Volume2 },
     { id: "app" as SettingsTab, label: "App", icon: SlidersHorizontal },
     { id: "session" as SettingsTab, label: "Session/Sync", icon: RefreshCw },
     { id: "data" as SettingsTab, label: "Data", icon: ChartPie },

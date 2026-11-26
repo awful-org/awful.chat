@@ -15,6 +15,7 @@
    * The stream is stopped on unmount and whenever the panel is closed. A
    * preview left running holds the camera light on behind a joined call.
    */
+  import { restorePicture } from "$lib/camera-picture";
   import { onDestroy, untrack } from "svelte";
   import { Mic, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
@@ -129,6 +130,13 @@
         video: cameraId ? { deviceId: { ideal: cameraId } } : true,
         audio: showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false,
       });
+      if (request !== requestId || !open) {
+        acquired.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      // The preview shows the picture chosen for this camera, as the call will.
+      const previewTrack = acquired.getVideoTracks()[0];
+      if (previewTrack) await restorePicture(previewTrack);
       if (request !== requestId || !open) {
         acquired.getTracks().forEach((track) => track.stop());
         return;
