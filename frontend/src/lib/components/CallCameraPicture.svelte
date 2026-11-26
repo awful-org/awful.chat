@@ -17,26 +17,53 @@
     track,
     x,
     y,
+    above = false,
     onClose,
-  }: { track: MediaStreamTrack; x: number; y: number; onClose: () => void } = $props();
+  }: {
+    track: MediaStreamTrack;
+    /** The point it was opened from. */
+    x: number;
+    y: number;
+    /** Open above that point rather than below it. */
+    above?: boolean;
+    onClose: () => void;
+  } = $props();
 
   let panel = $state<HTMLElement | null>(null);
+  // Measured, not estimated: how tall it is depends on which controls the
+  // camera offers and how the note under them wraps.
+  let width = $state(288);
+  let height = $state(0);
+  let viewW = $state(typeof window === "undefined" ? 0 : window.innerWidth);
+  let viewH = $state(typeof window === "undefined" ? 0 : window.innerHeight);
+
+  const PAD = 8;
+  const left = $derived(Math.max(PAD, Math.min(x, viewW - width - PAD)));
+  const top = $derived(
+    Math.max(PAD, Math.min(above ? y - height - PAD : y, viewH - height - PAD))
+  );
 
   function pressedOutside(e: PointerEvent) {
     if (panel && e.target instanceof Node && !panel.contains(e.target)) onClose();
   }
 </script>
 
-<svelte:window onpointerdown={pressedOutside} />
+<svelte:window
+  onpointerdown={pressedOutside}
+  bind:innerWidth={viewW}
+  bind:innerHeight={viewH}
+/>
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
   bind:this={panel}
+  bind:offsetWidth={width}
+  bind:offsetHeight={height}
   role="dialog"
   aria-label="Camera picture"
   tabindex="-1"
   class="fixed z-50 flex w-72 max-w-[calc(100vw-16px)] max-h-[calc(100dvh-16px)] flex-col rounded-md border border-border bg-popover shadow-xl font-mono"
-  style="top: {y}px; left: {x}px"
+  style="top: {top}px; left: {left}px; visibility: {height ? 'visible' : 'hidden'}"
   onclick={(e) => e.stopPropagation()}
   oncontextmenu={(e) => e.preventDefault()}
 >

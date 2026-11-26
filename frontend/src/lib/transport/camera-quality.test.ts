@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   cameraCaptureConstraints,
+  openCamera,
   cameraDisplaySizes,
   cameraEncodings,
   layerBitrate,
@@ -104,5 +105,48 @@ describe("display sizes", () => {
 
   it("a tile measured at zero (not laid out yet) is not measured", () => {
     expect(cameraDisplaySizes(["a"], new Set(), [["a", 0]])).toEqual(new Map([["a", null]]));
+  });
+});
+
+describe("opening the chosen camera", () => {
+  const fail = (name: string) => Object.assign(new Error(name), { name });
+  const media = (outcomes: (Error | "ok")[]) => {
+    const asked: MediaStreamConstraints[] = [];
+    return {
+      asked,
+      getUserMedia: async (c?: MediaStreamConstraints) => {
+        asked.push(c ?? {});
+        const next = outcomes.shift();
+        if (next instanceof Error) throw next;
+        return {} as MediaStream;
+      },
+    };
+  };
+  const size = { width: { ideal: 1920 } };
+
+  it("asks for the chosen camera exactly, so a smaller one is not passed over", async () => {
+    const m = media(["ok"]);
+    await openCamera("cam-1", size, false, m);
+    expect(m.asked).toEqual([{ video: { width: { ideal: 1920 }, deviceId: { exact: "cam-1" } }, audio: false }]);
+  });
+
+  it("falls back to any camera when the chosen one is gone", async () => {
+    for (const name of ["OverconstrainedError", "NotFoundError"]) {
+      const m = media([fail(name), "ok"]);
+      await openCamera("gone", size, false, m);
+      expect(m.asked[1]).toEqual({ video: { width: { ideal: 1920 }, deviceId: { ideal: "gone" } }, audio: false });
+    }
+  });
+
+  it("does not ask again after a refusal", async () => {
+    const m = media([fail("NotAllowedError"), "ok"]);
+    await expect(openCamera("cam-1", size, false, m)).rejects.toThrow("NotAllowedError");
+    expect(m.asked).toHaveLength(1);
+  });
+
+  it("with no camera chosen, just the size", async () => {
+    const m = media(["ok"]);
+    await openCamera(null, size, true, m);
+    expect(m.asked).toEqual([{ video: { width: { ideal: 1920 } }, audio: true }]);
   });
 });

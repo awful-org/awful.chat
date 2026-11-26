@@ -29,6 +29,36 @@ export function cameraCaptureConstraints(
     : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
 }
 
+/**
+ * Open the chosen camera at these constraints.
+ *
+ * The device is asked for `exact` first. As `ideal` it is only one of the
+ * things the browser weighs: a 640x480 webcam is further from a 1920x1080
+ * ideal than a different camera that is 1080p, so the chosen one lost to
+ * whichever other camera fit the size better. A camera since unplugged (or a
+ * phone no longer offering itself) fails `exact`, and then whatever camera
+ * is there is opened rather than none. A refused permission is not retried.
+ */
+export async function openCamera(
+  deviceId: string | null,
+  video: MediaTrackConstraints,
+  audio: MediaStreamConstraints["audio"] = false,
+  media: Pick<MediaDevices, "getUserMedia"> = navigator.mediaDevices
+): Promise<MediaStream> {
+  if (deviceId) {
+    try {
+      return await media.getUserMedia({ video: { ...video, deviceId: { exact: deviceId } }, audio });
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name !== "OverconstrainedError" && name !== "NotFoundError") throw err;
+    }
+  }
+  return media.getUserMedia({
+    video: deviceId ? { ...video, deviceId: { ideal: deviceId } } : video,
+    audio,
+  });
+}
+
 /** A touch screen as the main input: phones and tablets. */
 export function isHandheld(): boolean {
   return (

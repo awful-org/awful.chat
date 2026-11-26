@@ -56,7 +56,10 @@ jobs:
             echo "Not a pull request: everything runs."
             exit 0
           fi
-          files=$(git diff --name-only HEAD^1 HEAD)
+          # --no-renames: a moved file is listed at both its old path and its
+          # new one, so the area it left is checked as well as the one it
+          # reached.
+          files=$(git diff --name-only --no-renames HEAD^1 HEAD)
           printf 'Changed:\n%s\n' "$files"
           # The workflows themselves can change what any job does.
           all=false

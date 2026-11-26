@@ -187,6 +187,16 @@ describe("changing and keeping the picture", () => {
     expect(pictureChanged(first.track)).toBe(false);
   });
 
+  it("a move made after Reset, while an earlier one waits, lands after it", async () => {
+    const first = webcam();
+    await restorePicture(first.track);
+    void setPicture(first.track, "brightness", 250);
+    void resetPicture(first.track);
+    await setPicture(first.track, "brightness", 240);
+    expect(first.state.brightness).toBe(240);
+    expect(pictureChanged(first.track)).toBe(true);
+  });
+
   it("Auto turns automatic exposure back on and keeps the rest", async () => {
     const first = webcam();
     await restorePicture(first.track);

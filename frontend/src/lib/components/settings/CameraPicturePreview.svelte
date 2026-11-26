@@ -12,6 +12,7 @@
   import { Button } from "$lib/components/ui/button";
   import { cameras } from "$lib/cameras.svelte";
   import { restorePicture } from "$lib/camera-picture";
+  import { cameraCaptureConstraints, isHandheld, openCamera } from "$lib/transport/camera-quality";
   import CameraPicture from "./CameraPicture.svelte";
 
   let stream = $state<MediaStream | null>(null);
@@ -36,10 +37,10 @@
     starting = true;
     error = null;
     try {
-      const acquired = await navigator.mediaDevices.getUserMedia({
-        video: deviceId ? { deviceId: { ideal: deviceId } } : true,
-        audio: false,
-      });
+      // The size the call asks for (see DeviceCheck): a preview opened at
+      // the default 640x480 holds the camera there for a call camera started
+      // while it runs. And the chosen camera exactly, as the call opens it.
+      const acquired = await openCamera(deviceId, cameraCaptureConstraints(isHandheld()));
       const first = acquired.getVideoTracks()[0];
       if (first) await restorePicture(first);
       if (mine !== request || destroyed) {

@@ -860,14 +860,13 @@ import {
   let tileMenu = $state<{ tileId: string; x: number; y: number } | null>(null);
   let connectionDetails = $state<{ peerId: string; name: string } | null>(null);
   /** Where your camera's picture panel is open, if it is. */
-  let picturePanel = $state<{ x: number; y: number } | null>(null);
-  const PICTURE_PANEL_WIDTH = 288;
-  const PICTURE_PANEL_HEIGHT = 360;
-  const picturePanelPos = $derived(
-    picturePanel
-      ? clampMenu(picturePanel.x, picturePanel.y, PICTURE_PANEL_WIDTH, PICTURE_PANEL_HEIGHT)
-      : { x: 0, y: 0 }
-  );
+  /**
+   * Where your camera's picture panel is open, if it is: the point it was
+   * asked from, and whether it opens above it (from the camera button, so
+   * it does not cover the button). The panel keeps itself on screen from
+   * its own measured height.
+   */
+  let picturePanel = $state<{ x: number; y: number; above: boolean } | null>(null);
 
   /** Your camera is on and has picture controls to show. */
   function cameraHasPicture(): boolean {
@@ -878,9 +877,9 @@ import {
     );
   }
 
-  function openPicturePanel(x: number, y: number): void {
+  function openPicturePanel(x: number, y: number, above = false): void {
     closeMenus();
-    picturePanel = { x, y };
+    picturePanel = { x, y, above };
   }
 
   // Off with the camera: there is nothing left to adjust.
@@ -1207,7 +1206,9 @@ import {
     if (!cameraHasPicture()) return;
     e.preventDefault();
     e.stopPropagation();
-    openPicturePanel(e.clientX, e.clientY - PICTURE_PANEL_HEIGHT);
+    // Above the button itself, not the point clicked, so none of it is covered.
+    const top = (e.currentTarget as HTMLElement).getBoundingClientRect().top;
+    openPicturePanel(e.clientX, top, true);
   }
 
   function closeMenus(): void {
@@ -3036,8 +3037,9 @@ import {
     {#if picturePanel && localVideoTrack}
       <CallCameraPicture
         track={localVideoTrack}
-        x={picturePanelPos.x}
-        y={picturePanelPos.y}
+        x={picturePanel.x}
+        y={picturePanel.y}
+        above={picturePanel.above}
         onClose={() => (picturePanel = null)}
       />
     {/if}

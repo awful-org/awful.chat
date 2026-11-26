@@ -15,7 +15,7 @@
    * The stream is stopped on unmount and whenever the panel is closed. A
    * preview left running holds the camera light on behind a joined call.
    */
-  import { cameraCaptureConstraints, isHandheld } from "$lib/transport/camera-quality";
+  import { cameraCaptureConstraints, isHandheld, openCamera } from "$lib/transport/camera-quality";
   import { onDestroy, untrack } from "svelte";
   import { ChevronDown, Mic, SunMedium, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
@@ -138,17 +138,16 @@
     const wasDenied = permissionDenied;
     pending = true;
     try {
-      const acquired = await navigator.mediaDevices.getUserMedia({
-        // The size the call itself asks for. The browser keeps a camera
-        // that is already open at the size it was opened at, and "Start
-        // camera" asks for it while this preview still holds it: a preview
-        // at the default 640x480 held the call's camera to 640x480.
-        video: {
-          ...(cameraId ? { deviceId: { ideal: cameraId } } : {}),
-          ...cameraCaptureConstraints(isHandheld()),
-        },
-        audio: showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false,
-      });
+      // The size the call itself asks for. The browser keeps a camera that
+      // is already open at the size it was opened at, and "Start camera"
+      // asks for it while this preview still holds it: a preview at the
+      // default 640x480 held the call's camera to 640x480. The chosen camera
+      // exactly, as the call opens it (openCamera).
+      const acquired = await openCamera(
+        cameraId,
+        cameraCaptureConstraints(isHandheld()),
+        showMic ? (micId ? { deviceId: { ideal: micId } } : true) : false
+      );
       if (request !== requestId || !open) {
         acquired.getTracks().forEach((track) => track.stop());
         return;

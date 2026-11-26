@@ -50,8 +50,13 @@ const stageTiles = new SvelteMap<Element, string>();
 const stageTileSizes = new SvelteMap<Element, number>();
 let tileSizeObserver: ResizeObserver | null = null;
 
+/**
+ * The long side a 16:9 camera is drawn at in a tile of this size. Camera
+ * tiles crop to fill (object-cover), so in a tile taller than 16:9 the
+ * picture is drawn wider than the tile: a 300x600 tile shows it 1067 wide.
+ */
 function longSide(width: number, height: number): number {
-  return Math.round(Math.max(width, height));
+  return Math.round(Math.max(width, (height * 16) / 9));
 }
 
 /** The stage has this peer's camera tile on screen. */

@@ -281,8 +281,11 @@ function backfill(track: MediaStreamTrack, saved: CameraPicture): CameraPicture 
  * than a camera takes them: they gather while one is being applied, and the
  * latest of each control goes next.
  */
+// Each queued apply owns its batch: Reset or Auto drops the batch from here
+// (what was moved before them still goes first, then they override it), so
+// a move made after them starts a batch queued after them, never one that
+// is applied ahead of them.
 const pending = new WeakMap<MediaStreamTrack, PictureValues>();
-const scheduled = new WeakSet<MediaStreamTrack>();
 
 export function setPicture(track: MediaStreamTrack, key: PictureKey, value: number): Promise<void> {
   const { deviceId } = settingsOf(track);
@@ -290,14 +293,16 @@ export function setPicture(track: MediaStreamTrack, key: PictureKey, value: numb
     const saved = savedFor(deviceId) ?? { values: {}, defaults: {} };
     save(deviceId, { ...saved, values: { ...saved.values, [key]: value } });
   }
-  pending.set(track, { ...pending.get(track), [key]: value });
-  if (scheduled.has(track)) return queue.get(track) ?? Promise.resolve();
-  scheduled.add(track);
+  const batch = pending.get(track);
+  if (batch) {
+    batch[key] = value;
+    return queue.get(track) ?? Promise.resolve();
+  }
+  const fresh: PictureValues = { [key]: value };
+  pending.set(track, fresh);
   return enqueue(track, async () => {
-    scheduled.delete(track);
-    const values = pending.get(track);
-    pending.delete(track);
-    if (values) await apply(track, pictureSets(values));
+    if (pending.get(track) === fresh) pending.delete(track);
+    await apply(track, pictureSets(fresh));
   });
 }
 
@@ -335,8 +340,11 @@ export function autoMode(track: MediaStreamTrack, key: ManualKey): Promise<void>
   const caps = capabilitiesOf(track);
   const { deviceId } = settingsOf(track);
   const saved = savedFor(deviceId);
+  // The queued batch still applies the other controls, ahead of this; a move
+  // after this starts a batch of its own, behind it.
   const p = pending.get(track);
   if (p) delete p[key];
+  pending.delete(track);
   if (deviceId && saved) {
     const values = { ...saved.values };
     delete values[key];
