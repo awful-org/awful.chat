@@ -40,7 +40,7 @@
 
 <Dialog bind:open={uiState.cameraPickerOpen}>
   <DialogContent
-    class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-sm flex flex-col p-0"
+    class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-sm flex flex-col p-0 max-h-[85dvh]"
     closeClass="top-5"
   >
     <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
@@ -49,7 +49,7 @@
       >
     </DialogHeader>
 
-    <div class="flex flex-col gap-3 px-4 pb-4">
+    <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4">
       <DeviceCheck open={uiState.cameraPickerOpen} showMic={false} bind:ready={cameraReady} />
     </div>
 

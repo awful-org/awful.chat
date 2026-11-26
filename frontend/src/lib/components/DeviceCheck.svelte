@@ -16,7 +16,7 @@
    * preview left running holds the camera light on behind a joined call.
    */
   import { onDestroy, untrack } from "svelte";
-  import { Mic, Video, VideoOff } from "@lucide/svelte";
+  import { Mic, SunMedium, Video, VideoOff } from "@lucide/svelte";
   import { Label } from "$lib/components/ui/label";
   import { Button } from "$lib/components/ui/button";
   import {
@@ -26,7 +26,8 @@
     SelectTrigger,
   } from "$lib/components/ui/select";
   import { cameraLabel, cameras, refreshCameras, watchCameras } from "$lib/cameras.svelte";
-  import { restorePicture } from "$lib/camera-picture";
+  import { pictureControls, restorePicture } from "$lib/camera-picture";
+  import CameraPicture from "$lib/components/settings/CameraPicture.svelte";
   import { loadAudioPrefs, saveAudioPrefs } from "$lib/transport/audio-prefs";
   import { setVoiceInputDevice } from "$lib/transport/voice.svelte";
 
@@ -51,6 +52,14 @@
   let error = $state<string | null>(null);
   let permissionDenied = $state(false);
   let pending = $state(false);
+  /**
+   * The preview's camera, while it has picture controls: set here, they are
+   * saved for that camera and the call's camera starts with them.
+   */
+  const pictureTrack = $derived.by(() => {
+    const track = stream?.getVideoTracks()[0];
+    return track && pictureControls(track).length > 0 ? track : null;
+  });
   let requestId = 0;
   let audioCtx: AudioContext | null = null;
   let raf = 0;
@@ -315,6 +324,19 @@
         </SelectContent>
       </Select>
     </div>
+
+    {#if pictureTrack}
+      <div class="flex flex-col gap-1.5">
+        <Label
+          class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        >
+          <SunMedium class="mr-1 inline size-3" /> Picture
+        </Label>
+        {#key pictureTrack}
+          <CameraPicture track={pictureTrack} live={false} />
+        {/key}
+      </div>
+    {/if}
 
     {#if showMic}
       <div class="flex flex-col gap-1.5">

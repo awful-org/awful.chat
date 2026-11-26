@@ -20,7 +20,14 @@
     type PictureKey,
   } from "$lib/camera-picture";
 
-  let { track }: { track: MediaStreamTrack } = $props();
+  let {
+    track,
+    live = true,
+  }: {
+    track: MediaStreamTrack;
+    /** The camera is in the call now, not a preview before it. */
+    live?: boolean;
+  } = $props();
 
   let controls = $state<PictureControl[]>([]);
   let changed = $state(false);
@@ -106,7 +113,9 @@
     {/each}
     <div class="flex items-center justify-between gap-3">
       <p class="text-xs text-muted-foreground font-mono">
-        Everyone in the call sees these changes. They are kept for this camera.
+        {live
+          ? "Everyone in the call sees these changes. They are kept for this camera."
+          : "Kept for this camera, and used whenever it is on."}
       </p>
       <Button
         variant="outline"
