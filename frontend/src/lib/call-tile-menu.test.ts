@@ -99,6 +99,23 @@ describe("buildTileMenu", () => {
     expect(rows.some((r) => r.type === "volume")).toBe(false);
   });
 
+  it("offers your camera's picture only while it is on and has controls", () => {
+    const on = (hasPicture: boolean, cameraOff = false) =>
+      actions(
+        buildTileMenu(
+          tileMenuState({ kind: "camera", label: "You", isLocal: true, cameraOff, hasPicture })
+        )
+      );
+    expect(on(true)).toEqual(["focus", "fullscreen", "toggle-camera", "camera-picture", "toggle-mic"]);
+    expect(on(false)).not.toContain("camera-picture");
+    expect(on(true, true)).not.toContain("camera-picture");
+    // Never on somebody else's camera: these are YOUR camera's settings.
+    const theirs = buildTileMenu(
+      tileMenuState({ kind: "camera", label: "Ada", hasPicture: true })
+    );
+    expect(actions(theirs)).not.toContain("camera-picture");
+  });
+
   it("labels the local camera toggles by the state they move to", () => {
     const rows = buildTileMenu(
       tileMenuState({

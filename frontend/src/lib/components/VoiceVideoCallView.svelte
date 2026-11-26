@@ -20,6 +20,8 @@
   import { refreshPhonebook } from "$lib/rooms.svelte";
   import UserProfileCard from "./UserProfileCard.svelte";
   import PeerConnectionDetails from "./PeerConnectionDetails.svelte";
+  import CallCameraPicture from "./CallCameraPicture.svelte";
+  import { pictureControls } from "$lib/camera-picture";
   import {
     getVoicePeerVolume,
     isVoiceWithheld,
@@ -104,7 +106,7 @@
     SquareArrowOutUpRight,
     SquareArrowDownLeft,
   } from "@lucide/svelte";
-  import { Check, Columns2, MessageCircle, MonitorIcon, PictureInPicture2, SlidersHorizontal, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
+  import { Check, Columns2, MessageCircle, MonitorIcon, PictureInPicture2, SlidersHorizontal, SunMedium, User as UserIcon, UserPlus, UserRoundMinus } from "@lucide/svelte";
 import { loadProfile, getScopedProfile } from "$lib/profile.svelte";
 import {
   displayPrefs,
@@ -857,6 +859,34 @@ import {
    */
   let tileMenu = $state<{ tileId: string; x: number; y: number } | null>(null);
   let connectionDetails = $state<{ peerId: string; name: string } | null>(null);
+  /** Where your camera's picture panel is open, if it is. */
+  let picturePanel = $state<{ x: number; y: number } | null>(null);
+  const PICTURE_PANEL_WIDTH = 288;
+  const PICTURE_PANEL_HEIGHT = 360;
+  const picturePanelPos = $derived(
+    picturePanel
+      ? clampMenu(picturePanel.x, picturePanel.y, PICTURE_PANEL_WIDTH, PICTURE_PANEL_HEIGHT)
+      : { x: 0, y: 0 }
+  );
+
+  /** Your camera is on and has picture controls to show. */
+  function cameraHasPicture(): boolean {
+    return (
+      !!localVideoTrack &&
+      localVideoTrack.readyState === "live" &&
+      pictureControls(localVideoTrack).length > 0
+    );
+  }
+
+  function openPicturePanel(x: number, y: number): void {
+    closeMenus();
+    picturePanel = { x, y };
+  }
+
+  // Off with the camera: there is nothing left to adjust.
+  $effect(() => {
+    if (!localVideoTrack) picturePanel = null;
+  });
   /** Right-click on the call background: picks what the grid shows. */
   let viewMenu = $state<{ x: number; y: number } | null>(null);
   let peerVolumeSlider = $state(UNITY_STOP);
@@ -920,6 +950,7 @@ import {
       voiceWithheld: tile.kind === "camera" && !tile.isLocal && !!tile.peerId && isVoiceWithheld(tile.peerId),
       canWithholdVoice: tile.kind === "camera" && !tile.isLocal && !!tile.peerId && looksLikeDid(peerIdToDid(tile.peerId)),
       cameraOff,
+      hasPicture: tile.kind === "camera" && tile.isLocal && cameraHasPicture(),
       micMuted: muted,
       // Screen-share audio, not the sharer's voice: it arrives as its own
       // track and plays through the audio[data-remote] elements.
@@ -1021,6 +1052,8 @@ import {
   ): Promise<void> {
     const item =
       action.kind === "plugin" ? pluginMenuItems[action.index] : undefined;
+    // Where the menu was, for a panel it opens in its place.
+    const at = tileMenu ? { x: tileMenu.x, y: tileMenu.y } : null;
     closeMenus();
     switch (action.kind) {
       case "connection-details":
@@ -1109,6 +1142,9 @@ import {
       case "toggle-camera":
         cameraOnPressed();
         break;
+      case "camera-picture":
+        if (at) openPicturePanel(at.x, at.y);
+        break;
       case "toggle-mic":
         await toggleMute();
         break;
@@ -1166,6 +1202,14 @@ import {
     viewMenu = clampMenu(e.clientX, e.clientY, 340, Math.min(660, window.innerHeight - 16));
   }
 
+  /** Right-click on the camera button: its picture, while it is on. */
+  function onCameraButtonMenu(e: MouseEvent): void {
+    if (!cameraHasPicture()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openPicturePanel(e.clientX, e.clientY - PICTURE_PANEL_HEIGHT);
+  }
+
   function closeMenus(): void {
     tileMenu = null;
     viewMenu = null;
@@ -1200,6 +1244,7 @@ import {
     "screen-off": MonitorOff,
     camera: Camera,
     "camera-off": CameraOff,
+    picture: SunMedium,
     mic: Mic,
     "mic-off": MicOff,
     volume: Volume2,
@@ -2505,6 +2550,7 @@ import {
                 {...props}
                 type="button"
                 onclick={cameraOnPressed}
+                oncontextmenu={onCameraButtonMenu}
                 disabled={transportState.cameraPending}
                 aria-busy={transportState.cameraPending}
                 class:animate-pulse={transportState.cameraPending}
@@ -2693,6 +2739,7 @@ import {
               {...props}
               type="button"
               onclick={cameraOnPressed}
+              oncontextmenu={onCameraButtonMenu}
               disabled={transportState.cameraPending}
               aria-busy={transportState.cameraPending}
               class:animate-pulse={transportState.cameraPending}
@@ -2985,6 +3032,15 @@ import {
         {/each}
       </div>
     {/if}
+
+    {#if picturePanel && localVideoTrack}
+      <CallCameraPicture
+        track={localVideoTrack}
+        x={picturePanelPos.x}
+        y={picturePanelPos.y}
+        onClose={() => (picturePanel = null)}
+      />
+    {/if}
   </div>
 {/if}
 
@@ -3039,6 +3095,10 @@ import {
   onclick={closeMenus}
   onkeydown={(e) => {
     if (e.key === "Escape") {
+      if (picturePanel && !tileMenu && !viewMenu) {
+        picturePanel = null;
+        return;
+      }
       const anchor = viewMenu ? layoutMenuAnchor : null;
       closeMenus();
       anchor?.focus();
