@@ -40,7 +40,7 @@
 
 <Dialog bind:open={uiState.cameraPickerOpen}>
   <DialogContent
-    class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-sm flex flex-col p-0 max-h-[85dvh]"
+    class="bg-card border-border text-card-foreground font-mono w-full sm:max-w-[28.8rem] flex flex-col p-0 max-h-[85dvh]"
     closeClass="top-5"
   >
     <DialogHeader class="px-6 py-4 border-b border-border shrink-0">
