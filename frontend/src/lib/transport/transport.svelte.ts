@@ -4973,9 +4973,11 @@ _transport.on("message", (peerId, data, room) => {
               );
               const cardId = payload?.cardId;
               if (!payload || !cardId) return;
+              // The sender's own window first: a flood must not spend the
+              // shared replay set before its cap drops it.
+              if (!_checkEphemeralFloodCap(payload.pluginId, peerId)) return;
               if (!liveUpdateAdmission.accept(room, ephemeralMsg.senderDid ?? "",
                 peerIdToDid(peerId), ephemeralMsg.id, ephemeralMsg.timestamp)) return;
-              if (!_checkEphemeralFloodCap(payload.pluginId, peerId)) return;
               void getPlugin(payload.pluginId).then((plugin) => {
                 guard();
                 if (!plugin) return;

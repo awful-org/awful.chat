@@ -25,3 +25,14 @@ it("rejects stale, future, missing and nonfinite freshness values", () => {
     expect(gate.accept("room", "did:key:a", "did:key:a", "id", timestamp)).toBe(false);
   }
 });
+
+it("holds each author to a share of the set, so one flood does not shut out the others", () => {
+  let now = 100_000;
+  const gate = new LiveUpdateAdmission(() => now, 8, 3);
+  for (let i = 0; i < 3; i++) expect(gate.accept("room", "did:key:m", "did:key:m", `f${i}`, now)).toBe(true);
+  expect(gate.accept("room", "did:key:m", "did:key:m", "f3", now)).toBe(false);
+  expect(gate.accept("other", "did:key:m", "did:key:m", "f4", now)).toBe(false);
+  expect(gate.accept("room", "did:key:b", "did:key:b", "real", now)).toBe(true);
+  now += 60_001;
+  expect(gate.accept("room", "did:key:m", "did:key:m", "later", now)).toBe(true);
+});
