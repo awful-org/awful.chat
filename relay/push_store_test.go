@@ -205,7 +205,7 @@ func TestPushStoreShedsByAgeAfterARestart(t *testing.T) {
 		box := mailboxIDForDid(did)
 		boxes = append(boxes, box)
 		pushMu.Lock()
-		err := writePushBox(box, map[string]pushSubscription{deviceID(byte(50 + i)): {Endpoint: "https://fcm.googleapis.com/fcm/send/x", P256dh: "k", Auth: "a"}}, false)
+		err := writePushBox(box, map[string]pushSubscription{deviceID(byte(50 + i)): {Endpoint: "https://fcm.googleapis.com/fcm/send/x", P256dh: testPushP256dh, Auth: testPushAuth}}, false)
 		pushMu.Unlock()
 		if err != nil {
 			t.Fatal(err)

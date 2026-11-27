@@ -27,10 +27,13 @@ package main
 
 import (
 	"container/list"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -392,6 +395,49 @@ var pushSend = func(sub *webpush.Subscription, payload []byte, opts *webpush.Opt
 	// never useful and a hostile one could be large.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return resp.StatusCode, nil
+}
+
+// decodePushKey reads a subscription key the way the push library does: any of
+// the four base64 alphabets, padded or not.
+func decodePushKey(k string) ([]byte, bool) {
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding} {
+		if b, err := enc.DecodeString(k); err == nil {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
+// validPushKeys reports whether a subscription's keys are ones a browser could
+// have issued: p256dh an uncompressed point on P-256 and auth 16 bytes. Keys
+// that are not fail inside the encryption step before anything is sent, and
+// that failure must never reach the push service's health record, where it
+// would read as the service being down for every user it serves.
+func validPushKeys(p256dh, auth string) bool {
+	if len(p256dh) > pushMaxKeyLen || len(auth) > pushMaxKeyLen {
+		return false
+	}
+	pub, ok := decodePushKey(p256dh)
+	if !ok || len(pub) != 65 {
+		return false
+	}
+	if _, err := ecdh.P256().NewPublicKey(pub); err != nil {
+		return false
+	}
+	secret, ok := decodePushKey(auth)
+	return ok && len(secret) == 16
+}
+
+// pushServiceFault reports whether a send's outcome says something about the
+// push service itself: it could not be reached, or it answered with a 5xx.
+// Anything else - an answer below 500, or an error raised here before any
+// request went out - is about the one subscription.
+func pushServiceFault(status int, err error) bool {
+	if err != nil {
+		var uerr *url.Error
+		return errors.As(err, &uerr)
+	}
+	return status >= 500
 }
 
 // pushSubject is the VAPID "sub" claim - a contact a push vendor can reach if
@@ -807,6 +853,13 @@ func pushDeliver(box string) {
 			skipped++
 			continue
 		}
+		if !validPushKeys(s.P256dh, s.Auth) {
+			// Filed before subscribe checked keys. It can never be delivered
+			// and is dropped like an expired one.
+			expired++
+			dead = append(dead, device)
+			continue
+		}
 		host := pushHost(key)
 		if pushHostSuspended(host, time.Now()) {
 			skipped++
@@ -827,8 +880,16 @@ func pushDeliver(box string) {
 			opts,
 		)
 		<-host.slots
-		pushHostResult(host, err == nil && status < 500, time.Now())
+		fault := pushServiceFault(status, err)
+		if err == nil || fault {
+			pushHostResult(host, !fault, time.Now())
+		}
 		switch {
+		case err != nil && !fault:
+			// Raised here before anything was sent: this subscription cannot
+			// be delivered, and says nothing about the service.
+			expired++
+			dead = append(dead, device)
 		case err != nil:
 			failed++
 		case status == http.StatusNotFound || status == http.StatusGone:
@@ -975,7 +1036,7 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	k := req.Subscription.Keys
-	if k.P256dh == "" || k.Auth == "" || len(k.P256dh) > pushMaxKeyLen || len(k.Auth) > pushMaxKeyLen {
+	if !validPushKeys(k.P256dh, k.Auth) {
 		http.Error(w, "bad keys", http.StatusBadRequest)
 		return
 	}
