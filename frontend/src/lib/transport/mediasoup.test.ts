@@ -420,6 +420,47 @@ describe("a share that ended while we were away cannot leave a dead tile", () =>
     expect(internals.refusal).toBeNull();
   });
 
+  it("a consume the SFU has no transport for builds one and asks again, once", async () => {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    internals.device = { recvRtpCapabilities: {} };
+    const stale = fakeTransport();
+    internals.recvTransport = stale;
+    internals.ensureRecvTransport = async () => {};
+    const sent: Array<{ type: string; requestId: string }> = [];
+    internals.sfuWs = { readyState: WebSocket.OPEN, send: (m: string) => sent.push(JSON.parse(m)) };
+    const rebuild = vi.fn(() => {
+      internals.recvTransport = fakeTransport();
+    });
+    internals.rebuildRecvTransport = rebuild;
+
+    const consuming = (internals.consumeProducer as (p: string, id: string, s: string) => Promise<void>).call(
+      video,
+      "bob",
+      "p1",
+      "camera"
+    );
+    const flush = async () => {
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    };
+    await flush();
+    const fail = (requestId: string) =>
+      (internals.handleSignal as (msg: unknown) => void).call(video, {
+        type: "ms:consume-failed",
+        requestId,
+        producerId: "p1",
+        reason: "no-transport",
+      });
+    fail(sent[0].requestId);
+    await flush();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(sent.filter((m) => m.type === "ms:consume")).toHaveLength(2);
+    // Twice in a row is not a transport we can fix by building one.
+    fail(sent[1].requestId);
+    await expect(consuming).rejects.toThrow(PRODUCER_GONE);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
   it("a watch click on a gone producer retracts the tile and gives back the intent", async () => {
     const video = new MediasoupVideo();
     const internals = internalsOf(video);
@@ -1348,10 +1389,12 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     send(m: string) {
       this.sent.push(JSON.parse(m));
     }
-    close() {
+    closedWith: number | undefined;
+    close(code?: number) {
       if (this.readyState === FakeWs.CLOSED) return;
+      this.closedWith = code;
       this.readyState = FakeWs.CLOSED;
-      this.onclose?.({ code: 1005, reason: "" });
+      this.onclose?.({ code: code ?? 1005, reason: "" });
     }
     open() {
       this.readyState = FakeWs.OPEN;
@@ -1548,6 +1591,24 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     expect(s.join).toHaveBeenCalledWith("room", "me", "");
   });
 
+  it("a resume whose socket never opens keeps its token: the server is out of reach", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = dropped();
+      const done = s.rejoin();
+      const caught = done.catch((err: Error) => err);
+      // The connection attempt goes nowhere: no open, no error, no close.
+      vi.advanceTimersByTime(10_000);
+      const err = await caught;
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe("Video server unreachable - voice still works, retrying in the background");
+      expect(s.internals.resumeToken).toBe("tok-1");
+      expect(s.join).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps everything and its token while the SFU cannot be reached", async () => {
     const s = dropped();
     const done = s.rejoin();
@@ -1602,6 +1663,170 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     expect(schedule).toHaveBeenCalledWith(internals.joinGeneration, 1, 0);
     // No "connection lost" banner for a drop that may heal unseen.
     expect(errors).not.toHaveBeenCalled();
+  });
+
+  /** A joined session on an open socket, with the ladder stubbed out. */
+  async function joined() {
+    const video = new MediasoupVideo();
+    const internals = internalsOf(video);
+    video.setJoinSigner(() => "sig");
+    internals.currentRoomCode = "room";
+    internals.currentPeerId = "me";
+    const connected = (internals.connectSfu as (r: string, p: string) => Promise<string>).call(video, "room", "me");
+    const ws = FakeWs.made.at(-1)!;
+    ws.open();
+    ws.receive({ type: "auth:challenge", nonce: "n1" });
+    ws.receive({ type: "auth:joined", resumeToken: "tok-1" });
+    await connected;
+    internals.device = { recvRtpCapabilities: {} };
+    const schedule = vi.fn();
+    internals.scheduleRejoin = schedule;
+    const errors = vi.fn();
+    video.on("error", errors);
+    const request = (msg: Record<string, unknown>, type: string) =>
+      (internals.request as (m: unknown, t: string) => Promise<unknown>).call(video, msg, type);
+    return { video, internals, ws, schedule, errors, request };
+  }
+
+  // A phone that changed networks or slept keeps a socket the browser still
+  // calls open, for minutes: every request on it hung 10s and surfaced as
+  // "mediasoup request timeout: ms:consumer-options", and nothing healed.
+  it("a request nothing answers on a silent socket drops it and resumes at once", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = await joined();
+      const other = s.request({ type: "ms:diag", requestId: "r-other" }, "ms:diag");
+      const asked = s.request({ type: "ms:ping", requestId: "r-ping" }, "ms:pong");
+      vi.advanceTimersByTime(10_000);
+      await expect(asked).rejects.toThrow("SFU connection closed");
+      await expect(other).rejects.toThrow("SFU connection closed");
+      // Closed with the code the SFU holds a session for, and let go of.
+      expect(s.ws.closedWith).toBe(4000);
+      expect(s.internals.sfuWs).toBeNull();
+      expect(s.schedule).toHaveBeenCalledTimes(1);
+      expect(s.schedule).toHaveBeenCalledWith(s.internals.joinGeneration, 1, 0);
+      expect(s.errors).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a request unanswered while the socket still talks fails alone", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = await joined();
+      const asked = s.request({ type: "ms:ping", requestId: "r-ping" }, "ms:pong");
+      s.ws.receive({ type: "ms:producer-consumed", peerId: "bob", producerId: "p" });
+      vi.advanceTimersByTime(10_000);
+      await expect(asked).rejects.toThrow("The video server did not answer (ms:pong)");
+      expect(s.ws.readyState).toBe(FakeWs.OPEN);
+      expect(s.internals.sfuWs).toBe(s.ws);
+      expect(s.schedule).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("coming back to the app pings an open socket, once at a time", async () => {
+    const s = await joined();
+    s.video.ensureLive();
+    s.video.ensureLive();
+    const pings = s.ws.sent.filter((m) => m.type === "ms:ping");
+    expect(pings).toHaveLength(1);
+    s.ws.receive({ type: "ms:pong", requestId: pings[0].requestId });
+    await Promise.resolve();
+    await Promise.resolve();
+    s.video.ensureLive();
+    expect(s.ws.sent.filter((m) => m.type === "ms:ping")).toHaveLength(2);
+    expect(s.schedule).not.toHaveBeenCalled();
+  });
+
+  it("a transport the SFU let go of while the socket was down is built again", async () => {
+    const s = dropped();
+    const rebuildRecv = vi.fn();
+    const rebuildSend = vi.fn();
+    s.internals.rebuildRecvTransport = rebuildRecv;
+    s.internals.rebuildSendTransport = rebuildSend;
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({
+      type: "auth:resumed",
+      resumeToken: "tok-2",
+      peers: ["bob"],
+      producers: [{ peerId: "bob", producerId: "p-bob", source: "camera", kind: "video" }],
+      own: ["p-mine"],
+      consuming: ["p-bob"],
+      transports: ["send"],
+    });
+    await done;
+    expect(rebuildRecv).toHaveBeenCalledTimes(1);
+    expect(rebuildSend).not.toHaveBeenCalled();
+  });
+
+  it("an older SFU that names no transports leaves them alone", async () => {
+    const s = dropped();
+    const rebuildRecv = vi.fn();
+    s.internals.rebuildRecvTransport = rebuildRecv;
+    const done = s.rejoin();
+    const { ws } = challenged();
+    ws.receive({ type: "auth:resumed", resumeToken: "tok-2", peers: ["bob"], producers: [], own: ["p-mine"] });
+    await done;
+    expect(rebuildRecv).not.toHaveBeenCalled();
+  });
+
+  it("says nothing of an unreachable SFU while media still gets through", async () => {
+    const s = dropped();
+    const errors = vi.fn();
+    s.video.on("error", errors);
+    const done = s.rejoin();
+    const ws = FakeWs.made.at(-1)!;
+    ws.onerror?.();
+    await expect(done).rejects.toThrow();
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it("says the SFU is unreachable once the media is gone too", async () => {
+    const s = dropped();
+    (s.internals.sendTransport as { connectionState: string }).connectionState = "disconnected";
+    (s.internals.recvTransport as { connectionState: string }).connectionState = "disconnected";
+    const errors = vi.fn();
+    s.video.on("error", errors);
+    const done = s.rejoin();
+    const ws = FakeWs.made.at(-1)!;
+    ws.onerror?.();
+    await expect(done).rejects.toThrow();
+    expect(errors).toHaveBeenCalledTimes(1);
+  });
+
+  it("while offline the next try waits for the network instead of failing", async () => {
+    vi.useFakeTimers();
+    const target = new EventTarget();
+    const nav = { onLine: false };
+    vi.stubGlobal("navigator", nav);
+    vi.stubGlobal("window", target);
+    try {
+      const video = new MediasoupVideo();
+      const internals = internalsOf(video);
+      internals.currentRoomCode = "room";
+      internals.currentPeerId = "me";
+      const attempt = vi.fn(async () => {});
+      internals.attemptRejoin = attempt;
+      (internals.scheduleRejoin as (g: number, a: number, d: number) => void).call(video, internals.joinGeneration as number, 1, 0);
+      vi.advanceTimersByTime(60_000);
+      expect(attempt).not.toHaveBeenCalled();
+      nav.onLine = true;
+      target.dispatchEvent(new Event("online"));
+      expect(attempt).toHaveBeenCalledTimes(1);
+      // Leaving while it waits ends the wait.
+      nav.onLine = false;
+      (internals.scheduleRejoin as (g: number, a: number, d: number) => void).call(video, internals.joinGeneration as number, 1, 0);
+      vi.advanceTimersByTime(0);
+      video.leave();
+      target.dispatchEvent(new Event("online"));
+      expect(attempt).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -117,6 +117,8 @@ interface MSConsumeFailed {
   type: "ms:consume-failed";
   requestId: string;
   producerId: string;
+  /** Set when the stream is fine but this session has no recv transport. */
+  reason?: "no-transport";
 }
 interface MSNewProducer {
   type: "ms:new-producer";
@@ -200,6 +202,20 @@ interface MSDiagUnavailable {
   reason: "disabled" | "rate-limited";
 }
 
+// Client -> server: is this socket still answering? The client asks when it
+// comes back to the foreground or a request of its own went unanswered: a
+// socket the network dropped without either side seeing a close (a phone
+// changing networks, or one asleep) still reads as open in the browser, and
+// only an answer tells the two apart.
+interface MSPing {
+  type: "ms:ping";
+  requestId: string;
+}
+interface MSPong {
+  type: "ms:pong";
+  requestId: string;
+}
+
 // Envelope sent by the client over this WebSocket connection.
 // All messages from client arrive as: { type: "join" } or { type: "ms:*", ... }
 // `resume` is the token the SFU handed this client at its last join or
@@ -218,7 +234,8 @@ type ClientMsg =
   | MSCloseProducer
   | MSResumeConsumer
   | MSSetLayers
-  | MSDiag;
+  | MSDiag
+  | MSPing;
 
 // ── Per-peer state ────────────────────────────────────────────────────────────
 
@@ -570,6 +587,14 @@ function resumeSession(
     // reached us, and goes on forwarding to nobody until the client closes
     // it against this list.
     consuming: [...peer.consumersByProducerId.keys()],
+    // The transports this session still has. One reaped while the socket
+    // was down (it never connected, or its ICE failed) was announced with
+    // an ms:error that reached nobody, and the client would go on sending
+    // on it requests no one answers.
+    transports: [
+      ...(peer.sendTransport ? ["send"] : []),
+      ...(peer.recvTransport ? ["recv"] : []),
+    ],
   });
   console.log(`[sfu] peer ${peer.peerId} resumed its session in room ${peer.roomCode}`);
 }
@@ -1138,6 +1163,16 @@ async function handleSetLayers(peer: PeerState, msg: MSSetLayers): Promise<void>
 async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
   if (!peer.recvTransport) {
     console.warn(`[sfu] consume: no recv transport for peer ${peer.peerId}`);
+    // Answered, so the client does not wait out its timeout. Its transport
+    // went without it hearing (reaped while its socket was down), and
+    // "no-transport" tells it to build a new one rather than take the
+    // stream for ended.
+    send(peer.ws, {
+      type: "ms:consume-failed",
+      requestId: msg.requestId,
+      producerId: msg.producerId,
+      reason: "no-transport",
+    } as MSConsumeFailed);
     return;
   }
 
@@ -1236,23 +1271,36 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
       return;
     }
 
-    consumer = await peer.recvTransport.consume({
-      producerId: msg.producerId,
-      rtpCapabilities: msg.rtpCapabilities,
-      // Created paused (finding 3): the recv transport's DTLS handshake is
-      // not guaranteed to be done yet, and RTP forwarded before it completes
-      // is discarded - including the producer's next keyframe, which for a
-      // screen share on static content can be tens of seconds away. The
-      // client asks for ms:resume-consumer once its side of consume()
-      // resolves; mediasoup requests a fresh keyframe on resume, so the
-      // first frame the decoder ever sees is always an IDR.
-      paused: true,
-      // A camera tile that needs less than the top starts on its level.
-      // Ignored by mediasoup for anything without levels.
-      ...(spatialLayerOf(msg.spatialLayer) !== undefined
-        ? { preferredLayers: { spatialLayer: spatialLayerOf(msg.spatialLayer)! } }
-        : {}),
-    });
+    try {
+      consumer = await peer.recvTransport.consume({
+        producerId: msg.producerId,
+        rtpCapabilities: msg.rtpCapabilities,
+        // Created paused (finding 3): the recv transport's DTLS handshake is
+        // not guaranteed to be done yet, and RTP forwarded before it completes
+        // is discarded - including the producer's next keyframe, which for a
+        // screen share on static content can be tens of seconds away. The
+        // client asks for ms:resume-consumer once its side of consume()
+        // resolves; mediasoup requests a fresh keyframe on resume, so the
+        // first frame the decoder ever sees is always an IDR.
+        paused: true,
+        // A camera tile that needs less than the top starts on its level.
+        // Ignored by mediasoup for anything without levels.
+        ...(spatialLayerOf(msg.spatialLayer) !== undefined
+          ? { preferredLayers: { spatialLayer: spatialLayerOf(msg.spatialLayer)! } }
+          : {}),
+      });
+    } catch (err) {
+      // The producer closed after canConsume, or the transport went with
+      // the session: answer this one request, as above, so the client does
+      // not wait out its timeout and take the silence for a dead socket.
+      console.warn(`[sfu] consume of ${msg.producerId} failed for peer ${peer.peerId}:`, err);
+      send(peer.ws, {
+        type: "ms:consume-failed",
+        requestId: msg.requestId,
+        producerId: msg.producerId,
+      } as MSConsumeFailed);
+      return;
+    }
   } finally {
     peer.consumersInFlight--;
   }
@@ -2118,6 +2166,9 @@ async function main(): Promise<void> {
             break;
           case "ms:diag":
             await handleDiag(peer, msg as MSDiag);
+            break;
+          case "ms:ping":
+            send(ws, { type: "ms:pong", requestId: (msg as MSPing).requestId } as MSPong);
             break;
           default:
             console.warn("[sfu] unknown message type:", (msg as any).type);

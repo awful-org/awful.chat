@@ -28,6 +28,27 @@ import {
 /** What a click on a tile for a share that no longer exists surfaces. */
 export const PRODUCER_GONE = "That stream has ended";
 
+/**
+ * The close code for a socket dropped because it stopped answering: the SFU
+ * holds the session for a resume on it, as for one the network cut. Mirrors
+ * UNANSWERED_CLOSE_CODE in sfu/heartbeat.ts.
+ */
+const UNANSWERED_CLOSE_CODE = 4000;
+
+const SFU_CLOSED = "SFU connection closed";
+const SFU_REBUILT = "SFU session rebuilt";
+
+/**
+ * Whether a request failed only because its session's socket went: the
+ * resume or the rebuild that follows brings back every stream still on
+ * (by its reconcile, or the join replay), so there is nothing to tell the
+ * user about this one.
+ */
+function lostWithSocket(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message === SFU_CLOSED || message === SFU_REBUILT || message.startsWith("SFU not connected");
+}
+
 /** Producer announcements held waiting for a device or a roster entry. */
 const MAX_QUEUED_PRODUCERS = 64;
 
@@ -122,6 +143,8 @@ interface MSConsumeFailed {
   type: "ms:consume-failed";
   requestId: string;
   producerId: string;
+  /** The stream is fine, but the SFU holds no recv transport for us. */
+  reason?: "no-transport";
 }
 interface MSNewProducer {
   type: "ms:new-producer";
@@ -149,6 +172,8 @@ interface AuthResumed {
   own: string[];
   /** The producers our session consumes, as the SFU holds them. */
   consuming?: string[];
+  /** The transports the SFU still holds for us. */
+  transports?: ("send" | "recv")[];
 }
 interface MSProducerClosed {
   type: "ms:producer-closed";
@@ -223,6 +248,14 @@ interface MSDiag {
   type: "ms:diag";
   requestId: string;
 } // client -> server
+interface MSPing {
+  type: "ms:ping";
+  requestId: string;
+} // client -> server: is this socket still answering?
+interface MSPong {
+  type: "ms:pong";
+  requestId: string;
+}
 interface MSDiagReply {
   type: "ms:diag";
   requestId: string;
@@ -265,7 +298,9 @@ type MSMessage =
   | MSError
   | MSDiag
   | MSDiagReply
-  | MSDiagUnavailable;
+  | MSDiagUnavailable
+  | MSPing
+  | MSPong;
 
 /**
  * Turns an SFU refusal into a sentence for the person in the call. It reaches
@@ -460,6 +495,20 @@ export class MediasoupVideo implements VideoTransport {
   // construction now - see scheduleRejoin and attemptRejoin.
   private rejoinTimer: ReturnType<typeof setTimeout> | null = null;
   private rejoinP: Promise<void> | null = null;
+  /** A rung waiting for the network to come back, and how to stop it. */
+  private rejoinOnline: (() => void) | null = null;
+
+  /**
+   * Frames received on the current socket, and the sockets that finished
+   * authenticating. A request that goes unanswered while NOTHING at all
+   * arrived on its socket means the socket is gone, though the browser
+   * still has it open: a phone that changed networks or slept keeps a
+   * socket like that for minutes, and every request on it hangs.
+   */
+  private sfuFrames = 0;
+  private authedSockets = new WeakSet<WebSocket>();
+  /** A liveness ping in flight (ensureLive), so returns do not stack them. */
+  private pinging = false;
 
   // How many OTHER peers the SFU room held at join time (finding 13's interim
   // split-brain guard; the real fix is serving the pool at runtime, which is
@@ -548,6 +597,7 @@ export class MediasoupVideo implements VideoTransport {
       clearTimeout(this.rejoinTimer);
       this.rejoinTimer = null;
     }
+    this.rejoinOnline?.();
     this.producers.clear();
     this.consumers.clear();
     this.inflightConsumes.clear();
@@ -856,12 +906,24 @@ export class MediasoupVideo implements VideoTransport {
       this.sfuWs = ws;
       let proofSent = false;
       let authenticated = false;
+      let opened = false;
       const authTimer = setTimeout(() => {
-        reject(new Error("Video server authentication timed out. Update the app and server together."));
+        // A socket that never opened is a server out of reach - a phone
+        // with no network yet, its connection attempt going nowhere - not
+        // a failed handshake. Told apart, a resume keeps its token and
+        // tries again, where "update the app" gave up on the session.
+        reject(
+          new Error(
+            opened
+              ? "Video server authentication timed out. Update the app and server together."
+              : SFU_UNREACHABLE
+          )
+        );
         ws.close();
       }, 10_000);
 
       ws.onopen = () => {
+        opened = true;
         rec(ev("sfu.ws.open"));
         // Wait for a fresh challenge; never send an unauthenticated legacy join.
       };
@@ -875,6 +937,7 @@ export class MediasoupVideo implements VideoTransport {
       ws.onmessage = (e: MessageEvent<string>) => {
         try {
           if (this.sfuWs !== ws) return;
+          this.sfuFrames++;
           const msg = JSON.parse(e.data);
           if (!authenticated) {
             if (msg.type === "auth:challenge" && !proofSent && this.joinSigner) {
@@ -886,11 +949,13 @@ export class MediasoupVideo implements VideoTransport {
               ws.send(JSON.stringify({ type: "join", roomCode: wireRoom, peerId, signature, capability: admission?.capability, resume }));
             } else if (msg.type === "auth:joined" && proofSent) {
               authenticated = true;
+              this.authedSockets.add(ws);
               clearTimeout(authTimer);
               this.resumeToken = typeof msg.resumeToken === "string" ? msg.resumeToken : null;
               resolve("joined");
             } else if (msg.type === "auth:resumed" && proofSent && resume) {
               authenticated = true;
+              this.authedSockets.add(ws);
               clearTimeout(authTimer);
               this.resumeToken = typeof msg.resumeToken === "string" ? msg.resumeToken : null;
               // Here, not after the await: the frames behind this one are
@@ -941,7 +1006,7 @@ export class MediasoupVideo implements VideoTransport {
             })
           );
           // Its own requests only: the fresh socket's share the map.
-          this.failPending(ws, new Error("SFU connection closed"));
+          this.failPending(ws, new Error(SFU_CLOSED));
           return;
         }
         rec(
@@ -954,27 +1019,79 @@ export class MediasoupVideo implements VideoTransport {
         // backs off on its own. Treating its close as a session lost too
         // restarted the ladder at once, every time: a busy loop for as long
         // as the network stayed down.
-        const wasJoined = authenticated && this.device !== null;
-
-        // Reject all pending requests when connection drops
-        this.failPending(null, new Error("SFU connection closed"));
-
-        // If we were joined, get the session back
-        if (wasJoined && this.currentRoomCode && this.currentPeerId) {
-          // The SFU holds a session that dropped like this for a while, so
-          // the first try is a resume, at once: nothing on screen changes if
-          // it works. Without a token there is nothing to resume, and it is
-          // the full rebuild after a pause, as before.
-          if (this.canResume()) {
-            this.scheduleRejoin(this.joinGeneration, 1, 0);
-          } else {
-            const err: Error = new Error("SFU connection closed unexpectedly");
-            this.emit("error", err);
-            this.scheduleRejoin(this.joinGeneration);
-          }
-        }
+        this.socketLost(authenticated);
       };
     });
+  }
+
+  /**
+   * The current socket is gone: fail what it owed, and get the session
+   * back if it was joined.
+   */
+  private socketLost(authenticated: boolean): void {
+    const wasJoined = authenticated && this.device !== null;
+
+    // Reject all pending requests when connection drops
+    this.failPending(null, new Error(SFU_CLOSED));
+
+    // If we were joined, get the session back
+    if (wasJoined && this.currentRoomCode && this.currentPeerId) {
+      // The SFU holds a session that dropped like this for a while, so
+      // the first try is a resume, at once: nothing on screen changes if
+      // it works. Without a token there is nothing to resume, and it is
+      // the full rebuild after a pause, as before.
+      if (this.canResume()) {
+        this.scheduleRejoin(this.joinGeneration, 1, 0);
+      } else {
+        const err: Error = new Error("SFU connection closed unexpectedly");
+        this.emit("error", err);
+        this.scheduleRejoin(this.joinGeneration);
+      }
+    }
+  }
+
+  /**
+   * A request went unanswered and nothing else arrived on its socket
+   * meanwhile: the socket is gone, though the browser has not noticed and
+   * may not for minutes. Drop it and resume on a new one now, the way a
+   * close would have. The close code tells the SFU, if the frame gets
+   * there at all, to hold the session for that resume.
+   */
+  private dropUnansweredSocket(ws: WebSocket): void {
+    if (this.sfuWs !== ws) return;
+    rec(ev("sfu.ws.close", { d: { code: UNANSWERED_CLOSE_CODE, reason: "unanswered" } }));
+    const authenticated = this.authedSockets.has(ws);
+    // Its close event, whenever it comes, is a superseded socket's.
+    this.sfuWs = null;
+    try {
+      ws.close(UNANSWERED_CLOSE_CODE, "unanswered");
+    } catch {
+      // Already closing: the close event lands on the stale path all the same.
+    }
+    this.socketLost(authenticated);
+  }
+
+  /**
+   * Run a rung of the ladder, or, while the device is offline, as soon as
+   * it is back: a try made with no network fails at once, and the SFU only
+   * holds the session a short while, so the try that counts is the first
+   * one after the network returns.
+   */
+  private whenOnline(run: () => void): void {
+    if (typeof navigator === "undefined" || navigator.onLine !== false || typeof window === "undefined") {
+      run();
+      return;
+    }
+    const online = () => {
+      this.rejoinOnline = null;
+      window.removeEventListener("online", online);
+      run();
+    };
+    window.addEventListener("online", online);
+    this.rejoinOnline = () => {
+      this.rejoinOnline = null;
+      window.removeEventListener("online", online);
+    };
   }
 
   /**
@@ -1009,22 +1126,27 @@ export class MediasoupVideo implements VideoTransport {
       rec(ev("sfu.rejoin", { d: { attempt, delayMs: delay } }));
     }
     if (this.rejoinTimer) clearTimeout(this.rejoinTimer);
+    this.rejoinOnline?.();
     this.rejoinTimer = setTimeout(() => {
       this.rejoinTimer = null;
-      this.attemptRejoin(expectedGeneration).catch((err) => {
-        console.warn(`[MediasoupVideo] rejoin attempt ${attempt} failed:`, err);
-        // No attempt cap: the banner promises "retrying in the background",
-        // and a 5-rung ladder that quit after a minute made that a lie for
-        // any outage longer than one - video stayed dead for the rest of
-        // the call. Every 30s forever costs nothing; leaving the call ends
-        // the ladder because attemptRejoin then resolves as a no-op.
-        // join() bumps joinGeneration even when it fails, so chaining the
-        // ORIGINAL generation made every later rung bail silently. Re-read
-        // it; a manual rejoin still cancels the ladder because its open
-        // socket makes attemptRejoin a no-op.
-        this.scheduleRejoin(this.joinGeneration, attempt + 1);
-      });
+      this.whenOnline(() => this.runRejoinRung(expectedGeneration, attempt));
     }, delay);
+  }
+
+  private runRejoinRung(expectedGeneration: number, attempt: number): void {
+    this.attemptRejoin(expectedGeneration).catch((err) => {
+      console.warn(`[MediasoupVideo] rejoin attempt ${attempt} failed:`, err);
+      // No attempt cap: the banner promises "retrying in the background",
+      // and a 5-rung ladder that quit after a minute made that a lie for
+      // any outage longer than one - video stayed dead for the rest of
+      // the call. Every 30s forever costs nothing; leaving the call ends
+      // the ladder because attemptRejoin then resolves as a no-op.
+      // join() bumps joinGeneration even when it fails, so chaining the
+      // ORIGINAL generation made every later rung bail silently. Re-read
+      // it; a manual rejoin still cancels the ladder because its open
+      // socket makes attemptRejoin a no-op.
+      this.scheduleRejoin(this.joinGeneration, attempt + 1);
+    });
   }
 
   /**
@@ -1058,10 +1180,26 @@ export class MediasoupVideo implements VideoTransport {
    */
   ensureLive(): void {
     if (!this.currentRoomCode || !this.currentPeerId) return;
-    if (this.sessionIsLive()) return;
+    if (this.sessionIsLive()) {
+      // An open socket is not a live one: back from the background, or on
+      // a network that changed underneath, it may have been gone for a
+      // while. An unanswered ping drops it (see request).
+      this.pingSocket();
+      return;
+    }
     this.attemptRejoin(this.joinGeneration).catch(() => {
       this.scheduleRejoin(this.joinGeneration, 2);
     });
+  }
+
+  private pingSocket(): void {
+    if (this.pinging) return;
+    this.pinging = true;
+    this.request<MSPong>({ type: "ms:ping", requestId: this.nextRequestId() }, "ms:pong")
+      .catch(() => {})
+      .finally(() => {
+        this.pinging = false;
+      });
   }
 
   /**
@@ -1161,7 +1299,7 @@ export class MediasoupVideo implements VideoTransport {
     // join() assigns a fresh socket, so close this one rather than orphaning
     // it - and a half-open socket is exactly what we may be recovering from.
     // What it still owed fails now, not ten seconds into the new session.
-    this.failPending(this.sfuWs, new Error("SFU session rebuilt"));
+    this.failPending(this.sfuWs, new Error(SFU_REBUILT));
     this.sfuWs?.close();
     this.sfuWs = null;
     this.resumeToken = null;
@@ -1183,6 +1321,11 @@ export class MediasoupVideo implements VideoTransport {
     if (!this.resumeToken || !this.device || this.refusal) return false;
     if (this.sfuWs?.readyState === WebSocket.OPEN) return false;
     return !this.transportGone();
+  }
+
+  /** Whether a transport is connected, so some media is still getting through. */
+  private mediaFlowing(): boolean {
+    return [this.sendTransport, this.recvTransport].some((t) => t?.connectionState === "connected");
   }
 
   /** Whether either transport has failed or closed: its media is gone. */
@@ -1212,7 +1355,13 @@ export class MediasoupVideo implements VideoTransport {
       // (refused, timed out after connecting) will not get better by
       // resuming, so the next rung rebuilds.
       if (message !== SFU_UNREACHABLE) this.resumeToken = null;
-      this.emit("error", err instanceof Error ? err : new Error(message));
+      // Media has its own path and often runs on while the socket is down:
+      // a phone changing networks drops the socket for a moment and nothing
+      // on screen stops. "Unreachable" then only alarms; it is said once
+      // the streams are gone too, or for any other failure.
+      if (message !== SFU_UNREACHABLE || !this.mediaFlowing()) {
+        this.emit("error", err instanceof Error ? err : new Error(message));
+      }
       throw err;
     }
     if (how === "resumed") {
@@ -1232,7 +1381,7 @@ export class MediasoupVideo implements VideoTransport {
     rec(ev("sfu.rejoin", { d: { attempt: 0, delayMs: 0, after: "resume-expired" } }));
     const ws = this.sfuWs;
     this.sfuWs = null;
-    this.failPending(ws, new Error("SFU session rebuilt"));
+    this.failPending(ws, new Error(SFU_REBUILT));
     ws?.close();
     return false;
   }
@@ -1292,6 +1441,15 @@ export class MediasoupVideo implements VideoTransport {
     ]);
     for (const peerId of peers) {
       if (!room.has(peerId)) this.handleSignal({ type: "ms:peer-left", peerId });
+    }
+
+    // A transport the SFU reaped while the socket was down: its ms:error
+    // went nowhere, and everything asked on it would go unanswered. Built
+    // again before the announcements below, so their consumes use the new
+    // one. An older SFU says nothing here, and nothing changes.
+    if (state.transports) {
+      if (this.sendTransport && !state.transports.includes("send")) this.rebuildSendTransport();
+      if (this.recvTransport && !state.transports.includes("recv")) this.rebuildRecvTransport();
     }
 
     this.queuedProducers = this.queuedProducers.filter((q) => live.has(q.producerId));
@@ -1435,6 +1593,7 @@ export class MediasoupVideo implements VideoTransport {
     this.consumerStats.clear();
     for (const { peerId, producerId, source } of toRestore) {
       this.consumeProducer(peerId, producerId, source).catch((err) => {
+        if (lostWithSocket(err)) return;
         this.emit(
           "error",
           err instanceof Error ? err : new Error(String(err))
@@ -1621,7 +1780,7 @@ export class MediasoupVideo implements VideoTransport {
 
     // The session can be rebuilt while this waited: a transport for the old
     // one would sit on the new session's slot pointing at nothing.
-    if (this.sfuWs !== ws || !this.device) throw new Error("SFU session rebuilt");
+    if (this.sfuWs !== ws || !this.device) throw new Error(SFU_REBUILT);
     this.sendTransport = this.device.createSendTransport({
       ...(msg.options as mediasoupClient.types.TransportOptions),
       // The server never gathers relay candidates of its own (it is
@@ -1716,7 +1875,7 @@ export class MediasoupVideo implements VideoTransport {
 
     // The session can be rebuilt while this waited: a transport for the old
     // one would sit on the new session's slot pointing at nothing.
-    if (this.sfuWs !== ws || !this.device) throw new Error("SFU session rebuilt");
+    if (this.sfuWs !== ws || !this.device) throw new Error(SFU_REBUILT);
     this.recvTransport = this.device.createRecvTransport({
       ...(msg.options as mediasoupClient.types.TransportOptions),
       // See createSendTransport - the recv leg needs the same relay path
@@ -2067,7 +2226,8 @@ export class MediasoupVideo implements VideoTransport {
   private async consumeProducerInner(
     peerId: string,
     producerId: string,
-    source: VideoSource
+    source: VideoSource,
+    retry = true
   ): Promise<void> {
     if (!this.device) return;
     const generation = this.joinGeneration;
@@ -2088,6 +2248,7 @@ export class MediasoupVideo implements VideoTransport {
     }
     await this.ensureRecvTransport();
     if (!this.recvTransport) return;
+    const transport = this.recvTransport;
 
     // A camera starts on the level its tile calls for, rather than at the
     // top and stepping down a moment later. The SFU makes a new consumer
@@ -2106,6 +2267,13 @@ export class MediasoupVideo implements VideoTransport {
     );
     if (layer !== undefined) this.cameraLayersSent.set(producerId, layer);
     if (response.type !== "ms:consumer-options") {
+      // The SFU has no recv transport for us: it went while our socket was
+      // down, without our hearing. Build a new one and ask again, once;
+      // the stream itself is fine.
+      if (response.reason === "no-transport" && retry) {
+        if (this.recvTransport === transport) this.rebuildRecvTransport();
+        return this.consumeProducerInner(peerId, producerId, source, false);
+      }
       throw new Error(PRODUCER_GONE);
     }
 
@@ -2243,6 +2411,7 @@ export class MediasoupVideo implements VideoTransport {
             d: { err: errText(err), attempt: 2, producer: producerId },
           })
         );
+        if (lostWithSocket(err)) return;
         this.emit(
           "error",
           err instanceof Error ? err : new Error(String(err))
@@ -2459,9 +2628,18 @@ export class MediasoupVideo implements VideoTransport {
         return;
       }
 
+      const framesAtSend = this.sfuFrames;
       const timeoutId = setTimeout(() => {
         if (requestId) this.pendingById.delete(requestId);
-        reject(new Error(`mediasoup request timeout: ${responseType}`));
+        // Nothing at all came in on this socket since: it is the socket that
+        // is gone, not this one answer. This request goes with the others
+        // it owed, and the session is resumed on a new socket.
+        if (this.sfuWs === ws && this.sfuFrames === framesAtSend) {
+          reject(new Error(SFU_CLOSED));
+          this.dropUnansweredSocket(ws);
+          return;
+        }
+        reject(new Error(`The video server did not answer (${responseType})`));
       }, 10_000);
 
       if (requestId) {
@@ -2581,6 +2759,7 @@ export class MediasoupVideo implements VideoTransport {
       else this.consumers.delete(peerId);
     }
     this.consumeProducer(peerId, producerId, c.source).catch((err) => {
+      if (lostWithSocket(err)) return;
       this.emit("error", err instanceof Error ? err : new Error(String(err)));
     });
   }

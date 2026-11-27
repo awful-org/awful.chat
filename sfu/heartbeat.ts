@@ -80,6 +80,9 @@ export function describeClose(code: number, endedBy: EndedBy | undefined, second
       return `cut by the SFU: the same client resumed its session on a new socket (${after})`;
   }
   if (code === 1000 || code === 1001) return `closed by the client (code ${code}, ${after})`;
+  if (code === UNANSWERED_CLOSE_CODE) {
+    return `closed by the client: the socket stopped answering it, so it resumes on a new one (code ${code}, ${after})`;
+  }
   if (code === 1006) {
     return `dropped without a close frame - the network or a proxy in between (code 1006, ${after})`;
   }
@@ -90,12 +93,21 @@ export function describeClose(code: number, endedBy: EndedBy | undefined, second
  * Whether a joined session whose socket just closed is held for a resume
  * rather than ended. Only a socket that went without a close frame: the
  * network or a proxy dropping it (1006), or the SFU cutting one that stopped
- * answering. Its media usually runs on regardless - it has its own UDP path -
+ * answering; or one its client gave up on because it stopped answering
+ * (UNANSWERED_CLOSE_CODE). Its media usually runs on regardless - it has its own UDP path -
  * and the client comes back on a new socket within seconds. A client that
  * closes its socket (leaving, closing the tab) sends a close frame and leaves
  * at once, so a departure never lingers on anyone's screen.
  */
 export function holdsForResume(code: number, endedBy: EndedBy | undefined): boolean {
   if (endedBy === "heartbeat" || endedBy === "backpressure") return true;
-  return endedBy === undefined && code === 1006;
+  return endedBy === undefined && (code === 1006 || code === UNANSWERED_CLOSE_CODE);
 }
+
+/**
+ * The code a client closes with when the socket stopped answering it: it
+ * drops the socket to resume on a new one, and its close frame, if it gets
+ * here at all, must not read as leaving. Mirrored in the frontend's
+ * mediasoup.ts.
+ */
+export const UNANSWERED_CLOSE_CODE = 4000;

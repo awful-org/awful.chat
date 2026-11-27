@@ -17,7 +17,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import bs58 from "bs58";
 import { joinPayload, verifyJoin } from "./auth";
 import { envInteger } from "./config";
-import { describeClose, holdsForResume, sweepHeartbeatConnection, type HeartbeatSocket } from "./heartbeat";
+import { describeClose, holdsForResume, sweepHeartbeatConnection, UNANSWERED_CLOSE_CODE, type HeartbeatSocket } from "./heartbeat";
 
 // The SFU's port for this file, chosen in test.before by freePort().
 let PORT = 0;
@@ -576,6 +576,8 @@ test("a session whose socket dropped resumes on a new socket with its media inta
       assert.equal(back.reply.type, "auth:resumed");
       // The session it left: its own producer is still there...
       assert.deepEqual(back.reply.own, [producerId]);
+      // ...on the one transport it had, which the client keeps using.
+      assert.deepEqual(back.reply.transports, ["send"]);
       // ...and the room as it is now.
       assert.deepEqual(back.reply.peers, [testPeer("resume-b").peerId]);
       assert.deepEqual(back.reply.producers, []);
@@ -678,6 +680,45 @@ test("a client that closes its socket leaves at once, with nothing to resume", a
   }
 });
 
+test("a socket its client gave up on as unanswered is held for the resume", async () => {
+  const a = await joinWith("resume-unanswered", "unanswered-a");
+  const b = await joinWith("resume-unanswered", "unanswered-b");
+  const seenByB = record(b.ws);
+  try {
+    // The close frame got through: the socket was fine, only slow.
+    a.ws.close(UNANSWERED_CLOSE_CODE, "unanswered");
+    await closed(a.ws);
+    const back = await joinWith("resume-unanswered", "unanswered-a", a.reply.resumeToken);
+    try {
+      assert.equal(back.reply.type, "auth:resumed");
+      await settle(b.ws);
+      assert.equal(seenByB.some((m) => m.type === "ms:peer-left"), false);
+    } finally {
+      back.ws.close();
+    }
+  } finally {
+    b.ws.close();
+  }
+});
+
+test("ms:ping is answered, and a consume with no recv transport says so", async () => {
+  const a = await joinWith("ping-room", "ping-a");
+  try {
+    a.ws.send(JSON.stringify({ type: "ms:ping", requestId: "p1" }));
+    const pong = await nextMessage(a.ws, (m) => m.type === "ms:pong");
+    assert.equal(pong.requestId, "p1");
+
+    // Answered rather than left to the client's timeout, which it would
+    // take for a dead socket.
+    a.ws.send(JSON.stringify({ type: "ms:consume", requestId: "c1", producerId: "nope", rtpCapabilities: {} }));
+    const failed = await nextMessage(a.ws, (m) => m.type === "ms:consume-failed");
+    assert.equal(failed.requestId, "c1");
+    assert.equal(failed.reason, "no-transport");
+  } finally {
+    a.ws.close();
+  }
+});
+
 test("a wrong resume token is an ordinary join", async () => {
   const a = await joinWith("resume-wrong", "wrong-a");
   try {
@@ -707,6 +748,9 @@ test("holdsForResume: only a socket that went without a close frame is held", ()
   assert.equal(holdsForResume(1006, "replaced"), false);
   assert.equal(holdsForResume(1006, "resumed"), false);
   assert.equal(holdsForResume(1006, "join-timeout"), false);
+  // The client dropping a socket that stopped answering it, to resume.
+  assert.equal(holdsForResume(UNANSWERED_CLOSE_CODE, undefined), true);
+  assert.equal(holdsForResume(UNANSWERED_CLOSE_CODE, "replaced"), false);
 });
 
 test("sweepHeartbeatConnection: a socket stuck backpressured past the deadline is terminated", () => {
@@ -1058,7 +1102,8 @@ test("describeClose: names the SFU's own cuts, and a drop the SFU did not make",
   assert.match(describeClose(1006, "replaced", 5), /joined again/);
   assert.match(describeClose(1006, undefined, 44), /without a close frame - the network or a proxy/);
   assert.match(describeClose(1001, undefined, 3), /closed by the client \(code 1001/);
-  assert.match(describeClose(4000, undefined, 3), /^closed \(code 4000/);
+  assert.match(describeClose(4001, undefined, 3), /^closed \(code 4001/);
+  assert.match(describeClose(UNANSWERED_CLOSE_CODE, undefined, 3), /socket stopped answering it.*code 4000/);
 });
 
 test("sweepHeartbeatConnection: says why it terminated", () => {
