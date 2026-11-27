@@ -455,9 +455,21 @@ describe("a share that ended while we were away cannot leave a dead tile", () =>
     await flush();
     expect(rebuild).toHaveBeenCalledTimes(1);
     expect(sent.filter((m) => m.type === "ms:consume")).toHaveLength(2);
-    // Twice in a row is not a transport we can fix by building one.
+    // The retry is still the one consume of p1 in flight: a second ask
+    // for it shares the retry rather than sending a duplicate.
+    const again = (internals.consumeProducer as (p: string, id: string, s: string) => Promise<void>).call(
+      video,
+      "bob",
+      "p1",
+      "camera"
+    );
+    await flush();
+    expect(sent.filter((m) => m.type === "ms:consume")).toHaveLength(2);
+    // Twice in a row is not a transport we can fix by building one, and
+    // not the stream ending either.
     fail(sent[1].requestId);
-    await expect(consuming).rejects.toThrow(PRODUCER_GONE);
+    await expect(consuming).rejects.toThrow("no receive transport");
+    await expect(again).rejects.toThrow("no receive transport");
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
@@ -1666,7 +1678,7 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
   });
 
   /** A joined session on an open socket, with the ladder stubbed out. */
-  async function joined() {
+  async function joined(answersPing = true) {
     const video = new MediasoupVideo();
     const internals = internalsOf(video);
     video.setJoinSigner(() => "sig");
@@ -1676,7 +1688,7 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
     const ws = FakeWs.made.at(-1)!;
     ws.open();
     ws.receive({ type: "auth:challenge", nonce: "n1" });
-    ws.receive({ type: "auth:joined", resumeToken: "tok-1" });
+    ws.receive({ type: "auth:joined", resumeToken: "tok-1", ...(answersPing ? { answersPing: true } : {}) });
     await connected;
     internals.device = { recvRtpCapabilities: {} };
     const schedule = vi.fn();
@@ -1812,10 +1824,13 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
       const attempt = vi.fn(async () => {});
       internals.attemptRejoin = attempt;
       (internals.scheduleRejoin as (g: number, a: number, d: number) => void).call(video, internals.joinGeneration as number, 1, 0);
-      vi.advanceTimersByTime(60_000);
+      vi.advanceTimersByTime(29_000);
       expect(attempt).not.toHaveBeenCalled();
       nav.onLine = true;
       target.dispatchEvent(new Event("online"));
+      expect(attempt).toHaveBeenCalledTimes(1);
+      // The cap it would have fallen back to does not run it a second time.
+      vi.advanceTimersByTime(30_000);
       expect(attempt).toHaveBeenCalledTimes(1);
       // Leaving while it waits ends the wait.
       nav.onLine = false;
@@ -1823,10 +1838,63 @@ describe("a dropped signalling socket resumes the session instead of rebuilding 
       vi.advanceTimersByTime(0);
       video.leave();
       target.dispatchEvent(new Event("online"));
+      vi.advanceTimersByTime(30_000);
       expect(attempt).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("a browser that says offline while the SFU is there still tries, at the ladder's longest wait", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("navigator", { onLine: false });
+    vi.stubGlobal("window", new EventTarget());
+    try {
+      const video = new MediasoupVideo();
+      const internals = internalsOf(video);
+      internals.currentRoomCode = "room";
+      internals.currentPeerId = "me";
+      const attempt = vi.fn(async () => {});
+      internals.attemptRejoin = attempt;
+      (internals.scheduleRejoin as (g: number, a: number, d: number) => void).call(video, internals.joinGeneration as number, 1, 0);
+      vi.advanceTimersByTime(29_999);
+      expect(attempt).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(attempt).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // An older SFU answers no ms:ping and ends a session closed with 4000:
+  // silence from it says nothing about the socket.
+  it("an SFU that does not say it answers pings is not pinged, nor its socket dropped", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = await joined(false);
+      s.video.ensureLive();
+      expect(s.ws.sent.filter((m) => m.type === "ms:ping")).toHaveLength(0);
+      const asked = s.request({ type: "ms:diag", requestId: "r-d" }, "ms:diag");
+      vi.advanceTimersByTime(10_000);
+      await expect(asked).rejects.toThrow("The video server did not answer (ms:diag)");
+      expect(s.internals.sfuWs).toBe(s.ws);
+      expect(s.schedule).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a resume's socket, open but not yet joined, is not pinged", async () => {
+    const s = dropped();
+    const done = s.rejoin();
+    const ws = FakeWs.made.at(-1)!;
+    ws.open();
+    // Transports still connected and the device kept: the session reads live.
+    s.video.ensureLive();
+    expect(ws.sent.filter((m) => m.type === "ms:ping")).toHaveLength(0);
+    ws.receive({ type: "auth:challenge", nonce: "n1" });
+    ws.receive({ type: "auth:resumed", resumeToken: "tok-2", answersPing: true, peers: ["bob"], producers: [], own: ["p-mine"] });
+    await done;
   });
 });
 

@@ -704,6 +704,8 @@ test("a socket its client gave up on as unanswered is held for the resume", asyn
 test("ms:ping is answered, and a consume with no recv transport says so", async () => {
   const a = await joinWith("ping-room", "ping-a");
   try {
+    // Said up front, so a client only takes silence for a dead socket here.
+    assert.equal(a.reply.answersPing, true);
     a.ws.send(JSON.stringify({ type: "ms:ping", requestId: "p1" }));
     const pong = await nextMessage(a.ws, (m) => m.type === "ms:pong");
     assert.equal(pong.requestId, "p1");

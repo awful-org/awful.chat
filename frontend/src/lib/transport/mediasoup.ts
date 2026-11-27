@@ -36,6 +36,8 @@ export const PRODUCER_GONE = "That stream has ended";
 const UNANSWERED_CLOSE_CODE = 4000;
 
 const SFU_CLOSED = "SFU connection closed";
+/** The ladder's longest wait between tries. */
+const REJOIN_MAX_DELAY_MS = 30_000;
 const SFU_REBUILT = "SFU session rebuilt";
 
 /**
@@ -507,6 +509,12 @@ export class MediasoupVideo implements VideoTransport {
    */
   private sfuFrames = 0;
   private authedSockets = new WeakSet<WebSocket>();
+  /**
+   * Whether the SFU answers ms:ping and holds a session closed as
+   * unanswered. An older one does neither: a ping there goes unanswered on
+   * a perfectly good socket, and dropping it would end the session.
+   */
+  private sfuAnswersPing = false;
   /** A liveness ping in flight (ensureLive), so returns do not stack them. */
   private pinging = false;
 
@@ -950,12 +958,14 @@ export class MediasoupVideo implements VideoTransport {
             } else if (msg.type === "auth:joined" && proofSent) {
               authenticated = true;
               this.authedSockets.add(ws);
+              this.sfuAnswersPing = msg.answersPing === true;
               clearTimeout(authTimer);
               this.resumeToken = typeof msg.resumeToken === "string" ? msg.resumeToken : null;
               resolve("joined");
             } else if (msg.type === "auth:resumed" && proofSent && resume) {
               authenticated = true;
               this.authedSockets.add(ws);
+              this.sfuAnswersPing = msg.answersPing === true;
               clearTimeout(authTimer);
               this.resumeToken = typeof msg.resumeToken === "string" ? msg.resumeToken : null;
               // Here, not after the await: the frames behind this one are
@@ -1082,15 +1092,19 @@ export class MediasoupVideo implements VideoTransport {
       run();
       return;
     }
-    const online = () => {
-      this.rejoinOnline = null;
-      window.removeEventListener("online", online);
+    // Not forever: a browser can say offline while the SFU is reachable (a
+    // VPN or a LAN with no default route), and the ladder's longest wait
+    // still tries then.
+    const go = () => {
+      this.rejoinOnline?.();
       run();
     };
-    window.addEventListener("online", online);
+    window.addEventListener("online", go);
+    const cap = setTimeout(go, REJOIN_MAX_DELAY_MS);
     this.rejoinOnline = () => {
       this.rejoinOnline = null;
-      window.removeEventListener("online", online);
+      window.removeEventListener("online", go);
+      clearTimeout(cap);
     };
   }
 
@@ -1103,7 +1117,7 @@ export class MediasoupVideo implements VideoTransport {
   private scheduleRejoin(
     expectedGeneration: number,
     attempt = 1,
-    delay = Math.min(2000 * 2 ** (attempt - 1), 30_000)
+    delay = Math.min(2000 * 2 ** (attempt - 1), REJOIN_MAX_DELAY_MS)
   ): void {
     // ONE ladder, not one per failure. Four call sites schedule a rejoin (the
     // socket closing, either transport going failed/closed, ensureLive) and
@@ -1183,8 +1197,12 @@ export class MediasoupVideo implements VideoTransport {
     if (this.sessionIsLive()) {
       // An open socket is not a live one: back from the background, or on
       // a network that changed underneath, it may have been gone for a
-      // while. An unanswered ping drops it (see request).
-      this.pingSocket();
+      // while. An unanswered ping drops it (see request). Only a socket
+      // that has finished joining: a resume's socket, open but before its
+      // join, would be refused for a ping sent ahead of the join - and the
+      // resume lost with it.
+      const ws = this.sfuWs;
+      if (ws && this.authedSockets.has(ws) && this.sfuAnswersPing && !this.rejoinP) this.pingSocket();
       return;
     }
     this.attemptRejoin(this.joinGeneration).catch(() => {
@@ -2270,8 +2288,14 @@ export class MediasoupVideo implements VideoTransport {
       // The SFU has no recv transport for us: it went while our socket was
       // down, without our hearing. Build a new one and ask again, once;
       // the stream itself is fine.
-      if (response.reason === "no-transport" && retry) {
-        if (this.recvTransport === transport) this.rebuildRecvTransport();
+      if (response.reason === "no-transport") {
+        if (!retry) throw new Error("The video server has no receive transport for this call");
+        // The rebuild forgets every consume in flight, this one too: put it
+        // back, or another consume of this producer would go out beside the
+        // retry and the duplicate would break the recv side for good.
+        const mine = this.inflightConsumes.get(producerId);
+        if (this.recvTransport === transport) this.recoverRecvTransport();
+        if (mine && !this.inflightConsumes.has(producerId)) this.inflightConsumes.set(producerId, mine);
         return this.consumeProducerInner(peerId, producerId, source, false);
       }
       throw new Error(PRODUCER_GONE);
@@ -2634,7 +2658,7 @@ export class MediasoupVideo implements VideoTransport {
         // Nothing at all came in on this socket since: it is the socket that
         // is gone, not this one answer. This request goes with the others
         // it owed, and the session is resumed on a new socket.
-        if (this.sfuWs === ws && this.sfuFrames === framesAtSend) {
+        if (this.sfuWs === ws && this.sfuFrames === framesAtSend && this.sfuAnswersPing && this.authedSockets.has(ws)) {
           reject(new Error(SFU_CLOSED));
           this.dropUnansweredSocket(ws);
           return;

@@ -579,6 +579,7 @@ function resumeSession(
   send(ws, {
     type: "auth:resumed",
     resumeToken: peer.resumeToken,
+    answersPing: true,
     peers: [...room.keys()].filter((id) => id !== peer.peerId),
     producers: roomProducers(room, peer.peerId),
     own: [...peer.producers.keys()],
@@ -1294,10 +1295,14 @@ async function handleConsume(peer: PeerState, msg: MSConsume): Promise<void> {
       // the session: answer this one request, as above, so the client does
       // not wait out its timeout and take the silence for a dead socket.
       console.warn(`[sfu] consume of ${msg.producerId} failed for peer ${peer.peerId}:`, err);
+      // The transport going is not the stream ending: the client builds a
+      // new one and asks again, rather than taking the tile down.
+      const transportGone = !peer.recvTransport || peer.recvTransport.closed;
       send(peer.ws, {
         type: "ms:consume-failed",
         requestId: msg.requestId,
         producerId: msg.producerId,
+        ...(transportGone ? { reason: "no-transport" } : {}),
       } as MSConsumeFailed);
       return;
     }
@@ -2109,7 +2114,11 @@ async function main(): Promise<void> {
           oldPeer.ws.terminate();
         }
         room.set(peer.peerId, peer);
-        send(ws, { type: "auth:joined", resumeToken: peer.resumeToken });
+        // `answersPing`: this SFU answers ms:ping and holds a session its
+        // client closed as unanswered (UNANSWERED_CLOSE_CODE). A client
+        // only takes silence for a dead socket from one that says so: an
+        // older SFU answers no ping and ends a session closed that way.
+        send(ws, { type: "auth:joined", resumeToken: peer.resumeToken, answersPing: true });
 
         // Send existing producers to the newly joined peer so it can consume them
         for (const { peerId: existingPeerId, producerId, source } of roomProducers(room, peer.peerId)) {
