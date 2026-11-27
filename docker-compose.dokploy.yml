@@ -143,19 +143,19 @@ services:
       # everybody else out. A WebSocket is in flight for its whole life, so
       # inFlightReq is a per-client connection cap; ipstrategy.depth=0 keys it
       # on the connecting address (inFlightReq would otherwise key on the
-      # Host header, one bucket for everybody), and ipv6subnet on its /64, so
-      # one IPv6 allocation is one client. The rate limit bounds new
+      # Host header, one bucket for everybody). An IPv6 client is keyed by its
+      # full address: Traefik 3.2+ can key it by its /64 instead, but older
+      # Traefik refuses that option and would drop this router - see
+      # deploy/README.md before adding it. The rate limit bounds new
       # connections; its burst matches the connection cap, so a NAT holding
       # all 64 can reconnect at once after a relay restart. Both assume Traefik is the edge: behind a CDN every user
       # shares the CDN's addresses - set the depth to the CDN's hop count.
       - traefik.http.middlewares.${STACK:-awful}-relay-conns.inflightreq.amount=${RELAY_CONNS_PER_IP:-64}
       - traefik.http.middlewares.${STACK:-awful}-relay-conns.inflightreq.sourcecriterion.ipstrategy.depth=0
-      - traefik.http.middlewares.${STACK:-awful}-relay-conns.inflightreq.sourcecriterion.ipstrategy.ipv6subnet=64
       - traefik.http.middlewares.${STACK:-awful}-relay-dials.ratelimit.average=${RELAY_DIALS_PER_MINUTE:-60}
       - traefik.http.middlewares.${STACK:-awful}-relay-dials.ratelimit.period=1m
       - traefik.http.middlewares.${STACK:-awful}-relay-dials.ratelimit.burst=${RELAY_DIALS_BURST:-64}
       - traefik.http.middlewares.${STACK:-awful}-relay-dials.ratelimit.sourcecriterion.ipstrategy.depth=0
-      - traefik.http.middlewares.${STACK:-awful}-relay-dials.ratelimit.sourcecriterion.ipstrategy.ipv6subnet=64
       - traefik.http.routers.${STACK:-awful}-og.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/og`)
       - traefik.http.routers.${STACK:-awful}-og.entrypoints=websecure
       - traefik.http.routers.${STACK:-awful}-og.middlewares=${STACK:-awful}-relay-sec
