@@ -10,6 +10,7 @@
  * get to have it.
  */
 import { MessageType, type Message } from "$lib/types/message";
+import { showsAsImage } from "$lib/safe-mime";
 
 export interface RoomContextImage {
   infoHash: string;
@@ -79,7 +80,7 @@ export function buildRoomContext(
     const images: RoomContextImage[] = [];
     for (const file of msg.meta?.files ?? []) {
       if (imageBudget <= 0) break;
-      if (!file.mimeType?.startsWith("image/")) continue;
+      if (!showsAsImage(file.mimeType)) continue;
       imageBudget -= 1;
       images.push({
         infoHash: file.infoHash,

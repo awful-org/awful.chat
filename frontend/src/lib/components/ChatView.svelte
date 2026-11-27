@@ -196,6 +196,7 @@
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
   import { formatSize, seededRandom } from "$lib/utils";
+  import { showsAsImage } from "$lib/safe-mime";
   import { QUOTE_SHOWN_CHARS, getQuotableText } from "$lib/quote-helper";
   import InvitationDialog from "./InvitationDialog.svelte";
   import ArchivedHistory from "./ArchivedHistory.svelte";
@@ -1532,7 +1533,7 @@
   function pinnedImages(msg: Message): { key: string; url: string | null; alt: string; gif: boolean }[] {
     if (msg.type === MessageType.File) {
       return (msg.meta?.files ?? [])
-        .filter((f) => f.mimeType?.startsWith("image/"))
+        .filter((f) => showsAsImage(f.mimeType))
         .slice(0, 4)
         .map((f) => ({
           key: f.infoHash,
@@ -1550,7 +1551,7 @@
     if (msg.type === MessageType.File) {
       const caption = stripMarkdown(msg.content ?? "", resolveMentionDisplayName);
       const others = (msg.meta?.files ?? [])
-        .filter((f) => !f.mimeType?.startsWith("image/"))
+        .filter((f) => !showsAsImage(f.mimeType))
         .map((f) => f.filename);
       return [caption, ...others].filter(Boolean).join(" · ");
     }

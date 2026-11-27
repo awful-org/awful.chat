@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canOpenAsPage, safeBlobType } from "./safe-mime";
+import { canOpenAsPage, safeBlobType, showsAsImage } from "./safe-mime";
 
 describe("safeBlobType", () => {
   it("keeps images, audio, video, PDF and plain text", () => {
@@ -16,9 +16,29 @@ describe("safeBlobType", () => {
     }
   });
 
-  it("keeps SVG displayable in an <img> but never openable as a page", () => {
-    expect(safeBlobType("image/svg+xml")).toBe("image/svg+xml");
+  it("never types a blob as SVG: the browser's own image actions open it as a page", () => {
+    expect(safeBlobType("image/svg+xml")).toBe("application/octet-stream");
+    expect(safeBlobType("Image/SVG+XML; charset=utf-8")).toBe("application/octet-stream");
     expect(canOpenAsPage("image/svg+xml")).toBe(false);
+  });
+
+  it("returns no type a browser renders as a document that can hold script", () => {
+    const claims = ["image/svg+xml", "text/html", "application/xhtml+xml", "text/xml", "application/xml",
+      "image/svg", "application/rdf+xml", "text/xsl", "application/mathml+xml", "message/rfc822"];
+    for (const claim of claims) {
+      expect(safeBlobType(claim)).not.toMatch(/html|xml|svg|xsl|rfc822/);
+    }
+  });
+});
+
+describe("showsAsImage", () => {
+  it("shows raster images inline and SVG as a file", () => {
+    expect(showsAsImage("image/png")).toBe(true);
+    expect(showsAsImage("image/gif")).toBe(true);
+    expect(showsAsImage("image/svg+xml")).toBe(false);
+    expect(showsAsImage("IMAGE/SVG+XML")).toBe(false);
+    expect(showsAsImage("video/mp4")).toBe(false);
+    expect(showsAsImage(undefined)).toBe(false);
   });
 });
 

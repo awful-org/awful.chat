@@ -16,7 +16,7 @@
   import { getAttachmentsWithData, getMessages } from "$lib/storage";
   import { transportState, type Message } from "$lib/transport/transport.svelte";
   import { ChevronDown, ChevronUp, History } from "@lucide/svelte";
-  import { safeBlobType } from "$lib/safe-mime";
+  import { safeBlobType, showsAsImage } from "$lib/safe-mime";
 
   let { roomCode, roomName }: { roomCode: string; roomName: string } = $props();
 
@@ -119,7 +119,7 @@
           {#each msg.meta?.files ?? [] as file (file.infoHash)}
             {@const url = files.get(file.infoHash)}
             {#if url}
-              {#if file.mimeType.startsWith("image/")}
+              {#if showsAsImage(file.mimeType)}
                 <img src={url} alt={file.filename} class="max-h-60 max-w-full self-start rounded object-contain" />
               {:else}
                 <a class="self-start text-sm text-primary hover:underline" href={url} download={file.filename}>{file.filename}</a>

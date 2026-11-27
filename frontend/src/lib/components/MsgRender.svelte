@@ -134,7 +134,7 @@
     unpinWidget,
   } from "$lib/plugins/prefs.svelte";
   import type { PluginComponent } from "$lib/plugins/api";
-  import { canOpenAsPage } from "$lib/safe-mime";
+  import { canOpenAsPage, showsAsImage } from "$lib/safe-mime";
 
   interface Props {
     msg: Message;
@@ -257,7 +257,7 @@
 
   const lightboxKind = $derived(
     lightbox
-      ? lightbox.mimeType.startsWith("image/")
+      ? showsAsImage(lightbox.mimeType)
         ? "image"
         : previewKind(lightbox.filename, lightbox.mimeType, lightbox.size ?? 0)
       : null
@@ -1058,7 +1058,7 @@
             </div>
           {/if}
 
-          {#if file.mimeType.startsWith("image/")}
+          {#if showsAsImage(file.mimeType)}
             {@const box = mediaBoxStyle(file.width, file.height)}
             <!-- One answer for the message and the viewer it opens: what is
                  animated is measured before either decodes it. -->

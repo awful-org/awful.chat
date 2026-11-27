@@ -19,16 +19,30 @@ function base(mimeType: unknown): string {
 }
 
 /**
- * The type to build a blob with. SVG keeps its type - an <img> shows it and
- * cannot run its scripts - but never opens as a page (see canOpenAsPage).
- * Anything unknown becomes application/octet-stream, which a browser saves
- * rather than renders.
+ * The type to build a blob with. Anything else becomes
+ * application/octet-stream, which a browser saves rather than renders.
+ *
+ * SVG included: an <img> would not run its script, but the browser's own
+ * image actions ("Open image in new tab", copying the image address into the
+ * address bar, dragging it to the tab strip) load the blob URL as a page on
+ * the app's origin, and a browser-initiated load does not inherit the CSP.
+ * So no blob is ever typed as a document that can hold script, and an SVG is
+ * shown as a file to save (see showsAsImage).
  */
 export function safeBlobType(mimeType: unknown): string {
   const type = base(mimeType);
-  if (RASTER.has(type) || OPENABLE_EXTRA.has(type) || type === "image/svg+xml") return type;
+  if (RASTER.has(type) || OPENABLE_EXTRA.has(type)) return type;
   if (/^(audio|video)\/[a-z0-9.+-]+$/.test(type)) return type;
   return "application/octet-stream";
+}
+
+/**
+ * Whether a file of this type is shown inline as a picture. An image type the
+ * blob keeps (see safeBlobType): SVG is a file, not a picture.
+ */
+export function showsAsImage(mimeType: unknown): boolean {
+  const type = base(mimeType);
+  return type.startsWith("image/") && type !== "image/svg+xml";
 }
 
 /** Whether a file of this type may be opened as a page of its own. */

@@ -169,10 +169,14 @@ async function sanitizedMarkdown(
     ADD_ATTR: ["target"],
     // No <form>: a sanitized form is still a form, and a markdown file has
     // no business asking for input.
-    FORBID_TAGS: ["form", "input", "button", "style"],
+    // No SVG or MathML: <image href> and <feImage href> load remote URLs that
+    // the media switch never sees.
+    FORBID_TAGS: ["form", "input", "button", "style", "svg", "math"],
     // No inline styles either: they allowed a full-screen fixed overlay over
-    // the app, the start of any phishing page.
-    FORBID_ATTR: ["style"],
+    // the app, the start of any phishing page. No class for the same reason:
+    // the app's own utility classes (fixed inset-0 z-50) rebuild that overlay.
+    // No background: the old HTML attribute loads a remote image.
+    FORBID_ATTR: ["style", "class", "background"],
   });
 }
 
