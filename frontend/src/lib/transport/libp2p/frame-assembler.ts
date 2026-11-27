@@ -19,7 +19,9 @@ export class FrameAssembler {
   #chunks: Uint8Array[] = [];
   #held = 0;
 
-  constructor(private readonly maxFrameBytes: number) {}
+  /** The limit, or a function read at each header: a stream whose peer has
+   *  not proven anything yet can be held to less than one that has. */
+  constructor(private readonly maxFrameBytes: number | (() => number)) {}
 
   /**
    * Take one chunk; resolve every frame it completes, in order. Throws
@@ -27,18 +29,36 @@ export class FrameAssembler {
    * before anything of that frame is buffered past its first chunk.
    */
   push(chunk: Uint8Array): Uint8Array[] {
-    if (chunk.byteLength > 0) {
-      this.#chunks.push(chunk);
-      this.#held += chunk.byteLength;
-    }
+    this.add(chunk);
     const frames: Uint8Array[] = [];
-    while (this.#held >= 4) {
-      const length = this.#peekLength();
-      if (length > this.maxFrameBytes) throw new FrameTooLargeError(length);
-      if (this.#held < 4 + length) break;
-      frames.push(this.#take(4 + length).subarray(4));
-    }
+    for (let frame = this.next(); frame; frame = this.next()) frames.push(frame);
     return frames;
+  }
+
+  /** Hold a chunk without taking any frame out of it yet. */
+  add(chunk: Uint8Array): void {
+    if (chunk.byteLength === 0) return;
+    this.#chunks.push(chunk);
+    this.#held += chunk.byteLength;
+  }
+
+  /**
+   * The next whole frame, or null when it has not all arrived. One at a time,
+   * so a limit that depends on what earlier frames did is read after each.
+   * Throws FrameTooLargeError as soon as the header is over the limit.
+   */
+  next(): Uint8Array | null {
+    if (this.#held < 4) return null;
+    const length = this.#peekLength();
+    const max = typeof this.maxFrameBytes === "function" ? this.maxFrameBytes() : this.maxFrameBytes;
+    if (length > max) throw new FrameTooLargeError(length);
+    if (this.#held < 4 + length) return null;
+    return this.#take(4 + length).subarray(4);
+  }
+
+  /** Bytes held toward frames that have not all arrived. */
+  get held(): number {
+    return this.#held;
   }
 
   /** The big-endian length in the first four held bytes, across chunks. */
