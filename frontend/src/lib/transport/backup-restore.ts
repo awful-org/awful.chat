@@ -11,6 +11,7 @@ import {
   putIdentityRecord,
   bulkPutMessages,
   bulkAddNewMessages,
+  heldMessageIds,
   putAttachment,
   getAttachment,
   putRoom,
@@ -481,7 +482,12 @@ async function importDatabaseInner(
       // row that carries a signature which does not verify is a forgery -
       // every version a real row was ever signed with still verifies - while
       // an unsigned one is kept only where it is legitimately unsigned.
-      await bulkAddNewMessages(await mergeableMessages(chunk, ownDevice));
+      // Rows already held are kept as they are, so they are left out before
+      // the signature checks: a verify is a millisecond of main-thread crypto
+      // each, and a merge from a second device is mostly rows both hold.
+      const held = await heldMessageIds(chunk.map((m) => m.id));
+      const fresh = held.size ? chunk.filter((m) => !held.has(m.id)) : chunk;
+      await bulkAddNewMessages(await mergeableMessages(fresh, ownDevice));
     } else {
       await bulkPutMessages(chunk);
     }

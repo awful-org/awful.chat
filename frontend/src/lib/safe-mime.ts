@@ -45,6 +45,15 @@ export function showsAsImage(mimeType: unknown): boolean {
   return type.startsWith("image/") && type !== "image/svg+xml";
 }
 
+/**
+ * An object URL for a blob whose type came from a file: the user's own picks
+ * included, since an attached file can be one a peer sent them. Typed by
+ * safeBlobType, so no such URL opens as a document that can hold script.
+ */
+export function safeObjectURL(blob: Blob): string {
+  return URL.createObjectURL(new Blob([blob], { type: safeBlobType(blob.type) }));
+}
+
 /** Whether a file of this type may be opened as a page of its own. */
 export function canOpenAsPage(mimeType: unknown): boolean {
   const type = base(mimeType);

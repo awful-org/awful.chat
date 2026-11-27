@@ -196,7 +196,7 @@
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
   import { formatSize, seededRandom } from "$lib/utils";
-  import { showsAsImage } from "$lib/safe-mime";
+  import { safeObjectURL, showsAsImage } from "$lib/safe-mime";
   import { QUOTE_SHOWN_CHARS, getQuotableText } from "$lib/quote-helper";
   import InvitationDialog from "./InvitationDialog.svelte";
   import ArchivedHistory from "./ArchivedHistory.svelte";
@@ -509,8 +509,8 @@
       // A fresh URL, not the staged one: clearStagedFiles revokes those, and
       // it runs the moment this send starts, well before it finishes.
       url:
-        file.type.startsWith("image/") || file.type.startsWith("video/")
-          ? URL.createObjectURL(file)
+        showsAsImage(file.type) || file.type.startsWith("video/")
+          ? safeObjectURL(file)
           : null,
     }));
     sendingCaption = caption;
@@ -1688,7 +1688,7 @@
   }
 
   function isPreviewable(file: File): boolean {
-    return file.type.startsWith("image/") || file.type.startsWith("video/");
+    return showsAsImage(file.type) || file.type.startsWith("video/");
   }
 
   function getStagedPreviewURL(file: File): string | null {
@@ -2061,7 +2061,7 @@
       if (!isPreviewable(file)) continue;
       const key = fileKey(file);
       activeKeys.add(key);
-      if (!nextMap.has(key)) nextMap.set(key, URL.createObjectURL(file));
+      if (!nextMap.has(key)) nextMap.set(key, safeObjectURL(file));
     }
 
     for (const [key, url] of nextMap) {
@@ -3751,7 +3751,7 @@
                       <div class="rounded-md border border-border/70 bg-muted/30 p-2.5">
                         <p class="truncate text-sm text-foreground">{p.name}</p>
                         <p class="text-xs text-muted-foreground">{formatSize(p.size)} • sending…</p>
-                        {#if p.url && p.type.startsWith("image/")}
+                        {#if p.url && showsAsImage(p.type)}
                           <img
                             src={p.url}
                             alt={p.name}
@@ -3919,7 +3919,7 @@
               <Trash2 class="size-3" />
             </button>
 
-            {#if previewUrl && file.type.startsWith("image/")}
+            {#if previewUrl && showsAsImage(file.type)}
               <img
                 src={previewUrl}
                 alt={file.name}

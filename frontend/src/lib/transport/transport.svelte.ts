@@ -10,6 +10,7 @@ import {
 import { measureMedia } from "$lib/image-size";
 import { identityStore } from "../identity/identity.svelte";
 import { getQuotableText } from "../quote-helper";
+import { safeObjectURL } from "../safe-mime";
 import {
   _noteRefused,
   _withRefused,
@@ -280,6 +281,26 @@ import { createPluginFloodCaps } from "../plugins/flood-cap";
  */
 function _checkEphemeralFloodCap(pluginId: string, senderId: string): boolean {
   return _pluginFlood.ephemeral(pluginId, senderId);
+}
+
+/**
+ * Live plugin updates one peer may send a second, across every plugin, checked
+ * before the signature: a verify is a millisecond of main-thread crypto, and
+ * the per-plugin cap below runs only after it, with a key the sender chooses.
+ * Well above the send side's own pace (about four a second per plugin).
+ */
+const EPHEMERAL_PEER_PER_SECOND = 32;
+const _ephemeralPeerWindows = new Map<string, { start: number; n: number }>();
+
+function _ephemeralPeerBudget(peerId: string): boolean {
+  const now = Date.now();
+  const w = _ephemeralPeerWindows.get(peerId);
+  if (w && now - w.start < 1000) return ++w.n <= EPHEMERAL_PEER_PER_SECOND;
+  if (_ephemeralPeerWindows.size >= 4096) {
+    for (const [id, old] of _ephemeralPeerWindows) if (now - old.start >= 1000) _ephemeralPeerWindows.delete(id);
+  }
+  _ephemeralPeerWindows.set(peerId, { start: now, n: 1 });
+  return true;
 }
 
 /**
@@ -4934,6 +4955,7 @@ _transport.on("message", (peerId, data, room) => {
         // Wire-only ephemeral messages: verify, fold to card state, but never persist.
         // No watermark, lamport, or storage side effects.
         const ephemeralMsg = msg as WirePluginEphemeral;
+        if (room === null || !_ephemeralPeerBudget(peerId)) break;
         _verifyIncoming(ephemeralMsg as unknown as WireChatMessage, { room })
           .then((v) => {
             guard();
@@ -5933,7 +5955,7 @@ export async function sendFiles(
       seeding: true,
       peers: 0,
       seeders: 1,
-      blobURL: URL.createObjectURL(source),
+      blobURL: safeObjectURL(source),
     });
   }
 
