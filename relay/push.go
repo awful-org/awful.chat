@@ -435,6 +435,10 @@ func validPushKeys(p256dh, auth string) bool {
 // request went out - is about the one subscription.
 func pushServiceFault(status int, err error) bool {
 	if err != nil {
+		// Not the service's fault either way: under a wildcard entry it is a
+		// made-up name, and for an exact host it is this instance's resolver
+		// (a filtering or broken upstream), which suspending the service
+		// would not mend. The subscription is dropped only in the first case.
 		if pushEndpointUnresolvable(err) {
 			return false
 		}
@@ -899,8 +903,8 @@ func pushDeliver(box string) {
 			pushHostResult(host, !fault, time.Now())
 		}
 		switch {
-		case err != nil && pushEndpointUnresolvable(err):
-			// Its hostname does not exist: it can never be delivered.
+		case err != nil && pushEndpointUnresolvable(err) && strings.HasPrefix(key, "*"):
+			// A made-up name under a wildcard entry: it can never be delivered.
 			expired++
 			dead = append(dead, device)
 		case err != nil:

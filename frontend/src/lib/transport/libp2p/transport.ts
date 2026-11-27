@@ -79,8 +79,9 @@ const MAX_DIRECT_FRAME_BYTES = 4 * 1024 * 1024;
  */
 const MAX_INBOUND_PARTIAL_BYTES = 128 * 1024 * 1024;
 const INBOUND_PARTIAL_DEADLINE_MS = 60_000;
-/** A real peer holds one direct stream to us, two while one replaces it. */
-const MAX_INBOUND_DIRECT_STREAMS = 8;
+/** A real peer holds one direct stream to us, two while one replaces it;
+ *  the rest is room for a burst of reopens before the old ones reset. */
+const MAX_INBOUND_DIRECT_STREAMS = 16;
 const MAX_RENDEZVOUS_FRAME_BYTES = 16 * 1024;
 const PEER_REDIAL_DELAY_MS = 3_000;
 const PEER_REDIAL_MAX_MS = 60_000;
@@ -2774,7 +2775,15 @@ export class LibP2PTransport implements PeerTransport {
       return this.openOutboundStream(peerId, true);
     }
 
+    // Two opens can race (a cleanup in between forgets the first one's
+    // in-flight entry): the one already stored is replaced, so it is reset
+    // rather than left open on the connection, where it would count against
+    // the far side's inbound stream limit until the connection went away.
+    // Stored first: the old stream's close handler cleans up only while it is
+    // still the current one, and abort() can run that handler at once.
+    const replaced = this.peerStreams.get(peerId);
     this.peerStreams.set(peerId, stream);
+    if (replaced && replaced !== stream) replaced.abort(new Error("replaced by a newer stream"));
 
     stream.addEventListener("close", (_evt: StreamCloseEvent) => {
       // Only clean up if WE are still the current stream. The close event of

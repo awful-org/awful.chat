@@ -665,3 +665,34 @@ func TestPushUnresolvableEndpointNeverSuspendsTheService(t *testing.T) {
 		t.Fatalf("%d unresolvable subscription(s) kept", len(left))
 	}
 }
+
+// For an exact host, a lookup that fails is this instance's resolver, not the
+// endpoint: the subscriptions are kept, and the service is not suspended.
+func TestPushUnresolvableExactHostKeepsSubscriptions(t *testing.T) {
+	pushTestSetup(t)
+	pushHostsMu.Lock()
+	pushHosts = map[string]*pushHostState{}
+	pushHostsMu.Unlock()
+	fake := &fakePushService{err: &url.Error{Op: "Post", URL: "https://fcm.googleapis.com", Err: &net.DNSError{Err: "no such host", Name: "fcm.googleapis.com", IsNotFound: true}}}
+	fake.install()
+
+	did, _ := testDid(t)
+	box := mailboxIDForDid(did)
+	subs := map[string]pushSubscription{}
+	for i := 0; i < pushHostFailThreshold+1; i++ {
+		subs[deviceID(byte(60+i))] = pushSubscription{Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d", i), P256dh: testPushP256dh, Auth: testPushAuth}
+	}
+	if err := writePushBox(box, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	pushDeliver(box)
+	if host := pushHost(pushEndpointKey("https://fcm.googleapis.com/fcm/send/x")); pushHostSuspended(host, time.Now()) {
+		t.Fatal("a resolver failure suspended the push service")
+	}
+	pushMu.Lock()
+	left, _ := readPushBox(box)
+	pushMu.Unlock()
+	if len(left) != len(subs) {
+		t.Fatalf("kept %d of %d subscriptions", len(left), len(subs))
+	}
+}
