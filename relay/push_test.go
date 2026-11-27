@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -630,5 +631,37 @@ func TestPushUnreachableServiceIsSuspended(t *testing.T) {
 	pushDeliver(box)
 	if host := pushHost(pushEndpointKey("https://fcm.googleapis.com/fcm/send/x")); !pushHostSuspended(host, time.Now()) {
 		t.Fatal("an unreachable service was not suspended")
+	}
+}
+
+// Under a wildcard entry anyone can file endpoints at made-up subdomains. A
+// hostname that does not exist is the subscription's fault, not the
+// service's: it is dropped, and the service is never suspended for it.
+func TestPushUnresolvableEndpointNeverSuspendsTheService(t *testing.T) {
+	pushTestSetup(t)
+	pushHostsMu.Lock()
+	pushHosts = map[string]*pushHostState{}
+	pushHostsMu.Unlock()
+	fake := &fakePushService{err: &url.Error{Op: "Post", URL: "https://x.notify.windows.com", Err: &net.DNSError{Err: "no such host", Name: "x.notify.windows.com", IsNotFound: true}}}
+	fake.install()
+
+	did, _ := testDid(t)
+	box := mailboxIDForDid(did)
+	subs := map[string]pushSubscription{}
+	for i := 0; i < pushMaxDevices; i++ {
+		subs[deviceID(byte(60+i))] = pushSubscription{Endpoint: fmt.Sprintf("https://made-up-%d.notify.windows.com/w/x", i), P256dh: testPushP256dh, Auth: testPushAuth}
+	}
+	if err := writePushBox(box, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	pushDeliver(box)
+	if host := pushHost(pushEndpointKey("https://wns2-par02p.notify.windows.com/w/x")); pushHostSuspended(host, time.Now()) {
+		t.Fatal("made-up hostnames suspended the push service")
+	}
+	pushMu.Lock()
+	left, _ := readPushBox(box)
+	pushMu.Unlock()
+	if len(left) != 0 {
+		t.Fatalf("%d unresolvable subscription(s) kept", len(left))
 	}
 }

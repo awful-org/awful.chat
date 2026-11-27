@@ -36,6 +36,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -434,10 +435,23 @@ func validPushKeys(p256dh, auth string) bool {
 // request went out - is about the one subscription.
 func pushServiceFault(status int, err error) bool {
 	if err != nil {
+		if pushEndpointUnresolvable(err) {
+			return false
+		}
 		var uerr *url.Error
 		return errors.As(err, &uerr)
 	}
 	return status >= 500
+}
+
+// pushEndpointUnresolvable reports whether the endpoint's own hostname does
+// not exist. That is about the subscription, not the service: under a
+// wildcard entry (*.notify.windows.com) anyone can file endpoints at made-up
+// subdomains, and counting their lookups as the service failing would let
+// them suspend it for everyone.
+func pushEndpointUnresolvable(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
 // pushSubject is the VAPID "sub" claim - a contact a push vendor can reach if
@@ -885,6 +899,10 @@ func pushDeliver(box string) {
 			pushHostResult(host, !fault, time.Now())
 		}
 		switch {
+		case err != nil && pushEndpointUnresolvable(err):
+			// Its hostname does not exist: it can never be delivered.
+			expired++
+			dead = append(dead, device)
 		case err != nil:
 			// A local error (raised here before anything was sent) is not the
 			// subscription's: validPushKeys has already ruled its keys out,
