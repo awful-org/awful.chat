@@ -268,7 +268,7 @@ function pollSpeakers(): void {
  * active and only adds/removes what is needed.
  *
  * Wave 2 will call this in an effect that watches `participants`, `muted`,
- * `localMicStream`, and `selfId`.
+ * `localVoiceStream`, and `selfId`.
  */
 export function updateSpeakerTracks(
   participants: Map<
@@ -281,7 +281,9 @@ export function updateSpeakerTracks(
     }
   >,
   muted: boolean,
-  localMicStream: MediaStream | null,
+  /** What this user sends, after noise suppression: their own ring
+   *  matches what the others hear, as each remote ring already does. */
+  localVoiceStream: MediaStream | null,
   selfId: string
 ): void {
   const desiredPeers = new Set<string>();
@@ -294,8 +296,8 @@ export function updateSpeakerTracks(
   }
 
   // Add self's audio if not muted.
-  if (!muted && localMicStream) {
-    const track = localMicStream.getAudioTracks()[0];
+  if (!muted && localVoiceStream) {
+    const track = localVoiceStream.getAudioTracks()[0];
     if (track) {
       desiredPeers.add(selfId);
     }
@@ -305,7 +307,7 @@ export function updateSpeakerTracks(
   for (const peerId of desiredPeers) {
     const track =
       peerId === selfId
-        ? localMicStream?.getAudioTracks()[0]
+        ? localVoiceStream?.getAudioTracks()[0]
         : participants.get(peerId)?.audioTrack;
     if (track) {
       startSpeakerDetection(peerId, track);

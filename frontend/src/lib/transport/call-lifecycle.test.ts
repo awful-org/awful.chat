@@ -39,7 +39,7 @@ const transportState: Record<string, unknown> = {
   muted: false,
   deafened: false,
   transmissionOutputVolume: 1,
-  localMicStream: null,
+  localVoiceStream: null,
   localCameraStream: null,
   localScreenStream: null,
   cameraOff: true,
@@ -64,6 +64,7 @@ const voiceMock = {
     voiceMuted = false;
   }),
   getMicStream: () => null,
+  getSentStream: () => null,
   getOutputVolume: () => outputVolume,
   setOutputVolume: (v: number) => {
     outputVolume = v;

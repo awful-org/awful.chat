@@ -52,7 +52,7 @@ export function syncSpeakersFromCall(): void {
   updateSpeakerTracks(
     participants,
     transportState.muted,
-    transportState.localMicStream,
+    transportState.localVoiceStream,
     selfId()
   );
 }

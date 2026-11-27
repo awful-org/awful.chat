@@ -443,7 +443,9 @@ interface TransportState {
   participants: Map<string, ParticipantState>;
   localCameraStream: MediaStream | null;
   localScreenStream: MediaStream | null;
-  localMicStream: MediaStream | null;
+  /** What peers are sent from this mic: after noise suppression, call
+   * sounds mixed in. The speaking ring reads it. */
+  localVoiceStream: MediaStream | null;
   cameraOff: boolean;
   screenSharing: boolean;
   peerNames: Map<string, string>;
@@ -570,7 +572,7 @@ export const transportState = $state<TransportState>({
   participants: new Map(),
   localCameraStream: null,
   localScreenStream: null,
-  localMicStream: null,
+  localVoiceStream: null,
   cameraOff: true,
   screenSharing: false,
   peerNames: new Map(),

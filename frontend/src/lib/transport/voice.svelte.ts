@@ -330,7 +330,7 @@ function getDtln(): DtlnProcessor {
 export async function setVoiceInputDevice(deviceId: string): Promise<void> {
   saveAudioPrefs({ inputDevice: deviceId || null });
   await getVoice().setInputDevice(deviceId);
-  transportState.localMicStream = getVoice().getMicStream();
+  transportState.localVoiceStream = getVoice().getSentStream();
 }
 
 export function getVoiceInputDevices(): Promise<MediaDeviceInfo[]> {
@@ -422,7 +422,7 @@ export async function setVoiceDfnAttenuation(
   if (rebuilt) {
     await getVoice().reloadNoiseEngine("dfn3");
     // Restarts the mic too - see setVoiceDtlnEnabled.
-    transportState.localMicStream = getVoice().getMicStream();
+    transportState.localVoiceStream = getVoice().getSentStream();
   }
   return { ...next, rebuilt };
 }
@@ -437,7 +437,7 @@ export async function setVoiceDtlnEnabled(enabled: boolean): Promise<void> {
   // Toggling this restarts the mic, so the old stream's tracks are stopped.
   // Anything still holding the previous stream (the speaking-ring analyser)
   // would read silence from a dead track for the rest of the call.
-  transportState.localMicStream = getVoice().getMicStream();
+  transportState.localVoiceStream = getVoice().getSentStream();
 }
 
 export function getVoiceDtlnEnabled(): boolean {
@@ -448,7 +448,7 @@ export async function setVoiceNoiseEngine(engine: NoiseEngine): Promise<void> {
   saveAudioPrefs({ noiseEngine: engine });
   await getVoice().setNoiseEngine(engine);
   // Restarts the mic too - see setVoiceDtlnEnabled.
-  transportState.localMicStream = getVoice().getMicStream();
+  transportState.localVoiceStream = getVoice().getSentStream();
 }
 
 export function getVoiceNoiseEngine(): NoiseEngine {

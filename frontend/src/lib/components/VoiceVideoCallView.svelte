@@ -247,7 +247,6 @@ import {
     participants,
     localCameraStream,
     localScreenStream,
-    localMicStream,
     inCall,
     muted,
     deafened,

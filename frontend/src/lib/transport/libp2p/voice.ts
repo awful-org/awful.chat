@@ -1082,6 +1082,16 @@ export class LibP2PVoice implements VoiceTransport {
     return this.micStream;
   }
 
+  /**
+   * What peers are sent: the microphone after noise suppression, with any
+   * call sounds mixed in. The speaking ring reads this rather than the raw
+   * microphone, so your own ring lights up for what others actually hear,
+   * as theirs do on your screen for what they send you.
+   */
+  getSentStream(): MediaStream | null {
+    return this.processedStream;
+  }
+
   async setInputDevice(deviceId: string): Promise<void> {
     if (!this.audioCtx) {
       this.activeInputDevice = deviceId;

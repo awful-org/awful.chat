@@ -512,7 +512,7 @@ async function _joinCall(voiceChannel: string): Promise<void> {
     _sendCallPresence();
     transportState.muted = _voice.isMuted();
     _sendCallState();
-    transportState.localMicStream = _voice.getMicStream();
+    transportState.localVoiceStream = _voice.getSentStream();
   } catch (err) {
     releaseCallScreen();
     if (_presenceHeartbeat) {
@@ -527,7 +527,7 @@ async function _joinCall(voiceChannel: string): Promise<void> {
     transportState.muted = false;
     transportState.localCameraStream = null;
     transportState.localScreenStream = null;
-    transportState.localMicStream = null;
+    transportState.localVoiceStream = null;
     transportState.cameraOff = true;
     transportState.screenSharing = false;
     // An abandoned join is not a failure - the user left on purpose, and the
@@ -591,7 +591,7 @@ export function leaveCall(): void {
   transportState.participants = new Map();
   transportState.localCameraStream = null;
   transportState.localScreenStream = null;
-  transportState.localMicStream = null;
+  transportState.localVoiceStream = null;
   transportState.cameraOff = true;
   transportState.screenSharing = false;
   transportState.pendingTransmissions = new Map();
