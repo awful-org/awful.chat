@@ -81,3 +81,28 @@ it("does not navigate when private-file deletion fails", async () => {
   expect(replace).not.toHaveBeenCalled();
   expect(disk.entries.has("private/file")).toBe(true);
 });
+
+it("cancels the push subscription and the badge, so the wiped device is not woken for this identity", async () => {
+  const disk = fakeOPFS();
+  const replace = vi.fn();
+  const unsubscribe = vi.fn(async () => true);
+  const close = vi.fn();
+  const clearAppBadge = vi.fn(async () => {});
+  const registration = {
+    getNotifications: async () => [{ close }],
+    pushManager: { getSubscription: async () => ({ unsubscribe }) },
+  };
+  vi.stubGlobal("navigator", {
+    storage: disk.storage,
+    serviceWorker: { getRegistration: async () => registration },
+    clearAppBadge,
+  });
+  vi.stubGlobal("location", { replace });
+
+  const { executeDuressWipe } = await import("./duress");
+  void executeDuressWipe();
+  await vi.waitFor(() => expect(replace).toHaveBeenCalledWith("/"));
+  expect(close).toHaveBeenCalled();
+  expect(unsubscribe).toHaveBeenCalled();
+  expect(clearAppBadge).toHaveBeenCalled();
+});

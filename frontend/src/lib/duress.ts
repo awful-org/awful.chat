@@ -338,11 +338,23 @@ export async function executeDuressWipe(options: { notify?: boolean } = {}): Pro
   // shade naming the conversations this device is about to claim it never had,
   // and their tap targets survive the wipe. getNotifications only reaches this
   // origin's own.
+  //
+  // The push subscription outlives the wipe too: it belongs to the service
+  // worker's registration, which no storage wipe reaches, so every later DM
+  // to this identity would still show "New message" on a device that claims
+  // it never had an account. unsubscribe() talks only to the push vendor,
+  // never to our relay, which drops the endpoint on the vendor's 410.
   try {
     const reg = await navigator.serviceWorker?.getRegistration();
     for (const shown of (await reg?.getNotifications()) ?? []) shown.close();
+    await (await reg?.pushManager?.getSubscription())?.unsubscribe();
   } catch {
-    /* no service worker, or nothing showing */
+    /* no service worker, no subscription, or nothing showing */
+  }
+  try {
+    await (navigator as Navigator & { clearAppBadge?: () => Promise<void> }).clearAppBadge?.();
+  } catch {
+    /* no badge API */
   }
 
   // Our own open connection would block deleteDatabase forever - boot
