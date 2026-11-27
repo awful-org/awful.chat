@@ -129,6 +129,10 @@ const (
 	// now, and still leaves one busy carrier NAT thousands of pending DMs.
 	mailboxMaxHeldPerSource      = mailboxGlobalMaxFiles / 16
 	mailboxMaxHeldBytesPerSource = mailboxGlobalMaxBytes / 16
+	// An IPv6 /56 is also charged to its /48 (shareAggKey), which may hold
+	// this many shares - the factor the rate limit's /48 aggregate uses. One
+	// routed /48 is 256 /56s; without this it could hold the whole budget.
+	mailboxAggShares = ipv6AggregateFactor
 	// Maximum IDs one ack request may carry. A real client acks what it just
 	// collected, which is a small number bounded by mailboxMaxMsgs. This limit
 	// leaves clear headroom and prevents the ack loop from doing unbounded
@@ -183,6 +187,7 @@ var mailboxMu sync.Mutex
 // "different source" and nothing else, and it is gone at the next restart.
 type mailboxOrigin struct {
 	source string
+	agg    string // the source's /48, or empty - see shareAggKey
 	charge int64
 }
 
@@ -209,7 +214,15 @@ var mailboxSourceKey = func() []byte {
 // address is everybody behind it, and a share applied to it would be a
 // ceiling on the whole mailbox.
 func mailboxSourceTag(r *http.Request) string {
-	key := shareKey(clientAddr(r))
+	return mailboxTag(shareKey(clientAddr(r)))
+}
+
+// mailboxAggTag is the opaque name of the request's /48 aggregate, or empty.
+func mailboxAggTag(r *http.Request) string {
+	return mailboxTag(shareAggKey(clientAddr(r)))
+}
+
+func mailboxTag(key string) string {
 	if key == "" {
 		return ""
 	}
@@ -218,14 +231,35 @@ func mailboxSourceTag(r *http.Request) string {
 	return hex.EncodeToString(m.Sum(nil)[:12])
 }
 
-// mailboxRecordBlob charges a stored blob to its source. Caller holds
-// mailboxMu.
-func mailboxRecordBlob(box, id, source string, charge int64) {
-	mailboxBlobOrigin[box+"/"+id] = mailboxOrigin{source: source, charge: charge}
-	h := mailboxHeld[source]
-	h.files++
-	h.bytes += charge
-	mailboxHeld[source] = h
+// mailboxRecordBlob charges a stored blob to its source and its aggregate.
+// Caller holds mailboxMu.
+func mailboxRecordBlob(box, id, source, agg string, charge int64) {
+	mailboxBlobOrigin[box+"/"+id] = mailboxOrigin{source: source, agg: agg, charge: charge}
+	for _, k := range []string{source, agg} {
+		if k == "" {
+			continue
+		}
+		h := mailboxHeld[k]
+		h.files++
+		h.bytes += charge
+		mailboxHeld[k] = h
+	}
+}
+
+// mailboxOverShare reports whether one more blob of this charge would take
+// the source past its share, or its /48 past mailboxAggShares of them.
+// Caller holds mailboxMu.
+func mailboxOverShare(source, agg string, charge int64) bool {
+	if held := mailboxHeld[source]; held.files >= mailboxMaxHeldPerSource ||
+		held.bytes+charge > mailboxMaxHeldBytesPerSource {
+		return true
+	}
+	if agg == "" {
+		return false
+	}
+	held := mailboxHeld[agg]
+	return held.files >= mailboxMaxHeldPerSource*mailboxAggShares ||
+		held.bytes+charge > mailboxMaxHeldBytesPerSource*mailboxAggShares
 }
 
 // mailboxForgetBlob returns a removed blob's charge to its source and drops
@@ -239,14 +273,19 @@ func mailboxForgetBlob(box, id string) {
 		return
 	}
 	delete(mailboxBlobOrigin, key)
-	h := mailboxHeld[o.source]
-	h.files--
-	h.bytes -= o.charge
-	if h.files <= 0 {
-		delete(mailboxHeld, o.source)
-		return
+	for _, k := range []string{o.source, o.agg} {
+		if k == "" {
+			continue
+		}
+		h := mailboxHeld[k]
+		h.files--
+		h.bytes -= o.charge
+		if h.files <= 0 {
+			delete(mailboxHeld, k)
+			continue
+		}
+		mailboxHeld[k] = h
 	}
-	mailboxHeld[o.source] = h
 }
 
 // didToPubKey decodes a did:key to the raw ed25519 public key. The app's
@@ -919,6 +958,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	source := mailboxSourceTag(r)
+	agg := mailboxAggTag(r)
 
 	mailboxMu.Lock()
 	defer mailboxMu.Unlock()
@@ -999,8 +1039,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 		ownInBox := len(stored) > 0 && mailboxBlobOrigin[req.Box+"/"+stored[0].name].source == source
 		// Over its share, a source may still deposit where doing so evicts
 		// one of its own blobs, which does not grow what it holds.
-		if held := mailboxHeld[source]; (held.files >= mailboxMaxHeldPerSource ||
-			held.bytes+charge > mailboxMaxHeldBytesPerSource) && !(boxFull && ownInBox) {
+		if mailboxOverShare(source, agg, charge) && !(boxFull && ownInBox) {
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
 			return
 		}
@@ -1044,7 +1083,7 @@ func handleMailboxDeposit(w http.ResponseWriter, r *http.Request) {
 	mailboxFiles++
 	mailboxUsedBytes += charge
 	if source != "" {
-		mailboxRecordBlob(req.Box, id, source, charge)
+		mailboxRecordBlob(req.Box, id, source, agg, charge)
 	}
 	total += int64(len(blob))
 

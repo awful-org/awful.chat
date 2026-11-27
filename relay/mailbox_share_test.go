@@ -104,6 +104,38 @@ func TestMailboxSourceShareOfTheGlobalBudget(t *testing.T) {
 	}
 }
 
+// One routed /48 is 256 /56s, each a share of its own. Together they hold at
+// most mailboxAggShares shares, so one tunnel-broker allocation cannot fill
+// the global budget and close every box on the instance.
+func TestMailboxIPv6AggregateShare(t *testing.T) {
+	freshMailbox(t)
+	limit := mailboxMaxHeldPerSource * mailboxAggShares
+	var box string
+	for held := 0; held < limit; held++ {
+		if held%mailboxMaxMsgs == 0 {
+			did, _ := testDid(t)
+			box = mailboxIDForDid(did)
+		}
+		addr := fmt.Sprintf("2001:db8:0:%02x00::1", held%256) // a different /56 each time
+		code := depositFrom(t, addr, box, []byte("x"))
+		if code == http.StatusTooManyRequests {
+			resetRateLimiter(t)
+			code = depositFrom(t, addr, box, []byte("x"))
+		}
+		if code != http.StatusNoContent {
+			t.Fatalf("deposit %d refused inside the aggregate share: %d", held, code)
+		}
+	}
+	resetRateLimiter(t)
+	did, _ := testDid(t)
+	if code := depositFrom(t, "2001:db8:0:ff00::1", mailboxIDForDid(did), []byte("x")); code != http.StatusTooManyRequests {
+		t.Fatalf("a /48 past its aggregate share got %d, want 429", code)
+	}
+	if code := depositFrom(t, "2001:db8:1::1", mailboxIDForDid(did), []byte("x")); code != http.StatusNoContent {
+		t.Fatalf("another /48 was refused: %d", code)
+	}
+}
+
 // A box that is full sheds the depositor's own blobs before anyone else's,
 // so one source can no longer flush a named user's pending mail by parking
 // a hundred blobs in their box.
