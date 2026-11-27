@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -108,12 +113,25 @@ func pushRequest(t *testing.T, path string, body any, h http.HandlerFunc) *httpt
 	return w
 }
 
+// A real browser-shaped key pair: subscribe refuses keys that are not a P-256
+// point, and the send path drops a stored one that is not.
+var (
+	testPushP256dh = func() string {
+		k, err := ecdh.P256().GenerateKey(rand.Reader)
+		if err != nil {
+			panic(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(k.PublicKey().Bytes())
+	}()
+	testPushAuth = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{9}, 16))
+)
+
 func subscribeBody(did string, priv ed25519.PrivateKey, device, endpoint string) signedBody {
 	return signedBody{pushActionSubscribe, did, priv, map[string]any{
 		"device": device,
 		"subscription": map[string]any{
 			"endpoint": endpoint,
-			"keys":     map[string]string{"p256dh": "BN" + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 63)), "auth": base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{9}, 16))},
+			"keys":     map[string]string{"p256dh": testPushP256dh, "auth": testPushAuth},
 		},
 	}}
 }
@@ -528,5 +546,153 @@ func TestPushToldIsSweptWhileNothingIsSent(t *testing.T) {
 	}
 	if !told {
 		t.Error("the sweep dropped a device told within the hour, so it would ring again")
+	}
+}
+
+// Keys a browser could not have issued are refused at subscribe: they would
+// fail inside the encryption step, before anything is sent.
+func TestPushSubscribeRefusesKeysThatAreNotAPoint(t *testing.T) {
+	pushTestSetup(t)
+	did, priv := testDid(t)
+	for _, keys := range []map[string]string{
+		{"p256dh": "AA", "auth": "AA"},
+		{"p256dh": "BN" + base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{7}, 63)), "auth": testPushAuth},
+		{"p256dh": testPushP256dh, "auth": "AAAA"},
+	} {
+		body := subscribeBody(did, priv, deviceID(15), "https://fcm.googleapis.com/fcm/send/x")
+		body.payload["subscription"].(map[string]any)["keys"] = keys
+		if w := pushRequest(t, "/push/subscribe", body, handlePushSubscribe); w.Code != 400 {
+			t.Fatalf("keys %v: got %d, want 400", keys, w.Code)
+		}
+	}
+}
+
+// A send that fails before any request goes out says nothing about the push
+// service. Counting it would let one box of broken subscriptions suspend the
+// service for every user it serves.
+func TestPushLocalErrorsNeverSuspendTheService(t *testing.T) {
+	pushTestSetup(t)
+	pushHostsMu.Lock()
+	pushHosts = map[string]*pushHostState{}
+	pushHostsMu.Unlock()
+	fake := &fakePushService{err: errors.New("encryption failed")}
+	fake.install()
+
+	did, _ := testDid(t)
+	box := mailboxIDForDid(did)
+	subs := map[string]pushSubscription{}
+	for i := 0; i < pushMaxDevices; i++ {
+		subs[deviceID(byte(60+i))] = pushSubscription{Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d", i), P256dh: testPushP256dh, Auth: testPushAuth}
+	}
+	// One stored before subscribe checked keys: dropped without a send.
+	subs[deviceID(90)] = pushSubscription{Endpoint: "https://fcm.googleapis.com/fcm/send/old", P256dh: "AA", Auth: "AA"}
+	if err := writePushBox(box, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	pushDeliver(box)
+
+	if host := pushHost(pushEndpointKey("https://fcm.googleapis.com/fcm/send/x")); pushHostSuspended(host, time.Now()) {
+		t.Fatal("local send errors suspended the push service")
+	}
+	if fake.calls() != pushMaxDevices {
+		t.Fatalf("sends: got %d, want %d (the bad-key one is never sent)", fake.calls(), pushMaxDevices)
+	}
+	pushMu.Lock()
+	left, _ := readPushBox(box)
+	pushMu.Unlock()
+	// The bad-key one is dropped; the others are kept, since a local error
+	// (this instance's own keys, say) is no reason to forget a device.
+	if len(left) != pushMaxDevices {
+		t.Fatalf("kept %d subscription(s), want %d", len(left), pushMaxDevices)
+	}
+	if _, ok := left[deviceID(90)]; ok {
+		t.Fatal("the stored bad-key subscription was kept")
+	}
+}
+
+// A service that cannot be reached is still suspended.
+func TestPushUnreachableServiceIsSuspended(t *testing.T) {
+	pushTestSetup(t)
+	pushHostsMu.Lock()
+	pushHosts = map[string]*pushHostState{}
+	pushHostsMu.Unlock()
+	fake := &fakePushService{err: &url.Error{Op: "Post", URL: "https://fcm.googleapis.com", Err: errors.New("timeout")}}
+	fake.install()
+
+	did, _ := testDid(t)
+	box := mailboxIDForDid(did)
+	subs := map[string]pushSubscription{}
+	for i := 0; i < pushHostFailThreshold; i++ {
+		subs[deviceID(byte(60+i))] = pushSubscription{Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d", i), P256dh: testPushP256dh, Auth: testPushAuth}
+	}
+	if err := writePushBox(box, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	pushDeliver(box)
+	if host := pushHost(pushEndpointKey("https://fcm.googleapis.com/fcm/send/x")); !pushHostSuspended(host, time.Now()) {
+		t.Fatal("an unreachable service was not suspended")
+	}
+}
+
+// Under a wildcard entry anyone can file endpoints at made-up subdomains. A
+// hostname that does not exist is the subscription's fault, not the
+// service's: it is dropped, and the service is never suspended for it.
+func TestPushUnresolvableEndpointNeverSuspendsTheService(t *testing.T) {
+	pushTestSetup(t)
+	pushHostsMu.Lock()
+	pushHosts = map[string]*pushHostState{}
+	pushHostsMu.Unlock()
+	fake := &fakePushService{err: &url.Error{Op: "Post", URL: "https://x.notify.windows.com", Err: &net.DNSError{Err: "no such host", Name: "x.notify.windows.com", IsNotFound: true}}}
+	fake.install()
+
+	did, _ := testDid(t)
+	box := mailboxIDForDid(did)
+	subs := map[string]pushSubscription{}
+	for i := 0; i < pushMaxDevices; i++ {
+		subs[deviceID(byte(60+i))] = pushSubscription{Endpoint: fmt.Sprintf("https://made-up-%d.notify.windows.com/w/x", i), P256dh: testPushP256dh, Auth: testPushAuth}
+	}
+	if err := writePushBox(box, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	pushDeliver(box)
+	if host := pushHost(pushEndpointKey("https://wns2-par02p.notify.windows.com/w/x")); pushHostSuspended(host, time.Now()) {
+		t.Fatal("made-up hostnames suspended the push service")
+	}
+	pushMu.Lock()
+	left, _ := readPushBox(box)
+	pushMu.Unlock()
+	if len(left) != 0 {
+		t.Fatalf("%d unresolvable subscription(s) kept", len(left))
+	}
+}
+
+// For an exact host, a lookup that fails is this instance's resolver, not the
+// endpoint: the subscriptions are kept, and the service is not suspended.
+func TestPushUnresolvableExactHostKeepsSubscriptions(t *testing.T) {
+	pushTestSetup(t)
+	pushHostsMu.Lock()
+	pushHosts = map[string]*pushHostState{}
+	pushHostsMu.Unlock()
+	fake := &fakePushService{err: &url.Error{Op: "Post", URL: "https://fcm.googleapis.com", Err: &net.DNSError{Err: "no such host", Name: "fcm.googleapis.com", IsNotFound: true}}}
+	fake.install()
+
+	did, _ := testDid(t)
+	box := mailboxIDForDid(did)
+	subs := map[string]pushSubscription{}
+	for i := 0; i < pushHostFailThreshold+1; i++ {
+		subs[deviceID(byte(60+i))] = pushSubscription{Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d", i), P256dh: testPushP256dh, Auth: testPushAuth}
+	}
+	if err := writePushBox(box, subs, false); err != nil {
+		t.Fatal(err)
+	}
+	pushDeliver(box)
+	if host := pushHost(pushEndpointKey("https://fcm.googleapis.com/fcm/send/x")); pushHostSuspended(host, time.Now()) {
+		t.Fatal("a resolver failure suspended the push service")
+	}
+	pushMu.Lock()
+	left, _ := readPushBox(box)
+	pushMu.Unlock()
+	if len(left) != len(subs) {
+		t.Fatalf("kept %d of %d subscriptions", len(left), len(subs))
 	}
 }

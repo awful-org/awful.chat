@@ -416,8 +416,11 @@ func pluginProxySafeDial(ctx context.Context, network, addr string) (net.Conn, e
 		return nil, fmt.Errorf("disallowed port: %s", port)
 	}
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil || len(ips) == 0 {
-		return nil, fmt.Errorf("lookup failed for %s", host)
+	if err != nil {
+		return nil, fmt.Errorf("lookup failed for %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("lookup failed for %s: no addresses", host)
 	}
 	for _, ipAddr := range ips {
 		if isDisallowedIP(ipAddr.IP) {

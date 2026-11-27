@@ -242,7 +242,13 @@ export function initFiles(fileTransport: WebTorrentFileTransport): void {
     const guard = fileOperationGuard();
     const current = transportState.fileTransfers.get(infoHash);
     if (current && !current.blobURL) {
-      withFileTransfer({ ...current, blobURL: URL.createObjectURL(blob) });
+      // Retyped here too: a torrent's blob is typed from its file name, which
+      // the sender chose, and a .svg or .html one opened as a page from the
+      // download link would run on the app's origin.
+      withFileTransfer({
+        ...current,
+        blobURL: URL.createObjectURL(new Blob([blob], { type: safeBlobType(current.mimeType) })),
+      });
     }
     // Read back from this device's own storage, there is nothing new to
     // keep: storing it anyway re-sealed the row of every file in every room
@@ -355,7 +361,7 @@ async function _adoptInline(
   }
   if (bytes.byteLength !== file.size) return;
 
-  const f = new File([bytes], file.filename, { type: file.mimeType });
+  const f = new File([bytes], file.filename, { type: safeBlobType(file.mimeType) });
   // The infoHash is inside the message signature and seeding recomputes it
   // from the bytes, so a match proves these are the bytes the sender signed -
   // inline data needs no trust in the peer that relayed it.

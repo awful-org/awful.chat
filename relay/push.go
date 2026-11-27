@@ -27,12 +27,16 @@ package main
 
 import (
 	"container/list"
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -392,6 +396,66 @@ var pushSend = func(sub *webpush.Subscription, payload []byte, opts *webpush.Opt
 	// never useful and a hostile one could be large.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return resp.StatusCode, nil
+}
+
+// decodePushKey reads a subscription key the way the push library does: any of
+// the four base64 alphabets, padded or not.
+func decodePushKey(k string) ([]byte, bool) {
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding} {
+		if b, err := enc.DecodeString(k); err == nil {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
+// validPushKeys reports whether a subscription's keys are ones a browser could
+// have issued: p256dh an uncompressed point on P-256 and auth 16 bytes. Keys
+// that are not fail inside the encryption step before anything is sent, and
+// that failure must never reach the push service's health record, where it
+// would read as the service being down for every user it serves.
+func validPushKeys(p256dh, auth string) bool {
+	if len(p256dh) > pushMaxKeyLen || len(auth) > pushMaxKeyLen {
+		return false
+	}
+	pub, ok := decodePushKey(p256dh)
+	if !ok || len(pub) != 65 {
+		return false
+	}
+	if _, err := ecdh.P256().NewPublicKey(pub); err != nil {
+		return false
+	}
+	secret, ok := decodePushKey(auth)
+	return ok && len(secret) == 16
+}
+
+// pushServiceFault reports whether a send's outcome says something about the
+// push service itself: it could not be reached, or it answered with a 5xx.
+// Anything else - an answer below 500, or an error raised here before any
+// request went out - is about the one subscription.
+func pushServiceFault(status int, err error) bool {
+	if err != nil {
+		// Not the service's fault either way: under a wildcard entry it is a
+		// made-up name, and for an exact host it is this instance's resolver
+		// (a filtering or broken upstream), which suspending the service
+		// would not mend. The subscription is dropped only in the first case.
+		if pushEndpointUnresolvable(err) {
+			return false
+		}
+		var uerr *url.Error
+		return errors.As(err, &uerr)
+	}
+	return status >= 500
+}
+
+// pushEndpointUnresolvable reports whether the endpoint's own hostname does
+// not exist. That is about the subscription, not the service: under a
+// wildcard entry (*.notify.windows.com) anyone can file endpoints at made-up
+// subdomains, and counting their lookups as the service failing would let
+// them suspend it for everyone.
+func pushEndpointUnresolvable(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
 // pushSubject is the VAPID "sub" claim - a contact a push vendor can reach if
@@ -807,6 +871,13 @@ func pushDeliver(box string) {
 			skipped++
 			continue
 		}
+		if !validPushKeys(s.P256dh, s.Auth) {
+			// Filed before subscribe checked keys. It can never be delivered
+			// and is dropped like an expired one.
+			expired++
+			dead = append(dead, device)
+			continue
+		}
 		host := pushHost(key)
 		if pushHostSuspended(host, time.Now()) {
 			skipped++
@@ -827,9 +898,20 @@ func pushDeliver(box string) {
 			opts,
 		)
 		<-host.slots
-		pushHostResult(host, err == nil && status < 500, time.Now())
+		fault := pushServiceFault(status, err)
+		if err == nil || fault {
+			pushHostResult(host, !fault, time.Now())
+		}
 		switch {
+		case err != nil && pushEndpointUnresolvable(err) && strings.HasPrefix(key, "*"):
+			// A made-up name under a wildcard entry: it can never be delivered.
+			expired++
+			dead = append(dead, device)
 		case err != nil:
+			// A local error (raised here before anything was sent) is not the
+			// subscription's: validPushKeys has already ruled its keys out,
+			// which leaves this instance's own VAPID keys or randomness. So it
+			// touches neither the service's record nor the stored device.
 			failed++
 		case status == http.StatusNotFound || status == http.StatusGone:
 			// The push service's way of saying this subscription is gone for
@@ -975,7 +1057,7 @@ func handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	k := req.Subscription.Keys
-	if k.P256dh == "" || k.Auth == "" || len(k.P256dh) > pushMaxKeyLen || len(k.Auth) > pushMaxKeyLen {
+	if !validPushKeys(k.P256dh, k.Auth) {
 		http.Error(w, "bad keys", http.StatusBadRequest)
 		return
 	}

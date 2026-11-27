@@ -343,6 +343,22 @@ func shareKey(addr string) string {
 	return p.String()
 }
 
+// shareAggKey is the aggregate a share is also charged to: the IPv6 /48 that
+// holds the /56, or empty for IPv4 and for an address exemptFromShares. One
+// /48 is 256 /56s, and anyone with a routed /48 (free from tunnel brokers)
+// would otherwise hold 256 separate shares.
+func shareAggKey(addr string) string {
+	if exemptFromShares(addr) {
+		return ""
+	}
+	a := netip.MustParseAddr(addr).Unmap()
+	if a.Is4() {
+		return ""
+	}
+	p, _ := a.Prefix(48)
+	return p.String()
+}
+
 // rateKeyIP is the per-client bucket alone. Kept for the callers that only
 // need a stable key for one client.
 func rateKeyIP(s string) string {

@@ -19,6 +19,7 @@ import { stageEncryptedFile, stageDecryptedFile } from "../../room-security/file
 import { adoptCiphertext, consumeCiphertext, readCiphertext, writeCiphertext, removeCiphertext } from "./ciphertext-store";
 import { CiphertextChunkStore, OPFSChunkStore } from "./opfs-store";
 import { OPFSLease, STAGING_DIR } from "./opfs-lease";
+import { safeBlobType } from "../../safe-mime";
 
 export type FilePreparationPhase = "encrypting" | "hashing" | "caching";
 export type FilePreparationProgress = (
@@ -1677,7 +1678,9 @@ export class WebTorrentFileTransport implements FileTransferTransport {
         if (!blob) return;
         const prev = this.transfers.get(infoHash);
         if (prev?.blobURL) URL.revokeObjectURL(prev.blobURL);
-        const blobURL = URL.createObjectURL(blob);
+        // getBlob types the blob from the torrent's file name, which the
+        // sender chose: retype it from the allowlist, as every other path does.
+        const blobURL = URL.createObjectURL(new Blob([blob], { type: safeBlobType(descriptor.mimeType) }));
         this.upsertTransfer({
           ...prev,
           infoHash,

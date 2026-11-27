@@ -52,7 +52,7 @@ import {
   stopCallAudio,
 } from "$lib/transport/voice.svelte";
 import { CALL_SOUND_MAX_DURATION_MS } from "$lib/audio/call-audio-mixer";
-import { safeBlobType } from "$lib/safe-mime";
+import { safeBlobType, showsAsImage } from "$lib/safe-mime";
 import { createPluginSendCaps } from "./flood-cap";
 
 /**
@@ -162,7 +162,7 @@ export function makeHostApi(pluginId: string, roomCode: string): HostApi {
       const rows = await getAttachmentsByInfoHash(infoHash);
       guard();
       const row = rows.find(
-        (a) => a.roomCode === roomCode && a.mimeType.startsWith("image/")
+        (a) => a.roomCode === roomCode && showsAsImage(a.mimeType)
       );
       if (!row) return null;
       if (row.data && !row.encryption) return new Blob([row.data], { type: safeBlobType(row.mimeType) });

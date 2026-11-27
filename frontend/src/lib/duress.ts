@@ -305,8 +305,11 @@ if (typeof window !== "undefined" && typeof BroadcastChannel !== "undefined") {
  * Destroy this device's data: every IndexedDB database (identity, messages,
  * files - all of it), web storage, every Cache Storage bucket and the
  * origin's private file system (OPFS), then reload into the fresh-install
- * flow. Strictly local and silent: no network writes, no room leaves -
- * outbound traffic at wipe time is itself a tell. Never returns.
+ * flow. Silent toward our own infrastructure: no relay or room traffic, no
+ * room leaves - outbound traffic to us at wipe time is itself a tell. The one
+ * request it makes is the push subscription's unsubscribe, to the browser's
+ * push vendor: without it the wiped device keeps showing "New message" for
+ * this identity, a tell the person holding the phone sees. Never returns.
  */
 export async function executeDuressWipe(options: { notify?: boolean } = {}): Promise<never> {
   if (wipeStarted) return new Promise<never>(() => {});
@@ -338,11 +341,28 @@ export async function executeDuressWipe(options: { notify?: boolean } = {}): Pro
   // shade naming the conversations this device is about to claim it never had,
   // and their tap targets survive the wipe. getNotifications only reaches this
   // origin's own.
+  //
+  // The push subscription outlives the wipe too: it belongs to the service
+  // worker's registration, which no storage wipe reaches, so every later DM
+  // to this identity would still show "New message" on a device that claims
+  // it never had an account. unsubscribe() talks only to the push vendor,
+  // never to our relay, which drops the endpoint on the vendor's 410.
+  // Not awaited: an unsubscribe that never settles (offline, a stalled push
+  // service) must not hold up the deletions below.
   try {
     const reg = await navigator.serviceWorker?.getRegistration();
     for (const shown of (await reg?.getNotifications()) ?? []) shown.close();
+    void reg?.pushManager
+      ?.getSubscription()
+      .then((sub) => sub?.unsubscribe())
+      .catch(() => {});
   } catch {
     /* no service worker, or nothing showing */
+  }
+  try {
+    await (navigator as Navigator & { clearAppBadge?: () => Promise<void> }).clearAppBadge?.();
+  } catch {
+    /* no badge API */
   }
 
   // Our own open connection would block deleteDatabase forever - boot

@@ -18,6 +18,9 @@ export interface AdmissionConfig {
   maxPendingPerClient: number;
   maxPendingPerProxy: number;
   maxPendingTotal: number;
+  /** Joined sockets per client address (IPv6 per /64); see JoinedSockets. */
+  maxJoinedPerClient: number;
+  maxJoinedPerProxy: number;
 }
 
 function intFrom(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -60,6 +63,10 @@ const PRIVATE_RANGES: Array<[string, number, "ipv4" | "ipv6"]> = [
  *  - SFU_MAX_PENDING_PER_IP (8), SFU_MAX_PENDING_PER_PROXY (256),
  *    SFU_MAX_PENDING (1024): sockets not yet joined, per client address
  *    (IPv6 per /64), per trusted proxy that named no client, and in total.
+ *  - SFU_MAX_JOINED_PER_IP (32, a full room behind one NAT) and
+ *    SFU_MAX_JOINED_PER_PROXY (1024): sessions that have joined, those held
+ *    for a resume included, per client address (IPv6 per /64, and four times
+ *    that per /48) and per trusted proxy that named no client.
  */
 export function loadAdmissionConfig(env: NodeJS.ProcessEnv = process.env): AdmissionConfig {
   const allowedOrigins = new Set<string>();
@@ -98,6 +105,8 @@ export function loadAdmissionConfig(env: NodeJS.ProcessEnv = process.env): Admis
     maxPendingPerClient: intFrom(env, "SFU_MAX_PENDING_PER_IP", 8),
     maxPendingPerProxy: intFrom(env, "SFU_MAX_PENDING_PER_PROXY", 256),
     maxPendingTotal: intFrom(env, "SFU_MAX_PENDING", 1024),
+    maxJoinedPerClient: intFrom(env, "SFU_MAX_JOINED_PER_IP", 32),
+    maxJoinedPerProxy: intFrom(env, "SFU_MAX_JOINED_PER_PROXY", 1024),
   };
 }
 
@@ -131,6 +140,18 @@ function isTrusted(cfg: AdmissionConfig, addr: string): boolean {
   return false;
 }
 
+/** The /48 an IPv6 address sits in, or null for IPv4 and anything else. */
+export function aggregateOf(addr: string): string | null {
+  if (!isIPv6(addr)) return null;
+  const [head, tail = ""] = addr.toLowerCase().split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = addr.includes("::")
+    ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right]
+    : left;
+  return `${groups.slice(0, 3).map((g) => g.replace(/^0+(?=.)/, "")).join(":")}::/48`;
+}
+
 /** The /64 an IPv6 address sits in, as a bucket key; IPv4 unchanged. */
 export function bucketOf(addr: string): string {
   if (!isIPv6(addr)) return addr;
@@ -145,6 +166,8 @@ export function bucketOf(addr: string): string {
 
 export interface ClientKey {
   key: string;
+  /** The client's IPv6 /48, also charged for joined sockets; else absent. */
+  aggregate?: string;
   /** True when the key is a trusted proxy that named no client. */
   proxy: boolean;
 }
@@ -161,16 +184,55 @@ export function clientKey(
   forwardedFor: string | string[] | undefined,
 ): ClientKey {
   const remote = unmap(remoteAddress ?? "");
-  if (!isTrusted(cfg, remote)) return { key: bucketOf(remote), proxy: false };
+  if (!isTrusted(cfg, remote)) return clientOf(remote);
   const header = Array.isArray(forwardedFor) ? forwardedFor.join(",") : forwardedFor ?? "";
   const hops = header.split(",").map((h) => unmap(h.trim())).filter(Boolean);
   for (let i = hops.length - 1; i >= 0; i--) {
     const hop = hops[i];
     if (!isIPv4(hop) && !isIPv6(hop)) continue;
     if (isTrusted(cfg, hop)) continue;
-    return { key: bucketOf(hop), proxy: false };
+    return clientOf(hop);
   }
   return { key: `proxy:${remote}`, proxy: true };
+}
+
+function clientOf(addr: string): ClientKey {
+  const aggregate = aggregateOf(addr);
+  return aggregate ? { key: bucketOf(addr), aggregate, proxy: false } : { key: bucketOf(addr), proxy: false };
+}
+
+/**
+ * Counts sockets that have joined, per client and per IPv6 /48.
+ *
+ * Joining proves only that the client holds a key for the room it names, and
+ * anyone can make up a room. Without a cap per client, one address could hold
+ * a joined socket in each of MAX_ROOMS made-up rooms, and the rooms and RTC
+ * ports those hold are shared by the whole instance: every real call would
+ * then be refused.
+ */
+export class JoinedSockets {
+  private perKey = new Map<string, number>();
+  constructor(private cfg: AdmissionConfig) {}
+
+  /** Takes a slot and returns its release (safe to call more than once),
+   *  or null when the client or its /48 is full. */
+  tryAcquire(k: ClientKey): (() => void) | null {
+    const cap = k.proxy ? this.cfg.maxJoinedPerProxy : this.cfg.maxJoinedPerClient;
+    const keys: Array<[string, number]> = [[k.key, cap]];
+    if (k.aggregate) keys.push([`agg:${k.aggregate}`, cap * 4]);
+    for (const [key, limit] of keys) if ((this.perKey.get(key) ?? 0) >= limit) return null;
+    for (const [key] of keys) this.perKey.set(key, (this.perKey.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const [key] of keys) {
+        const n = (this.perKey.get(key) ?? 1) - 1;
+        if (n > 0) this.perKey.set(key, n);
+        else this.perKey.delete(key);
+      }
+    };
+  }
 }
 
 /** Counts sockets that have not joined yet, per bucket and in total. */

@@ -318,7 +318,24 @@ shape that means those per-address limits are inactive: bringing them into
 effect needs the client's address carried to the relay's libp2p listener,
 which takes PROXY protocol on a Traefik TCP router plus PROXY protocol
 support in the relay's listener (it has none today), or the listener
-exposed directly without Traefik in front.
+exposed directly without Traefik in front. So the compose caps each client
+at Traefik instead, on the router that carries the WebSocket:
+`RELAY_CONNS_PER_IP` (64) connections at once and `RELAY_DIALS_PER_MINUTE`
+(60, burst `RELAY_DIALS_BURST` 64) new ones. Without that, one machine could
+hold every one of `RELAY_MAX_CONNS` and keep every other browser out. Both
+key on the address Traefik sees, so behind a CDN or another proxy in front of
+Traefik they would put every user in one bucket: set the middleware's
+`ipstrategy.depth` to that proxy's hop count.
+
+An IPv6 client is counted by its full address, so if the relay domain has an
+AAAA record, one machine with a /64 can rotate addresses past both caps. On
+Traefik 3.2 or newer (`docker exec dokploy-traefik traefik version`), add
+`sourcecriterion.ipstrategy.ipv6subnet=64` to both middlewares to count a /64
+as one client. Do not add it on older Traefik: it rejects the option, and a
+label that fails to parse drops every router on the relay container. Traefik
+has no /48 aggregate either way. Also check how IPv6 reaches Traefik: through
+Docker's userland proxy on an IPv4-only network, every IPv6 client arrives
+from the bridge gateway and they would all share one bucket.
 
 **Plugin secrets are bound, one binding per name.** A
 `PLUGIN_PROXY_SECRETS` entry is `NAME@host?param=value`, for example

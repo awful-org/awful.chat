@@ -69,6 +69,19 @@ const RENDEZVOUS_PROTOCOL = "/awful/rendezvous/2.0.0";
 // messages (profiles-with-avatar, sync batches); rendezvous frames are tiny
 // REGISTER/UNREGISTER JSON.
 const MAX_DIRECT_FRAME_BYTES = 4 * 1024 * 1024;
+/**
+ * Unfinished direct frames, across every inbound stream. Anyone who knows our
+ * peerId can open streams and leave a 4 MB frame half sent on each, and peer
+ * ids are free: without a budget across streams that was memory without end.
+ * Real frames finish in moments, so a stream whose frame sits unfinished past
+ * the deadline is dropped, and one that would take the total past the budget
+ * is refused.
+ */
+const MAX_INBOUND_PARTIAL_BYTES = 128 * 1024 * 1024;
+const INBOUND_PARTIAL_DEADLINE_MS = 60_000;
+/** A real peer holds one direct stream to us, two while one replaces it;
+ *  the rest is room for a burst of reopens before the old ones reset. */
+const MAX_INBOUND_DIRECT_STREAMS = 16;
 const MAX_RENDEZVOUS_FRAME_BYTES = 16 * 1024;
 const PEER_REDIAL_DELAY_MS = 3_000;
 const PEER_REDIAL_MAX_MS = 60_000;
@@ -1150,6 +1163,8 @@ export class LibP2PTransport implements PeerTransport {
    * other was using.
    */
   private liveConnections = new Map<string, Connection>();
+  /** Bytes held in unfinished direct frames, across inbound streams (MAX_INBOUND_PARTIAL_BYTES). */
+  private inboundPartialBytes = 0;
   /**
    * Outbound streams that have proven they reach the other side.
    *
@@ -1480,7 +1495,7 @@ export class LibP2PTransport implements PeerTransport {
       // limits, but the assumption lives in the Go relay while this was the
       // one registration that omitted it - a relay that ever grants limits
       // would make every relayed peer connect and carry nothing.
-      { force: true, runOnLimitedConnection: true }
+      { force: true, runOnLimitedConnection: true, maxInboundStreams: MAX_INBOUND_DIRECT_STREAMS }
     );
     assertCurrent();
 
@@ -2760,7 +2775,15 @@ export class LibP2PTransport implements PeerTransport {
       return this.openOutboundStream(peerId, true);
     }
 
+    // Two opens can race (a cleanup in between forgets the first one's
+    // in-flight entry): the one already stored is replaced, so it is reset
+    // rather than left open on the connection, where it would count against
+    // the far side's inbound stream limit until the connection went away.
+    // Stored first: the old stream's close handler cleans up only while it is
+    // still the current one, and abort() can run that handler at once.
+    const replaced = this.peerStreams.get(peerId);
     this.peerStreams.set(peerId, stream);
+    if (replaced && replaced !== stream) replaced.abort(new Error("replaced by a newer stream"));
 
     stream.addEventListener("close", (_evt: StreamCloseEvent) => {
       // Only clean up if WE are still the current stream. The close event of
@@ -2949,15 +2972,46 @@ export class LibP2PTransport implements PeerTransport {
     // Frames out of the stream's chunks, each byte copied once: see
     // frame-assembler.ts for why merging per chunk had to go.
     const assembler = new FrameAssembler(MAX_DIRECT_FRAME_BYTES);
+    // What this stream holds of MAX_INBOUND_PARTIAL_BYTES, and since when.
+    let counted = 0;
+    let partialSince = 0;
+    let deadline: ReturnType<typeof setTimeout> | null = null;
+    const settle = () => {
+      this.inboundPartialBytes -= counted;
+      counted = 0;
+      if (deadline) clearTimeout(deadline);
+      deadline = null;
+    };
+    const drop = (why: string) => {
+      settle();
+      console.warn(`[LibP2PTransport] ${why} from ${fromId.slice(-8)}, aborting stream`);
+      stream.abort(new Error(why));
+    };
 
     stream.addEventListener("message", (evt: StreamMessageEvent) => {
       const chunk: Uint8Array =
         evt.data instanceof Uint8Array ? evt.data : evt.data.subarray();
+      if (this.inboundPartialBytes + chunk.byteLength > MAX_INBOUND_PARTIAL_BYTES) {
+        drop("inbound frame budget spent");
+        return;
+      }
 
       let frames: Uint8Array[];
       try {
         frames = assembler.push(chunk);
+        this.inboundPartialBytes += assembler.held - counted;
+        counted = assembler.held;
+        if (counted === 0) {
+          settle();
+        } else if (!deadline || frames.length > 0) {
+          // A frame finished, or the first bytes of one arrived: the next
+          // unfinished frame has the whole deadline from now.
+          if (deadline) clearTimeout(deadline);
+          partialSince = Date.now();
+          deadline = setTimeout(() => drop(`direct frame unfinished after ${Date.now() - partialSince}ms`), INBOUND_PARTIAL_DEADLINE_MS);
+        }
       } catch (err) {
+        settle();
         const len = err instanceof FrameTooLargeError ? err.bytes : -1;
         console.warn(
           `[LibP2PTransport] oversized direct frame (${len}b) from ${fromId.slice(-8)}, aborting stream`
@@ -3034,6 +3088,7 @@ export class LibP2PTransport implements PeerTransport {
     });
 
     stream.addEventListener("close", (_evt: StreamCloseEvent) => {
+      settle();
       stream.abort(new Error("remote closed"));
     });
   }

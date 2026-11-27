@@ -1711,6 +1711,15 @@ export async function bulkAddNewMessages(messages: Message[], guard: WriteGuard 
   return added.length;
 }
 
+/** Which of these message ids this device already holds, by key alone. */
+export async function heldMessageIds(ids: string[]): Promise<Set<string>> {
+  const database = await getDB();
+  const tx = database.transaction("messages", "readonly");
+  const keys = await Promise.all(ids.map((id) => tx.store.getKey(id)));
+  await tx.done;
+  return new Set(ids.filter((_, i) => keys[i] !== undefined));
+}
+
 export async function bulkPutMessages(messages: Message[], guard: WriteGuard = captureWriteGuard()): Promise<void> {
   const database = await getDB();
   guard();
@@ -3356,11 +3365,28 @@ export async function putRoomDeletionMarker(
   });
 }
 
+/**
+ * The key of the row getOwnProfile last found, so the next call reads that one
+ * row instead of the whole store: every send asks for the own profile, and the
+ * store holds every peer's avatar and banner too. Only a hint - the row is
+ * checked to still be ours before it is used - and forgotten with the
+ * database.
+ */
+let _ownProfileKey: Blinded | null = null;
+
 export async function getOwnProfile(
   selfDid?: string,
   opts?: { skipBytes?: boolean }
 ): Promise<OwnProfile | undefined> {
   const database = await getDB();
+  if (_ownProfileKey) {
+    const hinted = await database.get("profiles", _ownProfileKey);
+    if (hinted?.isMe === true) {
+      const ours = !selfDid || hinted.did === selfDid || hinted.did === (await blindValue(selfDid));
+      if (ours) return _open("profiles", hinted as OwnProfile, opts);
+    }
+    _ownProfileKey = null;
+  }
   // did and isMe are clear fields, so both lookups run before any decrypt.
   const all = await database.getAll("profiles");
   const own = all.filter((p) => p.isMe === true);
@@ -3375,7 +3401,12 @@ export async function getOwnProfile(
   }
   // skipBytes: senders only need the nickname - decrypting the avatar and
   // banner blobs on EVERY message send was a visible chunk of send latency.
-  if (mine) return _open("profiles", mine as OwnProfile, opts);
+  if (mine) {
+    // A hint only when it is unambiguous: with several isMe rows and no DID
+    // to tell them apart, every call keeps choosing from the full scan.
+    if (own.length === 1 || selfDid) _ownProfileKey = mine.did as Blinded;
+    return _open("profiles", mine as OwnProfile, opts);
+  }
   // Fall back to the row under our own did, and repair the flag. An incoming
   // profile used to be written over that row with isMe:false - our own second
   // device carries the same did - and the flag alone then hid a row that was
@@ -3967,6 +3998,7 @@ export function closeDatabase(): void {
   }
   _watermarkHolds.clear();
   _senderMax.clear();
+  _ownProfileKey = null;
 }
 
 // ── at-rest migration ────────────────────────────────────────────────────────

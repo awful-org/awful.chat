@@ -1,9 +1,13 @@
 import type { Connection, Stream, StreamMessageEvent } from "@libp2p/interface";
 import type { DiscoveryId, RoomKeys } from "./keys";
 import { isMembershipHello, SecureRoomChannel } from "./channel";
+import { FrameAssembler } from "../transport/libp2p/frame-assembler";
 
 export const ROOM_PROTOCOL = "/awful/room/2.0.0";
 const LIMIT = 2 * 1024 * 1024;
+/** The first frame is the membership hello, from a peer that has proven
+ *  nothing yet: anyone who learns a room's public id can dial a member. */
+const HELLO_LIMIT = 2048;
 
 /** Owns framing and lifetime on one Noise-authenticated libp2p stream. */
 export function attachRoomStream(options: {
@@ -20,7 +24,10 @@ export function attachRoomStream(options: {
 }): { close: () => void; getChannel: () => SecureRoomChannel | null } {
   const { stream, connection } = options;
   let channel: SecureRoomChannel | null = null;
-  let buf = new Uint8Array(0);
+  // Each byte copied once, and a frame refused at its header: merging every
+  // chunk into one growing buffer cost a full copy per chunk, so one 2 MB frame
+  // sent in tiny pieces held the main thread for seconds.
+  let frames = new FrameAssembler(() => (channel ? LIMIT : HELLO_LIMIT));
   let closed = false;
   const pendingWrites = new Set<() => void>();
   const timer = setTimeout(close, 10_000);
@@ -33,7 +40,7 @@ export function attachRoomStream(options: {
     stream.removeEventListener("message", receive);
     stream.removeEventListener("close", close);
     channel?.close();
-    buf = new Uint8Array(0);
+    frames = new FrameAssembler(0);
     stream.abort(new Error("Room channel closed"));
     options.onClose();
   }
@@ -76,18 +83,13 @@ export function attachRoomStream(options: {
     try {
       if (closed || connection.status !== "open") { close(); return; }
       const chunk = event.data instanceof Uint8Array ? event.data : event.data.subarray();
-      // No limit on the two together: one event can hold many whole frames (a
-      // relay circuit hands over as much as its window lets it read at once),
-      // and a limit here closed a channel every one of whose frames was fine.
-      // What is left over below is part of one frame, which has its own.
-      const merged = new Uint8Array(buf.length + chunk.length);
-      merged.set(buf); merged.set(chunk, buf.length); buf = merged;
-      while (buf.length >= 4) {
-        const length = new DataView(buf.buffer, buf.byteOffset).getUint32(0);
-        if (length > LIMIT || (!channel && length > 2048)) throw new Error("Oversized room frame");
-        if (buf.length < length + 4) break;
-        const frame = JSON.parse(new TextDecoder().decode(buf.subarray(4, length + 4)));
-        buf = buf.slice(length + 4);
+      // One event can hold many whole frames (a relay circuit hands over as
+      // much as its window lets it read at once); each has its own limit,
+      // read after the frame before it, so the hello opens the larger one.
+      frames.add(chunk);
+      for (let bytes = frames.next(); bytes; bytes = frames.next()) {
+        const length = bytes.length;
+        const frame = JSON.parse(new TextDecoder().decode(bytes));
         if (!channel) {
           if (!isMembershipHello(frame)) throw new Error("Expected membership hello");
           const keys = options.rooms.get(frame.room as DiscoveryId);

@@ -2,7 +2,7 @@ import * as mediasoup from "mediasoup";
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
 import { envInteger } from "./config";
-import { clientKey, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
+import { clientKey, JoinedSockets, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
 import { JOIN_TIMEOUT_MS, newJoinNonce, verifyJoin, verifyRoomAdmission } from "./auth";
 import { describeClose, holdsForResume, sweepHeartbeatConnection, type EndedBy, type HeartbeatSocket } from "./heartbeat";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -313,6 +313,10 @@ interface PeerState {
   // Set while the socket is gone and the session waits RESUME_GRACE_MS for
   // a resume; when it fires, the peer leaves as it would have at once.
   detachTimer: NodeJS.Timeout | null;
+  // Gives back this session's place in its client's joined-socket count
+  // (JoinedSockets). Held by the session, not its socket: a session waiting
+  // for a resume keeps its room and ports, so it keeps its place too.
+  releaseJoined: () => void;
 }
 
 // ── Resource ceilings ─────────────────────────────────────────────────────────
@@ -908,7 +912,12 @@ async function handleCreateTransport(
     }
   });
   transport.on("dtlsstatechange", (dtlsState) => {
-    if (dtlsState === "failed" || dtlsState === "closed") {
+    if (dtlsState === "connected") {
+      // The handshake completed: this transport can carry media, and no
+      // longer needs the timer that reaps one that never does.
+      const current = msg.direction === "send" ? peer.sendTransport : peer.recvTransport;
+      if (current === transport) clearTransportReapTimer(peer, msg.direction);
+    } else if (dtlsState === "failed" || dtlsState === "closed") {
       reapTransport(peer, msg.direction, transport, "transport-timeout");
     }
   });
@@ -985,9 +994,10 @@ async function handleConnectTransport(
 
   await transport.connect({ dtlsParameters: msg.dtlsParameters });
   peer.connectedTransports.add(msg.direction);
-  // The transport proved it can complete a handshake; it no longer needs the
-  // reap timer that exists to close it if this never happened.
-  clearTransportReapTimer(peer, msg.direction);
+  // The reap timer stays armed: connect() resolves on whatever parameters the
+  // client sent, and a client that never completes ICE and DTLS would
+  // otherwise hold its ports for as long as its socket stays open. It is
+  // cleared when the DTLS handshake actually completes (createTransport).
 }
 
 async function handleProduce(peer: PeerState, msg: MSProduce): Promise<void> {
@@ -1474,6 +1484,7 @@ function handleCloseProducer(peer: PeerState, msg: MSCloseProducer): void {
 
 function handlePeerLeft(peer: PeerState): void {
   clearDetachTimer(peer);
+  peer.releaseJoined();
   const room = rooms.get(peer.roomCode);
   if (!room) return;
 
@@ -1778,6 +1789,7 @@ const BACKPRESSURE_DEADLINE_MS = HEARTBEAT_INTERVAL_MS * 2;
 // unjoined - see sfu/admission.ts. Read once at boot, like everything above.
 const ADMISSION = loadAdmissionConfig();
 const pendingSockets = new PendingSockets(ADMISSION);
+const joinedSockets = new JoinedSockets(ADMISSION);
 
 async function main(): Promise<void> {
   worker = await mediasoup.createWorker({
@@ -1872,9 +1884,8 @@ async function main(): Promise<void> {
     // A socket that has not joined yet is counted against its client until
     // it joins or goes away. Each one is allowed JOIN_TIMEOUT_MS, and there
     // was no limit on how many one address could hold at once.
-    const releasePending = pendingSockets.tryAcquire(
-      clientKey(ADMISSION, req.socket.remoteAddress, req.headers["x-forwarded-for"]),
-    );
+    const admissionKey = clientKey(ADMISSION, req.socket.remoteAddress, req.headers["x-forwarded-for"]);
+    const releasePending = pendingSockets.tryAcquire(admissionKey);
     if (!releasePending) {
       // 1013: try again later. The client's own reconnect backoff does that.
       ws.close(1013, "Too many unjoined connections");
@@ -1974,6 +1985,21 @@ async function main(): Promise<void> {
         clearTimeout(joinTimer);
         // Authenticated: no longer an anonymous pending socket.
         releasePending();
+        // But still counted against its client: anyone can make up a room, so
+        // without this one address could take every room and RTC port on the
+        // instance (see JoinedSockets).
+        const releaseJoined = joinedSockets.tryAcquire(admissionKey);
+        if (!releaseJoined) {
+          console.warn("[sfu] joined-socket ceiling reached for one client; refusing a join");
+          send(ws, { type: "ms:error", reason: "server-full" });
+          ws.close(1013, "Too many video sessions from this address");
+          return;
+        }
+        // Until a session takes it over, the place belongs to this socket.
+        let joinedTaken = false;
+        ws.once("close", () => {
+          if (!joinedTaken) releaseJoined();
+        });
 
         const existingRoom = rooms.get(joinMsg.roomCode);
         if (!existingRoom && routers.size >= MAX_ROOMS) {
@@ -2003,6 +2029,11 @@ async function main(): Promise<void> {
           // socket may still read OPEN here (half-open, nothing told us), but
           // the one client that holds the token has already given up on it.
           peer = oldPeer;
+          // The session moves to this socket's place and gives back its old one.
+          const previousPlace = oldPeer.releaseJoined;
+          oldPeer.releaseJoined = releaseJoined;
+          joinedTaken = true;
+          previousPlace();
           resumeSession(oldPeer, ws, existingRoom!);
           return;
         }
@@ -2072,7 +2103,9 @@ async function main(): Promise<void> {
           lastDiagAt: 0,
           resumeToken: newResumeToken(),
           detachTimer: null,
+          releaseJoined,
         };
+        joinedTaken = true;
         const room = getOrCreateRoom(joinMsg.roomCode);
         if (oldPeer) {
           // The previous session failed a liveness probe, so its media is
@@ -2110,6 +2143,8 @@ async function main(): Promise<void> {
           clearTransportReapTimer(oldPeer, "send");
           clearTransportReapTimer(oldPeer, "recv");
           clearDetachTimer(oldPeer);
+          // Ended here rather than through handlePeerLeft.
+          oldPeer.releaseJoined();
           (oldPeer.ws as unknown as { endedBy?: EndedBy }).endedBy = "replaced";
           oldPeer.ws.terminate();
         }
