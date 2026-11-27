@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bucketOf, clientKey, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
+import { bucketOf, clientKey, JoinedSockets, loadAdmissionConfig, originAllowed, PendingSockets } from "./admission";
 
 test("origin: the app's DOMAIN and SFU_ALLOWED_ORIGINS, nothing else, once configured", () => {
   const cfg = loadAdmissionConfig({
@@ -73,4 +73,28 @@ test("pending sockets: per client, per proxy and in total, and released once", (
   // Five in total now: the global cap holds even for a fresh client.
   assert.equal(pending.size, 5);
   assert.equal(pending.tryAcquire({ key: "203.0.113.2", proxy: false }), null);
+});
+
+test("joined sockets: per client, per IPv6 /48, and released once", () => {
+  const cfg = loadAdmissionConfig({ SFU_MAX_JOINED_PER_IP: "2", SFU_MAX_JOINED_PER_PROXY: "3" });
+  const joined = new JoinedSockets(cfg);
+  const a = { key: "203.0.113.1", proxy: false };
+  const r1 = joined.tryAcquire(a);
+  assert.ok(r1 && joined.tryAcquire(a));
+  assert.equal(joined.tryAcquire(a), null);
+  r1!();
+  r1!();
+  assert.ok(joined.tryAcquire(a));
+  assert.equal(joined.tryAcquire(a), null);
+  assert.ok(joined.tryAcquire({ key: "203.0.113.2", proxy: false }));
+
+  // One /48 is 65,536 /64s: together they hold four clients' worth.
+  let held = 0;
+  for (let i = 0; i < 64; i++) {
+    const k = clientKey(cfg, `2001:db8:0:${i.toString(16)}::1`, undefined);
+    assert.equal(k.aggregate, "2001:db8:0::/48");
+    while (joined.tryAcquire(k)) held++;
+  }
+  assert.equal(held, 2 * 4);
+  assert.ok(joined.tryAcquire(clientKey(cfg, "2001:db8:1::1", undefined)));
 });

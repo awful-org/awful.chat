@@ -363,6 +363,30 @@ test("reaps a send transport that never completes ms:connect-transport", async (
   }
 });
 
+test("reaps a transport whose connect never completes a handshake", async () => {
+  // connect() resolves on any parameters the client sends. A client that
+  // sends made-up ones and never completes ICE and DTLS must not keep its
+  // ports for as long as its socket stays open.
+  const ws = await connectAndJoin("room-reap-connect", "peer-reap-connect");
+  try {
+    ws.send(JSON.stringify({ type: "ms:create-transport", direction: "send" }));
+    await nextMessage(ws, (m) => m.type === "ms:transport-options");
+    ws.send(JSON.stringify({
+      type: "ms:connect-transport",
+      direction: "send",
+      dtlsParameters: {
+        role: "client",
+        fingerprints: [{ algorithm: "sha-256", value: Array(32).fill("AB").join(":") }],
+      },
+    }));
+    const error = await nextMessage(ws, (m) => m.type === "ms:error", TRANSPORT_CONNECT_TIMEOUT_MS + 4000);
+    assert.equal(error.reason, "transport-timeout");
+    assert.equal(error.direction, "send");
+  } finally {
+    ws.close();
+  }
+});
+
 test("ms:restart-ice hands a connected transport fresh ICE credentials", async () => {
   const ws = await connectAndJoin("room-restart-ice", "peer-restart-ice");
   try {
