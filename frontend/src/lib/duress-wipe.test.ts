@@ -82,6 +82,23 @@ it("does not navigate when private-file deletion fails", async () => {
   expect(disk.entries.has("private/file")).toBe(true);
 });
 
+it("an unsubscribe that never settles does not hold up the wipe", async () => {
+  const disk = fakeOPFS();
+  disk.entries.set("private/file", new Blob(["x"]));
+  const replace = vi.fn();
+  const registration = {
+    getNotifications: async () => [],
+    pushManager: { getSubscription: async () => ({ unsubscribe: () => new Promise(() => {}) }) },
+  };
+  vi.stubGlobal("navigator", { storage: disk.storage, serviceWorker: { getRegistration: async () => registration } });
+  vi.stubGlobal("location", { replace });
+
+  const { executeDuressWipe } = await import("./duress");
+  void executeDuressWipe();
+  await vi.waitFor(() => expect(replace).toHaveBeenCalledWith("/"));
+  expect([...disk.entries.keys()]).toEqual([]);
+});
+
 it("cancels the push subscription and the badge, so the wiped device is not woken for this identity", async () => {
   const disk = fakeOPFS();
   const replace = vi.fn();
@@ -103,6 +120,7 @@ it("cancels the push subscription and the badge, so the wiped device is not woke
   void executeDuressWipe();
   await vi.waitFor(() => expect(replace).toHaveBeenCalledWith("/"));
   expect(close).toHaveBeenCalled();
+  await vi.waitFor(() => expect(unsubscribe).toHaveBeenCalled());
   expect(unsubscribe).toHaveBeenCalled();
   expect(clearAppBadge).toHaveBeenCalled();
 });

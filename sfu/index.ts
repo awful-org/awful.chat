@@ -313,6 +313,10 @@ interface PeerState {
   // Set while the socket is gone and the session waits RESUME_GRACE_MS for
   // a resume; when it fires, the peer leaves as it would have at once.
   detachTimer: NodeJS.Timeout | null;
+  // Gives back this session's place in its client's joined-socket count
+  // (JoinedSockets). Held by the session, not its socket: a session waiting
+  // for a resume keeps its room and ports, so it keeps its place too.
+  releaseJoined: () => void;
 }
 
 // ── Resource ceilings ─────────────────────────────────────────────────────────
@@ -1480,6 +1484,7 @@ function handleCloseProducer(peer: PeerState, msg: MSCloseProducer): void {
 
 function handlePeerLeft(peer: PeerState): void {
   clearDetachTimer(peer);
+  peer.releaseJoined();
   const room = rooms.get(peer.roomCode);
   if (!room) return;
 
@@ -1990,7 +1995,11 @@ async function main(): Promise<void> {
           ws.close(1013, "Too many video sessions from this address");
           return;
         }
-        ws.once("close", releaseJoined);
+        // Until a session takes it over, the place belongs to this socket.
+        let joinedTaken = false;
+        ws.once("close", () => {
+          if (!joinedTaken) releaseJoined();
+        });
 
         const existingRoom = rooms.get(joinMsg.roomCode);
         if (!existingRoom && routers.size >= MAX_ROOMS) {
@@ -2020,6 +2029,11 @@ async function main(): Promise<void> {
           // socket may still read OPEN here (half-open, nothing told us), but
           // the one client that holds the token has already given up on it.
           peer = oldPeer;
+          // The session moves to this socket's place and gives back its old one.
+          const previousPlace = oldPeer.releaseJoined;
+          oldPeer.releaseJoined = releaseJoined;
+          joinedTaken = true;
+          previousPlace();
           resumeSession(oldPeer, ws, existingRoom!);
           return;
         }
@@ -2089,7 +2103,9 @@ async function main(): Promise<void> {
           lastDiagAt: 0,
           resumeToken: newResumeToken(),
           detachTimer: null,
+          releaseJoined,
         };
+        joinedTaken = true;
         const room = getOrCreateRoom(joinMsg.roomCode);
         if (oldPeer) {
           // The previous session failed a liveness probe, so its media is
@@ -2127,6 +2143,8 @@ async function main(): Promise<void> {
           clearTransportReapTimer(oldPeer, "send");
           clearTransportReapTimer(oldPeer, "recv");
           clearDetachTimer(oldPeer);
+          // Ended here rather than through handlePeerLeft.
+          oldPeer.releaseJoined();
           (oldPeer.ws as unknown as { endedBy?: EndedBy }).endedBy = "replaced";
           oldPeer.ws.terminate();
         }

@@ -599,8 +599,13 @@ func TestPushLocalErrorsNeverSuspendTheService(t *testing.T) {
 	pushMu.Lock()
 	left, _ := readPushBox(box)
 	pushMu.Unlock()
-	if len(left) != 0 {
-		t.Fatalf("%d undeliverable subscription(s) kept", len(left))
+	// The bad-key one is dropped; the others are kept, since a local error
+	// (this instance's own keys, say) is no reason to forget a device.
+	if len(left) != pushMaxDevices {
+		t.Fatalf("kept %d subscription(s), want %d", len(left), pushMaxDevices)
+	}
+	if _, ok := left[deviceID(90)]; ok {
+		t.Fatal("the stored bad-key subscription was kept")
 	}
 }
 

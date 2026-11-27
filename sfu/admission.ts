@@ -63,9 +63,10 @@ const PRIVATE_RANGES: Array<[string, number, "ipv4" | "ipv6"]> = [
  *  - SFU_MAX_PENDING_PER_IP (8), SFU_MAX_PENDING_PER_PROXY (256),
  *    SFU_MAX_PENDING (1024): sockets not yet joined, per client address
  *    (IPv6 per /64), per trusted proxy that named no client, and in total.
- *  - SFU_MAX_JOINED_PER_IP (24), SFU_MAX_JOINED_PER_PROXY (1024): sockets
- *    that have joined, per client address (IPv6 per /64, and four times that
- *    per /48) and per trusted proxy that named no client.
+ *  - SFU_MAX_JOINED_PER_IP (32, a full room behind one NAT) and
+ *    SFU_MAX_JOINED_PER_PROXY (1024): sessions that have joined, those held
+ *    for a resume included, per client address (IPv6 per /64, and four times
+ *    that per /48) and per trusted proxy that named no client.
  */
 export function loadAdmissionConfig(env: NodeJS.ProcessEnv = process.env): AdmissionConfig {
   const allowedOrigins = new Set<string>();
@@ -104,7 +105,7 @@ export function loadAdmissionConfig(env: NodeJS.ProcessEnv = process.env): Admis
     maxPendingPerClient: intFrom(env, "SFU_MAX_PENDING_PER_IP", 8),
     maxPendingPerProxy: intFrom(env, "SFU_MAX_PENDING_PER_PROXY", 256),
     maxPendingTotal: intFrom(env, "SFU_MAX_PENDING", 1024),
-    maxJoinedPerClient: intFrom(env, "SFU_MAX_JOINED_PER_IP", 24),
+    maxJoinedPerClient: intFrom(env, "SFU_MAX_JOINED_PER_IP", 32),
     maxJoinedPerProxy: intFrom(env, "SFU_MAX_JOINED_PER_PROXY", 1024),
   };
 }

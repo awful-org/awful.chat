@@ -885,12 +885,11 @@ func pushDeliver(box string) {
 			pushHostResult(host, !fault, time.Now())
 		}
 		switch {
-		case err != nil && !fault:
-			// Raised here before anything was sent: this subscription cannot
-			// be delivered, and says nothing about the service.
-			expired++
-			dead = append(dead, device)
 		case err != nil:
+			// A local error (raised here before anything was sent) is not the
+			// subscription's: validPushKeys has already ruled its keys out,
+			// which leaves this instance's own VAPID keys or randomness. So it
+			// touches neither the service's record nor the stored device.
 			failed++
 		case status == http.StatusNotFound || status == http.StatusGone:
 			// The push service's way of saying this subscription is gone for

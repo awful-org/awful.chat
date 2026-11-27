@@ -1232,3 +1232,71 @@ test("a camera sent at three sizes is consumed at the level asked for, and moved
     for (const ws of viewers) ws.close();
   }
 });
+
+// Joined sessions are counted against their client (sfu/admission.ts
+// JoinedSockets), and a session held for a resume keeps its place: its room
+// and ports are still held, so a client that closed and re-joined in a loop
+// would otherwise take every room on the instance.
+describe("admission: joined sessions per client", () => {
+  let JOIN_PORT = 0;
+  let joinSfu: SpawnedSfu;
+
+  before(async () => {
+    JOIN_PORT = await freePort([PORT]);
+    // From 127.0.0.1 with no X-Forwarded-For: a trusted proxy naming nobody.
+    joinSfu = spawnSfu(JOIN_PORT, { SFU_MAX_JOINED_PER_PROXY: "2" });
+    await waitForServer(JOIN_PORT);
+  });
+
+  after(async () => {
+    await joinSfu.stop();
+  });
+
+  // Joins and reports the first answer: "joined" or the error's reason.
+  async function tryJoin(room: string, label: string): Promise<{ ws: WebSocket; outcome: string }> {
+    const roomCode = testRoom(room).room;
+    const ws = new WebSocket(wsUrl(JOIN_PORT));
+    const challenge = nextMessage(ws, (m) => m.type === "auth:challenge");
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+    const { nonce } = await challenge;
+    const peerId = testPeer(label).peerId;
+    const signature = sign(null, Buffer.from(joinPayload(nonce, roomCode, peerId)), testPeer(label).privateKey).toString("base64");
+    const answer = nextMessage(ws, (m) => m.type === "auth:joined" || m.type === "ms:error");
+    ws.send(JSON.stringify({ type: "join", roomCode, peerId, signature, capability: roomProof(nonce, roomCode, peerId) }));
+    const m = await answer;
+    return { ws, outcome: m.type === "auth:joined" ? "joined" : m.reason };
+  }
+
+  test("a client past its joined sessions is refused, and a held session keeps its place", async () => {
+    const a = await tryJoin("joined-cap-a", "joined-cap-a");
+    const b = await tryJoin("joined-cap-b", "joined-cap-b");
+    assert.equal(a.outcome, "joined");
+    assert.equal(b.outcome, "joined");
+    const c = await tryJoin("joined-cap-c", "joined-cap-c");
+    assert.equal(c.outcome, "server-full");
+    c.ws.close();
+
+    // Closed as unanswered: held for a resume, so still counted.
+    const closed = new Promise<void>((resolve) => a.ws.once("close", () => resolve()));
+    a.ws.close(4000);
+    await closed;
+    const d = await tryJoin("joined-cap-d", "joined-cap-d");
+    assert.equal(d.outcome, "server-full");
+    d.ws.close();
+
+    // Once the hold ends, the place is free again.
+    const end = Date.now() + RESUME_GRACE_MS + 4000;
+    let e = await tryJoin("joined-cap-e", "joined-cap-e");
+    while (e.outcome !== "joined" && Date.now() < end) {
+      e.ws.close();
+      await new Promise((r) => setTimeout(r, 100));
+      e = await tryJoin("joined-cap-e", "joined-cap-e");
+    }
+    assert.equal(e.outcome, "joined");
+    e.ws.close();
+    b.ws.close();
+  });
+});
